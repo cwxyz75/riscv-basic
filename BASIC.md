@@ -28,6 +28,36 @@ READY.
 - Ctrl-C at any point is BREAK: it abandons the line being typed, or stops a
   running program with `BREAK IN <line>`, then returns to `READY.`.
 
+## Program entry, tokenizing and LIST
+
+Details of how a typed line becomes a stored program line (D9: tokenized).
+
+- Leading spaces on a line are ignored. A line number is the run of digits at
+  the start; spaces after it are dropped. A number above 63999 (or too long to
+  fit) is `?SYNTAX ERROR`. A number with nothing after it deletes that line;
+  deleting a line that does not exist does nothing, silently.
+- Input is ASCII only. Any character outside ASCII is `?SYNTAX ERROR`.
+- **Keywords** are recognised anywhere outside a string literal, `REM` text and
+  `DATA` items, case-insensitively, taking the longest match at each position
+  (see the name-splitting rule under Values). `?` is read as `PRINT`.
+  The keyword list: `REM LET PRINT INPUT IF THEN GOTO GOSUB RETURN ON FOR TO
+  STEP NEXT END STOP DIM DATA READ RESTORE CLS COLOR LOCATE POKE RUN LIST NEW
+  AND OR NOT ABS INT SGN SQR SIN COS TAN ATN LOG EXP RND PEEK FRE TIMER LEN ASC
+  VAL STR$ CHR$ LEFT$ RIGHT$ MID$ TAB SPC`.
+- Outside string literals, `REM` text and `DATA` items, letters are folded to
+  upper case (so variable names are stored upper case). String literals (an
+  unterminated one runs to the end of the line), `REM` text, and `DATA` items
+  (up to the next `:` outside quotes) are stored exactly as typed. Spaces and
+  all other characters are kept as typed.
+- `LIST` prints each line as the line number, one space, then the line
+  detokenized: keyword text upper case, nothing inserted around it, so
+  `10 print"hi"` lists as `10 PRINT"hi"`.
+- `LIST` takes an optional range: `LIST` (all), `LIST 20` (that line),
+  `LIST 20-30`, `LIST 20-` (from 20), `LIST -30` (up to 30). Lines in the range
+  print in line-number order; an empty or reversed range prints nothing. Bad
+  numbers or other text after `LIST` are `?SYNTAX ERROR`.
+- `NEW` (with nothing after it) deletes the program.
+
 ## Values and variables
 
 - Two types: number (`f64`) and string (name ends in `$`). No integer type.

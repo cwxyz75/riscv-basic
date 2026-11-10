@@ -1,0 +1,8 @@
+READY.
+READY.
+READY.
+READY.
+5 REM first
+10 PRINT "hello"
+20 FOR I=1 TO 3
+READY.

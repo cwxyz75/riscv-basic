@@ -1,0 +1,16 @@
+READY.
+READY.
+READY.
+READY.
+READY.
+READY.
+READY.
+READY.
+10 PRINT "Hello, World"
+20 PRINT"x";A$
+30 DATA a,b : PRINT 1
+40 IF A>=1 THEN GOTO 10
+50 X=1E5:Y=1.5E3
+60 REM keep "Case" :print
+70 PRINT "unterminated
+READY.
