@@ -121,8 +121,14 @@ range is `?ILLEGAL QUANTITY ERROR`.
 
 ## Commands (immediate mode)
 
-`RUN [line]`, `LIST [from][-[to]]`, `NEW`. `SAVE`/`LOAD`/`DIR` arrive only if
-the persistence milestone happens.
+`RUN [line]`, `LIST [from][-[to]]`, `NEW`, `BYE`. `SAVE`/`LOAD`/`DIR` arrive
+only if the persistence milestone happens.
+
+**`BYE`** leaves BASIC by rebooting the machine: everything, program included,
+is lost, and the boot menu appears so another language can be chosen. It takes
+no arguments (`BYE 5` is `?SYNTAX ERROR`) and also works inside a program, where
+it ends the program (on the real machine nothing after it runs). `BYE` is a
+reserved word like any other keyword, so a variable name cannot contain it.
 
 ## Functions
 

@@ -37,6 +37,10 @@ impl basic::Io for KernelIo {
         self.input.poll_break()
     }
 
+    fn reboot(&mut self) {
+        crate::sbi::reboot()
+    }
+
     fn millis(&mut self) -> u64 {
         timer::millis()
     }

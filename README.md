@@ -7,7 +7,8 @@ of OpenSBI. Built for amusement.
 ## A session
 
 This is real output from the booted machine (captured by the boot tests'
-harness, with the typed lines echoed by the console as you would see them):
+harness, with the typed lines echoed by the console as you would see them),
+after pressing `1` at the boot menu. `BYE` reboots back to the menu:
 
 ```text
 RISCV BASIC V0.1
@@ -78,7 +79,7 @@ READY.
 ```sh
 brew install qemu
 rustup toolchain install     # reads rust-toolchain.toml: toolchain, components, riscv64 target
-make run                     # boots to READY.  (Ctrl-A then X quits QEMU)
+make run                     # boots to a language menu: press 1 for BASIC (Ctrl-A then X quits QEMU)
 ```
 
 Other commands:

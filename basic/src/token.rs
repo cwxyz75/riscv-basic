@@ -20,7 +20,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
     "STEP", "NEXT", "END", "STOP", "DIM", "DATA", "READ", "RESTORE", "CLS", "COLOR", "LOCATE",
     "POKE", "RUN", "LIST", "NEW", "AND", "OR", "NOT", "ABS", "INT", "SGN", "SQR", "SIN", "COS",
     "TAN", "ATN", "LOG", "EXP", "RND", "PEEK", "FRE", "TIMER", "LEN", "ASC", "VAL", "STR$", "CHR$",
-    "LEFT$", "RIGHT$", "MID$", "TAB", "SPC",
+    "LEFT$", "RIGHT$", "MID$", "TAB", "SPC", "BYE",
 ];
 
 /// The token byte for a keyword. Panics only if `name` is not in `KEYWORDS`,

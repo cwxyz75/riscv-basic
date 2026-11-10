@@ -31,6 +31,11 @@ pub trait Io {
     /// Milliseconds since boot, for `TIMER`.
     fn millis(&mut self) -> u64;
 
+    /// Reboot the machine (`BYE`). On real hardware this does not return; the
+    /// interpreter ends the current run right after calling it, for the sake of
+    /// implementations that do (such as the test console).
+    fn reboot(&mut self);
+
     /// Clear the screen and home the cursor (`CLS`). The default sends the ANSI
     /// escape sequence; an implementation with a real screen may override it.
     fn clear_screen(&mut self) {

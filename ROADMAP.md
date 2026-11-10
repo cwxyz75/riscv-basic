@@ -98,11 +98,11 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 Acceptance: a boot test sends `1` or `2` at the menu and lands in the chosen
 language; `BYE` reboots back to the menu.
 
-- [ ] Menu at boot (`1) BASIC  2) LOGO`), one keypress; option 2 says "not installed yet" and re-prompts until the LOGO track lands
-- [ ] Kernel hands the console to `basic::Interpreter` or, later, the LOGO runtime
-- [ ] `BYE` in BASIC: SBI System Reset (cold reboot) back to the menu
-- [ ] Update the QEMU test scripts to send the menu keystroke first
-- [ ] Update README and DESIGN (boot flow, decision log); record the "language is chosen at boot, no switching" decision
+- [x] Menu at boot (`1) BASIC  2) LOGO`), one keypress; option 2 says "not installed yet" and re-prompts until the LOGO track lands
+- [x] Kernel hands the console to `basic::Interpreter` or, later, the LOGO runtime
+- [x] `BYE` in BASIC: SBI System Reset (cold reboot) back to the menu
+- [x] Update the QEMU test scripts to send the menu keystroke first
+- [x] Update README and DESIGN (boot flow, decision log); record the "language is chosen at boot, no switching" decision
 
 ## LOGO track
 

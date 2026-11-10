@@ -7,6 +7,7 @@ const FID_SET_TIMER: usize = 0;
 const EID_SRST: usize = 0x5352_5354; // "SRST"
 const FID_SYSTEM_RESET: usize = 0;
 const RESET_TYPE_SHUTDOWN: usize = 0;
+const RESET_TYPE_COLD_REBOOT: usize = 1;
 const RESET_REASON_NONE: usize = 0;
 
 /// Make the machine raise a supervisor timer interrupt when the `time` counter
@@ -35,6 +36,25 @@ pub fn shutdown() -> ! {
             in("a7") EID_SRST,
             in("a6") FID_SYSTEM_RESET,
             inout("a0") RESET_TYPE_SHUTDOWN => _,
+            inout("a1") RESET_REASON_NONE => _,
+        );
+    }
+    loop {
+        // SAFETY: `wfi` just idles the hart until the next interrupt.
+        unsafe { asm!("wfi") }
+    }
+}
+
+/// Ask OpenSBI to cold-reboot the machine: everything restarts from the
+/// firmware, and the boot menu comes up again.
+pub fn reboot() -> ! {
+    // SAFETY: as for `shutdown`, with the cold-reboot reset type.
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") EID_SRST,
+            in("a6") FID_SYSTEM_RESET,
+            inout("a0") RESET_TYPE_COLD_REBOOT => _,
             inout("a1") RESET_REASON_NONE => _,
         );
     }
