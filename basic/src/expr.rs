@@ -4,12 +4,9 @@
 
 use crate::error::Error;
 use crate::io::Io;
+use crate::memory::Memory;
 use crate::token::{keyword, token};
-use alloc::collections::BTreeMap;
 use alloc::string::String;
-
-/// Numeric variables by (upper-case) name.
-pub(crate) type Variables = BTreeMap<String, f64>;
 
 /// Evaluate one expression starting at `pos` in `src`. Returns the value and
 /// the position just after the expression (trailing spaces not consumed).
@@ -17,13 +14,13 @@ pub(crate) type Variables = BTreeMap<String, f64>;
 pub(crate) fn evaluate<I: Io>(
     src: &[u8],
     pos: usize,
-    vars: &Variables,
+    mem: &mut Memory,
     io: &mut I,
 ) -> Result<(f64, usize), Error> {
     let mut parser = Parser {
         src,
         pos,
-        vars,
+        mem,
         io,
         and: token("AND"),
         or: token("OR"),
@@ -68,6 +65,34 @@ fn check(value: f64) -> Result<f64, Error> {
     }
 }
 
+/// The numeric functions that take one number and give one back.
+fn math(name: &str, x: f64) -> Result<f64, Error> {
+    let result = match name {
+        "ABS" => x.abs(),
+        "INT" => libm::floor(x),
+        "SGN" => {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        "SQR" if x < 0.0 => return Err(Error::IllegalQuantity),
+        "SQR" => libm::sqrt(x),
+        "SIN" => libm::sin(x),
+        "COS" => libm::cos(x),
+        "TAN" => libm::tan(x),
+        "ATN" => libm::atan(x),
+        "LOG" if x <= 0.0 => return Err(Error::IllegalQuantity),
+        "LOG" => libm::log(x),
+        "EXP" => libm::exp(x),
+        _ => return Err(Error::Syntax),
+    };
+    check(result)
+}
+
 /// A machine address for `PEEK`/`POKE`: a non-negative integer-valued number
 /// below 2^53, so it converts exactly.
 pub(crate) fn to_address(value: f64) -> Result<u64, Error> {
@@ -101,7 +126,7 @@ fn to_i32(value: f64) -> Result<i32, Error> {
 struct Parser<'a, I: Io> {
     src: &'a [u8],
     pos: usize,
-    vars: &'a Variables,
+    mem: &'a mut Memory,
     io: &'a mut I,
     and: u8,
     or: u8,
@@ -280,7 +305,7 @@ impl<I: Io> Parser<'_, I> {
             Some(b) if b.is_ascii_digit() || b == b'.' => self.number(),
             Some(b) if b.is_ascii_alphabetic() => {
                 let name = parse_name(self.src, &mut self.pos)?.ok_or(Error::Syntax)?;
-                Ok(self.vars.get(&name).copied().unwrap_or(0.0))
+                Ok(self.mem.number(&name))
             }
             Some(b) => match keyword(b) {
                 Some("PEEK") => {
@@ -291,6 +316,19 @@ impl<I: Io> Parser<'_, I> {
                 Some("TIMER") => {
                     self.pos += 1;
                     Ok(self.io.millis() as f64 / 1000.0)
+                }
+                Some("RND") => {
+                    self.pos += 1;
+                    let x = self.parenthesised()?;
+                    Ok(self.mem.rnd(x))
+                }
+                Some(
+                    name @ ("ABS" | "INT" | "SGN" | "SQR" | "SIN" | "COS" | "TAN" | "ATN" | "LOG"
+                    | "EXP"),
+                ) => {
+                    self.pos += 1;
+                    let x = self.parenthesised()?;
+                    math(name, x)
                 }
                 _ => Err(Error::Syntax),
             },
@@ -383,8 +421,8 @@ mod tests {
 
     fn eval(text: &str) -> Result<f64, Error> {
         let tokens = tokenize(text).unwrap();
-        let vars = Variables::new();
-        let (value, end) = evaluate(&tokens, 0, &vars, &mut TestIo)?;
+        let mut mem = Memory::default();
+        let (value, end) = evaluate(&tokens, 0, &mut mem, &mut TestIo)?;
         assert!(tokens[end..].iter().all(|&b| b == b' '), "trailing input");
         Ok(value)
     }
@@ -417,12 +455,15 @@ mod tests {
     #[test]
     fn variables_default_to_zero_and_reject_string_names() {
         let tokens = tokenize("X+1").unwrap();
-        let mut vars = Variables::new();
-        assert_eq!(evaluate(&tokens, 0, &vars, &mut TestIo).unwrap().0, 1.0);
-        vars.insert("X".into(), 4.0);
-        assert_eq!(evaluate(&tokens, 0, &vars, &mut TestIo).unwrap().0, 5.0);
+        let mut mem = Memory::default();
+        assert_eq!(evaluate(&tokens, 0, &mut mem, &mut TestIo).unwrap().0, 1.0);
+        mem.set_number("X".into(), 4.0);
+        assert_eq!(evaluate(&tokens, 0, &mut mem, &mut TestIo).unwrap().0, 5.0);
         let tokens = tokenize("A$").unwrap();
-        assert_eq!(evaluate(&tokens, 0, &vars, &mut TestIo), Err(Error::Syntax));
+        assert_eq!(
+            evaluate(&tokens, 0, &mut mem, &mut TestIo),
+            Err(Error::Syntax)
+        );
     }
 
     #[test]

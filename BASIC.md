@@ -221,6 +221,34 @@ strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
 - No way to interrupt a runaway program exists until BREAK handling arrives
   (milestone M6), so golden tests must not contain endless loops.
 
+## Numeric functions
+
+Every function takes its argument in parentheses, as in `SQR(X)`.
+
+| Function | Result |
+|---|---|
+| `ABS(x)` | absolute value |
+| `INT(x)` | the largest integer not above `x` (rounds toward minus infinity: `INT(-3.2)` is `-4`) |
+| `SGN(x)` | `-1`, `0` or `1` |
+| `SQR(x)` | square root; `x < 0` is `?ILLEGAL QUANTITY ERROR` |
+| `SIN(x)`, `COS(x)`, `TAN(x)` | trigonometry, `x` in radians |
+| `ATN(x)` | arctangent, in radians |
+| `LOG(x)` | natural logarithm; `x <= 0` is `?ILLEGAL QUANTITY ERROR` |
+| `EXP(x)` | e to the power `x`; too large is `?OVERFLOW ERROR` |
+| `RND(x)` | a pseudo-random number, see below |
+
+A missing parenthesis, an empty argument or a second argument is `?SYNTAX
+ERROR`. Results are rounded to 9 digits when printed, so values such as
+`SIN(1)` print as `0.841470985`.
+
+**`RND(x)`** gives a number from 0 up to but not including 1. With `x > 0` it
+returns the next number of the sequence; with `x = 0` it returns the previous
+number again; with `x < 0` it reseeds the generator from `x` and returns the
+first number of that sequence, so the same negative `x` always gives the same
+sequence. The generator starts from the same fixed state on every boot, so a
+program that wants a different sequence each time reseeds with `RND(-TIMER)`.
+Only these properties are specified, not the particular numbers.
+
 ## Machine access: `PEEK`, `POKE`, `TIMER`
 
 - **`PEEK(addr)`** reads one byte from the physical address `addr` and gives it
