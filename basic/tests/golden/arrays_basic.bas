@@ -1,0 +1,20 @@
+DIM A(5)
+A(0)=10: A(5)=50
+PRINT A(0);A(5)
+PRINT A(3)
+A(2)=A(0)+A(5)
+PRINT A(2)
+DIM N$(3)
+N$(1)="ONE": N$(2)="TWO"
+PRINT N$(1)+N$(2)
+PRINT N$(3);"|"
+A=7: PRINT A;A(0)
+DIM B(2,3)
+B(1,2)=5: B(2,3)=9
+PRINT B(1,2);B(2,3);B(0,0)
+DIM C(1,1,1): C(1,1,1)=3: PRINT C(1,1,1)
+FOR I=0 TO 5: A(I)=I*I: NEXT I
+PRINT A(4)
+A(1)=7: PRINT A(1.9);A(0.5)
+LET A(1)=3: PRINT A(1)
+FOR I=0 TO 4: A(I+1)=A(I)+1: NEXT I: PRINT A(5)
