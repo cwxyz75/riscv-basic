@@ -133,7 +133,7 @@ golden images; the same API draws in the QEMU window.
 
 Acceptance: golden transcripts and golden images for each item, under `make test`.
 
-- [ ] Settle the top open questions in `LOGO.md`
+- [x] Settle the top open questions in `LOGO.md`
 - [ ] Reader: words, numbers, lists, `:var`, `"word`, infix operators, arity-driven prefix parsing
 - [ ] Evaluator: turtle commands, `REPEAT`, `IF/IFELSE`, `MAKE/THING`, `PRINT/SHOW`
 - [ ] `TO ... END`, `OUTPUT/STOP`, recursion, dynamic scope
