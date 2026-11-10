@@ -100,6 +100,8 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D6 | Binary size is not a goal | Decided |
 | D7 | Console is direct 16550 MMIO from M0; SBI is used for shutdown and timer (revised from an earlier plan to bootstrap via SBI putchar) | Decided |
 | D8 | `basic` is `forbid(unsafe_code)`; hardware access only through `Io` | Proposed |
-| D9 | Tokenized program store | Proposed |
+| D9 | Tokenized program store (packed bytes, keywords as single-byte tokens; `LIST` detokenizes) | Decided |
 | D10 | Memory: fixed 32 KiB program area plus an `alloc`-backed heap; which allocator is open | Open |
 | D11 | Makefile (not `just`/`xtask`) to keep prerequisites minimal | Decided |
+| D12 | `PEEK`/`POKE` are raw and unrestricted, reaching any physical address through `Io`; a fault is a kernel crash (authentic, and no safety window to design) | Decided |
+| D13 | Language semantics settled in `BASIC.md`: full-length variable names, left-associative `^`, 32-bit logical operators, no `ELSE`, 14-column `PRINT` zones, `TIMER`, 255-char lines, 9-significant-digit number output | Decided |
