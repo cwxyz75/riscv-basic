@@ -20,6 +20,8 @@ Project: a toy 80s-style BASIC computer for QEMU RISC-V (`virt`), in Rust. Read
   the need for `unsafe` or an address in `basic/`, add a method to `Io` instead.
 - `console/` is the pure half of the console (line editor, ANSI helpers):
   `no_std`, `#![forbid(unsafe_code)]`, host-tested, no hardware access.
+- `turtle/` is the pure graphics half of LOGO (canvas trait, rasteriser, turtle):
+  `no_std`, `#![forbid(unsafe_code)]`, host-tested against golden images.
 - `examples/` holds the demo BASIC programs; golden tests load them with a
   `<LOAD examples/NAME.bas>` line and boot tests type them over the serial port.
 - `kernel/` owns everything hardware: boot, UART, traps, timer,

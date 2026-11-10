@@ -113,7 +113,8 @@ live only until the machine is switched off.
 |---|---|
 | `basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
 | `console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
-| `kernel/` | Boot code, UART driver, traps, timer, heap. Hosts the interpreter. |
+| `turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
+| `kernel/` | Boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
 | `examples/` | Demo BASIC programs (also used by the golden and boot tests). |
 | `scripts/` | The QEMU boot tests. |
 | `DESIGN.md` | Architecture, memory map, decision log. |

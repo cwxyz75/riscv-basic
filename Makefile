@@ -15,7 +15,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p basic -p console
+	cargo test -p basic -p console -p turtle
 
 fmt:
 	cargo fmt --all
@@ -24,7 +24,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p basic -p console --all-targets -- -D warnings
+	cargo clippy -p basic -p console -p turtle --all-targets -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
 
 kernel:

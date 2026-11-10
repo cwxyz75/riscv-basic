@@ -84,6 +84,52 @@ Typing happens in the serial terminal; the turtle draws in the QEMU window.
   heading, and erased by drawing it again with XOR (so no pixels need saving).
   `hideturtle`/`ht` and `showturtle`/`st` control it.
 
+## Turtle graphics in detail
+
+Fixes the rules the first graphics layer is built and tested against (the
+`turtle` crate, milestone L1). Everything here is integer-exact where it can be,
+so golden images are stable.
+
+- **Canvas and palette.** A canvas is a grid of pixels, each holding a palette
+  index 0 to 15. The machine's canvas is 640x480; the host tests use tiny ones
+  (and any even size works). The palette, as UCBLogo's: 0 black, 1 blue, 2 green,
+  3 cyan, 4 red, 5 magenta, 6 yellow, 7 white, 8 brown, 9 tan, 10 forest,
+  11 aqua, 12 salmon, 13 purple, 14 orange, 15 grey. The background starts at 0
+  and the pen at 7.
+- **Coordinates to pixels.** With a canvas `w` wide and `h` high, logo point
+  `(x, y)` is column `w/2 + round(x)` and row `h/2 - round(y)` (integer
+  division; `round` is `floor(v + 0.5)`; rows count down from the top). The
+  turtle keeps exact `f64` coordinates; only drawing rounds.
+- **Lines.** A move from P0 to P1 with the pen down draws the straight line
+  between the two rounded endpoints, both included, with this Bresenham:
+  `dx = |x1-x0|`, `dy = |y1-y0|`, `err = dx - dy`; plot; stop at the end point;
+  `e2 = 2*err`; if `e2 > -dy` then `err -= dy` and step x; if `e2 < dx` then
+  `err += dx` and step y; repeat. Pixels outside the canvas are skipped.
+- **Moving.** `forward d` moves `d` along the heading: `x += d*sin(h)`,
+  `y += d*cos(h)` (`h` in degrees, 0 is up, clockwise); `back d` is `forward -d`.
+  `left`/`right` turn; the heading is always kept in `[0, 360)`.
+  `setxy`, `setheading`, `home` (to `(0,0)`, heading 0, drawing nothing),
+  `clearscreen` (clear the canvas to 0 and go home), `clean` (clear the canvas,
+  turtle untouched), `setpencolor n` (0 to 15) and `penup`/`pendown` work as in
+  UCBLogo. `setxy` draws a line like a move when the pen is down.
+- **Wrap.** The turtle lives on a torus: coordinates run over the closed
+  interval `[-w/2, w/2] x [-h/2, h/2]`. A move that would leave it is drawn up
+  to the edge, the turtle reappears at the opposite edge, and the rest of the
+  move continues from there. (Pixels exactly at the right and bottom edges would
+  fall one past the canvas and are skipped, so those edge points show only on
+  the far side.) One move is cut off after 4096 edge crossings.
+- **`fill`.** Flood-fills, with the pen colour, the 4-connected region of
+  pixels that have the same colour as the pixel under the turtle, whether the
+  pen is up or down.
+- **The sprite.** When shown, a triangle is toggled onto the canvas: the tip
+  8 pixels ahead of the turtle and two corners 7 pixels away, at 150 degrees to
+  the right and to the left of the heading (30 degrees off straight back),
+  joined by three lines drawn with each line's
+  last pixel left out (so shared corners are toggled once). "Toggled" means the
+  pixel's colour is XORed with 15, so drawing it again erases it exactly. The
+  sprite is removed before any drawing operation and put back after, so it never
+  ends up in the picture, and `fill` never sees it.
+
 ## Control, data and I/O
 
 - `repeat n [..]`, `if cond [..]`, `ifelse cond [..] [..]`, `stop`, `output`/`op`,
