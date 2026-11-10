@@ -1,0 +1,12 @@
+print 1e200 * 1e200
+print 1e308 + 1e308
+print -1e308 - 1e308
+print 2 * 1e308
+print 1e308 / 0.1
+print 1e308 + 1e307
+print 1e-200 * 1e-200
+make "big 1e200
+print :big * :big
+print :big * 2
+print -:big * :big
+print "ok

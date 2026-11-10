@@ -95,7 +95,9 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
 fn run_logo(out: &mut Console) {
     use turtle::Canvas;
     let mut io = KernelIo::new();
-    let mut interpreter = logo::Interpreter::new();
+    // Every line compiles to machine code before it runs (`.engine "ast` switches
+    // to the reference interpreter).
+    let mut interpreter = logo::Interpreter::with_executor(jit::execute);
     match gfx::init() {
         Ok(pixels) => {
             let mut canvas = gfx::FbCanvas::new(pixels);

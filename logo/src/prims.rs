@@ -41,7 +41,7 @@ pub(crate) fn arity(name: &str) -> Option<usize> {
         "forward" | "back" | "left" | "right" | "setheading" | "setpencolor" | "wait" | "print"
         | "show" | "type" | "sqrt" | "sin" | "cos" | "arctan" | "abs" | "int" | "round"
         | "random" | "first" | "last" | "butfirst" | "butlast" | "count" | "emptyp" | "listp"
-        | "wordp" | "numberp" | "not" | "output" | "thing" | "run" => 1,
+        | "wordp" | "numberp" | "not" | "output" | "thing" | "run" | ".engine" => 1,
         "setxy" | "repeat" | "if" | "make" | "fput" | "lput" | "list" | "sentence" | "item"
         | "and" | "or" => 2,
         "ifelse" => 3,
@@ -193,6 +193,16 @@ pub(crate) fn call<I: Io, C: Canvas>(
             }
         }
         "bye" => m.io.reboot(),
+        ".engine" => match &a[0] {
+            Value::Word(w) if w.eq_ignore_ascii_case("ast") => {
+                it.engine = crate::interp::Engine::Ast
+            }
+            Value::Word(w) if w.eq_ignore_ascii_case("ir") => it.engine = crate::interp::Engine::Ir,
+            Value::Word(w) if w.eq_ignore_ascii_case("jit") && it.executor.is_some() => {
+                it.engine = crate::interp::Engine::Jit
+            }
+            other => return Err(bad(name, other).into()),
+        },
 
         // --- data and printing ---
         "make" => match &a[0] {

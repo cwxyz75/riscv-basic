@@ -7,3 +7,4 @@ description = "The LOGO language for riscv-basic: reader, parser, reference inte
 [dependencies]
 libm = "0.2"
 turtle = { path = "../turtle" }
+rv64 = { path = "../rv64" }

@@ -255,6 +255,55 @@ thing, and the interpreter becomes the oracle for the compiler.
   errors and side effects of the AST interpreter, instruction for instruction.
   The whole golden corpus runs under both and must agree.
 
+## Compilation to RV64 (milestones L4 and L5)
+
+The IR is compiled to RISC-V machine code, which is then run. Every instruction
+line typed at the prompt, every line of a procedure body when the procedure runs,
+and every list handed to `run` (or to a non-literal `repeat`/`if`/`ifelse`) is
+compiled before it executes; the code is discarded or cached, never
+interpreted. The AST and IR interpreters remain as oracles.
+
+- **Values (NaN-boxing).** Every value is one 64-bit word. A number is its
+  `f64` bits as they are (numbers are always finite, so their top 16 bits are
+  below `0xFFF0`). Anything else has its top 16 bits `0xFFF9` (a **word**),
+  `0xFFFA` (a **list**) or `0xFFFB` (**nothing**, the "no value" of a command),
+  with a 48-bit payload: an index into the value arena for words and lists, and
+  for *nothing* the pool index of the name of whatever produced it (so `fd
+  didn't output to print` can still name `fd`). A word is therefore any value
+  whose top 16 bits are `0xFFF9` or more, which generated code tests with one
+  shift and compare.
+- **The arena.** Words and lists that exist while a unit of code runs live in an
+  arena owned by that run and freed when it ends; values stored by `make` or
+  passed to procedures are copied out into the interpreter's own storage, so
+  nothing outlives the arena. The arena holds at most 262144 values; a run that
+  needs more stops with `Out of memory`.
+- **A unit of code** compiles to one function, `status = unit(ctx)`, following
+  the standard RISC-V calling convention: `ctx` in `a0`, status in `a0` (0 =
+  finished, 1 = stopped by an error or by `stop`/`output`, the details waiting in
+  the runtime), return address in `ra`, `s0` saved and used to keep `ctx`.
+  Temps and the `repeat` counters live in the function's stack frame; the
+  arguments of a call are copied to a small array at the bottom of the frame.
+- **The runtime-call table.** `ctx` begins with a table of function addresses,
+  one per runtime service; generated code loads an address from it and calls it
+  with `ctx` as the first argument. Services return two words in `a0`/`a1`: a
+  value (or count, or truth) and an error flag. The flag is checked after every
+  call and, when set, the unit returns status 1 at once. The services: `var`,
+  `const` (a word or list literal; numbers are loaded inline), `neg`, `infix`,
+  `call` (any primitive or procedure, by name pool index, late bound), `discard`,
+  `repeat_count`, `truth` and `fail`.
+- **Inline code.** Number literals, `Neg` (flip the sign bit), `Add`, `Sub` and
+  `Mul` on two numbers (with a finiteness check, falling back to the runtime
+  service for the error), `Discard` of a command, `Repeat` and `If` (with their
+  loops and branches) are generated inline. Everything else goes through the
+  runtime, which uses exactly the code the interpreters use.
+- **Choosing the engine.** The primitive `.engine "ast`, `.engine "ir` or
+  `.engine "jit` switches the engine for what is typed afterwards; on the
+  machine the default is `jit`. `.engine "jit` is `.engine doesn't like jit as
+  input` on a build that has no way to run machine code.
+- **Equivalence.** Compiled code must give the same output, drawing and errors
+  as the interpreters on the whole golden corpus, on the host (through an
+  emulator) and on the real machine.
+
 ## Control, data and I/O
 
 - `repeat n [..]`, `if cond [..]`, `ifelse cond [..] [..]`, `stop`, `output`/`op`,

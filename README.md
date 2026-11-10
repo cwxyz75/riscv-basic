@@ -67,7 +67,9 @@ READY.
 - **And LOGO.** Press `2` at the boot menu for a turtle-graphics LOGO (a UCBLogo
   subset, specified in [LOGO.md](LOGO.md)): `to ... end` procedures, recursion,
   dynamic scope, lists and words, `repeat`/`if`/`ifelse`/`run`, and a turtle
-  that draws in the QEMU window (`make run-logo`). Try `repeat 36 [repeat 4 [fd 80
+  that draws in the QEMU window (`make run-logo`). Every LOGO line is compiled to
+  RV64 machine code before it runs (`.engine "ast` switches to the reference
+  interpreter). Try `repeat 36 [repeat 4 [fd 80
   rt 90] rt 10]`.
 - **A small kernel under it.** Boot in S-mode, 16550 UART console with line
   editing (backspace, Ctrl-U, Ctrl-C, arrow keys ignored), traps with a fatal

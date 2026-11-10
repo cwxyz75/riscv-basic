@@ -11,6 +11,11 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use logo::abi::{
+    SERVICE_COUNT, SVC_CALL, SVC_CONST, SVC_DISCARD, SVC_FAIL, SVC_INFIX, SVC_NEG,
+    SVC_REPEAT_COUNT, SVC_TRUTH, SVC_VAR,
+};
+use logo::{JitHost, Ret};
 use rv64::{Asm, Cond, A0, FA0, FT0, FT1, FT2, T0, T1};
 
 static REGION_START: AtomicUsize = AtomicUsize::new(0);
@@ -35,6 +40,20 @@ impl Code {
         Code { words }
     }
 
+    /// Call the code as an `extern "C" fn(*mut Ctx) -> u64` (the shape of a
+    /// compiled LOGO unit).
+    ///
+    /// The caller must have loaded such a function.
+    fn call_unit(&self, ctx: *mut Ctx) -> u64 {
+        // SAFETY: `words` holds a compiled LOGO unit, a function following the C
+        // calling convention that takes a context pointer and returns a status
+        // (guaranteed by the caller); it is 4-byte aligned and stays alive for the
+        // duration of the call, and `ctx` points to a live `Ctx`.
+        let function: extern "C" fn(*mut Ctx) -> u64 =
+            unsafe { core::mem::transmute(self.words.as_ptr()) };
+        function(ctx)
+    }
+
     /// Call the code as an `extern "C" fn() -> u64`.
     ///
     /// The caller must have loaded code that is a valid function with that
@@ -47,6 +66,108 @@ impl Code {
         let function: extern "C" fn() -> u64 = unsafe { core::mem::transmute(self.words.as_ptr()) };
         function()
     }
+}
+
+impl Drop for Code {
+    fn drop(&mut self) {
+        // Forget the region if it is still this code (a later load replaced it
+        // otherwise), so the trap handler never dumps freed memory.
+        let ours = self.words.as_ptr() as usize;
+        if REGION_START.load(Ordering::Relaxed) == ours {
+            REGION_LEN.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+// ---- running compiled LOGO ----------------------------------------------------------
+
+/// What generated code receives as its first argument: the runtime-call table
+/// (service `n` at offset `8 * n`), then the host.
+#[repr(C)]
+struct Ctx {
+    table: [usize; SERVICE_COUNT],
+    /// The host, with its lifetime erased: it outlives every call the generated
+    /// code makes, because `execute` does not return until the code has.
+    host: *mut HostRef<'static>,
+}
+
+/// A thin box around the host trait object, so one thin pointer can carry it.
+struct HostRef<'a> {
+    host: &'a mut dyn JitHost,
+}
+
+/// The host behind `ctx`.
+///
+/// # Safety
+/// `ctx` must be the context `execute` set up, whose `host` is alive for the
+/// whole run of the generated code that is calling.
+unsafe fn host<'a>(ctx: *mut Ctx) -> &'a mut dyn JitHost {
+    // SAFETY: by the contract above, `ctx` and `(*ctx).host` are valid; the
+    // generated code only calls services one at a time, so no other reference
+    // to the host is in use.
+    unsafe { &mut *(*(*ctx).host).host }
+}
+
+extern "C" fn svc_var(ctx: *mut Ctx, name: u64) -> Ret {
+    // SAFETY: called by generated code with the context `execute` passed it.
+    unsafe { host(ctx).var(name) }
+}
+extern "C" fn svc_const(ctx: *mut Ctx, index: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).constant(index) }
+}
+extern "C" fn svc_neg(ctx: *mut Ctx, value: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).neg(value) }
+}
+extern "C" fn svc_infix(ctx: *mut Ctx, op: u64, a: u64, b: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).infix(op, a, b) }
+}
+extern "C" fn svc_call(ctx: *mut Ctx, name: u64, argc: u64, argv: *const u64) -> Ret {
+    // SAFETY: generated code passes the address of `argc` consecutive 64-bit
+    // words it has just written to its own stack frame.
+    let args = unsafe { core::slice::from_raw_parts(argv, argc as usize) };
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).call(name, args) }
+}
+extern "C" fn svc_discard(ctx: *mut Ctx, value: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).discard(value) }
+}
+extern "C" fn svc_repeat_count(ctx: *mut Ctx, value: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).repeat_count(value) }
+}
+extern "C" fn svc_truth(ctx: *mut Ctx, value: u64, name: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).truth(value, name) }
+}
+extern "C" fn svc_fail(ctx: *mut Ctx, index: u64) -> Ret {
+    // SAFETY: as for `svc_var`.
+    unsafe { host(ctx).fail(index) }
+}
+
+/// Run a compiled LOGO unit on the real machine: load it, set up the context,
+/// call it. This is the `ExecuteFn` the LOGO interpreter is built with.
+pub fn execute(code: &[u8], _frame_bytes: usize, host: &mut dyn JitHost) -> u64 {
+    let loaded = Code::load(code);
+    let mut table = [0usize; SERVICE_COUNT];
+    table[SVC_VAR] = svc_var as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    table[SVC_CONST] = svc_const as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    table[SVC_NEG] = svc_neg as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    table[SVC_INFIX] = svc_infix as extern "C" fn(*mut Ctx, u64, u64, u64) -> Ret as usize;
+    table[SVC_CALL] = svc_call as extern "C" fn(*mut Ctx, u64, u64, *const u64) -> Ret as usize;
+    table[SVC_DISCARD] = svc_discard as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    table[SVC_REPEAT_COUNT] = svc_repeat_count as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    table[SVC_TRUTH] = svc_truth as extern "C" fn(*mut Ctx, u64, u64) -> Ret as usize;
+    table[SVC_FAIL] = svc_fail as extern "C" fn(*mut Ctx, u64) -> Ret as usize;
+    let mut host_ref = HostRef { host };
+    let mut ctx = Ctx {
+        table,
+        host: core::ptr::addr_of_mut!(host_ref).cast::<HostRef<'static>>(),
+    };
+    loaded.call_unit(&mut ctx)
 }
 
 /// The address range `(start, length_in_bytes)` of the most recently loaded

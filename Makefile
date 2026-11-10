@@ -49,5 +49,6 @@ boot-test: kernel
 	python3 scripts/menu_test.py $(KERNEL_ELF)
 	python3 scripts/logo_test.py $(KERNEL_ELF)
 	python3 scripts/jit_test.py $(KERNEL_ELF)
+	python3 scripts/logo_diff_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

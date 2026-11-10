@@ -69,15 +69,18 @@ strings and arrays. Not yet decided; see D10.
   `forbid(unsafe_code)`, tested on the host against golden images; the kernel
   supplies a `Canvas` over the framebuffer.
 - **`logo`**: the LOGO language: reader, arity-driven parser, a reference
-  AST interpreter with dynamic scope, and a structured IR (lowering plus an IR
-  interpreter that must behave identically; it is the oracle for the compiler). `no_std`, `forbid(unsafe_code)`; text and
+  AST interpreter with dynamic scope, a structured IR (lowering plus an IR
+  interpreter that must behave identically), and the RV64 code generator with
+  its NaN-boxed runtime (`logo::jit`). The compiled engine is the default on
+  the machine; the other two are its oracles. `no_std`, `forbid(unsafe_code)`; text and
   time through its own `Io` trait, the screen through `turtle::Canvas`; tested
   on the host with golden transcripts and golden images.
 - **`rv64`**: a small RV64 assembler for the LOGO JIT (RV64I, M multiply, D
   double-precision, `fence.i`; labels with far-branch relaxation; a `li` that
-  loads any 64-bit constant). `no_std`, `forbid(unsafe_code)`. Encodings are
-  checked against LLVM's assembler, and `li` and the branch logic by running
-  the output in a tiny emulator on the host.
+  loads any 64-bit constant) and an emulator for it. `no_std`,
+  `forbid(unsafe_code)`. Encodings are checked against LLVM's assembler; `li`,
+  branches, FPU, memory and host calls by running the output in the emulator,
+  which also runs the LOGO code generator's output in host tests.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
 
@@ -131,6 +134,22 @@ marked. Two debugging keys at the boot menu exercise this: `3` runs JIT
 self-tests (a constant, FPU arithmetic, a loop, branch conditions, 64-bit
 tags) and `4` faults on purpose to show the dump.
 
+### Compiled LOGO
+
+Every LOGO line is lowered to the IR and compiled to an RV64 function before it
+runs (`logo/src/jit/`): number literals, negation, `+ - *` on numbers with a
+finiteness check, `Discard`, `repeat` and `if` are generated inline; everything
+else is a call through a table of nine runtime services in the context block
+(`ctx`), whose implementations are thin wrappers over the interpreters' own
+functions, so every error message is shared. Values are NaN-boxed (numbers are
+their bits; words and lists are arena handles under tags `0xFFF9`/`0xFFFA`;
+*nothing* carries its producer's name). The kernel's `jit::execute` is the only
+unsafe piece: it loads the code, builds `ctx` with `extern "C"` thunks and calls
+it. The same code generator output also runs in the `rv64` emulator on the host,
+and the whole golden corpus must agree across the AST interpreter, the IR
+interpreter, the emulated compiled engine, and (on the real machine) the
+compiled engine against the interpreter, down to the pixels.
+
 ## Interpreter shape (proposed)
 
 - Program lines stored **tokenized** (keywords become single bytes), sorted by
@@ -177,3 +196,4 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D17 | LOGO language semantics settled in `LOGO.md`: a UCBLogo subset, separate number and word types, 640x480 with `wrap`, a minimal list set, UCBLogo unary-minus rule, arena memory with no GC, an XOR triangle turtle | Decided |
 | D18 | The language is chosen at boot from a one-key menu and cannot be switched while running; changing language means rebooting (`BYE` in BASIC does a cold reboot through the SBI System Reset extension). One language's state never has to coexist with the other's | Decided |
 | D19 | Graphics: QEMU `ramfb` (a framebuffer in our RAM, set up through `fw_cfg` DMA), 640x480, 32-bit XRGB; headless tests take screenshots with the monitor's `screendump` | Decided |
+| D20 | LOGO runs as compiled RV64 by default; the AST and IR interpreters are kept as oracles (`.engine "ast`/`"ir`/`"jit` chooses). Generated code reaches the interpreter only through nine runtime services, whose implementations reuse the interpreter's own functions; values are NaN-boxed with a per-run arena | Decided |

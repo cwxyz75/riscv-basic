@@ -55,6 +55,7 @@ name = "logo"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "rv64",
  "turtle",
 ]
 

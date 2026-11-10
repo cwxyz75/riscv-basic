@@ -9,6 +9,7 @@ use crate::rng::Rng;
 use crate::value::Value;
 use crate::{Io, Line};
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use turtle::{Canvas, Turtle};
@@ -61,10 +62,17 @@ pub enum Engine {
     #[default]
     Ast,
     Ir,
+    /// Compile to RV64 and run the machine code (needs an executor).
+    Jit,
 }
 
 pub struct Interpreter {
-    engine: Engine,
+    pub(crate) engine: Engine,
+    /// How to run generated machine code, if this build can.
+    pub(crate) executor: Option<crate::jit::ExecuteFn>,
+    /// Compiled lines (procedure bodies mostly), by source text; cleared
+    /// whenever a procedure is defined, since arities may change.
+    jit_cache: BTreeMap<String, Rc<crate::jit::Compiled>>,
     procedures: BTreeMap<String, Procedure>,
     globals: BTreeMap<String, Value>,
     frames: Vec<Frame>,
@@ -86,12 +94,21 @@ impl Interpreter {
     pub fn with_engine(engine: Engine) -> Self {
         Interpreter {
             engine,
+            executor: None,
+            jit_cache: BTreeMap::new(),
             procedures: BTreeMap::new(),
             globals: BTreeMap::new(),
             frames: Vec::new(),
             turtle: Turtle::new(),
             rng: Rng::new(),
         }
+    }
+
+    /// An interpreter that compiles to machine code, run by `execute`.
+    pub fn with_executor(execute: crate::jit::ExecuteFn) -> Self {
+        let mut interpreter = Self::with_engine(Engine::Jit);
+        interpreter.executor = Some(execute);
+        interpreter
     }
 
     /// Print the start-up banner.
@@ -165,6 +182,8 @@ impl Interpreter {
         }
         self.procedures
             .insert(name.clone(), Procedure { params, body });
+        // Inputs may have changed: anything compiled so far may have misread a call.
+        self.jit_cache.clear();
         Ok(())
     }
 
@@ -179,8 +198,27 @@ impl Interpreter {
         m: &mut Machine<I, C>,
         source: &str,
     ) -> Result<(), Signal> {
+        if let (Engine::Jit, Some(execute)) = (self.engine, self.executor) {
+            let unit = match self.jit_cache.get(source) {
+                Some(unit) => Rc::clone(unit),
+                None => {
+                    let tokens = lex(source)?;
+                    let unit = Rc::new(self.compile_tokens(&tokens));
+                    self.jit_cache
+                        .insert(String::from(source), Rc::clone(&unit));
+                    unit
+                }
+            };
+            return crate::jit::run_unit(self, m, &unit, execute);
+        }
         let tokens = lex(source)?;
         self.run_tokens(m, &tokens)
+    }
+
+    /// Lower and compile a line of tokens to machine code.
+    fn compile_tokens(&self, tokens: &[Token]) -> crate::jit::Compiled {
+        let arity = |name: &str| self.arity(name);
+        crate::jit::compile(&crate::ir::lower(tokens, &arity))
     }
 
     /// Run instructions one at a time, each read just before it runs, so an
@@ -190,6 +228,10 @@ impl Interpreter {
         m: &mut Machine<I, C>,
         tokens: &[Token],
     ) -> Result<(), Signal> {
+        if let (Engine::Jit, Some(execute)) = (self.engine, self.executor) {
+            let unit = self.compile_tokens(tokens);
+            return crate::jit::run_unit(self, m, &unit, execute);
+        }
         if self.engine == Engine::Ir {
             let lowered = {
                 let arity = |name: &str| self.arity(name);

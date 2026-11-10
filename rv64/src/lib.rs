@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+pub mod emu;
+
 use alloc::vec::Vec;
 
 /// An integer register `x0`..`x31`.
