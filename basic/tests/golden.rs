@@ -4,6 +4,10 @@
 //! typed at the prompt, and the full console transcript (prompts included,
 //! typed input NOT echoed) must equal `tests/golden/NAME.out`.
 //!
+//! A script line of the form `<BREAK AFTER n>` is not typed input: when the
+//! interpreter reads it, the n-th following check for Ctrl-C reports "pressed"
+//! (the interpreter checks once before each statement it runs).
+//!
 //! To (re)generate expected outputs after an intended behaviour change:
 //!     BLESS=1 cargo test -p basic
 //! then review the diff of the `.out` files before committing.
@@ -20,6 +24,8 @@ struct ScriptIo {
     output: String,
     memory: HashMap<u64, u8>,
     clock_ms: u64,
+    /// Checks left until a simulated Ctrl-C (see the module comment).
+    break_after: Option<u64>,
 }
 
 impl Io for ScriptIo {
@@ -28,14 +34,31 @@ impl Io for ScriptIo {
     }
 
     fn read_line(&mut self) -> Line {
-        match self.input.pop_front() {
-            Some(line) => Line::Text(line),
-            None => Line::Eof,
+        while let Some(line) = self.input.pop_front() {
+            let directive = line
+                .strip_prefix("<BREAK AFTER ")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .and_then(|n| n.parse::<u64>().ok());
+            match directive {
+                Some(n) => self.break_after = Some(n),
+                None => return Line::Text(line),
+            }
         }
+        Line::Eof
     }
 
     fn break_pressed(&mut self) -> bool {
-        false
+        match self.break_after {
+            Some(n) if n <= 1 => {
+                self.break_after = None;
+                true
+            }
+            Some(n) => {
+                self.break_after = Some(n - 1);
+                false
+            }
+            None => false,
+        }
     }
 
     fn millis(&mut self) -> u64 {
@@ -59,6 +82,7 @@ fn transcript(source: &str) -> String {
         output: String::new(),
         memory: HashMap::new(),
         clock_ms: 0,
+        break_after: None,
     };
     Interpreter::new().run_session(&mut io);
     io.output

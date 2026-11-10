@@ -7,3 +7,5 @@ description = "BASIC interpreter core: no_std, hardware-free, testable on the ho
 # `libm` provides pow/trunc without std (decision D4).
 [dependencies]
 libm = "0.2"
+# Pure ANSI escape helpers (no hardware): CLS, COLOR and LOCATE are built on them.
+console = { path = "../console" }

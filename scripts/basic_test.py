@@ -51,13 +51,23 @@ def main() -> int:
         (b"20 PRINT N*2\r", 0.05),
         (b"RUN\r", 0.3),
         (b"21\r", 0.1),
+        # Ctrl-C reaches a running program through the serial port.
+        (b"NEW\r", 0.05),
+        (b"10 GOTO 10\r", 0.05),
+        (b"RUN\r", 0.3),
+        (b"\x03", 0.3),
+        # Screen control comes out as ANSI escape sequences.
+        (b"CLS\r", 0.05),
+        (b"COLOR 7,0\r", 0.05),
+        (b"LOCATE 3,5\r", 0.1),
+        (b"PRINT 7\r", 0.1),
     ]
     text, timed_out, returncode = boot(
         sys.argv[1],
         steps,
         wait_for="READY.",
         timeout=20,
-        stop_when=[lambda t: len(TIMER_READING.findall(t)) >= 2, " 42 \nREADY."],
+        stop_when=[lambda t: len(TIMER_READING.findall(t)) >= 2, "PRINT 7\n 7 \nREADY."],
     )
     status = check(
         text,
@@ -70,6 +80,11 @@ def main() -> int:
             'PRINT LEFT$("HELLO",2)+STR$(5)+CHR$(33)\nHE 5!\nREADY.',
             "PRINT A(2)+1\n 6 \nREADY.",
             "RUN\nN? 21\n 42 \nREADY.",
+            "RUN\nBREAK IN 10\nREADY.",
+            "CLS\n\x1b[2J\x1b[HREADY.",
+            "COLOR 7,0\n\x1b[37m\x1b[40mREADY.",
+            "LOCATE 3,5\n\x1b[3;5H\nREADY.",
+            "PRINT 7\n 7 \nREADY.",
             "PRINT FRE(0)\n 32730 \nREADY.",
             "PRINT ATN(1)*4\n 3.14159265 \nREADY.",
             "PRINT A=RND(1)\n-1 \nREADY.",

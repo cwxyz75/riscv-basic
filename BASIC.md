@@ -218,8 +218,9 @@ functions are specified under "Strings" below.
 - **Errors in a program** stop it and print `?<NAME> ERROR IN <line>` using
   the line that was executing. Syntax is only checked when a line runs.
 - `LIST` and `NEW` also work inside a program; `NEW` ends it.
-- No way to interrupt a runaway program exists until BREAK handling arrives
-  (milestone M6), so golden tests must not contain endless loops.
+- A runaway program can be stopped with Ctrl-C (see "Screen control and
+  BREAK"); golden tests may contain endless loops only together with a
+  `<BREAK AFTER n>` directive.
 
 ## Data and input: `DATA`, `READ`, `RESTORE`, `INPUT`
 
@@ -337,6 +338,28 @@ first number of that sequence, so the same negative `x` always gives the same
 sequence. The generator starts from the same fixed state on every boot, so a
 program that wants a different sequence each time reseeds with `RND(-TIMER)`.
 Only these properties are specified, not the particular numbers.
+
+## Screen control and BREAK
+
+- **`CLS`** clears the screen and puts the cursor at the top left.
+- **`COLOR fg[, bg]`** sets the text colour, and the background colour if
+  given, from the eight standard colours: 0 black, 1 red, 2 green, 3 yellow,
+  4 blue, 5 magenta, 6 cyan, 7 white. Anything outside 0 to 7 is `?ILLEGAL
+  QUANTITY ERROR`. The colours stay until changed.
+- **`LOCATE row, col`** moves the cursor; both count from 1, with row 1 the
+  top line and column 1 the left edge, and each must be from 1 to 999 (else
+  `?ILLEGAL QUANTITY ERROR`). Later `TAB` and `,` zones count from the new
+  column. As always `READY.` and error messages start on a fresh line, so a
+  `LOCATE` with nothing printed after it is followed by a newline unless it
+  went to column 1.
+- All of these are sent to the terminal as ANSI escape sequences (decision
+  D5). Numbers are truncated toward zero.
+- **BREAK:** pressing Ctrl-C stops a running program. The interpreter checks
+  for it before each statement it runs; when found it prints `BREAK IN <line>`
+  (or just `BREAK` for a statement typed at the prompt) and returns to
+  `READY.`. This also stops a runaway `FOR` loop typed at the prompt. (The
+  console handles Ctrl-C while a line is being typed, and `INPUT` handles it
+  while waiting, as described above.)
 
 ## Machine access: `PEEK`, `POKE`, `TIMER`
 

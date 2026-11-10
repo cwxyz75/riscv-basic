@@ -31,6 +31,28 @@ pub trait Io {
     /// Milliseconds since boot, for `TIMER`.
     fn millis(&mut self) -> u64;
 
+    /// Clear the screen and home the cursor (`CLS`). The default sends the ANSI
+    /// escape sequence; an implementation with a real screen may override it.
+    fn clear_screen(&mut self) {
+        let mut text = String::new();
+        let _ = console::ansi::clear_screen(&mut text);
+        self.write_str(&text);
+    }
+
+    /// Set the text colour and optionally the background (`COLOR`), each 0 to 7.
+    fn set_color(&mut self, fg: u8, bg: Option<u8>) {
+        let mut text = String::new();
+        let _ = console::ansi::color(&mut text, fg, bg);
+        self.write_str(&text);
+    }
+
+    /// Move the cursor to `row`, `col`, both from 1 (`LOCATE`).
+    fn move_cursor(&mut self, row: u16, col: u16) {
+        let mut text = String::new();
+        let _ = console::ansi::cursor_to(&mut text, row, col);
+        self.write_str(&text);
+    }
+
     /// Read one byte from physical address `addr` (`PEEK`). Unchecked: the
     /// interpreter has validated the number, nothing more.
     fn peek(&mut self, addr: u64) -> u8;

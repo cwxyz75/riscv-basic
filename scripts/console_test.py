@@ -4,7 +4,9 @@ lines at the serial prompt and check the echo and what the interpreter sees.
 
 Usage: console_test.py KERNEL_ELF
 
-The BASIC prompt `READY.` is the sync point. Each step types a line whose
+All the steps are typed at once, so this also checks that text typed ahead
+while BASIC is busy (it polls for Ctrl-C before every statement) is kept, not
+dropped. The BASIC prompt `READY.` is the sync point. Each step types a line whose
 effect on the line editor shows up in what BASIC prints back.
 """
 import sys
