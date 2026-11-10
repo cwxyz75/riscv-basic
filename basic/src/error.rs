@@ -12,6 +12,8 @@ pub(crate) enum Error {
     NextWithoutFor,
     OutOfMemory,
     ReturnWithoutGosub,
+    TypeMismatch,
+    StringTooLong,
 }
 
 impl Error {
@@ -26,6 +28,8 @@ impl Error {
             Error::NextWithoutFor => "NEXT WITHOUT FOR",
             Error::OutOfMemory => "OUT OF MEMORY",
             Error::ReturnWithoutGosub => "RETURN WITHOUT GOSUB",
+            Error::TypeMismatch => "TYPE MISMATCH",
+            Error::StringTooLong => "STRING TOO LONG",
         }
     }
 }

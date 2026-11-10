@@ -1,10 +1,11 @@
 use crate::error::{Error, Fault};
-use crate::expr::{evaluate, parse_name, to_address, to_byte};
+use crate::expr::{evaluate, evaluate_number, parse_name, to_address, to_byte, to_count};
 use crate::io::{Io, Line};
 use crate::memory::Memory;
 use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
 use crate::token::{detokenize, keyword, tokenize};
+use crate::value::Value;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -335,7 +336,7 @@ impl Interpreter {
         let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
-        self.mem.set_number(name, value);
+        self.mem.assign(name, value)?;
         Ok(Flow::Next)
     }
 
@@ -365,23 +366,32 @@ impl Interpreter {
                     let pad = ZONE - self.column % ZONE;
                     self.emit(io, &" ".repeat(pad));
                 }
-                _ if after_item => return Err(Error::Syntax),
-                b'"' => {
-                    // A string literal runs to the closing quote, or the end.
-                    let start = *pos + 1;
-                    let end = src[start..]
-                        .iter()
-                        .position(|&b| b == b'"')
-                        .map_or(src.len(), |i| start + i);
-                    let text: String = src[start..end].iter().map(|&b| char::from(b)).collect();
-                    self.emit(io, &text);
-                    *pos = (end + 1).min(src.len());
+                _ if keyword(byte).is_some_and(|k| k == "TAB" || k == "SPC") => {
+                    // TAB(n) / SPC(n): pad with spaces; no separator needed after.
+                    let is_tab = keyword(byte) == Some("TAB");
+                    *pos += 1;
+                    let (n, end) = evaluate_number(src, *pos, &mut self.mem, io)?;
+                    let n = to_count(n)?;
+                    if n > 255 {
+                        return Err(Error::IllegalQuantity);
+                    }
+                    let pad = if is_tab {
+                        n.saturating_sub(self.column)
+                    } else {
+                        n
+                    };
+                    self.emit(io, &" ".repeat(pad));
+                    *pos = end;
                     newline = true;
-                    after_item = true;
+                    after_item = false;
                 }
+                _ if after_item => return Err(Error::Syntax),
                 _ => {
                     let (value, end) = evaluate(src, *pos, &mut self.mem, io)?;
-                    self.emit(io, &format_number(value));
+                    match value {
+                        Value::Num(n) => self.emit(io, &format_number(n)),
+                        Value::Str(text) => self.emit(io, &text),
+                    }
                     *pos = end;
                     newline = true;
                     after_item = true;
@@ -401,7 +411,7 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (condition, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+        let (condition, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let word = tokens.get(*pos).and_then(|&b| keyword(b));
@@ -436,20 +446,23 @@ impl Interpreter {
         pos: &mut usize,
     ) -> Result<Flow, Error> {
         let var = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+        if var.ends_with('$') {
+            return Err(Error::TypeMismatch);
+        }
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
         }
-        let (start, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
+        let (start, end) = evaluate_number(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         expect_keyword(tokens, pos, "TO")?;
-        let (limit, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+        let (limit, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let mut step = 1.0;
         if tokens.get(*pos).and_then(|&b| keyword(b)) == Some("STEP") {
             *pos += 1;
-            let (value, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+            let (value, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
             step = value;
             *pos = end;
         }
@@ -539,7 +552,7 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (selector, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+        let (selector, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let word = tokens.get(*pos).and_then(|&b| keyword(b));
@@ -584,13 +597,13 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (address, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+        let (address, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b',') {
             return Err(Error::Syntax);
         }
-        let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
+        let (value, end) = evaluate_number(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
         io.poke(to_address(address)?, to_byte(value)?);

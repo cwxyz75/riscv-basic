@@ -1,0 +1,15 @@
+A$="HELLO"
+PRINT A$
+B$=A$+" WORLD"
+PRINT B$
+PRINT LEN(B$)
+PRINT "A"+"B"+"C"
+PRINT A$;A$
+C$=""
+PRINT LEN(C$)
+PRINT C$;"X"
+A=5: A$="Z": PRINT A;A$
+PRINT D$
+A$="K"
+10 PRINT "[";A$;"]"
+RUN

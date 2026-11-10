@@ -20,6 +20,7 @@ mod number;
 mod program;
 mod rng;
 mod token;
+mod value;
 
 pub use interp::Interpreter;
 pub use io::{Io, Line};
