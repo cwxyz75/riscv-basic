@@ -66,7 +66,7 @@ its output.
 
 Acceptance: golden tests for every statement and function in `BASIC.md`.
 
-- [ ] `GOSUB/RETURN`, `ON ... GOTO/GOSUB`
+- [x] `GOSUB/RETURN`, `ON ... GOTO/GOSUB`
 - [ ] `DIM` and arrays; strings and string functions
 - [ ] `DATA/READ/RESTORE`, `INPUT`
 - [ ] Math functions via `libm`; `RND`
