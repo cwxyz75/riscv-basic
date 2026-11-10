@@ -75,14 +75,40 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     let _ = ansi::reset(&mut out);
     let _ = writeln!(out);
 
-    let Language::Basic = menu::choose();
-    let mut io = KernelIo::new();
-    let mut interpreter = basic::Interpreter::new();
-    interpreter.banner(&mut io);
-    interpreter.run_session(&mut io);
+    match menu::choose() {
+        Language::Basic => {
+            let mut io = KernelIo::new();
+            let mut interpreter = basic::Interpreter::new();
+            interpreter.banner(&mut io);
+            interpreter.run_session(&mut io);
+        }
+        Language::Logo => run_logo(&mut out),
+    }
     // The serial console never reports end of input, so this is unreachable in
     // practice; power off cleanly if it ever happens.
     sbi::shutdown()
+}
+
+/// LOGO: terminal in, framebuffer out. Without a `ramfb` device it still runs,
+/// drawing into memory that nobody sees.
+fn run_logo(out: &mut Console) {
+    use turtle::Canvas;
+    let mut io = KernelIo::new();
+    let mut interpreter = logo::Interpreter::new();
+    match gfx::init() {
+        Ok(pixels) => {
+            let mut canvas = gfx::FbCanvas::new(pixels);
+            canvas.clear(0);
+            interpreter.banner(&mut io);
+            interpreter.run_session(&mut io, &mut canvas);
+        }
+        Err(reason) => {
+            let _ = writeln!(out, "(no screen: {reason})");
+            let mut canvas = turtle::Bitmap::new(gfx::WIDTH as i32, gfx::HEIGHT as i32);
+            interpreter.banner(&mut io);
+            interpreter.run_session(&mut io, &mut canvas);
+        }
+    }
 }
 
 #[panic_handler]

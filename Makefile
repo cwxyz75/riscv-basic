@@ -9,7 +9,7 @@ help:
 	@echo "make test       host tests for the interpreter crate (no QEMU needed)"
 	@echo "make kernel     build the kernel ELF"
 	@echo "make run        boot the kernel in QEMU (Ctrl-A then X to exit)"
-	@echo "make run-logo    boot with a graphics window (ramfb); press 2 at the menu for the LOGO screen"
+	@echo "make run-logo    boot with a graphics window (ramfb); press 2 at the menu for LOGO"
 	@echo "make debug      boot paused with a gdb stub on :1234"
 	@echo "make boot-test  boot in QEMU non-interactively and check the output"
 	@echo "make check      everything CI runs"
@@ -47,6 +47,6 @@ boot-test: kernel
 	python3 scripts/basic_test.py $(KERNEL_ELF)
 	python3 scripts/demo_test.py $(KERNEL_ELF)
 	python3 scripts/menu_test.py $(KERNEL_ELF)
-	python3 scripts/fb_test.py $(KERNEL_ELF)
+	python3 scripts/logo_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

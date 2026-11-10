@@ -10,7 +10,7 @@
 //! device is absent and `init` reports an error.
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use turtle::{rgb, Canvas, Turtle};
+use turtle::{rgb, Canvas};
 
 pub const WIDTH: usize = 640;
 pub const HEIGHT: usize = 480;
@@ -83,23 +83,6 @@ impl Canvas for FbCanvas {
     fn clear(&mut self, color: u8) {
         self.indices.fill(color & 0x0F);
         self.pixels.fill(rgb(color));
-    }
-}
-
-/// Draw a white 80-pixel turtle square, with its lower-left corner at logo point
-/// (-150, -100), on top of whatever is on the screen: the first proof that the
-/// turtle can draw in the window (checked by `scripts/fb_test.py`).
-pub fn draw_turtle_square(pixels: &'static mut [u32]) {
-    let mut canvas = FbCanvas::new(pixels);
-    let mut turtle = Turtle::new();
-    turtle.hide(&mut canvas);
-    turtle.pen_up();
-    turtle.set_xy(&mut canvas, -150.0, -100.0);
-    turtle.pen_down();
-    turtle.set_heading(&mut canvas, 90.0);
-    for _ in 0..4 {
-        turtle.forward(&mut canvas, 80.0);
-        turtle.right(&mut canvas, 90.0);
     }
 }
 
@@ -215,24 +198,4 @@ pub fn init() -> Result<&'static mut [u32], &'static str> {
         core::mem::size_of::<RamfbConfig>(),
     )?;
     Ok(pixels)
-}
-
-/// Eight colour bars over a grey ramp, so every channel and both axes can be
-/// checked from a screenshot: the top half is eight 80-pixel bars (black, red,
-/// green, yellow, blue, magenta, cyan, white), the bottom half a left-to-right
-/// ramp where pixel `x` has grey level `x * 255 / 639`.
-pub fn draw_test_pattern(pixels: &mut [u32]) {
-    const BARS: [u32; 8] = [
-        0x000000, 0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
-    ];
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            pixels[y * WIDTH + x] = if y < HEIGHT / 2 {
-                BARS[x / (WIDTH / 8)]
-            } else {
-                let grey = (x * 255 / (WIDTH - 1)) as u32;
-                (grey << 16) | (grey << 8) | grey
-            };
-        }
-    }
 }

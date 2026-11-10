@@ -59,3 +59,29 @@ impl basic::Io for KernelIo {
         unsafe { write_volatile(addr as *mut u8, value) }
     }
 }
+
+/// The same console, for the LOGO interpreter.
+impl logo::Io for KernelIo {
+    fn write_str(&mut self, s: &str) {
+        let _ = Console.write_str(s);
+    }
+
+    fn read_line(&mut self) -> logo::Line {
+        match self.input.read_line() {
+            terminal::Line::Text(text) => logo::Line::Text(String::from(text)),
+            terminal::Line::Break => logo::Line::Break,
+        }
+    }
+
+    fn break_pressed(&mut self) -> bool {
+        self.input.poll_break()
+    }
+
+    fn millis(&mut self) -> u64 {
+        timer::millis()
+    }
+
+    fn reboot(&mut self) {
+        crate::sbi::reboot()
+    }
+}

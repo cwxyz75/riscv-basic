@@ -34,7 +34,7 @@
 | `0x1010_0000` | fw_cfg (QEMU's firmware-configuration device; how `ramfb` is set up) |
 | `0x2000_0000` | pflash (candidate "cartridge" storage) |
 | `0x8000_0000` | RAM base (128 MiB default); OpenSBI occupies the first 2 MiB |
-| `0x8020_0000` | Kernel: `.text`, `.rodata`, `.data`, `.bss`, then a 64 KiB stack |
+| `0x8020_0000` | Kernel: `.text`, `.rodata`, `.data`, `.bss`, then a 4 MiB stack (the LOGO interpreter recurses) |
 
 Proposed layout above the kernel: a fixed **32 KiB BASIC program area** (so the
 banner's `BYTES FREE` is an honest, stable number) and a separate heap arena for
@@ -48,7 +48,9 @@ strings and arrays. Not yet decided; see D10.
 3. `kmain` enables the FPU, installs the trap vector, initialises the UART and
    the heap, starts the 10 ms timer tick, then shows the boot menu (one keypress:
    `1` BASIC, `2` LOGO, not installed yet). For BASIC it creates the interpreter,
-   prints the banner and runs the session loop forever. `BYE` cold-reboots the
+   prints the banner and runs the session loop forever; for LOGO it brings up the
+   framebuffer (or, without a `ramfb` device, a canvas nobody sees) and runs the
+   LOGO session loop. `BYE` cold-reboots the
    machine through SBI, which brings the menu back.
 4. Other harts stay parked in OpenSBI; we ignore them.
 
@@ -66,6 +68,10 @@ strings and arrays. Not yet decided; see D10.
   (position, heading, pen, wrap at the edges, an XOR sprite). `no_std`,
   `forbid(unsafe_code)`, tested on the host against golden images; the kernel
   supplies a `Canvas` over the framebuffer.
+- **`logo`**: the LOGO language: reader, arity-driven parser and a reference
+  AST interpreter with dynamic scope. `no_std`, `forbid(unsafe_code)`; text and
+  time through its own `Io` trait, the screen through `turtle::Canvas`; tested
+  on the host with golden transcripts and golden images.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
 
@@ -99,9 +105,9 @@ What worked and what bit us:
   reports that instead of faulting.
 - Tests need no window: the QEMU monitor command `screendump FILE` (over a
   loopback TCP monitor, because a macOS UNIX-socket path is limited to 104 bytes)
-  writes a PPM of the current screen, and `scripts/fb_test.py` checks colour bars
-  and a grey ramp pixel by pixel. `make run-logo` opens a real window; press `2`
-  at the menu to draw the test pattern.
+  writes a PPM of the current screen, and `scripts/logo_test.py` draws with LOGO and
+  checks the screenshot pixel by pixel. `make run-logo` opens a real window;
+  press `2` at the menu for LOGO.
 
 The turtle crate draws through a `Canvas` of palette indices; the kernel's
 `FbCanvas` keeps the indices in a shadow array (so fill and the XOR sprite can

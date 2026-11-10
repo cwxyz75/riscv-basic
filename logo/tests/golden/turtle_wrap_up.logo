@@ -1,0 +1,6 @@
+;canvas 5 6
+ht
+pu
+setxy 0 2
+pd
+fd 3

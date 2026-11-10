@@ -1,0 +1,24 @@
+print pos
+fd 3
+print pos
+print heading
+rt 90
+print heading
+print xcor
+fd 5
+print xcor
+setxy 1.5 -2
+print pos
+print ycor
+lt 135
+print heading
+home
+print pos
+print heading
+show pos
+rt 45
+print heading
+setheading 720
+print heading
+setheading -90
+print heading

@@ -55,8 +55,9 @@ def first_boot(kernel: str) -> int:
     readings = [float(x) for x in TIMER_READING.findall(text)]
     if len(readings) != 2 or not PAUSE * 0.6 <= readings[1] - readings[0] <= 5.0:
         problems.append(f"TIMER readings {readings}: expected two, about {PAUSE} s apart")
-    if not re.search(r"sepc=0x8020[0-9a-f]{4}\b", text):
-        problems.append("sepc should be an address inside the kernel image")
+    sepc = re.search(r"sepc=0x([0-9a-f]+)", text)
+    if not sepc or not 0x8020_0000 <= int(sepc.group(1), 16) < 0x8040_0000:
+        problems.append("sepc should be an address inside the kernel image (0x80200000..0x80400000)")
     report = re.search(r"ticks=(\d+) ms=(\d+)", text)
     if not report:
         problems.append("trap report should include ticks and ms")

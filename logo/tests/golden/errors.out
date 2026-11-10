@@ -1,0 +1,31 @@
+? I don't know how to foo
+? nope has no value
+? Not enough inputs to fd
+? Not enough inputs to print
+? 3
+You don't say what to do with 4
+? You don't say what to do with 3
+? Not enough inputs to +
+? fd doesn't like a as input
+? / doesn't like 0 as input
+? sqrt doesn't like -1 as input
+? first doesn't like [] as input
+? first doesn't like 5 as input
+? item doesn't like 5 as input
+? count doesn't like 12 as input
+? random doesn't like 0 as input
+? + doesn't like a as input
+? < doesn't like a as input
+? if doesn't like 3 as input
+? fd didn't output to print
+? Missing ]
+? Unexpected ]
+? Can only do that inside a procedure
+? Can only do that inside a procedure
+? I don't know how to foo
+? 5
+I don't know how to foo
+? > > ? undefined has no value
+? > > ? Out of memory
+? ok
+? 

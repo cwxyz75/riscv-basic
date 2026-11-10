@@ -1,0 +1,9 @@
+[package]
+name = "logo"
+version = "0.1.0"
+edition = "2021"
+description = "The LOGO language for riscv-basic: reader, parser, reference interpreter. Pure (no hardware, no unsafe); all machine access goes through Io and the turtle crate's Canvas"
+
+[dependencies]
+libm = "0.2"
+turtle = { path = "../turtle" }

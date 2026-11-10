@@ -8,6 +8,7 @@ description = "Bare-metal RISC-V (S-mode) host for the BASIC interpreter on QEMU
 basic = { path = "../basic" }
 console = { path = "../console" }
 turtle = { path = "../turtle" }
+logo = { path = "../logo" }
 # Free-list heap for the interpreter's strings, variables and program store
 # (decision D10).
 linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }

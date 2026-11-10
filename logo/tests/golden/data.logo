@@ -1,0 +1,44 @@
+print "hello
+print [a b [c d]]
+show [a b [c d]]
+show "hello
+print []
+show []
+print count "
+print count "hello
+print first "hello
+print last "hello
+print butfirst "hello
+print butlast "hello
+print first [a b c]
+print last [a b c]
+print bf [a b c]
+print bl [a b c]
+print fput "x [a b]
+print lput "x [a b]
+print list 1 2
+show list "a [b]
+print list "a [b]
+print se "a [b c]
+print se [a] [b]
+show se [a [b]] "c
+print item 2 [a b c]
+print item 1 "xyz
+print count [a b c]
+print first butfirst [a b c]
+print first [[x y] z]
+print emptyp []
+print emptyp [a]
+print emptyp "
+print listp [a]
+print listp "a
+print wordp "a
+print wordp 3
+print wordp [a]
+print numberp 3
+print numberp "3
+print numberp "a
+print [1 2 3]
+print [fd 100 rt 90]
+print [print "hi]
+print [1.50 2e1]
