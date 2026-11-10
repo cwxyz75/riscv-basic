@@ -30,4 +30,11 @@ pub trait Io {
 
     /// Milliseconds since boot, for `TIMER`.
     fn millis(&mut self) -> u64;
+
+    /// Read one byte from physical address `addr` (`PEEK`). Unchecked: the
+    /// interpreter has validated the number, nothing more.
+    fn peek(&mut self, addr: u64) -> u8;
+
+    /// Write one byte to physical address `addr` (`POKE`). Unchecked.
+    fn poke(&mut self, addr: u64, value: u8);
 }

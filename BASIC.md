@@ -195,6 +195,20 @@ strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
 - No way to interrupt a runaway program exists until BREAK handling arrives
   (milestone M6), so golden tests must not contain endless loops.
 
+## Machine access: `PEEK`, `POKE`, `TIMER`
+
+- **`PEEK(addr)`** reads one byte from the physical address `addr` and gives it
+  as a number from 0 to 255. **`POKE addr, val`** writes one byte. Both are
+  unchecked (decision D12). `addr` must be a non-negative integer-valued number
+  below 2^53 (so it is exactly representable) and `val` an integer-valued
+  number from 0 to 255; anything else is `?ILLEGAL QUANTITY ERROR`, raised
+  before the machine is touched. `PEEK` needs its parentheses; a missing `(` or
+  `)` is `?SYNTAX ERROR`. `POKE` takes exactly two arguments.
+- **`TIMER`** is the number of seconds since boot as a number (milliseconds
+  divided by 1000). It takes no parentheses or argument.
+- Arguments are evaluated left to right, and a `TIMER` or `PEEK` inside an
+  expression is read at the moment the expression reaches it.
+
 ## Number output
 
 `PRINT` writes a number as a sign field, the digits, and a trailing space: a
