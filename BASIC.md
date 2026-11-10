@@ -220,6 +220,35 @@ functions are specified under "Strings" below.
 - No way to interrupt a runaway program exists until BREAK handling arrives
   (milestone M6), so golden tests must not contain endless loops.
 
+## Data and input: `DATA`, `READ`, `RESTORE`, `INPUT`
+
+- **`DATA item[, item...]`** holds values for `READ`. Running a `DATA` statement
+  does nothing. An item is a double-quoted string (which may contain commas and
+  colons), or bare text up to the next comma, colon or end of line, with
+  spaces around it trimmed. Nothing between two commas, or after a trailing
+  comma, is an empty item.
+- **`READ target[, target...]`** takes the next items, in order, from all the
+  `DATA` statements of the program in line-number order (wherever they sit on
+  their line), and stores them in the targets: variables or array elements. The
+  pointer starts at the first item; `RUN`, `NEW` and `RESTORE` put it back
+  there. Reading past the last item is `?OUT OF DATA ERROR`. A target that is a
+  string variable receives the item as text (empty if empty). A numeric target
+  needs a number: an empty item reads as `0`; a bare item that is not a
+  complete number (sign, digits, fraction, exponent) is `?SYNTAX ERROR`; a
+  quoted item is `?TYPE MISMATCH ERROR`. These errors are reported against the
+  `READ` line.
+- **`RESTORE`** puts the `READ` pointer back at the first item.
+- **`INPUT ["prompt";] target[, target...]`** prints the prompt (a string
+  literal) followed by `? `, then reads a line from the console. The line is
+  split at commas into items, written like `DATA` items (so `"A,B",7` is two
+  items); an empty line is one empty item. If there are fewer items than
+  targets it prints `?? ` and reads another line for the rest; if there are
+  more it prints `?EXTRA IGNORED` and ignores the rest. A numeric target needs
+  a number as for `READ`; if any item is unusable it prints `?REDO FROM START`
+  and starts again with the prompt, assigning nothing until a whole line is
+  accepted. `INPUT` also works when typed at the prompt. Ctrl-C while waiting
+  stops the program as `STOP` does; the end of input quietly ends it.
+
 ## Arrays
 
 - **`DIM name(n[,m[,k]])[, ...]`** creates an array of numbers (or of strings,
@@ -345,7 +374,7 @@ After an error the program stops and the prompt returns.
 
 `SYNTAX`, `TYPE MISMATCH`, `UNDEF'D STATEMENT`, `NEXT WITHOUT FOR`,
 `RETURN WITHOUT GOSUB`, `OUT OF DATA`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
-`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
+`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`, `OUT OF DATA`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
 `STRING TOO LONG`.
 
 ## Faults

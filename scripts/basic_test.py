@@ -43,12 +43,20 @@ def main() -> int:
     steps = [(line, 0.05) for line in LINES]
     steps[-1] = (LINES[-1], PAUSE)
     steps.append((b"PRINT TIMER\r", 0.1))
+    # INPUT reads a line from the console in the middle of a running program.
+    steps += [
+        (b"NEW\r", 0.05),
+        (b'10 INPUT "N";N\r', 0.05),
+        (b"20 PRINT N*2\r", 0.05),
+        (b"RUN\r", 0.3),
+        (b"21\r", 0.1),
+    ]
     text, timed_out, returncode = boot(
         sys.argv[1],
         steps,
         wait_for="READY.",
         timeout=20,
-        stop_when=[lambda t: len(TIMER_READING.findall(t)) >= 2],
+        stop_when=[lambda t: len(TIMER_READING.findall(t)) >= 2, " 42 \nREADY."],
     )
     status = check(
         text,
@@ -60,6 +68,7 @@ def main() -> int:
             "PRINT 1/3\n 0.333333333 \nREADY.",
             'PRINT LEFT$("HELLO",2)+STR$(5)+CHR$(33)\nHE 5!\nREADY.',
             "PRINT A(2)+1\n 6 \nREADY.",
+            "RUN\nN? 21\n 42 \nREADY.",
             "PRINT ATN(1)*4\n 3.14159265 \nREADY.",
             "PRINT A=RND(1)\n-1 \nREADY.",
             f"PRINT PEEK({SCRATCH})\n 123 \nREADY.",
