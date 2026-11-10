@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=/opt/homebrew/bin:$PATH)",
+      "Bash(make test)",
+      "Bash(make check)",
+      "Bash(make kernel)",
+      "Bash(make boot-test)",
+      "Bash(make lint)",
+      "Bash(make fmt-check)",
+      "Bash(qemu-system-riscv64 --version)",
+      "Bash(rustup show)",
+      "mcp__ccd_pr__get_status",
+      "mcp__ccd_session_mgmt__list_sessions",
+      "mcp__ccd_session_mgmt__search_session_transcripts",
+      "mcp__ccd_turn__update_plan",
+      "mcp__ccd_turn__wrap_up"
+    ]
+  }
+}
