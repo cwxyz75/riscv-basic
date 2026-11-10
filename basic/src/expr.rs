@@ -72,7 +72,7 @@ fn check(value: f64) -> Result<f64, Error> {
 /// below 2^53, so it converts exactly.
 pub(crate) fn to_address(value: f64) -> Result<u64, Error> {
     const LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
-    if value >= 0.0 && value < LIMIT && value == libm::trunc(value) {
+    if (0.0..LIMIT).contains(&value) && value == libm::trunc(value) {
         Ok(value as u64)
     } else {
         Err(Error::IllegalQuantity)
