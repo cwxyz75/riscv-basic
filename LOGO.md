@@ -213,6 +213,48 @@ The rules the reference interpreter (milestone L2) is built and tested against.
   runs). Division by zero is
   `/ doesn't like 0 as input`.
 
+## The IR (milestone L3)
+
+Between the parser and any backend sits a small structured intermediate
+representation. It carries no backend detail, so the interpreter in this
+milestone and the RV64 code generator later are two ways of running the same
+thing, and the interpreter becomes the oracle for the compiler.
+
+- **Shape.** A line (or a procedure body line, or the text of a list) lowers to
+  a flat sequence of instructions over numbered **temps**. A temp holds *a value
+  or nothing* (a command leaves nothing), plus the name of the instruction that
+  produced it, for error messages. Instructions: `Const` (a number, word or list
+  literal), `Var` (dynamic lookup, `name has no value` if unset), `Neg`,
+  `Infix` (`+ - * / = < >`), `Call` (a primitive or a procedure, by name, late
+  bound, on the values of its input temps), `Discard` (a statement's temp must
+  hold nothing, else `You don't say what to do with ...`), `Repeat`, `If`
+  (which also serves `ifelse`), and `Fail` (raise an error).
+- **Order.** Temps are numbered in the order they are produced, operands before
+  the instruction that uses them, and an instruction's own result last, so the
+  numbering of any program is fixed and testable. Inputs are evaluated left to
+  right, exactly as in the AST interpreter.
+- **Control flow is inline when it can be.** `repeat n [..]`, `if c [..]` and
+  `ifelse c [..] [..]` whose list inputs are literal lists lower to `Repeat` and
+  `If` instructions holding nested blocks, the lists' text read and lowered once.
+  When an input is anything else (a variable holding a list, say) the
+  instruction stays a `Call` and the list is read and lowered when it runs.
+  `run` is always a `Call`. A `Repeat`/`If` leaves nothing in its temp, like the
+  commands they stand for.
+- **Errors keep their place.** A line is read instruction by instruction in the
+  interpreter, so an error in a later instruction must not stop earlier ones
+  from running. Lowering therefore turns an unreadable instruction (`Not enough
+  inputs to fd`, an unbalanced `)`) into a `Fail` instruction at that position
+  and stops; everything before it still runs first. (`Missing ]` and `Unexpected
+  ]` are found when the line is read and, as before, stop it before anything
+  runs.)
+- **Procedures.** A procedure's body is lowered when it is called, not when it
+  is defined, so it may use procedures defined later and a procedure redefined
+  with different inputs is seen correctly. (A later version may remember the
+  lowered body until the next definition; the result must not change.)
+- **Equivalence rule.** Running the IR must give exactly the output, drawing,
+  errors and side effects of the AST interpreter, instruction for instruction.
+  The whole golden corpus runs under both and must agree.
+
 ## Control, data and I/O
 
 - `repeat n [..]`, `if cond [..]`, `ifelse cond [..] [..]`, `stop`, `output`/`op`,

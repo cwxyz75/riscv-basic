@@ -68,8 +68,9 @@ strings and arrays. Not yet decided; see D10.
   (position, heading, pen, wrap at the edges, an XOR sprite). `no_std`,
   `forbid(unsafe_code)`, tested on the host against golden images; the kernel
   supplies a `Canvas` over the framebuffer.
-- **`logo`**: the LOGO language: reader, arity-driven parser and a reference
-  AST interpreter with dynamic scope. `no_std`, `forbid(unsafe_code)`; text and
+- **`logo`**: the LOGO language: reader, arity-driven parser, a reference
+  AST interpreter with dynamic scope, and a structured IR (lowering plus an IR
+  interpreter that must behave identically; it is the oracle for the compiler). `no_std`, `forbid(unsafe_code)`; text and
   time through its own `Io` trait, the screen through `turtle::Canvas`; tested
   on the host with golden transcripts and golden images.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line

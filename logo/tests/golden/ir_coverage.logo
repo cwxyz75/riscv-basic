@@ -1,0 +1,28 @@
+make "x 5
+print -:x
+print -(2 + 3)
+print 3 - -:x
+print -:x + 1
+print 2 * -:x
+-:x
+print -"a
+print -[1]
+make "body [print "hi]
+repeat 2 :body
+if 1 = 1 :body
+if 1 = 2 :body
+ifelse 1 = 2 :body [print "no]
+ifelse 1 = 1 :body :body
+ifelse 1 = 2 [print "a] :body
+make "n 3
+repeat :n [type :n]
+repeat 2 [fd]
+if 1 = 2 [fd]
+ifelse 1 = 2 [fd] [print "ok]
+repeat 2 [print 1 fd]
+repeat 3 [if 1 = 1 [type "x]]
+repeat "a [print 1]
+if "x [print 1]
+print repeat 1 [print 2]
+print if 1 = 1 [print 3]
+repeat 2 [print 1 print 2 3]

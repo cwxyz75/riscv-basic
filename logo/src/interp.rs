@@ -54,7 +54,17 @@ struct Frame {
     vars: BTreeMap<String, Value>,
 }
 
+/// Which interpreter runs the code: the one over the syntax tree (the
+/// reference), or the one over the lowered IR. Both must behave identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    #[default]
+    Ast,
+    Ir,
+}
+
 pub struct Interpreter {
+    engine: Engine,
     procedures: BTreeMap<String, Procedure>,
     globals: BTreeMap<String, Value>,
     frames: Vec<Frame>,
@@ -70,7 +80,12 @@ impl Default for Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
+        Self::with_engine(Engine::Ast)
+    }
+
+    pub fn with_engine(engine: Engine) -> Self {
         Interpreter {
+            engine,
             procedures: BTreeMap::new(),
             globals: BTreeMap::new(),
             frames: Vec::new(),
@@ -175,6 +190,13 @@ impl Interpreter {
         m: &mut Machine<I, C>,
         tokens: &[Token],
     ) -> Result<(), Signal> {
+        if self.engine == Engine::Ir {
+            let lowered = {
+                let arity = |name: &str| self.arity(name);
+                crate::ir::lower(tokens, &arity)
+            };
+            return crate::exec::run(self, m, &lowered);
+        }
         let mut pos = 0;
         while pos < tokens.len() {
             let expr = {
@@ -276,7 +298,7 @@ impl Interpreter {
     }
 
     /// Run a primitive or user procedure on already evaluated inputs.
-    fn call<I: Io, C: Canvas>(
+    pub(crate) fn call<I: Io, C: Canvas>(
         &mut self,
         m: &mut Machine<I, C>,
         name: &str,
@@ -320,7 +342,7 @@ impl Interpreter {
 }
 
 /// The infix operators.
-fn infix(op: Infix, a: Value, b: Value) -> Result<Value, LogoError> {
+pub(crate) fn infix(op: Infix, a: Value, b: Value) -> Result<Value, LogoError> {
     if op == Infix::Eq {
         return Ok(Value::boolean(a.equals(&b)));
     }

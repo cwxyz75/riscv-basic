@@ -49,14 +49,14 @@ pub(crate) fn arity(name: &str) -> Option<usize> {
     })
 }
 
-fn num(value: &Value, name: &str) -> Result<f64, LogoError> {
+pub(crate) fn num(value: &Value, name: &str) -> Result<f64, LogoError> {
     match value {
         Value::Num(n) => Ok(*n),
         other => Err(LogoError::DoesntLike(String::from(name), other.clone())),
     }
 }
 
-fn truth(value: &Value, name: &str) -> Result<bool, LogoError> {
+pub(crate) fn truth(value: &Value, name: &str) -> Result<bool, LogoError> {
     match value {
         Value::Word(w) if w.eq_ignore_ascii_case("true") => Ok(true),
         Value::Word(w) if w.eq_ignore_ascii_case("false") => Ok(false),
@@ -76,7 +76,7 @@ fn bad(name: &str, value: &Value) -> LogoError {
 }
 
 /// A list's items as source text, for `run` and friends.
-fn source_of(items: &[Value]) -> String {
+pub(crate) fn source_of(items: &[Value]) -> String {
     let mut out = String::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
