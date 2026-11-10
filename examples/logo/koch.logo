@@ -1,0 +1,13 @@
+to koch :size :depth
+if :depth = 0 [fd :size stop]
+koch :size / 3 :depth - 1
+lt 60
+koch :size / 3 :depth - 1
+rt 120
+koch :size / 3 :depth - 1
+lt 60
+koch :size / 3 :depth - 1
+end
+to snowflake :size :depth
+repeat 3 [koch :size :depth rt 120]
+end

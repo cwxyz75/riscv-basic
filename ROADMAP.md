@@ -171,8 +171,8 @@ every `to` definition is compiled before it runs.
 
 ### L6: LOGO showpiece
 
-- [ ] Classic programs as golden images (spirals, a tree, the Koch snowflake)
-- [ ] README screenshot or recording; tag `v0.2`
+- [x] Classic programs as golden images (spirals, a tree, the Koch snowflake): a spiral, a tree, a Koch snowflake and rotated squares, with expected pictures from an independent Python renderer (`scripts/verify_demo_images.py`, re-checked in CI), reproduced pixel for pixel by all three engines on the host and compiled-vs-interpreted on the machine
+- [x] README screenshot or recording; tag `v0.2`
 
 ## Spikes (time-boxed experiments, do early)
 

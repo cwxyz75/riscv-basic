@@ -66,7 +66,32 @@ impl Io for ScriptIo {
     }
 }
 
+/// Replace `<LOAD examples/logo/NAME.logo>` lines with that file's lines (path
+/// relative to the repository root), so a demo program is typed in from the one
+/// copy that ships in `examples/`.
+fn expand_loads(script: &str) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut out = String::new();
+    for line in script.lines() {
+        match line
+            .strip_prefix("<LOAD ")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            Some(path) => out.push_str(
+                &fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|e| panic!("cannot load {path}: {e}")),
+            ),
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 fn run(script: &str, engine: Engine) -> (String, String) {
+    let script = expand_loads(script);
     let mut lines: Vec<&str> = script.lines().collect();
     let (mut width, mut height) = (21, 21);
     if let Some(dims) = lines.first().and_then(|l| l.strip_prefix(";canvas ")) {
@@ -117,6 +142,15 @@ fn golden_cases() {
     let mut failures = Vec::new();
     for case in &cases {
         let script = fs::read_to_string(case).unwrap();
+        // Developer aid: with LOGO_DUMP=DIR, write the pictures actually drawn
+        // (AST engine) into DIR for inspection and comparison with an independent
+        // renderer, and check nothing. Never into the repository directly.
+        if let Some(dir) = std::env::var_os("LOGO_DUMP") {
+            let (_, picture) = run(&script, Engine::Ast);
+            let name = case.file_stem().unwrap().to_string_lossy().into_owned();
+            fs::write(Path::new(&dir).join(format!("{name}.img")), picture).unwrap();
+            continue;
+        }
         let out = case.with_extension("out");
         let want = fs::read_to_string(&out).unwrap_or_else(|_| panic!("missing {}", out.display()));
         let img = fs::read_to_string(case.with_extension("img")).ok();

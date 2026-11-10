@@ -1,0 +1,7 @@
+;canvas 100 100
+<LOAD examples/logo/koch.logo>
+ht
+pu
+setxy -27 -16
+pd
+snowflake 54 3

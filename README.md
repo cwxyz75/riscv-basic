@@ -1,8 +1,10 @@
 # riscv-basic
 
-A toy "80s home computer" for QEMU's RISC-V `virt` board: it boots straight into
-a BASIC prompt, and BASIC is the shell. Rust, `no_std`, running in S-mode on top
-of OpenSBI. Built for amusement.
+A toy "80s home computer" for QEMU's RISC-V `virt` board. It boots to a one-key
+menu: **BASIC**, an 80s-style BASIC that is the machine's shell, or **LOGO**, a
+turtle-graphics LOGO whose every line is compiled to RISC-V machine code by a
+JIT written for this project. Rust, `no_std`, running in S-mode on top of
+OpenSBI. Built for amusement.
 
 ## A session
 
@@ -52,6 +54,30 @@ PRINT 1/0
 ?DIVISION BY ZERO ERROR
 READY.
 ```
+
+## LOGO
+
+Press `2` at the boot menu. This is the screen of the machine running LOGO (a
+real capture taken through QEMU's monitor; the programs are in
+[`examples/logo/`](examples/logo)):
+
+![A cyan Koch snowflake, a yellow rosette of rotated squares and a green recursive tree drawn by LOGO on the machine](docs/logo-demo.png)
+
+```logo
+to square :size
+repeat 4 [fd :size rt 90]
+end
+to flower :size
+repeat 36 [square :size rt 10]
+end
+flower 80
+```
+
+Every line you type is compiled to RV64 machine code and run, by a JIT written
+for this project. The goldens for these pictures were not copied from the
+implementation's own output: they come from a separate Python turtle renderer
+(`scripts/verify_demo_images.py`), and the interpreter, the IR interpreter and the
+compiled engine must all reproduce them pixel for pixel.
 
 ## What it is
 
@@ -125,7 +151,8 @@ live only until the machine is switched off.
 | `rv64/` | A small RV64 assembler for the LOGO JIT. `no_std`, no `unsafe`; checked against LLVM and an emulator. |
 | `turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
 | `kernel/` | Boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
-| `examples/` | Demo BASIC programs (also used by the golden and boot tests). |
+| `examples/` | Demo BASIC programs (`*.bas`) and LOGO programs (`logo/*.logo`), also used by the golden and boot tests. |
+| `docs/` | The README screenshot. |
 | `scripts/` | The QEMU boot tests. |
 | `DESIGN.md` | Architecture, memory map, decision log. |
 | `BASIC.md` | The language spec. |
