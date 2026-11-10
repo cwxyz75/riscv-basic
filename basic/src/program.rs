@@ -2,6 +2,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::ops::Bound;
 
 /// Highest legal line number (see `BASIC.md`).
 pub(crate) const MAX_LINE: u16 = 63999;
@@ -25,6 +26,28 @@ impl Program {
     /// Delete the whole program (`NEW`).
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
+    }
+
+    /// The tokens of line `number`, if it exists.
+    pub(crate) fn get(&self, number: u16) -> Option<&[u8]> {
+        self.lines.get(&number).map(Vec::as_slice)
+    }
+
+    pub(crate) fn contains(&self, number: u16) -> bool {
+        self.lines.contains_key(&number)
+    }
+
+    /// The lowest line number in the program.
+    pub(crate) fn first(&self) -> Option<u16> {
+        self.lines.keys().next().copied()
+    }
+
+    /// The lowest line number strictly greater than `number`.
+    pub(crate) fn next_after(&self, number: u16) -> Option<u16> {
+        self.lines
+            .range((Bound::Excluded(number), Bound::Unbounded))
+            .next()
+            .map(|(n, _)| *n)
     }
 
     /// Lines with `from <= number <= to`, in line-number order. An empty or
@@ -60,6 +83,21 @@ mod tests {
         }
         assert_eq!(p.range(20, 30).count(), 2);
         assert_eq!(p.range(30, 10).count(), 0);
+    }
+
+    #[test]
+    fn navigation_helpers() {
+        let mut p = Program::default();
+        assert_eq!(p.first(), None);
+        for n in [30, 10, 20] {
+            p.set(n, vec![n as u8]);
+        }
+        assert_eq!(p.first(), Some(10));
+        assert_eq!(p.next_after(10), Some(20));
+        assert_eq!(p.next_after(15), Some(20));
+        assert_eq!(p.next_after(30), None);
+        assert!(p.contains(20) && !p.contains(25));
+        assert_eq!(p.get(20), Some(&[20u8][..]));
     }
 
     #[test]

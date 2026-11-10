@@ -8,6 +8,8 @@ pub(crate) enum Error {
     DivisionByZero,
     Overflow,
     IllegalQuantity,
+    UndefdStatement,
+    NextWithoutFor,
 }
 
 impl Error {
@@ -18,6 +20,22 @@ impl Error {
             Error::DivisionByZero => "DIVISION BY ZERO",
             Error::Overflow => "OVERFLOW",
             Error::IllegalQuantity => "ILLEGAL QUANTITY",
+            Error::UndefdStatement => "UNDEF'D STATEMENT",
+            Error::NextWithoutFor => "NEXT WITHOUT FOR",
         }
+    }
+}
+
+/// An error together with the program line it happened on (`None` when it
+/// happened in immediate mode), as reported by `?<NAME> ERROR IN <line>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fault {
+    pub(crate) error: Error,
+    pub(crate) line: Option<u16>,
+}
+
+impl From<Error> for Fault {
+    fn from(error: Error) -> Self {
+        Fault { error, line: None }
     }
 }

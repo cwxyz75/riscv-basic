@@ -1,9 +1,9 @@
-use crate::error::Error;
+use crate::error::{Error, Fault};
 use crate::expr::{evaluate, parse_name, Variables};
 use crate::io::{Io, Line};
 use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
-use crate::token::{detokenize, token, tokenize};
+use crate::token::{detokenize, keyword, tokenize};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -11,16 +11,39 @@ use alloc::vec::Vec;
 /// Width of a `PRINT` comma zone.
 const ZONE: usize = 14;
 
-/// The interpreter state: program store, variables, stacks, ...
+/// An active `FOR` loop: where `NEXT` jumps back to (just after the `FOR`
+/// statement) and how to step.
+#[derive(Debug)]
+struct ForFrame {
+    var: String,
+    limit: f64,
+    step: f64,
+    line: Option<u16>,
+    pos: usize,
+}
+
+/// What to do after a statement.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Carry on with the next statement.
+    Next,
+    /// Stop the program (or the typed line).
+    End,
+    /// Continue at byte `pos` of `line` (`None` is the typed line).
+    Jump { line: Option<u16>, pos: usize },
+}
+
+/// The interpreter state: program store, variables, loop stack, ...
 ///
-/// Milestone status (M3, in progress): typed lines are tokenized and stored;
-/// `LIST`, `NEW`, `LET` and `PRINT` work in immediate mode, with numeric
-/// expressions. Everything else answers `?SYNTAX ERROR` until the later M3
-/// items land. Behaviour is specified by `BASIC.md`.
+/// Milestone status (M3): typed lines are tokenized and stored; `RUN`,
+/// `GOTO`, `IF`, `FOR`/`NEXT`, `END`, `STOP`, `LET`, `PRINT`, `REM`, `LIST` and
+/// `NEW` work, with numeric expressions. Everything else answers `?SYNTAX
+/// ERROR` until the later milestones land. Behaviour is specified by `BASIC.md`.
 #[derive(Debug, Default)]
 pub struct Interpreter {
     program: Program,
     vars: Variables,
+    loops: Vec<ForFrame>,
     /// Output column of the console cursor, for `,` zones and fresh lines.
     column: usize,
 }
@@ -50,9 +73,12 @@ impl Interpreter {
     pub fn handle_line<I: Io>(&mut self, io: &mut I, line: &str) {
         // The user just pressed Enter, so the cursor is at the start of a line.
         self.column = 0;
-        if let Err(error) = self.try_handle_line(io, line) {
+        // Loops typed at the prompt live and die within one line.
+        self.loops.clear();
+        if let Err(fault) = self.try_handle_line(io, line) {
+            let location = fault.line.map_or(String::new(), |n| format!(" IN {n}"));
             self.fresh_line(io);
-            self.emit(io, &format!("?{} ERROR\n", error.name()));
+            self.emit(io, &format!("?{} ERROR{location}\n", fault.error.name()));
         }
     }
 
@@ -75,30 +101,26 @@ impl Interpreter {
         }
     }
 
-    fn try_handle_line<I: Io>(&mut self, io: &mut I, line: &str) -> Result<(), Error> {
+    fn try_handle_line<I: Io>(&mut self, io: &mut I, line: &str) -> Result<(), Fault> {
         let line = line.trim_start_matches([' ', '\t']);
         if line.is_empty() {
             return Ok(());
         }
         if line.starts_with(|c: char| c.is_ascii_digit()) {
-            return self.enter_program_line(line);
+            return Ok(self.enter_program_line(line)?);
         }
         let tokens = tokenize(line)?;
-        self.execute(io, &tokens)
-    }
-
-    /// Run one statement or command given as tokens.
-    fn execute<I: Io>(&mut self, io: &mut I, tokens: &[u8]) -> Result<(), Error> {
-        match tokens.split_first() {
-            Some((&first, rest)) if first == token("LIST") => self.list(io, rest),
-            Some((&first, rest)) if first == token("NEW") && is_blank(rest) => {
-                self.program.clear();
-                Ok(())
+        match self.run_line(io, None, &tokens, 0)? {
+            Flow::Jump {
+                line: Some(target),
+                pos,
+            } => {
+                if !self.program.contains(target) {
+                    return Err(Error::UndefdStatement.into());
+                }
+                self.run_program(io, target, pos)
             }
-            Some((&first, rest)) if first == token("PRINT") => self.print(io, rest),
-            Some((&first, rest)) if first == token("LET") => self.assign(rest),
-            Some((first, _)) if first.is_ascii_alphabetic() => self.assign(tokens),
-            _ => Err(Error::Syntax),
+            _ => Ok(()),
         }
     }
 
@@ -118,8 +140,355 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Run the stored program starting at byte `pos` of line `line`, which
+    /// must exist. Returns when the program ends or an error stops it.
+    fn run_program<I: Io>(
+        &mut self,
+        io: &mut I,
+        mut line: u16,
+        mut pos: usize,
+    ) -> Result<(), Fault> {
+        loop {
+            let Some(tokens) = self.program.get(line).map(<[u8]>::to_vec) else {
+                return Err(Error::UndefdStatement.into());
+            };
+            let here = Some(line);
+            let flow = self
+                .run_line(io, here, &tokens, pos)
+                .map_err(|error| Fault { error, line: here })?;
+            match flow {
+                Flow::Next => match self.program.next_after(line) {
+                    Some(next) => {
+                        line = next;
+                        pos = 0;
+                    }
+                    None => return Ok(()),
+                },
+                Flow::End | Flow::Jump { line: None, .. } => return Ok(()),
+                Flow::Jump {
+                    line: Some(target),
+                    pos: target_pos,
+                } => {
+                    if !self.program.contains(target) {
+                        return Err(Fault {
+                            error: Error::UndefdStatement,
+                            line: here,
+                        });
+                    }
+                    line = target;
+                    pos = target_pos;
+                }
+            }
+        }
+    }
+
+    /// Run the statements of one line of tokens from byte `pos` on. `line` is
+    /// the program line number, or `None` for a typed line. A jump to a
+    /// position within the same line is followed here; anything else is handed
+    /// back to the caller.
+    fn run_line<I: Io>(
+        &mut self,
+        io: &mut I,
+        line: Option<u16>,
+        tokens: &[u8],
+        mut pos: usize,
+    ) -> Result<Flow, Error> {
+        loop {
+            while matches!(tokens.get(pos), Some(b' ' | b'\t' | b':')) {
+                pos += 1;
+            }
+            if pos >= tokens.len() {
+                return Ok(Flow::Next);
+            }
+            match self.statement(io, line, tokens, &mut pos)? {
+                Flow::Next => {}
+                Flow::Jump {
+                    line: target,
+                    pos: target_pos,
+                } if target == line => pos = target_pos,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Execute the one statement starting at `tokens[*pos]` (not a space or
+    /// colon), leaving `*pos` just after it.
+    fn statement<I: Io>(
+        &mut self,
+        io: &mut I,
+        line: Option<u16>,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let first = tokens[*pos];
+        if first.is_ascii_alphabetic() {
+            return self.stmt_let(tokens, pos);
+        }
+        *pos += 1;
+        match keyword(first) {
+            Some("LET") => self.stmt_let(tokens, pos),
+            Some("PRINT") => self.stmt_print(io, tokens, pos),
+            Some("REM") => {
+                *pos = tokens.len();
+                Ok(Flow::Next)
+            }
+            Some("GOTO") => {
+                let target = parse_line_ref(tokens, pos)?;
+                end_of_statement(tokens, pos)?;
+                Ok(Flow::Jump {
+                    line: Some(target),
+                    pos: 0,
+                })
+            }
+            Some("IF") => self.stmt_if(tokens, pos),
+            Some("FOR") => self.stmt_for(line, tokens, pos),
+            Some("NEXT") => self.stmt_next(tokens, pos),
+            Some("END") => Ok(Flow::End),
+            Some("STOP") => {
+                self.fresh_line(io);
+                let message = match line {
+                    Some(n) => format!("BREAK IN {n}\n"),
+                    None => String::from("BREAK\n"),
+                };
+                self.emit(io, &message);
+                Ok(Flow::End)
+            }
+            Some("RUN") => self.stmt_run(tokens, pos),
+            Some("LIST") => {
+                let end = statement_end(tokens, *pos);
+                let args = &tokens[*pos..end];
+                *pos = end;
+                self.stmt_list(io, args)?;
+                Ok(Flow::Next)
+            }
+            Some("NEW") => {
+                let end = statement_end(tokens, *pos);
+                if !is_blank(&tokens[*pos..end]) {
+                    return Err(Error::Syntax);
+                }
+                *pos = end;
+                self.program.clear();
+                Ok(Flow::End)
+            }
+            _ => Err(Error::Syntax),
+        }
+    }
+
+    /// `[LET] name = expr`; `*pos` is just after `LET` or at the name.
+    fn stmt_let(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
+        let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos) != Some(&b'=') {
+            return Err(Error::Syntax);
+        }
+        let (value, end) = evaluate(tokens, *pos + 1, &self.vars)?;
+        *pos = end;
+        end_of_statement(tokens, pos)?;
+        self.vars.insert(name, value);
+        Ok(Flow::Next)
+    }
+
+    /// `PRINT [item [(;|,) [item]]...]`.
+    fn stmt_print<I: Io>(
+        &mut self,
+        io: &mut I,
+        src: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let mut newline = true;
+        let mut after_item = false;
+        loop {
+            skip_spaces(src, pos);
+            let Some(&byte) = src.get(*pos) else { break };
+            match byte {
+                b':' => break,
+                b';' => {
+                    *pos += 1;
+                    newline = false;
+                    after_item = false;
+                }
+                b',' => {
+                    *pos += 1;
+                    newline = false;
+                    after_item = false;
+                    let pad = ZONE - self.column % ZONE;
+                    self.emit(io, &" ".repeat(pad));
+                }
+                _ if after_item => return Err(Error::Syntax),
+                b'"' => {
+                    // A string literal runs to the closing quote, or the end.
+                    let start = *pos + 1;
+                    let end = src[start..]
+                        .iter()
+                        .position(|&b| b == b'"')
+                        .map_or(src.len(), |i| start + i);
+                    let text: String = src[start..end].iter().map(|&b| char::from(b)).collect();
+                    self.emit(io, &text);
+                    *pos = (end + 1).min(src.len());
+                    newline = true;
+                    after_item = true;
+                }
+                _ => {
+                    let (value, end) = evaluate(src, *pos, &self.vars)?;
+                    self.emit(io, &format_number(value));
+                    *pos = end;
+                    newline = true;
+                    after_item = true;
+                }
+            }
+        }
+        if newline {
+            self.emit(io, "\n");
+        }
+        Ok(Flow::Next)
+    }
+
+    /// `IF expr THEN line | statements`, `IF expr GOTO line`.
+    fn stmt_if(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
+        let (condition, end) = evaluate(tokens, *pos, &self.vars)?;
+        *pos = end;
+        skip_spaces(tokens, pos);
+        let word = tokens.get(*pos).and_then(|&b| keyword(b));
+        if word != Some("THEN") && word != Some("GOTO") {
+            return Err(Error::Syntax);
+        }
+        *pos += 1;
+        if condition == 0.0 {
+            // False: the rest of the line is skipped.
+            *pos = tokens.len();
+            return Ok(Flow::Next);
+        }
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos).is_some_and(u8::is_ascii_digit) || word == Some("GOTO") {
+            let target = parse_line_ref(tokens, pos)?;
+            end_of_statement(tokens, pos)?;
+            return Ok(Flow::Jump {
+                line: Some(target),
+                pos: 0,
+            });
+        }
+        // THEN followed by statements: just carry on with them.
+        Ok(Flow::Next)
+    }
+
+    /// `FOR v = a TO b [STEP c]`.
+    fn stmt_for(
+        &mut self,
+        line: Option<u16>,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let var = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos) != Some(&b'=') {
+            return Err(Error::Syntax);
+        }
+        let (start, end) = evaluate(tokens, *pos + 1, &self.vars)?;
+        *pos = end;
+        expect_keyword(tokens, pos, "TO")?;
+        let (limit, end) = evaluate(tokens, *pos, &self.vars)?;
+        *pos = end;
+        skip_spaces(tokens, pos);
+        let mut step = 1.0;
+        if tokens.get(*pos).and_then(|&b| keyword(b)) == Some("STEP") {
+            *pos += 1;
+            let (value, end) = evaluate(tokens, *pos, &self.vars)?;
+            step = value;
+            *pos = end;
+        }
+        end_of_statement(tokens, pos)?;
+
+        self.vars.insert(var.clone(), start);
+        // Restarting a loop discards it and every loop inside it.
+        if let Some(index) = self.loops.iter().position(|f| f.var == var) {
+            self.loops.truncate(index);
+        }
+        self.loops.push(ForFrame {
+            var,
+            limit,
+            step,
+            line,
+            pos: *pos,
+        });
+        Ok(Flow::Next)
+    }
+
+    /// `NEXT [v[,v...]]`.
+    fn stmt_next(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
+        let mut first = true;
+        loop {
+            skip_spaces(tokens, pos);
+            let name = parse_name(tokens, pos)?;
+            if name.is_none() && !first {
+                break;
+            }
+            let index = match &name {
+                None => self.loops.len().checked_sub(1),
+                Some(var) => self.loops.iter().rposition(|f| &f.var == var),
+            }
+            .ok_or(Error::NextWithoutFor)?;
+            // Loops inside the one being stepped are abandoned.
+            self.loops.truncate(index + 1);
+            let frame = &self.loops[index];
+            let value = self.vars.get(&frame.var).copied().unwrap_or(0.0) + frame.step;
+            if !value.is_finite() {
+                return Err(Error::Overflow);
+            }
+            let again = if frame.step >= 0.0 {
+                value <= frame.limit
+            } else {
+                value >= frame.limit
+            };
+            let var = frame.var.clone();
+            let target = Flow::Jump {
+                line: frame.line,
+                pos: frame.pos,
+            };
+            self.vars.insert(var, value);
+            if again {
+                return Ok(target);
+            }
+            self.loops.pop();
+
+            first = false;
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) == Some(&b',') {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        end_of_statement(tokens, pos)?;
+        Ok(Flow::Next)
+    }
+
+    /// `RUN [line]`.
+    fn stmt_run(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
+        skip_spaces(tokens, pos);
+        let given = if tokens.get(*pos).is_some_and(u8::is_ascii_digit) {
+            Some(parse_line_ref(tokens, pos)?)
+        } else {
+            None
+        };
+        end_of_statement(tokens, pos)?;
+        if let Some(n) = given {
+            if !self.program.contains(n) {
+                return Err(Error::UndefdStatement);
+            }
+        }
+        self.vars.clear();
+        self.loops.clear();
+        Ok(match given.or_else(|| self.program.first()) {
+            Some(start) => Flow::Jump {
+                line: Some(start),
+                pos: 0,
+            },
+            None => Flow::Next,
+        })
+    }
+
     /// `LIST [from][-[to]]`; `args` is the tokenized text after the keyword.
-    fn list<I: Io>(&mut self, io: &mut I, args: &[u8]) -> Result<(), Error> {
+    fn stmt_list<I: Io>(&mut self, io: &mut I, args: &[u8]) -> Result<(), Error> {
         let (from, to) = parse_range(&detokenize(args))?;
         let lines: Vec<String> = self
             .program
@@ -131,81 +500,55 @@ impl Interpreter {
         }
         Ok(())
     }
-
-    /// `[LET] name = expr`; `src` is everything after `LET` (or the whole
-    /// statement when `LET` was omitted).
-    fn assign(&mut self, src: &[u8]) -> Result<(), Error> {
-        let mut pos = 0;
-        let name = parse_name(src, &mut pos)?.ok_or(Error::Syntax)?;
-        while src.get(pos) == Some(&b' ') {
-            pos += 1;
-        }
-        if src.get(pos) != Some(&b'=') {
-            return Err(Error::Syntax);
-        }
-        let (value, end) = evaluate(src, pos + 1, &self.vars)?;
-        if !is_blank(&src[end..]) {
-            return Err(Error::Syntax);
-        }
-        self.vars.insert(name, value);
-        Ok(())
-    }
-
-    /// `PRINT [item [(;|,) [item]]...]`.
-    fn print<I: Io>(&mut self, io: &mut I, src: &[u8]) -> Result<(), Error> {
-        let mut pos = 0;
-        let mut newline = true;
-        let mut after_item = false;
-        loop {
-            while src.get(pos) == Some(&b' ') {
-                pos += 1;
-            }
-            let Some(&byte) = src.get(pos) else { break };
-            match byte {
-                b';' => {
-                    pos += 1;
-                    newline = false;
-                    after_item = false;
-                }
-                b',' => {
-                    pos += 1;
-                    newline = false;
-                    after_item = false;
-                    let pad = ZONE - self.column % ZONE;
-                    self.emit(io, &" ".repeat(pad));
-                }
-                _ if after_item => return Err(Error::Syntax),
-                b'"' => {
-                    // A string literal runs to the closing quote, or the end.
-                    let start = pos + 1;
-                    let end = src[start..]
-                        .iter()
-                        .position(|&b| b == b'"')
-                        .map_or(src.len(), |i| start + i);
-                    let text: String = src[start..end].iter().map(|&b| char::from(b)).collect();
-                    self.emit(io, &text);
-                    pos = (end + 1).min(src.len());
-                    newline = true;
-                    after_item = true;
-                }
-                _ => {
-                    let (value, end) = evaluate(src, pos, &self.vars)?;
-                    self.emit(io, &format_number(value));
-                    pos = end;
-                    newline = true;
-                    after_item = true;
-                }
-            }
-        }
-        if newline {
-            self.emit(io, "\n");
-        }
-        Ok(())
-    }
 }
 
 fn is_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == b' ' || b == b'\t')
+}
+
+fn skip_spaces(tokens: &[u8], pos: &mut usize) {
+    while matches!(tokens.get(*pos), Some(b' ' | b'\t')) {
+        *pos += 1;
+    }
+}
+
+/// A statement must be followed by a colon or the end of the line.
+fn end_of_statement(tokens: &[u8], pos: &mut usize) -> Result<(), Error> {
+    skip_spaces(tokens, pos);
+    match tokens.get(*pos) {
+        None | Some(b':') => Ok(()),
+        Some(_) => Err(Error::Syntax),
+    }
+}
+
+/// Index of the next `:` at or after `from`, or the end of the line.
+fn statement_end(tokens: &[u8], from: usize) -> usize {
+    tokens[from..]
+        .iter()
+        .position(|&b| b == b':')
+        .map_or(tokens.len(), |i| from + i)
+}
+
+/// Consume the keyword `word` (after spaces) or fail with a syntax error.
+fn expect_keyword(tokens: &[u8], pos: &mut usize, word: &str) -> Result<(), Error> {
+    skip_spaces(tokens, pos);
+    if tokens.get(*pos).and_then(|&b| keyword(b)) == Some(word) {
+        *pos += 1;
+        Ok(())
+    } else {
+        Err(Error::Syntax)
+    }
+}
+
+/// A line number written in a statement (`GOTO 100`), after optional spaces.
+fn parse_line_ref(tokens: &[u8], pos: &mut usize) -> Result<u16, Error> {
+    skip_spaces(tokens, pos);
+    let start = *pos;
+    while tokens.get(*pos).is_some_and(u8::is_ascii_digit) {
+        *pos += 1;
+    }
+    let digits: String = tokens[start..*pos].iter().map(|&b| char::from(b)).collect();
+    parse_line_number(&digits)
 }
 
 /// A line number: digits only (the caller guarantees that), at most 63999.

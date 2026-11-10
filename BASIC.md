@@ -156,6 +156,45 @@ strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
   line: if the cursor is not at column 0 (after `PRINT 1;`), a newline is
   printed first. Output already produced before an error stays.
 
+## Running programs: `RUN`, `GOTO`, `IF`, `FOR`, `END`, `STOP`
+
+- **Statement separator:** `:`. A program line or an immediate line may hold
+  several statements, run left to right. Extra or leading colons are ignored.
+  `REM` swallows the rest of the line, colons included.
+- **`RUN [line]`:** clears all variables and active `FOR` loops, then runs the
+  stored program from its lowest line, or from `line` (`?UNDEF'D STATEMENT
+  ERROR` if there is no such line). The program itself is untouched. Execution
+  goes in line-number order; running past the last line ends the program and
+  returns to `READY.`. Variables keep their values after the run, so they can
+  be inspected at the prompt.
+- **`GOTO line`:** continues at `line`. If there is no such line it is
+  `?UNDEF'D STATEMENT ERROR` (with `IN <line>` when it happens in a program).
+  Typed at the prompt, `GOTO line` starts running the program at that line
+  *without* clearing variables.
+- **`IF expr THEN line`**, **`IF expr THEN statement[: statement...]`**,
+  **`IF expr GOTO line`:** the condition is true when non-zero. When false,
+  the rest of the line (everything after the `IF`) is skipped. `THEN` may be
+  followed by another `IF`.
+- **`FOR v = a TO b [STEP c]` / `NEXT [v[,v...]]`:** `a`, `b` and `c` are
+  evaluated once, when the `FOR` runs; `STEP` defaults to 1. As in classic
+  BASIC the test happens at `NEXT`, so the body always runs at least once.
+  At `NEXT`, `v` is increased by the step; the loop repeats while `v <= b`
+  (step zero or positive) or `v >= b` (negative step), else it ends and
+  execution continues after the `NEXT`. A loop may start and end in the middle
+  of a line. Starting a `FOR` on a variable that already has an active loop
+  discards that loop and any loops inside it. `NEXT` with no name ends the
+  innermost loop; `NEXT v` first discards any loops inside `v`'s loop;
+  `NEXT I,J` is `NEXT I` then `NEXT J`. A `NEXT` with no matching active loop
+  is `?NEXT WITHOUT FOR ERROR`. Loops typed at the prompt must start and end on
+  one line (active loops are cleared at the start of every typed line).
+- **`END`:** stops the program silently. **`STOP`:** stops it and prints
+  `BREAK IN <line>`; typed at the prompt, `STOP` prints just `BREAK`.
+- **Errors in a program** stop it and print `?<NAME> ERROR IN <line>` using
+  the line that was executing. Syntax is only checked when a line runs.
+- `LIST` and `NEW` also work inside a program; `NEW` ends it.
+- No way to interrupt a runaway program exists until BREAK handling arrives
+  (milestone M6), so golden tests must not contain endless loops.
+
 ## Number output
 
 `PRINT` writes a number as a sign field, the digits, and a trailing space: a

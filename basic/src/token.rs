@@ -33,6 +33,12 @@ pub(crate) fn token(name: &str) -> u8 {
     FIRST_TOKEN + index as u8
 }
 
+/// The keyword a token byte stands for, if it is one.
+pub(crate) fn keyword(byte: u8) -> Option<&'static str> {
+    let index = usize::from(byte.checked_sub(FIRST_TOKEN)?);
+    KEYWORDS.get(index).copied()
+}
+
 /// The longest keyword that starts `rest` (case-insensitively), as
 /// `(table index, length in bytes)`.
 fn longest_keyword(rest: &[u8]) -> Option<(usize, usize)> {
