@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
-"""Milestone M1 boot test: type a scripted session at the serial console and
-check what the kernel echoes back and what it receives.
+"""Console boot test (milestone M1, driven through BASIC since M4): type
+lines at the serial prompt and check the echo and what the interpreter sees.
 
 Usage: console_test.py KERNEL_ELF
 
-The kernel is expected to show a `> ` prompt, echo what is typed (with the
-classic `BS SP BS` erase sequence for rubbed-out characters), and answer each
-finished line with `you typed: [LINE] (N chars)`. It shuts down on `exit`.
+The BASIC prompt `READY.` is the sync point. Each step types a line whose
+effect on the line editor shows up in what BASIC prints back.
 """
 import sys
 
 from boot_test import boot, check
 
-BS_SP_BS = "\x08 \x08"
+BS_SP_BS = "\x08 \x08"  # how a terminal is told to rub out one character
 
 # (bytes typed, text that must then appear in the output)
 STEPS = [
-    # The banner is printed through the ANSI helpers: green text, then reset.
-    ("", "\x1b[32mconsole ready; type a line, or `exit` to power off\x1b[0m\n"),
     # Backspace removes the previous character, and the terminal is told to erase it.
-    ("AB\x7fC\r", "> AB" + BS_SP_BS + "C\nyou typed: [AC] (2 chars)"),
+    ('PRINT "AB\x7fC"\r', 'PRINT "AB' + BS_SP_BS + 'C"\nAC\nREADY.'),
     # Ctrl-U erases the whole line, one erase sequence per character.
-    ("xyz\x15Q\r", "xyz" + BS_SP_BS * 3 + "Q\nyou typed: [Q] (1 chars)"),
-    # Ctrl-C abandons the line: echoes ^C and reports a break.
-    ("abc\x03", "abc^C\n(break)"),
+    ("PRINT 1\x15PRINT 2\r", "PRINT 1" + BS_SP_BS * 7 + "PRINT 2\n 2 \nREADY."),
+    # Ctrl-C abandons the line: echoes ^C and returns to the prompt.
+    ("PRINT 9\x03", "PRINT 9^C\nREADY."),
     # An arrow-key escape sequence (ESC [ A) is swallowed, not typed.
-    ("\x1b[Aok\r", "you typed: [ok] (2 chars)"),
-    # The line holds at most 255 characters; the rest is ignored.
-    ("a" * 300 + "\r", "(255 chars)"),
-    # An empty line is a line.
-    ("\r", "you typed: [] (0 chars)"),
+    ("\x1b[APRINT 3\r", "READY.\nPRINT 3\n 3 \nREADY."),
+    # The line holds at most 255 characters ("PRINT " + quote is 7): 248 a's get through.
+    ('PRINT "' + "a" * 300 + "\r", "a" * 248 + "\nREADY."),
+    # An empty line is just a new prompt.
+    ("\r", "READY.\n\nREADY."),
     # A CR LF pair is one Enter, not two.
-    ("x\r\ny\r", "you typed: [x] (1 chars)\n> y\nyou typed: [y] (1 chars)"),
+    ("PRINT 4\r\nPRINT 5\r", "PRINT 4\n 4 \nREADY.\nPRINT 5\n 5 \nREADY."),
     # Backspace on an empty line does nothing (and must not echo an erase).
-    ("\x7f\x7fz\r", "> z\nyou typed: [z]"),
+    ("\x7f\x7fPRINT 6\r", "READY.\nPRINT 6\n 6 \nREADY."),
     # Characters outside ASCII are ignored.
-    ("a\xe9b\r", "you typed: [ab] (2 chars)"),
-    # Shut down cleanly.
-    ("exit\r", "bye"),
+    ("PRINT 7\xe9\r", "PRINT 7\n 7 \nREADY."),
 ]
 
 
@@ -46,9 +41,16 @@ def main() -> int:
         print(__doc__, file=sys.stderr)
         return 2
     typed = "".join(step[0] for step in STEPS)
-    text, timed_out, returncode = boot(sys.argv[1], typed.encode("latin-1"), wait_for="console ready")
-    expects = ["hello from S-mode"] + [step[1] for step in STEPS]
-    return check(text, expects, timed_out, returncode)
+    expects = ["hello from S-mode", "RISCV BASIC V0.1\n32768 BYTES FREE\n\nREADY."]
+    expects += [step[1] for step in STEPS]
+    text, timed_out, returncode = boot(
+        sys.argv[1],
+        typed.encode("latin-1"),
+        wait_for="READY.",
+        stop_when=[STEPS[-1][1]],
+    )
+    # The 255-character limit: a 249th character must not have been accepted.
+    return check(text, expects, timed_out, returncode, forbidden=["a" * 249])
 
 
 if __name__ == "__main__":

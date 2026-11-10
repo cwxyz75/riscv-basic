@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Milestone M2 boot test: FPU, timer ticks, and trap reporting.
+"""Trap, timer and FPU boot test (milestone M2, driven through BASIC since M4).
 
 Usage: trap_test.py KERNEL_ELF
 
 Two boots:
-  1. The FPU works (the banner prints 1.5 * 2); `ticks` reports a tick count
-     and a millisecond clock that both advance in real time (two readings half
-     a second apart); `crash` executes an illegal instruction and the trap
-     handler reports scause and sepc, then powers the machine off cleanly.
-  2. `badload` reads an unmapped address; the handler must report a load access
-     fault whose stval is exactly that address.
+  1. The FPU works (the boot banner prints 1.5 * 2). `PRINT TIMER` twice, half
+     a second apart, shows the clock advancing. Then `PRINT PEEK(...)` of an
+     unmapped address must raise a load access fault; the trap handler reports
+     scause, sepc and stval (the faulting address), the tick counter and clock
+     (which must show the 10 ms timer interrupt has been running), and powers
+     the machine off cleanly.
+  2. `POKE` to the same unmapped address must raise a store access fault.
 
 Why two boots: a fatal trap powers the machine off.
 """
@@ -18,7 +19,9 @@ import sys
 
 from boot_test import boot, check
 
-PAUSE = 0.5  # seconds between the two `ticks` readings
+PAUSE = 0.5  # seconds between the two TIMER readings
+BAD_ADDRESS = 0x12345678  # nothing is mapped here on QEMU's virt machine
+TIMER_READING = re.compile(r"PRINT TIMER\n (\d+(?:\.\d+)?) \nREADY\.")
 
 
 def fail(problems, text) -> int:
@@ -29,11 +32,19 @@ def fail(problems, text) -> int:
 
 
 def first_boot(kernel: str) -> int:
-    steps = [(b"ticks\r", PAUSE), (b"ticks\r", 0.2), (b"crash\r", 1.0)]
-    text, timed_out, returncode = boot(kernel, steps, wait_for="console ready")
+    steps = [
+        (b"PRINT TIMER\r", PAUSE),
+        (b"PRINT TIMER\r", 0.1),
+        (f"PRINT PEEK({BAD_ADDRESS})\r".encode(), 1.0),
+    ]
+    text, timed_out, returncode = boot(kernel, steps, wait_for="READY.")
     status = check(
         text,
-        ["fpu: 1.5 * 2 = 3", "TRAP: scause=0x2 (illegal instruction)", "stval=0x"],
+        [
+            "fpu: 1.5 * 2 = 3",
+            "TRAP: scause=0x5 (load access fault)",
+            f"stval={BAD_ADDRESS:#x}",
+        ],
         timed_out,
         returncode,
     )
@@ -41,30 +52,32 @@ def first_boot(kernel: str) -> int:
         return status
 
     problems = []
-    readings = [(int(t), int(m)) for t, m in re.findall(r"ticks=(\d+) ms=(\d+)", text)]
-    if len(readings) != 2:
-        problems.append(f"expected two `ticks=N ms=M` readings, got {readings}")
-    else:
-        (t1, m1), (t2, m2) = readings
-        if not 300 <= m2 - m1 <= 2000:
-            problems.append(f"ms clock advanced by {m2 - m1}, expected about {int(PAUSE * 1000)}")
-        # Nominally 50 ticks; QEMU delivers them somewhat late, so only check the order of magnitude.
-        if not 10 <= t2 - t1 <= 200:
-            problems.append(f"tick counter advanced by {t2 - t1}, expected roughly {int(PAUSE * 100)}")
+    readings = [float(x) for x in TIMER_READING.findall(text)]
+    if len(readings) != 2 or not PAUSE * 0.6 <= readings[1] - readings[0] <= 5.0:
+        problems.append(f"TIMER readings {readings}: expected two, about {PAUSE} s apart")
     if not re.search(r"sepc=0x8020[0-9a-f]{4}\b", text):
         problems.append("sepc should be an address inside the kernel image")
+    report = re.search(r"ticks=(\d+) ms=(\d+)", text)
+    if not report:
+        problems.append("trap report should include ticks and ms")
+    else:
+        ticks, ms = int(report.group(1)), int(report.group(2))
+        # Nominally ms / 10 ticks; QEMU delivers them somewhat late, so only
+        # check that the tick counter has been advancing at all.
+        if ticks < 10 or ms < 500:
+            problems.append(f"ticks={ticks} ms={ms}: the timer should have been running for over 0.5 s")
     if timed_out or returncode != 0:
         problems.append(f"expected a clean shutdown (timed_out={timed_out}, status={returncode})")
     return fail(problems, text) if problems else 0
 
 
 def second_boot(kernel: str) -> int:
-    text, timed_out, returncode = boot(kernel, [(b"badload\r", 1.0)], wait_for="console ready")
+    text, timed_out, returncode = boot(kernel, [(f"POKE {BAD_ADDRESS},1\r".encode(), 1.0)], wait_for="READY.")
     problems = []
-    if "scause=0x5 (load access fault)" not in text:
-        problems.append("expected scause=0x5 (load access fault)")
-    if "stval=0x12345678" not in text:
-        problems.append("stval should be the faulting address 0x12345678")
+    if "scause=0x7 (store access fault)" not in text:
+        problems.append("expected scause=0x7 (store access fault)")
+    if f"stval={BAD_ADDRESS:#x}" not in text:
+        problems.append(f"stval should be the faulting address {BAD_ADDRESS:#x}")
     if timed_out or returncode != 0:
         problems.append(f"expected a clean shutdown (timed_out={timed_out}, status={returncode})")
     return fail(problems, text) if problems else 0
