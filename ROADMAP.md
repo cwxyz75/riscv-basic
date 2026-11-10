@@ -45,7 +45,8 @@ tick counter advances.
 
 Acceptance: golden tests cover each item, all passing under `make test`.
 
-- [x] Settle the top open questions in `BASIC.md`- [x] Tokenizer and the tokenized program store
+- [x] Settle the top open questions in `BASIC.md`
+- [x] Tokenizer and the tokenized program store
 - [x] Expression evaluator (numbers, precedence, comparisons)
 - [x] Immediate mode: `PRINT`, `LET`
 - [ ] Program entry, `LIST`, `NEW`, `RUN` (entry, `LIST` and `NEW` done; `RUN` pending)
