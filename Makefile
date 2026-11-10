@@ -15,7 +15,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p basic -p console -p turtle -p logo -p rv64
+	cargo test -p basic -p cartfs -p console -p turtle -p logo -p rv64
 	python3 scripts/verify_demo_images.py
 
 fmt:
@@ -25,7 +25,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p basic -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p basic -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
 
 kernel:

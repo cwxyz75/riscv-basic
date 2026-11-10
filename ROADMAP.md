@@ -85,8 +85,15 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 
 ## M7: Persistence (optional)
 
-- [ ] Choose pflash "cartridge" or virtio-blk
-- [ ] `SAVE`, `LOAD`, `DIR`
+Spec: DESIGN.md, "The disk" (D21, D22). Acceptance: a program saved in one boot
+is loaded and run in the next boot, in both languages, with a fresh QEMU process
+in between; the image is also checked from the host.
+
+- [x] Choose pflash "cartridge" or virtio-blk (virtio-blk, D21)
+- [x] `cartfs`: the disk format as a pure crate, host-tested (M7a)
+- [ ] BASIC `SAVE`, `LOAD`, `DIR`, `SCRATCH` (M7b)
+- [ ] LOGO `save`, `load`, `dir`, `erasefile` (M7c)
+- [ ] Kernel virtio-blk driver, `make` creates `disk.img`, persistence boot tests (M7d)
 
 ## M8: Showpiece
 

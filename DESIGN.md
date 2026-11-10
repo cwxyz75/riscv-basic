@@ -60,6 +60,9 @@ strings and arrays. Not yet decided; see D10.
   hardware knowledge. Its only window to the machine is the `Io` trait
   (`write_str`, `read_line`, `break_pressed`, `millis`, later screen and
   PEEK/POKE primitives). Tests implement `Io` with in-memory buffers.
+- **`cartfs`**: the disk format behind `SAVE`/`LOAD` (see "The disk"): header,
+  free-sector map, fixed directory and chained sectors over a `BlockDevice`
+  trait, with an in-memory disk for tests. `no_std`, `forbid(unsafe_code)`.
 - **`console`**: the pure, hardware-free half of the console: the line editor
   (a byte-at-a-time state machine) and the ANSI escape helpers. `no_std`,
   `forbid(unsafe_code)`, unit-tested on the host.
@@ -83,6 +86,34 @@ strings and arrays. Not yet decided; see D10.
   which also runs the LOGO code generator's output in host tests.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
+
+## The disk (persistence track, M7)
+
+`SAVE`/`LOAD` use one shared disk image, `disk.img`, attached to QEMU as a
+virtio block device (D21). Both languages see the same disk; each file is
+tagged with the language it belongs to, and a name is unique across the disk.
+The format is an old-school floppy (D22), implemented by the pure `cartfs`
+crate over a `BlockDevice` trait, so it is host-tested against an in-memory disk
+and the kernel only has to supply sector reads and writes.
+
+```text
+sector 0      header: "RVDISK01", total sectors u32, directory entries u32 (64)
+sector 1      free map: bit n (LSB first) set = sector n in use
+sectors 2-5   directory: 64 entries of 32 bytes
+sectors 6..   data: next-sector u16 (0 = last) + 510 payload bytes
+entry         name[16] NUL padded | kind u8 (0 free, 1 BASIC, 2 LOGO) | 0 |
+              first sector u16 | length u32 | 8 zero bytes   (all little-endian)
+```
+
+The standard disk is 2 MiB (4096 sectors, about 2 MB of payload; at most 4096
+sectors because the map is one sector). A file is at most 64 KiB. Names are 1-16
+characters from `A-Z 0-9 . - _`, case-insensitive, stored upper-case. Files
+are plain text: BASIC saves its `LIST` output, LOGO the text of its procedure
+definitions. Saving over an existing name of the same kind replaces it (in
+place in the directory, its old sectors reusable by the new copy); a name of the
+other kind is a type mismatch. Writes go data, then map, then directory entry.
+There is no journal: a power cut mid-save can lose that one file, as on a real
+floppy.
 
 ## Console model
 
@@ -197,3 +228,5 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D18 | The language is chosen at boot from a one-key menu and cannot be switched while running; changing language means rebooting (`BYE` in BASIC does a cold reboot through the SBI System Reset extension). One language's state never has to coexist with the other's | Decided |
 | D19 | Graphics: QEMU `ramfb` (a framebuffer in our RAM, set up through `fw_cfg` DMA), 640x480, 32-bit XRGB; headless tests take screenshots with the monitor's `screendump` | Decided |
 | D20 | LOGO runs as compiled RV64 by default; the AST and IR interpreters are kept as oracles (`.engine "ast`/`"ir`/`"jit` chooses). Generated code reaches the interpreter only through nine runtime services, whose implementations reuse the interpreter's own functions; values are NaN-boxed with a per-run arena | Decided |
+| D21 | Persistence is a virtio-mmio block device (`disk.img`, polled, no interrupts), not pflash: sector reads and writes map directly onto the format, the image is an ordinary file the host can create and inspect, and no flash erase/program protocol is needed | Decided |
+| D22 | The disk format is a fixed-directory floppy: header, free-sector map, 64 directory entries, chained data sectors, in the pure `cartfs` crate. One disk shared by both languages, files tagged by language, plain-text contents | Decided |
