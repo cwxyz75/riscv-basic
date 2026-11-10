@@ -3,12 +3,13 @@ KERNEL_ELF    := target/$(KERNEL_TARGET)/debug/kernel
 QEMU          := qemu-system-riscv64
 QEMU_FLAGS    := -machine virt -nographic -bios default
 
-.PHONY: help test fmt fmt-check lint kernel run debug boot-test check
+.PHONY: help test fmt fmt-check lint kernel run run-logo debug boot-test check
 
 help:
 	@echo "make test       host tests for the interpreter crate (no QEMU needed)"
 	@echo "make kernel     build the kernel ELF"
 	@echo "make run        boot the kernel in QEMU (Ctrl-A then X to exit)"
+	@echo "make run-logo    boot with a graphics window (ramfb); press 2 at the menu for the LOGO screen"
 	@echo "make debug      boot paused with a gdb stub on :1234"
 	@echo "make boot-test  boot in QEMU non-interactively and check the output"
 	@echo "make check      everything CI runs"
@@ -32,6 +33,11 @@ kernel:
 run: kernel
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
 
+# Same machine plus a framebuffer, shown in a window (QEMU picks the display
+# backend). The serial console stays in this terminal; Ctrl-A then X quits.
+run-logo: kernel
+	$(QEMU) -machine virt -bios default -device ramfb -serial mon:stdio -kernel $(KERNEL_ELF)
+
 debug: kernel
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) -s -S
 
@@ -41,5 +47,6 @@ boot-test: kernel
 	python3 scripts/basic_test.py $(KERNEL_ELF)
 	python3 scripts/demo_test.py $(KERNEL_ELF)
 	python3 scripts/menu_test.py $(KERNEL_ELF)
+	python3 scripts/fb_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

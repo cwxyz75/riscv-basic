@@ -28,6 +28,8 @@ def boot(
     wait_for: str = "",
     stop_when=(),
     menu_choice: bytes = b"1",
+    extra_args=(),
+    monitor: str = "none",
 ):
     """Boot `kernel`, send `stdin_data` to the serial port, return (text, timed_out, returncode).
 
@@ -38,7 +40,11 @@ def boot(
     predicate holds.
 
     The kernel starts with a language menu ("2) LOGO" is its last option line).
-    Once it is shown, `menu_choice` (default `1`, BASIC) is sent as the first
+    `extra_args` are added to the QEMU command line (for example
+    `["-device", "ramfb"]`) and `monitor` is the QEMU `-monitor` argument
+    (default none; the framebuffer test uses a loopback TCP monitor).
+
+    Once the menu is shown, `menu_choice` (default `1`, BASIC) is sent as the first
     keypress; pass `b""` to drive the menu yourself.
 
     If `wait_for` is given, the input is sent only once that text has appeared in
@@ -55,7 +61,8 @@ def boot(
         "-bios", "default",
         "-display", "none",
         "-serial", "stdio",
-        "-monitor", "none",
+        "-monitor", monitor,
+        *extra_args,
         "-kernel", kernel,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

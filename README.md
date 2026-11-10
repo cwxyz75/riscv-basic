@@ -87,6 +87,7 @@ Other commands:
 ```sh
 make test        # host tests for the interpreter and console crates (no QEMU needed)
 make kernel      # build the kernel ELF
+make run-logo     # boot with a graphics window; press 2 at the menu for the LOGO test pattern
 make debug       # boot paused, gdb stub on :1234
 make boot-test   # the scripted QEMU boot tests, as CI runs them
 make check       # everything CI runs: fmt, tests, clippy, boot tests

@@ -114,10 +114,10 @@ Spec: `LOGO.md`. The graphics layer (L0-L1) is useful to BASIC too (`PSET`,
 Acceptance: on the LOGO path only, the QEMU window shows a test pattern drawn by
 the kernel.
 
-- [ ] `ramfb` working: configure via fw_cfg, write pixels, window visible (`-device ramfb -display cocoa`)
-- [ ] Decide resolution and pixel format
-- [ ] Add a `make run-logo` style target; keep BASIC boot unchanged
-- [ ] Record what worked and what didn't in `DESIGN.md`
+- [x] `ramfb` working: configure via fw_cfg, write pixels, window visible (`-device ramfb -display cocoa`) (verified by `fb_test.py` with monitor screenshots, pixel for pixel; `make run-logo` opens the window, which I have not looked at myself)
+- [x] Decide resolution and pixel format (640x480, XRGB8888; D19)
+- [x] Add a `make run-logo` style target; keep BASIC boot unchanged
+- [x] Record what worked and what didn't in `DESIGN.md`
 
 ### L1: Canvas and turtle primitives
 
@@ -179,6 +179,6 @@ every `to` definition is compiled before it runs.
 - [x] Float formatting without surprises: `core::fmt` with `{:.8e}` rounds exactly, and the goldens plus `basic_test.py` agree on the host and under QEMU
 - [x] Ctrl-C delivery over the QEMU serial port (0x03 arrives as a byte, also while a program runs; verified with piped input, not yet with an interactive terminal)
 - [x] Allocator choice (D10): the `linked_list_allocator` crate (a bump allocator would leak on every statement)
-- [ ] `ramfb` on the RISC-V `virt` board with `-display cocoa` (L0)
+- [x] `ramfb` on the RISC-V `virt` board with `-display cocoa` (L0): works, see `DESIGN.md`
 - [ ] Can generated code run at all: emit, `fence.i`, jump, under QEMU (L4)
 - [ ] Deciding how far to take NaN-boxing without a garbage collector (L4)

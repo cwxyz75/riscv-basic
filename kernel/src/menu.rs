@@ -2,7 +2,7 @@
 //! The choice lasts until the next boot; `BYE` reboots back here.
 
 use crate::terminal::Console;
-use crate::uart;
+use crate::{gfx, uart};
 use core::fmt::Write;
 
 /// The languages the machine can run.
@@ -25,7 +25,24 @@ pub fn choose() -> Language {
                     return Language::Basic;
                 }
                 b'2' => {
-                    let _ = writeln!(out, "2\nLOGO is not installed yet.");
+                    let _ = writeln!(out, "2");
+                    // The LOGO track starts with the screen: bring up the
+                    // framebuffer and show a test pattern (see `gfx`).
+                    match gfx::init() {
+                        Ok(pixels) => {
+                            gfx::draw_test_pattern(pixels);
+                            let _ = writeln!(
+                                out,
+                                "framebuffer: {}x{} test pattern drawn",
+                                gfx::WIDTH,
+                                gfx::HEIGHT
+                            );
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(out, "framebuffer: {reason}");
+                        }
+                    }
+                    let _ = writeln!(out, "LOGO is not installed yet.");
                     break;
                 }
                 _ => {}
