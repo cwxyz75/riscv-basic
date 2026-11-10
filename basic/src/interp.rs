@@ -1,13 +1,15 @@
+use crate::data::{next_item, split_input, DataItem, DataPtr};
 use crate::error::{Error, Fault};
 use crate::expr::{
-    evaluate, evaluate_number, evaluate_subscripts, parse_name, to_address, to_byte, to_count,
+    evaluate, evaluate_number, evaluate_subscripts, parse_name, strict_number, to_address, to_byte,
+    to_count,
 };
 use crate::io::{Io, Line};
 use crate::memory::Memory;
 use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
 use crate::token::{detokenize, keyword, tokenize};
-use crate::value::Value;
+use crate::value::{check_length, Value};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,6 +29,30 @@ struct ForFrame {
     step: f64,
     line: Option<u16>,
     pos: usize,
+}
+
+/// Something a statement can store a value in: a variable, or an array element
+/// (with its subscripts already evaluated).
+#[derive(Debug)]
+struct Target {
+    name: String,
+    subs: Option<Vec<f64>>,
+}
+
+/// Turn a `DATA` or `INPUT` item into a value of the type `name` needs. A
+/// quoted item for a number is a type mismatch; a bare item that is not a
+/// complete number is a syntax error.
+fn convert_item(name: &str, item: &DataItem) -> Result<Value, Error> {
+    if name.ends_with('$') {
+        let text = match item {
+            DataItem::Quoted(s) | DataItem::Bare(s) => s.clone(),
+        };
+        return Ok(Value::Str(check_length(text)?));
+    }
+    match item {
+        DataItem::Quoted(_) => Err(Error::TypeMismatch),
+        DataItem::Bare(s) => strict_number(s)?.map(Value::Num).ok_or(Error::Syntax),
+    }
 }
 
 /// Where a `RETURN` goes back to: the statement after the `GOSUB`.
@@ -59,6 +85,8 @@ pub struct Interpreter {
     mem: Memory,
     loops: Vec<ForFrame>,
     gosubs: Vec<ReturnPoint>,
+    /// Where `READ` continues in the program's `DATA`.
+    data: Option<DataPtr>,
     /// Output column of the console cursor, for `,` zones and fresh lines.
     column: usize,
 }
@@ -293,14 +321,20 @@ impl Interpreter {
             Some("NEXT") => self.stmt_next(tokens, pos),
             Some("END") => Ok(Flow::End),
             Some("STOP") => {
-                self.fresh_line(io);
-                let message = match line {
-                    Some(n) => format!("BREAK IN {n}\n"),
-                    None => String::from("BREAK\n"),
-                };
-                self.emit(io, &message);
+                self.stop(io, line);
                 Ok(Flow::End)
             }
+            Some("DATA") => {
+                *pos = data_statement_end(tokens, *pos);
+                Ok(Flow::Next)
+            }
+            Some("READ") => self.stmt_read(io, tokens, pos),
+            Some("RESTORE") => {
+                end_of_statement(tokens, pos)?;
+                self.data = None;
+                Ok(Flow::Next)
+            }
+            Some("INPUT") => self.stmt_input(io, line, tokens, pos),
             Some("RUN") => self.stmt_run(tokens, pos),
             Some("POKE") => self.stmt_poke(io, tokens, pos),
             Some("DIM") => self.stmt_dim(io, tokens, pos),
@@ -318,6 +352,7 @@ impl Interpreter {
                 }
                 *pos = end;
                 self.program.clear();
+                self.data = None;
                 Ok(Flow::End)
             }
             _ => Err(Error::Syntax),
@@ -331,14 +366,7 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
-        let subscripts = if tokens.get(*pos) == Some(&b'(') {
-            let (subs, end) = evaluate_subscripts(tokens, *pos, &mut self.mem, io)?;
-            *pos = end;
-            Some(subs)
-        } else {
-            None
-        };
+        let target = self.parse_target(io, tokens, pos)?;
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
@@ -346,11 +374,33 @@ impl Interpreter {
         let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
-        match subscripts {
-            Some(subs) => self.mem.set_element(&name, &subs, value)?,
-            None => self.mem.assign(name, value)?,
-        }
+        self.store(&target, value)?;
         Ok(Flow::Next)
+    }
+
+    /// A variable or array element to assign to: `name` or `name(subscripts)`.
+    fn parse_target<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Target, Error> {
+        let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+        let subs = if tokens.get(*pos) == Some(&b'(') {
+            let (subs, end) = evaluate_subscripts(tokens, *pos, &mut self.mem, io)?;
+            *pos = end;
+            Some(subs)
+        } else {
+            None
+        };
+        Ok(Target { name, subs })
+    }
+
+    fn store(&mut self, target: &Target, value: Value) -> Result<(), Error> {
+        match &target.subs {
+            Some(subs) => self.mem.set_element(&target.name, subs, value),
+            None => self.mem.assign(target.name.clone(), value),
+        }
     }
 
     /// `PRINT [item [(;|,) [item]]...]`.
@@ -649,6 +699,119 @@ impl Interpreter {
         Ok(Flow::Next)
     }
 
+    /// Print `BREAK IN <line>` (or just `BREAK` at the prompt).
+    fn stop<I: Io>(&mut self, io: &mut I, line: Option<u16>) {
+        self.fresh_line(io);
+        let message = match line {
+            Some(n) => format!("BREAK IN {n}\n"),
+            None => String::from("BREAK\n"),
+        };
+        self.emit(io, &message);
+    }
+
+    /// `READ target[, target...]`.
+    fn stmt_read<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        loop {
+            let target = self.parse_target(io, tokens, pos)?;
+            let item = next_item(&self.program, &mut self.data)?;
+            let value = convert_item(&target.name, &item)?;
+            self.store(&target, value)?;
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) == Some(&b',') {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        end_of_statement(tokens, pos)?;
+        Ok(Flow::Next)
+    }
+
+    /// `INPUT ["prompt";] target[, target...]`.
+    fn stmt_input<I: Io>(
+        &mut self,
+        io: &mut I,
+        line: Option<u16>,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        skip_spaces(tokens, pos);
+        let mut prompt = String::new();
+        if tokens.get(*pos) == Some(&b'"') {
+            let start = *pos + 1;
+            let end = tokens[start..]
+                .iter()
+                .position(|&b| b == b'"')
+                .map_or(tokens.len(), |i| start + i);
+            prompt = tokens[start..end].iter().map(|&b| char::from(b)).collect();
+            *pos = (end + 1).min(tokens.len());
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) != Some(&b';') {
+                return Err(Error::Syntax);
+            }
+            *pos += 1;
+        }
+        let mut targets = Vec::new();
+        loop {
+            targets.push(self.parse_target(io, tokens, pos)?);
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) == Some(&b',') {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        end_of_statement(tokens, pos)?;
+
+        'attempt: loop {
+            self.emit(io, &prompt);
+            self.emit(io, "? ");
+            let mut items: Vec<DataItem> = Vec::new();
+            loop {
+                match io.read_line() {
+                    Line::Text(text) => {
+                        // The user pressed Enter, so the cursor is at a line start.
+                        self.column = 0;
+                        items.extend(split_input(&text));
+                    }
+                    Line::Break => {
+                        self.stop(io, line);
+                        return Ok(Flow::End);
+                    }
+                    Line::Eof => return Ok(Flow::End),
+                }
+                if items.len() >= targets.len() {
+                    break;
+                }
+                self.emit(io, "?? ");
+            }
+            if items.len() > targets.len() {
+                self.emit(io, "?EXTRA IGNORED\n");
+                items.truncate(targets.len());
+            }
+            let mut values = Vec::new();
+            for (target, item) in targets.iter().zip(&items) {
+                match convert_item(&target.name, item) {
+                    Ok(value) => values.push(value),
+                    Err(Error::Syntax | Error::TypeMismatch | Error::Overflow) => {
+                        self.emit(io, "?REDO FROM START\n");
+                        continue 'attempt;
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            for (target, value) in targets.iter().zip(values) {
+                self.store(target, value)?;
+            }
+            return Ok(Flow::Next);
+        }
+    }
+
     /// `RUN [line]`.
     fn stmt_run(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
         skip_spaces(tokens, pos);
@@ -666,6 +829,7 @@ impl Interpreter {
         self.mem.clear_variables();
         self.loops.clear();
         self.gosubs.clear();
+        self.data = None;
         Ok(match given.or_else(|| self.program.first()) {
             Some(start) => Flow::Jump {
                 line: Some(start),
@@ -692,6 +856,20 @@ impl Interpreter {
 
 fn is_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == b' ' || b == b'\t')
+}
+
+/// Index of the colon that ends a `DATA` statement (one outside double
+/// quotes), or the end of the line.
+fn data_statement_end(tokens: &[u8], from: usize) -> usize {
+    let mut in_quotes = false;
+    for (i, &b) in tokens.iter().enumerate().skip(from) {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b':' if !in_quotes => return i,
+            _ => {}
+        }
+    }
+    tokens.len()
 }
 
 fn skip_spaces(tokens: &[u8], pos: &mut usize) {

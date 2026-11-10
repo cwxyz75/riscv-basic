@@ -169,9 +169,10 @@ fn to_i32(value: f64) -> Result<i32, Error> {
     }
 }
 
-/// The number at the start of `text`, for `VAL`: optional spaces, a sign,
-/// digits with an optional fraction and exponent. `0` if there is none.
-fn leading_number(text: &str) -> Result<f64, Error> {
+/// Scan the number at the start of `text`: optional spaces, a sign, digits with
+/// an optional fraction and exponent. Returns its value and the index just past
+/// it, or `None` if there is no number there.
+fn scan_number(text: &str) -> Result<Option<(f64, usize)>, Error> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while bytes.get(i) == Some(&b' ') {
@@ -194,7 +195,7 @@ fn leading_number(text: &str) -> Result<f64, Error> {
         }
     }
     if digits == 0 {
-        return Ok(0.0);
+        return Ok(None);
     }
     // An exponent only counts if it has digits after it.
     if matches!(bytes.get(i), Some(b'E' | b'e')) {
@@ -210,7 +211,24 @@ fn leading_number(text: &str) -> Result<f64, Error> {
         }
     }
     let value: f64 = text[start..i].parse().map_err(|_| Error::Syntax)?;
-    check(value)
+    Ok(Some((check(value)?, i)))
+}
+
+/// The number at the start of `text`, for `VAL`: `0` if there is none.
+fn leading_number(text: &str) -> Result<f64, Error> {
+    Ok(scan_number(text)?.map_or(0.0, |(value, _)| value))
+}
+
+/// A complete number, for `READ` and `INPUT`: the whole of `text` (spaces
+/// around it allowed) must be a number. Empty is `0`; anything else is `None`.
+pub(crate) fn strict_number(text: &str) -> Result<Option<f64>, Error> {
+    if text.trim_matches(' ').is_empty() {
+        return Ok(Some(0.0));
+    }
+    match scan_number(text)? {
+        Some((value, end)) if text[end..].trim_matches(' ').is_empty() => Ok(Some(value)),
+        _ => Ok(None),
+    }
 }
 
 struct Parser<'a, I: Io> {

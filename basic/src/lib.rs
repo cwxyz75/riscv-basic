@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod data;
 mod error;
 mod expr;
 mod interp;

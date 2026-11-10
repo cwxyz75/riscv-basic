@@ -16,6 +16,7 @@ pub(crate) enum Error {
     StringTooLong,
     BadSubscript,
     RedimdArray,
+    OutOfData,
 }
 
 impl Error {
@@ -34,6 +35,7 @@ impl Error {
             Error::StringTooLong => "STRING TOO LONG",
             Error::BadSubscript => "BAD SUBSCRIPT",
             Error::RedimdArray => "REDIM'D ARRAY",
+            Error::OutOfData => "OUT OF DATA",
         }
     }
 }
