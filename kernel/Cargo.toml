@@ -6,6 +6,7 @@ description = "Bare-metal RISC-V (S-mode) host for the BASIC interpreter on QEMU
 
 [dependencies]
 basic = { path = "../basic" }
+cartfs = { path = "../cartfs" }
 console = { path = "../console" }
 turtle = { path = "../turtle" }
 logo = { path = "../logo" }

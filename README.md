@@ -79,6 +79,16 @@ implementation's own output: they come from a separate Python turtle renderer
 (`scripts/verify_demo_images.py`), and the interpreter, the IR interpreter and the
 compiled engine must all reproduce them pixel for pixel.
 
+## Saving your work
+
+`make run` and `make run-logo` attach a 2 MiB disk image, `disk.img` (created on
+first use, never overwritten), shared by both languages. In BASIC: `SAVE "NAME"`,
+`LOAD "NAME"`, `DIR`, `SCRATCH "NAME"`. In LOGO: `save "name`, `load "name`
+(runs the file as if typed), `dir`, `erasefile "name`. Files survive `BYE` and
+restarting QEMU. The format is an old-school floppy (directory, free map, chained
+sectors; see `DESIGN.md`), and `python3 scripts/disk.py ls disk.img` reads it from
+the host.
+
 ## What it is
 
 - **A BASIC in the Microsoft/Commodore tradition.** Line-numbered programs

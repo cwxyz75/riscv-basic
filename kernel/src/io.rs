@@ -3,18 +3,23 @@
 
 use crate::terminal::{self, Console, Input};
 use crate::timer;
+use alloc::boxed::Box;
 use alloc::string::String;
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
 
 pub struct KernelIo {
     input: Input,
+    disk: Box<dyn cartfs::Files>,
 }
 
 impl KernelIo {
-    pub const fn new() -> Self {
+    /// The console, with the disk (or the lack of one) found by probing the
+    /// virtio slots. Needs the heap.
+    pub fn new() -> Self {
         KernelIo {
             input: Input::new(),
+            disk: crate::virtio_blk::open(),
         }
     }
 }
@@ -43,6 +48,10 @@ impl basic::Io for KernelIo {
 
     fn millis(&mut self) -> u64 {
         timer::millis()
+    }
+
+    fn files(&mut self) -> Option<&mut dyn cartfs::Files> {
+        Some(&mut *self.disk)
     }
 
     fn peek(&mut self, addr: u64) -> u8 {
@@ -83,5 +92,9 @@ impl logo::Io for KernelIo {
 
     fn reboot(&mut self) {
         crate::sbi::reboot()
+    }
+
+    fn files(&mut self) -> Option<&mut dyn cartfs::Files> {
+        Some(&mut *self.disk)
     }
 }
