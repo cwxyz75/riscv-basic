@@ -47,4 +47,9 @@ pub trait Io {
     fn millis(&mut self) -> u64;
     /// Reboot the machine (`bye`); on real hardware this does not return.
     fn reboot(&mut self);
+    /// The disk behind `save`, `load`, `dir` and `erasefile`; `None` if the
+    /// machine has none.
+    fn files(&mut self) -> Option<&mut dyn cartfs::Files> {
+        None
+    }
 }

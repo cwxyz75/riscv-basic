@@ -14,7 +14,8 @@ once after `.engine "ast`, the reference interpreter. Then:
     through the QEMU monitor must be identical under both engines, and must show
     something drawn.
 
-The scripts that depend on the host harness (`<BREAK AFTER n>`) are skipped.
+The scripts that depend on the host harness (`<BREAK AFTER n>`, and the disk
+directives, which need a disk this test does not attach) are skipped.
 Each run is its own QEMU process; runs go in parallel.
 """
 import concurrent.futures
@@ -154,7 +155,10 @@ def main() -> int:
     kernel = sys.argv[1]
     names = []
     for path in sorted(GOLDEN.glob("*.logo")):
-        if "<BREAK AFTER" in path.read_text():
+        text = path.read_text()
+        if "<BREAK AFTER" in text or any(
+            marker in text for marker in ("<DISK ", "<FILE ", "<NO DISK>", "<BAD DISK>")
+        ):
             continue
         names.append(path.stem)
     failures = []

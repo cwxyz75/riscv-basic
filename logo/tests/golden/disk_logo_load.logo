@@ -1,0 +1,13 @@
+<DISK SECTORS 16>
+<FILE LOGO START>
+to twice :x
+print :x print :x
+end
+; a comment
+
+twice "hello
+make "a 5
+<END FILE>
+load "start
+print :a
+twice 7

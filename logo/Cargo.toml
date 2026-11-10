@@ -8,3 +8,5 @@ description = "The LOGO language for riscv-basic: reader, parser, reference inte
 libm = "0.2"
 turtle = { path = "../turtle" }
 rv64 = { path = "../rv64" }
+# The disk interface (pure): save, load, dir and erasefile talk to `cartfs::Files`.
+cartfs = { path = "../cartfs" }

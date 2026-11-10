@@ -9,6 +9,7 @@
 //! following check for Ctrl-C reports "pressed". Expected files are worked out
 //! by hand from `LOGO.md`; never bless them blindly.
 
+use cartfs::{Disk, Files, Kind, MemDisk, Unavailable};
 use logo::{Engine, Interpreter, Io, Line};
 use std::collections::VecDeque;
 use std::fs;
@@ -20,6 +21,7 @@ struct ScriptIo {
     output: String,
     clock_ms: u64,
     break_after: Option<u64>,
+    files: Option<Box<dyn Files>>,
 }
 
 impl Io for ScriptIo {
@@ -64,6 +66,87 @@ impl Io for ScriptIo {
     fn reboot(&mut self) {
         self.output.push_str("[reboot]\n");
     }
+
+    fn files(&mut self) -> Option<&mut dyn Files> {
+        match &mut self.files {
+            Some(files) => Some(&mut **files),
+            None => None,
+        }
+    }
+}
+
+/// Disk directives, anywhere in a script (none: no disk): `<DISK SECTORS n>` a
+/// freshly formatted disk of n sectors (n - 6 blocks of data), `<NO DISK>`,
+/// `<BAD DISK>` (unformatted), `<DISK ERROR>` (reads fail), and `<FILE BASIC
+/// NAME>` / `<FILE LOGO NAME>` through `<END FILE>` to put a file on the disk.
+/// Returns the disk and the remaining lines.
+type DiskMaker = Box<dyn Fn() -> Option<Box<dyn Files>>>;
+
+fn take_disk(script: &str) -> (DiskMaker, String) {
+    let mut kind_of_disk = DiskKind::None;
+    let mut sectors = 0;
+    let mut files: Vec<(Kind, String, String)> = Vec::new();
+    let mut open: Option<(Kind, String, String)> = None;
+    let mut rest = String::new();
+    for line in script.lines() {
+        if let Some(file) = open.as_mut() {
+            if line == "<END FILE>" {
+                files.push(open.take().unwrap());
+            } else {
+                file.2.push_str(line);
+                file.2.push('\n');
+            }
+        } else if let Some(n) = line
+            .strip_prefix("<DISK SECTORS ")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            kind_of_disk = DiskKind::Formatted;
+            sectors = n.parse::<u32>().expect("sector count");
+        } else if line == "<NO DISK>" {
+            kind_of_disk = DiskKind::None;
+        } else if line == "<BAD DISK>" {
+            kind_of_disk = DiskKind::Unformatted;
+        } else if line == "<DISK ERROR>" {
+            kind_of_disk = DiskKind::Broken;
+        } else if let Some(r) = line
+            .strip_prefix("<FILE ")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            let (kind, name) = r.split_once(' ').expect("<FILE KIND NAME>");
+            let kind = match kind {
+                "BASIC" => Kind::Basic,
+                "LOGO" => Kind::Logo,
+                other => panic!("unknown file kind {other}"),
+            };
+            open = Some((kind, name.to_owned(), String::new()));
+        } else {
+            rest.push_str(line);
+            rest.push('\n');
+        }
+    }
+    // Every engine run gets its own fresh disk.
+    let make = move || -> Option<Box<dyn Files>> {
+        match kind_of_disk {
+            DiskKind::None => None,
+            DiskKind::Unformatted => Some(Box::new(Unavailable(cartfs::Error::NotFormatted))),
+            DiskKind::Broken => Some(Box::new(Unavailable(cartfs::Error::Device))),
+            DiskKind::Formatted => {
+                let mut d = Disk::format(MemDisk::new(sectors)).expect("format");
+                for (kind, name, text) in &files {
+                    d.save(name, *kind, text.as_bytes()).expect("preload");
+                }
+                Some(Box::new(d))
+            }
+        }
+    };
+    (Box::new(make), rest)
+}
+
+enum DiskKind {
+    None,
+    Unformatted,
+    Broken,
+    Formatted,
 }
 
 /// Replace `<LOAD examples/logo/NAME.logo>` lines with that file's lines (path
@@ -91,7 +174,7 @@ fn expand_loads(script: &str) -> String {
 }
 
 fn run(script: &str, engine: Engine) -> (String, String) {
-    let script = expand_loads(script);
+    let (make_disk, script) = take_disk(&expand_loads(script));
     let mut lines: Vec<&str> = script.lines().collect();
     let (mut width, mut height) = (21, 21);
     if let Some(dims) = lines.first().and_then(|l| l.strip_prefix(";canvas ")) {
@@ -108,6 +191,7 @@ fn run(script: &str, engine: Engine) -> (String, String) {
         output: String::new(),
         clock_ms: 0,
         break_after: None,
+        files: make_disk(),
     };
     let mut interpreter = match engine {
         // Compiled code runs in the RV64 emulator.

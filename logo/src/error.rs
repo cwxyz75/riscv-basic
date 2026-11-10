@@ -20,6 +20,8 @@ pub(crate) enum LogoError {
     OutOfMemory,
     OutOfRange,
     Stopped,
+    Disk(cartfs::Error),
+    MissingEnd,
 }
 
 impl LogoError {
@@ -44,6 +46,16 @@ impl LogoError {
             LogoError::OutOfMemory => String::from("Out of memory"),
             LogoError::OutOfRange => String::from("Number out of range"),
             LogoError::Stopped => String::from("Stopped!"),
+            LogoError::MissingEnd => String::from("Missing end"),
+            LogoError::Disk(e) => String::from(match e {
+                cartfs::Error::NoDevice => "No disk attached",
+                cartfs::Error::NotFormatted => "Disk is not formatted",
+                cartfs::Error::Device | cartfs::Error::Corrupt => "Disk error",
+                cartfs::Error::NotFound => "File not found",
+                cartfs::Error::TypeMismatch => "File is not a LOGO file",
+                cartfs::Error::BadName => "Bad file name",
+                cartfs::Error::Full | cartfs::Error::TooBig => "Disk full",
+            }),
         }
     }
 }

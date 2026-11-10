@@ -1,0 +1,17 @@
+<DISK SECTORS 16>
+to hello
+print "hi
+end
+to sq :n
+repeat 4 [fd :n rt 90]
+end
+save "Shapes
+to hello
+print "changed
+end
+hello
+load "shapes
+hello
+dir
+erasefile "SHAPES
+dir
