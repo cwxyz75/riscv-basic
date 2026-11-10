@@ -135,9 +135,8 @@ the persistence milestone happens.
 
 ## Expressions, `PRINT` and `LET` in detail
 
-Fills in the operator table above. Numbers only, plus string literals as
-`PRINT` items; string variables and string expressions arrive with the
-strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
+Fills in the operator table above. Typing of values, strings and string
+functions are specified under "Strings" below.
 
 - **Number literals:** digits with an optional fraction and an optional
   exponent: `5`, `5.`, `.5`, `1.5E3`, `1E-3`. An `E` with no digits after it is
@@ -221,6 +220,43 @@ strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
 - No way to interrupt a runaway program exists until BREAK handling arrives
   (milestone M6), so golden tests must not contain endless loops.
 
+## Strings
+
+- **Values and names:** a string variable's name ends in `$`; `A` and `A$` are
+  different variables. An unset string is `""`. String literals are written in
+  double quotes (an unterminated one runs to the end of the line). Strings
+  are ASCII, at most **255 characters**: a result longer than that is `?STRING
+  TOO LONG ERROR`. Assigning a number to a string variable, or a string to a
+  numeric one, is `?TYPE MISMATCH ERROR`.
+- **Operators:** `+` joins two strings; between a number and a string it is
+  `?TYPE MISMATCH ERROR`, as is any other arithmetic or logic operator
+  (`-`, `*`, `/`, `^`, unary `-`, `NOT`, `AND`, `OR`) with a string operand.
+  The comparisons `= <> < > <= >=` work on two numbers or two strings (not
+  mixed: `?TYPE MISMATCH ERROR`); strings compare by character code, so `"A" <
+  "a"`, and a string is less than any longer string it is a prefix of.
+  Everywhere a number is required (an `IF` condition, a `FOR` variable, `ON`,
+  `POKE`, `PEEK`, the numeric functions, ...), a string is `?TYPE MISMATCH ERROR`.
+- **Functions:**
+
+| Function | Result |
+|---|---|
+| `LEN(s$)` | number of characters |
+| `ASC(s$)` | character code of the first character; `""` is `?ILLEGAL QUANTITY ERROR` |
+| `VAL(s$)` | the number at the start of `s$` after any spaces (sign, digits, fraction, exponent as in a program); `0` if there is none |
+| `STR$(x)` | `x` as `PRINT` would write it, without the trailing space: `STR$(5)` is `" 5"`, `STR$(-5)` is `"-5"` |
+| `CHR$(n)` | the character with code `n`, 0 to 127, else `?ILLEGAL QUANTITY ERROR` |
+| `LEFT$(s$,n)` | the first `n` characters (all of `s$` if it is shorter) |
+| `RIGHT$(s$,n)` | the last `n` characters |
+| `MID$(s$,i[,n])` | `n` characters starting at character `i` (counting from 1), or all the rest if `n` is left out; `i` below 1 is `?ILLEGAL QUANTITY ERROR`, and starting past the end gives `""` |
+
+  Counts and positions (`n`, `i`) are truncated toward zero; a negative count is
+  `?ILLEGAL QUANTITY ERROR`. A wrong number of arguments is `?SYNTAX ERROR`.
+- **`PRINT`:** an item can be any string or number expression. `TAB(n)` moves
+  to column `n` (counting from 0) by printing spaces, or does nothing if the
+  cursor is already there or beyond; `SPC(n)` prints `n` spaces; `n` is from 0
+  to 255 (else `?ILLEGAL QUANTITY ERROR`). Unlike other items, `TAB(...)` and
+  `SPC(...)` need no `;` after them: `PRINT TAB(5)"X"` is fine.
+
 ## Numeric functions
 
 Every function takes its argument in parentheses, as in `SQR(X)`.
@@ -286,7 +322,8 @@ After an error the program stops and the prompt returns.
 
 `SYNTAX`, `TYPE MISMATCH`, `UNDEF'D STATEMENT`, `NEXT WITHOUT FOR`,
 `RETURN WITHOUT GOSUB`, `OUT OF DATA`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
-`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`.
+`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`,
+`STRING TOO LONG`.
 
 ## Faults
 
