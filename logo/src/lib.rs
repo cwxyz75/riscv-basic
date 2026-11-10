@@ -12,6 +12,7 @@ mod error;
 mod exec;
 mod interp;
 mod ir;
+mod jit;
 mod lex;
 mod parse;
 mod prims;
@@ -19,6 +20,7 @@ mod rng;
 mod value;
 
 pub use interp::{Engine, Interpreter};
+pub use jit::{abi, emulated_execute, ExecuteFn, JitHost, Ret};
 
 use alloc::string::String;
 

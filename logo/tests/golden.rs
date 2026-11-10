@@ -84,7 +84,12 @@ fn run(script: &str, engine: Engine) -> (String, String) {
         clock_ms: 0,
         break_after: None,
     };
-    Interpreter::with_engine(engine).run_session(&mut io, &mut canvas);
+    let mut interpreter = match engine {
+        // Compiled code runs in the RV64 emulator.
+        Engine::Jit => Interpreter::with_executor(logo::emulated_execute),
+        other => Interpreter::with_engine(other),
+    };
+    interpreter.run_session(&mut io, &mut canvas);
     (io.output, canvas.to_ascii())
 }
 
@@ -115,9 +120,10 @@ fn golden_cases() {
         let out = case.with_extension("out");
         let want = fs::read_to_string(&out).unwrap_or_else(|_| panic!("missing {}", out.display()));
         let img = fs::read_to_string(case.with_extension("img")).ok();
-        // The AST interpreter and the IR interpreter must both match the
-        // hand-derived files, and therefore each other.
-        for engine in [Engine::Ast, Engine::Ir] {
+        // The AST interpreter, the IR interpreter and the compiled engine (RV64
+        // code in the emulator) must all match the hand-derived files, and
+        // therefore each other.
+        for engine in [Engine::Ast, Engine::Ir, Engine::Jit] {
             let (transcript, picture) = run(&script, engine);
             if transcript != want {
                 failures.push(format!(

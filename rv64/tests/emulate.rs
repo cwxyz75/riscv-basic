@@ -1,105 +1,24 @@
 //! Behavioural tests: run assembled code in a tiny RV64 emulator (just the
 //! integer instructions the tests use) and check the results.
 
+use rv64::emu::Emulator;
 use rv64::*;
 
-/// Run `code` from address 0 until it returns (`jalr zero, 0(ra)` with `ra = 0`
-/// at entry), and return the registers.
-fn run(code: &[u8], max_steps: usize) -> [u64; 32] {
-    let words: Vec<u32> = code
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    let mut x = [0u64; 32];
-    let mut pc: i64 = 0;
-    for _ in 0..max_steps {
-        let Some(&w) = words.get((pc / 4) as usize).filter(|_| pc >= 0) else {
-            return x;
-        };
-        let rd = (w >> 7 & 31) as usize;
-        let rs1 = (w >> 15 & 31) as usize;
-        let rs2 = (w >> 20 & 31) as usize;
-        let funct3 = w >> 12 & 7;
-        let imm_i = (w as i32) >> 20;
-        let mut next = pc + 4;
-        let write = |x: &mut [u64; 32], rd: usize, v: u64| {
-            if rd != 0 {
-                x[rd] = v;
-            }
-        };
-        match w & 0x7f {
-            0x37 => write(&mut x, rd, ((w & 0xffff_f000) as i32) as i64 as u64), // lui
-            0x13 => {
-                let v = match funct3 {
-                    0 => x[rs1].wrapping_add(imm_i as i64 as u64), // addi
-                    1 => x[rs1] << (w >> 20 & 63),                 // slli
-                    _ => panic!("unsupported OP-IMM funct3 {funct3}"),
-                };
-                write(&mut x, rd, v);
-            }
-            0x1b => {
-                assert_eq!(funct3, 0, "only addiw");
-                let v = (x[rs1] as i32).wrapping_add(imm_i) as i64 as u64; // addiw
-                write(&mut x, rd, v);
-            }
-            0x33 => {
-                let v = if w >> 30 & 1 == 1 {
-                    x[rs1].wrapping_sub(x[rs2])
-                } else {
-                    x[rs1].wrapping_add(x[rs2])
-                };
-                write(&mut x, rd, v);
-            }
-            0x63 => {
-                let off = ((w >> 31 & 1) << 12
-                    | (w >> 7 & 1) << 11
-                    | (w >> 25 & 0x3f) << 5
-                    | (w >> 8 & 0xf) << 1) as i32;
-                let off = (off << 19) >> 19;
-                let (a, b) = (x[rs1], x[rs2]);
-                let taken = match funct3 {
-                    0 => a == b,
-                    1 => a != b,
-                    4 => (a as i64) < (b as i64),
-                    5 => (a as i64) >= (b as i64),
-                    6 => a < b,
-                    7 => a >= b,
-                    _ => panic!("bad branch"),
-                };
-                if taken {
-                    next = pc + i64::from(off);
-                }
-            }
-            0x6f => {
-                let off = ((w >> 31 & 1) << 20
-                    | (w >> 12 & 0xff) << 12
-                    | (w >> 20 & 1) << 11
-                    | (w >> 21 & 0x3ff) << 1) as i32;
-                let off = (off << 11) >> 11;
-                write(&mut x, rd, (pc + 4) as u64);
-                next = pc + i64::from(off);
-            }
-            0x67 => {
-                // jalr: only `ret` to address 0 ends the run
-                let target = (x[rs1] as i64 + i64::from(imm_i)) & !1;
-                write(&mut x, rd, (pc + 4) as u64);
-                if target == 0 {
-                    return x; // returned to the initial `ra`: the run is over
-                }
-                next = target;
-            }
-            op => panic!("unsupported opcode {op:#x} (word {w:#010x})"),
-        }
-        pc = next;
-    }
-    panic!("did not finish in {max_steps} steps");
+/// Run `code` (loaded at address 0x1000) until it returns, and return `a0`.
+fn run_a0(code: &[u8], max_steps: usize) -> u64 {
+    let mut emu = Emulator::new(0x1000, 0x2000);
+    emu.write_bytes(0x1000, code).unwrap();
+    emu.call(0x1000, &[], max_steps, &mut |target, _| {
+        panic!("unexpected call to {target:#x}")
+    })
+    .unwrap()
 }
 
 fn load_constant(value: i64) -> u64 {
     let mut a = Asm::new();
     a.li(A0, value);
     a.ret();
-    run(&a.finish().unwrap(), 100)[10]
+    run_a0(&a.finish().unwrap(), 100)
 }
 
 #[test]
@@ -175,7 +94,7 @@ fn a_backward_branch_makes_a_loop() {
     a.addi(T0, T0, -1);
     a.bnez(T0, top);
     a.ret();
-    assert_eq!(run(&a.finish().unwrap(), 1000)[10], 55);
+    assert_eq!(run_a0(&a.finish().unwrap(), 1000), 55);
 }
 
 #[test]
@@ -187,7 +106,7 @@ fn a_forward_branch_skips_code() {
     a.li(A0, 2);
     a.bind(skip);
     a.ret();
-    assert_eq!(run(&a.finish().unwrap(), 100)[10], 1);
+    assert_eq!(run_a0(&a.finish().unwrap(), 100), 1);
 
     // The same, not taken.
     let mut a = Asm::new();
@@ -198,7 +117,7 @@ fn a_forward_branch_skips_code() {
     a.li(A0, 2);
     a.bind(skip);
     a.ret();
-    assert_eq!(run(&a.finish().unwrap(), 100)[10], 2);
+    assert_eq!(run_a0(&a.finish().unwrap(), 100), 2);
 }
 
 #[test]
@@ -225,7 +144,7 @@ fn conditional_branches_cover_all_conditions() {
         a.li(A0, 1); // fall-through marker
         a.bind(target);
         a.ret();
-        let result = run(&a.finish().unwrap(), 100)[10];
+        let result = run_a0(&a.finish().unwrap(), 100);
         assert_eq!(result == 0, taken, "{cond:?} {x} {y}");
     }
 }
@@ -243,7 +162,7 @@ fn branches_reach_farther_than_a_short_branch() {
     a.li(A0, 9); // skipped
     a.bind(far);
     a.ret();
-    assert_eq!(run(&a.finish().unwrap(), 10_000)[10], 7);
+    assert_eq!(run_a0(&a.finish().unwrap(), 10_000), 7);
 }
 
 #[test]
@@ -259,7 +178,7 @@ fn jal_saves_the_return_address_and_labels_must_be_bound() {
     a.bind(sub);
     a.addi(A0, A0, 1);
     a.ret(); // back to the instruction after the jal
-    assert_eq!(run(&a.finish().unwrap(), 100)[10], 101);
+    assert_eq!(run_a0(&a.finish().unwrap(), 100), 101);
 
     let mut a = Asm::new();
     let never = a.new_label();

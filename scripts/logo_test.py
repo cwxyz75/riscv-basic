@@ -54,10 +54,32 @@ def read_ppm(path: str):
     return width, height, pixels
 
 
+def ctrl_c(kernel: str) -> int:
+    """Ctrl-C stops a long compiled loop: `Stopped!`, and LOGO carries on."""
+    steps = [
+        ("RISCV LOGO V0.2", 0.0),
+        (b"ht\r", 0.1),
+        (b"repeat 100000000 [fd 0]\r", 1.0),  # would run for a very long time
+        (b"\x03", 0.5),
+        (b"print 7\r", 0.2),
+    ]
+    text, timed_out, returncode = boot(
+        kernel, steps, menu_choice=b"2", timeout=40, stop_when=["print 7\n7\n? "]
+    )
+    return check(
+        text,
+        ["repeat 100000000 [fd 0]\nStopped!\n? ", "print 7\n7\n? "],
+        timed_out,
+        returncode,
+    )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
+    if ctrl_c(sys.argv[1]):
+        return 1
     port = free_port()
     shot = os.path.join(tempfile.mkdtemp(), "screen.ppm")
     state = {"grabbed": False}
