@@ -510,7 +510,7 @@ impl<I: Io> Parser<'_, I> {
     fn call(&mut self, name: &str, mut args: Vec<Value>) -> Result<Value, Error> {
         let arity = match name {
             "ABS" | "INT" | "SGN" | "SQR" | "SIN" | "COS" | "TAN" | "ATN" | "LOG" | "EXP"
-            | "RND" | "PEEK" | "LEN" | "ASC" | "VAL" | "STR$" | "CHR$" => 1..=1,
+            | "RND" | "PEEK" | "FRE" | "LEN" | "ASC" | "VAL" | "STR$" | "CHR$" => 1..=1,
             "LEFT$" | "RIGHT$" => 2..=2,
             "MID$" => 2..=3,
             _ => return Err(Error::Syntax),
@@ -526,6 +526,10 @@ impl<I: Io> Parser<'_, I> {
 
         match name {
             "RND" => Ok(Value::Num(self.mem.rnd(first.num()?))),
+            "FRE" => {
+                first.num()?;
+                Ok(Value::Num(self.mem.program_free() as f64))
+            }
             "PEEK" => {
                 let address = to_address(first.num()?)?;
                 Ok(Value::Num(f64::from(self.io.peek(address))))

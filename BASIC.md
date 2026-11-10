@@ -67,9 +67,10 @@ Details of how a typed line becomes a stored program line (D9: tokenized).
   exactly as it was; a replacement that would not fit leaves the old line in
   place. A replacement is judged by its net cost (the old line's bytes are
   given back). Deleting lines and `NEW` give bytes back.
-- `BYTES FREE` in the banner is 32768 minus the bytes used. (`FRE(0)` will
-  report the same number.) Variables, strings and arrays live in a separate
-  heap and are not counted here.
+- `BYTES FREE` in the banner is 32768 minus the bytes used. **`FRE(x)`**
+  gives the same number at any moment (the argument must be a number and is
+  otherwise ignored; `FRE(0)` is the usual form). Variables, strings and arrays
+  live in a separate heap and are not counted here.
 
 ## Values and variables
 

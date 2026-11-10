@@ -2,6 +2,7 @@
 //! number generator.
 
 use crate::error::Error;
+use crate::program::PROGRAM_AREA;
 use crate::rng::Rng;
 use crate::value::Value;
 use alloc::collections::BTreeMap;
@@ -52,6 +53,9 @@ pub(crate) struct Memory {
     arrays: BTreeMap<String, Array>,
     /// Elements held by all arrays, against `MAX_ARRAY_ELEMENTS`.
     array_elements: usize,
+    /// Free bytes of the program area, kept up to date by the interpreter so
+    /// that `FRE` can report it from inside an expression.
+    program_free: usize,
     rng: Rng,
 }
 
@@ -62,6 +66,7 @@ impl Default for Memory {
             strings: BTreeMap::new(),
             arrays: BTreeMap::new(),
             array_elements: 0,
+            program_free: PROGRAM_AREA,
             rng: Rng::new(),
         }
     }
@@ -187,6 +192,14 @@ impl Memory {
             _ => return Err(Error::TypeMismatch),
         }
         Ok(())
+    }
+
+    pub(crate) fn program_free(&self) -> usize {
+        self.program_free
+    }
+
+    pub(crate) fn set_program_free(&mut self, bytes: usize) {
+        self.program_free = bytes;
     }
 
     /// `RND(x)`: next number for `x > 0`, the previous one again for `x = 0`,

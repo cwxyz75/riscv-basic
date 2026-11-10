@@ -71,7 +71,7 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 - [x] `DIM` and arrays
 - [x] `DATA/READ/RESTORE`, `INPUT`
 - [x] Math functions via `libm`; `RND`
-- [ ] Complete error set with line numbers
+- [x] Complete error set with line numbers
 
 ## M6: Screen and feel
 

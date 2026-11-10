@@ -195,6 +195,7 @@ impl Interpreter {
         } else {
             self.program.set(number, tokenize(body)?)?;
         }
+        self.mem.set_program_free(self.program.bytes_free());
         Ok(())
     }
 
@@ -352,6 +353,7 @@ impl Interpreter {
                 }
                 *pos = end;
                 self.program.clear();
+                self.mem.set_program_free(self.program.bytes_free());
                 self.data = None;
                 Ok(Flow::End)
             }
