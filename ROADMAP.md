@@ -85,8 +85,8 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 
 ## M8: Showpiece
 
-- [ ] Demo programs as golden tests (guess-the-number, 99 bottles, Hunt the Wumpus)
-- [ ] README with a recorded session; tag `v0.1`
+- [x] Demo programs as golden tests (guess-the-number, 99 bottles, Hunt the Wumpus), plus `demo_test.py` running them on the real machine
+- [x] README with a recorded session; tag `v0.1`
 
 ## Spikes (time-boxed experiments, do early)
 

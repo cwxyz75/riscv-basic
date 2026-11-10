@@ -4,6 +4,10 @@
 //! typed at the prompt, and the full console transcript (prompts included,
 //! typed input NOT echoed) must equal `tests/golden/NAME.out`.
 //!
+//! A script line of the form `<LOAD examples/NAME.bas>` is replaced by that
+//! file's lines (path relative to the repository root), so a demo program is
+//! typed in from the one copy that ships in `examples/`.
+//!
 //! A script line of the form `<BREAK AFTER n>` is not typed input: when the
 //! interpreter reads it, the n-th following check for Ctrl-C reports "pressed"
 //! (the interpreter checks once before each statement it runs).
@@ -76,9 +80,29 @@ impl Io for ScriptIo {
     }
 }
 
+/// The script's lines, with `<LOAD path>` directives expanded.
+fn expand(source: &str) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut lines = Vec::new();
+    for line in source.lines() {
+        match line
+            .strip_prefix("<LOAD ")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            Some(path) => {
+                let text = fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|e| panic!("cannot load {path}: {e}"));
+                lines.extend(text.lines().map(str::to_owned));
+            }
+            None => lines.push(line.to_owned()),
+        }
+    }
+    lines
+}
+
 fn transcript(source: &str) -> String {
     let mut io = ScriptIo {
-        input: source.lines().map(str::to_owned).collect(),
+        input: expand(source).into(),
         output: String::new(),
         memory: HashMap::new(),
         clock_ms: 0,
