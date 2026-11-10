@@ -1,0 +1,10 @@
+LET A=5
+PRINT A
+B=A*2
+PRINT B
+PRINT C
+let x1 = 3
+PRINT X1+A
+print a
+A=A+1
+PRINT A

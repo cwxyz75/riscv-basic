@@ -46,11 +46,11 @@ tick counter advances.
 Acceptance: golden tests cover each item, all passing under `make test`.
 
 - [x] Settle the top open questions in `BASIC.md`- [x] Tokenizer and the tokenized program store
-- [ ] Expression evaluator (numbers, precedence, comparisons)
-- [ ] Immediate mode: `PRINT`, `LET`
+- [x] Expression evaluator (numbers, precedence, comparisons)
+- [x] Immediate mode: `PRINT`, `LET`
 - [ ] Program entry, `LIST`, `NEW`, `RUN` (entry, `LIST` and `NEW` done; `RUN` pending)
 - [ ] `GOTO`, `IF/THEN`, `FOR/NEXT`
-- [ ] Number formatting per spec
+- [x] Number formatting per spec
 
 ## M4: Integration
 

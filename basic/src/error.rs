@@ -5,6 +5,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
     Syntax,
+    DivisionByZero,
+    Overflow,
+    IllegalQuantity,
 }
 
 impl Error {
@@ -12,6 +15,9 @@ impl Error {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Error::Syntax => "SYNTAX",
+            Error::DivisionByZero => "DIVISION BY ZERO",
+            Error::Overflow => "OVERFLOW",
+            Error::IllegalQuantity => "ILLEGAL QUANTITY",
         }
     }
 }

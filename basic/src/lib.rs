@@ -12,8 +12,10 @@
 extern crate alloc;
 
 mod error;
+mod expr;
 mod interp;
 mod io;
+mod number;
 mod program;
 mod token;
 
