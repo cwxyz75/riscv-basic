@@ -1,6 +1,7 @@
 use crate::error::{Error, Fault};
-use crate::expr::{evaluate, parse_name, to_address, to_byte, Variables};
+use crate::expr::{evaluate, parse_name, to_address, to_byte};
 use crate::io::{Io, Line};
+use crate::memory::Memory;
 use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
 use crate::token::{detokenize, keyword, tokenize};
@@ -52,7 +53,7 @@ enum Flow {
 #[derive(Debug, Default)]
 pub struct Interpreter {
     program: Program,
-    vars: Variables,
+    mem: Memory,
     loops: Vec<ForFrame>,
     gosubs: Vec<ReturnPoint>,
     /// Output column of the console cursor, for `,` zones and fresh lines.
@@ -331,10 +332,10 @@ impl Interpreter {
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
         }
-        let (value, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
+        let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
-        self.vars.insert(name, value);
+        self.mem.set_number(name, value);
         Ok(Flow::Next)
     }
 
@@ -379,7 +380,7 @@ impl Interpreter {
                     after_item = true;
                 }
                 _ => {
-                    let (value, end) = evaluate(src, *pos, &self.vars, io)?;
+                    let (value, end) = evaluate(src, *pos, &mut self.mem, io)?;
                     self.emit(io, &format_number(value));
                     *pos = end;
                     newline = true;
@@ -400,7 +401,7 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (condition, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        let (condition, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let word = tokens.get(*pos).and_then(|&b| keyword(b));
@@ -439,22 +440,22 @@ impl Interpreter {
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
         }
-        let (start, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
+        let (start, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         expect_keyword(tokens, pos, "TO")?;
-        let (limit, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        let (limit, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let mut step = 1.0;
         if tokens.get(*pos).and_then(|&b| keyword(b)) == Some("STEP") {
             *pos += 1;
-            let (value, end) = evaluate(tokens, *pos, &self.vars, io)?;
+            let (value, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
             step = value;
             *pos = end;
         }
         end_of_statement(tokens, pos)?;
 
-        self.vars.insert(var.clone(), start);
+        self.mem.set_number(var.clone(), start);
         // Restarting a loop discards it and every loop inside it.
         if let Some(index) = self.loops.iter().position(|f| f.var == var) {
             self.loops.truncate(index);
@@ -486,7 +487,7 @@ impl Interpreter {
             // Loops inside the one being stepped are abandoned.
             self.loops.truncate(index + 1);
             let frame = &self.loops[index];
-            let value = self.vars.get(&frame.var).copied().unwrap_or(0.0) + frame.step;
+            let value = self.mem.number(&frame.var) + frame.step;
             if !value.is_finite() {
                 return Err(Error::Overflow);
             }
@@ -500,7 +501,7 @@ impl Interpreter {
                 line: frame.line,
                 pos: frame.pos,
             };
-            self.vars.insert(var, value);
+            self.mem.set_number(var, value);
             if again {
                 return Ok(target);
             }
@@ -538,7 +539,7 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (selector, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        let (selector, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let word = tokens.get(*pos).and_then(|&b| keyword(b));
@@ -583,13 +584,13 @@ impl Interpreter {
         tokens: &[u8],
         pos: &mut usize,
     ) -> Result<Flow, Error> {
-        let (address, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        let (address, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b',') {
             return Err(Error::Syntax);
         }
-        let (value, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
+        let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
         io.poke(to_address(address)?, to_byte(value)?);
@@ -610,7 +611,7 @@ impl Interpreter {
                 return Err(Error::UndefdStatement);
             }
         }
-        self.vars.clear();
+        self.mem.clear_variables();
         self.loops.clear();
         self.gosubs.clear();
         Ok(match given.or_else(|| self.program.first()) {

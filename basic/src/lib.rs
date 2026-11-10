@@ -15,8 +15,10 @@ mod error;
 mod expr;
 mod interp;
 mod io;
+mod memory;
 mod number;
 mod program;
+mod rng;
 mod token;
 
 pub use interp::Interpreter;
