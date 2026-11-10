@@ -45,8 +45,10 @@ strings and arrays. Not yet decided; see D10.
    `_start` in S-mode with `a0` = hart id, `a1` = device-tree pointer.
 2. `_start` sets the stack, zeroes `.bss`, calls `kmain`.
 3. `kmain` enables the FPU, installs the trap vector, initialises the UART and
-   the heap, starts the 10 ms timer tick, then creates the interpreter, prints
-   the banner and runs the session loop forever.
+   the heap, starts the 10 ms timer tick, then shows the boot menu (one keypress:
+   `1` BASIC, `2` LOGO, not installed yet). For BASIC it creates the interpreter,
+   prints the banner and runs the session loop forever. `BYE` cold-reboots the
+   machine through SBI, which brings the menu back.
 4. Other harts stay parked in OpenSBI; we ignore them.
 
 ## Crates
@@ -115,3 +117,4 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D15 | Traps: one entry point saves all integer and floating-point registers; a supervisor timer interrupt (10 ms tick, SBI `set_timer`) returns, every other trap is fatal and reports `scause`/`sepc`/`stval` before powering off. The `time` counter is assumed to run at QEMU virt's 10 MHz (a constant in `timer.rs`, not read from the device tree) | Decided |
 | D16 | LOGO's JIT is a hand-written RV64 emitter (template code generation, stack-slot values, no register allocator), not Cranelift: the generated code is simple, the work is in the runtime, a dependency tree of unknown `no_std` bare-metal behaviour is not worth it, and a small emitter keeps the project readable and host-testable. The IR stays backend-neutral so a second backend could be added | Decided |
 | D17 | LOGO language semantics settled in `LOGO.md`: a UCBLogo subset, separate number and word types, 640x480 with `wrap`, a minimal list set, UCBLogo unary-minus rule, arena memory with no GC, an XOR triangle turtle | Decided |
+| D18 | The language is chosen at boot from a one-key menu and cannot be switched while running; changing language means rebooting (`BYE` in BASIC does a cold reboot through the SBI System Reset extension). One language's state never has to coexist with the other's | Decided |

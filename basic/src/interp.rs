@@ -348,6 +348,11 @@ impl Interpreter {
                 self.column = 0;
                 Ok(Flow::Next)
             }
+            Some("BYE") => {
+                end_of_statement(tokens, pos)?;
+                io.reboot();
+                Ok(Flow::End)
+            }
             Some("COLOR") => self.stmt_color(io, tokens, pos),
             Some("LOCATE") => self.stmt_locate(io, tokens, pos),
             Some("POKE") => self.stmt_poke(io, tokens, pos),

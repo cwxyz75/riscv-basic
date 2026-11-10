@@ -40,5 +40,6 @@ boot-test: kernel
 	python3 scripts/trap_test.py $(KERNEL_ELF)
 	python3 scripts/basic_test.py $(KERNEL_ELF)
 	python3 scripts/demo_test.py $(KERNEL_ELF)
+	python3 scripts/menu_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

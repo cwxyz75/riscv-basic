@@ -21,6 +21,7 @@ impl Io for RecordIo {
     fn millis(&mut self) -> u64 {
         0
     }
+    fn reboot(&mut self) {}
     fn peek(&mut self, _: u64) -> u8 {
         0
     }

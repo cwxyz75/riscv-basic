@@ -27,11 +27,19 @@ def boot(
     qemu: str = "qemu-system-riscv64",
     wait_for: str = "",
     stop_when=(),
+    menu_choice: bytes = b"1",
 ):
     """Boot `kernel`, send `stdin_data` to the serial port, return (text, timed_out, returncode).
 
     `stdin_data` is either bytes, or a list of (bytes, pause_seconds) steps sent
     one after another with a pause after each (to let time pass between inputs).
+    A step whose first element is a string or a predicate (taking the output so
+    far) does not send anything: it waits until that string appears or the
+    predicate holds.
+
+    The kernel starts with a language menu ("2) LOGO" is its last option line).
+    Once it is shown, `menu_choice` (default `1`, BASIC) is sent as the first
+    keypress; pass `b""` to drive the menu yourself.
 
     If `wait_for` is given, the input is sent only once that text has appeared in
     the output (so it is not typed into a machine that is still booting, where
@@ -64,6 +72,16 @@ def boot(
     thread.start()
 
     deadline = time.monotonic() + timeout
+
+    def seen_text() -> str:
+        return bytes(captured).decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+    if menu_choice:
+        while "2) LOGO" not in seen_text() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if proc.poll() is None:
+            proc.stdin.write(menu_choice)
+            proc.stdin.flush()
     marker = wait_for.encode()
     while marker and marker not in captured and proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -71,6 +89,11 @@ def boot(
     for chunk, pause in steps:
         if proc.poll() is not None:
             break
+        if isinstance(chunk, str) or callable(chunk):
+            holds = chunk if callable(chunk) else (lambda t, s=chunk: s in t)
+            while not holds(seen_text()) and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            continue
         try:
             proc.stdin.write(chunk)
             proc.stdin.flush()

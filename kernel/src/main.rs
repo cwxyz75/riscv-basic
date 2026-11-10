@@ -10,6 +10,7 @@ extern crate alloc;
 mod cpu;
 mod heap;
 mod io;
+mod menu;
 mod sbi;
 mod terminal;
 mod timer;
@@ -22,6 +23,7 @@ use core::fmt::Write;
 use core::hint::black_box;
 use core::panic::PanicInfo;
 use io::KernelIo;
+use menu::Language;
 use terminal::Console;
 
 // Entry point. OpenSBI jumps here in S-mode with a0 = hart id, a1 = device-tree
@@ -72,6 +74,7 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     let _ = ansi::reset(&mut out);
     let _ = writeln!(out);
 
+    let Language::Basic = menu::choose();
     let mut io = KernelIo::new();
     let mut interpreter = basic::Interpreter::new();
     interpreter.banner(&mut io);

@@ -71,6 +71,10 @@ impl Io for ScriptIo {
         now
     }
 
+    fn reboot(&mut self) {
+        self.output.push_str("[reboot]\n");
+    }
+
     fn peek(&mut self, addr: u64) -> u8 {
         self.memory.get(&addr).copied().unwrap_or(0)
     }

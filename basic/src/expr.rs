@@ -644,6 +644,7 @@ mod tests {
         fn millis(&mut self) -> u64 {
             1500
         }
+        fn reboot(&mut self) {}
         fn peek(&mut self, addr: u64) -> u8 {
             addr as u8
         }
