@@ -11,6 +11,7 @@ pub(crate) enum Error {
     UndefdStatement,
     NextWithoutFor,
     OutOfMemory,
+    ReturnWithoutGosub,
 }
 
 impl Error {
@@ -24,6 +25,7 @@ impl Error {
             Error::UndefdStatement => "UNDEF'D STATEMENT",
             Error::NextWithoutFor => "NEXT WITHOUT FOR",
             Error::OutOfMemory => "OUT OF MEMORY",
+            Error::ReturnWithoutGosub => "RETURN WITHOUT GOSUB",
         }
     }
 }

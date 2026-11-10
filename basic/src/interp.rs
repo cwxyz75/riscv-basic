@@ -11,6 +11,9 @@ use alloc::vec::Vec;
 /// Width of a `PRINT` comma zone.
 const ZONE: usize = 14;
 
+/// How many `GOSUB`s may be pending at once; deeper is `?OUT OF MEMORY`.
+const MAX_GOSUB_DEPTH: usize = 1000;
+
 /// An active `FOR` loop: where `NEXT` jumps back to (just after the `FOR`
 /// statement) and how to step.
 #[derive(Debug)]
@@ -18,6 +21,13 @@ struct ForFrame {
     var: String,
     limit: f64,
     step: f64,
+    line: Option<u16>,
+    pos: usize,
+}
+
+/// Where a `RETURN` goes back to: the statement after the `GOSUB`.
+#[derive(Debug)]
+struct ReturnPoint {
     line: Option<u16>,
     pos: usize,
 }
@@ -44,6 +54,7 @@ pub struct Interpreter {
     program: Program,
     vars: Variables,
     loops: Vec<ForFrame>,
+    gosubs: Vec<ReturnPoint>,
     /// Output column of the console cursor, for `,` zones and fresh lines.
     column: usize,
 }
@@ -87,8 +98,9 @@ impl Interpreter {
     pub fn handle_line<I: Io>(&mut self, io: &mut I, line: &str) {
         // The user just pressed Enter, so the cursor is at the start of a line.
         self.column = 0;
-        // Loops typed at the prompt live and die within one line.
+        // Loops and subroutine calls typed at the prompt live and die within one line.
         self.loops.clear();
+        self.gosubs.clear();
         if let Err(fault) = self.try_handle_line(io, line) {
             let location = fault.line.map_or(String::new(), |n| format!(" IN {n}"));
             self.fresh_line(io);
@@ -255,6 +267,24 @@ impl Interpreter {
                 })
             }
             Some("IF") => self.stmt_if(io, tokens, pos),
+            Some("GOSUB") => {
+                let target = parse_line_ref(tokens, pos)?;
+                end_of_statement(tokens, pos)?;
+                self.call(line, *pos, target)
+            }
+            Some("RETURN") => {
+                end_of_statement(tokens, pos)?;
+                match self.gosubs.pop() {
+                    None => Err(Error::ReturnWithoutGosub),
+                    // A GOSUB typed at the prompt has nothing to return to.
+                    Some(ReturnPoint { line: None, .. }) => Ok(Flow::End),
+                    Some(point) => Ok(Flow::Jump {
+                        line: point.line,
+                        pos: point.pos,
+                    }),
+                }
+            }
+            Some("ON") => self.stmt_on(io, line, tokens, pos),
             Some("FOR") => self.stmt_for(io, line, tokens, pos),
             Some("NEXT") => self.stmt_next(tokens, pos),
             Some("END") => Ok(Flow::End),
@@ -488,6 +518,64 @@ impl Interpreter {
         Ok(Flow::Next)
     }
 
+    /// Push a return point (line `line`, byte `pos`) and jump to `target`.
+    fn call(&mut self, line: Option<u16>, pos: usize, target: u16) -> Result<Flow, Error> {
+        if self.gosubs.len() >= MAX_GOSUB_DEPTH {
+            return Err(Error::OutOfMemory);
+        }
+        self.gosubs.push(ReturnPoint { line, pos });
+        Ok(Flow::Jump {
+            line: Some(target),
+            pos: 0,
+        })
+    }
+
+    /// `ON expr GOTO l1,l2,...` / `ON expr GOSUB l1,l2,...`.
+    fn stmt_on<I: Io>(
+        &mut self,
+        io: &mut I,
+        line: Option<u16>,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let (selector, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        *pos = end;
+        skip_spaces(tokens, pos);
+        let word = tokens.get(*pos).and_then(|&b| keyword(b));
+        if word != Some("GOTO") && word != Some("GOSUB") {
+            return Err(Error::Syntax);
+        }
+        *pos += 1;
+        let mut targets = Vec::new();
+        loop {
+            targets.push(parse_line_ref(tokens, pos)?);
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) == Some(&b',') {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        end_of_statement(tokens, pos)?;
+        // Truncate toward zero; anything outside 1..=count falls through.
+        let choice = libm::trunc(selector) as i64;
+        let Some(&target) = usize::try_from(choice)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| targets.get(i))
+        else {
+            return Ok(Flow::Next);
+        };
+        if word == Some("GOSUB") {
+            self.call(line, *pos, target)
+        } else {
+            Ok(Flow::Jump {
+                line: Some(target),
+                pos: 0,
+            })
+        }
+    }
+
     /// `POKE addr, value`.
     fn stmt_poke<I: Io>(
         &mut self,
@@ -524,6 +612,7 @@ impl Interpreter {
         }
         self.vars.clear();
         self.loops.clear();
+        self.gosubs.clear();
         Ok(match given.or_else(|| self.program.first()) {
             Some(start) => Flow::Jump {
                 line: Some(start),

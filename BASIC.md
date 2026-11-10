@@ -200,6 +200,19 @@ strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
   `NEXT I,J` is `NEXT I` then `NEXT J`. A `NEXT` with no matching active loop
   is `?NEXT WITHOUT FOR ERROR`. Loops typed at the prompt must start and end on
   one line (active loops are cleared at the start of every typed line).
+- **`GOSUB line` / `RETURN`:** `GOSUB` jumps to `line` and remembers the
+  statement after it; `RETURN` jumps back there. Subroutines may nest, up to
+  1000 deep (deeper is `?OUT OF MEMORY ERROR`, which stops a runaway
+  recursion). `RETURN` with nothing to return to is `?RETURN WITHOUT GOSUB
+  ERROR`. `RUN` forgets any pending returns. `GOSUB` typed at the prompt runs
+  the subroutine, and its `RETURN` then ends the run (back to `READY.`); the
+  rest of the typed line is not executed.
+- **`ON expr GOTO l1,l2,...` / `ON expr GOSUB l1,l2,...`:** `expr` is
+  truncated toward zero; if the result is `n` with `1 <= n <= number of lines`
+  control goes to the nth line, otherwise (zero, negative, too large) execution
+  simply continues with the next statement. A missing target line is `?UNDEF'D
+  STATEMENT ERROR`, but only if it is the one chosen. `ON ... GOSUB` returns to
+  the statement after the whole `ON`.
 - **`END`:** stops the program silently. **`STOP`:** stops it and prints
   `BREAK IN <line>`; typed at the prompt, `STOP` prints just `BREAK`.
 - **Errors in a program** stop it and print `?<NAME> ERROR IN <line>` using
