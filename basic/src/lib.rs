@@ -11,8 +11,11 @@
 
 extern crate alloc;
 
+mod error;
 mod interp;
 mod io;
+mod program;
+mod token;
 
 pub use interp::Interpreter;
 pub use io::{Io, Line};
