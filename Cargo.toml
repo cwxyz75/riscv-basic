@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["basic", "kernel"]
+# Plain `cargo test` / `cargo build` at the root only touches the host-testable
+# interpreter crate. The kernel targets bare-metal RISC-V and is built from
+# inside kernel/ (see Makefile), which picks up kernel/.cargo/config.toml.
+default-members = ["basic"]

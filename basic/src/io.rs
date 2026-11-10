@@ -1,0 +1,33 @@
+use alloc::string::String;
+
+/// What the console handed back when the interpreter asked for a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Line {
+    /// A finished line of text, without the line terminator. Line editing
+    /// (backspace, echo, ...) is the `Io` implementation's job, not ours.
+    Text(String),
+    /// The user pressed BREAK (Ctrl-C) while the line was being typed.
+    Break,
+    /// No more input. Never happens on real hardware; lets scripted tests end.
+    Eof,
+}
+
+/// Everything the interpreter needs from the outside world.
+///
+/// The kernel implements this on top of the UART; tests implement it with
+/// in-memory buffers. Screen primitives (CLS, COLOR, LOCATE) and PEEK/POKE
+/// access will be added as default or required methods in later milestones.
+pub trait Io {
+    /// Write text to the console.
+    fn write_str(&mut self, s: &str);
+
+    /// Block until a full line is available.
+    fn read_line(&mut self) -> Line;
+
+    /// Non-blocking check: has the user pressed BREAK since the last call?
+    /// Polled by `RUN` between statements.
+    fn break_pressed(&mut self) -> bool;
+
+    /// Milliseconds since boot, for `TIMER`.
+    fn millis(&mut self) -> u64;
+}
