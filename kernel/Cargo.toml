@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Bare-metal RISC-V (S-mode) host for the BASIC interpreter on QEMU virt"
 
-# The `basic` dependency (and a global allocator) arrive at the integration
-# milestone; see ROADMAP.md.
 [dependencies]
+basic = { path = "../basic" }
 console = { path = "../console" }
+# Free-list heap for the interpreter's strings, variables and program store
+# (decision D10).
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }

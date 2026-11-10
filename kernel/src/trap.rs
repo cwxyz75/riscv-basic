@@ -114,6 +114,13 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
         cpu::read_sepc(),
         cpu::read_stval()
     );
-    let _ = writeln!(out, "      ra={:#x} sp={:#x}", frame.regs[1], frame.regs[2]);
+    let _ = writeln!(
+        out,
+        "      ra={:#x} sp={:#x} ticks={} ms={}",
+        frame.regs[1],
+        frame.regs[2],
+        timer::ticks(),
+        timer::millis()
+    );
     sbi::shutdown()
 }

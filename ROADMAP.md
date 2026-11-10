@@ -58,9 +58,9 @@ Acceptance: golden tests cover each item, all passing under `make test`.
 Acceptance: a boot test pipes a BASIC program into the serial port and checks
 its output.
 
-- [ ] Kernel depends on `basic`; global allocator
-- [ ] Kernel `Io` over the UART; banner with a real `BYTES FREE`
-- [ ] Session loop runs on boot
+- [x] Kernel depends on `basic`; global allocator
+- [x] Kernel `Io` over the UART; banner with a real `BYTES FREE`
+- [x] Session loop runs on boot
 
 ## M5: Language completion
 
@@ -75,7 +75,7 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 ## M6: Screen and feel
 
 - [ ] `CLS`, `COLOR`, `LOCATE`; BREAK handling during `RUN`
-- [ ] `TIMER`; `PEEK`/`POKE` per the settled policy (interpreter side done and golden-tested; the kernel's `Io` implementation arrives with M4)
+- [x] `TIMER`; `PEEK`/`POKE` per the settled policy (golden-tested on the host, and `basic_test.py` / `trap_test.py` exercise them under QEMU)
 
 ## M7: Persistence (optional)
 
@@ -91,4 +91,4 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 
 - [ ] Float formatting without surprises (`core::fmt` versus hand-rolled)
 - [ ] Ctrl-C delivery over the QEMU serial port
-- [ ] Allocator choice (D10): bump versus free-list versus the `linked_list_allocator` crate
+- [x] Allocator choice (D10): the `linked_list_allocator` crate (a bump allocator would leak on every statement)

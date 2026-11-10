@@ -44,9 +44,9 @@ strings and arrays. Not yet decided; see D10.
 1. QEMU loads OpenSBI and our ELF; OpenSBI initialises the hart and jumps to
    `_start` in S-mode with `a0` = hart id, `a1` = device-tree pointer.
 2. `_start` sets the stack, zeroes `.bss`, calls `kmain`.
-3. `kmain` (from M2 on) installs the trap vector, enables the FPU, and
-   initialises the heap. From M4 on it creates the interpreter, prints the
-   banner and runs the session loop.
+3. `kmain` enables the FPU, installs the trap vector, initialises the UART and
+   the heap, starts the 10 ms timer tick, then creates the interpreter, prints
+   the banner and runs the session loop forever.
 4. Other harts stay parked in OpenSBI; we ignore them.
 
 ## Crates
@@ -107,7 +107,7 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D7 | Console is direct 16550 MMIO from M0; SBI is used for shutdown and timer (revised from an earlier plan to bootstrap via SBI putchar) | Decided |
 | D8 | `basic` is `forbid(unsafe_code)`; hardware access only through `Io` | Proposed |
 | D9 | Tokenized program store (packed bytes, keywords as single-byte tokens; `LIST` detokenizes) | Decided |
-| D10 | Memory: fixed 32 KiB program area plus an `alloc`-backed heap; which allocator is open | Open |
+| D10 | Memory: a fixed 32 KiB program area (a stored line costs its tokens + 5 bytes; `?OUT OF MEMORY` when full) plus a 16 MiB `alloc` heap for strings, variables and the interpreter's own data, managed by the `linked_list_allocator` crate | Decided |
 | D11 | Makefile (not `just`/`xtask`) to keep prerequisites minimal | Decided |
 | D12 | `PEEK`/`POKE` are raw and unrestricted, reaching any physical address through `Io`; a fault is a kernel crash (authentic, and no safety window to design) | Decided |
 | D13 | Language semantics settled in `BASIC.md`: full-length variable names, left-associative `^`, 32-bit logical operators, no `ELSE`, 14-column `PRINT` zones, `TIMER`, 255-char lines, 9-significant-digit number output | Decided |

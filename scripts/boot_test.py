@@ -26,6 +26,7 @@ def boot(
     timeout: float = 10.0,
     qemu: str = "qemu-system-riscv64",
     wait_for: str = "",
+    stop_when=(),
 ):
     """Boot `kernel`, send `stdin_data` to the serial port, return (text, timed_out, returncode).
 
@@ -35,6 +36,10 @@ def boot(
     If `wait_for` is given, the input is sent only once that text has appeared in
     the output (so it is not typed into a machine that is still booting, where
     the firmware may swallow it); otherwise it is sent immediately.
+
+    If `stop_when` is given (strings, or predicates taking the output so far),
+    QEMU is killed as soon as every one holds (for an interactive kernel that
+    never exits on its own); this is not reported as a timeout.
     """
     cmd = [
         qemu,
@@ -76,6 +81,11 @@ def boot(
             time.sleep(0.02)
     timed_out = False
     while proc.poll() is None:
+        if stop_when:
+            seen = bytes(captured).decode("utf-8", errors="replace").replace("\r\n", "\n")
+            if all(w(seen) if callable(w) else w in seen for w in stop_when):
+                proc.kill()
+                break
         if time.monotonic() >= deadline:
             timed_out = True
             proc.kill()
@@ -87,11 +97,13 @@ def boot(
     return text, timed_out, proc.returncode
 
 
-def check(text: str, expects: list, timed_out: bool, returncode) -> int:
-    """Print a verdict; return 0 if every expected string is in `text`, else 1."""
+def check(text: str, expects: list, timed_out: bool, returncode, forbidden=()) -> int:
+    """Print a verdict; return 0 if every expected string is in `text` and no
+    forbidden string is, else 1."""
     missing = [e for e in expects if e not in text]
-    if missing:
-        print("boot test FAILED; missing:", missing, file=sys.stderr)
+    present = [f for f in forbidden if f in text]
+    if missing or present:
+        print("boot test FAILED; missing:", missing, "| unexpectedly present:", present, file=sys.stderr)
         print("timed out:", timed_out, "| exit status:", returncode, file=sys.stderr)
         print("--- captured output ---", file=sys.stderr)
         print(text, file=sys.stderr)

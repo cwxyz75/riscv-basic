@@ -53,6 +53,20 @@ impl Interpreter {
         Self::default()
     }
 
+    /// Bytes of the program area still free (the `BYTES FREE` figure).
+    pub fn bytes_free(&self) -> usize {
+        self.program.bytes_free()
+    }
+
+    /// Print the start-up banner: the title and the free program memory.
+    pub fn banner<I: Io>(&mut self, io: &mut I) {
+        let text = format!(
+            "RISCV BASIC V0.1\n{} BYTES FREE\n\n",
+            self.program.bytes_free()
+        );
+        self.emit(io, &text);
+    }
+
     /// The top-level loop: print `READY.`, read a line, handle it, repeat.
     /// Returns only when the console reports end of input.
     pub fn run_session<I: Io>(&mut self, io: &mut I) {
@@ -135,7 +149,7 @@ impl Interpreter {
         if body.is_empty() {
             self.program.delete(number);
         } else {
-            self.program.set(number, tokenize(body)?);
+            self.program.set(number, tokenize(body)?)?;
         }
         Ok(())
     }

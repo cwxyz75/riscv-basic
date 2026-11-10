@@ -58,6 +58,19 @@ Details of how a typed line becomes a stored program line (D9: tokenized).
   numbers or other text after `LIST` are `?SYNTAX ERROR`.
 - `NEW` (with nothing after it) deletes the program.
 
+## Program memory
+
+- The program area is **32768 bytes**. A stored line costs its token bytes
+  (the line body after the number, as stored) plus **5 bytes** of overhead
+  (as in classic BASIC: a link, the line number and a terminator).
+- A line that would not fit is `?OUT OF MEMORY ERROR`, and the program is left
+  exactly as it was; a replacement that would not fit leaves the old line in
+  place. A replacement is judged by its net cost (the old line's bytes are
+  given back). Deleting lines and `NEW` give bytes back.
+- `BYTES FREE` in the banner is 32768 minus the bytes used. (`FRE(0)` will
+  report the same number.) Variables, strings and arrays live in a separate
+  heap and are not counted here.
+
 ## Values and variables
 
 - Two types: number (`f64`) and string (name ends in `$`). No integer type.

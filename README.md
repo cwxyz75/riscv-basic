@@ -15,10 +15,10 @@ READY.
 RUN
 ```
 
-**Status:** the interpreter core (M3) works on the host and the kernel boots to
-a line-edited serial console with traps, a timer and the FPU working
-(M0 to M2). Wiring them together is next. See
-[ROADMAP.md](ROADMAP.md).
+**Status:** it boots to a working BASIC prompt under QEMU: line-numbered
+programs, `RUN`, `GOTO`, `IF`, `FOR`/`NEXT`, numeric maths, `PEEK`/`POKE`,
+`TIMER` (milestones M0 to M4). Strings, arrays, `DATA`/`READ`, `INPUT` and
+the math functions are next. See [ROADMAP.md](ROADMAP.md).
 
 ## Prerequisites (macOS)
 
