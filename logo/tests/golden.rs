@@ -9,7 +9,7 @@
 //! following check for Ctrl-C reports "pressed". Expected files are worked out
 //! by hand from `LOGO.md`; never bless them blindly.
 
-use logo::{Interpreter, Io, Line};
+use logo::{Engine, Interpreter, Io, Line};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
@@ -66,7 +66,7 @@ impl Io for ScriptIo {
     }
 }
 
-fn run(script: &str) -> (String, String) {
+fn run(script: &str, engine: Engine) -> (String, String) {
     let mut lines: Vec<&str> = script.lines().collect();
     let (mut width, mut height) = (21, 21);
     if let Some(dims) = lines.first().and_then(|l| l.strip_prefix(";canvas ")) {
@@ -84,7 +84,7 @@ fn run(script: &str) -> (String, String) {
         clock_ms: 0,
         break_after: None,
     };
-    Interpreter::new().run_session(&mut io, &mut canvas);
+    Interpreter::with_engine(engine).run_session(&mut io, &mut canvas);
     (io.output, canvas.to_ascii())
 }
 
@@ -111,22 +111,27 @@ fn golden_cases() {
     assert!(!cases.is_empty());
     let mut failures = Vec::new();
     for case in &cases {
-        let (transcript, picture) = run(&fs::read_to_string(case).unwrap());
+        let script = fs::read_to_string(case).unwrap();
         let out = case.with_extension("out");
         let want = fs::read_to_string(&out).unwrap_or_else(|_| panic!("missing {}", out.display()));
-        if transcript != want {
-            failures.push(format!(
-                "--- {} ---\nexpected:\n{want}\ngot:\n{transcript}",
-                case.display()
-            ));
-        }
-        let img = case.with_extension("img");
-        if let Ok(want) = fs::read_to_string(&img) {
-            if picture != want {
+        let img = fs::read_to_string(case.with_extension("img")).ok();
+        // The AST interpreter and the IR interpreter must both match the
+        // hand-derived files, and therefore each other.
+        for engine in [Engine::Ast, Engine::Ir] {
+            let (transcript, picture) = run(&script, engine);
+            if transcript != want {
                 failures.push(format!(
-                    "--- {} ---\nexpected:\n{want}got:\n{picture}",
-                    img.display()
+                    "--- {} ({engine:?}) ---\nexpected:\n{want}\ngot:\n{transcript}",
+                    case.display()
                 ));
+            }
+            if let Some(want) = &img {
+                if &picture != want {
+                    failures.push(format!(
+                        "--- {} ({engine:?}) image ---\nexpected:\n{want}got:\n{picture}",
+                        case.display()
+                    ));
+                }
             }
         }
     }

@@ -9,14 +9,16 @@
 extern crate alloc;
 
 mod error;
+mod exec;
 mod interp;
+mod ir;
 mod lex;
 mod parse;
 mod prims;
 mod rng;
 mod value;
 
-pub use interp::Interpreter;
+pub use interp::{Engine, Interpreter};
 
 use alloc::string::String;
 

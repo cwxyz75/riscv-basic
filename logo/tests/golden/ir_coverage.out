@@ -1,0 +1,28 @@
+? ? -5
+? -5
+? 8
+? -4
+? -10
+? You don't say what to do with -5
+? - doesn't like a as input
+? - doesn't like [1] as input
+? ? hi
+hi
+? hi
+? ? no
+? hi
+? hi
+? ? 333? Not enough inputs to fd
+? ? ok
+? 1
+Not enough inputs to fd
+? xxx? repeat doesn't like a as input
+? if doesn't like x as input
+? 2
+repeat didn't output to print
+? 3
+if didn't output to print
+? 1
+2
+You don't say what to do with 3
+? 

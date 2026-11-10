@@ -146,8 +146,8 @@ Acceptance: golden transcripts and golden images for each item, under `make test
 Acceptance: an IR interpreter on the host matches the L2 interpreter on the
 whole golden corpus.
 
-- [ ] IR definition and lowering from the AST
-- [ ] IR interpreter; differential test against L2
+- [x] IR definition and lowering from the AST
+- [x] IR interpreter; differential test against L2 (the whole golden corpus runs under both engines; mutation-checked)
 
 ### L4: RV64 backend
 
