@@ -36,8 +36,14 @@ run: kernel
 
 # Same machine plus a framebuffer, shown in a window (QEMU picks the display
 # backend). The serial console stays in this terminal; Ctrl-A then X quits.
+# On macOS the Cocoa window can show the screen magnified 2x and cropped to one
+# quadrant on a Retina display; zoom-to-fit scales the whole screen to the window.
+ifeq ($(shell uname),Darwin)
+LOGO_DISPLAY := -display cocoa,zoom-to-fit=on
+endif
+
 run-logo: kernel
-	$(QEMU) -machine virt -bios default -device ramfb -serial mon:stdio -kernel $(KERNEL_ELF)
+	$(QEMU) -machine virt -bios default -device ramfb $(LOGO_DISPLAY) -serial mon:stdio -kernel $(KERNEL_ELF)
 
 debug: kernel
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) -s -S
