@@ -23,6 +23,9 @@ Project: a toy 80s-style BASIC computer for QEMU RISC-V (`virt`), in Rust. Read
 - `logo/` is the LOGO interpreter (reader, parser, evaluator): `no_std`,
   `#![forbid(unsafe_code)]`, host-tested with golden transcripts and images; its
   only window to the machine is `logo::Io` and `turtle::Canvas`.
+- `rv64/` is the RV64 assembler for the LOGO JIT: `no_std`,
+  `#![forbid(unsafe_code)]`, host-tested (LLVM-derived encoding vectors, an
+  emulator for `li` and branches). Only `kernel/src/jit.rs` executes generated code.
 - `turtle/` is the pure graphics half of LOGO (canvas trait, rasteriser, turtle):
   `no_std`, `#![forbid(unsafe_code)]`, host-tested against golden images.
 - `examples/` holds the demo BASIC programs; golden tests load them with a

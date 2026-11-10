@@ -15,7 +15,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p basic -p console -p turtle
+	cargo test -p basic -p console -p turtle -p logo -p rv64
 
 fmt:
 	cargo fmt --all
@@ -24,7 +24,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p basic -p console -p turtle --all-targets -- -D warnings
+	cargo clippy -p basic -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
 
 kernel:
@@ -48,5 +48,6 @@ boot-test: kernel
 	python3 scripts/demo_test.py $(KERNEL_ELF)
 	python3 scripts/menu_test.py $(KERNEL_ELF)
 	python3 scripts/logo_test.py $(KERNEL_ELF)
+	python3 scripts/jit_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

@@ -73,6 +73,11 @@ strings and arrays. Not yet decided; see D10.
   interpreter that must behave identically; it is the oracle for the compiler). `no_std`, `forbid(unsafe_code)`; text and
   time through its own `Io` trait, the screen through `turtle::Canvas`; tested
   on the host with golden transcripts and golden images.
+- **`rv64`**: a small RV64 assembler for the LOGO JIT (RV64I, M multiply, D
+  double-precision, `fence.i`; labels with far-branch relaxation; a `li` that
+  loads any 64-bit constant). `no_std`, `forbid(unsafe_code)`. Encodings are
+  checked against LLVM's assembler, and `li` and the branch logic by running
+  the output in a tiny emulator on the host.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
 
@@ -113,6 +118,18 @@ What worked and what bit us:
 The turtle crate draws through a `Canvas` of palette indices; the kernel's
 `FbCanvas` keeps the indices in a shadow array (so fill and the XOR sprite can
 read the picture back) and writes the palette colour to the framebuffer.
+
+## Running generated code (LOGO JIT, spike L4)
+
+Generated code is machine code in ordinary heap memory: paging is off and all of
+RAM is executable, so the kernel copies the code into a `Vec<u32>` (so it is
+4-aligned), executes `fence.i` so instruction fetch sees it, and calls it as a C
+function. All of that, and nothing else unsafe, is in `kernel/src/jit.rs`. The
+address range of the latest code is remembered so that a fatal trap inside
+generated code prints a dump of every instruction word with the faulting one
+marked. Two debugging keys at the boot menu exercise this: `3` runs JIT
+self-tests (a constant, FPU arithmetic, a loop, branch conditions, 64-bit
+tags) and `4` faults on purpose to show the dump.
 
 ## Interpreter shape (proposed)
 
