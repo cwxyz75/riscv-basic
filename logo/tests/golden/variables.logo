@@ -1,0 +1,32 @@
+make "x 5
+print :x
+make "x :x + 1
+print thing "x
+make "Name "Bob
+print :name
+to setit
+make "x 99
+end
+setit
+print :x
+to setl :x
+make "x 1
+print :x
+end
+setl 50
+print :x
+to inner
+print :x
+end
+to outer :x
+inner
+end
+outer 7
+to newvar
+make "fresh 42
+end
+newvar
+print :fresh
+make "l [a b]
+print :l
+print first :l

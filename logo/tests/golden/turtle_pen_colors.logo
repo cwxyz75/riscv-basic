@@ -1,0 +1,15 @@
+;canvas 7 3
+ht
+pu
+setxy -3 0
+pd
+seth 90
+setpc 4
+fd 1
+setpc 15
+fd 1
+pu
+fd 1
+pd
+setpc 2
+fd 1

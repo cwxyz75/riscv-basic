@@ -1,0 +1,47 @@
+to double :n
+output :n * 2
+end
+print double 4
+print double double 3
+to greet :name
+print se "hello :name
+end
+greet "world
+GREET "again
+to fact :n
+if :n = 0 [output 1]
+output :n * fact :n - 1
+end
+print fact 5
+print fact 10
+print fact 20
+to fib :n
+if :n < 2 [output :n]
+output (fib :n - 1) + (fib :n - 2)
+end
+print fib 10
+to countdown :n
+if :n = 0 [stop]
+print :n
+countdown :n - 1
+end
+countdown 3
+to two :a :b
+print :a - :b
+end
+two 10 3
+to hi
+print "one
+end
+hi
+to hi
+print "two
+end
+hi
+to caller
+later
+end
+to later
+print "late
+end
+caller

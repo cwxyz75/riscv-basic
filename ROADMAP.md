@@ -134,12 +134,12 @@ golden images; the same API draws in the QEMU window.
 Acceptance: golden transcripts and golden images for each item, under `make test`.
 
 - [x] Settle the top open questions in `LOGO.md`
-- [ ] Reader: words, numbers, lists, `:var`, `"word`, infix operators, arity-driven prefix parsing
-- [ ] Evaluator: turtle commands, `REPEAT`, `IF/IFELSE`, `MAKE/THING`, `PRINT/SHOW`
-- [ ] `TO ... END`, `OUTPUT/STOP`, recursion, dynamic scope
-- [ ] Core list and word operations; `RUN`
-- [ ] Error messages
-- [ ] Runs on the machine behind the boot menu (terminal in, framebuffer out)
+- [x] Reader: words, numbers, lists, `:var`, `"word`, infix operators, arity-driven prefix parsing
+- [x] Evaluator: turtle commands, `REPEAT`, `IF/IFELSE`, `MAKE/THING`, `PRINT/SHOW`
+- [x] `TO ... END`, `OUTPUT/STOP`, recursion, dynamic scope
+- [x] Core list and word operations; `RUN`
+- [x] Error messages
+- [x] Runs on the machine behind the boot menu (terminal in, framebuffer out; `logo_test.py` checks text and a screenshot pixel by pixel)
 
 ### L3: IR
 

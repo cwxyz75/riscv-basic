@@ -130,6 +130,89 @@ so golden images are stable.
   sprite is removed before any drawing operation and put back after, so it never
   ends up in the picture, and `fill` never sees it.
 
+## Reader, evaluation and errors in detail
+
+The rules the reference interpreter (milestone L2) is built and tested against.
+
+- **Reading a line.** Words are runs of letters, digits and `_ . ?` starting
+  with a letter, `_`, `.` or `?`; they stop at spaces, brackets, parentheses,
+  quotes, colons and the infix characters `+ - * / = < >`. `"word` is a quoted
+  word that runs to a space, bracket or parenthesis (`"` alone is the empty
+  word). `:name` is a variable reference. Numbers are digits with an optional
+  fraction and an optional exponent (`12`, `3.5`, `1e3`, `2.5e-3`). A `;`
+  starts a comment that runs to the end of the line. Names of procedures and
+  variables are case-insensitive (folded to lower case); quoted words and the
+  contents of lists keep their case.
+- **Lists.** `[ ... ]` is a list: its contents are not evaluated. Inside a list,
+  a number-looking item is a number and everything else is a word whose text is
+  kept exactly (`"hi` and `:x` keep their quote and colon). A line that ends
+  inside a list is `Missing ]`; a stray `]` is `Unexpected ]`. Code is data:
+  `run` and `repeat` rebuild source text from a list (items joined with single
+  spaces, nested lists in brackets, numbers in their printed form) and read it
+  again, so `[fd -50]`, `[print "hi]` and `[3 - 2]` mean what they look like.
+- **Unary minus** is decided while reading, by the rule under Syntax: it is
+  unary at the start of an instruction, after an infix operator, `(` or `[`, or
+  after a space when not followed by a space. A unary minus directly before a
+  number makes that number negative; before anything else it negates the
+  following operand.
+- **Instructions and arity.** Every procedure has a fixed number of inputs.
+  An instruction line is a sequence of instructions, each read and run before
+  the next (so an error leaves earlier instructions done). Each input of a
+  prefix procedure is a full expression, so `fd 50 + 10` is `fd 60`. Infix
+  operators bind tighter than procedure inputs: `*` and `/` first, then `+`
+  and `-`, then `=` `<` `>`, all left to right; `( )` groups. An unknown name is
+  read as a procedure with no inputs, so `foo 10` reports `I don't know how to
+  foo` before it ever looks at `10`. Parentheses only group: calling a
+  procedure with a variable number of inputs, as in `(sum 1 2 3)`, is not
+  supported.
+- **Commands and operations.** A command does something; an operation also
+  outputs a value. An instruction must be a command: a value with nothing to
+  use it is `You don't say what to do with 3`. An input that is a command
+  (outputs nothing) is `fd didn't output to print`.
+- **Truth.** The words `true` and `false`. `if` and `ifelse` need one of them
+  (else `if doesn't like 3 as input`). `=` is true for equal numbers, for words
+  that match ignoring case, and for lists whose items are equal in turn; a
+  number and a word are never equal. `<` and `>` need two numbers.
+- **Procedures.** `to name :a :b` starts a definition; the lines that follow
+  (prompt `> `) are its body until a line `end`. Defining again replaces it.
+  A body is read each time the procedure is called, so it may use procedures
+  defined later. Variables: inputs live in the procedure's frame, and a
+  variable is found by searching the frames of the running procedures from
+  newest to oldest, then the globals (**dynamic scope**). `make "name value`
+  sets the variable where it is found, or creates a global if there is none;
+  `thing "name` and `:name` read it (`name has no value` if there is none).
+  `stop` ends the running procedure; `output value` (`op`) ends it with a
+  value; either outside a procedure is `Can only do that inside a procedure`.
+  Nesting deeper than 400 procedure calls is `Out of memory`.
+- **The primitives of v0.2.** Turtle: `forward fd back bk left lt right rt
+  penup pu pendown pd home clearscreen cs clean setxy setheading seth
+  setpencolor setpc hideturtle ht showturtle st fill`, and the operations `pos`
+  (a list `[x y]`), `heading`, `xcor`, `ycor`. Control: `repeat n [..]`, `if`,
+  `ifelse`, `run`, `stop`, `output`/`op`, `wait n` (n/60 seconds), `bye`
+  (reboot to the boot menu). Data: `make thing print show type random sqrt sin
+  cos arctan abs int round`, with `and or not`. Lists and words: `first last
+  butfirst bf butlast bl fput lput list sentence se count item emptyp listp
+  wordp numberp`. `sin`, `cos` and `arctan` use degrees; `int` truncates toward
+  zero; `round` rounds halves away from zero; `random n` is a whole number from
+  0 to n-1 (n a number of at least 1); `item n` counts from 1.
+- **Printing.** `print` writes its input and a newline: a list without its
+  outer brackets (`a b [c d]`), a word as it is, a number as below. `show`
+  keeps the outer brackets. `type` is `print` without the newline. A number
+  prints like C's `%.12g`: 12 significant digits, trailing zeros and a bare
+  decimal point removed, whole numbers without a point, and scientific form
+  (`1e+20`, `1.5e-07`) when the decimal exponent is below -4 or at least 12.
+  Negative zero prints as `0`.
+- **Errors**, each a single line that abandons the rest of the line and returns
+  to the prompt: `I don't know how to foo`; `foo has no value`; `Not enough
+  inputs to foo`; `You don't say what to do with 3`; `foo doesn't like bar as
+  input` (`bar` shown as `print` would, lists with brackets); `foo didn't
+  output to bar`; `Missing ]`; `Unexpected ]`; `Can only do that inside a
+  procedure`; `Out of memory`; `Missing )` and `Unexpected )` for unbalanced
+  parentheses; `Number out of range` when arithmetic overflows; and `Stopped!`
+  when Ctrl-C interrupts a running instruction (checked before each primitive
+  runs). Division by zero is
+  `/ doesn't like 0 as input`.
+
 ## Control, data and I/O
 
 - `repeat n [..]`, `if cond [..]`, `ifelse cond [..] [..]`, `stop`, `output`/`op`,

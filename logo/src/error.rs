@@ -1,0 +1,49 @@
+//! LOGO errors, with the wording specified in `LOGO.md`.
+
+use crate::value::Value;
+use alloc::format;
+use alloc::string::String;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LogoError {
+    DontKnowHow(String),
+    NoValue(String),
+    NotEnoughInputs(String),
+    DontSayWhatToDo(Value),
+    DoesntLike(String, Value),
+    DidntOutput(String, String),
+    MissingBracket,
+    UnexpectedBracket,
+    MissingParen,
+    UnexpectedParen,
+    OnlyInProcedure,
+    OutOfMemory,
+    OutOfRange,
+    Stopped,
+}
+
+impl LogoError {
+    /// The one-line message shown to the user.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            LogoError::DontKnowHow(name) => format!("I don't know how to {name}"),
+            LogoError::NoValue(name) => format!("{name} has no value"),
+            LogoError::NotEnoughInputs(name) => format!("Not enough inputs to {name}"),
+            LogoError::DontSayWhatToDo(v) => {
+                format!("You don't say what to do with {}", v.show_form())
+            }
+            LogoError::DoesntLike(name, v) => {
+                format!("{name} doesn't like {} as input", v.show_form())
+            }
+            LogoError::DidntOutput(from, to) => format!("{from} didn't output to {to}"),
+            LogoError::MissingBracket => String::from("Missing ]"),
+            LogoError::UnexpectedBracket => String::from("Unexpected ]"),
+            LogoError::MissingParen => String::from("Missing )"),
+            LogoError::UnexpectedParen => String::from("Unexpected )"),
+            LogoError::OnlyInProcedure => String::from("Can only do that inside a procedure"),
+            LogoError::OutOfMemory => String::from("Out of memory"),
+            LogoError::OutOfRange => String::from("Number out of range"),
+            LogoError::Stopped => String::from("Stopped!"),
+        }
+    }
+}

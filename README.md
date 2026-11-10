@@ -64,6 +64,11 @@ READY.
   (ANSI escapes), `TAB`/`SPC`, and Ctrl-C to stop a running program.
   Errors look like `?SYNTAX ERROR IN 20`. The language is specified in
   [BASIC.md](BASIC.md).
+- **And LOGO.** Press `2` at the boot menu for a turtle-graphics LOGO (a UCBLogo
+  subset, specified in [LOGO.md](LOGO.md)): `to ... end` procedures, recursion,
+  dynamic scope, lists and words, `repeat`/`if`/`ifelse`/`run`, and a turtle
+  that draws in the QEMU window (`make run-logo`). Try `repeat 36 [repeat 4 [fd 80
+  rt 90] rt 10]`.
 - **A small kernel under it.** Boot in S-mode, 16550 UART console with line
   editing (backspace, Ctrl-U, Ctrl-C, arrow keys ignored), traps with a fatal
   report of `scause`/`sepc`/`stval`, a 10 ms timer tick, the FPU, and a heap.
@@ -87,7 +92,7 @@ Other commands:
 ```sh
 make test        # host tests for the interpreter and console crates (no QEMU needed)
 make kernel      # build the kernel ELF
-make run-logo     # boot with a graphics window; press 2 at the menu for the LOGO test pattern
+make run-logo     # boot with a graphics window; press 2 at the menu for LOGO
 make debug       # boot paused, gdb stub on :1234
 make boot-test   # the scripted QEMU boot tests, as CI runs them
 make check       # everything CI runs: fmt, tests, clippy, boot tests
@@ -113,6 +118,7 @@ live only until the machine is switched off.
 |---|---|
 | `basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
 | `console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
+| `logo/` | The LOGO language: reader, parser, reference interpreter. `no_std`, no hardware, no `unsafe`; tested against golden transcripts and images. |
 | `turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
 | `kernel/` | Boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
 | `examples/` | Demo BASIC programs (also used by the golden and boot tests). |

@@ -1,0 +1,6 @@
+;canvas 11 11
+ht
+to sq :s
+repeat 4 [fd :s rt 90]
+end
+sq 4
