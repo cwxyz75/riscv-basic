@@ -1,9 +1,7 @@
 //! Milestone M0: prove the toolchain. Boot in S-mode under OpenSBI, say hello
 //! over the serial port, and shut the machine down cleanly through SBI.
 //!
-//! STATUS: drafted without being compiled or booted (the authoring environment
-//! had no RISC-V target or QEMU). Getting `make boot-test` green is the first
-//! job; expect to fix small things.
+//! STATUS: verified locally (`make boot-test` passes under QEMU on macOS).
 
 #![no_std]
 #![no_main]

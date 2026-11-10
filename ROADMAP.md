@@ -11,16 +11,16 @@ parallel, for example in a cloud session while the kernel work happens locally.
 - [x] Repo scaffold: workspace, Makefile, CI workflow, boot-test script
 - [x] Planning docs: DESIGN, BASIC, ROADMAP, CLAUDE
 - [x] `basic` crate skeleton with the `Io` seam and golden-test harness (host tests pass)
-- [ ] Kernel M0 code is *drafted but unverified*: never compiled or booted
+- [x] Kernel M0 code compiles and boots locally (`make check` green on macOS)
 
 ## M0: Toolchain smoke test
 
 Acceptance: `make boot-test` passes locally and in CI. QEMU prints
 `hello from S-mode` and exits cleanly through SBI shutdown.
 
-- [ ] Prerequisites installed (`brew install qemu`, `rustup toolchain install`)
-- [ ] `make kernel` builds
-- [ ] `make run` shows the hello line
+- [x] Prerequisites installed (`brew install qemu`, `rustup toolchain install`)
+- [x] `make kernel` builds
+- [x] `make run` shows the hello line (checked via the boot test's captured output)
 - [ ] `make boot-test` passes; CI green
 
 ## M1: Console

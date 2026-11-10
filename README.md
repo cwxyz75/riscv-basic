@@ -16,7 +16,7 @@ RUN
 ```
 
 **Status:** planning baseline. The interpreter is a stub and the kernel is an
-unverified M0 draft. See [ROADMAP.md](ROADMAP.md).
+M0 hello-world that boots in QEMU. See [ROADMAP.md](ROADMAP.md).
 
 ## Prerequisites (macOS)
 
