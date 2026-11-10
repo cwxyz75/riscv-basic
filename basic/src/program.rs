@@ -1,5 +1,6 @@
 //! The tokenized program store: line number to token bytes, kept sorted.
 
+use crate::error::Error;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Bound;
@@ -7,25 +8,54 @@ use core::ops::Bound;
 /// Highest legal line number (see `BASIC.md`).
 pub(crate) const MAX_LINE: u16 = 63999;
 
+/// Size of the program area in bytes (see "Program memory" in `BASIC.md`).
+pub(crate) const PROGRAM_AREA: usize = 32768;
+
+/// Bytes of bookkeeping charged per stored line, on top of its tokens.
+const LINE_OVERHEAD: usize = 5;
+
+fn line_cost(tokens: &[u8]) -> usize {
+    tokens.len() + LINE_OVERHEAD
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Program {
     lines: BTreeMap<u16, Vec<u8>>,
+    /// Bytes of the program area in use.
+    used: usize,
 }
 
 impl Program {
-    /// Store a line, replacing any existing line with the same number.
-    pub(crate) fn set(&mut self, number: u16, tokens: Vec<u8>) {
+    /// Store a line, replacing any existing line with the same number. If the
+    /// result would not fit in the program area, nothing changes and the error
+    /// is `OutOfMemory`.
+    pub(crate) fn set(&mut self, number: u16, tokens: Vec<u8>) -> Result<(), Error> {
+        let old_cost = self.lines.get(&number).map_or(0, |old| line_cost(old));
+        let used = self.used - old_cost + line_cost(&tokens);
+        if used > PROGRAM_AREA {
+            return Err(Error::OutOfMemory);
+        }
+        self.used = used;
         self.lines.insert(number, tokens);
+        Ok(())
     }
 
     /// Delete a line. Deleting a line that does not exist does nothing.
     pub(crate) fn delete(&mut self, number: u16) {
-        self.lines.remove(&number);
+        if let Some(old) = self.lines.remove(&number) {
+            self.used -= line_cost(&old);
+        }
     }
 
     /// Delete the whole program (`NEW`).
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
+        self.used = 0;
+    }
+
+    /// Bytes of the program area still free.
+    pub(crate) fn bytes_free(&self) -> usize {
+        PROGRAM_AREA - self.used
     }
 
     /// The tokens of line `number`, if it exists.
@@ -68,9 +98,9 @@ mod tests {
     #[test]
     fn lines_come_back_sorted_and_replaceable() {
         let mut p = Program::default();
-        p.set(20, vec![1]);
-        p.set(10, vec![2]);
-        p.set(20, vec![3]);
+        p.set(20, vec![1]).unwrap();
+        p.set(10, vec![2]).unwrap();
+        p.set(20, vec![3]).unwrap();
         let all: Vec<_> = p.range(0, MAX_LINE).collect();
         assert_eq!(all, vec![(10, &[2u8][..]), (20, &[3u8][..])]);
     }
@@ -79,7 +109,7 @@ mod tests {
     fn range_is_inclusive_and_reversed_is_empty() {
         let mut p = Program::default();
         for n in [10, 20, 30] {
-            p.set(n, vec![]);
+            p.set(n, vec![]).unwrap();
         }
         assert_eq!(p.range(20, 30).count(), 2);
         assert_eq!(p.range(30, 10).count(), 0);
@@ -90,7 +120,7 @@ mod tests {
         let mut p = Program::default();
         assert_eq!(p.first(), None);
         for n in [30, 10, 20] {
-            p.set(n, vec![n as u8]);
+            p.set(n, vec![n as u8]).unwrap();
         }
         assert_eq!(p.first(), Some(10));
         assert_eq!(p.next_after(10), Some(20));
@@ -101,9 +131,31 @@ mod tests {
     }
 
     #[test]
+    fn accounting_and_out_of_memory() {
+        let mut p = Program::default();
+        assert_eq!(p.bytes_free(), PROGRAM_AREA);
+        p.set(10, vec![0; 100]).unwrap();
+        assert_eq!(p.bytes_free(), PROGRAM_AREA - 105);
+        // Replacing is judged by net cost.
+        p.set(10, vec![0; 50]).unwrap();
+        assert_eq!(p.bytes_free(), PROGRAM_AREA - 55);
+        // Too big: unchanged.
+        assert_eq!(p.set(20, vec![0; PROGRAM_AREA]), Err(Error::OutOfMemory));
+        assert_eq!(p.bytes_free(), PROGRAM_AREA - 55);
+        assert_eq!(p.get(20), None);
+        // Exactly full is allowed.
+        p.set(30, vec![0; PROGRAM_AREA - 55 - 5]).unwrap();
+        assert_eq!(p.bytes_free(), 0);
+        p.delete(30);
+        assert_eq!(p.bytes_free(), PROGRAM_AREA - 55);
+        p.clear();
+        assert_eq!(p.bytes_free(), PROGRAM_AREA);
+    }
+
+    #[test]
     fn delete_missing_line_is_harmless_and_clear_empties() {
         let mut p = Program::default();
-        p.set(10, vec![]);
+        p.set(10, vec![]).unwrap();
         p.delete(99);
         assert_eq!(p.range(0, MAX_LINE).count(), 1);
         p.clear();

@@ -10,6 +10,7 @@ pub(crate) enum Error {
     IllegalQuantity,
     UndefdStatement,
     NextWithoutFor,
+    OutOfMemory,
 }
 
 impl Error {
@@ -22,6 +23,7 @@ impl Error {
             Error::IllegalQuantity => "ILLEGAL QUANTITY",
             Error::UndefdStatement => "UNDEF'D STATEMENT",
             Error::NextWithoutFor => "NEXT WITHOUT FOR",
+            Error::OutOfMemory => "OUT OF MEMORY",
         }
     }
 }
