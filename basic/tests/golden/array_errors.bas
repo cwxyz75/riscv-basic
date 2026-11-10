@@ -1,0 +1,20 @@
+DIM A(3)
+DIM A(3)
+PRINT A(4)
+PRINT A(-1)
+PRINT A(1,1)
+PRINT A("X")
+A(1)="X"
+A$(1)=5
+DIM B(-1)
+DIM C(1,2,3,4)
+DIM
+DIM D(
+DIM E
+DIM E(5) , F(2)
+E(5)=1: F(2)=2: PRINT E(5)+F(2)
+DIM G(100000)
+DIM H(30000)
+DIM I(20000)
+10 DIM Z(2): Z(9)=1
+RUN

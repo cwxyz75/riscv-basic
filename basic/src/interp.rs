@@ -1,5 +1,7 @@
 use crate::error::{Error, Fault};
-use crate::expr::{evaluate, evaluate_number, parse_name, to_address, to_byte, to_count};
+use crate::expr::{
+    evaluate, evaluate_number, evaluate_subscripts, parse_name, to_address, to_byte, to_count,
+};
 use crate::io::{Io, Line};
 use crate::memory::Memory;
 use crate::number::format_number;
@@ -301,6 +303,7 @@ impl Interpreter {
             }
             Some("RUN") => self.stmt_run(tokens, pos),
             Some("POKE") => self.stmt_poke(io, tokens, pos),
+            Some("DIM") => self.stmt_dim(io, tokens, pos),
             Some("LIST") => {
                 let end = statement_end(tokens, *pos);
                 let args = &tokens[*pos..end];
@@ -329,6 +332,13 @@ impl Interpreter {
         pos: &mut usize,
     ) -> Result<Flow, Error> {
         let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+        let subscripts = if tokens.get(*pos) == Some(&b'(') {
+            let (subs, end) = evaluate_subscripts(tokens, *pos, &mut self.mem, io)?;
+            *pos = end;
+            Some(subs)
+        } else {
+            None
+        };
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
@@ -336,7 +346,10 @@ impl Interpreter {
         let (value, end) = evaluate(tokens, *pos + 1, &mut self.mem, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
-        self.mem.assign(name, value)?;
+        match subscripts {
+            Some(subs) => self.mem.set_element(&name, &subs, value)?,
+            None => self.mem.assign(name, value)?,
+        }
         Ok(Flow::Next)
     }
 
@@ -588,6 +601,32 @@ impl Interpreter {
                 pos: 0,
             })
         }
+    }
+
+    /// `DIM name(bound[,bound...])[, name(...)...]`.
+    fn stmt_dim<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        loop {
+            let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
+            if tokens.get(*pos) != Some(&b'(') {
+                return Err(Error::Syntax);
+            }
+            let (bounds, end) = evaluate_subscripts(tokens, *pos, &mut self.mem, io)?;
+            *pos = end;
+            self.mem.dim(name, &bounds)?;
+            skip_spaces(tokens, pos);
+            if tokens.get(*pos) == Some(&b',') {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+        end_of_statement(tokens, pos)?;
+        Ok(Flow::Next)
     }
 
     /// `POKE addr, value`.

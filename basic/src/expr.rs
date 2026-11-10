@@ -45,6 +45,27 @@ pub(crate) fn evaluate_number<I: Io>(
     Ok((value.num()?, end))
 }
 
+/// Parse a subscript list `( n [, n ...] )` starting at `pos` (spaces before
+/// the `(` are allowed). Returns the numbers and the position after the `)`.
+pub(crate) fn evaluate_subscripts<I: Io>(
+    src: &[u8],
+    pos: usize,
+    mem: &mut Memory,
+    io: &mut I,
+) -> Result<(Vec<f64>, usize), Error> {
+    let mut parser = Parser {
+        src,
+        pos,
+        mem,
+        io,
+        and: token("AND"),
+        or: token("OR"),
+        not: token("NOT"),
+    };
+    let subs = parser.subscripts()?;
+    Ok((subs, parser.pos))
+}
+
 /// Read a variable name at `*pos` (skipping leading spaces): a letter, then
 /// letters and digits, then an optional `$` for a string variable. `None` if
 /// there is no name there.
@@ -396,6 +417,10 @@ impl<I: Io> Parser<'_, I> {
             Some(b) if b.is_ascii_digit() || b == b'.' => self.number().map(Value::Num),
             Some(b) if b.is_ascii_alphabetic() => {
                 let name = parse_name(self.src, &mut self.pos)?.ok_or(Error::Syntax)?;
+                if self.src.get(self.pos) == Some(&b'(') {
+                    let subs = self.subscripts()?;
+                    return self.mem.element(&name, &subs);
+                }
                 Ok(self.mem.get(&name))
             }
             Some(b) => match keyword(b) {
@@ -427,6 +452,15 @@ impl<I: Io> Parser<'_, I> {
             .iter()
             .map(|&b| char::from(b))
             .collect()
+    }
+
+    /// A subscript list: one to three numbers in parentheses.
+    fn subscripts(&mut self) -> Result<Vec<f64>, Error> {
+        let args = self.arguments()?;
+        if args.is_empty() || args.len() > 3 {
+            return Err(Error::Syntax);
+        }
+        args.into_iter().map(Value::num).collect()
     }
 
     /// A function's argument list: `( [expression {, expression}] )`.

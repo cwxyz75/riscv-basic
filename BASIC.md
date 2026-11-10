@@ -220,6 +220,29 @@ functions are specified under "Strings" below.
 - No way to interrupt a runaway program exists until BREAK handling arrives
   (milestone M6), so golden tests must not contain endless loops.
 
+## Arrays
+
+- **`DIM name(n[,m[,k]])[, ...]`** creates an array of numbers (or of strings,
+  if the name ends in `$`) with 1 to 3 dimensions. A subscript runs from 0 to
+  the declared bound, so `DIM A(5)` has six elements, `A(0)` to `A(5)`. All
+  elements start as `0` (or `""`). More than three dimensions is `?SYNTAX
+  ERROR`; a negative bound is `?ILLEGAL QUANTITY ERROR`; `DIM` of an array that
+  already exists is `?REDIM'D ARRAY ERROR`.
+- **Names:** `A(1)` is an element of the array `A`; the array `A` and the
+  variable `A` are different things (likewise `A$(1)` and `A$`). The `(` must
+  follow the name directly.
+- **Use without `DIM`:** the first use of an array that was never dimensioned
+  creates it with bound 10 in each dimension used, so `X(3)=4` makes `X` a
+  one-dimensional array of 11 elements, and `Y(1,1)=2` a 11 by 11 one.
+- **Subscripts** are numbers, truncated toward zero. One outside 0..bound, or a
+  different number of subscripts than the array has dimensions, is `?BAD
+  SUBSCRIPT ERROR`.
+- **Assignment and reading:** `A(i)=expr` (with or without `LET`) stores an
+  element, and `A(i)` in an expression reads one, with the usual type checks.
+- **Memory:** all arrays together may hold at most 40000 elements; a `DIM`
+  (or implicit creation) that would go over is `?OUT OF MEMORY ERROR`. `RUN`
+  deletes all arrays along with the other variables.
+
 ## Strings
 
 - **Values and names:** a string variable's name ends in `$`; `A` and `A$` are
@@ -322,7 +345,7 @@ After an error the program stops and the prompt returns.
 
 `SYNTAX`, `TYPE MISMATCH`, `UNDEF'D STATEMENT`, `NEXT WITHOUT FOR`,
 `RETURN WITHOUT GOSUB`, `OUT OF DATA`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
-`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`,
+`DIVISION BY ZERO`, `ILLEGAL QUANTITY`, `OVERFLOW`, `OUT OF MEMORY`, `BAD SUBSCRIPT`, `REDIM'D ARRAY`,
 `STRING TOO LONG`.
 
 ## Faults
