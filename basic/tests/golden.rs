@@ -12,11 +12,19 @@
 //! interpreter reads it, the n-th following check for Ctrl-C reports "pressed"
 //! (the interpreter checks once before each statement it runs).
 //!
+//! Disk directives (anywhere in the script, applied before it runs; a script
+//! without one has no disk): `<DISK SECTORS n>` attaches a freshly formatted
+//! disk of n sectors (n - 6 blocks of data), `<NO DISK>` (the default),
+//! `<BAD DISK>` an unformatted one, `<DISK ERROR>` one whose reads fail, and
+//! `<FILE BASIC NAME>` / `<FILE LOGO NAME>` through `<END FILE>` puts the lines
+//! between as a file on the disk.
+//!
 //! To (re)generate expected outputs after an intended behaviour change:
 //!     BLESS=1 cargo test -p basic
 //! then review the diff of the `.out` files before committing.
 
 use basic::{Interpreter, Io, Line};
+use cartfs::{Disk, Files, Kind, MemDisk, Unavailable};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +38,7 @@ struct ScriptIo {
     clock_ms: u64,
     /// Checks left until a simulated Ctrl-C (see the module comment).
     break_after: Option<u64>,
+    files: Option<Box<dyn Files>>,
 }
 
 impl Io for ScriptIo {
@@ -75,6 +84,13 @@ impl Io for ScriptIo {
         self.output.push_str("[reboot]\n");
     }
 
+    fn files(&mut self) -> Option<&mut dyn Files> {
+        match &mut self.files {
+            Some(files) => Some(&mut **files),
+            None => None,
+        }
+    }
+
     fn peek(&mut self, addr: u64) -> u8 {
         self.memory.get(&addr).copied().unwrap_or(0)
     }
@@ -104,13 +120,66 @@ fn expand(source: &str) -> Vec<String> {
     lines
 }
 
+/// Split the disk directives out of a script, returning the disk they describe
+/// and the lines that are left to type.
+fn take_disk(lines: Vec<String>) -> (Option<Box<dyn Files>>, Vec<String>) {
+    let mut disk: Option<Box<dyn Files>> = None;
+    let mut sectors = None;
+    let mut files: Vec<(Kind, String, String)> = Vec::new();
+    let mut typed = Vec::new();
+    let mut open: Option<(Kind, String, String)> = None;
+    for line in lines {
+        if let Some(file) = open.as_mut() {
+            if line == "<END FILE>" {
+                files.push(open.take().unwrap());
+            } else {
+                file.2.push_str(&line);
+                file.2.push('\n');
+            }
+        } else if let Some(n) = line
+            .strip_prefix("<DISK SECTORS ")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            sectors = Some(n.parse::<u32>().expect("sector count"));
+        } else if line == "<NO DISK>" {
+        } else if line == "<BAD DISK>" {
+            disk = Some(Box::new(Unavailable(cartfs::Error::NotFormatted)));
+        } else if line == "<DISK ERROR>" {
+            disk = Some(Box::new(Unavailable(cartfs::Error::Device)));
+        } else if let Some(rest) = line
+            .strip_prefix("<FILE ")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            let (kind, name) = rest.split_once(' ').expect("<FILE KIND NAME>");
+            let kind = match kind {
+                "BASIC" => Kind::Basic,
+                "LOGO" => Kind::Logo,
+                other => panic!("unknown file kind {other}"),
+            };
+            open = Some((kind, name.to_owned(), String::new()));
+        } else {
+            typed.push(line);
+        }
+    }
+    if let Some(n) = sectors {
+        let mut d = Disk::format(MemDisk::new(n)).expect("format");
+        for (kind, name, text) in files {
+            d.save(&name, kind, text.as_bytes()).expect("preload file");
+        }
+        disk = Some(Box::new(d));
+    }
+    (disk, typed)
+}
+
 fn transcript(source: &str) -> String {
+    let (files, typed) = take_disk(expand(source));
     let mut io = ScriptIo {
-        input: expand(source).into(),
+        input: typed.into(),
         output: String::new(),
         memory: HashMap::new(),
         clock_ms: 0,
         break_after: None,
+        files,
     };
     Interpreter::new().run_session(&mut io);
     io.output

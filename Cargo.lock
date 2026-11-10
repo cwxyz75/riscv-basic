@@ -6,6 +6,7 @@ version = 4
 name = "basic"
 version = "0.1.0"
 dependencies = [
+ "cartfs",
  "console",
  "libm",
 ]

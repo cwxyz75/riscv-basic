@@ -9,3 +9,5 @@ description = "BASIC interpreter core: no_std, hardware-free, testable on the ho
 libm = "0.2"
 # Pure ANSI escape helpers (no hardware): CLS, COLOR and LOCATE are built on them.
 console = { path = "../console" }
+# The disk interface (pure): SAVE, LOAD, DIR and SCRATCH talk to `cartfs::Files`.
+cartfs = { path = "../cartfs" }

@@ -64,4 +64,10 @@ pub trait Io {
 
     /// Write one byte to physical address `addr` (`POKE`). Unchecked.
     fn poke(&mut self, addr: u64, value: u8);
+
+    /// The disk behind `SAVE`, `LOAD`, `DIR` and `SCRATCH`. `None` means the
+    /// machine has no disk (`?DEVICE NOT PRESENT ERROR`).
+    fn files(&mut self) -> Option<&mut dyn cartfs::Files> {
+        None
+    }
 }
