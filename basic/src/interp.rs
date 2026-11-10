@@ -1,17 +1,28 @@
 use crate::error::Error;
+use crate::expr::{evaluate, parse_name, Variables};
 use crate::io::{Io, Line};
+use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
 use crate::token::{detokenize, token, tokenize};
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// Width of a `PRINT` comma zone.
+const ZONE: usize = 14;
 
 /// The interpreter state: program store, variables, stacks, ...
 ///
-/// Milestone status (M3, in progress): typed lines are tokenized and stored,
-/// and `LIST` and `NEW` work. Everything else answers `?SYNTAX ERROR` until
-/// the later M3 items land. Behaviour is specified by `BASIC.md`.
+/// Milestone status (M3, in progress): typed lines are tokenized and stored;
+/// `LIST`, `NEW`, `LET` and `PRINT` work in immediate mode, with numeric
+/// expressions. Everything else answers `?SYNTAX ERROR` until the later M3
+/// items land. Behaviour is specified by `BASIC.md`.
 #[derive(Debug, Default)]
 pub struct Interpreter {
     program: Program,
+    vars: Variables,
+    /// Output column of the console cursor, for `,` zones and fresh lines.
+    column: usize,
 }
 
 impl Interpreter {
@@ -23,7 +34,8 @@ impl Interpreter {
     /// Returns only when the console reports end of input.
     pub fn run_session<I: Io>(&mut self, io: &mut I) {
         loop {
-            io.write_str("READY.\n");
+            self.fresh_line(io);
+            self.emit(io, "READY.\n");
             match io.read_line() {
                 Line::Text(text) => self.handle_line(io, &text),
                 Line::Break => {}
@@ -36,8 +48,30 @@ impl Interpreter {
     /// (starts with a line number) or a statement/command to run immediately.
     /// Errors are reported to the user, never returned or panicked.
     pub fn handle_line<I: Io>(&mut self, io: &mut I, line: &str) {
+        // The user just pressed Enter, so the cursor is at the start of a line.
+        self.column = 0;
         if let Err(error) = self.try_handle_line(io, line) {
-            io.write_str(&format!("?{} ERROR\n", error.name()));
+            self.fresh_line(io);
+            self.emit(io, &format!("?{} ERROR\n", error.name()));
+        }
+    }
+
+    /// Write to the console, tracking the cursor column.
+    fn emit<I: Io>(&mut self, io: &mut I, text: &str) {
+        io.write_str(text);
+        for c in text.chars() {
+            if c == '\n' {
+                self.column = 0;
+            } else {
+                self.column += 1;
+            }
+        }
+    }
+
+    /// Start a new line if the cursor is not already at the start of one.
+    fn fresh_line<I: Io>(&mut self, io: &mut I) {
+        if self.column != 0 {
+            self.emit(io, "\n");
         }
     }
 
@@ -50,12 +84,20 @@ impl Interpreter {
             return self.enter_program_line(line);
         }
         let tokens = tokenize(line)?;
+        self.execute(io, &tokens)
+    }
+
+    /// Run one statement or command given as tokens.
+    fn execute<I: Io>(&mut self, io: &mut I, tokens: &[u8]) -> Result<(), Error> {
         match tokens.split_first() {
             Some((&first, rest)) if first == token("LIST") => self.list(io, rest),
             Some((&first, rest)) if first == token("NEW") && is_blank(rest) => {
                 self.program.clear();
                 Ok(())
             }
+            Some((&first, rest)) if first == token("PRINT") => self.print(io, rest),
+            Some((&first, rest)) if first == token("LET") => self.assign(rest),
+            Some((first, _)) if first.is_ascii_alphabetic() => self.assign(tokens),
             _ => Err(Error::Syntax),
         }
     }
@@ -77,10 +119,86 @@ impl Interpreter {
     }
 
     /// `LIST [from][-[to]]`; `args` is the tokenized text after the keyword.
-    fn list<I: Io>(&self, io: &mut I, args: &[u8]) -> Result<(), Error> {
+    fn list<I: Io>(&mut self, io: &mut I, args: &[u8]) -> Result<(), Error> {
         let (from, to) = parse_range(&detokenize(args))?;
-        for (number, tokens) in self.program.range(from, to) {
-            io.write_str(&format!("{number} {}\n", detokenize(tokens)));
+        let lines: Vec<String> = self
+            .program
+            .range(from, to)
+            .map(|(number, tokens)| format!("{number} {}\n", detokenize(tokens)))
+            .collect();
+        for line in lines {
+            self.emit(io, &line);
+        }
+        Ok(())
+    }
+
+    /// `[LET] name = expr`; `src` is everything after `LET` (or the whole
+    /// statement when `LET` was omitted).
+    fn assign(&mut self, src: &[u8]) -> Result<(), Error> {
+        let mut pos = 0;
+        let name = parse_name(src, &mut pos)?.ok_or(Error::Syntax)?;
+        while src.get(pos) == Some(&b' ') {
+            pos += 1;
+        }
+        if src.get(pos) != Some(&b'=') {
+            return Err(Error::Syntax);
+        }
+        let (value, end) = evaluate(src, pos + 1, &self.vars)?;
+        if !is_blank(&src[end..]) {
+            return Err(Error::Syntax);
+        }
+        self.vars.insert(name, value);
+        Ok(())
+    }
+
+    /// `PRINT [item [(;|,) [item]]...]`.
+    fn print<I: Io>(&mut self, io: &mut I, src: &[u8]) -> Result<(), Error> {
+        let mut pos = 0;
+        let mut newline = true;
+        let mut after_item = false;
+        loop {
+            while src.get(pos) == Some(&b' ') {
+                pos += 1;
+            }
+            let Some(&byte) = src.get(pos) else { break };
+            match byte {
+                b';' => {
+                    pos += 1;
+                    newline = false;
+                    after_item = false;
+                }
+                b',' => {
+                    pos += 1;
+                    newline = false;
+                    after_item = false;
+                    let pad = ZONE - self.column % ZONE;
+                    self.emit(io, &" ".repeat(pad));
+                }
+                _ if after_item => return Err(Error::Syntax),
+                b'"' => {
+                    // A string literal runs to the closing quote, or the end.
+                    let start = pos + 1;
+                    let end = src[start..]
+                        .iter()
+                        .position(|&b| b == b'"')
+                        .map_or(src.len(), |i| start + i);
+                    let text: String = src[start..end].iter().map(|&b| char::from(b)).collect();
+                    self.emit(io, &text);
+                    pos = (end + 1).min(src.len());
+                    newline = true;
+                    after_item = true;
+                }
+                _ => {
+                    let (value, end) = evaluate(src, pos, &self.vars)?;
+                    self.emit(io, &format_number(value));
+                    pos = end;
+                    newline = true;
+                    after_item = true;
+                }
+            }
+        }
+        if newline {
+            self.emit(io, "\n");
         }
         Ok(())
     }
@@ -113,7 +231,7 @@ fn parse_bound(text: &str) -> Result<Option<u16>, Error> {
 
 /// The argument of `LIST`: nothing (all), `n`, `a-b`, `a-` or `-b`.
 fn parse_range(text: &str) -> Result<(u16, u16), Error> {
-    let parts: alloc::vec::Vec<&str> = text.split('-').collect();
+    let parts: Vec<&str> = text.split('-').collect();
     match parts.as_slice() {
         [single] => Ok(match parse_bound(single)? {
             Some(n) => (n, n),

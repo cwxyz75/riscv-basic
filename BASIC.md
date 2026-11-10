@@ -120,6 +120,42 @@ the persistence milestone happens.
 - Number to string: `STR$`, `CHR$`.
 - String: `LEFT$`, `RIGHT$`, `MID$` (1-based).
 
+## Expressions, `PRINT` and `LET` in detail
+
+Fills in the operator table above. Numbers only, plus string literals as
+`PRINT` items; string variables and string expressions arrive with the
+strings milestone (a name ending in `$` is `?SYNTAX ERROR` until then).
+
+- **Number literals:** digits with an optional fraction and an optional
+  exponent: `5`, `5.`, `.5`, `1.5E3`, `1E-3`. An `E` with no digits after it is
+  `?SYNTAX ERROR`.
+- **Variables:** a numeric variable not yet assigned is `0`. Names are
+  case-insensitive. Because keywords are split out of names (see Values), a
+  name that contains a keyword cannot be used: `LET TOTAL=1` is
+  `?SYNTAX ERROR`.
+- **Chaining:** operators of equal precedence group left to right, including
+  comparisons (`1<2<3` is `(1<2)<3`).
+- **`^`:** the base is a number, variable or parenthesised expression. The
+  exponent may carry a sign, so `2^-1` is `0.5`. Unary minus binds looser than
+  `^`: `-2^2` is `-4`.
+- **Arithmetic faults:** dividing by zero (including `0/0`) is `?DIVISION BY
+  ZERO ERROR`. Any other result that is infinite (including a literal too large
+  to represent) is `?OVERFLOW ERROR`. A result that is not a number, such as
+  `(-8)^(1/3)`, is `?ILLEGAL QUANTITY ERROR`.
+- **Logic:** `NOT`, `AND` and `OR` truncate each operand toward zero to a
+  32-bit signed integer, so `NOT 1` is `-2` and `5.9 AND 7` is `5`.
+- **`LET`:** `[LET] name = expr`. Assigning does not print anything.
+- **`PRINT`:** a list of items separated by `;` or `,`. An item is a string
+  literal or an expression. Two items with no separator between them
+  (`PRINT "A" 1`, `PRINT 1 2`) are `?SYNTAX ERROR`. `;` adds nothing. `,`
+  moves to the next 14-column zone (always at least one column; a position
+  already on a zone boundary moves to the next one). A trailing `;` or `,`
+  suppresses the newline. `PRINT` alone prints just a newline. Columns count
+  characters since the start of the output line.
+- **Prompt and errors:** `READY.` and error messages always start on a fresh
+  line: if the cursor is not at column 0 (after `PRINT 1;`), a newline is
+  printed first. Output already produced before an error stays.
+
 ## Number output
 
 `PRINT` writes a number as a sign field, the digits, and a trailing space: a

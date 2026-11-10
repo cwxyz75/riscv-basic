@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "BASIC interpreter core: no_std, hardware-free, testable on the host"
 
-# No dependencies yet. `libm` joins at the math-functions milestone (see ROADMAP.md).
+# `libm` provides pow/trunc without std (decision D4).
 [dependencies]
+libm = "0.2"
