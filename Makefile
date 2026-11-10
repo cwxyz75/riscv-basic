@@ -3,7 +3,12 @@ KERNEL_ELF    := target/$(KERNEL_TARGET)/debug/kernel
 QEMU          := qemu-system-riscv64
 QEMU_FLAGS    := -machine virt -nographic -bios default
 
-.PHONY: help test fmt fmt-check lint kernel run run-logo debug boot-test check
+# The disk for SAVE/LOAD: a raw image on a virtio block device. The kernel's
+# driver speaks the modern virtio-mmio transport, hence force-legacy=false.
+DISK          := disk.img
+DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
+
+.PHONY: help disk test fmt fmt-check lint kernel run run-logo debug boot-test check
 
 help:
 	@echo "make test       host tests for the interpreter crate (no QEMU needed)"
@@ -12,6 +17,7 @@ help:
 	@echo "make run-logo    boot with a graphics window (ramfb); press 2 at the menu for LOGO"
 	@echo "make debug      boot paused with a gdb stub on :1234"
 	@echo "make boot-test  boot in QEMU non-interactively and check the output"
+	@echo "make disk       create disk.img (2 MiB, for SAVE/LOAD) if it does not exist"
 	@echo "make check      everything CI runs"
 
 test:
@@ -31,8 +37,14 @@ lint:
 kernel:
 	cd kernel && cargo build
 
-run: kernel
-	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
+# Created only if missing (no prerequisites), so your saved files are never wiped.
+$(DISK):
+	python3 scripts/disk.py new $(DISK)
+
+disk: $(DISK)
+
+run: kernel $(DISK)
+	$(QEMU) $(QEMU_FLAGS) $(DISK_FLAGS) -kernel $(KERNEL_ELF)
 
 # Same machine plus a framebuffer, shown in a window (QEMU picks the display
 # backend). The serial console stays in this terminal; Ctrl-A then X quits.
@@ -42,11 +54,11 @@ ifeq ($(shell uname),Darwin)
 LOGO_DISPLAY := -display cocoa,zoom-to-fit=on
 endif
 
-run-logo: kernel
-	$(QEMU) -machine virt -bios default -device ramfb $(LOGO_DISPLAY) -serial mon:stdio -kernel $(KERNEL_ELF)
+run-logo: kernel $(DISK)
+	$(QEMU) -machine virt -bios default $(DISK_FLAGS) -device ramfb $(LOGO_DISPLAY) -serial mon:stdio -kernel $(KERNEL_ELF)
 
-debug: kernel
-	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) -s -S
+debug: kernel $(DISK)
+	$(QEMU) $(QEMU_FLAGS) $(DISK_FLAGS) -kernel $(KERNEL_ELF) -s -S
 
 boot-test: kernel
 	python3 scripts/console_test.py $(KERNEL_ELF)
@@ -57,5 +69,6 @@ boot-test: kernel
 	python3 scripts/logo_test.py $(KERNEL_ELF)
 	python3 scripts/jit_test.py $(KERNEL_ELF)
 	python3 scripts/logo_diff_test.py $(KERNEL_ELF)
+	python3 scripts/disk_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

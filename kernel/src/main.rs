@@ -18,6 +18,7 @@ mod terminal;
 mod timer;
 mod trap;
 mod uart;
+mod virtio_blk;
 
 use console::ansi;
 use core::arch::global_asm;

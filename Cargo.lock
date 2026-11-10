@@ -24,6 +24,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "basic",
+ "cartfs",
  "console",
  "linked_list_allocator",
  "logo",

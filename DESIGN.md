@@ -115,6 +115,14 @@ other kind is a type mismatch. Writes go data, then map, then directory entry.
 There is no journal: a power cut mid-save can lose that one file, as on a real
 floppy.
 
+The kernel's driver (`kernel/src/virtio_blk.rs`) is polled and handles one request
+at a time over the "modern" virtio-mmio transport (QEMU needs
+`-global virtio-mmio.force-legacy=false`; the Makefile and `scripts/disk_test.py`
+pass it). With no block device, or one that is not formatted, `SAVE`/`LOAD` report
+`DEVICE NOT PRESENT` / `DISK NOT FORMATTED` instead of failing at boot.
+`scripts/disk.py` makes and reads images independently of the Rust crate and is
+what the boot test checks the kernel against.
+
 ## Console model
 
 The serial terminal is the monitor. The line editor (logic in the `console`

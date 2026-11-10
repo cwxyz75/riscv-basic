@@ -83,7 +83,7 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 - [x] `CLS`, `COLOR`, `LOCATE`; BREAK handling during `RUN`
 - [x] `TIMER`; `PEEK`/`POKE` per the settled policy (golden-tested on the host, and `basic_test.py` / `trap_test.py` exercise them under QEMU)
 
-## M7: Persistence (optional)
+## M7: Persistence
 
 Spec: DESIGN.md, "The disk" (D21, D22). Acceptance: a program saved in one boot
 is loaded and run in the next boot, in both languages, with a fresh QEMU process
@@ -93,7 +93,7 @@ in between; the image is also checked from the host.
 - [x] `cartfs`: the disk format as a pure crate, host-tested (M7a)
 - [x] BASIC `SAVE`, `LOAD`, `DIR`, `SCRATCH` (M7b; host goldens against an in-memory disk; the machine has no disk until M7d)
 - [x] LOGO `save`, `load`, `dir`, `erasefile` (M7c; host goldens on all three engines against an in-memory disk)
-- [ ] Kernel virtio-blk driver, `make` creates `disk.img`, persistence boot tests (M7d)
+- [x] Kernel virtio-blk driver, `make` creates `disk.img`, persistence boot tests (M7d; `disk_test.py` on QEMU: save, reboot, load; fresh process; LOGO; a file made by the independent host tool; no disk; blank disk)
 
 ## M8: Showpiece
 
