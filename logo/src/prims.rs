@@ -6,6 +6,7 @@ use crate::interp::{Eval, Interpreter, Machine, Signal};
 use crate::lex::lex;
 use crate::value::Value;
 use crate::Io;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use turtle::Canvas;
@@ -37,11 +38,12 @@ fn canonical(name: &str) -> &str {
 pub(crate) fn arity(name: &str) -> Option<usize> {
     Some(match canonical(name) {
         "penup" | "pendown" | "home" | "clearscreen" | "clean" | "hideturtle" | "showturtle"
-        | "fill" | "pos" | "heading" | "xcor" | "ycor" | "stop" | "bye" => 0,
+        | "fill" | "pos" | "heading" | "xcor" | "ycor" | "stop" | "bye" | "dir" => 0,
         "forward" | "back" | "left" | "right" | "setheading" | "setpencolor" | "wait" | "print"
         | "show" | "type" | "sqrt" | "sin" | "cos" | "arctan" | "abs" | "int" | "round"
         | "random" | "first" | "last" | "butfirst" | "butlast" | "count" | "emptyp" | "listp"
-        | "wordp" | "numberp" | "not" | "output" | "thing" | "run" | ".engine" => 1,
+        | "wordp" | "numberp" | "not" | "output" | "thing" | "run" | ".engine" | "save"
+        | "load" | "erasefile" => 1,
         "setxy" | "repeat" | "if" | "make" | "fput" | "lput" | "list" | "sentence" | "item"
         | "and" | "or" => 2,
         "ifelse" => 3,
@@ -61,6 +63,14 @@ pub(crate) fn truth(value: &Value, name: &str) -> Result<bool, LogoError> {
         Value::Word(w) if w.eq_ignore_ascii_case("true") => Ok(true),
         Value::Word(w) if w.eq_ignore_ascii_case("false") => Ok(false),
         other => Err(LogoError::DoesntLike(String::from(name), other.clone())),
+    }
+}
+
+/// A file name input: it must be a word.
+fn file_name(value: &Value, name: &str) -> Result<String, LogoError> {
+    match value {
+        Value::Word(w) => Ok(w.clone()),
+        other => Err(bad(name, other)),
     }
 }
 
@@ -193,6 +203,53 @@ pub(crate) fn call<I: Io, C: Canvas>(
             }
         }
         "bye" => m.io.reboot(),
+        "save" => {
+            let file = file_name(&a[0], name)?;
+            let text = it.procedures_text();
+            let files =
+                m.io.files()
+                    .ok_or(LogoError::Disk(cartfs::Error::NoDevice))?;
+            files
+                .save(&file, cartfs::Kind::Logo, text.as_bytes())
+                .map_err(LogoError::Disk)?;
+        }
+        "erasefile" => {
+            let file = file_name(&a[0], name)?;
+            let files =
+                m.io.files()
+                    .ok_or(LogoError::Disk(cartfs::Error::NoDevice))?;
+            files
+                .delete(&file, cartfs::Kind::Logo)
+                .map_err(LogoError::Disk)?;
+        }
+        "load" => {
+            let file = file_name(&a[0], name)?;
+            let files =
+                m.io.files()
+                    .ok_or(LogoError::Disk(cartfs::Error::NoDevice))?;
+            let data = files
+                .load(&file, cartfs::Kind::Logo)
+                .map_err(LogoError::Disk)?;
+            let text = String::from_utf8_lossy(&data).into_owned();
+            it.load_text(m, &text)?;
+        }
+        "dir" => {
+            let files =
+                m.io.files()
+                    .ok_or(LogoError::Disk(cartfs::Error::NoDevice))?;
+            let entries = files.dir().map_err(LogoError::Disk)?;
+            let free = files.free_sectors().map_err(LogoError::Disk)?;
+            let mut text = String::new();
+            for e in entries {
+                let kind = match e.kind {
+                    cartfs::Kind::Basic => "BASIC",
+                    cartfs::Kind::Logo => "LOGO",
+                };
+                text.push_str(&format!("{:<16}  {:<5}  {:>6}\n", e.name, kind, e.len));
+            }
+            text.push_str(&format!("{free} BLOCKS FREE.\n"));
+            m.io.write_str(&text);
+        }
         ".engine" => match &a[0] {
             Value::Word(w) if w.eq_ignore_ascii_case("ast") => {
                 it.engine = crate::interp::Engine::Ast

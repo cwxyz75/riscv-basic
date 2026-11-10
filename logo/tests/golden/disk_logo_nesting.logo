@@ -1,0 +1,30 @@
+<DISK SECTORS 40>
+<FILE LOGO C1>
+load "c2
+<END FILE>
+<FILE LOGO C2>
+load "c3
+<END FILE>
+<FILE LOGO C3>
+load "c4
+<END FILE>
+<FILE LOGO C4>
+load "c5
+<END FILE>
+<FILE LOGO C5>
+load "c6
+<END FILE>
+<FILE LOGO C6>
+load "c7
+<END FILE>
+<FILE LOGO C7>
+load "c8
+<END FILE>
+<FILE LOGO C8>
+load "c9
+<END FILE>
+<FILE LOGO C9>
+print "deep
+<END FILE>
+load "c2
+load "c1

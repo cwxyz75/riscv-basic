@@ -17,6 +17,9 @@ use turtle::{Canvas, Turtle};
 /// Deepest procedure nesting before `Out of memory`.
 const MAX_DEPTH: usize = 400;
 
+/// Deepest nesting of `load` inside `load` before `Out of memory`.
+const MAX_LOAD_DEPTH: usize = 8;
+
 /// Why evaluation stopped early.
 #[derive(Debug)]
 pub(crate) enum Signal {
@@ -76,6 +79,7 @@ pub struct Interpreter {
     procedures: BTreeMap<String, Procedure>,
     globals: BTreeMap<String, Value>,
     frames: Vec<Frame>,
+    load_depth: usize,
     pub(crate) turtle: Turtle,
     pub(crate) rng: Rng,
 }
@@ -99,6 +103,7 @@ impl Interpreter {
             procedures: BTreeMap::new(),
             globals: BTreeMap::new(),
             frames: Vec::new(),
+            load_depth: 0,
             turtle: Turtle::new(),
             rng: Rng::new(),
         }
@@ -157,16 +162,7 @@ impl Interpreter {
         m: &mut Machine<I, C>,
         header: &[Token],
     ) -> Result<(), LogoError> {
-        let Some(Token::Word(name)) = header.get(1) else {
-            return Err(LogoError::NotEnoughInputs(String::from("to")));
-        };
-        let params = header[2..]
-            .iter()
-            .filter_map(|t| match t {
-                Token::Var(v) => Some(v.clone()),
-                _ => None,
-            })
-            .collect();
+        let (name, params) = Self::header(header)?;
         let mut body = Vec::new();
         loop {
             m.io.write_str("> ");
@@ -180,10 +176,93 @@ impl Interpreter {
                 Line::Break | Line::Eof => return Ok(()),
             }
         }
-        self.procedures
-            .insert(name.clone(), Procedure { params, body });
+        self.install(name, params, body);
+        Ok(())
+    }
+
+    /// The name and input names from a `to name :a :b` line.
+    fn header(header: &[Token]) -> Result<(String, Vec<String>), LogoError> {
+        let Some(Token::Word(name)) = header.get(1) else {
+            return Err(LogoError::NotEnoughInputs(String::from("to")));
+        };
+        let params = header[2..]
+            .iter()
+            .filter_map(|t| match t {
+                Token::Var(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok((name.clone(), params))
+    }
+
+    fn install(&mut self, name: String, params: Vec<String>, body: Vec<String>) {
+        self.procedures.insert(name, Procedure { params, body });
         // Inputs may have changed: anything compiled so far may have misread a call.
         self.jit_cache.clear();
+    }
+
+    /// Every procedure as source text, sorted by name (what `save` writes).
+    pub(crate) fn procedures_text(&self) -> String {
+        let mut text = String::new();
+        for (name, procedure) in &self.procedures {
+            text.push_str("to ");
+            text.push_str(name);
+            for param in &procedure.params {
+                text.push_str(" :");
+                text.push_str(param);
+            }
+            text.push('\n');
+            for line in &procedure.body {
+                text.push_str(line);
+                text.push('\n');
+            }
+            text.push_str("end\n");
+        }
+        text
+    }
+
+    /// Run the text of a file as if typed, without prompts (`load`).
+    pub(crate) fn load_text<I: Io, C: Canvas>(
+        &mut self,
+        m: &mut Machine<I, C>,
+        text: &str,
+    ) -> Result<(), Signal> {
+        if self.load_depth >= MAX_LOAD_DEPTH {
+            return Err(LogoError::OutOfMemory.into());
+        }
+        self.load_depth += 1;
+        let result = self.load_lines(m, text);
+        self.load_depth -= 1;
+        result
+    }
+
+    fn load_lines<I: Io, C: Canvas>(
+        &mut self,
+        m: &mut Machine<I, C>,
+        text: &str,
+    ) -> Result<(), Signal> {
+        let mut lines = text.lines();
+        while let Some(line) = lines.next() {
+            let tokens = lex(line)?;
+            if tokens.first() == Some(&Token::Word(String::from("to"))) {
+                let (name, params) = Self::header(&tokens)?;
+                let mut body = Vec::new();
+                let mut closed = false;
+                for body_line in lines.by_ref() {
+                    if body_line.trim().eq_ignore_ascii_case("end") {
+                        closed = true;
+                        break;
+                    }
+                    body.push(String::from(body_line));
+                }
+                if !closed {
+                    return Err(LogoError::MissingEnd.into());
+                }
+                self.install(name, params, body);
+            } else {
+                self.run_tokens(m, &tokens)?;
+            }
+        }
         Ok(())
     }
 

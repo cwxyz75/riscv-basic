@@ -1,0 +1,7 @@
+<DISK SECTORS 7>
+to p
+fd 1
+end
+save "a
+save "b
+dir

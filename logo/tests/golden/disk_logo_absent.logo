@@ -1,0 +1,5 @@
+<NO DISK>
+save "a
+load "a
+dir
+erasefile "a

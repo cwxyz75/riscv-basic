@@ -1,0 +1,5 @@
+<DISK ERROR>
+save "a
+load "a
+dir
+erasefile "a

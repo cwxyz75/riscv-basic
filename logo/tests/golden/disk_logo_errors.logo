@@ -1,0 +1,28 @@
+<DISK SECTORS 16>
+<FILE BASIC PROG>
+10 PRINT 1
+<END FILE>
+<FILE LOGO BAD>
+fd
+print "after
+<END FILE>
+<FILE LOGO OPEN>
+to unfinished
+fd 1
+<END FILE>
+<FILE LOGO SELF>
+load "self
+<END FILE>
+load "prog
+save "prog
+erasefile "prog
+load "nothere
+erasefile "nothere
+save "abcdefghijklmnopq
+save 5
+save
+load "bad
+load "open
+unfinished
+load "self
+dir

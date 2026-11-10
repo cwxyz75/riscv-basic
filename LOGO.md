@@ -317,6 +317,50 @@ interpreted. The AST and IR interpreters remain as oracles.
   `foreach` (they need procedures as values), only `run` and `repeat` take
   lists of instructions.
 
+## The disk: `save`, `load`, `dir`, `erasefile`
+
+The machine has one disk, shared with BASIC (format and limits: `DESIGN.md`,
+"The disk"); each file is tagged with the language that wrote it. These four are
+primitives like any other (so a procedure cannot be given one of these names).
+
+- **`save name`** (command): writes every defined procedure, sorted by name, as
+  its source text: `to name :input ...`, the body lines exactly as typed, then
+  `end`, each line ending in a newline. Variables, the turtle and the picture are
+  not saved. Saving over an existing LOGO file of that name replaces it; with no
+  procedures defined it saves an empty file. `name` must be a word (`save "shapes`).
+- **`load name`** (command): reads the file and runs its lines as if they had
+  been typed at the prompt, but without prompts or echo: a `to ... end` block
+  defines a procedure (replacing one of that name), any other line is run.
+  Comments (`;`) and blank lines are ignored. The first error stops the load and
+  is reported as usual; what was defined or run before it stays. A `to` with no
+  `end` before the end of the file is `Missing end` and defines nothing. A
+  file may itself `load` another; more than 8 loads nested is `Out of memory`
+  (so a file that loads itself ends). A BASIC file is an error (below).
+- **`dir`** (command): lists every file on the disk, both languages, in the same
+  layout as BASIC's `DIR`: name left-aligned in 16 columns, two spaces, the
+  language (`BASIC` or `LOGO`) left-aligned in 5, two spaces, the size in bytes
+  right-aligned in 6, then a last line `n BLOCKS FREE.`.
+- **`erasefile name`** (command): deletes the LOGO file `name`.
+
+Names follow BASIC's rules: 1 to 16 characters from `A-Z 0-9 . - _`,
+case-insensitive, shown upper-case.
+
+Disk errors, in the usual one-line form:
+
+| Message | When |
+|---|---|
+| `No disk attached` | the machine has no disk |
+| `Disk is not formatted` | there is a disk but no file system on it |
+| `Disk error` | a read or write failed, or the disk's structures are damaged |
+| `File not found` | `load` or `erasefile` of a name that does not exist |
+| `File is not a LOGO file` | the name exists but belongs to BASIC |
+| `Bad file name` | see Names |
+| `Disk full` | no free blocks, all 64 directory entries used, or a file over the size limit; the disk is left unchanged |
+| `Missing end` | see `load` |
+
+A name that is not a word is `save doesn't like 5 as input`, and a missing input
+is `Not enough inputs to save`, as for any primitive.
+
 ## Errors
 
 Classic LOGO wording, no line numbers:
