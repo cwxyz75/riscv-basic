@@ -16,6 +16,7 @@ help:
 
 test:
 	cargo test -p basic -p console -p turtle -p logo -p rv64
+	python3 scripts/verify_demo_images.py
 
 fmt:
 	cargo fmt --all

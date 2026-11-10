@@ -46,6 +46,20 @@ def monitor_command(port: int, command: str) -> None:
         time.sleep(1.0)
 
 
+ROOT = GOLDEN.parent.parent.parent
+
+
+def script_lines(name: str) -> list:
+    """The script's lines with `<LOAD path>` replaced by that file's lines."""
+    lines = []
+    for line in (GOLDEN / f"{name}.logo").read_text().splitlines():
+        if line.startswith("<LOAD ") and line.endswith(">"):
+            lines += (ROOT / line[6:-1]).read_text().splitlines()
+        else:
+            lines.append(line)
+    return lines
+
+
 def split_prompts(typed: list, expected: str) -> list:
     """Cut the hand-derived transcript into (prompt, output) per typed line."""
     prompts, in_definition = [], False
@@ -77,7 +91,7 @@ def with_echo(typed: list, expected: str, engine_lines: list) -> str:
 
 
 def run(kernel: str, name: str, engine: str, drawing: bool) -> tuple:
-    script = (GOLDEN / f"{name}.logo").read_text().splitlines()
+    script = script_lines(name)
     typed = script[1:] if drawing else script  # the `;canvas` comment is only for the host harness
     engine_lines = [] if engine == "jit" else ['.engine "ast']
     expected = with_echo(typed, (GOLDEN / f"{name}.out").read_text(), engine_lines)

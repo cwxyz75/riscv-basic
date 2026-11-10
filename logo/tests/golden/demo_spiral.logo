@@ -1,0 +1,4 @@
+;canvas 100 80
+<LOAD examples/logo/spiral.logo>
+ht
+spiral 2 91

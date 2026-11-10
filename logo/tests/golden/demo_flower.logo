@@ -1,0 +1,4 @@
+;canvas 80 80
+<LOAD examples/logo/squares.logo>
+ht
+flower 20

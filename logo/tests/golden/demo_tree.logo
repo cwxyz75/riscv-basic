@@ -1,0 +1,7 @@
+;canvas 100 100
+<LOAD examples/logo/tree.logo>
+ht
+pu
+setxy 0 -45
+pd
+tree 30

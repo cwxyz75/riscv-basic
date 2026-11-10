@@ -1,0 +1,10 @@
+to tree :size
+if :size < 4 [stop]
+fd :size
+lt 25
+tree :size * 0.7
+rt 50
+tree :size * 0.7
+lt 25
+bk :size
+end

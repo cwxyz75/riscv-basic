@@ -1,0 +1,6 @@
+to spiral :size :angle
+if :size > 30 [stop]
+fd :size
+rt :angle
+spiral :size + 2 :angle
+end
