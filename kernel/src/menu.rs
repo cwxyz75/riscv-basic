@@ -31,6 +31,7 @@ pub fn choose() -> Language {
                     match gfx::init() {
                         Ok(pixels) => {
                             gfx::draw_test_pattern(pixels);
+                            gfx::draw_turtle_square(pixels);
                             let _ = writeln!(
                                 out,
                                 "framebuffer: {}x{} test pattern drawn",

@@ -6,7 +6,9 @@ Usage: fb_test.py KERNEL_ELF
 Boots with `-device ramfb`, picks LOGO at the menu (the kernel then configures
 the framebuffer and draws a test pattern), and takes a screenshot through the
 QEMU monitor (`screendump`, which works with no window at all). The screenshot
-must be 640x480 and show the pattern: eight colour bars over a grey ramp.
+must be 640x480 and show the pattern: eight colour bars over a grey ramp, with a white turtle square (the first
+drawing by the turtle crate through the kernel's framebuffer canvas) drawn on
+top of the lower left part of the ramp.
 """
 import os
 import socket
@@ -92,6 +94,15 @@ def main() -> int:
                 for y in (0, 120, 239):
                     if at(x, y) != colour:
                         problems.append(f"bar {bar} at ({x},{y}): {at(x, y)}, expected {colour}")
+        # The turtle square covers columns 170..250, rows 340..420: white outline,
+        # and the ramp still showing through inside it.
+        for x, y in [(170, 340), (170, 380), (170, 420), (210, 340), (210, 420), (250, 340), (250, 380), (250, 420)]:
+            if at(x, y) != (255, 255, 255):
+                problems.append(f"turtle square edge at ({x},{y}): {at(x, y)}, expected white")
+        for x, y in [(171, 341), (210, 380), (249, 419), (169, 380), (251, 380), (210, 339), (210, 421)]:
+            grey = x * 255 // (WIDTH - 1)
+            if at(x, y) != (grey, grey, grey):
+                problems.append(f"next to the square at ({x},{y}): {at(x, y)}, expected ramp {(grey,) * 3}")
         for x in (0, 1, 100, 319, 320, 500, 638, 639):
             grey = x * 255 // (WIDTH - 1)
             for y in (240, 360, 479):

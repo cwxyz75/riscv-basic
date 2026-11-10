@@ -124,10 +124,10 @@ the kernel.
 Acceptance: host tests render turtle operations to a bitmap and compare against
 golden images; the same API draws in the QEMU window.
 
-- [ ] `Canvas` trait (pixel, line, fill, clear); a host backend that renders to an in-memory bitmap
-- [ ] Line rasteriser, pen colours, fill
-- [ ] Turtle state (position, heading, pen) with golden images
-- [ ] Kernel `Canvas` over the framebuffer
+- [x] `Canvas` trait (pixel, line, fill, clear); a host backend that renders to an in-memory bitmap
+- [x] Line rasteriser, pen colours, fill
+- [x] Turtle state (position, heading, pen) with golden images
+- [x] Kernel `Canvas` over the framebuffer (a turtle square drawn on screen, checked pixel by pixel in `fb_test.py`)
 
 ### L2: LOGO interpreter (reference semantics)
 

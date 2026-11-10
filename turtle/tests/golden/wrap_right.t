@@ -1,0 +1,7 @@
+canvas 8 4
+ht
+pu
+setxy 2 0
+pd
+seth 90
+fd 4

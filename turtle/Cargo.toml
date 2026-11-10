@@ -1,0 +1,8 @@
+[package]
+name = "turtle"
+version = "0.1.0"
+edition = "2021"
+description = "Turtle graphics for riscv-basic's LOGO: canvas trait, rasteriser, turtle. Pure, no hardware, tested on the host against golden images"
+
+[dependencies]
+libm = "0.2"

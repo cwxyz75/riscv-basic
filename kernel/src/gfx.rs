@@ -10,6 +10,7 @@
 //! device is absent and `init` reports an error.
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use turtle::{rgb, Canvas, Turtle};
 
 pub const WIDTH: usize = 640;
 pub const HEIGHT: usize = 480;
@@ -31,6 +32,76 @@ const DMA_WRITE: u32 = 1 << 4;
 #[repr(align(4096))]
 struct Framebuffer([u32; WIDTH * HEIGHT]);
 static mut FRAMEBUFFER: Framebuffer = Framebuffer([0; WIDTH * HEIGHT]);
+
+/// The palette index of every pixel, so the turtle can read the picture back
+/// (flood fill, sprite toggling). The framebuffer itself only holds colours.
+static mut INDICES: [u8; WIDTH * HEIGHT] = [0; WIDTH * HEIGHT];
+
+/// A turtle [`Canvas`] over the framebuffer: palette indices are kept in
+/// `INDICES` and the matching colour is written to the screen.
+pub struct FbCanvas {
+    pixels: &'static mut [u32],
+    indices: &'static mut [u8],
+}
+
+impl FbCanvas {
+    /// Wrap the framebuffer `pixels` returned by [`init`]. Call once.
+    pub fn new(pixels: &'static mut [u32]) -> Self {
+        // SAFETY: `INDICES` is private and, after this, reachable only through
+        // the slice held by the one `FbCanvas`; it is created once per boot.
+        let indices: &'static mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(addr_of_mut!(INDICES).cast::<u8>(), WIDTH * HEIGHT)
+        };
+        FbCanvas { pixels, indices }
+    }
+}
+
+impl Canvas for FbCanvas {
+    fn width(&self) -> i32 {
+        WIDTH as i32
+    }
+
+    fn height(&self) -> i32 {
+        HEIGHT as i32
+    }
+
+    fn pixel(&self, x: i32, y: i32) -> u8 {
+        if x < 0 || y < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 {
+            return 0;
+        }
+        self.indices[y as usize * WIDTH + x as usize]
+    }
+
+    fn set_pixel(&mut self, x: i32, y: i32, color: u8) {
+        if x >= 0 && y >= 0 && x < WIDTH as i32 && y < HEIGHT as i32 {
+            let i = y as usize * WIDTH + x as usize;
+            self.indices[i] = color & 0x0F;
+            self.pixels[i] = rgb(color);
+        }
+    }
+
+    fn clear(&mut self, color: u8) {
+        self.indices.fill(color & 0x0F);
+        self.pixels.fill(rgb(color));
+    }
+}
+
+/// Draw a white 80-pixel turtle square, with its lower-left corner at logo point
+/// (-150, -100), on top of whatever is on the screen: the first proof that the
+/// turtle can draw in the window (checked by `scripts/fb_test.py`).
+pub fn draw_turtle_square(pixels: &'static mut [u32]) {
+    let mut canvas = FbCanvas::new(pixels);
+    let mut turtle = Turtle::new();
+    turtle.hide(&mut canvas);
+    turtle.pen_up();
+    turtle.set_xy(&mut canvas, -150.0, -100.0);
+    turtle.pen_down();
+    turtle.set_heading(&mut canvas, 90.0);
+    for _ in 0..4 {
+        turtle.forward(&mut canvas, 80.0);
+        turtle.right(&mut canvas, 90.0);
+    }
+}
 
 /// The `etc/ramfb` configuration block (all fields big-endian). It must be
 /// exactly 28 bytes, as the device's file is, so it is packed (plain `repr(C)`

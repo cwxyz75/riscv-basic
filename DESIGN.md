@@ -61,6 +61,11 @@ strings and arrays. Not yet decided; see D10.
 - **`console`**: the pure, hardware-free half of the console: the line editor
   (a byte-at-a-time state machine) and the ANSI escape helpers. `no_std`,
   `forbid(unsafe_code)`, unit-tested on the host.
+- **`turtle`**: turtle graphics for LOGO: a `Canvas` trait, a Bresenham
+  rasteriser and flood fill, an in-memory `Bitmap` for tests, and the `Turtle`
+  (position, heading, pen, wrap at the edges, an XOR sprite). `no_std`,
+  `forbid(unsafe_code)`, tested on the host against golden images; the kernel
+  supplies a `Canvas` over the framebuffer.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
 
@@ -97,6 +102,10 @@ What worked and what bit us:
   writes a PPM of the current screen, and `scripts/fb_test.py` checks colour bars
   and a grey ramp pixel by pixel. `make run-logo` opens a real window; press `2`
   at the menu to draw the test pattern.
+
+The turtle crate draws through a `Canvas` of palette indices; the kernel's
+`FbCanvas` keeps the indices in a shadow array (so fill and the XOR sprite can
+read the picture back) and writes the palette colour to the framebuffer.
 
 ## Interpreter shape (proposed)
 
