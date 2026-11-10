@@ -22,12 +22,15 @@ import time
 
 def boot(
     kernel: str,
-    stdin_data: bytes = b"",
+    stdin_data=b"",
     timeout: float = 10.0,
     qemu: str = "qemu-system-riscv64",
     wait_for: str = "",
 ):
     """Boot `kernel`, send `stdin_data` to the serial port, return (text, timed_out, returncode).
+
+    `stdin_data` is either bytes, or a list of (bytes, pause_seconds) steps sent
+    one after another with a pause after each (to let time pass between inputs).
 
     If `wait_for` is given, the input is sent only once that text has appeared in
     the output (so it is not typed into a machine that is still booting, where
@@ -59,12 +62,18 @@ def boot(
     marker = wait_for.encode()
     while marker and marker not in captured and proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
-    if proc.poll() is None:
+    steps = [(stdin_data, 0.0)] if isinstance(stdin_data, (bytes, bytearray)) else list(stdin_data)
+    for chunk, pause in steps:
+        if proc.poll() is not None:
+            break
         try:
-            proc.stdin.write(stdin_data)
+            proc.stdin.write(chunk)
             proc.stdin.flush()
         except BrokenPipeError:
-            pass
+            break
+        end = time.monotonic() + pause
+        while time.monotonic() < end and proc.poll() is None:
+            time.sleep(0.02)
     timed_out = False
     while proc.poll() is None:
         if time.monotonic() >= deadline:

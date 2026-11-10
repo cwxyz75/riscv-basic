@@ -7,12 +7,17 @@
 #![no_std]
 #![no_main]
 
+mod cpu;
+mod sbi;
 mod terminal;
+mod timer;
+mod trap;
 mod uart;
 
 use console::ansi;
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
+use core::hint::black_box;
 use core::panic::PanicInfo;
 use terminal::{Console, Input, Line};
 
@@ -40,34 +45,19 @@ _start:
 "#
 );
 
-/// Ask OpenSBI to power the machine off (System Reset extension, "SRST").
-fn shutdown() -> ! {
-    const EID_SRST: usize = 0x5352_5354;
-    const FID_SYSTEM_RESET: usize = 0;
-    const RESET_TYPE_SHUTDOWN: usize = 0;
-    const RESET_REASON_NONE: usize = 0;
-    // SAFETY: `ecall` from S-mode traps into OpenSBI, which implements the
-    // SRST extension. Arguments follow the SBI calling convention.
-    unsafe {
-        asm!(
-            "ecall",
-            in("a7") EID_SRST,
-            in("a6") FID_SYSTEM_RESET,
-            inout("a0") RESET_TYPE_SHUTDOWN => _,
-            inout("a1") RESET_REASON_NONE => _,
-        );
-    }
-    loop {
-        // SAFETY: wfi just idles the hart until the next interrupt.
-        unsafe { asm!("wfi") }
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
+    // Before anything can use floating point (or take a trap).
+    cpu::enable_fpu();
+    trap::init();
     uart::init();
     let mut out = Console;
     let _ = writeln!(out, "riscv-basic: hello from S-mode (hart {hart_id})");
+    let product = black_box(1.5_f64) * black_box(2.0_f64);
+    let _ = writeln!(out, "fpu: 1.5 * 2 = {product}");
+    timer::init();
+    cpu::enable_interrupts();
+
     let _ = ansi::color(&mut out, 2, None);
     let _ = write!(out, "console ready; type a line, or `exit` to power off");
     let _ = ansi::reset(&mut out);
@@ -80,9 +70,28 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
         match input.read_line() {
             Line::Text(text) => {
                 let _ = writeln!(out, "you typed: [{text}] ({} chars)", text.len());
-                if text == "exit" {
-                    let _ = writeln!(out, "bye");
-                    shutdown();
+                match text {
+                    "exit" => {
+                        let _ = writeln!(out, "bye");
+                        sbi::shutdown();
+                    }
+                    "ticks" => {
+                        let _ = writeln!(out, "ticks={} ms={}", timer::ticks(), timer::millis());
+                    }
+                    "crash" => {
+                        // SAFETY: deliberately executes the architecturally
+                        // illegal `unimp` instruction to exercise the trap
+                        // handler; it reports the fault and powers off.
+                        unsafe { asm!("unimp") };
+                    }
+                    "badload" => {
+                        // SAFETY: deliberately reads an address with nothing
+                        // mapped behind it, to provoke a load access fault
+                        // whose `stval` is that address; the trap handler
+                        // reports it and powers off.
+                        let _ = unsafe { core::ptr::read_volatile(0x1234_5678 as *const u8) };
+                    }
+                    _ => {}
                 }
             }
             Line::Break => {
@@ -96,5 +105,5 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     let mut console = Console;
     let _ = writeln!(console, "\nKERNEL PANIC: {info}");
-    shutdown()
+    sbi::shutdown()
 }
