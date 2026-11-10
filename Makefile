@@ -14,7 +14,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p basic
+	cargo test -p basic -p console
 
 fmt:
 	cargo fmt --all
@@ -23,7 +23,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p basic --all-targets -- -D warnings
+	cargo clippy -p basic -p console --all-targets -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
 
 kernel:
@@ -36,6 +36,6 @@ debug: kernel
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) -s -S
 
 boot-test: kernel
-	python3 scripts/boot_test.py $(KERNEL_ELF) --expect "hello from S-mode"
+	python3 scripts/console_test.py $(KERNEL_ELF)
 
 check: fmt-check test lint boot-test

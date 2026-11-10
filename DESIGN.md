@@ -55,14 +55,20 @@ strings and arrays. Not yet decided; see D10.
   hardware knowledge. Its only window to the machine is the `Io` trait
   (`write_str`, `read_line`, `break_pressed`, `millis`, later screen and
   PEEK/POKE primitives). Tests implement `Io` with in-memory buffers.
+- **`console`**: the pure, hardware-free half of the console: the line editor
+  (a byte-at-a-time state machine) and the ANSI escape helpers. `no_std`,
+  `forbid(unsafe_code)`, unit-tested on the host.
 - **`kernel`**: everything hardware. Implements `Io` over the UART, owns line
   editing, traps, timer, allocator, shutdown.
 
 ## Console model
 
-The serial terminal is the monitor. The kernel's line editor owns echo,
-backspace (`0x7f`/`0x08`), Ctrl-U, and Ctrl-C (which becomes `Line::Break`);
-the interpreter only ever sees finished lines. Screen commands (`CLS`, `COLOR`,
+The serial terminal is the monitor. The line editor (logic in the `console`
+crate, driven by the kernel over the UART) owns echo, backspace (`0x7f`/`0x08`,
+echoed as `BS SP BS`), Ctrl-U, and Ctrl-C (echoed as `^C`, becoming
+`Line::Break`); it also swallows arrow-key escape sequences, ignores non-ASCII
+bytes, treats CR LF as one Enter, and holds at most 255 characters. The
+interpreter only ever sees finished lines. Screen commands (`CLS`, `COLOR`,
 `LOCATE`) become `Io` methods whose default implementations emit ANSI escapes.
 
 ## Interpreter shape (proposed)
@@ -105,3 +111,4 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D11 | Makefile (not `just`/`xtask`) to keep prerequisites minimal | Decided |
 | D12 | `PEEK`/`POKE` are raw and unrestricted, reaching any physical address through `Io`; a fault is a kernel crash (authentic, and no safety window to design) | Decided |
 | D13 | Language semantics settled in `BASIC.md`: full-length variable names, left-associative `^`, 32-bit logical operators, no `ELSE`, 14-column `PRINT` zones, `TIMER`, 255-char lines, 9-significant-digit number output | Decided |
+| D14 | Line editing lives in a separate pure `console` crate (host-testable), not in the kernel; the kernel only moves bytes between the UART and it | Decided |

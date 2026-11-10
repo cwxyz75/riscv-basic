@@ -28,9 +28,9 @@ Acceptance: `make boot-test` passes locally and in CI. QEMU prints
 Acceptance: a scripted boot test types a line (including a backspace) and sees
 it echoed correctly.
 
-- [ ] UART receive (polling, line-status register) and a proper init
-- [ ] Line editor: echo, backspace, Ctrl-U, Ctrl-C returns `Line::Break`
-- [ ] ANSI helpers (clear screen, colour, cursor position)
+- [x] UART receive (polling, line-status register) and a proper init
+- [x] Line editor: echo, backspace, Ctrl-U, Ctrl-C returns `Line::Break`
+- [x] ANSI helpers (clear screen, colour, cursor position)
 
 ## M2: Traps and timer
 

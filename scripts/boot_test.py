@@ -1,17 +1,94 @@
 #!/usr/bin/env python3
 """Boot the kernel in QEMU non-interactively and check the serial output.
 
-Usage:
+Command line:
     boot_test.py KERNEL_ELF --expect "text" [--expect "more"] [--stdin FILE] [--timeout 10]
 
 Exit status 0 if every --expect string appears in the output, 1 otherwise.
 QEMU is killed after --timeout seconds if it has not exited on its own (the
 kernel shuts down via SBI when it has nothing left to do, but an interactive
 BASIC session never will, so a timeout is a normal way for a test to end).
+
+As a module (see console_test.py), `boot()` runs QEMU with bytes on the serial
+port and `check()` reports missing strings. Output is compared with CRLF
+normalised to LF.
 """
 import argparse
 import subprocess
 import sys
+import threading
+import time
+
+
+def boot(
+    kernel: str,
+    stdin_data: bytes = b"",
+    timeout: float = 10.0,
+    qemu: str = "qemu-system-riscv64",
+    wait_for: str = "",
+):
+    """Boot `kernel`, send `stdin_data` to the serial port, return (text, timed_out, returncode).
+
+    If `wait_for` is given, the input is sent only once that text has appeared in
+    the output (so it is not typed into a machine that is still booting, where
+    the firmware may swallow it); otherwise it is sent immediately.
+    """
+    cmd = [
+        qemu,
+        "-machine", "virt",
+        "-bios", "default",
+        "-display", "none",
+        "-serial", "stdio",
+        "-monitor", "none",
+        "-kernel", kernel,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    captured = bytearray()
+
+    def reader():
+        while True:
+            chunk = proc.stdout.read1(4096)
+            if not chunk:
+                return
+            captured.extend(chunk)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + timeout
+    marker = wait_for.encode()
+    while marker and marker not in captured and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if proc.poll() is None:
+        try:
+            proc.stdin.write(stdin_data)
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass
+    timed_out = False
+    while proc.poll() is None:
+        if time.monotonic() >= deadline:
+            timed_out = True
+            proc.kill()
+            break
+        time.sleep(0.02)
+    proc.wait()
+    thread.join(timeout=2)
+    text = bytes(captured).decode("utf-8", errors="replace").replace("\r\n", "\n")
+    return text, timed_out, proc.returncode
+
+
+def check(text: str, expects: list, timed_out: bool, returncode) -> int:
+    """Print a verdict; return 0 if every expected string is in `text`, else 1."""
+    missing = [e for e in expects if e not in text]
+    if missing:
+        print("boot test FAILED; missing:", missing, file=sys.stderr)
+        print("timed out:", timed_out, "| exit status:", returncode, file=sys.stderr)
+        print("--- captured output ---", file=sys.stderr)
+        print(text, file=sys.stderr)
+        return 1
+    print("boot test passed" + (" (QEMU killed at timeout)" if timed_out else ""))
+    return 0
 
 
 def main() -> int:
@@ -28,34 +105,8 @@ def main() -> int:
         with open(args.stdin, "rb") as f:
             stdin_data = f.read()
 
-    cmd = [
-        args.qemu,
-        "-machine", "virt",
-        "-bios", "default",
-        "-display", "none",
-        "-serial", "stdio",
-        "-monitor", "none",
-        "-kernel", args.kernel,
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    timed_out = False
-    try:
-        out, _ = proc.communicate(input=stdin_data, timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
-        out, _ = proc.communicate()
-
-    text = out.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    missing = [e for e in args.expect if e not in text]
-    if missing:
-        print("boot test FAILED; missing:", missing, file=sys.stderr)
-        print("timed out:", timed_out, "| exit status:", proc.returncode, file=sys.stderr)
-        print("--- captured output ---", file=sys.stderr)
-        print(text, file=sys.stderr)
-        return 1
-    print("boot test passed" + (" (QEMU killed at timeout)" if timed_out else ""))
-    return 0
+    text, timed_out, returncode = boot(args.kernel, stdin_data, args.timeout, args.qemu)
+    return check(text, args.expect, timed_out, returncode)
 
 
 if __name__ == "__main__":
