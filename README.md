@@ -16,7 +16,8 @@ RUN
 ```
 
 **Status:** the interpreter core (M3) works on the host and the kernel boots to
-a line-edited serial console (M0, M1). Wiring them together is next. See
+a line-edited serial console with traps, a timer and the FPU working
+(M0 to M2). Wiring them together is next. See
 [ROADMAP.md](ROADMAP.md).
 
 ## Prerequisites (macOS)

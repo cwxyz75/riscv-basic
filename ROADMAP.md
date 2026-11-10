@@ -37,9 +37,9 @@ it echoed correctly.
 Acceptance: a deliberate fault prints `scause`/`sepc`/`stval` and shuts down; a
 tick counter advances.
 
-- [ ] Trap vector (`stvec`) and a handler that reports the cause
-- [ ] Timer through the SBI TIME extension; `millis()` source
-- [ ] Enable the FPU (`sstatus.FS`)
+- [x] Trap vector (`stvec`) and a handler that reports the cause
+- [x] Timer through the SBI TIME extension; `millis()` source
+- [x] Enable the FPU (`sstatus.FS`)
 
 ## M3: Interpreter core (host-first)
 
