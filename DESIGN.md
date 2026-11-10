@@ -58,8 +58,8 @@ strings and arrays. Not yet decided; see D10.
 
 - **`basic`**: the interpreter. `no_std` + `alloc`, `forbid(unsafe_code)`, no
   hardware knowledge. Its only window to the machine is the `Io` trait
-  (`write_str`, `read_line`, `break_pressed`, `millis`, later screen and
-  PEEK/POKE primitives). Tests implement `Io` with in-memory buffers.
+  (`write_str`, `read_line`, `break_pressed`, `millis`, screen and PEEK/POKE
+  primitives, and `files()`, the disk, as a `cartfs::Files`). Tests implement `Io` with in-memory buffers.
 - **`cartfs`**: the disk format behind `SAVE`/`LOAD` (see "The disk"): header,
   free-sector map, fixed directory and chained sectors over a `BlockDevice`
   trait, with an in-memory disk for tests. `no_std`, `forbid(unsafe_code)`.
@@ -106,7 +106,7 @@ entry         name[16] NUL padded | kind u8 (0 free, 1 BASIC, 2 LOGO) | 0 |
 ```
 
 The standard disk is 2 MiB (4096 sectors, about 2 MB of payload; at most 4096
-sectors because the map is one sector). A file is at most 64 KiB. Names are 1-16
+sectors because the map is one sector). A file is at most 128 KiB. Names are 1-16
 characters from `A-Z 0-9 . - _`, case-insensitive, stored upper-case. Files
 are plain text: BASIC saves its `LIST` output, LOGO the text of its procedure
 definitions. Saving over an existing name of the same kind replaces it (in

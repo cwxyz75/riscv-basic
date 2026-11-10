@@ -121,14 +121,63 @@ range is `?ILLEGAL QUANTITY ERROR`.
 
 ## Commands (immediate mode)
 
-`RUN [line]`, `LIST [from][-[to]]`, `NEW`, `BYE`. `SAVE`/`LOAD`/`DIR` arrive
-only if the persistence milestone happens.
+`RUN [line]`, `LIST [from][-[to]]`, `NEW`, `BYE`, and the disk commands
+`SAVE`, `LOAD`, `DIR`, `SCRATCH` below.
 
 **`BYE`** leaves BASIC by rebooting the machine: everything, program included,
 is lost, and the boot menu appears so another language can be chosen. It takes
 no arguments (`BYE 5` is `?SYNTAX ERROR`) and also works inside a program, where
 it ends the program (on the real machine nothing after it runs). `BYE` is a
 reserved word like any other keyword, so a variable name cannot contain it.
+
+## The disk: `SAVE`, `LOAD`, `DIR`, `SCRATCH`
+
+The machine has one disk, shared with LOGO (format and limits: `DESIGN.md`,
+"The disk"). Each file is tagged with the language that wrote it. These are
+ordinary statements (they also work inside a program) and each takes no
+arguments beyond those shown; extra text is `?SYNTAX ERROR`. All four are
+reserved words, so a variable name cannot contain `SAVE`, `LOAD`, `DIR` or
+`SCRATCH` (`DIRECTION` is `DIR` `ECTION`; the same trap as `TOTAL`).
+
+- **`SAVE name`**: stores the program as text, exactly what `LIST` prints (one
+  `number text` line per program line, each ending in a newline). `name` is a
+  string expression (`SAVE "HELLO"`, `SAVE N$`). Saving over an existing BASIC
+  file of that name replaces it. An empty program saves an empty file.
+- **`LOAD name`**: replaces the program with the file's. The text is entered
+  line by line as if typed, so lines are tokenized and a line with a bad body
+  is an error. Blank lines are ignored. Any line that does not start with a
+  line number is `?SYNTAX ERROR`, and a program too large for the program area
+  is `?OUT OF MEMORY ERROR`; in either case the old program is left exactly as
+  it was. `LOAD` does not run the program; as `RUN` does, it clears variables,
+  pending `GOSUB`/`FOR` state and the `DATA` pointer. Inside a running
+  program `LOAD` ends that program (as `NEW` does), leaving the new one loaded.
+- **`DIR`**: lists every file on the disk, both languages, sorted by name, one
+  per line: the name left-aligned in 16 columns, two spaces, the language
+  (`BASIC` or `LOGO`) left-aligned in 5 columns, two spaces, and the size in
+  bytes right-aligned in 6 columns. Then a last line `n BLOCKS FREE.`, where a
+  block is a 512-byte disk sector (510 bytes of text). An empty disk prints
+  only that line.
+- **`SCRATCH name`**: deletes the BASIC file `name`.
+
+**Names**: 1 to 16 characters from `A-Z`, `0-9`, `.`, `-`, `_`, case-insensitive
+(shown upper-case). Anything else, an empty name or a longer one is `?BAD FILE
+NAME ERROR`. A string longer than 255 is still `?STRING TOO LONG ERROR`, and a
+number is `?TYPE MISMATCH ERROR`, as everywhere.
+
+**Disk errors** (each reported as `?<NAME> ERROR`, with `IN <line>` in a program):
+
+| Name | When |
+|---|---|
+| `DEVICE NOT PRESENT` | the machine has no disk attached |
+| `DISK NOT FORMATTED` | there is a disk but it holds no file system |
+| `DISK ERROR` | the disk failed to read or write, or its structures are damaged |
+| `FILE NOT FOUND` | `LOAD` or `SCRATCH` of a name that does not exist |
+| `FILE TYPE MISMATCH` | the name exists but belongs to the other language |
+| `DISK FULL` | no free blocks, all 64 directory entries used, or a file over the size limit; the disk is left unchanged |
+| `BAD FILE NAME` | see Names |
+
+Saved files survive `BYE`, power-off and a restart of the emulator, as long as
+the same disk image is attached.
 
 ## Functions
 

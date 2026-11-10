@@ -27,7 +27,7 @@ pub const MAGIC: &[u8; 8] = b"RVDISK01";
 pub const MAX_SECTORS: u32 = 4096;
 pub const DIR_ENTRIES: usize = 64;
 pub const NAME_MAX: usize = 16;
-pub const MAX_FILE: usize = 65536;
+pub const MAX_FILE: usize = 131072;
 const ENTRY: usize = 32;
 const FIRST_DIR: u32 = 2;
 const DIR_SECTORS: u32 = (DIR_ENTRIES * ENTRY / SECTOR) as u32;
@@ -59,6 +59,8 @@ impl Kind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The machine has no disk attached (never produced by [`Disk`] itself).
+    NoDevice,
     /// The device failed a read or write.
     Device,
     /// No valid header: the disk was never formatted (or is not ours).
@@ -110,6 +112,56 @@ impl BlockDevice for MemDisk {
         let dst = self.bytes.get_mut(at..at + SECTOR).ok_or(Error::Device)?;
         dst.copy_from_slice(buf);
         Ok(())
+    }
+}
+
+/// What the interpreters need from a disk. [`Disk`] implements it; so does
+/// [`Unavailable`], which stands in when there is no usable disk.
+pub trait Files {
+    fn save(&mut self, name: &str, kind: Kind, data: &[u8]) -> Result<(), Error>;
+    fn load(&mut self, name: &str, kind: Kind) -> Result<Vec<u8>, Error>;
+    fn delete(&mut self, name: &str, kind: Kind) -> Result<(), Error>;
+    fn dir(&mut self) -> Result<Vec<DirEntry>, Error>;
+    fn free_sectors(&mut self) -> Result<u32, Error>;
+}
+
+/// A disk that is not there (or not formatted): every operation fails with the
+/// given error.
+pub struct Unavailable(pub Error);
+
+impl Files for Unavailable {
+    fn save(&mut self, _: &str, _: Kind, _: &[u8]) -> Result<(), Error> {
+        Err(self.0)
+    }
+    fn load(&mut self, _: &str, _: Kind) -> Result<Vec<u8>, Error> {
+        Err(self.0)
+    }
+    fn delete(&mut self, _: &str, _: Kind) -> Result<(), Error> {
+        Err(self.0)
+    }
+    fn dir(&mut self) -> Result<Vec<DirEntry>, Error> {
+        Err(self.0)
+    }
+    fn free_sectors(&mut self) -> Result<u32, Error> {
+        Err(self.0)
+    }
+}
+
+impl<D: BlockDevice> Files for Disk<D> {
+    fn save(&mut self, name: &str, kind: Kind, data: &[u8]) -> Result<(), Error> {
+        Disk::save(self, name, kind, data)
+    }
+    fn load(&mut self, name: &str, kind: Kind) -> Result<Vec<u8>, Error> {
+        Disk::load(self, name, kind)
+    }
+    fn delete(&mut self, name: &str, kind: Kind) -> Result<(), Error> {
+        Disk::delete(self, name, kind)
+    }
+    fn dir(&mut self) -> Result<Vec<DirEntry>, Error> {
+        Disk::dir(self)
+    }
+    fn free_sectors(&mut self) -> Result<u32, Error> {
+        Disk::free_sectors(self)
     }
 }
 

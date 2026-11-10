@@ -91,7 +91,7 @@ in between; the image is also checked from the host.
 
 - [x] Choose pflash "cartridge" or virtio-blk (virtio-blk, D21)
 - [x] `cartfs`: the disk format as a pure crate, host-tested (M7a)
-- [ ] BASIC `SAVE`, `LOAD`, `DIR`, `SCRATCH` (M7b)
+- [x] BASIC `SAVE`, `LOAD`, `DIR`, `SCRATCH` (M7b; host goldens against an in-memory disk; the machine has no disk until M7d)
 - [ ] LOGO `save`, `load`, `dir`, `erasefile` (M7c)
 - [ ] Kernel virtio-blk driver, `make` creates `disk.img`, persistence boot tests (M7d)
 

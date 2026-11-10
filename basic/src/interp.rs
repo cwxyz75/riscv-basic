@@ -185,16 +185,7 @@ impl Interpreter {
     /// `line` starts with a digit: store it, replace an existing line, or
     /// (number alone) delete.
     fn enter_program_line(&mut self, line: &str) -> Result<(), Error> {
-        let digits_end = line
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(line.len());
-        let number = parse_line_number(&line[..digits_end])?;
-        let body = line[digits_end..].trim_start_matches([' ', '\t']);
-        if body.is_empty() {
-            self.program.delete(number);
-        } else {
-            self.program.set(number, tokenize(body)?)?;
-        }
+        enter_line(&mut self.program, line)?;
         self.mem.set_program_free(self.program.bytes_free());
         Ok(())
     }
@@ -362,6 +353,14 @@ impl Interpreter {
                 let args = &tokens[*pos..end];
                 *pos = end;
                 self.stmt_list(io, args)?;
+                Ok(Flow::Next)
+            }
+            Some("SAVE") => self.stmt_save(io, tokens, pos),
+            Some("LOAD") => self.stmt_load(io, tokens, pos),
+            Some("SCRATCH") => self.stmt_scratch(io, tokens, pos),
+            Some("DIR") => {
+                end_of_statement(tokens, pos)?;
+                self.stmt_dir(io)?;
                 Ok(Flow::Next)
             }
             Some("NEW") => {
@@ -902,6 +901,101 @@ impl Interpreter {
         })
     }
 
+    /// The file name operand of `SAVE`, `LOAD` and `SCRATCH`: a string
+    /// expression that ends the statement.
+    fn file_name<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<String, Error> {
+        let (value, end) = evaluate(tokens, *pos, &mut self.mem, io)?;
+        *pos = end;
+        end_of_statement(tokens, pos)?;
+        value.string()
+    }
+
+    /// `SAVE name`: the program as `LIST` prints it.
+    fn stmt_save<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let name = self.file_name(io, tokens, pos)?;
+        let text: String = self
+            .program
+            .range(0, u16::MAX)
+            .map(|(number, tokens)| format!("{number} {}\n", detokenize(tokens)))
+            .collect();
+        let files = io.files().ok_or(Error::DeviceNotPresent)?;
+        files.save(&name, cartfs::Kind::Basic, text.as_bytes())?;
+        Ok(Flow::Next)
+    }
+
+    /// `LOAD name`: replace the program with the file's lines, or change
+    /// nothing if any of them is bad.
+    fn stmt_load<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let name = self.file_name(io, tokens, pos)?;
+        let files = io.files().ok_or(Error::DeviceNotPresent)?;
+        let data = files.load(&name, cartfs::Kind::Basic)?;
+        let text = String::from_utf8(data).map_err(|_| Error::Syntax)?;
+        let mut program = Program::default();
+        for line in text.lines() {
+            let line = line.trim_start_matches([' ', '\t']);
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with(|c: char| c.is_ascii_digit()) {
+                return Err(Error::Syntax);
+            }
+            enter_line(&mut program, line)?;
+        }
+        self.program = program;
+        self.mem.set_program_free(self.program.bytes_free());
+        self.mem.clear_variables();
+        self.loops.clear();
+        self.gosubs.clear();
+        self.data = None;
+        Ok(Flow::End)
+    }
+
+    /// `SCRATCH name`.
+    fn stmt_scratch<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let name = self.file_name(io, tokens, pos)?;
+        let files = io.files().ok_or(Error::DeviceNotPresent)?;
+        files.delete(&name, cartfs::Kind::Basic)?;
+        Ok(Flow::Next)
+    }
+
+    /// `DIR`: every file, sorted, then the free block count.
+    fn stmt_dir<I: Io>(&mut self, io: &mut I) -> Result<(), Error> {
+        let files = io.files().ok_or(Error::DeviceNotPresent)?;
+        let entries = files.dir()?;
+        let free = files.free_sectors()?;
+        let mut text = String::new();
+        for e in entries {
+            let kind = match e.kind {
+                cartfs::Kind::Basic => "BASIC",
+                cartfs::Kind::Logo => "LOGO",
+            };
+            text.push_str(&format!("{:<16}  {:<5}  {:>6}\n", e.name, kind, e.len));
+        }
+        text.push_str(&format!("{free} BLOCKS FREE.\n"));
+        self.emit(io, &text);
+        Ok(())
+    }
+
     /// `LIST [from][-[to]]`; `args` is the tokenized text after the keyword.
     fn stmt_list<I: Io>(&mut self, io: &mut I, args: &[u8]) -> Result<(), Error> {
         let (from, to) = parse_range(&detokenize(args))?;
@@ -915,6 +1009,21 @@ impl Interpreter {
         }
         Ok(())
     }
+}
+
+/// Store, replace or delete one numbered line (`line` starts with a digit).
+fn enter_line(program: &mut Program, line: &str) -> Result<(), Error> {
+    let digits_end = line
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(line.len());
+    let number = parse_line_number(&line[..digits_end])?;
+    let body = line[digits_end..].trim_start_matches([' ', '\t']);
+    if body.is_empty() {
+        program.delete(number);
+    } else {
+        program.set(number, tokenize(body)?)?;
+    }
+    Ok(())
 }
 
 fn is_blank(bytes: &[u8]) -> bool {
