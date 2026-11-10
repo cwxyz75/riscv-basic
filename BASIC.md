@@ -32,9 +32,11 @@ READY.
 
 - Two types: number (`f64`) and string (name ends in `$`). No integer type.
 - Names: a letter followed by letters and digits; **all characters are
-  significant** (unlike classic MS BASIC's first two). How names that contain
-  a keyword are tokenized (`TOTAL` contains `TO`) is **(open)**: classic BASIC
-  splits it, which is a notorious trap; settle before writing the tokenizer.
+  significant** (unlike classic MS BASIC's first two). Keywords are
+  recognised anywhere in a name, as in classic BASIC: the tokenizer scans left
+  to right and takes the first keyword it finds, so `TOTAL` is `TO` followed by
+  `TAL`, and `SCORE` is `SC` `OR` `E`. Program authors must avoid keywords
+  inside names. This is deliberate (authenticity) and a known trap.
 - Unset numbers are `0`, unset strings are `""`.
 - Arrays: `DIM A(10)`, `DIM N$(5,5)`; subscripts run `0` to the declared bound.
   Using an undeclared array implicitly dimensions it to 10. Up to 3 dimensions.
