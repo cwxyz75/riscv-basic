@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod cpu;
+mod gfx;
 mod heap;
 mod io;
 mod menu;

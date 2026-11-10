@@ -49,7 +49,9 @@ def main() -> int:
         text,
         [
             "Choose a language:\n  1) BASIC\n  2) LOGO\nYour choice: ",
-            "Your choice: 2\nLOGO is not installed yet.\nYour choice: 1\nRISCV BASIC V0.1",
+            # Without `-device ramfb` the LOGO path says so before "not installed".
+            "Your choice: 2\nframebuffer: no ramfb device (start QEMU with -device ramfb)\n"
+            "LOGO is not installed yet.\nYour choice: 1\nRISCV BASIC V0.1",
             "PRINT 6*7\n 42 \nREADY.",
             "BYE\n",
             "PRINT 8*9\n 72 \nREADY.",
