@@ -10,8 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "console"
+version = "0.1.0"
+
+[[package]]
 name = "kernel"
 version = "0.1.0"
+dependencies = [
+ "console",
+]
 
 [[package]]
 name = "libm"

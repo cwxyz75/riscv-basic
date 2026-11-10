@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Bare-metal RISC-V (S-mode) host for the BASIC interpreter on QEMU virt"
 
-# M0 is standalone. The `basic` dependency (and a global allocator) arrive at
-# the integration milestone; see ROADMAP.md.
+# The `basic` dependency (and a global allocator) arrive at the integration
+# milestone; see ROADMAP.md.
 [dependencies]
+console = { path = "../console" }

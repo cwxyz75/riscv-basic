@@ -6,7 +6,7 @@ Project: a toy 80s-style BASIC computer for QEMU RISC-V (`virt`), in Rust. Read
 
 ## Commands
 
-- `make test`: host tests for `basic/`. Fast; run constantly.
+- `make test`: host tests for `basic/` and `console/`. Fast; run constantly.
 - `make kernel` / `make run` / `make debug`: build / boot / boot-paused-for-gdb.
 - `make boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
 - `make check`: fmt, tests, clippy, boot test. Run before calling anything done.
@@ -18,7 +18,9 @@ Project: a toy 80s-style BASIC computer for QEMU RISC-V (`virt`), in Rust. Read
 - `basic/` is `no_std` + `alloc`, `#![forbid(unsafe_code)]`, and knows nothing
   about hardware. All machine access goes through the `Io` trait. If you feel
   the need for `unsafe` or an address in `basic/`, add a method to `Io` instead.
-- `kernel/` owns everything hardware: boot, UART, line editing, traps, timer,
+- `console/` is the pure half of the console (line editor, ANSI helpers):
+  `no_std`, `#![forbid(unsafe_code)]`, host-tested, no hardware access.
+- `kernel/` owns everything hardware: boot, UART, traps, timer,
   allocator. Every `unsafe` block gets a `// SAFETY:` comment saying why it holds.
 - No paging, no user mode, no processes. These are non-goals (see `DESIGN.md`).
 

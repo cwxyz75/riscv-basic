@@ -1,14 +1,20 @@
-//! Milestone M0: prove the toolchain. Boot in S-mode under OpenSBI, say hello
-//! over the serial port, and shut the machine down cleanly through SBI.
+//! Milestone M1: boot in S-mode under OpenSBI, say hello over the serial port,
+//! and run a line-edited echo console (UART receive, backspace, Ctrl-U, Ctrl-C).
+//! The machine shuts down cleanly through SBI when asked to `exit`.
 //!
 //! STATUS: verified locally (`make boot-test` passes under QEMU on macOS).
 
 #![no_std]
 #![no_main]
 
+mod terminal;
+mod uart;
+
+use console::ansi;
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::panic::PanicInfo;
+use terminal::{Console, Input, Line};
 
 // Entry point. OpenSBI jumps here in S-mode with a0 = hart id, a1 = device-tree
 // pointer. We set up a stack, zero .bss, and call into Rust. a0/a1 are left
@@ -33,30 +39,6 @@ _start:
     j    3b
 "#
 );
-
-/// QEMU `virt` maps an NS16550A UART here. QEMU transmits a byte as soon as it
-/// is written to the transmit register, so no initialisation is needed yet.
-const UART0: *mut u8 = 0x1000_0000 as *mut u8;
-
-fn uart_putc(byte: u8) {
-    // SAFETY: UART0 is the memory-mapped transmit register on QEMU's virt
-    // machine; a volatile one-byte write is the documented way to use it.
-    unsafe { core::ptr::write_volatile(UART0, byte) }
-}
-
-struct Console;
-
-impl Write for Console {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                uart_putc(b'\r');
-            }
-            uart_putc(byte);
-        }
-        Ok(())
-    }
-}
 
 /// Ask OpenSBI to power the machine off (System Reset extension, "SRST").
 fn shutdown() -> ! {
@@ -83,9 +65,31 @@ fn shutdown() -> ! {
 
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
-    let mut console = Console;
-    let _ = writeln!(console, "riscv-basic: hello from S-mode (hart {hart_id})");
-    shutdown()
+    uart::init();
+    let mut out = Console;
+    let _ = writeln!(out, "riscv-basic: hello from S-mode (hart {hart_id})");
+    let _ = ansi::color(&mut out, 2, None);
+    let _ = write!(out, "console ready; type a line, or `exit` to power off");
+    let _ = ansi::reset(&mut out);
+    let _ = writeln!(out);
+
+    // Temporary M1 loop: the BASIC interpreter replaces it at integration (M4).
+    let mut input = Input::new();
+    loop {
+        let _ = write!(out, "> ");
+        match input.read_line() {
+            Line::Text(text) => {
+                let _ = writeln!(out, "you typed: [{text}] ({} chars)", text.len());
+                if text == "exit" {
+                    let _ = writeln!(out, "bye");
+                    shutdown();
+                }
+            }
+            Line::Break => {
+                let _ = writeln!(out, "(break)");
+            }
+        }
+    }
 }
 
 #[panic_handler]

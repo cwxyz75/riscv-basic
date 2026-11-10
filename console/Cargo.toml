@@ -1,0 +1,7 @@
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2021"
+description = "Pure console logic for riscv-basic: the line editor and ANSI escape helpers. No hardware, no unsafe, tested on the host"
+
+[dependencies]

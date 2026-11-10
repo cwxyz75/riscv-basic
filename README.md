@@ -15,8 +15,9 @@ READY.
 RUN
 ```
 
-**Status:** planning baseline. The interpreter is a stub and the kernel is an
-M0 hello-world that boots in QEMU. See [ROADMAP.md](ROADMAP.md).
+**Status:** the interpreter core (M3) works on the host and the kernel boots to
+a line-edited serial console (M0, M1). Wiring them together is next. See
+[ROADMAP.md](ROADMAP.md).
 
 ## Prerequisites (macOS)
 
@@ -28,7 +29,7 @@ rustup toolchain install     # reads rust-toolchain.toml: toolchain, components,
 ## Commands
 
 ```sh
-make test        # host tests for the interpreter (no QEMU needed)
+make test        # host tests for the interpreter and console crates (no QEMU needed)
 make kernel      # build the kernel ELF
 make run         # boot in QEMU (Ctrl-A then X to quit)
 make debug       # boot paused, gdb stub on :1234
@@ -41,7 +42,8 @@ make check       # everything CI runs
 | Path | What |
 |---|---|
 | `basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
-| `kernel/` | Boot code, UART console, traps. Hosts the interpreter. |
+| `console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
+| `kernel/` | Boot code, UART driver, traps. Hosts the interpreter. |
 | `scripts/` | Test helpers (`boot_test.py`). |
 | `DESIGN.md` | Architecture, memory map, decision log. |
 | `BASIC.md` | The language spec, including open questions to settle. |
