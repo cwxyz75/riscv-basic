@@ -1,5 +1,5 @@
 use crate::error::{Error, Fault};
-use crate::expr::{evaluate, parse_name, Variables};
+use crate::expr::{evaluate, parse_name, to_address, to_byte, Variables};
 use crate::io::{Io, Line};
 use crate::number::format_number;
 use crate::program::{Program, MAX_LINE};
@@ -222,11 +222,11 @@ impl Interpreter {
     ) -> Result<Flow, Error> {
         let first = tokens[*pos];
         if first.is_ascii_alphabetic() {
-            return self.stmt_let(tokens, pos);
+            return self.stmt_let(io, tokens, pos);
         }
         *pos += 1;
         match keyword(first) {
-            Some("LET") => self.stmt_let(tokens, pos),
+            Some("LET") => self.stmt_let(io, tokens, pos),
             Some("PRINT") => self.stmt_print(io, tokens, pos),
             Some("REM") => {
                 *pos = tokens.len();
@@ -240,8 +240,8 @@ impl Interpreter {
                     pos: 0,
                 })
             }
-            Some("IF") => self.stmt_if(tokens, pos),
-            Some("FOR") => self.stmt_for(line, tokens, pos),
+            Some("IF") => self.stmt_if(io, tokens, pos),
+            Some("FOR") => self.stmt_for(io, line, tokens, pos),
             Some("NEXT") => self.stmt_next(tokens, pos),
             Some("END") => Ok(Flow::End),
             Some("STOP") => {
@@ -254,6 +254,7 @@ impl Interpreter {
                 Ok(Flow::End)
             }
             Some("RUN") => self.stmt_run(tokens, pos),
+            Some("POKE") => self.stmt_poke(io, tokens, pos),
             Some("LIST") => {
                 let end = statement_end(tokens, *pos);
                 let args = &tokens[*pos..end];
@@ -275,13 +276,18 @@ impl Interpreter {
     }
 
     /// `[LET] name = expr`; `*pos` is just after `LET` or at the name.
-    fn stmt_let(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
+    fn stmt_let<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
         let name = parse_name(tokens, pos)?.ok_or(Error::Syntax)?;
         skip_spaces(tokens, pos);
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
         }
-        let (value, end) = evaluate(tokens, *pos + 1, &self.vars)?;
+        let (value, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
         *pos = end;
         end_of_statement(tokens, pos)?;
         self.vars.insert(name, value);
@@ -329,7 +335,7 @@ impl Interpreter {
                     after_item = true;
                 }
                 _ => {
-                    let (value, end) = evaluate(src, *pos, &self.vars)?;
+                    let (value, end) = evaluate(src, *pos, &self.vars, io)?;
                     self.emit(io, &format_number(value));
                     *pos = end;
                     newline = true;
@@ -344,8 +350,13 @@ impl Interpreter {
     }
 
     /// `IF expr THEN line | statements`, `IF expr GOTO line`.
-    fn stmt_if(&mut self, tokens: &[u8], pos: &mut usize) -> Result<Flow, Error> {
-        let (condition, end) = evaluate(tokens, *pos, &self.vars)?;
+    fn stmt_if<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let (condition, end) = evaluate(tokens, *pos, &self.vars, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let word = tokens.get(*pos).and_then(|&b| keyword(b));
@@ -372,8 +383,9 @@ impl Interpreter {
     }
 
     /// `FOR v = a TO b [STEP c]`.
-    fn stmt_for(
+    fn stmt_for<I: Io>(
         &mut self,
+        io: &mut I,
         line: Option<u16>,
         tokens: &[u8],
         pos: &mut usize,
@@ -383,16 +395,16 @@ impl Interpreter {
         if tokens.get(*pos) != Some(&b'=') {
             return Err(Error::Syntax);
         }
-        let (start, end) = evaluate(tokens, *pos + 1, &self.vars)?;
+        let (start, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
         *pos = end;
         expect_keyword(tokens, pos, "TO")?;
-        let (limit, end) = evaluate(tokens, *pos, &self.vars)?;
+        let (limit, end) = evaluate(tokens, *pos, &self.vars, io)?;
         *pos = end;
         skip_spaces(tokens, pos);
         let mut step = 1.0;
         if tokens.get(*pos).and_then(|&b| keyword(b)) == Some("STEP") {
             *pos += 1;
-            let (value, end) = evaluate(tokens, *pos, &self.vars)?;
+            let (value, end) = evaluate(tokens, *pos, &self.vars, io)?;
             step = value;
             *pos = end;
         }
@@ -459,6 +471,26 @@ impl Interpreter {
             }
         }
         end_of_statement(tokens, pos)?;
+        Ok(Flow::Next)
+    }
+
+    /// `POKE addr, value`.
+    fn stmt_poke<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let (address, end) = evaluate(tokens, *pos, &self.vars, io)?;
+        *pos = end;
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos) != Some(&b',') {
+            return Err(Error::Syntax);
+        }
+        let (value, end) = evaluate(tokens, *pos + 1, &self.vars, io)?;
+        *pos = end;
+        end_of_statement(tokens, pos)?;
+        io.poke(to_address(address)?, to_byte(value)?);
         Ok(Flow::Next)
     }
 

@@ -75,7 +75,7 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 ## M6: Screen and feel
 
 - [ ] `CLS`, `COLOR`, `LOCATE`; BREAK handling during `RUN`
-- [ ] `TIMER`; `PEEK`/`POKE` per the settled policy
+- [ ] `TIMER`; `PEEK`/`POKE` per the settled policy (interpreter side done and golden-tested; the kernel's `Io` implementation arrives with M4)
 
 ## M7: Persistence (optional)
 
