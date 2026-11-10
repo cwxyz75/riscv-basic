@@ -20,5 +20,5 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Install QEMU and OpenSBI
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc opensbi
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-riscv opensbi
       - run: make boot-test
