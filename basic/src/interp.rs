@@ -259,6 +259,11 @@ impl Interpreter {
             if pos >= tokens.len() {
                 return Ok(Flow::Next);
             }
+            // Ctrl-C is checked before every statement.
+            if io.break_pressed() {
+                self.stop(io, line);
+                return Ok(Flow::End);
+            }
             match self.statement(io, line, tokens, &mut pos)? {
                 Flow::Next => {}
                 Flow::Jump {
@@ -337,6 +342,14 @@ impl Interpreter {
             }
             Some("INPUT") => self.stmt_input(io, line, tokens, pos),
             Some("RUN") => self.stmt_run(tokens, pos),
+            Some("CLS") => {
+                end_of_statement(tokens, pos)?;
+                io.clear_screen();
+                self.column = 0;
+                Ok(Flow::Next)
+            }
+            Some("COLOR") => self.stmt_color(io, tokens, pos),
+            Some("LOCATE") => self.stmt_locate(io, tokens, pos),
             Some("POKE") => self.stmt_poke(io, tokens, pos),
             Some("DIM") => self.stmt_dim(io, tokens, pos),
             Some("LIST") => {
@@ -681,6 +694,49 @@ impl Interpreter {
         Ok(Flow::Next)
     }
 
+    /// `COLOR fg[, bg]`.
+    fn stmt_color<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let (fg, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
+        *pos = end;
+        let mut bg = None;
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos) == Some(&b',') {
+            let (value, end) = evaluate_number(tokens, *pos + 1, &mut self.mem, io)?;
+            *pos = end;
+            bg = Some(colour_number(value)?);
+        }
+        end_of_statement(tokens, pos)?;
+        io.set_color(colour_number(fg)?, bg);
+        Ok(Flow::Next)
+    }
+
+    /// `LOCATE row, col`.
+    fn stmt_locate<I: Io>(
+        &mut self,
+        io: &mut I,
+        tokens: &[u8],
+        pos: &mut usize,
+    ) -> Result<Flow, Error> {
+        let (row, end) = evaluate_number(tokens, *pos, &mut self.mem, io)?;
+        *pos = end;
+        skip_spaces(tokens, pos);
+        if tokens.get(*pos) != Some(&b',') {
+            return Err(Error::Syntax);
+        }
+        let (col, end) = evaluate_number(tokens, *pos + 1, &mut self.mem, io)?;
+        *pos = end;
+        end_of_statement(tokens, pos)?;
+        let (row, col) = (screen_position(row)?, screen_position(col)?);
+        io.move_cursor(row, col);
+        self.column = usize::from(col) - 1;
+        Ok(Flow::Next)
+    }
+
     /// `POKE addr, value`.
     fn stmt_poke<I: Io>(
         &mut self,
@@ -872,6 +928,22 @@ fn data_statement_end(tokens: &[u8], from: usize) -> usize {
         }
     }
     tokens.len()
+}
+
+/// A colour for `COLOR`: 0 to 7.
+fn colour_number(value: f64) -> Result<u8, Error> {
+    match u8::try_from(to_count(value)?) {
+        Ok(n) if n <= 7 => Ok(n),
+        _ => Err(Error::IllegalQuantity),
+    }
+}
+
+/// A row or column for `LOCATE`: 1 to 999.
+fn screen_position(value: f64) -> Result<u16, Error> {
+    match u16::try_from(to_count(value)?) {
+        Ok(n) if (1..=999).contains(&n) => Ok(n),
+        _ => Err(Error::IllegalQuantity),
+    }
 }
 
 fn skip_spaces(tokens: &[u8], pos: &mut usize) {

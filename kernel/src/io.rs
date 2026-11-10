@@ -2,12 +2,10 @@
 //! the timer and raw memory.
 
 use crate::terminal::{self, Console, Input};
-use crate::{timer, uart};
+use crate::timer;
 use alloc::string::String;
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
-
-const CTRL_C: u8 = 0x03;
 
 pub struct KernelIo {
     input: Input,
@@ -33,14 +31,10 @@ impl basic::Io for KernelIo {
         }
     }
 
-    /// Drain whatever has been typed and report whether Ctrl-C was among it.
-    /// Other typed-ahead characters are discarded.
+    /// Has Ctrl-C been pressed? Other typed-ahead characters are kept for the
+    /// next line read.
     fn break_pressed(&mut self) -> bool {
-        let mut pressed = false;
-        while let Some(byte) = uart::try_getc() {
-            pressed |= byte == CTRL_C;
-        }
-        pressed
+        self.input.poll_break()
     }
 
     fn millis(&mut self) -> u64 {

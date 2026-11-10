@@ -75,7 +75,7 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 
 ## M6: Screen and feel
 
-- [ ] `CLS`, `COLOR`, `LOCATE`; BREAK handling during `RUN`
+- [x] `CLS`, `COLOR`, `LOCATE`; BREAK handling during `RUN`
 - [x] `TIMER`; `PEEK`/`POKE` per the settled policy (golden-tested on the host, and `basic_test.py` / `trap_test.py` exercise them under QEMU)
 
 ## M7: Persistence (optional)
@@ -90,6 +90,6 @@ Acceptance: golden tests for every statement and function in `BASIC.md`.
 
 ## Spikes (time-boxed experiments, do early)
 
-- [ ] Float formatting without surprises (`core::fmt` versus hand-rolled)
-- [ ] Ctrl-C delivery over the QEMU serial port
+- [x] Float formatting without surprises: `core::fmt` with `{:.8e}` rounds exactly, and the goldens plus `basic_test.py` agree on the host and under QEMU
+- [x] Ctrl-C delivery over the QEMU serial port (0x03 arrives as a byte, also while a program runs; verified with piped input, not yet with an interactive terminal)
 - [x] Allocator choice (D10): the `linked_list_allocator` crate (a bump allocator would leak on every statement)
