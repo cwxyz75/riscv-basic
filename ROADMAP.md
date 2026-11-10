@@ -21,7 +21,7 @@ Acceptance: `make boot-test` passes locally and in CI. QEMU prints
 - [x] Prerequisites installed (`brew install qemu`, `rustup toolchain install`)
 - [x] `make kernel` builds
 - [x] `make run` shows the hello line (checked via the boot test's captured output)
-- [ ] `make boot-test` passes; CI green
+- [x] `make boot-test` passes; CI green
 
 ## M1: Console
 
