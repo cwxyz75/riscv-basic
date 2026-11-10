@@ -3,7 +3,7 @@
 //! back here.
 
 use crate::terminal::Console;
-use crate::uart;
+use crate::{jit, uart};
 use core::fmt::Write;
 
 /// The languages the machine can run.
@@ -27,6 +27,16 @@ pub fn choose() -> Language {
             b'2' => {
                 let _ = writeln!(out, "2");
                 return Language::Logo;
+            }
+            // Debugging aids for the LOGO JIT (not listed in the menu).
+            b'3' => {
+                let _ = writeln!(out, "3");
+                jit::self_test(&mut out);
+                let _ = write!(out, "Your choice: ");
+            }
+            b'4' => {
+                let _ = writeln!(out, "4\njit: faulting on purpose");
+                jit::crash_demo();
             }
             _ => {}
         }

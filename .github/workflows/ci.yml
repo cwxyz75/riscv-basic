@@ -10,8 +10,8 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p basic -p console -p turtle --all-targets -- -D warnings
-      - run: cargo test -p basic -p console -p turtle
+      - run: cargo clippy -p basic -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+      - run: cargo test -p basic -p console -p turtle -p logo -p rv64
 
   kernel:
     runs-on: ubuntu-latest

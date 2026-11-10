@@ -22,6 +22,7 @@ dependencies = [
  "console",
  "linked_list_allocator",
  "logo",
+ "rv64",
  "turtle",
 ]
 
@@ -56,6 +57,10 @@ dependencies = [
  "libm",
  "turtle",
 ]
+
+[[package]]
+name = "rv64"
+version = "0.1.0"
 
 [[package]]
 name = "scopeguard"

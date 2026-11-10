@@ -122,5 +122,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
         timer::ticks(),
         timer::millis()
     );
+    // If the fault happened inside generated code, show that code.
+    crate::jit::dump_for_fault(&mut out, cpu::read_sepc());
     sbi::shutdown()
 }

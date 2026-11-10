@@ -1,0 +1,7 @@
+[package]
+name = "rv64"
+version = "0.1.0"
+edition = "2021"
+description = "A small RV64 assembler for riscv-basic's LOGO JIT: instruction encoders, labels and the li pseudo-instruction. Pure, no unsafe; encodings are checked against LLVM's assembler"
+
+[dependencies]

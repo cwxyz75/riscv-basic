@@ -11,6 +11,7 @@ mod cpu;
 mod gfx;
 mod heap;
 mod io;
+mod jit;
 mod menu;
 mod sbi;
 mod terminal;

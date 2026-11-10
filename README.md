@@ -93,6 +93,7 @@ Other commands:
 make test        # host tests for the interpreter and console crates (no QEMU needed)
 make kernel      # build the kernel ELF
 make run-logo     # boot with a graphics window; press 2 at the menu for LOGO
+                 # (menu keys 3 and 4 are JIT debugging aids: self-test, and a deliberate fault)
 make debug       # boot paused, gdb stub on :1234
 make boot-test   # the scripted QEMU boot tests, as CI runs them
 make check       # everything CI runs: fmt, tests, clippy, boot tests
@@ -119,6 +120,7 @@ live only until the machine is switched off.
 | `basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
 | `console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
 | `logo/` | The LOGO language: reader, parser, reference interpreter. `no_std`, no hardware, no `unsafe`; tested against golden transcripts and images. |
+| `rv64/` | A small RV64 assembler for the LOGO JIT. `no_std`, no `unsafe`; checked against LLVM and an emulator. |
 | `turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
 | `kernel/` | Boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
 | `examples/` | Demo BASIC programs (also used by the golden and boot tests). |
