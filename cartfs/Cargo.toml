@@ -1,0 +1,7 @@
+[package]
+name = "cartfs"
+version = "0.1.0"
+edition = "2021"
+description = "The disk format for riscv-basic's SAVE/LOAD: a fixed directory, a free-sector map and chained sectors, over a block-device trait. Pure, host-tested"
+
+[dependencies]

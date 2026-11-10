@@ -30,6 +30,8 @@ Project: a toy 80s-style BASIC computer for QEMU RISC-V (`virt`), in Rust. Read
   `no_std`, `#![forbid(unsafe_code)]`, host-tested against golden images.
 - `examples/` holds the demo BASIC programs; golden tests load them with a
   `<LOAD examples/NAME.bas>` line and boot tests type them over the serial port.
+- `cartfs/` is the disk format for SAVE/LOAD (directory, free map, chained
+  sectors) over a `BlockDevice` trait: `no_std`, `forbid(unsafe_code)`, host-tested.
 - `kernel/` owns everything hardware: boot, UART, traps, timer,
   allocator. Every `unsafe` block gets a `// SAFETY:` comment saying why it holds.
 - No paging, no user mode, no processes. These are non-goals (see `DESIGN.md`).
