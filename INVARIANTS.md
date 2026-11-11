@@ -37,9 +37,12 @@ get filled in as each area is built.
 |---|---|---|
 | C1 | **Lock ordering is global and fixed**, listed below; a lock is only taken while holding locks earlier in the order. Not negotiable | Debug-build lock-order checker (S5); loom/shuttle on extracted logic |
 | C2 | Interrupts are disabled while a spinlock is held | Debug assertion (S5) |
-| C3 | One block/wake path: no lost wakeups and no double wakeups | loom/shuttle on `kcore::latch` (S0), then the real wait queue (S2) |
-| C4 | Each runnable thread is in exactly one place (a run queue, running, or blocked) | Debug assertions, scheduler model test (S2) |
-| C5 | Atomics and fences live only in `kcore::sync` and the small audited layer; everything else relies on `Send`/`Sync` | Review; grep gate (S2) |
+| C3 | One block/wake path: no lost wakeups and no double wakeups | loom/shuttle on `kcore::latch` (S0); `kcore/tests/sched_model.rs` (model, token and wait-queue scenarios, mutation-checked) and QEMU `wake_before_block_is_not_lost`, `producer_consumer_loses_no_wakeup` (S2). Multi-hart interleavings: S5 |
+| C4 | Each runnable thread is in exactly one place (a run queue, running, or blocked) | `Sched::audit` after every step of the random model test, for every policy; the core rejects a policy pick that is not runnable (`bad_picks`) (S2) |
+| C5 | Atomics and fences live only in `kcore::sync` and the small audited layer; everything else relies on `Send`/`Sync` | Review only so far (a grep gate is **TODO**; the S2 kernel code uses `core::sync::atomic` directly for tick counters and test flags) |
+| C6 | Scheduler state is touched only with interrupts disabled (single hart), and never across a context switch; the kernel heap is interrupt-safe because the tick allocates | `debug_assert` in `thread::kernel()`; heap wrapper (S2); becomes a real lock in S5 |
+| C7 | Kernel threads do no floating point and thread switches save no FP state, so `sstatus.FS` stays Off and accidental FP use traps | QEMU `fp_unit_is_off` (S2); revisit when user mode (S3) needs FP |
+
 
 ### Lock order
 

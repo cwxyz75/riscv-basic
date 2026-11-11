@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless boot test for the OS track (milestone S0).
 
-Usage: os_boot_test.py OS_KERNEL_ELF [FAILING_OS_KERNEL_ELF]
+Usage: os_boot_test.py OS_KERNEL_ELF [FAILING_OS_KERNEL_ELF [ROUND_ROBIN_OS_KERNEL_ELF]]
 
 Boots the kernel in QEMU with no display and reads the structured lines it prints
 on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
@@ -39,7 +39,25 @@ REQUIRED = [
     "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
+    # S2: threads, timer, scheduler
+    "timer_ticks_advance", "threads_start_run_and_finish", "many_threads_do_not_leak",
+    "sleep_wakes_on_time", "idle_runs_when_nothing_else_does",
+    "wake_before_block_is_not_lost", "producer_consumer_loses_no_wakeup",
+    "equal_priority_hogs_share_the_cpu", "two_waiters_on_one_queue_wake_in_order",
+    "a_thread_can_spawn_threads", "joining_nothing_does_not_hang",
+    "stack_guard_damage_is_detected", "fp_unit_is_off", "scheduler_class_is_fixed_priority",
+    "higher_priority_runs_at_once_on_spawn", "lower_priority_waits_for_higher",
+    "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
+    "the_latency_test_can_fail",
 ]
+
+# Tests that only make sense for the fixed-priority class: a kernel booted with the
+# round-robin class must pass everything else.
+PRIORITY_ONLY = {
+    "higher_priority_runs_at_once_on_spawn", "lower_priority_waits_for_higher",
+    "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
+    "the_latency_test_can_fail",
+}
 TEST = re.compile(r"^##TEST (\S+) (PASS|FAIL)(?: (.*))?$")
 DONE = re.compile(r"^##DONE pass=(\d+) fail=(\d+)$")
 BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
@@ -78,7 +96,7 @@ def parse(lines):
     return boot, tests, done, panics, bad
 
 
-def problems(lines, status, timed_out, expect_fail: bool):
+def problems(lines, status, timed_out, expect_fail: bool, required=None):
     boot, tests, done, panics, bad = parse(lines)
     found = []
     if timed_out:
@@ -102,7 +120,7 @@ def problems(lines, status, timed_out, expect_fail: bool):
             found.append(f"expected exactly one failing test, saw {failed}")
         if not expect_fail and failed:
             found.append(f"failing tests: {[n for n, ok, _ in tests if not ok]}")
-    missing = [n for n in REQUIRED if n not in {n for n, _, _ in tests}]
+    missing = [n for n in (REQUIRED if required is None else required) if n not in {n for n, _, _ in tests}]
     if missing:
         found.append(f"required tests not reported: {missing}")
     if len({n for n, _, _ in tests}) != len(tests):
@@ -116,14 +134,20 @@ def problems(lines, status, timed_out, expect_fail: bool):
 
 
 def main() -> int:
-    if len(sys.argv) not in (2, 3):
+    if len(sys.argv) not in (2, 3, 4):
         print(__doc__, file=sys.stderr)
         return 2
+    runs = [(sys.argv[1], False, None, "kernel")]
+    if len(sys.argv) >= 3:
+        runs.append((sys.argv[2], True, None, "fail-demo kernel (must be detected as failing)"))
+    if len(sys.argv) == 4:
+        generic = [n for n in REQUIRED if n not in PRIORITY_ONLY and n != "scheduler_class_is_fixed_priority"]
+        generic.append("scheduler_class_is_round_robin")  # proves the feature really selected it
+        runs.append((sys.argv[3], False, generic, "round-robin class kernel (generic tests only)"))
     failed = 0
-    for kernel, expect_fail in [(sys.argv[1], False)] + ([(sys.argv[2], True)] if len(sys.argv) == 3 else []):
+    for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
-        found = problems(lines, status, timed_out, expect_fail)
-        label = "fail-demo kernel (must be detected as failing)" if expect_fail else "kernel"
+        found = problems(lines, status, timed_out, expect_fail, required)
         if found:
             failed = 1
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)

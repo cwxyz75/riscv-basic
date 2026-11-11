@@ -16,7 +16,7 @@ pub struct TrapFrame {
     sepc: u64,
     scause: u64,
     stval: u64,
-    _pad: u64,
+    sstatus: u64,
 }
 
 global_asm!(
@@ -64,10 +64,14 @@ trap_entry:
     sd   t0, 264(sp)
     csrr t0, stval
     sd   t0, 272(sp)
+    csrr t0, sstatus
+    sd   t0, 280(sp)
     mv   a0, sp
     call trap_handler
     ld   t0, 256(sp)
     csrw sepc, t0
+    ld   t0, 280(sp)
+    csrw sstatus, t0
     ld   x1, 8(sp)
     ld   x3, 24(sp)
     ld   x4, 32(sp)
@@ -173,6 +177,11 @@ pub fn flush_tlb() {
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let cause = frame.scause;
+    if cause == (1 << 63) | 5 {
+        // Supervisor timer interrupt: the scheduler's tick (and preemption).
+        crate::thread::timer_interrupt();
+        return;
+    }
     let access = match cause {
         12 => Access::Exec,
         13 => Access::Read,
