@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod aspace;
+pub mod elf;
 pub mod frame;
 pub mod handle;
 pub mod ipc;
@@ -18,6 +19,7 @@ pub mod pagetable;
 pub mod sched;
 pub mod sync;
 pub mod testlog;
+pub mod usercopy;
 
 use frame::FrameDb;
 use pagetable::PhysMem;

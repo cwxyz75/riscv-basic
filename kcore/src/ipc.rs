@@ -260,6 +260,51 @@ fn read_at(
     })
 }
 
+/// What `channel_read` / `channel_read_txid` would do right now, without doing it: the
+/// sizes (bytes, handles) of the message they would deliver, or the error they would
+/// return (including BUFFER_TOO_SMALL with the sizes, and NO_MEMORY for a full table).
+/// The syscall layer uses it to validate the destination buffers against the *actual*
+/// message before dequeuing anything.
+pub fn channel_peek(
+    reg: &Kobjs,
+    table: &HandleTable,
+    ch: Handle,
+    txid: Option<u32>,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<(usize, usize), ReadError> {
+    let me = channel_of(reg, table, ch, Rights::READ)?;
+    let KObj::Channel(c) = reg.get(me).expect("resolved") else {
+        unreachable!()
+    };
+    let pos = match txid {
+        Some(t) => c
+            .queue
+            .iter()
+            .position(|m| m.data.len() >= 4 && m.data[..4] == t.to_le_bytes()),
+        None => (!c.queue.is_empty()).then_some(0),
+    };
+    let Some(i) = pos else {
+        return Err(if c.peer_closed {
+            Status::PeerClosed
+        } else {
+            Status::ShouldWait
+        }
+        .into());
+    };
+    let msg = &c.queue[i];
+    if msg.data.len() > max_bytes || msg.handles.len() > max_handles {
+        return Err(ReadError::TooSmall {
+            bytes: msg.data.len(),
+            handles: msg.handles.len(),
+        });
+    }
+    if table.room() < msg.handles.len() {
+        return Err(Status::NoMemory.into());
+    }
+    Ok((msg.data.len(), msg.handles.len()))
+}
+
 /// Read the oldest message. Handles arrive in the caller's table.
 pub fn channel_read(
     reg: &mut Kobjs,

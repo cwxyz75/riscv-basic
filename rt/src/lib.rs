@@ -1,0 +1,289 @@
+//! The native runtime for user programs (OS-ARCHITECTURE.md, section 14; S3b): raw
+//! syscalls, a `_start` that calls the program's `app_main`, a panic handler, and a
+//! small formatted-output and test-reporting layer, all without an allocator.
+//!
+//! Only builds for the RISC-V user target (it contains `ecall`).
+#![no_std]
+
+use abi::status::Status;
+use core::arch::{asm, global_asm};
+use core::fmt::{self, Write};
+
+pub use abi;
+
+/// The result of a raw syscall: the status code and the two result registers.
+#[derive(Debug, Clone, Copy)]
+pub struct Ret {
+    pub status: i32,
+    pub a1: usize,
+    pub a2: usize,
+}
+
+impl Ret {
+    pub fn status(&self) -> Option<Status> {
+        Status::from_code(self.status)
+    }
+}
+
+/// A raw syscall (SYSCALLS.md, "ABI").
+pub fn syscall(number: usize, args: [usize; 6]) -> Ret {
+    let (status, a1, a2): (usize, usize, usize);
+    // SAFETY: `ecall` traps to the kernel, which preserves every register except the
+    // results in a0 to a2 (SYSCALLS.md). No memory is touched except through pointers the
+    // caller passed, which the kernel validates.
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") number,
+            inlateout("a0") args[0] => status,
+            inlateout("a1") args[1] => a1,
+            inlateout("a2") args[2] => a2,
+            in("a3") args[3],
+            in("a4") args[4],
+            in("a5") args[5],
+            options(nostack),
+        );
+    }
+    Ret {
+        status: status as i32,
+        a1,
+        a2,
+    }
+}
+
+pub mod sys {
+    use super::{syscall, Ret};
+    use abi::syscall::*;
+
+    pub fn debug_write(bytes: &[u8]) -> Ret {
+        syscall(
+            DEBUG_WRITE,
+            [bytes.as_ptr() as usize, bytes.len(), 0, 0, 0, 0],
+        )
+    }
+    pub fn exit(code: i32) -> ! {
+        syscall(PROCESS_EXIT, [code as usize, 0, 0, 0, 0, 0]);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    pub fn thread_yield() -> Ret {
+        syscall(THREAD_YIELD, [0; 6])
+    }
+    pub fn clock_get() -> u64 {
+        syscall(CLOCK_GET, [0; 6]).a1 as u64
+    }
+    pub fn handle_close(h: u32) -> Ret {
+        syscall(HANDLE_CLOSE, [h as usize, 0, 0, 0, 0, 0])
+    }
+    pub fn handle_duplicate(h: u32, rights: u32) -> Ret {
+        syscall(HANDLE_DUPLICATE, [h as usize, rights as usize, 0, 0, 0, 0])
+    }
+    pub fn handle_replace(h: u32, rights: u32) -> Ret {
+        syscall(HANDLE_REPLACE, [h as usize, rights as usize, 0, 0, 0, 0])
+    }
+    pub fn channel_create() -> Ret {
+        syscall(CHANNEL_CREATE, [0; 6])
+    }
+    pub fn channel_write(
+        ch: u32,
+        bytes: *const u8,
+        nbytes: usize,
+        handles: *const u32,
+        nhandles: usize,
+    ) -> Ret {
+        syscall(
+            CHANNEL_WRITE,
+            [
+                ch as usize,
+                bytes as usize,
+                nbytes,
+                handles as usize,
+                nhandles,
+                0,
+            ],
+        )
+    }
+    pub fn channel_read(
+        ch: u32,
+        bytes: *mut u8,
+        max_bytes: usize,
+        handles: *mut u32,
+        max_handles: usize,
+    ) -> Ret {
+        syscall(
+            CHANNEL_READ,
+            [
+                ch as usize,
+                bytes as usize,
+                max_bytes,
+                handles as usize,
+                max_handles,
+                0,
+            ],
+        )
+    }
+    pub fn channel_read_txid(
+        ch: u32,
+        txid: u32,
+        bytes: *mut u8,
+        max_bytes: usize,
+        handles: *mut u32,
+        max_handles: usize,
+    ) -> Ret {
+        syscall(
+            CHANNEL_READ_TXID,
+            [
+                ch as usize,
+                txid as usize,
+                bytes as usize,
+                max_bytes,
+                handles as usize,
+                max_handles,
+            ],
+        )
+    }
+    pub fn event_create() -> Ret {
+        syscall(EVENT_CREATE, [0; 6])
+    }
+    pub fn event_signal(ev: u32, clear: u32, set: u32) -> Ret {
+        syscall(
+            EVENT_SIGNAL,
+            [ev as usize, clear as usize, set as usize, 0, 0, 0],
+        )
+    }
+    pub fn object_signals(h: u32) -> Ret {
+        syscall(OBJECT_SIGNALS, [h as usize, 0, 0, 0, 0, 0])
+    }
+}
+
+/// A fixed-size text buffer: formatted output without an allocator.
+pub struct Buf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Buf<N> {
+    pub const fn new() -> Self {
+        Buf {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> Default for Buf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Write for Buf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < N {
+                self.bytes[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Print formatted text to the serial console (one `debug_write` per call).
+pub fn print(args: fmt::Arguments) {
+    let mut buf = Buf::<512>::new();
+    let _ = buf.write_fmt(args);
+    sys::debug_write(buf.as_bytes());
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        $crate::print(format_args!("{}\n", format_args!($($arg)*)));
+    }};
+}
+
+/// Why a test failed: a one-line message in a fixed buffer.
+pub type Detail = Buf<200>;
+
+/// Fail a test with a formatted message unless `cond` holds.
+#[macro_export]
+macro_rules! ensure {
+    ($cond:expr, $($arg:tt)*) => {
+        if !($cond) {
+            let mut d = $crate::Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!($($arg)*));
+            return Err(d);
+        }
+    };
+}
+
+/// Compare two values; fail with both in the message.
+#[macro_export]
+macro_rules! ensure_eq {
+    ($got:expr, $want:expr, $($arg:tt)*) => {{
+        let (g, w) = (&$got, &$want);
+        if *g != *w {
+            let mut d = $crate::Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("{}: got {:?}, want {:?}", format_args!($($arg)*), g, w));
+            return Err(d);
+        }
+    }};
+}
+
+/// Report one test in the structured form the boot harness reads.
+pub fn report(name: &str, result: Result<(), Detail>) -> bool {
+    match result {
+        Ok(()) => {
+            println!("##TEST {} PASS", name);
+            true
+        }
+        Err(detail) => {
+            let text = core::str::from_utf8(detail.as_bytes()).unwrap_or("(not utf-8)");
+            println!("##TEST {} FAIL {}", name, text);
+            false
+        }
+    }
+}
+
+extern "Rust" {
+    fn app_main() -> i32;
+}
+
+global_asm!(
+    r#"
+    .section .text._start
+    .globl _start
+_start:
+    call rt_start
+1:
+    j 1b
+"#
+);
+
+/// The first Rust code of every program: call the program's `app_main` and exit with
+/// its result. (The kernel starts a process with `a0` = its start argument.)
+#[no_mangle]
+extern "C" fn rt_start(arg: usize) -> ! {
+    START_ARG.store(arg, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `app_main` is defined by the program being linked, with this signature.
+    let code = unsafe { app_main() };
+    sys::exit(code)
+}
+
+static START_ARG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The start argument the kernel passed in `a0`.
+pub fn start_arg() -> usize {
+    START_ARG.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("##PANIC user program: {}", info);
+    sys::exit(101)
+}

@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-kernel os-test os-miri os-boot-test os-boot-test-aia test fmt fmt-check lint kernel run run-logo debug boot-test check
+.PHONY: help disk os-user os-kernel os-test os-miri os-boot-test os-boot-test-aia test fmt fmt-check lint kernel run run-logo debug boot-test check
 
 help:
 	@echo "make test       host tests for the interpreter crate (no QEMU needed)"
@@ -35,6 +35,7 @@ fmt-check:
 lint:
 	cargo clippy -p abi -p kcore -p basic -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
+	cd init && cargo clippy -p rt -p init -- -D warnings
 	cd os-kernel && cargo clippy -- -D warnings
 
 kernel:
@@ -81,7 +82,12 @@ OS_RR_ELF   := target/os-rr/$(KERNEL_TARGET)/debug/os-kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
-os-kernel:
+# The user programs (init, crash) are built for the no-FPU user target and embedded in the
+# kernel image, so they must exist before the kernel is built.
+os-user:
+	cd init && cargo build
+
+os-kernel: os-user
 	cd os-kernel && cargo build
 	cd os-kernel && cargo build --features fail-demo --target-dir ../target/os-fail
 	cd os-kernel && cargo build --features sched-round-robin --target-dir ../target/os-rr

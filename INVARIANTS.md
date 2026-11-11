@@ -19,7 +19,7 @@ get filled in as each area is built.
 | H3 | Rights only shrink: duplicate, replace, transfer and open never produce a handle with a right its source lacked | `handle_model`, `channel_model` (a model of every handle's rights), `rights_escalation_is_refused` (S3a) |
 | H4 | A message in flight owns its handles: if the channel dies they are closed, never leaked, and never duplicated | `channel_model`, `registry_model`, `cycles_are_swept` with `Registry::live()` as the leak counter (S3a) |
 | H5 | Authority is holding a handle: no syscall consults identity, a path or ambient state to grant access | Review against `SYSCALLS.md` (S3) |
-| H6 | Process death releases every object it held | Table drain + reachability sweep tested on the host (S3a); the same leak check against allocator counts in QEMU (S3c) |
+| H6 | Process death releases every object it held | Table drain + reachability sweep tested on the host (S3a); QEMU `process_exit_releases_all_objects` and `process_teardown_returns_every_frame` for a single process (S3b); with several processes and threads in S3c |
 
 ## Memory
 
@@ -29,7 +29,9 @@ get filled in as each area is built.
 | M2 | W^X: no mapping is both writable and executable (JIT needs an explicit, narrower policy, Q6) | `Perms::validate` refuses it (host test); QEMU `kernel_mappings_are_w_xor_x` walks the live kernel table (S1) |
 | M3 | Frame reference counts are conserved: after any map/unmap/fault/teardown sequence the counts return to baseline | Model tests end with a baseline check; QEMU `balanced()` wraps every lazy-memory test, plus `churn_does_not_leak` (S1) |
 | M4 | All memory operations go through the VMO interface, never directly to frames | Review; the only frame-granting path to a mapping is `AddressSpace::handle_fault` via `Vmos::page_for` (S1) |
-| M5 | Kernel memory is never reachable from a user mapping; the kernel image is not writable through the direct map | QEMU `direct_map_does_not_alias_the_image`; user-mapping rule needs S3 (partial) |
+| M5 | Kernel memory is never reachable from a user mapping; the kernel image is not writable through the direct map | QEMU `direct_map_does_not_alias_the_image`; `usercopy.rs` (a user pointer into the shared kernel half or page zero is refused even with a user-bit region over it); QEMU `user_store_to_kernel_memory_is_fatal`, `user_load_from_kernel_memory_is_fatal` (S3b) |
+| M6 | Every user pointer is validated and copied by a page-table walk, never dereferenced; a bad pointer is INVALID_ARGS and changes nothing | `kcore/tests/usercopy.rs` (every bad-pointer class, no partial writes); `init` tests `debug_write_pointer_rules`, `buffers_are_validated_before_a_read` (S3b) |
+| M7 | A user program is hostile data: the ELF loader accepts only what is safe to map (user half, in the file, no W+X, no executable stack, no overlap) and never panics | `kcore/tests/elf_loader.rs` (every rule, plus a mutation fuzz of 3000 images); QEMU `a_corrupt_program_is_refused_without_leaks` (S3b) |
 
 ## Concurrency
 
@@ -43,6 +45,15 @@ get filled in as each area is built.
 | C6 | Scheduler state is touched only with interrupts disabled (single hart), and never across a context switch; the kernel heap is interrupt-safe because the tick allocates | `debug_assert` in `thread::kernel()`; heap wrapper (S2); becomes a real lock in S5 |
 | C7 | Kernel threads do no floating point and thread switches save no FP state, so `sstatus.FS` stays Off and accidental FP use traps | QEMU `fp_unit_is_off` (S2); revisit when user mode (S3) needs FP |
 
+
+### Process and address-space rules (S3b)
+
+| # | Invariant | How checked |
+|---|---|---|
+| P1 | Returning to user mode always uses the returning thread's own address space (satp), however many processes ran in between, on both return paths (syscall and timer interrupt) | QEMU `two_processes_do_not_share_memory`, `yielding_processes_do_not_share_memory`; each return-path hook was shown necessary by removing it |
+| P2 | The kernel's top-level page-table slots never change after the first process exists | `kmem::kernel_half_unchanged`, checked at every process start and by QEMU `kernel_top_level_slots_are_stable` |
+| P3 | A user fault the kernel cannot resolve ends the process, never the kernel; the exit code says why (`-1000 - scause`) | QEMU: eight fault kinds, `the_stack_has_a_guard_page`, `a_syscall_with_sp_in_the_kernel_is_harmless` |
+| P4 | A user program can only reach the kernel through syscalls: registers other than a0-a2 are preserved, no kernel value is left in a user register | QEMU `registers_survive_a_syscall`; `enter_user` zeroes every register but a0 and sp |
 
 ### Lock order
 

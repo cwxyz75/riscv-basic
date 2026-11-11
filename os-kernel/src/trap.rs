@@ -13,10 +13,28 @@ use kcore::testlog;
 #[repr(C)]
 pub struct TrapFrame {
     x: [u64; 32],
-    sepc: u64,
-    scause: u64,
-    stval: u64,
-    sstatus: u64,
+    pub sepc: u64,
+    pub scause: u64,
+    pub stval: u64,
+    pub sstatus: u64,
+}
+
+impl TrapFrame {
+    /// The user's register `x{n}` (a0 is 10, a7 is 17).
+    pub fn arg(&self, n: usize) -> u64 {
+        self.x[n]
+    }
+
+    /// Put syscall results in a0 (and a1, a2 when given).
+    pub fn set_return(&mut self, a0: u64, a1: Option<u64>, a2: Option<u64>) {
+        self.x[10] = a0;
+        if let Some(v) = a1 {
+            self.x[11] = v;
+        }
+        if let Some(v) = a2 {
+            self.x[12] = v;
+        }
+    }
 }
 
 global_asm!(
@@ -25,6 +43,9 @@ global_asm!(
     .balign 4
     .globl trap_entry
 trap_entry:
+    csrrw sp, sscratch, sp       # sp <-> sscratch: from U-mode sscratch is the kernel stack top
+    bnez  sp, 2f                 # nonzero: we came from user mode
+    csrrw sp, sscratch, sp       # from the kernel: undo (sscratch is 0 in the kernel)
     addi sp, sp, -288
     sd   x1, 8(sp)
     sd   x3, 24(sp)
@@ -57,7 +78,44 @@ trap_entry:
     sd   x30, 240(sp)
     sd   x31, 248(sp)
     addi t0, sp, 288
-    sd   t0, 16(sp)
+    sd   t0, 16(sp)              # the interrupted sp
+    j    3f
+2:  # from user mode: sp is the kernel stack top, sscratch holds the user sp
+    addi sp, sp, -288
+    sd   x1, 8(sp)
+    sd   x3, 24(sp)
+    sd   x4, 32(sp)
+    sd   x5, 40(sp)
+    sd   x6, 48(sp)
+    sd   x7, 56(sp)
+    sd   x8, 64(sp)
+    sd   x9, 72(sp)
+    sd   x10, 80(sp)
+    sd   x11, 88(sp)
+    sd   x12, 96(sp)
+    sd   x13, 104(sp)
+    sd   x14, 112(sp)
+    sd   x15, 120(sp)
+    sd   x16, 128(sp)
+    sd   x17, 136(sp)
+    sd   x18, 144(sp)
+    sd   x19, 152(sp)
+    sd   x20, 160(sp)
+    sd   x21, 168(sp)
+    sd   x22, 176(sp)
+    sd   x23, 184(sp)
+    sd   x24, 192(sp)
+    sd   x25, 200(sp)
+    sd   x26, 208(sp)
+    sd   x27, 216(sp)
+    sd   x28, 224(sp)
+    sd   x29, 232(sp)
+    sd   x30, 240(sp)
+    sd   x31, 248(sp)
+    csrr t0, sscratch
+    sd   t0, 16(sp)              # the user's sp
+    csrw sscratch, zero          # in the kernel now: a trap here is a kernel trap
+3:
     csrr t0, sepc
     sd   t0, 256(sp)
     csrr t0, scause
@@ -72,6 +130,11 @@ trap_entry:
     csrw sepc, t0
     ld   t0, 280(sp)
     csrw sstatus, t0
+    andi t1, t0, 256             # SPP: was the trap taken from the kernel?
+    bnez t1, 4f
+    addi t1, sp, 288
+    csrw sscratch, t1            # returning to user mode: the next trap needs the kernel stack top
+4:
     ld   x1, 8(sp)
     ld   x3, 24(sp)
     ld   x4, 32(sp)
@@ -116,7 +179,7 @@ pub fn init() {
     let entry = trap_entry as *const () as usize;
     // SAFETY: writing stvec only changes where traps go; `trap_entry` is 4-byte
     // aligned code in the kernel text, valid at its upper-half address.
-    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) entry) };
+    unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
 }
 
 // A self-test can declare that the next fault is expected to be refused; the
@@ -180,6 +243,17 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     if cause == (1 << 63) | 5 {
         // Supervisor timer interrupt: the scheduler's tick (and preemption).
         crate::thread::timer_interrupt();
+        if frame.sstatus & (1 << 8) == 0 {
+            // Interrupted user code: other threads may have run (under their own address
+            // space) before we got the CPU back.
+            crate::user::activate_current();
+        }
+        return;
+    }
+    if frame.sstatus & (1 << 8) == 0 {
+        // SPP = 0: the trap came from user mode.
+        crate::user::user_trap(frame);
+        crate::user::activate_current();
         return;
     }
     let access = match cause {

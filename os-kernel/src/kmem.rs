@@ -155,3 +155,46 @@ pub fn satp() -> u64 {
     unsafe { core::arch::asm!("csrr {}, satp", out(reg) v) };
     v
 }
+
+/// Switch back to the kernel's own page table (before a process's root is freed).
+pub fn use_kernel_table() {
+    let root = get().aspace.table().root();
+    let satp = (8u64 << 60) | root;
+    // SAFETY: the kernel's table maps everything the kernel executes from and touches;
+    // the flush drops the translations of the table being left.
+    unsafe {
+        core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp);
+    }
+}
+
+/// Flush the whole TLB.
+pub fn flush_tlb() {
+    // SAFETY: `sfence.vma` with no operands flushes all translations; no other effect.
+    unsafe { core::arch::asm!("sfence.vma zero, zero") };
+}
+
+/// The kernel's top-level (upper half) page-table entries as `init` left them. Process page
+/// tables copy these at creation, so the kernel must never create or free a top-level slot
+/// afterwards (OD41); `kernel_half_unchanged` checks.
+static mut KERNEL_HALF: [u64; 256] = [0; 256];
+
+fn kernel_half_now() -> [u64; 256] {
+    let root = get().aspace.table().root();
+    let mut out = [0u64; 256];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot =
+            kcore::pagetable::PhysMem::read_u64(&get().mm.mem, (root << 12) + (256 + i as u64) * 8);
+    }
+    out
+}
+
+/// Remember the kernel half now (called once, after the S1 memory tests, before any process).
+pub fn snapshot_kernel_half() {
+    // SAFETY: called once at boot, interrupts off or a single thread, before `kernel_half_unchanged`.
+    unsafe { *addr_of_mut!(KERNEL_HALF) = kernel_half_now() };
+}
+
+pub fn kernel_half_unchanged() -> bool {
+    // SAFETY: read of a static written once by `snapshot_kernel_half`.
+    kernel_half_now() == unsafe { *addr_of!(KERNEL_HALF) }
+}

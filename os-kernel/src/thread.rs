@@ -459,3 +459,16 @@ pub fn debug_set_guard(tid: Tid, intact: bool) {
 pub fn class_name() -> &'static str {
     kcore::sched::SchedClass::name(&new_class())
 }
+
+/// The top of the calling thread's kernel stack (where a trap from user mode starts).
+pub fn current_stack_top() -> u64 {
+    irq::without(|| {
+        let k = kernel();
+        let t = k.threads.get(&k.running).expect("running thread exists");
+        let stack = t
+            .stack
+            .as_ref()
+            .expect("a user thread has its own kernel stack");
+        ((stack.as_ptr() as usize + STACK_BYTES) & !15) as u64
+    })
+}

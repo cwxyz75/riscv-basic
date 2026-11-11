@@ -58,6 +58,13 @@ pub enum RegionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmoGone;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmoError {
+    Gone,
+    OutOfRange,
+    NoMemory,
+}
+
 struct Vmo {
     pages: u64,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
@@ -111,6 +118,84 @@ impl Vmos {
                 dropped.is_ok(),
                 "a committed page holds the VMO's reference"
             );
+        }
+        Ok(())
+    }
+
+    /// Write bytes into a VMO at `offset`, committing pages as needed (loading a program
+    /// image, filling a buffer before it is shared). Nothing is written if the range does
+    /// not fit inside the VMO.
+    pub fn write<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), VmoError> {
+        self.access(mm, id, offset, data.len(), |mm, pa, range| {
+            mm.mem.write_bytes(pa, &data[range])
+        })
+    }
+
+    /// Read bytes out of a VMO (uncommitted pages read as zeros and stay uncommitted).
+    pub fn read<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        id: u64,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), VmoError> {
+        let len = out.len();
+        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        let end = offset.checked_add(len as u64).ok_or(VmoError::OutOfRange)?;
+        if end > vmo.pages * PAGE_SIZE {
+            return Err(VmoError::OutOfRange);
+        }
+        let mut done = 0;
+        while done < len {
+            let at = offset + done as u64;
+            let (page, inner) = (at / PAGE_SIZE, (at % PAGE_SIZE) as usize);
+            let n = (PAGE_SIZE as usize - inner).min(len - done);
+            match vmo.committed.get(&page) {
+                Some(&pfn) => mm
+                    .mem
+                    .read_bytes((pfn << 12) + inner as u64, &mut out[done..done + n]),
+                None => out[done..done + n].fill(0),
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn access<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        id: u64,
+        offset: u64,
+        len: usize,
+        mut each: impl FnMut(&mut Mm<M>, u64, core::ops::Range<usize>),
+    ) -> Result<(), VmoError> {
+        let pages = self.map.get(&id).ok_or(VmoError::Gone)?.pages;
+        let end = offset.checked_add(len as u64).ok_or(VmoError::OutOfRange)?;
+        if end > pages * PAGE_SIZE {
+            return Err(VmoError::OutOfRange);
+        }
+        // Commit everything first so a failure part-way leaves no half-written data.
+        let mut at = offset;
+        while at < end {
+            self.page_for(mm, id, at / PAGE_SIZE)
+                .map_err(|_| VmoError::NoMemory)?;
+            at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
+        }
+        let vmo = self.map.get(&id).expect("exists");
+        let mut done = 0;
+        while done < len {
+            let at = offset + done as u64;
+            let (page, inner) = (at / PAGE_SIZE, at % PAGE_SIZE);
+            let n = ((PAGE_SIZE - inner) as usize).min(len - done);
+            let pfn = vmo.committed[&page];
+            each(mm, (pfn << 12) + inner, done..done + n);
+            done += n;
         }
         Ok(())
     }
@@ -288,6 +373,16 @@ impl AddressSpace {
             });
         }
         Ok(())
+    }
+
+    /// Unmap everything and free the tables of a process whose table shares the kernel's
+    /// upper half (`PageTable::new_with_kernel_half`): the shared half is left alone.
+    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>) {
+        let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
+        for start in starts {
+            let _ = self.unmap_region(mm, start);
+        }
+        self.table.destroy_user(mm);
     }
 
     /// Unmap everything and free the tables.

@@ -98,6 +98,91 @@ The syscall layer must reject `nbytes > MAX_MSG_BYTES` and `nhandles > MAX_MSG_H
 with TOO_BIG *before* copying anything from user memory, so a user-chosen length never
 drives unbounded work.
 
+## User address space and process start (S3b)
+
+User addresses are the Sv39 lower half, `0x0000_0000_0000_1000` up to (not including)
+`0x0000_0040_0000_0000`; page 0 is never mapped. A process starts with `sp` at
+`0x0000_0020_0000_0000`, a user stack of 64 pages (256 KiB) mapped below it and
+committed lazily, an unmapped guard page under that, `a0 = 0`, and every other
+register 0. The program image is a static ELF64 for RISC-V (`ET_EXEC`, little endian,
+one `PT_LOAD` per segment): segments become lazily committed memory objects mapped with
+their own permissions (R, RW or RX; a segment that is both writable and executable is
+refused, INVARIANTS M2); `PT_GNU_STACK` asking for an executable stack is refused. The
+kernel half of the address space is shared by every process and is not reachable from
+user mode (no U bit).
+
+The kernel half's top-level page-table slots are fixed once the first process exists (a
+process copies them when it is created); the kernel never creates or frees one afterwards
+(OD41), and refuses to start a process if one changed.
+
+A user thread that faults on an address no region covers, on a permission its region
+does not give, or that executes an illegal instruction, ends its process (exit code
+`-1000 - scause`); the kernel never trusts a user fault.
+
+## Syscall numbers and registers (S3b)
+
+`a7` = number, `a0`..`a5` = arguments, results: `a0` = status, `a1`, `a2` = values.
+
+| # | Call | Arguments | Results |
+|---|---|---|---|
+| 0 | debug_write | `a0` ptr, `a1` len | |
+| 1 | process_exit | `a0` code | does not return |
+| 2 | thread_yield | | |
+| 3 | clock_get | | `a1` ticks since boot (1 ms each) |
+| 10 | handle_close | `a0` handle | |
+| 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
+| 12 | handle_replace | `a0` handle, `a1` rights | `a1` new handle |
+| 20 | channel_create | | `a1`, `a2` the two handles |
+| 21 | channel_write | `a0` channel, `a1` bytes, `a2` nbytes, `a3` handles, `a4` nhandles | |
+| 22 | channel_read | `a0` channel, `a1` bytes buf, `a2` max_bytes, `a3` handles buf, `a4` max_handles | `a1` nbytes, `a2` nhandles (set on OK and on BUFFER_TOO_SMALL) |
+| 23 | channel_read_txid | `a0` channel, `a1` txid, `a2` bytes buf, `a3` max_bytes, `a4` handles buf, `a5` max_handles | `a1`, `a2` as 22 |
+| 30 | event_create | | `a1` handle |
+| 31 | event_signal | `a0` event, `a1` clear, `a2` set | |
+| 32 | object_signals | `a0` handle | `a1` the signal word |
+
+A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
+
+### Execution model of a syscall (S3b)
+
+A syscall runs to completion with interrupts off, on the calling thread's kernel stack, so
+it is atomic with respect to every other thread and to the timer (no thread is preempted
+mid-syscall). That keeps S3b simple and is *not* a promise for later: S5 (SMP) replaces
+it with locks, and long syscalls (a 64 KiB message copy, the object sweep) are a latency
+cost the real-time band will feel. The kernel does not touch the user's `sp`, `gp` or `tp`
+(it has its own stack and uses no thread pointer); S5 must reload `gp`/`tp` on entry.
+Arguments declared 32-bit (handles, rights, signal masks, `txid`) must fit in 32 bits: a
+value with higher bits set is BAD_HANDLE (a handle), ACCESS_DENIED (rights) or INVALID_ARGS
+(a signal mask or `txid`), never silently truncated.
+
+### Copying from and to user memory
+
+For every pointer argument the kernel (1) checks `ptr + len` does not wrap and stays in
+the user half, (2) walks the process's page tables page by page, committing a lazily
+backed page through the fault path if it is not yet mapped, (3) requires the page to be
+user-accessible and to allow the access (read for a source, write for a destination),
+and copies through the direct map. Anything else is `INVALID_ARGS`; a zero length never
+touches memory, whatever the pointer. A call that fails on a pointer changes nothing.
+`debug_write` is limited to 4096 bytes per call (TOO_BIG beyond). It is a debugging aid for
+the trusted boot-time suite: nothing ties a `##TEST` line to the program that wrote it.
+
+### debug_write(ptr, len) -> status
+
+Sends bytes to the serial console. Rights: none (a debugging aid for the boot-time
+suite; real processes get a console channel in S4). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
+Errors: INVALID_ARGS (bad pointer);
+TOO_BIG (len over 4096).
+
+### process_exit(code) -> does not return
+
+Ends the calling process: its threads stop, its handle table is closed (INVARIANTS H6),
+its address space is torn down.
+
+### thread_yield() -> status, clock_get() -> status, ticks, object_signals(handle) -> status, signals
+
+`thread_yield` gives up the rest of the time slice. `clock_get` returns ticks of 1 ms
+since boot. `object_signals` reads the signal word of the object a handle names
+(BAD_HANDLE for a bad handle; no right needed, the signals are not secret to a holder).
+
 ## Entry template
 
 ```text
@@ -190,6 +275,12 @@ returned); NO_MEMORY (the caller's table lacks room for the message's handles; t
 message stays queued).
 Invariants: H4. Tests: `channel_basics`, `channel_errors`, `channel_model`.
 
+The user's destination pointers are checked against the **message actually delivered**, not
+against the declared capacity: a 5-byte message needs 5 writable bytes however large
+`max_bytes` is (a capacity over the limits counts as the limit). They are checked *after*
+the status above is known (so BUFFER_TOO_SMALL and SHOULD_WAIT win over a bad pointer) and
+*before* the message is dequeued, so a bad pointer is INVALID_ARGS and never loses a message.
+
 ### channel_read_txid(channel, txid, max_bytes, max_handles) -> status, bytes, handles
 
 As `channel_read` but takes the oldest message whose first 4 bytes (little endian) equal
@@ -240,13 +331,13 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 
 | Call | Status |
 |---|---|
-| handle_close, handle_duplicate, handle_replace | specified (S3a); pure logic tested |
-| channel_create, channel_write, channel_read, channel_read_txid | specified (S3a); pure logic tested |
-| event_create, event_signal | specified (S3a); pure logic tested |
-| channel_call | planned, S3b |
+| handle_close, handle_duplicate, handle_replace | specified (S3a); implemented in S3b |
+| channel_create, channel_write, channel_read, channel_read_txid | specified (S3a); implemented in S3b |
+| event_create, event_signal | specified (S3a); implemented in S3b |
+| channel_call | planned, S3c |
 | object_wait (wait on a signal with a deadline), object_wait_many / ports | planned, S3c |
-| debug_write, process_exit, thread_exit, clock_get | planned, S3b |
-| vmo_create, vmo_read, vmo_write, vmo_set_size, vmo_create_child | planned, S3b |
-| vmar_map, vmar_unmap, vmar_protect | planned, S3b |
-| process_create, process_start, process_kill, thread_create, thread_start | planned, S3b/S3c |
+| debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
+| vmo_create, vmo_read, vmo_write, vmo_set_size, vmo_create_child | planned, S3c |
+| vmar_map, vmar_unmap, vmar_protect | planned, S3c |
+| process_create, process_start, process_kill, thread_create, thread_start | planned, S3c |
 | socket_create, socket_write, socket_read | planned, S3c |
