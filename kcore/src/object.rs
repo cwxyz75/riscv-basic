@@ -11,6 +11,9 @@
 
 use alloc::vec::Vec;
 
+/// Slots reserved when a registry is created (`abi::limits::MAX_OBJECTS`).
+const PREALLOC_SLOTS: usize = 16384;
+
 /// The object count above which `needs_sweep` is true until the first sweep.
 const SWEEP_MIN: usize = 256;
 
@@ -74,7 +77,11 @@ impl<T: Object> Default for Registry<T> {
 impl<T: Object> Registry<T> {
     pub fn new() -> Registry<T> {
         Registry {
-            slots: Vec::new(),
+            // Reserved once: growing a table this size by doubling needs a contiguous block
+            // twice as large as the old one, and an allocation failure is a kernel panic
+            // (found by the trust-boundary audit). Owners cap `live` at `MAX_OBJECTS`, and
+            // slots are reused, so the table never needs to grow.
+            slots: Vec::with_capacity(PREALLOC_SLOTS),
             free: Vec::new(),
             live: 0,
             threshold: SWEEP_MIN,
@@ -267,7 +274,9 @@ impl<T: Object> Registry<T> {
                 self.release(id);
             }
         }
-        self.threshold = SWEEP_MIN.max(self.live * 2);
+        // Never past the cap (garbage cycles must not be able to fill it), and never so close
+        // to it that every creation sweeps while the objects are all genuinely reachable.
+        self.threshold = SWEEP_MIN.max(self.live * 2).min(PREALLOC_SLOTS - 4);
         doomed.len()
     }
 }

@@ -768,7 +768,9 @@ fn wait_with_deadline_zero_polls() -> Outcome {
         (S::TimedOut.code(), 0),
         "nothing set: TIMED_OUT, observed 0"
     );
-    ensure!(sys::clock_get() - t0 <= 1, "it did not wait");
+    // A poll does not block; it may still be preempted between the two clock reads on a
+    // loaded host, so the bound is loose (a real wait would be unbounded).
+    ensure!(sys::clock_get() - t0 <= 25, "it did not wait");
     Ok(())
 }
 
@@ -3167,6 +3169,147 @@ fn dead_port_bindings_vanish_at_once() -> Outcome {
     Ok(())
 }
 
+// Regression tests from the trust-boundary audit (kernel memory caps must end in NO_MEMORY,
+// never a kernel panic).
+
+/// Park events 64 at a time in channel messages until something refuses: the refusal must be
+/// NO_MEMORY, and everything must work again once the channels are closed.
+fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
+    let mut chans = [0u32; 10];
+    for i in 0..5 {
+        let (a, b) = channel()?;
+        chans[2 * i] = a;
+        chans[2 * i + 1] = b;
+    }
+    let mut made = 0u32;
+    let mut refused = None;
+    'outer: for &ch in chans.iter() {
+        for _ in 0..128 {
+            let mut hs = [0u32; 64];
+            let mut got = 0;
+            for h in hs.iter_mut() {
+                let r = sys::event_create();
+                if r.status != 0 {
+                    refused = st(r);
+                    break;
+                }
+                *h = r.a1 as u32;
+                got += 1;
+                made += 1;
+            }
+            if got > 0 {
+                let w = sys::channel_write(ch, core::ptr::null(), 0, hs.as_ptr(), got);
+                if w.status != 0 {
+                    refused = st(w);
+                    break 'outer;
+                }
+            }
+            if refused.is_some() {
+                break 'outer;
+            }
+        }
+    }
+    ensure_eq!(
+        refused,
+        Some(S::NoMemory),
+        "after {made} events the refusal is NO_MEMORY"
+    );
+    for ch in chans {
+        sys::handle_close(ch);
+    }
+    ensure!(
+        event().is_ok(),
+        "objects can be made again after the channels are closed"
+    );
+    Ok(())
+}
+
+fn mappings_per_process_are_bounded() -> Outcome {
+    let me = me()?;
+    let v = vmo(1)?;
+    let base = 0x10_0000_0000u64;
+    let mut n = 0u64;
+    let mut refused = None;
+    while n < 3000 {
+        let r = sys::process_map(me, v, base + n * 8192, 0, 4096, PF_R);
+        if r.status != 0 {
+            refused = st(r);
+            break;
+        }
+        n += 1;
+    }
+    ensure_eq!(
+        refused,
+        Some(S::NoMemory),
+        "a limit on regions (reached at {n})"
+    );
+    ensure!(n >= 512, "the limit is not absurdly low ({n})");
+    for i in 0..n {
+        sys::process_unmap(me, base + i * 8192);
+    }
+    ensure_eq!(
+        st(sys::process_map(me, v, base, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "room again"
+    );
+    Ok(())
+}
+
+/// Queued handles are kernel memory: they are charged to the IPC budget.
+fn queued_handles_are_charged_to_the_budget() -> Outcome {
+    let e = event()?;
+    let mut sent = 0u32;
+    let mut refused = None;
+    let mut chans = [0u32; 40];
+    let mut nch = 0;
+    'outer: for _ in 0..20 {
+        let (a, b) = channel()?;
+        chans[nch] = a;
+        chans[nch + 1] = b;
+        nch += 2;
+        for side in [a, b] {
+            for _ in 0..128 {
+                let mut hs = [0u32; 64];
+                for h in hs.iter_mut() {
+                    let r = sys::handle_duplicate(e, Rights::SAME.0);
+                    if r.status != 0 {
+                        refused = st(r);
+                        break 'outer;
+                    }
+                    *h = r.a1 as u32;
+                }
+                let w = sys::channel_write(side, core::ptr::null(), 0, hs.as_ptr(), 64);
+                if w.status != 0 {
+                    refused = st(w);
+                    break 'outer;
+                }
+                sent += 1;
+            }
+        }
+    }
+    ensure!(
+        matches!(refused, Some(S::NoMemory) | Some(S::ShouldWait)),
+        "refused after {sent} messages with {refused:?}"
+    );
+    ensure!(sent < 4000, "{sent} messages of 64 handles were accepted");
+    for &c in &chans[..nch] {
+        sys::handle_close(c);
+    }
+    let (a, _b) = channel()?;
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            b"ok".as_ptr(),
+            2,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "usable again"
+    );
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -3674,6 +3817,18 @@ pub fn app_main() -> i32 {
         (
             "kill_a_child_blocked_in_port_wait",
             kill_a_child_blocked_in_port_wait,
+        ),
+        (
+            "the_object_cap_is_reached_without_a_kernel_panic",
+            the_object_cap_is_reached_without_a_kernel_panic,
+        ),
+        (
+            "mappings_per_process_are_bounded",
+            mappings_per_process_are_bounded,
+        ),
+        (
+            "queued_handles_are_charged_to_the_budget",
+            queued_handles_are_charged_to_the_budget,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

@@ -1022,9 +1022,17 @@ fn reap_vmos() {
     irq::without(|| {
         let s = state();
         let k = kmem::get();
+        if s.pending_vmos.is_empty() {
+            return;
+        }
+        // One pass over all regions, not one per pending VMO.
+        let mut mapped: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
+        for p in s.procs.values() {
+            p.aspace.collect_vmos(&mut mapped);
+        }
         let pending = core::mem::take(&mut s.pending_vmos);
         for id in pending {
-            if s.procs.values().any(|p| p.aspace.maps_vmo(id)) {
+            if mapped.contains(&id) {
                 s.pending_vmos.push(id);
             } else {
                 let _ = k.vmos.destroy(&mut k.mm, id);
@@ -1447,7 +1455,7 @@ fn process_create() -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        if s.procs.len() >= abi::limits::MAX_PROCESSES {
+        if s.procs.len() >= abi::limits::MAX_PROCESSES || !kmem::kernel_half_unchanged() {
             return bad(Status::NoMemory);
         }
         let k = kmem::get();
@@ -1600,7 +1608,10 @@ fn process_map(a: [u64; 6]) -> Reply {
         target
             .aspace
             .map_region(&k.vmos, vaddr, length / 4096, vid, offset / 4096, perms)
-            .map_err(|_| (Status::InvalidArgs, None, None))?;
+            .map_err(|e| match e {
+                kcore::aspace::RegionError::TooMany => (Status::NoMemory, None, None),
+                _ => (Status::InvalidArgs, None, None),
+            })?;
         Ok((None, None))
     })
 }

@@ -33,8 +33,9 @@ jobs:
         run: |
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
+          qemu-system-riscv64 -cpu help | grep -i rva23 || echo "NO RVA23 CPU"
           dpkg -l opensbi | tail -1
-      - run: make home-boot-test os-boot-test os-boot-test-aia
+      - run: make home-boot-test os-boot-test os-boot-test-aia os-boot-test-rva23
 
   miri:
     runs-on: ubuntu-latest

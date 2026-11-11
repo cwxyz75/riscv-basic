@@ -148,8 +148,10 @@ pub fn init(boot_prio: Prio) {
     // The kernel does no floating point and thread switches do not save FP state:
     // keep the FPU off (sstatus.FS = 0) so any accidental use traps instead of
     // silently corrupting another thread's registers.
-    // SAFETY: clears sstatus.FS only.
-    unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
+    // The same for the vector unit (sstatus.VS, bits 10:9; mandatory in RVA23, OD47): no vector
+    // state is saved per thread, so user mode must not be able to use it either.
+    // SAFETY: clears sstatus.FS and sstatus.VS only.
+    unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     let mut sched = Sched::new(new_class());
     let boot = sched.adopt_current(boot_prio).expect("boot thread");
     let mut threads = BTreeMap::new();
@@ -500,7 +502,7 @@ pub fn fp_off() -> bool {
     let v: usize;
     // SAFETY: reads a CSR.
     unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) v) };
-    v >> 13 & 3 == 0
+    v >> 13 & 3 == 0 && v >> 9 & 3 == 0
 }
 
 pub fn heap_free() -> usize {

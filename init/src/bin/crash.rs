@@ -157,6 +157,12 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
+        28 => {
+            // vsetvli t0, zero, e8, m1, ta, ma: illegal while sstatus.VS is off
+            // SAFETY: either traps (the process dies) or only changes vl/vtype and t0.
+            unsafe { asm!(".4byte 0x0c0072d7", out("t0") _) };
+            return 77;
+        }
         26 => {
             // take a socket end from the bootstrap channel and drain it to the end of the
             // stream; the exit code is how many bytes arrived
