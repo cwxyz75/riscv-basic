@@ -103,6 +103,17 @@ pub mod rights {
                 | Self::SIGNAL.0
                 | Self::WAIT.0,
         );
+        pub const VMO: Rights = Rights(
+            Self::DUPLICATE.0
+                | Self::TRANSFER.0
+                | Self::READ.0
+                | Self::WRITE.0
+                | Self::EXECUTE.0
+                | Self::MAP.0,
+        );
+        pub const PROCESS: Rights = Rights(
+            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
+        );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
 
@@ -132,6 +143,8 @@ pub mod signals {
     pub const READABLE: u32 = 1 << 0;
     pub const WRITABLE: u32 = 1 << 1;
     pub const PEER_CLOSED: u32 = 1 << 2;
+    /// A process has ended.
+    pub const TERMINATED: u32 = 1 << 3;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
 }
@@ -153,6 +166,10 @@ pub mod limits {
     /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for
     /// per-job quotas (OS-ARCHITECTURE Q9).
     pub const MAX_OBJECTS: usize = 65536;
+    /// Pages in one VMO (64 MiB).
+    pub const MAX_VMO_PAGES: u64 = 16384;
+    /// Live processes at once.
+    pub const MAX_PROCESSES: usize = 64;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
@@ -173,6 +190,17 @@ pub mod syscall {
     pub const EVENT_SIGNAL: usize = 31;
     pub const OBJECT_SIGNALS: usize = 32;
     pub const OBJECT_WAIT: usize = 33;
+    pub const VMO_CREATE: usize = 40;
+    pub const VMO_READ: usize = 41;
+    pub const VMO_WRITE: usize = 42;
+    pub const VMO_GET_SIZE: usize = 43;
+    pub const PROCESS_CREATE: usize = 50;
+    pub const PROCESS_SELF: usize = 51;
+    pub const PROCESS_MAP: usize = 52;
+    pub const PROCESS_UNMAP: usize = 53;
+    pub const PROCESS_START: usize = 54;
+    pub const PROCESS_KILL: usize = 55;
+    pub const PROCESS_INFO: usize = 56;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").

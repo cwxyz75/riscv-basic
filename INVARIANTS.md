@@ -19,7 +19,7 @@ get filled in as each area is built.
 | H3 | Rights only shrink: duplicate, replace, transfer and open never produce a handle with a right its source lacked | `handle_model`, `channel_model` (a model of every handle's rights), `rights_escalation_is_refused` (S3a) |
 | H4 | A message in flight owns its handles: if the channel dies they are closed, never leaked, and never duplicated | `channel_model`, `registry_model`, `cycles_are_swept` with `Registry::live()` as the leak counter (S3a) |
 | H5 | Authority is holding a handle: no syscall consults identity, a path or ambient state to grant access | Review against `SYSCALLS.md` (S3) |
-| H6 | Process death releases every object it held | Table drain + reachability sweep tested on the host (S3a); QEMU `process_exit_releases_all_objects` and `process_teardown_returns_every_frame` for a single process (S3b); with several processes and threads in S3c |
+| H6 | Process death releases every object it held | Table drain + reachability sweep tested on the host (S3a); QEMU `process_exit_releases_all_objects` and `process_teardown_returns_every_frame` for a single process (S3b); S3c-2a: children launched, killed (running, blocked, never started) and abandoned by their parent leak nothing (`no_process_or_vmo_survives_init`, `many_children_do_not_leak`); a VMO lives while a handle or a mapping does; threads in S3c-2b |
 
 ## Memory
 

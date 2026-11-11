@@ -77,6 +77,36 @@ pub fn app_main() -> i32 {
             }
             return down(0) as i32;
         }
+        14 => {
+            // a polite child: wait for one message on the bootstrap channel, echo it back
+            // reversed, exit with 3
+            let mut buf = [0u8; 64];
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
+            let r = rt::sys::channel_read(
+                rt::BOOTSTRAP,
+                buf.as_mut_ptr(),
+                64,
+                core::ptr::null_mut(),
+                0,
+            );
+            if r.status != 0 {
+                return 100;
+            }
+            buf[..r.a1].reverse();
+            rt::sys::channel_write(rt::BOOTSTRAP, buf.as_ptr(), r.a1, core::ptr::null(), 0);
+            return 3;
+        }
+        15 => {
+            // spin forever in user mode (only a kill ends this)
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        16 => {
+            // block forever in a wait (only a kill ends this)
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
+            return 9;
+        }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
             // syscall (the other way a process loses the CPU, so the other return path).

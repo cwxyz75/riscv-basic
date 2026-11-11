@@ -96,6 +96,11 @@ impl Vmos {
         self.next
     }
 
+    /// How many VMOs exist (a leak counter for tests).
+    pub fn count(&self) -> usize {
+        self.map.len()
+    }
+
     pub fn exists(&self, id: u64) -> bool {
         self.map.contains_key(&id)
     }
@@ -296,6 +301,17 @@ impl AddressSpace {
             },
         );
         Ok(())
+    }
+
+    /// Does any region of this address space map VMO `vmo`?
+    pub fn maps_vmo(&self, vmo: u64) -> bool {
+        self.regions.values().any(|r| r.vmo == vmo)
+    }
+
+    /// The permissions of the region covering `va`, if there is one (mapped yet or not).
+    pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
+        let (&start, r) = self.regions.range(..=va).next_back()?;
+        (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
     }
 
     /// Remove the region starting at `start`, unmapping its pages and dropping the

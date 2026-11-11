@@ -55,6 +55,10 @@ fn helper_main(_: usize) {
                     let _ = end.write(&msg);
                 }
                 b'C' => break,
+                b'I' => {
+                    // hand over the `crash` program image as a VMO (for the user-level launcher)
+                    let _ = end.write_with_vmo(&msg[..5], user::CRASH_ELF);
+                }
                 b'T' => {
                     thread::sleep_ticks(3);
                     break;
@@ -93,6 +97,7 @@ pub fn run_all() -> Report {
 
     // The user-level suite, as a process.
     let frames = free_frames();
+    let vmos_before = kmem::get().vmos.count();
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
             user::INIT_ELF,
@@ -124,6 +129,18 @@ pub fn run_all() -> Report {
             Ok(())
         } else {
             Err(format!("free frames {} -> {}", frames, free_frames()))
+        },
+    );
+    push(
+        "no_process_or_vmo_survives_init",
+        if user::process_count() == 0 && kmem::get().vmos.count() == vmos_before {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} processes and {} VMOs left (wanted 0 and {vmos_before})",
+                user::process_count(),
+                kmem::get().vmos.count()
+            ))
         },
     );
     push(

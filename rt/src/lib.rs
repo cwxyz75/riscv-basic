@@ -162,6 +162,75 @@ pub mod sys {
             [h as usize, mask as usize, deadline as usize, 0, 0, 0],
         )
     }
+    pub fn vmo_create(pages: u64) -> Ret {
+        syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
+    }
+    pub fn vmo_read(vmo: u32, offset: u64, buf: *mut u8, len: usize) -> Ret {
+        syscall(
+            VMO_READ,
+            [vmo as usize, offset as usize, buf as usize, len, 0, 0],
+        )
+    }
+    pub fn vmo_write(vmo: u32, offset: u64, buf: *const u8, len: usize) -> Ret {
+        syscall(
+            VMO_WRITE,
+            [vmo as usize, offset as usize, buf as usize, len, 0, 0],
+        )
+    }
+    pub fn vmo_get_size(vmo: u32) -> Ret {
+        syscall(VMO_GET_SIZE, [vmo as usize, 0, 0, 0, 0, 0])
+    }
+    pub fn process_create() -> Ret {
+        syscall(PROCESS_CREATE, [0; 6])
+    }
+    pub fn process_self() -> Ret {
+        syscall(PROCESS_SELF, [0; 6])
+    }
+    pub fn process_map(
+        process: u32,
+        vmo: u32,
+        vaddr: u64,
+        vmo_offset: u64,
+        length: u64,
+        flags: u64,
+    ) -> Ret {
+        syscall(
+            PROCESS_MAP,
+            [
+                process as usize,
+                vmo as usize,
+                vaddr as usize,
+                vmo_offset as usize,
+                length as usize,
+                flags as usize,
+            ],
+        )
+    }
+    pub fn process_unmap(process: u32, vaddr: u64) -> Ret {
+        syscall(
+            PROCESS_UNMAP,
+            [process as usize, vaddr as usize, 0, 0, 0, 0],
+        )
+    }
+    pub fn process_start(process: u32, entry: u64, sp: u64, bootstrap: u32, arg: u64) -> Ret {
+        syscall(
+            PROCESS_START,
+            [
+                process as usize,
+                entry as usize,
+                sp as usize,
+                bootstrap as usize,
+                arg as usize,
+                0,
+            ],
+        )
+    }
+    pub fn process_kill(process: u32, code: i32) -> Ret {
+        syscall(PROCESS_KILL, [process as usize, code as usize, 0, 0, 0, 0])
+    }
+    pub fn process_info(process: u32) -> Ret {
+        syscall(PROCESS_INFO, [process as usize, 0, 0, 0, 0, 0])
+    }
     pub fn channel_call(ch: u32, args: &super::CallArgs) -> Ret {
         syscall(
             CHANNEL_CALL,

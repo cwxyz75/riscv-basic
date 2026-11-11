@@ -79,6 +79,7 @@ change.
 | READABLE | 0 | a channel has a queued message |
 | WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
 | PEER_CLOSED | 2 | the other end of a channel is gone |
+| TERMINATED | 3 | a process has ended |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
 ## Limits
@@ -140,6 +141,17 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 31 | event_signal | `a0` event, `a1` clear, `a2` set | |
 | 32 | object_signals | `a0` handle | `a1` the signal word |
 | 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
+| 40 | vmo_create | `a0` pages | `a1` handle |
+| 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
+| 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
+| 43 | vmo_get_size | `a0` vmo | `a1` bytes |
+| 50 | process_create | | `a1` handle |
+| 51 | process_self | | `a1` handle |
+| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
+| 53 | process_unmap | `a0` process, `a1` vaddr | |
+| 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
+| 55 | process_kill | `a0` process, `a1` code | |
+| 56 | process_info | `a0` process | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
@@ -249,6 +261,86 @@ Tests: `channel_call_*` in `init`.
 Every process starts with exactly one handle, **handle value 1**: a channel endpoint, the
 bootstrap channel, whose other end the creator keeps (OS-ARCHITECTURE section 9). It has
 the default channel rights. Everything else a program is given arrives as a message on it.
+
+## Memory objects and processes (S3c-2a)
+
+### Objects
+
+A **VMO** (memory object) is a lazily committed run of pages (1 to `MAX_VMO_PAGES`, 16384 =
+64 MiB), zero until written, that can be read and written by handle and mapped into
+processes. Rights: DUPLICATE, TRANSFER, READ, WRITE, EXECUTE, MAP. A **process** object
+is a handle to an address space, a handle table and (once started) a thread. Rights:
+DUPLICATE, TRANSFER, MANAGE (map, start, kill), INSPECT (exit code), WAIT. A process raises
+the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle to a process
+kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
+closing the last handle to a VMO frees it once nothing maps it.
+
+### vmo_create(pages) -> status, handle
+
+New zero-filled VMO. Errors: INVALID_ARGS (`pages` is 0 or over the limit); NO_MEMORY (object
+cap or kernel memory). Tests: `vmo_*` in `init`.
+
+### vmo_read(vmo, offset, buffer, length) / vmo_write(vmo, offset, buffer, length) -> status
+
+Copy between a VMO and user memory. Rights: READ / WRITE. Errors, in order: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (a bad user pointer, or the range does not lie
+inside the VMO: `offset + length` wraps or exceeds its size; a zero `length` is allowed
+anywhere inside or at the end). `length` is limited to `MAX_MSG_BYTES` per call (TOO_BIG).
+Nothing is written on an error.
+
+### vmo_get_size(vmo) -> status, bytes
+
+The size in bytes. Errors: BAD_HANDLE; WRONG_TYPE.
+
+### process_create() -> status, handle
+
+A new, empty, not yet started process: an address space with nothing mapped and an empty handle
+table. Errors: NO_MEMORY (kernel memory, or `MAX_PROCESSES` reached).
+
+### process_self() -> status, handle
+
+A handle to the calling process, with MANAGE, INSPECT, WAIT and DUPLICATE (not TRANSFER).
+
+### process_map(process, vmo, vaddr, vmo_offset, length, flags) -> status
+
+Map `length` bytes of `vmo` starting at byte `vmo_offset` into `process` at `vaddr`, with
+permissions `flags` (R = 1, W = 2, X = 4; read is always implied; W and X together is
+INVALID_ARGS, INVARIANTS M2). Pages are committed on first touch.
+Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
+Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
+process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
+`length` 0; unknown flag bits; W with X; the range outside the user half (or including page zero) or outside the
+VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
+reserved); NO_MEMORY. Mapping into a running process takes effect at once.
+Tests: `process_map_*` in `init`.
+
+### process_unmap(process, vaddr) -> status
+
+Remove the mapping that starts at `vaddr`. Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; BAD_STATE; INVALID_ARGS (no mapping starts there).
+
+### process_start(process, entry, sp, bootstrap, arg) -> status
+
+Start the process's first thread at `entry` with stack pointer `sp` and `a0 = arg`. The
+channel endpoint `bootstrap` leaves the caller's table and becomes the new process's handle 1
+(the bootstrap channel). Rights: MANAGE on `process`; TRANSFER on `bootstrap`. The process must
+not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
+16-byte aligned and in the user half (what is mapped below it is the caller's business).
+Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
+channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`).
+On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`.
+
+### process_kill(process, code) -> status
+
+End the process with exit code `code` (as if it had called `process_exit(code)`): its threads
+stop, its handle table is closed, its address space is torn down, TERMINATED is raised.
+Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (already ended).
+A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
+
+### process_info(process) -> status, exit_code
+
+The exit code of an ended process (`-1000 - scause` after a fault). Rights: INSPECT.
+Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 
 ## Entry template
 
@@ -405,7 +497,9 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | object_wait (wait on a signal with a deadline) | specified (S3c-1) |
 | object_wait_many / ports | planned, S3c-3 |
 | debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
-| vmo_create, vmo_read, vmo_write, vmo_set_size, vmo_create_child | planned, S3c |
-| vmar_map, vmar_unmap, vmar_protect | planned, S3c |
-| process_create, process_start, process_kill, thread_create, thread_start | planned, S3c |
+| vmo_create, vmo_read, vmo_write, vmo_get_size | specified (S3c-2a) |
+| vmo_set_size, vmo_create_child | planned, later |
+| process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
+| process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
+| thread_create, thread_exit | planned, S3c-2b |
 | socket_create, socket_write, socket_read | planned, S3c |

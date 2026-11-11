@@ -1182,6 +1182,765 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
     Ok(())
 }
 
+// --- VMOs, processes and the user-level launcher (S3c-2a) ---------------------------------
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+const PF_R: u64 = 1;
+const PF_W: u64 = 2;
+const PF_X: u64 = 4;
+const TOP: u64 = 0x40_0000_0000;
+
+/// The handle of the program image VMO the kernel-side helper sent us (0 until fetched).
+static IMAGE: AtomicU32 = AtomicU32::new(0);
+
+fn vmo(pages: u64) -> Result<u32, Detail> {
+    Ok(ok(sys::vmo_create(pages), "vmo_create")?.a1 as u32)
+}
+
+fn proc_create() -> Result<u32, Detail> {
+    Ok(ok(sys::process_create(), "process_create")?.a1 as u32)
+}
+
+fn weaker(h: u32, rights: u32) -> Result<u32, Detail> {
+    let d = ok(sys::handle_duplicate(h, Rights::SAME.0), "duplicate")?.a1 as u32;
+    Ok(ok(sys::handle_replace(d, rights), "replace")?.a1 as u32)
+}
+
+fn vmo_basics() -> Outcome {
+    let v = vmo(3)?;
+    ensure_eq!(sys::vmo_get_size(v).a1, 3 * 4096, "size of a 3 page VMO");
+    let data: [u8; 20] = core::array::from_fn(|i| i as u8 + 1);
+    ensure_eq!(
+        st(sys::vmo_write(v, 4090, data.as_ptr(), 20)),
+        Some(S::Ok),
+        "a write across a page boundary"
+    );
+    let mut back = [0u8; 20];
+    ensure_eq!(
+        st(sys::vmo_read(v, 4090, back.as_mut_ptr(), 20)),
+        Some(S::Ok),
+        "read it back"
+    );
+    ensure_eq!(back, data, "the same bytes");
+    let mut zero = [9u8; 16];
+    ensure_eq!(
+        st(sys::vmo_read(v, 0, zero.as_mut_ptr(), 16)),
+        Some(S::Ok),
+        "an untouched area"
+    );
+    ensure_eq!(zero, [0u8; 16], "reads as zeros");
+    ensure_eq!(
+        st(sys::vmo_write(v, 3 * 4096 - 4, data.as_ptr(), 8)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    ensure_eq!(
+        st(sys::vmo_write(v, u64::MAX, data.as_ptr(), 1)),
+        Some(S::InvalidArgs),
+        "offset overflow"
+    );
+    ensure_eq!(
+        st(sys::vmo_read(v, 3 * 4096, zero.as_mut_ptr(), 0)),
+        Some(S::Ok),
+        "an empty read at the end"
+    );
+    ensure_eq!(
+        st(sys::vmo_read(v, 3 * 4096 + 1, zero.as_mut_ptr(), 0)),
+        Some(S::InvalidArgs),
+        "an empty read past the end"
+    );
+    ensure_eq!(
+        st(sys::vmo_write(v, 0, data.as_ptr(), 65537)),
+        Some(S::TooBig),
+        "over the per-call limit"
+    );
+    ensure_eq!(
+        st(sys::vmo_create(0)),
+        Some(S::InvalidArgs),
+        "a VMO of no pages"
+    );
+    ensure_eq!(
+        st(sys::vmo_create(16385)),
+        Some(S::InvalidArgs),
+        "over 64 MiB"
+    );
+    ensure_eq!(
+        st(sys::vmo_write(v, 0, 0x10 as *const u8, 4)),
+        Some(S::InvalidArgs),
+        "a bad source pointer"
+    );
+    ensure_eq!(
+        st(sys::vmo_read(v, 0, KERNEL_ADDR as *mut u8, 4)),
+        Some(S::InvalidArgs),
+        "a kernel destination"
+    );
+    let ro = weaker(v, Rights::READ.0)?;
+    let wo = weaker(v, Rights::WRITE.0)?;
+    ensure_eq!(
+        st(sys::vmo_write(ro, 0, data.as_ptr(), 4)),
+        Some(S::AccessDenied),
+        "write with a read-only handle"
+    );
+    ensure_eq!(
+        st(sys::vmo_read(wo, 0, zero.as_mut_ptr(), 4)),
+        Some(S::AccessDenied),
+        "read with a write-only handle"
+    );
+    let e = event()?;
+    ensure_eq!(
+        st(sys::vmo_read(e, 0, zero.as_mut_ptr(), 4)),
+        Some(S::WrongType),
+        "an event is no VMO"
+    );
+    ensure_eq!(st(sys::vmo_get_size(BAD)), Some(S::BadHandle), "bad handle");
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::VMO_GET_SIZE,
+            [(1usize << 32) | v as usize, 0, 0, 0, 0, 0]
+        )),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    // two handles, one VMO: a write through one shows through the other
+    let dup = ok(sys::handle_duplicate(v, Rights::SAME.0), "dup")?.a1 as u32;
+    sys::vmo_write(dup, 100, b"shared".as_ptr(), 6);
+    let mut s = [0u8; 6];
+    sys::vmo_read(v, 100, s.as_mut_ptr(), 6);
+    ensure_eq!(&s, b"shared", "one memory object");
+    Ok(())
+}
+
+fn process_map_argument_checks() -> Outcome {
+    let p = proc_create()?;
+    let v = vmo(4)?;
+    let map = |vaddr: u64, off: u64, len: u64, flags: u64| {
+        st(sys::process_map(p, v, vaddr, off, len, flags))
+    };
+    ensure_eq!(
+        map(0x1_0001, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "unaligned address"
+    );
+    ensure_eq!(
+        map(0x1_0000, 1, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "unaligned offset"
+    );
+    ensure_eq!(map(0x1_0000, 0, 0, PF_R), Some(S::InvalidArgs), "length 0");
+    ensure_eq!(
+        map(0x1_0000, 0, 100, PF_R),
+        Some(S::InvalidArgs),
+        "unaligned length"
+    );
+    ensure_eq!(
+        map(0x1_0000, 0, 4096, 8),
+        Some(S::InvalidArgs),
+        "an unknown flag"
+    );
+    ensure_eq!(
+        map(0x1_0000, 0, 4096, PF_W | PF_X),
+        Some(S::InvalidArgs),
+        "writable and executable"
+    );
+    ensure_eq!(map(0, 0, 4096, PF_R), Some(S::InvalidArgs), "page zero");
+    ensure_eq!(
+        map(TOP - 4096, 0, 8192, PF_R),
+        Some(S::InvalidArgs),
+        "over the top of the user half"
+    );
+    ensure_eq!(
+        map(0xffff_ffff_8000_0000, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "a kernel address"
+    );
+    ensure_eq!(
+        map(0x1_0000, 3 * 4096, 8192, PF_R),
+        Some(S::InvalidArgs),
+        "past the end of the VMO"
+    );
+    ensure_eq!(
+        map(0x1_0000, u64::MAX - 4095, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "offset overflow"
+    );
+    ensure_eq!(
+        map(0x1_0000, 0, 4 * 4096, PF_R | PF_W),
+        Some(S::Ok),
+        "a good mapping"
+    );
+    ensure_eq!(
+        map(0x1_0000, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "overlap"
+    );
+    ensure_eq!(
+        map(0x1_3000, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "overlap with the last page"
+    );
+    ensure_eq!(
+        map(0x1_4000, 0, 4096, PF_R),
+        Some(S::Ok),
+        "right after is fine"
+    );
+    // rights
+    let no_map = weaker(v, Rights::READ.0)?;
+    ensure_eq!(
+        st(sys::process_map(p, no_map, 0x8_0000, 0, 4096, PF_R)),
+        Some(S::AccessDenied),
+        "no MAP right"
+    );
+    let ro_map = weaker(v, Rights::READ.0 | Rights::MAP.0)?;
+    ensure_eq!(
+        st(sys::process_map(p, ro_map, 0x8_0000, 0, 4096, PF_W)),
+        Some(S::AccessDenied),
+        "W without WRITE"
+    );
+    ensure_eq!(
+        st(sys::process_map(p, ro_map, 0x8_0000, 0, 4096, PF_X)),
+        Some(S::AccessDenied),
+        "X without EXECUTE"
+    );
+    ensure_eq!(
+        st(sys::process_map(p, ro_map, 0x8_0000, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "R with READ|MAP"
+    );
+    let no_manage = weaker(p, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::process_map(no_manage, v, 0x9_0000, 0, 4096, PF_R)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    let e = event()?;
+    ensure_eq!(
+        st(sys::process_map(e, v, 0x9_0000, 0, 4096, PF_R)),
+        Some(S::WrongType),
+        "an event as the process"
+    );
+    ensure_eq!(
+        st(sys::process_map(p, e, 0x9_0000, 0, 4096, PF_R)),
+        Some(S::WrongType),
+        "an event as the VMO"
+    );
+    ensure_eq!(
+        st(sys::process_map(BAD, v, 0x9_0000, 0, 4096, PF_R)),
+        Some(S::BadHandle),
+        "bad process handle"
+    );
+    ensure_eq!(
+        st(sys::process_map(p, BAD, 0x9_0000, 0, 4096, PF_R)),
+        Some(S::BadHandle),
+        "bad VMO handle"
+    );
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::PROCESS_MAP,
+            [
+                (1usize << 32) | p as usize,
+                v as usize,
+                0x9_0000,
+                0,
+                4096,
+                1
+            ]
+        )),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    // unmap
+    ensure_eq!(
+        st(sys::process_unmap(p, 0x1_1000)),
+        Some(S::InvalidArgs),
+        "no mapping starts there"
+    );
+    ensure_eq!(
+        st(sys::process_unmap(no_manage, 0x1_0000)),
+        Some(S::AccessDenied),
+        "unmap needs MANAGE"
+    );
+    ensure_eq!(st(sys::process_unmap(p, 0x1_0000)), Some(S::Ok), "unmap");
+    ensure_eq!(
+        st(sys::process_unmap(p, 0x1_0000)),
+        Some(S::InvalidArgs),
+        "unmap again"
+    );
+    ensure_eq!(
+        st(sys::process_map(p, v, 0x1_0000, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "the range is free again"
+    );
+    Ok(())
+}
+
+fn process_start_argument_checks() -> Outcome {
+    let p = proc_create()?;
+    let code = vmo(2)?;
+    ensure_eq!(
+        st(sys::process_map(p, code, 0x2_0000, 0, 8192, PF_R | PF_X)),
+        Some(S::Ok),
+        "map some code"
+    );
+    let data = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(p, data, 0x4_0000, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "and some data"
+    );
+    let (mine, theirs) = channel()?;
+    let go = |entry: u64, sp: u64, bs: u32| st(sys::process_start(p, entry, sp, bs, 0));
+    ensure_eq!(
+        go(0x3_0000, 0x4_1000, theirs),
+        Some(S::InvalidArgs),
+        "entry in no mapping"
+    );
+    ensure_eq!(
+        go(0x4_0000, 0x4_1000, theirs),
+        Some(S::InvalidArgs),
+        "entry in a mapping that is not executable"
+    );
+    ensure_eq!(
+        go(0x2_0000, 0x4_0ff8, theirs),
+        Some(S::InvalidArgs),
+        "sp not 16-byte aligned"
+    );
+    ensure_eq!(
+        go(0x2_0000, TOP + 16, theirs),
+        Some(S::InvalidArgs),
+        "sp above the user half"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        go(0x2_0000, 0x4_1000, ev),
+        Some(S::WrongType),
+        "an event as the bootstrap handle"
+    );
+    let no_transfer = weaker(theirs, Rights::READ.0 | Rights::WRITE.0)?;
+    ensure_eq!(
+        go(0x2_0000, 0x4_1000, no_transfer),
+        Some(S::AccessDenied),
+        "no TRANSFER on the bootstrap handle"
+    );
+    ensure_eq!(
+        go(0x2_0000, 0x4_1000, BAD),
+        Some(S::BadHandle),
+        "bad bootstrap handle"
+    );
+    ensure_eq!(
+        st(sys::process_start(BAD, 0x2_0000, 0x4_1000, theirs, 0)),
+        Some(S::BadHandle),
+        "bad process handle"
+    );
+    ensure_eq!(
+        st(sys::process_start(ev, 0x2_0000, 0x4_1000, theirs, 0)),
+        Some(S::WrongType),
+        "an event as the process"
+    );
+    let no_manage = weaker(p, Rights::INSPECT.0)?;
+    ensure_eq!(
+        st(sys::process_start(no_manage, 0x2_0000, 0x4_1000, theirs, 0)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    ensure!(
+        sys::object_signals(theirs).status == 0 && sys::object_signals(mine).status == 0,
+        "a refused start left the handle with us"
+    );
+    // process_kill / process_info argument checks on the same process
+    ensure_eq!(st(sys::process_info(p)), Some(S::BadState), "not ended yet");
+    ensure_eq!(
+        st(sys::process_info(no_manage)),
+        Some(S::BadState),
+        "INSPECT is enough"
+    );
+    let weak = weaker(p, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::process_info(weak)),
+        Some(S::AccessDenied),
+        "info needs INSPECT"
+    );
+    ensure_eq!(
+        st(sys::process_kill(weak, 1)),
+        Some(S::AccessDenied),
+        "kill needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::process_kill(ev, 1)),
+        Some(S::WrongType),
+        "an event as the process"
+    );
+    ensure_eq!(
+        st(sys::process_kill(BAD, 1)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    Ok(())
+}
+
+fn fetch_the_program_image() -> Outcome {
+    let (m, n) = request(21, b'I', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u32; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!(
+        (r.status, r.a1, r.a2),
+        (0, 5, 1),
+        "the reply carries a handle (call: status, nbytes, nhandles)"
+    );
+    let image = got[0];
+    let size = sys::vmo_get_size(image).a1;
+    ensure!(size > 1000, "the image VMO is {size} bytes");
+    let mut head = [0u8; 4];
+    sys::vmo_read(image, 0, head.as_mut_ptr(), 4);
+    ensure_eq!(&head, b"\x7fELF", "it holds an ELF file");
+    IMAGE.store(image, Ordering::Relaxed);
+    Ok(())
+}
+
+fn le(b: &[u8], at: usize, n: usize) -> u64 {
+    let mut v = 0u64;
+    for i in 0..n {
+        v |= (b[at + i] as u64) << (8 * i);
+    }
+    v
+}
+
+/// The launcher: read the ELF in `image`, build a process from it (one VMO and one mapping
+/// per PT_LOAD segment, plus a stack), and start it with start argument `arg`. Returns our
+/// handle to the process and our end of its bootstrap channel. This is what a real launcher
+/// does (OS-ARCHITECTURE 9): the kernel never parses an executable for it.
+fn launch(arg: u64) -> Result<(u32, u32), Detail> {
+    let image = IMAGE.load(Ordering::Relaxed);
+    ensure!(image != 0, "no image was fetched");
+    let mut eh = [0u8; 64];
+    ok(
+        sys::vmo_read(image, 0, eh.as_mut_ptr(), 64),
+        "read the ELF header",
+    )?;
+    let (entry, phoff, phnum) = (le(&eh, 24, 8), le(&eh, 32, 8), le(&eh, 56, 2) as usize);
+    ensure!(phnum <= 16, "{phnum} program headers");
+    let mut ph = [0u8; 56 * 16];
+    ok(
+        sys::vmo_read(image, phoff, ph.as_mut_ptr(), 56 * phnum),
+        "read the program headers",
+    )?;
+    let proc = proc_create()?;
+    for i in 0..phnum {
+        let h = &ph[i * 56..(i + 1) * 56];
+        if le(h, 0, 4) != 1 {
+            continue; // not PT_LOAD
+        }
+        let (flags, offset, vaddr, filesz, memsz) = (
+            le(h, 4, 4),
+            le(h, 8, 8),
+            le(h, 16, 8),
+            le(h, 32, 8),
+            le(h, 40, 8),
+        );
+        let lead = vaddr % 4096;
+        let pages = (lead + memsz).div_ceil(4096);
+        let seg = vmo(pages)?;
+        let mut done = 0u64;
+        let mut chunk = [0u8; 2048];
+        while done < filesz {
+            let n = (filesz - done).min(2048);
+            ok(
+                sys::vmo_read(image, offset + done, chunk.as_mut_ptr(), n as usize),
+                "read the image",
+            )?;
+            ok(
+                sys::vmo_write(seg, lead + done, chunk.as_ptr(), n as usize),
+                "fill the segment",
+            )?;
+            done += n;
+        }
+        let perms =
+            PF_R | if flags & 2 != 0 { PF_W } else { 0 } | if flags & 1 != 0 { PF_X } else { 0 };
+        ok(
+            sys::process_map(proc, seg, vaddr - lead, 0, pages * 4096, perms),
+            "map a segment",
+        )?;
+    }
+    let stack = vmo(16)?;
+    ok(
+        sys::process_map(proc, stack, 0x10_0000_0000, 0, 16 * 4096, PF_R | PF_W),
+        "map the stack",
+    )?;
+    let (mine, theirs) = channel()?;
+    ok(
+        sys::process_start(proc, entry, 0x10_0000_0000 + 16 * 4096, theirs, arg),
+        "start",
+    )?;
+    Ok((proc, mine))
+}
+
+fn wait_ended(proc: u32, ticks: u64) -> Result<(), Detail> {
+    let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
+    ensure_eq!(r.status, 0, "the process ended");
+    ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
+    Ok(())
+}
+
+fn child_exit_code_and_terminated_signal() -> Outcome {
+    let (p, mine) = launch(8)?;
+    wait_ended(p, 500)?;
+    let r = sys::process_info(p);
+    ensure_eq!((r.status, r.a1 as i64), (0, 42), "the child's exit code");
+    ensure!(
+        sys::object_signals(mine).a1 as u32 & sig::PEER_CLOSED != 0,
+        "its handles were closed: our end of the bootstrap channel sees it"
+    );
+    Ok(())
+}
+
+fn child_faults_are_contained() -> Outcome {
+    for (variant, want) in [(1u64, -1015i64), (7, -1013), (5, -1002)] {
+        let (p, _mine) = launch(variant)?;
+        wait_ended(p, 500)?;
+        let r = sys::process_info(p);
+        ensure_eq!(
+            (r.status, r.a1 as i64),
+            (0, want),
+            "exit code of variant {variant}"
+        );
+    }
+    Ok(())
+}
+
+fn parent_and_child_talk() -> Outcome {
+    let (p, mine) = launch(14)?;
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            b"ping".as_ptr(),
+            4,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send to the child"
+    );
+    let r = sys::object_wait(
+        mine,
+        sig::READABLE | sig::PEER_CLOSED,
+        sys::clock_get() + 500,
+    );
+    ensure!(
+        r.status == 0 && r.a1 as u32 & sig::READABLE != 0,
+        "the child answered"
+    );
+    let mut buf = [0u8; 8];
+    let r = sys::channel_read(mine, buf.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..4]),
+        (0, 4, &b"gnip"[..]),
+        "the reversed message"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 3, "its exit code");
+    Ok(())
+}
+
+fn kill_a_spinning_child() -> Outcome {
+    let (p, _mine) = launch(15)?;
+    ensure_eq!(st(sys::process_info(p)), Some(S::BadState), "still running");
+    let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 4);
+    ensure_eq!(
+        st(r),
+        Some(S::TimedOut),
+        "a spinning child does not end by itself"
+    );
+    ensure_eq!(st(sys::process_kill(p, 77)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 77, "the exit code we gave");
+    ensure_eq!(
+        st(sys::process_kill(p, 1)),
+        Some(S::BadState),
+        "kill it again"
+    );
+    Ok(())
+}
+
+fn kill_a_blocked_child() -> Outcome {
+    let (p, _mine) = launch(16)?;
+    let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 4);
+    ensure_eq!(st(r), Some(S::TimedOut), "the child is blocked in a wait");
+    ensure_eq!(st(sys::process_kill(p, -5)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -5, "its exit code");
+    Ok(())
+}
+
+fn closing_the_last_process_handle_kills_the_child() -> Outcome {
+    let (p, mine) = launch(15)?;
+    sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3);
+    ensure_eq!(
+        st(sys::handle_close(p)),
+        Some(S::Ok),
+        "drop the only handle to the child"
+    );
+    let r = sys::object_wait(mine, sig::PEER_CLOSED, sys::clock_get() + 500);
+    ensure_eq!(
+        r.status,
+        0,
+        "the child is gone: its end of the channel closed"
+    );
+    Ok(())
+}
+
+fn a_process_that_never_started_can_be_killed() -> Outcome {
+    let p = proc_create()?;
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(p, v, 0x1_0000, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "give it some memory"
+    );
+    ensure_eq!(
+        st(sys::process_kill(p, 5)),
+        Some(S::Ok),
+        "kill it before it ran"
+    );
+    ensure_eq!(
+        sys::object_signals(p).a1 as u32 & sig::TERMINATED,
+        sig::TERMINATED,
+        "TERMINATED at once"
+    );
+    ensure_eq!(sys::process_info(p).a1 as i64, 5, "exit code");
+    ensure_eq!(
+        st(sys::process_map(p, v, 0x2_0000, 0, 4096, PF_R)),
+        Some(S::BadState),
+        "an ended process takes no mappings"
+    );
+    let (_mine, theirs) = channel()?;
+    ensure_eq!(
+        st(sys::process_start(p, 0x1_0000, 0x1_1000, theirs, 0)),
+        Some(S::BadState),
+        "and cannot be started"
+    );
+    Ok(())
+}
+
+fn process_self_and_mapping_into_ourselves() -> Outcome {
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_info(me)),
+        Some(S::BadState),
+        "we have not ended"
+    );
+    let list = [me];
+    let (a, _b) = channel()?;
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            core::ptr::null(),
+            0,
+            list.as_ptr(),
+            1
+        )),
+        Some(S::AccessDenied),
+        "a self handle cannot be sent away"
+    );
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(me, v, 0x6_0000, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map a VMO into ourselves"
+    );
+    // SAFETY: 0x6_0000 was just mapped read-write in this process.
+    unsafe { core::ptr::write_volatile(0x6_0010 as *mut u32, 0xdead_beef) };
+    let mut b = [0u8; 4];
+    sys::vmo_read(v, 0x10, b.as_mut_ptr(), 4);
+    ensure_eq!(
+        u32::from_le_bytes(b),
+        0xdead_beef,
+        "the store through the mapping is in the VMO"
+    );
+    sys::vmo_write(v, 0x20, 0x1234_5678u32.to_le_bytes().as_ptr(), 4);
+    // SAFETY: as above.
+    let seen = unsafe { core::ptr::read_volatile(0x6_0020 as *const u32) };
+    ensure_eq!(
+        seen,
+        0x1234_5678,
+        "and a write to the VMO is visible through the mapping"
+    );
+    ensure_eq!(st(sys::process_unmap(me, 0x6_0000)), Some(S::Ok), "unmap");
+    let again = ok(sys::process_self(), "a second self handle")?.a1 as u32;
+    ensure_eq!(
+        st(sys::handle_close(again)),
+        Some(S::Ok),
+        "closing a self handle does not end us"
+    );
+    ensure_eq!(
+        st(sys::handle_close(me)),
+        Some(S::Ok),
+        "not even the last one"
+    );
+    Ok(())
+}
+
+fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
+    // SYSCALLS.md: closing the last handle to a VMO frees it "once nothing maps it". A
+    // mapping must keep the VMO alive, including pages not yet touched.
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    let v = vmo(2)?;
+    sys::vmo_write(v, 0, 0xfeed_f00du32.to_le_bytes().as_ptr(), 4);
+    ensure_eq!(
+        st(sys::process_map(me, v, 0x7_0000, 0, 8192, PF_R | PF_W)),
+        Some(S::Ok),
+        "map both pages"
+    );
+    ensure_eq!(
+        st(sys::handle_close(v)),
+        Some(S::Ok),
+        "close the only VMO handle"
+    );
+    // SAFETY: 0x7_0000..0x7_2000 is mapped read-write in this process.
+    let (first, second) = unsafe {
+        (
+            core::ptr::read_volatile(0x7_0000 as *const u32),
+            core::ptr::read_volatile(0x7_1000 as *const u32),
+        )
+    };
+    ensure_eq!(first, 0xfeed_f00d, "the committed page survives");
+    ensure_eq!(second, 0, "an untouched page still faults in as zeros");
+    // SAFETY: as above.
+    unsafe { core::ptr::write_volatile(0x7_1000 as *mut u32, 1) };
+    ensure_eq!(st(sys::process_unmap(me, 0x7_0000)), Some(S::Ok), "unmap");
+    Ok(())
+}
+
+fn many_children_do_not_leak() -> Outcome {
+    // The kernel checks after we exit that no process, VMO, object or frame is left.
+    for _ in 0..6 {
+        let (p, _m) = launch(8)?;
+        wait_ended(p, 500)?;
+    }
+    for _ in 0..4 {
+        let (p, _m) = launch(15)?;
+        ensure_eq!(st(sys::process_kill(p, 1)), Some(S::Ok), "kill");
+        wait_ended(p, 500)?;
+    }
+    for _ in 0..3 {
+        let (p, _m) = launch(16)?;
+        sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 2);
+        sys::handle_close(p);
+    }
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -1538,6 +2297,38 @@ pub fn app_main() -> i32 {
         ("wait_and_call_argument_edges", wait_and_call_argument_edges),
         ("channel_call_carries_handles", channel_call_carries_handles),
         ("kernel_ends_survive_a_sweep", kernel_ends_survive_a_sweep),
+        ("vmo_basics", vmo_basics),
+        ("process_map_argument_checks", process_map_argument_checks),
+        (
+            "process_start_argument_checks",
+            process_start_argument_checks,
+        ),
+        ("fetch_the_program_image", fetch_the_program_image),
+        (
+            "child_exit_code_and_terminated_signal",
+            child_exit_code_and_terminated_signal,
+        ),
+        ("child_faults_are_contained", child_faults_are_contained),
+        ("parent_and_child_talk", parent_and_child_talk),
+        ("kill_a_spinning_child", kill_a_spinning_child),
+        ("kill_a_blocked_child", kill_a_blocked_child),
+        (
+            "closing_the_last_process_handle_kills_the_child",
+            closing_the_last_process_handle_kills_the_child,
+        ),
+        (
+            "a_process_that_never_started_can_be_killed",
+            a_process_that_never_started_can_be_killed,
+        ),
+        (
+            "process_self_and_mapping_into_ourselves",
+            process_self_and_mapping_into_ourselves,
+        ),
+        (
+            "vmo_closed_while_mapped_keeps_its_pages",
+            vmo_closed_while_mapped_keeps_its_pages,
+        ),
+        ("many_children_do_not_leak", many_children_do_not_leak),
         (
             "wait_is_woken_by_the_peer_closing",
             wait_is_woken_by_the_peer_closing,
