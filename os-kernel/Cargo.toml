@@ -1,0 +1,13 @@
+[package]
+name = "os-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the bare-metal kernel binary (S0: a stub that boots, runs self-tests and reports through the serial port and QEMU's test finisher)"
+
+[dependencies]
+abi = { path = "../abi" }
+kcore = { path = "../kcore" }
+
+[features]
+# Make one self-test fail on purpose, so the boot test can prove it sees failures.
+fail-demo = []

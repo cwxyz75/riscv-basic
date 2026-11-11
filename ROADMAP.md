@@ -198,21 +198,21 @@ every `to` definition is compiled before it runs.
 
 Spec: `OS-ARCHITECTURE.md` (design in sections 2-16, decisions in 17, open
 questions in 18). A separate kernel binary and new crates; the home computer above
-is untouched. **Nothing here is built yet.** Each milestone ends in a demo and has a
+is untouched. **S0 is built; S1 onwards is not.** Each milestone ends in a demo and has a
 runnable acceptance check, written before the code. Tick a box only when verified in
-QEMU (for SMP work, in both normal and icount modes). Crate names are provisional
-until S0 fixes them.
+QEMU (for SMP work, in both normal and icount modes). Crate names are fixed by S0:
+`abi`, `kcore`, `os-kernel`; more arrive with their milestones.
 
 ### S0: Foundation
 
 Acceptance: a host test run and a headless boot test both gate `make` targets and
 run in CI.
 
-- [ ] Workspace members for the new crates; the new kernel binary builds
-- [ ] Host test setup including loom/shuttle and Miri
-- [ ] Stub kernel in QEMU prints structured test lines and exits through the test finisher with a pass/fail code
-- [ ] `INVARIANTS.md` and `SYSCALLS.md` skeletons
-- [ ] `make os-test` and `make os-boot-test` exist and are added to `make check`
+- [x] Workspace members for the new crates (`abi`, `kcore`, `os-kernel`); the new kernel binary builds
+- [x] Host test setup including loom/shuttle and Miri (`kcore::latch` is the first thing under them; mutation-checked: a non-atomic `take` is caught by both loom and shuttle; Miri passes; CI has a Miri job, `make check` does not need nightly)
+- [x] Stub kernel in QEMU prints structured test lines and exits through the test finisher with a pass/fail code (a `fail-demo` build proves the harness detects failure; mutation-checked)
+- [x] `INVARIANTS.md` and `SYSCALLS.md` skeletons
+- [x] `make os-test` and `make os-boot-test` exist and are added to `make check` (and CI)
 
 ### S1: Memory
 
