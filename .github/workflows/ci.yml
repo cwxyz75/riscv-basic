@@ -25,7 +25,12 @@ jobs:
         run: rustup toolchain install
       - name: Install QEMU and OpenSBI
         run: sudo apt-get update && sudo apt-get install -y qemu-system-riscv opensbi
-      - run: make boot-test os-boot-test
+      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
+        run: |
+          qemu-system-riscv64 --version | head -1
+          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
+          dpkg -l opensbi | tail -1
+      - run: make boot-test os-boot-test os-boot-test-aia
 
   miri:
     runs-on: ubuntu-latest

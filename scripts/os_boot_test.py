@@ -12,7 +12,8 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##PANIC <message>
     ##DONE pass=<n> fail=<n>
 
-The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+The machine type comes from $OS_MACHINE (default `virt`; `make os-boot-test-aia` uses
+`virt,aia=aplic-imsic`). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -23,6 +24,7 @@ nothing.
 This parser is deliberately written separately from the Rust code that prints the
 lines (`kcore::testlog`), so the two cannot share a misreading of the format.
 """
+import os
 import re
 import subprocess
 import sys
@@ -66,7 +68,7 @@ BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
-        "qemu-system-riscv64", "-machine", "virt", "-bios", "default",
+        "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
         "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
         *extra, "-kernel", kernel,
     ]
