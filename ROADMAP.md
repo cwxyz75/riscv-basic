@@ -6,10 +6,14 @@ The task tracker. Tick a box only when its acceptance criterion has been
 M3 (interpreter, host-only) is independent of M0-M2 (kernel) and can proceed in
 parallel, for example in a cloud session while the kernel work happens locally.
 
-There are two tracks. **M0-M8 are the BASIC machine** (done except the optional
-M7). **M9 and the L-series add LOGO** as a second language, chosen at a boot
+There are three tracks. **M0-M8 are the BASIC machine** (all done, including
+M7 persistence). **M9 and the L-series add LOGO** as a second language, chosen at a boot
 menu; the choice is permanent for that boot, and switching means rebooting.
 The language spec for the new track is `LOGO.md`.
+
+A third track, the **S-series** at the end of this file, is the OS: a separate
+kernel binary and new crates, specified in `OS-ARCHITECTURE.md`. It does not change
+the home computer described by M0-M9 and L0-L6.
 
 ## Done so far (baseline)
 
@@ -189,3 +193,127 @@ every `to` definition is compiled before it runs.
 - [x] `ramfb` on the RISC-V `virt` board with `-display cocoa` (L0): works, see `DESIGN.md`
 - [x] Can generated code run at all: emit, `fence.i`, jump, under QEMU (L4): yes, see `DESIGN.md`
 - [x] Deciding how far to take NaN-boxing without a garbage collector (L4): per-run arena (262144 values), values copied into interpreter storage by `make`/calls, `Out of memory` beyond that
+
+## OS track (S-series)
+
+Spec: `OS-ARCHITECTURE.md` (design in sections 2-16, decisions in 17, open
+questions in 18). A separate kernel binary and new crates; the home computer above
+is untouched. **Nothing here is built yet.** Each milestone ends in a demo and has a
+runnable acceptance check, written before the code. Tick a box only when verified in
+QEMU (for SMP work, in both normal and icount modes). Crate names are provisional
+until S0 fixes them.
+
+### S0: Foundation
+
+Acceptance: a host test run and a headless boot test both gate `make` targets and
+run in CI.
+
+- [ ] Workspace members for the new crates; the new kernel binary builds
+- [ ] Host test setup including loom/shuttle and Miri
+- [ ] Stub kernel in QEMU prints structured test lines and exits through the test finisher with a pass/fail code
+- [ ] `INVARIANTS.md` and `SYSCALLS.md` skeletons
+- [ ] `make os-test` and `make os-boot-test` exist and are added to `make check`
+
+### S1: Memory
+
+Acceptance: model-based tests agree with the reference model on the host; in QEMU,
+map/unmap/fault sequences return allocation counts to baseline.
+
+- [ ] Frame allocator and frame database with refcounts (pure crate, model-tested)
+- [ ] Sv39 on, kernel in the upper half, kernel heap
+- [ ] Page-fault handler with lazy commit through the memory-object (VMO) interface
+
+### S2: Threads and scheduling (one hart)
+
+Acceptance: a high-priority thread stays within a latency bound while CPU hogs run;
+the scheduler conformance suite passes.
+
+- [ ] Thread object, per-thread kernel stacks, context switch
+- [ ] Timer preemption and the single block/wake path
+- [ ] Fixed-priority scheduler with a real-time band, as a boot-selected class; conformance suite
+
+### S3: User mode, syscalls, handles, channels, VMOs
+
+Acceptance: a user test suite passes; every syscall's error cases are covered per
+`SYSCALLS.md`; killing a process leaks no objects.
+
+- [ ] User mode, syscall entry, handle table with rights
+- [ ] Channels (with `call`), ports, events, sockets
+- [ ] Process, address-space and VMO objects; minimal ELF loader starts `init` from the boot image
+- [ ] Process death releases everything (leak check)
+
+### S4: First interactive system
+
+Acceptance: a scripted shell session passes (`ls`, `cat`, `echo`, a pipeline);
+Ctrl-C kills the foreground job.
+
+- [ ] Launcher and startup message
+- [ ] Memory filesystem server
+- [ ] Console server; shell with builtins and external commands
+- [ ] Pipes through the socket object
+
+### S5: SMP
+
+Acceptance: every earlier suite passes with `-smp 4` in normal and icount modes; a
+long stress run reports no lock-order violations and no leaks.
+
+- [ ] Secondary harts via SBI HSM; per-hart state and run queues
+- [ ] IPIs and remote TLB shootdown
+- [ ] Big kernel lock first, then per-object locks on the hot paths
+- [ ] Lock-order checker in debug builds; stress suite
+
+### S6: Storage drivers
+
+Acceptance: a pattern written to the virtual disk reads back identical; the block
+driver can be killed and restarted.
+
+- [ ] Interrupt objects and device-memory VMOs
+- [ ] Driver manager and device-tree parsing
+- [ ] Userspace virtio-blk driver and block protocol
+
+### S7: libc and ported software
+
+Acceptance: BASIC goldens pass as a userland program; a Lua test script passes.
+
+- [ ] C libc subset; threads on futexes
+- [ ] `basic` crate as a userland program over a stdio-backed `Io`
+- [ ] Lua port
+
+### S8: Network, lower layers
+
+Acceptance: the guest pings its gateway; UDP echo works through `hostfwd`.
+
+- [ ] virtio-net driver
+- [ ] ARP, IPv4, ICMP, UDP
+- [ ] DHCP client
+
+### S9: TCP and HTTP
+
+Acceptance: a hash-verified fetch from a host HTTP server; host `curl` against an
+in-OS HTTP server serving memory-filesystem files; the lossy-link suite passes.
+
+- [ ] TCP (state machine, retransmission, congestion control) with packet-script tests
+- [ ] Sockets interface in the libc
+- [ ] Simulated lossy/reordering link suite
+- [ ] HTTP server demo; DNS resolver
+
+### S10: Namespaces and attributes
+
+Acceptance: scripted attribute queries pass; a union-backed `/bin` demo works.
+
+- [ ] Indexed attributes and `query` in the memory filesystem
+- [ ] Union server
+- [ ] Manifest-driven, confined-by-default shell
+
+### S11: Compatibility
+
+Acceptance: ported software that needs `fork` runs.
+
+- [ ] `fork` shim over copy-on-write snapshot VMOs
+- [ ] `mmap` private and shared; pager-backed VMOs
+- [ ] `posix_spawn`, a signals subset, the process server
+
+Longer-term backlog (see `OS-ARCHITECTURE.md` section 16): a real on-disk
+filesystem with crash-injection tests, a 9P bridge, graphics and input, scheduler
+alternatives against the conformance suite, capability revocation, quotas,
+self-hosting.
