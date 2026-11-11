@@ -1713,9 +1713,8 @@ fn process_kill(a: [u64; 6]) -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let (_, tpid, terminated, _) =
-            ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
-                .map_err(|e| (e, None, None))?;
+        let (_, tpid, terminated, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::KILL)
+            .map_err(|e| (e, None, None))?;
         if terminated || !s.procs.contains_key(&tpid) {
             return Err((Status::BadState, None, None));
         }

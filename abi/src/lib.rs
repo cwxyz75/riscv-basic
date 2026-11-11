@@ -90,8 +90,9 @@ pub mod rights {
         pub const WAIT: Rights = Rights(1 << 7);
         pub const MANAGE: Rights = Rights(1 << 8);
         pub const INSPECT: Rights = Rights(1 << 9);
+        pub const KILL: Rights = Rights(1 << 10);
         /// Every assigned right bit.
-        pub const ALL: Rights = Rights(0x3ff);
+        pub const ALL: Rights = Rights(0x7ff);
         /// Not a right: "the same rights as the source", for duplicate and replace.
         pub const SAME: Rights = Rights(1 << 31);
 
@@ -112,7 +113,12 @@ pub mod rights {
                 | Self::MAP.0,
         );
         pub const PROCESS: Rights = Rights(
-            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
+            Self::DUPLICATE.0
+                | Self::TRANSFER.0
+                | Self::MANAGE.0
+                | Self::KILL.0
+                | Self::INSPECT.0
+                | Self::WAIT.0,
         );
         pub const SOCKET: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::READ.0 | Self::WRITE.0 | Self::WAIT.0,
