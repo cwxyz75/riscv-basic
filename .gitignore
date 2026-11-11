@@ -2,3 +2,4 @@
 *.swp
 .DS_Store
 /disk.img
+.claude/worktrees/
