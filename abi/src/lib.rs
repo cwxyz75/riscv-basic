@@ -149,6 +149,38 @@ pub mod limits {
     pub const MAX_OBJECTS: usize = 65536;
 }
 
+/// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
+pub mod syscall {
+    pub const DEBUG_WRITE: usize = 0;
+    pub const PROCESS_EXIT: usize = 1;
+    pub const THREAD_YIELD: usize = 2;
+    pub const CLOCK_GET: usize = 3;
+    pub const HANDLE_CLOSE: usize = 10;
+    pub const HANDLE_DUPLICATE: usize = 11;
+    pub const HANDLE_REPLACE: usize = 12;
+    pub const CHANNEL_CREATE: usize = 20;
+    pub const CHANNEL_WRITE: usize = 21;
+    pub const CHANNEL_READ: usize = 22;
+    pub const CHANNEL_READ_TXID: usize = 23;
+    pub const EVENT_CREATE: usize = 30;
+    pub const EVENT_SIGNAL: usize = 31;
+    pub const OBJECT_SIGNALS: usize = 32;
+}
+
+/// The user address space (SYSCALLS.md, "User address space and process start").
+pub mod user {
+    /// Lowest mappable user address; page 0 is never mapped.
+    pub const BASE: u64 = 0x1000;
+    /// First address above the user half.
+    pub const TOP: u64 = 0x0000_0040_0000_0000;
+    /// Initial `sp`.
+    pub const STACK_TOP: u64 = 0x0000_0020_0000_0000;
+    /// Pages of lazily committed stack below `STACK_TOP`.
+    pub const STACK_PAGES: u64 = 64;
+    /// Longest `debug_write`.
+    pub const MAX_DEBUG_WRITE: usize = 4096;
+}
+
 /// The kernel's address-space layout (Sv39, kernel in the upper half).
 pub mod layout {
     /// Where OpenSBI puts the kernel image in physical memory.

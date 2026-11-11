@@ -20,6 +20,8 @@ mod selftest;
 mod thread;
 mod timer;
 mod trap;
+mod user;
+mod user_tests;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -35,6 +37,12 @@ struct Tally {
 }
 
 impl Tally {
+    /// Count results the user suite has already printed as `##TEST` lines.
+    fn add(&mut self, pass: u32, fail: u32) {
+        self.pass += pass;
+        self.fail += fail;
+    }
+
     fn record(&mut self, name: &str, result: Result<(), &str>) {
         let _ = testlog::test(&mut console::Console, name, result);
         if result.is_ok() {
@@ -48,7 +56,7 @@ impl Tally {
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     let mut out = console::Console;
-    let _ = testlog::boot(&mut out, "os-kernel", "s2");
+    let _ = testlog::boot(&mut out, "os-kernel", "s3");
     let _ = writeln!(
         out,
         "hello from the OS track, hart {hart_id}, paging via the early table"
@@ -104,6 +112,19 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
+        }
+    }
+    // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
+    // kernel); the kernel-side checks are reported here.
+    kmem::snapshot_kernel_half();
+    let before = user::reported();
+    let report = user_tests::run_all();
+    let _ = before;
+    tally.add(report.user_reported.0, report.user_reported.1);
+    for (name, outcome) in &report.tests {
+        match outcome {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(detail)),
         }
     }
     #[cfg(feature = "fail-demo")]

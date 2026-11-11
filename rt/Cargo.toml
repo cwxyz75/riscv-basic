@@ -1,0 +1,8 @@
+[package]
+name = "rt"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the native userland runtime (S3b): syscall wrappers, panic handler, _start, a tiny test harness. no_std, no allocator"
+
+[dependencies]
+abi = { path = "../abi" }

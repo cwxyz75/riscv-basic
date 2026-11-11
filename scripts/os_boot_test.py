@@ -51,6 +51,28 @@ REQUIRED = [
     "higher_priority_runs_at_once_on_spawn", "lower_priority_waits_for_higher",
     "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
     "the_latency_test_can_fail",
+    # S3b: user mode (the first group is reported by the user-level suite `init`, the second
+    # by the kernel about processes)
+    "user_mode_runs_and_prints", "clock_advances_in_user_mode", "unknown_syscalls_are_refused",
+    "debug_write_pointer_rules", "handle_syscalls_reject_bad_values", "event_syscalls",
+    "channel_round_trip", "channel_sends_handles", "channel_syscall_errors",
+    "channel_buffer_too_small_keeps_message", "buffers_are_validated_before_a_read",
+    "channel_txid_read", "channel_peer_closed", "user_cannot_forge_kernel_lines",
+    "rights_cannot_be_widened", "stack_grows_lazily", "syscall_layer_bounds",
+    "cycles_do_not_grow_memory",
+    "user_programs_are_embedded", "init_runs_in_user_mode_and_passes",
+    "process_teardown_returns_every_frame", "process_exit_releases_all_objects",
+    "user_store_to_kernel_memory_is_fatal", "user_load_from_kernel_memory_is_fatal",
+    "user_store_to_own_text_is_fatal", "user_jump_to_data_is_fatal",
+    "user_privileged_instruction_is_fatal", "user_jump_to_unmapped_memory_is_fatal",
+    "user_null_pointer_load_is_fatal", "user_exit_code_is_reported",
+    "a_corrupt_program_is_refused_without_leaks",
+    "registers_survive_a_syscall", "wide_arguments_are_not_truncated",
+    "channel_read_checks_the_message_not_the_capacity", "user_jump_to_kernel_text_is_fatal",
+    "a_syscall_with_sp_in_the_kernel_is_harmless", "the_stack_has_a_guard_page",
+    "kernel_top_level_slots_are_stable", "two_processes_do_not_share_memory",
+    "yielding_processes_do_not_share_memory",
+    "two_process_teardown_returns_every_frame",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the

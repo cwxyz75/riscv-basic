@@ -13,6 +13,41 @@ use crate::Mm;
 pub trait PhysMem {
     fn read_u64(&self, pa: u64) -> u64;
     fn write_u64(&mut self, pa: u64, value: u64);
+    /// Copy bytes out of physical memory (any alignment). Whole aligned words go at once.
+    fn read_bytes(&self, pa: u64, out: &mut [u8]) {
+        let mut i = 0;
+        while i < out.len() {
+            let a = pa + i as u64;
+            if a & 7 == 0 && out.len() - i >= 8 {
+                out[i..i + 8].copy_from_slice(&self.read_u64(a).to_le_bytes());
+                i += 8;
+            } else {
+                out[i] = (self.read_u64(a & !7) >> ((a & 7) * 8)) as u8;
+                i += 1;
+            }
+        }
+    }
+    /// Copy bytes into physical memory (any alignment). Whole aligned words go at once.
+    fn write_bytes(&mut self, pa: u64, data: &[u8]) {
+        let mut i = 0;
+        while i < data.len() {
+            let a = pa + i as u64;
+            if a & 7 == 0 && data.len() - i >= 8 {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&data[i..i + 8]);
+                self.write_u64(a, u64::from_le_bytes(w));
+                i += 8;
+            } else {
+                let shift = (a & 7) * 8;
+                let word = self.read_u64(a & !7);
+                self.write_u64(
+                    a & !7,
+                    (word & !(0xff << shift)) | (u64::from(data[i]) << shift),
+                );
+                i += 1;
+            }
+        }
+    }
     /// Fill a frame with zeros.
     fn zero_frame(&mut self, pfn: Pfn) {
         for word in 0..PAGE_SIZE / 8 {
@@ -140,6 +175,44 @@ impl PageTable {
         let root = mm.db.alloc()?;
         mm.mem.zero_frame(root);
         Some(PageTable { root })
+    }
+
+    /// A fresh table for a user process: empty in the lower half, and sharing the
+    /// kernel's upper half (top-level entries 256..512 are copied, so every process sees
+    /// the same kernel mappings; OD41). Free it with `destroy_user`, never `destroy`.
+    pub fn new_with_kernel_half<M: PhysMem>(
+        mm: &mut Mm<M>,
+        kernel: &PageTable,
+    ) -> Option<PageTable> {
+        let table = PageTable::new(mm)?;
+        for i in 256..512u64 {
+            let pte = mm.mem.read_u64((kernel.root << 12) + i * 8);
+            mm.mem.write_u64((table.root << 12) + i * 8, pte);
+        }
+        Some(table)
+    }
+
+    /// Free the root and every table of the lower (user) half. The shared kernel half is
+    /// not touched. The user leaves must already be unmapped.
+    pub fn destroy_user<M: PhysMem>(self, mm: &mut Mm<M>) {
+        fn walk<M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
+            if level > 0 {
+                for i in 0..512 {
+                    let pte = mm.mem.read_u64((table << 12) + i * 8);
+                    if pte & V != 0 && !is_leaf(pte) {
+                        walk(mm, ppn(pte), level - 1);
+                    }
+                }
+            }
+            let _ = mm.db.dec(table);
+        }
+        for i in 0..256u64 {
+            let pte = mm.mem.read_u64((self.root << 12) + i * 8);
+            if pte & V != 0 && !is_leaf(pte) {
+                walk(mm, ppn(pte), 1);
+            }
+        }
+        let _ = mm.db.dec(self.root);
     }
 
     /// Wrap an existing root (the kernel's boot table). Do not `destroy` it.

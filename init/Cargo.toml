@@ -1,0 +1,8 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the first user program (the boot-time user test suite) and the `crash` program that misbehaves on purpose (S3b)"
+
+[dependencies]
+rt = { path = "../rt" }

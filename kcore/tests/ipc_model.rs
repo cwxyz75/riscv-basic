@@ -1109,3 +1109,70 @@ fn the_object_cap_applies_to_channel_pairs_too() {
     );
     assert_eq!(reg.live(), abi::limits::MAX_OBJECTS);
 }
+
+#[test]
+fn peek_predicts_exactly_what_a_read_would_do() {
+    let (mut reg, mut t) = world();
+    let (a, b) = channel_create(&mut reg, &mut t).unwrap();
+    assert_eq!(
+        channel_peek(&reg, &t, b, None, 9, 9),
+        Err(ReadError::Status(Status::ShouldWait))
+    );
+    let e = event_create(&mut reg, &mut t).unwrap();
+    channel_write(&mut reg, &mut t, a, &[5, 0, 0, 0, 1, 2], &[e]).unwrap();
+    assert_eq!(channel_peek(&reg, &t, b, None, 6, 1), Ok((6, 1)));
+    assert_eq!(
+        channel_peek(&reg, &t, b, None, 5, 1),
+        Err(ReadError::TooSmall {
+            bytes: 6,
+            handles: 1
+        })
+    );
+    assert_eq!(
+        channel_peek(&reg, &t, b, None, 6, 0),
+        Err(ReadError::TooSmall {
+            bytes: 6,
+            handles: 1
+        })
+    );
+    assert_eq!(channel_peek(&reg, &t, b, Some(5), 6, 1), Ok((6, 1)));
+    assert_eq!(
+        channel_peek(&reg, &t, b, Some(6), 6, 1),
+        Err(ReadError::Status(Status::ShouldWait)),
+        "no such txid"
+    );
+    assert_eq!(
+        channel_peek(&reg, &t, Handle(0), None, 6, 1),
+        Err(ReadError::Status(Status::BadHandle))
+    );
+    let ev = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(
+        channel_peek(&reg, &t, ev, None, 6, 1),
+        Err(ReadError::Status(Status::WrongType))
+    );
+    // peeking changes nothing: the real read then agrees
+    let got = channel_read(&mut reg, &mut t, b, 6, 1).unwrap();
+    assert_eq!((got.data.len(), got.handles.len()), (6, 1));
+    t.close(&mut reg, a).unwrap();
+    assert_eq!(
+        channel_peek(&reg, &t, b, None, 6, 1),
+        Err(ReadError::Status(Status::PeerClosed))
+    );
+    t.drain(&mut reg);
+    // a full table
+    let mut small = HandleTable::new(4);
+    let (a, b) = channel_create(&mut reg, &mut small).unwrap();
+    let e1 = event_create(&mut reg, &mut small).unwrap();
+    let e2 = event_create(&mut reg, &mut small).unwrap();
+    channel_write(&mut reg, &mut small, a, b"", &[e1, e2]).unwrap();
+    let _fill = (
+        event_create(&mut reg, &mut small).unwrap(),
+        event_create(&mut reg, &mut small).unwrap(),
+    );
+    assert_eq!(
+        channel_peek(&reg, &small, b, None, 0, 2),
+        Err(ReadError::Status(Status::NoMemory))
+    );
+    small.drain(&mut reg);
+    assert_eq!(reg.live(), 0);
+}

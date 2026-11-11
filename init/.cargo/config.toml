@@ -1,0 +1,4 @@
+# Applies when cargo is run from inside init/ (the Makefile does this): user programs
+# are built for the no-FPU RISC-V target (OD40), as static executables.
+[build]
+target = "riscv64imac-unknown-none-elf"
