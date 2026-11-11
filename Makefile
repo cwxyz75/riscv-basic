@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-kernel os-test os-miri os-boot-test test fmt fmt-check lint kernel run run-logo debug boot-test check
+.PHONY: help disk os-kernel os-test os-miri os-boot-test os-boot-test-aia test fmt fmt-check lint kernel run run-logo debug boot-test check
 
 help:
 	@echo "make test       host tests for the interpreter crate (no QEMU needed)"
@@ -107,4 +107,9 @@ os-miri:
 os-boot-test: os-kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
 
-check: fmt-check test lint boot-test os-test os-boot-test
+# The same boot test on QEMU's AIA interrupt controller (APLIC + IMSIC) instead of the
+# PLIC (OD35). Needs QEMU with `-machine virt,aia=...` (7.2 or later).
+os-boot-test-aia: os-kernel
+	OS_MACHINE=virt,aia=aplic-imsic python3 scripts/os_boot_test.py $(OS_ELF)
+
+check: fmt-check test lint boot-test os-test os-boot-test os-boot-test-aia
