@@ -1565,7 +1565,7 @@ fn process_start_argument_checks() -> Outcome {
     ensure_eq!(
         st(sys::process_kill(weak, 1)),
         Some(S::AccessDenied),
-        "kill needs MANAGE"
+        "kill needs KILL"
     );
     ensure_eq!(
         st(sys::process_kill(ev, 1)),
@@ -3310,6 +3310,74 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     Ok(())
 }
 
+// --- The KILL right (S4a) ---------------------------------------------------------------------
+
+fn kill_needs_the_kill_right_and_nothing_else() -> Outcome {
+    let (p, _m) = launch(15)?;
+    // MANAGE (and everything but KILL) is not enough to end a process
+    let all_but_kill = weaker(p, Rights::PROCESS.0 & !Rights::KILL.0)?;
+    ensure_eq!(
+        st(sys::process_kill(all_but_kill, 9)),
+        Some(S::AccessDenied),
+        "kill needs KILL, not MANAGE"
+    );
+    // KILL alone cannot do what MANAGE does: no mapping, no new threads
+    let kill_only = weaker(p, Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(kill_only, v, 0x7_0000, 0, 4096, PF_R)),
+        Some(S::AccessDenied),
+        "KILL does not allow mapping into the process"
+    );
+    ensure_eq!(
+        st(sys::thread_create(
+            kill_only,
+            child_entry()?,
+            0x20_0000_0000 + 0x4000,
+            0
+        )),
+        Some(S::AccessDenied),
+        "KILL does not allow adding threads"
+    );
+    // ... and it can be handed to another process (here: sent through a channel and back)
+    let (a, b) = channel()?;
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            b"k".as_ptr(),
+            1,
+            [kill_only].as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "a KILL|WAIT|TRANSFER handle can be sent"
+    );
+    let mut hb = [0u32; 1];
+    let mut mb = [0u8; 4];
+    let r = sys::channel_read(b, mb.as_mut_ptr(), 4, hb.as_mut_ptr(), 1);
+    ensure_eq!((r.status, r.a2), (0, 1), "received it");
+    ensure_eq!(
+        st(sys::process_info(hb[0])),
+        Some(S::AccessDenied),
+        "no INSPECT on the narrowed handle"
+    );
+    ensure_eq!(
+        st(sys::process_kill(hb[0], 9)),
+        Some(S::Ok),
+        "the KILL-only handle kills"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 9, "with the code it gave");
+    // process_self handles carry no KILL: a process ends itself with process_exit
+    let me = me()?;
+    ensure_eq!(
+        st(sys::process_kill(me, 1)),
+        Some(S::AccessDenied),
+        "no KILL on a self handle"
+    );
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -3829,6 +3897,10 @@ pub fn app_main() -> i32 {
         (
             "queued_handles_are_charged_to_the_budget",
             queued_handles_are_charged_to_the_budget,
+        ),
+        (
+            "kill_needs_the_kill_right_and_nothing_else",
+            kill_needs_the_kill_right_and_nothing_else,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

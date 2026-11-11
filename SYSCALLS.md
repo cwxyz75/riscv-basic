@@ -62,8 +62,9 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | MAP | 5 | mapping into an address space (VMO) |
 | SIGNAL | 6 | changing user signals (event) |
 | WAIT | 7 | waiting on the object |
-| MANAGE | 8 | controlling a process or thread (start, kill) |
+| MANAGE | 8 | controlling a process or thread (map, start, create threads) |
 | INSPECT | 9 | reading its properties |
+| KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
 
 `SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
 `handle_replace` it means "the same as the source handle".
@@ -280,7 +281,7 @@ A **VMO** (memory object) is a lazily committed run of pages (1 to `MAX_VMO_PAGE
 64 MiB), zero until written, that can be read and written by handle and mapped into
 processes. Rights: DUPLICATE, TRANSFER, READ, WRITE, EXECUTE, MAP. A **process** object
 is a handle to an address space, a handle table and (once started) a thread. Rights:
-DUPLICATE, TRANSFER, MANAGE (map, start, kill), INSPECT (exit code), WAIT. A process raises
+DUPLICATE, TRANSFER, MANAGE (map, start, create threads), KILL, INSPECT (exit code), WAIT. A process raises
 the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle to a process
 kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
 closing the last handle to a VMO frees it once nothing maps it.
@@ -309,7 +310,7 @@ table. Errors: NO_MEMORY (kernel memory, or `MAX_PROCESSES` reached).
 
 ### process_self() -> status, handle
 
-A handle to the calling process, with MANAGE, INSPECT, WAIT and DUPLICATE (not TRANSFER).
+A handle to the calling process, with MANAGE, INSPECT, WAIT and DUPLICATE (not TRANSFER, not KILL: a process ends itself with `process_exit`).
 
 ### process_map(process, vmo, vaddr, vmo_offset, length, flags) -> status
 
@@ -344,7 +345,7 @@ On any error nothing changes (the handle stays with the caller). Tests: `process
 
 End the process with exit code `code` (as if it had called `process_exit(code)`): its threads
 stop, its handle table is closed, its address space is torn down, TERMINATED is raised.
-Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (already ended).
+Rights: KILL (MANAGE alone is not enough). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (already ended).
 A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
 
 ### process_info(process) -> status, exit_code
