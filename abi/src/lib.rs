@@ -17,6 +17,138 @@ pub mod finisher {
     }
 }
 
+/// Status codes returned in `a0` by every syscall (SYSCALLS.md, "Status codes").
+pub mod status {
+    #[repr(i32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Status {
+        Ok = 0,
+        BadHandle = -1,
+        WrongType = -2,
+        AccessDenied = -3,
+        InvalidArgs = -4,
+        NoMemory = -5,
+        ShouldWait = -6,
+        PeerClosed = -7,
+        BufferTooSmall = -8,
+        TooBig = -9,
+        BadState = -10,
+        NotSupported = -11,
+        TimedOut = -12,
+        BadSyscall = -13,
+    }
+
+    impl Status {
+        pub const fn code(self) -> i32 {
+            self as i32
+        }
+
+        pub fn from_code(code: i32) -> Option<Status> {
+            Some(match code {
+                0 => Status::Ok,
+                -1 => Status::BadHandle,
+                -2 => Status::WrongType,
+                -3 => Status::AccessDenied,
+                -4 => Status::InvalidArgs,
+                -5 => Status::NoMemory,
+                -6 => Status::ShouldWait,
+                -7 => Status::PeerClosed,
+                -8 => Status::BufferTooSmall,
+                -9 => Status::TooBig,
+                -10 => Status::BadState,
+                -11 => Status::NotSupported,
+                -12 => Status::TimedOut,
+                -13 => Status::BadSyscall,
+                _ => return None,
+            })
+        }
+    }
+}
+
+/// A handle value as userland sees it (SYSCALLS.md, "ABI").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Handle(pub u32);
+
+impl Handle {
+    pub const INVALID: Handle = Handle(0);
+}
+
+/// Rights carried by a handle (SYSCALLS.md, "Rights"). Rights only ever shrink.
+pub mod rights {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Rights(pub u32);
+
+    impl Rights {
+        pub const NONE: Rights = Rights(0);
+        pub const DUPLICATE: Rights = Rights(1 << 0);
+        pub const TRANSFER: Rights = Rights(1 << 1);
+        pub const READ: Rights = Rights(1 << 2);
+        pub const WRITE: Rights = Rights(1 << 3);
+        pub const EXECUTE: Rights = Rights(1 << 4);
+        pub const MAP: Rights = Rights(1 << 5);
+        pub const SIGNAL: Rights = Rights(1 << 6);
+        pub const WAIT: Rights = Rights(1 << 7);
+        pub const MANAGE: Rights = Rights(1 << 8);
+        pub const INSPECT: Rights = Rights(1 << 9);
+        /// Every assigned right bit.
+        pub const ALL: Rights = Rights(0x3ff);
+        /// Not a right: "the same rights as the source", for duplicate and replace.
+        pub const SAME: Rights = Rights(1 << 31);
+
+        pub const CHANNEL: Rights = Rights(
+            Self::DUPLICATE.0
+                | Self::TRANSFER.0
+                | Self::READ.0
+                | Self::WRITE.0
+                | Self::SIGNAL.0
+                | Self::WAIT.0,
+        );
+        pub const EVENT: Rights =
+            Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
+
+        pub const fn union(self, other: Rights) -> Rights {
+            Rights(self.0 | other.0)
+        }
+
+        /// Does `self` include every right in `other`?
+        pub const fn contains(self, other: Rights) -> bool {
+            self.0 & other.0 == other.0
+        }
+
+        /// Are all of `self`'s rights also in `other`?
+        pub const fn is_subset_of(self, other: Rights) -> bool {
+            self.0 & !other.0 == 0
+        }
+
+        /// Only assigned bits are set.
+        pub const fn is_valid(self) -> bool {
+            self.0 & !Self::ALL.0 == 0
+        }
+    }
+}
+
+/// Signal bits (SYSCALLS.md, "Signals").
+pub mod signals {
+    pub const READABLE: u32 = 1 << 0;
+    pub const WRITABLE: u32 = 1 << 1;
+    pub const PEER_CLOSED: u32 = 1 << 2;
+    /// User signals: bits 24 to 31, changed only by `event_signal`.
+    pub const USER_MASK: u32 = 0xff00_0000;
+}
+
+/// Limits (SYSCALLS.md, "Limits").
+pub mod limits {
+    pub const MAX_HANDLES: usize = 4096;
+    pub const MAX_MSG_BYTES: usize = 65536;
+    pub const MAX_MSG_HANDLES: usize = 64;
+    pub const MAX_QUEUED_MSGS: usize = 128;
+    /// Bytes a channel endpoint may have queued (so 128 large messages cannot pile up).
+    pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
+    /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for
+    /// per-job quotas (OS-ARCHITECTURE Q9).
+    pub const MAX_OBJECTS: usize = 65536;
+}
+
 /// The kernel's address-space layout (Sv39, kernel in the upper half).
 pub mod layout {
     /// Where OpenSBI puts the kernel image in physical memory.

@@ -1,0 +1,356 @@
+//! Channels and events: the kernel objects of S3a, and the operations on them that
+//! take handles (SYSCALLS.md, "Channels" and "Events"). Pure logic over a
+//! [`Registry`] and a [`HandleTable`]; the syscall layer only copies bytes in and out.
+
+use crate::handle::{Entry, HandleTable};
+use crate::object::{ObjId, Object, Registry};
+use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_QUEUED_BYTES, MAX_QUEUED_MSGS};
+use abi::rights::Rights;
+use abi::signals;
+use abi::status::Status;
+use abi::Handle;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+/// One queued message: bytes, and the handles that travel with it (each holding a
+/// reference to its object).
+pub struct Message {
+    pub data: Vec<u8>,
+    pub handles: Vec<Entry>,
+}
+
+impl Channel {
+    fn queued_bytes(&self) -> usize {
+        self.queue.iter().map(|m| m.data.len()).sum()
+    }
+}
+
+pub struct Channel {
+    peer: Option<ObjId>,
+    /// Messages written by the peer, waiting to be read from this end.
+    queue: VecDeque<Message>,
+    peer_closed: bool,
+}
+
+pub struct Event {
+    signals: u32,
+}
+
+/// Every kernel object kind so far; later milestones add variants.
+pub enum KObj {
+    Channel(Channel),
+    Event(Event),
+}
+
+impl Object for KObj {
+    fn held(&self, out: &mut Vec<ObjId>) {
+        if let KObj::Channel(c) = self {
+            for m in &c.queue {
+                out.extend(m.handles.iter().map(|e| e.obj));
+            }
+        }
+    }
+
+    fn peer(&self) -> Option<ObjId> {
+        match self {
+            KObj::Channel(c) => c.peer,
+            KObj::Event(_) => None,
+        }
+    }
+
+    fn peer_destroyed(&mut self) {
+        if let KObj::Channel(c) = self {
+            c.peer = None;
+            c.peer_closed = true;
+        }
+    }
+}
+
+pub type Kobjs = Registry<KObj>;
+
+/// What `channel_read` returns.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Received {
+    pub data: Vec<u8>,
+    pub handles: Vec<Handle>,
+}
+
+/// Why a read could not deliver, with the sizes needed when the buffers were too small.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    Status(Status),
+    TooSmall { bytes: usize, handles: usize },
+}
+
+impl From<Status> for ReadError {
+    fn from(s: Status) -> Self {
+        ReadError::Status(s)
+    }
+}
+
+/// Resolve `h` to a channel object, checking the type and a right.
+fn channel_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<ObjId, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Channel(_)) => {}
+        Some(_) => return Err(Status::WrongType),
+        None => return Err(Status::BadHandle),
+    }
+    if !entry.rights.contains(need) {
+        return Err(Status::AccessDenied);
+    }
+    Ok(entry.obj)
+}
+
+/// A connected pair of channel endpoints, both with the default channel rights.
+pub fn channel_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+) -> Result<(Handle, Handle), Status> {
+    if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let end = || Channel {
+        peer: None,
+        queue: VecDeque::new(),
+        peer_closed: false,
+    };
+    let (a_end, b_end) = (end(), end());
+    let a = reg.create(KObj::Channel(a_end));
+    let b = reg.create(KObj::Channel(b_end));
+    for (me, other) in [(a, b), (b, a)] {
+        if let Some(KObj::Channel(c)) = reg.get_mut(me) {
+            c.peer = Some(other);
+        }
+    }
+    let ha = table.insert(a, Rights::CHANNEL).expect("room was checked");
+    let hb = table.insert(b, Rights::CHANNEL).expect("room was checked");
+    Ok((ha, hb))
+}
+
+/// Queue a message on the peer of `ch`, moving `handles` out of the caller's table
+/// into it. Changes nothing unless it succeeds. The checks run in the order SYSCALLS.md
+/// lists them: sizes first (they bound the work of everything after), then handles,
+/// then the channel itself.
+pub fn channel_write(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    data: &[u8],
+    handles: &[Handle],
+) -> Result<(), Status> {
+    if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
+        return Err(Status::TooBig);
+    }
+    // BAD_HANDLE: the channel, then each listed handle.
+    let ch_entry = table.get(ch)?;
+    for &h in handles {
+        table.get(h)?;
+    }
+    // WRONG_TYPE.
+    match reg.get(ch_entry.obj) {
+        Some(KObj::Channel(_)) => {}
+        Some(_) => return Err(Status::WrongType),
+        None => return Err(Status::BadHandle),
+    }
+    // ACCESS_DENIED: WRITE on the channel, TRANSFER on each listed handle.
+    if !ch_entry.rights.contains(Rights::WRITE) {
+        return Err(Status::AccessDenied);
+    }
+    for &h in handles {
+        table.check_transferable(h)?;
+    }
+    // INVALID_ARGS: a handle listed twice.
+    for (i, h) in handles.iter().enumerate() {
+        if handles[..i].contains(h) {
+            return Err(Status::InvalidArgs);
+        }
+    }
+    let me = ch_entry.obj;
+    let KObj::Channel(this) = reg.get(me).expect("resolved") else {
+        unreachable!()
+    };
+    let peer = this.peer;
+    // NOT_SUPPORTED: an endpoint of this very channel in the list. Sending either end
+    // through the channel would put it in its own queue, a self-cycle.
+    for &h in handles {
+        let o = table.get(h).expect("validated").obj;
+        if o == me || Some(o) == peer {
+            return Err(Status::NotSupported);
+        }
+    }
+    let peer = peer.ok_or(Status::PeerClosed)?;
+    match reg.get(peer) {
+        Some(KObj::Channel(p)) => {
+            if p.queue.len() >= MAX_QUEUED_MSGS || p.queued_bytes() + data.len() > MAX_QUEUED_BYTES
+            {
+                return Err(Status::ShouldWait);
+            }
+        }
+        _ => return Err(Status::PeerClosed),
+    }
+    // Allocate before committing, so running out of memory changes nothing.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes
+        .try_reserve_exact(data.len())
+        .map_err(|_| Status::NoMemory)?;
+    bytes.extend_from_slice(data);
+    let mut entries: Vec<Entry> = Vec::new();
+    entries
+        .try_reserve_exact(handles.len())
+        .map_err(|_| Status::NoMemory)?;
+    // Commit: the handles leave the table and travel with the message.
+    entries.extend(
+        handles
+            .iter()
+            .map(|&h| table.remove_for_transfer(h).expect("validated")),
+    );
+    if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
+        p.queue.push_back(Message {
+            data: bytes,
+            handles: entries,
+        });
+    }
+    Ok(())
+}
+
+fn read_at(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    me: ObjId,
+    pick: impl Fn(&VecDeque<Message>) -> Option<usize>,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<Received, ReadError> {
+    let KObj::Channel(c) = reg.get(me).expect("resolved") else {
+        unreachable!()
+    };
+    let Some(i) = pick(&c.queue) else {
+        // Nothing to deliver. If the peer is gone nothing more can ever arrive, so say so,
+        // even when other, non-matching messages remain queued (a `txid` read).
+        return Err(if c.peer_closed {
+            Status::PeerClosed
+        } else {
+            Status::ShouldWait
+        }
+        .into());
+    };
+    let msg = &c.queue[i];
+    if msg.data.len() > max_bytes || msg.handles.len() > max_handles {
+        return Err(ReadError::TooSmall {
+            bytes: msg.data.len(),
+            handles: msg.handles.len(),
+        });
+    }
+    if table.room() < msg.handles.len() {
+        return Err(Status::NoMemory.into());
+    }
+    let KObj::Channel(c) = reg.get_mut(me).expect("resolved") else {
+        unreachable!()
+    };
+    let msg = c.queue.remove(i).expect("picked");
+    let handles = msg
+        .handles
+        .iter()
+        .map(|e| table.insert(e.obj, e.rights).expect("room was checked"))
+        .collect();
+    Ok(Received {
+        data: msg.data,
+        handles,
+    })
+}
+
+/// Read the oldest message. Handles arrive in the caller's table.
+pub fn channel_read(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<Received, ReadError> {
+    let me = channel_of(reg, table, ch, Rights::READ)?;
+    read_at(
+        reg,
+        table,
+        me,
+        |q| (!q.is_empty()).then_some(0),
+        max_bytes,
+        max_handles,
+    )
+}
+
+/// Read the oldest message whose first four bytes (little endian) are `txid`.
+pub fn channel_read_txid(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    txid: u32,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<Received, ReadError> {
+    let me = channel_of(reg, table, ch, Rights::READ)?;
+    let pick = |q: &VecDeque<Message>| {
+        q.iter()
+            .position(|m| m.data.len() >= 4 && m.data[..4] == txid.to_le_bytes())
+    };
+    read_at(reg, table, me, pick, max_bytes, max_handles)
+}
+
+/// A new event with all user signals clear.
+pub fn event_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let id = reg.create(KObj::Event(Event { signals: 0 }));
+    Ok(table.insert(id, Rights::EVENT).expect("room was checked"))
+}
+
+/// Clear then set user signals on an event.
+pub fn event_signal(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    ev: Handle,
+    clear: u32,
+    set: u32,
+) -> Result<(), Status> {
+    let entry = table.get(ev)?;
+    if !matches!(reg.get(entry.obj), Some(KObj::Event(_))) {
+        return Err(if reg.is_alive(entry.obj) {
+            Status::WrongType
+        } else {
+            Status::BadHandle
+        });
+    }
+    if !entry.rights.contains(Rights::SIGNAL) {
+        return Err(Status::AccessDenied);
+    }
+    if (clear | set) & !signals::USER_MASK != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    if let Some(KObj::Event(e)) = reg.get_mut(entry.obj) {
+        e.signals = (e.signals & !clear) | set;
+    }
+    Ok(())
+}
+
+/// The signal word of the object a handle names.
+pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj).ok_or(Status::BadHandle)? {
+        KObj::Event(e) => Ok(e.signals),
+        KObj::Channel(c) => {
+            let mut s = 0;
+            if !c.queue.is_empty() {
+                s |= signals::READABLE;
+            }
+            if c.peer_closed {
+                s |= signals::PEER_CLOSED;
+            } else if let Some(KObj::Channel(p)) = c.peer.and_then(|p| reg.get(p)) {
+                if p.queue.len() < MAX_QUEUED_MSGS && p.queued_bytes() < MAX_QUEUED_BYTES {
+                    s |= signals::WRITABLE;
+                }
+            }
+            Ok(s)
+        }
+    }
+}

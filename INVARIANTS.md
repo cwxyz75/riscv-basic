@@ -14,12 +14,12 @@ get filled in as each area is built.
 
 | # | Invariant | How checked |
 |---|---|---|
-| H1 | A handle value cannot be forged: only the kernel mints values, and a value names an entry in the caller's own table | Property test on the handle table (S3) |
-| H2 | Stale values fail: a closed or reused slot's old value is rejected (generation counter); value 0 is never valid | Property test (S3) |
-| H3 | Rights only shrink: duplicate, replace, transfer and open never produce a handle with a right its source lacked | Property test over random operation sequences (S3) |
-| H4 | A message in flight owns its handles: if the channel dies they are closed, never leaked, and never duplicated | Model test and leak check (S3) |
+| H1 | A handle value cannot be forged: only the kernel mints values, and a value names an entry in the caller's own table | `kcore/tests/handle_model.rs`: random and adversarial values never resolve unless live (S3a) |
+| H2 | Stale values fail: a closed or reused slot's old value is rejected (generation counter); value 0 is never valid | `handle_model` (S3a). Known limit: a slot reused 65536 times can accept a very old value |
+| H3 | Rights only shrink: duplicate, replace, transfer and open never produce a handle with a right its source lacked | `handle_model`, `channel_model` (a model of every handle's rights), `rights_escalation_is_refused` (S3a) |
+| H4 | A message in flight owns its handles: if the channel dies they are closed, never leaked, and never duplicated | `channel_model`, `registry_model`, `cycles_are_swept` with `Registry::live()` as the leak counter (S3a) |
 | H5 | Authority is holding a handle: no syscall consults identity, a path or ambient state to grant access | Review against `SYSCALLS.md` (S3) |
-| H6 | Process death releases every object it held | Leak check against allocator counts (S3) |
+| H6 | Process death releases every object it held | Table drain + reachability sweep tested on the host (S3a); the same leak check against allocator counts in QEMU (S3c) |
 
 ## Memory
 
