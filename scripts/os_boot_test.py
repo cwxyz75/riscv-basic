@@ -13,7 +13,7 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##DONE pass=<n> fail=<n>
 
 The machine type comes from $OS_MACHINE (default `virt`; `make os-boot-test-aia` uses
-`virt,aia=aplic-imsic`). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+`virt,aia=aplic-imsic`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -100,6 +100,7 @@ def run(kernel: str, extra=()):
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
         "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
+        *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
         *extra, "-kernel", kernel,
     ]
     try:
