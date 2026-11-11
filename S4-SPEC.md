@@ -326,7 +326,7 @@ exits on `halt` (section 8).
   `rt` heap's mapped VMOs do not "shrink", so no baseline comparison is attempted between
   rounds inside a process.
 
-## 13. Syscall authority S4 leaves ambient (to tighten with jobs, Q9)
+## 13. Syscall authority S4 leaves ambient (to tighten with jobs, Q9; see `TIDY-UP.md` T1, T2, T4)
 
 `process_create`, `vmo_create`, `socket_create`, `channel_create`, `event_create`,
 `debug_write`, thread creation in one's own process. A confined program can therefore create
@@ -347,8 +347,8 @@ deputy (no paths: `GetVmo` plus VMO slices, no channel copies of programs); `##`
 serial bridge; stale statements.
 
 Defaults chosen for the product-owner questions (change any by saying so):
-1. `ls` and `cat` are in `/etc/trusted` (they get a read-only root); other programs are
-   confined. A fuller powerbox (the shell opens path arguments) waits for the manifest-driven
+1. `ls` and `cat` are in `/etc/trusted` (they get a read-only root; recorded as `TIDY-UP.md`
+   T3); other programs are confined. A fuller powerbox (the shell opens path arguments) waits for the manifest-driven
    shell milestone.
 2. A child's `CWD` is read-only.
 3. A kill-only `KILL` right is added to the kernel in S4a.
