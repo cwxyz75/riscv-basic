@@ -33,7 +33,6 @@ pub static CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.el
 pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 /// The boot image (S4-SPEC section 3): every user program and the fixture files, as one
 /// archive that becomes a read-only VMO for `init`.
-#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg.bin"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
@@ -1405,7 +1404,6 @@ impl KernelEnd {
 
     /// Send `data` with handles that are in the kernel's table (`ktable_*` helpers make them);
     /// they move into the message. Nothing moves if the write fails.
-    #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
     pub fn write_handles(&self, data: &[u8], handles: &[Handle]) -> Result<(), Status> {
         let r = irq::without(|| {
             let s = state();
@@ -1467,7 +1465,6 @@ pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
 /// A read-only VMO (READ, MAP, DUPLICATE, TRANSFER) holding `bytes`, as a handle in the
 /// kernel's table.
 /// Close a handle in the kernel's own table (cleanup when a send did not happen).
-#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn ktable_close(h: Handle) {
     irq::without(|| {
         let s = state();
@@ -1476,7 +1473,6 @@ pub fn ktable_close(h: Handle) {
     notify();
 }
 
-#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
     irq::without(|| {
         let s = state();

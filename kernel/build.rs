@@ -18,7 +18,7 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let built = PathBuf::from(&dir).join("../target/riscv64imac-unknown-none-elf/debug");
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for name in ["suite", "init", "crash", "hello"] {
+    for name in ["suite", "init", "crash", "hello", "launcher"] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         let bytes = std::fs::read(&src).unwrap_or_default();

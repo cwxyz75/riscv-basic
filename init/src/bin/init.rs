@@ -46,6 +46,31 @@ pub fn app_main() -> i32 {
     let Ok(entries) = proto::bootimg::parse(&img) else {
         return 5;
     };
+    // Start the launcher with `rt::spawn` (the first services cannot use one).
+    let Some(launcher_entry) = entries.iter().find(|e| e.name == b"launcher") else {
+        return 9;
+    };
+    let launcher_img = &img
+        [launcher_entry.offset as usize..(launcher_entry.offset + launcher_entry.size) as usize];
+    let (launch_ch, launcher_end) = {
+        let c = rt::sys::channel_create();
+        if c.status != 0 {
+            return 10;
+        }
+        (c.a1 as u32, c.a2 as u32)
+    };
+    let launcher_startup = proto::startup::Startup {
+        args: alloc::vec![b"launcher".to_vec()],
+        roles: alloc::vec![(Role::ServiceLaunch, 0)],
+        ..proto::startup::Startup::default()
+    };
+    let Ok(lbytes) = launcher_startup.encode() else {
+        return 11;
+    };
+    let Ok(_launcher_proc) = rt::spawn::spawn(launcher_img, &lbytes, &[launcher_end]) else {
+        return 12;
+    };
+    let mut txid = 0u32;
     let mut banner = String::from("riscv-os S4a init ready; image:");
     for e in &entries {
         banner.push(' ');
@@ -103,6 +128,17 @@ pub fn app_main() -> i32 {
                     );
                     let _ = io::write_all(serial, msg.as_bytes());
                     line.clear();
+                } else if let Some(rest) = line.strip_prefix(b"run ") {
+                    // test aid for S4b: run a boot-image program through the launcher with
+                    // its output captured, e.g. `run hello a b`
+                    txid += 1;
+                    let words: Vec<&[u8]> = rest
+                        .split(|&c| c == b' ')
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    let out = run_program(launch_ch, image_vmo, &entries, &words, txid);
+                    let _ = io::write_all(serial, out.as_bytes());
+                    line.clear();
                 } else if line.as_slice() == b"quitx" {
                     // test aid: leave an unterminated line in front of the kernel's verdict
                     let _ = io::write_all(serial, b"bye-no-newline");
@@ -128,4 +164,87 @@ pub fn app_main() -> i32 {
             }
         }
     }
+}
+
+/// `run <name> args...`: spawn a boot-image program through the launcher, give it an empty
+/// stdin, return what it printed followed by `[exit N]` (or an error line).
+fn run_program(
+    launch_ch: u32,
+    image_vmo: u32,
+    entries: &[proto::bootimg::Entry],
+    words: &[&[u8]],
+    txid: u32,
+) -> String {
+    use proto::startup::Startup;
+    use rt::abi::rights::Rights;
+    use rt::sys;
+    let Some(name) = words.first() else {
+        return String::from("run: missing program name\r\n");
+    };
+    let Some(e) = entries.iter().find(|e| e.name == *name) else {
+        return alloc::format!("run: {}: not found\r\n", String::from_utf8_lossy(name));
+    };
+    let narrow = |h: u32, r: u32| -> Option<u32> {
+        let d = sys::handle_duplicate(h, Rights::SAME.0);
+        if d.status != 0 {
+            return None;
+        }
+        let n = sys::handle_replace(d.a1 as u32, r);
+        sys::handle_close(h);
+        (n.status == 0).then_some(n.a1 as u32)
+    };
+    let (in_w, in_r) = {
+        let s = sys::socket_create();
+        (s.a1 as u32, s.a2 as u32)
+    };
+    let (out_r, out_w) = {
+        let s = sys::socket_create();
+        (s.a1 as u32, s.a2 as u32)
+    };
+    let (Some(in_r), Some(out_w)) = (
+        narrow(in_r, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
+        narrow(out_w, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
+    ) else {
+        return String::from("run: could not make pipes\r\n");
+    };
+    let startup = Startup {
+        args: words.iter().map(|w| w.to_vec()).collect(),
+        roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1)],
+        ..Startup::default()
+    };
+    let proc = rt::launch::spawn_via(
+        launch_ch,
+        image_vmo,
+        u64::from(e.offset),
+        u64::from(e.size),
+        &startup,
+        &[in_r, out_w],
+        txid,
+    );
+    sys::handle_close(in_w); // an empty stdin: end of stream at once
+    let proc = match proc {
+        Ok(p) => p,
+        Err(status) => {
+            sys::handle_close(out_r);
+            return alloc::format!(
+                "run: {}: spawn failed ({})\r\n",
+                String::from_utf8_lossy(name),
+                status
+            );
+        }
+    };
+    let mut out = String::new();
+    let mut buf = [0u8; 128];
+    while let Ok(n) = io::read(out_r, &mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    sys::handle_close(out_r);
+    sys::object_wait(proc, rt::abi::signals::TERMINATED, u64::MAX);
+    let code = sys::process_info(proc);
+    sys::handle_close(proc);
+    out.push_str(&alloc::format!("[exit {}]\r\n", code.a1 as i64));
+    out
 }

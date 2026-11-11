@@ -59,6 +59,14 @@ fn helper_main(_: usize) {
                     // hand over the `crash` program image as a VMO (for the user-level launcher)
                     let _ = end.write_with_vmo(&msg[..5], user::CRASH_ELF);
                 }
+                b'B' => {
+                    // the boot image as a read-only VMO (for the launcher tests)
+                    if let Ok(h) = user::ktable_readonly_vmo(user::BOOT_IMAGE) {
+                        if end.write_handles(&msg[..5], &[h]).is_err() {
+                            user::ktable_close(h);
+                        }
+                    }
+                }
                 b'H' => {
                     // the `hello` program image, for the runtime tests
                     let _ = end.write_with_vmo(&msg[..5], user::HELLO_ELF);

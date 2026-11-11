@@ -16,6 +16,10 @@ pub mod heap;
 #[cfg(feature = "heap")]
 pub mod io;
 #[cfg(feature = "heap")]
+pub mod launch;
+#[cfg(feature = "heap")]
+pub mod spawn;
+#[cfg(feature = "heap")]
 pub mod startup;
 
 /// The result of a raw syscall: the status code and the two result registers.

@@ -23,7 +23,7 @@ import threading
 import time
 
 TIMEOUT = float(os.environ.get("S4_TIMEOUT", "90"))
-BANNER = (b"riscv-os S4a init ready; image: init crash hello fixtures/hello.txt "
+BANNER = (b"riscv-os S4a init ready; image: init crash hello launcher fixtures/hello.txt "
           b"fixtures/lines.txt fixtures/sub/inner.txt")
 
 
@@ -114,6 +114,13 @@ def main():
     s.step(b"raw \xff\xfe|\n", [b"\xff\xfe|"], "binary bytes")
     # a write larger than one socket buffer, then the line after it
     s.step(b"big\n", [b"b" * 70000, b"big: Ok(())"], "a 70000-byte write")
+    # S4b: programs run through the launcher service. `hello` prints its arguments and copies its
+    # (empty) stdin; its exit code is the argument count (here 4: hello a b c).
+    s.step(b"run hello a b c\n", [b"args=hello a b c", b"[exit 4]"], "a program run by the launcher")
+    s.step(b"run hello\n", [b"args=hello", b"[exit 1]"], "a second run")
+    s.step(b"run nosuch\n", [b"run: nosuch: not found"], "an unknown program")
+    s.step(b"run fixtures/hello.txt\n", [b"run: fixtures/hello.txt: spawn failed (-107)"], "a text file is not a program")
+    s.step(b"run hello after-errors\n", [b"args=hello after-errors", b"[exit 2]"], "the launcher still works")
     # the boot image handle is read-only
     s.step(b"rights\n", [b"rights: write=-3 mapw=-3 mapr=0 mapx=-3 dup_all=-3 dup_same=0 "
                          b"write_dup=-3"], "the boot image rights")
