@@ -39,6 +39,11 @@ pub trait Object {
     fn needs_cleanup(&self) -> bool {
         false
     }
+    /// Bytes of kernel memory this object holds on behalf of its user (queued data), counted
+    /// in the registry's `meter` so a global budget can be enforced.
+    fn meter(&self) -> usize {
+        0
+    }
 }
 
 struct Slot<T> {
@@ -55,6 +60,9 @@ pub struct Registry<T: Object> {
     threshold: usize,
     /// Destroyed objects that `needs_cleanup`, waiting for the owner.
     graveyard: Vec<T>,
+    /// Sum of `meter()` over live objects (kept by the owner through `meter_add` /
+    /// `meter_sub` as data is queued and dequeued, and by destruction).
+    meter: usize,
 }
 
 impl<T: Object> Default for Registry<T> {
@@ -71,6 +79,7 @@ impl<T: Object> Registry<T> {
             live: 0,
             threshold: SWEEP_MIN,
             graveyard: Vec::new(),
+            meter: 0,
         }
     }
 
@@ -122,6 +131,19 @@ impl<T: Object> Registry<T> {
         self.slot(id).is_some()
     }
 
+    /// Bytes currently counted by the meter.
+    pub fn meter(&self) -> usize {
+        self.meter
+    }
+
+    pub fn meter_add(&mut self, n: usize) {
+        self.meter += n;
+    }
+
+    pub fn meter_sub(&mut self, n: usize) {
+        self.meter = self.meter.saturating_sub(n);
+    }
+
     /// The number of live objects: the leak counter of the tests.
     pub fn live(&self) -> usize {
         self.live
@@ -158,6 +180,7 @@ impl<T: Object> Registry<T> {
             slot.gen = slot.gen.wrapping_add(1);
             self.free.push(id.index);
             self.live -= 1;
+            self.meter = self.meter.saturating_sub(obj.meter());
             obj.held(&mut work);
             if let Some(peer) = obj.peer() {
                 if let Some(p) = self.get_mut(peer) {
@@ -222,6 +245,7 @@ impl<T: Object> Registry<T> {
             slot.gen = slot.gen.wrapping_add(1);
             self.free.push(index);
             self.live -= 1;
+            self.meter = self.meter.saturating_sub(obj.meter());
             // The references a doomed object holds go away with it. Those to other doomed
             // objects are moot; those to survivors must be given back, or the survivor
             // could never be freed.

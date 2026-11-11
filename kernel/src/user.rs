@@ -705,7 +705,6 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
         nr::SOCKET_WRITE | nr::SOCKET_READ | nr::PORT_UNBIND if over(0) => Some(Status::BadHandle),
         nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
-        nr::PORT_BIND if over(2) => Some(Status::InvalidArgs),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
         nr::EVENT_SIGNAL if over(0) => Some(Status::BadHandle),
@@ -779,7 +778,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let port = ipc::port_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(port.0)), None))
         }
-        nr::PORT_BIND => ipc::port_bind(objs, &p.handles, h(0), h(1), a[2] as u32, a[3])
+        nr::PORT_BIND => ipc::port_bind(objs, &p.handles, h(0), h(1), a[2], a[3])
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
         nr::PORT_UNBIND => ipc::port_unbind(objs, &p.handles, h(0), a[1])
@@ -1135,10 +1134,17 @@ fn port_wait(a: [u64; 6]) -> Reply {
             .map_err(|e| (e, None, None))?
             .map_err(|e| (e, None, None))
     };
+    // Poll, and while nothing is ready and the deadline has not passed, sleep until the port
+    // is READABLE and poll again (the readiness seen by the sleep check can be gone by the time
+    // we poll, so one wait is not enough).
     let mut got = poll()?;
-    if got.is_none() && deadline != 0 {
+    while got.is_none()
+        && deadline != 0
+        && thread::ticks() < deadline
+        && irq::without(killed_now).is_none()
+    {
         let q = irq::without(|| state().signal_queue);
-        // Ready, killed, or the handle stopped naming a port (the poll below then says so).
+        // Ready, killed, or the handle stopped naming a port (the poll then says so).
         thread::wait_deadline(
             q,
             || {

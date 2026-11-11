@@ -3094,6 +3094,79 @@ fn kill_a_child_blocked_in_port_wait() -> Outcome {
     Ok(())
 }
 
+// Regression tests from the independent review of S3c-3.
+
+fn socket_memory_is_bounded() -> Outcome {
+    let chunk = [7u8; SOCKET_BUFFER];
+    let mut pairs = [(0u32, 0u32); 64];
+    let mut n = 0;
+    let mut hit_the_limit = false;
+    while n < pairs.len() {
+        let (a, b) = socket()?;
+        pairs[n] = (a, b);
+        n += 1;
+        let r = sys::socket_write(a, chunk.as_ptr(), chunk.len());
+        if r.status != 0 {
+            ensure_eq!(
+                st(r),
+                Some(S::NoMemory),
+                "the system-wide budget is NO_MEMORY"
+            );
+            hit_the_limit = true;
+            break;
+        }
+    }
+    ensure!(hit_the_limit, "300 sockets of 64 KiB were accepted");
+    // closing the sockets gives the budget back
+    for &(a, b) in &pairs[..n] {
+        sys::handle_close(a);
+        sys::handle_close(b);
+    }
+    let (a, _b) = socket()?;
+    ensure_eq!(
+        sys::socket_write(a, chunk.as_ptr(), chunk.len()).status,
+        0,
+        "room again"
+    );
+    Ok(())
+}
+
+fn dead_port_bindings_vanish_at_once() -> Outcome {
+    let p = port()?;
+    let m = sig::READABLE | sig::PEER_CLOSED;
+    let (a, b) = socket()?;
+    ensure_eq!(st(sys::port_bind(p, b, m, 1)), Some(S::Ok), "bind");
+    sys::handle_close(b);
+    sys::handle_close(a);
+    ensure_eq!(
+        st(sys::port_unbind(p, 1)),
+        Some(S::InvalidArgs),
+        "unbind of a vanished binding"
+    );
+    for k in 100..356u64 {
+        let (x, y) = socket()?;
+        sys::port_bind(p, y, m, k);
+        sys::handle_close(y);
+        sys::handle_close(x);
+    }
+    let (_x, y) = socket()?;
+    ensure_eq!(
+        st(sys::port_bind(p, y, m, 9999)),
+        Some(S::Ok),
+        "a port full of dead bindings"
+    );
+    let e = event()?;
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::PORT_BIND,
+            [e as usize, e as usize, 1 << 32, 1, 0, 0]
+        )),
+        Some(S::WrongType),
+        "a wide mask comes after the type check"
+    );
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -3579,6 +3652,11 @@ pub fn app_main() -> i32 {
         (
             "a_blocked_writer_wakes_when_space_appears",
             a_blocked_writer_wakes_when_space_appears,
+        ),
+        ("socket_memory_is_bounded", socket_memory_is_bounded),
+        (
+            "dead_port_bindings_vanish_at_once",
+            dead_port_bindings_vanish_at_once,
         ),
         ("port_argument_checks", port_argument_checks),
         (

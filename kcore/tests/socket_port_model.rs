@@ -11,6 +11,19 @@ use kcore::handle::HandleTable;
 use kcore::ipc::*;
 use std::collections::VecDeque;
 
+/// `port_bind` with a 32-bit mask (the syscall's mask is 64 bits wide so that the kernel can
+/// reject wider ones itself).
+fn port_bind(
+    reg: &mut Kobjs,
+    t: &HandleTable,
+    port: Handle,
+    obj: Handle,
+    mask: u32,
+    key: u64,
+) -> Result<(), Status> {
+    kcore::ipc::port_bind(reg, t, port, obj, u64::from(mask), key)
+}
+
 fn world() -> (Kobjs, HandleTable) {
     (Kobjs::new(), HandleTable::new(abi::limits::MAX_HANDLES))
 }
@@ -350,4 +363,96 @@ fn random_socket_stream_against_a_model() {
             }
         }
     }
+}
+
+#[test]
+fn dead_bindings_vanish_at_once() {
+    let (mut reg, mut t) = world();
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let m = signals::READABLE | signals::PEER_CLOSED;
+    let (a, b) = socket_create(&mut reg, &mut t).unwrap();
+    port_bind(&mut reg, &t, port, b, m, 1).unwrap();
+    t.close(&mut reg, b).unwrap();
+    t.close(&mut reg, a).unwrap();
+    assert_eq!(
+        port_unbind(&mut reg, &t, port, 1),
+        Err(Status::InvalidArgs),
+        "already gone"
+    );
+    let (c, d) = socket_create(&mut reg, &mut t).unwrap();
+    port_bind(&mut reg, &t, port, d, m, 1).expect("its key is free");
+    // 256 dead bindings do not fill the port
+    for k in 100..356u64 {
+        let (x, y) = socket_create(&mut reg, &mut t).unwrap();
+        port_bind(&mut reg, &t, port, y, m, k).unwrap();
+        t.close(&mut reg, y).unwrap();
+        t.close(&mut reg, x).unwrap();
+    }
+    let _ = c;
+    port_bind(&mut reg, &t, port, d, m, 9999).expect("dead bindings are not counted");
+    // a mask wider than 32 bits is INVALID_ARGS, after the handle and rights checks
+    let e = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(
+        kcore::ipc::port_bind(&mut reg, &t, port, e, 1 << 32, 5),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        kcore::ipc::port_bind(&mut reg, &t, e, e, 1 << 32, 5),
+        Err(Status::WrongType),
+        "type first"
+    );
+}
+
+#[test]
+fn the_system_wide_buffer_budget_is_enforced() {
+    use abi::limits::MAX_IPC_BYTES;
+    let (mut reg, mut t) = world();
+    let chunk = vec![1u8; SOCKET_BUFFER];
+    let mut ends = vec![];
+    let mut total = 0usize;
+    // fill sockets until the budget is gone: a write never succeeds past it
+    loop {
+        let (a, b) = socket_create(&mut reg, &mut t).unwrap();
+        match socket_write(&mut reg, &t, a, &chunk) {
+            Ok(n) => total += n,
+            Err(e) => {
+                assert_eq!(e, Status::NoMemory, "budget exhausted is NO_MEMORY");
+                break;
+            }
+        }
+        ends.push((a, b));
+        assert!(total <= MAX_IPC_BYTES);
+    }
+    assert!(
+        total <= MAX_IPC_BYTES && total + SOCKET_BUFFER > MAX_IPC_BYTES,
+        "filled to the brim: {total}"
+    );
+    assert_eq!(
+        reg.meter(),
+        total,
+        "the meter counts exactly what is queued"
+    );
+    // channels share the budget
+    let (c, _d) = channel_create(&mut reg, &mut t).unwrap();
+    let big = vec![0u8; 1000];
+    let mut got = channel_write(&mut reg, &mut t, c, &big, &[]);
+    while got.is_ok() {
+        got = channel_write(&mut reg, &mut t, c, &big, &[]);
+    }
+    assert!(
+        matches!(got, Err(Status::NoMemory) | Err(Status::ShouldWait)),
+        "{got:?}"
+    );
+    // reading frees budget, destroying an endpoint frees what it held
+    let (a, b) = ends[0];
+    assert_eq!(socket_read(&mut reg, &t, b, 1000).unwrap().len(), 1000);
+    assert_eq!(socket_write(&mut reg, &t, a, &[2u8; 400]), Ok(400));
+    let before = reg.meter();
+    t.close(&mut reg, a).unwrap();
+    t.close(&mut reg, b).unwrap();
+    assert_eq!(
+        reg.meter(),
+        before - (SOCKET_BUFFER - 1000 + 400),
+        "destruction gives the bytes back"
+    );
 }

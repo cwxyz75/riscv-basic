@@ -185,6 +185,9 @@ pub mod limits {
     /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
     /// 8 MiB kernel heap; a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
     pub const MAX_USER_THREADS: usize = 128;
+    /// Bytes buffered in all channels and sockets together (another stand-in for per-job
+    /// quotas, Q9): a write that would exceed it fails with NO_MEMORY.
+    pub const MAX_IPC_BYTES: usize = 2 * 1024 * 1024;
     /// Bytes buffered per socket endpoint.
     pub const SOCKET_BUFFER: usize = 65536;
     /// Bindings in one port.
