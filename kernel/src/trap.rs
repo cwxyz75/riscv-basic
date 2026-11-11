@@ -1,51 +1,171 @@
-//! Trap entry and handling. Every trap (exception or interrupt) lands in
-//! `trap_entry`, which saves all integer and floating-point registers into a
-//! frame on the current stack and calls `trap_handler`. A timer interrupt
-//! returns to where it happened; anything else is fatal: the handler reports
-//! `scause`, `sepc` and `stval` and powers the machine off.
+//! Kernel traps. S1 handles page faults (the lazy-commit path through
+//! `kcore::aspace`) and treats everything else as fatal. No user mode yet, so every
+//! trap comes from the kernel itself, on the kernel stack.
 
-use crate::terminal::Console;
-use crate::{cpu, sbi, timer};
+use crate::{console::Console, finisher, kmem};
 use core::arch::global_asm;
-use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use kcore::aspace::{Access, FaultError};
+use kcore::testlog;
 
-/// The registers saved by `trap_entry`: `regs[i]` is `x<i>` (slot 0 is unused),
-/// `fregs[i]` is `f<i>`. 512 bytes, which keeps `sp` 16-byte aligned.
+/// Saved registers: x0 is unused (slot kept so the index is the register number),
+/// then the trap CSRs.
 #[repr(C)]
 pub struct TrapFrame {
-    pub regs: [usize; 32],
-    // Saved so floating-point code interrupted by a tick is not corrupted; only
-    // the assembly reads and writes it.
-    #[allow(dead_code)]
-    pub fregs: [u64; 32],
+    x: [u64; 32],
+    pub sepc: u64,
+    pub scause: u64,
+    pub stval: u64,
+    pub sstatus: u64,
+}
+
+impl TrapFrame {
+    /// The user's register `x{n}` (a0 is 10, a7 is 17).
+    pub fn arg(&self, n: usize) -> u64 {
+        self.x[n]
+    }
+
+    /// Put syscall results in a0 (and a1, a2 when given).
+    pub fn set_return(&mut self, a0: u64, a1: Option<u64>, a2: Option<u64>) {
+        self.x[10] = a0;
+        if let Some(v) = a1 {
+            self.x[11] = v;
+        }
+        if let Some(v) = a2 {
+            self.x[12] = v;
+        }
+    }
 }
 
 global_asm!(
     r#"
-    .section .text.trap
+    .section .text
     .balign 4
     .globl trap_entry
 trap_entry:
-    addi sp, sp, -512
+    csrrw sp, sscratch, sp       # sp <-> sscratch: from U-mode sscratch is the kernel stack top
+    bnez  sp, 2f                 # nonzero: we came from user mode
+    csrrw sp, sscratch, sp       # from the kernel: undo (sscratch is 0 in the kernel)
+    addi sp, sp, -288
     sd   x1, 8(sp)
-    .irp i, 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    sd   x\i, \i*8(sp)
-    .endr
-    addi t0, sp, 512
-    sd   t0, 16(sp)
-    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    fsd  f\i, (32+\i)*8(sp)
-    .endr
+    sd   x3, 24(sp)
+    sd   x4, 32(sp)
+    sd   x5, 40(sp)
+    sd   x6, 48(sp)
+    sd   x7, 56(sp)
+    sd   x8, 64(sp)
+    sd   x9, 72(sp)
+    sd   x10, 80(sp)
+    sd   x11, 88(sp)
+    sd   x12, 96(sp)
+    sd   x13, 104(sp)
+    sd   x14, 112(sp)
+    sd   x15, 120(sp)
+    sd   x16, 128(sp)
+    sd   x17, 136(sp)
+    sd   x18, 144(sp)
+    sd   x19, 152(sp)
+    sd   x20, 160(sp)
+    sd   x21, 168(sp)
+    sd   x22, 176(sp)
+    sd   x23, 184(sp)
+    sd   x24, 192(sp)
+    sd   x25, 200(sp)
+    sd   x26, 208(sp)
+    sd   x27, 216(sp)
+    sd   x28, 224(sp)
+    sd   x29, 232(sp)
+    sd   x30, 240(sp)
+    sd   x31, 248(sp)
+    addi t0, sp, 288
+    sd   t0, 16(sp)              # the interrupted sp
+    j    3f
+2:  # from user mode: sp is the kernel stack top, sscratch holds the user sp
+    addi sp, sp, -288
+    sd   x1, 8(sp)
+    sd   x3, 24(sp)
+    sd   x4, 32(sp)
+    sd   x5, 40(sp)
+    sd   x6, 48(sp)
+    sd   x7, 56(sp)
+    sd   x8, 64(sp)
+    sd   x9, 72(sp)
+    sd   x10, 80(sp)
+    sd   x11, 88(sp)
+    sd   x12, 96(sp)
+    sd   x13, 104(sp)
+    sd   x14, 112(sp)
+    sd   x15, 120(sp)
+    sd   x16, 128(sp)
+    sd   x17, 136(sp)
+    sd   x18, 144(sp)
+    sd   x19, 152(sp)
+    sd   x20, 160(sp)
+    sd   x21, 168(sp)
+    sd   x22, 176(sp)
+    sd   x23, 184(sp)
+    sd   x24, 192(sp)
+    sd   x25, 200(sp)
+    sd   x26, 208(sp)
+    sd   x27, 216(sp)
+    sd   x28, 224(sp)
+    sd   x29, 232(sp)
+    sd   x30, 240(sp)
+    sd   x31, 248(sp)
+    csrr t0, sscratch
+    sd   t0, 16(sp)              # the user's sp
+    csrw sscratch, zero          # in the kernel now: a trap here is a kernel trap
+3:
+    csrr t0, sepc
+    sd   t0, 256(sp)
+    csrr t0, scause
+    sd   t0, 264(sp)
+    csrr t0, stval
+    sd   t0, 272(sp)
+    csrr t0, sstatus
+    sd   t0, 280(sp)
     mv   a0, sp
     call trap_handler
-    .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    fld  f\i, (32+\i)*8(sp)
-    .endr
+    ld   t0, 256(sp)
+    csrw sepc, t0
+    ld   t0, 280(sp)
+    csrw sstatus, t0
+    andi t1, t0, 256             # SPP: was the trap taken from the kernel?
+    bnez t1, 4f
+    addi t1, sp, 288
+    csrw sscratch, t1            # returning to user mode: the next trap needs the kernel stack top
+4:
     ld   x1, 8(sp)
-    .irp i, 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-    ld   x\i, \i*8(sp)
-    .endr
-    addi sp, sp, 512
+    ld   x3, 24(sp)
+    ld   x4, 32(sp)
+    ld   x5, 40(sp)
+    ld   x6, 48(sp)
+    ld   x7, 56(sp)
+    ld   x8, 64(sp)
+    ld   x9, 72(sp)
+    ld   x10, 80(sp)
+    ld   x11, 88(sp)
+    ld   x12, 96(sp)
+    ld   x13, 104(sp)
+    ld   x14, 112(sp)
+    ld   x15, 120(sp)
+    ld   x16, 128(sp)
+    ld   x17, 136(sp)
+    ld   x18, 144(sp)
+    ld   x19, 152(sp)
+    ld   x20, 160(sp)
+    ld   x21, 168(sp)
+    ld   x22, 176(sp)
+    ld   x23, 184(sp)
+    ld   x24, 192(sp)
+    ld   x25, 200(sp)
+    ld   x26, 208(sp)
+    ld   x27, 216(sp)
+    ld   x28, 224(sp)
+    ld   x29, 232(sp)
+    ld   x30, 240(sp)
+    ld   x31, 248(sp)
+    ld   sp, 16(sp)
     sret
 "#
 );
@@ -54,75 +174,131 @@ extern "C" {
     fn trap_entry();
 }
 
-/// Point `stvec` at `trap_entry`.
+/// Point `stvec` at the trap entry (direct mode).
 pub fn init() {
-    cpu::write_stvec(trap_entry as unsafe extern "C" fn() as usize);
+    let entry = trap_entry as *const () as usize;
+    // SAFETY: writing stvec only changes where traps go; `trap_entry` is 4-byte
+    // aligned code in the kernel text, valid at its upper-half address.
+    unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
 }
 
-const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
-const SUPERVISOR_TIMER: usize = 5;
+// A self-test can declare that the next fault is expected to be refused; the
+// handler then records it and steps over the faulting instruction instead of
+// dying. (The refusal itself is what is being tested.)
+static EXPECT: AtomicBool = AtomicBool::new(false);
+static LOG_CAUSE: AtomicU64 = AtomicU64::new(0);
+static LOG_ADDR: AtomicU64 = AtomicU64::new(0);
+static LOG_ERROR: AtomicU64 = AtomicU64::new(u64::MAX);
 
-fn exception_name(code: usize) -> &'static str {
-    match code {
-        0 => "instruction address misaligned",
-        1 => "instruction access fault",
-        2 => "illegal instruction",
-        3 => "breakpoint",
-        4 => "load address misaligned",
-        5 => "load access fault",
-        6 => "store address misaligned",
-        7 => "store access fault",
-        8 => "environment call from U-mode",
-        9 => "environment call from S-mode",
-        12 => "instruction page fault",
-        13 => "load page fault",
-        15 => "store page fault",
-        _ => "unknown",
+/// A refused fault, as the handler saw it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub cause: u64,
+    pub addr: u64,
+    pub error: FaultError,
+}
+
+fn error_code(e: FaultError) -> u64 {
+    match e {
+        FaultError::NoRegion => 0,
+        FaultError::Denied => 1,
+        FaultError::VmoGone => 2,
+        FaultError::NoMemory => 3,
+        FaultError::MapFailed(_) => 4,
     }
 }
 
-fn interrupt_name(code: usize) -> &'static str {
-    match code {
-        1 => "supervisor software interrupt",
-        5 => "supervisor timer interrupt",
-        9 => "supervisor external interrupt",
-        _ => "unknown interrupt",
-    }
+/// Run `access` (which should touch memory the fault handler will refuse) and
+/// report the refusal, or `None` if no fault was refused.
+pub fn expect_refused(access: impl FnOnce()) -> Option<Refused> {
+    LOG_ERROR.store(u64::MAX, Ordering::SeqCst);
+    EXPECT.store(true, Ordering::SeqCst);
+    access();
+    EXPECT.store(false, Ordering::SeqCst);
+    let error = match LOG_ERROR.load(Ordering::SeqCst) {
+        0 => FaultError::NoRegion,
+        1 => FaultError::Denied,
+        2 => FaultError::VmoGone,
+        3 => FaultError::NoMemory,
+        4 => FaultError::MapFailed(kcore::pagetable::MapError::AlreadyMapped),
+        _ => return None,
+    };
+    Some(Refused {
+        cause: LOG_CAUSE.load(Ordering::SeqCst),
+        addr: LOG_ADDR.load(Ordering::SeqCst),
+        error,
+    })
 }
 
-/// Called from `trap_entry` with the saved registers.
+/// Flush the whole TLB (after unmapping).
+pub fn flush_tlb() {
+    // SAFETY: `sfence.vma` with no operands orders and flushes all address
+    // translations; it has no other effect.
+    unsafe { core::arch::asm!("sfence.vma zero, zero") };
+}
+
 #[no_mangle]
-pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
-    let scause = cpu::read_scause();
-    let is_interrupt = scause & INTERRUPT_BIT != 0;
-    let code = scause & !INTERRUPT_BIT;
-
-    if is_interrupt && code == SUPERVISOR_TIMER {
-        timer::on_interrupt();
+extern "C" fn trap_handler(frame: &mut TrapFrame) {
+    let cause = frame.scause;
+    if cause == (1 << 63) | 5 {
+        // Supervisor timer interrupt: the scheduler's tick (and preemption).
+        crate::thread::timer_interrupt();
+        if frame.sstatus & (1 << 8) == 0 {
+            // Interrupted user code: other threads may have run (under their own address
+            // space) before we got the CPU back.
+            crate::user::activate_current();
+        }
         return;
     }
-
-    let name = if is_interrupt {
-        interrupt_name(code)
-    } else {
-        exception_name(code)
+    if frame.sstatus & (1 << 8) == 0 {
+        // SPP = 0: the trap came from user mode.
+        crate::user::user_trap(frame);
+        crate::user::activate_current();
+        return;
+    }
+    let access = match cause {
+        12 => Access::Exec,
+        13 => Access::Read,
+        15 => Access::Write,
+        _ => fatal(frame, format_args!("unexpected trap")),
     };
-    let mut out = Console;
-    let _ = writeln!(
-        out,
-        "\nTRAP: scause={scause:#x} ({name}) sepc={:#x} stval={:#x}",
-        cpu::read_sepc(),
-        cpu::read_stval()
+    let k = kmem::get();
+    match k
+        .aspace
+        .handle_fault(&mut k.mm, &mut k.vmos, frame.stval, access)
+    {
+        Ok(()) => flush_tlb(),
+        // Only data faults can be stepped over: after an instruction-fetch fault
+        // `sepc` is the unmapped target, not an instruction we can skip.
+        Err(error) if cause != 12 && EXPECT.swap(false, Ordering::SeqCst) => {
+            LOG_CAUSE.store(cause, Ordering::SeqCst);
+            LOG_ADDR.store(frame.stval, Ordering::SeqCst);
+            LOG_ERROR.store(error_code(error), Ordering::SeqCst);
+            frame.sepc += instruction_length(frame.sepc);
+        }
+        Err(error) => fatal(frame, format_args!("page fault refused: {error:?}")),
+    }
+}
+
+/// 2 for a compressed instruction, 4 otherwise (RISC-V encodes it in the low bits).
+fn instruction_length(pc: u64) -> u64 {
+    // SAFETY: `pc` is the address of the instruction that just trapped, in
+    // kernel text that is mapped and readable.
+    let half = unsafe { core::ptr::read_volatile(pc as *const u16) };
+    if half & 3 == 3 {
+        4
+    } else {
+        2
+    }
+}
+
+fn fatal(frame: &TrapFrame, what: core::fmt::Arguments) -> ! {
+    let _ = testlog::panic(
+        &mut Console,
+        &format_args!(
+            "{what}: scause={:#x} sepc={:#x} stval={:#x}",
+            frame.scause, frame.sepc, frame.stval
+        ),
     );
-    let _ = writeln!(
-        out,
-        "      ra={:#x} sp={:#x} ticks={} ms={}",
-        frame.regs[1],
-        frame.regs[2],
-        timer::ticks(),
-        timer::millis()
-    );
-    // If the fault happened inside generated code, show that code.
-    crate::jit::dump_for_fault(&mut out, cpu::read_sepc());
-    sbi::shutdown()
+    finisher::exit(false)
 }

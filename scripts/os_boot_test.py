@@ -32,7 +32,7 @@ import sys
 TIMEOUT = 30
 
 # Tests the kernel must report, by name. A kernel that silently drops a test must
-# not pass (S1). Keep in step with `os-kernel/src/selftest.rs` and `main.rs`.
+# not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
 REQUIRED = [
     "bss_is_zeroed", "latch_works_on_the_target",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",

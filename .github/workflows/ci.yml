@@ -5,6 +5,7 @@ on: [push, pull_request]
 jobs:
   host:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -15,22 +16,25 @@ jobs:
       - name: OS crates under the loom and shuttle model checkers
         run: make os-test
       - name: Check the demo pictures against the independent renderer
-        run: python3 scripts/verify_demo_images.py
+        run: python3 home/scripts/verify_demo_images.py
 
   kernel:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Install QEMU and OpenSBI
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-riscv opensbi
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi
       - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
         run: |
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
           dpkg -l opensbi | tail -1
-      - run: make boot-test os-boot-test os-boot-test-aia
+      - run: make home-boot-test os-boot-test os-boot-test-aia
 
   miri:
     runs-on: ubuntu-latest

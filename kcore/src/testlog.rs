@@ -59,13 +59,13 @@ mod tests {
     #[test]
     fn lines_have_the_documented_shape() {
         let mut s = String::new();
-        boot(&mut s, "os-kernel", "s0").unwrap();
+        boot(&mut s, "kernel", "s0").unwrap();
         test(&mut s, "a_b", Ok(())).unwrap();
         test(&mut s, "c", Err("bad\nthing")).unwrap();
         done(&mut s, 1, 1).unwrap();
         assert_eq!(
             s,
-            "##BOOT os-kernel s0\n##TEST a_b PASS\n##TEST c FAIL bad thing\n##DONE pass=1 fail=1\n"
+            "##BOOT kernel s0\n##TEST a_b PASS\n##TEST c FAIL bad thing\n##DONE pass=1 fail=1\n"
         );
     }
 

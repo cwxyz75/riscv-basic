@@ -1,123 +1,144 @@
-//! The kernel: boot in S-mode under OpenSBI, bring up the console, traps, timer,
-//! FPU and heap, then hand the machine to the BASIC interpreter, which runs the
-//! `READY.` prompt forever. See `DESIGN.md` for how the pieces fit.
+//! The OS-track kernel. S0 made the harness; S1 (this) turns on Sv39 with the
+//! kernel in the upper half, adds the frame allocator, the kernel heap and the
+//! page-fault path with lazily committed memory objects, and proves them with
+//! self-tests that report as structured lines (`kcore::testlog`) and end QEMU
+//! through the test finisher with a pass/fail exit status.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod cpu;
-mod gfx;
+mod boot;
+mod console;
+mod finisher;
 mod heap;
-mod io;
-mod jit;
-mod menu;
-mod sbi;
-mod terminal;
+mod irq;
+mod kmem;
+mod sched_tests;
+mod selftest;
+mod thread;
 mod timer;
 mod trap;
-mod uart;
-mod virtio_blk;
+mod user;
+mod user_tests;
 
-use console::ansi;
-use core::arch::global_asm;
 use core::fmt::Write;
-use core::hint::black_box;
 use core::panic::PanicInfo;
-use io::KernelIo;
-use menu::Language;
-use terminal::Console;
+use kcore::latch::Latch;
+use kcore::testlog;
 
-// Entry point. OpenSBI jumps here in S-mode with a0 = hart id, a1 = device-tree
-// pointer. We set up a stack, zero .bss, and call into Rust. a0/a1 are left
-// untouched so they arrive as kmain's arguments.
-global_asm!(
-    r#"
-    .section .text.init
-    .globl _start
-_start:
-    la   sp, __stack_top
-    la   t0, __bss_start
-    la   t1, __bss_end
-1:
-    bgeu t0, t1, 2f
-    sd   zero, 0(t0)
-    addi t0, t0, 8
-    j    1b
-2:
-    call kmain
-3:
-    wfi
-    j    3b
-"#
-);
+/// A zero-initialised static: it lives in .bss, so this checks `_start` cleared it.
+static BSS_PROBE: [u64; 64] = [0; 64];
+
+struct Tally {
+    pass: u32,
+    fail: u32,
+}
+
+impl Tally {
+    /// Count results the user suite has already printed as `##TEST` lines.
+    fn add(&mut self, pass: u32, fail: u32) {
+        self.pass += pass;
+        self.fail += fail;
+    }
+
+    fn record(&mut self, name: &str, result: Result<(), &str>) {
+        let _ = testlog::test(&mut console::Console, name, result);
+        if result.is_ok() {
+            self.pass += 1;
+        } else {
+            self.fail += 1;
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
-    // Before anything can use floating point (or take a trap).
-    cpu::enable_fpu();
-    trap::init();
-    uart::init();
-    heap::init();
-
-    let mut out = Console;
-    let _ = writeln!(out, "riscv-basic: hello from S-mode (hart {hart_id})");
-    let product = black_box(1.5_f64) * black_box(2.0_f64);
-    let _ = writeln!(out, "fpu: 1.5 * 2 = {product}");
-    timer::init();
-    cpu::enable_interrupts();
-
-    let _ = ansi::color(&mut out, 2, None);
-    let _ = write!(
+    let mut out = console::Console;
+    let _ = testlog::boot(&mut out, "kernel", "s3");
+    let _ = writeln!(
         out,
-        "kernel ready: {} KiB heap, timer running",
-        heap::HEAP_SIZE / 1024
+        "hello from the OS track, hart {hart_id}, paging via the early table"
     );
-    let _ = ansi::reset(&mut out);
-    let _ = writeln!(out);
 
-    match menu::choose() {
-        Language::Basic => {
-            let mut io = KernelIo::new();
-            let mut interpreter = basic::Interpreter::new();
-            interpreter.banner(&mut io);
-            interpreter.run_session(&mut io);
+    let mut tally = Tally { pass: 0, fail: 0 };
+    tally.record(
+        "bss_is_zeroed",
+        if BSS_PROBE.iter().all(|&w| w == 0) {
+            Ok(())
+        } else {
+            Err("a .bss word was not zero")
+        },
+    );
+    tally.record("latch_works_on_the_target", {
+        let latch = Latch::new();
+        latch.set();
+        if latch.take() && !latch.take() {
+            Ok(())
+        } else {
+            Err("latch semantics broke on riscv64")
         }
-        Language::Logo => run_logo(&mut out),
-    }
-    // The serial console never reports end of input, so this is unreachable in
-    // practice; power off cleanly if it ever happens.
-    sbi::shutdown()
-}
+    });
 
-/// LOGO: terminal in, framebuffer out. Without a `ramfb` device it still runs,
-/// drawing into memory that nobody sees.
-fn run_logo(out: &mut Console) {
-    use turtle::Canvas;
-    let mut io = KernelIo::new();
-    // Every line compiles to machine code before it runs (`.engine "ast` switches
-    // to the reference interpreter).
-    let mut interpreter = logo::Interpreter::with_executor(jit::execute);
-    match gfx::init() {
-        Ok(pixels) => {
-            let mut canvas = gfx::FbCanvas::new(pixels);
-            canvas.clear(0);
-            interpreter.banner(&mut io);
-            interpreter.run_session(&mut io, &mut canvas);
-        }
-        Err(reason) => {
-            let _ = writeln!(out, "(no screen: {reason})");
-            let mut canvas = turtle::Bitmap::new(gfx::WIDTH as i32, gfx::HEIGHT as i32);
-            interpreter.banner(&mut io);
-            interpreter.run_session(&mut io, &mut canvas);
+    heap::init();
+    trap::init();
+    kmem::init();
+    let _ = writeln!(
+        out,
+        "kernel page table active; {} frames free",
+        kmem::get().mm.db.free_count()
+    );
+
+    for (name, test) in selftest::TESTS {
+        match test() {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(&detail)),
         }
     }
+    // S2: threads, the timer and the scheduler. The boot thread becomes a real-time
+    // thread and interrupts come on.
+    thread::init(sched_tests::MAIN_PRIO);
+    timer::start();
+    irq::enable_timer_interrupt();
+    irq::enable();
+    let class = thread::class_name();
+    let _ = writeln!(out, "scheduler class: {class}");
+    tally.record(
+        &alloc::format!("scheduler_class_is_{}", class.replace('-', "_")),
+        Ok(()),
+    );
+    for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
+        match test() {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(&detail)),
+        }
+    }
+    // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
+    // kernel); the kernel-side checks are reported here.
+    kmem::snapshot_kernel_half();
+    let before = user::reported();
+    let report = user_tests::run_all();
+    let _ = before;
+    tally.add(report.user_reported.0, report.user_reported.1);
+    for (name, outcome) in &report.tests {
+        match outcome {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(detail)),
+        }
+    }
+    #[cfg(feature = "fail-demo")]
+    tally.record(
+        "deliberate_failure",
+        Err("fail-demo build: failing on purpose"),
+    );
+
+    let _ = testlog::done(&mut out, tally.pass, tally.fail);
+    finisher::exit(tally.fail == 0)
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut console = Console;
-    let _ = writeln!(console, "\nKERNEL PANIC: {info}");
-    sbi::shutdown()
+    let _ = testlog::panic(&mut console::Console, info);
+    finisher::exit(false)
 }

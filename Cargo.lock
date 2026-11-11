@@ -110,6 +110,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "home-kernel"
+version = "0.1.0"
+dependencies = [
+ "basic",
+ "cartfs",
+ "console",
+ "linked_list_allocator",
+ "logo",
+ "rv64",
+ "turtle",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -129,13 +142,9 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
- "basic",
- "cartfs",
- "console",
+ "abi",
+ "kcore",
  "linked_list_allocator",
- "logo",
- "rv64",
- "turtle",
 ]
 
 [[package]]
@@ -232,15 +241,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "os-kernel"
-version = "0.1.0"
-dependencies = [
- "abi",
- "kcore",
- "linked_list_allocator",
-]
 
 [[package]]
 name = "owo-colors"
