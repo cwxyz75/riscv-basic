@@ -1,6 +1,12 @@
 # Design
 
-## Goals and non-goals
+## Goals and non-goals (home computer)
+
+> This section describes the home computer: the BASIC/LOGO kernel in `kernel/`,
+> which is finished and stays as designed. The repository also has an **OS track**
+> with different goals (processes, paging, SMP, networking, POSIX) in a separate
+> kernel; its design is `OS-ARCHITECTURE.md`. The non-goals below apply to the home
+> computer only (see D23).
 
 **Goals**
 - Boot QEMU's RISC-V `virt` machine straight to a `READY.` prompt; BASIC is the shell.
@@ -10,7 +16,7 @@
 
 **Non-goals**
 - Multitasking, processes, user mode, virtual memory/paging, SMP.
-- A real filesystem (until the optional persistence milestone), networking.
+- A real filesystem (the `cartfs` floppy-style disk for SAVE/LOAD is the only storage), networking.
 - Real hardware, graphics beyond ANSI text, POSIX/Unix compatibility.
 - Binary size. (An 8 KB ROM was the 80s constraint; we don't have it.)
 
@@ -212,13 +218,21 @@ reports every problem as a BASIC error and returns to `READY.`.
    scripted input to the serial port, check the output.
 4. **CI** runs 1 and 2 on every push, and 3 in a QEMU-equipped job.
 
+## The OS track
+
+A second, separate track (the S-series in `ROADMAP.md`) builds a multicore
+capability microkernel with userspace servers, written entirely by AI. It has its
+own kernel binary and new crates, and may reuse the pure crates here without
+forking them. Its architecture, decision log (OD numbers) and open questions are in
+`OS-ARCHITECTURE.md`; none of it changes the design described in this file.
+
 ## Decision log
 
 | # | Decision | Status |
 |---|---|---|
 | D1 | Rust (stable), `no_std` | Decided |
 | D2 | RV64GC on QEMU `virt`, OpenSBI firmware, kernel in S-mode | Decided |
-| D3 | No paging, user mode or processes | Decided |
+| D3 | No paging, user mode or processes (home-computer kernel only; see D23) | Decided |
 | D4 | Numbers are `f64` (hardware FP; `libm` for transcendental functions) | Decided |
 | D5 | The terminal is the monitor; ANSI escapes for screen control | Decided |
 | D6 | Binary size is not a goal | Decided |
@@ -238,3 +252,5 @@ reports every problem as a BASIC error and returns to `READY.`.
 | D20 | LOGO runs as compiled RV64 by default; the AST and IR interpreters are kept as oracles (`.engine "ast`/`"ir`/`"jit` chooses). Generated code reaches the interpreter only through nine runtime services, whose implementations reuse the interpreter's own functions; values are NaN-boxed with a per-run arena | Decided |
 | D21 | Persistence is a virtio-mmio block device (`disk.img`, polled, no interrupts), not pflash: sector reads and writes map directly onto the format, the image is an ordinary file the host can create and inspect, and no flash erase/program protocol is needed | Decided |
 | D22 | The disk format is a fixed-directory floppy: header, free-sector map, 64 directory entries, chained data sectors, in the pure `cartfs` crate. One disk shared by both languages, files tagged by language, plain-text contents | Decided |
+| D23 | The repository has two tracks. The home computer (`kernel/`, BASIC, LOGO) is finished and keeps its non-goals. A new **OS track** (S-series) is a separate kernel binary and new crates, specified in `OS-ARCHITECTURE.md`, and may reuse the pure crates without forking them. D3 and the non-goals above apply to the home computer only | Decided |
+| D24 | OS-track design decisions are logged in `OS-ARCHITECTURE.md` section 17 (OD1, OD2, ...), not in this table, so the two tracks' histories stay separate | Decided |
