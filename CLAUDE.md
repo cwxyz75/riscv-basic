@@ -8,7 +8,7 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
   human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it, plus the S-series in
-  `ROADMAP.md`, before working on it. Nothing from it is built yet; S0 is next.
+  `ROADMAP.md`, before working on it. S0 (foundation) is done; S1 (memory) is next.
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").
@@ -19,9 +19,10 @@ boundaries").
 - `make kernel` / `make run` / `make debug`: build / boot / boot-paused-for-gdb.
 - `make boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
 - `make check`: fmt, tests, clippy, boot test. Run before calling anything done.
-- OS-track targets (planned names `make os-test`, `make os-boot-test`) do not exist
-  until S0 creates them. Don't assume them; `make check` is extended to cover them
-  once they exist.
+- OS track: `make os-kernel` / `make os-test` (host tests plus loom and shuttle) /
+  `make os-boot-test` (headless QEMU, structured output) / `make os-miri` (needs
+  nightly; CI runs it). `make check` covers all but Miri. OS-track cargo commands
+  run from inside `os-kernel/`, like `kernel/`.
 - Kernel cargo commands must run from inside `kernel/` (it has its own
   `.cargo/config.toml` that sets the target). The Makefile handles this.
 
@@ -88,7 +89,7 @@ boots, `// SAFETY:` comments, `make check`). In addition:
   logic is also run under loom/shuttle and Miri.
 - `INVARIANTS.md` (handle unforgeability, rights monotonicity, lock ordering, memory
   ownership) and `SYSCALLS.md` (every syscall: preconditions, rights, errors) are
-  created in S0. Every change preserves them, and the lock ordering is not negotiable.
+  exist (skeletons from S0, filled in by each milestone). Every change preserves them, and the lock ordering is not negotiable.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
 - Tick an S-series box only when verified in QEMU. For SMP work that means both

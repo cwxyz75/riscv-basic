@@ -164,6 +164,26 @@ The full log is in section 17. The shape of the system:
    device for pass/fail. A fully headless boot-test loop, seconds per change.
 9. **Say what could not be verified** (no QEMU, flaky, ran only in one mode).
 
+### 3.2.1 Structured test output
+
+Every OS-track kernel and test program reports through the serial port in lines that
+start at column 0 with `##`; anything else on the port is free-form noise and is
+ignored. The format (S0, OD28):
+
+```text
+##BOOT <name> <version>
+##TEST <name> PASS
+##TEST <name> FAIL <detail>
+##PANIC <message>
+##DONE pass=<n> fail=<n>
+```
+
+The verdict is QEMU's exit status, from the test finisher device at `0x100000`
+(write `0x5555` to pass; `(code << 16) | 0x3333` to fail with status `code`), and the
+lines must agree with it. The kernel formats the lines with the pure `kcore::testlog`;
+`scripts/os_boot_test.py` parses them with its own independent code, and a
+`fail-demo` build proves the harness really sees a failure.
+
 ### 3.3 Anticipated failure modes
 
 - Shared blind spots between code and tests (rule 2).
@@ -677,6 +697,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD25 | The OS lives in this repo as a new track (S-series) with its own kernel binary and new crates; the home computer keeps its non-goals; `CLAUDE.md`, `DESIGN.md` (D23, D24) and `ROADMAP.md` amended | Decided |
 | OD26 | The OS track is launched as a separate kernel binary with its own `make` targets, not as a boot-menu entry on the home-computer kernel | Decided |
 | OD27 | Small third-party utility crates (such as an allocator or `libm`) are allowed in the kernel and userland, each with its own decision-log entry; the kernel, network stack, filesystem and libc are written here. Test-time crates (loom, shuttle, proptest, Miri) assumed fine | Decided |
+| OD28 | Structured serial test output (`##BOOT/##TEST/##DONE/##PANIC`) plus QEMU's test finisher for the exit status; a deliberately failing build proves the harness detects failure (section 3.2.1) | Decided |
 
 ---
 

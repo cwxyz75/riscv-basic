@@ -1,0 +1,7 @@
+# Applies when cargo is run from inside os-kernel/ (the Makefile does this).
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+# `cargo run` from kernel/ boots the kernel in QEMU.
+[target.riscv64gc-unknown-none-elf]
+runner = "qemu-system-riscv64 -machine virt -nographic -bios default -kernel"

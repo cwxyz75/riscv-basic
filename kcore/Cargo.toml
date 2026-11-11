@@ -1,0 +1,19 @@
+[package]
+name = "kcore"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: pure kernel logic (no hardware, no unsafe), tested on the host with model-based, loom, shuttle and Miri tests"
+
+[dependencies]
+
+# Concurrency checkers, host only (they are dependencies, not dev-dependencies,
+# because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")
+# swaps the atomics in `kcore::sync` for the checker's own; see the Makefile.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = "0.8"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
