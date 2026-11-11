@@ -36,10 +36,23 @@ pub struct Event {
     signals: u32,
 }
 
+/// A process, as a kernel object: what a process handle names.
+pub struct ProcessObj {
+    pub pid: u32,
+    pub terminated: bool,
+    pub exit_code: i32,
+    /// Destroying this object (the last handle closing) kills a still-running process. False
+    /// for processes the kernel itself started: their `process_self` handles are only views.
+    pub kill_on_close: bool,
+}
+
 /// Every kernel object kind so far; later milestones add variants.
 pub enum KObj {
     Channel(Channel),
     Event(Event),
+    /// A memory object, by id in the VMO store.
+    Vmo(u64),
+    Process(ProcessObj),
 }
 
 impl Object for KObj {
@@ -54,8 +67,12 @@ impl Object for KObj {
     fn peer(&self) -> Option<ObjId> {
         match self {
             KObj::Channel(c) => c.peer,
-            KObj::Event(_) => None,
+            _ => None,
         }
+    }
+
+    fn needs_cleanup(&self) -> bool {
+        matches!(self, KObj::Vmo(_) | KObj::Process(_))
     }
 
     fn peer_destroyed(&mut self) {
@@ -383,6 +400,8 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
     let entry = table.get(h)?;
     match reg.get(entry.obj).ok_or(Status::BadHandle)? {
         KObj::Event(e) => Ok(e.signals),
+        KObj::Vmo(_) => Ok(0),
+        KObj::Process(p) => Ok(if p.terminated { signals::TERMINATED } else { 0 }),
         KObj::Channel(c) => {
             let mut s = 0;
             if !c.queue.is_empty() {
@@ -397,5 +416,87 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
             }
             Ok(s)
         }
+    }
+}
+
+/// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
+pub fn vmo_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    id: u64,
+) -> Result<Handle, Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let obj = reg.create(KObj::Vmo(id));
+    Ok(table.insert(obj, Rights::VMO).expect("room was checked"))
+}
+
+/// The VMO store id behind a VMO handle that carries `need`.
+pub fn vmo_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<u64, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Vmo(id)) => {
+            if entry.rights.contains(need) {
+                Ok(*id)
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// A process object for `pid`, with a handle in `table` (default process rights).
+pub fn process_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    pid: u32,
+    kill_on_close: bool,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let obj = reg.create(KObj::Process(ProcessObj {
+        pid,
+        terminated: false,
+        exit_code: 0,
+        kill_on_close,
+    }));
+    Ok((
+        table
+            .insert(obj, Rights::PROCESS)
+            .expect("room was checked"),
+        obj,
+    ))
+}
+
+/// The process object behind a process handle that carries `need`: its id and state.
+pub fn process_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, u32, bool, i32), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Process(p)) => {
+            if entry.rights.contains(need) {
+                Ok((entry.obj, p.pid, p.terminated, p.exit_code))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// Record that the process behind `obj` has ended (raises TERMINATED).
+pub fn process_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
+    if let Some(KObj::Process(p)) = reg.get_mut(obj) {
+        p.terminated = true;
+        p.exit_code = code;
     }
 }

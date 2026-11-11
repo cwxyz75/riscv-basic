@@ -33,6 +33,12 @@ pub trait Object {
     }
     /// Called when the peer has been destroyed.
     fn peer_destroyed(&mut self) {}
+    /// Does destroying this object require work the registry cannot do (freeing a VMO's
+    /// pages, killing a process)? If so it is kept in the registry's graveyard for the owner
+    /// to collect with [`Registry::drain_dead`].
+    fn needs_cleanup(&self) -> bool {
+        false
+    }
 }
 
 struct Slot<T> {
@@ -47,6 +53,8 @@ pub struct Registry<T: Object> {
     live: usize,
     /// `needs_sweep` once `live` passes this.
     threshold: usize,
+    /// Destroyed objects that `needs_cleanup`, waiting for the owner.
+    graveyard: Vec<T>,
 }
 
 impl<T: Object> Default for Registry<T> {
@@ -62,6 +70,7 @@ impl<T: Object> Registry<T> {
             free: Vec::new(),
             live: 0,
             threshold: SWEEP_MIN,
+            graveyard: Vec::new(),
         }
     }
 
@@ -155,7 +164,22 @@ impl<T: Object> Registry<T> {
                     p.peer_destroyed();
                 }
             }
+            if obj.needs_cleanup() {
+                self.graveyard.push(obj);
+            }
         }
+    }
+
+    /// The destroyed objects whose destruction needs work from the owner (since the last
+    /// call), oldest first. Call after any operation that can destroy objects: `release`,
+    /// `sweep`, closing handles, draining a table.
+    pub fn drain_dead(&mut self) -> Vec<T> {
+        core::mem::take(&mut self.graveyard)
+    }
+
+    /// Is any destroyed object waiting in the graveyard?
+    pub fn has_dead(&self) -> bool {
+        !self.graveyard.is_empty()
     }
 
     /// Has the number of live objects grown enough that the owner should call `sweep`
@@ -204,6 +228,9 @@ impl<T: Object> Registry<T> {
             obj.held(&mut dropped_refs);
             if let Some(peer) = obj.peer() {
                 peers.push(peer);
+            }
+            if obj.needs_cleanup() {
+                self.graveyard.push(obj);
             }
         }
         for peer in peers {

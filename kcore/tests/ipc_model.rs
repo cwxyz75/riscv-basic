@@ -1176,3 +1176,124 @@ fn peek_predicts_exactly_what_a_read_would_do() {
     small.drain(&mut reg);
     assert_eq!(reg.live(), 0);
 }
+
+#[test]
+fn destroyed_vmos_and_processes_are_handed_back_for_cleanup_exactly_once() {
+    let (mut reg, mut t) = world();
+    let v1 = vmo_object_create(&mut reg, &mut t, 101).unwrap();
+    let v2 = vmo_object_create(&mut reg, &mut t, 102).unwrap();
+    let (p1, p1_obj) = process_object_create(&mut reg, &mut t, 7, true).unwrap();
+    let (_c1, _c2) = channel_create(&mut reg, &mut t).unwrap();
+    let e = event_create(&mut reg, &mut t).unwrap();
+    assert!(reg.drain_dead().is_empty(), "nothing has died yet");
+    // a duplicate keeps the VMO alive: closing one handle is not a destruction
+    let v2b = t.duplicate(&mut reg, v2, Rights::SAME).unwrap();
+    t.close(&mut reg, v2).unwrap();
+    assert!(reg.drain_dead().is_empty());
+    t.close(&mut reg, v2b).unwrap();
+    t.close(&mut reg, e).unwrap(); // events need no cleanup
+    t.close(&mut reg, v1).unwrap();
+    let dead: Vec<u64> = reg
+        .drain_dead()
+        .into_iter()
+        .filter_map(|o| {
+            if let KObj::Vmo(id) = o {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        dead,
+        vec![102, 101],
+        "both VMOs, once each, in destruction order"
+    );
+    assert!(reg.drain_dead().is_empty(), "drained means gone");
+    // a process object destroyed while it is still running is handed back as not terminated
+    t.close(&mut reg, p1).unwrap();
+    match reg.drain_dead().pop() {
+        Some(KObj::Process(p)) => assert_eq!((p.pid, p.terminated), (7, false)),
+        _ => panic!("the process object was not handed back"),
+    }
+    assert!(!reg.is_alive(p1_obj));
+    t.drain(&mut reg);
+    // and objects destroyed by a sweep (a cycle holding a VMO in a queue) are handed back too
+    let mut t = HandleTable::new(64);
+    let (x, w) = channel_create(&mut reg, &mut t).unwrap();
+    let (z, y) = channel_create(&mut reg, &mut t).unwrap();
+    let v = vmo_object_create(&mut reg, &mut t, 555).unwrap();
+    channel_write(&mut reg, &mut t, y, b"", &[x]).unwrap();
+    channel_write(&mut reg, &mut t, w, b"", &[z, v]).unwrap(); // z and the VMO ride in x's queue
+    t.close(&mut reg, w).unwrap();
+    t.close(&mut reg, y).unwrap();
+    assert!(
+        reg.drain_dead().is_empty(),
+        "counting alone frees nothing here"
+    );
+    let roots: Vec<_> = t.objects().collect();
+    reg.sweep(&roots);
+    let dead: Vec<u64> = reg
+        .drain_dead()
+        .into_iter()
+        .filter_map(|o| {
+            if let KObj::Vmo(id) = o {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(dead, vec![555], "the sweep reports the VMO it destroyed");
+    assert_eq!(reg.live(), 0);
+}
+
+#[test]
+fn process_and_vmo_handles_check_type_and_rights() {
+    let (mut reg, mut t) = world();
+    let v = vmo_object_create(&mut reg, &mut t, 9).unwrap();
+    let (p, pobj) = process_object_create(&mut reg, &mut t, 3, true).unwrap();
+    let e = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(vmo_of(&reg, &t, v, Rights::MAP), Ok(9));
+    assert_eq!(vmo_of(&reg, &t, p, Rights::NONE), Err(Status::WrongType));
+    assert_eq!(
+        vmo_of(&reg, &t, Handle(77), Rights::NONE),
+        Err(Status::BadHandle)
+    );
+    let dup_v = t.duplicate(&mut reg, v, Rights::SAME).unwrap();
+    let ro = t.replace(dup_v, Rights::READ).unwrap();
+    assert_eq!(vmo_of(&reg, &t, ro, Rights::READ), Ok(9));
+    assert_eq!(
+        vmo_of(&reg, &t, ro, Rights::WRITE),
+        Err(Status::AccessDenied)
+    );
+    assert_eq!(
+        process_of(&reg, &t, p, Rights::MANAGE).map(|(_, pid, term, code)| (pid, term, code)),
+        Ok((3, false, 0))
+    );
+    assert_eq!(
+        process_of(&reg, &t, e, Rights::NONE).err(),
+        Some(Status::WrongType)
+    );
+    assert_eq!(
+        process_of(&reg, &t, v, Rights::NONE).err(),
+        Some(Status::WrongType)
+    );
+    let dup_p = t.duplicate(&mut reg, p, Rights::SAME).unwrap();
+    let inspect_less = t.replace(dup_p, Rights::WAIT).unwrap();
+    assert_eq!(
+        process_of(&reg, &t, inspect_less, Rights::INSPECT).err(),
+        Some(Status::AccessDenied)
+    );
+    assert_eq!(signals_of(&reg, &t, p), Ok(0));
+    process_mark_terminated(&mut reg, pobj, -1015);
+    assert_eq!(signals_of(&reg, &t, p), Ok(signals::TERMINATED));
+    assert_eq!(
+        process_of(&reg, &t, p, Rights::INSPECT).map(|(_, _, term, code)| (term, code)),
+        Ok((true, -1015))
+    );
+    assert_eq!(signals_of(&reg, &t, v), Ok(0));
+    t.drain(&mut reg);
+    let _ = reg.drain_dead();
+    assert_eq!(reg.live(), 0);
+}

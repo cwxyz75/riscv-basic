@@ -106,6 +106,8 @@ struct KThread {
     /// `None` for the boot thread, which runs on the boot stack.
     stack: Option<Box<[u64]>>,
     name: &'static str,
+    /// Nobody will `join` this thread: when it exits the reaper frees it.
+    detached: bool,
 }
 
 struct Kernel {
@@ -114,6 +116,9 @@ struct Kernel {
     running: Tid,
     exits: WaitQueue,
     queues: Vec<WaitQueue>,
+    /// Exited detached threads waiting for the reaper.
+    zombies: Vec<Tid>,
+    reaper_queue: usize,
 }
 
 static mut KERNEL: Option<Kernel> = None;
@@ -154,6 +159,7 @@ pub fn init(boot_prio: Prio) {
             ctx: Box::default(),
             stack: None,
             name: "boot",
+            detached: false,
         },
     );
     // SAFETY: called once, interrupts off, before any other use of KERNEL.
@@ -164,9 +170,14 @@ pub fn init(boot_prio: Prio) {
             running: boot,
             exits: WaitQueue::new(),
             queues: Vec::new(),
+            zombies: Vec::new(),
+            reaper_queue: 0,
         });
     }
     spawn("idle", PRIO_IDLE, idle_main, 0);
+    let q = new_queue();
+    kernel().reaper_queue = q;
+    spawn("reaper", REAPER_PRIO, reaper_main, 0);
 }
 
 fn idle_main(_: usize) {
@@ -193,6 +204,15 @@ extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
 /// Create a thread. It runs `entry(arg)` and then exits. It may preempt the caller
 /// at once if it has a higher priority.
 pub fn spawn(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
+    spawn_with(name, prio, entry, arg, false)
+}
+
+/// A thread nobody joins: when it exits the reaper thread frees its stack and record.
+pub fn spawn_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
+    spawn_with(name, prio, entry, arg, true)
+}
+
+fn spawn_with(name: &'static str, prio: Prio, entry: fn(usize), arg: usize, detached: bool) -> Tid {
     let mut stack: Box<[u64]> = alloc::vec![0u64; STACK_WORDS].into_boxed_slice();
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.as_ptr() as usize + STACK_BYTES;
@@ -210,6 +230,7 @@ pub fn spawn(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Ti
                 ctx,
                 stack: Some(stack),
                 name,
+                detached,
             },
         );
         reschedule();
@@ -333,8 +354,23 @@ pub fn exit() -> ! {
     irq::without(|| {
         let k = kernel();
         k.sched.exit_current().expect("running thread");
-        let Kernel { sched, exits, .. } = k;
+        let me = k.running;
+        let detached = k.threads.get(&me).is_some_and(|t| t.detached);
+        let Kernel {
+            sched,
+            exits,
+            queues,
+            zombies,
+            reaper_queue,
+            ..
+        } = k;
         exits.wake_all(sched);
+        if detached {
+            // Nobody will join it: hand it to the reaper (which runs once we have switched
+            // away, so its stack is no longer in use when it is freed).
+            zombies.push(me);
+            queues[*reaper_queue].wake_all(sched);
+        }
         reschedule();
     });
     unreachable!("an exited thread was scheduled again");
@@ -510,4 +546,24 @@ pub fn current_stack_top() -> u64 {
             .expect("a user thread has its own kernel stack");
         ((stack.as_ptr() as usize + STACK_BYTES) & !15) as u64
     })
+}
+
+/// Priority of the reaper: above everything that can create work for it.
+const REAPER_PRIO: Prio = 50;
+
+/// Frees detached threads once they have exited (stack, context, scheduler record).
+fn reaper_main(_: usize) {
+    loop {
+        let q = irq::without(|| kernel().reaper_queue);
+        wait_until(q, || !kernel().zombies.is_empty());
+        irq::without(|| {
+            let k = kernel();
+            let dead: Vec<Tid> = core::mem::take(&mut k.zombies);
+            for tid in dead {
+                if k.sched.reap(tid).is_ok() {
+                    k.threads.remove(&tid);
+                }
+            }
+        });
+    }
 }

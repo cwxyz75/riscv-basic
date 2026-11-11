@@ -330,3 +330,21 @@ fn a_region_outside_the_user_half_is_still_refused_by_the_copy_checks() {
     w.kernel.destroy(&mut w.mm);
     assert_eq!(w.mm.db.free_count(), w.baseline);
 }
+
+#[test]
+fn region_perms_at_finds_the_covering_region() {
+    let mut w = world();
+    region(&mut w, 0x1_0000, 2, Perms::RX.user());
+    region(&mut w, 0x4_0000, 1, Perms::RW.user());
+    assert_eq!(w.proc.region_perms_at(0x1_0000), Some(Perms::RX.user()));
+    assert_eq!(
+        w.proc.region_perms_at(0x1_1fff),
+        Some(Perms::RX.user()),
+        "the last byte of a region"
+    );
+    assert_eq!(w.proc.region_perms_at(0x1_2000), None, "one past the end");
+    assert_eq!(w.proc.region_perms_at(0xffff), None, "just below");
+    assert_eq!(w.proc.region_perms_at(0x4_0800), Some(Perms::RW.user()));
+    assert_eq!(w.proc.region_perms_at(0), None);
+    w.teardown();
+}

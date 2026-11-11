@@ -40,6 +40,24 @@ struct Process {
     /// The creator's end of the bootstrap channel (a handle in `UserState::ktable`), until
     /// a test or server takes it with `take_bootstrap`.
     kernel_end: Option<Handle>,
+    /// Where the first thread starts the stack (0: the default `STACK_TOP`).
+    start_sp: u64,
+    /// The process's object (for TERMINATED and kill-on-close), if it has one.
+    obj: Option<kcore::object::ObjId>,
+    state: ProcState,
+    /// Started by `process_start`: its own thread tears it down when it ends and nobody
+    /// joins that thread.
+    detached: bool,
+    /// `process_kill` asked for it to end, with this exit code; its thread dies at its next
+    /// return to user mode (or wakes from a wait to do so).
+    killed: Option<i32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcState {
+    /// Created and possibly populated, no thread yet.
+    Created,
+    Running,
 }
 
 struct UserState {
@@ -47,6 +65,9 @@ struct UserState {
     procs: BTreeMap<u32, Process>,
     thread_pid: BTreeMap<Tid, u32>,
     next_pid: u32,
+    /// VMOs whose last handle is gone but that some address space still maps: freed when the
+    /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
+    pending_vmos: Vec<u64>,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     ktable: HandleTable,
     /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
@@ -84,6 +105,7 @@ fn state() -> &'static mut UserState {
             procs: BTreeMap::new(),
             thread_pid: BTreeMap::new(),
             next_pid: 1,
+            pending_vmos: Vec::new(),
             ktable: HandleTable::new(256),
             signal_queue: thread::new_queue(),
             line: String::new(),
@@ -99,6 +121,11 @@ pub fn reported() -> (u32, u32) {
         let s = state();
         (s.pass, s.fail)
     })
+}
+
+/// How many processes exist right now (a leak counter for tests).
+pub fn process_count() -> usize {
+    irq::without(|| state().procs.len())
 }
 
 /// The number of live kernel objects (for leak checks).
@@ -181,6 +208,11 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         arg,
         exit_code: None,
         kernel_end: None,
+        start_sp: 0,
+        obj: None,
+        state: ProcState::Running,
+        detached: false,
+        killed: None,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
@@ -218,18 +250,27 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
 }
 
 fn user_thread_main(pid: usize) {
-    let (entry, arg, satp) = irq::without(|| {
+    let (entry, arg, satp, sp) = irq::without(|| {
         let s = state();
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
         s.thread_pid.insert(thread::current(), pid as u32);
         let p = &s.procs[&(pid as u32)];
-        (p.entry, p.arg, satp_of(p))
+        (
+            p.entry,
+            p.arg,
+            satp_of(p),
+            if p.start_sp != 0 {
+                p.start_sp
+            } else {
+                STACK_TOP
+            },
+        )
     });
     let top = thread::current_stack_top();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
-    unsafe { enter_user(entry, STACK_TOP, arg, satp, top) }
+    unsafe { enter_user(entry, sp, arg, satp, top) }
 }
 
 core::arch::global_asm!(
@@ -289,16 +330,29 @@ extern "C" {
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.
 pub fn finish(pid: u32, tid: Tid) -> i32 {
     thread::join(tid);
+    teardown(pid)
+}
+
+/// Take a process apart: close its handle table, sweep what nothing can reach any more,
+/// mark its process object TERMINATED, free its address space and memory, and wake
+/// everything that was waiting on any of that. Returns its exit code. Runs with interrupts
+/// off, never holds a borrow across `notify`, and is safe to call from the dying thread
+/// itself (it first switches to the kernel page table, whose upper half every process
+/// shares).
+fn teardown(pid: u32) -> i32 {
     // Back to the kernel's own page table before the process's root is freed.
     kmem::use_kernel_table();
-    let mut process = irq::without(|| {
+    let Some(mut process) = irq::without(|| {
         let s = state();
-        s.thread_pid.remove(&tid);
-        s.procs.remove(&pid).expect("process exists")
-    });
-    // A process that vanished without a recorded code (cannot happen today) is not mistaken
-    // for `exit(-1)`.
-    let code = process.exit_code.unwrap_or(i32::MIN);
+        s.thread_pid.retain(|_, p| *p != pid);
+        s.procs.remove(&pid)
+    }) else {
+        // Another killer got here first (two kills of a never-started process can race): it
+        // does the teardown.
+        return i32::MIN;
+    };
+    // A process that vanished without a recorded code is not mistaken for `exit(-1)`.
+    let code = process.exit_code.or(process.killed).unwrap_or(i32::MIN);
     irq::without(|| {
         let s = state();
         process.handles.drain(&mut s.objs);
@@ -310,32 +364,48 @@ pub fn finish(pid: u32, tid: Tid) -> i32 {
         // kernel's own handles.
         let roots = s.roots();
         s.objs.sweep(&roots);
+        if let Some(obj) = process.obj {
+            ipc::process_mark_terminated(&mut s.objs, obj, code);
+        }
         if !s.line.is_empty() {
             let line = core::mem::take(&mut s.line);
             let _ = writeln!(Console, "{line}");
         }
     });
-    let k = kmem::get();
-    process.aspace.destroy_user(&mut k.mm);
-    for id in process.vmos {
-        let _ = k.vmos.destroy(&mut k.mm, id);
-    }
+    irq::without(|| {
+        let k = kmem::get();
+        process.aspace.destroy_user(&mut k.mm);
+        for id in process.vmos {
+            let _ = k.vmos.destroy(&mut k.mm, id);
+        }
+    });
     kmem::flush_tlb();
-    notify(); // peers of what this process held now see PEER_CLOSED
+    notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
 }
 
 /// End the calling user thread's process with `code`.
 fn exit_process(code: i32) -> ! {
-    irq::without(|| {
+    // (pid, detached): a process started by `process_start` has nobody to `finish` it, so its
+    // own last thread tears it down; a kernel-started one is torn down by its `finish`.
+    let me = irq::without(|| {
         let s = state();
-        if let Some(&pid) = s.thread_pid.get(&thread::current()) {
-            if let Some(p) = s.procs.get_mut(&pid) {
-                p.exit_code = Some(code);
-            }
-        }
+        let pid = *s.thread_pid.get(&thread::current())?;
+        let p = s.procs.get_mut(&pid)?;
+        p.exit_code = Some(code);
+        Some((pid, p.detached))
     });
+    if let Some((pid, true)) = me {
+        teardown(pid);
+    }
     thread::exit()
+}
+
+/// The exit code the calling thread's process was told to die with (`process_kill`), if any.
+fn killed_now() -> Option<i32> {
+    let s = state();
+    let pid = s.thread_pid.get(&thread::current())?;
+    s.procs.get(pid)?.killed
 }
 
 /// The satp value last written for user mode (so a switch is only made when needed).
@@ -350,6 +420,11 @@ fn satp_of(p: &Process) -> u64 {
 /// threads of different processes are switched between, and the kernel half is shared so
 /// kernel code runs under any of them, but returning to user mode must use *this* one.
 pub fn activate_current() {
+    // A process that was killed while its thread was not running dies here, at the point
+    // where it would otherwise return to user mode.
+    if let Some(code) = irq::without(killed_now) {
+        exit_process(code);
+    }
     let satp = irq::without(|| {
         let s = state();
         s.thread_pid
@@ -436,6 +511,17 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
+        nr::PROCESS_CREATE
+        | nr::PROCESS_SELF
+        | nr::PROCESS_MAP
+        | nr::PROCESS_UNMAP
+        | nr::PROCESS_START
+        | nr::PROCESS_KILL
+        | nr::PROCESS_INFO => {
+            let r = process_call(n, a);
+            notify();
+            reply(frame, r);
+        }
         nr::CHANNEL_CALL => {
             let r = channel_call(a);
             notify();
@@ -473,7 +559,8 @@ fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
     }
 }
 
-type Reply = Result<(Option<u64>, Option<u64>), (Status, Option<u64>, Option<u64>)>;
+type ReplyErr = (Status, Option<u64>, Option<u64>);
+type Reply = Result<(Option<u64>, Option<u64>), ReplyErr>;
 
 fn fail(s: Status) -> Reply {
     Err((s, None, None))
@@ -509,6 +596,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             Some(Status::BadHandle)
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
+        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
         nr::EVENT_SIGNAL if over(0) => Some(Status::BadHandle),
@@ -633,6 +721,55 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 Err(ReadError::Status(st)) => Err((st, None, None)),
             }
         }
+        nr::VMO_CREATE => {
+            if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {
+                return fail(Status::InvalidArgs);
+            }
+            let id = k.vmos.create(a[0]);
+            match ipc::vmo_object_create(objs, &mut p.handles, id) {
+                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Err(e) => {
+                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    fail(e)
+                }
+            }
+        }
+        nr::VMO_GET_SIZE => {
+            let id =
+                ipc::vmo_of(objs, &p.handles, h(0), Rights::NONE).map_err(|e| (e, None, None))?;
+            let pages = k.vmos.pages(id).ok_or((Status::BadHandle, None, None))?;
+            Ok((Some(pages * 4096), None))
+        }
+        nr::VMO_READ | nr::VMO_WRITE => {
+            let writing = n == nr::VMO_WRITE;
+            let need = if writing { Rights::WRITE } else { Rights::READ };
+            let id = ipc::vmo_of(objs, &p.handles, h(0), need).map_err(|e| (e, None, None))?;
+            let (offset, buf, len) = (a[1], a[2], a[3]);
+            if len > MAX_MSG_BYTES as u64 {
+                return fail(Status::TooBig);
+            }
+            let len = len as usize;
+            let size = k.vmos.pages(id).ok_or((Status::BadHandle, None, None))? * 4096;
+            if offset.checked_add(len as u64).is_none_or(|end| end > size) {
+                return fail(Status::InvalidArgs);
+            }
+            if writing {
+                let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, len)
+                    .map_err(|e| (e, None, None))?;
+                k.vmos
+                    .write(&mut k.mm, id, offset, &data)
+                    .map_err(|_| (Status::NoMemory, None, None))?;
+            } else {
+                verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, len)
+                    .map_err(|e| (e, None, None))?;
+                let mut data = alloc::vec![0u8; len];
+                k.vmos
+                    .read(&mut k.mm, id, offset, &mut data)
+                    .map_err(|_| (Status::InvalidArgs, None, None))?;
+                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, &data);
+            }
+            Ok((None, None))
+        }
         _ => fail(Status::BadSyscall),
     }
 }
@@ -693,8 +830,87 @@ fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
 
 /// Wake every thread waiting on a signal (they re-check their own conditions).
 pub fn notify() {
+    cleanup_dead();
+    reap_vmos();
     let q = irq::without(|| state().signal_queue);
     thread::wake_all(q);
+}
+
+static CLEANING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Do the kernel work that destroying objects calls for: free the pages of a VMO that has
+/// no handle left, and kill a process whose last handle was closed. (The registry cannot
+/// reach the frame database or the process table, so it hands the dead objects back.)
+fn cleanup_dead() {
+    if CLEANING.swap(true, Ordering::SeqCst) {
+        return; // a cleanup is already running further up the stack; it will see our work
+    }
+    loop {
+        let dead = irq::without(|| state().objs.drain_dead());
+        if dead.is_empty() {
+            // Clear the flag and look once more in the same interrupts-off step, so work
+            // pushed between the last drain and the clear is not stranded.
+            let again = irq::without(|| {
+                CLEANING.store(false, Ordering::SeqCst);
+                state().objs.has_dead()
+            });
+            if again && !CLEANING.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            return;
+        }
+        for obj in dead {
+            match obj {
+                ipc::KObj::Vmo(id) => {
+                    irq::without(|| state().pending_vmos.push(id));
+                    reap_vmos();
+                }
+                ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
+                    request_kill(p.pid, -2000)
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Free the VMOs whose last handle is gone and that no address space maps any more.
+fn reap_vmos() {
+    irq::without(|| {
+        let s = state();
+        let k = kmem::get();
+        let pending = core::mem::take(&mut s.pending_vmos);
+        for id in pending {
+            if s.procs.values().any(|p| p.aspace.maps_vmo(id)) {
+                s.pending_vmos.push(id);
+            } else {
+                let _ = k.vmos.destroy(&mut k.mm, id);
+            }
+        }
+    });
+}
+
+/// End process `pid` with `code`, from any other thread: a process with no thread yet is
+/// torn down at once; a running one is told to die and woken (its thread exits at its next
+/// return to user mode).
+fn request_kill(pid: u32, code: i32) {
+    let direct = irq::without(|| {
+        let s = state();
+        match s.procs.get_mut(&pid) {
+            Some(p) if p.state == ProcState::Created => {
+                p.exit_code = Some(code);
+                true
+            }
+            Some(p) => {
+                p.killed.get_or_insert(code);
+                false
+            }
+            None => false,
+        }
+    });
+    if direct {
+        teardown(pid);
+    }
 }
 
 /// Run `f` on the calling thread's process, with interrupts off. `Err(BadState)` if the
@@ -729,6 +945,7 @@ fn signals_now(h: Handle) -> Result<u32, Status> {
 const WAITABLE_SIGNALS: u32 = abi::signals::READABLE
     | abi::signals::WRITABLE
     | abi::signals::PEER_CLOSED
+    | abi::signals::TERMINATED
     | abi::signals::USER_MASK;
 
 fn object_wait(a: [u64; 6]) -> Reply {
@@ -753,7 +970,7 @@ fn object_wait(a: [u64; 6]) -> Reply {
         // A handle that stops naming anything ends the wait (the check below then reports it).
         thread::wait_deadline(
             q,
-            || signals_now(h).map_or(true, |s| s & mask != 0),
+            || killed_now().is_some() || signals_now(h).map_or(true, |s| s & mask != 0),
             deadline,
         );
     }
@@ -840,6 +1057,9 @@ fn channel_call(a: [u64; 6]) -> Reply {
         let Some(p) = s.procs.get(&pid) else {
             return true;
         };
+        if p.killed.is_some() {
+            return true;
+        }
         !matches!(
             ipc::channel_peek(
                 &s.objs,
@@ -959,6 +1179,28 @@ impl KernelEnd {
         r
     }
 
+    /// Send `data` together with a new VMO holding `image` (the receiver gets a VMO handle
+    /// with the default VMO rights). Used to hand a program image to a launcher.
+    pub fn write_with_vmo(&self, data: &[u8], image: &[u8]) -> Result<(), Status> {
+        let r = irq::without(|| {
+            let s = state();
+            let k = kmem::get();
+            let pages = (image.len() as u64).div_ceil(4096).max(1);
+            let id = k.vmos.create(pages);
+            k.vmos
+                .write(&mut k.mm, id, 0, image)
+                .map_err(|_| Status::NoMemory)?;
+            let h = ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id)?;
+            let r = ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, &[h]);
+            if r.is_err() {
+                let _ = s.ktable.close(&mut s.objs, h);
+            }
+            r
+        });
+        notify();
+        r
+    }
+
     /// Wait until a message is readable or the peer has closed; false on timeout.
     pub fn wait_readable(&self, deadline: u64) -> bool {
         let q = irq::without(|| state().signal_queue);
@@ -979,4 +1221,326 @@ impl KernelEnd {
     pub fn close(self) {
         drop(self);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process syscalls (S3c-2a). They touch two processes (the caller and a target), so they
+// work in short interrupts-off steps that never hold both at once.
+
+const PF_R: u64 = 1;
+const PF_W: u64 = 2;
+const PF_X: u64 = 4;
+
+fn bad(s: Status) -> Reply {
+    Err((s, None, None))
+}
+
+fn process_call(n: usize, a: [u64; 6]) -> Reply {
+    // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
+    let wide = |i: usize| a[i] > u64::from(u32::MAX);
+    match n {
+        nr::PROCESS_CREATE => process_create(),
+        nr::PROCESS_SELF => process_self(),
+        nr::PROCESS_MAP if wide(0) || wide(1) => bad(Status::BadHandle),
+        nr::PROCESS_MAP => process_map(a),
+        nr::PROCESS_UNMAP if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_UNMAP => process_unmap(a),
+        nr::PROCESS_START if wide(0) || wide(3) => bad(Status::BadHandle),
+        nr::PROCESS_START => process_start(a),
+        nr::PROCESS_KILL | nr::PROCESS_INFO if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_KILL => process_kill(a),
+        nr::PROCESS_INFO => process_info(a),
+        _ => bad(Status::BadSyscall),
+    }
+}
+
+fn caller_pid(s: &UserState) -> Result<u32, Status> {
+    s.thread_pid
+        .get(&thread::current())
+        .copied()
+        .ok_or(Status::BadState)
+}
+
+fn process_create() -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        if s.procs.len() >= abi::limits::MAX_PROCESSES {
+            return bad(Status::NoMemory);
+        }
+        let k = kmem::get();
+        let table = PageTable::new_with_kernel_half(&mut k.mm, k.aspace.table()).ok_or((
+            Status::NoMemory,
+            None,
+            None,
+        ))?;
+        let pid = s.next_pid;
+        s.next_pid += 1;
+        let UserState { objs, procs, .. } = s;
+        let creator = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        let (handle, obj) = match ipc::process_object_create(objs, &mut creator.handles, pid, true)
+        {
+            Ok(x) => x,
+            Err(e) => {
+                PageTable::destroy_user(table, &mut k.mm);
+                return bad(e);
+            }
+        };
+        procs.insert(
+            pid,
+            Process {
+                aspace: AddressSpace::new(table),
+                handles: HandleTable::new(MAX_HANDLES),
+                asid: (pid & 0xffff) as u16,
+                vmos: Vec::new(),
+                entry: 0,
+                arg: 0,
+                exit_code: None,
+                kernel_end: None,
+                start_sp: 0,
+                obj: Some(obj),
+                state: ProcState::Created,
+                detached: true,
+                killed: None,
+            },
+        );
+        Ok((Some(u64::from(handle.0)), None))
+    })
+}
+
+fn process_self() -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let UserState { objs, procs, .. } = s;
+        let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        let rights =
+            Rights(Rights::MANAGE.0 | Rights::INSPECT.0 | Rights::WAIT.0 | Rights::DUPLICATE.0);
+        if p.handles.room() < 1 {
+            return bad(Status::NoMemory);
+        }
+        match p.obj.filter(|&o| objs.is_alive(o)) {
+            Some(obj) => {
+                // another view of the same process object
+                objs.retain(obj);
+                let h = p.handles.insert(obj, rights).expect("room was checked");
+                Ok((Some(u64::from(h.0)), None))
+            }
+            None => {
+                let (h, obj) = ipc::process_object_create(objs, &mut p.handles, me, false)
+                    .map_err(|e| (e, None, None))?;
+                // narrow the default rights: a self handle cannot be sent away
+                let h = p.handles.replace(h, rights).expect("just created");
+                p.obj = Some(obj);
+                Ok((Some(u64::from(h.0)), None))
+            }
+        }
+    })
+}
+
+/// Resolve a process handle and a VMO handle of the caller, checking them in the order
+/// SYSCALLS.md lists (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED). Returns the target pid and
+/// the VMO id.
+fn resolve_map_args(
+    s: &UserState,
+    me: u32,
+    ph: Handle,
+    vh: Handle,
+    flags: u64,
+) -> Result<(u32, u64), Status> {
+    let caller = s.procs.get(&me).ok_or(Status::BadState)?;
+    let pe = caller.handles.get(ph)?;
+    let ve = caller.handles.get(vh)?;
+    let tpid = match s.objs.get(pe.obj) {
+        Some(ipc::KObj::Process(p)) => p.pid,
+        _ => return Err(Status::WrongType),
+    };
+    let vid = match s.objs.get(ve.obj) {
+        Some(ipc::KObj::Vmo(id)) => *id,
+        _ => return Err(Status::WrongType),
+    };
+    let mut need = Rights(Rights::MAP.0 | Rights::READ.0);
+    if flags & PF_W != 0 {
+        need = need.union(Rights::WRITE);
+    }
+    if flags & PF_X != 0 {
+        need = need.union(Rights::EXECUTE);
+    }
+    if !pe.rights.contains(Rights::MANAGE) || !ve.rights.contains(need) {
+        return Err(Status::AccessDenied);
+    }
+    Ok((tpid, vid))
+}
+
+fn process_map(a: [u64; 6]) -> Reply {
+    let (ph, vh) = (Handle(a[0] as u32), Handle(a[1] as u32));
+    let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tpid, vid) = resolve_map_args(s, me, ph, vh, flags).map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        let target = s
+            .procs
+            .get_mut(&tpid)
+            .ok_or((Status::BadState, None, None))?;
+        if target.exit_code.is_some() || target.killed.is_some() {
+            return bad(Status::BadState);
+        }
+        let aligned = |x: u64| x.is_multiple_of(4096);
+        let in_user = vaddr >= abi::user::BASE
+            && vaddr
+                .checked_add(length)
+                .is_some_and(|end| end <= abi::user::TOP);
+        let vmo_pages = k.vmos.pages(vid).ok_or((Status::BadHandle, None, None))?;
+        let inside_vmo = offset
+            .checked_add(length)
+            .is_some_and(|end| end <= vmo_pages * 4096);
+        if !aligned(vaddr)
+            || !aligned(offset)
+            || !aligned(length)
+            || length == 0
+            || flags & !(PF_R | PF_W | PF_X) != 0
+            || (flags & PF_W != 0 && flags & PF_X != 0)
+            || !in_user
+            || !inside_vmo
+        {
+            return bad(Status::InvalidArgs);
+        }
+        let perms = Perms {
+            read: true,
+            write: flags & PF_W != 0,
+            exec: flags & PF_X != 0,
+            user: true,
+        };
+        target
+            .aspace
+            .map_region(&k.vmos, vaddr, length / 4096, vid, offset / 4096, perms)
+            .map_err(|_| (Status::InvalidArgs, None, None))?;
+        Ok((None, None))
+    })
+}
+
+fn process_unmap(a: [u64; 6]) -> Reply {
+    let ph = Handle(a[0] as u32);
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, tpid, _, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
+            .map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        let target = s
+            .procs
+            .get_mut(&tpid)
+            .ok_or((Status::BadState, None, None))?;
+        if target.exit_code.is_some() || target.killed.is_some() {
+            return bad(Status::BadState);
+        }
+        target
+            .aspace
+            .unmap_region(&mut k.mm, a[1])
+            .map_err(|_| (Status::InvalidArgs, None, None))?;
+        kmem::flush_tlb();
+        Ok((None, None))
+    })
+    .inspect(|_| reap_vmos())
+}
+
+fn process_start(a: [u64; 6]) -> Reply {
+    let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
+    let (entry, sp, arg) = (a[1], a[2], a[4]);
+    let started = irq::without(|| -> Result<u32, (Status, Option<u64>, Option<u64>)> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let pe = caller.handles.get(ph).map_err(|e| (e, None, None))?;
+        let be = caller.handles.get(bh).map_err(|e| (e, None, None))?;
+        let tpid = match s.objs.get(pe.obj) {
+            Some(ipc::KObj::Process(p)) => p.pid,
+            _ => return bad(Status::WrongType).map(|_| 0),
+        };
+        if !matches!(s.objs.get(be.obj), Some(ipc::KObj::Channel(_))) {
+            return bad(Status::WrongType).map(|_| 0);
+        }
+        if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
+            return bad(Status::AccessDenied).map(|_| 0);
+        }
+        let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
+        if target.state != ProcState::Created
+            || target.exit_code.is_some()
+            || target.killed.is_some()
+        {
+            return bad(Status::BadState).map(|_| 0);
+        }
+        let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+        let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
+        if !entry_ok || !sp_ok {
+            return bad(Status::InvalidArgs).map(|_| 0);
+        }
+        // Commit: the channel end moves into the new process as its handle 1.
+        let UserState { procs, .. } = s;
+        let caller = procs.get_mut(&me).expect("caller exists");
+        let moved = caller
+            .handles
+            .remove_for_transfer(bh)
+            .map_err(|e| (e, None, None))?;
+        let target = procs.get_mut(&tpid).expect("target exists");
+        let first = target
+            .handles
+            .insert(moved.obj, moved.rights)
+            .expect("an empty table has room");
+        assert_eq!(
+            first,
+            abi::BOOTSTRAP_HANDLE,
+            "the bootstrap channel must be handle 1"
+        );
+        target.entry = entry;
+        target.arg = arg;
+        target.start_sp = sp;
+        target.state = ProcState::Running;
+        Ok(tpid)
+    })?;
+    // The new thread (registered by itself once it runs). Spawned after the state borrow is
+    // gone: spawning can switch to it at once.
+    thread::spawn_detached("user", 10, user_thread_main, started as usize);
+    Ok((None, None))
+}
+
+fn process_kill(a: [u64; 6]) -> Reply {
+    let ph = Handle(a[0] as u32);
+    let code = a[1] as i32;
+    let (tpid, me) = irq::without(|| -> Result<(u32, u32), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, tpid, terminated, _) =
+            ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
+                .map_err(|e| (e, None, None))?;
+        if terminated || !s.procs.contains_key(&tpid) {
+            return Err((Status::BadState, None, None));
+        }
+        Ok((tpid, me))
+    })?;
+    if tpid == me {
+        exit_process(code);
+    }
+    request_kill(tpid, code);
+    Ok((None, None))
+}
+
+fn process_info(a: [u64; 6]) -> Reply {
+    let ph = Handle(a[0] as u32);
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, _, terminated, code) =
+            ipc::process_of(&s.objs, &caller.handles, ph, Rights::INSPECT)
+                .map_err(|e| (e, None, None))?;
+        if !terminated {
+            return bad(Status::BadState);
+        }
+        Ok((Some(code as i64 as u64), None))
+    })
 }
