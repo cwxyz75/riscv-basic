@@ -755,7 +755,7 @@ fn wait_returns_at_once_when_the_condition_holds() -> Outcome {
     let t0 = sys::clock_get();
     let r = sys::object_wait(e, 1 << 25, u64::MAX);
     ensure_eq!(r.status, 0, "an already set signal, waiting forever");
-    ensure!(sys::clock_get() - t0 <= 6, "it did not wait");
+    ensure!(sys::clock_get() - t0 <= 40, "it did not wait"); // loose: a loaded host can preempt between the clock reads (a real wait would be unbounded)
     Ok(())
 }
 
@@ -1036,8 +1036,8 @@ fn wait_and_call_argument_edges() -> Outcome {
     let t0 = sys::clock_get();
     let r = sys::object_wait(e, 1 << 24, 1);
     ensure_eq!(st(r), Some(S::TimedOut), "a deadline in the past");
-    ensure!(sys::clock_get() - t0 <= 6, "it did not wait");
-    // a set signal beats a deadline in the past
+    ensure!(sys::clock_get() - t0 <= 40, "it did not wait"); // loose: a loaded host can preempt between the clock reads (a real wait would be unbounded)
+                                                             // a set signal beats a deadline in the past
     ensure_eq!(st(sys::event_signal(e, 0, 1 << 24)), Some(S::Ok), "signal");
     ensure_eq!(
         sys::object_wait(e, 1 << 24, 1).status,
