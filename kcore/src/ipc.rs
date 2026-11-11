@@ -46,6 +46,13 @@ pub struct ProcessObj {
     pub kill_on_close: bool,
 }
 
+/// A user thread, as a kernel object: what a thread handle names.
+pub struct ThreadObj {
+    pub pid: u32,
+    pub terminated: bool,
+    pub exit_code: i32,
+}
+
 /// Every kernel object kind so far; later milestones add variants.
 pub enum KObj {
     Channel(Channel),
@@ -53,6 +60,7 @@ pub enum KObj {
     /// A memory object, by id in the VMO store.
     Vmo(u64),
     Process(ProcessObj),
+    Thread(ThreadObj),
 }
 
 impl Object for KObj {
@@ -402,6 +410,7 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
         KObj::Event(e) => Ok(e.signals),
         KObj::Vmo(_) => Ok(0),
         KObj::Process(p) => Ok(if p.terminated { signals::TERMINATED } else { 0 }),
+        KObj::Thread(t) => Ok(if t.terminated { signals::TERMINATED } else { 0 }),
         KObj::Channel(c) => {
             let mut s = 0;
             if !c.queue.is_empty() {
@@ -498,5 +507,55 @@ pub fn process_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
     if let Some(KObj::Process(p)) = reg.get_mut(obj) {
         p.terminated = true;
         p.exit_code = code;
+    }
+}
+
+/// A thread object for a user thread of `pid`, with a handle in `table` (default thread rights).
+pub fn thread_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    pid: u32,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let obj = reg.create(KObj::Thread(ThreadObj {
+        pid,
+        terminated: false,
+        exit_code: 0,
+    }));
+    Ok((
+        table.insert(obj, Rights::THREAD).expect("room was checked"),
+        obj,
+    ))
+}
+
+/// The thread object behind a thread handle that carries `need`: (terminated, exit code).
+pub fn thread_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(bool, i32), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Thread(t)) => {
+            if entry.rights.contains(need) {
+                Ok((t.terminated, t.exit_code))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// Record that the thread behind `obj` has ended (raises TERMINATED). A thread object that
+/// has already been destroyed (every handle closed) is ignored.
+pub fn thread_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
+    if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
+        t.terminated = true;
+        t.exit_code = code;
     }
 }

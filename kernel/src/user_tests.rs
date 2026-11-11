@@ -98,6 +98,7 @@ pub fn run_all() -> Report {
     // The user-level suite, as a process.
     let frames = free_frames();
     let vmos_before = kmem::get().vmos.count();
+    let threads_before = thread::thread_count();
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
             user::INIT_ELF,
@@ -140,6 +141,19 @@ pub fn run_all() -> Report {
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before})",
                 user::process_count(),
                 kmem::get().vmos.count()
+            ))
+        },
+    );
+    thread::sleep_ticks(3); // detached user threads and their stacks are freed by the reaper
+    push(
+        "no_kernel_thread_survives_init",
+        if thread::thread_count() == threads_before {
+            Ok(())
+        } else {
+            Err(format!(
+                "kernel threads {} -> {}",
+                threads_before,
+                thread::thread_count()
             ))
         },
     );

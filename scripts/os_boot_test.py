@@ -13,7 +13,7 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##DONE pass=<n> fail=<n>
 
 The machine type comes from $OS_MACHINE (default `virt`; `make os-boot-test-aia` uses
-`virt,aia=aplic-imsic`). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+`virt,aia=aplic-imsic`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -29,7 +29,7 @@ import re
 import subprocess
 import sys
 
-TIMEOUT = 30
+TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "90"))
 
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
@@ -80,7 +80,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "a_thread_made_by_the_parent_faults_or_exits", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -100,6 +100,7 @@ def run(kernel: str, extra=()):
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
         "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
+        *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
         *extra, "-kernel", kernel,
     ]
     try:

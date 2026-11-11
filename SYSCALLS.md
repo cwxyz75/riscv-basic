@@ -79,7 +79,7 @@ change.
 | READABLE | 0 | a channel has a queued message |
 | WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
 | PEER_CLOSED | 2 | the other end of a channel is gone |
-| TERMINATED | 3 | a process has ended |
+| TERMINATED | 3 | a process or a thread has ended |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
 ## Limits
@@ -152,6 +152,9 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
+| 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
+| 61 | thread_exit | `a0` code | does not return |
+| 62 | thread_info | `a0` thread | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
@@ -327,7 +330,7 @@ channel endpoint `bootstrap` leaves the caller's table and becomes the new proce
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
 16-byte aligned and in the user half (what is mapped below it is the caller's business).
 Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
-channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`).
+channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads).
 On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`.
 
 ### process_kill(process, code) -> status
@@ -341,6 +344,47 @@ A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
 
 The exit code of an ended process (`-1000 - scause` after a fault). Rights: INSPECT.
 Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+
+## Threads (S3c-2b)
+
+A process runs one or more user threads, all sharing its address space and handle table.
+The first thread starts at `process_start` (or at load, for a kernel-started process); more
+are made with `thread_create`. A thread is a kernel object (kind THREAD): a handle to it can
+be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
+INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (8) live threads per process.
+
+Ending. `thread_exit(code)` ends the calling thread only. When the last live thread of a
+process ends, the process ends, with exit code `code` of that last thread unless the
+process had already been given one (`process_exit`, `process_kill`, a fault). `process_exit`,
+`process_kill` and any fault in any thread end the **whole** process: every other thread
+stops at its next return to user mode (a blocked one is woken to die), and the process object
+is TERMINATED only after the last of its threads has gone and its memory is freed. A thread
+that was killed before it ever ran never runs user code.
+
+### thread_create(process, entry, sp, arg) -> status, handle
+
+Start a new thread in a running process: it begins at `entry` in U-mode with `a0 = arg`, the
+stack pointer `sp`, and every other register zero. The new thread's stack is the caller's to
+provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
+dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
+aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
+threads, the system already has `MAX_USER_THREADS` (128; each thread costs a kernel stack), the
+caller's handle table is full, or the system-wide object cap `MAX_OBJECTS` is reached). The process handle may be the caller's
+`process_self` handle. On error nothing changes. Tests: `thread_create_*`.
+
+### thread_exit(code) -> does not return
+
+End the calling thread (see above). Its thread object is TERMINATED with exit code `code`.
+
+### thread_info(thread) -> status, exit_code
+
+The exit code of an ended thread (`-1000 - scause` is *not* used: a fault ends the process
+and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+
+The kernel takes no lock: syscalls run with interrupts off on the one hart (S5 revisits this
+with SMP; OD46).
 
 ## Entry template
 
@@ -501,5 +545,5 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_set_size, vmo_create_child | planned, later |
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
-| thread_create, thread_exit | planned, S3c-2b |
+| thread_create, thread_exit, thread_info | specified (S3c-2b) |
 | socket_create, socket_write, socket_read | planned, S3c |

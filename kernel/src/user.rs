@@ -51,6 +51,21 @@ struct Process {
     /// `process_kill` asked for it to end, with this exit code; its thread dies at its next
     /// return to user mode (or wakes from a wait to do so).
     killed: Option<i32>,
+    /// User threads that exist and have not ended (counted from `thread_create`, before the
+    /// thread first runs). The process is torn down when this reaches 0.
+    threads_alive: usize,
+    /// The thread objects of the live threads, to mark them TERMINATED when they end.
+    thread_objs: BTreeMap<Tid, kcore::object::ObjId>,
+}
+
+/// What a new user thread needs to start (looked up by the thread itself: a thread's start
+/// argument is one word).
+struct ThreadStart {
+    pid: u32,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    obj: Option<kcore::object::ObjId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +83,9 @@ struct UserState {
     /// VMOs whose last handle is gone but that some address space still maps: freed when the
     /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
     pending_vmos: Vec<u64>,
+    /// Thread starts waiting for their thread to run, by token.
+    starts: BTreeMap<usize, ThreadStart>,
+    next_token: usize,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     ktable: HandleTable,
     /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
@@ -106,6 +124,8 @@ fn state() -> &'static mut UserState {
             thread_pid: BTreeMap::new(),
             next_pid: 1,
             pending_vmos: Vec::new(),
+            starts: BTreeMap::new(),
+            next_token: 1,
             ktable: HandleTable::new(256),
             signal_queue: thread::new_queue(),
             line: String::new(),
@@ -213,6 +233,8 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         state: ProcState::Running,
         detached: false,
         killed: None,
+        threads_alive: 1,
+        thread_objs: BTreeMap::new(),
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
@@ -244,33 +266,72 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         }
         return Err(LoadError::NoMemory);
     }
-    irq::without(|| state().procs.insert(pid, process));
-    let tid = thread::spawn("user", 10, user_thread_main, pid as usize);
+    let token = irq::without(|| {
+        let s = state();
+        let (entry, arg) = (process.entry, process.arg);
+        s.procs.insert(pid, process);
+        new_start(s, pid, entry, STACK_TOP, arg, None)
+    });
+    let tid = thread::spawn("user", 10, user_thread_main, token);
     Ok((pid, tid))
 }
 
-fn user_thread_main(pid: usize) {
-    let (entry, arg, satp, sp) = irq::without(|| {
+/// Register a thread start and return its token.
+fn new_start(
+    s: &mut UserState,
+    pid: u32,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    obj: Option<kcore::object::ObjId>,
+) -> usize {
+    let token = s.next_token;
+    s.next_token += 1;
+    s.starts.insert(
+        token,
+        ThreadStart {
+            pid,
+            entry,
+            sp,
+            arg,
+            obj,
+        },
+    );
+    token
+}
+
+fn user_thread_main(token: usize) {
+    let top = thread::current_stack_top();
+    // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
+    // between would otherwise be seen only at the next trap, after user code had run.
+    let _ = irq::save_and_disable();
+    let (ts, satp, killed) = {
         let s = state();
+        let ts = s
+            .starts
+            .remove(&token)
+            .expect("a thread start was registered");
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
-        s.thread_pid.insert(thread::current(), pid as u32);
-        let p = &s.procs[&(pid as u32)];
-        (
-            p.entry,
-            p.arg,
-            satp_of(p),
-            if p.start_sp != 0 {
-                p.start_sp
-            } else {
-                STACK_TOP
-            },
-        )
-    });
-    let top = thread::current_stack_top();
+        s.thread_pid.insert(thread::current(), ts.pid);
+        let p = s
+            .procs
+            .get_mut(&ts.pid)
+            .expect("a process lives while one of its threads does");
+        if let Some(o) = ts.obj {
+            p.thread_objs.insert(thread::current(), o);
+        }
+        let satp = satp_of(p);
+        (ts, satp, p.killed)
+    };
+    // Killed before it ever ran: it never runs user code.
+    if let Some(code) = killed {
+        irq::enable();
+        leave(code, true);
+    }
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
-    unsafe { enter_user(entry, sp, arg, satp, top) }
+    unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
 }
 
 core::arch::global_asm!(
@@ -330,6 +391,10 @@ extern "C" {
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.
 pub fn finish(pid: u32, tid: Tid) -> i32 {
     thread::join(tid);
+    // Other threads of the process may outlive the first one.
+    while irq::without(|| state().procs.get(&pid).map_or(0, |p| p.threads_alive)) > 0 {
+        thread::sleep_ticks(1);
+    }
     teardown(pid)
 }
 
@@ -384,19 +449,41 @@ fn teardown(pid: u32) -> i32 {
     code
 }
 
-/// End the calling user thread's process with `code`.
 fn exit_process(code: i32) -> ! {
-    // (pid, detached): a process started by `process_start` has nobody to `finish` it, so its
-    // own last thread tears it down; a kernel-started one is torn down by its `finish`.
+    leave(code, true)
+}
+
+/// The calling thread ends. With `whole`, its process ends too (`process_exit`, a fault, a
+/// kill): every other thread is told to die. Without it (`thread_exit`) only this thread goes,
+/// and the process ends when the last thread does. The process is torn down by its last thread
+/// (a process started by `process_start`), or by `finish` (one the kernel started).
+fn leave(code: i32, whole: bool) -> ! {
     let me = irq::without(|| {
         let s = state();
-        let pid = *s.thread_pid.get(&thread::current())?;
-        let p = s.procs.get_mut(&pid)?;
-        p.exit_code = Some(code);
-        Some((pid, p.detached))
+        let tid = thread::current();
+        let pid = s.thread_pid.remove(&tid)?;
+        let UserState { objs, procs, .. } = s;
+        let p = procs.get_mut(&pid)?;
+        // A code the process was already given by a kill wins over this thread's own.
+        let code = p.killed.unwrap_or(code);
+        if let Some(o) = p.thread_objs.remove(&tid) {
+            ipc::thread_mark_terminated(objs, o, code);
+        }
+        p.threads_alive -= 1;
+        if whole {
+            p.exit_code.get_or_insert(code);
+            p.killed.get_or_insert(code);
+        } else if p.threads_alive == 0 {
+            p.exit_code.get_or_insert(code);
+        }
+        Some((pid, p.detached, p.threads_alive))
     });
-    if let Some((pid, true)) = me {
-        teardown(pid);
+    match me {
+        Some((_, _, alive)) if alive > 0 => notify(), // siblings and waiters on this thread
+        Some((pid, true, _)) => {
+            teardown(pid);
+        }
+        _ => {}
     }
     thread::exit()
 }
@@ -509,6 +596,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             thread::yield_now();
         }
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
+        nr::THREAD_EXIT => leave(a[0] as i32, false),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PROCESS_CREATE
@@ -517,7 +605,9 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_UNMAP
         | nr::PROCESS_START
         | nr::PROCESS_KILL
-        | nr::PROCESS_INFO => {
+        | nr::PROCESS_INFO
+        | nr::THREAD_CREATE
+        | nr::THREAD_INFO => {
             let r = process_call(n, a);
             notify();
             reply(frame, r);
@@ -537,6 +627,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::CHANNEL_READ
                     | nr::CHANNEL_READ_TXID
                     | nr::HANDLE_CLOSE
+                    // a replaced handle's old value names nothing: waits on it end
+                    | nr::HANDLE_REPLACE
                     | nr::EVENT_SIGNAL
                     // creating objects can sweep garbage, which closes peers
                     | nr::CHANNEL_CREATE
@@ -1250,6 +1342,10 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_KILL | nr::PROCESS_INFO if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_KILL => process_kill(a),
         nr::PROCESS_INFO => process_info(a),
+        nr::THREAD_CREATE if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_CREATE => thread_create(a),
+        nr::THREAD_INFO if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_INFO => thread_info(a),
         _ => bad(Status::BadSyscall),
     }
 }
@@ -1302,6 +1398,8 @@ fn process_create() -> Reply {
                 state: ProcState::Created,
                 detached: true,
                 killed: None,
+                threads_alive: 0,
+                thread_objs: BTreeMap::new(),
             },
         );
         Ok((Some(u64::from(handle.0)), None))
@@ -1450,7 +1548,7 @@ fn process_unmap(a: [u64; 6]) -> Reply {
 fn process_start(a: [u64; 6]) -> Reply {
     let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
-    let started = irq::without(|| -> Result<u32, (Status, Option<u64>, Option<u64>)> {
+    let started = irq::without(|| -> Result<usize, (Status, Option<u64>, Option<u64>)> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
@@ -1472,6 +1570,9 @@ fn process_start(a: [u64; 6]) -> Reply {
             || target.killed.is_some()
         {
             return bad(Status::BadState).map(|_| 0);
+        }
+        if total_threads(s) >= abi::limits::MAX_USER_THREADS {
+            return bad(Status::NoMemory).map(|_| 0);
         }
         let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
         let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
@@ -1499,11 +1600,12 @@ fn process_start(a: [u64; 6]) -> Reply {
         target.arg = arg;
         target.start_sp = sp;
         target.state = ProcState::Running;
-        Ok(tpid)
+        target.threads_alive = 1;
+        Ok(new_start(s, tpid, entry, sp, arg, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
-    thread::spawn_detached("user", 10, user_thread_main, started as usize);
+    thread::spawn_detached("user", 10, user_thread_main, started);
     Ok((None, None))
 }
 
@@ -1538,6 +1640,64 @@ fn process_info(a: [u64; 6]) -> Reply {
         let (_, _, terminated, code) =
             ipc::process_of(&s.objs, &caller.handles, ph, Rights::INSPECT)
                 .map_err(|e| (e, None, None))?;
+        if !terminated {
+            return bad(Status::BadState);
+        }
+        Ok((Some(code as i64 as u64), None))
+    })
+}
+
+/// User threads alive in the whole system.
+fn total_threads(s: &UserState) -> usize {
+    s.procs.values().map(|p| p.threads_alive).sum()
+}
+
+fn thread_create(a: [u64; 6]) -> Reply {
+    let ph = Handle(a[0] as u32);
+    let (entry, sp, arg) = (a[1], a[2], a[3]);
+    let (token, handle) = irq::without(|| -> Result<(usize, u32), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, tpid, _, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
+            .map_err(|e| (e, None, None))?;
+        let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
+        if target.state != ProcState::Running
+            || target.exit_code.is_some()
+            || target.killed.is_some()
+        {
+            return bad(Status::BadState).map(|_| (0, 0));
+        }
+        let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+        let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
+        if !entry_ok || !sp_ok {
+            return bad(Status::InvalidArgs).map(|_| (0, 0));
+        }
+        if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
+            || total_threads(s) >= abi::limits::MAX_USER_THREADS
+        {
+            return bad(Status::NoMemory).map(|_| (0, 0));
+        }
+        let UserState { objs, procs, .. } = s;
+        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        let (handle, obj) = ipc::thread_object_create(objs, &mut caller.handles, tpid)
+            .map_err(|e| (e, None, None))?;
+        procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
+        Ok((new_start(s, tpid, entry, sp, arg, Some(obj)), handle.0))
+    })?;
+    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
+    thread::spawn_detached("user", 10, user_thread_main, token);
+    Ok((Some(u64::from(handle)), None))
+}
+
+fn thread_info(a: [u64; 6]) -> Reply {
+    let th = Handle(a[0] as u32);
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (terminated, code) = ipc::thread_of(&s.objs, &caller.handles, th, Rights::INSPECT)
+            .map_err(|e| (e, None, None))?;
         if !terminated {
             return bad(Status::BadState);
         }

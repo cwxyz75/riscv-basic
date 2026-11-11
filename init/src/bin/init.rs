@@ -1941,6 +1941,613 @@ fn many_children_do_not_leak() -> Outcome {
     Ok(())
 }
 
+// --- Threads (S3c-2b) -----------------------------------------------------------------------
+
+use core::sync::atomic::AtomicU64;
+
+static NEXT_STACK: AtomicU64 = AtomicU64::new(0x30_0000_0000);
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+static WOKEN_AT: AtomicU64 = AtomicU64::new(0);
+static WOKEN_STATUS: AtomicU32 = AtomicU32::new(99);
+
+fn me() -> Result<u32, Detail> {
+    Ok(ok(sys::process_self(), "process_self")?.a1 as u32)
+}
+
+/// Map a fresh 4-page stack into our own address space; returns its top.
+fn own_stack() -> Result<u64, Detail> {
+    let base = NEXT_STACK.fetch_add(0x10_0000, Ordering::SeqCst);
+    let v = vmo(4)?;
+    ok(
+        sys::process_map(me()?, v, base, 0, 4 * 4096, PF_R | PF_W),
+        "map a stack",
+    )?;
+    Ok(base + 4 * 4096)
+}
+
+fn new_thread(f: extern "C" fn(usize) -> !, arg: usize) -> Result<u32, Detail> {
+    let top = own_stack()?;
+    Ok(ok(
+        sys::thread_create(me()?, f as *const () as usize as u64, top, arg as u64),
+        "thread_create",
+    )?
+    .a1 as u32)
+}
+
+extern "C" fn worker_set(arg: usize) -> ! {
+    COUNTER.store(arg as u32, Ordering::SeqCst);
+    sys::thread_exit(7)
+}
+
+/// `arg` is an event handle: wait for user signal 0 and record when and how the wait ended.
+extern "C" fn worker_wait_event(arg: usize) -> ! {
+    let r = sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + 2000);
+    WOKEN_AT.store(sys::clock_get(), Ordering::SeqCst);
+    WOKEN_STATUS.store(r.status as u32, Ordering::SeqCst);
+    sys::thread_exit(if r.status == 0 { 0 } else { 1 })
+}
+
+fn thread_create_argument_checks() -> Outcome {
+    let top = own_stack()?;
+    let me = me()?;
+    let entry = worker_set as *const () as usize as u64;
+    let go = |p: u32, entry: u64, sp: u64| st(sys::thread_create(p, entry, sp, 0));
+    ensure_eq!(go(BAD, entry, top), Some(S::BadHandle), "bad handle");
+    let ev = event()?;
+    ensure_eq!(
+        go(ev, entry, top),
+        Some(S::WrongType),
+        "an event as the process"
+    );
+    let weak = weaker(me, Rights::WAIT.0)?;
+    ensure_eq!(go(weak, entry, top), Some(S::AccessDenied), "no MANAGE");
+    static DATA: u64 = 5;
+    ensure_eq!(
+        go(me, &DATA as *const u64 as u64, top),
+        Some(S::InvalidArgs),
+        "an entry that is not executable"
+    );
+    ensure_eq!(
+        go(me, 0x2_0000_0000, top),
+        Some(S::InvalidArgs),
+        "an unmapped entry"
+    );
+    ensure_eq!(
+        go(me, entry, top - 8),
+        Some(S::InvalidArgs),
+        "sp not 16-byte aligned"
+    );
+    ensure_eq!(
+        go(me, entry, TOP + 16),
+        Some(S::InvalidArgs),
+        "sp above the user half"
+    );
+    ensure_eq!(go(me, entry, 0), Some(S::InvalidArgs), "sp 0");
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::THREAD_CREATE,
+            [
+                (1usize << 32) | me as usize,
+                entry as usize,
+                top as usize,
+                0,
+                0,
+                0
+            ]
+        )),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    // a process that has not started, and one that has ended
+    let p = proc_create()?;
+    ensure_eq!(
+        go(p, entry, top),
+        Some(S::BadState),
+        "a process that was never started"
+    );
+    ensure_eq!(st(sys::process_kill(p, 1)), Some(S::Ok), "end it");
+    ensure_eq!(go(p, entry, top), Some(S::BadState), "an ended process");
+    // thread_info
+    ensure_eq!(
+        st(sys::thread_info(BAD)),
+        Some(S::BadHandle),
+        "info: bad handle"
+    );
+    ensure_eq!(
+        st(sys::thread_info(ev)),
+        Some(S::WrongType),
+        "info: an event"
+    );
+    ensure_eq!(
+        st(sys::thread_info(me)),
+        Some(S::WrongType),
+        "info: a process"
+    );
+    Ok(())
+}
+
+fn threads_share_memory_and_report_exit_codes() -> Outcome {
+    COUNTER.store(0, Ordering::SeqCst);
+    let t = new_thread(worker_set, 42)?;
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "the thread ended");
+    ensure_eq!(COUNTER.load(Ordering::SeqCst), 42, "it wrote our memory");
+    let r = sys::thread_info(t);
+    ensure_eq!((r.status, r.a1 as i64), (0, 7), "its exit code");
+    let weak = weaker(t, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::thread_info(weak)),
+        Some(S::AccessDenied),
+        "info needs INSPECT"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        sys::object_signals(t).a1 as u32 & sig::TERMINATED,
+        sig::TERMINATED,
+        "TERMINATED stays set"
+    );
+    let _ = ev;
+    Ok(())
+}
+
+fn a_user_signal_wakes_a_blocked_thread() -> Outcome {
+    let ev = event()?;
+    let t = new_thread(worker_wait_event, ev as usize)?;
+    // the thread blocks; nothing wakes it for a while
+    let gate = event()?;
+    let r = sys::object_wait(gate, 1 << 24, sys::clock_get() + 6);
+    ensure_eq!(st(r), Some(S::TimedOut), "we wait a few ticks");
+    ensure_eq!(
+        sys::object_signals(t).a1 as u32 & sig::TERMINATED,
+        0,
+        "the thread is still blocked"
+    );
+    ensure_eq!(st(sys::thread_info(t)), Some(S::BadState), "not ended yet");
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        st(sys::event_signal(ev, 0, 1 << 24)),
+        Some(S::Ok),
+        "signal the event"
+    );
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "the thread ended");
+    ensure_eq!(WOKEN_STATUS.load(Ordering::SeqCst), 0, "its wait succeeded");
+    let woke = WOKEN_AT.load(Ordering::SeqCst);
+    ensure!(
+        within(woke.saturating_sub(t0), 0, 5),
+        "it woke {} ticks after the signal",
+        woke.saturating_sub(t0)
+    );
+    ensure_eq!(sys::thread_info(t).a1, 0, "exit code 0");
+    Ok(())
+}
+
+fn thread_limit_and_slots_are_reused() -> Outcome {
+    let ev = event()?;
+    let mut ts = [0u32; 8];
+    let mut n = 0;
+    loop {
+        let top = own_stack()?;
+        let r = sys::thread_create(
+            me()?,
+            worker_wait_event as *const () as usize as u64,
+            top,
+            ev as u64,
+        );
+        if r.status != 0 {
+            ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
+            break;
+        }
+        ensure!(n < ts.len(), "more than 8 threads were allowed");
+        ts[n] = r.a1 as u32;
+        n += 1;
+    }
+    // this thread plus `n` others: the limit is 8 in all
+    ensure_eq!(n, 7, "threads created on top of the one we are");
+    ensure_eq!(
+        st(sys::event_signal(ev, 0, 1 << 24)),
+        Some(S::Ok),
+        "wake them all"
+    );
+    for &t in &ts[..n] {
+        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+        ensure_eq!(r.status, 0, "a thread ended");
+    }
+    ensure_eq!(
+        st(sys::event_signal(ev, 1 << 24, 0)),
+        Some(S::Ok),
+        "clear the signal"
+    );
+    let t = new_thread(worker_set, 1)?;
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "after they ended, there is room again"
+    );
+    Ok(())
+}
+
+fn second_thread_outlives_the_first() -> Outcome {
+    let (p, _m) = launch(17)?;
+    let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 6);
+    ensure_eq!(
+        st(r),
+        Some(S::TimedOut),
+        "the first thread left; the process lives on"
+    );
+    ensure_eq!(st(sys::process_kill(p, 77)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 77, "the kill's exit code");
+    Ok(())
+}
+
+fn a_thread_can_end_the_whole_process() -> Outcome {
+    let (p, _m) = launch(18)?;
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        9,
+        "exit(9) from the second thread"
+    );
+    Ok(())
+}
+
+fn a_fault_in_any_thread_ends_the_process() -> Outcome {
+    let (p, _m) = launch(19)?;
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -1013, "the load fault");
+    Ok(())
+}
+
+fn the_last_thread_sets_the_exit_code() -> Outcome {
+    let (p, _m) = launch(20)?;
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 6, "the last thread's code");
+    Ok(())
+}
+
+fn many_threaded_children_do_not_leak() -> Outcome {
+    for _ in 0..3 {
+        for variant in [18u64, 19, 20] {
+            let (p, _m) = launch(variant)?;
+            wait_ended(p, 500)?;
+        }
+        let (p, _m) = launch(17)?;
+        sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 2);
+        ensure_eq!(st(sys::process_kill(p, 1)), Some(S::Ok), "kill");
+        wait_ended(p, 500)?;
+    }
+    Ok(())
+}
+
+// Regression tests from the independent review of S3c-2b.
+
+fn threads_created_but_not_run_when_the_process_ends() -> Outcome {
+    for _ in 0..5 {
+        let (p, _m) = launch(22)?;
+        wait_ended(p, 500)?;
+        ensure_eq!(
+            sys::process_info(p).a1 as i64,
+            3,
+            "exit(3) with unstarted threads"
+        );
+        let (p, _m) = launch(23)?;
+        wait_ended(p, 500)?;
+        ensure_eq!(sys::process_info(p).a1 as i64, 8, "the last thread's code");
+    }
+    Ok(())
+}
+
+fn kill_a_process_that_is_creating_threads() -> Outcome {
+    for d in 0..12u64 {
+        let (p, _m) = launch(24)?;
+        let g = event()?;
+        sys::object_wait(g, 1 << 24, sys::clock_get() + d % 4 + 1);
+        ensure_eq!(st(sys::process_kill(p, 5)), Some(S::Ok), "kill");
+        wait_ended(p, 500)?;
+        ensure_eq!(sys::process_info(p).a1 as i64, 5, "the kill's code");
+    }
+    Ok(())
+}
+
+fn thread_create_with_a_full_handle_table() -> Outcome {
+    let me = me()?;
+    let top = own_stack()?;
+    let entry = worker_set as *const () as usize as u64;
+    static HS: [AtomicU32; 4200] = [const { AtomicU32::new(0) }; 4200];
+    let mut n = 0;
+    while n < HS.len() {
+        let r = sys::event_create();
+        if r.status != 0 {
+            break;
+        }
+        HS[n].store(r.a1 as u32, Ordering::Relaxed);
+        n += 1;
+    }
+    ensure_eq!(
+        st(sys::thread_create(me, entry, top, 0)),
+        Some(S::NoMemory),
+        "table full"
+    );
+    for h in &HS[..n] {
+        sys::handle_close(h.load(Ordering::Relaxed));
+    }
+    for _ in 0..3 {
+        let t = new_thread(worker_set, 1)?;
+        ensure_eq!(
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+            0,
+            "threads work again"
+        );
+    }
+    Ok(())
+}
+
+fn a_thread_handle_closed_early_is_harmless() -> Outcome {
+    let ev = event()?;
+    let t = new_thread(worker_wait_event, ev as usize)?;
+    ensure_eq!(
+        st(sys::handle_close(t)),
+        Some(S::Ok),
+        "close the thread handle"
+    );
+    for _ in 0..50 {
+        let e = event()?;
+        sys::handle_close(e);
+    }
+    ensure_eq!(
+        st(sys::event_signal(ev, 0, 1 << 24)),
+        Some(S::Ok),
+        "wake it"
+    );
+    let gate = event()?;
+    sys::object_wait(gate, 1 << 24, sys::clock_get() + 10);
+    Ok(())
+}
+
+/// Many children each trying to start seven threads: the system-wide limit must turn into
+/// NO_MEMORY for the children, never a kernel out-of-memory panic.
+fn a_thread_hog_cannot_exhaust_the_kernel() -> Outcome {
+    let mut ps = [0u32; 40];
+    let mut n = 0;
+    while n < ps.len() {
+        // once the system-wide thread limit is reached a start is refused with NO_MEMORY
+        match launch(21) {
+            Ok((h, _m)) => ps[n] = h,
+            Err(_) => break,
+        }
+        n += 1;
+    }
+    for &p in &ps[..n] {
+        sys::process_kill(p, 1);
+    }
+    for &p in &ps[..n] {
+        wait_ended(p, 2000)?;
+    }
+    ensure!(n >= 10, "only {n} children could be started");
+    Ok(())
+}
+
+// Tests from the independent (Fable) review of S3c-2b.
+
+fn child_entry() -> Result<u64, Detail> {
+    let image = IMAGE.load(Ordering::Relaxed);
+    let mut eh = [0u8; 64];
+    ok(
+        sys::vmo_read(image, 0, eh.as_mut_ptr(), 64),
+        "read the ELF header",
+    )?;
+    Ok(le(&eh, 24, 8))
+}
+
+/// Another thread in child `p` at the program entry with start arg `arg`, on its own stack.
+fn child_thread(p: u32, slot: u64, arg: u64) -> Result<u32, Detail> {
+    let base = 0x20_0000_0000 + slot * 0x10_0000;
+    let v = vmo(4)?;
+    ok(
+        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
+        "map a child stack",
+    )?;
+    sys::handle_close(v);
+    Ok(ok(
+        sys::thread_create(p, child_entry()?, base + 4 * 4096, arg),
+        "thread_create in a child",
+    )?
+    .a1 as u32)
+}
+
+fn thread_ended_with(t: u32, code: i64) -> Outcome {
+    ensure_eq!(
+        sys::object_signals(t).a1 as u32 & sig::TERMINATED,
+        sig::TERMINATED,
+        "a thread is TERMINATED once its process is"
+    );
+    let r = sys::thread_info(t);
+    ensure_eq!((r.status, r.a1 as i64), (0, code), "thread exit code");
+    Ok(())
+}
+
+fn nap(ticks: u64) -> Outcome {
+    let gate = event()?;
+    sys::object_wait(gate, 1 << 24, sys::clock_get() + ticks);
+    sys::handle_close(gate);
+    Ok(())
+}
+
+extern "C" fn worker_spin(_: usize) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+extern "C" fn worker_block_forever(arg: usize) -> ! {
+    sys::object_wait(arg as u32, 1 << 24, u64::MAX);
+    sys::thread_exit(1)
+}
+
+fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
+    let ev = event()?;
+    WOKEN_STATUS.store(99, Ordering::SeqCst);
+    let t = new_thread(worker_wait_event, ev as usize)?; // waits on `ev` up to 2000 ticks
+    nap(4)?;
+    // nap's close woke every waiter: let the worker re-check and sleep again
+    for _ in 0..3 {
+        sys::thread_yield();
+    }
+    let _ev2 = ok(sys::handle_replace(ev, Rights::SAME.0), "replace")?.a1 as u32;
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 100);
+    let prompt = r.status == 0;
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 3000); // leave nothing behind
+    ensure!(prompt, "the waiter slept on after its handle was replaced");
+    ensure_eq!(
+        WOKEN_STATUS.load(Ordering::SeqCst) as i32,
+        S::BadHandle.code(),
+        "the wait reports BAD_HANDLE"
+    );
+    Ok(())
+}
+
+fn child_with_a_ready_exit_thread() -> Result<(u32, u32, u32), Detail> {
+    let (p, m) = launch(25)?;
+    let base = 0x20_0000_0000u64;
+    let v = vmo(4)?;
+    ok(
+        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
+        "map the stack before the child runs",
+    )?;
+    nap(3)?;
+    // a thread that would exit(42) at once
+    let t = ok(
+        sys::thread_create(p, child_entry()?, base + 4 * 4096, 8),
+        "thread_create",
+    )?
+    .a1 as u32;
+    Ok((p, m, t))
+}
+
+fn a_thread_killed_before_it_ran_runs_no_user_code() -> Outcome {
+    let (p, _m, t) = child_with_a_ready_exit_thread()?;
+    ensure_eq!(
+        st(sys::process_kill(p, 55)),
+        Some(S::Ok),
+        "kill before it ran"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 55, "the kill's exit code");
+    thread_ended_with(t, 55)
+}
+
+fn kill_a_child_whose_threads_never_ran() -> Outcome {
+    let (p, _m) = launch(15)?;
+    let mut ts = [0u32; 7];
+    for (i, t) in ts.iter_mut().enumerate() {
+        *t = child_thread(p, i as u64, 15)?;
+    }
+    ensure_eq!(
+        st(sys::thread_create(
+            p,
+            child_entry()?,
+            0x20_0000_0000 + 0x4000,
+            15
+        )),
+        Some(S::NoMemory),
+        "a ninth thread"
+    );
+    ensure_eq!(st(sys::process_kill(p, 55)), Some(S::Ok), "kill");
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 55, "exit code");
+    for t in ts {
+        thread_ended_with(t, 55)?;
+    }
+    Ok(())
+}
+
+fn kill_a_child_with_blocked_and_spinning_threads() -> Outcome {
+    let (p, _m) = launch(16)?;
+    nap(3)?;
+    let mut ts = [0u32; 6];
+    for (i, t) in ts.iter_mut().enumerate().take(3) {
+        *t = child_thread(p, i as u64, 16)?;
+    }
+    nap(3)?;
+    for (i, t) in ts.iter_mut().enumerate().skip(3) {
+        *t = child_thread(p, i as u64, 15)?;
+    }
+    nap(6)?;
+    ensure_eq!(st(sys::process_info(p)), Some(S::BadState), "still running");
+    ensure_eq!(st(sys::process_kill(p, -9)), Some(S::Ok), "kill");
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -9, "exit code");
+    for t in ts {
+        thread_ended_with(t, -9)?;
+    }
+    Ok(())
+}
+
+fn closing_handles_early_and_kill_on_close() -> Outcome {
+    let (p, mine) = launch(15)?;
+    let mut ts = [0u32; 7];
+    for (i, t) in ts.iter_mut().enumerate() {
+        *t = child_thread(p, i as u64, 15)?;
+    }
+    for &t in &ts[..4] {
+        ensure_eq!(
+            st(sys::handle_close(t)),
+            Some(S::Ok),
+            "close a thread handle"
+        );
+    }
+    ensure_eq!(st(sys::handle_close(p)), Some(S::Ok), "drop the process");
+    let r = sys::object_wait(mine, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(r.status, 0, "the child is gone");
+    for &t in &ts[4..] {
+        thread_ended_with(t, -2000)?;
+    }
+    Ok(())
+}
+
+fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
+    let (p, _m) = launch(16)?;
+    nap(3)?;
+    let b = child_thread(p, 0, 16)?;
+    nap(3)?;
+    let t = child_thread(p, 1, 7)?; // null load
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -1013, "the fault code");
+    thread_ended_with(t, -1013)?;
+    thread_ended_with(b, -1013)?;
+    let (p, _m) = launch(16)?;
+    nap(3)?;
+    let b = child_thread(p, 0, 16)?;
+    nap(3)?;
+    let t = child_thread(p, 1, 8)?; // exit(42)
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 42, "exit(42) from a thread");
+    thread_ended_with(t, 42)?;
+    thread_ended_with(b, 42)?;
+    ensure_eq!(
+        st(sys::thread_create(
+            p,
+            child_entry()?,
+            0x20_0000_0000 + 0x4000,
+            15
+        )),
+        Some(S::BadState),
+        "no thread in an ended process"
+    );
+    Ok(())
+}
+
+/// Last in the table: init exits with a blocked, a spinning and a not-yet-run thread alive.
+fn threads_left_behind_when_init_exits() -> Outcome {
+    let ev = event()?;
+    new_thread(worker_block_forever, ev as usize)?;
+    new_thread(worker_spin, 0)?;
+    nap(3)?;
+    new_thread(worker_spin, 0)?;
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -2330,6 +2937,86 @@ pub fn app_main() -> i32 {
         ),
         ("many_children_do_not_leak", many_children_do_not_leak),
         (
+            "thread_create_argument_checks",
+            thread_create_argument_checks,
+        ),
+        (
+            "threads_share_memory_and_report_exit_codes",
+            threads_share_memory_and_report_exit_codes,
+        ),
+        (
+            "a_user_signal_wakes_a_blocked_thread",
+            a_user_signal_wakes_a_blocked_thread,
+        ),
+        (
+            "thread_limit_and_slots_are_reused",
+            thread_limit_and_slots_are_reused,
+        ),
+        (
+            "second_thread_outlives_the_first",
+            second_thread_outlives_the_first,
+        ),
+        (
+            "a_thread_can_end_the_whole_process",
+            a_thread_can_end_the_whole_process,
+        ),
+        (
+            "a_fault_in_any_thread_ends_the_process",
+            a_fault_in_any_thread_ends_the_process,
+        ),
+        (
+            "the_last_thread_sets_the_exit_code",
+            the_last_thread_sets_the_exit_code,
+        ),
+        (
+            "many_threaded_children_do_not_leak",
+            many_threaded_children_do_not_leak,
+        ),
+        (
+            "threads_created_but_not_run_when_the_process_ends",
+            threads_created_but_not_run_when_the_process_ends,
+        ),
+        (
+            "kill_a_process_that_is_creating_threads",
+            kill_a_process_that_is_creating_threads,
+        ),
+        (
+            "thread_create_with_a_full_handle_table",
+            thread_create_with_a_full_handle_table,
+        ),
+        (
+            "a_thread_handle_closed_early_is_harmless",
+            a_thread_handle_closed_early_is_harmless,
+        ),
+        (
+            "a_thread_hog_cannot_exhaust_the_kernel",
+            a_thread_hog_cannot_exhaust_the_kernel,
+        ),
+        (
+            "replacing_a_handle_ends_a_siblings_wait",
+            replacing_a_handle_ends_a_siblings_wait,
+        ),
+        (
+            "a_thread_killed_before_it_ran_runs_no_user_code",
+            a_thread_killed_before_it_ran_runs_no_user_code,
+        ),
+        (
+            "kill_a_child_whose_threads_never_ran",
+            kill_a_child_whose_threads_never_ran,
+        ),
+        (
+            "kill_a_child_with_blocked_and_spinning_threads",
+            kill_a_child_with_blocked_and_spinning_threads,
+        ),
+        (
+            "closing_handles_early_and_kill_on_close",
+            closing_handles_early_and_kill_on_close,
+        ),
+        (
+            "a_thread_made_by_the_parent_faults_or_exits",
+            a_thread_made_by_the_parent_faults_or_exits,
+        ),
+        (
             "wait_is_woken_by_the_peer_closing",
             wait_is_woken_by_the_peer_closing,
         ),
@@ -2341,6 +3028,10 @@ pub fn app_main() -> i32 {
         ("stack_grows_lazily", stack_grows_lazily),
         ("syscall_layer_bounds", syscall_layer_bounds),
         ("cycles_do_not_grow_memory", cycles_do_not_grow_memory),
+        (
+            "threads_left_behind_when_init_exits",
+            threads_left_behind_when_init_exits,
+        ),
     ];
     for (name, test) in tests {
         if !report(name, test()) {
