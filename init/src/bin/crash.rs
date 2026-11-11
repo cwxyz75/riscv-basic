@@ -136,6 +136,50 @@ pub fn app_main() -> i32 {
             }
             rt::sys::thread_exit(6);
         }
+        21 => {
+            // hog: seven spinning threads (a test starts many of these)
+            for _ in 0..7 {
+                spawn(spin_forever, 0);
+            }
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        25 => {
+            // touch the 4 stack pages the parent mapped at 0x20_0000_0000 (present in the page
+            // table, so a thread started on them takes no first-touch fault), then block forever
+            for page in 0..4usize {
+                // SAFETY: the parent mapped these pages read-write before starting us.
+                unsafe {
+                    core::ptr::write_volatile((0x20_0000_0000usize + page * 4096) as *mut u8, 1)
+                };
+            }
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
+            return 9;
+        }
+        22 => {
+            // threads created but perhaps not yet run when the whole process exits
+            for _ in 0..3 {
+                spawn(spin_forever, 0);
+            }
+            rt::sys::exit(3);
+        }
+        23 => {
+            // the first thread leaves at once; the process lives until the second ends
+            spawn(exit_eight, 0);
+            rt::sys::thread_exit(1);
+        }
+        24 => {
+            // create short-lived threads in a loop until killed
+            let me = rt::sys::process_self().a1 as u32;
+            let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
+            loop {
+                let r = rt::sys::thread_create(me, exit_eight as *const () as usize as u64, top, 0);
+                if r.status == 0 {
+                    rt::sys::handle_close(r.a1 as u32);
+                }
+            }
+        }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
             // syscall (the other way a process loses the CPU, so the other return path).
@@ -222,4 +266,8 @@ extern "C" fn fault(_: usize) -> ! {
 
 extern "C" fn thread_exit_four(_: usize) -> ! {
     rt::sys::thread_exit(4)
+}
+
+extern "C" fn exit_eight(_: usize) -> ! {
+    rt::sys::thread_exit(8)
 }

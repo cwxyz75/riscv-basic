@@ -301,7 +301,11 @@ fn new_start(
 }
 
 fn user_thread_main(token: usize) {
-    let (ts, satp, killed) = irq::without(|| {
+    let top = thread::current_stack_top();
+    // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
+    // between would otherwise be seen only at the next trap, after user code had run.
+    let _ = irq::save_and_disable();
+    let (ts, satp, killed) = {
         let s = state();
         let ts = s
             .starts
@@ -319,12 +323,12 @@ fn user_thread_main(token: usize) {
         }
         let satp = satp_of(p);
         (ts, satp, p.killed)
-    });
+    };
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
+        irq::enable();
         leave(code, true);
     }
-    let top = thread::current_stack_top();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
     unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
@@ -460,6 +464,8 @@ fn leave(code: i32, whole: bool) -> ! {
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
+        // A code the process was already given by a kill wins over this thread's own.
+        let code = p.killed.unwrap_or(code);
         if let Some(o) = p.thread_objs.remove(&tid) {
             ipc::thread_mark_terminated(objs, o, code);
         }
@@ -621,6 +627,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::CHANNEL_READ
                     | nr::CHANNEL_READ_TXID
                     | nr::HANDLE_CLOSE
+                    // a replaced handle's old value names nothing: waits on it end
+                    | nr::HANDLE_REPLACE
                     | nr::EVENT_SIGNAL
                     // creating objects can sweep garbage, which closes peers
                     | nr::CHANNEL_CREATE
@@ -1563,6 +1571,9 @@ fn process_start(a: [u64; 6]) -> Reply {
         {
             return bad(Status::BadState).map(|_| 0);
         }
+        if total_threads(s) >= abi::limits::MAX_USER_THREADS {
+            return bad(Status::NoMemory).map(|_| 0);
+        }
         let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
         let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
         if !entry_ok || !sp_ok {
@@ -1636,6 +1647,11 @@ fn process_info(a: [u64; 6]) -> Reply {
     })
 }
 
+/// User threads alive in the whole system.
+fn total_threads(s: &UserState) -> usize {
+    s.procs.values().map(|p| p.threads_alive).sum()
+}
+
 fn thread_create(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0] as u32);
     let (entry, sp, arg) = (a[1], a[2], a[3]);
@@ -1657,7 +1673,9 @@ fn thread_create(a: [u64; 6]) -> Reply {
         if !entry_ok || !sp_ok {
             return bad(Status::InvalidArgs).map(|_| (0, 0));
         }
-        if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS {
+        if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
+            || total_threads(s) >= abi::limits::MAX_USER_THREADS
+        {
             return bad(Status::NoMemory).map(|_| (0, 0));
         }
         let UserState { objs, procs, .. } = s;

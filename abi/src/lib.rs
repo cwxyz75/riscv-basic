@@ -175,6 +175,9 @@ pub mod limits {
     pub const MAX_PROCESSES: usize = 64;
     /// Live user threads in one process.
     pub const MAX_THREADS_PER_PROCESS: usize = 8;
+    /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
+    /// 8 MiB kernel heap; a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
+    pub const MAX_USER_THREADS: usize = 128;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").

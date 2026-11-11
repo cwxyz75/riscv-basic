@@ -79,7 +79,7 @@ change.
 | READABLE | 0 | a channel has a queued message |
 | WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
 | PEER_CLOSED | 2 | the other end of a channel is gone |
-| TERMINATED | 3 | a process has ended |
+| TERMINATED | 3 | a process or a thread has ended |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
 ## Limits
@@ -152,6 +152,9 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
+| 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
+| 61 | thread_exit | `a0` code | does not return |
+| 62 | thread_info | `a0` thread | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
@@ -327,7 +330,7 @@ channel endpoint `bootstrap` leaves the caller's table and becomes the new proce
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
 16-byte aligned and in the user half (what is mapped below it is the caller's business).
 Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
-channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`).
+channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads).
 On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`.
 
 ### process_kill(process, code) -> status
@@ -366,7 +369,8 @@ provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
 dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
 aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
-threads, or the caller's handle table is full). The process handle may be the caller's
+threads, the system already has `MAX_USER_THREADS` (128; each thread costs a kernel stack), the
+caller's handle table is full, or the system-wide object cap `MAX_OBJECTS` is reached). The process handle may be the caller's
 `process_self` handle. On error nothing changes. Tests: `thread_create_*`.
 
 ### thread_exit(code) -> does not return
