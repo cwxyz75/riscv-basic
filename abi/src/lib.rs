@@ -114,6 +114,9 @@ pub mod rights {
         pub const PROCESS: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
+        pub const THREAD: Rights = Rights(
+            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
+        );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
 
@@ -170,6 +173,8 @@ pub mod limits {
     pub const MAX_VMO_PAGES: u64 = 16384;
     /// Live processes at once.
     pub const MAX_PROCESSES: usize = 64;
+    /// Live user threads in one process.
+    pub const MAX_THREADS_PER_PROCESS: usize = 8;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
@@ -201,6 +206,9 @@ pub mod syscall {
     pub const PROCESS_START: usize = 54;
     pub const PROCESS_KILL: usize = 55;
     pub const PROCESS_INFO: usize = 56;
+    pub const THREAD_CREATE: usize = 60;
+    pub const THREAD_EXIT: usize = 61;
+    pub const THREAD_INFO: usize = 62;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").

@@ -225,6 +225,28 @@ pub mod sys {
             ],
         )
     }
+    pub fn thread_create(process: u32, entry: u64, sp: u64, arg: u64) -> Ret {
+        syscall(
+            THREAD_CREATE,
+            [
+                process as usize,
+                entry as usize,
+                sp as usize,
+                arg as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    pub fn thread_exit(code: i32) -> ! {
+        syscall(THREAD_EXIT, [code as usize, 0, 0, 0, 0, 0]);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    pub fn thread_info(thread: u32) -> Ret {
+        syscall(THREAD_INFO, [thread as usize, 0, 0, 0, 0, 0])
+    }
     pub fn process_kill(process: u32, code: i32) -> Ret {
         syscall(PROCESS_KILL, [process as usize, code as usize, 0, 0, 0, 0])
     }

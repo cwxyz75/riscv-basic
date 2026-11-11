@@ -107,6 +107,35 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
+        17 => {
+            // a spinning second thread; the first thread leaves, the process lives on
+            spawn(spin_forever, 0);
+            rt::sys::thread_exit(5);
+        }
+        18 => {
+            // a second thread ends the whole process with exit(9) after a short wait; the first
+            // thread spins and is stopped by it
+            spawn(exit_soon, 0);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        19 => {
+            // a second thread faults (null load): the whole process dies with the fault code
+            spawn(fault, 0);
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
+            return 9;
+        }
+        20 => {
+            // a second thread exits with 4; the first waits for it, checks what it left, then
+            // exits with 6, the last thread's code and so the process's
+            let h = spawn(thread_exit_four, 0);
+            let r = rt::sys::object_wait(h, rt::abi::signals::TERMINATED, u64::MAX);
+            if r.status != 0 || rt::sys::thread_info(h).a1 != 4 {
+                return 100;
+            }
+            rt::sys::thread_exit(6);
+        }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
             // syscall (the other way a process loses the CPU, so the other return path).
@@ -150,4 +179,47 @@ pub fn app_main() -> i32 {
         _ => {}
     }
     0
+}
+
+#[repr(align(16))]
+#[allow(dead_code)]
+struct Stack([u8; 8192]);
+static mut STACK: Stack = Stack([0; 8192]);
+
+/// Start a second thread running `f(arg)` on a static stack; returns its thread handle.
+fn spawn(f: extern "C" fn(usize) -> !, arg: usize) -> u32 {
+    let me = rt::sys::process_self().a1 as u32;
+    // Only the address of the static is taken; the one new thread uses it as its stack.
+    let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
+    let r = rt::sys::thread_create(me, f as *const () as usize as u64, top, arg as u64);
+    if r.status != 0 {
+        rt::sys::exit(100 + (-(r.status as i64)) as i32);
+    }
+    r.a1 as u32
+}
+
+extern "C" fn spin_forever(_: usize) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+extern "C" fn exit_soon(_: usize) -> ! {
+    let t = rt::sys::clock_get() + 3;
+    // an event nobody signals: a timed wait
+    let ev = rt::sys::event_create().a1 as u32;
+    rt::sys::object_wait(ev, 1 << 24, t);
+    rt::sys::exit(9)
+}
+
+extern "C" fn fault(_: usize) -> ! {
+    // SAFETY: deliberately invalid; the kernel must end the whole process.
+    unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+extern "C" fn thread_exit_four(_: usize) -> ! {
+    rt::sys::thread_exit(4)
 }

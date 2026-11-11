@@ -342,6 +342,46 @@ A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
 The exit code of an ended process (`-1000 - scause` after a fault). Rights: INSPECT.
 Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 
+## Threads (S3c-2b)
+
+A process runs one or more user threads, all sharing its address space and handle table.
+The first thread starts at `process_start` (or at load, for a kernel-started process); more
+are made with `thread_create`. A thread is a kernel object (kind THREAD): a handle to it can
+be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
+INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (8) live threads per process.
+
+Ending. `thread_exit(code)` ends the calling thread only. When the last live thread of a
+process ends, the process ends, with exit code `code` of that last thread unless the
+process had already been given one (`process_exit`, `process_kill`, a fault). `process_exit`,
+`process_kill` and any fault in any thread end the **whole** process: every other thread
+stops at its next return to user mode (a blocked one is woken to die), and the process object
+is TERMINATED only after the last of its threads has gone and its memory is freed. A thread
+that was killed before it ever ran never runs user code.
+
+### thread_create(process, entry, sp, arg) -> status, handle
+
+Start a new thread in a running process: it begins at `entry` in U-mode with `a0 = arg`, the
+stack pointer `sp`, and every other register zero. The new thread's stack is the caller's to
+provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
+dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
+aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
+threads, or the caller's handle table is full). The process handle may be the caller's
+`process_self` handle. On error nothing changes. Tests: `thread_create_*`.
+
+### thread_exit(code) -> does not return
+
+End the calling thread (see above). Its thread object is TERMINATED with exit code `code`.
+
+### thread_info(thread) -> status, exit_code
+
+The exit code of an ended thread (`-1000 - scause` is *not* used: a fault ends the process
+and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+
+The kernel takes no lock: syscalls run with interrupts off on the one hart (S5 revisits this
+with SMP; OD46).
+
 ## Entry template
 
 ```text
@@ -501,5 +541,5 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_set_size, vmo_create_child | planned, later |
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
-| thread_create, thread_exit | planned, S3c-2b |
+| thread_create, thread_exit, thread_info | specified (S3c-2b) |
 | socket_create, socket_write, socket_read | planned, S3c |

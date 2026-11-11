@@ -29,7 +29,7 @@ import re
 import subprocess
 import sys
 
-TIMEOUT = 30
+TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "90"))
 
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
@@ -80,7 +80,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
