@@ -146,6 +146,7 @@ dependencies = [
  "abi",
  "kcore",
  "linked_list_allocator",
+ "proto",
 ]
 
 [[package]]

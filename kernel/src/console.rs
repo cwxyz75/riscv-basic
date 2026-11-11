@@ -9,6 +9,19 @@ const BASE: usize = (DIRECT_BASE + 0x1000_0000) as usize;
 const LSR: usize = 5;
 const LSR_THR_EMPTY: u8 = 1 << 5;
 
+/// One received byte, if the UART has one (polled; the S4 serial bridge calls this every tick).
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub fn try_read() -> Option<u8> {
+    // SAFETY: the 16550's line-status and receive registers, mapped like the transmit ones.
+    unsafe {
+        if read_volatile((BASE + LSR) as *const u8) & 1 != 0 {
+            Some(read_volatile(BASE as *const u8))
+        } else {
+            None
+        }
+    }
+}
+
 pub struct Console;
 
 impl fmt::Write for Console {

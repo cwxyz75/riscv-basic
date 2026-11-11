@@ -42,7 +42,7 @@ Rules:
 
 | ID | Sev | Shortcut | Why it was acceptable | Proper fix, and when |
 |---|---|---|---|---|
-| T14 | M | **Serial access through a kernel bridge thread** (S4 spec, OD52), not a user-mode driver with MMIO and interrupt capabilities. | No device-capability objects until S6. | S6: interrupt object + MMIO VMO; `consoled` drives the UART directly; delete the bridge. |
+| T14 | M | **Serial access through a kernel bridge thread** (S4 spec, OD52), not a user-mode driver with MMIO and interrupt capabilities. The bridge **polls** the UART every tick (no receive interrupt), drops input bytes when the process is not reading (counted), and a kernel `##` line can still split a forwarded chunk only between chunks. | No device-capability objects until S6. | S6: interrupt object + MMIO VMO; `consoled` drives the UART directly; delete the bridge. |
 | T15 | M | **Service death policy = rebuild the whole stack** (S4): no service discovery, no reconnect, `memfsd` state lost on restart. | Memory filesystem has nothing to keep; keeps S4 small. | A name/registry service with reconnect, and real state recovery with the disk filesystem (S6+). |
 | T16 | M | **memfs keeps file data in the server's heap**, programs are copied through memory objects only for `/bin` (S4 spec section 7). | Simple, host-testable. | Back files with VMOs (`GetVmo` for everything), shared page cache, `mmap` (S11). |
 | T17 | M | **No socket half-close**: a terminal has no end-of-file for programs; `cat` with no arguments ends only with Ctrl-C (S4). | Rare in S4. | Add `socket_shutdown` (or a close-write right) before pipelines of real tools matter. |
@@ -56,7 +56,7 @@ Rules:
 | T20 | M | **Rust target is `riscv64gc`** although the OS targets RVA23 (OD47); the boot test runs on `-cpu rva23s64` but code is not built for it, and Sstc/hardware features are not used (SBI `TIME` is used for the tick). | Nothing needs RVA23-only features yet. | Move the target when a feature needs it (vector, Sstc); decide what the kernel may assume per OD47 and test it. |
 | T21 | M | **Timing-based tests follow the host clock** (QEMU tick = host millisecond), so windows have slack and fail on loaded machines (the round-robin kernel on CI flaked twice). | Simple and independent of the code under test. | A virtual-time/icount mode for the timing tests (also needed by S5), with strict windows. |
 | T22 | L | **Mutation checks are done by hand** on each milestone. | Cheap enough per milestone. | A small script that applies a list of mutations and requires a failing test for each. |
-| T23 | L | **CI is slow (8 to 10 minutes) and runs everything in one job**; the boot-test harness has a 240 s per-kernel timeout. | Works. | Split jobs (home computer, OS boot, AIA, RVA23), cache the toolchain, parallelise QEMU runs. |
+| T23 | L | **CI is slow (8 to 12 minutes) and runs everything in one job** (it used to run the whole suite twice per branch push; it now runs once per PR, and on pushes to `main` only); the boot-test harness has a 240 s per-kernel timeout. | Works. | Split jobs (home computer, OS boot, AIA, RVA23), cache the toolchain, parallelise QEMU runs. |
 | T24 | L | **The "independent review" is by a model of the same family** as the author; the human does not read the code. Fable-class reviews are expensive and used sparingly (feedback in memory). | The process rule is the best we have. | Keep real independent oracles where they exist (host tools, upstream test suites); consider a differently trained reviewer for the highest-risk milestones. |
 
 ## Resolved
