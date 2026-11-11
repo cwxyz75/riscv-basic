@@ -59,9 +59,9 @@ READY.
 
 Press `2` at the boot menu. This is the screen of the machine running LOGO (a
 real capture taken through QEMU's monitor; the programs are in
-[`examples/logo/`](examples/logo)):
+[`home/examples/logo/`](home/examples/logo)):
 
-![A cyan Koch snowflake, a yellow rosette of rotated squares and a green recursive tree drawn by LOGO on the machine](docs/logo-demo.png)
+![A cyan Koch snowflake, a yellow rosette of rotated squares and a green recursive tree drawn by LOGO on the machine](home/docs/logo-demo.png)
 
 ```logo
 to square :size
@@ -76,17 +76,17 @@ flower 80
 Every line you type is compiled to RV64 machine code and run, by a JIT written
 for this project. The goldens for these pictures were not copied from the
 implementation's own output: they come from a separate Python turtle renderer
-(`scripts/verify_demo_images.py`), and the interpreter, the IR interpreter and the
+(`home/scripts/verify_demo_images.py`), and the interpreter, the IR interpreter and the
 compiled engine must all reproduce them pixel for pixel.
 
 ## Saving your work
 
-`make run` and `make run-logo` attach a 2 MiB disk image, `disk.img` (created on
+`make home-run` and `make home-run-logo` attach a 2 MiB disk image, `disk.img` (created on
 first use, never overwritten), shared by both languages. In BASIC: `SAVE "NAME"`,
 `LOAD "NAME"`, `DIR`, `SCRATCH "NAME"`. In LOGO: `save "name`, `load "name`
 (runs the file as if typed), `dir`, `erasefile "name`. Files survive `BYE` and
 restarting QEMU. The format is an old-school floppy (directory, free map, chained
-sectors; see `DESIGN.md`), and `python3 scripts/disk.py ls disk.img` reads it from
+sectors; see `DESIGN.md`), and `python3 home/scripts/disk.py ls disk.img` reads it from
 the host.
 
 ## What it is
@@ -99,11 +99,11 @@ the host.
   `TIMER`, `PEEK`/`POKE` on real physical addresses, `CLS`/`COLOR`/`LOCATE`
   (ANSI escapes), `TAB`/`SPC`, and Ctrl-C to stop a running program.
   Errors look like `?SYNTAX ERROR IN 20`. The language is specified in
-  [BASIC.md](BASIC.md).
+  [BASIC.md](home/BASIC.md).
 - **And LOGO.** Press `2` at the boot menu for a turtle-graphics LOGO (a UCBLogo
-  subset, specified in [LOGO.md](LOGO.md)): `to ... end` procedures, recursion,
+  subset, specified in [LOGO.md](home/LOGO.md)): `to ... end` procedures, recursion,
   dynamic scope, lists and words, `repeat`/`if`/`ifelse`/`run`, and a turtle
-  that draws in the QEMU window (`make run-logo`). Every LOGO line is compiled to
+  that draws in the QEMU window (`make home-run-logo`). Every LOGO line is compiled to
   RV64 machine code before it runs (`.engine "ast` switches to the reference
   interpreter). Try `repeat 36 [repeat 4 [fd 80
   rt 90] rt 10]`.
@@ -111,9 +111,9 @@ the host.
   editing (backspace, Ctrl-U, Ctrl-C, arrow keys ignored), traps with a fatal
   report of `scause`/`sepc`/`stval`, a 10 ms timer tick, the FPU, and a heap.
   No paging, no processes: it is a home computer, not an OS. See
-  [DESIGN.md](DESIGN.md).
+  [DESIGN.md](home/DESIGN.md).
 - **Tested without hardware.** The interpreter runs on the host under
-  `cargo test` against golden transcripts (`basic/tests/golden/`); QEMU boot
+  `cargo test` against golden transcripts (`home/basic/tests/golden/`); QEMU boot
   tests type scripted sessions into the real kernel, including the demo
   programs below.
 
@@ -122,31 +122,33 @@ the host.
 ```sh
 brew install qemu
 rustup toolchain install     # reads rust-toolchain.toml: toolchain, components, riscv64 target
-make run                     # boots to a language menu: press 1 for BASIC (Ctrl-A then X quits QEMU)
+make home-run                # boots to a language menu: press 1 for BASIC (Ctrl-A then X quits QEMU)
 ```
 
 Other commands:
 
 ```sh
-make test        # host tests for the interpreter and console crates (no QEMU needed)
-make kernel      # build the kernel ELF
-make run-logo     # boot with a graphics window; press 2 at the menu for LOGO
+make test             # host tests for the home-computer crates and the OS crates (no QEMU needed)
+make home-kernel      # build the home-computer kernel ELF
+make home-run-logo    # boot with a graphics window; press 2 at the menu for LOGO
                  # (menu keys 3 and 4 are JIT debugging aids: self-test, and a deliberate fault)
-make debug       # boot paused, gdb stub on :1234
-make boot-test   # the scripted QEMU boot tests, as CI runs them
+make home-debug       # boot paused, gdb stub on :1234
+make home-boot-test   # the scripted QEMU boot tests, as CI runs them
+make kernel           # the OS track: build the new kernel (see OS-ARCHITECTURE.md)
+make os-boot-test     # the OS track: boot it headlessly and check its structured output
 make check       # everything CI runs: fmt, tests, clippy, boot tests
 ```
 
 ## Programs to try
 
-[`examples/`](examples) holds three programs. After `make run`, paste one into
+[`home/examples/`](home/examples) holds three programs. After `make home-run`, paste one into
 the terminal (typed-ahead text is kept while BASIC is busy), then type `RUN`:
 
 | Program | What it shows |
 |---|---|
-| [`guess.bas`](examples/guess.bas) | `INPUT`, `RND`, `IF`, `GOTO`, `STR$` |
-| [`bottles.bas`](examples/bottles.bas) | `FOR ... STEP -1`, `GOSUB`, string functions |
-| [`wumpus.bas`](examples/wumpus.bas) | arrays, `DATA`/`READ`, `GOSUB`, `INPUT`, a 20-room cave |
+| [`guess.bas`](home/examples/guess.bas) | `INPUT`, `RND`, `IF`, `GOTO`, `STR$` |
+| [`bottles.bas`](home/examples/bottles.bas) | `FOR ... STEP -1`, `GOSUB`, string functions |
+| [`wumpus.bas`](home/examples/wumpus.bas) | arrays, `DATA`/`READ`, `GOSUB`, `INPUT`, a 20-room cave |
 
 There is no `SAVE`/`LOAD` yet (the optional persistence milestone): programs
 live only until the machine is switched off.
@@ -155,17 +157,20 @@ live only until the machine is switched off.
 
 | Path | What |
 |---|---|
-| `basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
-| `console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
-| `logo/` | The LOGO language: reader, parser, reference interpreter. `no_std`, no hardware, no `unsafe`; tested against golden transcripts and images. |
-| `rv64/` | A small RV64 assembler for the LOGO JIT. `no_std`, no `unsafe`; checked against LLVM and an emulator. |
-| `turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
-| `kernel/` | Boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
-| `examples/` | Demo BASIC programs (`*.bas`) and LOGO programs (`logo/*.logo`), also used by the golden and boot tests. |
-| `docs/` | The README screenshot. |
-| `scripts/` | The QEMU boot tests. |
-| `DESIGN.md` | Architecture, memory map, decision log. |
-| `BASIC.md` | The language spec. |
+| `home/` | The finished home computer: BASIC and LOGO behind a boot menu (v0.2). Everything below up to `kernel/` lives inside it. |
+| `home/basic/` | The interpreter. `no_std`, no hardware, no `unsafe`; tested on the host. |
+| `home/console/` | Line editor and ANSI helpers. `no_std`, no hardware, no `unsafe`; tested on the host. |
+| `home/logo/` | The LOGO language: reader, parser, reference interpreter. `no_std`, no hardware, no `unsafe`; tested against golden transcripts and images. |
+| `home/rv64/` | A small RV64 assembler for the LOGO JIT. `no_std`, no `unsafe`; checked against LLVM and an emulator. |
+| `home/turtle/` | Turtle graphics (canvas, rasteriser, turtle) for LOGO. `no_std`, no hardware, no `unsafe`; tested against golden images. |
+| `home/cartfs/` | The SAVE/LOAD disk format. `no_std`, no `unsafe`; tested on the host. |
+| `home/kernel/` | The home computer's boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
+| `home/examples/`, `home/docs/`, `home/scripts/` | Demo programs, the screenshot, and the home computer's QEMU boot tests. |
+| `home/DESIGN.md`, `home/BASIC.md`, `home/LOGO.md` | Architecture and decision log; the two language specs. |
+| `kernel/` | The OS track's kernel (S-series): boots, threads, user mode, syscalls. |
+| `abi/`, `kcore/`, `rt/`, `init/` | The OS track's other crates: syscall ABI, pure kernel core, user runtime, user programs. |
+| `scripts/` | The OS track's headless boot test. |
+| `OS-ARCHITECTURE.md`, `SYSCALLS.md`, `INVARIANTS.md` | The OS track's spec, syscall reference and invariants. |
 | `ROADMAP.md` | Milestones with acceptance criteria; the task tracker. |
 | `CLAUDE.md` | Working agreement for AI coding sessions. |
 

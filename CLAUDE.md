@@ -3,30 +3,35 @@
 Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 
 - **The home computer** (BASIC and LOGO behind a boot menu): finished, v0.2. It
-  lives in `kernel/` and the language crates. Read `ROADMAP.md` (M and L series),
-  `DESIGN.md`, `BASIC.md` and `LOGO.md` before working on it.
+  lives in `home/` (its kernel is `home/kernel/`, plus the language crates). Read
+  `ROADMAP.md` (M and L series), `home/DESIGN.md`, `home/BASIC.md` and `home/LOGO.md`
+  before working on it.
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
   human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it, plus the S-series in
-  `ROADMAP.md`, before working on it. S0 (foundation), S1 (memory) and S2 (threads and scheduling) are done; S3 (user mode, syscalls, handles) is next.
+  `ROADMAP.md`, before working on it. S0 (foundation), S1 (memory) and S2 (threads and scheduling) are done; S3 (user mode, syscalls, handles; S3c-2a: VMOs and processes) is in progress.
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").
 
 ## Commands
 
-- `make test`: host tests for `basic/` and `console/`. Fast; run constantly.
-- `make kernel` / `make run` / `make debug`: build / boot / boot-paused-for-gdb.
-- `make boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
+- `make test`: host tests for the home-computer crates (`home/basic/`, `home/console/`, ...). Fast; run constantly.
+- `make home-kernel` / `make home-run` / `make home-debug`: build / boot / boot-paused-for-gdb.
+- `make home-boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
 - `make check`: fmt, tests, clippy, boot test. Run before calling anything done.
-- OS track: `make os-kernel` / `make os-test` (host tests plus loom and shuttle) /
+- OS track: `make kernel` / `make os-test` (host tests plus loom and shuttle) /
   `make os-boot-test` (headless QEMU, structured output) / `make os-miri` (needs
   nightly; CI runs it). `make check` covers all but Miri. OS-track cargo commands
-  run from inside `os-kernel/`, like `kernel/`.
-- Kernel cargo commands must run from inside `kernel/` (it has its own
-  `.cargo/config.toml` that sets the target). The Makefile handles this.
+  run from inside `kernel/`, like `home/kernel/`.
+- Kernel cargo commands must run from inside the kernel's own directory (each has its
+  own `.cargo/config.toml` that sets the target). The Makefile handles this. The two
+  kernels are different packages: `kernel` (OS track) and `home-kernel` (home computer).
 
 ## Layout and boundaries
+
+The home computer lives under `home/` (all paths in the next block are relative to it);
+the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the top level.
 
 - `basic/` is `no_std` + `alloc`, `#![forbid(unsafe_code)]`, and knows nothing
   about hardware. All machine access goes through the `Io` trait. If you feel
@@ -38,18 +43,18 @@ boundaries").
   only window to the machine is `logo::Io` and `turtle::Canvas`.
 - `rv64/` is the RV64 assembler for the LOGO JIT: `no_std`,
   `#![forbid(unsafe_code)]`, host-tested (LLVM-derived encoding vectors, an
-  emulator for `li` and branches). Only `kernel/src/jit.rs` executes generated code.
+  emulator for `li` and branches). Only `home/kernel/src/jit.rs` executes generated code.
 - `turtle/` is the pure graphics half of LOGO (canvas trait, rasteriser, turtle):
   `no_std`, `#![forbid(unsafe_code)]`, host-tested against golden images.
 - `examples/` holds the demo BASIC programs; golden tests load them with a
   `<LOAD examples/NAME.bas>` line and boot tests type them over the serial port.
 - `cartfs/` is the disk format for SAVE/LOAD (directory, free map, chained
   sectors) over a `BlockDevice` trait: `no_std`, `forbid(unsafe_code)`, host-tested.
-- `kernel/` owns everything hardware: boot, UART, virtio-blk, traps, timer,
+- `home/kernel/` owns everything hardware: boot, UART, virtio-blk, traps, timer,
   allocator. Every `unsafe` block gets a `// SAFETY:` comment saying why it holds.
-- **Home-computer kernel only:** `kernel/` has no paging, no user mode, no
-  processes and no SMP. These are its non-goals (see `DESIGN.md`) and stay that
-  way. Do not grow `kernel/` toward the OS track. The OS track gets its own kernel
+- **Home-computer kernel only:** `home/kernel/` has no paging, no user mode, no
+  processes and no SMP. These are its non-goals (see `home/DESIGN.md`) and stay that
+  way. Do not grow `home/kernel/` toward the OS track. The OS track gets its own kernel
   binary and new crates (provisional names in `OS-ARCHITECTURE.md` section 16), and
   may reuse the pure crates (`basic`, `console`, `logo`, `turtle`, `rv64`,
   `cartfs`) without forking them.
@@ -57,15 +62,15 @@ boundaries").
 ## Working agreement
 
 - One milestone (or a slice of one) per branch/PR. `main` always builds and boots.
-- Interpreter behaviour is specified by `BASIC.md` and pinned by golden tests in
-  `basic/tests/golden/`. Write the golden test first, watch it fail, then implement.
+- Interpreter behaviour is specified by `home/BASIC.md` and pinned by golden tests in
+  `home/basic/tests/golden/`. Write the golden test first, watch it fail, then implement.
   Never run `BLESS=1` blindly: read the diff of the `.out` files.
-- If `BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
+- If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
 - Only tick a `ROADMAP.md` box when its acceptance criterion has actually been
   verified (for kernel work, that means booted in QEMU, not just compiled).
 - Binary size is not a goal. Prefer simple over small; `core::fmt` is fine.
-- Record real design choices in the decision log in `DESIGN.md`.
+- Record real design choices in the decision log in `home/DESIGN.md`.
 - If something can't be verified in your environment (e.g. no QEMU), say so
   plainly rather than assuming it works.
 
@@ -75,7 +80,7 @@ Everything above still applies (one milestone per PR, `main` always builds and
 boots, `// SAFETY:` comments, `make check`). In addition:
 
 - The spec is `OS-ARCHITECTURE.md`. Design decisions are logged in its section 17
-  (OD numbers), not in `DESIGN.md`. Open questions are in its section 18: stop and
+  (OD numbers), not in `home/DESIGN.md`. Open questions are in its section 18: stop and
   ask rather than guessing.
 - All code is AI-written and the human is the product owner, so nothing relies on a
   human reading the code. Every milestone needs a **runnable acceptance check,

@@ -1,4 +1,4 @@
-# Applies when cargo is run from inside os-kernel/ (the Makefile does this).
+# Applies when cargo is run from inside kernel/ (the Makefile does this).
 [build]
 target = "riscv64gc-unknown-none-elf"
 

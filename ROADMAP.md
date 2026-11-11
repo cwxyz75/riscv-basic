@@ -1,5 +1,10 @@
 # Roadmap
 
+> **Repository layout note.** The home computer (M and L series) now lives under `home/`
+> and the OS kernel is `kernel/` (it was `os-kernel/`). Older entries below use the paths of
+> their time: `kernel/` there means `home/kernel/`, and `make run`, `make boot-test` and
+> `make kernel` became `make home-run`, `make home-boot-test` and `make home-kernel`.
+
 The task tracker. Tick a box only when its acceptance criterion has been
 **verified** (for kernel work, that means booted in QEMU, not merely compiled).
 

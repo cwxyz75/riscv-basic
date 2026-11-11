@@ -21,7 +21,7 @@ compatibility as non-goals**. This document proposes the opposite on purpose, fo
 a different kernel, so the two cannot share a kernel binary.
 
 **Settled (2026-11-10, OD25):** the OS lives in this repository as a **new track**
-(the S-series in `ROADMAP.md`). `CLAUDE.md`, `DESIGN.md` (D23, D24) and `ROADMAP.md`
+(the S-series in `ROADMAP.md`). `CLAUDE.md`, `home/DESIGN.md` (D23, D24) and `ROADMAP.md`
 have been amended accordingly.
 
 - The home computer is finished and **keeps its non-goals**. Do not grow `kernel/`
@@ -696,7 +696,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD22 | Skip NUMA, hotplug, heterogeneous cores | Decided |
 | OD23 | A kernel socket (byte stream) object is in the minimal object set | Proposed |
 | OD24 | Independent adversarial reviewer and external oracles are part of the process | Proposed |
-| OD25 | The OS lives in this repo as a new track (S-series) with its own kernel binary and new crates; the home computer keeps its non-goals; `CLAUDE.md`, `DESIGN.md` (D23, D24) and `ROADMAP.md` amended | Decided |
+| OD25 | The OS lives in this repo as a new track (S-series) with its own kernel binary and new crates; the home computer keeps its non-goals; `CLAUDE.md`, `home/DESIGN.md` (D23, D24) and `ROADMAP.md` amended | Decided |
 | OD26 | The OS track is launched as a separate kernel binary with its own `make` targets, not as a boot-menu entry on the home-computer kernel | Decided |
 | OD27 | Small third-party utility crates (such as an allocator or `libm`) are allowed in the kernel and userland, each with its own decision-log entry; the kernel, network stack, filesystem and libc are written here. Test-time crates (loom, shuttle, proptest, Miri) assumed fine | Decided |
 | OD28 | Structured serial test output (`##BOOT/##TEST/##DONE/##PANIC`) plus QEMU's test finisher for the exit status; a deliberately failing build proves the harness detects failure (section 3.2.1) | Decided |

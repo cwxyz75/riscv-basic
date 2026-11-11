@@ -1,36 +1,53 @@
-//! Time: a millisecond clock from the `time` counter, and a periodic tick
-//! driven by SBI timer interrupts.
+//! The supervisor timer, through the SBI TIME extension (OpenSBI), at a 1 ms tick.
+//! QEMU `virt`'s `time` counter runs at 10 MHz.
 
-use crate::{cpu, sbi};
+use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Frequency of the `time` counter on QEMU's `virt` machine (10 MHz).
-pub const TIMEBASE_HZ: u64 = 10_000_000;
+const EID_TIME: usize = 0x5449_4D45;
+/// Counter cycles per tick: 10 MHz / 1000 = 1 ms.
+pub const TICK_CYCLES: u64 = 10_000;
 
-/// Interrupt period: 10 ms, i.e. 100 ticks a second.
-const TICK_PERIOD: u64 = TIMEBASE_HZ / 100;
+static DEADLINE: AtomicU64 = AtomicU64::new(0);
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
-
-/// Milliseconds since boot (the source for BASIC's `TIMER`).
-pub fn millis() -> u64 {
-    cpu::rdtime() / (TIMEBASE_HZ / 1000)
+pub fn now() -> u64 {
+    let t: u64;
+    // SAFETY: reads the `time` CSR (user-readable counter).
+    unsafe { asm!("csrr {}, time", out(reg) t) };
+    t
 }
 
-/// Number of timer interrupts taken so far.
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+fn set(deadline: u64) {
+    // SAFETY: `ecall` from S-mode into OpenSBI's TIME extension (a7 = extension,
+    // a6 = function 0 = set_timer, a0 = deadline); it also clears a pending timer
+    // interrupt. Standard SBI calling convention.
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") EID_TIME,
+            in("a6") 0usize,
+            inout("a0") deadline as usize => _,
+            out("a1") _,
+        );
+    }
 }
 
-/// Start the periodic tick. The trap vector must be installed, and interrupts
-/// are only taken once `cpu::enable_interrupts` has been called.
-pub fn init() {
-    sbi::set_timer(cpu::rdtime() + TICK_PERIOD);
-    cpu::enable_timer_interrupt();
+/// Program the first tick.
+pub fn start() {
+    let first = now() + TICK_CYCLES;
+    DEADLINE.store(first, Ordering::SeqCst);
+    set(first);
 }
 
-/// Called from the trap handler on a supervisor timer interrupt.
-pub fn on_interrupt() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    sbi::set_timer(cpu::rdtime() + TICK_PERIOD);
+/// Program the next tick (called from the timer interrupt). Deadlines advance by
+/// exact multiples, so ticks do not drift; if we fell behind (the host stalled the
+/// emulator) the next one is a full tick away rather than a burst.
+pub fn next_tick() {
+    let mut next = DEADLINE.load(Ordering::SeqCst) + TICK_CYCLES;
+    let t = now();
+    if next <= t {
+        next = t + TICK_CYCLES;
+    }
+    DEADLINE.store(next, Ordering::SeqCst);
+    set(next);
 }
