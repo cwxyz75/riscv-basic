@@ -12,7 +12,8 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##PANIC <message>
     ##DONE pass=<n> fail=<n>
 
-The verdict comes from the kernel's exit status (QEMU's test finisher device:
+The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
 fail on purpose), this checks that failure is detected: nonzero exit status, a
@@ -27,6 +28,18 @@ import subprocess
 import sys
 
 TIMEOUT = 30
+
+# Tests the kernel must report, by name. A kernel that silently drops a test must
+# not pass (S1). Keep in step with `os-kernel/src/selftest.rs` and `main.rs`.
+REQUIRED = [
+    "bss_is_zeroed", "latch_works_on_the_target",
+    "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
+    "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
+    "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
+    "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
+    "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
+    "shared_vmo_is_one_memory", "churn_does_not_leak",
+]
 TEST = re.compile(r"^##TEST (\S+) (PASS|FAIL)(?: (.*))?$")
 DONE = re.compile(r"^##DONE pass=(\d+) fail=(\d+)$")
 BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
@@ -36,7 +49,7 @@ def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
         "qemu-system-riscv64", "-machine", "virt", "-bios", "default",
-        "-display", "none", "-serial", "stdio", "-monitor", "none",
+        "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
         *extra, "-kernel", kernel,
     ]
     try:
@@ -89,6 +102,9 @@ def problems(lines, status, timed_out, expect_fail: bool):
             found.append(f"expected exactly one failing test, saw {failed}")
         if not expect_fail and failed:
             found.append(f"failing tests: {[n for n, ok, _ in tests if not ok]}")
+    missing = [n for n in REQUIRED if n not in {n for n, _, _ in tests}]
+    if missing:
+        found.append(f"required tests not reported: {missing}")
     if len({n for n, _, _ in tests}) != len(tests):
         found.append("duplicate test names")
     if not timed_out:

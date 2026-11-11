@@ -93,8 +93,14 @@ os-test:
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.
+# Only the unit tests and the frame-database model run under Miri: the page-table and
+# address-space model tests take minutes there, and kcore forbids unsafe code, so
+# Miri has little to find in them.
+# Only the unit tests and the frame-database model run under Miri: the page-table and
+# address-space model tests are minutes slow there, and kcore forbids unsafe code,
+# so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
-	cargo +nightly miri test -p abi -p kcore --target-dir target/miri
+	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
 
 os-boot-test: os-kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF)
