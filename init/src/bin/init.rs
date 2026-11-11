@@ -7,6 +7,10 @@
 // Test failures carry a fixed 200-byte message buffer by design (there is no allocator).
 #![allow(clippy::result_large_err)]
 
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
 use rt::abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
 use rt::abi::rights::Rights;
 use rt::abi::signals;
@@ -1195,6 +1199,8 @@ const TOP: u64 = 0x40_0000_0000;
 
 /// The handle of the program image VMO the kernel-side helper sent us (0 until fetched).
 static IMAGE: AtomicU32 = AtomicU32::new(0);
+/// The `hello` program image (S4a runtime tests).
+static HELLO_IMAGE: AtomicU32 = AtomicU32::new(0);
 
 fn vmo(pages: u64) -> Result<u32, Detail> {
     Ok(ok(sys::vmo_create(pages), "vmo_create")?.a1 as u32)
@@ -1624,7 +1630,10 @@ fn le(b: &[u8], at: usize, n: usize) -> u64 {
 /// handle to the process and our end of its bootstrap channel. This is what a real launcher
 /// does (OS-ARCHITECTURE 9): the kernel never parses an executable for it.
 fn launch(arg: u64) -> Result<(u32, u32), Detail> {
-    let image = IMAGE.load(Ordering::Relaxed);
+    launch_image(IMAGE.load(Ordering::Relaxed), arg)
+}
+
+fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
     ensure!(image != 0, "no image was fetched");
     let mut eh = [0u8; 64];
     ok(
@@ -1857,12 +1866,12 @@ fn process_self_and_mapping_into_ourselves() -> Outcome {
     );
     let v = vmo(1)?;
     ensure_eq!(
-        st(sys::process_map(me, v, 0x6_0000, 0, 4096, PF_R | PF_W)),
+        st(sys::process_map(me, v, 0x400_0000, 0, 4096, PF_R | PF_W)),
         Some(S::Ok),
         "map a VMO into ourselves"
     );
-    // SAFETY: 0x6_0000 was just mapped read-write in this process.
-    unsafe { core::ptr::write_volatile(0x6_0010 as *mut u32, 0xdead_beef) };
+    // SAFETY: 0x400_0000 was just mapped read-write in this process.
+    unsafe { core::ptr::write_volatile(0x400_0010 as *mut u32, 0xdead_beef) };
     let mut b = [0u8; 4];
     sys::vmo_read(v, 0x10, b.as_mut_ptr(), 4);
     ensure_eq!(
@@ -1872,13 +1881,13 @@ fn process_self_and_mapping_into_ourselves() -> Outcome {
     );
     sys::vmo_write(v, 0x20, 0x1234_5678u32.to_le_bytes().as_ptr(), 4);
     // SAFETY: as above.
-    let seen = unsafe { core::ptr::read_volatile(0x6_0020 as *const u32) };
+    let seen = unsafe { core::ptr::read_volatile(0x400_0020 as *const u32) };
     ensure_eq!(
         seen,
         0x1234_5678,
         "and a write to the VMO is visible through the mapping"
     );
-    ensure_eq!(st(sys::process_unmap(me, 0x6_0000)), Some(S::Ok), "unmap");
+    ensure_eq!(st(sys::process_unmap(me, 0x400_0000)), Some(S::Ok), "unmap");
     let again = ok(sys::process_self(), "a second self handle")?.a1 as u32;
     ensure_eq!(
         st(sys::handle_close(again)),
@@ -3378,6 +3387,166 @@ fn kill_needs_the_kill_right_and_nothing_else() -> Outcome {
     Ok(())
 }
 
+// --- The S4a runtime: startup message, heap, stdio -------------------------------------------
+
+use proto::startup::{Role, Startup};
+
+fn fetch_the_hello_image() -> Outcome {
+    let (m, n) = request(22, b'H', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u32; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
+    HELLO_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+fn send_startup(mine: u32, s: &Startup, handles: &[u32]) -> Outcome {
+    let bytes = s.encode().map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("encode: {e:?}"));
+        d
+    })?;
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            bytes.as_ptr(),
+            bytes.len(),
+            handles.as_ptr(),
+            handles.len()
+        )),
+        Some(S::Ok),
+        "send the startup message"
+    );
+    Ok(())
+}
+
+/// Start `hello` with `args`, a stdin pipe and a stdout pipe; returns (process, our write end of
+/// stdin, our read end of stdout).
+fn start_hello(args: &[&[u8]]) -> Result<(u32, u32, u32), Detail> {
+    let (p, mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
+    let (in_w, in_r) = socket()?;
+    let (out_r, out_w) = socket()?;
+    // Narrow the ends we give away, then close our originals: the stream only ends for the
+    // reader when every handle to the other end is gone.
+    let in_r_child = weaker(in_r, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    let out_w_child = weaker(out_w, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    sys::handle_close(in_r);
+    sys::handle_close(out_w);
+    let s = Startup {
+        args: args.iter().map(|a| a.to_vec()).collect(),
+        env: vec![],
+        namespace: vec![],
+        roles: vec![(Role::Stdin, 0), (Role::Stdout, 1)],
+    };
+    send_startup(mine, &s, &[in_r_child, out_w_child])?;
+    Ok((p, in_w, out_r))
+}
+
+/// Read a socket to the end of the stream.
+fn read_to_end(h: u32) -> Result<Vec<u8>, Detail> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let r = sys::socket_read(h, buf.as_mut_ptr(), buf.len());
+        match st(r) {
+            Some(S::Ok) => out.extend_from_slice(&buf[..r.a1]),
+            Some(S::PeerClosed) => return Ok(out),
+            Some(S::ShouldWait) => {
+                let w = sys::object_wait(
+                    h,
+                    sig::READABLE | sig::PEER_CLOSED,
+                    sys::clock_get() + 10_000,
+                );
+                ensure!(w.status == 0, "the program stopped talking");
+            }
+            other => ensure!(false, "read: {other:?}"),
+        }
+    }
+}
+
+fn runtime_startup_heap_and_stdio() -> Outcome {
+    let (p, in_w, out_r) = start_hello(&[b"hello", b"world"])?;
+    ensure_eq!(
+        sys::socket_write(in_w, b"abc".as_ptr(), 3).status,
+        0,
+        "feed its stdin"
+    );
+    ensure_eq!(st(sys::handle_close(in_w)), Some(S::Ok), "end of its stdin");
+    let out = read_to_end(out_r)?;
+    ensure_eq!(&out[..], &b"args=hello world\nabc"[..], "what it printed");
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        2,
+        "exit code: the number of arguments"
+    );
+    Ok(())
+}
+
+fn runtime_heap_stops_at_its_cap() -> Outcome {
+    let (p, in_w, out_r) = start_hello(&[b"hello", b"hog"])?;
+    let _ = out_r;
+    wait_ended(p, 5000)?;
+    let blocks = sys::process_info(p).a1 as i64;
+    ensure!(
+        (10..=16).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing (cap 16 MiB, some in use)"
+    );
+    let _ = in_w;
+    Ok(())
+}
+
+fn runtime_refuses_a_bad_startup_message() -> Outcome {
+    let (p, mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            b"nonsense".as_ptr(),
+            8,
+            [ev].as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "send garbage with a handle"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        -2001,
+        "the exit code for a malformed message"
+    );
+    Ok(())
+}
+
+fn runtime_without_a_startup_message() -> Outcome {
+    let (p, mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
+    ensure_eq!(
+        st(sys::handle_close(mine)),
+        Some(S::Ok),
+        "close our end: no message will come"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        -2002,
+        "the exit code when nothing arrives"
+    );
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -3901,6 +4070,23 @@ pub fn app_main() -> i32 {
         (
             "kill_needs_the_kill_right_and_nothing_else",
             kill_needs_the_kill_right_and_nothing_else,
+        ),
+        ("fetch_the_hello_image", fetch_the_hello_image),
+        (
+            "runtime_startup_heap_and_stdio",
+            runtime_startup_heap_and_stdio,
+        ),
+        (
+            "runtime_heap_stops_at_its_cap",
+            runtime_heap_stops_at_its_cap,
+        ),
+        (
+            "runtime_refuses_a_bad_startup_message",
+            runtime_refuses_a_bad_startup_message,
+        ),
+        (
+            "runtime_without_a_startup_message",
+            runtime_without_a_startup_message,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

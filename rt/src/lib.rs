@@ -11,6 +11,13 @@ use core::fmt::{self, Write};
 
 pub use abi;
 
+#[cfg(feature = "heap")]
+pub mod heap;
+#[cfg(feature = "heap")]
+pub mod io;
+#[cfg(feature = "heap")]
+pub mod startup;
+
 /// The result of a raw syscall: the status code and the two result registers.
 #[derive(Debug, Clone, Copy)]
 pub struct Ret {

@@ -17,7 +17,7 @@ fn main() {
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let built = PathBuf::from(&dir).join("../target/riscv64imac-unknown-none-elf/debug");
-    for name in ["init", "crash"] {
+    for name in ["init", "crash", "hello"] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         let bytes = std::fs::read(&src).unwrap_or_default();
