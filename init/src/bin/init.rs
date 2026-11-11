@@ -2548,6 +2548,552 @@ fn threads_left_behind_when_init_exits() -> Outcome {
     Ok(())
 }
 
+// --- Sockets and ports (S3c-3) --------------------------------------------------------------
+
+const SOCKET_BUFFER: usize = 65536;
+
+fn socket() -> Result<(u32, u32), Detail> {
+    let r = ok(sys::socket_create(), "socket_create")?;
+    Ok((r.a1 as u32, r.a2 as u32))
+}
+
+fn port() -> Result<u32, Detail> {
+    Ok(ok(sys::port_create(), "port_create")?.a1 as u32)
+}
+
+fn sleep_in_thread(ticks: u64) {
+    let gate = sys::event_create().a1 as u32;
+    sys::object_wait(gate, 1 << 24, sys::clock_get() + ticks);
+    sys::handle_close(gate);
+}
+
+extern "C" fn worker_signal_later(arg: usize) -> ! {
+    sleep_in_thread(6);
+    sys::event_signal(arg as u32, 0, 1 << 24);
+    sys::thread_exit(0)
+}
+
+extern "C" fn worker_write_later(arg: usize) -> ! {
+    sleep_in_thread(6);
+    // Let the waiter that the set-up calls woke go back to sleep: with one global wait queue a
+    // missing wake-up is otherwise masked by an earlier one (found by the wake-up audit).
+    for _ in 0..3 {
+        sys::thread_yield();
+    }
+    let r = sys::socket_write(arg as u32, b"ping".as_ptr(), 4);
+    // Linger without making any syscall that wakes waiters, so that only the write's own
+    // wake-up can end a waiter's sleep (an exit would wake everyone and hide a missing one).
+    let until = sys::clock_get() + 40;
+    while sys::clock_get() < until {
+        core::hint::spin_loop();
+    }
+    sys::thread_exit(r.status as i32)
+}
+
+/// Wait (up to 2000 ticks) until the socket can take a write, then write 3 bytes.
+extern "C" fn worker_write_when_writable(arg: usize) -> ! {
+    let r = sys::object_wait(arg as u32, sig::WRITABLE, sys::clock_get() + 2000);
+    if r.status != 0 {
+        sys::thread_exit(1);
+    }
+    let w = sys::socket_write(arg as u32, b"abc".as_ptr(), 3);
+    sys::thread_exit(if w.status == 0 { w.a1 as i32 } else { 2 })
+}
+
+fn socket_syscalls() -> Outcome {
+    let (a, b) = socket()?;
+    let mut buf = [0u8; 16];
+    ensure_eq!(
+        st(sys::socket_read(b, buf.as_mut_ptr(), 4)),
+        Some(S::ShouldWait),
+        "empty and open"
+    );
+    let w = sys::socket_write(a, b"hello".as_ptr(), 5);
+    ensure_eq!((w.status, w.a1), (0, 5), "write (status, written)");
+    let r = sys::socket_read(b, buf.as_mut_ptr(), 3);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..3]),
+        (0, 3, &b"hel"[..]),
+        "a short read"
+    );
+    let r = sys::socket_read(b, buf.as_mut_ptr(), 16);
+    ensure_eq!((r.status, r.a1, &buf[..2]), (0, 2, &b"lo"[..]), "the rest");
+    ensure_eq!(
+        st(sys::socket_read(b, buf.as_mut_ptr(), 0)),
+        Some(S::Ok),
+        "max 0 on an empty socket"
+    );
+    // full buffer: short write, then SHOULD_WAIT
+    let big = [9u8; 4096];
+    let mut total = 0usize;
+    while total < SOCKET_BUFFER {
+        let w = sys::socket_write(a, big.as_ptr(), 4096);
+        ensure_eq!(w.status, 0, "filling the buffer");
+        total += w.a1;
+    }
+    ensure_eq!(total, SOCKET_BUFFER, "exactly the buffer size fits");
+    ensure_eq!(
+        st(sys::socket_write(a, big.as_ptr(), 1)),
+        Some(S::ShouldWait),
+        "full"
+    );
+    ensure_eq!(
+        sys::object_signals(a).a1 as u32 & sig::WRITABLE,
+        0,
+        "not WRITABLE when full"
+    );
+    ensure_eq!(
+        st(sys::socket_write(a, big.as_ptr(), 0)),
+        Some(S::Ok),
+        "an empty write is fine"
+    );
+    let r = sys::socket_read(b, buf.as_mut_ptr(), 10);
+    ensure_eq!((r.status, r.a1), (0, 10), "make room");
+    ensure_eq!(
+        sys::object_signals(a).a1 as u32 & sig::WRITABLE,
+        sig::WRITABLE,
+        "WRITABLE again"
+    );
+    let w = sys::socket_write(a, big.as_ptr(), 100);
+    ensure_eq!(
+        (w.status, w.a1),
+        (0, 10),
+        "a short write of the room that was left"
+    );
+    // errors
+    ensure_eq!(
+        st(sys::socket_write(a, big.as_ptr(), SOCKET_BUFFER + 1)),
+        Some(S::TooBig),
+        "write too big"
+    );
+    ensure_eq!(
+        st(sys::socket_read(b, buf.as_mut_ptr(), SOCKET_BUFFER + 1)),
+        Some(S::TooBig),
+        "read too big"
+    );
+    ensure_eq!(
+        st(sys::socket_write(BAD, big.as_ptr(), 1)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    let e = event()?;
+    ensure_eq!(
+        st(sys::socket_write(e, big.as_ptr(), 1)),
+        Some(S::WrongType),
+        "an event is no socket"
+    );
+    ensure_eq!(
+        st(sys::socket_read(e, buf.as_mut_ptr(), 1)),
+        Some(S::WrongType),
+        "an event is no socket (read)"
+    );
+    let ro = weaker(a, Rights::READ.0)?;
+    let wo = weaker(a, Rights::WRITE.0)?;
+    ensure_eq!(
+        st(sys::socket_write(ro, big.as_ptr(), 1)),
+        Some(S::AccessDenied),
+        "no WRITE"
+    );
+    ensure_eq!(
+        st(sys::socket_read(wo, buf.as_mut_ptr(), 1)),
+        Some(S::AccessDenied),
+        "no READ"
+    );
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::SOCKET_WRITE,
+            [
+                (1usize << 32) | a as usize,
+                big.as_ptr() as usize,
+                1,
+                0,
+                0,
+                0
+            ]
+        )),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    // bad pointers lose no data
+    ensure_eq!(
+        st(sys::socket_write(wo, 0x10 as *const u8, 4)),
+        Some(S::InvalidArgs),
+        "bad source"
+    );
+    ensure_eq!(
+        st(sys::socket_read(b, KERNEL_ADDR as *mut u8, 4)),
+        Some(S::InvalidArgs),
+        "kernel destination"
+    );
+    let n = sys::socket_read(b, buf.as_mut_ptr(), 8);
+    ensure_eq!((n.status, n.a1), (0, 8), "the data is still there");
+    Ok(())
+}
+
+fn socket_end_of_stream() -> Outcome {
+    let (a, b) = socket()?;
+    sys::socket_write(a, b"tail".as_ptr(), 4);
+    ensure_eq!(st(sys::handle_close(a)), Some(S::Ok), "close the writer");
+    let s = sys::object_signals(b).a1 as u32;
+    ensure_eq!(
+        s & (sig::READABLE | sig::PEER_CLOSED),
+        sig::READABLE | sig::PEER_CLOSED,
+        "data and PEER_CLOSED"
+    );
+    let mut buf = [0u8; 8];
+    let r = sys::socket_read(b, buf.as_mut_ptr(), 8);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..4]),
+        (0, 4, &b"tail"[..]),
+        "the remaining data first"
+    );
+    ensure_eq!(
+        st(sys::socket_read(b, buf.as_mut_ptr(), 8)),
+        Some(S::PeerClosed),
+        "then the end of the stream"
+    );
+    ensure_eq!(
+        st(sys::socket_write(b, b"x".as_ptr(), 1)),
+        Some(S::PeerClosed),
+        "writing to a closed peer"
+    );
+    Ok(())
+}
+
+fn socket_ends_travel_over_channels() -> Outcome {
+    let (a, b) = socket()?;
+    let (c, d) = channel()?;
+    ensure_eq!(
+        st(sys::channel_write(c, b"s".as_ptr(), 1, [b].as_ptr(), 1)),
+        Some(S::Ok),
+        "send a socket end"
+    );
+    let mut hb = [0u32; 1];
+    let mut mb = [0u8; 4];
+    let r = sys::channel_read(d, mb.as_mut_ptr(), 4, hb.as_mut_ptr(), 1);
+    ensure_eq!((r.status, r.a2), (0, 1), "received it");
+    sys::socket_write(a, b"via".as_ptr(), 3);
+    let mut buf = [0u8; 4];
+    let r = sys::socket_read(hb[0], buf.as_mut_ptr(), 4);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..3]),
+        (0, 3, &b"via"[..]),
+        "the received end works"
+    );
+    Ok(())
+}
+
+fn a_child_reads_a_socket_to_the_end() -> Outcome {
+    let (p, mine) = launch(26)?;
+    let (a, b) = socket()?;
+    ensure_eq!(
+        st(sys::channel_write(mine, b"s".as_ptr(), 1, [b].as_ptr(), 1)),
+        Some(S::Ok),
+        "give the child an end"
+    );
+    let data = [5u8; 100];
+    ensure_eq!(
+        sys::socket_write(a, data.as_ptr(), 100).a1,
+        100,
+        "write 100 bytes"
+    );
+    sys::socket_write(a, data.as_ptr(), 28);
+    ensure_eq!(
+        st(sys::handle_close(a)),
+        Some(S::Ok),
+        "close our end: the end of the stream"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        128,
+        "the child counted every byte"
+    );
+    Ok(())
+}
+
+fn a_blocked_reader_wakes_when_data_arrives() -> Outcome {
+    let (a, b) = socket()?;
+    let t = new_thread(worker_write_later, a as usize)?;
+    let t0 = sys::clock_get();
+    let r = sys::object_wait(b, sig::READABLE, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "woken by the write");
+    // Strictly: the writer lingers 40 ticks after its write without waking anyone, so a
+    // reader woken only by the writer's exit would be about 45 ticks late.
+    let took = sys::clock_get() - t0;
+    ensure!(
+        took >= 5 && (loose() || took <= 25),
+        "after about 6 ticks, not {took}"
+    );
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    Ok(())
+}
+
+fn a_blocked_writer_wakes_when_space_appears() -> Outcome {
+    let (a, b) = socket()?;
+    let big = [1u8; 4096];
+    for _ in 0..16 {
+        sys::socket_write(a, big.as_ptr(), 4096);
+    }
+    let t = new_thread(worker_write_when_writable, a as usize)?;
+    sleep_in_thread(5);
+    ensure_eq!(
+        st(sys::thread_info(t)),
+        Some(S::BadState),
+        "the writer is still blocked"
+    );
+    let mut buf = [0u8; 8];
+    sys::socket_read(b, buf.as_mut_ptr(), 8);
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "the writer was woken by our read");
+    ensure_eq!(sys::thread_info(t).a1, 3, "and wrote 3 bytes");
+    Ok(())
+}
+
+fn port_argument_checks() -> Outcome {
+    let p = port()?;
+    ensure_eq!(sys::object_signals(p).a1, 0, "a fresh port has no signals");
+    let e = event()?;
+    let (a, _b) = socket()?;
+    let m = 1u32 << 24;
+    ensure_eq!(
+        st(sys::port_bind(BAD, e, m, 1)),
+        Some(S::BadHandle),
+        "bad port"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, BAD, m, 1)),
+        Some(S::BadHandle),
+        "bad object"
+    );
+    ensure_eq!(
+        st(sys::port_bind(e, e, m, 1)),
+        Some(S::WrongType),
+        "an event is no port"
+    );
+    let nomanage = weaker(p, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::port_bind(nomanage, e, m, 1)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    let nowait = weaker(e, Rights::SIGNAL.0)?;
+    ensure_eq!(
+        st(sys::port_bind(p, nowait, m, 1)),
+        Some(S::AccessDenied),
+        "object without WAIT"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, e, 0, 1)),
+        Some(S::InvalidArgs),
+        "empty mask"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, e, 1 << 10, 1)),
+        Some(S::InvalidArgs),
+        "not a signal"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, p, sig::READABLE, 1)),
+        Some(S::InvalidArgs),
+        "a port in a port"
+    );
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::PORT_BIND,
+            [p as usize, e as usize, 1 << 32, 1, 0, 0]
+        )),
+        Some(S::InvalidArgs),
+        "a mask wider than 32 bits"
+    );
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::PORT_BIND,
+            [(1usize << 32) | p as usize, e as usize, m as usize, 1, 0, 0]
+        )),
+        Some(S::BadHandle),
+        "a wide port handle"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, e, m, 1)),
+        Some(S::Ok),
+        "a good binding"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, a, sig::READABLE, 1)),
+        Some(S::InvalidArgs),
+        "key already bound"
+    );
+    ensure_eq!(
+        st(sys::port_unbind(p, 9)),
+        Some(S::InvalidArgs),
+        "unknown key"
+    );
+    ensure_eq!(
+        st(sys::port_unbind(nomanage, 1)),
+        Some(S::AccessDenied),
+        "unbind needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::port_unbind(e, 1)),
+        Some(S::WrongType),
+        "unbind on an event"
+    );
+    ensure_eq!(
+        st(sys::port_wait(BAD, 0)),
+        Some(S::BadHandle),
+        "wait: bad handle"
+    );
+    ensure_eq!(
+        st(sys::port_wait(e, 0)),
+        Some(S::WrongType),
+        "wait: not a port"
+    );
+    let nowait_port = weaker(p, Rights::MANAGE.0)?;
+    ensure_eq!(
+        st(sys::port_wait(nowait_port, 0)),
+        Some(S::AccessDenied),
+        "wait needs WAIT"
+    );
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::PORT_WAIT,
+            [(1usize << 32) | p as usize, 0, 0, 0, 0, 0]
+        )),
+        Some(S::BadHandle),
+        "wide handle"
+    );
+    ensure_eq!(st(sys::port_unbind(p, 1)), Some(S::Ok), "unbind");
+    // the binding limit
+    for k in 0..256u64 {
+        ensure_eq!(st(sys::port_bind(p, e, m, k)), Some(S::Ok), "binding {k}");
+    }
+    ensure_eq!(
+        st(sys::port_bind(p, e, m, 1000)),
+        Some(S::NoMemory),
+        "257th binding"
+    );
+    Ok(())
+}
+
+fn port_wait_levels_timeouts_and_fairness() -> Outcome {
+    let p = port()?;
+    let (e1, e2) = (event()?, event()?);
+    let m = 1u32 << 24;
+    sys::port_bind(p, e1, m, 11);
+    sys::port_bind(p, e2, m, 22);
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        st(sys::port_wait(p, 0)),
+        Some(S::TimedOut),
+        "a poll with nothing ready"
+    );
+    ensure_eq!(
+        st(sys::port_wait(p, sys::clock_get() + 4)),
+        Some(S::TimedOut),
+        "a short wait times out"
+    );
+    ensure!(
+        within(sys::clock_get() - t0, 4, 10),
+        "the timeout took {} ticks",
+        sys::clock_get() - t0
+    );
+    sys::event_signal(e1, 0, m);
+    sys::event_signal(e2, 0, m);
+    ensure_eq!(
+        sys::object_signals(p).a1 as u32,
+        sig::READABLE,
+        "the port is READABLE"
+    );
+    let mut seen = [0u32; 2];
+    for _ in 0..6 {
+        let r = sys::port_wait(p, 0);
+        ensure_eq!(r.status, 0, "a ready binding");
+        ensure_eq!(r.a2 as u32, m, "observed is signals & mask");
+        match r.a1 {
+            11 => seen[0] += 1,
+            22 => seen[1] += 1,
+            k => ensure!(false, "unexpected key {k}"),
+        }
+    }
+    ensure_eq!(seen, [3, 3], "both ready bindings are served in turn");
+    sys::event_signal(e1, m, 0);
+    for _ in 0..3 {
+        ensure_eq!(sys::port_wait(p, 0).a1, 22, "only the one still asserted");
+    }
+    sys::event_signal(e2, m, 0);
+    ensure_eq!(
+        st(sys::port_wait(p, 0)),
+        Some(S::TimedOut),
+        "deasserted: nothing ready"
+    );
+    // closing the object drops its binding
+    sys::event_signal(e1, 0, m);
+    sys::handle_close(e1);
+    ensure_eq!(
+        st(sys::port_wait(p, 0)),
+        Some(S::TimedOut),
+        "the destroyed object's binding is gone"
+    );
+    ensure_eq!(
+        st(sys::port_bind(p, e2, m, 11)),
+        Some(S::Ok),
+        "and its key is free"
+    );
+    Ok(())
+}
+
+fn port_wait_blocks_until_an_object_is_ready() -> Outcome {
+    let p = port()?;
+    let ev = event()?;
+    sys::port_bind(p, ev, 1 << 24, 77);
+    let t = new_thread(worker_signal_later, ev as usize)?;
+    let t0 = sys::clock_get();
+    let r = sys::port_wait(p, sys::clock_get() + 500);
+    ensure_eq!((r.status, r.a1), (0, 77), "woken with the key");
+    ensure!(
+        within(sys::clock_get() - t0, 5, 12),
+        "after about 6 ticks, not {}",
+        sys::clock_get() - t0
+    );
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    Ok(())
+}
+
+fn port_wait_sees_socket_data_and_object_wait_works_on_a_port() -> Outcome {
+    let p = port()?;
+    let (a, b) = socket()?;
+    sys::port_bind(p, b, sig::READABLE | sig::PEER_CLOSED, 5);
+    let t = new_thread(worker_write_later, a as usize)?;
+    let r = sys::object_wait(p, sig::READABLE, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "object_wait on the port itself");
+    let r = sys::port_wait(p, 0);
+    ensure_eq!(
+        (r.status, r.a1, r.a2 as u32),
+        (0, 5, sig::READABLE),
+        "the socket is readable"
+    );
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    sys::handle_close(a);
+    let r = sys::port_wait(p, 0);
+    ensure_eq!(
+        r.a2 as u32,
+        sig::READABLE | sig::PEER_CLOSED,
+        "peer closed too"
+    );
+    Ok(())
+}
+
+fn kill_a_child_blocked_in_port_wait() -> Outcome {
+    let (p, _m) = launch(27)?;
+    let r = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 5);
+    ensure_eq!(st(r), Some(S::TimedOut), "the child waits on its port");
+    ensure_eq!(st(sys::process_kill(p, 31)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 31, "exit code");
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -3015,6 +3561,41 @@ pub fn app_main() -> i32 {
         (
             "a_thread_made_by_the_parent_faults_or_exits",
             a_thread_made_by_the_parent_faults_or_exits,
+        ),
+        ("socket_syscalls", socket_syscalls),
+        ("socket_end_of_stream", socket_end_of_stream),
+        (
+            "socket_ends_travel_over_channels",
+            socket_ends_travel_over_channels,
+        ),
+        (
+            "a_child_reads_a_socket_to_the_end",
+            a_child_reads_a_socket_to_the_end,
+        ),
+        (
+            "a_blocked_reader_wakes_when_data_arrives",
+            a_blocked_reader_wakes_when_data_arrives,
+        ),
+        (
+            "a_blocked_writer_wakes_when_space_appears",
+            a_blocked_writer_wakes_when_space_appears,
+        ),
+        ("port_argument_checks", port_argument_checks),
+        (
+            "port_wait_levels_timeouts_and_fairness",
+            port_wait_levels_timeouts_and_fairness,
+        ),
+        (
+            "port_wait_blocks_until_an_object_is_ready",
+            port_wait_blocks_until_an_object_is_ready,
+        ),
+        (
+            "port_wait_sees_socket_data_and_object_wait_works_on_a_port",
+            port_wait_sees_socket_data_and_object_wait_works_on_a_port,
+        ),
+        (
+            "kill_a_child_blocked_in_port_wait",
+            kill_a_child_blocked_in_port_wait,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

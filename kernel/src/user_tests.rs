@@ -112,6 +112,14 @@ pub fn run_all() -> Report {
         thread::join(helper);
         Ok(code)
     })();
+    // A child that outlived init dies asynchronously (kill flag, then its own exit): give it a
+    // bounded time, so one leaking test does not also fail the leak checks below.
+    for _ in 0..200 {
+        if user::process_count() == 0 {
+            break;
+        }
+        thread::sleep_ticks(1);
+    }
     let reported = user::reported();
     push(
         "init_runs_in_user_mode_and_passes",

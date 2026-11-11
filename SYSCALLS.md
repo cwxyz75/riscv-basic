@@ -152,6 +152,13 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
+| 70 | socket_create | | `a1`, `a2` the two handles |
+| 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
+| 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
+| 80 | port_create | | `a1` handle |
+| 81 | port_bind | `a0` port, `a1` object, `a2` mask, `a3` key | |
+| 82 | port_unbind | `a0` port, `a1` key | |
+| 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
 | 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
@@ -386,6 +393,67 @@ WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 The kernel takes no lock: syscalls run with interrupts off on the one hart (S5 revisits this
 with SMP; OD46).
 
+## Sockets and ports (S3c-3)
+
+### Sockets
+
+A socket is a connected pair of byte-stream endpoints (pipes, stdio, network socket endpoints
+build on it). Each endpoint owns an inbound buffer of at most `SOCKET_BUFFER` (65536) bytes.
+Rights: DUPLICATE, TRANSFER, READ, WRITE, WAIT. Signals: READABLE (own buffer not empty),
+WRITABLE (peer exists and its buffer has free space), PEER_CLOSED (the peer endpoint is gone;
+READABLE stays set while bytes remain, so a reader drains them and then sees the end).
+
+### socket_create() -> status, handle0, handle1
+
+NO_MEMORY if the handle table has no room for two handles or the object cap is reached.
+
+### socket_write(socket, bytes, length) -> status, written
+
+Append up to `length` bytes to the peer's buffer; a write that does not fit completely writes
+what fits (a short write) and reports it. Rights: WRITE. `length` at most `SOCKET_BUFFER`.
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG; INVALID_ARGS (the source is
+not readable user memory); PEER_CLOSED (the peer is gone; nothing written); SHOULD_WAIT (the
+peer's buffer is full and `length` > 0; nothing written). `length` 0 is OK with `written` 0.
+
+### socket_read(socket, buffer, max) -> status, read
+
+Remove up to `max` bytes from the own buffer into `buffer`. Rights: READ. `max` at most
+`SOCKET_BUFFER`. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG; then, if
+`max` > 0 and the buffer is empty: PEER_CLOSED (the peer is gone: end of stream) or
+SHOULD_WAIT; INVALID_ARGS (the destination is not writable user memory; nothing is removed).
+`max` 0 is OK with `read` 0.
+
+### Ports
+
+A port is a wait set: it watches signals on other objects and reports which are asserted.
+Rights: DUPLICATE, TRANSFER, MANAGE (bind, unbind), WAIT (port_wait, object_wait). Its own
+signal READABLE is set while any binding is ready, so a port can be waited on with
+`object_wait`; a port cannot be bound to a port. A binding is *level-triggered*: it is ready
+exactly while `signals(object) & mask != 0`, and reporting it consumes nothing. A binding
+holds no reference: when the object is destroyed the binding disappears.
+
+### port_create() -> status, handle
+
+### port_bind(port, object, mask, key) -> status
+
+Watch `object` for `mask`; report it under `key` (chosen by the caller, unique within the
+port). Rights: MANAGE on `port`, WAIT on `object`. `mask` must be non-empty and within the
+waitable signals. Errors, in order: BAD_HANDLE (port, then object); WRONG_TYPE (`port` is not
+a port); ACCESS_DENIED; INVALID_ARGS (bad mask; `object` is a port; `key` already bound);
+NO_MEMORY (`MAX_PORT_BINDINGS` (256) bindings).
+
+### port_unbind(port, key) -> status
+
+Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such key).
+
+### port_wait(port, deadline) -> status, key, observed
+
+Wait until some binding is ready or the absolute tick `deadline` passes (0: do not block;
+`u64::MAX`: no deadline), then return one ready binding's `key` and `observed` (`signals &
+mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
+Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;
+ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once.
+
 ## Entry template
 
 ```text
@@ -539,11 +607,11 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | event_create, event_signal | specified (S3a); implemented in S3b |
 | channel_call | specified (S3c-1) |
 | object_wait (wait on a signal with a deadline) | specified (S3c-1) |
-| object_wait_many / ports | planned, S3c-3 |
+| port_create, port_bind, port_unbind, port_wait | specified (S3c-3) |
 | debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
 | vmo_create, vmo_read, vmo_write, vmo_get_size | specified (S3c-2a) |
 | vmo_set_size, vmo_create_child | planned, later |
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | thread_create, thread_exit, thread_info | specified (S3c-2b) |
-| socket_create, socket_write, socket_read | planned, S3c |
+| socket_create, socket_write, socket_read | specified (S3c-3) |
