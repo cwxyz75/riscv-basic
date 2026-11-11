@@ -4,7 +4,10 @@
 
 use crate::handle::{Entry, HandleTable};
 use crate::object::{ObjId, Object, Registry};
-use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_QUEUED_BYTES, MAX_QUEUED_MSGS};
+use abi::limits::{
+    MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_PORT_BINDINGS,
+    MAX_QUEUED_BYTES, MAX_QUEUED_MSGS, SOCKET_BUFFER,
+};
 use abi::rights::Rights;
 use abi::signals;
 use abi::status::Status;
@@ -53,6 +56,27 @@ pub struct ThreadObj {
     pub exit_code: i32,
 }
 
+/// One end of a byte-stream socket: what it holds is what its *peer* wrote.
+pub struct SocketEnd {
+    peer: Option<ObjId>,
+    buf: VecDeque<u8>,
+    peer_closed: bool,
+}
+
+/// One binding of a port: watch `obj` for `mask`, report as `key`.
+struct Binding {
+    obj: ObjId,
+    mask: u32,
+    key: u64,
+}
+
+/// A wait set. Bindings hold no references: a destroyed object's binding is pruned.
+pub struct PortObj {
+    bindings: Vec<Binding>,
+    /// Where the next poll starts, so ready bindings are reported in turn.
+    next: usize,
+}
+
 /// Every kernel object kind so far; later milestones add variants.
 pub enum KObj {
     Channel(Channel),
@@ -61,6 +85,8 @@ pub enum KObj {
     Vmo(u64),
     Process(ProcessObj),
     Thread(ThreadObj),
+    Socket(SocketEnd),
+    Port(PortObj),
 }
 
 impl Object for KObj {
@@ -75,6 +101,7 @@ impl Object for KObj {
     fn peer(&self) -> Option<ObjId> {
         match self {
             KObj::Channel(c) => c.peer,
+            KObj::Socket(s) => s.peer,
             _ => None,
         }
     }
@@ -83,10 +110,25 @@ impl Object for KObj {
         matches!(self, KObj::Vmo(_) | KObj::Process(_))
     }
 
+    fn meter(&self) -> usize {
+        match self {
+            KObj::Channel(c) => c.queued_bytes(),
+            KObj::Socket(s) => s.buf.len(),
+            _ => 0,
+        }
+    }
+
     fn peer_destroyed(&mut self) {
-        if let KObj::Channel(c) = self {
-            c.peer = None;
-            c.peer_closed = true;
+        match self {
+            KObj::Channel(c) => {
+                c.peer = None;
+                c.peer_closed = true;
+            }
+            KObj::Socket(s) => {
+                s.peer = None;
+                s.peer_closed = true;
+            }
+            _ => {}
         }
     }
 }
@@ -214,6 +256,10 @@ pub fn channel_write(
         }
         _ => return Err(Status::PeerClosed),
     }
+    // The system-wide budget for queued data (a user must not be able to exhaust kernel memory).
+    if reg.meter() + data.len() > MAX_IPC_BYTES {
+        return Err(Status::NoMemory);
+    }
     // Allocate before committing, so running out of memory changes nothing.
     let mut bytes: Vec<u8> = Vec::new();
     bytes
@@ -230,11 +276,13 @@ pub fn channel_write(
             .iter()
             .map(|&h| table.remove_for_transfer(h).expect("validated")),
     );
+    let n = bytes.len();
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
         p.queue.push_back(Message {
             data: bytes,
             handles: entries,
         });
+        reg.meter_add(n);
     }
     Ok(())
 }
@@ -274,6 +322,7 @@ fn read_at(
         unreachable!()
     };
     let msg = c.queue.remove(i).expect("picked");
+    reg.meter_sub(msg.data.len());
     let handles = msg
         .handles
         .iter()
@@ -406,11 +455,28 @@ pub fn event_signal(
 /// The signal word of the object a handle names.
 pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, Status> {
     let entry = table.get(h)?;
-    match reg.get(entry.obj).ok_or(Status::BadHandle)? {
-        KObj::Event(e) => Ok(e.signals),
-        KObj::Vmo(_) => Ok(0),
-        KObj::Process(p) => Ok(if p.terminated { signals::TERMINATED } else { 0 }),
-        KObj::Thread(t) => Ok(if t.terminated { signals::TERMINATED } else { 0 }),
+    object_signals(reg, entry.obj).ok_or(Status::BadHandle)
+}
+
+/// The signal word of a live object (None if it is gone).
+fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
+    Some(match reg.get(obj)? {
+        KObj::Event(e) => e.signals,
+        KObj::Vmo(_) => 0,
+        KObj::Process(p) => {
+            if p.terminated {
+                signals::TERMINATED
+            } else {
+                0
+            }
+        }
+        KObj::Thread(t) => {
+            if t.terminated {
+                signals::TERMINATED
+            } else {
+                0
+            }
+        }
         KObj::Channel(c) => {
             let mut s = 0;
             if !c.queue.is_empty() {
@@ -423,9 +489,325 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
                     s |= signals::WRITABLE;
                 }
             }
-            Ok(s)
+            s
+        }
+        KObj::Socket(e) => {
+            let mut s = 0;
+            if !e.buf.is_empty() {
+                s |= signals::READABLE;
+            }
+            if e.peer_closed {
+                s |= signals::PEER_CLOSED;
+            } else if let Some(KObj::Socket(p)) = e.peer.and_then(|p| reg.get(p)) {
+                if p.buf.len() < SOCKET_BUFFER {
+                    s |= signals::WRITABLE;
+                }
+            }
+            s
+        }
+        KObj::Port(p) => {
+            if p.bindings.iter().any(|b| binding_ready(reg, b)) {
+                signals::READABLE
+            } else {
+                0
+            }
+        }
+    })
+}
+
+/// Is the binding's object alive with a watched signal asserted? (Ports cannot be bound,
+/// so this never recurses.)
+fn binding_ready(reg: &Kobjs, b: &Binding) -> bool {
+    matches!(object_signals(reg, b.obj), Some(s) if s & b.mask != 0)
+}
+
+// --- sockets ---
+
+fn socket_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<ObjId, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Socket(_)) => {}
+        Some(_) => return Err(Status::WrongType),
+        None => return Err(Status::BadHandle),
+    }
+    if !entry.rights.contains(need) {
+        return Err(Status::AccessDenied);
+    }
+    Ok(entry.obj)
+}
+
+/// A connected pair of socket endpoints with the default socket rights.
+pub fn socket_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<(Handle, Handle), Status> {
+    if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let end = || SocketEnd {
+        peer: None,
+        buf: VecDeque::new(),
+        peer_closed: false,
+    };
+    let a = reg.create(KObj::Socket(end()));
+    let b = reg.create(KObj::Socket(end()));
+    for (me, other) in [(a, b), (b, a)] {
+        if let Some(KObj::Socket(s)) = reg.get_mut(me) {
+            s.peer = Some(other);
         }
     }
+    let ha = table.insert(a, Rights::SOCKET).expect("room was checked");
+    let hb = table.insert(b, Rights::SOCKET).expect("room was checked");
+    Ok((ha, hb))
+}
+
+/// The checks of `socket_write` that come before the source memory is touched: handle, type,
+/// rights, size.
+pub fn socket_write_check(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    len: usize,
+) -> Result<(), Status> {
+    socket_of(reg, table, h, Rights::WRITE)?;
+    if len > SOCKET_BUFFER {
+        return Err(Status::TooBig);
+    }
+    Ok(())
+}
+
+/// Append as much of `data` as fits to the peer's buffer; returns how many bytes that was.
+pub fn socket_write(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    data: &[u8],
+) -> Result<usize, Status> {
+    let me = socket_of(reg, table, h, Rights::WRITE)?;
+    if data.len() > SOCKET_BUFFER {
+        return Err(Status::TooBig);
+    }
+    let meter = reg.meter();
+    let peer = match reg.get(me) {
+        Some(KObj::Socket(s)) if !s.peer_closed => s.peer,
+        _ => None,
+    }
+    .ok_or(Status::PeerClosed)?;
+    let Some(KObj::Socket(p)) = reg.get_mut(peer) else {
+        return Err(Status::PeerClosed);
+    };
+    let end_room = SOCKET_BUFFER - p.buf.len();
+    if data.is_empty() {
+        return Ok(0);
+    }
+    if end_room == 0 {
+        return Err(Status::ShouldWait);
+    }
+    // Both limits apply: this end's buffer and the system-wide budget (NO_MEMORY, not
+    // SHOULD_WAIT: other sockets' readers will not make room for this one).
+    let global_room = MAX_IPC_BYTES.saturating_sub(meter);
+    if global_room == 0 {
+        return Err(Status::NoMemory);
+    }
+    let n = end_room.min(global_room).min(data.len());
+    p.buf.try_reserve(n).map_err(|_| Status::NoMemory)?;
+    p.buf.extend(&data[..n]);
+    reg.meter_add(n);
+    Ok(n)
+}
+
+/// How many bytes `socket_read` would return for `max` (so the caller can check the
+/// destination before anything is removed), or the error a read would give.
+pub fn socket_peek(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    max: usize,
+) -> Result<usize, Status> {
+    let me = socket_of(reg, table, h, Rights::READ)?;
+    if max > SOCKET_BUFFER {
+        return Err(Status::TooBig);
+    }
+    let Some(KObj::Socket(s)) = reg.get(me) else {
+        return Err(Status::BadHandle);
+    };
+    if max == 0 {
+        return Ok(0);
+    }
+    if s.buf.is_empty() {
+        return Err(if s.peer_closed {
+            Status::PeerClosed
+        } else {
+            Status::ShouldWait
+        });
+    }
+    Ok(max.min(s.buf.len()))
+}
+
+/// Remove and return up to `max` bytes (see [`socket_peek`]).
+pub fn socket_read(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    max: usize,
+) -> Result<Vec<u8>, Status> {
+    let n = socket_peek(reg, table, h, max)?;
+    let me = socket_of(reg, table, h, Rights::READ)?;
+    let Some(KObj::Socket(s)) = reg.get_mut(me) else {
+        return Err(Status::BadHandle);
+    };
+    let out: Vec<u8> = s.buf.drain(..n).collect();
+    if s.buf.is_empty() {
+        // give the memory back: an idle socket holds nothing
+        s.buf = VecDeque::new();
+    }
+    reg.meter_sub(n);
+    Ok(out)
+}
+
+// --- ports ---
+
+fn port_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<ObjId, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Port(_)) => {}
+        Some(_) => return Err(Status::WrongType),
+        None => return Err(Status::BadHandle),
+    }
+    if !entry.rights.contains(need) {
+        return Err(Status::AccessDenied);
+    }
+    Ok(entry.obj)
+}
+
+pub fn port_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let obj = reg.create(KObj::Port(PortObj {
+        bindings: Vec::new(),
+        next: 0,
+    }));
+    Ok(table.insert(obj, Rights::PORT).expect("room was checked"))
+}
+
+/// Drop the bindings whose object has been destroyed (the spec says they disappear at once,
+/// so every operation that looks at the binding set prunes first).
+fn prune_port(reg: &mut Kobjs, port_obj: ObjId) {
+    let dead: Vec<u64> = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => p
+            .bindings
+            .iter()
+            .filter(|b| !reg.is_alive(b.obj))
+            .map(|b| b.key)
+            .collect(),
+        _ => return,
+    };
+    if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
+        for k in dead {
+            if let Some(at) = p.bindings.iter().position(|b| b.key == k) {
+                p.bindings.remove(at);
+                if p.next > at {
+                    p.next -= 1;
+                }
+            }
+        }
+    }
+}
+
+pub fn port_bind(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    object: Handle,
+    mask: u64,
+    key: u64,
+) -> Result<(), Status> {
+    let pe = table.get(port)?;
+    let oe = table.get(object)?;
+    let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
+    match reg.get(oe.obj) {
+        Some(_) => {}
+        None => return Err(Status::BadHandle),
+    }
+    if !oe.rights.contains(Rights::WAIT) {
+        return Err(Status::AccessDenied);
+    }
+    let _ = pe;
+    if mask == 0
+        || mask > u64::from(u32::MAX)
+        || (mask as u32) & !signals::WAITABLE != 0
+        || matches!(reg.get(oe.obj), Some(KObj::Port(_)))
+    {
+        return Err(Status::InvalidArgs);
+    }
+    let mask = mask as u32;
+    prune_port(reg, port_obj);
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    if p.bindings.iter().any(|b| b.key == key) {
+        return Err(Status::InvalidArgs);
+    }
+    if p.bindings.len() >= MAX_PORT_BINDINGS {
+        return Err(Status::NoMemory);
+    }
+    p.bindings.push(Binding {
+        obj: oe.obj,
+        mask,
+        key,
+    });
+    Ok(())
+}
+
+pub fn port_unbind(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    key: u64,
+) -> Result<(), Status> {
+    let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
+    prune_port(reg, port_obj);
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    let at = p
+        .bindings
+        .iter()
+        .position(|b| b.key == key)
+        .ok_or(Status::InvalidArgs)?;
+    p.bindings.remove(at);
+    if p.next > at {
+        p.next -= 1;
+    }
+    Ok(())
+}
+
+/// One ready binding as `(key, observed)`, rotating, after pruning bindings whose object is
+/// gone; `None` if nothing is ready. Needs WAIT on the port.
+pub fn port_poll(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+) -> Result<Option<(u64, u32)>, Status> {
+    let port_obj = port_of(reg, table, port, Rights::WAIT)?;
+    prune_port(reg, port_obj);
+    let picked = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => {
+            let n = p.bindings.len();
+            (0..n)
+                .map(|i| (p.next + i) % n)
+                .find(|&i| binding_ready(reg, &p.bindings[i]))
+                .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj))
+        }
+        _ => return Err(Status::BadHandle),
+    };
+    let observed =
+        picked.and_then(|(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask)));
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    if let Some((i, ..)) = picked {
+        p.next = i + 1;
+    }
+    Ok(observed)
 }
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).

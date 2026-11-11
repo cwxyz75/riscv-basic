@@ -225,6 +225,40 @@ pub mod sys {
             ],
         )
     }
+    pub fn socket_create() -> Ret {
+        syscall(SOCKET_CREATE, [0; 6])
+    }
+    pub fn socket_write(socket: u32, bytes: *const u8, len: usize) -> Ret {
+        syscall(
+            SOCKET_WRITE,
+            [socket as usize, bytes as usize, len, 0, 0, 0],
+        )
+    }
+    pub fn socket_read(socket: u32, buf: *mut u8, max: usize) -> Ret {
+        syscall(SOCKET_READ, [socket as usize, buf as usize, max, 0, 0, 0])
+    }
+    pub fn port_create() -> Ret {
+        syscall(PORT_CREATE, [0; 6])
+    }
+    pub fn port_bind(port: u32, object: u32, mask: u32, key: u64) -> Ret {
+        syscall(
+            PORT_BIND,
+            [
+                port as usize,
+                object as usize,
+                mask as usize,
+                key as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    pub fn port_unbind(port: u32, key: u64) -> Ret {
+        syscall(PORT_UNBIND, [port as usize, key as usize, 0, 0, 0, 0])
+    }
+    pub fn port_wait(port: u32, deadline: u64) -> Ret {
+        syscall(PORT_WAIT, [port as usize, deadline as usize, 0, 0, 0, 0])
+    }
     pub fn thread_create(process: u32, entry: u64, sp: u64, arg: u64) -> Ret {
         syscall(
             THREAD_CREATE,

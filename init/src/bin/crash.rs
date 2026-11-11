@@ -157,6 +157,44 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
+        26 => {
+            // take a socket end from the bootstrap channel and drain it to the end of the
+            // stream; the exit code is how many bytes arrived
+            use rt::abi::status::Status;
+            let mut hbuf = [0u32; 1];
+            let mut mbuf = [0u8; 8];
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
+            let r =
+                rt::sys::channel_read(rt::BOOTSTRAP, mbuf.as_mut_ptr(), 8, hbuf.as_mut_ptr(), 1);
+            if r.status != 0 || r.a2 != 1 {
+                return 100;
+            }
+            let h = hbuf[0];
+            let mut total = 0usize;
+            let mut buf = [0u8; 64];
+            loop {
+                let r = rt::sys::socket_read(h, buf.as_mut_ptr(), 64);
+                match r.status() {
+                    Some(Status::Ok) => total += r.a1,
+                    Some(Status::PeerClosed) => break,
+                    Some(Status::ShouldWait) => {
+                        rt::sys::object_wait(
+                            h,
+                            rt::abi::signals::READABLE | rt::abi::signals::PEER_CLOSED,
+                            u64::MAX,
+                        );
+                    }
+                    _ => return 101,
+                }
+            }
+            return total as i32;
+        }
+        27 => {
+            // wait on a port with nothing bound, forever (only a kill ends this)
+            let port = rt::sys::port_create().a1 as u32;
+            rt::sys::port_wait(port, u64::MAX);
+            return 9;
+        }
         22 => {
             // threads created but perhaps not yet run when the whole process exits
             for _ in 0..3 {

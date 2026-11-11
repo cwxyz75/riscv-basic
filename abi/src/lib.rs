@@ -114,6 +114,11 @@ pub mod rights {
         pub const PROCESS: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
+        pub const SOCKET: Rights = Rights(
+            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::READ.0 | Self::WRITE.0 | Self::WAIT.0,
+        );
+        pub const PORT: Rights =
+            Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::WAIT.0);
         pub const THREAD: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
@@ -150,6 +155,8 @@ pub mod signals {
     pub const TERMINATED: u32 = 1 << 3;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
+    /// Every signal a wait or a port binding may name.
+    pub const WAITABLE: u32 = READABLE | WRITABLE | PEER_CLOSED | TERMINATED | USER_MASK;
 }
 
 /// The handle value of the bootstrap channel every process starts with.
@@ -178,6 +185,13 @@ pub mod limits {
     /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
     /// 8 MiB kernel heap; a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
     pub const MAX_USER_THREADS: usize = 128;
+    /// Bytes buffered in all channels and sockets together (another stand-in for per-job
+    /// quotas, Q9): a write that would exceed it fails with NO_MEMORY.
+    pub const MAX_IPC_BYTES: usize = 2 * 1024 * 1024;
+    /// Bytes buffered per socket endpoint.
+    pub const SOCKET_BUFFER: usize = 65536;
+    /// Bindings in one port.
+    pub const MAX_PORT_BINDINGS: usize = 256;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
@@ -212,6 +226,13 @@ pub mod syscall {
     pub const THREAD_CREATE: usize = 60;
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
+    pub const SOCKET_CREATE: usize = 70;
+    pub const SOCKET_WRITE: usize = 71;
+    pub const SOCKET_READ: usize = 72;
+    pub const PORT_CREATE: usize = 80;
+    pub const PORT_BIND: usize = 81;
+    pub const PORT_UNBIND: usize = 82;
+    pub const PORT_WAIT: usize = 83;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").

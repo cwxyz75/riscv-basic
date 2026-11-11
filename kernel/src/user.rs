@@ -483,7 +483,9 @@ fn leave(code: i32, whole: bool) -> ! {
         Some((pid, true, _)) => {
             teardown(pid);
         }
-        _ => {}
+        // the last thread of a kernel-started process: `finish` tears it down, but waiters
+        // on this thread must not have to wait for that poll
+        _ => notify(),
     }
     thread::exit()
 }
@@ -599,6 +601,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::THREAD_EXIT => leave(a[0] as i32, false),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
+        nr::PORT_WAIT => reply(frame, port_wait(a)),
         nr::PROCESS_CREATE
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
@@ -633,6 +636,13 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
                     // creating objects can sweep garbage, which closes peers
                     | nr::CHANNEL_CREATE
                     | nr::EVENT_CREATE
+                    | nr::SOCKET_CREATE
+                    | nr::PORT_CREATE
+                    // data moved, space freed, or a binding that is ready at once
+                    | nr::SOCKET_WRITE
+                    | nr::SOCKET_READ
+                    | nr::PORT_BIND
+                    | nr::PORT_UNBIND
             ) {
                 notify();
             }
@@ -666,7 +676,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     };
     let k = kmem::get();
     // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
-    if matches!(n, nr::CHANNEL_CREATE | nr::EVENT_CREATE) && s.objs.needs_sweep() {
+    if matches!(
+        n,
+        nr::CHANNEL_CREATE | nr::EVENT_CREATE | nr::SOCKET_CREATE | nr::PORT_CREATE
+    ) && s.objs.needs_sweep()
+    {
         let roots = s.roots();
         s.objs.sweep(&roots);
     }
@@ -689,6 +703,8 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
+        nr::SOCKET_WRITE | nr::SOCKET_READ | nr::PORT_UNBIND if over(0) => Some(Status::BadHandle),
+        nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
         nr::EVENT_SIGNAL if over(0) => Some(Status::BadHandle),
@@ -733,6 +749,41 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let (x, y) = ipc::channel_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
         }
+        nr::SOCKET_CREATE => {
+            let (x, y) = ipc::socket_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
+        }
+        nr::SOCKET_WRITE => {
+            let len = a[2] as usize;
+            ipc::socket_write_check(objs, &p.handles, h(0), len).map_err(|e| (e, None, None))?;
+            let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], len)
+                .map_err(|e| (e, None, None))?;
+            ipc::socket_write(objs, &p.handles, h(0), &data)
+                .map(|n| (Some(n as u64), None))
+                .map_err(|e| (e, None, None))
+        }
+        nr::SOCKET_READ => {
+            let max = a[2] as usize;
+            // What a read would deliver, checked against the destination before anything is
+            // removed, so a bad pointer never loses data.
+            let n = ipc::socket_peek(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
+            verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], n)
+                .map_err(|e| (e, None, None))?;
+            let data =
+                ipc::socket_read(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
+            let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], &data);
+            Ok((Some(data.len() as u64), None))
+        }
+        nr::PORT_CREATE => {
+            let port = ipc::port_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            Ok((Some(u64::from(port.0)), None))
+        }
+        nr::PORT_BIND => ipc::port_bind(objs, &p.handles, h(0), h(1), a[2], a[3])
+            .map(|_| (None, None))
+            .map_err(|e| (e, None, None)),
+        nr::PORT_UNBIND => ipc::port_unbind(objs, &p.handles, h(0), a[1])
+            .map(|_| (None, None))
+            .map_err(|e| (e, None, None)),
         nr::EVENT_CREATE => {
             let e = ipc::event_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(e.0)), None))
@@ -1034,11 +1085,7 @@ fn signals_now(h: Handle) -> Result<u32, Status> {
     ipc::signals_of(&s.objs, &p.handles, h)
 }
 
-const WAITABLE_SIGNALS: u32 = abi::signals::READABLE
-    | abi::signals::WRITABLE
-    | abi::signals::PEER_CLOSED
-    | abi::signals::TERMINATED
-    | abi::signals::USER_MASK;
+const WAITABLE_SIGNALS: u32 = abi::signals::WAITABLE;
 
 fn object_wait(a: [u64; 6]) -> Reply {
     if a[0] > u64::from(u32::MAX) {
@@ -1072,6 +1119,45 @@ fn object_wait(a: [u64; 6]) -> Reply {
         Ok((Some(u64::from(seen)), None))
     } else {
         Err((Status::TimedOut, Some(u64::from(seen)), None))
+    }
+}
+
+/// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
+/// then report one in turn.
+fn port_wait(a: [u64; 6]) -> Reply {
+    if a[0] > u64::from(u32::MAX) {
+        return fail(Status::BadHandle);
+    }
+    let (h, deadline) = (Handle(a[0] as u32), a[1]);
+    let poll = || {
+        with_proc(|objs, p, _| ipc::port_poll(objs, &p.handles, h))
+            .map_err(|e| (e, None, None))?
+            .map_err(|e| (e, None, None))
+    };
+    // Poll, and while nothing is ready and the deadline has not passed, sleep until the port
+    // is READABLE and poll again (the readiness seen by the sleep check can be gone by the time
+    // we poll, so one wait is not enough).
+    let mut got = poll()?;
+    while got.is_none()
+        && deadline != 0
+        && thread::ticks() < deadline
+        && irq::without(killed_now).is_none()
+    {
+        let q = irq::without(|| state().signal_queue);
+        // Ready, killed, or the handle stopped naming a port (the poll then says so).
+        thread::wait_deadline(
+            q,
+            || {
+                killed_now().is_some()
+                    || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
+            },
+            deadline,
+        );
+        got = poll()?;
+    }
+    match got {
+        Some((key, observed)) => Ok((Some(key), Some(u64::from(observed)))),
+        None => fail(Status::TimedOut),
     }
 }
 
