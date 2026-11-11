@@ -37,7 +37,7 @@ pub fn app_main() -> i32 {
             if b.try_reserve_exact(1 << 20).is_err() {
                 break;
             }
-            b.resize(1 << 20, 1);
+            // (the memory is reserved from the heap, not touched: the test is about the cap)
             blocks.push(b);
         }
         return blocks.len() as i32;

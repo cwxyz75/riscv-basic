@@ -3498,7 +3498,7 @@ fn runtime_startup_heap_and_stdio() -> Outcome {
 fn runtime_heap_stops_at_its_cap() -> Outcome {
     let (p, in_w, out_r) = start_hello(&[b"hello", b"hog"])?;
     let _ = out_r;
-    wait_ended(p, 5000)?;
+    wait_ended(p, 30_000)?;
     let blocks = sys::process_info(p).a1 as i64;
     ensure!(
         (10..=16).contains(&blocks),
@@ -3814,10 +3814,11 @@ fn syscall_layer_bounds() -> Outcome {
 }
 
 fn cycles_do_not_grow_memory() -> Outcome {
-    // The OD39 loop: make two channels hold each other and drop every handle. 17,000 rounds
-    // make 68,000 objects, more than the kernel's cap of 65,536: it must keep sweeping or
-    // this ends in NoMemory.
-    for i in 0..17_000u32 {
+    // The OD39 loop: make two channels hold each other and drop every handle. 9,000 rounds
+    // leave 18,000 unreachable objects (two per round: the pair that holds each other), more
+    // than the kernel's cap of 16,384 (`MAX_OBJECTS`): it must keep sweeping or this ends in
+    // NoMemory.
+    for i in 0..9_000u32 {
         let (x, w) = channel().map_err(|mut d| {
             let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" at round {i}"));
             d

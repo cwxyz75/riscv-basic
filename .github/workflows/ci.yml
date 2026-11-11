@@ -1,6 +1,11 @@
 name: ci
 
-on: [push, pull_request]
+# Pull requests run the suite once; pushes only matter on main (a branch push with an open PR would
+# run exactly the same jobs a second time).
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   host:
