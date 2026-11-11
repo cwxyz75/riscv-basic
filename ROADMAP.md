@@ -198,7 +198,7 @@ every `to` definition is compiled before it runs.
 
 Spec: `OS-ARCHITECTURE.md` (design in sections 2-16, decisions in 17, open
 questions in 18). A separate kernel binary and new crates; the home computer above
-is untouched. **S0 and S1 are built; S2 onwards is not.** Each milestone ends in a demo and has a
+is untouched. **S0, S1 and S2 are built; S3 onwards is not.** Each milestone ends in a demo and has a
 runnable acceptance check, written before the code. Tick a box only when verified in
 QEMU (for SMP work, in both normal and icount modes). Crate names are fixed by S0:
 `abi`, `kcore`, `os-kernel`; more arrive with their milestones.
@@ -238,9 +238,22 @@ S2 adds a lock, and `FrameDb` refcount overflow is untested.
 Acceptance: a high-priority thread stays within a latency bound while CPU hogs run;
 the scheduler conformance suite passes.
 
-- [ ] Thread object, per-thread kernel stacks, context switch
-- [ ] Timer preemption and the single block/wake path
-- [ ] Fixed-priority scheduler with a real-time band, as a boot-selected class; conformance suite
+- [x] Thread object, per-thread kernel stacks, context switch (`os-kernel/src/thread.rs`; 32 KiB heap stacks with canaries; voluntary and trap-time switches; per-thread `sstatus` in the trap frame)
+- [x] Timer preemption and the single block/wake path (1 ms SBI tick; `Sched::block_current`/`wake`/`sleep_until` with a wake token; wait queues; no-lost-wakeup tests on host and QEMU)
+- [x] Fixed-priority scheduler with a real-time band, as a boot-selected class; conformance suite (`kcore::sched`: `FixedPriority` and `RoundRobin` run through one random model test against an independent reference model, plus hand-derived scenarios; class chosen by Cargo feature, OD32; both classes boot in QEMU. Not done: the starvation watchdog that falls back to the default policy; priority donation (hook only))
+
+Independent review (fresh-context agent, before merge) found, and I fixed: time-slice
+starvation within a level (a preempted thread got a fresh slice every time, so a
+periodic higher-priority thread could starve its peer; slices are now per thread and a
+preempted thread keeps what it had left; the random model shared the flaw, so a
+hand-derived scenario now catches it), `join` hanging on self, unknown or already
+joined threads (now returns false), stale wait-queue entries swallowing wakeups,
+a leak check blind to the scheduler core's records, a single-word stack canary (now an
+8-word guard checked on both sides of a switch, with a test that the detector fires),
+and a round-robin run that could not prove the feature took effect (a structured
+`scheduler_class_is_*` line is required). Documented rather than fixed: a wake token is
+discarded by `sleep_until` (stated in the API docs), the atomics grep gate (INVARIANTS
+C5) is still TODO, and wall-clock jitter bounds were widened.
 
 ### S3: User mode, syscalls, handles, channels, VMOs
 

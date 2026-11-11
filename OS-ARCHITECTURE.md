@@ -701,6 +701,9 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD29 | S1 kernel heap is a fixed `.bss` region under the `linked_list_allocator` crate (as the home computer's kernel); user-visible memory comes from the refcounted frame database, not from it. A slab over frames can replace it later | Decided |
 | OD30 | S1 kernel layout: linked in the Sv39 upper half at `0xffff_ffff_8020_0000`, loaded at `0x8020_0000`; a throwaway 1 GiB-leaf boot table in `_start` enables paging, then `kmem::init` builds the real table with the pure `kcore` code (4 KiB leaves, W^X per section) and drops the boot table. The direct map (`0xffff_ffc0_0000_0000 + pa`) covers only frame-database RAM and the device pages in use, never the kernel image | Decided |
 | OD31 | RAM size is assumed to be 128 MiB (`abi::layout::RAM_SIZE`; the boot test passes `-m 128M`) until the device manager parses the device tree (S6) | Decided (limitation) |
+| OD32 | Scheduling classes are chosen at build time by a Cargo feature (`sched-round-robin`; default fixed-priority), which satisfies "selected at boot" until there is a command line to read; the class interface lives in `kcore::sched::SchedClass`, the core keeps all mechanism and validates the policy's choices | Decided |
+| OD33 | Priorities 0 (idle), 1-31 (normal), 32-63 (real-time); a tick is 1 ms (SBI timer) and a time slice is 10 ticks; a thread preempted by a better one returns to the front of its level, one whose slice ends goes to the back | Decided |
+| OD34 | The single block/wake path is `Sched::block_current`/`wake` with a one-shot wake token (a wake that races ahead of the block is not lost; wakes do not queue); sleeping is a timer plus that path; wait queues are built on it. S2 kernel threads have heap-allocated 32 KiB stacks with a canary checked at every switch; the kernel heap is interrupt-safe because the tick allocates | Decided |
 
 ---
 

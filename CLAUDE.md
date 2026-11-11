@@ -8,7 +8,7 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
   human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it, plus the S-series in
-  `ROADMAP.md`, before working on it. S0 (foundation) and S1 (memory) are done; S2 (threads and scheduling) is next.
+  `ROADMAP.md`, before working on it. S0 (foundation), S1 (memory) and S2 (threads and scheduling) are done; S3 (user mode, syscalls, handles) is next.
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").

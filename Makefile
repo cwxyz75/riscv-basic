@@ -77,12 +77,14 @@ boot-test: kernel
 # --- OS track (S-series; see OS-ARCHITECTURE.md) ---
 OS_ELF      := target/$(KERNEL_TARGET)/debug/os-kernel
 OS_FAIL_ELF := target/os-fail/$(KERNEL_TARGET)/debug/os-kernel
+OS_RR_ELF   := target/os-rr/$(KERNEL_TARGET)/debug/os-kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
 os-kernel:
 	cd os-kernel && cargo build
 	cd os-kernel && cargo build --features fail-demo --target-dir ../target/os-fail
+	cd os-kernel && cargo build --features sched-round-robin --target-dir ../target/os-rr
 
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
@@ -103,6 +105,6 @@ os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
 
 os-boot-test: os-kernel
-	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF)
+	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
 
 check: fmt-check test lint boot-test os-test os-boot-test

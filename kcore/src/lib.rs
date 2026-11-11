@@ -12,6 +12,7 @@ pub mod aspace;
 pub mod frame;
 pub mod latch;
 pub mod pagetable;
+pub mod sched;
 pub mod sync;
 pub mod testlog;
 

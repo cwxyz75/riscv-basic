@@ -13,8 +13,12 @@ mod boot;
 mod console;
 mod finisher;
 mod heap;
+mod irq;
 mod kmem;
+mod sched_tests;
 mod selftest;
+mod thread;
+mod timer;
 mod trap;
 
 use core::fmt::Write;
@@ -44,7 +48,7 @@ impl Tally {
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     let mut out = console::Console;
-    let _ = testlog::boot(&mut out, "os-kernel", "s1");
+    let _ = testlog::boot(&mut out, "os-kernel", "s2");
     let _ = writeln!(
         out,
         "hello from the OS track, hart {hart_id}, paging via the early table"
@@ -79,6 +83,24 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     );
 
     for (name, test) in selftest::TESTS {
+        match test() {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(&detail)),
+        }
+    }
+    // S2: threads, the timer and the scheduler. The boot thread becomes a real-time
+    // thread and interrupts come on.
+    thread::init(sched_tests::MAIN_PRIO);
+    timer::start();
+    irq::enable_timer_interrupt();
+    irq::enable();
+    let class = thread::class_name();
+    let _ = writeln!(out, "scheduler class: {class}");
+    tally.record(
+        &alloc::format!("scheduler_class_is_{}", class.replace('-', "_")),
+        Ok(()),
+    );
+    for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
