@@ -22,6 +22,19 @@ pub struct Message {
     pub handles: Vec<Entry>,
 }
 
+/// Kernel memory a queued message costs beyond its bytes (the queue node and the `Message`).
+const MSG_OVERHEAD: usize = 64;
+/// What one port binding costs.
+const BINDING_COST: usize = 32;
+
+impl Message {
+    /// What this message counts against the IPC budget: bytes, a fixed overhead, and its
+    /// handle entries (they are kernel memory too: found by the trust-boundary audit).
+    fn cost(&self) -> usize {
+        self.data.len() + MSG_OVERHEAD + self.handles.len() * core::mem::size_of::<Entry>()
+    }
+}
+
 impl Channel {
     fn queued_bytes(&self) -> usize {
         self.queue.iter().map(|m| m.data.len()).sum()
@@ -112,8 +125,9 @@ impl Object for KObj {
 
     fn meter(&self) -> usize {
         match self {
-            KObj::Channel(c) => c.queued_bytes(),
+            KObj::Channel(c) => c.queue.iter().map(Message::cost).sum(),
             KObj::Socket(s) => s.buf.len(),
+            KObj::Port(p) => p.bindings.len() * BINDING_COST,
             _ => 0,
         }
     }
@@ -257,8 +271,13 @@ pub fn channel_write(
         _ => return Err(Status::PeerClosed),
     }
     // The system-wide budget for queued data (a user must not be able to exhaust kernel memory).
-    if reg.meter() + data.len() > MAX_IPC_BYTES {
+    let cost = data.len() + MSG_OVERHEAD + handles.len() * core::mem::size_of::<Entry>();
+    if reg.meter() + cost > MAX_IPC_BYTES {
         return Err(Status::NoMemory);
+    }
+    match reg.get_mut(peer) {
+        Some(KObj::Channel(p)) => p.queue.try_reserve(1).map_err(|_| Status::NoMemory)?,
+        _ => return Err(Status::PeerClosed),
     }
     // Allocate before committing, so running out of memory changes nothing.
     let mut bytes: Vec<u8> = Vec::new();
@@ -276,13 +295,12 @@ pub fn channel_write(
             .iter()
             .map(|&h| table.remove_for_transfer(h).expect("validated")),
     );
-    let n = bytes.len();
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
         p.queue.push_back(Message {
             data: bytes,
             handles: entries,
         });
-        reg.meter_add(n);
+        reg.meter_add(cost);
     }
     Ok(())
 }
@@ -322,7 +340,7 @@ fn read_at(
         unreachable!()
     };
     let msg = c.queue.remove(i).expect("picked");
-    reg.meter_sub(msg.data.len());
+    reg.meter_sub(msg.cost());
     let handles = msg
         .handles
         .iter()
@@ -700,16 +718,19 @@ fn prune_port(reg: &mut Kobjs, port_obj: ObjId) {
             .collect(),
         _ => return,
     };
+    let mut removed = 0;
     if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
         for k in dead {
             if let Some(at) = p.bindings.iter().position(|b| b.key == k) {
                 p.bindings.remove(at);
+                removed += 1;
                 if p.next > at {
                     p.next -= 1;
                 }
             }
         }
     }
+    reg.meter_sub(removed * BINDING_COST);
 }
 
 pub fn port_bind(
@@ -749,11 +770,13 @@ pub fn port_bind(
     if p.bindings.len() >= MAX_PORT_BINDINGS {
         return Err(Status::NoMemory);
     }
+    p.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
     p.bindings.push(Binding {
         obj: oe.obj,
         mask,
         key,
     });
+    reg.meter_add(BINDING_COST);
     Ok(())
 }
 
@@ -777,6 +800,7 @@ pub fn port_unbind(
     if p.next > at {
         p.next -= 1;
     }
+    reg.meter_sub(BINDING_COST);
     Ok(())
 }
 

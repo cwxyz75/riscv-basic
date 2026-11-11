@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-aia test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-aia os-boot-test-rva23 test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -119,4 +119,8 @@ os-boot-test: kernel
 os-boot-test-aia: kernel
 	OS_MACHINE=virt,aia=aplic-imsic python3 scripts/os_boot_test.py $(OS_ELF)
 
-check: fmt-check test lint home-boot-test os-test os-boot-test os-boot-test-aia
+# The reference CPU of the OS track (OD47).
+os-boot-test-rva23: kernel
+	OS_CPU=rva23s64 python3 scripts/os_boot_test.py $(OS_ELF)
+
+check: fmt-check test lint home-boot-test os-test os-boot-test os-boot-test-aia os-boot-test-rva23

@@ -53,6 +53,8 @@ pub enum RegionError {
     /// The pages asked for are not all inside the VMO.
     OutsideVmo,
     NoRegion,
+    /// The address space already has `MAX_REGIONS` regions.
+    TooMany,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +284,9 @@ impl AddressSpace {
         if vmo_page.checked_add(pages).is_none_or(|e| e > total) {
             return Err(RegionError::OutsideVmo);
         }
+        if self.regions.len() >= abi::limits::MAX_REGIONS {
+            return Err(RegionError::TooMany);
+        }
         // Overlap with the previous region or any region starting inside this one.
         if let Some((&s, r)) = self.regions.range(..=start).next_back() {
             if s + r.pages * PAGE_SIZE > start {
@@ -301,6 +306,11 @@ impl AddressSpace {
             },
         );
         Ok(())
+    }
+
+    /// Add the ids of every VMO this address space maps to `out`.
+    pub fn collect_vmos(&self, out: &mut alloc::collections::BTreeSet<u64>) {
+        out.extend(self.regions.values().map(|r| r.vmo));
     }
 
     /// Does any region of this address space map VMO `vmo`?

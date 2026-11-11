@@ -327,14 +327,14 @@ fn deeply_nested_channels_release_without_recursion() {
     let (mut reg, mut t) = world();
     let (mut outer_a, outer_b) = channel_create(&mut reg, &mut t).unwrap();
     let first_b = outer_b;
-    for _ in 0..20_000 {
+    for _ in 0..8_000 {
         let (a, b) = channel_create(&mut reg, &mut t).unwrap();
         // put end b of the new pair into the current outer channel's queue
         channel_write(&mut reg, &mut t, outer_a, b"nest", &[b]).unwrap();
         t.close(&mut reg, outer_a).unwrap();
         outer_a = a;
     }
-    assert!(reg.live() > 20_000);
+    assert!(reg.live() > 8_000);
     t.close(&mut reg, outer_a).unwrap();
     t.close(&mut reg, first_b).unwrap();
     assert_eq!(reg.live(), 0, "the whole chain was freed");
@@ -1296,4 +1296,32 @@ fn process_and_vmo_handles_check_type_and_rights() {
     t.drain(&mut reg);
     let _ = reg.drain_dead();
     assert_eq!(reg.live(), 0);
+}
+
+#[test]
+fn queued_handles_and_headers_count_against_the_budget() {
+    // Messages cost memory beyond their bytes (header and handle entries); the meter must
+    // see it, and give it back exactly when the message is read or its channel destroyed.
+    let (mut reg, mut t) = world();
+    let (a, b) = channel_create(&mut reg, &mut t).unwrap();
+    assert_eq!(reg.meter(), 0);
+    let e = event_create(&mut reg, &mut t).unwrap();
+    let dups: Vec<Handle> = (0..8)
+        .map(|_| {
+            let en = t.get(e).unwrap();
+            t.insert(en.obj, en.rights).unwrap()
+        })
+        .collect();
+    channel_write(&mut reg, &mut t, a, b"", &dups).unwrap();
+    let one = reg.meter();
+    assert!(one > 8 * 8, "handles are not free: {one}");
+    channel_write(&mut reg, &mut t, a, b"", &[]).unwrap();
+    assert!(reg.meter() > one, "even an empty message costs its header");
+    channel_read(&mut reg, &mut t, b, 0, 8).unwrap();
+    channel_read(&mut reg, &mut t, b, 0, 8).unwrap();
+    assert_eq!(reg.meter(), 0, "reading gives everything back");
+    channel_write(&mut reg, &mut t, a, b"xyz", &[]).unwrap();
+    t.close(&mut reg, a).unwrap();
+    t.close(&mut reg, b).unwrap();
+    assert_eq!(reg.meter(), 0, "so does destroying the channel");
 }

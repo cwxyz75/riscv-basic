@@ -175,7 +175,7 @@ pub mod limits {
     pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
     /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for
     /// per-job quotas (OS-ARCHITECTURE Q9).
-    pub const MAX_OBJECTS: usize = 65536;
+    pub const MAX_OBJECTS: usize = 16384;
     /// Pages in one VMO (64 MiB).
     pub const MAX_VMO_PAGES: u64 = 16384;
     /// Live processes at once.
@@ -190,6 +190,8 @@ pub mod limits {
     pub const MAX_IPC_BYTES: usize = 2 * 1024 * 1024;
     /// Bytes buffered per socket endpoint.
     pub const SOCKET_BUFFER: usize = 65536;
+    /// Mapped regions in one address space.
+    pub const MAX_REGIONS: usize = 1024;
     /// Bindings in one port.
     pub const MAX_PORT_BINDINGS: usize = 256;
 }
