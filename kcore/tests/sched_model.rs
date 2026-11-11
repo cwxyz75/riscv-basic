@@ -629,3 +629,44 @@ fn a_thread_is_queued_at_most_once() {
         "the stale entry must be replaced, not duplicated"
     );
 }
+
+#[test]
+fn a_wait_with_a_deadline_ends_at_the_deadline_or_at_a_wake_whichever_is_first() {
+    let mut s = Sched::new(FixedPriority::new());
+    s.adopt_current(PRIO_IDLE).unwrap();
+    let mut q = WaitQueue::new();
+    let (a, b) = (s.spawn(5).unwrap(), s.spawn(5).unwrap());
+    assert_eq!(s.current(), Some(a));
+    assert_eq!(q.wait_until(&mut s, 5), Ok(true), "a waits until tick 5");
+    assert_eq!(s.current(), Some(b));
+    assert_eq!(
+        q.wait_until(&mut s, 100),
+        Ok(true),
+        "b waits until tick 100"
+    );
+    for _ in 0..4 {
+        s.tick();
+        assert_eq!(s.state(a), Some(State::Blocked));
+    }
+    s.tick(); // tick 5
+    assert_eq!(
+        s.current(),
+        Some(a),
+        "the deadline wakes a, exactly on tick 5"
+    );
+    // a's entry in the queue is stale now; a real wake goes to b and cancels b's timer
+    assert_eq!(
+        q.wake_one(&mut s),
+        Some(b),
+        "the stale entry for a is skipped"
+    );
+    assert_eq!(
+        s.timer_of(b),
+        None,
+        "b's deadline was cancelled by the wake"
+    );
+    // a wait whose deadline has already passed does not block
+    assert_eq!(q.wait_until(&mut s, 5), Ok(false));
+    assert!(q.is_empty());
+    assert_eq!(s.audit(), Ok(()));
+}

@@ -301,13 +301,24 @@ pub fn wake(tid: Tid) {
 
 /// Sleep for `n` ticks (or until woken).
 pub fn sleep_ticks(n: u64) {
-    irq::without(|| {
-        let k = kernel();
-        let deadline = k.sched.now() + n;
-        if k.sched.sleep_until(deadline).expect("running thread") {
-            reschedule();
+    let deadline = irq::without(|| kernel().sched.now() + n);
+    // A loop: a stale entry on a wait queue can wake a sleeper early, and the sleep must not
+    // end before its deadline.
+    loop {
+        let done = irq::without(|| {
+            let k = kernel();
+            if k.sched.now() >= deadline {
+                return true;
+            }
+            if k.sched.sleep_until(deadline).expect("running thread") {
+                reschedule();
+            }
+            false
+        });
+        if done {
+            return;
         }
-    });
+    }
 }
 
 pub fn set_priority(tid: Tid, prio: Prio) {
@@ -368,6 +379,34 @@ pub fn new_queue() -> usize {
         k.queues.push(WaitQueue::new());
         k.queues.len() - 1
     })
+}
+
+/// Block on queue `q` until `ready()` holds or the clock reaches `deadline` (absolute
+/// ticks). Returns whether `ready()` held. `ready` runs with interrupts off, like
+/// `wait_until`, so checking and sleeping are one atomic step.
+pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    loop {
+        let result = irq::without(|| {
+            if ready() {
+                return Some(true);
+            }
+            let k = kernel();
+            if k.sched.now() >= deadline {
+                return Some(false);
+            }
+            let Kernel { sched, queues, .. } = k;
+            if queues[q]
+                .wait_until(sched, deadline)
+                .expect("running thread")
+            {
+                reschedule();
+            }
+            None
+        });
+        if let Some(r) = result {
+            return r;
+        }
+    }
 }
 
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts

@@ -155,6 +155,43 @@ pub mod sys {
     pub fn object_signals(h: u32) -> Ret {
         syscall(OBJECT_SIGNALS, [h as usize, 0, 0, 0, 0, 0])
     }
+    /// Wait until `signals(h) & mask != 0` or tick `deadline` (0: do not wait, u64::MAX: forever).
+    pub fn object_wait(h: u32, mask: u32, deadline: u64) -> Ret {
+        syscall(
+            OBJECT_WAIT,
+            [h as usize, mask as usize, deadline as usize, 0, 0, 0],
+        )
+    }
+    pub fn channel_call(ch: u32, args: &super::CallArgs) -> Ret {
+        syscall(
+            CHANNEL_CALL,
+            [
+                ch as usize,
+                args as *const super::CallArgs as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+}
+
+/// The handle value of the bootstrap channel every process starts with (SYSCALLS.md).
+pub const BOOTSTRAP: u32 = 1;
+
+/// The argument record of `channel_call` (SYSCALLS.md; 56 bytes).
+#[repr(C)]
+pub struct CallArgs {
+    pub req_bytes: u64,
+    pub req_handles: u64,
+    pub req_nbytes: u32,
+    pub req_nhandles: u32,
+    pub rep_bytes: u64,
+    pub rep_handles: u64,
+    pub rep_max_bytes: u32,
+    pub rep_max_handles: u32,
+    pub deadline: u64,
 }
 
 /// A fixed-size text buffer: formatted output without an allocator.
