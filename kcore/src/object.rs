@@ -218,8 +218,7 @@ impl<T: Object> Registry<T> {
     /// process that makes them in a loop must not be allowed to grow memory without
     /// bound until it dies (decision OD37).
     pub fn needs_sweep(&self) -> bool {
-        // Also when the object cap is near: garbage cycles must not be able to fill it.
-        self.live > self.threshold || self.live + 4 > PREALLOC_SLOTS
+        self.live > self.threshold
     }
 
     /// Destroy every object that is not reachable from `roots` by following held
@@ -275,7 +274,9 @@ impl<T: Object> Registry<T> {
                 self.release(id);
             }
         }
-        self.threshold = SWEEP_MIN.max(self.live * 2).min(PREALLOC_SLOTS * 3 / 4);
+        // Never past the cap (garbage cycles must not be able to fill it), and never so close
+        // to it that every creation sweeps while the objects are all genuinely reachable.
+        self.threshold = SWEEP_MIN.max(self.live * 2).min(PREALLOC_SLOTS - 4);
         doomed.len()
     }
 }

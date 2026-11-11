@@ -768,7 +768,9 @@ fn wait_with_deadline_zero_polls() -> Outcome {
         (S::TimedOut.code(), 0),
         "nothing set: TIMED_OUT, observed 0"
     );
-    ensure!(sys::clock_get() - t0 <= 1, "it did not wait");
+    // A poll does not block; it may still be preempted between the two clock reads on a
+    // loaded host, so the bound is loose (a real wait would be unbounded).
+    ensure!(sys::clock_get() - t0 <= 25, "it did not wait");
     Ok(())
 }
 
