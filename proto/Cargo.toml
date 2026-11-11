@@ -1,0 +1,7 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: wire formats of the S4 userland protocols (startup message, boot image, launcher, file protocol, console control). Pure, no_std, host-tested."
+
+[dependencies]
