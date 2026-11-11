@@ -1,9 +1,102 @@
 # Syscalls (OS track)
 
 The contract between the kernel and userland, and the one kernel artifact meant to
-be readable. **Empty skeleton, created in S0.** Syscalls are specified here *before*
-they are implemented (S3); the target is about 50. Each gets an entry in this form,
-and a test for every error case listed.
+be readable. Syscalls are specified here *before* they are implemented; the target is
+about 50. Each entry has the form below, and every error listed has a test.
+
+Status of this file: **S3a** specifies the ABI, status codes, rights, signals and the
+handle and channel/event calls (their pure logic is built and model-tested in
+`kcore`). The rest of the S3 calls are listed in the index as *planned* and get full
+entries before their implementation (S3b, S3c).
+
+## ABI (decision OD36)
+
+- A syscall is `ecall` from user mode (U-mode). The number is in `a7`; arguments are in
+  `a0` to `a5`; nothing else is read. On return `a0` is a **status** (0 or a negative
+  code, below) and `a1` onwards carry results where an entry says so. All other
+  registers are preserved.
+- A **handle** is a 32-bit value. 0 is never valid. The low 16 bits are the table slot
+  plus 1; the high 16 bits are a generation that changes every time the slot is freed,
+  so a stale value fails (INVARIANTS H2). Values are meaningful only in the process
+  that holds them.
+- **Pointers** are user virtual addresses; the kernel validates them (inside the
+  caller's own address space, mapped with the needed permission) and copies. It never
+  reads user memory through `sstatus.SUM`. A bad pointer is `INVALID_ARGS`, never a
+  fault in the kernel.
+- There is **no errno** and no partial success: a call either does everything it says
+  or changes nothing (the exception, `channel_read` with a too-small buffer, is
+  stated where it happens).
+- Unknown syscall numbers return `BAD_SYSCALL`.
+
+### Status codes
+
+| Name | Code | Meaning |
+|---|---|---|
+| OK | 0 | success |
+| BAD_HANDLE | -1 | the value is not a live handle in this process (0, never issued, closed, or stale) |
+| WRONG_TYPE | -2 | the handle is live but names the wrong kind of object |
+| ACCESS_DENIED | -3 | the handle lacks a right the call needs, or the call would widen rights |
+| INVALID_ARGS | -4 | an argument is malformed (bad pointer, bad flag, duplicate handle in a list, ...) |
+| NO_MEMORY | -5 | the kernel cannot allocate, or this process's handle table is full |
+| SHOULD_WAIT | -6 | the operation would block and was asked not to (e.g. reading an empty channel) |
+| PEER_CLOSED | -7 | the other end is gone |
+| BUFFER_TOO_SMALL | -8 | the caller's buffer cannot hold the result (sizes are returned) |
+| TOO_BIG | -9 | a message or list is over a limit |
+| BAD_STATE | -10 | the object is not in a state that allows this |
+| NOT_SUPPORTED | -11 | valid request the kernel will not do (e.g. a channel endpoint sent over itself) |
+| TIMED_OUT | -12 | a wait reached its deadline |
+| BAD_SYSCALL | -13 | no such syscall number |
+
+### Rights
+
+A right is a bit in a handle's rights mask. A handle can hold any subset of the rights
+its object kind defines; rights can only be removed, never added (INVARIANTS H3).
+
+| Right | Bit | Allows |
+|---|---|---|
+| DUPLICATE | 0 | `handle_duplicate` of this handle |
+| TRANSFER | 1 | sending this handle through a channel |
+| READ | 2 | reading (channel messages, VMO contents) |
+| WRITE | 3 | writing |
+| EXECUTE | 4 | mapping executable (VMO) |
+| MAP | 5 | mapping into an address space (VMO) |
+| SIGNAL | 6 | changing user signals (event) |
+| WAIT | 7 | waiting on the object |
+| MANAGE | 8 | controlling a process or thread (start, kill) |
+| INSPECT | 9 | reading its properties |
+
+`SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
+`handle_replace` it means "the same as the source handle".
+
+### Signals
+
+Each waitable object has a 32-bit signal word. Bits 0 to 7 are set by the kernel; bits
+24 to 31 are *user signals* that only the holder of an event handle with SIGNAL can
+change.
+
+| Signal | Bit | Raised when |
+|---|---|---|
+| READABLE | 0 | a channel has a queued message |
+| WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
+| PEER_CLOSED | 2 | the other end of a channel is gone |
+| USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
+
+## Limits
+
+`MAX_HANDLES` 4096 per process (the handle encoding allows 65535); `MAX_MSG_BYTES`
+65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
+`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 65536 kernel objects
+alive at once (creating more is NO_MEMORY).
+
+These bound each endpoint and the object count, **not total memory**: the worst case is
+still large (65536 objects, each possibly holding a full queue). A real bound needs
+per-job quotas (OS-ARCHITECTURE Q9), which do not exist yet; until then the limits only
+stop the easy ways of exhausting the kernel, and a hostile process can still do harm by
+filling many channels. Stated plainly so nobody relies on more than this.
+
+The syscall layer must reject `nbytes > MAX_MSG_BYTES` and `nhandles > MAX_MSG_HANDLES`
+with TOO_BIG *before* copying anything from user memory, so a user-chosen length never
+drives unbounded work.
 
 ## Entry template
 
@@ -16,22 +109,144 @@ Preconditions:  what must hold about the arguments and the caller.
 Rights:         the rights each handle argument must carry (or "none").
 Effects:        what changes (objects created, handles moved, signals raised).
 Blocking:       never | may block until <condition> | may be interrupted by <x>.
-Errors:         BAD_HANDLE | WRONG_TYPE | ACCESS_DENIED | INVALID_ARGS | NO_MEMORY |
-                (others as needed): when each is returned.
+Errors:         each status the call can return and exactly when.
 Invariants:     which rules in INVARIANTS.md this call touches.
-Tests:          the test names covering success and every error above.
+Tests:          the tests covering success and every error above.
 ```
 
-## Conventions (draft)
+## Handles
 
-- Every syscall that names a kernel object takes a handle, never a pointer or an id.
-- Every error is a distinct negative status code; there is no `errno` and no partial
-  success without a documented return value.
-- Pointers from user mode are validated by the kernel (inside the caller's own
-  address space, correctly aligned, correct permission) before use.
-- No syscall can make a handle with more rights than the one it was derived from
-  (INVARIANTS.md H3).
+### handle_close(handle) -> status
+
+Closes a handle: the slot is freed and the object loses one reference.
+Preconditions: none beyond a valid handle. Rights: none. Blocking: never.
+Effects: the slot's generation changes. If that was the last reference the object is
+destroyed (see Object lifetime below).
+Errors: BAD_HANDLE.
+Invariants: H2, H4, H6. Tests: `handle_model`, `registry_model`.
+
+### handle_duplicate(handle, rights) -> status, new_handle
+
+Makes a second handle to the same object with `rights` (or SAME_RIGHTS).
+Rights: the source needs DUPLICATE. Effects: one more reference to the object; the
+table gains one entry. Blocking: never.
+Errors: BAD_HANDLE; ACCESS_DENIED (source lacks DUPLICATE, or `rights` has a bit the
+source lacks, or `rights` has a bit no right uses); NO_MEMORY (table full; nothing
+changes).
+Invariants: H3. Tests: `handle_model`, `rights_escalation_is_refused`.
+
+### handle_replace(handle, rights) -> status, new_handle
+
+Atomically closes `handle` and returns a new handle to the same object with `rights`
+(or SAME_RIGHTS). The old value is invalid afterwards, even if the call fails after
+validation. Used to drop rights.
+Rights: none needed on the source (replacing cannot widen). Effects: reference count
+unchanged.
+Errors: BAD_HANDLE; ACCESS_DENIED (`rights` is not a subset of the source's, or has an
+unassigned bit). On error the handle is unchanged and still valid.
+Invariants: H2, H3. Tests: `handle_model`, `rights_escalation_is_refused`.
+
+## Channels
+
+A channel is a pair of endpoints. A message is up to MAX_MSG_BYTES bytes and up to
+MAX_MSG_HANDLES handles, delivered in order to the *other* endpoint's queue. The
+first 4 bytes of a message are by convention a transaction id (`channel_call`).
+
+### channel_create() -> status, handle0, handle1
+
+Creates a connected pair. Both handles have DUPLICATE, TRANSFER, READ, WRITE, SIGNAL
+and WAIT. Errors: NO_MEMORY (fewer than two free slots, `MAX_OBJECTS` reached, or no memory; nothing created).
+Tests: `channel_basics`, `channel_model`.
+
+### channel_write(channel, bytes, nbytes, handles, nhandles) -> status
+
+Queues a message on the peer. The listed handles leave the caller's table and travel in
+the message; they appear in the receiver's table when it reads.
+Rights: `channel` needs WRITE; every listed handle needs TRANSFER.
+Effects: the handles are removed from the caller's table *only if the whole call
+succeeds*; the message holds one reference to each handle's object.
+Blocking: never.
+Errors, checked in this order: TOO_BIG (over MAX_MSG_BYTES or MAX_MSG_HANDLES; first,
+because it bounds the work of every later check); BAD_HANDLE (the channel, then each
+listed handle); WRONG_TYPE (not a channel); ACCESS_DENIED (no WRITE on the channel, then
+a listed handle without TRANSFER); INVALID_ARGS (a handle listed twice); NOT_SUPPORTED
+(either endpoint *of this channel*, by object identity, is in the list: that would put
+an endpoint in its own queue); PEER_CLOSED; SHOULD_WAIT (the peer's queue holds
+MAX_QUEUED_MSGS, or MAX_QUEUED_BYTES with this message); NO_MEMORY (the kernel cannot
+allocate the message; nothing changed). On any error the caller's table is unchanged.
+Invariants: H1, H3, H4. Tests: `channel_basics`, `channel_errors`, `channel_model`.
+
+### channel_read(channel, max_bytes, max_handles) -> status, bytes, handles
+
+Dequeues the oldest message. Its handles are inserted into the caller's table (rights
+unchanged) and returned.
+Rights: `channel` needs READ. Blocking: never (the syscall layer adds a blocking
+variant with a wait; see `object_wait`).
+Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; SHOULD_WAIT (queue empty and the peer is
+open); PEER_CLOSED (queue empty and the peer is gone: messages queued before the peer
+closed are still delivered first); BUFFER_TOO_SMALL (the front message does not fit
+`max_bytes` or `max_handles`; **the message stays queued** and the actual sizes are
+returned); NO_MEMORY (the caller's table lacks room for the message's handles; the
+message stays queued).
+Invariants: H4. Tests: `channel_basics`, `channel_errors`, `channel_model`.
+
+### channel_read_txid(channel, txid, max_bytes, max_handles) -> status, bytes, handles
+
+As `channel_read` but takes the oldest message whose first 4 bytes (little endian) equal
+`txid`, skipping others. Used by `channel_call` to pick its reply out of a busy channel.
+Errors as `channel_read`, with one difference: if no queued message matches, the result is
+PEER_CLOSED when the peer is gone (nothing more can ever arrive, even though other
+messages may still be queued) and SHOULD_WAIT otherwise.
+Tests: `channel_txid`, `a_txid_read_on_a_closed_channel_does_not_wait_forever`.
+
+### channel_call (planned, S3b)
+
+`channel_write` then wait for a reply with the same transaction id, in one call. The
+point of a distinct call is priority donation (OS-ARCHITECTURE 5.3): not implemented, the
+hook is.
+
+## Events
+
+### event_create() -> status, handle
+
+An object with 8 user signals. Rights: DUPLICATE, TRANSFER, SIGNAL, WAIT.
+Errors: NO_MEMORY (table full, `MAX_OBJECTS` reached, or no memory). Tests: `event_basics`.
+
+### event_signal(event, clear_mask, set_mask) -> status
+
+Clears then sets user signal bits.
+Rights: SIGNAL. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (a mask has
+a bit outside the user signals).
+Tests: `event_basics`, `event_model`.
+
+## Object lifetime
+
+Every handle and every in-flight message entry holds one reference to its object. When
+the last reference goes, the object is destroyed: a channel endpoint's queued messages
+are dropped (their handles released in turn, iteratively, so nesting depth is no
+problem), and its peer gets PEER_CLOSED. A **cycle** (two endpoints each queued in the
+other's channel, with no handle to either) cannot be freed by counting; the kernel
+reclaims such garbage by reachability from every process's handle table when a process
+dies, and also **under pressure**: before creating a kernel object the kernel asks
+`Registry::needs_sweep` (the object count has doubled since the last sweep) and, if so,
+sweeps from every process's table. Without that, one process making cycles in a loop
+could grow kernel memory without bound while it is still alive; with it the garbage stays
+within a constant factor of the live set (decision OD37). A sweep returns the references
+that destroyed objects held on survivors, so survivors are still freed correctly.
+Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_held`,
+`a_process_cannot_grow_kernel_memory_by_making_cycles`, `random_channels_agree_with_the_model`.
 
 ## Index
 
-(none yet)
+| Call | Status |
+|---|---|
+| handle_close, handle_duplicate, handle_replace | specified (S3a); pure logic tested |
+| channel_create, channel_write, channel_read, channel_read_txid | specified (S3a); pure logic tested |
+| event_create, event_signal | specified (S3a); pure logic tested |
+| channel_call | planned, S3b |
+| object_wait (wait on a signal with a deadline), object_wait_many / ports | planned, S3c |
+| debug_write, process_exit, thread_exit, clock_get | planned, S3b |
+| vmo_create, vmo_read, vmo_write, vmo_set_size, vmo_create_child | planned, S3b |
+| vmar_map, vmar_unmap, vmar_protect | planned, S3b |
+| process_create, process_start, process_kill, thread_create, thread_start | planned, S3b/S3c |
+| socket_create, socket_write, socket_read | planned, S3c |

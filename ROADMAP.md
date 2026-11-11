@@ -257,6 +257,8 @@ C5) is still TODO, and wall-clock jitter bounds were widened.
 
 ### S3: User mode, syscalls, handles, channels, VMOs
 
+Built in slices (OD38). **S3a (done): the pure half**: `SYSCALLS.md` (ABI, status codes, rights, signals, handle/channel/event calls), `kcore::{handle, object, ipc}` with model tests, mutation-checked (all caught). Independent review found and I fixed: `Registry::sweep` leaked survivors' references; a user-driven cycle loop grew kernel memory without bound (now a pressure sweep, a per-endpoint byte cap and an object cap; honest limit: per-job quotas, Q9, are still needed for a real bound); `channel_write` error order disagreed with the spec (spec, code and model now agree); a txid read on a closed channel could wait forever; the random model now covers events, txid reads, limit-sized messages, queue-full and mid-run sweeps. S3b: user mode, syscall entry, ELF loader, `init`, user-level suite. S3c: remaining objects and QEMU process-death leak checks.
+
 Acceptance: a user test suite passes; every syscall's error cases are covered per
 `SYSCALLS.md`; killing a process leaks no objects.
 

@@ -10,7 +10,10 @@ extern crate alloc;
 
 pub mod aspace;
 pub mod frame;
+pub mod handle;
+pub mod ipc;
 pub mod latch;
+pub mod object;
 pub mod pagetable;
 pub mod sched;
 pub mod sync;
