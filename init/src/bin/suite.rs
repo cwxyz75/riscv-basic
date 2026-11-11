@@ -3547,6 +3547,52 @@ fn runtime_without_a_startup_message() -> Outcome {
     Ok(())
 }
 
+fn runtime_io_fails_instead_of_spinning_without_wait() -> Outcome {
+    // A pipe end without WAIT cannot be waited on: a blocked read must fail with the kernel's
+    // error, not loop (found by the S4a review: it spun at full speed).
+    let (a, b) = socket()?;
+    let _ = a;
+    let ro = weaker(b, Rights::READ.0)?;
+    let t0 = sys::clock_get();
+    let mut buf = [0u8; 4];
+    let r = rt::io::read(ro, &mut buf);
+    ensure_eq!(
+        r,
+        Err(rt::io::IoError::Other(S::AccessDenied.code())),
+        "read without WAIT"
+    );
+    ensure!(sys::clock_get() - t0 < 50, "it must fail at once, not wait");
+    let wo = weaker(a, Rights::WRITE.0)?;
+    let full = alloc::vec![0u8; SOCKET_BUFFER];
+    ensure_eq!(rt::io::write_all(wo, &full), Ok(()), "fill the buffer");
+    ensure_eq!(
+        rt::io::write_all(wo, b"more"),
+        Err(rt::io::IoError::Other(S::AccessDenied.code())),
+        "write without WAIT on a full socket"
+    );
+    // a write larger than one socket buffer is split by the helper
+    let (c, d) = socket()?;
+    let big = alloc::vec![7u8; 70_000];
+    let reader = new_thread(drain_for_big_write, d as usize)?;
+    ensure_eq!(rt::io::write_all(c, &big), Ok(()), "a 70000-byte write_all");
+    let r = sys::object_wait(reader, sig::TERMINATED, sys::clock_get() + 5000);
+    ensure_eq!(r.status, 0, "the reader finished");
+    ensure_eq!(sys::thread_info(reader).a1, 70_000, "and saw every byte");
+    Ok(())
+}
+
+extern "C" fn drain_for_big_write(arg: usize) -> ! {
+    let mut total = 0usize;
+    let mut buf = [0u8; 4096];
+    while total < 70_000 {
+        match rt::io::read(arg as u32, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n,
+        }
+    }
+    sys::thread_exit(total as i32)
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -4088,6 +4134,10 @@ pub fn app_main() -> i32 {
         (
             "runtime_without_a_startup_message",
             runtime_without_a_startup_message,
+        ),
+        (
+            "runtime_io_fails_instead_of_spinning_without_wait",
+            runtime_io_fails_instead_of_spinning_without_wait,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

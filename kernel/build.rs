@@ -31,19 +31,26 @@ fn main() {
     // program is an empty entry, so a bare `cargo clippy` still builds.
     let fixtures = PathBuf::from(&dir).join("../fixtures");
     println!("cargo:rerun-if-changed={}", fixtures.display());
-    if let Ok(rd) = std::fs::read_dir(&fixtures) {
-        let mut names: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-        names.sort_by_key(|e| e.file_name());
-        for e in names {
-            if e.path().is_file() {
-                let name = format!("fixtures/{}", e.file_name().to_string_lossy());
-                image_files.push((
+    // Entries are named `fixtures/<path relative to fixtures/>` (memfs mounts them under /home).
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = format!("{prefix}/{}", e.file_name().to_string_lossy());
+            if e.path().is_dir() {
+                walk(&e.path(), &name, out);
+            } else if e.path().is_file() {
+                out.push((
                     name.into_bytes(),
                     std::fs::read(e.path()).unwrap_or_default(),
                 ));
             }
         }
     }
+    walk(&fixtures, "fixtures", &mut image_files);
     let refs: Vec<(&[u8], &[u8])> = image_files
         .iter()
         .map(|(n, d)| (n.as_slice(), d.as_slice()))

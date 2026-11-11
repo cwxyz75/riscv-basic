@@ -8,8 +8,8 @@ pub const REQUEST_HEADER: usize = 32;
 pub const REPLY_HEADER: usize = 20;
 /// Largest `Read`/`Write` data.
 pub const MAX_IO: usize = 32 * 1024;
-/// Largest whole message (header plus payload).
-pub const MAX_MESSAGE: usize = REQUEST_HEADER + MAX_IO + 1024;
+/// Largest whole message: 33 KiB (S4-SPEC section 7), header plus payload of at most 32 KiB.
+pub const MAX_MESSAGE: usize = 33 * 1024;
 pub const MAX_COMPONENT: usize = 255;
 pub const MAX_COMPONENTS: usize = 32;
 pub const MAX_PATH: usize = 1024;
@@ -93,13 +93,15 @@ pub struct Request<'a> {
 pub enum FrameError {
     TooShort,
     TooBig,
+    /// A flag or right bit that no operation defines.
+    BadBits,
     /// The length field disagrees with the bytes that follow.
     BadLength,
 }
 
 impl Request<'_> {
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        if self.payload.len() > MAX_IO + 1024 {
+        if self.payload.len() > MAX_IO {
             return Err(FrameError::TooBig);
         }
         let mut out = Vec::with_capacity(REQUEST_HEADER + self.payload.len());
@@ -128,11 +130,19 @@ pub fn decode_request(b: &[u8]) -> Result<Request<'_>, FrameError> {
     if b.len() - REQUEST_HEADER != len {
         return Err(FrameError::BadLength);
     }
+    if len > MAX_IO {
+        return Err(FrameError::TooBig);
+    }
+    let flags = rd_u16(b, 6).ok_or(FrameError::TooShort)?;
+    let rights = rd_u32(b, 8).ok_or(FrameError::TooShort)?;
+    if flags & !flags::ALL != 0 || rights & !rights::ALL != 0 {
+        return Err(FrameError::BadBits);
+    }
     Ok(Request {
         txid: rd_u32(b, 0).ok_or(FrameError::TooShort)?,
         op: rd_u16(b, 4).ok_or(FrameError::TooShort)?,
-        flags: rd_u16(b, 6).ok_or(FrameError::TooShort)?,
-        rights: rd_u32(b, 8).ok_or(FrameError::TooShort)?,
+        flags,
+        rights,
         a: rd_u64(b, 12).ok_or(FrameError::TooShort)?,
         b: rd_u64(b, 20).ok_or(FrameError::TooShort)?,
         payload: &b[REQUEST_HEADER..],
@@ -154,7 +164,7 @@ pub struct Reply<'a> {
 
 impl Reply<'_> {
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        if self.payload.len() > MAX_IO + 1024 {
+        if self.payload.len() > MAX_IO {
             return Err(FrameError::TooBig);
         }
         let mut out = Vec::with_capacity(REPLY_HEADER + self.payload.len());
@@ -177,6 +187,9 @@ pub fn decode_reply(b: &[u8]) -> Result<Reply<'_>, FrameError> {
     let len = rd_u32(b, 16).ok_or(FrameError::TooShort)? as usize;
     if b.len() - REPLY_HEADER != len {
         return Err(FrameError::BadLength);
+    }
+    if len > MAX_IO {
+        return Err(FrameError::TooBig);
     }
     Ok(Reply {
         txid: rd_u32(b, 0).ok_or(FrameError::TooShort)?,
@@ -211,7 +224,8 @@ pub fn valid_name(n: &[u8]) -> Result<(), PathError> {
 }
 
 /// Split a relative path into validated components. `..` can never appear, so a directory
-/// connection is a sandbox boundary.
+/// connection is a sandbox boundary. An *empty* path is `Malformed` here: the server treats an
+/// empty `Open` path as `Clone` (S4-SPEC section 7) before calling this.
 pub fn split_path(p: &[u8]) -> Result<Vec<&[u8]>, PathError> {
     if p.is_empty() || p.len() > MAX_PATH {
         return Err(if p.is_empty() {

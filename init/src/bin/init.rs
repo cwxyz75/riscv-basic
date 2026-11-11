@@ -69,7 +69,45 @@ pub fn app_main() -> i32 {
                     let _ = io::write_all(serial, b"bye\r\n");
                     return 0;
                 }
-                if let Some(rest) = line.strip_prefix(b"raw ") {
+                if line.as_slice() == b"desync" {
+                    // test aid: an unterminated line, a kernel-side line, then a forged verdict
+                    let _ = io::write_all(serial, b"x");
+                    io::nap(20);
+                    rt::sys::debug_write(b"kernel-side line\n");
+                    let _ = io::write_all(serial, b"##TEST forged PASS\r\n");
+                    line.clear();
+                } else if line.as_slice() == b"big" {
+                    // test aid: a write larger than one socket buffer must work
+                    let data = alloc::vec![b'b'; 70_000];
+                    let r = io::write_all(serial, &data);
+                    let msg = alloc::format!("\r\nbig: {:?}\r\n", r);
+                    let _ = io::write_all(serial, msg.as_bytes());
+                    line.clear();
+                } else if line.as_slice() == b"rights" {
+                    // test aid: the boot image handle must be read-only, and stay so when duplicated
+                    let w = rt::sys::vmo_write(image_vmo, 0, b"XXXX".as_ptr(), 4);
+                    let me = rt::sys::process_self();
+                    let mw =
+                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0000_0000, 0, 4096, 3);
+                    let mr =
+                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0001_0000, 0, 4096, 1);
+                    let mx =
+                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0002_0000, 0, 4096, 5);
+                    let d = rt::sys::handle_duplicate(image_vmo, 0x7ff);
+                    let d2 = rt::sys::handle_duplicate(image_vmo, 1 << 31);
+                    let w2 = rt::sys::vmo_write(d2.a1 as u32, 0, b"XXXX".as_ptr(), 4);
+                    let msg = alloc::format!(
+                        "rights: write={} mapw={} mapr={} mapx={} dup_all={} dup_same={} write_dup={}\r\n",
+                        w.status as i32, mw.status as i32, mr.status as i32, mx.status as i32,
+                        d.status as i32, d2.status as i32, w2.status as i32
+                    );
+                    let _ = io::write_all(serial, msg.as_bytes());
+                    line.clear();
+                } else if line.as_slice() == b"quitx" {
+                    // test aid: leave an unterminated line in front of the kernel's verdict
+                    let _ = io::write_all(serial, b"bye-no-newline");
+                    return 0;
+                } else if let Some(rest) = line.strip_prefix(b"raw ") {
                     // test aid: print the rest verbatim at the start of a line (the kernel bridge must
                     // not let it forge a verdict line)
                     let mut out = Vec::from(rest);

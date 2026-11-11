@@ -50,10 +50,13 @@ union directories, per-job quotas (Q9), SMP.
 3. **Serial socket bridge.** A kernel thread connects the UART to one end of a socket pair;
    the other end goes to `init`. UART input is buffered in a bounded ring in the interrupt path
    (overflow drops and counts); the thread copies both ways and never blocks the interrupt
-   path or the kernel's `##` output. **The bridge rewrites a `##` at the start of any line it forwards from a user program to the
-   UART as `# #`, and the kernel serialises whole lines**, so no user program, and no file
-   `cat`ed to the terminal, can forge a verdict line (`##TEST`, `##PANIC`, `##DONE`) or
-   interleave mid-line with kernel output. `debug_write` stays for test programs (OS-ARCH `##` protocol); S4 services use it only for
+   path or the kernel's `##` output. **All UART output goes through one shared line state (`kcore::linestate`, OD52): a `##` at the
+   start of a line a user program writes becomes `# #`, and kernel verdict text (`##...`) is
+   preceded by a line break when the physical line is not at its start**, so no user program,
+   and no file `cat`ed to the terminal, can forge a verdict line (`##TEST`, `##PANIC`,
+   `##DONE`) or swallow a real one. Bytes pass through unchanged (no text conversion). The
+   bridge is a polling thread (`TIDY-UP.md` T14); input it cannot deliver yet is kept (4 KiB)
+   and retried every tick, and bytes lost beyond that are counted and checked. `debug_write` stays for test programs (OS-ARCH `##` protocol); S4 services use it only for
    `init`'s own `##` lines and the `rt` panic handler.
 4. **`SYSCALLS.md` fixes:** `MAX_OBJECTS` is 16384 (document drift); the launcher's default
    stack is 256 KiB (OD42), not 64 KiB.
@@ -79,7 +82,9 @@ Rules that make this table true:
   or stall it by not reading). **Every client gets its own connection**: the file protocol has
   a `Clone(rights, endpoint)` op (and `Open` with an empty path) that binds a fresh endpoint to
   the same node with equal or fewer rights. A child's `CWD` is always such a fresh connection.
-- Pipe ends passed to stages are narrowed with `handle_replace` to read-only / write-only.
+- Pipe ends passed to stages are narrowed with `handle_replace` to read-only / write-only but
+  **keep `WAIT`** (a blocked read or write waits on its own end; without WAIT the runtime fails
+  instead of spinning).
 - The launcher closes its end of the bootstrap channel after writing the startup message (the
   message stays readable; the child cannot park IPC budget on that channel).
 - Every handle forwarded to a child must carry `TRANSFER`; the launcher forwards exactly the
@@ -100,7 +105,10 @@ nstdio (role u32, handle_index u32) pairs
 
 The message's handle array holds the handles; indices refer to it. Roles: `STDIN=1`, `STDOUT=2`
 (stderr is `STDOUT`), `SERVICE_FS=3`, `SERVICE_LAUNCH=4`, `SERVICE_CONSOLE=5`, `BOOT_IMAGE=6`,
-`SERIAL=7`, `SERVICE_INIT=8`. Namespace prefixes: `"."` (the working directory) and `"/"`
+`SERIAL=7`, `SERVICE_INIT=8`. **Programs read the message themselves** with `rt::startup::read`
+(not before `main`); a message that does not parse, or that arrives with a handle nothing
+refers to, exits `-2001`; no message at all exits `-2002`. Strings contain no NUL; namespace
+prefixes are only `"."` and `"/"`, each at most once. Namespace prefixes: `"."` (the working directory) and `"/"`
 (the root: only for trusted programs). Limits: message at most 16 KiB; at most 32 handles; each
 string at most 1024 bytes; `argc` at most 64, `envc` at most 16, `nsc` at most 4. The parser
 (pure, in `proto`, `forbid(unsafe_code)`, fuzzed) rejects: wrong magic/version, counts that
@@ -112,10 +120,12 @@ duplicate role, trailing bytes. On rejection the child exits `-2001`. Nothing pa
 A userspace service on one channel (from `init`, handed to `sh` only). It holds **no filesystem
 authority**: the caller supplies the program.
 
-`Spawn` request (`proto::launch`): `txid:u32, op:u16=1`, then `image_offset:u64, image_len:u64`,
-the startup-message bytes to deliver (section 5 format), and in the message handles: element 0
-is a VMO handle (the image, or the boot image with offset/length; READ|MAP rights), then the
-handles the startup message references. It (1) validates every size before allocating (image
+`Spawn` request (`proto::launch`, normative byte layout in its golden test): `txid:u32, op:u16=1,
+pad:u16=0, image_offset:u64, image_len:u64, startup_len:u32`, then the startup-message bytes to
+deliver (section 5 format), and in the message handles: element 0 is a VMO handle (the image,
+or the boot image with offset/length; READ|MAP rights), then the handles the startup message
+references (at most 33 handles in all). The reply is `txid:u32, status:i32` plus, on success,
+the process handle. It (1) validates every size before allocating (image
 at most 4 MiB, at most 16 segments, total mapped at most 16 MiB, startup message at most 16
 KiB), (2) parses the ELF with `kcore::elf` (pure, linked in), (3) creates a process, one VMO per
 PT_LOAD segment (bytes copied from the image VMO with `vmo_read`/`vmo_write`, no large channel
@@ -254,7 +264,7 @@ messages to `STDOUT` and exit 1 on error):
   expected `NOT_FOUND`/`BAD_REQUEST`/`ACCESS_DENIED` as derived in the golden.
 - `spin`: never ends (for Ctrl-C).
 
-**Fixtures** (in the boot image, listed by `ls /home`): `/home/hello.txt` containing
+**Fixtures** (in the boot image as `fixtures/<path>`, which `memfsd` mounts under `/home`; listed by `ls /home`): `/home/hello.txt` containing
 `hello, world\n`; `/home/lines.txt` containing `one\ntwo\nthree\n`; directory `/home/sub/` with
 `/home/sub/inner.txt` containing `inner\n`. A fixed fixture set keeps the golden stable when
 programs are added to `/bin`.

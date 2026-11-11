@@ -80,11 +80,12 @@ pub fn read() -> Result<Env, EnvError> {
                     signals::READABLE | signals::PEER_CLOSED,
                     u64::MAX,
                 );
+                if w.status != 0 {
+                    // e.g. no WAIT right: fail instead of spinning
+                    return Err(EnvError::Read(w.status));
+                }
                 let seen = w.a1 as u32;
-                if w.status == 0
-                    && seen & signals::READABLE == 0
-                    && seen & signals::PEER_CLOSED != 0
-                {
+                if seen & signals::READABLE == 0 && seen & signals::PEER_CLOSED != 0 {
                     return Err(EnvError::NoMessage);
                 }
             }

@@ -128,6 +128,8 @@ os-interactive: os-user
 
 os-serial-test: os-interactive
 	python3 scripts/s4a_serial_test.py $(OS_INTERACTIVE_ELF)
+	@# the harness must be able to fail: a wrong expectation has to be reported
+	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
 
 # The reference CPU of the OS track (OD47).
 os-boot-test-rva23: kernel
