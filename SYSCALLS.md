@@ -87,14 +87,16 @@ change.
 
 `MAX_HANDLES` 4096 per process (the handle encoding allows 65535); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
-`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 65536 kernel objects
-alive at once (creating more is NO_MEMORY).
+`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
+alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
+data (message bytes, headers, queued handles, port bindings) in the whole system;
+`MAX_REGIONS` 1024 per address space; `MAX_THREADS_PER_PROCESS` 8 and `MAX_USER_THREADS` 128;
+`MAX_PROCESSES` 64.
 
-These bound each endpoint and the object count, **not total memory**: the worst case is
-still large (65536 objects, each possibly holding a full queue). A real bound needs
-per-job quotas (OS-ARCHITECTURE Q9), which do not exist yet; until then the limits only
-stop the easy ways of exhausting the kernel, and a hostile process can still do harm by
-filling many channels. Stated plainly so nobody relies on more than this.
+These keep the kernel from panicking and from running out of its fixed heap (OD50); they are
+not per-process limits. A real bound needs per-job quotas (OS-ARCHITECTURE Q9, `TIDY-UP.md`
+T1), which do not exist yet: one process can still use a whole cap and starve the others. Stated
+plainly so nobody relies on more than this.
 
 The syscall layer must reject `nbytes > MAX_MSG_BYTES` and `nhandles > MAX_MSG_HANDLES`
 with TOO_BIG *before* copying anything from user memory, so a user-chosen length never

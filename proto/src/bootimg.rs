@@ -29,6 +29,18 @@ pub enum BootImageError {
     BadExtent,
     /// Building: a size does not fit 32 bits.
     TooBig,
+    /// Two entries share bytes.
+    Overlap,
+}
+
+/// An image name is a relative path of non-empty components, none of them `.` or `..`, with
+/// no NUL (memfsd builds `/bin` and `/home` from these names).
+fn valid_name(n: &[u8]) -> bool {
+    !n.is_empty()
+        && n.len() <= MAX_NAME
+        && !n.contains(&0)
+        && n.split(|&b| b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b"..")
 }
 
 /// Build an image from `(name, data)` pairs, in order.
@@ -38,7 +50,7 @@ pub fn build(files: &[(&[u8], &[u8])]) -> Result<Vec<u8>, BootImageError> {
     }
     let mut table = 8usize;
     for (name, _) in files {
-        if name.is_empty() || name.len() > MAX_NAME {
+        if !valid_name(name) {
             return Err(BootImageError::BadName);
         }
         table += 2 + name.len() + 8;
@@ -90,6 +102,9 @@ pub fn parse(img: &[u8]) -> Result<Vec<Entry>, BootImageError> {
             .get(at + 2..at + 2 + n)
             .ok_or(BootImageError::Truncated)?
             .to_vec();
+        if !valid_name(&name) {
+            return Err(BootImageError::BadName);
+        }
         let offset = rd_u32(img, at + 2 + n).ok_or(BootImageError::Truncated)?;
         let size = rd_u32(img, at + 6 + n).ok_or(BootImageError::Truncated)?;
         at += 10 + n;
@@ -105,6 +120,16 @@ pub fn parse(img: &[u8]) -> Result<Vec<Entry>, BootImageError> {
         if (e.offset as usize) < at || e.offset % 16 != 0 || end > img.len() {
             return Err(BootImageError::BadExtent);
         }
+    }
+    // No two non-empty extents may share bytes.
+    let mut spans: Vec<(u32, u32)> = entries
+        .iter()
+        .filter(|e| e.size > 0)
+        .map(|e| (e.offset, e.offset + e.size))
+        .collect();
+    spans.sort();
+    if spans.windows(2).any(|w| w[0].1 > w[1].0) {
+        return Err(BootImageError::Overlap);
     }
     Ok(entries)
 }

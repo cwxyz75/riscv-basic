@@ -72,12 +72,51 @@ pub enum StartupError {
     DuplicateRole,
     /// Encoding: a field exceeds its limit.
     Limit,
+    /// A handle that arrived with the message but nothing refers to: unreferenced authority.
+    UnreferencedHandle,
+    /// A namespace prefix other than `"."` or `"/"`, or one used twice.
+    BadNamespace,
+    /// A NUL byte in an argument, environment string or prefix.
+    NulInString,
 }
 
 impl Startup {
     /// Encode; fails if any limit is exceeded (so an encoder cannot produce what the decoder
     /// would refuse).
+    /// Everything the decoder checks that does not need the handle count, so that the encoder
+    /// produces nothing the decoder would refuse.
+    fn validate(&self) -> Result<(), StartupError> {
+        for s in self.args.iter().chain(self.env.iter()) {
+            if s.contains(&0) {
+                return Err(StartupError::NulInString);
+            }
+        }
+        for (i, (prefix, idx)) in self.namespace.iter().enumerate() {
+            if prefix != b"." && prefix != b"/" {
+                return Err(StartupError::BadNamespace);
+            }
+            if self.namespace[..i].iter().any(|(p, _)| p == prefix) {
+                return Err(StartupError::BadNamespace);
+            }
+            if self.namespace[..i].iter().any(|(_, j)| j == idx) {
+                return Err(StartupError::DuplicateHandle);
+            }
+        }
+        for (i, (role, idx)) in self.roles.iter().enumerate() {
+            if self.roles[..i].iter().any(|(r, _)| r == role) {
+                return Err(StartupError::DuplicateRole);
+            }
+            if self.roles[..i].iter().any(|(_, j)| j == idx)
+                || self.namespace.iter().any(|(_, j)| j == idx)
+            {
+                return Err(StartupError::DuplicateHandle);
+            }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, StartupError> {
+        self.validate()?;
         if self.args.len() > MAX_ARGS
             || self.env.len() > MAX_ENV
             || self.namespace.len() > MAX_NAMESPACE
@@ -154,6 +193,9 @@ impl Startup {
         };
         for _ in 0..nsc {
             let prefix = get_str(b, &mut at)?;
+            if (prefix != b"." && prefix != b"/") || s.namespace.iter().any(|(p, _)| *p == prefix) {
+                return Err(StartupError::BadNamespace);
+            }
             let idx = rd_u32(b, at).ok_or(StartupError::Truncated)?;
             at += 4;
             s.namespace.push((prefix, claim(idx)?));
@@ -170,6 +212,14 @@ impl Startup {
         }
         if at != b.len() {
             return Err(StartupError::TrailingBytes);
+        }
+        // Every handle that arrived must be named: a handle nobody refers to is authority the
+        // parent handed over by mistake.
+        if used[..nhandles].iter().any(|u| !u) {
+            return Err(StartupError::UnreferencedHandle);
+        }
+        if s.args.iter().chain(s.env.iter()).any(|x| x.contains(&0)) {
+            return Err(StartupError::NulInString);
         }
         Ok(s)
     }

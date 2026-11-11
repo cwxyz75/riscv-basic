@@ -14,6 +14,7 @@ pub mod frame;
 pub mod handle;
 pub mod ipc;
 pub mod latch;
+pub mod linestate;
 pub mod object;
 pub mod pagetable;
 pub mod sched;

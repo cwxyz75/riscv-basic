@@ -952,7 +952,8 @@ fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
                 let _ = writeln!(Console, "{text}");
             }
             None if text.starts_with("##") => {
-                let _ = writeln!(Console, "user: {text}");
+                // One piece, so the console's line guard sees a line that starts with "user:".
+                let _ = Console.write_str(&alloc::format!("user: {text}\n"));
             }
             None => {
                 let _ = writeln!(Console, "{text}");
@@ -1381,10 +1382,17 @@ impl KernelEnd {
             let k = kmem::get();
             let pages = (image.len() as u64).div_ceil(4096).max(1);
             let id = k.vmos.create(pages);
-            k.vmos
-                .write(&mut k.mm, id, 0, image)
-                .map_err(|_| Status::NoMemory)?;
-            let h = ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id)?;
+            if k.vmos.write(&mut k.mm, id, 0, image).is_err() {
+                let _ = k.vmos.destroy(&mut k.mm, id);
+                return Err(Status::NoMemory);
+            }
+            let h = match ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    return Err(e);
+                }
+            };
             let r = ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, &[h]);
             if r.is_err() {
                 let _ = s.ktable.close(&mut s.objs, h);
@@ -1458,6 +1466,16 @@ pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
 
 /// A read-only VMO (READ, MAP, DUPLICATE, TRANSFER) holding `bytes`, as a handle in the
 /// kernel's table.
+/// Close a handle in the kernel's own table (cleanup when a send did not happen).
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub fn ktable_close(h: Handle) {
+    irq::without(|| {
+        let s = state();
+        let _ = s.ktable.close(&mut s.objs, h);
+    });
+    notify();
+}
+
 #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
     irq::without(|| {
@@ -1465,10 +1483,17 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         let k = kmem::get();
         let pages = (bytes.len() as u64).div_ceil(4096).max(1);
         let id = k.vmos.create(pages);
-        k.vmos
-            .write(&mut k.mm, id, 0, bytes)
-            .map_err(|_| Status::NoMemory)?;
-        let h = ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id)?;
+        if k.vmos.write(&mut k.mm, id, 0, bytes).is_err() {
+            let _ = k.vmos.destroy(&mut k.mm, id);
+            return Err(Status::NoMemory);
+        }
+        let h = match ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = k.vmos.destroy(&mut k.mm, id);
+                return Err(e);
+            }
+        };
         s.ktable
             .replace(
                 h,

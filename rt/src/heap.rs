@@ -55,7 +55,8 @@ impl UserHeap {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            // Give the CPU to the holder (it may have been preempted inside `grow`).
+            sys::thread_yield();
         }
         // SAFETY: the lock is held, so no other reference to the state exists.
         let r = f(unsafe { &mut *self.state.get() });
