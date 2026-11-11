@@ -97,6 +97,9 @@ boots, `// SAFETY:` comments, `make check`). In addition:
   exist (skeletons from S0, filled in by each milestone). Every change preserves them, and the lock ordering is not negotiable.
 - Architecture target: **RVA23** (OD47). The OS track does not support hardware below that
   profile; the home computer under `home/` keeps its rv64gc contract.
+- **Shortcuts go in `TIDY-UP.md`.** Any stand-in, ambient authority, deferred review finding or
+  "good enough for now" is recorded there in the same PR (what, why acceptable, risk, proper
+  fix and when). Fixed ones move to its Resolved table.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
 - Tick an S-series box only when verified in QEMU. For SMP work that means both
