@@ -126,6 +126,7 @@ dependencies = [
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "proto",
  "rt",
 ]
 
@@ -352,6 +353,8 @@ name = "rt"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "linked_list_allocator",
+ "proto",
 ]
 
 [[package]]

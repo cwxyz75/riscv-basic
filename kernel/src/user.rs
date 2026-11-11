@@ -28,6 +28,7 @@ use kcore::usercopy::{copy_from_user, copy_to_user, verify_writable};
 /// The embedded user programs (see build.rs); empty if they were not built.
 pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 pub static CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
+pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
 struct Process {
     aspace: AddressSpace,

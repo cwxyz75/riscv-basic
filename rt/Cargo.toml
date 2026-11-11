@@ -2,7 +2,14 @@
 name = "rt"
 version = "0.1.0"
 edition = "2021"
-description = "OS track: the native userland runtime (S3b): syscall wrappers, panic handler, _start, a tiny test harness. no_std, no allocator"
+description = "OS track: the native userland runtime: syscall wrappers, panic handler, _start, a tiny test harness; with the `heap` feature also a heap, the startup message reader and stdio helpers (S4a)"
 
 [dependencies]
 abi = { path = "../abi" }
+proto = { path = "../proto", optional = true }
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"], optional = true }
+
+[features]
+# A global allocator that grows by mapping VMOs into a reserved virtual range, the
+# startup-message reader and blocking socket helpers. Programs that use it get `alloc`.
+heap = ["dep:proto", "dep:linked_list_allocator"]

@@ -59,6 +59,10 @@ fn helper_main(_: usize) {
                     // hand over the `crash` program image as a VMO (for the user-level launcher)
                     let _ = end.write_with_vmo(&msg[..5], user::CRASH_ELF);
                 }
+                b'H' => {
+                    // the `hello` program image, for the runtime tests
+                    let _ = end.write_with_vmo(&msg[..5], user::HELLO_ELF);
+                }
                 b'T' => {
                     thread::sleep_ticks(3);
                     break;

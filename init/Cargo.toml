@@ -5,4 +5,5 @@ edition = "2021"
 description = "OS track: the first user program (the boot-time user test suite) and the `crash` program that misbehaves on purpose (S3b)"
 
 [dependencies]
-rt = { path = "../rt" }
+proto = { path = "../proto" }
+rt = { path = "../rt", features = ["heap"] }
