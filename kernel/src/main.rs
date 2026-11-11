@@ -5,6 +5,7 @@
 //! through the test finisher with a pass/fail exit status.
 
 #![no_std]
+#![cfg_attr(feature = "interactive", allow(dead_code))]
 #![no_main]
 
 extern crate alloc;
@@ -13,6 +14,8 @@ mod boot;
 mod console;
 mod finisher;
 mod heap;
+#[cfg(feature = "interactive")]
+mod interactive;
 mod irq;
 mod kmem;
 mod sched_tests;
@@ -118,6 +121,9 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     // kernel); the kernel-side checks are reported here.
     kmem::snapshot_kernel_half();
     let before = user::reported();
+    #[cfg(feature = "interactive")]
+    let report = interactive::run();
+    #[cfg(not(feature = "interactive"))]
     let report = user_tests::run_all();
     let _ = before;
     tally.add(report.user_reported.0, report.user_reported.1);

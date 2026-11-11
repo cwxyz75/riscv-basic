@@ -42,7 +42,7 @@ Rules:
 
 | ID | Sev | Shortcut | Why it was acceptable | Proper fix, and when |
 |---|---|---|---|---|
-| T14 | M | **Serial access through a kernel bridge thread** (S4 spec, OD52), not a user-mode driver with MMIO and interrupt capabilities. | No device-capability objects until S6. | S6: interrupt object + MMIO VMO; `consoled` drives the UART directly; delete the bridge. |
+| T14 | M | **Serial access through a kernel bridge thread** (S4 spec, OD52), not a user-mode driver with MMIO and interrupt capabilities. The bridge **polls** the UART every tick (no receive interrupt), drops input bytes when the process is not reading (counted), and a kernel `##` line can still split a forwarded chunk only between chunks. | No device-capability objects until S6. | S6: interrupt object + MMIO VMO; `consoled` drives the UART directly; delete the bridge. |
 | T15 | M | **Service death policy = rebuild the whole stack** (S4): no service discovery, no reconnect, `memfsd` state lost on restart. | Memory filesystem has nothing to keep; keeps S4 small. | A name/registry service with reconnect, and real state recovery with the disk filesystem (S6+). |
 | T16 | M | **memfs keeps file data in the server's heap**, programs are copied through memory objects only for `/bin` (S4 spec section 7). | Simple, host-testable. | Back files with VMOs (`GetVmo` for everything), shared page cache, `mmap` (S11). |
 | T17 | M | **No socket half-close**: a terminal has no end-of-file for programs; `cat` with no arguments ends only with Ctrl-C (S4). | Rare in S4. | Add `socket_shutdown` (or a close-write right) before pipelines of real tools matter. |

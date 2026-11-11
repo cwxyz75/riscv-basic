@@ -31,7 +31,7 @@ fn run(image: &[u8], arg: u64) -> Result<i32, String> {
 static mut HELPER_END: Option<user::KernelEnd> = None;
 
 /// A stand-in server on the kernel side of init's bootstrap channel (see the comment in
-/// init.rs above `wait_arguments_are_checked`): the first 4 bytes of a request are a
+/// suite.rs above `wait_arguments_are_checked`): the first 4 bytes of a request are a
 /// transaction id, the 5th the operation.
 fn helper_main(_: usize) {
     // SAFETY: set by `run_all` just before this thread is spawned, taken once here.
@@ -90,7 +90,7 @@ pub fn run_all() -> Report {
 
     push(
         "user_programs_are_embedded",
-        if user::INIT_ELF.len() > 1000 && user::CRASH_ELF.len() > 1000 {
+        if user::SUITE_ELF.len() > 1000 && user::CRASH_ELF.len() > 1000 {
             Ok(())
         } else {
             Err(String::from(
@@ -105,7 +105,7 @@ pub fn run_all() -> Report {
     let threads_before = thread::thread_count();
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
-            user::INIT_ELF,
+            user::SUITE_ELF,
             u64::from(cfg!(feature = "sched-round-robin")),
         )
         .map_err(|e| format!("could not start init: {e:?}"))?;
@@ -315,7 +315,7 @@ pub fn run_all() -> Report {
         },
     );
     // Bad programs are refused before anything is built.
-    let mut corrupt = alloc::vec::Vec::from(user::INIT_ELF);
+    let mut corrupt = alloc::vec::Vec::from(user::SUITE_ELF);
     corrupt[0] = 0;
     let frames = free_frames();
     push(

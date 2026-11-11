@@ -17,10 +17,37 @@ fn main() {
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let built = PathBuf::from(&dir).join("../target/riscv64imac-unknown-none-elf/debug");
-    for name in ["init", "crash", "hello"] {
+    let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for name in ["suite", "init", "crash", "hello"] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         let bytes = std::fs::read(&src).unwrap_or_default();
+        if name != "suite" {
+            image_files.push((name.as_bytes().to_vec(), bytes.clone()));
+        }
         std::fs::write(out.join(format!("{name}.elf")), bytes).expect("write the embedded program");
     }
+    // The boot image: every program (not the test suite) plus the fixture files. A missing
+    // program is an empty entry, so a bare `cargo clippy` still builds.
+    let fixtures = PathBuf::from(&dir).join("../fixtures");
+    println!("cargo:rerun-if-changed={}", fixtures.display());
+    if let Ok(rd) = std::fs::read_dir(&fixtures) {
+        let mut names: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        names.sort_by_key(|e| e.file_name());
+        for e in names {
+            if e.path().is_file() {
+                let name = format!("fixtures/{}", e.file_name().to_string_lossy());
+                image_files.push((
+                    name.into_bytes(),
+                    std::fs::read(e.path()).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    let refs: Vec<(&[u8], &[u8])> = image_files
+        .iter()
+        .map(|(n, d)| (n.as_slice(), d.as_slice()))
+        .collect();
+    let image = proto::bootimg::build(&refs).expect("build the boot image");
+    std::fs::write(out.join("bootimg.bin"), image).expect("write the boot image");
 }

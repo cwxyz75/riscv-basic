@@ -26,8 +26,15 @@ use kcore::sched::Tid;
 use kcore::usercopy::{copy_from_user, copy_to_user, verify_writable};
 
 /// The embedded user programs (see build.rs); empty if they were not built.
-pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
+pub static SUITE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/suite.elf"));
 pub static CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
+/// The interactive supervisor (`init`, S4a): the first program of the interactive boot.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
+/// The boot image (S4-SPEC section 3): every user program and the fixture files, as one
+/// archive that becomes a read-only VMO for `init`.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg.bin"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
 struct Process {
@@ -1388,6 +1395,18 @@ impl KernelEnd {
         r
     }
 
+    /// Send `data` with handles that are in the kernel's table (`ktable_*` helpers make them);
+    /// they move into the message. Nothing moves if the write fails.
+    #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+    pub fn write_handles(&self, data: &[u8], handles: &[Handle]) -> Result<(), Status> {
+        let r = irq::without(|| {
+            let s = state();
+            ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, handles)
+        });
+        notify();
+        r
+    }
+
     /// Wait until a message is readable or the peer has closed; false on timeout.
     pub fn wait_readable(&self, deadline: u64) -> bool {
         let q = irq::without(|| state().signal_queue);
@@ -1407,6 +1426,88 @@ impl KernelEnd {
     /// Close the end (the same as dropping it).
     pub fn close(self) {
         drop(self);
+    }
+}
+
+/// The kernel's end of a socket (in the kernel's own handle table), for the serial bridge.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub struct KernelSocket {
+    handle: Handle,
+}
+
+impl Drop for KernelSocket {
+    fn drop(&mut self) {
+        irq::without(|| {
+            let s = state();
+            let _ = s.ktable.close(&mut s.objs, self.handle);
+        });
+        notify();
+    }
+}
+
+/// A new socket pair: the kernel keeps one end; the other end's handle is in the kernel's
+/// table, ready to be sent to a process with [`KernelEnd::write_handles`].
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
+    irq::without(|| {
+        let s = state();
+        let (kernel, user) = ipc::socket_create(&mut s.objs, &mut s.ktable)?;
+        Ok((KernelSocket { handle: kernel }, user))
+    })
+}
+
+/// A read-only VMO (READ, MAP, DUPLICATE, TRANSFER) holding `bytes`, as a handle in the
+/// kernel's table.
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
+    irq::without(|| {
+        let s = state();
+        let k = kmem::get();
+        let pages = (bytes.len() as u64).div_ceil(4096).max(1);
+        let id = k.vmos.create(pages);
+        k.vmos
+            .write(&mut k.mm, id, 0, bytes)
+            .map_err(|_| Status::NoMemory)?;
+        let h = ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id)?;
+        s.ktable
+            .replace(
+                h,
+                Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
+            )
+            .inspect_err(|_| {
+                let _ = s.ktable.close(&mut s.objs, h);
+            })
+    })
+}
+
+#[cfg_attr(not(feature = "interactive"), allow(dead_code))]
+impl KernelSocket {
+    /// Up to `max` bytes the process wrote to its end.
+    pub fn read(&self, max: usize) -> Result<Vec<u8>, Status> {
+        let r = irq::without(|| {
+            let s = state();
+            ipc::socket_read(&mut s.objs, &s.ktable, self.handle, max)
+        });
+        notify();
+        r
+    }
+
+    /// Bytes for the process to read; returns how many were accepted.
+    pub fn write(&self, data: &[u8]) -> Result<usize, Status> {
+        let r = irq::without(|| {
+            let s = state();
+            ipc::socket_write(&mut s.objs, &s.ktable, self.handle, data)
+        });
+        notify();
+        r
+    }
+
+    /// The socket's signals (READABLE, PEER_CLOSED, ...), 0 if it names nothing.
+    pub fn signals(&self) -> u32 {
+        irq::without(|| {
+            let s = state();
+            ipc::signals_of(&s.objs, &s.ktable, self.handle).unwrap_or(0)
+        })
     }
 }
 
