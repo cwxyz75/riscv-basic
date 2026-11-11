@@ -136,6 +136,12 @@ pub mod signals {
     pub const USER_MASK: u32 = 0xff00_0000;
 }
 
+/// The handle value of the bootstrap channel every process starts with.
+pub const BOOTSTRAP_HANDLE: Handle = Handle(1);
+
+/// Size of the `channel_call` argument record (SYSCALLS.md).
+pub const CHANNEL_CALL_ARGS_BYTES: usize = 56;
+
 /// Limits (SYSCALLS.md, "Limits").
 pub mod limits {
     pub const MAX_HANDLES: usize = 4096;
@@ -162,9 +168,11 @@ pub mod syscall {
     pub const CHANNEL_WRITE: usize = 21;
     pub const CHANNEL_READ: usize = 22;
     pub const CHANNEL_READ_TXID: usize = 23;
+    pub const CHANNEL_CALL: usize = 24;
     pub const EVENT_CREATE: usize = 30;
     pub const EVENT_SIGNAL: usize = 31;
     pub const OBJECT_SIGNALS: usize = 32;
+    pub const OBJECT_WAIT: usize = 33;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").

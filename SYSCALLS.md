@@ -139,14 +139,18 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 30 | event_create | | `a1` handle |
 | 31 | event_signal | `a0` event, `a1` clear, `a2` set | |
 | 32 | object_signals | `a0` handle | `a1` the signal word |
+| 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
+| 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
 
 ### Execution model of a syscall (S3b)
 
-A syscall runs to completion with interrupts off, on the calling thread's kernel stack, so
-it is atomic with respect to every other thread and to the timer (no thread is preempted
-mid-syscall). That keeps S3b simple and is *not* a promise for later: S5 (SMP) replaces
+A syscall runs with interrupts off on the calling thread's kernel stack, so the timer never
+preempts it. It is atomic with respect to every other thread **except at its documented
+blocking and wake-up points**: `object_wait`, `channel_call` and the wake-up that follows any
+call that can change a signal may switch to another thread in the middle of the call (the
+kernel never keeps a reference to shared state across such a point). That keeps S3b simple and is *not* a promise for later: S5 (SMP) replaces
 it with locks, and long syscalls (a 64 KiB message copy, the object sweep) are a latency
 cost the real-time band will feel. The kernel does not touch the user's `sp`, `gp` or `tp`
 (it has its own stack and uses no thread pointer); S5 must reload `gp`/`tp` on entry.
@@ -182,6 +186,69 @@ its address space is torn down.
 `thread_yield` gives up the rest of the time slice. `clock_get` returns ticks of 1 ms
 since boot. `object_signals` reads the signal word of the object a handle names
 (BAD_HANDLE for a bad handle; no right needed, the signals are not secret to a holder).
+
+## Waiting, calling and the bootstrap handle (S3c-1)
+
+### object_wait(handle, mask, deadline) -> status, observed
+
+Blocks the calling thread until `signals(handle) & mask != 0` or the clock reaches
+`deadline` (absolute ticks, as `clock_get` counts; `0` means "do not wait", `u64::MAX`
+"forever"). The result `observed` is the signal word when the call returned (also on
+TIMED_OUT).
+Rights: WAIT on `handle`. Blocking: until a signal in `mask` is set, the deadline, or the
+process is killed.
+Effects: none (waiting changes no signal).
+Errors, in order: BAD_HANDLE (also if the handle stops naming anything while waiting);
+ACCESS_DENIED (no WAIT right); INVALID_ARGS (`mask` is 0 or has
+a bit that is not a signal); TIMED_OUT (the deadline arrived first, or `deadline` was 0 and
+nothing in `mask` was set). A condition that already holds returns OK at once, even with
+`deadline` 0. Only the signals in `mask` end a wait: to stop waiting for a message when the
+peer dies, include PEER_CLOSED (`READABLE | PEER_CLOSED`).
+Invariants: C3 (no lost wakeup: the check and the sleep are one atomic step).
+Tests: `wait_*` in `init`.
+
+### channel_call(channel, args) -> status, nbytes, nhandles
+
+Sends one request and waits for the reply with the same transaction id, in one call.
+`args` points to a 56-byte record in user memory (little endian):
+
+| offset | field |
+|---|---|
+| 0 | `u64` request bytes pointer |
+| 8 | `u64` request handles pointer |
+| 16 | `u32` request byte count (at least 4: the first 4 bytes are the transaction id) |
+| 20 | `u32` request handle count |
+| 24 | `u64` reply bytes buffer |
+| 32 | `u64` reply handles buffer |
+| 40 | `u32` reply buffer capacity (bytes) |
+| 44 | `u32` reply buffer capacity (handles) |
+| 48 | `u64` deadline (absolute ticks, `u64::MAX` for none) |
+
+Rights: WRITE and READ on `channel`; TRANSFER on the request handles.
+Effects: as `channel_write` then `channel_read_txid` with the request's transaction id.
+Messages with other transaction ids stay queued, for other readers or later reads.
+Blocking: until the reply arrives, the peer closes, or the deadline.
+Errors before anything is sent, in order: INVALID_ARGS (a bad `args` pointer); BAD_HANDLE
+(also: any `a0` over 32 bits); TOO_BIG (request over the limits); INVALID_ARGS (a request under
+4 bytes); WRONG_TYPE, then ACCESS_DENIED (no READ or no WRITE on the channel); INVALID_ARGS
+(a bad request pointer); then those of `channel_write` for the request (BAD_HANDLE for a listed
+handle, ACCESS_DENIED for one without TRANSFER, INVALID_ARGS for a duplicate, NOT_SUPPORTED,
+PEER_CLOSED, SHOULD_WAIT for a full queue). **Errors after the request was sent** (it is
+not taken back, and its handles have gone): PEER_CLOSED (the peer closed before replying),
+TIMED_OUT (the deadline passed first; the reply may still arrive and can be read with
+`channel_read_txid`), BUFFER_TOO_SMALL (the reply is too big for the capacity; it stays queued
+and the sizes come back in `nbytes`, `nhandles`), INVALID_ARGS (the reply buffer or reply handles
+buffer is not writable; the reply stays queued), NO_MEMORY (the reply carries handles and the
+table has no room; it stays queued).
+The kernel does not donate priority to the server yet (OS-ARCHITECTURE 5.3): the call is
+where that attaches.
+Tests: `channel_call_*` in `init`.
+
+### The bootstrap handle
+
+Every process starts with exactly one handle, **handle value 1**: a channel endpoint, the
+bootstrap channel, whose other end the creator keeps (OS-ARCHITECTURE section 9). It has
+the default channel rights. Everything else a program is given arrives as a message on it.
 
 ## Entry template
 
@@ -334,8 +401,9 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | handle_close, handle_duplicate, handle_replace | specified (S3a); implemented in S3b |
 | channel_create, channel_write, channel_read, channel_read_txid | specified (S3a); implemented in S3b |
 | event_create, event_signal | specified (S3a); implemented in S3b |
-| channel_call | planned, S3c |
-| object_wait (wait on a signal with a deadline), object_wait_many / ports | planned, S3c |
+| channel_call | specified (S3c-1) |
+| object_wait (wait on a signal with a deadline) | specified (S3c-1) |
+| object_wait_many / ports | planned, S3c-3 |
 | debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
 | vmo_create, vmo_read, vmo_write, vmo_set_size, vmo_create_child | planned, S3c |
 | vmar_map, vmar_unmap, vmar_protect | planned, S3c |

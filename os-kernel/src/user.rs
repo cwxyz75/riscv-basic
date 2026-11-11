@@ -37,6 +37,9 @@ struct Process {
     entry: u64,
     arg: u64,
     exit_code: Option<i32>,
+    /// The creator's end of the bootstrap channel (a handle in `UserState::ktable`), until
+    /// a test or server takes it with `take_bootstrap`.
+    kernel_end: Option<Handle>,
 }
 
 struct UserState {
@@ -44,10 +47,28 @@ struct UserState {
     procs: BTreeMap<u32, Process>,
     thread_pid: BTreeMap<Tid, u32>,
     next_pid: u32,
+    /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
+    ktable: HandleTable,
+    /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
+    /// a signal wakes it, and each waiter re-checks its own condition.
+    signal_queue: usize,
     /// Output of user programs, assembled into lines.
     line: String,
     pass: u32,
     fail: u32,
+}
+
+impl UserState {
+    /// Every object something outside the registry can still reach: all processes' handles
+    /// **and the kernel's own** (the creator ends of bootstrap channels). Any sweep must use
+    /// all of these (a root left out is destroyed, whatever still points at it).
+    fn roots(&self) -> Vec<kcore::object::ObjId> {
+        self.procs
+            .values()
+            .flat_map(|q| q.handles.objects())
+            .chain(self.ktable.objects())
+            .collect()
+    }
 }
 
 static mut USER: Option<UserState> = None;
@@ -63,6 +84,8 @@ fn state() -> &'static mut UserState {
             procs: BTreeMap::new(),
             thread_pid: BTreeMap::new(),
             next_pid: 1,
+            ktable: HandleTable::new(256),
+            signal_queue: thread::new_queue(),
             line: String::new(),
             pass: 0,
             fail: 0,
@@ -157,7 +180,38 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         entry: parsed.entry,
         arg,
         exit_code: None,
+        kernel_end: None,
     };
+    // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
+    let mut process = process;
+    let made = irq::without(|| -> bool {
+        let s = state();
+        let Ok((kernel_end, process_end)) = ipc::channel_create(&mut s.objs, &mut s.ktable) else {
+            return false;
+        };
+        let entry = s
+            .ktable
+            .remove_for_transfer(process_end)
+            .expect("a fresh handle can be transferred");
+        let first = process
+            .handles
+            .insert(entry.obj, entry.rights)
+            .expect("an empty table has room");
+        assert_eq!(
+            first,
+            abi::BOOTSTRAP_HANDLE,
+            "the bootstrap channel must be handle 1"
+        );
+        process.kernel_end = Some(kernel_end);
+        true
+    });
+    if !made {
+        process.aspace.destroy_user(&mut k.mm);
+        for id in process.vmos {
+            let _ = k.vmos.destroy(&mut k.mm, id);
+        }
+        return Err(LoadError::NoMemory);
+    }
     irq::without(|| state().procs.insert(pid, process));
     let tid = thread::spawn("user", 10, user_thread_main, pid as usize);
     Ok((pid, tid))
@@ -237,12 +291,10 @@ pub fn finish(pid: u32, tid: Tid) -> i32 {
     thread::join(tid);
     // Back to the kernel's own page table before the process's root is freed.
     kmem::use_kernel_table();
-    let (mut process, others) = irq::without(|| {
+    let mut process = irq::without(|| {
         let s = state();
         s.thread_pid.remove(&tid);
-        let p = s.procs.remove(&pid).expect("process exists");
-        let others: Vec<_> = s.procs.values().flat_map(|q| q.handles.objects()).collect();
-        (p, others)
+        s.procs.remove(&pid).expect("process exists")
     });
     // A process that vanished without a recorded code (cannot happen today) is not mistaken
     // for `exit(-1)`.
@@ -250,8 +302,14 @@ pub fn finish(pid: u32, tid: Tid) -> i32 {
     irq::without(|| {
         let s = state();
         process.handles.drain(&mut s.objs);
-        // Anything still alive that no remaining process can reach (reference cycles).
-        s.objs.sweep(&others);
+        if let Some(end) = process.kernel_end.take() {
+            let _ = s.ktable.close(&mut s.objs, end);
+        }
+        // Anything still alive that nothing can reach (reference cycles). The roots are
+        // computed here, in the same interrupts-off step as the sweep, and include the
+        // kernel's own handles.
+        let roots = s.roots();
+        s.objs.sweep(&roots);
         if !s.line.is_empty() {
             let line = core::mem::take(&mut s.line);
             let _ = writeln!(Console, "{line}");
@@ -263,6 +321,7 @@ pub fn finish(pid: u32, tid: Tid) -> i32 {
         let _ = k.vmos.destroy(&mut k.mm, id);
     }
     kmem::flush_tlb();
+    notify(); // peers of what this process held now see PEER_CLOSED
     code
 }
 
@@ -376,16 +435,41 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
+        nr::OBJECT_WAIT => reply(frame, object_wait(a)),
+        nr::CHANNEL_CALL => {
+            let r = channel_call(a);
+            notify();
+            reply(frame, r);
+        }
         _ => {
             let result = dispatch(n, a);
-            match result {
-                Ok((a1, a2)) => frame.set_return(0, a1, a2),
-                Err((s, a1, a2)) => frame.set_return(s.code() as i64 as u64, a1, a2),
+            // A syscall that can change a signal wakes every waiter (after the borrows of
+            // `dispatch` are gone, since waking may switch threads).
+            if matches!(
+                n,
+                nr::CHANNEL_WRITE
+                    | nr::CHANNEL_READ
+                    | nr::CHANNEL_READ_TXID
+                    | nr::HANDLE_CLOSE
+                    | nr::EVENT_SIGNAL
+                    // creating objects can sweep garbage, which closes peers
+                    | nr::CHANNEL_CREATE
+                    | nr::EVENT_CREATE
+            ) {
+                notify();
             }
+            reply(frame, result);
         }
     }
     if n == nr::THREAD_YIELD {
         // status already set above
+    }
+}
+
+fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
+    match r {
+        Ok((a1, a2)) => frame.set_return(0, a1, a2),
+        Err((s, a1, a2)) => frame.set_return(s.code() as i64 as u64, a1, a2),
     }
 }
 
@@ -404,7 +488,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let k = kmem::get();
     // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
     if matches!(n, nr::CHANNEL_CREATE | nr::EVENT_CREATE) && s.objs.needs_sweep() {
-        let roots: Vec<_> = s.procs.values().flat_map(|q| q.handles.objects()).collect();
+        let roots = s.roots();
         s.objs.sweep(&roots);
     }
     let UserState {
@@ -604,5 +688,295 @@ fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
     }
     if !line.is_empty() {
         flush(core::mem::take(line));
+    }
+}
+
+/// Wake every thread waiting on a signal (they re-check their own conditions).
+pub fn notify() {
+    let q = irq::without(|| state().signal_queue);
+    thread::wake_all(q);
+}
+
+/// Run `f` on the calling thread's process, with interrupts off. `Err(BadState)` if the
+/// caller is not a user thread.
+fn with_proc<R>(
+    f: impl FnOnce(&mut Kobjs, &mut Process, &mut kmem::Kmem) -> R,
+) -> Result<R, Status> {
+    irq::without(|| {
+        let s = state();
+        let pid = *s
+            .thread_pid
+            .get(&thread::current())
+            .ok_or(Status::BadState)?;
+        let k = kmem::get();
+        let UserState { objs, procs, .. } = s;
+        let p = procs.get_mut(&pid).ok_or(Status::BadState)?;
+        Ok(f(objs, p, k))
+    })
+}
+
+/// The signal word of `h` in the calling process (0 if it names nothing). Interrupts off.
+fn signals_now(h: Handle) -> Result<u32, Status> {
+    let s = state();
+    let pid = s
+        .thread_pid
+        .get(&thread::current())
+        .ok_or(Status::BadState)?;
+    let p = s.procs.get(pid).ok_or(Status::BadState)?;
+    ipc::signals_of(&s.objs, &p.handles, h)
+}
+
+const WAITABLE_SIGNALS: u32 = abi::signals::READABLE
+    | abi::signals::WRITABLE
+    | abi::signals::PEER_CLOSED
+    | abi::signals::USER_MASK;
+
+fn object_wait(a: [u64; 6]) -> Reply {
+    if a[0] > u64::from(u32::MAX) {
+        return fail(Status::BadHandle);
+    }
+    let (h, deadline) = (Handle(a[0] as u32), a[2]);
+    let rights = with_proc(|_, p, _| p.handles.get(h))
+        .map_err(|e| (e, None, None))?
+        .map_err(|e| (e, None, None))?
+        .rights;
+    if !rights.contains(Rights::WAIT) {
+        return fail(Status::AccessDenied);
+    }
+    if a[1] > u64::from(u32::MAX) || a[1] == 0 || (a[1] as u32) & !WAITABLE_SIGNALS != 0 {
+        return fail(Status::InvalidArgs);
+    }
+    let mask = a[1] as u32;
+    let observed = || irq::without(|| signals_now(h));
+    if deadline != 0 {
+        let q = irq::without(|| state().signal_queue);
+        // A handle that stops naming anything ends the wait (the check below then reports it).
+        thread::wait_deadline(
+            q,
+            || signals_now(h).map_or(true, |s| s & mask != 0),
+            deadline,
+        );
+    }
+    // The handle may have gone while we slept: BAD_HANDLE, not a wait that quietly times out.
+    let seen = observed().map_err(|e| (e, None, None))?;
+    if seen & mask != 0 {
+        Ok((Some(u64::from(seen)), None))
+    } else {
+        Err((Status::TimedOut, Some(u64::from(seen)), None))
+    }
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(a)
+}
+
+fn channel_call(a: [u64; 6]) -> Reply {
+    if a[0] > u64::from(u32::MAX) {
+        return fail(Status::BadHandle);
+    }
+    let ch = Handle(a[0] as u32);
+    let rec = with_proc(|_, p, k| {
+        copy_from_user(
+            &mut p.aspace,
+            &mut k.mm,
+            &mut k.vmos,
+            a[1],
+            abi::CHANNEL_CALL_ARGS_BYTES,
+        )
+    })
+    .map_err(|e| (e, None, None))?
+    .map_err(|e| (e, None, None))?;
+    let (req_bytes, req_handles) = (le64(&rec, 0), le64(&rec, 8));
+    let (nbytes, nhandles) = (le32(&rec, 16) as usize, le32(&rec, 20) as usize);
+    let (rd_bytes, rd_handles) = (le64(&rec, 24), le64(&rec, 32));
+    let (rd_max_bytes, rd_max_handles) = (
+        (le32(&rec, 40) as usize).min(MAX_MSG_BYTES),
+        (le32(&rec, 44) as usize).min(MAX_MSG_HANDLES),
+    );
+    let deadline = le64(&rec, 48);
+    if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
+        return fail(Status::TooBig);
+    }
+    if nbytes < 4 {
+        return fail(Status::InvalidArgs);
+    }
+    // Send the request.
+    let txid = with_proc(|objs, p, k| -> Result<u32, Status> {
+        let entry = p.handles.get(ch)?;
+        if !(entry.rights.contains(Rights::READ) && entry.rights.contains(Rights::WRITE)) {
+            // (a non-channel handle still reports WRONG_TYPE first, below, via channel_write)
+            if !matches!(objs.get(entry.obj), Some(ipc::KObj::Channel(_))) {
+                return Err(Status::WrongType);
+            }
+            return Err(Status::AccessDenied);
+        }
+        let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, req_bytes, nbytes)?;
+        let raw = copy_from_user(
+            &mut p.aspace,
+            &mut k.mm,
+            &mut k.vmos,
+            req_handles,
+            nhandles * 4,
+        )?;
+        ipc::channel_write(objs, &mut p.handles, ch, &data, &handle_list(&raw))?;
+        Ok(le32(&data, 0))
+    })
+    .map_err(|e| (e, None, None))?
+    .map_err(|e| (e, None, None))?;
+    notify();
+    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
+    let q = irq::without(|| state().signal_queue);
+    let ready = || {
+        let s = state();
+        let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+            return true;
+        };
+        let Some(p) = s.procs.get(&pid) else {
+            return true;
+        };
+        !matches!(
+            ipc::channel_peek(
+                &s.objs,
+                &p.handles,
+                ch,
+                Some(txid),
+                rd_max_bytes,
+                rd_max_handles
+            ),
+            Err(ReadError::Status(Status::ShouldWait))
+        )
+    };
+    thread::wait_deadline(q, ready, deadline);
+    let out = with_proc(|objs, p, k| -> Reply {
+        match ipc::channel_peek(
+            objs,
+            &p.handles,
+            ch,
+            Some(txid),
+            rd_max_bytes,
+            rd_max_handles,
+        ) {
+            Ok((nb, nh)) => {
+                verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_bytes, nb)
+                    .map_err(|e| (e, None, None))?;
+                verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_handles, nh * 4)
+                    .map_err(|e| (e, None, None))?;
+                let got = ipc::channel_read_txid(
+                    objs,
+                    &mut p.handles,
+                    ch,
+                    txid,
+                    rd_max_bytes,
+                    rd_max_handles,
+                )
+                .map_err(|_| (Status::BadState, None, None))?;
+                let raw: Vec<u8> = got.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
+                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_bytes, &got.data);
+                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_handles, &raw);
+                Ok((Some(got.data.len() as u64), Some(got.handles.len() as u64)))
+            }
+            Err(ReadError::TooSmall { bytes, handles }) => Err((
+                Status::BufferTooSmall,
+                Some(bytes as u64),
+                Some(handles as u64),
+            )),
+            Err(ReadError::Status(Status::ShouldWait)) => Err((Status::TimedOut, None, None)),
+            Err(ReadError::Status(st)) => Err((st, None, None)),
+        }
+    })
+    .map_err(|e| (e, None, None))?;
+    out
+}
+
+/// The creator's end of a process's bootstrap channel, held by the kernel (S3c-1). Kernel
+/// code (a test helper today, the launcher later) talks to the new process through it.
+pub struct KernelEnd {
+    handle: Handle,
+}
+
+impl Drop for KernelEnd {
+    /// Dropping an end closes it, so a forgotten end cannot leak a kernel-table slot.
+    fn drop(&mut self) {
+        irq::without(|| {
+            let s = state();
+            let _ = s.ktable.close(&mut s.objs, self.handle);
+        });
+        notify();
+    }
+}
+
+/// Take the kernel's end of `pid`'s bootstrap channel (once). Whoever takes it must `close` it.
+pub fn take_bootstrap(pid: u32) -> Option<KernelEnd> {
+    irq::without(|| {
+        state()
+            .procs
+            .get_mut(&pid)?
+            .kernel_end
+            .take()
+            .map(|handle| KernelEnd { handle })
+    })
+}
+
+impl KernelEnd {
+    pub fn write(&self, data: &[u8]) -> Result<(), Status> {
+        let r = irq::without(|| {
+            let s = state();
+            ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, &[])
+        });
+        notify();
+        r
+    }
+
+    /// Take the oldest message (handles in it are closed: the kernel does not keep them).
+    pub fn read(&self) -> Result<Vec<u8>, Status> {
+        let r = irq::without(|| {
+            let s = state();
+            let got = ipc::channel_read(
+                &mut s.objs,
+                &mut s.ktable,
+                self.handle,
+                MAX_MSG_BYTES,
+                MAX_MSG_HANDLES,
+            );
+            match got {
+                Ok(msg) => {
+                    for h in msg.handles {
+                        let _ = s.ktable.close(&mut s.objs, h);
+                    }
+                    Ok(msg.data)
+                }
+                Err(ReadError::Status(st)) => Err(st),
+                Err(ReadError::TooSmall { .. }) => Err(Status::BadState),
+            }
+        });
+        notify();
+        r
+    }
+
+    /// Wait until a message is readable or the peer has closed; false on timeout.
+    pub fn wait_readable(&self, deadline: u64) -> bool {
+        let q = irq::without(|| state().signal_queue);
+        let h = self.handle;
+        thread::wait_deadline(
+            q,
+            || {
+                let s = state();
+                ipc::signals_of(&s.objs, &s.ktable, h)
+                    .map(|sig| sig & (abi::signals::READABLE | abi::signals::PEER_CLOSED) != 0)
+                    .unwrap_or(true)
+            },
+            deadline,
+        )
+    }
+
+    /// Close the end (the same as dropping it).
+    pub fn close(self) {
+        drop(self);
     }
 }

@@ -73,6 +73,13 @@ REQUIRED = [
     "kernel_top_level_slots_are_stable", "two_processes_do_not_share_memory",
     "yielding_processes_do_not_share_memory",
     "two_process_teardown_returns_every_frame",
+    "wait_arguments_are_checked", "wait_returns_at_once_when_the_condition_holds",
+    "wait_with_deadline_zero_polls", "wait_times_out_at_the_deadline",
+    "wait_is_woken_by_a_message", "channel_call_round_trip",
+    "channel_call_skips_unrelated_messages",
+    "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
+    "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
+    "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the

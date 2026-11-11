@@ -3,7 +3,8 @@
 //! ended with the right exit code while the kernel carries on; and tearing a process down
 //! must give back every frame and every kernel object (INVARIANTS H6).
 
-use crate::{kmem, user};
+use crate::{kmem, thread, user};
+use abi::status::Status;
 use alloc::format;
 use alloc::string::String;
 
@@ -24,6 +25,48 @@ fn run(image: &[u8], arg: u64) -> Result<i32, String> {
     let (pid, tid) =
         user::start(image, arg).map_err(|e| format!("could not start the program: {e:?}"))?;
     Ok(user::finish(pid, tid))
+}
+
+/// The kernel's end of init's bootstrap channel, for the helper thread.
+static mut HELPER_END: Option<user::KernelEnd> = None;
+
+/// A stand-in server on the kernel side of init's bootstrap channel (see the comment in
+/// init.rs above `wait_arguments_are_checked`): the first 4 bytes of a request are a
+/// transaction id, the 5th the operation.
+fn helper_main(_: usize) {
+    // SAFETY: set by `run_all` just before this thread is spawned, taken once here.
+    let end =
+        unsafe { (*core::ptr::addr_of_mut!(HELPER_END)).take() }.expect("the helper's end was set");
+    loop {
+        if !end.wait_readable(u64::MAX) {
+            continue;
+        }
+        match end.read() {
+            Ok(msg) if msg.len() >= 5 => match msg[4] {
+                b'E' => {
+                    let _ = end.write(&msg);
+                }
+                b'D' => {
+                    thread::sleep_ticks(3);
+                    let _ = end.write(&msg);
+                }
+                b'N' => {
+                    let _ = end.write(&[0xad, 0xde, 0, 0, b'n']);
+                    let _ = end.write(&msg);
+                }
+                b'C' => break,
+                b'T' => {
+                    thread::sleep_ticks(3);
+                    break;
+                }
+                _ => {} // 'S' and anything else: silence
+            },
+            Ok(_) => {}
+            Err(Status::ShouldWait) => {}
+            Err(_) => break, // PEER_CLOSED: the process is gone
+        }
+    }
+    end.close();
 }
 
 pub struct Report {
@@ -50,7 +93,19 @@ pub fn run_all() -> Report {
 
     // The user-level suite, as a process.
     let frames = free_frames();
-    let code = run(user::INIT_ELF, 0);
+    let code = (|| -> Result<i32, String> {
+        let (pid, tid) = user::start(
+            user::INIT_ELF,
+            u64::from(cfg!(feature = "sched-round-robin")),
+        )
+        .map_err(|e| format!("could not start init: {e:?}"))?;
+        // SAFETY: the helper thread has not been spawned yet; it takes this once.
+        unsafe { *core::ptr::addr_of_mut!(HELPER_END) = user::take_bootstrap(pid) };
+        let helper = thread::spawn("helper", 20, helper_main, 0);
+        let code = user::finish(pid, tid);
+        thread::join(helper);
+        Ok(code)
+    })();
     let reported = user::reported();
     push(
         "init_runs_in_user_mode_and_passes",

@@ -552,6 +552,25 @@ impl WaitQueue {
         Ok(blocked)
     }
 
+    /// Like `wait`, but also wakes at tick `deadline` (a timeout). Returns whether it
+    /// blocked; after waking the caller tells a wake from a timeout by re-checking its
+    /// condition and the clock. A thread woken by the deadline leaves a stale entry here,
+    /// which `wake_one` skips (it is not blocked) and the thread's next wait replaces.
+    pub fn wait_until<C: SchedClass>(
+        &mut self,
+        sched: &mut Sched<C>,
+        deadline: u64,
+    ) -> Result<bool, SchedError> {
+        let me = sched.current().ok_or(SchedError::NoCurrent)?;
+        self.waiters.retain(|&t| t != me);
+        self.waiters.push_back(me);
+        let blocked = sched.sleep_until(deadline)?;
+        if !blocked {
+            self.waiters.retain(|&t| t != me);
+        }
+        Ok(blocked)
+    }
+
     /// Wake the longest-waiting thread, if any.
     pub fn wake_one<C: SchedClass>(&mut self, sched: &mut Sched<C>) -> Option<Tid> {
         while let Some(tid) = self.waiters.pop_front() {
