@@ -198,7 +198,7 @@ every `to` definition is compiled before it runs.
 
 Spec: `OS-ARCHITECTURE.md` (design in sections 2-16, decisions in 17, open
 questions in 18). A separate kernel binary and new crates; the home computer above
-is untouched. **S0 is built; S1 onwards is not.** Each milestone ends in a demo and has a
+is untouched. **S0 and S1 are built; S2 onwards is not.** Each milestone ends in a demo and has a
 runnable acceptance check, written before the code. Tick a box only when verified in
 QEMU (for SMP work, in both normal and icount modes). Crate names are fixed by S0:
 `abi`, `kcore`, `os-kernel`; more arrive with their milestones.
@@ -219,9 +219,19 @@ run in CI.
 Acceptance: model-based tests agree with the reference model on the host; in QEMU,
 map/unmap/fault sequences return allocation counts to baseline.
 
-- [ ] Frame allocator and frame database with refcounts (pure crate, model-tested)
-- [ ] Sv39 on, kernel in the upper half, kernel heap
-- [ ] Page-fault handler with lazy commit through the memory-object (VMO) interface
+- [x] Frame allocator and frame database with refcounts (`kcore::frame`, model-tested against a reference model; mutation-checked)
+- [x] Sv39 on, kernel in the upper half, kernel heap (`kcore::pagetable` + `os-kernel`; verified in QEMU: `paging_enabled`, `runs_in_the_upper_half`, `low_half_is_empty`, W^X walk of the live table)
+- [x] Page-fault handler with lazy commit through the memory-object (VMO) interface (`kcore::aspace`; QEMU tests for lazy read/write, refused faults, shared VMOs and zero leaks over 200 cycles. Not covered in QEMU: instruction-fetch faults (host only), RAM size is assumed 128 MiB)
+
+Independent review (fresh-context agent, before merge) found: a spurious-fault
+livelock when an existing mapping cannot satisfy the access (fixed, tested, mutation-
+checked); an unhandleable expected instruction-fetch fault arm (now fatal); the device
+tree inside the frame database range (top 2 MiB reserved); region size unbounded
+(capped at 1 GiB); a mislabelled map error (`FaultError::MapFailed`); weak tests (added
+NoMemory, huge-leaf, PTE-bit, region-argument and overlap tests, full-section and
+whole-direct-map QEMU checks). Left as documented limits: the TLB flush after unmap is
+the caller's job (stated in the API docs), `kmem::get` is aliasing-by-convention until
+S2 adds a lock, and `FrameDb` refcount overflow is untested.
 
 ### S2: Threads and scheduling (one hart)
 

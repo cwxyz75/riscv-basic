@@ -698,6 +698,9 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD26 | The OS track is launched as a separate kernel binary with its own `make` targets, not as a boot-menu entry on the home-computer kernel | Decided |
 | OD27 | Small third-party utility crates (such as an allocator or `libm`) are allowed in the kernel and userland, each with its own decision-log entry; the kernel, network stack, filesystem and libc are written here. Test-time crates (loom, shuttle, proptest, Miri) assumed fine | Decided |
 | OD28 | Structured serial test output (`##BOOT/##TEST/##DONE/##PANIC`) plus QEMU's test finisher for the exit status; a deliberately failing build proves the harness detects failure (section 3.2.1) | Decided |
+| OD29 | S1 kernel heap is a fixed `.bss` region under the `linked_list_allocator` crate (as the home computer's kernel); user-visible memory comes from the refcounted frame database, not from it. A slab over frames can replace it later | Decided |
+| OD30 | S1 kernel layout: linked in the Sv39 upper half at `0xffff_ffff_8020_0000`, loaded at `0x8020_0000`; a throwaway 1 GiB-leaf boot table in `_start` enables paging, then `kmem::init` builds the real table with the pure `kcore` code (4 KiB leaves, W^X per section) and drops the boot table. The direct map (`0xffff_ffc0_0000_0000 + pa`) covers only frame-database RAM and the device pages in use, never the kernel image | Decided |
+| OD31 | RAM size is assumed to be 128 MiB (`abi::layout::RAM_SIZE`; the boot test passes `-m 128M`) until the device manager parses the device tree (S6) | Decided (limitation) |
 
 ---
 

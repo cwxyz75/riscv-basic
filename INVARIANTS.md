@@ -25,11 +25,11 @@ get filled in as each area is built.
 
 | # | Invariant | How checked |
 |---|---|---|
-| M1 | A physical frame has one owner set: no frame is mapped by two unrelated owners | Model test + frame-database audit (S1) |
-| M2 | W^X: no mapping is both writable and executable (JIT needs an explicit, narrower policy, Q6) | Page-table walker test (S1) |
-| M3 | Frame reference counts are conserved: after any map/unmap/fault/teardown sequence the counts return to baseline | Model test; QEMU allocation counts (S1) |
-| M4 | All memory operations go through the VMO interface, never directly to frames | Review; crate boundaries (S1) |
-| M5 | Kernel memory is never reachable from a user mapping | Page-table walker test (S1) |
+| M1 | A physical frame has one owner set: no frame is mapped by two unrelated owners | Model tests (`kcore/tests/*_model.rs`): independent frame accounting by formula after every step; `FrameDb::audit`; QEMU `shared_vmo_is_one_memory` (S1) |
+| M2 | W^X: no mapping is both writable and executable (JIT needs an explicit, narrower policy, Q6) | `Perms::validate` refuses it (host test); QEMU `kernel_mappings_are_w_xor_x` walks the live kernel table (S1) |
+| M3 | Frame reference counts are conserved: after any map/unmap/fault/teardown sequence the counts return to baseline | Model tests end with a baseline check; QEMU `balanced()` wraps every lazy-memory test, plus `churn_does_not_leak` (S1) |
+| M4 | All memory operations go through the VMO interface, never directly to frames | Review; the only frame-granting path to a mapping is `AddressSpace::handle_fault` via `Vmos::page_for` (S1) |
+| M5 | Kernel memory is never reachable from a user mapping; the kernel image is not writable through the direct map | QEMU `direct_map_does_not_alias_the_image`; user-mapping rule needs S3 (partial) |
 
 ## Concurrency
 
