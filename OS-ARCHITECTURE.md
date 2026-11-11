@@ -202,8 +202,10 @@ lines must agree with it. The kernel formats the lines with the pure `kcore::tes
   kernel in S-mode. Secondary harts are started through the SBI HSM extension.
 - **Sv39** paging (512 GiB virtual, three levels). Kernel in the upper half. Use
   the two software (RSW) PTE bits for kernel bookkeeping such as COW. Use ASIDs.
-- Interrupts: PLIC to start (as in the existing project's memory map); consider
-  AIA later. Timer and IPIs through SBI first; Sstc later if wanted.
+- Interrupts: **AIA** (APLIC + IMSIC; QEMU `-machine virt,aia=aplic-imsic`, OD35), not the
+  PLIC the home computer's memory map describes. Timer and IPIs through SBI first
+  (OpenSBI already routes IPIs through the IMSIC); Sstc later if wanted. External device
+  interrupts first matter in S6.
 - Remote TLB flushes through the SBI RFENCE extension at first.
 - Devices: **virtio-mmio** first (no PCI enumeration). PCI/virtio-pci later if
   realism is wanted.
@@ -704,6 +706,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD32 | Scheduling classes are chosen at build time by a Cargo feature (`sched-round-robin`; default fixed-priority), which satisfies "selected at boot" until there is a command line to read; the class interface lives in `kcore::sched::SchedClass`, the core keeps all mechanism and validates the policy's choices | Decided |
 | OD33 | Priorities 0 (idle), 1-31 (normal), 32-63 (real-time); a tick is 1 ms (SBI timer) and a time slice is 10 ticks; a thread preempted by a better one returns to the front of its level, one whose slice ends goes to the back | Decided |
 | OD34 | The single block/wake path is `Sched::block_current`/`wake` with a one-shot wake token (a wake that races ahead of the block is not lost; wakes do not queue); sleeping is a timer plus that path; wait queues are built on it. S2 kernel threads have heap-allocated 32 KiB stacks with a canary checked at every switch; the kernel heap is interrupt-safe because the tick allocates | Decided |
+| OD35 | External interrupts use AIA (APLIC + IMSIC), not the PLIC. Verified on QEMU 11.1.3 (local) and QEMU 10.2.1 with OpenSBI 1.8.1 (CI): the machine exposes `smaia`/`ssaia`, OpenSBI uses the IMSIC for IPIs, and the OS kernel passes its whole boot test with `aia=aplic-imsic` (`make os-boot-test-aia`, also in `make check` and CI). The driver-facing interrupt object stays independent of the controller. The home computer is unchanged (PLIC default) | Decided |
 
 ---
 
@@ -717,7 +720,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
   `linked_list_allocator` and `libm`), each with its own decision-log entry. The
   kernel, network stack, filesystem and libc are written here. Test-time crates
   (loom, shuttle, proptest, Miri) are assumed fine.
-- **Q3: PLIC or AIA** for external interrupts, and whether to adopt Sstc timers.
+- **Q3 (resolved, OD35): PLIC or AIA.** AIA (APLIC + IMSIC). Sstc timers: still open, optional; the SBI `TIME` call works and is what S2 uses.
 - **Q4: Pager-backed VMOs:** when (S11 as listed, or earlier if `mmap` pain shows up).
 - **Q5: `exec` model:** spawn-and-replace vs a kernel "reset process" operation.
 - **Q6: Executable mappings** for the LOGO JIT: a VMO/VMAR permission and policy.
