@@ -1,0 +1,8 @@
+[package]
+name = "memfs"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the pure tree of the memory filesystem (S4c): nodes, names, quotas, read-only subtrees, open-reference counting. No I/O; the server `memfsd` is a thin loop over it."
+
+[dependencies]
+proto = { path = "../proto" }

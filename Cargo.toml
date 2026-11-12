@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "abi", "init", "kcore", "kernel", "proto", "rt",
+    "abi", "init", "kcore", "kernel", "memfs", "proto", "rt",
     "home/basic", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
 # host-testable crates. The two kernels target bare-metal RISC-V and are built from
 # inside kernel/ and home/kernel/ (see Makefile), which pick up their .cargo/config.toml.
 default-members = [
-    "abi", "kcore", "proto",
+    "abi", "kcore", "memfs", "proto",
     "home/basic", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
 
