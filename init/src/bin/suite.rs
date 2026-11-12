@@ -4029,11 +4029,13 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     ensure_eq!(
         progs,
         vec![
+            b"bomb".to_vec(),
             b"cat".to_vec(),
             b"consoled".to_vec(),
             b"crash".to_vec(),
             b"echo".to_vec(),
             b"hello".to_vec(),
+            b"hog".to_vec(),
             b"init".to_vec(),
             b"launcher".to_vec(),
             b"ls".to_vec(),
@@ -5351,7 +5353,11 @@ fn root_job() -> Result<u32, Detail> {
 }
 
 fn job(parent: u32, procs: u64, threads: u64, pages: u64) -> Result<u32, Detail> {
-    Ok(ok(sys::job_create(parent, procs, threads, pages), "job_create")?.a1 as u32)
+    Ok(ok(
+        sys::job_create(parent, procs, threads, pages, u64::MAX),
+        "job_create",
+    )?
+    .a1 as u32)
 }
 
 /// (used, limit) of a job's resource: 0 processes, 1 threads, 2 pages.
@@ -5381,7 +5387,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     // a job is a job: the other kinds of handle are the wrong type
     let ev = ok(sys::event_create(), "event")?.a1 as u32;
     ensure_eq!(
-        st(sys::job_create(ev, u64::MAX, u64::MAX, u64::MAX)),
+        st(sys::job_create(ev, u64::MAX, u64::MAX, u64::MAX, u64::MAX)),
         Some(S::WrongType),
         "job_create on an event"
     );
@@ -5391,19 +5397,19 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_info on an event"
     );
     ensure_eq!(
-        st(sys::job_create(0, 1, 1, 1)),
+        st(sys::job_create(0, 1, 1, 1, u64::MAX)),
         Some(S::BadHandle),
         "job_create on handle 0"
     );
     let gone = job(root, 1, 1, 1)?;
     sys::handle_close(gone);
     ensure_eq!(
-        st(sys::job_create(gone, 1, 1, 1)),
+        st(sys::job_create(gone, 1, 1, 1, u64::MAX)),
         Some(S::BadHandle),
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 3)),
+        st(sys::job_info(root, 4)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -5425,12 +5431,12 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "manage may not inspect"
     );
     ensure_eq!(
-        st(sys::job_create(inspect, 1, 1, 1)),
+        st(sys::job_create(inspect, 1, 1, 1, u64::MAX)),
         Some(S::AccessDenied),
         "inspect may not create"
     );
     ensure_eq!(
-        st(sys::job_set_limits(kill, 1, 1, 1)),
+        st(sys::job_set_limits(kill, 1, 1, 1, u64::MAX)),
         Some(S::AccessDenied),
         "kill may not set limits"
     );
@@ -5491,7 +5497,10 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
         "the root job's count is back where it was"
     );
     // set_limits works on a live job: raise it and a parent can make processes again
-    ok(sys::job_set_limits(j, 2, u64::MAX, u64::MAX), "raise")?;
+    ok(
+        sys::job_set_limits(j, 2, u64::MAX, u64::MAX, u64::MAX),
+        "raise",
+    )?;
     let a = ok(sys::process_create_in(j), "first")?.a1 as u32;
     let b = ok(sys::process_create_in(j), "second")?.a1 as u32;
     ensure_eq!(
@@ -5500,7 +5509,10 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
         "a third process is over the limit"
     );
     // lowering the limit below usage keeps what exists and refuses more
-    ok(sys::job_set_limits(j, 1, u64::MAX, u64::MAX), "lower")?;
+    ok(
+        sys::job_set_limits(j, 1, u64::MAX, u64::MAX, u64::MAX),
+        "lower",
+    )?;
     ensure_eq!(job_use(j, 0)?, (2, 1), "usage above a lowered limit stays");
     sys::handle_close(a);
     sys::handle_close(b);
@@ -5525,7 +5537,10 @@ fn job_limits_stop_a_thread_bomb() -> Outcome {
     );
     job_use_settles(j, 1, 0, 500)?;
     // with one thread allowed, a second running process cannot be started
-    ok(sys::job_set_limits(j, u64::MAX, 1, u64::MAX), "one thread")?;
+    ok(
+        sys::job_set_limits(j, u64::MAX, 1, u64::MAX, u64::MAX),
+        "one thread",
+    )?;
     let (q, _mq) = launch_image_in(IMAGE.load(Ordering::Relaxed), 15, j)?; // spins
     let second = launch_image_in(IMAGE.load(Ordering::Relaxed), 15, j);
     ensure!(
@@ -5598,7 +5613,7 @@ fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
     )?;
     // a limit set after the fact applies to what is committed next
     ok(
-        sys::job_set_limits(parent, u64::MAX, u64::MAX, 1),
+        sys::job_set_limits(parent, u64::MAX, u64::MAX, 1, u64::MAX),
         "lower the parent",
     )?;
     ensure_eq!(
@@ -5672,6 +5687,122 @@ fn jobs_do_not_leak() -> Outcome {
     }
     job_use_settles(root, 0, procs0, 500)?;
     sys::handle_close(root);
+    Ok(())
+}
+
+fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
+    // (found by the independent review of S4.5a: the refusal came after the bootstrap handle had
+    // moved, and a second start found handle 1 taken and panicked the kernel)
+    let root = root_job()?;
+    let j = job(root, u64::MAX, 0, u64::MAX)?; // no threads at all
+    let p = proc_create_in(j)?;
+    let seg = ok(sys::vmo_create_in(1, j), "segment")?.a1 as u32;
+    ok(
+        sys::process_map(p, seg, 0x1_0000, 0, 4096, PF_R | PF_X),
+        "map some code",
+    )?;
+    let (mine, theirs) = channel()?;
+    for attempt in 1..=3 {
+        ensure_eq!(
+            st(sys::process_start(p, 0x1_0000, 0x1_0000 + 4096, theirs, 0)),
+            Some(S::NoMemory),
+            "start {attempt} in a job with no threads"
+        );
+        // the bootstrap handle is still ours: nothing moved
+        ensure_eq!(
+            st(sys::object_signals(theirs)),
+            Some(S::Ok),
+            "our handle after refusal {attempt}"
+        );
+    }
+    // once a thread is allowed the same start goes through (the code is one `jr` to itself)
+    ok(
+        sys::job_set_limits(j, u64::MAX, 1, u64::MAX, u64::MAX),
+        "allow one thread",
+    )?;
+    ok(
+        sys::process_start(p, 0x1_0000, 0x1_0000 + 4096, theirs, 0),
+        "the retry",
+    )?;
+    ensure_eq!(job_use(j, 1)?.0, 1, "one thread running");
+    ok(sys::process_kill(p, -3), "end it")?;
+    wait_ended(p, 500)?;
+    job_use_settles(j, 1, 0, 500)?;
+    for h in [mine, seg, p, j, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+fn page_tables_are_charged_to_the_job() -> Outcome {
+    // Page-table frames are memory too: a program must not be able to spend its machine's frames
+    // on tables for scattered mappings while its page count stays tiny (found by the review).
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, 40)?;
+    let p = proc_create_in(j)?;
+    let (base, _) = job_use(j, 2)?;
+    ensure!(base >= 1, "the process's root table is charged ({base})");
+    let v = ok(sys::vmo_create_in(1, j), "a VMO")?.a1 as u32;
+    let mut mapped = 0u64;
+    loop {
+        let r = sys::process_map(p, v, 0x1_0000_0000 + mapped * 0x20_0000, 0, 4096, PF_R);
+        if r.status != 0 {
+            ensure_eq!(st(r), Some(S::NoMemory), "the mapping that did not fit");
+            break;
+        }
+        mapped += 1;
+        ensure!(mapped < 40, "mappings were never refused");
+    }
+    ensure!(
+        (1..40).contains(&mapped),
+        "{mapped} scattered mappings fit in a 40-page job"
+    );
+    let (used, _) = job_use(j, 2)?;
+    ensure!(
+        used > mapped,
+        "each mapping costs more than nothing ({used} pages for {mapped})"
+    );
+    // unmapping gives the charge back
+    ok(sys::process_unmap(p, 0x1_0000_0000), "unmap the first")?;
+    let (after, _) = job_use(j, 2)?;
+    ensure!(
+        after < used,
+        "unmapping credited its table pages ({used} -> {after})"
+    );
+    ok(
+        sys::process_map(p, v, 0x1_0000_0000, 0, 4096, PF_R),
+        "map again where there is room",
+    )?;
+    sys::handle_close(p); // never started: gone at once, everything it was charged is credited
+    sys::handle_close(v);
+    job_use_settles(j, 2, 0, 500)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+fn a_job_limits_how_many_jobs_may_exist_below_it() -> Outcome {
+    let root = root_job()?;
+    let top = ok(
+        sys::job_create(root, u64::MAX, u64::MAX, u64::MAX, 3),
+        "top",
+    )?
+    .a1 as u32;
+    let a = job(top, u64::MAX, u64::MAX, u64::MAX)?;
+    let b = job(a, u64::MAX, u64::MAX, u64::MAX)?; // a grandchild counts against top too
+    let c = job(top, u64::MAX, u64::MAX, u64::MAX)?;
+    ensure_eq!(job_use(top, 3)?, (3, 3), "three jobs below top");
+    ensure_eq!(
+        st(sys::job_create(a, 1, 1, 1, 0)),
+        Some(S::NoMemory),
+        "a fourth, anywhere below top"
+    );
+    sys::handle_close(c);
+    ok(sys::job_create(a, 1, 1, 1, 0), "room after one went")?;
+    // (the 256-job cap is no longer the only bound: a program given a job cannot use it up)
+    for h in [b, a, top, root] {
+        sys::handle_close(h);
+    }
     Ok(())
 }
 
@@ -6038,6 +6169,18 @@ pub fn app_main() -> i32 {
             job_kill_ends_every_process_below_and_forbids_more,
         ),
         ("jobs_do_not_leak", jobs_do_not_leak),
+        (
+            "a_refused_process_start_changes_nothing_and_can_be_retried",
+            a_refused_process_start_changes_nothing_and_can_be_retried,
+        ),
+        (
+            "page_tables_are_charged_to_the_job",
+            page_tables_are_charged_to_the_job,
+        ),
+        (
+            "a_job_limits_how_many_jobs_may_exist_below_it",
+            a_job_limits_how_many_jobs_may_exist_below_it,
+        ),
         (
             "threads_left_behind_when_init_exits",
             threads_left_behind_when_init_exits,

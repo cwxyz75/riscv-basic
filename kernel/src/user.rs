@@ -67,6 +67,11 @@ struct Process {
     /// The job this process is charged to (it holds one use of it): its process, its threads
     /// and, through the VMOs made for it, its memory.
     job: JobId,
+    /// Pages charged to `job` for the page-table frames this process's mappings can need (a
+    /// worst-case estimate per mapped region, plus the root table), by region start; credited
+    /// when the region goes or the process ends. Table frames are not VMO pages, so without this
+    /// a program could spend memory the page limit never sees.
+    table_charge: BTreeMap<u64, u64>,
     /// Started by the kernel (`start`): may ask for the root job (`job_root`). Nothing a program
     /// creates is privileged.
     privileged: bool,
@@ -158,6 +163,14 @@ pub fn reported() -> (u32, u32) {
 }
 
 /// How many processes exist right now (a leak counter for tests).
+/// Jobs alive (the root included) and the root job's live process and thread counts: all back
+/// to 1, 0 and 0 when nothing is left (a leak oracle for the ledger, INVARIANTS J2).
+pub fn job_ledger() -> (usize, u64, u64) {
+    let jobs = &kmem::get().vmos.jobs;
+    let u = jobs.usage(JobId::ROOT).unwrap_or_default();
+    (jobs.live(), u.processes, u.threads)
+}
+
 pub fn process_count() -> usize {
     irq::without(|| state().procs.len())
 }
@@ -250,6 +263,7 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         threads_alive: 1,
         thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
+        table_charge: BTreeMap::new(),
         privileged: true,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
@@ -463,6 +477,8 @@ fn teardown(pid: u32) -> i32 {
         for id in process.vmos {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
+        let tables: u64 = process.table_charge.values().sum();
+        k.vmos.jobs.credit(process.job, Resource::Pages, tables);
         k.vmos.jobs.credit(process.job, Resource::Processes, 1);
         k.vmos.jobs.release(process.job);
     });
@@ -1653,8 +1669,14 @@ fn process_create(a: [u64; 6]) -> Reply {
             .jobs
             .charge(job, Resource::Processes, 1)
             .map_err(|e| (job_status(e), None, None))?;
+        // the process's root page table is charged to its job too (one page)
+        if let Err(e) = k.vmos.jobs.charge(job, Resource::Pages, 1) {
+            k.vmos.jobs.credit(job, Resource::Processes, 1);
+            return bad(job_status(e));
+        }
         k.vmos.jobs.retain(job);
         let give_back = |k: &mut kmem::Kmem| {
+            k.vmos.jobs.credit(job, Resource::Pages, 1);
             k.vmos.jobs.credit(job, Resource::Processes, 1);
             k.vmos.jobs.release(job);
         };
@@ -1694,6 +1716,7 @@ fn process_create(a: [u64; 6]) -> Reply {
                 threads_alive: 0,
                 thread_objs: BTreeMap::new(),
                 job,
+                table_charge: BTreeMap::from([(u64::MAX, 1)]),
                 privileged: false,
             },
         );
@@ -1806,13 +1829,25 @@ fn process_map(a: [u64; 6]) -> Reply {
             exec: flags & PF_X != 0,
             user: true,
         };
-        target
-            .aspace
-            .map_region(&k.vmos, vaddr, length / 4096, vid, offset / 4096, perms)
-            .map_err(|e| match e {
+        // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus
+        // one for each end not aligned to them) and two interior ones.
+        let tables = length / 4096 / 512 + 4;
+        k.vmos
+            .jobs
+            .charge(target.job, Resource::Pages, tables)
+            .map_err(|e| (job_status(e), None, None))?;
+        if let Err(e) =
+            target
+                .aspace
+                .map_region(&k.vmos, vaddr, length / 4096, vid, offset / 4096, perms)
+        {
+            k.vmos.jobs.credit(target.job, Resource::Pages, tables);
+            return Err(match e {
                 kcore::aspace::RegionError::TooMany => (Status::NoMemory, None, None),
                 _ => (Status::InvalidArgs, None, None),
-            })?;
+            });
+        }
+        target.table_charge.insert(vaddr, tables);
         Ok((None, None))
     })
 }
@@ -1837,6 +1872,9 @@ fn process_unmap(a: [u64; 6]) -> Reply {
             .aspace
             .unmap_region(&mut k.mm, a[1])
             .map_err(|_| (Status::InvalidArgs, None, None))?;
+        if let Some(tables) = target.table_charge.remove(&a[1]) {
+            k.vmos.jobs.credit(target.job, Resource::Pages, tables);
+        }
         kmem::flush_tlb();
         Ok((None, None))
     })
@@ -1880,6 +1918,14 @@ fn process_start(a: [u64; 6]) -> Reply {
         if !entry_ok || !sp_ok {
             return bad(Status::InvalidArgs).map(|_| 0);
         }
+        // The thread's charge comes before anything changes: a refusal must leave the caller's
+        // handle with the caller and the process exactly as it was (SYSCALLS.md: on any error
+        // nothing changes), or a retry would find handle 1 taken.
+        kmem::get()
+            .vmos
+            .jobs
+            .charge(target.job, Resource::Threads, 1)
+            .map_err(|e| (job_status(e), None, None))?;
         // Commit: the channel end moves into the new process as its handle 1.
         let UserState { procs, .. } = s;
         let caller = procs.get_mut(&me).expect("caller exists");
@@ -1899,11 +1945,6 @@ fn process_start(a: [u64; 6]) -> Reply {
         );
         target.entry = entry;
         target.arg = arg;
-        kmem::get()
-            .vmos
-            .jobs
-            .charge(target.job, Resource::Threads, 1)
-            .map_err(|e| (job_status(e), None, None))?;
         target.start_sp = sp;
         target.state = ProcState::Running;
         target.threads_alive = 1;
@@ -2036,6 +2077,7 @@ fn limits_of(a: [u64; 6], at: usize) -> Limits {
         processes: a[at],
         threads: a[at + 1],
         pages: a[at + 2],
+        jobs: a[at + 3],
     }
 }
 
@@ -2105,6 +2147,7 @@ fn job_info(a: [u64; 6]) -> Reply {
             0 => Resource::Processes,
             1 => Resource::Threads,
             2 => Resource::Pages,
+            3 => Resource::Jobs,
             _ => return bad(Status::InvalidArgs),
         };
         let jobs = &kmem::get().vmos.jobs;
@@ -2117,6 +2160,7 @@ fn job_info(a: [u64; 6]) -> Reply {
             Resource::Processes => limits.processes,
             Resource::Threads => limits.threads,
             Resource::Pages => limits.pages,
+            Resource::Jobs => limits.jobs,
         };
         Ok((Some(used), Some(limit)))
     })

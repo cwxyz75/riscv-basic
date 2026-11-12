@@ -68,8 +68,8 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"cat", b"consoled", b"crash", b"echo", b"hello", b"init", b"launcher", b"ls",
-       b"memfsd", b"probe", b"sh", b"spin"]
+BIN = [b"bomb", b"cat", b"consoled", b"crash", b"echo", b"hello", b"hog", b"init", b"launcher",
+       b"ls", b"memfsd", b"probe", b"sh", b"spin"]
 
 
 def main():
@@ -79,7 +79,7 @@ def main():
 
     # builtins
     step(b"help\n", [b"$ help", b"builtins: cd pwd exit help halt",
-                     b"programs: ls cat echo probe spin"], "help")
+                     b"programs: ls cat echo probe spin hog bomb"], "help")
     step(b"pwd\n", [b"$ pwd", b"/home"], "pwd at start")
     step(b"\n", [b"$ "], "an empty line")
     step(b"# only a comment\n", [b"$ # only a comment"], "a comment")
@@ -139,8 +139,34 @@ def main():
     # confinement: `probe` has only a read-only working directory
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108",
                       b"write ./f: -3", b"clone: ok", b"clone all: -3", b"root: absent",
-                      b"spawn: -1"],
+                      b"spawn: -5"],
          "probe: nothing outside the working directory")
+
+    # limits (S4.5): a program is the only process of its job, runs at most four threads, and
+    # has a bounded amount of memory, whatever it tries
+    step(b"bomb\n", [b"$ bomb", b"bomb: process_create: -5", b"bomb: threads: 3 then -5"],
+         "a process and thread bomb is refused")
+    counts = []
+    for attempt in (1, 2):
+        step(b"hog\n", [b"$ hog"], f"a memory hog, run {attempt}")
+        mib = 0
+        while True:
+            line = s.next_line("the hog's output")
+            if line == f"hog: refused at {mib} MiB".encode():
+                break
+            mib += 1
+            if line != f"hog: {mib} MiB".encode():
+                fail(s, f"hog output: expected 'hog: {mib} MiB', got {line!r}")
+        line = s.next_line("the hog's exit")
+        if line != b"[exit 7]":
+            fail(s, f"the hog ended with {line!r}, wanted [exit 7]")
+        counts.append(mib)
+    # the 4096-page job holds the program's image and stack too: about 15 MiB, never more than 16
+    if not 8 <= counts[0] <= 16:
+        fail(s, f"the hog got {counts[0]} MiB of a 16 MiB job")
+    if counts[0] != counts[1]:
+        fail(s, f"the second hog got {counts[1]} MiB, the first {counts[0]}: memory was not given back")
+    step(b"echo survived\n", [b"$ echo survived", b"survived"], "the shell after the hog")
 
     # Ctrl-C
     step(b"spin\n", [b"$ spin", b"spinning"], "a running job")

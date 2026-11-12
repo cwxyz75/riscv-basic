@@ -46,6 +46,18 @@ pub fn caller_rights() -> u32 {
 /// message, or (on failure before that) are closed here. On failure everything created here is
 /// released.
 pub fn spawn(image: &[u8], startup: &[u8], handles: &[u32]) -> Result<u32, SpawnError> {
+    spawn_in(image, startup, handles, 0)
+}
+
+/// Like [`spawn`], with the process and all the memory built for it charged to `job` (a job
+/// handle with MANAGE; 0 means the caller's own job). The new process lives in `job`, so its
+/// limits are the program's limits.
+pub fn spawn_in(
+    image: &[u8],
+    startup: &[u8],
+    handles: &[u32],
+    job: u32,
+) -> Result<u32, SpawnError> {
     let early = |handles: &[u32], e: SpawnError| {
         for &h in handles {
             sys::handle_close(h);
@@ -69,13 +81,13 @@ pub fn spawn(image: &[u8], startup: &[u8], handles: &[u32]) -> Result<u32, Spawn
     if total > MAX_MAPPED {
         return early(handles, SpawnError::TooBig);
     }
-    let p = sys::process_create();
+    let p = sys::process_create_in(job);
     if p.status != 0 {
         return early(handles, sys_err(p.status));
     }
     let proc = p.a1 as u32;
     let mut moved = false;
-    let result = build_and_start(proc, &parsed, image, startup, handles, &mut moved);
+    let result = build_and_start(proc, &parsed, image, startup, handles, job, &mut moved);
     match result {
         Ok(()) => {
             // Narrow the handle we hand back: replace, then the narrowed handle is the only one.
@@ -108,12 +120,13 @@ fn build_and_start(
     image: &[u8],
     startup: &[u8],
     handles: &[u32],
+    job: u32,
     moved: &mut bool,
 ) -> Result<(), SpawnError> {
     for seg in &parsed.segments {
         let (first, end) = seg.pages();
         let pages = end - first;
-        let v = sys::vmo_create(pages);
+        let v = sys::vmo_create_in(pages, job);
         if v.status != 0 {
             return Err(sys_err(v.status));
         }
@@ -146,7 +159,7 @@ fn build_and_start(
             return Err(sys_err(m.status));
         }
     }
-    let s = sys::vmo_create(STACK_PAGES);
+    let s = sys::vmo_create_in(STACK_PAGES, job);
     if s.status != 0 {
         return Err(sys_err(s.status));
     }

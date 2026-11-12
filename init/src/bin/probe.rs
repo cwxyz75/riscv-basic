@@ -65,10 +65,9 @@ pub fn app_main() -> i32 {
         "absent"
     };
     lines.push(format!("root: {root}\n"));
-    // there is no launcher among the handles: a made-up handle number is no handle at all
-    let msg = [0u8; 8];
-    let w = sys::channel_write(1000, msg.as_ptr(), msg.len(), core::ptr::null(), 0);
-    lines.push(format!("spawn: {}\n", w.status as i32));
+    // it may not start another process: its job allows only itself (NO_MEMORY, -5)
+    let w = sys::process_create();
+    lines.push(format!("spawn: {}\n", w.status));
     for l in &lines {
         if let Err(c) = p.out(l.as_bytes()) {
             return c;
