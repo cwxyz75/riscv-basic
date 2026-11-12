@@ -162,7 +162,7 @@ scheduler still schedules on the boot hart only. Heap and console locks (K5) lan
 Acceptance: `make os-boot-test` passes unchanged with `-smp 4`; `harts_come_online` sees `N` harts with
 distinct `tp`, each having taken at least 3 timer interrupts; `ipi_reaches_every_hart` (the boot hart sends
 `RESCHED`, every other hart's counter increments); `-smp 1` output unchanged.
-**S5b: the BKL and the multi-hart scheduler core, host first (built).** *(Deviation: the kernel keeps using the single-hart interface of `Sched` (hart 0) until S5c; the multi-hart interface, affinity, the pending-reschedule protocol and the audit are in and tested on the host.)* `kcore::sched` with `harts`, affinity and
+**S5b: the BKL and the multi-hart scheduler core, host first (built).** *(Deviations: the kernel keeps using the single-hart interface of `Sched` (hart 0) until S5c; the multi-hart interface, affinity, the pending-reschedule protocol and the audit are in and tested on the host. The loom/shuttle models of the lock hand-over and the wake/IPI/idle race were not written (TIDY-UP T38). Parked harts do not loop on the lock during the suite: the exact-count test is one bounded burst, and sustained contention comes with S5c, when every hart ticks and schedules under the lock.)* `kcore::sched` with `harts`, affinity and
 `current[hart]`, the weakened audit, a per-class model/property suite (random wake/sleep/priority/yield/
 exit across up to 8 harts: no thread lost, none on two harts, a pending reschedule or the best thread),
 and loom/shuttle models of the BKL hand-over (K3) and the wake/IPI/idle race. Kernel: `kernel_lock`, the

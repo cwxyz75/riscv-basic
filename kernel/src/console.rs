@@ -104,3 +104,8 @@ pub fn write_user(bytes: &[u8]) {
         }
     });
 }
+
+/// Take and drop the UART lock (the lock-order test).
+pub fn with_uart_for_test() {
+    with_uart(|| ());
+}

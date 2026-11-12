@@ -79,16 +79,37 @@ pub fn lock_released(class: Class) {
     note_release(class);
 }
 
-/// Test support: pretend the calling hart holds `class` while `f` runs and report whether the
-/// checker flags taking `probe` then (without panicking).
+/// Test support: pretend the calling hart holds `held`, then really take `probe` through the
+/// code the kernel uses, with the checker counting instead of panicking, and report whether it
+/// flagged the order. (So a lock site that forgot to call the checker, or a checker that never
+/// fires, fails the test; the real BKL/heap/UART take paths are exercised, not just a predicate.)
 pub fn order_check(held: Class, probe: Class) -> bool {
     let was = crate::irq::save_and_disable();
     PANIC_ON_VIOLATION.store(false, Ordering::SeqCst);
     let me = percpu::this();
-    let before = me.locks_held.load(Ordering::Relaxed);
+    let saved = me.locks_held.load(Ordering::Relaxed);
     me.locks_held.fetch_or(1 << held as u32, Ordering::Relaxed);
-    let flagged = violates(probe);
-    me.locks_held.store(before, Ordering::Relaxed);
+    let before = VIOLATIONS.load(Ordering::SeqCst);
+    match probe {
+        Class::Bkl => {
+            lock();
+            unlock();
+        }
+        Class::Heap => {
+            // the heap's own path: `alloc` notes the class around the allocator
+            let b = alloc::vec![0u8; 64];
+            core::hint::black_box(&b);
+            drop(b);
+        }
+        Class::Uart => {
+            use core::fmt::Write;
+            let _ = write!(crate::console::Console, "");
+            crate::console::with_uart_for_test();
+        }
+    }
+    let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
+    VIOLATIONS.store(before, Ordering::SeqCst);
+    me.locks_held.store(saved, Ordering::Relaxed);
     PANIC_ON_VIOLATION.store(true, Ordering::SeqCst);
     crate::irq::restore(was);
     flagged
@@ -102,6 +123,14 @@ pub fn lock() {
     debug_assert!(!crate::irq::enabled(), "BKL taken with interrupts on");
     let hart = percpu::this();
     let me = me();
+    // the order check applies to a reentrant take too: a path that holds HEAP or UART and then
+    // takes a lock the hart already owns is still taking it in the wrong order
+    if violates(Class::Bkl) {
+        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+        if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
+            panic!("lock order violation: taking the BKL while holding a later lock");
+        }
+    }
     if OWNER.load(Ordering::Relaxed) == me {
         hart.bkl_depth.fetch_add(1, Ordering::Relaxed);
         return;

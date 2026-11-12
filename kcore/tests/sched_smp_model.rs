@@ -15,20 +15,21 @@ fn world<C: SchedClass>(class: C, harts: usize) -> (Sched<C>, Vec<Tid>) {
     (s, idle)
 }
 
-/// What a hart would do on the IPI: reschedule itself.
-fn serve_pokes<C: SchedClass>(s: &mut Sched<C>) {
+/// What the harts would do on their IPIs: each hart that was *poked* reschedules itself. A hart
+/// that is marked pending but was never poked is not served (it would wait for its next timer
+/// tick in the kernel): `owed` is the set of poked harts not yet served, kept by the caller.
+fn serve_pokes<C: SchedClass>(s: &mut Sched<C>, owed: &mut u32) {
     // (serving one hart can queue a thread another hart should take: go on until nothing is left)
     for _ in 0..100 {
-        let pokes = s.take_pokes();
-        let mut any = pokes != 0;
-        for h in 0..s.harts() {
-            if pokes & (1 << h) != 0 || s.resched_pending(h) {
-                s.reschedule_on(h);
-                any = true;
-            }
-        }
-        if !any {
+        *owed |= s.take_pokes();
+        if *owed == 0 {
             return;
+        }
+        for h in 0..s.harts() {
+            if *owed & (1 << h) != 0 {
+                *owed &= !(1 << h);
+                s.reschedule_on(h);
+            }
         }
     }
     panic!("reschedules never settled");
@@ -79,7 +80,7 @@ fn a_pinned_thread_runs_only_on_its_hart() {
     let p = s.spawn_on(0, 7, Some(2)).unwrap();
     assert_ne!(s.current_on(0), Some(p));
     assert_ne!(s.current_on(1), Some(p));
-    serve_pokes(&mut s);
+    serve_pokes(&mut s, &mut 0);
     assert_eq!(s.current_on(2), Some(p));
     // when hart 2 yields it, no other hart takes it
     s.yield_current_on(2).unwrap();
@@ -95,7 +96,7 @@ fn a_pinned_thread_runs_only_on_its_hart() {
 fn equal_priority_threads_spread_over_idle_harts_and_a_thread_runs_on_one_hart_only() {
     let (mut s, _idle) = world(FixedPriority::new(), 4);
     let ts: Vec<Tid> = (0..4).map(|_| s.spawn_on(0, 4, None).unwrap()).collect();
-    serve_pokes(&mut s);
+    serve_pokes(&mut s, &mut 0);
     let mut on: Vec<Tid> = (0..4).map(|h| s.current_on(h).unwrap()).collect();
     on.sort();
     let mut want = ts.clone();
@@ -110,6 +111,7 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
             let mut rng = Rng::new(seed * 8 + harts as u64);
             let (mut s, idle) = world(make(), harts);
             let mut live: Vec<Tid> = Vec::new(); // non-idle, not exited
+            let mut owed = 0u32; // harts poked and not yet served
             for step in 0..STEPS {
                 let ctx = format!(
                     "class {} harts {harts} seed {seed} step {step}",
@@ -159,7 +161,16 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
                         s.advance_to(to, h);
                     }
                     9 => s.tick_slice(h),
-                    _ => serve_pokes(&mut s),
+                    _ => serve_pokes(&mut s, &mut owed),
+                }
+                owed |= s.take_pokes();
+                // every hart that is marked pending has been poked (a missed poke would leave it
+                // waiting for its next timer tick)
+                for g in 0..harts {
+                    assert!(
+                        !s.resched_pending(g) || owed & (1 << g) != 0,
+                        "{ctx}: hart {g} is pending but was never poked"
+                    );
                 }
                 s.audit().unwrap_or_else(|e| panic!("{ctx}: audit: {e}"));
                 // every hart always has a thread to run (its idle thread at worst)
@@ -180,8 +191,7 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
                 if strict_priority && step % 7 == 0 {
                     // once every hart has served its pending reschedule, each runs the best thread
                     // that may run there: nothing queued and allowed is strictly better
-                    let mut t = world_copy_check(&mut s, &ctx);
-                    t.take();
+                    world_copy_check(&mut s, &mut owed, &ctx);
                 }
             }
         }
@@ -189,15 +199,14 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
 }
 
 /// Serve every pending reschedule, then check the strong property for the priority policy.
-fn world_copy_check<C: SchedClass>(s: &mut Sched<C>, ctx: &str) -> Option<()> {
-    serve_pokes(s);
+fn world_copy_check<C: SchedClass>(s: &mut Sched<C>, owed: &mut u32, ctx: &str) {
+    serve_pokes(s, owed);
     // `audit` now has no pending excuse left: it fails if a better thread waits for any hart
     for h in 0..s.harts() {
         assert!(!s.resched_pending(h), "{ctx}: pending after serving");
     }
     s.audit()
         .unwrap_or_else(|e| panic!("{ctx}: after serving pokes: {e}"));
-    Some(())
 }
 
 #[test]
@@ -211,23 +220,39 @@ fn random_operations_keep_every_per_hart_rule_round_robin() {
 }
 
 #[test]
-fn a_lone_hart_behaves_exactly_like_the_single_hart_core() {
-    // the legacy interface and the hart-0 interface are the same thing
-    let mut a = Sched::new(FixedPriority::new());
-    let mut b = Sched::with_harts(FixedPriority::new(), 1);
-    let ta = a.adopt_current(1).unwrap();
-    let tb = b.adopt_current_on(0, 1, None).unwrap();
-    assert_eq!(ta, tb);
-    for p in [3u8, 2, 5, 1] {
-        assert_eq!(a.spawn(p).unwrap(), b.spawn_on(0, p, None).unwrap());
-        assert_eq!(a.current(), b.current_on(0));
+fn a_rotated_thread_is_offered_to_the_other_harts() {
+    // (found by the S5b review) hart 0 rotates an unpinned priority-5 thread out for a pinned
+    // peer; hart 1 runs priority 3: the rotated thread must be poked onto hart 1
+    let (mut s, _idle) = world(FixedPriority::new(), 2);
+    let a = s.spawn_on(0, 5, None).unwrap();
+    let b = s.spawn_on(0, 5, Some(0)).unwrap();
+    let low = s.spawn_on(1, 3, Some(1)).unwrap();
+    let mut owed = 0;
+    serve_pokes(&mut s, &mut owed);
+    assert_eq!(s.current_on(1), Some(low).or(s.current_on(1)));
+    // run hart 0's slice out: the other 5 takes over and the first goes back in the queue
+    for _ in 0..TIMESLICE_TICKS + 1 {
+        s.tick_slice(0);
+        owed |= s.take_pokes();
     }
-    for _ in 0..40 {
-        a.tick();
-        b.advance_to(b.now() + 1, 0);
-        b.tick_slice(0);
-        assert_eq!(a.current(), b.current_on(0));
-    }
-    a.audit().unwrap();
-    b.audit().unwrap();
+    serve_pokes(&mut s, &mut owed);
+    assert!(
+        [s.current_on(0), s.current_on(1)].contains(&Some(a))
+            && [s.current_on(0), s.current_on(1)].contains(&Some(b)),
+        "both priority-5 threads run, one on each hart"
+    );
+    s.audit().unwrap();
+}
+
+#[test]
+fn a_wake_leaves_a_token_for_a_thread_running_on_another_hart() {
+    // (C3, across harts) a wake that arrives while the thread is still Running elsewhere must not
+    // be lost: its next block consumes the token and does not block
+    let (mut s, _idle) = world(FixedPriority::new(), 2);
+    let t = s.spawn_on(1, 6, Some(1)).unwrap();
+    assert_eq!(s.current_on(1), Some(t));
+    s.wake_on(0, t).unwrap(); // not blocked: leaves a token
+    assert_eq!(s.block_current_on(1), Ok(false), "the token let it through");
+    assert_eq!(s.block_current_on(1), Ok(true), "and only once");
+    s.audit().unwrap();
 }

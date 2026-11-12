@@ -90,7 +90,7 @@ list, with the reason for their position, in the change that adds them.
 
 | # | Invariant | How checked |
 |---|---|---|
-| K1 | Shared kernel state is touched only with the BKL held: `thread::kernel()`, `user::state()` and `kmem::get()` assert it | the whole suite at -smp 1, 2, 4 (a violation panics) |
+| K1 | Shared kernel state is touched only with the BKL held: `thread::kernel()`, `user::state()` and `kmem::get()` assert it (`debug_assert!`: debug builds only, so the release SMP run does not check K1) | the whole suite at -smp 1, 2, 4 in debug builds (a violation panics) |
 | K2 | The BKL is released at `sret`, in `enter_user`, and before idle `wfi`: another hart can take it while this one runs user code or idles | `bkl_is_released_on_user_entry_and_idle` (a probing hart; mutation-checked) |
 | K3 | A thread's nesting depth is saved at a context switch and restored when it resumes, on whatever hart; the lock itself never leaves the hart that switches | the suite (a lost or doubled level panics on the assert in `unlock`) |
 | K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
