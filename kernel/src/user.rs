@@ -575,9 +575,19 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
                     Some(pid) if va < abi::user::TOP => {
                         let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
-                        p.aspace
-                            .handle_fault(&mut k.mm, &mut k.vmos, va, access)
-                            .is_ok()
+                        let r = p.aspace.handle_fault(&mut k.mm, &mut k.vmos, va, access);
+                        if let Err(e) = &r {
+                            // (a diagnostic for memory exhaustion: which fault, and what is left)
+                            let _ = e;
+                            let _ = writeln!(
+                                Console,
+                                "note: user fault at {va:#x} refused ({:?}); free frames {}, job pages {:?}",
+                                r,
+                                k.mm.db.free_count(),
+                                k.vmos.jobs.usage(p.job).map(|u| u.pages)
+                            );
+                        }
+                        r.is_ok()
                     }
                     _ => false,
                 }
