@@ -24,7 +24,7 @@ use kcore::ipc::{self, Kobjs, ReadError};
 use kcore::job::{JobError, JobId, Limits, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::sched::Tid;
-use kcore::usercopy::{copy_from_user, copy_to_user, verify_writable};
+use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
 
 /// The embedded user programs (see build.rs); empty if they were not built.
 pub static SUITE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/suite.elf"));
@@ -817,7 +817,8 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             let data =
                 ipc::socket_read(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
-            let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], &data);
+            copy_to_user_verified(&mut p.aspace, &mut k.mm, a[1], &data)
+                .map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
         nr::PORT_CREATE => {
@@ -900,9 +901,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             match got {
                 Ok(r) => {
                     let raw: Vec<u8> = r.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
-                    // The destinations were verified, so these cannot fail.
-                    let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, bytes_at, &r.data);
-                    let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, handles_at, &raw);
+                    // The destinations were verified: these writes allocate nothing (T10).
+                    copy_to_user_verified(&mut p.aspace, &mut k.mm, bytes_at, &r.data)
+                        .map_err(|e| (e, None, None))?;
+                    copy_to_user_verified(&mut p.aspace, &mut k.mm, handles_at, &raw)
+                        .map_err(|e| (e, None, None))?;
                     Ok((Some(r.data.len() as u64), Some(r.handles.len() as u64)))
                 }
                 Err(ReadError::TooSmall { bytes, handles }) => Err((
@@ -964,7 +967,8 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 k.vmos
                     .read(&mut k.mm, id, offset, &mut data)
                     .map_err(|_| (Status::InvalidArgs, None, None))?;
-                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, &data);
+                copy_to_user_verified(&mut p.aspace, &mut k.mm, buf, &data)
+                    .map_err(|e| (e, None, None))?;
             }
             Ok((None, None))
         }
@@ -1352,8 +1356,10 @@ fn channel_call(a: [u64; 6]) -> Reply {
                 )
                 .map_err(|_| (Status::BadState, None, None))?;
                 let raw: Vec<u8> = got.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
-                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_bytes, &got.data);
-                let _ = copy_to_user(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_handles, &raw);
+                copy_to_user_verified(&mut p.aspace, &mut k.mm, rd_bytes, &got.data)
+                    .map_err(|e| (e, None, None))?;
+                copy_to_user_verified(&mut p.aspace, &mut k.mm, rd_handles, &raw)
+                    .map_err(|e| (e, None, None))?;
                 Ok((Some(got.data.len() as u64), Some(got.handles.len() as u64)))
             }
             Err(ReadError::TooSmall { bytes, handles }) => Err((
@@ -2106,7 +2112,7 @@ fn job_create(a: [u64; 6]) -> Reply {
     })
 }
 
-/// `job_set_limits(job, processes, threads, pages)`: needs MANAGE. Usage above a new limit is
+/// `job_set_limits(job, processes, threads, pages, jobs)`: needs SET_LIMITS (not MANAGE). Usage above a new limit is
 /// not undone: later charges fail until it is back under.
 fn job_set_limits(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
@@ -2117,7 +2123,7 @@ fn job_set_limits(a: [u64; 6]) -> Reply {
             &s.objs,
             &caller.handles,
             Handle(a[0] as u32),
-            Rights::MANAGE,
+            Rights::SET_LIMITS,
         )
         .map_err(|e| (e, None, None))?;
         kmem::get()

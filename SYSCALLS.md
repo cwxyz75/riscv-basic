@@ -15,8 +15,8 @@ entries before their implementation (S3b, S3c).
   `a0` to `a5`; nothing else is read. On return `a0` is a **status** (0 or a negative
   code, below) and `a1` onwards carry results where an entry says so. All other
   registers are preserved.
-- A **handle** is a 32-bit value. 0 is never valid. The low 16 bits are the table slot
-  plus 1; the high 16 bits are a generation that changes every time the slot is freed,
+- A **handle** is a 32-bit value. 0 is never valid. The low 13 bits are the table slot
+  plus 1 (at most 8191 slots); the high 19 bits are a generation that changes every time the slot is freed,
   so a stale value fails (INVARIANTS H2). Values are meaningful only in the process
   that holds them.
 - **Pointers** are user virtual addresses; the kernel validates them (inside the
@@ -65,6 +65,7 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | MANAGE | 8 | controlling a process or thread (map, start, create threads) |
 | INSPECT | 9 | reading its properties |
 | KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
+| SET_LIMITS | 11 | changing a job's limits (`job_set_limits`); separate from MANAGE so that making things inside a job does not allow lifting its limits |
 
 `SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
 `handle_replace` it means "the same as the source handle".
@@ -407,11 +408,9 @@ limit on jobs). The handle carries every job right.
 
 ### job_set_limits(job, processes, threads, pages) -> status
 
-Needs MANAGE. Usage above a new limit is not undone; later charges fail until usage is back under
-it. **MANAGE is one right for everything about the job** (creating children, processes and VMOs in
-it, and changing its limits): a program that holds MANAGE on a job can raise that job's limits, so
-a confined program must never be given MANAGE on the job it runs in. The launcher gives every
-program a job of its own and keeps the only handle (TIDY-UP T36). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+Needs SET_LIMITS (MANAGE is not enough: a holder of MANAGE can make children, processes and VMOs in
+the job but cannot lift its limits). Usage above a new limit is not undone; later charges fail
+until usage is back under it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
 
 ### job_info(job, which) -> status, used, limit
 

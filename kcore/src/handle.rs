@@ -1,8 +1,10 @@
 //! A process's handle table (OS-ARCHITECTURE.md, 5.1; SYSCALLS.md, "Handles").
 //!
-//! A handle value is `generation << 16 | (slot + 1)`: the slot plus one so that 0 is
-//! never valid, and a generation that changes each time the slot is freed so a stale
-//! value fails instead of naming whatever reuses the slot (INVARIANTS H2). The table
+//! A handle value is `generation << 13 | (slot + 1)`: the slot plus one (13 bits, so up to 8191
+//! slots) so that 0 is never valid, and a 19-bit generation that changes each time the slot is
+//! freed so a stale value fails instead of naming whatever reuses the slot (INVARIANTS H2). A
+//! slot whose generation has used its whole range is retired, never reused, so a stale value
+//! cannot become valid again by wrap-around. The table
 //! maps a handle to an object id and a rights mask; rights only ever shrink (H3).
 //!
 //! Each live handle owns one reference to its object. Operations that create a handle
@@ -21,8 +23,14 @@ pub struct Entry {
     pub rights: Rights,
 }
 
+/// Bits of a handle value that hold the slot number plus one.
+const SLOT_BITS: u32 = 13;
+const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+/// The generations a slot goes through before it is retired.
+const GENERATIONS: u32 = 1 << (32 - SLOT_BITS);
+
 struct Slot {
-    gen: u16,
+    gen: u32,
     entry: Option<Entry>,
 }
 
@@ -34,12 +42,12 @@ pub struct HandleTable {
 }
 
 impl HandleTable {
-    /// A table that holds at most `limit` handles (capped at 65535 by the encoding).
+    /// A table that holds at most `limit` handles (capped at 8191 by the encoding).
     pub fn new(limit: usize) -> HandleTable {
         HandleTable {
             slots: Vec::new(),
             free: Vec::new(),
-            limit: limit.min(0xffff),
+            limit: limit.min(SLOT_MASK as usize),
             live: 0,
         }
     }
@@ -59,14 +67,14 @@ impl HandleTable {
 
     fn decode(&self, h: Handle) -> Option<usize> {
         let value = h.0;
-        let slot = (value & 0xffff).checked_sub(1)? as usize;
-        let gen = (value >> 16) as u16;
+        let slot = (value & SLOT_MASK).checked_sub(1)? as usize;
+        let gen = value >> SLOT_BITS;
         let s = self.slots.get(slot)?;
         (s.gen == gen && s.entry.is_some()).then_some(slot)
     }
 
-    fn encode(slot: usize, gen: u16) -> Handle {
-        Handle(((gen as u32) << 16) | (slot as u32 + 1))
+    fn encode(slot: usize, gen: u32) -> Handle {
+        Handle((gen << SLOT_BITS) | (slot as u32 + 1))
     }
 
     /// Look up a handle.
@@ -87,6 +95,10 @@ impl HandleTable {
                 s as usize
             }
             None => {
+                // (retired slots stay in the vector, so the slot numbers must still fit)
+                if self.slots.len() >= SLOT_MASK as usize {
+                    return Err(Status::NoMemory);
+                }
                 self.slots.push(Slot { gen: 0, entry });
                 self.slots.len() - 1
             }
@@ -99,8 +111,12 @@ impl HandleTable {
     fn remove(&mut self, slot: usize) -> Entry {
         let s = &mut self.slots[slot];
         let entry = s.entry.take().expect("occupied");
-        s.gen = s.gen.wrapping_add(1);
-        self.free.push(slot as u16);
+        s.gen += 1;
+        // A slot that has gone through every generation is retired: reusing it would wrap the
+        // generation round to values stale handles still hold.
+        if s.gen < GENERATIONS {
+            self.free.push(slot as u16);
+        }
         self.live -= 1;
         entry
     }

@@ -348,3 +348,46 @@ fn region_perms_at_finds_the_covering_region() {
     assert_eq!(w.proc.region_perms_at(0), None);
     w.teardown();
 }
+
+#[test]
+fn a_verified_copy_needs_no_allocation_and_refuses_pages_that_are_not_there() {
+    use kcore::usercopy::{copy_to_user_verified, verify_writable};
+    let mut w = world();
+    region(&mut w, 0x1_0000, 4, Perms::RW.user());
+    region(&mut w, 0x3_0000, 1, Perms::R.user());
+    let data: Vec<u8> = (0..6000u32).map(|i| (i % 253) as u8).collect();
+    // before verification nothing is committed, so the bare verified copy refuses
+    assert_eq!(
+        copy_to_user_verified(&mut w.proc, &mut w.mm, 0x1_0000 + 50, &data),
+        Err(Status::InvalidArgs),
+        "an uncommitted page is not there yet"
+    );
+    // verification commits and maps the range; then the copy takes no frames at all
+    verify_writable(
+        &mut w.proc,
+        &mut w.mm,
+        &mut w.vmos,
+        0x1_0000 + 50,
+        data.len(),
+    )
+    .unwrap();
+    let free = w.mm.db.free_count();
+    assert_eq!(
+        copy_to_user_verified(&mut w.proc, &mut w.mm, 0x1_0000 + 50, &data),
+        Ok(())
+    );
+    assert_eq!(w.mm.db.free_count(), free, "the copy allocated nothing");
+    assert_eq!(w.read(0x1_0000 + 50, data.len()).unwrap(), data);
+    // a read-only mapping is refused even when it is mapped
+    let _ = w.read(0x3_0000, 1).unwrap();
+    assert_eq!(
+        copy_to_user_verified(&mut w.proc, &mut w.mm, 0x3_0000, &[1]),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        copy_to_user_verified(&mut w.proc, &mut w.mm, 0x10, &[1]),
+        Err(Status::InvalidArgs),
+        "below the user base"
+    );
+    w.teardown();
+}

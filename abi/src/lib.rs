@@ -91,8 +91,11 @@ pub mod rights {
         pub const MANAGE: Rights = Rights(1 << 8);
         pub const INSPECT: Rights = Rights(1 << 9);
         pub const KILL: Rights = Rights(1 << 10);
+        /// Change a job's limits (a job handle only). Apart from MANAGE so that a program can be
+        /// given the power to make things inside a job without the power to lift the job's limits.
+        pub const SET_LIMITS: Rights = Rights(1 << 11);
         /// Every assigned right bit.
-        pub const ALL: Rights = Rights(0x7ff);
+        pub const ALL: Rights = Rights(0xfff);
         /// Not a right: "the same rights as the source", for duplicate and replace.
         pub const SAME: Rights = Rights(1 << 31);
 
@@ -131,7 +134,12 @@ pub mod rights {
         /// A job: create children and processes in it, set limits (MANAGE), end everything in it
         /// (KILL), read usage (INSPECT).
         pub const JOB: Rights = Rights(
-            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::KILL.0 | Self::INSPECT.0,
+            Self::DUPLICATE.0
+                | Self::TRANSFER.0
+                | Self::MANAGE.0
+                | Self::KILL.0
+                | Self::INSPECT.0
+                | Self::SET_LIMITS.0,
         );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
