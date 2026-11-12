@@ -155,7 +155,7 @@ nothing shared).
 
 ## 7. Slices, in order (each leaves `main` green, one PR each)
 
-**S5a: bring-up with parked harts.** `PerHart`, the `tp`/`sscratch` convention (landed first, with the
+**S5a: bring-up with parked harts (built).** *(Deviation: `ticks()` stays the boot hart's counter in S5a, since only the boot hart schedules; the time-CSR clock moves to S5b/S5c where several harts tick. Each hart has its own deadline already.)* `PerHart`, the `tp`/`sscratch` convention (landed first, with the
 existing S3 suites as its regression test, before any second hart runs), per-hart `satp`, HSM discovery and
 start through `EARLY_ROOT`, per-hart timers on the time-CSR clock, idle threads that only idle; the
 scheduler still schedules on the boot hart only. Heap and console locks (K5) land here (secondaries print).

@@ -66,6 +66,14 @@ get filled in as each area is built.
 | J4 | A job's memory is charged where the page is committed (`Vmos::page_for`), nowhere else: no path commits a page without the charge | code structure; `committed_pages_are_charged...` |
 | J5 | Objects and queued data are charged exactly once and credited exactly once: an object's creator pays for the object, the creator of an endpoint pays for what is queued in it, and a destroyed object's credit is applied before the next charge; a charged object holds a use of its job until then, so a record never goes while it has usage | `kcore/tests/job_ipc_quota.rs` (a random walk compared with the registry's own counts), QEMU `job_quotas_...`, the end-of-session ledger check; mutation-checked |
 
+### Hart rules (S5a)
+
+| # | Invariant | How checked |
+|---|---|---|
+| M1 | In kernel code `tp` holds `&PerHart` of the hart running it. It is never restored from a trap frame on a return to the kernel (a thread may resume on another hart); the user's `tp` is saved in the frame and restored only on the return to user mode; `sscratch` is `&PerHart` in user mode and 0 in the kernel | the S3 user suites and every `-smp 4` run (a wrong `tp` would break every trap; migration of a thread between harts only starts in S5c, where its tests are added); `harts_come_online` checks each secondary bound `tp` to its own record |
+| M2 | A secondary hart enters on the early boot table (the kernel's own table has no identity mapping), jumps to the upper half, and only then switches to the kernel table; it touches no shared kernel state until the big kernel lock exists (S5b) | `harts_come_online`, `ipi_reaches_every_hart` |
+| M3 | The user's `satp` last written is per hart (`PerHart::active_satp`) | code structure; S5c tests |
+
 ### Lock order
 
 (Empty until S5. The first entry added is the big kernel lock; every later lock is

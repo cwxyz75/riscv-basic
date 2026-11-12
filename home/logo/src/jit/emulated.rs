@@ -53,9 +53,9 @@ pub fn emulated_execute(code: &[u8], frame_bytes: usize, host: &mut dyn JitHost)
         for register in [5, 6, 7, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31] {
             e.x[register] = 0xBAD0_BAD0_BAD0_BAD0;
         }
-        for register in 0..32 {
+        for (register, slot) in e.f.iter_mut().enumerate() {
             if !(8..=9).contains(&register) && !(18..=27).contains(&register) {
-                e.f[register] = 0x7FF8_BAD0_BAD0_BAD0;
+                *slot = 0x7FF8_BAD0_BAD0_BAD0;
             }
         }
         e.x[10] = ret.value;

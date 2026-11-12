@@ -43,13 +43,13 @@ global_asm!(
     .balign 4
     .globl trap_entry
 trap_entry:
-    csrrw sp, sscratch, sp       # sp <-> sscratch: from U-mode sscratch is the kernel stack top
-    bnez  sp, 2f                 # nonzero: we came from user mode
-    csrrw sp, sscratch, sp       # from the kernel: undo (sscratch is 0 in the kernel)
+    csrrw tp, sscratch, tp       # user mode: tp = &PerHart, sscratch = the user's tp
+                                 # kernel: tp = 0 (sscratch is 0 in the kernel), sscratch = &PerHart
+    bnez  tp, 2f                 # nonzero: we came from user mode
+    csrrw tp, sscratch, tp       # from the kernel: undo (tp = &PerHart again, sscratch = 0)
     addi sp, sp, -288
     sd   x1, 8(sp)
     sd   x3, 24(sp)
-    sd   x4, 32(sp)
     sd   x5, 40(sp)
     sd   x6, 48(sp)
     sd   x7, 56(sp)
@@ -77,14 +77,16 @@ trap_entry:
     sd   x29, 232(sp)
     sd   x30, 240(sp)
     sd   x31, 248(sp)
+    sd   x4, 32(sp)              # (kept for the frame's sake; never restored on a return to the kernel)
     addi t0, sp, 288
     sd   t0, 16(sp)              # the interrupted sp
     j    3f
-2:  # from user mode: sp is the kernel stack top, sscratch holds the user sp
+2:  # from user mode: tp = &PerHart; switch to this hart's kernel stack
+    sd   sp, 8(tp)               # PerHart.scratch_sp = the user's sp
+    ld   sp, 0(tp)               # PerHart.kstack_top
     addi sp, sp, -288
     sd   x1, 8(sp)
     sd   x3, 24(sp)
-    sd   x4, 32(sp)
     sd   x5, 40(sp)
     sd   x6, 48(sp)
     sd   x7, 56(sp)
@@ -113,6 +115,8 @@ trap_entry:
     sd   x30, 240(sp)
     sd   x31, 248(sp)
     csrr t0, sscratch
+    sd   t0, 32(sp)              # the user's tp
+    ld   t0, 8(tp)
     sd   t0, 16(sp)              # the user's sp
     csrw sscratch, zero          # in the kernel now: a trap here is a kernel trap
 3:
@@ -132,12 +136,45 @@ trap_entry:
     csrw sstatus, t0
     andi t1, t0, 256             # SPP: was the trap taken from the kernel?
     bnez t1, 4f
+    # returning to user mode: the next trap needs this hart's kernel stack top and its PerHart
     addi t1, sp, 288
-    csrw sscratch, t1            # returning to user mode: the next trap needs the kernel stack top
-4:
+    sd   t1, 0(tp)               # (tp is this hart's PerHart: kernel code never changes it)
+    csrw sscratch, tp
+    ld   x4, 32(sp)              # the user's tp
     ld   x1, 8(sp)
     ld   x3, 24(sp)
-    ld   x4, 32(sp)
+    ld   x5, 40(sp)
+    ld   x6, 48(sp)
+    ld   x7, 56(sp)
+    ld   x8, 64(sp)
+    ld   x9, 72(sp)
+    ld   x10, 80(sp)
+    ld   x11, 88(sp)
+    ld   x12, 96(sp)
+    ld   x13, 104(sp)
+    ld   x14, 112(sp)
+    ld   x15, 120(sp)
+    ld   x16, 128(sp)
+    ld   x17, 136(sp)
+    ld   x18, 144(sp)
+    ld   x19, 152(sp)
+    ld   x20, 160(sp)
+    ld   x21, 168(sp)
+    ld   x22, 176(sp)
+    ld   x23, 184(sp)
+    ld   x24, 192(sp)
+    ld   x25, 200(sp)
+    ld   x26, 208(sp)
+    ld   x27, 216(sp)
+    ld   x28, 224(sp)
+    ld   x29, 232(sp)
+    ld   x30, 240(sp)
+    ld   x31, 248(sp)
+    ld   sp, 16(sp)
+    sret
+4:  # returning to the kernel: tp stays as it is (a thread may have moved to another hart)
+    ld   x1, 8(sp)
+    ld   x3, 24(sp)
     ld   x5, 40(sp)
     ld   x6, 48(sp)
     ld   x7, 56(sp)
@@ -240,8 +277,29 @@ pub fn flush_tlb() {
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let cause = frame.scause;
+    if cause == (1 << 63) | 1 {
+        // Supervisor software interrupt: an IPI.
+        crate::smp::ipi_interrupt();
+        return;
+    }
+    if cause == (1 << 63) | 5
+        && crate::percpu::this()
+            .index
+            .load(core::sync::atomic::Ordering::Relaxed)
+            != 0
+    {
+        // A secondary hart's timer (S5a: parked harts only count their ticks and re-arm).
+        crate::percpu::this()
+            .timer_ticks
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        crate::timer::next_tick();
+        return;
+    }
     if cause == (1 << 63) | 5 {
         // Supervisor timer interrupt: the scheduler's tick (and preemption).
+        crate::percpu::this()
+            .timer_ticks
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         crate::thread::timer_interrupt();
         if frame.sstatus & (1 << 8) == 0 {
             // Interrupted user code: other threads may have run (under their own address
@@ -293,6 +351,7 @@ fn instruction_length(pc: u64) -> u64 {
 }
 
 fn fatal(frame: &TrapFrame, what: core::fmt::Arguments) -> ! {
+    crate::console::break_lock();
     let _ = testlog::panic(
         &mut Console,
         &format_args!(

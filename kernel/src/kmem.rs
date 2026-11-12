@@ -130,6 +130,7 @@ pub fn init() {
         })
     };
     let satp = (8u64 << 60) | root;
+    KERNEL_SATP.store(satp, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the new table maps everything the kernel is executing from and
     // touching: text, rodata, data/bss/stack, the direct map and the two devices.
     // `sfence.vma` then drops the translations of the early table.
@@ -155,6 +156,9 @@ pub fn satp() -> u64 {
     unsafe { core::arch::asm!("csrr {}, satp", out(reg) v) };
     v
 }
+
+/// The kernel's own `satp` value, recorded once by `init` (the secondary harts load it).
+pub static KERNEL_SATP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Switch back to the kernel's own page table (before a process's root is freed).
 pub fn use_kernel_table() {
