@@ -3644,7 +3644,7 @@ fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
     let size = sys::vmo_get_size(vmo).a1 as u64;
     let img = rt::spawn::read_image(vmo, 0, size).ok_or_else(|| {
         let mut d = Detail::new();
-        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("read the boot image"));
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("read the boot image (size {size})"));
         d
     })?;
     let entries = bootimg::parse(&img).map_err(|e| {
