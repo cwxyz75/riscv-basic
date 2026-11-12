@@ -373,7 +373,7 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
         ));
     }
     let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
-    if frames_after + 8 < frames_before {
+    if frames_after != frames_before {
         return Err(format!("frames {frames_before} -> {frames_after}"));
     }
     Ok(())
@@ -489,7 +489,7 @@ fn smp_churn_stress() -> Result<(), String> {
         return Err(format!("VMOs {vmos_before} -> {vmos_after}"));
     }
     let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
-    if frames_after + 8 < frames_before {
+    if frames_after != frames_before {
         return Err(format!("frames {frames_before} -> {frames_after}"));
     }
     if crate::bkl::VIOLATIONS.load(Ordering::SeqCst) != 0 {

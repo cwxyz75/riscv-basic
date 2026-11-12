@@ -21,6 +21,7 @@ pub mod pagetable;
 pub mod sched;
 pub mod sync;
 pub mod testlog;
+pub mod ticket;
 pub mod usercopy;
 
 use frame::FrameDb;

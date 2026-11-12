@@ -46,7 +46,7 @@ pub struct PerHart {
     pub tp_seen: AtomicUsize,
     /// The nesting depth of the big kernel lock held on this hart (the lock follows the thread:
     /// `bkl::swap_depth`).
-    pub bkl_depth: AtomicU32,
+    pub bkl_depth: kcore::ticket::Depth,
     /// The lock classes this hart holds (bit per `bkl::Class`), for the lock-order checker.
     pub locks_held: AtomicU32,
     /// Work for the hart's IPI handler (S5b tests): kind, argument, result and a done flag.
@@ -74,7 +74,7 @@ impl PerHart {
             pending: AtomicU32::new(0),
             deadline: AtomicU64::new(0),
             tp_seen: AtomicUsize::new(0),
-            bkl_depth: AtomicU32::new(0),
+            bkl_depth: kcore::ticket::Depth::new(),
             locks_held: AtomicU32::new(0),
             work_kind: AtomicU32::new(0),
             work_arg: AtomicU64::new(0),
