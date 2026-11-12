@@ -41,6 +41,8 @@ jobs:
             targets: os-boot-test-rr
           - name: release build
             targets: os-boot-test-release
+          - name: four harts
+            targets: os-boot-test-smp
           - name: AIA, RVA23, serial
             targets: os-boot-test-aia os-boot-test-rva23 os-serial-test
     steps:

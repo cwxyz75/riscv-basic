@@ -393,7 +393,8 @@ enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 ker
     csrw  satp, a3
     sfence.vma zero, zero
     csrw  sepc, a0
-    csrw  sscratch, a4           # from now on a trap is a trap from user mode
+    sd    a4, 0(tp)              # PerHart.kstack_top: where the next trap from user mode lands
+    csrw  sscratch, tp           # from now on a trap is a trap from user mode
     li    t0, 256
     csrc  sstatus, t0            # SPP = 0: sret goes to U-mode
     li    t0, 32
@@ -552,9 +553,6 @@ fn killed_now() -> Option<i32> {
     s.procs.get(pid)?.killed
 }
 
-/// The satp value last written for user mode (so a switch is only made when needed).
-static ACTIVE_SATP: AtomicU64 = AtomicU64::new(0);
-
 fn satp_of(p: &Process) -> u64 {
     (8u64 << 60) | (u64::from(p.asid) << 44) | p.aspace.table().root()
 }
@@ -577,7 +575,12 @@ pub fn activate_current() {
             .map(satp_of)
     });
     if let Some(satp) = satp {
-        if ACTIVE_SATP.swap(satp, Ordering::SeqCst) != satp || kmem::satp() != satp {
+        if crate::percpu::this()
+            .active_satp
+            .swap(satp, Ordering::SeqCst)
+            != satp
+            || kmem::satp() != satp
+        {
             // SAFETY: `satp` names a live process root whose upper half is the kernel's; the
             // flush drops the translations of whatever table was active.
             unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp) };

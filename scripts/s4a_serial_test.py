@@ -34,6 +34,8 @@ class Session:
                "-monitor", "none", "-kernel", kernel]
         if os.environ.get("OS_CPU"):
             cmd[1:1] = ["-cpu", os.environ["OS_CPU"]]
+        if os.environ.get("OS_SMP"):
+            cmd[1:1] = ["-smp", os.environ["OS_SMP"]]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
         self.lines = queue.Queue()

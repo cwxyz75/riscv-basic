@@ -34,7 +34,7 @@ TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "240"))
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
 REQUIRED = [
-    "bss_is_zeroed", "latch_works_on_the_target",
+    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
     "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
@@ -101,6 +101,8 @@ def run(kernel: str, extra=()):
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
         "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
         *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
+        # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
+        *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
         # the host is (TIDY-UP T21). e.g. OS_ICOUNT=shift=4,sleep=off
         *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") else []),
@@ -192,6 +194,9 @@ def main() -> int:
     for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
         found = problems(lines, status, timed_out, expect_fail, required)
+        want_harts = int(os.environ.get("OS_SMP", "1"))
+        if want_harts > 1 and f"harts online: {want_harts}" not in text.split("\n"):
+            found.append(f"the kernel did not report 'harts online: {want_harts}'")
         if found:
             failed = 1
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)

@@ -18,8 +18,11 @@ mod heap;
 mod interactive;
 mod irq;
 mod kmem;
+mod percpu;
 mod sched_tests;
 mod selftest;
+mod smp;
+mod smp_tests;
 mod thread;
 mod timer;
 mod trap;
@@ -58,6 +61,11 @@ impl Tally {
 
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
+    // First of all: this hart's record in `tp` (the trap entry needs it).
+    percpu::bind(0, hart_id);
+    percpu::this()
+        .online
+        .store(true, core::sync::atomic::Ordering::Release);
     let mut out = console::Console;
     let _ = testlog::boot(&mut out, "kernel", "s3");
     let _ = writeln!(
@@ -92,6 +100,11 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
         "kernel page table active; {} frames free",
         kmem::get().mm.db.free_count()
     );
+    // S5a: start the other harts (they only idle and count interrupts until S5c).
+    let harts = smp::start_secondaries(hart_id);
+    if harts > 1 {
+        let _ = writeln!(out, "harts online: {}", smp::online());
+    }
 
     for (name, test) in selftest::TESTS {
         match test() {
@@ -104,6 +117,7 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     thread::init(sched_tests::MAIN_PRIO);
     timer::start();
     irq::enable_timer_interrupt();
+    smp::enable_ipi_on_this_hart();
     irq::enable();
     let class = thread::class_name();
     let _ = writeln!(out, "scheduler class: {class}");
@@ -112,6 +126,12 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
         Ok(()),
     );
     for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
+        match test() {
+            Ok(()) => tally.record(name, Ok(())),
+            Err(detail) => tally.record(name, Err(&detail)),
+        }
+    }
+    for (name, test) in smp_tests::TESTS {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),

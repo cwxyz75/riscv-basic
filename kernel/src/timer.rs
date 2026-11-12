@@ -8,8 +8,6 @@ const EID_TIME: usize = 0x5449_4D45;
 /// Counter cycles per tick: 10 MHz / 1000 = 1 ms.
 pub const TICK_CYCLES: u64 = 10_000;
 
-static DEADLINE: AtomicU64 = AtomicU64::new(0);
-
 pub fn now() -> u64 {
     let t: u64;
     // SAFETY: reads the `time` CSR (user-readable counter).
@@ -32,10 +30,12 @@ fn set(deadline: u64) {
     }
 }
 
-/// Program the first tick.
+/// Program this hart's first tick (each hart has its own deadline and its own timer).
 pub fn start() {
     let first = now() + TICK_CYCLES;
-    DEADLINE.store(first, Ordering::SeqCst);
+    crate::percpu::this()
+        .deadline
+        .store(first, Ordering::SeqCst);
     set(first);
 }
 
@@ -43,11 +43,12 @@ pub fn start() {
 /// exact multiples, so ticks do not drift; if we fell behind (the host stalled the
 /// emulator) the next one is a full tick away rather than a burst.
 pub fn next_tick() {
-    let mut next = DEADLINE.load(Ordering::SeqCst) + TICK_CYCLES;
+    let hart = crate::percpu::this();
+    let mut next = hart.deadline.load(Ordering::SeqCst) + TICK_CYCLES;
     let t = now();
     if next <= t {
         next = t + TICK_CYCLES;
     }
-    DEADLINE.store(next, Ordering::SeqCst);
+    hart.deadline.store(next, Ordering::SeqCst);
     set(next);
 }
