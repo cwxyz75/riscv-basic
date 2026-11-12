@@ -12,6 +12,14 @@ type Test = (&'static str, fn() -> Result<(), String>);
 pub const TESTS: &[Test] = &[
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
+    (
+        "bkl_is_exclusive_under_contention",
+        bkl_is_exclusive_under_contention,
+    ),
+    (
+        "lock_order_violations_are_detected",
+        lock_order_violations_are_detected,
+    ),
 ];
 
 /// Wait up to `ms` milliseconds for `ready`.
@@ -131,6 +139,63 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
         if h.timer_ticks.load(Ordering::SeqCst) < ticks + 10 {
             return Err(format!("hart {i}'s timer stalled after the IPIs"));
         }
+    }
+    Ok(())
+}
+
+fn bkl_is_exclusive_under_contention() -> Result<(), String> {
+    use crate::bkl;
+    const M: u64 = 20_000;
+    let n = smp::started();
+    smp::LOCK_COUNTER.store(0, Ordering::SeqCst);
+    for i in 1..n {
+        smp::start_work(i, smp::WORK_BKL_COUNT, M);
+    }
+    // the boot hart does the same, through the kernel's critical section
+    for _ in 0..M {
+        crate::irq::without(smp::racy_increment);
+    }
+    for i in 1..n {
+        if smp::wait_work(i, 5 * 10_000_000) != Some(M) {
+            return Err(format!("hart {i} did not finish its increments"));
+        }
+    }
+    let got = smp::LOCK_COUNTER.load(Ordering::SeqCst);
+    if got != M * n as u64 {
+        return Err(format!(
+            "{got} increments counted of {}: the lock did not exclude",
+            M * n as u64
+        ));
+    }
+    if !bkl::is_free() {
+        return Err(String::from("the lock is still held"));
+    }
+    Ok(())
+}
+
+fn lock_order_violations_are_detected() -> Result<(), String> {
+    use crate::bkl::{order_check, Class};
+    // the order is BKL, then HEAP, then UART: taking an earlier class while holding a later one
+    // is flagged, taking a later one while holding an earlier one is not
+    for (held, probe, bad) in [
+        (Class::Heap, Class::Bkl, true),
+        (Class::Uart, Class::Bkl, true),
+        (Class::Uart, Class::Heap, true),
+        (Class::Bkl, Class::Heap, false),
+        (Class::Bkl, Class::Uart, false),
+        (Class::Heap, Class::Uart, false),
+    ] {
+        if order_check(held, probe) != bad {
+            return Err(format!(
+                "holding {held:?}, taking {probe:?}: expected flagged={bad}"
+            ));
+        }
+    }
+    if crate::bkl::VIOLATIONS.load(Ordering::SeqCst) != 0 {
+        return Err(format!(
+            "{} lock-order violations in the real run so far",
+            crate::bkl::VIOLATIONS.load(Ordering::SeqCst)
+        ));
     }
     Ok(())
 }

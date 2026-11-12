@@ -1,4 +1,5 @@
-//! Interrupt masking (`sstatus.SIE`) and the timer interrupt enable bit.
+//! Interrupt masking (`sstatus.SIE`), the timer interrupt enable bit, and `without`, the kernel's
+//! critical section: interrupts off *and the big kernel lock held* (S5b; see `bkl.rs`).
 
 use core::arch::asm;
 
@@ -42,7 +43,9 @@ pub fn enable_timer_interrupt() {
 /// Run `f` with interrupts disabled, restoring the previous state after.
 pub fn without<R>(f: impl FnOnce() -> R) -> R {
     let was = save_and_disable();
+    crate::bkl::lock();
     let r = f();
+    crate::bkl::unlock();
     restore(was);
     r
 }

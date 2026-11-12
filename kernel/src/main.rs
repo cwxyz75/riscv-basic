@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod bkl;
 mod boot;
 mod console;
 mod finisher;
@@ -115,6 +116,8 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     // S2: threads, the timer and the scheduler. The boot thread becomes a real-time
     // thread and interrupts come on.
     thread::init(sched_tests::MAIN_PRIO);
+    // From here the big kernel lock is real: entry points assert that it is held.
+    bkl::enforce();
     timer::start();
     irq::enable_timer_interrupt();
     smp::enable_ipi_on_this_hart();

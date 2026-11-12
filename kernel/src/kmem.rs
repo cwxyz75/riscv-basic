@@ -42,8 +42,13 @@ static mut KMEM: Option<Kmem> = None;
 ///
 /// A safe function only because there is one hart: the aliasing rule above is
 /// enforced by convention, and S2 (threads, interrupts) must replace it with a lock.
+#[track_caller]
 pub fn get() -> &'static mut Kmem {
-    // SAFETY: single hart, interrupts off; `init` filled the option before any
+    debug_assert!(
+        crate::bkl::held(),
+        "memory state touched without the big kernel lock"
+    );
+    // SAFETY: the big kernel lock is held (checked above once it is enforced); `init` filled the option before any
     // user of `get` runs, and callers follow the rule above, so no two live
     // references alias.
     unsafe {
@@ -162,7 +167,7 @@ pub static KERNEL_SATP: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 
 /// Switch back to the kernel's own page table (before a process's root is freed).
 pub fn use_kernel_table() {
-    let root = get().aspace.table().root();
+    let root = crate::irq::without(|| get().aspace.table().root());
     let satp = (8u64 << 60) | root;
     // SAFETY: the kernel's table maps everything the kernel executes from and touches;
     // the flush drops the translations of the table being left.
@@ -183,13 +188,17 @@ pub fn flush_tlb() {
 static mut KERNEL_HALF: [u64; 256] = [0; 256];
 
 fn kernel_half_now() -> [u64; 256] {
-    let root = get().aspace.table().root();
-    let mut out = [0u64; 256];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot =
-            kcore::pagetable::PhysMem::read_u64(&get().mm.mem, (root << 12) + (256 + i as u64) * 8);
-    }
-    out
+    crate::irq::without(|| {
+        let root = get().aspace.table().root();
+        let mut out = [0u64; 256];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = kcore::pagetable::PhysMem::read_u64(
+                &get().mm.mem,
+                (root << 12) + (256 + i as u64) * 8,
+            );
+        }
+        out
+    })
 }
 
 /// Remember the kernel half now (called once, after the S1 memory tests, before any process).

@@ -276,6 +276,29 @@ pub fn flush_tlb() {
 
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
+    // Every trap holds the big kernel lock while the kernel handles it (S5, K2); interrupts are
+    // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
+    // which the lock's reentrancy covers.
+    //
+    // Two traps are exempt in S5b because they touch nothing shared: a software interrupt (an
+    // IPI) and a parked secondary hart's timer interrupt (S5c, when secondaries schedule, takes
+    // the lock for the timer too).
+    let cause = frame.scause;
+    let secondary = crate::percpu::this()
+        .index
+        .load(core::sync::atomic::Ordering::Relaxed)
+        != 0;
+    let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && secondary);
+    if light {
+        trap_body(frame);
+        return;
+    }
+    crate::bkl::lock();
+    trap_body(frame);
+    crate::bkl::unlock();
+}
+
+fn trap_body(frame: &mut TrapFrame) {
     let cause = frame.scause;
     if cause == (1 << 63) | 1 {
         // Supervisor software interrupt: an IPI.

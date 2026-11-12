@@ -31,10 +31,14 @@ static UART_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 
 fn with_uart<R>(f: impl FnOnce() -> R) -> R {
     use core::sync::atomic::Ordering;
-    crate::irq::without(|| {
+    // (interrupts off, but deliberately *not* the BKL: the console is used outside it, and the
+    // lock order is BKL, heap, UART)
+    let was = crate::irq::save_and_disable();
+    let r = {
         let me = crate::percpu::this().index.load(Ordering::Relaxed) + 1;
         let outer = UART_OWNER.load(Ordering::Relaxed) != me;
         if outer {
+            crate::bkl::lock_taken(crate::bkl::Class::Uart);
             while UART_OWNER
                 .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
@@ -45,9 +49,12 @@ fn with_uart<R>(f: impl FnOnce() -> R) -> R {
         let r = f();
         if outer {
             UART_OWNER.store(0, Ordering::Release);
+            crate::bkl::lock_released(crate::bkl::Class::Uart);
         }
         r
-    })
+    };
+    crate::irq::restore(was);
+    r
 }
 
 /// Break the UART lock (the panic path: whoever held it may never release it).
@@ -96,4 +103,9 @@ pub fn write_user(bytes: &[u8]) {
             line.user_byte(b, &mut put);
         }
     });
+}
+
+/// Take and drop the UART lock (the lock-order test).
+pub fn with_uart_for_test() {
+    with_uart(|| ());
 }
