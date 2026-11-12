@@ -106,6 +106,14 @@ pub fn run() -> crate::user_tests::Report {
         Err(e) => Err(e.clone()),
     };
     tests.push(("interactive_init_exits_cleanly".into(), verdict));
+    // The services `init` started (launcher, filesystem) end when their last client, `init`,
+    // is gone; give them a bounded time (a loaded machine needs more than a few ticks).
+    for _ in 0..2000 {
+        if user::process_count() == 0 {
+            break;
+        }
+        thread::sleep_ticks(1);
+    }
     thread::sleep_ticks(3);
     let dropped = DROPPED.load(core::sync::atomic::Ordering::Relaxed);
     tests.push((
