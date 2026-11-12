@@ -47,7 +47,7 @@ pub fn app_main() -> i32 {
         return 5;
     };
     // Start the launcher with `rt::spawn` (the first services cannot use one).
-    let Some(launcher_entry) = entries.iter().find(|e| e.name == b"launcher") else {
+    let Some(launcher_entry) = entries.iter().find(|e| e.name == b"bin/launcher") else {
         return 9;
     };
     let launcher_img = &img
@@ -70,6 +70,35 @@ pub fn app_main() -> i32 {
     let Ok(_launcher_proc) = rt::spawn::spawn(launcher_img, &lbytes, &[launcher_end]) else {
         return 12;
     };
+    // Start the filesystem server the same way: it gets its root channel and the boot image.
+    let Some(fs_entry) = entries.iter().find(|e| e.name == b"bin/memfsd") else {
+        return 13;
+    };
+    let fs_img = &img[fs_entry.offset as usize..(fs_entry.offset + fs_entry.size) as usize];
+    let (fs_mine, fs_theirs) = {
+        let c = rt::sys::channel_create();
+        if c.status != 0 {
+            return 14;
+        }
+        (c.a1 as u32, c.a2 as u32)
+    };
+    let fs_image_dup = rt::sys::handle_duplicate(image_vmo, rt::abi::rights::Rights::SAME.0);
+    if fs_image_dup.status != 0 {
+        return 15;
+    }
+    let fs_startup = proto::startup::Startup {
+        args: alloc::vec![b"memfsd".to_vec()],
+        roles: alloc::vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
+        ..proto::startup::Startup::default()
+    };
+    let Ok(fbytes) = fs_startup.encode() else {
+        return 16;
+    };
+    let Ok(_fs_proc) = rt::spawn::spawn(fs_img, &fbytes, &[fs_theirs, fs_image_dup.a1 as u32])
+    else {
+        return 17;
+    };
+    let mut fsroot = rt::fs::Fs::new(fs_mine);
     let mut txid = 0u32;
     let mut banner = String::from("riscv-os S4a init ready; image:");
     for e in &entries {
@@ -139,6 +168,23 @@ pub fn app_main() -> i32 {
                     let out = run_program(launch_ch, image_vmo, &entries, &words, txid);
                     let _ = io::write_all(serial, out.as_bytes());
                     line.clear();
+                } else if let Some(rest) = line.strip_prefix(b"ls ") {
+                    // test aid for S4c: list a directory through the filesystem server
+                    let out = fs_ls(&mut fsroot, rest);
+                    let _ = io::write_all(serial, out.as_bytes());
+                    line.clear();
+                } else if let Some(rest) = line.strip_prefix(b"cat ") {
+                    let out = fs_cat(&mut fsroot, rest);
+                    let _ = io::write_all(serial, &out);
+                    line.clear();
+                } else if let Some(rest) = line.strip_prefix(b"write ") {
+                    // `write <path> <text>`: create or replace a file (only /tmp accepts it)
+                    let mut parts = rest.splitn(2, |&c| c == b' ');
+                    let path = parts.next().unwrap_or(b"");
+                    let text = parts.next().unwrap_or(b"");
+                    let out = fs_write(&mut fsroot, path, text);
+                    let _ = io::write_all(serial, out.as_bytes());
+                    line.clear();
                 } else if line.as_slice() == b"quitx" {
                     // test aid: leave an unterminated line in front of the kernel's verdict
                     let _ = io::write_all(serial, b"bye-no-newline");
@@ -181,7 +227,13 @@ fn run_program(
     let Some(name) = words.first() else {
         return String::from("run: missing program name\r\n");
     };
-    let Some(e) = entries.iter().find(|e| e.name == *name) else {
+    // a bare name is a program in /bin; a name with a slash is an image path as given
+    let path: Vec<u8> = if name.contains(&b'/') {
+        name.to_vec()
+    } else {
+        [&b"bin/"[..], name].concat()
+    };
+    let Some(e) = entries.iter().find(|e| e.name == path) else {
         return alloc::format!("run: {}: not found\r\n", String::from_utf8_lossy(name));
     };
     let narrow = |h: u32, r: u32| -> Option<u32> {
@@ -247,4 +299,84 @@ fn run_program(
     sys::handle_close(proc);
     out.push_str(&alloc::format!("[exit {}]\r\n", code.a1 as i64));
     out
+}
+
+fn fs_error(what: &str, path: &[u8], status: i32) -> String {
+    use proto::file::status as st;
+    let why = match status {
+        st::NOT_FOUND => "not found",
+        st::BAD_REQUEST | st::NAME_TOO_LONG => "bad path",
+        st::IS_DIRECTORY => "is a directory",
+        st::NOT_DIRECTORY => "not a directory",
+        -3 => "access denied",
+        st::QUOTA => "no space",
+        _ => "error",
+    };
+    alloc::format!("{what}: {}: {why}\n", String::from_utf8_lossy(path))
+}
+
+fn fs_ls(root: &mut rt::fs::Fs, path: &[u8]) -> String {
+    use proto::file::{flags, rights};
+    let want = rights::READ | rights::ENUMERATE;
+    let dir = if path == b"." {
+        root.clone_conn(want)
+    } else {
+        root.open(path, flags::DIRECTORY, want)
+    };
+    let mut dir = match dir {
+        Ok(d) => d,
+        Err(e) => return fs_error("ls", path, e),
+    };
+    let mut out = String::new();
+    match dir.read_dir() {
+        Ok(entries) => {
+            for e in entries {
+                out.push_str(&String::from_utf8_lossy(&e.name));
+                if e.is_dir {
+                    out.push('/');
+                }
+                out.push('\n');
+            }
+        }
+        Err(e) => out = fs_error("ls", path, e),
+    }
+    dir.close();
+    out
+}
+
+fn fs_cat(root: &mut rt::fs::Fs, path: &[u8]) -> Vec<u8> {
+    use proto::file::rights;
+    match root.open(path, 0, rights::READ) {
+        Ok(mut f) => {
+            let r = f.read_all();
+            f.close();
+            match r {
+                Ok(data) => data,
+                Err(e) => fs_error("cat", path, e).into_bytes(),
+            }
+        }
+        Err(e) => fs_error("cat", path, e).into_bytes(),
+    }
+}
+
+fn fs_write(root: &mut rt::fs::Fs, path: &[u8], text: &[u8]) -> String {
+    use proto::file::{flags, rights};
+    // create or truncate, then write
+    match root.open(
+        path,
+        flags::CREATE | flags::TRUNCATE,
+        rights::READ | rights::WRITE,
+    ) {
+        Ok(mut f) => {
+            let mut data = text.to_vec();
+            data.push(b'\n');
+            let r = f.write_all(0, &data);
+            f.close();
+            match r {
+                Ok(()) => String::from("ok\n"),
+                Err(e) => fs_error("write", path, e),
+            }
+        }
+        Err(e) => fs_error("write", path, e),
+    }
 }

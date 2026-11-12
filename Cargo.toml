@@ -18,6 +18,8 @@ default-members = [
 debug = 0
 [profile.dev.package.rt]
 debug = 0
+[profile.dev.package.memfs]
+debug = 0
 [profile.dev.package.proto]
 debug = 0
 [profile.dev.package.linked_list_allocator]

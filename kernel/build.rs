@@ -18,20 +18,21 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let built = PathBuf::from(&dir).join("../target/riscv64imac-unknown-none-elf/debug");
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for name in ["suite", "init", "crash", "hello", "launcher"] {
+    for name in ["suite", "init", "crash", "hello", "launcher", "memfsd"] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
         let bytes = std::fs::read(&src).unwrap_or_default();
         if name != "suite" {
-            image_files.push((name.as_bytes().to_vec(), bytes.clone()));
+            image_files.push((format!("bin/{name}").into_bytes(), bytes.clone()));
         }
         std::fs::write(out.join(format!("{name}.elf")), bytes).expect("write the embedded program");
     }
     // The boot image: every program (not the test suite) plus the fixture files. A missing
     // program is an empty entry, so a bare `cargo clippy` still builds.
-    let fixtures = PathBuf::from(&dir).join("../fixtures");
+    let fixtures = PathBuf::from(&dir).join("../bootfs");
     println!("cargo:rerun-if-changed={}", fixtures.display());
-    // Entries are named `fixtures/<path relative to fixtures/>` (memfs mounts them under /home).
+    // Programs are `bin/<name>`; everything under `bootfs/` keeps its relative path (`etc/trusted`,
+    // `home/hello.txt`): an image name is the absolute path of the file without the leading slash.
     fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
@@ -50,7 +51,12 @@ fn main() {
             }
         }
     }
-    walk(&fixtures, "fixtures", &mut image_files);
+    let mut files = Vec::new();
+    walk(&fixtures, "", &mut files);
+    for (n, d) in files {
+        // walk() prefixes every name with "/": drop it
+        image_files.push((n[1..].to_vec(), d));
+    }
     let refs: Vec<(&[u8], &[u8])> = image_files
         .iter()
         .map(|(n, d)| (n.as_slice(), d.as_slice()))

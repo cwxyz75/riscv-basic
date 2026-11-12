@@ -23,8 +23,8 @@ import threading
 import time
 
 TIMEOUT = float(os.environ.get("S4_TIMEOUT", "90"))
-BANNER = (b"riscv-os S4a init ready; image: init crash hello launcher fixtures/hello.txt "
-          b"fixtures/lines.txt fixtures/sub/inner.txt")
+BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/launcher bin/memfsd etc/trusted "
+          b"home/hello.txt home/lines.txt home/sub/inner.txt")
 
 
 class Session:
@@ -119,8 +119,22 @@ def main():
     s.step(b"run hello a b c\n", [b"args=hello a b c", b"[exit 4]"], "a program run by the launcher")
     s.step(b"run hello\n", [b"args=hello", b"[exit 1]"], "a second run")
     s.step(b"run nosuch\n", [b"run: nosuch: not found"], "an unknown program")
-    s.step(b"run fixtures/hello.txt\n", [b"run: fixtures/hello.txt: spawn failed (-107)"], "a text file is not a program")
+    s.step(b"run home/hello.txt\n", [b"run: home/hello.txt: spawn failed (-107)"], "a text file is not a program")
     s.step(b"run hello after-errors\n", [b"args=hello after-errors", b"[exit 2]"], "the launcher still works")
+    # S4c: the filesystem server, through init's `ls`, `cat` and `write` test commands
+    s.step(b"ls .\n", [b"bin/", b"etc/", b"home/", b"tmp/"], "the top level")
+    s.step(b"ls bin\n", [b"crash", b"hello", b"init", b"launcher", b"memfsd"], "the programs")
+    s.step(b"ls home\n", [b"hello.txt", b"lines.txt", b"sub/"], "the home directory")
+    s.step(b"cat home/hello.txt\n", [b"hello, world"], "a fixture")
+    s.step(b"cat home/sub/inner.txt\n", [b"inner"], "a nested fixture")
+    s.step(b"cat etc/trusted\n", [b"ls", b"cat"], "the trust list")
+    s.step(b"write tmp/note some text here\n", [b"ok"], "a write to /tmp")
+    s.step(b"cat tmp/note\n", [b"some text here"], "reading it back")
+    s.step(b"write bin/x hi\n", [b"write: bin/x: access denied"], "writing into /bin")
+    s.step(b"write home/hello.txt hi\n", [b"write: home/hello.txt: access denied"], "overwriting a fixture")
+    s.step(b"cat nope\n", [b"cat: nope: not found"], "a missing file")
+    s.step(b"cat ../etc/trusted\n", [b"cat: ../etc/trusted: bad path"], "a path with ..")
+    s.step(b"ls tmp\n", [b"note"], "the writable directory")
     # the boot image handle is read-only
     s.step(b"rights\n", [b"rights: write=-3 mapw=-3 mapr=0 mapx=-3 dup_all=-3 dup_same=0 "
                          b"write_dup=-3"], "the boot image rights")

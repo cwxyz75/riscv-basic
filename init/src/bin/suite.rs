@@ -3594,6 +3594,16 @@ extern "C" fn drain_for_big_write(arg: usize) -> ! {
 }
 
 /// A failure detail that names the source line (for `?` on an `Option` or an opaque error).
+/// A failure detail for a protocol status that came back where it should not have.
+fn msg_e(status: i32, line: u32) -> Detail {
+    let mut d = Detail::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut d,
+        format_args!("unexpected status {status} at suite.rs:{line}"),
+    );
+    d
+}
+
 fn msg_at(line: u32) -> Detail {
     let mut d = Detail::new();
     let _ = core::fmt::Write::write_fmt(
@@ -3652,7 +3662,7 @@ fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
 /// its service channel, the boot image VMO).
 fn start_launcher() -> Result<(u32, u32, u32), Detail> {
     let bi = boot_image_vmo()?;
-    let (off, len) = image_entry(bi, b"launcher")?;
+    let (off, len) = image_entry(bi, b"bin/launcher")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (mine, theirs) = channel()?;
     let s = Startup {
@@ -3737,7 +3747,7 @@ fn hello_startup(args: &[&[u8]]) -> Result<(Vec<u8>, u32, u32, u32, u32), Detail
 
 fn launcher_spawns_a_program_from_the_boot_image() -> Outcome {
     let (_lp, ch, bi) = start_launcher()?;
-    let (off, len) = image_entry(bi, b"hello")?;
+    let (off, len) = image_entry(bi, b"bin/hello")?;
     let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello", b"x"])?;
     let (status, proc) = ask_launcher(ch, bi, 1, off, len, &bytes, &[in_r, out_w])?;
     ensure_eq!(status, 0, "spawn status");
@@ -3772,7 +3782,7 @@ fn launcher_spawns_a_program_from_the_boot_image() -> Outcome {
 
 fn the_process_handle_the_launcher_returns_cannot_manage() -> Outcome {
     let (_lp, ch, bi) = start_launcher()?;
-    let (off, len) = image_entry(bi, b"hello")?;
+    let (off, len) = image_entry(bi, b"bin/hello")?;
     let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello"])?;
     let (status, proc) = ask_launcher(ch, bi, 1, off, len, &bytes, &[in_r, out_w])?;
     ensure_eq!(status, 0, "spawn");
@@ -3798,9 +3808,9 @@ fn the_process_handle_the_launcher_returns_cannot_manage() -> Outcome {
 
 fn the_launcher_refuses_bad_images_and_requests_without_leaks() -> Outcome {
     let (lp, ch, bi) = start_launcher()?;
-    let (hoff, hlen) = image_entry(bi, b"hello")?;
+    let (hoff, hlen) = image_entry(bi, b"bin/hello")?;
     // not an ELF: a fixture text file
-    let (foff, flen) = image_entry(bi, b"fixtures/hello.txt")?;
+    let (foff, flen) = image_entry(bi, b"home/hello.txt")?;
     let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"x"])?;
     let (status, proc) = ask_launcher(ch, bi, 1, foff, flen, &bytes, &[in_r, out_w])?;
     ensure_eq!(
@@ -3886,7 +3896,7 @@ fn the_launcher_refuses_bad_images_and_requests_without_leaks() -> Outcome {
 
 fn many_launcher_spawns_do_not_leak() -> Outcome {
     let (_lp, ch, bi) = start_launcher()?;
-    let (off, len) = image_entry(bi, b"hello")?;
+    let (off, len) = image_entry(bi, b"bin/hello")?;
     for i in 0..12u32 {
         let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello"])?;
         let (status, proc) = ask_launcher(ch, bi, 10 + i, off, len, &bytes, &[in_r, out_w])?;
@@ -3896,10 +3906,736 @@ fn many_launcher_spawns_do_not_leak() -> Outcome {
         wait_ended(proc.ok_or_else(|| msg_at(line!()))?, 2000)?;
     }
     // a failing spawn in the middle must not disturb later ones
-    let (foff, flen) = image_entry(bi, b"fixtures/lines.txt")?;
+    let (foff, flen) = image_entry(bi, b"home/lines.txt")?;
     let (bytes, _a, in_r, _b, out_w) = hello_startup(&[b"x"])?;
     let (status, _) = ask_launcher(ch, bi, 99, foff, flen, &bytes, &[in_r, out_w])?;
     ensure_eq!(status, proto::file::status::BAD_ELF, "bad image");
+    Ok(())
+}
+
+// --- The memory filesystem server (S4c) --------------------------------------------------------
+
+use proto::file::{flags as pfl, op as pop, rights as prt, status as pst};
+use rt::fs::Fs;
+
+const RW_DIR: u32 = prt::READ | prt::ENUMERATE | prt::CREATE | prt::WRITE;
+const RO_DIR: u32 = prt::READ | prt::ENUMERATE;
+const DENIED: i32 = -3; // the kernel's ACCESS_DENIED, which memfsd uses for rights and read-only
+const TOO_BIG: i32 = -9;
+
+fn code<T>(r: Result<T, i32>) -> Option<i32> {
+    r.err()
+}
+
+/// Start memfsd from the boot image: (process handle, a root connection with every right, the
+/// boot image VMO).
+fn start_memfsd() -> Result<(u32, Fs, u32), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/memfsd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u32;
+    let s = Startup {
+        args: vec![b"memfsd".to_vec()],
+        roles: vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[theirs, image_dup]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn memfsd: {e:?}"));
+        d
+    })?;
+    Ok((p, Fs::new(mine), bi))
+}
+
+fn names(es: &[proto::file::DirEntry]) -> Vec<Vec<u8>> {
+    es.iter().map(|e| e.name.clone()).collect()
+}
+
+fn memfsd_serves_the_boot_image() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let top = root.read_dir().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&top),
+        vec![
+            b"bin".to_vec(),
+            b"etc".to_vec(),
+            b"home".to_vec(),
+            b"tmp".to_vec()
+        ],
+        "the top level"
+    );
+    ensure!(top[0].is_dir && top[3].is_dir, "they are directories");
+    let mut bin = root
+        .open(b"bin", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let progs = names(&bin.read_dir().map_err(|e| msg_e(e, line!()))?);
+    ensure_eq!(
+        progs,
+        vec![
+            b"crash".to_vec(),
+            b"hello".to_vec(),
+            b"init".to_vec(),
+            b"launcher".to_vec(),
+            b"memfsd".to_vec()
+        ],
+        "the programs"
+    );
+    let mut f = root
+        .open(b"home/hello.txt", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        f.read_all().map_err(|e| msg_e(e, line!()))?,
+        b"hello, world\n".to_vec(),
+        "a fixture"
+    );
+    ensure_eq!(f.size(), Ok(13), "its size");
+    ensure_eq!(
+        f.read(7, 100),
+        Ok(b"world\n".to_vec()),
+        "a read from the middle"
+    );
+    ensure_eq!(f.read(13, 10), Ok(vec![]), "a read at the end");
+    ensure_eq!(f.read(u64::MAX, 10), Ok(vec![]), "a read far past the end");
+    let mut g = root
+        .open(b"home/sub/inner.txt", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(g.read_all(), Ok(b"inner\n".to_vec()), "a nested fixture");
+    let mut t = root
+        .open(b"etc/trusted", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(t.read_all(), Ok(b"ls\ncat\n".to_vec()), "the trust list");
+    let mut prog = root
+        .open(b"bin/hello", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    let head = prog.read(0, 4).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        head,
+        b"\x7fELF".to_vec(),
+        "a program reads as its ELF bytes"
+    );
+    ensure_eq!(
+        root.stat(b"home/lines.txt"),
+        Ok(rt::fs::Stat {
+            is_dir: false,
+            size: 14
+        }),
+        "stat by path"
+    );
+    ensure_eq!(
+        root.stat(b"home/sub"),
+        Ok(rt::fs::Stat {
+            is_dir: true,
+            size: 1
+        }),
+        "stat a directory"
+    );
+    ensure_eq!(
+        code(root.stat(b"home/nope")),
+        Some(pst::NOT_FOUND),
+        "stat of a missing path"
+    );
+    Ok(())
+}
+
+fn memfsd_tmp_is_the_only_writable_place() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut f = tmp
+        .open(b"note", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(f.write(0, b"hello"), Ok(5), "write");
+    ensure_eq!(f.read_all(), Ok(b"hello".to_vec()), "read it back");
+    ensure_eq!(f.write(8, b"!"), Ok(1), "a write past the end");
+    ensure_eq!(
+        f.read_all(),
+        Ok(b"hello\0\0\0!".to_vec()),
+        "leaves a zero gap"
+    );
+    ensure_eq!(f.set_size(2), Ok(()), "truncate");
+    ensure_eq!(f.read_all(), Ok(b"he".to_vec()), "and the data is cut");
+    ensure_eq!(tmp.mkdir(b"d"), Ok(()), "mkdir");
+    ensure_eq!(code(tmp.mkdir(b"d")), Some(pst::EXISTS), "mkdir twice");
+    ensure_eq!(
+        code(tmp.unlink(b"d").and(tmp.unlink(b"d"))),
+        Some(pst::NOT_FOUND),
+        "unlink twice"
+    );
+    let names_now = names(&tmp.read_dir().map_err(|e| msg_e(e, line!()))?);
+    ensure_eq!(names_now, vec![b"note".to_vec()], "what is left");
+    ensure_eq!(
+        code(tmp.open(b"note", pfl::CREATE | pfl::EXCLUSIVE, prt::READ)),
+        Some(pst::EXISTS),
+        "exclusive create"
+    );
+    ensure_eq!(
+        code(tmp.open(b"gone", 0, prt::READ)),
+        Some(pst::NOT_FOUND),
+        "open a missing file"
+    );
+    // everything else is read-only
+    ensure_eq!(
+        code(root.mkdir(b"x")),
+        Some(DENIED),
+        "no new top-level names"
+    );
+    let mut bin = root
+        .open(b"bin", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(bin.unlink(b"hello")),
+        Some(DENIED),
+        "no unlink in /bin (no WRITE on this connection)"
+    );
+    ensure_eq!(
+        code(root.open(b"bin/hello", 0, prt::READ | prt::WRITE)),
+        Some(DENIED),
+        "no write access to a program"
+    );
+    ensure_eq!(
+        code(root.open(b"bin/new", pfl::CREATE, prt::READ | prt::WRITE)),
+        Some(DENIED),
+        "no creating in /bin"
+    );
+    ensure_eq!(
+        code(root.open(b"home/hello.txt", 0, prt::READ | prt::WRITE)),
+        Some(DENIED),
+        "fixtures are read-only"
+    );
+    ensure_eq!(
+        code(root.open(b"home", pfl::DIRECTORY, RW_DIR)),
+        Some(DENIED),
+        "no writable handle to /home"
+    );
+    ensure!(
+        root.open(b"tmp", pfl::DIRECTORY, RW_DIR).is_ok(),
+        "but /tmp is fine"
+    );
+    Ok(())
+}
+
+fn memfsd_paths_cannot_escape_a_directory_handle() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    for bad in [
+        &b".."[..],
+        b"/etc",
+        b"a//b",
+        b"home/../etc",
+        b"./home",
+        b"home/",
+        &[b'x'; 256][..],
+        b"a\0b",
+    ] {
+        let c = code(root.open(bad, 0, prt::READ));
+        ensure!(
+            c == Some(pst::BAD_REQUEST) || c == Some(pst::NAME_TOO_LONG),
+            "{bad:?} gave {c:?}"
+        );
+    }
+    let deep = vec!["a"; 33].join("/");
+    ensure_eq!(
+        code(root.open(deep.as_bytes(), 0, prt::READ)),
+        Some(pst::BAD_REQUEST),
+        "too deep"
+    );
+    // from a directory handle nothing outside it can be named
+    let mut home = root
+        .open(b"home", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(home.open(b"../etc/trusted", 0, prt::READ)),
+        Some(pst::BAD_REQUEST),
+        "no parent"
+    );
+    ensure_eq!(
+        code(home.open(b"etc/trusted", 0, prt::READ)),
+        Some(pst::NOT_FOUND),
+        "not inside /home"
+    );
+    ensure_eq!(
+        code(home.stat(b"..")),
+        Some(pst::BAD_REQUEST),
+        "stat has the same rules"
+    );
+    ensure!(
+        home.open(b"sub/inner.txt", 0, prt::READ).is_ok(),
+        "a path below it works"
+    );
+    // a directory needs the DIRECTORY flag, a file refuses it
+    ensure_eq!(
+        code(root.open(b"home", 0, prt::READ)),
+        Some(pst::IS_DIRECTORY),
+        "a directory without the flag"
+    );
+    ensure_eq!(
+        code(root.open(b"home/hello.txt", pfl::DIRECTORY, prt::READ)),
+        Some(pst::NOT_DIRECTORY),
+        "a file with it"
+    );
+    Ok(())
+}
+
+fn memfsd_rights_only_shrink() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut ro = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(ro.clone_conn(prt::ALL)),
+        Some(DENIED),
+        "a clone cannot ask for more"
+    );
+    ensure_eq!(
+        code(ro.open(b"tmp", pfl::DIRECTORY, RW_DIR)),
+        Some(DENIED),
+        "an open cannot ask for more"
+    );
+    ensure_eq!(code(ro.mkdir(b"x")), Some(DENIED), "no WRITE: no mkdir");
+    ensure_eq!(code(ro.unlink(b"tmp")), Some(DENIED), "no WRITE: no unlink");
+    ensure_eq!(
+        code(ro.open(b"tmp/f", pfl::CREATE, prt::READ)),
+        Some(DENIED),
+        "no CREATE"
+    );
+    let mut small = ro.clone_conn(prt::READ).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(small.read_dir()),
+        Some(DENIED),
+        "no ENUMERATE: no listing"
+    );
+    ensure!(
+        small.open(b"home/hello.txt", 0, prt::READ).is_ok(),
+        "READ is enough to open"
+    );
+    let mut none = ro.clone_conn(0).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(none.open(b"home", pfl::DIRECTORY, 0)),
+        Some(DENIED),
+        "no READ: no opening"
+    );
+    // a file connection with READ only cannot write, one with WRITE only cannot read
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut rw = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    rw.write(0, b"abc").map_err(|e| msg_e(e, line!()))?;
+    let mut r = rw.clone_conn(prt::READ).map_err(|e| msg_e(e, line!()))?;
+    let mut w = rw.clone_conn(prt::WRITE).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(code(r.write(0, b"x")), Some(DENIED), "read-only connection");
+    ensure_eq!(
+        code(r.set_size(0)),
+        Some(DENIED),
+        "read-only connection, set_size"
+    );
+    ensure_eq!(code(w.read(0, 1)), Some(DENIED), "write-only connection");
+    ensure_eq!(code(w.size()), Some(DENIED), "write-only connection, size");
+    ensure_eq!(w.write(3, b"d"), Ok(1), "but it writes");
+    ensure_eq!(r.read_all(), Ok(b"abcd".to_vec()), "and the reader sees it");
+    // a file connection cannot be given directory rights
+    ensure_eq!(
+        code(rw.clone_conn(prt::CREATE)),
+        Some(DENIED),
+        "CREATE is more than a file connection has"
+    );
+    Ok(())
+}
+
+fn raw_request(ch: u32, bytes: &[u8], handles: &[u32]) -> Outcome {
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            bytes.as_ptr(),
+            bytes.len(),
+            handles.as_ptr(),
+            handles.len()
+        )),
+        Some(S::Ok),
+        "send"
+    );
+    Ok(())
+}
+
+fn reply_status(ch: u32) -> Result<i32, Detail> {
+    let w = sys::object_wait(
+        ch,
+        sig::READABLE | sig::PEER_CLOSED,
+        sys::clock_get() + 10_000,
+    );
+    ensure_eq!(w.status, 0, "an answer or a close");
+    let mut buf = alloc::vec![0u8; 4096];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+    if r.status != 0 {
+        return Ok(i32::MIN); // closed with nothing to read
+    }
+    let rep = proto::file::decode_reply(&buf[..r.a1]).map_err(|_| msg_at(line!()))?;
+    Ok(rep.status)
+}
+
+fn memfsd_protocol_violations() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let req = |txid: u32, opc: u16, a: u64, b: u64, payload: &[u8]| {
+        proto::file::Request {
+            txid,
+            op: opc,
+            flags: 0,
+            rights: prt::READ,
+            a,
+            b,
+            payload,
+        }
+        .encode()
+        .unwrap()
+    };
+    // each case gets its own connection so a closed one does not hide the next
+    let fresh = |root: &mut Fs| -> Result<Fs, Detail> {
+        root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))
+    };
+    // unknown op
+    let c = fresh(&mut root)?;
+    raw_request(c.ch, &req(1, 99, 0, 0, &[]), &[])?;
+    ensure_eq!(reply_status(c.ch)?, pst::BAD_REQUEST, "an unknown op");
+    // a directory op on a file connection and the other way round
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let f = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    raw_request(f.ch, &req(2, pop::READDIR, 0, 0, &[]), &[])?;
+    ensure_eq!(reply_status(f.ch)?, pst::NOT_DIRECTORY, "READDIR on a file");
+    raw_request(tmp.ch, &req(3, pop::READ, 0, 1, &[]), &[])?;
+    ensure_eq!(
+        reply_status(tmp.ch)?,
+        pst::IS_DIRECTORY,
+        "READ on a directory"
+    );
+    // OPEN without its endpoint, READ with a stray handle (which the server must close)
+    let c = fresh(&mut root)?;
+    raw_request(c.ch, &req(4, pop::OPEN, 0, 0, b"home"), &[])?;
+    ensure_eq!(
+        reply_status(c.ch)?,
+        pst::BAD_REQUEST,
+        "OPEN without a handle"
+    );
+    let (stray_mine, stray) = channel()?;
+    raw_request(f.ch, &req(5, pop::READ, 0, 1, &[]), &[stray])?;
+    ensure_eq!(reply_status(f.ch)?, pst::BAD_REQUEST, "READ with a handle");
+    let w = sys::object_wait(stray_mine, sig::PEER_CLOSED, sys::clock_get() + 2000);
+    ensure_eq!(w.status, 0, "the stray handle was closed");
+    // a bad length field, bad bits, a read longer than the limit
+    let mut bad = req(6, pop::READ, 0, 1, &[]);
+    bad[28] = 5;
+    let c = fresh(&mut root)?;
+    raw_request(c.ch, &bad, &[])?;
+    ensure_eq!(
+        reply_status(c.ch)?,
+        pst::BAD_REQUEST,
+        "a lying length field"
+    );
+    raw_request(f.ch, &req(7, pop::READ, 0, 40_000, &[]), &[])?;
+    ensure_eq!(reply_status(f.ch)?, pst::BAD_REQUEST, "a READ above 32 KiB");
+    // too short to carry a txid: the connection is dropped
+    let c = fresh(&mut root)?;
+    raw_request(c.ch, b"xy", &[])?;
+    ensure_eq!(
+        reply_status(c.ch)?,
+        i32::MIN,
+        "a 2-byte message closes the connection"
+    );
+    // too many handles (a request carries at most one): dropped, all handles closed
+    let c = fresh(&mut root)?;
+    let (m1, h1) = channel()?;
+    let (m2, h2) = channel()?;
+    raw_request(c.ch, &req(8, pop::OPEN, 0, 0, b"home"), &[h1, h2])?;
+    ensure_eq!(
+        reply_status(c.ch)?,
+        i32::MIN,
+        "two handles close the connection"
+    );
+    for m in [m1, m2] {
+        ensure_eq!(
+            sys::object_wait(m, sig::PEER_CLOSED, sys::clock_get() + 2000).status,
+            0,
+            "handles closed"
+        );
+    }
+    // an oversized message
+    let c = fresh(&mut root)?;
+    let big = alloc::vec![0u8; 40 * 1024];
+    raw_request(c.ch, &big, &[])?;
+    ensure_eq!(
+        reply_status(c.ch)?,
+        i32::MIN,
+        "an oversized message closes the connection"
+    );
+    // the server is still fine
+    ensure!(root.stat(b"home").is_ok(), "memfsd carried on");
+    Ok(())
+}
+
+fn memfsd_quotas_and_connection_limit() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let chunk = alloc::vec![0xabu8; 32 * 1024];
+    let mut a = tmp
+        .open(b"a", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    for i in 0..128u64 {
+        ensure_eq!(
+            a.write(i * 32 * 1024, &chunk),
+            Ok(32 * 1024),
+            "fill a: chunk {i}"
+        );
+    }
+    ensure_eq!(
+        code(a.write(4 * 1024 * 1024, b"x")),
+        Some(TOO_BIG),
+        "a file is at most 4 MiB"
+    );
+    ensure_eq!(
+        code(a.set_size(4 * 1024 * 1024 + 1)),
+        Some(TOO_BIG),
+        "set_size past the file limit"
+    );
+    let mut b = tmp
+        .open(b"b", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    for i in 0..128u64 {
+        ensure_eq!(
+            b.write(i * 32 * 1024, &chunk),
+            Ok(32 * 1024),
+            "fill b: chunk {i}"
+        );
+    }
+    let mut c = tmp
+        .open(b"c", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(code(c.write(0, b"x")), Some(pst::QUOTA), "8 MiB in all");
+    ensure_eq!(c.size(), Ok(0), "nothing was written");
+    ensure_eq!(code(c.set_size(10)), Some(pst::QUOTA), "holes count");
+    ensure_eq!(tmp.unlink(b"a"), Ok(()), "delete one");
+    ensure_eq!(
+        a.size(),
+        Ok(4 * 1024 * 1024),
+        "it is still open, so still there"
+    );
+    ensure_eq!(
+        code(c.write(0, b"x")),
+        Some(pst::QUOTA),
+        "and still counted"
+    );
+    a.close();
+    ensure_eq!(
+        c.write(0, b"x"),
+        Ok(1),
+        "closing the last connection frees its bytes"
+    );
+    // connections: at most 200 live ones in all
+    let mut conns: Vec<Fs> = Vec::new();
+    let mut refused = None;
+    for _ in 0..205 {
+        match root.clone_conn(RO_DIR) {
+            Ok(x) => conns.push(x),
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    ensure_eq!(refused, Some(pst::QUOTA), "the connection limit");
+    ensure!(
+        conns.len() > 150 && conns.len() < 200,
+        "{} clones were accepted",
+        conns.len()
+    );
+    for x in conns {
+        x.close();
+    }
+    ensure!(
+        root.clone_conn(RO_DIR).is_ok(),
+        "room again after they close"
+    );
+    Ok(())
+}
+
+fn memfsd_unlinked_open_files_live_until_closed() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut f = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    f.write(0, b"data").map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(tmp.unlink(b"f"), Ok(()), "unlink while open");
+    ensure_eq!(
+        code(tmp.open(b"f", 0, prt::READ)),
+        Some(pst::NOT_FOUND),
+        "the name is gone"
+    );
+    ensure_eq!(
+        f.read_all(),
+        Ok(b"data".to_vec()),
+        "the open connection still reads"
+    );
+    let mut f2 = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        f2.read_all(),
+        Ok(vec![]),
+        "the name now means a new, empty file"
+    );
+    // truncate on open
+    f2.write(0, b"zzzz").map_err(|e| msg_e(e, line!()))?;
+    let mut f3 = tmp
+        .open(b"f", pfl::TRUNCATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(f3.read_all(), Ok(vec![]), "TRUNCATE empties it");
+    ensure_eq!(
+        code(tmp.open(b"f", pfl::TRUNCATE, prt::READ)),
+        Some(pst::BAD_REQUEST),
+        "TRUNCATE needs WRITE"
+    );
+    Ok(())
+}
+
+fn memfsd_hands_out_programs_the_launcher_can_run() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let (_lp, lch, lbi) = start_launcher()?;
+    let _ = lbi;
+    let mut prog = root
+        .open(b"bin/hello", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    let (vmo, off, len) = prog.get_vmo().map_err(|e| msg_e(e, line!()))?;
+    ensure!(len > 1000, "the program is {len} bytes");
+    // the VMO handle is read-only
+    ensure_eq!(
+        st(sys::vmo_write(vmo, 0, b"X".as_ptr(), 1)),
+        Some(S::AccessDenied),
+        "the image handle is read-only"
+    );
+    let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello", b"from", b"memfsd"])?;
+    let (status, proc) = ask_launcher(lch, vmo, 1, off, len, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, 0, "the launcher accepts what memfsd handed out");
+    sys::handle_close(in_w);
+    ensure_eq!(
+        &read_to_end(out_r)?[..],
+        &b"args=hello from memfsd\n"[..],
+        "and it runs"
+    );
+    wait_ended(proc.ok_or_else(|| msg_at(line!()))?, 2000)?;
+    // only image files have a VMO
+    let mut text = root
+        .open(b"home/hello.txt", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    let (fv, foff, flen) = text.get_vmo().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        flen,
+        13,
+        "every boot-image file has a VMO extent, fixtures included"
+    );
+    let mut word = [0u8; 5];
+    sys::vmo_read(fv, foff, word.as_mut_ptr(), 5);
+    ensure_eq!(&word, b"hello", "and it is the file's bytes");
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut mine = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(mine.get_vmo()),
+        Some(pst::BAD_REQUEST),
+        "nor is a writable file"
+    );
+    Ok(())
+}
+
+fn memfsd_listing_pages_and_a_slow_client_stalls_only_itself() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    // 300 long names: more than one 32 KiB page of listing
+    for i in 0..300u32 {
+        let mut name = alloc::format!("{i:05}").into_bytes();
+        name.extend_from_slice(&[b'n'; 200]);
+        tmp.open(&name, pfl::CREATE, prt::READ)
+            .map_err(|e| msg_e(e, line!()))?
+            .close();
+    }
+    let all = tmp.read_dir().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(all.len(), 300, "every entry arrives over several pages");
+    ensure!(
+        all.windows(2).all(|w| w[0].name < w[1].name),
+        "in name order"
+    );
+    // a client that sends many reads and never reads a reply
+    let mut big = tmp
+        .open(b"big", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    big.write(0, &alloc::vec![7u8; 32 * 1024])
+        .map_err(|e| msg_e(e, line!()))?;
+    let slow = big.clone_conn(prt::READ).map_err(|e| msg_e(e, line!()))?;
+    for i in 0..12u32 {
+        let rq = proto::file::Request {
+            txid: 1000 + i,
+            op: pop::READ,
+            flags: 0,
+            rights: 0,
+            a: 0,
+            b: 32 * 1024,
+            payload: &[],
+        }
+        .encode()
+        .unwrap();
+        ensure_eq!(
+            st(sys::channel_write(
+                slow.ch,
+                rq.as_ptr(),
+                rq.len(),
+                core::ptr::null(),
+                0
+            )),
+            Some(S::Ok),
+            "queue request {i}"
+        );
+    }
+    // another client is served promptly meanwhile
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        root.stat(b"home").map(|s| s.is_dir),
+        Ok(true),
+        "another client"
+    );
+    ensure!(
+        sys::clock_get() - t0 < 2000,
+        "another client is not stalled ({} ticks)",
+        sys::clock_get() - t0
+    );
+    // the slow client eventually reads every reply, in order
+    let mut got = 0u32;
+    let mut slow = slow;
+    while got < 12 {
+        let a = slow.read_reply().map_err(|e| msg_e(e, line!()))?;
+        ensure_eq!(a.status, 0, "reply {got}");
+        ensure_eq!(a.payload.len(), 32 * 1024, "its length");
+        got += 1;
+    }
+    Ok(())
+}
+
+fn memfsd_exits_when_every_client_is_gone() -> Outcome {
+    let (p, root, _bi) = start_memfsd()?;
+    root.close();
+    wait_ended(p, 5000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 0, "a clean exit");
     Ok(())
 }
 
@@ -4492,6 +5228,37 @@ pub fn app_main() -> i32 {
         (
             "many_launcher_spawns_do_not_leak",
             many_launcher_spawns_do_not_leak,
+        ),
+        ("memfsd_serves_the_boot_image", memfsd_serves_the_boot_image),
+        (
+            "memfsd_tmp_is_the_only_writable_place",
+            memfsd_tmp_is_the_only_writable_place,
+        ),
+        (
+            "memfsd_paths_cannot_escape_a_directory_handle",
+            memfsd_paths_cannot_escape_a_directory_handle,
+        ),
+        ("memfsd_rights_only_shrink", memfsd_rights_only_shrink),
+        ("memfsd_protocol_violations", memfsd_protocol_violations),
+        (
+            "memfsd_quotas_and_connection_limit",
+            memfsd_quotas_and_connection_limit,
+        ),
+        (
+            "memfsd_unlinked_open_files_live_until_closed",
+            memfsd_unlinked_open_files_live_until_closed,
+        ),
+        (
+            "memfsd_hands_out_programs_the_launcher_can_run",
+            memfsd_hands_out_programs_the_launcher_can_run,
+        ),
+        (
+            "memfsd_listing_pages_and_a_slow_client_stalls_only_itself",
+            memfsd_listing_pages_and_a_slow_client_stalls_only_itself,
+        ),
+        (
+            "memfsd_exits_when_every_client_is_gone",
+            memfsd_exits_when_every_client_is_gone,
         ),
         (
             "syscalls_stay_fast_with_many_live_processes",
