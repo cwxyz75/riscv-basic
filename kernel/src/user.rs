@@ -129,6 +129,15 @@ impl UserState {
     }
 }
 
+/// The quota to charge new objects to: `job` (the creating process's, or the root's for the
+/// kernel's own objects).
+fn quota(job: JobId) -> ipc::Quota<'static> {
+    ipc::Quota {
+        jobs: &mut kmem::get().vmos.jobs,
+        job: Some(job),
+    }
+}
+
 static mut USER: Option<UserState> = None;
 
 fn state() -> &'static mut UserState {
@@ -163,12 +172,16 @@ pub fn reported() -> (u32, u32) {
 }
 
 /// How many processes exist right now (a leak counter for tests).
-/// Jobs alive (the root included) and the root job's live process and thread counts: all back
-/// to 1, 0 and 0 when nothing is left (a leak oracle for the ledger, INVARIANTS J2).
-pub fn job_ledger() -> (usize, u64, u64) {
-    let jobs = &kmem::get().vmos.jobs;
-    let u = jobs.usage(JobId::ROOT).unwrap_or_default();
-    (jobs.live(), u.processes, u.threads)
+/// (jobs alive including the root, and the root job's live processes, threads, objects and queued
+/// IPC bytes): `(1, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
+/// J2). Applies the credits of destroyed objects first.
+pub fn job_ledger() -> (usize, u64, u64, u64, u64) {
+    irq::without(|| {
+        ipc::settle(&mut state().objs, &mut kmem::get().vmos.jobs);
+        let jobs = &kmem::get().vmos.jobs;
+        let u = jobs.usage(JobId::ROOT).unwrap_or_default();
+        (jobs.live(), u.processes, u.threads, u.objects, u.ipc_bytes)
+    })
 }
 
 pub fn process_count() -> usize {
@@ -270,7 +283,9 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     let mut process = process;
     let made = irq::without(|| -> bool {
         let s = state();
-        let Ok((kernel_end, process_end)) = ipc::channel_create(&mut s.objs, &mut s.ktable) else {
+        let Ok((kernel_end, process_end)) =
+            ipc::channel_create_in(&mut s.objs, &mut s.ktable, &mut quota(JobId::ROOT))
+        else {
             return false;
         };
         let entry = s
@@ -792,11 +807,13 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             Ok((Some(u64::from(nh.0)), None))
         }
         nr::CHANNEL_CREATE => {
-            let (x, y) = ipc::channel_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            let (x, y) = ipc::channel_create_in(objs, &mut p.handles, &mut quota(p.job))
+                .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
         }
         nr::SOCKET_CREATE => {
-            let (x, y) = ipc::socket_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            let (x, y) = ipc::socket_create_in(objs, &mut p.handles, &mut quota(p.job))
+                .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
         }
         nr::SOCKET_WRITE => {
@@ -804,7 +821,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             ipc::socket_write_check(objs, &p.handles, h(0), len).map_err(|e| (e, None, None))?;
             let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], len)
                 .map_err(|e| (e, None, None))?;
-            ipc::socket_write(objs, &p.handles, h(0), &data)
+            ipc::socket_write_in(objs, &p.handles, h(0), &data, &mut kmem::get().vmos.jobs)
                 .map(|n| (Some(n as u64), None))
                 .map_err(|e| (e, None, None))
         }
@@ -815,24 +832,36 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let n = ipc::socket_peek(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
             verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], n)
                 .map_err(|e| (e, None, None))?;
-            let data =
-                ipc::socket_read(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
+            let data = ipc::socket_read_in(objs, &p.handles, h(0), max, &mut kmem::get().vmos.jobs)
+                .map_err(|e| (e, None, None))?;
             copy_to_user_verified(&mut p.aspace, &mut k.mm, a[1], &data)
                 .map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
         nr::PORT_CREATE => {
-            let port = ipc::port_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            let port = ipc::port_create_in(objs, &mut p.handles, &mut quota(p.job))
+                .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(port.0)), None))
         }
-        nr::PORT_BIND => ipc::port_bind(objs, &p.handles, h(0), h(1), a[2], a[3])
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::PORT_UNBIND => ipc::port_unbind(objs, &p.handles, h(0), a[1])
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
+        nr::PORT_BIND => ipc::port_bind_in(
+            objs,
+            &p.handles,
+            h(0),
+            h(1),
+            a[2],
+            a[3],
+            &mut kmem::get().vmos.jobs,
+        )
+        .map(|_| (None, None))
+        .map_err(|e| (e, None, None)),
+        nr::PORT_UNBIND => {
+            ipc::port_unbind_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
+                .map(|_| (None, None))
+                .map_err(|e| (e, None, None))
+        }
         nr::EVENT_CREATE => {
-            let e = ipc::event_create(objs, &mut p.handles).map_err(|e| (e, None, None))?;
+            let e = ipc::event_create_in(objs, &mut p.handles, &mut quota(p.job))
+                .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(e.0)), None))
         }
         nr::EVENT_SIGNAL => ipc::event_signal(objs, &p.handles, h(0), a[1] as u32, a[2] as u32)
@@ -854,9 +883,16 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             let raw = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[3], nhandles * 4)
                 .map_err(|e| (e, None, None))?;
-            ipc::channel_write(objs, &mut p.handles, h(0), &data, &handle_list(&raw))
-                .map(|_| (None, None))
-                .map_err(|e| (e, None, None))
+            ipc::channel_write_in(
+                objs,
+                &mut p.handles,
+                h(0),
+                &data,
+                &handle_list(&raw),
+                &mut kmem::get().vmos.jobs,
+            )
+            .map(|_| (None, None))
+            .map_err(|e| (e, None, None))
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID => {
             let (txid, bytes_at, max_bytes, handles_at, max_handles) = if n == nr::CHANNEL_READ {
@@ -895,8 +931,23 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             )
             .map_err(|e| (e, None, None))?;
             let got = match txid {
-                None => ipc::channel_read(objs, &mut p.handles, h(0), mb, mh),
-                Some(t) => ipc::channel_read_txid(objs, &mut p.handles, h(0), t, mb, mh),
+                None => ipc::channel_read_in(
+                    objs,
+                    &mut p.handles,
+                    h(0),
+                    mb,
+                    mh,
+                    &mut kmem::get().vmos.jobs,
+                ),
+                Some(t) => ipc::channel_read_txid_in(
+                    objs,
+                    &mut p.handles,
+                    h(0),
+                    t,
+                    mb,
+                    mh,
+                    &mut kmem::get().vmos.jobs,
+                ),
             };
             match got {
                 Ok(r) => {
@@ -927,7 +978,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 ipc::job_of(objs, &p.handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
             };
             let id = k.vmos.create_in(a[0], job);
-            match ipc::vmo_object_create(objs, &mut p.handles, id) {
+            match ipc::vmo_object_create_in(objs, &mut p.handles, id, &mut quota(job)) {
                 Ok(h) => Ok((Some(u64::from(h.0)), None)),
                 Err(e) => {
                     let _ = k.vmos.destroy(&mut k.mm, id);
@@ -1211,7 +1262,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
     }
     let (h, deadline) = (Handle(a[0] as u32), a[1]);
     let poll = || {
-        with_proc(|objs, p, _| ipc::port_poll(objs, &p.handles, h))
+        with_proc(|objs, p, k| ipc::port_poll_in(objs, &p.handles, h, &mut k.vmos.jobs))
             .map_err(|e| (e, None, None))?
             .map_err(|e| (e, None, None))
     };
@@ -1300,7 +1351,14 @@ fn channel_call(a: [u64; 6]) -> Reply {
             req_handles,
             nhandles * 4,
         )?;
-        ipc::channel_write(objs, &mut p.handles, ch, &data, &handle_list(&raw))?;
+        ipc::channel_write_in(
+            objs,
+            &mut p.handles,
+            ch,
+            &data,
+            &handle_list(&raw),
+            &mut kmem::get().vmos.jobs,
+        )?;
         Ok(le32(&data, 0))
     })
     .map_err(|e| (e, None, None))?
@@ -1346,13 +1404,14 @@ fn channel_call(a: [u64; 6]) -> Reply {
                     .map_err(|e| (e, None, None))?;
                 verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, rd_handles, nh * 4)
                     .map_err(|e| (e, None, None))?;
-                let got = ipc::channel_read_txid(
+                let got = ipc::channel_read_txid_in(
                     objs,
                     &mut p.handles,
                     ch,
                     txid,
                     rd_max_bytes,
                     rd_max_handles,
+                    &mut k.vmos.jobs,
                 )
                 .map_err(|_| (Status::BadState, None, None))?;
                 let raw: Vec<u8> = got.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
@@ -1408,7 +1467,14 @@ impl KernelEnd {
     pub fn write(&self, data: &[u8]) -> Result<(), Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, &[])
+            ipc::channel_write_in(
+                &mut s.objs,
+                &mut s.ktable,
+                self.handle,
+                data,
+                &[],
+                &mut kmem::get().vmos.jobs,
+            )
         });
         notify();
         r
@@ -1418,12 +1484,13 @@ impl KernelEnd {
     pub fn read(&self) -> Result<Vec<u8>, Status> {
         let r = irq::without(|| {
             let s = state();
-            let got = ipc::channel_read(
+            let got = ipc::channel_read_in(
                 &mut s.objs,
                 &mut s.ktable,
                 self.handle,
                 MAX_MSG_BYTES,
                 MAX_MSG_HANDLES,
+                &mut kmem::get().vmos.jobs,
             );
             match got {
                 Ok(msg) => {
@@ -1452,14 +1519,26 @@ impl KernelEnd {
                 let _ = k.vmos.destroy(&mut k.mm, id);
                 return Err(Status::NoMemory);
             }
-            let h = match ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id) {
+            let h = match ipc::vmo_object_create_in(
+                &mut s.objs,
+                &mut s.ktable,
+                id,
+                &mut quota(JobId::ROOT),
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = k.vmos.destroy(&mut k.mm, id);
                     return Err(e);
                 }
             };
-            let r = ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, &[h]);
+            let r = ipc::channel_write_in(
+                &mut s.objs,
+                &mut s.ktable,
+                self.handle,
+                data,
+                &[h],
+                &mut kmem::get().vmos.jobs,
+            );
             if r.is_err() {
                 let _ = s.ktable.close(&mut s.objs, h);
             }
@@ -1474,7 +1553,14 @@ impl KernelEnd {
     pub fn write_handles(&self, data: &[u8], handles: &[Handle]) -> Result<(), Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::channel_write(&mut s.objs, &mut s.ktable, self.handle, data, handles)
+            ipc::channel_write_in(
+                &mut s.objs,
+                &mut s.ktable,
+                self.handle,
+                data,
+                handles,
+                &mut kmem::get().vmos.jobs,
+            )
         });
         notify();
         r
@@ -1524,7 +1610,8 @@ impl Drop for KernelSocket {
 pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
     irq::without(|| {
         let s = state();
-        let (kernel, user) = ipc::socket_create(&mut s.objs, &mut s.ktable)?;
+        let (kernel, user) =
+            ipc::socket_create_in(&mut s.objs, &mut s.ktable, &mut quota(JobId::ROOT))?;
         Ok((KernelSocket { handle: kernel }, user))
     })
 }
@@ -1550,7 +1637,12 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
             let _ = k.vmos.destroy(&mut k.mm, id);
             return Err(Status::NoMemory);
         }
-        let h = match ipc::vmo_object_create(&mut s.objs, &mut s.ktable, id) {
+        let h = match ipc::vmo_object_create_in(
+            &mut s.objs,
+            &mut s.ktable,
+            id,
+            &mut quota(JobId::ROOT),
+        ) {
             Ok(h) => h,
             Err(e) => {
                 let _ = k.vmos.destroy(&mut k.mm, id);
@@ -1574,7 +1666,13 @@ impl KernelSocket {
     pub fn read(&self, max: usize) -> Result<Vec<u8>, Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::socket_read(&mut s.objs, &s.ktable, self.handle, max)
+            ipc::socket_read_in(
+                &mut s.objs,
+                &s.ktable,
+                self.handle,
+                max,
+                &mut kmem::get().vmos.jobs,
+            )
         });
         notify();
         r
@@ -1584,7 +1682,13 @@ impl KernelSocket {
     pub fn write(&self, data: &[u8]) -> Result<usize, Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::socket_write(&mut s.objs, &s.ktable, self.handle, data)
+            ipc::socket_write_in(
+                &mut s.objs,
+                &s.ktable,
+                self.handle,
+                data,
+                &mut kmem::get().vmos.jobs,
+            )
         });
         notify();
         r
@@ -1694,8 +1798,13 @@ fn process_create(a: [u64; 6]) -> Reply {
         s.next_pid += 1;
         let UserState { objs, procs, .. } = s;
         let creator = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let (handle, obj) = match ipc::process_object_create(objs, &mut creator.handles, pid, true)
-        {
+        let (handle, obj) = match ipc::process_object_create_in(
+            objs,
+            &mut creator.handles,
+            pid,
+            true,
+            &mut quota(job),
+        ) {
             Ok(x) => x,
             Err(e) => {
                 PageTable::destroy_user(table, &mut k.mm);
@@ -1749,8 +1858,14 @@ fn process_self() -> Reply {
                 Ok((Some(u64::from(h.0)), None))
             }
             None => {
-                let (h, obj) = ipc::process_object_create(objs, &mut p.handles, me, false)
-                    .map_err(|e| (e, None, None))?;
+                let (h, obj) = ipc::process_object_create_in(
+                    objs,
+                    &mut p.handles,
+                    me,
+                    false,
+                    &mut quota(p.job),
+                )
+                .map_err(|e| (e, None, None))?;
                 // narrow the default rights: a self handle cannot be sent away
                 let h = p.handles.replace(h, rights).expect("just created");
                 p.obj = Some(obj);
@@ -2036,7 +2151,12 @@ fn thread_create(a: [u64; 6]) -> Reply {
         jobs.charge(tjob, Resource::Threads, 1)
             .map_err(|e| (job_status(e), None, None))?;
         let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let (handle, obj) = match ipc::thread_object_create(objs, &mut caller.handles, tpid) {
+        let (handle, obj) = match ipc::thread_object_create_in(
+            objs,
+            &mut caller.handles,
+            tpid,
+            &mut quota(caller.job),
+        ) {
             Ok(x) => x,
             Err(e) => {
                 jobs.credit(tjob, Resource::Threads, 1);
@@ -2077,32 +2197,60 @@ fn job_status(e: JobError) -> Status {
     }
 }
 
-/// Limits from three syscall words (`u64::MAX` means no limit).
-fn limits_of(a: [u64; 6], at: usize) -> Limits {
-    Limits {
-        processes: a[at],
-        threads: a[at + 1],
-        pages: a[at + 2],
-        jobs: a[at + 3],
-    }
+/// Read six limits (processes, threads, pages, jobs, objects, ipc_bytes: `u64::MAX` means none)
+/// from the 48 bytes of user memory at `ptr`.
+fn read_limits(s: &mut UserState, me: u32, ptr: u64) -> Result<Limits, ReplyErr> {
+    let k = kmem::get();
+    let p = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+    let raw = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, ptr, 48)
+        .map_err(|e| (e, None, None))?;
+    let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+    Ok(Limits {
+        processes: w(0),
+        threads: w(1),
+        pages: w(2),
+        jobs: w(3),
+        objects: w(4),
+        ipc_bytes: w(5),
+    })
 }
 
-/// `job_create(parent, processes, threads, pages) -> handle`: a child job of the job `parent`
-/// (needs MANAGE). The child can never use more than any ancestor allows, whatever its own
+/// `job_create(parent, limits_ptr) -> handle`: a child job of the job `parent` (needs MANAGE) with
+/// the six limits at `limits_ptr`. The child can never use more than any ancestor allows, whatever its own
 /// limits say.
 fn job_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        // credits of objects destroyed since the last charge come first: a job that has just
+        // closed its children must be able to make another at once
+        ipc::settle(&mut s.objs, &mut kmem::get().vmos.jobs);
+        {
+            let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+            ipc::job_of(
+                &s.objs,
+                &caller.handles,
+                Handle(a[0] as u32),
+                Rights::MANAGE,
+            )
+            .map_err(|e| (e, None, None))?;
+        }
+        let limits = read_limits(s, me, a[1])?;
         let UserState { objs, procs, .. } = s;
         let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
         let parent = ipc::job_of(objs, &caller.handles, Handle(a[0] as u32), Rights::MANAGE)
             .map_err(|e| (e, None, None))?;
         let jobs = &mut kmem::get().vmos.jobs;
         let id = jobs
-            .create(parent, limits_of(a, 1))
+            .create(parent, limits)
             .map_err(|e| (job_status(e), None, None))?;
-        match ipc::job_object_create(objs, &mut caller.handles, id, Rights::JOB) {
+        match ipc::job_object_create(
+            objs,
+            &mut caller.handles,
+            id,
+            Rights::JOB,
+            &mut quota(caller.job),
+        ) {
             Ok(h) => Ok((Some(u64::from(h.0)), None)),
             Err(e) => {
                 jobs.release(id);
@@ -2112,7 +2260,7 @@ fn job_create(a: [u64; 6]) -> Reply {
     })
 }
 
-/// `job_set_limits(job, processes, threads, pages, jobs)`: needs SET_LIMITS (not MANAGE). Usage above a new limit is
+/// `job_set_limits(job, limits_ptr)`: needs SET_LIMITS (not MANAGE). Usage above a new limit is
 /// not undone: later charges fail until it is back under.
 fn job_set_limits(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
@@ -2126,10 +2274,11 @@ fn job_set_limits(a: [u64; 6]) -> Reply {
             Rights::SET_LIMITS,
         )
         .map_err(|e| (e, None, None))?;
+        let limits = read_limits(s, me, a[1])?;
         kmem::get()
             .vmos
             .jobs
-            .set_limits(job, limits_of(a, 1))
+            .set_limits(job, limits)
             .map_err(|e| (job_status(e), None, None))?;
         Ok((None, None))
     })
@@ -2154,6 +2303,8 @@ fn job_info(a: [u64; 6]) -> Reply {
             1 => Resource::Threads,
             2 => Resource::Pages,
             3 => Resource::Jobs,
+            4 => Resource::Objects,
+            5 => Resource::IpcBytes,
             _ => return bad(Status::InvalidArgs),
         };
         let jobs = &kmem::get().vmos.jobs;
@@ -2167,6 +2318,8 @@ fn job_info(a: [u64; 6]) -> Reply {
             Resource::Threads => limits.threads,
             Resource::Pages => limits.pages,
             Resource::Jobs => limits.jobs,
+            Resource::Objects => limits.objects,
+            Resource::IpcBytes => limits.ipc_bytes,
         };
         Ok((Some(used), Some(limit)))
     })
@@ -2225,7 +2378,13 @@ fn job_root() -> Reply {
         }
         let jobs = &mut kmem::get().vmos.jobs;
         jobs.retain(JobId::ROOT);
-        match ipc::job_object_create(objs, &mut caller.handles, JobId::ROOT, Rights::JOB) {
+        match ipc::job_object_create(
+            objs,
+            &mut caller.handles,
+            JobId::ROOT,
+            Rights::JOB,
+            &mut quota(caller.job),
+        ) {
             Ok(h) => Ok((Some(u64::from(h.0)), None)),
             Err(e) => {
                 jobs.release(JobId::ROOT);

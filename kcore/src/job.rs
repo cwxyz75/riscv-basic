@@ -1,5 +1,6 @@
 //! Jobs and resource limits (S4.5, decisions OD56-OD58): a tree of accounts. A job has limits on
-//! four resources (live processes, live threads, committed memory pages, live child jobs); a charge against a
+//! six resources (live processes, live threads, committed memory pages, live child jobs, live
+//! kernel objects, bytes queued in channels, sockets and ports); a charge against a
 //! job is applied to the job **and every ancestor**, so a child can never use more than its
 //! parent allows however its own limits are set.
 //!
@@ -39,6 +40,11 @@ pub enum Resource {
     Pages,
     /// Jobs below this one (children, grandchildren, ...).
     Jobs,
+    /// Kernel objects (channels, events, sockets, ports, VMOs, processes, threads, jobs) alive that
+    /// were created by processes of this job.
+    Objects,
+    /// Bytes queued in the channels, sockets and ports created by this job's processes.
+    IpcBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +53,8 @@ pub struct Limits {
     pub threads: u64,
     pub pages: u64,
     pub jobs: u64,
+    pub objects: u64,
+    pub ipc_bytes: u64,
 }
 
 impl Limits {
@@ -55,6 +63,8 @@ impl Limits {
         threads: UNLIMITED,
         pages: UNLIMITED,
         jobs: UNLIMITED,
+        objects: UNLIMITED,
+        ipc_bytes: UNLIMITED,
     };
 
     fn get(&self, r: Resource) -> u64 {
@@ -63,6 +73,8 @@ impl Limits {
             Resource::Threads => self.threads,
             Resource::Pages => self.pages,
             Resource::Jobs => self.jobs,
+            Resource::Objects => self.objects,
+            Resource::IpcBytes => self.ipc_bytes,
         }
     }
 }
@@ -74,6 +86,8 @@ pub struct Usage {
     pub threads: u64,
     pub pages: u64,
     pub jobs: u64,
+    pub objects: u64,
+    pub ipc_bytes: u64,
 }
 
 impl Usage {
@@ -83,6 +97,8 @@ impl Usage {
             Resource::Threads => &mut self.threads,
             Resource::Pages => &mut self.pages,
             Resource::Jobs => &mut self.jobs,
+            Resource::Objects => &mut self.objects,
+            Resource::IpcBytes => &mut self.ipc_bytes,
         }
     }
 
@@ -92,6 +108,8 @@ impl Usage {
             Resource::Threads => self.threads,
             Resource::Pages => self.pages,
             Resource::Jobs => self.jobs,
+            Resource::Objects => self.objects,
+            Resource::IpcBytes => self.ipc_bytes,
         }
     }
 }
@@ -274,6 +292,22 @@ impl Jobs {
         Ok(())
     }
 
+    /// How much more of `r` a charge to `id` could take right now: the smallest room along the
+    /// chain (`u64::MAX` if nothing limits it).
+    pub fn room(&self, id: JobId, r: Resource) -> u64 {
+        let mut room = UNLIMITED;
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let Some(rec) = self.rec(c) else { return 0 };
+            let limit = rec.limits.get(r);
+            if limit != UNLIMITED {
+                room = room.min(limit.saturating_sub(rec.usage.get(r)));
+            }
+            cur = rec.parent;
+        }
+        room
+    }
+
     /// Give back what `charge` took.
     pub fn credit(&mut self, id: JobId, r: Resource, n: u64) {
         let mut cur = Some(id);
@@ -298,6 +332,8 @@ mod tests {
             threads: t,
             pages: g,
             jobs: UNLIMITED,
+            objects: UNLIMITED,
+            ipc_bytes: UNLIMITED,
         }
     }
 

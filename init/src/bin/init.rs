@@ -651,19 +651,20 @@ fn start_stack(
     };
     // The session's job, and under it the job the launcher makes every program's job in (S4.5).
     // Limits are generous for the services and bounded for programs: all together at most 64 MiB
-    // of memory, 32 processes and 64 threads; programs at most 16 processes and 32 MiB.
+    // of memory, 32 processes, 64 threads, 4000 objects and 1.5 MiB of queued IPC data; programs
+    // all together at most 16 processes, 32 MiB, 1000 objects and 768 KiB queued.
     let root = sys::job_root();
     if root.status != 0 {
         return Err(38);
     }
     let root = root.a1 as u32;
-    let session = sys::job_create(root, 32, 64, 16384, 40);
+    let session = sys::job_create(root, &[32, 64, 16384, 40, 4000, 1536 * 1024]);
     sys::handle_close(root);
     if session.status != 0 {
         return Err(38);
     }
     let session = session.a1 as u32;
-    let apps = sys::job_create(session, 16, 32, 8192, 20);
+    let apps = sys::job_create(session, &[16, 32, 8192, 20, 1000, 768 * 1024]);
     if apps.status != 0 {
         sys::handle_close(session);
         return Err(38);

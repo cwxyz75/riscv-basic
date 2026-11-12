@@ -64,6 +64,7 @@ get filled in as each area is built.
 | J2 | Every charge is credited back exactly once: a process at teardown, a thread when it ends, a page when its VMO is freed. A job record with usage is never freed (`debug_assert` in `Jobs::release`: a leak is a kernel panic in the tests) | QEMU `jobs_do_not_leak`, `job_*_credited_back`; mutation-checked |
 | J3 | No ambient job authority: no call returns the caller's own job; `job_root` is refused to every process the kernel did not start; a job handle's rights only shrink (H3) | QEMU `job_syscalls_check_handles_rights_and_arguments` (a child proves it) |
 | J4 | A job's memory is charged where the page is committed (`Vmos::page_for`), nowhere else: no path commits a page without the charge | code structure; `committed_pages_are_charged...` |
+| J5 | Objects and queued data are charged exactly once and credited exactly once: an object's creator pays for the object, the creator of an endpoint pays for what is queued in it, and a destroyed object's credit is applied before the next charge; a charged object holds a use of its job until then, so a record never goes while it has usage | `kcore/tests/job_ipc_quota.rs` (a random walk compared with the registry's own counts), QEMU `job_quotas_...`, the end-of-session ledger check; mutation-checked |
 
 ### Lock order
 

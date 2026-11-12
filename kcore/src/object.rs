@@ -9,6 +9,7 @@
 //! channels, with no handle to either); [`Registry::sweep`] frees those by
 //! reachability from a set of roots (decision OD37).
 
+use crate::job::JobId;
 use alloc::vec::Vec;
 
 /// Slots reserved when a registry is created (`abi::limits::MAX_OBJECTS`).
@@ -55,12 +56,20 @@ pub trait Object {
     fn meter(&self) -> usize {
         0
     }
+    /// The part of `meter()` that is charged to the object's job (queued data; not, for example,
+    /// a port's bindings, which are bounded by the object quota and counted globally only).
+    fn charged_bytes(&self) -> usize {
+        0
+    }
 }
 
 struct Slot<T> {
     gen: u32,
     refs: u32,
     obj: Option<T>,
+    /// The job this object is charged to (S4.5c), if it is charged at all. When the object is
+    /// destroyed, one object and the bytes it still held are queued as credits for that job.
+    job: Option<JobId>,
 }
 
 pub struct Registry<T: Object> {
@@ -74,6 +83,9 @@ pub struct Registry<T: Object> {
     /// Sum of `meter()` over live objects (kept by the owner through `meter_add` /
     /// `meter_sub` as data is queued and dequeued, and by destruction).
     meter: usize,
+    /// Credits for charged objects that were destroyed since the last `take_credits`:
+    /// (job, bytes the object still held). One object per entry.
+    credits: Vec<(JobId, usize)>,
 }
 
 impl<T: Object> Default for Registry<T> {
@@ -95,16 +107,30 @@ impl<T: Object> Registry<T> {
             threshold: SWEEP_MIN,
             graveyard: Vec::new(),
             meter: 0,
+            credits: Vec::new(),
         }
     }
 
-    /// Store an object with one reference (the caller's, to be moved into a handle).
+    /// Store an object with one reference (the caller's, to be moved into a handle). It is not
+    /// charged to any job.
     pub fn create(&mut self, obj: T) -> ObjId {
+        self.create_charged(obj, None)
+    }
+
+    /// Like `create`, for an object the caller has charged to `job` (one object): destroying it
+    /// queues the credit (`take_credits`).
+    pub fn create_in(&mut self, obj: T, job: JobId) -> ObjId {
+        self.create_charged(obj, Some(job))
+    }
+
+    /// `create` / `create_in` with the job as an option.
+    pub fn create_charged(&mut self, obj: T, job: Option<JobId>) -> ObjId {
         self.live += 1;
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.refs = 1;
             slot.obj = Some(obj);
+            slot.job = job;
             ObjId {
                 index,
                 gen: slot.gen,
@@ -114,6 +140,7 @@ impl<T: Object> Registry<T> {
                 gen: 0,
                 refs: 1,
                 obj: Some(obj),
+                job,
             });
             ObjId {
                 index: self.slots.len() as u32 - 1,
@@ -144,6 +171,16 @@ impl<T: Object> Registry<T> {
 
     pub fn is_alive(&self, id: ObjId) -> bool {
         self.slot(id).is_some()
+    }
+
+    /// The job a live object is charged to (`None`: it is not charged).
+    pub fn job_of(&self, id: ObjId) -> Option<JobId> {
+        self.slot(id)?.job
+    }
+
+    /// The credits owed to jobs for objects destroyed since the last call: (job, bytes held).
+    pub fn take_credits(&mut self) -> Vec<(JobId, usize)> {
+        core::mem::take(&mut self.credits)
     }
 
     /// Bytes currently counted by the meter.
@@ -192,7 +229,11 @@ impl<T: Object> Registry<T> {
                 continue;
             }
             let obj = slot.obj.take().expect("slot was live");
+            let charged = slot.job.take();
             slot.gen = slot.gen.wrapping_add(1);
+            if let Some(job) = charged {
+                self.credits.push((job, obj.charged_bytes()));
+            }
             self.free.push(id.index);
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
@@ -256,6 +297,9 @@ impl<T: Object> Registry<T> {
         for &index in &doomed {
             let slot = &mut self.slots[index as usize];
             let obj = slot.obj.take().expect("live");
+            if let Some(job) = slot.job.take() {
+                self.credits.push((job, obj.charged_bytes()));
+            }
             slot.refs = 0;
             slot.gen = slot.gen.wrapping_add(1);
             self.free.push(index);

@@ -256,7 +256,13 @@ pub fn app_main() -> i32 {
             if rt::sys::job_root().status == -3 {
                 code |= 1;
             }
-            if rt::sys::job_create(77, u64::MAX, u64::MAX, u64::MAX, u64::MAX).status == -1 {
+            if rt::sys::job_create(
+                77,
+                &[u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX],
+            )
+            .status
+                == -1
+            {
                 code |= 2;
             }
             if rt::sys::process_create().status == -5 {
@@ -293,6 +299,45 @@ pub fn app_main() -> i32 {
                 code |= 2;
             }
             return code;
+        }
+        34 => {
+            // S4.5c: an IPC hog. Make socket pairs and fill them with data until the job's budget
+            // says no; the exit code is how many KiB it managed to queue.
+            let mut queued = 0usize;
+            let block = [3u8; 1024];
+            loop {
+                let pair = rt::sys::socket_create();
+                if pair.status != 0 {
+                    return if pair.status == -5 {
+                        (queued / 1024) as i32
+                    } else {
+                        -1
+                    };
+                }
+                for _ in 0..32 {
+                    let w = rt::sys::socket_write(pair.a1 as u32, block.as_ptr(), block.len());
+                    if w.status != 0 {
+                        return if w.status == -5 {
+                            (queued / 1024) as i32
+                        } else {
+                            -2
+                        };
+                    }
+                    queued += w.a1;
+                }
+            }
+        }
+        35 => {
+            // S4.5c: an object bomb. Make events until the job's object quota says no; the exit
+            // code is how many it made.
+            let mut made = 0;
+            loop {
+                let e = rt::sys::event_create();
+                if e.status != 0 {
+                    return if e.status == -5 { made } else { -1 };
+                }
+                made += 1;
+            }
         }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
