@@ -27,6 +27,8 @@ pub enum Role {
     BootImage = 6,
     Serial = 7,
     ServiceInit = 8,
+    /// The console server's end of the shell's terminal socket.
+    Tty = 9,
 }
 
 impl Role {
@@ -40,6 +42,7 @@ impl Role {
             6 => Role::BootImage,
             7 => Role::Serial,
             8 => Role::ServiceInit,
+            9 => Role::Tty,
             _ => return None,
         })
     }

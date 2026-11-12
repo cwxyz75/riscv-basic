@@ -119,6 +119,11 @@ pub fn app_main() -> i32 {
         };
         for &b in &buf[..n] {
             if b == b'\r' || b == b'\n' {
+                if line.as_slice() == b"console" {
+                    // test aid for S4d: hand the serial line to the console server and act as
+                    // the shell's stand-in on its terminal socket
+                    return console_session(serial, &img, &entries);
+                }
                 if line.as_slice() == b"quit" {
                     let _ = io::write_all(serial, b"bye\r\n");
                     return 0;
@@ -395,5 +400,214 @@ fn fs_write(root: &mut rt::fs::Fs, path: &[u8], text: &[u8]) -> String {
             }
         }
         Err(e) => fs_error("write", path, e),
+    }
+}
+
+/// Narrow a handle to `rights` (duplicate, then replace the duplicate, then close the original).
+fn narrow_handle(h: u32, rights: u32) -> Option<u32> {
+    use rt::sys;
+    let d = sys::handle_duplicate(h, rt::abi::rights::Rights::SAME.0);
+    if d.status != 0 {
+        return None;
+    }
+    let n = sys::handle_replace(d.a1 as u32, rights);
+    sys::handle_close(h);
+    (n.status == 0).then_some(n.a1 as u32)
+}
+
+fn image_entry<'a>(
+    img: &'a [u8],
+    entries: &[proto::bootimg::Entry],
+    name: &[u8],
+) -> Option<&'a [u8]> {
+    let e = entries.iter().find(|e| e.name == name)?;
+    img.get(e.offset as usize..(e.offset + e.size) as usize)
+}
+
+/// S4d test aid: start `consoled` with the serial socket, then talk to it on the terminal socket
+/// as a stand-in for the shell. Lines from the terminal are answered like this:
+/// `spin` starts the `spin` program and registers it as the foreground job; `flood` writes
+/// 500000 bytes in one go; `quit` and Ctrl-D (a lone 0x04) end the session; a lone 0x03
+/// (Ctrl-C) reports `interrupt` and what became of the job; anything else answers `got: <line>`.
+fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+    use rt::abi::rights::Rights;
+    use rt::sys;
+    let Some(cimg) = image_entry(img, entries, b"bin/consoled") else {
+        return 20;
+    };
+    let kill_wait = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
+    let (Some(spin_img), tty, ctl_pair) = (
+        image_entry(img, entries, b"bin/spin"),
+        sys::socket_create(),
+        sys::channel_create(),
+    ) else {
+        return 21;
+    };
+    if tty.status != 0 || ctl_pair.status != 0 {
+        return 22;
+    }
+    let (tty_mine, tty_theirs) = (tty.a1 as u32, tty.a2 as u32);
+    let (ctl_mine, ctl_theirs) = (ctl_pair.a1 as u32, ctl_pair.a2 as u32);
+    let startup = proto::startup::Startup {
+        args: alloc::vec![b"consoled".to_vec()],
+        roles: alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
+        ..proto::startup::Startup::default()
+    };
+    let Ok(sbytes) = startup.encode() else {
+        return 23;
+    };
+    let Ok(consoled) = rt::spawn::spawn(cimg, &sbytes, &[serial, tty_theirs, ctl_theirs]) else {
+        return 24;
+    };
+    let _ = io::write_all(tty_mine, b"console ready\n");
+    let mut job: Option<u32> = None;
+    let mut line: Vec<u8> = Vec::new();
+    let mut txid = 0u32;
+    let mut buf = [0u8; 64];
+    'session: loop {
+        let n = match io::read(tty_mine, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &b in &buf[..n] {
+            match b {
+                0x04 if line.is_empty() => {
+                    let _ = io::write_all(tty_mine, b"eof\n");
+                    break 'session;
+                }
+                0x03 if line.is_empty() => {
+                    let _ = io::write_all(tty_mine, b"interrupt\n");
+                    if let Some(j) = job.take() {
+                        let w = sys::object_wait(
+                            j,
+                            rt::abi::signals::TERMINATED,
+                            sys::clock_get() + 3000,
+                        );
+                        let msg = if w.status == 0 {
+                            alloc::format!("job: exit {}\n", sys::process_info(j).a1 as i64)
+                        } else {
+                            String::from("job: still running\n")
+                        };
+                        let _ = io::write_all(tty_mine, msg.as_bytes());
+                        sys::handle_close(j);
+                    }
+                }
+                b'\n' => {
+                    let cmd = core::mem::take(&mut line);
+                    if cmd.as_slice() == b"quit" {
+                        let _ = io::write_all(tty_mine, b"bye\n");
+                        break 'session;
+                    } else if cmd.as_slice() == b"spin" {
+                        let out = sys::socket_create();
+                        let spawned = (out.status == 0)
+                            .then(|| {
+                                let st = proto::startup::Startup {
+                                    args: alloc::vec![b"spin".to_vec()],
+                                    roles: alloc::vec![(Role::Stdout, 0)],
+                                    ..Default::default()
+                                };
+                                let bytes = st.encode().ok()?;
+                                let out_w = narrow_handle(
+                                    out.a2 as u32,
+                                    Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+                                )?;
+                                rt::spawn::spawn(spin_img, &bytes, &[out_w]).ok()
+                            })
+                            .flatten();
+                        if out.status == 0 {
+                            sys::handle_close(out.a1 as u32);
+                        }
+                        let msg = match spawned {
+                            Some(p) => {
+                                let dup = sys::handle_duplicate(p, kill_wait);
+                                txid += 1;
+                                let msg = proto::console::encode(
+                                    txid,
+                                    proto::console::Control::SetForeground,
+                                );
+                                let hs = [dup.a1 as u32];
+                                let w = sys::channel_write(
+                                    ctl_mine,
+                                    msg.as_ptr(),
+                                    msg.len(),
+                                    hs.as_ptr(),
+                                    1,
+                                );
+                                if dup.status != 0 || w.status != 0 {
+                                    sys::process_kill(p, -1);
+                                    sys::handle_close(p);
+                                    String::from("spin: could not register\n")
+                                } else {
+                                    // wait for the acknowledgement: from then on Ctrl-C reaches it
+                                    let mut ok = false;
+                                    let mut rb = [0u8; 16];
+                                    for _ in 0..200 {
+                                        let r = sys::channel_read(
+                                            ctl_mine,
+                                            rb.as_mut_ptr(),
+                                            rb.len(),
+                                            core::ptr::null_mut(),
+                                            0,
+                                        );
+                                        if r.status == 0 {
+                                            ok = proto::console::decode_reply(&rb[..r.a1])
+                                                == Some((txid, 0));
+                                            break;
+                                        }
+                                        io::nap(5);
+                                    }
+                                    if ok {
+                                        job = Some(p);
+                                        String::from("spin: started\n")
+                                    } else {
+                                        sys::process_kill(p, -1);
+                                        sys::handle_close(p);
+                                        String::from("spin: no acknowledgement\n")
+                                    }
+                                }
+                            }
+                            None => String::from("spin: could not start\n"),
+                        };
+                        let _ = io::write_all(tty_mine, msg.as_bytes());
+                    } else if cmd.as_slice() == b"flood" {
+                        let data = alloc::vec![b'f'; 500_000];
+                        let _ = io::write_all(tty_mine, &data);
+                        let _ = io::write_all(tty_mine, b"\nflood: done\n");
+                        // let the serial line drain, so the drop notice precedes the end marker
+                        io::nap(1500);
+                        let _ = io::write_all(tty_mine, b"flood: end\n");
+                    } else {
+                        let mut out = Vec::from(&b"got: "[..]);
+                        out.extend_from_slice(&cmd);
+                        out.push(b'\n');
+                        let _ = io::write_all(tty_mine, &out);
+                    }
+                }
+                _ => line.push(b),
+            }
+        }
+    }
+    if let Some(j) = job.take() {
+        sys::process_kill(j, -1);
+        sys::handle_close(j);
+    }
+    // closing the terminal ends the console server; wait until it has flushed the serial line
+    sys::handle_close(tty_mine);
+    sys::handle_close(ctl_mine);
+    let w = sys::object_wait(
+        consoled,
+        rt::abi::signals::TERMINATED,
+        sys::clock_get() + 5000,
+    );
+    let code = if w.status == 0 {
+        sys::process_info(consoled).a1 as i64
+    } else {
+        -1
+    };
+    sys::handle_close(consoled);
+    if code == 0 {
+        0
+    } else {
+        25
     }
 }
