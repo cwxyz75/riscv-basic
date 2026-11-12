@@ -25,7 +25,13 @@ pub struct Limits {
     pub max_bytes: usize,
     /// Bytes in one file.
     pub max_file: usize,
+    /// Bytes of bookkeeping (names and per-node overhead) in the whole tree: names are client
+    /// data too, and 8192 nodes with 255-byte names are megabytes.
+    pub max_meta: usize,
 }
+
+/// What a node costs against `max_meta` beyond its name.
+const NODE_OVERHEAD: usize = 96;
 
 impl Default for Limits {
     fn default() -> Limits {
@@ -33,6 +39,7 @@ impl Default for Limits {
             max_nodes: 8192,
             max_bytes: 8 * 1024 * 1024,
             max_file: 4 * 1024 * 1024,
+            max_meta: 2 * 1024 * 1024,
         }
     }
 }
@@ -88,10 +95,11 @@ impl Blob {
         self.chunks.len() * CHUNK
     }
 
-    fn read(&self, offset: usize, len: usize) -> Vec<u8> {
+    fn read(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
         let start = offset.min(self.len);
         let end = start.saturating_add(len).min(self.len);
-        let mut out = Vec::with_capacity(end - start);
+        let mut out = Vec::new();
+        out.try_reserve_exact(end - start).ok()?;
         let mut at = start;
         while at < end {
             let (c, o) = (at / CHUNK, at % CHUNK);
@@ -99,7 +107,7 @@ impl Blob {
             out.extend_from_slice(&self.chunks[c][o..o + n]);
             at += n;
         }
-        out
+        Some(out)
     }
 
     /// Copy `data` in at `offset` (the blob is already long enough).
@@ -136,7 +144,7 @@ impl Blob {
         } else {
             self.chunks.truncate(need);
             // the unused tail of the last chunk must read as zeros if the file grows again
-            if new_len % CHUNK != 0 {
+            if !new_len.is_multiple_of(CHUNK) {
                 if let Some(last) = self.chunks.last_mut() {
                     last[new_len % CHUNK..].fill(0);
                 }
@@ -154,6 +162,8 @@ enum Data {
 }
 
 struct Node {
+    /// Name length plus overhead, charged to `max_meta` while the node lives.
+    cost: usize,
     data: Data,
     /// Directory entries that name this node (0 once unlinked, 1 while linked).
     links: u32,
@@ -168,6 +178,7 @@ pub struct Fs {
     free: Vec<NodeId>,
     live: usize,
     bytes: usize,
+    meta: usize,
 }
 
 fn check_name(n: &[u8]) -> Result<(), Error> {
@@ -181,6 +192,7 @@ impl Fs {
             links: 1,
             refs: 0,
             readonly: false,
+            cost: 0,
         };
         Fs {
             limits,
@@ -188,6 +200,7 @@ impl Fs {
             free: Vec::new(),
             live: 1,
             bytes: 0,
+            meta: 0,
         }
     }
 
@@ -203,6 +216,11 @@ impl Fs {
     /// Bytes of file data held.
     pub fn bytes_used(&self) -> usize {
         self.bytes
+    }
+
+    /// Bytes of name and node bookkeeping charged so far.
+    pub fn meta_used(&self) -> usize {
+        self.meta
     }
 
     /// Heap bytes the file data really occupies (capacity, not length): what the server's own
@@ -300,10 +318,12 @@ impl Fs {
                 return Err(Error::NotFound);
             }
         }
-        if self.live >= self.limits.max_nodes {
+        let cost = name.len() + NODE_OVERHEAD;
+        if self.live >= self.limits.max_nodes || self.meta + cost > self.limits.max_meta {
             return Err(Error::Quota);
         }
         let node = Node {
+            cost,
             data,
             links: 1,
             refs: 0,
@@ -318,6 +338,7 @@ impl Fs {
             (self.nodes.len() - 1) as NodeId
         };
         self.live += 1;
+        self.meta += cost;
         if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
             m.insert(name.to_vec(), id);
         }
@@ -403,6 +424,7 @@ impl Fs {
                 continue;
             }
             if let Some(Some(n)) = self.nodes.get_mut(id as usize).map(|s| s.take()) {
+                self.meta -= n.cost;
                 match &n.data {
                     Data::File(b) => self.bytes -= b.len,
                     // Defence in depth: whatever a dying directory still names dies with it.
@@ -425,7 +447,9 @@ impl Fs {
     /// Up to `len` bytes of a file at `offset` (fewer at the end; empty past it).
     pub fn read(&self, id: NodeId, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
         match &self.node(id)?.data {
-            Data::File(b) => Ok(b.read(usize::try_from(offset).unwrap_or(usize::MAX), len)),
+            Data::File(b) => b
+                .read(usize::try_from(offset).unwrap_or(usize::MAX), len)
+                .ok_or(Error::Quota),
             Data::Dir(_) => Err(Error::IsDirectory),
             Data::Image { .. } => Err(Error::ReadOnly),
         }

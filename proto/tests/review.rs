@@ -232,3 +232,14 @@ fn accepted_input_round_trips() {
         }
     }
 }
+
+#[test]
+fn boot_images_refuse_names_that_are_both_file_and_directory() {
+    let clash: [(&[u8], &[u8]); 2] = [(b"bin", b"1"), (b"bin/ls", b"2")];
+    assert_eq!(bootimg::build(&clash), Err(BootImageError::Conflict));
+    let dup: [(&[u8], &[u8]); 2] = [(b"a", b"1"), (b"a", b"2")];
+    assert_eq!(bootimg::build(&dup), Err(BootImageError::DuplicateName));
+    // `bin` and `binary` are different names
+    let fine: [(&[u8], &[u8]); 2] = [(b"bin/ls", b"1"), (b"binary", b"2")];
+    assert!(bootimg::build(&fine).is_ok());
+}

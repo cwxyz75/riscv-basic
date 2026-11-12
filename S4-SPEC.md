@@ -154,7 +154,7 @@ defines (0, except `Open`/`Clone` which carry exactly 1); anything else is a pro
 Ops on a **directory** connection: `1 Open(path, flags, rights)+endpoint`, `2 Clone(rights)+
 endpoint`, `3 ReadDir(cookie = last name seen, empty = start)`, `4 Mkdir(name)`, `5 Unlink(name)`,
 `6 Stat(path)`; `2 Clone` is also valid on a file connection. Ops on a **file** connection: `10 Read(offset, len)`, `11 Write(offset, data)`,
-`12 GetSize`, `13 SetSize(n)`, `14 Stat`, `15 GetVmo(rights)` (for every boot-image file, `/bin` programs included: the reply carries a
+`12 GetSize`, `13 SetSize(n)`, `14 Stat`, `15 GetVmo` (no arguments; for every boot-image file, `/bin` programs included: the reply carries a
 read-only handle to the *whole* boot image VMO, `a` = the file's offset and the 8-byte payload
 its length, so no program is ever copied through channels; any other file is `BAD_REQUEST`). Flags for `Open`: `CREATE`, `EXCLUSIVE`, `TRUNCATE`,
 `DIRECTORY`.
@@ -177,10 +177,17 @@ Rules:
   freed with the last connection). `SetSize` charges the quota for growth (holes count as
   bytes). Offsets and lengths are checked with overflow-safe arithmetic.
 - Quotas (server totals, enforced, each with a test): 8192 nodes; 8 MiB of file bytes; file
-  size at most 4 MiB; **at most 200 live connections in all** (one port holds 256 bindings,
+  size at most 4 MiB; 2 MiB of names and per-node overhead (each node is charged its name plus
+  96 bytes: 8192 nodes with 255-byte names would otherwise be megabytes the byte quota never
+  sees); 2 MiB of replies held for clients with no room (a connection that would exceed it is
+  dropped); every allocation a client can drive is fallible, so the worst case (8 + 2 + 2 MiB
+  plus message copies) fits the server's 16 MiB heap; **at most 200 live connections in all** (one port holds 256 bindings,
   leaving room for the service channel); excess `Open`/`Clone` is `QUOTA`. Servers cannot tell
   clients apart (INVARIANTS H5), so per-client limits are not specified.
-- `Open` needs READ on the directory connection (it traverses). A request with the wrong number
+- `Open` needs READ on the directory connection (it traverses), `Mkdir`/`Unlink`/`SetSize`/`Write`
+  need WRITE, `ReadDir` needs ENUMERATE, everything else READ. The server also refuses an endpoint
+  whose peer end it already serves (`object_info`): both ends of one channel handed over would
+  make connections nobody could close and a reply/request echo that never ends. A request with the wrong number
   of handles for its op is answered `BAD_REQUEST` and its handles are closed; only a structurally
   broken one (too short to carry a txid, more handles or bytes than any request may have) closes
   the connection. The endpoint of an `Open`/`Clone` must be a channel end with READ, WRITE, WAIT

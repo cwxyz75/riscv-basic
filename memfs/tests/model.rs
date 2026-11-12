@@ -24,6 +24,7 @@ fn small() -> Limits {
         max_nodes: 6,
         max_bytes: 100,
         max_file: 60,
+        max_meta: 1 << 20,
     }
 }
 
@@ -561,4 +562,52 @@ fn chunked_storage_is_exact_across_chunk_boundaries() {
     assert_eq!(&all[50_000..], b"tail");
     // memory held is the counted bytes rounded up to chunks, per file
     assert!(fs.data_capacity() <= fs.bytes_used() + 2 * 16 * 1024);
+}
+
+#[test]
+fn names_and_nodes_are_charged_so_the_tree_cannot_outgrow_its_budget() {
+    // 8192 nodes with 255-byte names would be megabytes the file-byte quota never sees.
+    let mut fs = Fs::new(Limits::default());
+    let mut made = 0usize;
+    for i in 0..8192u32 {
+        let mut name = format!("{i:05}").into_bytes();
+        name.resize(255, b'n');
+        match fs.mkdir(ROOT, &name) {
+            Ok(_) => made += 1,
+            Err(Error::Quota) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(
+        made < 8192 && made > 5000,
+        "the meta budget stops it early: {made}"
+    );
+    assert!(fs.meta_used() <= Limits::default().max_meta);
+    // unlinking gives the budget back
+    let mut first = format!("{:05}", 0).into_bytes();
+    first.resize(255, b'n');
+    fs.unlink(ROOT, &first).unwrap();
+    let before = fs.meta_used();
+    let mut again = format!("{:05}", 99999).into_bytes();
+    again.resize(255, b'n');
+    assert!(fs.mkdir(ROOT, &again).is_ok());
+    assert_eq!(fs.meta_used(), before + 255 + 96);
+    // short names are cheap: the node limit is what stops them
+    let mut fs = Fs::new(Limits::default());
+    let mut n = 0;
+    while fs.create_file(ROOT, format!("{n}").as_bytes()).is_ok() {
+        n += 1;
+    }
+    assert_eq!(n, 8191, "root + 8191 files = 8192 nodes");
+}
+
+#[test]
+fn set_size_at_exactly_the_file_limit() {
+    let mut fs = Fs::new(Limits::default());
+    let f = fs.create_file(ROOT, b"f").unwrap();
+    let max = Limits::default().max_file as u64;
+    assert_eq!(fs.set_size(f, max), Ok(()), "exactly the limit is fine");
+    assert_eq!(fs.set_size(f, max + 1), Err(Error::TooBig));
+    assert_eq!(fs.write(f, max, b"x"), Err(Error::TooBig));
+    assert_eq!(fs.write(f, max - 1, b"x"), Ok(1));
 }

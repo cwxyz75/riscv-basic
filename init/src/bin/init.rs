@@ -245,18 +245,26 @@ fn run_program(
         sys::handle_close(h);
         (n.status == 0).then_some(n.a1 as u32)
     };
-    let (in_w, in_r) = {
-        let s = sys::socket_create();
-        (s.a1 as u32, s.a2 as u32)
-    };
-    let (out_r, out_w) = {
-        let s = sys::socket_create();
-        (s.a1 as u32, s.a2 as u32)
-    };
+    let s1 = sys::socket_create();
+    let s2 = sys::socket_create();
+    if s1.status != 0 || s2.status != 0 {
+        for s in [&s1, &s2] {
+            if s.status == 0 {
+                sys::handle_close(s.a1 as u32);
+                sys::handle_close(s.a2 as u32);
+            }
+        }
+        return String::from("run: could not make pipes\r\n");
+    }
+    let (in_w, in_r) = (s1.a1 as u32, s1.a2 as u32);
+    let (out_r, out_w) = (s2.a1 as u32, s2.a2 as u32);
     let (Some(in_r), Some(out_w)) = (
         narrow(in_r, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
         narrow(out_w, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
     ) else {
+        for h in [in_w, in_r, out_r, out_w] {
+            sys::handle_close(h);
+        }
         return String::from("run: could not make pipes\r\n");
     };
     let startup = Startup {

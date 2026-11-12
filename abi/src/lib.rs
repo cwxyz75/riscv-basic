@@ -220,6 +220,7 @@ pub mod syscall {
     pub const EVENT_SIGNAL: usize = 31;
     pub const OBJECT_SIGNALS: usize = 32;
     pub const OBJECT_WAIT: usize = 33;
+    pub const OBJECT_INFO: usize = 34;
     pub const VMO_CREATE: usize = 40;
     pub const VMO_READ: usize = 41;
     pub const VMO_WRITE: usize = 42;
