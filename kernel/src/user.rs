@@ -140,9 +140,13 @@ fn quota(job: JobId) -> ipc::Quota<'static> {
 
 static mut USER: Option<UserState> = None;
 
+#[track_caller]
 fn state() -> &'static mut UserState {
-    debug_assert!(!irq::enabled(), "user state touched with interrupts on");
-    // SAFETY: one hart, interrupts off (debug-checked); every caller drops the reference
+    debug_assert!(
+        !irq::enabled() && crate::bkl::held(),
+        "user state touched without the big kernel lock"
+    );
+    // SAFETY: the big kernel lock is held (debug-checked); every caller drops the reference
     // before any context switch, so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
@@ -206,7 +210,13 @@ pub enum LoadError {
 
 /// Load `image` into a new process and start it with start argument `arg`. Returns the
 /// process id and the id of its thread.
+/// Build a process from `image` and start its first thread. The whole construction runs under the
+/// big kernel lock (it touches the frame database, the VMO store and the process table).
 pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
+    irq::without(|| start_locked(image, arg))
+}
+
+fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);
     }
@@ -352,8 +362,11 @@ fn new_start(
 fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
     // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
-    // between would otherwise be seen only at the next trap, after user code had run.
+    // between would otherwise be seen only at the next trap, after user code had run. The big
+    // kernel lock is held while the thread's start is looked up and dropped just before the
+    // jump to user mode (nothing user-visible runs under it).
     let _ = irq::save_and_disable();
+    crate::bkl::lock();
     let (ts, satp, killed) = {
         let s = state();
         let ts = s
@@ -375,9 +388,13 @@ fn user_thread_main(token: usize) {
     };
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
+        crate::bkl::unlock();
         irq::enable();
         leave(code, true);
     }
+    // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
+    // (loads from this thread's stack and CSR writes) run before `sret`.
+    crate::bkl::unlock();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
     unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
@@ -1171,6 +1188,11 @@ fn reap_vmos() {
 /// End process `pid` with `code`, from any other thread: a process with no thread yet is
 /// torn down at once; a running one is told to die and woken (its thread exits at its next
 /// return to user mode).
+/// End process `pid` with `code` from kernel code (the tests).
+pub fn end_process(pid: u32, code: i32) {
+    request_kill(pid, code);
+}
+
 fn request_kill(pid: u32, code: i32) {
     let direct = irq::without(|| {
         let s = state();

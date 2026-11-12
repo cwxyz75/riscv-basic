@@ -11,6 +11,8 @@ pub const MAX_HARTS: usize = 8;
 
 /// Why a hart was sent an IPI (bits of `PerHart::pending`).
 pub const IPI_RESCHED: u32 = 1;
+/// Run the hart's `work_kind` job in its IPI handler (tests of the lock).
+pub const IPI_WORK: u32 = 2;
 
 /// The layout of the first two fields is used by the trap assembly (`trap.rs`, `user.rs`).
 #[repr(C)]
@@ -36,6 +38,16 @@ pub struct PerHart {
     pub deadline: AtomicU64,
     /// The value of `tp` this hart saw when it bound itself (must equal this record's address).
     pub tp_seen: AtomicUsize,
+    /// The nesting depth of the big kernel lock held on this hart (the lock follows the thread:
+    /// `bkl::swap_depth`).
+    pub bkl_depth: AtomicU32,
+    /// The lock classes this hart holds (bit per `bkl::Class`), for the lock-order checker.
+    pub locks_held: AtomicU32,
+    /// Work for the hart's IPI handler (S5b tests): kind, argument, result and a done flag.
+    pub work_kind: AtomicU32,
+    pub work_arg: AtomicU64,
+    pub work_result: AtomicU64,
+    pub work_done: AtomicBool,
     /// The `satp` last written for user mode on this hart (so a switch is made only when needed).
     pub active_satp: AtomicU64,
 }
@@ -53,6 +65,12 @@ impl PerHart {
             pending: AtomicU32::new(0),
             deadline: AtomicU64::new(0),
             tp_seen: AtomicUsize::new(0),
+            bkl_depth: AtomicU32::new(0),
+            locks_held: AtomicU32::new(0),
+            work_kind: AtomicU32::new(0),
+            work_arg: AtomicU64::new(0),
+            work_result: AtomicU64::new(0),
+            work_done: AtomicBool::new(false),
             active_satp: AtomicU64::new(0),
         }
     }

@@ -108,6 +108,10 @@ struct KThread {
     name: &'static str,
     /// Nobody will `join` this thread: when it exits the reaper frees it.
     detached: bool,
+    /// The big kernel lock's nesting depth this thread had when it was switched out (K3); a new
+    /// thread starts at 1: it is born inside the context switch that first runs it, and its
+    /// bootstrap leaves that region.
+    bkl_depth: u32,
 }
 
 struct Kernel {
@@ -128,10 +132,11 @@ pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 
 /// The scheduler state. Callers hold interrupts disabled (so the timer interrupt
 /// cannot re-enter) and do not keep the reference across a context switch.
+#[track_caller]
 fn kernel() -> &'static mut Kernel {
     debug_assert!(
-        !irq::enabled(),
-        "scheduler state touched with interrupts on"
+        !irq::enabled() && crate::bkl::held(),
+        "scheduler state touched without the big kernel lock"
     );
     // SAFETY: one hart, interrupts off (checked above in debug builds), and every
     // caller drops the reference before any switch, so no two live `&mut` alias.
@@ -162,6 +167,7 @@ pub fn init(boot_prio: Prio) {
             stack: None,
             name: "boot",
             detached: false,
+            bkl_depth: 0,
         },
     );
     // SAFETY: called once, interrupts off, before any other use of KERNEL.
@@ -194,7 +200,9 @@ fn idle_main(_: usize) {
 /// First Rust code of every new thread (called from the assembly trampoline).
 #[no_mangle]
 extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
-    // A new thread starts inside a context switch, with interrupts off.
+    // A new thread starts inside a context switch, with interrupts off and the big kernel lock
+    // handed over at depth 1: it leaves that region now and runs outside the lock (K4).
+    crate::bkl::unlock();
     irq::enable();
     // SAFETY: `entry` is the `fn(usize)` that `spawn` stored, round-tripped through
     // a register as an address.
@@ -233,6 +241,7 @@ fn spawn_with(name: &'static str, prio: Prio, entry: fn(usize), arg: usize, deta
                 stack: Some(stack),
                 name,
                 detached,
+                bkl_depth: 1,
             },
         );
         reschedule();
@@ -261,6 +270,7 @@ fn reschedule() {
             );
         }
         let old: *mut Context = &mut *outgoing.ctx;
+        let outgoing_tid = k.running;
         k.running = next;
         let incoming = k.threads.get(&next).expect("next thread exists");
         if let Some(stack) = &incoming.stack {
@@ -271,6 +281,14 @@ fn reschedule() {
             );
         }
         let new: *const Context = &*incoming.ctx;
+        // The lock stays with this hart across the switch, but its nesting depth now belongs to
+        // the incoming thread (K3); the outgoing thread keeps its own for when it resumes.
+        let in_depth = incoming.bkl_depth;
+        let out_depth = crate::bkl::swap_depth(in_depth);
+        k.threads
+            .get_mut(&outgoing_tid)
+            .expect("outgoing thread exists")
+            .bkl_depth = out_depth;
         (old, new)
     };
     // SAFETY: `old` and `new` point into boxed contexts that stay alive and in

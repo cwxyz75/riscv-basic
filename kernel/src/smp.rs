@@ -139,7 +139,10 @@ pub fn ipi_interrupt() {
     unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
     let me = percpu::this();
     // take the reasons first, then count: whoever sees the count move sees the bits already gone
-    let _reasons = me.pending.swap(0, Ordering::SeqCst);
+    let reasons = me.pending.swap(0, Ordering::SeqCst);
+    if reasons & percpu::IPI_WORK != 0 {
+        do_work(me);
+    }
     me.ipis.fetch_add(1, Ordering::SeqCst);
     // (S5c: IPI_RESCHED makes the hart reschedule; in S5a there is nothing to do.)
 }
@@ -232,3 +235,71 @@ pub fn online() -> usize {
 
 #[allow(dead_code)]
 pub const RESCHED: u32 = IPI_RESCHED;
+
+// ---- work run in a hart's IPI handler (the big-lock tests) ----
+
+pub const WORK_BKL_COUNT: u32 = 1;
+pub const WORK_BKL_PROBE: u32 = 2;
+
+/// The shared counter of the lock-exclusion test: incremented with a deliberately non-atomic
+/// read-modify-write, so only mutual exclusion keeps it exact.
+pub static LOCK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Add one to `LOCK_COUNTER` the racy way (a pause between the load and the store).
+pub fn racy_increment() {
+    let v = LOCK_COUNTER.load(Ordering::Relaxed);
+    core::hint::spin_loop();
+    LOCK_COUNTER.store(v + 1, Ordering::Relaxed);
+}
+
+fn do_work(me: &percpu::PerHart) {
+    let arg = me.work_arg.load(Ordering::SeqCst);
+    match me.work_kind.load(Ordering::SeqCst) {
+        WORK_BKL_COUNT => {
+            for _ in 0..arg {
+                crate::bkl::lock();
+                racy_increment();
+                crate::bkl::unlock();
+            }
+            me.work_result.store(arg, Ordering::SeqCst);
+        }
+        WORK_BKL_PROBE => {
+            // for `arg` timer cycles, try the lock over and over; report successes and failures
+            let end = timer::now() + arg;
+            let (mut ok, mut fail) = (0u64, 0u64);
+            while timer::now() < end {
+                if crate::bkl::try_lock() {
+                    ok += 1;
+                    crate::bkl::unlock();
+                } else {
+                    fail += 1;
+                }
+            }
+            me.work_result.store(ok | (fail << 32), Ordering::SeqCst);
+        }
+        _ => {}
+    }
+    me.work_done.store(true, Ordering::Release);
+}
+
+/// Start `kind`/`arg` on hart `index` (not the caller) through an IPI.
+pub fn start_work(index: usize, kind: u32, arg: u64) {
+    let h = percpu::hart(index);
+    h.work_done.store(false, Ordering::SeqCst);
+    h.work_kind.store(kind, Ordering::SeqCst);
+    h.work_arg.store(arg, Ordering::SeqCst);
+    send_ipi(index, percpu::IPI_WORK);
+}
+
+/// Wait (bounded, in timer cycles) for the work on hart `index`; returns its result.
+pub fn wait_work(index: usize, timeout_cycles: u64) -> Option<u64> {
+    let h = percpu::hart(index);
+    let end = timer::now() + timeout_cycles;
+    while !h.work_done.load(Ordering::Acquire) {
+        if timer::now() > end {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    Some(h.work_result.load(Ordering::SeqCst))
+}

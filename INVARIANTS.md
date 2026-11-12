@@ -76,8 +76,25 @@ get filled in as each area is built.
 
 ### Lock order
 
-(Empty until S5. The first entry added is the big kernel lock; every later lock is
-inserted here, with the reason for its position, in the same change that adds it.)
+1. **BKL** (`kernel/src/bkl.rs`): protects all shared kernel state. Taken by `irq::without` and by
+   every trap handler (except an IPI and a parked secondary's timer in S5b); reentrant per hart;
+   released on every path that leaves kernel code; follows the thread across a context switch (K3).
+2. **HEAP** (the allocator's spin lock, interrupts off): used inside and outside the BKL, so it
+   comes after it.
+3. **UART** (reentrant per hart, interrupts off, held for a whole formatted print): last, because
+   anything may print.
+
+A hart that holds a class may take a class with a *higher* number, never a lower one; the checker
+(`bkl::note_acquire`) panics on a violation in every build and counts it. New locks go into this
+list, with the reason for their position, in the change that adds them.
+
+| # | Invariant | How checked |
+|---|---|---|
+| K1 | Shared kernel state is touched only with the BKL held: `thread::kernel()`, `user::state()` and `kmem::get()` assert it | the whole suite at -smp 1, 2, 4 (a violation panics) |
+| K2 | The BKL is released at `sret`, in `enter_user`, and before idle `wfi`: another hart can take it while this one runs user code or idles | `bkl_is_released_on_user_entry_and_idle` (a probing hart; mutation-checked) |
+| K3 | A thread's nesting depth is saved at a context switch and restored when it resumes, on whatever hart; the lock itself never leaves the hart that switches | the suite (a lost or doubled level panics on the assert in `unlock`) |
+| K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
+| K5 | Lock order BKL, HEAP, UART | `lock_order_violations_are_detected`, and the checker panics in the real run |
 
 ## Namespaces and paths
 

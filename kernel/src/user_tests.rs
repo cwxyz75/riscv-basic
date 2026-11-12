@@ -18,7 +18,7 @@ const LOAD_PAGE_FAULT: i32 = 13;
 const STORE_PAGE_FAULT: i32 = 15;
 
 fn free_frames() -> usize {
-    kmem::get().mm.db.free_count()
+    crate::irq::without(|| kmem::get().mm.db.free_count())
 }
 
 fn run(image: &[u8], arg: u64) -> Result<i32, String> {
@@ -85,6 +85,37 @@ fn helper_main(_: usize) {
     end.close();
 }
 
+/// While user code runs on the boot hart, and while it idles, another hart must be able to take
+/// the big kernel lock (the lock is released on every path that leaves kernel code). With one
+/// hart there is nobody to ask, and the check passes without observing anything.
+fn bkl_is_released() -> Outcome {
+    use crate::smp;
+    if smp::started() < 2 {
+        return Ok(());
+    }
+    const PROBE_CYCLES: u64 = 400_000; // 40 ms of the 10 MHz counter
+    let probe = |phase: &str| -> Outcome {
+        smp::start_work(1, smp::WORK_BKL_PROBE, PROBE_CYCLES);
+        thread::sleep_ticks(60);
+        let r = smp::wait_work(1, 10 * 10_000_000).ok_or_else(|| format!("{phase}: no answer"))?;
+        let (ok, fail) = (r & 0xffff_ffff, r >> 32);
+        if ok < 100 || ok < 4 * fail {
+            return Err(format!(
+                "{phase}: the other hart took the lock {ok} times and found it held {fail} times"
+            ));
+        }
+        Ok(())
+    };
+    // phase 1: a user thread spinning in U-mode on this hart
+    let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
+    let a = probe("user mode");
+    user::end_process(pid, -7);
+    user::finish(pid, tid);
+    a?;
+    // phase 2: this hart idle (every thread blocked)
+    probe("idle")
+}
+
 pub struct Report {
     /// (name, outcome) of each kernel-side test.
     pub tests: alloc::vec::Vec<(String, Outcome)>,
@@ -107,9 +138,11 @@ pub fn run_all() -> Report {
         },
     );
 
+    push("bkl_is_released_on_user_entry_and_idle", bkl_is_released());
+
     // The user-level suite, as a process.
     let frames = free_frames();
-    let vmos_before = kmem::get().vmos.count();
+    let vmos_before = crate::irq::without(|| kmem::get().vmos.count());
     let threads_before = thread::thread_count();
     let code = (|| -> Result<i32, String> {
         let (pid, tid) = user::start(
@@ -155,7 +188,7 @@ pub fn run_all() -> Report {
     push(
         "no_process_or_vmo_survives_init",
         if user::process_count() == 0
-            && kmem::get().vmos.count() == vmos_before
+            && crate::irq::without(|| kmem::get().vmos.count()) == vmos_before
             && user::job_ledger() == (1, 0, 0, 0, 0)
         {
             Ok(())
@@ -164,7 +197,7 @@ pub fn run_all() -> Report {
                 "{} processes and {} VMOs left (wanted 0 and {vmos_before}); (jobs, processes, \
                  threads) {:?}, wanted (1, 0, 0, 0, 0)",
                 user::process_count(),
-                kmem::get().vmos.count(),
+                crate::irq::without(|| kmem::get().vmos.count()),
                 user::job_ledger()
             ))
         },

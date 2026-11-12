@@ -19,16 +19,20 @@ struct IrqSafeHeap(LockedHeap);
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let was = irq::save_and_disable();
+        crate::bkl::lock_taken(crate::bkl::Class::Heap);
         // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
         let p = unsafe { self.0.alloc(layout) };
+        crate::bkl::lock_released(crate::bkl::Class::Heap);
         irq::restore(was);
         p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let was = irq::save_and_disable();
+        crate::bkl::lock_taken(crate::bkl::Class::Heap);
         // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
         unsafe { self.0.dealloc(ptr, layout) };
+        crate::bkl::lock_released(crate::bkl::Class::Heap);
         irq::restore(was);
     }
 }
