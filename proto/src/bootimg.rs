@@ -31,6 +31,17 @@ pub enum BootImageError {
     TooBig,
     /// Two entries share bytes.
     Overlap,
+    /// A name is also a directory another name lives in (`bin` and `bin/ls`).
+    Conflict,
+}
+
+/// Does any name equal `a` followed by `/` and more of another name?
+fn has_conflict(names: &[&[u8]]) -> bool {
+    names.iter().any(|a| {
+        names
+            .iter()
+            .any(|b| b.len() > a.len() && b.starts_with(a) && b[a.len()] == b'/')
+    })
 }
 
 /// An image name is a relative path of non-empty components, none of them `.` or `..`, with
@@ -47,6 +58,15 @@ fn valid_name(n: &[u8]) -> bool {
 pub fn build(files: &[(&[u8], &[u8])]) -> Result<Vec<u8>, BootImageError> {
     if files.len() > MAX_ENTRIES {
         return Err(BootImageError::TooMany);
+    }
+    let all: Vec<&[u8]> = files.iter().map(|(n, _)| *n).collect();
+    for (i, n) in all.iter().enumerate() {
+        if all[..i].contains(n) {
+            return Err(BootImageError::DuplicateName);
+        }
+    }
+    if has_conflict(&all) {
+        return Err(BootImageError::Conflict);
     }
     let mut table = 8usize;
     for (name, _) in files {
@@ -118,6 +138,10 @@ pub fn parse_prefix(img: &[u8], total_len: usize) -> Result<Vec<Entry>, BootImag
             return Err(BootImageError::DuplicateName);
         }
         entries.push(Entry { name, offset, size });
+    }
+    let all: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
+    if has_conflict(&all) {
+        return Err(BootImageError::Conflict);
     }
     for e in &entries {
         let end = (e.offset as usize)

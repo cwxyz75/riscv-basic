@@ -25,6 +25,14 @@ pub struct ObjId {
     gen: u32,
 }
 
+impl ObjId {
+    /// A number that names this object for as long as it lives and never again afterwards (the
+    /// slot's generation is part of it): the "kernel object id" user programs may compare.
+    pub fn koid(&self) -> u64 {
+        (u64::from(self.gen) << 32) | (u64::from(self.index) + 1)
+    }
+}
+
 /// What the registry needs from the objects it stores.
 pub trait Object {
     /// The ids this object holds references to (queued handles, for a channel).

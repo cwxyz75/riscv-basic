@@ -834,6 +834,19 @@ pub fn port_poll(
     Ok(observed)
 }
 
+/// The identity of the object a handle names, and of its peer (0 if it has none or the peer is
+/// gone): `(koid, peer_koid)`. A process can use it to see that two handles it holds are the two
+/// ends of one channel.
+pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, u64), Status> {
+    let entry = table.get(h)?;
+    let obj = reg.get(entry.obj).ok_or(Status::BadHandle)?;
+    let peer = obj
+        .peer()
+        .filter(|&p| reg.is_alive(p))
+        .map_or(0, |p| p.koid());
+    Ok((entry.obj.koid(), peer))
+}
+
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
 pub fn vmo_object_create(
     reg: &mut Kobjs,

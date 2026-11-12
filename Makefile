@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-aia os-boot-test-rva23 os-interactive os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-aia os-boot-test-rva23 os-interactive os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -113,6 +113,14 @@ os-miri:
 
 os-boot-test: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
+
+# The same, split so CI can run the parts as separate jobs (a slow or flaky one does not hide the
+# others): the normal and fail-demo kernels, and the round-robin kernel.
+os-boot-test-main: kernel
+	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF)
+
+os-boot-test-rr: kernel
+	python3 scripts/os_boot_test.py --rr $(OS_RR_ELF)
 
 # The same boot test on QEMU's AIA interrupt controller (APLIC + IMSIC) instead of the
 # PLIC (OD35). Needs QEMU with `-machine virt,aia=...` (7.2 or later).

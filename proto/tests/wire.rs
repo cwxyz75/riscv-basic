@@ -186,8 +186,10 @@ fn bootimg_rejects_malformed_images() {
     s[15] = 0xff;
     assert_eq!(bootimg::parse(&s), Err(BootImageError::BadExtent));
     // duplicate names
-    let dup: [(&[u8], &[u8]); 2] = [(b"a", b"1"), (b"a", b"2")];
-    let d = bootimg::build(&dup).unwrap();
+    // (the builder refuses them now, so make the bytes: rename the second entry "b" to "a")
+    let two: [(&[u8], &[u8]); 2] = [(b"a", b"1"), (b"b", b"2")];
+    let mut d = bootimg::build(&two).unwrap();
+    d[21] = b'a';
     assert_eq!(bootimg::parse(&d), Err(BootImageError::DuplicateName));
     // empty name, too many entries
     let empty: [(&[u8], &[u8]); 1] = [(b"", b"1")];

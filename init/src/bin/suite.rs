@@ -4430,11 +4430,16 @@ fn memfsd_quotas_and_connection_limit() -> Outcome {
         "and still counted"
     );
     a.close();
-    ensure_eq!(
-        c.write(0, b"x"),
-        Ok(1),
-        "closing the last connection frees its bytes"
-    );
+    // the server frees a's bytes when it sees the close: give it a moment
+    let mut freed = false;
+    for _ in 0..50 {
+        if c.write(0, b"x") == Ok(1) {
+            freed = true;
+            break;
+        }
+        rt::io::nap(10);
+    }
+    ensure!(freed, "closing the last connection frees its bytes");
     // connections: at most 200 live ones in all
     let mut conns: Vec<Fs> = Vec::new();
     let mut refused = None;
@@ -4448,17 +4453,292 @@ fn memfsd_quotas_and_connection_limit() -> Outcome {
         }
     }
     ensure_eq!(refused, Some(pst::QUOTA), "the connection limit");
+    // 200 in all; four are ours (root, /tmp, b, c), `a` just closed (the server may not have seen
+    // that yet): so 196, or 195 if it has not
     ensure!(
-        conns.len() > 150 && conns.len() < 200,
+        conns.len() == 196 || conns.len() == 195,
         "{} clones were accepted",
         conns.len()
     );
+    // a refused open must not have done anything: not even the truncation it asked for
+    ensure_eq!(
+        code(tmp.open(b"c", pfl::TRUNCATE, prt::READ | prt::WRITE)),
+        Some(pst::QUOTA),
+        "an open refused at the limit"
+    );
+    ensure_eq!(c.read_all(), Ok(b"x".to_vec()), "left the file alone");
     for x in conns {
         x.close();
     }
     ensure!(
         root.clone_conn(RO_DIR).is_ok(),
         "room again after they close"
+    );
+    Ok(())
+}
+
+fn memfsd_refuses_endpoints_it_cannot_serve_and_orphans() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    // an event or a VMO passed as the "endpoint" is refused, and does not use up a connection
+    for _ in 0..250 {
+        let ev = event()?;
+        let r = root
+            .call(pop::OPEN, pfl::DIRECTORY, RO_DIR, 0, 0, b"home", Some(ev))
+            .map_err(|e| msg_e(e, line!()))?;
+        ensure_eq!(r.status, pst::BAD_REQUEST, "a non-channel endpoint");
+        sys::handle_close(ev);
+    }
+    ensure!(
+        root.clone_conn(RO_DIR).is_ok(),
+        "no connection was consumed"
+    );
+    // a directory unlinked while open takes no new children (they would leak the quota for good)
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    tmp.mkdir(b"d").map_err(|e| msg_e(e, line!()))?;
+    let mut d = tmp
+        .open(b"d", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    tmp.unlink(b"d").map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(d.open(b"f", pfl::CREATE, prt::READ | prt::WRITE)),
+        Some(pst::NOT_FOUND),
+        "create in an orphan"
+    );
+    ensure_eq!(
+        code(d.mkdir(b"g")),
+        Some(pst::NOT_FOUND),
+        "mkdir in an orphan"
+    );
+    d.close();
+    // a reply that arrives after its caller gave up is not taken for the next answer
+    let mut f = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    f.write(0, b"12345").map_err(|e| msg_e(e, line!()))?;
+    let stale = proto::file::Request {
+        txid: 0xffff_ffff,
+        op: pop::GETSIZE,
+        flags: 0,
+        rights: 0,
+        a: 0,
+        b: 0,
+        payload: &[],
+    }
+    .encode()
+    .unwrap();
+    raw_request(f.ch, &stale, &[])?;
+    ensure_eq!(
+        f.size(),
+        Ok(5),
+        "the stale reply was discarded, not returned"
+    );
+    Ok(())
+}
+
+fn clone_request(txid: u32) -> Vec<u8> {
+    proto::file::Request {
+        txid,
+        op: pop::CLONE,
+        flags: 0,
+        rights: RO_DIR,
+        a: 0,
+        b: 0,
+        payload: &[],
+    }
+    .encode()
+    .unwrap()
+}
+
+fn memfsd_refuses_both_ends_of_one_channel() -> Outcome {
+    // A client that hands the server both ends of a channel it made would leave connections
+    // nobody can close (neither end ever sees PEER_CLOSED), and a reply sent on one end would be
+    // read back as a request on the other, for ever (found by the S4b/S4c review).
+    let (p, mut root, _bi) = start_memfsd()?;
+    for i in 0..120u32 {
+        let (x, y) = channel()?;
+        raw_request(root.ch, &clone_request(2 * i), &[x])?;
+        let s1 = reply_status(root.ch)?;
+        raw_request(root.ch, &clone_request(2 * i + 1), &[y])?;
+        let s2 = reply_status(root.ch)?;
+        ensure_eq!(s1, 0, "the first end of pair {i} is an ordinary client");
+        ensure_eq!(
+            s2,
+            pst::BAD_REQUEST,
+            "the second end of pair {i} is refused"
+        );
+    }
+    rt::io::nap(50);
+    match root.clone_conn(RO_DIR) {
+        Ok(c) => c.close(),
+        Err(e) => return Err(msg_e(e, line!())),
+    }
+    root.close();
+    let ended = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 5000).status == 0;
+    ensure!(ended, "memfsd ends when its last real client is gone");
+    Ok(())
+}
+
+fn memfsd_survives_memory_pressure_from_quota_legal_clients() -> Outcome {
+    // Files use the whole byte quota, names the whole name budget, and 197 clients each ask for a
+    // 32 KiB read while the shared IPC budget is full, so every reply has to be held. The server
+    // must stay up (it drops the connections it cannot serve).
+    let (p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let chunk = alloc::vec![0xabu8; 32 * 1024];
+    // Under the round-robin class every round trip waits for a scheduling slice (this test took
+    // 77 s there), so it uses a lighter load; the exact budgets are host tests anyway.
+    let (nfiles, nnames, nconns) = if loose() {
+        (8u32, 100u32, 100usize)
+    } else {
+        (64, 700, 200)
+    };
+    // 64 files of 128 KiB: the whole 8 MiB byte quota in few round trips (every round trip is a
+    // scheduling slice under the round-robin class)
+    for i in 0..nfiles {
+        let name = alloc::format!("f{i:03}").into_bytes();
+        let mut f = tmp
+            .open(&name, pfl::CREATE, prt::READ | prt::WRITE)
+            .map_err(|e| msg_e(e, line!()))?;
+        for part in 0..4u64 {
+            let r = f.write(part * 32 * 1024, &chunk);
+            ensure!(r == Ok(32 * 1024), "file {i} part {part}: {r:?}");
+        }
+        f.close();
+    }
+    // names are charged too (the exact budget is a host test; here a good share of it)
+    let mut made = 0u32;
+    for i in 0..nnames {
+        let mut name = alloc::format!("{i:05}").into_bytes();
+        name.extend_from_slice(&[b'n'; 250]);
+        match tmp.mkdir(&name) {
+            Ok(()) => made += 1,
+            Err(_) => break,
+        }
+    }
+    ensure!(made == nnames, "{made} long-named directories");
+    let mut one = tmp
+        .open(b"f000", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut conns: Vec<Fs> = Vec::new();
+    for _ in 0..nconns {
+        match one.clone_conn(prt::READ) {
+            Ok(c) => conns.push(c),
+            Err(_) => break,
+        }
+    }
+    // fill the shared IPC budget with our own junk, so no reply can be queued
+    let mut junk: Vec<(u32, u32)> = Vec::new();
+    'fill: loop {
+        let (m, t) = channel()?;
+        junk.push((m, t));
+        let mut n = 0;
+        loop {
+            match st(sys::channel_write(
+                m,
+                chunk.as_ptr(),
+                chunk.len(),
+                core::ptr::null(),
+                0,
+            )) {
+                Some(S::Ok) => n += 1,
+                Some(S::ShouldWait) => break,
+                _ => break 'fill,
+            }
+        }
+        if n == 0 || junk.len() > 80 {
+            break;
+        }
+    }
+    let rq = proto::file::Request {
+        txid: 7,
+        op: pop::READ,
+        flags: 0,
+        rights: 0,
+        a: 0,
+        b: 32 * 1024,
+        payload: &[],
+    }
+    .encode()
+    .unwrap();
+    for c in conns.iter() {
+        for _ in 0..50 {
+            if st(sys::channel_write(
+                c.ch,
+                rq.as_ptr(),
+                rq.len(),
+                core::ptr::null(),
+                0,
+            )) == Some(S::Ok)
+            {
+                break;
+            }
+            rt::io::nap(2);
+        }
+    }
+    rt::io::nap(200);
+    let died = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 10).status == 0;
+    let exit = if died {
+        sys::process_info(p).a1 as i64
+    } else {
+        0
+    };
+    for (m, t) in junk {
+        sys::handle_close(m);
+        sys::handle_close(t);
+    }
+    ensure!(
+        !died,
+        "memfsd died (exit {exit}) under {} connections and {made} directories",
+        conns.len()
+    );
+    let answers = root.stat(b"home").is_ok();
+    for c in conns {
+        c.close(); // their unread replies count against the shared IPC budget until then
+    }
+    ensure!(answers, "and it still answers");
+    Ok(())
+}
+
+fn memfsd_rights_are_checked_op_by_op() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp_rw = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    tmp_rw.mkdir(b"keep").map_err(|e| msg_e(e, line!()))?;
+    // a read-only connection to the writable directory cannot change it
+    let mut tmp_ro = root
+        .open(b"tmp", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(tmp_ro.mkdir(b"x")),
+        Some(DENIED),
+        "mkdir without WRITE"
+    );
+    ensure_eq!(
+        code(tmp_ro.unlink(b"keep")),
+        Some(DENIED),
+        "unlink without WRITE"
+    );
+    // a connection with no rights at all can do nothing
+    let mut none = tmp_rw.clone_conn(0).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(code(none.stat(b"keep")), Some(DENIED), "stat without READ");
+    // a write-only file connection can neither stat nor ask for a VMO
+    let mut f = tmp_rw
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut wo = f.clone_conn(prt::WRITE).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(code(wo.fstat()), Some(DENIED), "fstat without READ");
+    ensure_eq!(code(wo.get_vmo()), Some(DENIED), "get_vmo without READ");
+    ensure_eq!(code(wo.size()), Some(DENIED), "size without READ");
+    // a file connection never gets directory rights
+    ensure_eq!(
+        code(tmp_rw.open(b"f", 0, prt::READ | prt::ENUMERATE)),
+        Some(pst::BAD_REQUEST),
+        "ENUMERATE on a file"
     );
     Ok(())
 }
@@ -4623,7 +4903,7 @@ fn memfsd_listing_pages_and_a_slow_client_stalls_only_itself() -> Outcome {
     let mut got = 0u32;
     let mut slow = slow;
     while got < 12 {
-        let a = slow.read_reply().map_err(|e| msg_e(e, line!()))?;
+        let a = slow.read_next_reply().map_err(|e| msg_e(e, line!()))?;
         ensure_eq!(a.status, 0, "reply {got}");
         ensure_eq!(a.payload.len(), 32 * 1024, "its length");
         got += 1;
@@ -4663,6 +4943,50 @@ fn syscalls_stay_fast_with_many_live_processes() -> Outcome {
     ensure!(
         took < 1800,
         "3000 syscalls took {took} ticks with live processes around"
+    );
+    Ok(())
+}
+
+fn object_info_names_objects_and_peers() -> Outcome {
+    let (a, b) = channel()?;
+    let ia = ok(sys::object_info(a), "info a")?;
+    let ib = ok(sys::object_info(b), "info b")?;
+    ensure!(
+        ia.a1 != 0 && ib.a1 != 0 && ia.a1 != ib.a1,
+        "two ends, two ids"
+    );
+    ensure_eq!(ia.a2, ib.a1, "a's peer is b");
+    ensure_eq!(ib.a2, ia.a1, "b's peer is a");
+    let dup = ok(sys::handle_duplicate(a, Rights::SAME.0), "dup")?.a1 as u32;
+    ensure_eq!(
+        ok(sys::object_info(dup), "info dup")?.a1,
+        ia.a1,
+        "a duplicate names the same object"
+    );
+    let e = event()?;
+    let ie = ok(sys::object_info(e), "info e")?;
+    ensure_eq!((ie.a1 != 0, ie.a2), (true, 0), "an event has no peer");
+    sys::handle_close(b);
+    ensure_eq!(
+        ok(sys::object_info(a), "info a again")?.a2,
+        0,
+        "once the peer is gone it reads 0"
+    );
+    ensure_eq!(st(sys::object_info(BAD)), Some(S::BadHandle), "bad handle");
+    ensure_eq!(
+        st(rt::syscall(
+            rt::abi::syscall::OBJECT_INFO,
+            [(1usize << 32) | a as usize, 0, 0, 0, 0, 0]
+        )),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    // ids are not reused: a new object gets a new id even in the same slot
+    sys::handle_close(e);
+    let e2 = event()?;
+    ensure!(
+        ok(sys::object_info(e2), "info e2")?.a1 != ie.a1,
+        "a freed object's id is never reused"
     );
     Ok(())
 }
@@ -5245,6 +5569,22 @@ pub fn app_main() -> i32 {
             memfsd_quotas_and_connection_limit,
         ),
         (
+            "memfsd_refuses_endpoints_it_cannot_serve_and_orphans",
+            memfsd_refuses_endpoints_it_cannot_serve_and_orphans,
+        ),
+        (
+            "memfsd_refuses_both_ends_of_one_channel",
+            memfsd_refuses_both_ends_of_one_channel,
+        ),
+        (
+            "memfsd_survives_memory_pressure_from_quota_legal_clients",
+            memfsd_survives_memory_pressure_from_quota_legal_clients,
+        ),
+        (
+            "memfsd_rights_are_checked_op_by_op",
+            memfsd_rights_are_checked_op_by_op,
+        ),
+        (
             "memfsd_unlinked_open_files_live_until_closed",
             memfsd_unlinked_open_files_live_until_closed,
         ),
@@ -5263,6 +5603,10 @@ pub fn app_main() -> i32 {
         (
             "syscalls_stay_fast_with_many_live_processes",
             syscalls_stay_fast_with_many_live_processes,
+        ),
+        (
+            "object_info_names_objects_and_peers",
+            object_info_names_objects_and_peers,
         ),
         (
             "wait_is_woken_by_the_peer_closing",

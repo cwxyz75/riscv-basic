@@ -706,7 +706,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     // handle, grants no right and sets no signal, instead of being silently truncated.
     let over = |i: usize| a[i] > u64::from(u32::MAX);
     let bad_args = match n {
-        nr::HANDLE_CLOSE | nr::OBJECT_SIGNALS | nr::CHANNEL_WRITE if over(0) => {
+        nr::HANDLE_CLOSE | nr::OBJECT_SIGNALS | nr::OBJECT_INFO | nr::CHANNEL_WRITE if over(0) => {
             Some(Status::BadHandle)
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
@@ -798,6 +798,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
         nr::EVENT_SIGNAL => ipc::event_signal(objs, &p.handles, h(0), a[1] as u32, a[2] as u32)
             .map(|_| (None, None))
+            .map_err(|e| (e, None, None)),
+        nr::OBJECT_INFO => ipc::object_info(objs, &p.handles, h(0))
+            .map(|(k, peer)| (Some(k), Some(peer)))
             .map_err(|e| (e, None, None)),
         nr::OBJECT_SIGNALS => ipc::signals_of(objs, &p.handles, h(0))
             .map(|s| (Some(u64::from(s)), None))
@@ -1016,7 +1019,6 @@ fn cleanup_dead() {
                 ipc::KObj::Vmo(id) => {
                     irq::without(|| state().pending_vmos.push(id));
                     REAP_DIRTY.store(true, Ordering::SeqCst);
-                    reap_vmos();
                 }
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
                     request_kill(p.pid, -2000)
@@ -1024,6 +1026,8 @@ fn cleanup_dead() {
                 _ => {}
             }
         }
+        // One scan for everything that died in this round (not one per VMO).
+        reap_vmos();
     }
 }
 

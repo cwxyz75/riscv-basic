@@ -175,6 +175,9 @@ pub mod sys {
             [h as usize, mask as usize, deadline as usize, 0, 0, 0],
         )
     }
+    pub fn object_info(h: u32) -> Ret {
+        syscall(OBJECT_INFO, [h as usize, 0, 0, 0, 0, 0])
+    }
     pub fn vmo_create(pages: u64) -> Ret {
         syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
     }

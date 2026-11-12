@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use memfs::{Error, Fs, Kind, Limits, NodeId, ROOT};
-use proto::file::{self, flags, op, rights as pr, status, Reply};
+use proto::file::{self, flags, op, rights as pr, status};
 use proto::startup::Role;
 use rt::abi::rights::Rights;
 use rt::abi::signals;
@@ -24,6 +24,34 @@ const MAX_CONNECTIONS: usize = 200;
 const PENDING_TIMEOUT: u64 = 30_000;
 /// Requests handled per wake-up of one connection (the port rotates, so none starves).
 const BATCH: usize = 4;
+/// Bytes of replies held for clients that have no room (all connections together). With the file
+/// quota (8 MiB), the name budget (2 MiB) and this, the worst case fits the 16 MiB heap; a
+/// connection that would push the total over is dropped.
+const PENDING_CAP: usize = 2 * 1024 * 1024;
+
+/// A copy that reports running out of memory instead of aborting the server.
+fn try_copy(src: &[u8]) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(src.len()).ok()?;
+    v.extend_from_slice(src);
+    Some(v)
+}
+
+/// The bytes of a reply (`proto::file` layout), built without aborting on allocation failure.
+fn encode_reply(txid: u32, status: i32, a: u64, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() > file::MAX_IO {
+        return None;
+    }
+    let mut v = Vec::new();
+    v.try_reserve_exact(file::REPLY_HEADER + payload.len())
+        .ok()?;
+    v.extend_from_slice(&txid.to_le_bytes());
+    v.extend_from_slice(&status.to_le_bytes());
+    v.extend_from_slice(&a.to_le_bytes());
+    v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    v.extend_from_slice(payload);
+    Some(v)
+}
 
 struct Pending {
     bytes: Vec<u8>,
@@ -33,6 +61,8 @@ struct Pending {
 
 struct Conn {
     ch: u32,
+    /// The kernel object id of `ch` (to spot a client that hands over both ends of one channel).
+    koid: u64,
     node: NodeId,
     rights: u32,
     is_dir: bool,
@@ -47,6 +77,10 @@ struct Server {
     port: u32,
     image_vmo: u32,
     rx: Vec<u8>,
+    /// Kernel object ids of the channel ends we serve.
+    own: alloc::collections::BTreeSet<u64>,
+    /// Bytes of replies held in `Conn::pending`.
+    pending_bytes: usize,
 }
 
 fn err_status(e: Error, name_len: usize) -> i32 {
@@ -84,29 +118,57 @@ impl Server {
         }
     }
 
-    fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> u64 {
+    /// Start serving `ch` as a connection to `node`. `None` if the port refuses to watch it (the
+    /// handle is not a channel, or the port is full): nothing changes then, and the handle is
+    /// still the caller's to close.
+    fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> Option<u64> {
+        // Only a channel end we may read and write can be served: probe with a zero-sized read
+        // (an event or a VMO answers WRONG_TYPE; a channel says SHOULD_WAIT, PEER_CLOSED or
+        // BUFFER_TOO_SMALL and loses nothing).
+        let probe = sys::channel_read(ch, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
+        if matches!(
+            probe.status(),
+            Some(Status::WrongType) | Some(Status::AccessDenied) | Some(Status::BadHandle)
+        ) {
+            return None;
+        }
+        // Both ends of one channel must never be served at once: neither would ever see
+        // PEER_CLOSED, the connections could not be reclaimed, and a reply sent on one end would be
+        // read back as a request on the other (an endless exchange).
+        let info = sys::object_info(ch);
+        if info.status != 0 || (info.a2 != 0 && self.own.contains(&(info.a2 as u64))) {
+            return None;
+        }
+        let koid = info.a1 as u64;
         let key = self.next_key;
+        let b = sys::port_bind(self.port, ch, signals::READABLE | signals::PEER_CLOSED, key);
+        if b.status != 0 {
+            return None;
+        }
         self.next_key += 1;
+        self.own.insert(koid);
         let _ = self.fs.retain(node);
         self.conns.insert(
             key,
             Conn {
                 ch,
+                koid,
                 node,
                 rights,
                 is_dir,
                 pending: None,
             },
         );
-        self.bind(key, ch, false);
-        key
+        Some(key)
     }
 
     fn close_conn(&mut self, key: u64) {
         if let Some(c) = self.conns.remove(&key) {
             sys::port_unbind(self.port, key);
             sys::handle_close(c.ch);
+            self.own.remove(&c.koid);
             if let Some(p) = c.pending {
+                self.pending_bytes -= p.bytes.len();
                 if let Some(h) = p.handle {
                     sys::handle_close(h);
                 }
@@ -126,22 +188,19 @@ impl Server {
         payload: &[u8],
         handle: Option<u32>,
     ) {
-        let Ok(bytes) = (Reply {
-            txid,
-            status,
-            a,
-            payload,
-        })
-        .encode() else {
-            if let Some(h) = handle {
+        let close_handle = |h: Option<u32>| {
+            if let Some(h) = h {
                 sys::handle_close(h);
             }
+        };
+        let Some(bytes) = encode_reply(txid, status, a, payload) else {
+            // out of memory (or a payload that cannot be a reply): drop the connection
+            close_handle(handle);
+            self.close_conn(key);
             return;
         };
         let Some(c) = self.conns.get_mut(&key) else {
-            if let Some(h) = handle {
-                sys::handle_close(h);
-            }
+            close_handle(handle);
             return;
         };
         let hs = [handle.unwrap_or(0)];
@@ -150,6 +209,13 @@ impl Server {
         match r.status() {
             Some(Status::Ok) => {}
             Some(Status::ShouldWait) | Some(Status::NoMemory) => {
+                if self.pending_bytes + bytes.len() > PENDING_CAP {
+                    // too much is already waiting on clients that do not read: this one goes
+                    close_handle(handle);
+                    self.close_conn(key);
+                    return;
+                }
+                self.pending_bytes += bytes.len();
                 c.pending = Some(Pending {
                     bytes,
                     handle,
@@ -160,9 +226,7 @@ impl Server {
             }
             _ => {
                 // the client is gone or the write is hopeless
-                if let Some(h) = handle {
-                    sys::handle_close(h);
-                }
+                close_handle(handle);
                 self.close_conn(key);
             }
         }
@@ -180,23 +244,16 @@ impl Server {
         let r = sys::channel_write(c.ch, p.bytes.as_ptr(), p.bytes.len(), hs.as_ptr(), n);
         match r.status() {
             Some(Status::Ok) => {
+                self.pending_bytes -= p.bytes.len();
                 let ch = c.ch;
                 self.bind(key, ch, false);
             }
-            Some(Status::ShouldWait) | Some(Status::NoMemory) => {
-                if sys::clock_get() >= p.deadline {
-                    if let Some(h) = p.handle {
-                        sys::handle_close(h);
-                    }
-                    self.close_conn(key);
-                } else {
-                    c.pending = Some(p);
-                }
+            Some(Status::ShouldWait) | Some(Status::NoMemory) if sys::clock_get() < p.deadline => {
+                c.pending = Some(p);
             }
             _ => {
-                if let Some(h) = p.handle {
-                    sys::handle_close(h);
-                }
+                // too late, or the client is gone: close_conn releases the reply and its handle
+                c.pending = Some(p);
                 self.close_conn(key);
             }
         }
@@ -225,7 +282,13 @@ impl Server {
             }
             let (nb, nh) = (r.a1, r.a2);
             let endpoint = (nh == 1).then_some(hs[0]);
-            let msg = self.rx[..nb].to_vec();
+            let Some(msg) = try_copy(&self.rx[..nb]) else {
+                if let Some(h) = endpoint {
+                    sys::handle_close(h);
+                }
+                self.close_conn(key);
+                return;
+            };
             self.handle_request(key, &msg, endpoint);
         }
     }
@@ -303,7 +366,7 @@ impl Server {
                 } else {
                     return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
                 };
-                match self.fs.read_dir(node, cookie, 1000) {
+                match self.fs.read_dir(node, cookie, 128) {
                     Ok(list) => {
                         let entries: Vec<file::DirEntry> = list
                             .into_iter()
@@ -382,7 +445,11 @@ impl Server {
                         let (off, total) = self.fs.image_extent(node).unwrap_or((0, 0));
                         let start = req.a.min(total);
                         let n = (total - start).min(len as u64) as usize;
-                        let mut buf = alloc::vec![0u8; n];
+                        let mut buf: Vec<u8> = Vec::new();
+                        if buf.try_reserve_exact(n).is_err() {
+                            return self.send(key, txid, status::QUOTA, 0, &[], None);
+                        }
+                        buf.resize(n, 0);
                         if n > 0 {
                             let r = sys::vmo_read(self.image_vmo, off + start, buf.as_mut_ptr(), n);
                             if r.status != 0 {
@@ -392,10 +459,7 @@ impl Server {
                         self.send(key, txid, 0, n as u64, &buf, None);
                     }
                     Ok(_) => match self.fs.read(node, req.a, len) {
-                        Ok(data) => {
-                            let data = data.to_vec();
-                            self.send(key, txid, 0, data.len() as u64, &data, None);
-                        }
+                        Ok(data) => self.send(key, txid, 0, data.len() as u64, &data, None),
                         Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
                     },
                     Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
@@ -462,6 +526,13 @@ impl Server {
         endpoint: u32,
     ) -> Result<u8, i32> {
         let denied = Status::AccessDenied.code();
+        // The connection limit comes first: nothing may be created or truncated for an open that
+        // is going to be refused.
+        if self.conns.len() >= MAX_CONNECTIONS {
+            return Err(status::QUOTA);
+        }
+        // A clone (or an open of an empty path) names the node it is on: no flag applies.
+        let fl = if path.is_empty() { 0 } else { fl };
         let (target, created_new) = if path.is_empty() {
             (dir, false)
         } else {
@@ -518,18 +589,20 @@ impl Server {
         if !is_dir && want & (pr::ENUMERATE | pr::CREATE) != 0 {
             return undo(self, status::BAD_REQUEST);
         }
+        if fl & flags::TRUNCATE != 0 && (is_dir || want & pr::WRITE == 0) {
+            return undo(self, status::BAD_REQUEST);
+        }
+        let Some(key) = self.add_conn(endpoint, target, want, is_dir) else {
+            // not something the port can watch (an event or a VMO passed as the "endpoint")
+            return undo(self, status::BAD_REQUEST);
+        };
+        // Truncate last: nothing destructive happens unless the open succeeds.
         if fl & flags::TRUNCATE != 0 {
-            if is_dir || want & pr::WRITE == 0 {
-                return undo(self, status::BAD_REQUEST);
-            }
             if let Err(e) = self.fs.set_size(target, 0) {
-                return undo(self, err_status(e, 0));
+                self.close_conn(key);
+                return Err(err_status(e, 0));
             }
         }
-        if self.conns.len() >= MAX_CONNECTIONS {
-            return undo(self, status::QUOTA);
-        }
-        self.add_conn(endpoint, target, want, is_dir);
         Ok(kind_byte(kind))
     }
 }
@@ -539,6 +612,10 @@ fn build_tree(fs: &mut Fs, entries: &[proto::bootimg::Entry]) -> Option<()> {
     let _ = tmp;
     for e in entries {
         let comps = file::split_path(&e.name).ok()?;
+        // `tmp` is the one writable directory and is made above: an image name may not use it
+        if comps[0] == b"tmp" {
+            return None;
+        }
         let (last, parents) = comps.split_last()?;
         let mut at = ROOT;
         for c in parents {
@@ -608,9 +685,13 @@ pub fn app_main() -> i32 {
         port: p.a1 as u32,
         image_vmo,
         rx: alloc::vec![0u8; file::MAX_MESSAGE],
+        own: alloc::collections::BTreeSet::new(),
+        pending_bytes: 0,
     };
     // The service channel is the root directory connection with every right.
-    server.add_conn(root_ch, ROOT, pr::ALL, true);
+    if server.add_conn(root_ch, ROOT, pr::ALL, true).is_none() {
+        return 9;
+    }
     loop {
         let any_pending = server.conns.values().any(|c| c.pending.is_some());
         let deadline = if any_pending {

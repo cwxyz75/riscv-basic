@@ -144,6 +144,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 31 | event_signal | `a0` event, `a1` clear, `a2` set | |
 | 32 | object_signals | `a0` handle | `a1` the signal word |
 | 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
+| 34 | object_info | `a0` handle | `a1` koid, `a2` peer koid |
 | 40 | vmo_create | `a0` pages | `a1` handle |
 | 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
@@ -213,6 +214,14 @@ since boot. `object_signals` reads the signal word of the object a handle names
 (BAD_HANDLE for a bad handle; no right needed, the signals are not secret to a holder).
 
 ## Waiting, calling and the bootstrap handle (S3c-1)
+
+### object_info(handle) -> status, koid, peer_koid
+
+The identity of the object a handle names (`koid`: unique among live objects, never reused) and
+of its peer (`peer_koid`; 0 for an object with no peer, or whose peer is gone). No right is
+needed. It lets a server see that two handles it holds are the two ends of one channel (a client
+can hand a server both ends of a channel it made, so that neither end ever sees PEER_CLOSED).
+Errors: BAD_HANDLE (also a handle value wider than 32 bits). Tests: `object_info_names_objects_and_peers`.
 
 ### object_wait(handle, mask, deadline) -> status, observed
 

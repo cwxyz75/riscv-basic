@@ -48,33 +48,37 @@ pub fn spawn_via(
         sys::handle_close(d.a1 as u32);
         return Err(w.status);
     }
-    let wait = sys::object_wait(
-        ch,
-        signals::READABLE | signals::PEER_CLOSED,
-        sys::clock_get() + ANSWER_TIMEOUT,
-    );
-    if wait.status != 0 {
-        return Err(wait.status);
-    }
-    let mut buf = [0u8; 16];
-    let mut h = [0u32; 1];
-    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
-    if r.status != 0 {
-        return Err(r.status);
-    }
-    match launch::decode_reply(&buf[..r.a1]) {
-        Some((id, 0)) if id == txid && r.a2 == 1 => Ok(h[0]),
-        Some((id, status)) if id == txid && status != 0 => {
-            for &x in &h[..r.a2] {
-                sys::handle_close(x);
-            }
-            Err(status)
+    // A reply to an earlier request (one that arrived after its caller gave up) is discarded, with
+    // the process handle it may carry (closing the last handle to a started process ends it).
+    let deadline = sys::clock_get() + ANSWER_TIMEOUT;
+    loop {
+        let wait = sys::object_wait(ch, signals::READABLE | signals::PEER_CLOSED, deadline);
+        if wait.status != 0 {
+            return Err(wait.status);
         }
-        _ => {
+        let mut buf = [0u8; 16];
+        let mut h = [0u32; 1];
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
+        if r.status != 0 {
+            return Err(r.status);
+        }
+        let reply = launch::decode_reply(&buf[..r.a1]);
+        let close_handles = || {
             for &x in &h[..r.a2] {
                 sys::handle_close(x);
             }
-            Err(-4)
+        };
+        match reply {
+            Some((id, 0)) if id == txid && r.a2 == 1 => return Ok(h[0]),
+            Some((id, status)) if id == txid && status != 0 => {
+                close_handles();
+                return Err(status);
+            }
+            Some((id, _)) if id != txid => close_handles(), // stale: keep waiting
+            _ => {
+                close_handles();
+                return Err(-4);
+            }
         }
     }
 }
