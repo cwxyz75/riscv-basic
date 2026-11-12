@@ -134,9 +134,12 @@ message with the forwarded handles, closes its end, (5) `process_start`s, (6) re
 status and the **process handle** with rights `WAIT|INSPECT|KILL|DUPLICATE|TRANSFER` (not
 `MANAGE`, so the caller cannot map into or add threads to the child). On any error everything
 created is released (leak checks must show it). It reads requests with exactly
-`max_handles = 40` and `max_bytes = 20 KiB`; a message that does not fit (`BUFFER_TOO_SMALL`)
-is a protocol violation: the launcher closes that client connection (it would otherwise block
-the queue head forever) and closes every handle that arrived with a bad request.
+`max_handles = 33` (the image VMO plus at most the startup message's 32) and `max_bytes` = the
+28-byte header plus at most a 16 KiB startup message; a message that does not fit
+(`BUFFER_TOO_SMALL`) is a protocol violation: the launcher closes that client connection (it
+would otherwise block the queue head forever) and closes every handle that arrived with a bad
+request. The launcher serves **one client**, so closing that connection ends the launcher (and
+the supervisor rebuilds the stack; `TIDY-UP.md` T30).
 
 ## 7. File protocol (memfs)
 
@@ -177,18 +180,24 @@ Rules:
   size at most 4 MiB; **at most 200 live connections in all** (one port holds 256 bindings,
   leaving room for the service channel); excess `Open`/`Clone` is `QUOTA`. Servers cannot tell
   clients apart (INVARIANTS H5), so per-client limits are not specified.
+- `Open` needs READ on the directory connection (it traverses). A request with the wrong number
+  of handles for its op is answered `BAD_REQUEST` and its handles are closed; only a structurally
+  broken one (too short to carry a txid, more handles or bytes than any request may have) closes
+  the connection. The endpoint of an `Open`/`Clone` must be a channel end with READ, WRITE, WAIT
+  and TRANSFER; anything else is `BAD_REQUEST`. A refused `Open` has no side effect (the
+  connection limit is checked before anything is created or truncated; `Clone` ignores flags).
 - Event loop: one port, every connection bound for `READABLE|PEER_CLOSED`. A reply that
-  cannot be written (`SHOULD_WAIT`, queue full) is held as that connection's single pending
-  reply and the connection is unbound until it is `WRITABLE` again (backpressure); a client
-  that never reads therefore stalls only itself. `NO_MEMORY` (the kernel's global IPC budget)
-  on a reply is treated the same way with a retry deadline of 1 s, then the connection is
-  closed. Requests are read with exact `max_handles` for their op; `BUFFER_TOO_SMALL` or any
+  cannot be written (`SHOULD_WAIT`, queue full; or `NO_MEMORY`, the kernel's global IPC budget)
+  is held as that connection's single pending reply and the connection is polled on a 10 ms
+  timer instead of being bound to the port (a channel's WRITABLE means room for *some* message,
+  so a binding would spin: `TIDY-UP.md` T28); a client that never reads therefore stalls only
+  itself, and the connection is closed after 30 s. Requests are read with exact `max_handles` for their op; `BUFFER_TOO_SMALL` or any
   unexpected handle is a protocol violation (close the connection, close every received
   handle). A malformed request gets `BAD_REQUEST` when a `txid` can be read, else the connection
   is closed.
 - The pure `memfs` crate holds the tree, name validation, quota accounting and all
-  operations; `memfsd` is a thin loop over it. File data is `Vec<u8>` chunks in the server's
-  heap (16 MiB cap, so the 8 MiB file quota fits).
+  operations; `memfsd` is a thin loop over it. File data is stored in fixed 16 KiB chunks in the server's heap (16 MiB cap, so the 8 MiB
+  file quota fits with room to spare): a file holds about the bytes it counts, never twice.
 - An image name is the absolute path of the file without its leading slash (`bin/hello`,
   `etc/trusted`, `home/sub/inner.txt`; `kernel/build.rs` makes them from the `bootfs/` tree and the
   built programs). `/bin` and `/etc` are **boot-image-backed read-only nodes** (no write path exists); `/tmp` is

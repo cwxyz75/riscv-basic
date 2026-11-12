@@ -294,7 +294,16 @@ fn run_program(
         out.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     sys::handle_close(out_r);
-    sys::object_wait(proc, rt::abi::signals::TERMINATED, u64::MAX);
+    let w = sys::object_wait(
+        proc,
+        rt::abi::signals::TERMINATED,
+        sys::clock_get() + 10_000,
+    );
+    if w.status != 0 {
+        sys::process_kill(proc, -1);
+        sys::handle_close(proc);
+        return String::from("run: the program did not finish\r\n");
+    }
     let code = sys::process_info(proc);
     sys::handle_close(proc);
     out.push_str(&alloc::format!("[exit {}]\r\n", code.a1 as i64));

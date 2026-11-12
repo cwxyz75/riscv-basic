@@ -71,21 +71,25 @@ fn files_directories_and_their_errors() {
 fn reads_writes_holes_and_truncation() {
     let mut fs = Fs::new(Limits::default());
     let f = fs.create_file(ROOT, b"f").unwrap();
-    assert_eq!(fs.read(f, 0, 10), Ok(&b""[..]));
+    assert_eq!(fs.read(f, 0, 10), Ok(b"".to_vec()));
     assert_eq!(fs.write(f, 0, b"hello"), Ok(5));
-    assert_eq!(fs.read(f, 0, 100), Ok(&b"hello"[..]));
-    assert_eq!(fs.read(f, 1, 3), Ok(&b"ell"[..]));
-    assert_eq!(fs.read(f, 5, 3), Ok(&b""[..]), "at the end");
-    assert_eq!(fs.read(f, 99, 3), Ok(&b""[..]), "past the end");
-    assert_eq!(fs.read(f, u64::MAX, 3), Ok(&b""[..]), "an absurd offset");
+    assert_eq!(fs.read(f, 0, 100), Ok(b"hello".to_vec()));
+    assert_eq!(fs.read(f, 1, 3), Ok(b"ell".to_vec()));
+    assert_eq!(fs.read(f, 5, 3), Ok(b"".to_vec()), "at the end");
+    assert_eq!(fs.read(f, 99, 3), Ok(b"".to_vec()), "past the end");
+    assert_eq!(
+        fs.read(f, u64::MAX, 3),
+        Ok(b"".to_vec()),
+        "an absurd offset"
+    );
     // a write past the end leaves a zero-filled gap
     assert_eq!(fs.write(f, 8, b"X"), Ok(1));
-    assert_eq!(fs.read(f, 0, 100), Ok(&b"hello\0\0\0X"[..]));
+    assert_eq!(fs.read(f, 0, 100), Ok(b"hello\0\0\0X".to_vec()));
     assert_eq!(fs.size(f), Ok(9));
     assert_eq!(fs.bytes_used(), 9);
     // overwrite in the middle does not change the size
     assert_eq!(fs.write(f, 1, b"EY"), Ok(2));
-    assert_eq!(fs.read(f, 0, 3), Ok(&b"hEY"[..]));
+    assert_eq!(fs.read(f, 0, 3), Ok(b"hEY".to_vec()));
     assert_eq!(fs.size(f), Ok(9));
     assert_eq!(
         fs.write(f, 3, b""),
@@ -95,10 +99,10 @@ fn reads_writes_holes_and_truncation() {
     assert_eq!(fs.write(f, u64::MAX, b"x"), Err(Error::BadRange));
     assert_eq!(fs.write(f, u64::MAX - 1, b"xyz"), Err(Error::BadRange));
     fs.set_size(f, 3).unwrap();
-    assert_eq!(fs.read(f, 0, 10), Ok(&b"hEY"[..]));
+    assert_eq!(fs.read(f, 0, 10), Ok(b"hEY".to_vec()));
     assert_eq!(fs.bytes_used(), 3, "shrinking gives the bytes back");
     fs.set_size(f, 6).unwrap();
-    assert_eq!(fs.read(f, 0, 10), Ok(&b"hEY\0\0\0"[..]));
+    assert_eq!(fs.read(f, 0, 10), Ok(b"hEY\0\0\0".to_vec()));
     assert_eq!(fs.bytes_used(), 6);
 }
 
@@ -152,14 +156,14 @@ fn unlinked_nodes_live_while_open_and_names_can_be_reused() {
     assert_eq!(fs.lookup(ROOT, b"f"), Err(Error::NotFound));
     assert_eq!(
         fs.read(f, 0, 10),
-        Ok(&b"data"[..]),
+        Ok(b"data".to_vec()),
         "still readable through the connection"
     );
     assert_eq!(fs.bytes_used(), 4, "and still counted");
     // the name is free again, with a different node
     let f2 = fs.create_file(ROOT, b"f").unwrap();
     assert_ne!(f2, f);
-    assert_eq!(fs.read(f2, 0, 10), Ok(&b""[..]));
+    assert_eq!(fs.read(f2, 0, 10), Ok(b"".to_vec()));
     fs.release(f);
     assert_eq!(fs.bytes_used(), 0, "released: freed");
     assert_eq!(
@@ -176,8 +180,8 @@ fn unlinked_nodes_live_while_open_and_names_can_be_reused() {
     fs.unlink(ROOT, b"d").unwrap();
     assert_eq!(
         fs.create_file(d, b"x"),
-        Ok(fs.lookup(d, b"x").unwrap()),
-        "an orphaned directory still works"
+        Err(Error::NotFound),
+        "an orphaned directory takes nothing new"
     );
     fs.release(d);
     // the root is never freed
@@ -213,7 +217,11 @@ fn read_only_directories_files_and_images() {
     );
     assert_eq!(fs.write(doc, 0, b"y"), Err(Error::ReadOnly));
     assert_eq!(fs.set_size(doc, 0), Err(Error::ReadOnly));
-    assert_eq!(fs.read(doc, 0, 5), Ok(&b"x"[..]), "a read-only file reads");
+    assert_eq!(
+        fs.read(doc, 0, 5),
+        Ok(b"x".to_vec()),
+        "a read-only file reads"
+    );
     assert_eq!(
         fs.create_file(tmp, b"other"),
         Ok(fs.lookup(tmp, b"other").unwrap())
@@ -466,4 +474,91 @@ fn random_operations_agree_with_the_model() {
             assert_eq!(fs.node_count(), model.entries.len() + 1, "nodes {ctx}");
         }
     }
+}
+
+#[test]
+fn an_orphaned_directory_takes_nothing_new_and_leaks_nothing() {
+    // Found by the S4b/S4c review: a directory unlinked while a connection holds it accepted new
+    // children, which were never freed (the node and byte quotas leaked for good).
+    let mut fs = Fs::new(Limits::default());
+    let d = fs.mkdir(ROOT, b"d").unwrap();
+    fs.retain(d).unwrap();
+    fs.unlink(ROOT, b"d").unwrap();
+    assert_eq!(
+        fs.create_file(d, b"f"),
+        Err(Error::NotFound),
+        "no creating in an orphan"
+    );
+    assert_eq!(fs.mkdir(d, b"g"), Err(Error::NotFound));
+    fs.release(d);
+    assert_eq!(fs.node_count(), 1);
+    assert_eq!(fs.bytes_used(), 0);
+    // a child that is still held keeps its parent's contents alive no longer than its refs
+    let d = fs.mkdir(ROOT, b"d").unwrap();
+    let f = fs.create_file(d, b"f").unwrap();
+    fs.write(f, 0, &[1u8; 100]).unwrap();
+    fs.retain(f).unwrap();
+    fs.unlink(d, b"f").unwrap();
+    fs.unlink(ROOT, b"d").unwrap();
+    assert_eq!(
+        fs.read(f, 0, 3),
+        Ok([1u8, 1, 1].to_vec()),
+        "the held file survives its parent"
+    );
+    fs.release(f);
+    assert_eq!((fs.node_count(), fs.bytes_used()), (1, 0));
+}
+
+#[test]
+fn file_growth_does_not_hold_more_memory_than_it_counts() {
+    // Amortised Vec growth reached twice the counted bytes after sequential appends.
+    let mut fs = Fs::new(Limits::default());
+    let f = fs.create_file(ROOT, b"f").unwrap();
+    let chunk = [7u8; 32 * 1024];
+    for i in 0..70u64 {
+        fs.write(f, i * 32 * 1024, &chunk).unwrap();
+        assert!(
+            fs.data_capacity() <= fs.bytes_used() + 32 * 1024,
+            "after chunk {i}: {} bytes held for {} counted",
+            fs.data_capacity(),
+            fs.bytes_used()
+        );
+    }
+}
+
+#[test]
+fn chunked_storage_is_exact_across_chunk_boundaries() {
+    let mut fs = Fs::new(Limits::default());
+    let f = fs.create_file(ROOT, b"f").unwrap();
+    let pattern: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(fs.write(f, 0, &pattern), Ok(70_000));
+    assert_eq!(fs.read(f, 0, 100_000), Ok(pattern.clone()));
+    assert_eq!(
+        fs.read(f, 16_380, 10),
+        Ok(pattern[16_380..16_390].to_vec()),
+        "across a boundary"
+    );
+    assert_eq!(
+        fs.read(f, 32_768, 1),
+        Ok(pattern[32_768..32_769].to_vec()),
+        "at a boundary"
+    );
+    // shrink into the middle of a chunk, grow again: the new bytes are zeros, not the old data
+    fs.set_size(f, 20_000).unwrap();
+    fs.set_size(f, 40_000).unwrap();
+    let back = fs.read(f, 0, 40_000).unwrap();
+    assert_eq!(&back[..20_000], &pattern[..20_000]);
+    assert!(
+        back[20_000..].iter().all(|&b| b == 0),
+        "stale bytes came back after truncate+grow"
+    );
+    // a write that leaves a hole across several chunks
+    let g = fs.create_file(ROOT, b"g").unwrap();
+    fs.write(g, 50_000, b"tail").unwrap();
+    let all = fs.read(g, 0, 60_000).unwrap();
+    assert_eq!(all.len(), 50_004);
+    assert!(all[..50_000].iter().all(|&b| b == 0));
+    assert_eq!(&all[50_000..], b"tail");
+    // memory held is the counted bytes rounded up to chunks, per file
+    assert!(fs.data_capacity() <= fs.bytes_used() + 2 * 16 * 1024);
 }

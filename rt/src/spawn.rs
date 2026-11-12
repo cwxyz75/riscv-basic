@@ -81,6 +81,8 @@ pub fn spawn(image: &[u8], startup: &[u8], handles: &[u32]) -> Result<u32, Spawn
             // Narrow the handle we hand back: replace, then the narrowed handle is the only one.
             let r = sys::handle_replace(proc, caller_rights());
             if r.status != 0 {
+                // The child is already running: end it rather than leave it with no owner.
+                sys::process_kill(proc, -1);
                 sys::handle_close(proc);
                 return Err(sys_err(r.status));
             }
@@ -117,9 +119,10 @@ fn build_and_start(
         }
         let vmo = v.a1 as u32;
         let lead = seg.vaddr % 4096;
-        let bytes = image
-            .get(seg.offset as usize..(seg.offset + seg.filesz) as usize)
-            .ok_or(SpawnError::BadElf)?;
+        let Some(bytes) = image.get(seg.offset as usize..(seg.offset + seg.filesz) as usize) else {
+            sys::handle_close(vmo);
+            return Err(SpawnError::BadElf);
+        };
         let mut done = 0usize;
         while done < bytes.len() {
             let n = (bytes.len() - done).min(32 * 1024);

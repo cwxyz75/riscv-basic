@@ -4430,11 +4430,16 @@ fn memfsd_quotas_and_connection_limit() -> Outcome {
         "and still counted"
     );
     a.close();
-    ensure_eq!(
-        c.write(0, b"x"),
-        Ok(1),
-        "closing the last connection frees its bytes"
-    );
+    // the server frees a's bytes when it sees the close: give it a moment
+    let mut freed = false;
+    for _ in 0..50 {
+        if c.write(0, b"x") == Ok(1) {
+            freed = true;
+            break;
+        }
+        rt::io::nap(10);
+    }
+    ensure!(freed, "closing the last connection frees its bytes");
     // connections: at most 200 live ones in all
     let mut conns: Vec<Fs> = Vec::new();
     let mut refused = None;
@@ -4448,17 +4453,86 @@ fn memfsd_quotas_and_connection_limit() -> Outcome {
         }
     }
     ensure_eq!(refused, Some(pst::QUOTA), "the connection limit");
+    // 200 in all; four are ours (root, /tmp, b, c), `a` just closed (the server may not have seen
+    // that yet): so 196, or 195 if it has not
     ensure!(
-        conns.len() > 150 && conns.len() < 200,
+        conns.len() == 196 || conns.len() == 195,
         "{} clones were accepted",
         conns.len()
     );
+    // a refused open must not have done anything: not even the truncation it asked for
+    ensure_eq!(
+        code(tmp.open(b"c", pfl::TRUNCATE, prt::READ | prt::WRITE)),
+        Some(pst::QUOTA),
+        "an open refused at the limit"
+    );
+    ensure_eq!(c.read_all(), Ok(b"x".to_vec()), "left the file alone");
     for x in conns {
         x.close();
     }
     ensure!(
         root.clone_conn(RO_DIR).is_ok(),
         "room again after they close"
+    );
+    Ok(())
+}
+
+fn memfsd_refuses_endpoints_it_cannot_serve_and_orphans() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    // an event or a VMO passed as the "endpoint" is refused, and does not use up a connection
+    for _ in 0..250 {
+        let ev = event()?;
+        let r = root
+            .call(pop::OPEN, pfl::DIRECTORY, RO_DIR, 0, 0, b"home", Some(ev))
+            .map_err(|e| msg_e(e, line!()))?;
+        ensure_eq!(r.status, pst::BAD_REQUEST, "a non-channel endpoint");
+        sys::handle_close(ev);
+    }
+    ensure!(
+        root.clone_conn(RO_DIR).is_ok(),
+        "no connection was consumed"
+    );
+    // a directory unlinked while open takes no new children (they would leak the quota for good)
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    tmp.mkdir(b"d").map_err(|e| msg_e(e, line!()))?;
+    let mut d = tmp
+        .open(b"d", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    tmp.unlink(b"d").map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(d.open(b"f", pfl::CREATE, prt::READ | prt::WRITE)),
+        Some(pst::NOT_FOUND),
+        "create in an orphan"
+    );
+    ensure_eq!(
+        code(d.mkdir(b"g")),
+        Some(pst::NOT_FOUND),
+        "mkdir in an orphan"
+    );
+    d.close();
+    // a reply that arrives after its caller gave up is not taken for the next answer
+    let mut f = tmp
+        .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    f.write(0, b"12345").map_err(|e| msg_e(e, line!()))?;
+    let stale = proto::file::Request {
+        txid: 0xffff_ffff,
+        op: pop::GETSIZE,
+        flags: 0,
+        rights: 0,
+        a: 0,
+        b: 0,
+        payload: &[],
+    }
+    .encode()
+    .unwrap();
+    raw_request(f.ch, &stale, &[])?;
+    ensure_eq!(
+        f.size(),
+        Ok(5),
+        "the stale reply was discarded, not returned"
     );
     Ok(())
 }
@@ -4623,7 +4697,7 @@ fn memfsd_listing_pages_and_a_slow_client_stalls_only_itself() -> Outcome {
     let mut got = 0u32;
     let mut slow = slow;
     while got < 12 {
-        let a = slow.read_reply().map_err(|e| msg_e(e, line!()))?;
+        let a = slow.read_next_reply().map_err(|e| msg_e(e, line!()))?;
         ensure_eq!(a.status, 0, "reply {got}");
         ensure_eq!(a.payload.len(), 32 * 1024, "its length");
         got += 1;
@@ -5243,6 +5317,10 @@ pub fn app_main() -> i32 {
         (
             "memfsd_quotas_and_connection_limit",
             memfsd_quotas_and_connection_limit,
+        ),
+        (
+            "memfsd_refuses_endpoints_it_cannot_serve_and_orphans",
+            memfsd_refuses_endpoints_it_cannot_serve_and_orphans,
         ),
         (
             "memfsd_unlinked_open_files_live_until_closed",

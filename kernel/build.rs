@@ -40,7 +40,17 @@ fn main() {
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
-            let name = format!("{prefix}/{}", e.file_name().to_string_lossy());
+            let fname = e.file_name().to_string_lossy().into_owned();
+            // Hidden files (`.DS_Store`) and symlinks are not boot-image content.
+            if fname.starts_with('.') || e.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+                continue;
+            }
+            let name = format!("{prefix}/{fname}");
+            if prefix.is_empty() && fname == "tmp" {
+                panic!(
+                    "bootfs/tmp: `/tmp` is made by memfsd and must not come from the boot image"
+                );
+            }
             if e.path().is_dir() {
                 walk(&e.path(), &name, out);
             } else if e.path().is_file() {

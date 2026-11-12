@@ -84,8 +84,25 @@ impl Server {
         }
     }
 
-    fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> u64 {
+    /// Start serving `ch` as a connection to `node`. `None` if the port refuses to watch it (the
+    /// handle is not a channel, or the port is full): nothing changes then, and the handle is
+    /// still the caller's to close.
+    fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> Option<u64> {
+        // Only a channel end we may read and write can be served: probe with a zero-sized read
+        // (an event or a VMO answers WRONG_TYPE; a channel says SHOULD_WAIT, PEER_CLOSED or
+        // BUFFER_TOO_SMALL and loses nothing).
+        let probe = sys::channel_read(ch, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
+        if matches!(
+            probe.status(),
+            Some(Status::WrongType) | Some(Status::AccessDenied) | Some(Status::BadHandle)
+        ) {
+            return None;
+        }
         let key = self.next_key;
+        let b = sys::port_bind(self.port, ch, signals::READABLE | signals::PEER_CLOSED, key);
+        if b.status != 0 {
+            return None;
+        }
         self.next_key += 1;
         let _ = self.fs.retain(node);
         self.conns.insert(
@@ -98,8 +115,7 @@ impl Server {
                 pending: None,
             },
         );
-        self.bind(key, ch, false);
-        key
+        Some(key)
     }
 
     fn close_conn(&mut self, key: u64) {
@@ -462,6 +478,13 @@ impl Server {
         endpoint: u32,
     ) -> Result<u8, i32> {
         let denied = Status::AccessDenied.code();
+        // The connection limit comes first: nothing may be created or truncated for an open that
+        // is going to be refused.
+        if self.conns.len() >= MAX_CONNECTIONS {
+            return Err(status::QUOTA);
+        }
+        // A clone (or an open of an empty path) names the node it is on: no flag applies.
+        let fl = if path.is_empty() { 0 } else { fl };
         let (target, created_new) = if path.is_empty() {
             (dir, false)
         } else {
@@ -518,18 +541,20 @@ impl Server {
         if !is_dir && want & (pr::ENUMERATE | pr::CREATE) != 0 {
             return undo(self, status::BAD_REQUEST);
         }
+        if fl & flags::TRUNCATE != 0 && (is_dir || want & pr::WRITE == 0) {
+            return undo(self, status::BAD_REQUEST);
+        }
+        let Some(key) = self.add_conn(endpoint, target, want, is_dir) else {
+            // not something the port can watch (an event or a VMO passed as the "endpoint")
+            return undo(self, status::BAD_REQUEST);
+        };
+        // Truncate last: nothing destructive happens unless the open succeeds.
         if fl & flags::TRUNCATE != 0 {
-            if is_dir || want & pr::WRITE == 0 {
-                return undo(self, status::BAD_REQUEST);
-            }
             if let Err(e) = self.fs.set_size(target, 0) {
-                return undo(self, err_status(e, 0));
+                self.close_conn(key);
+                return Err(err_status(e, 0));
             }
         }
-        if self.conns.len() >= MAX_CONNECTIONS {
-            return undo(self, status::QUOTA);
-        }
-        self.add_conn(endpoint, target, want, is_dir);
         Ok(kind_byte(kind))
     }
 }
@@ -539,6 +564,10 @@ fn build_tree(fs: &mut Fs, entries: &[proto::bootimg::Entry]) -> Option<()> {
     let _ = tmp;
     for e in entries {
         let comps = file::split_path(&e.name).ok()?;
+        // `tmp` is the one writable directory and is made above: an image name may not use it
+        if comps[0] == b"tmp" {
+            return None;
+        }
         let (last, parents) = comps.split_last()?;
         let mut at = ROOT;
         for c in parents {
@@ -610,7 +639,9 @@ pub fn app_main() -> i32 {
         rx: alloc::vec![0u8; file::MAX_MESSAGE],
     };
     // The service channel is the root directory connection with every right.
-    server.add_conn(root_ch, ROOT, pr::ALL, true);
+    if server.add_conn(root_ch, ROOT, pr::ALL, true).is_none() {
+        return 9;
+    }
     loop {
         let any_pending = server.conns.values().any(|c| c.pending.is_some());
         let deadline = if any_pending {

@@ -27,6 +27,12 @@ pub struct Answer {
     pub handle: Option<u32>,
 }
 
+/// A reply with the transaction id it answers.
+struct Tagged {
+    txid: u32,
+    answer: Answer,
+}
+
 pub struct Fs {
     pub ch: u32,
     txid: u32,
@@ -66,18 +72,44 @@ impl Fs {
         let n = usize::from(send.is_some());
         let w = sys::channel_write(self.ch, req.as_ptr(), req.len(), hs.as_ptr(), n);
         if w.status != 0 {
+            // a failed write moves nothing: the endpoint we meant to send is still ours
+            if let Some(h) = send {
+                sys::handle_close(h);
+            }
             return Err(w.status);
         }
         self.read_reply()
     }
 
-    /// Read the next reply on this connection.
+    /// Read the reply to the last request. A reply to an *earlier* request (one that arrived after
+    /// its call had given up) is discarded, with any handle it carried, instead of being taken for
+    /// this one's answer.
     pub fn read_reply(&mut self) -> Result<Answer, i32> {
-        let wait = sys::object_wait(
-            self.ch,
-            signals::READABLE | signals::PEER_CLOSED,
-            sys::clock_get() + REPLY_TIMEOUT,
-        );
+        let deadline = sys::clock_get() + REPLY_TIMEOUT;
+        loop {
+            let a = self.read_reply_any(deadline)?;
+            if a.txid == self.txid {
+                return Ok(a.answer);
+            }
+            if let Some(h) = a.answer.handle {
+                sys::handle_close(h);
+            }
+            if a.txid.wrapping_sub(self.txid) as i32 > 0 {
+                return Err(-4); // from the future: the server is broken
+            }
+        }
+    }
+
+    /// Read the next reply on this connection whatever request it answers (for callers that
+    /// pipeline several requests).
+    pub fn read_next_reply(&mut self) -> Result<Answer, i32> {
+        Ok(self
+            .read_reply_any(sys::clock_get() + REPLY_TIMEOUT)?
+            .answer)
+    }
+
+    fn read_reply_any(&mut self, deadline: u64) -> Result<Tagged, i32> {
+        let wait = sys::object_wait(self.ch, signals::READABLE | signals::PEER_CLOSED, deadline);
         if wait.status != 0 {
             return Err(wait.status);
         }
@@ -94,12 +126,14 @@ impl Fs {
             a,
             payload,
         } = reply;
-        let _ = txid;
-        Ok(Answer {
-            status,
-            a,
-            payload: payload.to_vec(),
-            handle: (r.a2 == 1).then_some(h[0]),
+        Ok(Tagged {
+            txid,
+            answer: Answer {
+                status,
+                a,
+                payload: payload.to_vec(),
+                handle: (r.a2 == 1).then_some(h[0]),
+            },
         })
     }
 
