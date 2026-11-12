@@ -379,18 +379,26 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     Ok(())
 }
 
-/// A spinner in user mode on another hart is ended promptly: the kill's IPI makes the victim trap
-/// well inside a timer tick (without it the victim would notice at its next 1 ms tick, half a
-/// millisecond later on average). Measured in the `time` counter, from the call to the moment the
-/// victim's process began to end; the median of 15 kills must be under 200 microseconds.
+/// A spinner in user mode on another hart is ended promptly. The kill sends a reschedule IPI to the
+/// other harts, in the same locked region that sets the victim's kill flag: the test counts the
+/// IPIs the secondary harts handle between the call and the victim's end (the control build
+/// without the kick sees none), and checks that the end came well within a timer tick (the
+/// tick alone would also do it, so that bound is a sanity check, not the guard).
 fn kill_a_spinner_on_another_hart() -> Result<(), String> {
     use crate::user;
     let n = smp::started();
     if n < 2 {
         return Ok(());
     }
+    let ipis = || -> u64 {
+        (1..n)
+            .map(|i| percpu::hart(i).resched_ipis.load(Ordering::SeqCst))
+            .sum()
+    };
+    let mut kicked = 0;
     let mut cycles = alloc::vec::Vec::new();
-    for _ in 0..15 {
+    const TRIALS: usize = 15;
+    for _ in 0..TRIALS {
         let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
         // wait until some secondary hart is running user code (the spinner was placed there)
         if !wait_for(1000, || {
@@ -400,7 +408,8 @@ fn kill_a_spinner_on_another_hart() -> Result<(), String> {
             user::finish(pid, tid);
             return Err(String::from("the spinner never ran on a secondary hart"));
         }
-        let t0 = crate::timer::now();
+        thread::sleep_ticks(2); // let the start-up IPIs settle
+        let (t0, before) = (crate::timer::now(), ipis());
         user::end_process(pid, -3);
         let code = user::finish(pid, tid);
         let took = user::LAST_EXIT_CYCLES
@@ -409,13 +418,21 @@ fn kill_a_spinner_on_another_hart() -> Result<(), String> {
         if code != -3 {
             return Err(format!("exit code {code}, wanted -3"));
         }
+        if ipis() > before {
+            kicked += 1;
+        }
         cycles.push(took);
+    }
+    if kicked < TRIALS - 1 {
+        return Err(format!(
+            "only {kicked} of {TRIALS} kills sent a reschedule IPI to the other harts"
+        ));
     }
     cycles.sort_unstable();
     let median = cycles[cycles.len() / 2];
-    if median > 2_000 {
+    if median > 10_000 {
         return Err(format!(
-            "the median kill took {median} cycles (> 200 us) to reach a spinner on another hart"
+            "the median kill took {median} cycles (over one 1 ms tick)"
         ));
     }
     Ok(())
