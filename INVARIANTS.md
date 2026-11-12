@@ -70,7 +70,7 @@ get filled in as each area is built.
 
 | # | Invariant | How checked |
 |---|---|---|
-| M1 | In kernel code `tp` holds `&PerHart` of the hart running it. It is never restored from a trap frame on a return to the kernel (a thread may resume on another hart); the user's `tp` is saved in the frame and restored only on the return to user mode; `sscratch` is `&PerHart` in user mode and 0 in the kernel | the S3 user suites and every `-smp 4` run (a wrong `tp` after a migration would corrupt the next trap) |
+| M1 | In kernel code `tp` holds `&PerHart` of the hart running it. It is never restored from a trap frame on a return to the kernel (a thread may resume on another hart); the user's `tp` is saved in the frame and restored only on the return to user mode; `sscratch` is `&PerHart` in user mode and 0 in the kernel | the S3 user suites and every `-smp 4` run (a wrong `tp` would break every trap; migration of a thread between harts only starts in S5c, where its tests are added); `harts_come_online` checks each secondary bound `tp` to its own record |
 | M2 | A secondary hart enters on the early boot table (the kernel's own table has no identity mapping), jumps to the upper half, and only then switches to the kernel table; it touches no shared kernel state until the big kernel lock exists (S5b) | `harts_come_online`, `ipi_reaches_every_hart` |
 | M3 | The user's `satp` last written is per hart (`PerHart::active_satp`) | code structure; S5c tests |
 

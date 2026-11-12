@@ -351,6 +351,7 @@ fn instruction_length(pc: u64) -> u64 {
 }
 
 fn fatal(frame: &TrapFrame, what: core::fmt::Arguments) -> ! {
+    crate::console::break_lock();
     let _ = testlog::panic(
         &mut Console,
         &format_args!(

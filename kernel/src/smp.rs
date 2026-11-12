@@ -3,9 +3,11 @@
 //! takes its own timer interrupts and software interrupts and counts them; the scheduler and every
 //! piece of shared kernel state stay on the boot hart (the big kernel lock arrives in S5b).
 
+use crate::console::Console;
 use crate::percpu::{self, IPI_RESCHED, MAX_HARTS};
 use crate::{irq, kmem, timer};
 use core::arch::{asm, global_asm};
+use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const EID_HSM: usize = 0x48_534D;
@@ -16,7 +18,9 @@ const FID_SEND_IPI: usize = 0;
 /// `hart_get_status` result for a hart that exists and is waiting to be started.
 const HSM_STOPPED: usize = 1;
 
-/// Per-hart boot stacks: 32 KiB each, like every kernel thread, with a canary at the bottom.
+/// Per-hart boot stacks: 32 KiB each, like every kernel thread, with a canary at the bottom
+/// (`stack_canaries_intact` checks it).
+pub const CANARY: u64 = 0xdead_beef_cafe_f00d;
 const STACK_BYTES: usize = 32 * 1024;
 #[repr(C, align(16))]
 struct BootStacks([[u8; STACK_BYTES]; MAX_HARTS]);
@@ -93,6 +97,10 @@ extern "C" {
 #[no_mangle]
 extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     percpu::bind(index, hart_id);
+    let tp: usize;
+    // SAFETY: reads `tp`, just bound to this hart's record.
+    unsafe { asm!("mv {}, tp", out(reg) tp) };
+    percpu::this().tp_seen.store(tp, Ordering::Relaxed);
     crate::trap::init(); // stvec; sscratch = 0
                          // FPU and vector unit off, like the boot hart (thread::init), so any use traps.
                          // SAFETY: clears sstatus.FS and sstatus.VS only.
@@ -130,8 +138,9 @@ pub fn ipi_interrupt() {
     // SAFETY: clears sip.SSIP, the pending bit of the software interrupt; nothing else.
     unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
     let me = percpu::this();
-    me.ipis.fetch_add(1, Ordering::SeqCst);
+    // take the reasons first, then count: whoever sees the count move sees the bits already gone
     let _reasons = me.pending.swap(0, Ordering::SeqCst);
+    me.ipis.fetch_add(1, Ordering::SeqCst);
     // (S5c: IPI_RESCHED makes the hart reschedule; in S5a there is nothing to do.)
 }
 
@@ -152,6 +161,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
         let stacks = core::ptr::addr_of_mut!(BOOT_STACKS) as usize;
         for i in 0..MAX_HARTS {
             (*core::ptr::addr_of_mut!(SECONDARY_STACK_TOPS))[i] = stacks + (i + 1) * STACK_BYTES;
+            *((stacks + i * STACK_BYTES) as *mut u64) = CANARY;
         }
     }
     let entry_phys = secondary_entry as *const () as usize - abi::layout::KERNEL_OFFSET as usize;
@@ -160,22 +170,31 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
         if id == boot_hart_id {
             continue;
         }
-        if sbi(EID_HSM, FID_HART_GET_STATUS, id, 0, 0).error != 0 {
+        let r = sbi(EID_HSM, FID_HART_GET_STATUS, id, 0, 0);
+        if r.error != 0 {
             continue; // no such hart
         }
         if next >= MAX_HARTS {
             break;
         }
-        let r = sbi(EID_HSM, FID_HART_GET_STATUS, id, 0, 0);
         if r.value != HSM_STOPPED {
-            continue; // already running or starting: not ours to start
+            // already running or starting: not ours to start
+            let _ = writeln!(
+                Console,
+                "hart {id}: not stopped (state {}), left alone",
+                r.value
+            );
+            continue;
         }
         // dense index `next`; the record's ids are filled in by the hart itself, but the target
         // of an IPI needs its hart id before then, so set it here too
         percpu::hart(next).hart_id.store(id, Ordering::Relaxed);
         percpu::hart(next).index.store(next, Ordering::Relaxed);
-        if sbi(EID_HSM, FID_HART_START, id, entry_phys, next).error == 0 {
+        let start = sbi(EID_HSM, FID_HART_START, id, entry_phys, next);
+        if start.error == 0 {
             next += 1;
+        } else {
+            let _ = writeln!(Console, "hart {id}: hart_start failed ({})", start.error);
         }
     }
     STARTED.store(next, Ordering::SeqCst);
@@ -190,6 +209,13 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
         }
     }
     next
+}
+
+/// Are the canaries at the bottom of every started hart's boot stack intact?
+pub fn stack_canaries_intact() -> bool {
+    let stacks = core::ptr::addr_of!(BOOT_STACKS) as usize;
+    // SAFETY: reads the first word of each started hart's stack, a private static.
+    (0..started()).all(|i| unsafe { *((stacks + i * STACK_BYTES) as *const u64) } == CANARY)
 }
 
 /// How many harts were started (the boot hart included).

@@ -52,6 +52,21 @@ fn harts_come_online() -> Result<(), String> {
             }
         }
     }
+    // each secondary saw its own record's address in `tp` when it bound itself
+    for i in 1..n {
+        let h = percpu::hart(i);
+        if h.tp_seen.load(Ordering::Relaxed) != h as *const percpu::PerHart as usize {
+            return Err(format!(
+                "hart {i} bound tp to {:#x}",
+                h.tp_seen.load(Ordering::Relaxed)
+            ));
+        }
+    }
+    if !smp::stack_canaries_intact() {
+        return Err(String::from(
+            "a hart's boot stack overflowed into its canary",
+        ));
+    }
     // the calling hart's `tp` is its own record
     let me = percpu::this();
     if !(0..n).any(|i| core::ptr::eq(me, percpu::hart(i))) {
@@ -94,6 +109,27 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
         let h = percpu::hart(i);
         if !wait_for(1000, || h.ipis.load(Ordering::SeqCst) > was) {
             return Err(format!("hart {i} missed the second IPI"));
+        }
+    }
+    // no interrupt storm afterwards (a software interrupt that is never cleared would re-fire
+    // for ever and starve the timer): the counts hold still and the timers keep running
+    let after: alloc::vec::Vec<(u64, u64)> = (0..n)
+        .map(|i| {
+            let h = percpu::hart(i);
+            (
+                h.ipis.load(Ordering::SeqCst),
+                h.timer_ticks.load(Ordering::SeqCst),
+            )
+        })
+        .collect();
+    thread::sleep_ticks(30);
+    for (i, &(ipis, ticks)) in after.iter().enumerate().skip(1) {
+        let h = percpu::hart(i);
+        if h.ipis.load(Ordering::SeqCst) != ipis {
+            return Err(format!("hart {i} keeps taking IPIs nobody sent"));
+        }
+        if h.timer_ticks.load(Ordering::SeqCst) < ticks + 10 {
+            return Err(format!("hart {i}'s timer stalled after the IPIs"));
         }
     }
     Ok(())

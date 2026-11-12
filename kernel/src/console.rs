@@ -24,6 +24,37 @@ pub fn try_read() -> Option<u8> {
 
 pub struct Console;
 
+/// The UART lock (S5, K5): held by one hart at a time, taken with interrupts off, reentrant per
+/// hart (so `write_fmt` can hold it across a whole line while `write_str` takes it again). The
+/// value is the owner's hart index + 1, or 0 when free.
+static UART_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn with_uart<R>(f: impl FnOnce() -> R) -> R {
+    use core::sync::atomic::Ordering;
+    crate::irq::without(|| {
+        let me = crate::percpu::this().index.load(Ordering::Relaxed) + 1;
+        let outer = UART_OWNER.load(Ordering::Relaxed) != me;
+        if outer {
+            while UART_OWNER
+                .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+        }
+        let r = f();
+        if outer {
+            UART_OWNER.store(0, Ordering::Release);
+        }
+        r
+    })
+}
+
+/// Break the UART lock (the panic path: whoever held it may never release it).
+pub fn break_lock() {
+    UART_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
+}
+
 /// The physical line state shared by every writer (kernel and bridge): see
 /// `kcore::linestate`. Accessed only with interrupts off.
 static mut LINE: kcore::linestate::LineState = kcore::linestate::LineState::new();
@@ -39,8 +70,13 @@ fn put(byte: u8) {
 }
 
 impl fmt::Write for Console {
+    /// A whole formatted print is one critical section, so lines from two harts never interleave.
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        with_uart(|| fmt::write(self, args))
+    }
+
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::irq::without(|| {
+        with_uart(|| {
             // SAFETY: interrupts are off and this is the only access path to `LINE`.
             let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
             line.kernel_text(s.as_bytes(), &mut put);
@@ -53,7 +89,7 @@ impl fmt::Write for Console {
 /// line-start `##` rewritten to `# #`, through the same line state as the kernel's own output.
 #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn write_user(bytes: &[u8]) {
-    crate::irq::without(|| {
+    with_uart(|| {
         // SAFETY: as in `write_str`.
         let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
         for &b in bytes {

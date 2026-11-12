@@ -165,6 +165,7 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    console::break_lock();
     let _ = testlog::panic(&mut console::Console, info);
     finisher::exit(false)
 }

@@ -34,6 +34,8 @@ pub struct PerHart {
     pub pending: AtomicU32,
     /// The next timer deadline of this hart (`time` counter value).
     pub deadline: AtomicU64,
+    /// The value of `tp` this hart saw when it bound itself (must equal this record's address).
+    pub tp_seen: AtomicUsize,
     /// The `satp` last written for user mode on this hart (so a switch is made only when needed).
     pub active_satp: AtomicU64,
 }
@@ -50,6 +52,7 @@ impl PerHart {
             ipis: AtomicU64::new(0),
             pending: AtomicU32::new(0),
             deadline: AtomicU64::new(0),
+            tp_seen: AtomicUsize::new(0),
             active_satp: AtomicU64::new(0),
         }
     }

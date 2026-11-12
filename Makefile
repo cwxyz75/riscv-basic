@@ -131,12 +131,14 @@ os-boot-test-release:
 	cd init && cargo build --release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-release
 	python3 scripts/os_boot_test.py $(OS_REL_ELF)
+	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_REL_ELF)
 
 # The same suite with several harts (S5): the secondary harts must come online, take timer and
 # software interrupts, and leave every other test as it was.
 os-boot-test-smp: kernel os-interactive
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
+	OS_SMP=4 OS_ICOUNT=shift=0,sleep=off OS_BOOT_TIMEOUT=900 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	OS_SMP=4 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 
