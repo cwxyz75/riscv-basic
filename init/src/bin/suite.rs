@@ -5265,10 +5265,6 @@ pub fn app_main() -> i32 {
             syscalls_stay_fast_with_many_live_processes,
         ),
         (
-            "syscalls_stay_fast_with_many_live_processes",
-            syscalls_stay_fast_with_many_live_processes,
-        ),
-        (
             "wait_is_woken_by_the_peer_closing",
             wait_is_woken_by_the_peer_closing,
         ),
