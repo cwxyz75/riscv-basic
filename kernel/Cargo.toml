@@ -19,6 +19,9 @@ proto = { path = "../proto" }
 # Boot into the interactive system (S4): the supervisor `init`, the serial console bridge and
 # the boot image instead of the user test suite.
 interactive = []
+# The interactive boot with `init` in its test-command mode (the scripted S4a-S4d checks drive its
+# `run`, `ls`, `console` ... commands) instead of the supervisor that starts the shell.
+repl = ["interactive"]
 # Make one self-test fail on purpose, so the boot test can prove it sees failures.
 fail-demo = []
 # Boot with the plain round-robin scheduling class instead of fixed-priority (OD32).

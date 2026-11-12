@@ -46,6 +46,9 @@ pub fn app_main() -> i32 {
     let Ok(entries) = proto::bootimg::parse(&img) else {
         return 5;
     };
+    if env.startup.args.get(1).map(|a| a.as_slice()) != Some(b"repl") {
+        return supervise(serial, image_vmo, &img, &entries);
+    }
     // Start the launcher with `rt::spawn` (the first services cannot use one).
     let Some(launcher_entry) = entries.iter().find(|e| e.name == b"bin/launcher") else {
         return 9;
@@ -609,5 +612,197 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
         0
     } else {
         25
+    }
+}
+
+/// The services of one interactive session, in start order.
+struct Stack {
+    memfsd: u32,
+    launcher: u32,
+    consoled: u32,
+    sh: u32,
+    /// `sh` writes here when the user says `halt`.
+    halt: u32,
+}
+
+fn kill_close(h: u32) {
+    rt::sys::process_kill(h, -1);
+    rt::sys::handle_close(h);
+}
+
+fn start_stack(
+    serial: u32,
+    image_vmo: u32,
+    img: &[u8],
+    entries: &[proto::bootimg::Entry],
+) -> Result<Stack, i32> {
+    use proto::startup::Startup;
+    use rt::abi::rights::Rights;
+    use rt::sys;
+    let chan = || -> Result<(u32, u32), i32> {
+        let c = sys::channel_create();
+        if c.status != 0 {
+            return Err(30);
+        }
+        Ok((c.a1 as u32, c.a2 as u32))
+    };
+    let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u32]| -> Result<u32, i32> {
+        let path: Vec<u8> = [&b"bin/"[..], name].concat();
+        let Some(image) = image_entry(img, entries, &path) else {
+            for &h in handles {
+                sys::handle_close(h);
+            }
+            return Err(31);
+        };
+        let st = Startup {
+            args: alloc::vec![name.to_vec()],
+            roles,
+            ..Startup::default()
+        };
+        let Ok(bytes) = st.encode() else {
+            return Err(32);
+        };
+        rt::spawn::spawn(image, &bytes, handles).map_err(|_| 33)
+    };
+    // the launcher: its only client is the shell
+    let (launch_sh, launch_theirs) = chan()?;
+    let launcher = start(
+        b"launcher",
+        alloc::vec![(Role::ServiceLaunch, 0)],
+        &[launch_theirs],
+    )?;
+    // the filesystem: init clones one connection for the shell and lets go of the root
+    let (fs_mine, fs_theirs) = chan()?;
+    let image_dup = sys::handle_duplicate(image_vmo, Rights::SAME.0);
+    if image_dup.status != 0 {
+        return Err(34);
+    }
+    let memfsd = start(
+        b"memfsd",
+        alloc::vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
+        &[fs_theirs, image_dup.a1 as u32],
+    )?;
+    let mut root = rt::fs::Fs::new(fs_mine);
+    let sh_fs = match root.clone_conn(proto::file::rights::READ | proto::file::rights::ENUMERATE) {
+        Ok(f) => f,
+        Err(e) => {
+            sys::debug_write(alloc::format!("init: clone of the root failed: {e}\n").as_bytes());
+            return Err(35);
+        }
+    };
+    root.close();
+    // the console server: the serial line, the terminal socket, the control channel
+    let tty = sys::socket_create();
+    if tty.status != 0 {
+        return Err(36);
+    }
+    let (tty_console, tty_sh) = (tty.a1 as u32, tty.a2 as u32);
+    let (ctl_console, ctl_sh) = chan()?;
+    let serial_dup = sys::handle_duplicate(serial, Rights::SAME.0);
+    if serial_dup.status != 0 {
+        return Err(37);
+    }
+    let consoled = start(
+        b"consoled",
+        alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
+        &[serial_dup.a1 as u32, tty_console, ctl_console],
+    )?;
+    let (halt_init, halt_sh) = chan()?;
+    let sh = start(
+        b"sh",
+        alloc::vec![
+            (Role::Tty, 0),
+            (Role::ServiceFs, 1),
+            (Role::ServiceLaunch, 2),
+            (Role::ServiceConsole, 3),
+            (Role::ServiceInit, 4)
+        ],
+        &[tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh],
+    )?;
+    Ok(Stack {
+        memfsd,
+        launcher,
+        consoled,
+        sh,
+        halt: halt_init,
+    })
+}
+
+/// End a session: stop the shell first (which closes the terminal and so ends the console server
+/// once it has flushed the serial line), then the rest.
+fn stop_stack(s: Stack) {
+    use rt::sys;
+    sys::process_kill(s.sh, -1);
+    let w = sys::object_wait(
+        s.consoled,
+        rt::abi::signals::TERMINATED,
+        sys::clock_get() + 2000,
+    );
+    let _ = w;
+    for h in [s.sh, s.consoled, s.launcher, s.memfsd] {
+        kill_close(h);
+    }
+    sys::handle_close(s.halt);
+}
+
+/// The supervisor (S4-SPEC section 10): start `memfsd`, `launcher`, `consoled` and `sh`; when the
+/// shell exits (or any service dies) end the session and start a fresh one; on `halt` end it and
+/// return 0, which lets the kernel run its leak checks and power off.
+fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+    use rt::abi::signals;
+    use rt::sys;
+    let mut sessions = 0;
+    loop {
+        sessions += 1;
+        if sessions > 50 {
+            return 40;
+        }
+        let stack = match start_stack(serial, image_vmo, img, entries) {
+            Ok(s) => s,
+            Err(code) => {
+                sys::debug_write(b"init: the session could not start\n");
+                return code;
+            }
+        };
+        let port = sys::port_create();
+        if port.status != 0 {
+            return 41;
+        }
+        let port = port.a1 as u32;
+        let watched = [stack.sh, stack.consoled, stack.launcher, stack.memfsd];
+        for (i, &h) in watched.iter().enumerate() {
+            sys::port_bind(port, h, signals::TERMINATED, i as u64);
+        }
+        sys::port_bind(port, stack.halt, signals::READABLE, 9);
+        let r = sys::port_wait(port, u64::MAX);
+        sys::handle_close(port);
+        if r.status != 0 {
+            stop_stack(stack);
+            return 42;
+        }
+        match r.a1 {
+            9 => {
+                // `halt`: leave only if the message really was a halt
+                let mut b = [0u8; 8];
+                let m = sys::channel_read(
+                    stack.halt,
+                    b.as_mut_ptr(),
+                    b.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
+                stop_stack(stack);
+                if m.status == 0 && &b[..m.a1] == b"halt" {
+                    return 0;
+                }
+                sys::debug_write(b"init: a bad halt message\n");
+            }
+            0 => stop_stack(stack), // the shell ended (exit, Ctrl-D, crash): a fresh session
+            _ => {
+                sys::debug_write(b"init: a service died, restarting the session\n");
+                stop_stack(stack);
+            }
+        }
+        io::nap(50);
     }
 }

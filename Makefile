@@ -138,16 +138,20 @@ os-boot-test-aia: kernel
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
 OS_INTERACTIVE_ELF := target/os-interactive/$(KERNEL_TARGET)/debug/kernel
+OS_REPL_ELF := target/os-repl/$(KERNEL_TARGET)/debug/kernel
 
 os-interactive: os-user
 	cd kernel && cargo build --features interactive --target-dir ../target/os-interactive
+	cd kernel && cargo build --features repl --target-dir ../target/os-repl
 
 os-serial-test: os-interactive
-	python3 scripts/s4a_serial_test.py $(OS_INTERACTIVE_ELF)
-	python3 scripts/s4d_console_test.py $(OS_INTERACTIVE_ELF)
+	python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
+	python3 scripts/s4d_console_test.py $(OS_REPL_ELF)
+	python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 	@# the harness must be able to fail: a wrong expectation has to be reported
-	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
-	@if S4_TIMEOUT=15 python3 scripts/s4d_console_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the console test passed a broken expectation"; exit 1; fi
+	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
+	@if S4_TIMEOUT=15 python3 scripts/s4d_console_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the console test passed a broken expectation"; exit 1; fi
+	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
 # The reference CPU of the OS track (OD47).
 os-boot-test-rva23: kernel
