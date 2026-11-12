@@ -3903,6 +3903,31 @@ fn many_launcher_spawns_do_not_leak() -> Outcome {
     Ok(())
 }
 
+fn syscalls_stay_fast_with_many_live_processes() -> Outcome {
+    // Every VMO a process closes after mapping it stays pending until the process dies; the
+    // kernel must not rescan all of them on every wake-up (it once cost ~1 ms per syscall with a
+    // dozen service processes alive, found when the filesystem tests were added).
+    let mut kids = [0u32; 12];
+    for k in kids.iter_mut() {
+        let (p, _mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
+        *k = p;
+    }
+    let t0 = sys::clock_get();
+    for _ in 0..1500 {
+        let e = event()?;
+        sys::handle_close(e);
+    }
+    let took = sys::clock_get() - t0;
+    ensure!(
+        took < 600,
+        "3000 syscalls took {took} ticks with 12 processes alive"
+    );
+    for k in kids {
+        sys::process_kill(k, 1);
+    }
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -4464,6 +4489,10 @@ pub fn app_main() -> i32 {
         (
             "many_launcher_spawns_do_not_leak",
             many_launcher_spawns_do_not_leak,
+        ),
+        (
+            "syscalls_stay_fast_with_many_live_processes",
+            syscalls_stay_fast_with_many_live_processes,
         ),
         (
             "wait_is_woken_by_the_peer_closing",
