@@ -4589,9 +4589,16 @@ fn memfsd_survives_memory_pressure_from_quota_legal_clients() -> Outcome {
         .open(b"tmp", pfl::DIRECTORY, RW_DIR)
         .map_err(|e| msg_e(e, line!()))?;
     let chunk = alloc::vec![0xabu8; 32 * 1024];
+    // Under the round-robin class every round trip waits for a scheduling slice (this test took
+    // 77 s there), so it uses a lighter load; the exact budgets are host tests anyway.
+    let (nfiles, nnames, nconns) = if loose() {
+        (8u32, 100u32, 100usize)
+    } else {
+        (64, 700, 200)
+    };
     // 64 files of 128 KiB: the whole 8 MiB byte quota in few round trips (every round trip is a
     // scheduling slice under the round-robin class)
-    for i in 0..64u32 {
+    for i in 0..nfiles {
         let name = alloc::format!("f{i:03}").into_bytes();
         let mut f = tmp
             .open(&name, pfl::CREATE, prt::READ | prt::WRITE)
@@ -4604,7 +4611,7 @@ fn memfsd_survives_memory_pressure_from_quota_legal_clients() -> Outcome {
     }
     // names are charged too (the exact budget is a host test; here a good share of it)
     let mut made = 0u32;
-    for i in 0..700u32 {
+    for i in 0..nnames {
         let mut name = alloc::format!("{i:05}").into_bytes();
         name.extend_from_slice(&[b'n'; 250]);
         match tmp.mkdir(&name) {
@@ -4612,12 +4619,12 @@ fn memfsd_survives_memory_pressure_from_quota_legal_clients() -> Outcome {
             Err(_) => break,
         }
     }
-    ensure!(made == 700, "{made} long-named directories");
+    ensure!(made == nnames, "{made} long-named directories");
     let mut one = tmp
         .open(b"f000", 0, prt::READ)
         .map_err(|e| msg_e(e, line!()))?;
     let mut conns: Vec<Fs> = Vec::new();
-    for _ in 0..200 {
+    for _ in 0..nconns {
         match one.clone_conn(prt::READ) {
             Ok(c) => conns.push(c),
             Err(_) => break,

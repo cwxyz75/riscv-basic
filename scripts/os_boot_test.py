@@ -101,6 +101,9 @@ def run(kernel: str, extra=()):
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
         "-m", "128M", "-display", "none", "-serial", "stdio", "-monitor", "none",
         *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
+        # Deterministic guest time (instruction counting): the tests then do not depend on how fast
+        # the host is (TIDY-UP T21). e.g. OS_ICOUNT=shift=4,sleep=off
+        *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") else []),
         *extra, "-kernel", kernel,
     ]
     try:
@@ -166,17 +169,25 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
     return found
 
 
+def round_robin_run(kernel):
+    generic = [n for n in REQUIRED if n not in PRIORITY_ONLY and n != "scheduler_class_is_fixed_priority"]
+    generic.append("scheduler_class_is_round_robin")  # proves the feature really selected it
+    return (kernel, False, generic, "round-robin class kernel (generic tests only)")
+
+
 def main() -> int:
-    if len(sys.argv) not in (2, 3, 4):
-        print(__doc__, file=sys.stderr)
-        return 2
-    runs = [(sys.argv[1], False, None, "kernel")]
-    if len(sys.argv) >= 3:
-        runs.append((sys.argv[2], True, None, "fail-demo kernel (must be detected as failing)"))
-    if len(sys.argv) == 4:
-        generic = [n for n in REQUIRED if n not in PRIORITY_ONLY and n != "scheduler_class_is_fixed_priority"]
-        generic.append("scheduler_class_is_round_robin")  # proves the feature really selected it
-        runs.append((sys.argv[3], False, generic, "round-robin class kernel (generic tests only)"))
+    # `--rr KERNEL`: only the round-robin kernel (CI runs it as its own job)
+    if len(sys.argv) == 3 and sys.argv[1] == "--rr":
+        runs = [round_robin_run(sys.argv[2])]
+    else:
+        if len(sys.argv) not in (2, 3, 4):
+            print(__doc__, file=sys.stderr)
+            return 2
+        runs = [(sys.argv[1], False, None, "kernel")]
+        if len(sys.argv) >= 3:
+            runs.append((sys.argv[2], True, None, "fail-demo kernel (must be detected as failing)"))
+        if len(sys.argv) == 4:
+            runs.append(round_robin_run(sys.argv[3]))
     failed = 0
     for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
