@@ -236,6 +236,8 @@ serial line for up to a second) when the client closes its terminal socket or th
 goes away. Ctrl-C type-ahead is discarded only within the chunk that carried the Ctrl-C (a
 serial read is at most 256 bytes), which is what the editor's own contract allows.
 
+**S4.5b (implemented).** Every program started by the launcher runs in a job of its own (one process, four threads, 4096 pages = 16 MiB including its image, stack and page tables, no sub-jobs), made under the `apps` job `init` gives the launcher (role `JOB`); `init` runs the four services in a session job and ends the whole session with `job_kill`. `probe`'s `spawn` line is now the real `process_create` refusal (`-5`); `bomb` shows a process and a thread bomb refused (`process_create: -5`, `threads: 3 then -5`); `hog` takes memory until its heap cannot grow (`hog: refused at N MiB`, `[exit 7]`), and a second run gets exactly the same amount, which shows that the memory comes back. The kernel's end-of-session checks also require the job ledger to be back to the root job alone with no processes or threads charged.
+
 **S4e decisions (implemented).** `probe` prints, in this order, `open /etc/trusted: -108`,
 `open ../x: -108`, `write ./f: -3`, `clone: ok`, `clone all: -3`, `root: absent`, `spawn: -1` (BAD_REQUEST for a
 path the wire cannot express, ACCESS_DENIED for rights it does not have, BAD_HANDLE for a handle

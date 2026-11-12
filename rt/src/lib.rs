@@ -208,7 +208,7 @@ pub mod sys {
         syscall(PROCESS_CREATE, [job as usize, 0, 0, 0, 0, 0])
     }
     /// `u64::MAX` means no limit.
-    pub fn job_create(parent: u32, processes: u64, threads: u64, pages: u64) -> Ret {
+    pub fn job_create(parent: u32, processes: u64, threads: u64, pages: u64, jobs: u64) -> Ret {
         syscall(
             JOB_CREATE,
             [
@@ -216,12 +216,12 @@ pub mod sys {
                 processes as usize,
                 threads as usize,
                 pages as usize,
-                0,
+                jobs as usize,
                 0,
             ],
         )
     }
-    pub fn job_set_limits(job: u32, processes: u64, threads: u64, pages: u64) -> Ret {
+    pub fn job_set_limits(job: u32, processes: u64, threads: u64, pages: u64, jobs: u64) -> Ret {
         syscall(
             JOB_SET_LIMITS,
             [
@@ -229,12 +229,12 @@ pub mod sys {
                 processes as usize,
                 threads as usize,
                 pages as usize,
-                0,
+                jobs as usize,
                 0,
             ],
         )
     }
-    /// `which`: 0 processes, 1 threads, 2 pages. Returns `a1` = used, `a2` = limit.
+    /// `which`: 0 processes, 1 threads, 2 pages, 3 jobs. Returns `a1` = used, `a2` = limit.
     pub fn job_info(job: u32, which: u64) -> Ret {
         syscall(JOB_INFO, [job as usize, which as usize, 0, 0, 0, 0])
     }

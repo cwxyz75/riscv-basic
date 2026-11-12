@@ -617,6 +617,9 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
 
 /// The services of one interactive session, in start order.
 struct Stack {
+    /// The job every process of the session lives in (handle with every right): `stop_stack` ends
+    /// whatever is left in it, and its limits are the whole session's.
+    session: u32,
     memfsd: u32,
     launcher: u32,
     consoled: u32,
@@ -646,6 +649,26 @@ fn start_stack(
         }
         Ok((c.a1 as u32, c.a2 as u32))
     };
+    // The session's job, and under it the job the launcher makes every program's job in (S4.5).
+    // Limits are generous for the services and bounded for programs: all together at most 64 MiB
+    // of memory, 32 processes and 64 threads; programs at most 16 processes and 32 MiB.
+    let root = sys::job_root();
+    if root.status != 0 {
+        return Err(38);
+    }
+    let root = root.a1 as u32;
+    let session = sys::job_create(root, 32, 64, 16384, 40);
+    sys::handle_close(root);
+    if session.status != 0 {
+        return Err(38);
+    }
+    let session = session.a1 as u32;
+    let apps = sys::job_create(session, 16, 32, 8192, 20);
+    if apps.status != 0 {
+        sys::handle_close(session);
+        return Err(38);
+    }
+    let apps = apps.a1 as u32;
     let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u32]| -> Result<u32, i32> {
         let path: Vec<u8> = [&b"bin/"[..], name].concat();
         let Some(image) = image_entry(img, entries, &path) else {
@@ -662,14 +685,29 @@ fn start_stack(
         let Ok(bytes) = st.encode() else {
             return Err(32);
         };
-        rt::spawn::spawn(image, &bytes, handles).map_err(|_| 33)
+        rt::spawn::spawn_in(image, &bytes, handles, session).map_err(|e| {
+            sys::debug_write(
+                alloc::format!(
+                    "init: could not start {}: {e:?}\n",
+                    String::from_utf8_lossy(name)
+                )
+                .as_bytes(),
+            );
+            33
+        })
     };
     // the launcher: its only client is the shell
     let (launch_sh, launch_theirs) = chan()?;
+    // (the launcher gets the right to make jobs and processes under `apps`, nothing more)
+    let apps_for_launcher = sys::handle_duplicate(apps, Rights::MANAGE.0 | Rights::TRANSFER.0);
+    sys::handle_close(apps);
+    if apps_for_launcher.status != 0 {
+        return Err(39);
+    }
     let launcher = start(
         b"launcher",
-        alloc::vec![(Role::ServiceLaunch, 0)],
-        &[launch_theirs],
+        alloc::vec![(Role::ServiceLaunch, 0), (Role::Job, 1)],
+        &[launch_theirs, apps_for_launcher.a1 as u32],
     )?;
     // the filesystem: init clones one connection for the shell and lets go of the root
     let (fs_mine, fs_theirs) = chan()?;
@@ -720,6 +758,7 @@ fn start_stack(
         &[tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh],
     )?;
     Ok(Stack {
+        session,
         memfsd,
         launcher,
         consoled,
@@ -742,6 +781,10 @@ fn stop_stack(s: Stack) {
     for h in [s.sh, s.consoled, s.launcher, s.memfsd] {
         kill_close(h);
     }
+    // Whatever else the session started (programs the shell left behind) goes too, and nothing
+    // can start in it any more.
+    sys::job_kill(s.session, -1);
+    sys::handle_close(s.session);
     sys::handle_close(s.halt);
 }
 

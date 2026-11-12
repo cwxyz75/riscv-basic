@@ -256,7 +256,7 @@ pub fn app_main() -> i32 {
             if rt::sys::job_root().status == -3 {
                 code |= 1;
             }
-            if rt::sys::job_create(77, u64::MAX, u64::MAX, u64::MAX).status == -1 {
+            if rt::sys::job_create(77, u64::MAX, u64::MAX, u64::MAX, u64::MAX).status == -1 {
                 code |= 2;
             }
             if rt::sys::process_create().status == -5 {

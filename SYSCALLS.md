@@ -167,9 +167,9 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
-| 90 | job_create | `a0` parent job, `a1` processes, `a2` threads, `a3` pages | `a1` handle |
-| 91 | job_set_limits | `a0` job, `a1` processes, `a2` threads, `a3` pages | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages) | `a1` used, `a2` limit |
+| 90 | job_create | `a0` parent job, `a1` processes, `a2` threads, `a3` pages, `a4` jobs | `a1` handle |
+| 91 | job_set_limits | `a0` job, `a1` processes, `a2` threads, `a3` pages, `a4` jobs | |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs) | `a1` used, `a2` limit |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 
@@ -359,8 +359,10 @@ channel endpoint `bootstrap` leaves the caller's table and becomes the new proce
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
 16-byte aligned and in the user half (what is mapped below it is the caller's business).
 Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
-channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads).
-On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`.
+channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads, or the process's job or an ancestor
+is at its thread limit; the refusal comes before anything changes).
+On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`,
+`a_refused_process_start_changes_nothing_and_can_be_retried`.
 
 ### process_kill(process, code) -> status
 
@@ -377,9 +379,9 @@ Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 ## Jobs and limits (S4.5, OD56-OD58)
 
 A **job** is an account that processes, threads and memory are charged to; jobs form a tree with
-the kernel's **root job** (no limits) on top. A job has limits on three resources: live
-**processes**, live **threads**, and **pages** of memory committed in VMOs (`u64::MAX` means no
-limit). A charge is applied to the job and **every ancestor**, so a job can never use more than
+the kernel's **root job** (no limits) on top. A job has limits on four resources: live
+**processes**, live **threads**, **pages** of memory (committed VMO pages and page-table frames),
+and **jobs** (how many jobs may exist below it, at any depth) (`u64::MAX` means no limit). A charge is applied to the job and **every ancestor**, so a job can never use more than
 any ancestor allows, whatever its own limits say. Every process belongs to the job it was created
 in; the kernel's first process (`init`) is in the root job.
 
@@ -390,23 +392,30 @@ started. Limits are exhausted with NO_MEMORY.
 
 What is charged: a process from `process_create` to its teardown; a thread from the moment it is
 created (`process_start` or `thread_create`) until it ends; a VMO page from the moment it is first
-committed (a write, a read through a mapping, a fault) until the VMO is freed (the memory held
-by the page tables and the kernel's own objects is bounded by the global caps, not charged). A job
+committed (a write, a read through a mapping, a fault) until the VMO is freed; **page tables** as
+a worst-case estimate: one page for a process's root table and, per mapped region, one page per
+512 pages it spans plus four, charged to the process's job when the region is mapped and credited
+when it is unmapped or the process ends (the kernel's own objects are bounded by the global caps,
+not charged). A job
 record lives while any process, VMO, job object or child job holds it.
 
 ### job_create(parent, processes, threads, pages) -> status, handle
 
 A child of `parent` (MANAGE) with these limits. Errors, in order: BAD_HANDLE; WRONG_TYPE;
-ACCESS_DENIED; NO_MEMORY (object cap, or 256 jobs exist). The handle carries every job right.
+ACCESS_DENIED; NO_MEMORY (object cap, 256 jobs exist, or the parent or an ancestor is at its
+limit on jobs). The handle carries every job right.
 
 ### job_set_limits(job, processes, threads, pages) -> status
 
 Needs MANAGE. Usage above a new limit is not undone; later charges fail until usage is back under
-it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+it. **MANAGE is one right for everything about the job** (creating children, processes and VMOs in
+it, and changing its limits): a program that holds MANAGE on a job can raise that job's limits, so
+a confined program must never be given MANAGE on the job it runs in. The launcher gives every
+program a job of its own and keeps the only handle (TIDY-UP T36). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages; `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs; `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 ### job_kill(job, code) -> status
@@ -445,7 +454,8 @@ WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has e
 dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
 aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
 threads, the system already has `MAX_USER_THREADS` (128; each thread costs a kernel stack), the
-caller's handle table is full, or the system-wide object cap `MAX_OBJECTS` is reached). The process handle may be the caller's
+caller's handle table is full, the system-wide object cap `MAX_OBJECTS` is reached, or the process's
+job or an ancestor is at its thread limit). The process handle may be the caller's
 `process_self` handle. On error nothing changes. Tests: `thread_create_*`.
 
 ### thread_exit(code) -> does not return

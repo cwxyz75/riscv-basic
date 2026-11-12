@@ -1,5 +1,5 @@
 //! Jobs and resource limits (S4.5, decisions OD56-OD58): a tree of accounts. A job has limits on
-//! three resources (live processes, live threads, committed memory pages); a charge against a
+//! four resources (live processes, live threads, committed memory pages, live child jobs); a charge against a
 //! job is applied to the job **and every ancestor**, so a child can never use more than its
 //! parent allows however its own limits are set.
 //!
@@ -37,6 +37,8 @@ pub enum Resource {
     Processes,
     Threads,
     Pages,
+    /// Jobs below this one (children, grandchildren, ...).
+    Jobs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,7 @@ pub struct Limits {
     pub processes: u64,
     pub threads: u64,
     pub pages: u64,
+    pub jobs: u64,
 }
 
 impl Limits {
@@ -51,6 +54,7 @@ impl Limits {
         processes: UNLIMITED,
         threads: UNLIMITED,
         pages: UNLIMITED,
+        jobs: UNLIMITED,
     };
 
     fn get(&self, r: Resource) -> u64 {
@@ -58,6 +62,7 @@ impl Limits {
             Resource::Processes => self.processes,
             Resource::Threads => self.threads,
             Resource::Pages => self.pages,
+            Resource::Jobs => self.jobs,
         }
     }
 }
@@ -68,6 +73,7 @@ pub struct Usage {
     pub processes: u64,
     pub threads: u64,
     pub pages: u64,
+    pub jobs: u64,
 }
 
 impl Usage {
@@ -76,6 +82,7 @@ impl Usage {
             Resource::Processes => &mut self.processes,
             Resource::Threads => &mut self.threads,
             Resource::Pages => &mut self.pages,
+            Resource::Jobs => &mut self.jobs,
         }
     }
 
@@ -84,6 +91,7 @@ impl Usage {
             Resource::Processes => self.processes,
             Resource::Threads => self.threads,
             Resource::Pages => self.pages,
+            Resource::Jobs => self.jobs,
         }
     }
 }
@@ -161,6 +169,8 @@ impl Jobs {
         if self.live >= MAX_JOBS {
             return Err(JobError::TooManyJobs);
         }
+        // a job below `parent` counts against the parent's limit on jobs, and every ancestor's
+        self.charge(parent, Resource::Jobs, 1)?;
         let rec = Rec {
             parent: Some(parent),
             limits,
@@ -181,6 +191,9 @@ impl Jobs {
 
     /// One more holder of `id`.
     pub fn retain(&mut self, id: JobId) {
+        if id == JobId::ROOT {
+            return; // permanent: its use count is never touched
+        }
         if let Some(r) = self.rec_mut(id) {
             r.uses += 1;
         }
@@ -203,6 +216,9 @@ impl Jobs {
                 self.recs[id.0 as usize] = None;
                 self.free.push(id.0);
                 self.live -= 1;
+                if let Some(parent) = cur {
+                    self.credit(parent, Resource::Jobs, 1);
+                }
             }
         }
     }
@@ -281,6 +297,7 @@ mod tests {
             processes: p,
             threads: t,
             pages: g,
+            jobs: UNLIMITED,
         }
     }
 
@@ -290,8 +307,9 @@ mod tests {
         assert_eq!(j.limits(JobId::ROOT), Some(Limits::UNLIMITED));
         assert_eq!(j.charge(JobId::ROOT, Resource::Pages, 1 << 40), Ok(()));
         j.credit(JobId::ROOT, Resource::Pages, 1 << 40);
+        j.retain(JobId::ROOT);
         j.release(JobId::ROOT);
-        j.release(JobId::ROOT); // (over-release of the kernel's own use is harmless)
+        j.release(JobId::ROOT); // (the kernel's own use is permanent: nothing changes it)
         assert!(j.exists(JobId::ROOT));
         assert_eq!(j.live(), 1);
     }
@@ -347,7 +365,8 @@ mod tests {
         let low = j.create(top, Limits::UNLIMITED).unwrap();
         assert_eq!(j.charge(low, Resource::Pages, 6), Err(JobError::Exceeded));
         assert_eq!(j.usage(low).unwrap(), Usage::default());
-        assert_eq!(j.usage(top).unwrap(), Usage::default());
+        assert_eq!(j.usage(top).unwrap().pages, 0);
+        assert_eq!(j.usage(top).unwrap().processes, 0);
     }
 
     #[test]
@@ -388,6 +407,34 @@ mod tests {
             j.create(JobId(77), Limits::UNLIMITED),
             Err(JobError::NoSuchJob)
         );
+    }
+
+    #[test]
+    fn child_jobs_are_limited_and_counted_for_every_ancestor() {
+        let mut j = Jobs::new();
+        let top = j
+            .create(
+                JobId::ROOT,
+                Limits {
+                    jobs: 3,
+                    ..Limits::UNLIMITED
+                },
+            )
+            .unwrap();
+        let a = j.create(top, Limits::UNLIMITED).unwrap();
+        let b = j.create(a, Limits::UNLIMITED).unwrap(); // a grandchild counts for top too
+        let c = j.create(top, Limits::UNLIMITED).unwrap();
+        assert_eq!(j.usage(top).unwrap().jobs, 3);
+        assert_eq!(j.create(a, Limits::UNLIMITED), Err(JobError::Exceeded));
+        assert_eq!(j.create(top, Limits::UNLIMITED), Err(JobError::Exceeded));
+        assert_eq!(j.live(), 5, "a refused job leaves no record");
+        // a job's record goes when its last use does, and the count falls with it
+        j.release(c);
+        assert_eq!(j.usage(top).unwrap().jobs, 2);
+        j.release(b);
+        j.release(a);
+        assert_eq!(j.usage(top).unwrap().jobs, 0);
+        assert!(j.create(top, Limits::UNLIMITED).is_ok());
     }
 
     #[test]

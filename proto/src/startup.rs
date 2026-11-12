@@ -29,6 +29,8 @@ pub enum Role {
     ServiceInit = 8,
     /// The console server's end of the shell's terminal socket.
     Tty = 9,
+    /// A job handle: for the launcher, the job it makes each program's job under.
+    Job = 10,
 }
 
 impl Role {
@@ -43,6 +45,7 @@ impl Role {
             7 => Role::Serial,
             8 => Role::ServiceInit,
             9 => Role::Tty,
+            10 => Role::Job,
             _ => return None,
         })
     }

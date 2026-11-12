@@ -27,7 +27,7 @@ use rt::sys;
 
 const PROMPT: &[u8] = b"$ ";
 const BANNER: &[u8] = b"riscv-os S4 ready\n";
-const HELP: &[u8] = b"builtins: cd pwd exit help halt\nprograms: ls cat echo probe spin\n";
+const HELP: &[u8] = b"builtins: cd pwd exit help halt\nprograms: ls cat echo probe spin hog bomb\n";
 const KILLED: i64 = -130;
 const PIPE_EXIT: i64 = 141;
 

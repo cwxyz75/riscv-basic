@@ -142,13 +142,17 @@ pub fn run() -> crate::user_tests::Report {
     ));
     tests.push((
         "interactive_nothing_survives_init".into(),
-        if user::process_count() == 0 && user::live_objects() == 0 {
+        if user::process_count() == 0
+            && user::live_objects() == 0
+            && user::job_ledger() == (1, 0, 0)
+        {
             Ok(())
         } else {
             Err(format!(
-                "{} processes and {} objects left",
+                "{} processes, {} objects and (jobs, processes, threads) {:?} left",
                 user::process_count(),
-                user::live_objects()
+                user::live_objects(),
+                user::job_ledger()
             ))
         },
     ));

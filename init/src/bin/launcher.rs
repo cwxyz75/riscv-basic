@@ -14,6 +14,12 @@ use rt::spawn::{self, SpawnError};
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
+/// What a program started by the launcher may use (the job made for it, S4-SPEC section 6): it
+/// is the only process, it may run a few threads, and its memory (image, stack, heap) is capped.
+const PROGRAM_PROCESSES: u64 = 1;
+const PROGRAM_THREADS: u64 = 4;
+const PROGRAM_PAGES: u64 = 4096;
+
 /// Request limits (S4-SPEC section 6): handles = image VMO + at most the startup message's 32;
 /// bytes = the 28-byte header plus at most a 16 KiB startup message.
 const MAX_REQ_BYTES: usize = launch::HEADER + proto::startup::MAX_BYTES;
@@ -34,7 +40,7 @@ fn close_all(hs: &[u32]) {
 }
 
 /// Handle one request; returns false when the client is gone or violated the protocol.
-fn serve_one(ch: u32) -> bool {
+fn serve_one(ch: u32, jobs: Option<u32>) -> bool {
     let mut bytes = alloc::vec![0u8; MAX_REQ_BYTES];
     let mut handles = [0u32; MAX_REQ_HANDLES];
     // Exact buffers: a message that does not fit is a protocol violation, not something to retry
@@ -85,7 +91,25 @@ fn serve_one(ch: u32) -> bool {
         return reply(ch, txid, status::BAD_REQUEST, None);
     };
     sys::handle_close(image_vmo);
-    let result = spawn::spawn(&image, req.startup, forwarded);
+    // Every program gets a job of its own under the launcher's (S4.5): it can make no other
+    // process, only a few threads, and a bounded amount of memory, whatever it does.
+    let result = match jobs {
+        None => spawn::spawn(&image, req.startup, forwarded),
+        Some(parent) => {
+            let j = sys::job_create(parent, PROGRAM_PROCESSES, PROGRAM_THREADS, PROGRAM_PAGES, 0);
+            if j.status != 0 {
+                close_all(forwarded);
+                drop(image);
+                return reply(ch, txid, j.status, None);
+            }
+            let job = j.a1 as u32;
+            let r = spawn::spawn_in(&image, req.startup, forwarded, job);
+            // (the process holds the job now; ours is not needed, and must not be kept: a
+            // handle to its own job's MANAGE would let the launcher outlive nothing useful)
+            sys::handle_close(job);
+            r
+        }
+    };
     drop(image);
     match result {
         Ok(proc) => {
@@ -117,6 +141,7 @@ pub fn app_main() -> i32 {
     let Some(ch) = env.handle(Role::ServiceLaunch) else {
         return 3;
     };
-    while serve_one(ch) {}
+    let jobs = env.handle(Role::Job);
+    while serve_one(ch, jobs) {}
     0
 }
