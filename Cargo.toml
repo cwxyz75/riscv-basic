@@ -16,17 +16,35 @@ default-members = [
 # images up to 4 MiB): no debug info for the packages that make them. (The kernels keep theirs.)
 [profile.dev.package.init]
 debug = 0
+opt-level = 2
 [profile.dev.package.rt]
 debug = 0
+opt-level = 2
 [profile.dev.package.memfs]
 debug = 0
+opt-level = 2
 [profile.dev.package.proto]
 debug = 0
+opt-level = 2
 [profile.dev.package.linked_list_allocator]
 debug = 0
+opt-level = 2
 [profile.dev.package.spinning_top]
 debug = 0
+opt-level = 2
 [profile.dev.package.lock_api]
 debug = 0
+opt-level = 2
 [profile.dev.package.scopeguard]
 debug = 0
+opt-level = 2
+
+# The OS track is optimised even in the dev profile: its boot tests are the slowest checks in
+# the repo, and debug assertions and overflow checks (which do not depend on opt-level) stay on.
+# The home computer's crates keep opt-level 0.
+[profile.dev.package.abi]
+opt-level = 2
+[profile.dev.package.kcore]
+opt-level = 2
+[profile.dev.package.kernel]
+opt-level = 2

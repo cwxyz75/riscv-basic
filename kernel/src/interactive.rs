@@ -25,6 +25,17 @@ static STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::ne
 /// or an exhausted IPC budget delays input, it does not lose it, until this many bytes pile up.
 const PENDING_MAX: usize = 4096;
 
+/// Forward whatever the process wrote that the bridge has not yet printed. Called when the bridge
+/// stops (init is gone), so output written just before exit is not lost.
+fn flush_output(sock: &user::KernelSocket) {
+    while let Ok(bytes) = sock.read(256) {
+        if bytes.is_empty() {
+            break;
+        }
+        console::write_user(&bytes);
+    }
+}
+
 fn bridge_main(_: usize) {
     use core::sync::atomic::Ordering;
     // SAFETY: set by `run` just before this thread is spawned, taken once here.
@@ -44,7 +55,7 @@ fn bridge_main(_: usize) {
                 Ok(n) => {
                     pending.drain(..n);
                 }
-                Err(abi::status::Status::PeerClosed) => return,
+                Err(abi::status::Status::PeerClosed) => return flush_output(&sock),
                 Err(_) => {} // full or out of budget: try again next tick
             }
             if pending.len() >= PENDING_MAX {
@@ -59,11 +70,12 @@ fn bridge_main(_: usize) {
         // process -> UART
         match sock.read(256) {
             Ok(bytes) => console::write_user(&bytes),
-            Err(abi::status::Status::PeerClosed) => return, // init is gone
+            Err(abi::status::Status::PeerClosed) => return flush_output(&sock), // init is gone
             Err(_) => {}
         }
         thread::sleep_ticks(1);
     }
+    flush_output(&sock);
 }
 
 /// Run the interactive system to the end of `init`; returns the kernel-side checks.
