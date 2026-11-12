@@ -104,6 +104,23 @@ mod tests {
     }
 
     #[test]
+    fn decode_never_panics_on_any_mutation() {
+        let base = encode(0x0102_0304, Control::SetForeground);
+        for i in 0..base.len() {
+            for v in 0..=255u8 {
+                let mut m = base.clone();
+                m[i] = v;
+                for nh in [0usize, 1, 16, 17] {
+                    let _ = decode(&m, nh);
+                }
+            }
+        }
+        for n in 0..32 {
+            let _ = decode(&alloc::vec![0xa5u8; n], 1);
+        }
+    }
+
+    #[test]
     fn reply_round_trip() {
         assert_eq!(decode_reply(&encode_reply(5, -3)), Some((5, -3)));
         assert_eq!(decode_reply(&[0; 7]), None);

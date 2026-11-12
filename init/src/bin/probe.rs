@@ -58,6 +58,13 @@ pub fn app_main() -> i32 {
     }
     let r = code(dir.clone_conn(rights::ALL).map(Fs::close));
     lines.push(format!("clone all: {r}\n"));
+    // a program that is not on the trusted list has no root directory at all
+    let root = if p.env.namespace(b"/").is_some() {
+        "present"
+    } else {
+        "absent"
+    };
+    lines.push(format!("root: {root}\n"));
     // there is no launcher among the handles: a made-up handle number is no handle at all
     let msg = [0u8; 8];
     let w = sys::channel_write(1000, msg.as_ptr(), msg.len(), core::ptr::null(), 0);

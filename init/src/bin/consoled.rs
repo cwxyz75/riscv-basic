@@ -78,7 +78,6 @@ impl Console {
 
     /// Push queued output to the serial socket. Returns false when the serial line is gone.
     fn pump_serial(&mut self) -> bool {
-        self.retry = false;
         loop {
             if self.serial_buf.is_empty() {
                 if !self.tty.has_output() {
@@ -104,6 +103,11 @@ impl Console {
                 }
                 Some(Status::NoMemory) => {
                     self.retry = true;
+                    if self.serial_w_bound {
+                        // (a level-triggered binding would fire at once and spin)
+                        self.unbind(K_SERIAL_W);
+                        self.serial_w_bound = false;
+                    }
                     return true;
                 }
                 _ => return false, // PEER_CLOSED or worse
@@ -137,6 +141,10 @@ impl Console {
                 }
                 Some(Status::NoMemory) => {
                     self.retry = true;
+                    if self.tty_w_bound {
+                        self.unbind(K_TTY_W);
+                        self.tty_w_bound = false;
+                    }
                     return true;
                 }
                 _ => return false,
@@ -243,15 +251,13 @@ impl Console {
     fn flush_at_end(&mut self) {
         let deadline = sys::clock_get() + 1000;
         while sys::clock_get() < deadline {
-            self.pump_serial();
+            if !self.pump_serial() {
+                return; // the serial line is gone: nothing more can be flushed
+            }
             if self.serial_buf.is_empty() && !self.tty.has_output() {
                 return;
             }
-            sys::object_wait(
-                self.serial,
-                signals::WRITABLE | signals::PEER_CLOSED,
-                sys::clock_get() + 20,
-            );
+            sys::object_wait(self.serial, signals::WRITABLE, sys::clock_get() + 20);
         }
     }
 }
@@ -324,6 +330,7 @@ pub fn app_main() -> i32 {
             c.clear_jobs();
             return 0;
         }
+        c.retry = false; // (each pump sets it again when its write needs a retry)
         let tty_ok = c.pump_tty();
         let serial_ok = c.pump_serial();
         if !serial_ok || !tty_ok {
