@@ -237,14 +237,15 @@ goes away. Ctrl-C type-ahead is discarded only within the chunk that carried the
 serial read is at most 256 bytes), which is what the editor's own contract allows.
 
 **S4e decisions (implemented).** `probe` prints, in this order, `open /etc/trusted: -108`,
-`open ../x: -108`, `write ./f: -3`, `clone: ok`, `clone all: -3`, `spawn: -1` (BAD_REQUEST for a
+`open ../x: -108`, `write ./f: -3`, `clone: ok`, `clone all: -3`, `root: absent`, `spawn: -1` (BAD_REQUEST for a
 path the wire cannot express, ACCESS_DENIED for rights it does not have, BAD_HANDLE for a handle
 number that is not in its table). `cat` of a directory says `not a file`, `ls` of a file `not a
 directory`, a `..` path `bad path`. A builtin in a pipeline is refused (`sh: <name>: a builtin
 cannot be piped`). The shell's root connection is read-only (the filesystem root is read-only;
 `/tmp` has no shell-side writer yet, T33). A shell exit or crash rebuilds the whole stack (T32),
 `halt` ends the session through a message on the `SERVICE_INIT` channel. The start gate is not
-built (T31). The kernel feature `interactive` boots the supervisor; `repl` boots `init`'s test
+built: a Ctrl-C before the registration is acknowledged is found as a waiting 0x03 on the terminal and
+acted on by `sh` (T31). The kernel feature `interactive` boots the supervisor; `repl` boots `init`'s test
 command mode that the S4a-S4d scripted checks drive. The boot image is limited by `init` reading it
 whole into its 16 MiB heap, so the programs are linked without debug info.
 

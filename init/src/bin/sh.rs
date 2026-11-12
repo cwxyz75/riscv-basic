@@ -101,6 +101,18 @@ impl Shell {
         }
     }
 
+    /// Take whatever the terminal has for us right now, without waiting.
+    fn read_ahead(&mut self) {
+        loop {
+            let mut buf = [0u8; 256];
+            let r = sys::socket_read(self.tty, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(Status::Ok) if r.a1 > 0 => self.inbuf.extend_from_slice(&buf[..r.a1]),
+                _ => return,
+            }
+        }
+    }
+
     /// After a Ctrl-C killed a job the console server also sends the one-byte 0x03 that wakes an
     /// idle shell; this shell has already reported, so swallow it (bounded wait).
     fn swallow_interrupt(&mut self) {
@@ -153,7 +165,10 @@ impl Shell {
                 0,
             );
             if r.status == 0 {
-                return ctl::decode_reply(&rb[..r.a1]) == Some((self.txid, 0));
+                match ctl::decode_reply(&rb[..r.a1]) {
+                    Some((t, st)) if t == self.txid => return st == 0,
+                    _ => continue, // a late reply to an earlier call: skip it
+                }
             }
             if r.status() != Some(Status::ShouldWait) {
                 return false;
@@ -255,6 +270,9 @@ impl Shell {
             Err(_) => {
                 sys::handle_close(vmo);
                 close_all(&forward);
+                if let Some(Ok(r)) = root {
+                    r.close();
+                }
                 return Err(String::from("sh: could not open the working directory\n"));
             }
         }
@@ -376,10 +394,31 @@ impl Shell {
         // register the job (duplicates with only KILL|WAIT|TRANSFER), then wait for every stage
         let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
         let dups: Vec<u32> = procs.iter().filter_map(|&p| dup(p, job_rights)).collect();
-        let registered = dups.len() == procs.len() && self.control(Control::SetForeground, &dups);
+        let registered = if dups.len() == procs.len() {
+            self.control(Control::SetForeground, &dups)
+        } else {
+            close_all(&dups);
+            false
+        };
         if !registered {
-            // (`control` closed the handles it was given when the write failed)
+            // Without a registration Ctrl-C could not reach the job and the wait below would
+            // never end: do not run it.
+            for &p in &procs {
+                sys::process_kill(p, -1);
+            }
+            close_all(&procs);
             self.say(b"sh: could not register the job\n");
+            return;
+        }
+        // A Ctrl-C typed before the registration was acknowledged reached the console server
+        // while it had no job to kill, but its 0x03 byte is already waiting on the terminal:
+        // honour it now (this closes the start-gate race, T31).
+        self.read_ahead();
+        if let Some(i) = self.inbuf.iter().position(|&b| b == 0x03) {
+            self.inbuf.remove(i);
+            for &p in &procs {
+                sys::process_kill(p, KILLED as i32);
+            }
         }
         let port = sys::port_create();
         let mut left = procs.len();
@@ -415,9 +454,7 @@ impl Shell {
                 report.push_str(&format!("[exit {code}]\n"));
             }
         }
-        if registered {
-            self.control(Control::ClearForeground, &[]);
-        }
+        self.control(Control::ClearForeground, &[]);
         close_all(&procs);
         self.say(report.as_bytes());
         if killed {

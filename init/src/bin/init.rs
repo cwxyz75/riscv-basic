@@ -751,10 +751,12 @@ fn stop_stack(s: Stack) {
 fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
     use rt::abi::signals;
     use rt::sys;
-    let mut sessions = 0;
+    // Consecutive sessions that ended because a service died (a shell that exits is normal and
+    // never counted): a crash loop is given up after this many.
+    let mut failures = 0;
     loop {
-        sessions += 1;
-        if sessions > 50 {
+        if failures > 20 {
+            sys::debug_write(b"init: giving up after repeated service failures\n");
             return 40;
         }
         let stack = match start_stack(serial, image_vmo, img, entries) {
@@ -797,12 +799,18 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
                 }
                 sys::debug_write(b"init: a bad halt message\n");
             }
-            0 => stop_stack(stack), // the shell ended (exit, Ctrl-D, crash): a fresh session
+            0 => {
+                // the shell ended (exit, Ctrl-D, crash): a fresh session
+                failures = 0;
+                stop_stack(stack);
+            }
             _ => {
                 sys::debug_write(b"init: a service died, restarting the session\n");
+                failures += 1;
                 stop_stack(stack);
             }
         }
-        io::nap(50);
+        // (a short pause, longer the more often a service has failed in a row)
+        io::nap(50 * (1 + failures));
     }
 }

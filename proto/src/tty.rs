@@ -266,6 +266,21 @@ mod tests {
     }
 
     #[test]
+    fn any_serial_bytes_are_handled() {
+        // every byte value in every position of a short stream, with a small queue
+        let mut t = Tty::new(32);
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let i = t.serial_in(&[a, b, b'x', b'\r']);
+                assert!(i.deliver.len() <= 8);
+                while t.has_output() {
+                    let _ = t.take_out(16);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_queue_never_exceeds_its_cap_whatever_arrives() {
         let mut t = Tty::new(64);
         for _ in 0..1000 {

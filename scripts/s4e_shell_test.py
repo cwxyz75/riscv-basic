@@ -138,7 +138,8 @@ def main():
 
     # confinement: `probe` has only a read-only working directory
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108",
-                      b"write ./f: -3", b"clone: ok", b"clone all: -3", b"spawn: -1"],
+                      b"write ./f: -3", b"clone: ok", b"clone all: -3", b"root: absent",
+                      b"spawn: -1"],
          "probe: nothing outside the working directory")
 
     # Ctrl-C
@@ -149,6 +150,24 @@ def main():
     step(b"echo after\n", [b"$ echo after", b"after"], "one prompt after the kill (no extra prompt)")
     step(b"\x03", [b"$ ^C"], "Ctrl-C at an idle prompt")
     step(b"echo idle\n", [b"$ echo idle", b"idle"], "the shell after an idle Ctrl-C")
+    # a Ctrl-C typed together with the command, before the job is even registered, still ends it
+    # (the job may or may not have printed its first line yet)
+    step(b"spin\n\x03", [b"$ spin"], "a command and Ctrl-C in one write")
+    s.wait_for_prompt = False
+    while True:
+        line = s.next_line("the early Ctrl-C")
+        if line == b"spinning":
+            continue
+        if line != b"^C":
+            fail(s, f"early Ctrl-C: expected ^C, got {line!r}")
+        break
+    line = s.next_line("the early Ctrl-C report")
+    if line == b"spinning":  # (printed between the echo and the report)
+        line = s.next_line("the early Ctrl-C report")
+    if line != b"[exit -130]":
+        fail(s, f"early Ctrl-C: expected [exit -130], got {line!r}")
+    s.wait_for_prompt = True
+    step(b"echo calm\n", [b"$ echo calm", b"calm"], "one prompt after an early Ctrl-C")
     step(b"spin | cat\n", [b"$ spin | cat", b"spinning"], "a running pipeline")
     s.wait_for_prompt = False
     step(b"\x03", [b"^C", b"[exit -130]", b"[exit -130]"], "Ctrl-C kills every stage")
