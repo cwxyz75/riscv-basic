@@ -34,7 +34,7 @@ TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "240"))
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
 REQUIRED = [
-    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
+    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
     "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",

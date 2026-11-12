@@ -114,9 +114,13 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     irq::enable_timer_interrupt();
     enable_software_interrupt();
     percpu::this().online.store(true, Ordering::Release);
-    // Parked (S5a): idle, taking interrupts, touching nothing shared.
+    // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
+    // shared), then this hart joins it for good.
     irq::enable();
     loop {
+        if crate::thread::scheduler_exists() {
+            crate::thread::join_scheduler();
+        }
         // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled.
         unsafe { asm!("wfi") };
     }
@@ -134,7 +138,7 @@ pub fn enable_ipi_on_this_hart() {
 
 /// The software interrupt handler (called from the trap handler on any hart): clear the pending
 /// bit, take the reasons, count.
-pub fn ipi_interrupt() {
+pub fn ipi_interrupt() -> u32 {
     // SAFETY: clears sip.SSIP, the pending bit of the software interrupt; nothing else.
     unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
     let me = percpu::this();
@@ -143,8 +147,11 @@ pub fn ipi_interrupt() {
     if reasons & percpu::IPI_WORK != 0 {
         do_work(me);
     }
+    if reasons & percpu::IPI_RESCHED != 0 {
+        me.resched_ipis.fetch_add(1, Ordering::SeqCst);
+    }
     me.ipis.fetch_add(1, Ordering::SeqCst);
-    // (S5c: IPI_RESCHED makes the hart reschedule; in S5a there is nothing to do.)
+    reasons
 }
 
 /// Send `reason` to hart `index` (an IPI through SBI).

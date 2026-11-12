@@ -176,6 +176,16 @@ pub fn use_kernel_table() {
     }
 }
 
+/// Load the kernel's own `satp` if the hart has something else in it (a user process's root).
+pub fn use_kernel_table_if_needed() {
+    let want = KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
+    if satp() != want {
+        // SAFETY: the kernel table maps everything the kernel runs from and touches; the flush
+        // drops the translations of the table being left.
+        unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) want) };
+    }
+}
+
 /// Flush the whole TLB.
 pub fn flush_tlb() {
     // SAFETY: `sfence.vma` with no operands flushes all translations; no other effect.

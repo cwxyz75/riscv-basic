@@ -276,42 +276,49 @@ pub fn flush_tlb() {
 
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
+    let from_user = frame.sstatus & (1 << 8) == 0;
+    if from_user {
+        crate::user::user_mode_left();
+    }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
     // which the lock's reentrancy covers.
     //
-    // Two traps are exempt in S5b because they touch nothing shared: a software interrupt (an
-    // IPI) and a parked secondary hart's timer interrupt (S5c, when secondaries schedule, takes
-    // the lock for the timer too).
     let cause = frame.scause;
-    let secondary = crate::percpu::this()
-        .index
-        .load(core::sync::atomic::Ordering::Relaxed)
-        != 0;
-    let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && secondary);
+    let ready = crate::thread::scheduler_ready();
+    // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
+    // hart's timer before the scheduler exists touches nothing shared.
+    let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && !ready);
     if light {
         trap_body(frame);
-        return;
+    } else {
+        crate::bkl::lock();
+        trap_body(frame);
+        crate::bkl::unlock();
     }
-    crate::bkl::lock();
-    trap_body(frame);
-    crate::bkl::unlock();
+    // (the trap exit returns to user mode if this frame came from it)
+    if from_user {
+        crate::user::user_mode_entered();
+    }
 }
 
 fn trap_body(frame: &mut TrapFrame) {
     let cause = frame.scause;
     if cause == (1 << 63) | 1 {
         // Supervisor software interrupt: an IPI.
-        crate::smp::ipi_interrupt();
+        let reasons = crate::smp::ipi_interrupt();
+        if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
+            crate::bkl::lock();
+            crate::thread::reschedule_this_hart();
+            if frame.sstatus & (1 << 8) == 0 {
+                crate::user::activate_current();
+            }
+            crate::bkl::unlock();
+        }
         return;
     }
-    if cause == (1 << 63) | 5
-        && crate::percpu::this()
-            .index
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != 0
-    {
-        // A secondary hart's timer (S5a: parked harts only count their ticks and re-arm).
+    if cause == (1 << 63) | 5 && !crate::thread::scheduler_ready() {
+        // A secondary hart's timer before the scheduler exists: count and re-arm.
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);

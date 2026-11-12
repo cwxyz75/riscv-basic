@@ -395,6 +395,7 @@ fn user_thread_main(token: usize) {
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();
+    user_mode_entered();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
     unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
@@ -1188,6 +1189,30 @@ fn reap_vmos() {
 /// End process `pid` with `code`, from any other thread: a process with no thread yet is
 /// torn down at once; a running one is told to die and woken (its thread exits at its next
 /// return to user mode).
+/// How many harts are in (or just entering) user mode now, and the most there have been at once.
+static USER_NOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static USER_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A hart is about to return to user mode.
+pub fn user_mode_entered() {
+    let now = USER_NOW.fetch_add(1, Ordering::SeqCst) + 1;
+    USER_MAX.fetch_max(now, Ordering::SeqCst);
+}
+
+/// A hart took a trap from user mode.
+pub fn user_mode_left() {
+    USER_NOW.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The most harts that were in user mode at the same moment since the last reset.
+pub fn max_harts_in_user_mode() -> usize {
+    USER_MAX.load(Ordering::SeqCst)
+}
+
+pub fn reset_user_mode_high_water() {
+    USER_MAX.store(USER_NOW.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
 /// End process `pid` with `code` from kernel code (the tests).
 pub fn end_process(pid: u32, code: i32) {
     request_kill(pid, code);
