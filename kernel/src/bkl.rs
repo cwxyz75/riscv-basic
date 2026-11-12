@@ -163,11 +163,6 @@ pub fn swap_depth(incoming: u32) -> u32 {
     out
 }
 
-/// The depth of the calling hart right now (tests).
-pub fn depth() -> u32 {
-    percpu::this().bkl_depth.load(Ordering::Relaxed)
-}
-
 /// Is the BKL free (nobody holds it)? For tests, from any hart.
 pub fn is_free() -> bool {
     OWNER.load(Ordering::Relaxed) == 0
