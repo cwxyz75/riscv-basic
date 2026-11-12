@@ -1,0 +1,7 @@
+[package]
+name = "shell-core"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the pure half of the shell (S4-SPEC section 8): line grammar and lexical paths. no_std, no unsafe, host-tested."
+
+[dependencies]

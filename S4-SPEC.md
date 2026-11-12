@@ -236,6 +236,18 @@ serial line for up to a second) when the client closes its terminal socket or th
 goes away. Ctrl-C type-ahead is discarded only within the chunk that carried the Ctrl-C (a
 serial read is at most 256 bytes), which is what the editor's own contract allows.
 
+**S4e decisions (implemented).** `probe` prints, in this order, `open /etc/trusted: -108`,
+`open ../x: -108`, `write ./f: -3`, `clone: ok`, `clone all: -3`, `spawn: -1` (BAD_REQUEST for a
+path the wire cannot express, ACCESS_DENIED for rights it does not have, BAD_HANDLE for a handle
+number that is not in its table). `cat` of a directory says `not a file`, `ls` of a file `not a
+directory`, a `..` path `bad path`. A builtin in a pipeline is refused (`sh: <name>: a builtin
+cannot be piped`). The shell's root connection is read-only (the filesystem root is read-only;
+`/tmp` has no shell-side writer yet, T33). A shell exit or crash rebuilds the whole stack (T32),
+`halt` ends the session through a message on the `SERVICE_INIT` channel. The start gate is not
+built (T31). The kernel feature `interactive` boots the supervisor; `repl` boots `init`'s test
+command mode that the S4a-S4d scripted checks drive. The boot image is limited by `init` reading it
+whole into its 16 MiB heap, so the programs are linked without debug info.
+
 **Ctrl-C (0x03).** consoled (1) calls `process_kill(h, -130)` on every handle of the foreground
 set (no IPC needed, so it works when the IPC budget is exhausted; `BAD_STATE` from an
 already-dead job is fine), (2) discards the line being edited and type-ahead, (3) echoes

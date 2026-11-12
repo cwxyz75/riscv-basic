@@ -3974,12 +3974,17 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     ensure_eq!(
         progs,
         vec![
+            b"cat".to_vec(),
             b"consoled".to_vec(),
             b"crash".to_vec(),
+            b"echo".to_vec(),
             b"hello".to_vec(),
             b"init".to_vec(),
             b"launcher".to_vec(),
+            b"ls".to_vec(),
             b"memfsd".to_vec(),
+            b"probe".to_vec(),
+            b"sh".to_vec(),
             b"spin".to_vec()
         ],
         "the programs"

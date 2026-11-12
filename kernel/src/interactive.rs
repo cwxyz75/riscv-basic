@@ -91,7 +91,11 @@ pub fn run() -> crate::user_tests::Report {
         let image =
             user::ktable_readonly_vmo(user::BOOT_IMAGE).map_err(|e| format!("image: {e:?}"))?;
         let msg = Startup {
-            args: alloc::vec![b"init".to_vec()],
+            args: if cfg!(feature = "repl") {
+                alloc::vec![b"init".to_vec(), b"repl".to_vec()]
+            } else {
+                alloc::vec![b"init".to_vec()]
+            },
             env: Vec::new(),
             namespace: Vec::new(),
             roles: alloc::vec![(Role::BootImage, 0), (Role::Serial, 1)],

@@ -129,6 +129,7 @@ dependencies = [
  "memfs",
  "proto",
  "rt",
+ "shell-core",
 ]
 
 [[package]]
@@ -400,6 +401,10 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shell-core"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"

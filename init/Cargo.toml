@@ -8,3 +8,4 @@ description = "OS track: the first user program (the boot-time user test suite) 
 proto = { path = "../proto" }
 memfs = { path = "../memfs" }
 rt = { path = "../rt", features = ["heap"] }
+shell-core = { path = "../shell-core" }
