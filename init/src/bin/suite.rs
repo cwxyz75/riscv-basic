@@ -3644,7 +3644,21 @@ use proto::bootimg;
 use proto::launch;
 
 /// A read-only VMO of the boot image, from the kernel-side helper.
+/// The boot image VMO, fetched once: the kernel makes a fresh copy of the whole image (about a
+/// thousand pages) for every request, so asking in every test left a dozen copies behind and
+/// the suite ran the machine out of memory on a runner whose image was a little larger.
 fn boot_image_vmo() -> Result<u32, Detail> {
+    static CACHED: AtomicU32 = AtomicU32::new(0);
+    let have = CACHED.load(Ordering::Relaxed);
+    if have != 0 {
+        return Ok(have);
+    }
+    let h = fetch_boot_image_vmo()?;
+    CACHED.store(h, Ordering::Relaxed);
+    Ok(h)
+}
+
+fn fetch_boot_image_vmo() -> Result<u32, Detail> {
     let (m, n) = request(23, b'B', b"");
     let mut reply = [0u8; 16];
     let mut got = [0u32; 2];
