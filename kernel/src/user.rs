@@ -843,12 +843,22 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(port.0)), None))
         }
-        nr::PORT_BIND => ipc::port_bind(objs, &p.handles, h(0), h(1), a[2], a[3])
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::PORT_UNBIND => ipc::port_unbind(objs, &p.handles, h(0), a[1])
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
+        nr::PORT_BIND => ipc::port_bind_in(
+            objs,
+            &p.handles,
+            h(0),
+            h(1),
+            a[2],
+            a[3],
+            &mut kmem::get().vmos.jobs,
+        )
+        .map(|_| (None, None))
+        .map_err(|e| (e, None, None)),
+        nr::PORT_UNBIND => {
+            ipc::port_unbind_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
+                .map(|_| (None, None))
+                .map_err(|e| (e, None, None))
+        }
         nr::EVENT_CREATE => {
             let e = ipc::event_create_in(objs, &mut p.handles, &mut quota(p.job))
                 .map_err(|e| (e, None, None))?;
@@ -1252,7 +1262,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
     }
     let (h, deadline) = (Handle(a[0] as u32), a[1]);
     let poll = || {
-        with_proc(|objs, p, _| ipc::port_poll(objs, &p.handles, h))
+        with_proc(|objs, p, k| ipc::port_poll_in(objs, &p.handles, h, &mut k.vmos.jobs))
             .map_err(|e| (e, None, None))?
             .map_err(|e| (e, None, None))
     };
@@ -2212,6 +2222,19 @@ fn job_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        // credits of objects destroyed since the last charge come first: a job that has just
+        // closed its children must be able to make another at once
+        ipc::settle(&mut s.objs, &mut kmem::get().vmos.jobs);
+        {
+            let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+            ipc::job_of(
+                &s.objs,
+                &caller.handles,
+                Handle(a[0] as u32),
+                Rights::MANAGE,
+            )
+            .map_err(|e| (e, None, None))?;
+        }
         let limits = read_limits(s, me, a[1])?;
         let UserState { objs, procs, .. } = s;
         let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
@@ -2243,7 +2266,6 @@ fn job_set_limits(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let limits = read_limits(s, me, a[1])?;
         let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         let job = ipc::job_of(
             &s.objs,
@@ -2252,6 +2274,7 @@ fn job_set_limits(a: [u64; 6]) -> Reply {
             Rights::SET_LIMITS,
         )
         .map_err(|e| (e, None, None))?;
+        let limits = read_limits(s, me, a[1])?;
         kmem::get()
             .vmos
             .jobs

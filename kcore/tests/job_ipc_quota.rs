@@ -274,3 +274,102 @@ fn random_operations_keep_the_ledger_equal_to_the_registrys_own_counts() {
         assert!(w.used(j, Resource::Objects) <= 60 && w.used(j, Resource::IpcBytes) <= 3000);
     }
 }
+
+impl W {
+    fn port(&mut self, job: JobId) -> Result<Handle, Status> {
+        let mut q = Quota {
+            jobs: &mut self.jobs,
+            job: Some(job),
+        };
+        ipc::port_create_in(&mut self.reg, &mut self.table, &mut q)
+    }
+    fn event(&mut self, job: JobId) -> Result<Handle, Status> {
+        let mut q = Quota {
+            jobs: &mut self.jobs,
+            job: Some(job),
+        };
+        ipc::event_create_in(&mut self.reg, &mut self.table, &mut q)
+    }
+}
+
+#[test]
+fn port_bindings_are_charged_to_the_ports_job() {
+    // (found by the S4.5c review: 255 ports x 256 bindings could fill the whole global budget
+    // while the job's own usage read zero)
+    let mut w = world();
+    let j = w.jobs.create(JobId::ROOT, limits(UNLIMITED, 320)).unwrap();
+    let port = w.port(j).unwrap();
+    let ev = w.event(j).unwrap();
+    let mut bound = 0u64;
+    while ipc::port_bind_in(&mut w.reg, &w.table, port, ev, 1 << 3, bound, &mut w.jobs).is_ok() {
+        bound += 1;
+        assert!(bound < 100, "the budget never applied");
+    }
+    assert_eq!(bound, 10, "320 bytes at 32 a binding");
+    assert_eq!(w.used(j, Resource::IpcBytes), 320);
+    ipc::port_unbind_in(&mut w.reg, &w.table, port, 3, &mut w.jobs).unwrap();
+    assert_eq!(w.used(j, Resource::IpcBytes), 288);
+    assert!(
+        ipc::port_bind_in(&mut w.reg, &w.table, port, ev, 1 << 3, 99, &mut w.jobs).is_ok(),
+        "room after an unbind"
+    );
+    // destroying the bound-to object prunes its bindings (and their charge) at the next look
+    w.table.close(&mut w.reg, ev).unwrap();
+    let _ = ipc::port_poll_in(&mut w.reg, &w.table, port, &mut w.jobs).unwrap();
+    assert_eq!(w.used(j, Resource::IpcBytes), 0);
+    // and a port that goes with bindings still on it gives them back
+    let ev2 = w.event(j).unwrap();
+    ipc::port_bind_in(&mut w.reg, &w.table, port, ev2, 1 << 3, 1, &mut w.jobs).unwrap();
+    w.table.close(&mut w.reg, port).unwrap();
+    w.settle();
+    assert_eq!(w.used(j, Resource::IpcBytes), 0);
+}
+
+#[test]
+fn a_charge_sees_the_credits_of_objects_closed_just_before_without_an_explicit_settle() {
+    let mut w = world();
+    let j = w.jobs.create(JobId::ROOT, limits(UNLIMITED, 300)).unwrap();
+    let (tx, rx) = w.channel(j).unwrap();
+    let (tx2, _rx2) = w.channel(j).unwrap(); // made before the job fills up
+    while w.send(tx, 50).is_ok() {}
+    assert!(w.send(tx2, 50).is_err(), "the job is full");
+    // closing the first pair frees all of its queue; a write on the other pair, with nothing
+    // created in between, must already see that room
+    w.table.close(&mut w.reg, tx).unwrap();
+    w.table.close(&mut w.reg, rx).unwrap();
+    assert!(w.send(tx2, 50).is_ok(), "the write settled the old credits");
+}
+
+#[test]
+fn swept_cycles_and_handles_in_flight_are_credited() {
+    let mut w = world();
+    let j = w
+        .jobs
+        .create(JobId::ROOT, limits(UNLIMITED, UNLIMITED))
+        .unwrap();
+    let (a, b) = w.channel(j).unwrap();
+    let (c, d) = w.channel(j).unwrap();
+    // a message that carries a handle costs its entry too, and the meter agrees with the ledger
+    ipc::channel_write_in(&mut w.reg, &mut w.table, a, &[1, 2, 3], &[c], &mut w.jobs).unwrap();
+    assert_eq!(w.used(j, Resource::IpcBytes), w.reg.meter() as u64);
+    assert!(
+        w.reg.meter() > 3 + 32,
+        "the handle entry is part of the cost"
+    );
+    // a cycle: each pair's far end travels in the other's queue; then every handle is dropped
+    ipc::channel_write_in(&mut w.reg, &mut w.table, d, &[], &[b], &mut w.jobs).unwrap();
+    w.table.close(&mut w.reg, a).unwrap();
+    w.table.close(&mut w.reg, d).unwrap();
+    let roots: Vec<_> = w.table.objects().collect();
+    assert!(roots.is_empty());
+    let swept = w.reg.sweep(&roots);
+    assert!(swept >= 2, "the unreachable objects were destroyed");
+    w.settle();
+    assert_eq!(w.used(j, Resource::Objects), w.reg.live() as u64);
+    assert_eq!(w.used(j, Resource::IpcBytes), w.reg.meter() as u64);
+    assert_eq!(w.reg.live(), 0);
+    assert_eq!(w.used(j, Resource::IpcBytes), 0);
+    // the job record lives while credits are pending and goes with the last one
+    w.jobs.release(j);
+    assert!(!w.jobs.exists(j));
+}

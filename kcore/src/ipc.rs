@@ -139,6 +139,7 @@ impl Object for KObj {
         match self {
             KObj::Channel(c) => c.queue.iter().map(Message::cost).sum(),
             KObj::Socket(s) => s.buf.len(),
+            KObj::Port(p) => p.bindings.len() * BINDING_COST,
             _ => 0,
         }
     }
@@ -834,7 +835,7 @@ pub fn port_create_in(
 
 /// Drop the bindings whose object has been destroyed (the spec says they disappear at once,
 /// so every operation that looks at the binding set prunes first).
-fn prune_port(reg: &mut Kobjs, port_obj: ObjId) {
+fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
     let dead: Vec<u64> = match reg.get(port_obj) {
         Some(KObj::Port(p)) => p
             .bindings
@@ -857,16 +858,19 @@ fn prune_port(reg: &mut Kobjs, port_obj: ObjId) {
         }
     }
     reg.meter_sub(removed * BINDING_COST);
+    credit_bytes(reg, jobs, port_obj, removed * BINDING_COST);
 }
 
-pub fn port_bind(
+pub fn port_bind_in(
     reg: &mut Kobjs,
     table: &HandleTable,
     port: Handle,
     object: Handle,
     mask: u64,
     key: u64,
+    jobs: &mut Jobs,
 ) -> Result<(), Status> {
+    settle(reg, jobs);
     let pe = table.get(port)?;
     let oe = table.get(object)?;
     let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
@@ -886,7 +890,7 @@ pub fn port_bind(
         return Err(Status::InvalidArgs);
     }
     let mask = mask as u32;
-    prune_port(reg, port_obj);
+    prune_port(reg, jobs, port_obj);
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
         return Err(Status::BadHandle);
     };
@@ -897,6 +901,11 @@ pub fn port_bind(
         return Err(Status::NoMemory);
     }
     p.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
+    // a binding costs queued-data budget of the port's job, like a queued message would
+    charge_bytes(reg, jobs, port_obj, BINDING_COST)?;
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
     p.bindings.push(Binding {
         obj: oe.obj,
         mask,
@@ -906,14 +915,15 @@ pub fn port_bind(
     Ok(())
 }
 
-pub fn port_unbind(
+pub fn port_unbind_in(
     reg: &mut Kobjs,
     table: &HandleTable,
     port: Handle,
     key: u64,
+    jobs: &mut Jobs,
 ) -> Result<(), Status> {
     let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
-    prune_port(reg, port_obj);
+    prune_port(reg, jobs, port_obj);
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
         return Err(Status::BadHandle);
     };
@@ -927,18 +937,20 @@ pub fn port_unbind(
         p.next -= 1;
     }
     reg.meter_sub(BINDING_COST);
+    credit_bytes(reg, jobs, port_obj, BINDING_COST);
     Ok(())
 }
 
 /// One ready binding as `(key, observed)`, rotating, after pruning bindings whose object is
 /// gone; `None` if nothing is ready. Needs WAIT on the port.
-pub fn port_poll(
+pub fn port_poll_in(
     reg: &mut Kobjs,
     table: &HandleTable,
     port: Handle,
+    jobs: &mut Jobs,
 ) -> Result<Option<(u64, u32)>, Status> {
     let port_obj = port_of(reg, table, port, Rights::WAIT)?;
-    prune_port(reg, port_obj);
+    prune_port(reg, jobs, port_obj);
     let picked = match reg.get(port_obj) {
         Some(KObj::Port(p)) => {
             let n = p.bindings.len();
@@ -1150,7 +1162,8 @@ pub fn thread_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
     }
 }
 
-// --- convenience calls that charge nobody (the pure tests, and anything that has no job) ---
+// --- convenience calls for registries with no charged objects (the pure tests). They settle into a
+// scratch ledger, so they must not be used on a registry that holds charged objects. ---
 
 pub fn channel_create(
     reg: &mut Kobjs,
@@ -1293,4 +1306,29 @@ pub fn socket_read(
     max: usize,
 ) -> Result<Vec<u8>, Status> {
     socket_read_in(reg, table, h, max, &mut Jobs::new())
+}
+pub fn port_bind(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    object: Handle,
+    mask: u64,
+    key: u64,
+) -> Result<(), Status> {
+    port_bind_in(reg, table, port, object, mask, key, &mut Jobs::new())
+}
+pub fn port_unbind(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    key: u64,
+) -> Result<(), Status> {
+    port_unbind_in(reg, table, port, key, &mut Jobs::new())
+}
+pub fn port_poll(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+) -> Result<Option<(u64, u32)>, Status> {
+    port_poll_in(reg, table, port, &mut Jobs::new())
 }

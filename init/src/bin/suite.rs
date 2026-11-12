@@ -5902,6 +5902,30 @@ fn job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back() -> Outco
     Ok(())
 }
 
+fn job_create_sees_the_credit_of_a_job_closed_just_before() -> Outcome {
+    // (found by the S4.5c review: a dead child kept counting against its parent's limit on jobs
+    // until some unrelated charging call settled the credits)
+    let root = root_job()?;
+    let top = ok(
+        sys::job_create(root, &[u64::MAX, u64::MAX, u64::MAX, 1, u64::MAX, u64::MAX]),
+        "top",
+    )?
+    .a1 as u32;
+    for round in 0..5 {
+        let c = job(top, u64::MAX, u64::MAX, u64::MAX).map_err(|mut d| {
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" in round {round}"));
+            d
+        })?;
+        let v = ok(sys::vmo_create_in(1, c), "a VMO in the child")?.a1 as u32;
+        sys::handle_close(v);
+        sys::handle_close(c);
+    }
+    job_use_settles(top, 3, 0, 500)?;
+    sys::handle_close(top);
+    sys::handle_close(root);
+    Ok(())
+}
+
 #[no_mangle]
 pub fn app_main() -> i32 {
     let mut failed = 0;
@@ -6280,6 +6304,10 @@ pub fn app_main() -> i32 {
         (
             "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back",
             job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back,
+        ),
+        (
+            "job_create_sees_the_credit_of_a_job_closed_just_before",
+            job_create_sees_the_credit_of_a_job_closed_just_before,
         ),
         (
             "threads_left_behind_when_init_exits",
