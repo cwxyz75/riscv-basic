@@ -224,6 +224,18 @@ socket with `\n` expanded to `\r\n`; each completed line is delivered with its `
 `exit`. (Sockets have no half-close, so there is no end of stream on the terminal for
 programs: `cat` with no arguments on the terminal ends only by Ctrl-C. Documented, tested.)
 
+**S4d decisions (implemented).** The terminal socket reaches `consoled` as role `TTY` (9) next to
+`SERIAL` and `SERVICE_CONSOLE`. A control message is answered with `txid:u32, status:i32`
+(0 = done), so the shell can wait for the registration before it releases its children. The
+"one-byte `0x03` line" after Ctrl-C is exactly one byte, 0x03, with no newline (like the
+Ctrl-D byte). Output the serial line cannot take is queued up to 16 KiB; beyond that the oldest
+bytes are dropped and, once the queue drains, `\r\n[console: N bytes dropped]\r\n` is printed
+(N = the bytes dropped since the last notice). Lines waiting for a client that is not reading are
+held up to 4 KiB, then dropped and counted. The session ends (consoled exits 0 after flushing the
+serial line for up to a second) when the client closes its terminal socket or the serial line
+goes away. Ctrl-C type-ahead is discarded only within the chunk that carried the Ctrl-C (a
+serial read is at most 256 bytes), which is what the editor's own contract allows.
+
 **Ctrl-C (0x03).** consoled (1) calls `process_kill(h, -130)` on every handle of the foreground
 set (no IPC needed, so it works when the IPC budget is exhausted; `BAD_STATE` from an
 already-dead job is fine), (2) discards the line being edited and type-ahead, (3) echoes

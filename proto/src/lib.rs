@@ -12,6 +12,7 @@ pub mod console;
 pub mod file;
 pub mod launch;
 pub mod startup;
+pub mod tty;
 
 pub(crate) fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(

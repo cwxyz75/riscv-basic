@@ -285,6 +285,9 @@ dependencies = [
 [[package]]
 name = "proto"
 version = "0.1.0"
+dependencies = [
+ "console",
+]
 
 [[package]]
 name = "quote"

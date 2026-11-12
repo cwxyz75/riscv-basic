@@ -54,3 +54,59 @@ pub fn decode(b: &[u8], nhandles: usize) -> Result<(u32, Control), ControlError>
         _ => Err(ControlError::BadOp),
     }
 }
+
+/// The server's reply to a control message: `txid:u32, status:i32` (0 = done).
+pub fn encode_reply(txid: u32, status: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&txid.to_le_bytes());
+    out.extend_from_slice(&status.to_le_bytes());
+    out
+}
+
+pub fn decode_reply(b: &[u8]) -> Option<(u32, i32)> {
+    if b.len() != 8 {
+        return None;
+    }
+    Some((rd_u32(b, 0)?, rd_u32(b, 4)? as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_round_trip_and_handle_counts() {
+        let m = encode(7, Control::SetForeground);
+        assert_eq!(decode(&m, 1), Ok((7, Control::SetForeground)));
+        assert_eq!(decode(&m, MAX_JOBS), Ok((7, Control::SetForeground)));
+        assert_eq!(decode(&m, 0), Err(ControlError::BadHandles));
+        assert_eq!(decode(&m, MAX_JOBS + 1), Err(ControlError::BadHandles));
+        let c = encode(9, Control::ClearForeground);
+        assert_eq!(decode(&c, 0), Ok((9, Control::ClearForeground)));
+        assert_eq!(decode(&c, 1), Err(ControlError::BadHandles));
+    }
+
+    #[test]
+    fn malformed_control_messages_are_errors() {
+        let m = encode(1, Control::SetForeground);
+        for n in 0..m.len() {
+            assert_eq!(decode(&m[..n], 1), Err(ControlError::TooShort));
+        }
+        let mut long = m.clone();
+        long.push(0);
+        assert_eq!(decode(&long, 1), Err(ControlError::TooShort));
+        let mut bad_op = m.clone();
+        bad_op[4] = 99;
+        assert_eq!(decode(&bad_op, 1), Err(ControlError::BadOp));
+        let mut reserved = m;
+        reserved[6] = 1;
+        assert_eq!(decode(&reserved, 1), Err(ControlError::BadOp));
+    }
+
+    #[test]
+    fn reply_round_trip() {
+        assert_eq!(decode_reply(&encode_reply(5, -3)), Some((5, -3)));
+        assert_eq!(decode_reply(&[0; 7]), None);
+        assert_eq!(decode_reply(&[0; 9]), None);
+    }
+}
