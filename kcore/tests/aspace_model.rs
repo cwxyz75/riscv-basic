@@ -463,6 +463,7 @@ fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
                 threads: UNLIMITED,
                 pages: 3,
                 jobs: UNLIMITED,
+                ..Limits::UNLIMITED
             },
         )
         .unwrap();

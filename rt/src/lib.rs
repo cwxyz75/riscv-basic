@@ -207,34 +207,24 @@ pub mod sys {
     pub fn process_create_in(job: u32) -> Ret {
         syscall(PROCESS_CREATE, [job as usize, 0, 0, 0, 0, 0])
     }
-    /// `u64::MAX` means no limit.
-    pub fn job_create(parent: u32, processes: u64, threads: u64, pages: u64, jobs: u64) -> Ret {
+    /// The limits of a job: processes, threads, pages, jobs, objects, ipc bytes (`u64::MAX` means
+    /// no limit), in that order.
+    pub type Limits = [u64; 6];
+    /// No limit on anything.
+    pub const NO_LIMITS: Limits = [u64::MAX; 6];
+    pub fn job_create(parent: u32, limits: &Limits) -> Ret {
         syscall(
             JOB_CREATE,
-            [
-                parent as usize,
-                processes as usize,
-                threads as usize,
-                pages as usize,
-                jobs as usize,
-                0,
-            ],
+            [parent as usize, limits.as_ptr() as usize, 0, 0, 0, 0],
         )
     }
-    pub fn job_set_limits(job: u32, processes: u64, threads: u64, pages: u64, jobs: u64) -> Ret {
+    pub fn job_set_limits(job: u32, limits: &Limits) -> Ret {
         syscall(
             JOB_SET_LIMITS,
-            [
-                job as usize,
-                processes as usize,
-                threads as usize,
-                pages as usize,
-                jobs as usize,
-                0,
-            ],
+            [job as usize, limits.as_ptr() as usize, 0, 0, 0, 0],
         )
     }
-    /// `which`: 0 processes, 1 threads, 2 pages, 3 jobs. Returns `a1` = used, `a2` = limit.
+    /// `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes. Returns `a1` = used, `a2` = limit.
     pub fn job_info(job: u32, which: u64) -> Ret {
         syscall(JOB_INFO, [job as usize, which as usize, 0, 0, 0, 0])
     }

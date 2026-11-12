@@ -19,6 +19,10 @@ use rt::sys;
 const PROGRAM_PROCESSES: u64 = 1;
 const PROGRAM_THREADS: u64 = 4;
 const PROGRAM_PAGES: u64 = 4096;
+/// Kernel objects the program may hold alive (handles are bounded separately), and bytes it may
+/// leave queued in the channels and sockets it creates.
+const PROGRAM_OBJECTS: u64 = 256;
+const PROGRAM_IPC_BYTES: u64 = 192 * 1024;
 
 /// Request limits (S4-SPEC section 6): handles = image VMO + at most the startup message's 32;
 /// bytes = the 28-byte header plus at most a 16 KiB startup message.
@@ -96,7 +100,17 @@ fn serve_one(ch: u32, jobs: Option<u32>) -> bool {
     let result = match jobs {
         None => spawn::spawn(&image, req.startup, forwarded),
         Some(parent) => {
-            let j = sys::job_create(parent, PROGRAM_PROCESSES, PROGRAM_THREADS, PROGRAM_PAGES, 0);
+            let j = sys::job_create(
+                parent,
+                &[
+                    PROGRAM_PROCESSES,
+                    PROGRAM_THREADS,
+                    PROGRAM_PAGES,
+                    0,
+                    PROGRAM_OBJECTS,
+                    PROGRAM_IPC_BYTES,
+                ],
+            );
             if j.status != 0 {
                 close_all(forwarded);
                 drop(image);

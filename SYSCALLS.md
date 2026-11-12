@@ -168,9 +168,9 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
-| 90 | job_create | `a0` parent job, `a1` processes, `a2` threads, `a3` pages, `a4` jobs | `a1` handle |
-| 91 | job_set_limits | `a0` job, `a1` processes, `a2` threads, `a3` pages, `a4` jobs | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs) | `a1` used, `a2` limit |
+| 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
+| 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes) | `a1` used, `a2` limit |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 
@@ -380,9 +380,12 @@ Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 ## Jobs and limits (S4.5, OD56-OD58)
 
 A **job** is an account that processes, threads and memory are charged to; jobs form a tree with
-the kernel's **root job** (no limits) on top. A job has limits on four resources: live
+the kernel's **root job** (no limits) on top. A job has limits on six resources: live
 **processes**, live **threads**, **pages** of memory (committed VMO pages and page-table frames),
-and **jobs** (how many jobs may exist below it, at any depth) (`u64::MAX` means no limit). A charge is applied to the job and **every ancestor**, so a job can never use more than
+**jobs** (how many may exist below it, at any depth), **objects** (kernel objects alive that its
+processes created) and **ipc bytes** (data queued in the channels and sockets its processes
+created) (`u64::MAX` means no limit). The limits travel as six little-endian `u64`s in user
+memory, in this order: processes, threads, pages, jobs, objects, ipc bytes. A charge is applied to the job and **every ancestor**, so a job can never use more than
 any ancestor allows, whatever its own limits say. Every process belongs to the job it was created
 in; the kernel's first process (`init`) is in the root job.
 
@@ -397,13 +400,18 @@ committed (a write, a read through a mapping, a fault) until the VMO is freed; *
 a worst-case estimate: one page for a process's root table and, per mapped region, one page per
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
 when it is unmapped or the process ends (the kernel's own objects are bounded by the global caps,
-not charged). A job
+not charged). **Objects** are charged to the job of the process that creates them (a channel or
+socket pair counts two) and credited when they are destroyed. **Queued data** is charged to the job
+that created the *endpoint holding the queue* (so the creator of a conversation pays for both
+buffers, whoever writes into them), credited when read or when the endpoint is destroyed; a
+socket write takes only as many bytes as the job has room for. A port's bindings are bounded by
+the object quota and the global budget, not charged to a job. A job
 record lives while any process, VMO, job object or child job holds it.
 
 ### job_create(parent, processes, threads, pages) -> status, handle
 
-A child of `parent` (MANAGE) with these limits. Errors, in order: BAD_HANDLE; WRONG_TYPE;
-ACCESS_DENIED; NO_MEMORY (object cap, 256 jobs exist, or the parent or an ancestor is at its
+A child of `parent` (MANAGE) with the limits at `a1`. Errors, in order: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; INVALID_ARGS (the limits cannot be read: a bad pointer); NO_MEMORY (object cap, 256 jobs exist, or the parent or an ancestor is at its
 limit on jobs). The handle carries every job right.
 
 ### job_set_limits(job, processes, threads, pages) -> status
@@ -414,7 +422,7 @@ until usage is back under it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs; `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes; `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 ### job_kill(job, code) -> status

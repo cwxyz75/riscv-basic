@@ -156,7 +156,9 @@ pub fn run_all() -> Report {
         "no_process_or_vmo_survives_init",
         if user::process_count() == 0
             && kmem::get().vmos.count() == vmos_before
-            && user::job_ledger() == (1, 0, 0)
+            && user::job_ledger().0 == 1
+            && user::job_ledger().1 == 0
+            && user::job_ledger().2 == 0
         {
             Ok(())
         } else {

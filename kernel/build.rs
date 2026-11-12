@@ -24,7 +24,7 @@ fn main() {
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for name in [
         "suite", "init", "crash", "hello", "launcher", "memfsd", "consoled", "spin", "echo", "cat",
-        "ls", "probe", "sh", "hog", "bomb",
+        "ls", "probe", "sh", "hog", "bomb", "ipchog",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

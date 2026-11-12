@@ -9,6 +9,7 @@ with nothing typed yet is unterminated and joins the next thing printed (`$ ^C`)
 Usage: s4e_shell_test.py INTERACTIVE_KERNEL_ELF [--break-expectation]
 """
 import os
+import re
 import sys
 import time
 
@@ -68,7 +69,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"bomb", b"cat", b"consoled", b"crash", b"echo", b"hello", b"hog", b"init", b"launcher",
+BIN = [b"bomb", b"cat", b"consoled", b"crash", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher",
        b"ls", b"memfsd", b"probe", b"sh", b"spin"]
 
 
@@ -79,7 +80,7 @@ def main():
 
     # builtins
     step(b"help\n", [b"$ help", b"builtins: cd pwd exit help halt",
-                     b"programs: ls cat echo probe spin hog bomb"], "help")
+                     b"programs: ls cat echo probe spin hog bomb ipchog"], "help")
     step(b"pwd\n", [b"$ pwd", b"/home"], "pwd at start")
     step(b"\n", [b"$ "], "an empty line")
     step(b"# only a comment\n", [b"$ # only a comment"], "a comment")
@@ -167,6 +168,23 @@ def main():
     if counts[0] != counts[1]:
         fail(s, f"the second hog got {counts[1]} MiB, the first {counts[0]}: memory was not given back")
     step(b"echo survived\n", [b"$ echo survived", b"survived"], "the shell after the hog")
+
+    # quotas on kernel objects and queued data (S4.5c): the hog is stopped by its own job, twice
+    # with identical results, and the pipes of the shell keep working around it
+    results = []
+    for attempt in (1, 2):
+        step(b"ipchog\n", [b"$ ipchog", b"ipchog: queued 192 KiB"], f"an ipc and object hog, run {attempt}")
+        line = s.next_line("the hog's event count")
+        m = re.fullmatch(rb"ipchog: made (\d+) events", line)
+        if not m:
+            fail(s, f"ipchog: expected the event count, got {line!r}")
+        results.append(int(m.group(1)))
+        step(b"echo through | cat | cat\n", [b"$ echo through | cat | cat", b"through"],
+             "pipes work right after the hog")
+    if not 180 <= results[0] <= 250:
+        fail(s, f"the hog made {results[0]} events of a 256-object job")
+    if results[0] != results[1]:
+        fail(s, f"second run {results[1]} events, first {results[0]}: objects were not given back")
 
     # Ctrl-C
     step(b"spin\n", [b"$ spin", b"spinning"], "a running job")

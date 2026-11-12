@@ -3,7 +3,7 @@
 //! [`Registry`] and a [`HandleTable`]; the syscall layer only copies bytes in and out.
 
 use crate::handle::{Entry, HandleTable};
-use crate::job::JobId;
+use crate::job::{JobId, Jobs, Resource};
 use crate::object::{ObjId, Object, Registry};
 use abi::limits::{
     MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_PORT_BINDINGS,
@@ -135,6 +135,14 @@ impl Object for KObj {
         }
     }
 
+    fn charged_bytes(&self) -> usize {
+        match self {
+            KObj::Channel(c) => c.queue.iter().map(Message::cost).sum(),
+            KObj::Socket(s) => s.buf.len(),
+            _ => 0,
+        }
+    }
+
     fn peer_destroyed(&mut self) {
         match self {
             KObj::Channel(c) => {
@@ -151,6 +159,68 @@ impl Object for KObj {
 }
 
 pub type Kobjs = Registry<KObj>;
+
+/// Who is charged for a new object: the job of the creating process, and the ledger.
+pub struct Quota<'a> {
+    pub jobs: &'a mut Jobs,
+    /// `None`: the objects are not charged to anyone (the pure tests' convenience calls).
+    pub job: Option<JobId>,
+}
+
+impl Quota<'_> {
+    /// Charge `n` new objects to the job (after applying what destroyed objects gave back).
+    fn objects(&mut self, reg: &mut Kobjs, n: u64) -> Result<(), Status> {
+        settle(reg, self.jobs);
+        match self.job {
+            Some(job) => {
+                self.jobs
+                    .charge(job, Resource::Objects, n)
+                    .map_err(|_| Status::NoMemory)?;
+                // each charged object holds a use of its job until its credit is applied
+                // (`settle`), so the record cannot be freed while it still has usage
+                for _ in 0..n {
+                    self.jobs.retain(job);
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// Apply the credits owed for objects destroyed since the last call: one object and the queued
+/// bytes each held. Every function that charges a job calls this first, so a job that has just
+/// closed things can use the room at once.
+pub fn settle(reg: &mut Kobjs, jobs: &mut Jobs) {
+    for (job, bytes) in reg.take_credits() {
+        jobs.credit(job, Resource::Objects, 1);
+        jobs.credit(job, Resource::IpcBytes, bytes as u64);
+        jobs.release(job); // the use the object held (see `Quota::objects`)
+    }
+}
+
+/// Charge `n` queued bytes to the job of `obj` (nothing for an object that is not charged).
+fn charge_bytes(reg: &Kobjs, jobs: &mut Jobs, obj: ObjId, n: usize) -> Result<(), Status> {
+    match reg.job_of(obj) {
+        Some(job) => jobs
+            .charge(job, Resource::IpcBytes, n as u64)
+            .map_err(|_| Status::NoMemory),
+        None => Ok(()),
+    }
+}
+
+/// Charge without a refusal (the room was checked just before).
+fn charge_bytes_unchecked(reg: &Kobjs, jobs: &mut Jobs, obj: ObjId, n: usize) {
+    if let Some(job) = reg.job_of(obj) {
+        let _ = jobs.charge(job, Resource::IpcBytes, n as u64);
+    }
+}
+
+fn credit_bytes(reg: &Kobjs, jobs: &mut Jobs, obj: ObjId, n: usize) {
+    if let Some(job) = reg.job_of(obj) {
+        jobs.credit(job, Resource::IpcBytes, n as u64);
+    }
+}
 
 /// What `channel_read` returns.
 #[derive(Debug, PartialEq, Eq)]
@@ -187,21 +257,23 @@ fn channel_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 }
 
 /// A connected pair of channel endpoints, both with the default channel rights.
-pub fn channel_create(
+pub fn channel_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
+    q: &mut Quota,
 ) -> Result<(Handle, Handle), Status> {
     if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
+    q.objects(reg, 2)?;
     let end = || Channel {
         peer: None,
         queue: VecDeque::new(),
         peer_closed: false,
     };
     let (a_end, b_end) = (end(), end());
-    let a = reg.create(KObj::Channel(a_end));
-    let b = reg.create(KObj::Channel(b_end));
+    let a = reg.create_charged(KObj::Channel(a_end), q.job);
+    let b = reg.create_charged(KObj::Channel(b_end), q.job);
     for (me, other) in [(a, b), (b, a)] {
         if let Some(KObj::Channel(c)) = reg.get_mut(me) {
             c.peer = Some(other);
@@ -216,12 +288,13 @@ pub fn channel_create(
 /// into it. Changes nothing unless it succeeds. The checks run in the order SYSCALLS.md
 /// lists them: sizes first (they bound the work of everything after), then handles,
 /// then the channel itself.
-pub fn channel_write(
+pub fn channel_write_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     ch: Handle,
     data: &[u8],
     handles: &[Handle],
+    jobs: &mut Jobs,
 ) -> Result<(), Status> {
     if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
         return Err(Status::TooBig);
@@ -278,20 +351,33 @@ pub fn channel_write(
     if reg.meter() + cost > MAX_IPC_BYTES {
         return Err(Status::NoMemory);
     }
+    // The job of the endpoint that receives the message pays for it, until it is read or the
+    // endpoint goes; the charge comes before anything is allocated or moved, and is given back
+    // if an allocation then fails.
+    settle(reg, jobs);
+    charge_bytes(reg, jobs, peer, cost)?;
+    let undo = |reg: &Kobjs, jobs: &mut Jobs, e: Status| {
+        credit_bytes(reg, jobs, peer, cost);
+        Err(e)
+    };
     match reg.get_mut(peer) {
-        Some(KObj::Channel(p)) => p.queue.try_reserve(1).map_err(|_| Status::NoMemory)?,
-        _ => return Err(Status::PeerClosed),
+        Some(KObj::Channel(p)) => {
+            if p.queue.try_reserve(1).is_err() {
+                return undo(reg, jobs, Status::NoMemory);
+            }
+        }
+        _ => return undo(reg, jobs, Status::PeerClosed),
     }
     // Allocate before committing, so running out of memory changes nothing.
     let mut bytes: Vec<u8> = Vec::new();
-    bytes
-        .try_reserve_exact(data.len())
-        .map_err(|_| Status::NoMemory)?;
+    if bytes.try_reserve_exact(data.len()).is_err() {
+        return undo(reg, jobs, Status::NoMemory);
+    }
     bytes.extend_from_slice(data);
     let mut entries: Vec<Entry> = Vec::new();
-    entries
-        .try_reserve_exact(handles.len())
-        .map_err(|_| Status::NoMemory)?;
+    if entries.try_reserve_exact(handles.len()).is_err() {
+        return undo(reg, jobs, Status::NoMemory);
+    }
     // Commit: the handles leave the table and travel with the message.
     entries.extend(
         handles
@@ -315,6 +401,7 @@ fn read_at(
     pick: impl Fn(&VecDeque<Message>) -> Option<usize>,
     max_bytes: usize,
     max_handles: usize,
+    jobs: &mut Jobs,
 ) -> Result<Received, ReadError> {
     let KObj::Channel(c) = reg.get(me).expect("resolved") else {
         unreachable!()
@@ -344,6 +431,7 @@ fn read_at(
     };
     let msg = c.queue.remove(i).expect("picked");
     reg.meter_sub(msg.cost());
+    credit_bytes(reg, jobs, me, msg.cost());
     let handles = msg
         .handles
         .iter()
@@ -401,12 +489,13 @@ pub fn channel_peek(
 }
 
 /// Read the oldest message. Handles arrive in the caller's table.
-pub fn channel_read(
+pub fn channel_read_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     ch: Handle,
     max_bytes: usize,
     max_handles: usize,
+    jobs: &mut Jobs,
 ) -> Result<Received, ReadError> {
     let me = channel_of(reg, table, ch, Rights::READ)?;
     read_at(
@@ -416,32 +505,39 @@ pub fn channel_read(
         |q| (!q.is_empty()).then_some(0),
         max_bytes,
         max_handles,
+        jobs,
     )
 }
 
 /// Read the oldest message whose first four bytes (little endian) are `txid`.
-pub fn channel_read_txid(
+pub fn channel_read_txid_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     ch: Handle,
     txid: u32,
     max_bytes: usize,
     max_handles: usize,
+    jobs: &mut Jobs,
 ) -> Result<Received, ReadError> {
     let me = channel_of(reg, table, ch, Rights::READ)?;
     let pick = |q: &VecDeque<Message>| {
         q.iter()
             .position(|m| m.data.len() >= 4 && m.data[..4] == txid.to_le_bytes())
     };
-    read_at(reg, table, me, pick, max_bytes, max_handles)
+    read_at(reg, table, me, pick, max_bytes, max_handles, jobs)
 }
 
 /// A new event with all user signals clear.
-pub fn event_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+pub fn event_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    q: &mut Quota,
+) -> Result<Handle, Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let id = reg.create(KObj::Event(Event { signals: 0 }));
+    q.objects(reg, 1)?;
+    let id = reg.create_charged(KObj::Event(Event { signals: 0 }), q.job);
     Ok(table.insert(id, Rights::EVENT).expect("room was checked"))
 }
 
@@ -558,17 +654,22 @@ fn socket_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resul
 }
 
 /// A connected pair of socket endpoints with the default socket rights.
-pub fn socket_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<(Handle, Handle), Status> {
+pub fn socket_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    q: &mut Quota,
+) -> Result<(Handle, Handle), Status> {
     if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
+    q.objects(reg, 2)?;
     let end = || SocketEnd {
         peer: None,
         buf: VecDeque::new(),
         peer_closed: false,
     };
-    let a = reg.create(KObj::Socket(end()));
-    let b = reg.create(KObj::Socket(end()));
+    let a = reg.create_charged(KObj::Socket(end()), q.job);
+    let b = reg.create_charged(KObj::Socket(end()), q.job);
     for (me, other) in [(a, b), (b, a)] {
         if let Some(KObj::Socket(s)) = reg.get_mut(me) {
             s.peer = Some(other);
@@ -595,12 +696,14 @@ pub fn socket_write_check(
 }
 
 /// Append as much of `data` as fits to the peer's buffer; returns how many bytes that was.
-pub fn socket_write(
+pub fn socket_write_in(
     reg: &mut Kobjs,
     table: &HandleTable,
     h: Handle,
     data: &[u8],
+    jobs: &mut Jobs,
 ) -> Result<usize, Status> {
+    settle(reg, jobs);
     let me = socket_of(reg, table, h, Rights::WRITE)?;
     if data.len() > SOCKET_BUFFER {
         return Err(Status::TooBig);
@@ -627,10 +730,20 @@ pub fn socket_write(
     if global_room == 0 {
         return Err(Status::NoMemory);
     }
-    let n = end_room.min(global_room).min(data.len());
+    // ... and the job of the receiving endpoint's quota (its creator pays for what is queued).
+    let job = reg.job_of(peer);
+    let job_room = job.map_or(usize::MAX, |j| jobs.room(j, Resource::IpcBytes) as usize);
+    if job_room == 0 {
+        return Err(Status::NoMemory);
+    }
+    let n = end_room.min(global_room).min(job_room).min(data.len());
+    let Some(KObj::Socket(p)) = reg.get_mut(peer) else {
+        return Err(Status::PeerClosed);
+    };
     p.buf.try_reserve(n).map_err(|_| Status::NoMemory)?;
     p.buf.extend(&data[..n]);
     reg.meter_add(n);
+    charge_bytes_unchecked(reg, jobs, peer, n);
     Ok(n)
 }
 
@@ -663,11 +776,12 @@ pub fn socket_peek(
 }
 
 /// Remove and return up to `max` bytes (see [`socket_peek`]).
-pub fn socket_read(
+pub fn socket_read_in(
     reg: &mut Kobjs,
     table: &HandleTable,
     h: Handle,
     max: usize,
+    jobs: &mut Jobs,
 ) -> Result<Vec<u8>, Status> {
     let n = socket_peek(reg, table, h, max)?;
     let me = socket_of(reg, table, h, Rights::READ)?;
@@ -680,6 +794,7 @@ pub fn socket_read(
         s.buf = VecDeque::new();
     }
     reg.meter_sub(n);
+    credit_bytes(reg, jobs, me, n);
     Ok(out)
 }
 
@@ -698,14 +813,22 @@ fn port_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<
     Ok(entry.obj)
 }
 
-pub fn port_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+pub fn port_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    q: &mut Quota,
+) -> Result<Handle, Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let obj = reg.create(KObj::Port(PortObj {
-        bindings: Vec::new(),
-        next: 0,
-    }));
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Port(PortObj {
+            bindings: Vec::new(),
+            next: 0,
+        }),
+        q.job,
+    );
     Ok(table.insert(obj, Rights::PORT).expect("room was checked"))
 }
 
@@ -851,15 +974,17 @@ pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, 
 }
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
-pub fn vmo_object_create(
+pub fn vmo_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     id: u64,
+    q: &mut Quota,
 ) -> Result<Handle, Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let obj = reg.create(KObj::Vmo(id));
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Vmo(id), q.job);
     Ok(table.insert(obj, Rights::VMO).expect("room was checked"))
 }
 
@@ -870,11 +995,13 @@ pub fn job_object_create(
     table: &mut HandleTable,
     id: JobId,
     rights: Rights,
+    q: &mut Quota,
 ) -> Result<Handle, Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let obj = reg.create(KObj::Job(id));
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Job(id), q.job);
     Ok(table.insert(obj, rights).expect("room was checked"))
 }
 
@@ -911,21 +1038,26 @@ pub fn vmo_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 }
 
 /// A process object for `pid`, with a handle in `table` (default process rights).
-pub fn process_object_create(
+pub fn process_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     pid: u32,
     kill_on_close: bool,
+    q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let obj = reg.create(KObj::Process(ProcessObj {
-        pid,
-        terminated: false,
-        exit_code: 0,
-        kill_on_close,
-    }));
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Process(ProcessObj {
+            pid,
+            terminated: false,
+            exit_code: 0,
+            kill_on_close,
+        }),
+        q.job,
+    );
     Ok((
         table
             .insert(obj, Rights::PROCESS)
@@ -964,19 +1096,24 @@ pub fn process_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
 }
 
 /// A thread object for a user thread of `pid`, with a handle in `table` (default thread rights).
-pub fn thread_object_create(
+pub fn thread_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     pid: u32,
+    q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
-    let obj = reg.create(KObj::Thread(ThreadObj {
-        pid,
-        terminated: false,
-        exit_code: 0,
-    }));
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Thread(ThreadObj {
+            pid,
+            terminated: false,
+            exit_code: 0,
+        }),
+        q.job,
+    );
     Ok((
         table.insert(obj, Rights::THREAD).expect("room was checked"),
         obj,
@@ -1011,4 +1148,149 @@ pub fn thread_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
         t.terminated = true;
         t.exit_code = code;
     }
+}
+
+// --- convenience calls that charge nobody (the pure tests, and anything that has no job) ---
+
+pub fn channel_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+) -> Result<(Handle, Handle), Status> {
+    channel_create_in(
+        reg,
+        table,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn event_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+    event_create_in(
+        reg,
+        table,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn socket_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<(Handle, Handle), Status> {
+    socket_create_in(
+        reg,
+        table,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn port_create(reg: &mut Kobjs, table: &mut HandleTable) -> Result<Handle, Status> {
+    port_create_in(
+        reg,
+        table,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn vmo_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    id: u64,
+) -> Result<Handle, Status> {
+    vmo_object_create_in(
+        reg,
+        table,
+        id,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn process_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    pid: u32,
+    kill_on_close: bool,
+) -> Result<(Handle, ObjId), Status> {
+    process_object_create_in(
+        reg,
+        table,
+        pid,
+        kill_on_close,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn thread_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    pid: u32,
+) -> Result<(Handle, ObjId), Status> {
+    thread_object_create_in(
+        reg,
+        table,
+        pid,
+        &mut Quota {
+            jobs: &mut Jobs::new(),
+            job: None,
+        },
+    )
+}
+pub fn channel_write(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    data: &[u8],
+    handles: &[Handle],
+) -> Result<(), Status> {
+    channel_write_in(reg, table, ch, data, handles, &mut Jobs::new())
+}
+pub fn channel_read(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<Received, ReadError> {
+    channel_read_in(reg, table, ch, max_bytes, max_handles, &mut Jobs::new())
+}
+pub fn channel_read_txid(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    txid: u32,
+    max_bytes: usize,
+    max_handles: usize,
+) -> Result<Received, ReadError> {
+    channel_read_txid_in(
+        reg,
+        table,
+        ch,
+        txid,
+        max_bytes,
+        max_handles,
+        &mut Jobs::new(),
+    )
+}
+pub fn socket_write(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    data: &[u8],
+) -> Result<usize, Status> {
+    socket_write_in(reg, table, h, data, &mut Jobs::new())
+}
+pub fn socket_read(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    max: usize,
+) -> Result<Vec<u8>, Status> {
+    socket_read_in(reg, table, h, max, &mut Jobs::new())
 }

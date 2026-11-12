@@ -4037,6 +4037,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"hello".to_vec(),
             b"hog".to_vec(),
             b"init".to_vec(),
+            b"ipchog".to_vec(),
             b"launcher".to_vec(),
             b"ls".to_vec(),
             b"memfsd".to_vec(),
@@ -5354,7 +5355,10 @@ fn root_job() -> Result<u32, Detail> {
 
 fn job(parent: u32, procs: u64, threads: u64, pages: u64) -> Result<u32, Detail> {
     Ok(ok(
-        sys::job_create(parent, procs, threads, pages, u64::MAX),
+        sys::job_create(
+            parent,
+            &[procs, threads, pages, u64::MAX, u64::MAX, u64::MAX],
+        ),
         "job_create",
     )?
     .a1 as u32)
@@ -5387,7 +5391,10 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     // a job is a job: the other kinds of handle are the wrong type
     let ev = ok(sys::event_create(), "event")?.a1 as u32;
     ensure_eq!(
-        st(sys::job_create(ev, u64::MAX, u64::MAX, u64::MAX, u64::MAX)),
+        st(sys::job_create(
+            ev,
+            &[u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]
+        )),
         Some(S::WrongType),
         "job_create on an event"
     );
@@ -5397,19 +5404,22 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_info on an event"
     );
     ensure_eq!(
-        st(sys::job_create(0, 1, 1, 1, u64::MAX)),
+        st(sys::job_create(0, &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX])),
         Some(S::BadHandle),
         "job_create on handle 0"
     );
     let gone = job(root, 1, 1, 1)?;
     sys::handle_close(gone);
     ensure_eq!(
-        st(sys::job_create(gone, 1, 1, 1, u64::MAX)),
+        st(sys::job_create(
+            gone,
+            &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX]
+        )),
         Some(S::BadHandle),
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 4)),
+        st(sys::job_info(root, 6)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -5431,17 +5441,26 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "manage may not inspect"
     );
     ensure_eq!(
-        st(sys::job_create(inspect, 1, 1, 1, u64::MAX)),
+        st(sys::job_create(
+            inspect,
+            &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX]
+        )),
         Some(S::AccessDenied),
         "inspect may not create"
     );
     ensure_eq!(
-        st(sys::job_set_limits(kill, 1, 1, 1, u64::MAX)),
+        st(sys::job_set_limits(
+            kill,
+            &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX]
+        )),
         Some(S::AccessDenied),
         "kill may not set limits"
     );
     ensure_eq!(
-        st(sys::job_set_limits(manage, 1, 1, 1, u64::MAX)),
+        st(sys::job_set_limits(
+            manage,
+            &[1, 1, 1, u64::MAX, u64::MAX, u64::MAX]
+        )),
         Some(S::AccessDenied),
         "MANAGE alone may not lift or change limits (T36)"
     );
@@ -5449,16 +5468,13 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     ensure_eq!(
         st(sys::job_set_limits(
             setter,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX
+            &[u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]
         )),
         Some(S::Ok),
         "SET_LIMITS may set limits"
     );
     ensure_eq!(
-        st(sys::job_create(setter, 1, 1, 1, 1)),
+        st(sys::job_create(setter, &[1, 1, 1, 1, u64::MAX, u64::MAX])),
         Some(S::AccessDenied),
         "SET_LIMITS alone may not create jobs"
     );
@@ -5520,7 +5536,7 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
     );
     // set_limits works on a live job: raise it and a parent can make processes again
     ok(
-        sys::job_set_limits(j, 2, u64::MAX, u64::MAX, u64::MAX),
+        sys::job_set_limits(j, &[2, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
         "raise",
     )?;
     let a = ok(sys::process_create_in(j), "first")?.a1 as u32;
@@ -5532,7 +5548,7 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
     );
     // lowering the limit below usage keeps what exists and refuses more
     ok(
-        sys::job_set_limits(j, 1, u64::MAX, u64::MAX, u64::MAX),
+        sys::job_set_limits(j, &[1, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
         "lower",
     )?;
     ensure_eq!(job_use(j, 0)?, (2, 1), "usage above a lowered limit stays");
@@ -5560,7 +5576,7 @@ fn job_limits_stop_a_thread_bomb() -> Outcome {
     job_use_settles(j, 1, 0, 500)?;
     // with one thread allowed, a second running process cannot be started
     ok(
-        sys::job_set_limits(j, u64::MAX, 1, u64::MAX, u64::MAX),
+        sys::job_set_limits(j, &[u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
         "one thread",
     )?;
     let (q, _mq) = launch_image_in(IMAGE.load(Ordering::Relaxed), 15, j)?; // spins
@@ -5635,7 +5651,10 @@ fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
     )?;
     // a limit set after the fact applies to what is committed next
     ok(
-        sys::job_set_limits(parent, u64::MAX, u64::MAX, 1, u64::MAX),
+        sys::job_set_limits(
+            parent,
+            &[u64::MAX, u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX],
+        ),
         "lower the parent",
     )?;
     ensure_eq!(
@@ -5739,7 +5758,7 @@ fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
     }
     // once a thread is allowed the same start goes through (the code is one `jr` to itself)
     ok(
-        sys::job_set_limits(j, u64::MAX, 1, u64::MAX, u64::MAX),
+        sys::job_set_limits(j, &[u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
         "allow one thread",
     )?;
     ok(
@@ -5806,7 +5825,7 @@ fn page_tables_are_charged_to_the_job() -> Outcome {
 fn a_job_limits_how_many_jobs_may_exist_below_it() -> Outcome {
     let root = root_job()?;
     let top = ok(
-        sys::job_create(root, u64::MAX, u64::MAX, u64::MAX, 3),
+        sys::job_create(root, &[u64::MAX, u64::MAX, u64::MAX, 3, u64::MAX, u64::MAX]),
         "top",
     )?
     .a1 as u32;
@@ -5815,16 +5834,71 @@ fn a_job_limits_how_many_jobs_may_exist_below_it() -> Outcome {
     let c = job(top, u64::MAX, u64::MAX, u64::MAX)?;
     ensure_eq!(job_use(top, 3)?, (3, 3), "three jobs below top");
     ensure_eq!(
-        st(sys::job_create(a, 1, 1, 1, 0)),
+        st(sys::job_create(a, &[1, 1, 1, 0, u64::MAX, u64::MAX])),
         Some(S::NoMemory),
         "a fourth, anywhere below top"
     );
     sys::handle_close(c);
-    ok(sys::job_create(a, 1, 1, 1, 0), "room after one went")?;
+    ok(
+        sys::job_create(a, &[1, 1, 1, 0, u64::MAX, u64::MAX]),
+        "room after one went",
+    )?;
     // (the 256-job cap is no longer the only bound: a program given a job cannot use it up)
     for h in [b, a, top, root] {
         sys::handle_close(h);
     }
+    Ok(())
+}
+
+fn job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back() -> Outcome {
+    let root = root_job()?;
+    let image = IMAGE.load(Ordering::Relaxed);
+    // objects: the child's own process object counts, so a limit of 11 leaves ten events
+    let j = ok(
+        sys::job_create(
+            root,
+            &[u64::MAX, u64::MAX, u64::MAX, u64::MAX, 11, u64::MAX],
+        ),
+        "a job with 11 objects",
+    )?
+    .a1 as u32;
+    let (p, _m) = launch_image_in(image, 35, j)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        10,
+        "events the object bomb made"
+    );
+    sys::handle_close(p); // (the process object lives while we hold a handle to it)
+    job_use_settles(j, 4, 0, 500)?;
+    // bytes: a 40 KiB queue budget; the hog gets about that much in and is then refused
+    ok(
+        sys::job_set_limits(j, &[u64::MAX, u64::MAX, u64::MAX, u64::MAX, 100, 40 * 1024]),
+        "a 40 KiB budget",
+    )?;
+    let (p, _m) = launch_image_in(image, 34, j)?;
+    wait_ended(p, 3000)?;
+    let kib = sys::process_info(p).a1 as i64;
+    ensure!(
+        (30..=40).contains(&kib),
+        "the hog queued {kib} KiB of a 40 KiB budget"
+    );
+    // meanwhile this program (in the root job) was never short: the shared budget is not the
+    // hog's to use up
+    let (a, b) =
+        ok(sys::socket_create(), "a socket in the root job").map(|r| (r.a1 as u32, r.a2 as u32))?;
+    ok(
+        sys::socket_write(a, [1u8; 4096].as_ptr(), 4096),
+        "write while the hog is dead",
+    )?;
+    sys::handle_close(a);
+    sys::handle_close(b);
+    // everything the child held comes back when it is gone
+    sys::handle_close(p);
+    job_use_settles(j, 5, 0, 1000)?;
+    job_use_settles(j, 4, 0, 1000)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
     Ok(())
 }
 
@@ -6202,6 +6276,10 @@ pub fn app_main() -> i32 {
         (
             "a_job_limits_how_many_jobs_may_exist_below_it",
             a_job_limits_how_many_jobs_may_exist_below_it,
+        ),
+        (
+            "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back",
+            job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back,
         ),
         (
             "threads_left_behind_when_init_exits",
