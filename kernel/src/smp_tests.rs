@@ -172,7 +172,8 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
             M * n as u64
         ));
     }
-    if !bkl::is_free() {
+    // (other harts take the lock for their timer ticks, so "free" is a moment, not a state)
+    if !wait_for(100, bkl::is_free) {
         return Err(String::from("the lock is still held"));
     }
     Ok(())
@@ -229,8 +230,8 @@ fn high_runner(_: usize) {
 /// told by a reschedule IPI and the thread runs there.
 fn a_wake_preempts_a_lower_priority_hart() -> Result<(), String> {
     let n = smp::started();
-    if n < 2 {
-        return Ok(());
+    if n < 2 || thread::class_name() != "fixed-priority" {
+        return Ok(()); // (priorities mean nothing to the round-robin class)
     }
     const TRIALS: usize = 12;
     STOP.store(false, Ordering::SeqCst);
@@ -306,11 +307,9 @@ fn user_threads_run_in_parallel() -> Result<(), String> {
     if n < 2 {
         return Ok(());
     }
-    thread::DEFAULT_AFFINITY.store(usize::MAX, Ordering::SeqCst);
     user::reset_user_mode_high_water();
     let a = user::start(user::CRASH_ELF, 15);
     let b = user::start(user::CRASH_ELF, 15);
-    thread::DEFAULT_AFFINITY.store(0, Ordering::SeqCst);
     let (a, b) = (
         a.map_err(|e| format!("{e:?}"))?,
         b.map_err(|e| format!("{e:?}"))?,

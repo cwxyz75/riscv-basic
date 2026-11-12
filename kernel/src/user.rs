@@ -331,7 +331,8 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         s.procs.insert(pid, process);
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
-    let tid = thread::spawn("user", 10, user_thread_main, token);
+    // user threads may run on any hart (kernel threads stay on the boot hart by default)
+    let tid = thread::spawn_free("user", 10, user_thread_main, token);
     Ok((pid, tid))
 }
 
@@ -2123,7 +2124,7 @@ fn process_start(a: [u64; 6]) -> Reply {
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
-    thread::spawn_detached("user", 10, user_thread_main, started);
+    thread::spawn_free_detached("user", 10, user_thread_main, started);
     Ok((None, None))
 }
 
@@ -2217,7 +2218,7 @@ fn thread_create(a: [u64; 6]) -> Reply {
         Ok((new_start(s, tpid, entry, sp, arg, Some(obj)), handle.0))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
-    thread::spawn_detached("user", 10, user_thread_main, token);
+    thread::spawn_free_detached("user", 10, user_thread_main, token);
     Ok((Some(u64::from(handle)), None))
 }
 

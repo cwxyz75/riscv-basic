@@ -172,7 +172,8 @@ the lock-order checker with its own failing-order test (`lock_order_violations_a
 N harts each do M increments of a protected counter under `kernel_lock` while the boot hart runs the
 suite), so S5b already contends the lock. Acceptance: host suites, `make os-boot-test` green with
 `-smp 1` and `-smp 4`.
-**S5c1: harts schedule, threads pinned.** Secondaries run the scheduler under the BKL; wake IPIs;
+**S5c1 and S5c2: harts schedule (built together).** *(Deviations: kernel threads (the test suites, helpers, the serial bridge, the reaper) stay pinned to the boot hart by default; only user threads, new test threads made with `spawn_free`, and the secondaries' idle threads migrate. `ticks()` is still the boot hart's tick counter; each hart ticks its own slice. The BKL became a ticket lock.)*
+**S5c1, as specified:** Secondaries run the scheduler under the BKL; wake IPIs;
 `current[hart]`; every existing thread keeps its boot-hart affinity except the new tests' threads.
 Acceptance: the whole suite passes with `-smp 2` and `-smp 4`; `a_wake_preempts_a_lower_priority_hart`;
 `user_threads_run_in_parallel` measured by a kernel counter of **harts concurrently in U-mode** (a

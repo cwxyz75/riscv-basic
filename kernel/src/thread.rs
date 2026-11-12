@@ -282,6 +282,7 @@ pub fn spawn(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Ti
 }
 
 /// A thread nobody joins: when it exits the reaper thread frees its stack and record.
+#[allow(dead_code)]
 pub fn spawn_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
     spawn_with(name, prio, entry, arg, true)
 }
@@ -293,6 +294,11 @@ pub static DEFAULT_AFFINITY: core::sync::atomic::AtomicUsize =
 fn default_affinity() -> Option<usize> {
     let a = DEFAULT_AFFINITY.load(Ordering::Relaxed);
     (a != usize::MAX).then_some(a)
+}
+
+/// Like `spawn_detached`, free to run on any hart.
+pub fn spawn_free_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
+    spawn_with_affinity(name, prio, entry, arg, true, None)
 }
 
 /// Create a thread that may run on any hart, whatever the default is.
@@ -730,17 +736,6 @@ fn reaper_main(_: usize) {
             }
         });
     }
-}
-
-/// Names of the threads running on each hart (diagnostics for the SMP tests).
-pub fn running_names() -> Vec<&'static str> {
-    irq::without(|| {
-        let k = kernel();
-        k.running
-            .iter()
-            .map(|t| k.threads.get(t).map_or("?", |th| th.name))
-            .collect()
-    })
 }
 
 /// The scheduler's view of a thread (diagnostics for the SMP tests).
