@@ -84,6 +84,12 @@ fn align16(n: usize) -> usize {
 
 /// Parse and validate the table of an image.
 pub fn parse(img: &[u8]) -> Result<Vec<Entry>, BootImageError> {
+    parse_prefix(img, img.len())
+}
+
+/// Like [`parse`] when only a *prefix* of the image is in memory (at least the whole table) and
+/// the image is `total_len` bytes long: the extents are checked against `total_len`.
+pub fn parse_prefix(img: &[u8], total_len: usize) -> Result<Vec<Entry>, BootImageError> {
     if img.get(0..4).ok_or(BootImageError::Truncated)? != MAGIC {
         return Err(BootImageError::BadMagic);
     }
@@ -117,7 +123,7 @@ pub fn parse(img: &[u8]) -> Result<Vec<Entry>, BootImageError> {
         let end = (e.offset as usize)
             .checked_add(e.size as usize)
             .ok_or(BootImageError::BadExtent)?;
-        if (e.offset as usize) < at || e.offset % 16 != 0 || end > img.len() {
+        if (e.offset as usize) < at || e.offset % 16 != 0 || end > total_len {
             return Err(BootImageError::BadExtent);
         }
     }

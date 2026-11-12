@@ -150,10 +150,10 @@ defines (0, except `Open`/`Clone` which carry exactly 1); anything else is a pro
 
 Ops on a **directory** connection: `1 Open(path, flags, rights)+endpoint`, `2 Clone(rights)+
 endpoint`, `3 ReadDir(cookie = last name seen, empty = start)`, `4 Mkdir(name)`, `5 Unlink(name)`,
-`6 Stat(path)`. Ops on a **file** connection: `10 Read(offset, len)`, `11 Write(offset, data)`,
-`12 GetSize`, `13 SetSize(n)`, `14 Stat`, `15 GetVmo(rights)` (read-only files: returns a VMO
-handle; for `/bin` entries it is a slice descriptor `(vmo, offset, len)` of the boot image, so
-no program is ever copied through channels). Flags for `Open`: `CREATE`, `EXCLUSIVE`, `TRUNCATE`,
+`6 Stat(path)`; `2 Clone` is also valid on a file connection. Ops on a **file** connection: `10 Read(offset, len)`, `11 Write(offset, data)`,
+`12 GetSize`, `13 SetSize(n)`, `14 Stat`, `15 GetVmo(rights)` (for every boot-image file, `/bin` programs included: the reply carries a
+read-only handle to the *whole* boot image VMO, `a` = the file's offset and the 8-byte payload
+its length, so no program is ever copied through channels; any other file is `BAD_REQUEST`). Flags for `Open`: `CREATE`, `EXCLUSIVE`, `TRUNCATE`,
 `DIRECTORY`.
 
 **Statuses** (protocol statuses are kernel statuses plus these, negative `i32`): `-100 NOT_FOUND`,
@@ -189,7 +189,9 @@ Rules:
 - The pure `memfs` crate holds the tree, name validation, quota accounting and all
   operations; `memfsd` is a thin loop over it. File data is `Vec<u8>` chunks in the server's
   heap (16 MiB cap, so the 8 MiB file quota fits).
-- `/bin` and `/etc` are **boot-image-backed read-only nodes** (no write path exists); `/tmp` is
+- An image name is the absolute path of the file without its leading slash (`bin/hello`,
+  `etc/trusted`, `home/sub/inner.txt`; `kernel/build.rs` makes them from the `bootfs/` tree and the
+  built programs). `/bin` and `/etc` are **boot-image-backed read-only nodes** (no write path exists); `/tmp` is
   the only writable subtree; `/home` is the shell's starting directory (read-only fixtures of
   section 8). `init` unpacks nothing: `memfsd` builds the directory entries from the boot
   image table.

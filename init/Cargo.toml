@@ -6,4 +6,5 @@ description = "OS track: the first user program (the boot-time user test suite) 
 
 [dependencies]
 proto = { path = "../proto" }
+memfs = { path = "../memfs" }
 rt = { path = "../rt", features = ["heap"] }

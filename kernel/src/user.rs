@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
@@ -452,6 +452,7 @@ fn teardown(pid: u32) -> i32 {
         }
     });
     kmem::flush_tlb();
+    REAP_DIRTY.store(true, Ordering::SeqCst); // its mappings are gone: pending VMOs may go
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
 }
@@ -1014,6 +1015,7 @@ fn cleanup_dead() {
             match obj {
                 ipc::KObj::Vmo(id) => {
                     irq::without(|| state().pending_vmos.push(id));
+                    REAP_DIRTY.store(true, Ordering::SeqCst);
                     reap_vmos();
                 }
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
@@ -1025,8 +1027,18 @@ fn cleanup_dead() {
     }
 }
 
+/// Set whenever something happened that could let a pending VMO go: one was queued, a mapping
+/// was removed, or a process was torn down. `reap_vmos` runs only then: it scans every region of
+/// every process, and every VMO a process closes after mapping it stays pending until the
+/// process dies, so scanning on every wake-up cost about a millisecond per syscall once a
+/// dozen service processes were alive.
+static REAP_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// Free the VMOs whose last handle is gone and that no address space maps any more.
 fn reap_vmos() {
+    if !REAP_DIRTY.swap(false, Ordering::SeqCst) {
+        return;
+    }
     irq::without(|| {
         let s = state();
         let k = kmem::get();
@@ -1762,7 +1774,10 @@ fn process_unmap(a: [u64; 6]) -> Reply {
         kmem::flush_tlb();
         Ok((None, None))
     })
-    .inspect(|_| reap_vmos())
+    .inspect(|_| {
+        REAP_DIRTY.store(true, Ordering::SeqCst);
+        reap_vmos();
+    })
 }
 
 fn process_start(a: [u64; 6]) -> Reply {

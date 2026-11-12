@@ -58,9 +58,10 @@ pub mod op {
         }
     }
 
-    /// Does this op belong to a directory connection (else a file connection)?
+    /// Does this op belong to a directory connection only? (`CLONE` is valid on both kinds; every
+    /// other op that is not listed here belongs to file connections.)
     pub fn is_directory_op(op: u16) -> bool {
-        matches!(op, OPEN | CLONE | READDIR | MKDIR | UNLINK | STAT)
+        matches!(op, OPEN | READDIR | MKDIR | UNLINK | STAT)
     }
 }
 
