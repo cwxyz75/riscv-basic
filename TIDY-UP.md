@@ -32,7 +32,7 @@ Rules:
 
 | ID | Sev | Shortcut | Why it was acceptable | Proper fix, and when |
 |---|---|---|---|---|
-| T25 | L | **`init` still has test-aid commands** (`raw`, `desync`, `big`, `rights`, `quitx`) that exist so the serial test can probe the bridge. | v0 supervisor with no shell yet. | Remove or gate them behind a test build when `init` stops reading the serial socket (S4d/S4e). |
+| T25 | L | **`init` still has test-aid commands** (`raw`, `desync`, `big`, `rights`, `quitx`, `run`) that exist so the serial test can probe the bridge. | v0 supervisor with no shell yet. | Remove or gate them behind a test build when `init` stops reading the serial socket (S4d/S4e). |
 | T26 | L | **The user heap lock yields but is a spin lock held across several syscalls** while growing; one reserved range, no shrinking, lazy growth means frame exhaustion shows up as a fault on first touch, not a failed allocation. | One program thread today. | Per-thread arenas or a futex-style lock; account heap frames to a job (T1). |
 | T27 | L | **Wire formats beyond the startup message** (console control, `ReadDir` entry packing, file framing) were defined in `proto` and its goldens, not first in the spec; the spec now points at those goldens as normative. | The spec stayed at the level of operations. | Spec appendix with the byte layouts when memfs and consoled land (S4c/S4d). |
 

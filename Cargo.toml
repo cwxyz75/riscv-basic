@@ -11,3 +11,20 @@ default-members = [
     "abi", "kcore", "proto",
     "home/basic", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
+
+# The user programs are embedded in the boot image and must stay small (the launcher accepts
+# images up to 4 MiB): no debug info for the packages that make them. (The kernels keep theirs.)
+[profile.dev.package.init]
+debug = 0
+[profile.dev.package.rt]
+debug = 0
+[profile.dev.package.proto]
+debug = 0
+[profile.dev.package.linked_list_allocator]
+debug = 0
+[profile.dev.package.spinning_top]
+debug = 0
+[profile.dev.package.lock_api]
+debug = 0
+[profile.dev.package.scopeguard]
+debug = 0

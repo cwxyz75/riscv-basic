@@ -1909,7 +1909,7 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     let v = vmo(2)?;
     sys::vmo_write(v, 0, 0xfeed_f00du32.to_le_bytes().as_ptr(), 4);
     ensure_eq!(
-        st(sys::process_map(me, v, 0x7_0000, 0, 8192, PF_R | PF_W)),
+        st(sys::process_map(me, v, 0x500_0000, 0, 8192, PF_R | PF_W)),
         Some(S::Ok),
         "map both pages"
     );
@@ -1918,18 +1918,18 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
         Some(S::Ok),
         "close the only VMO handle"
     );
-    // SAFETY: 0x7_0000..0x7_2000 is mapped read-write in this process.
+    // SAFETY: 0x500_0000..0x500_2000 is mapped read-write in this process.
     let (first, second) = unsafe {
         (
-            core::ptr::read_volatile(0x7_0000 as *const u32),
-            core::ptr::read_volatile(0x7_1000 as *const u32),
+            core::ptr::read_volatile(0x500_0000 as *const u32),
+            core::ptr::read_volatile(0x500_1000 as *const u32),
         )
     };
     ensure_eq!(first, 0xfeed_f00d, "the committed page survives");
     ensure_eq!(second, 0, "an untouched page still faults in as zeros");
     // SAFETY: as above.
-    unsafe { core::ptr::write_volatile(0x7_1000 as *mut u32, 1) };
-    ensure_eq!(st(sys::process_unmap(me, 0x7_0000)), Some(S::Ok), "unmap");
+    unsafe { core::ptr::write_volatile(0x500_1000 as *mut u32, 1) };
+    ensure_eq!(st(sys::process_unmap(me, 0x500_0000)), Some(S::Ok), "unmap");
     Ok(())
 }
 
@@ -3593,6 +3593,316 @@ extern "C" fn drain_for_big_write(arg: usize) -> ! {
     sys::thread_exit(total as i32)
 }
 
+/// A failure detail that names the source line (for `?` on an `Option` or an opaque error).
+fn msg_at(line: u32) -> Detail {
+    let mut d = Detail::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut d,
+        format_args!("unexpected None/Err at suite.rs:{line}"),
+    );
+    d
+}
+
+// --- The launcher service (S4b) ----------------------------------------------------------------
+
+use proto::bootimg;
+use proto::launch;
+
+/// A read-only VMO of the boot image, from the kernel-side helper.
+fn boot_image_vmo() -> Result<u32, Detail> {
+    let (m, n) = request(23, b'B', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u32; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the boot image");
+    Ok(got[0])
+}
+
+/// (offset, length) of a boot image entry.
+fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
+    let size = sys::vmo_get_size(vmo).a1 as u64;
+    let img = rt::spawn::read_image(vmo, 0, size).ok_or_else(|| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("read the boot image"));
+        d
+    })?;
+    let entries = bootimg::parse(&img).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("parse: {e:?}"));
+        d
+    })?;
+    let e = entries.iter().find(|e| e.name == name);
+    ensure!(e.is_some(), "no entry {:?}", core::str::from_utf8(name));
+    let e = e.unwrap();
+    Ok((u64::from(e.offset), u64::from(e.size)))
+}
+
+/// Start the launcher from the boot image through `rt::spawn`: (its process handle, our end of
+/// its service channel, the boot image VMO).
+fn start_launcher() -> Result<(u32, u32, u32), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"launcher")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"launcher".to_vec()],
+        roles: vec![(Role::ServiceLaunch, 0)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[theirs]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn the launcher: {e:?}"));
+        d
+    })?;
+    Ok((p, mine, bi))
+}
+
+/// Ask the launcher to spawn the image at (offset, len) of `bi`, with `startup` and `forward`
+/// handles. Returns (status, process handle if any).
+fn ask_launcher(
+    ch: u32,
+    bi: u32,
+    txid: u32,
+    off: u64,
+    len: u64,
+    startup: &[u8],
+    forward: &[u32],
+) -> Result<(i32, Option<u32>), Detail> {
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    // Built by hand: the encoder refuses the invalid extents some tests need to send.
+    let mut req = Vec::new();
+    req.extend_from_slice(&txid.to_le_bytes());
+    req.extend_from_slice(&1u16.to_le_bytes());
+    req.extend_from_slice(&0u16.to_le_bytes());
+    req.extend_from_slice(&off.to_le_bytes());
+    req.extend_from_slice(&len.to_le_bytes());
+    req.extend_from_slice(&(startup.len() as u32).to_le_bytes());
+    req.extend_from_slice(startup);
+    let mut hs = vec![image_dup];
+    hs.extend_from_slice(forward);
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            req.as_ptr(),
+            req.len(),
+            hs.as_ptr(),
+            hs.len()
+        )),
+        Some(S::Ok),
+        "send the request"
+    );
+    let w = sys::object_wait(
+        ch,
+        sig::READABLE | sig::PEER_CLOSED,
+        sys::clock_get() + 10_000,
+    );
+    ensure_eq!(w.status, 0, "the launcher answered");
+    let mut buf = [0u8; 16];
+    let mut h = [0u32; 1];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), 16, h.as_mut_ptr(), 1);
+    ensure_eq!(r.status, 0, "read the reply");
+    let (id, status) = launch::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(id, txid, "the reply is for this request");
+    Ok((status, if r.a2 == 1 { Some(h[0]) } else { None }))
+}
+
+fn hello_startup(args: &[&[u8]]) -> Result<(Vec<u8>, u32, u32, u32, u32), Detail> {
+    // returns (startup bytes, in_w (ours), in_r_child, out_r (ours), out_w_child)
+    let (in_w, in_r) = socket()?;
+    let (out_r, out_w) = socket()?;
+    let in_r_child = weaker(in_r, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    let out_w_child = weaker(out_w, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    sys::handle_close(in_r);
+    sys::handle_close(out_w);
+    let s = Startup {
+        args: args.iter().map(|a| a.to_vec()).collect(),
+        roles: vec![(Role::Stdin, 0), (Role::Stdout, 1)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    Ok((bytes, in_w, in_r_child, out_r, out_w_child))
+}
+
+fn launcher_spawns_a_program_from_the_boot_image() -> Outcome {
+    let (_lp, ch, bi) = start_launcher()?;
+    let (off, len) = image_entry(bi, b"hello")?;
+    let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello", b"x"])?;
+    let (status, proc) = ask_launcher(ch, bi, 1, off, len, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, 0, "spawn status");
+    let proc = proc.ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(
+        sys::socket_write(in_w, b"abc".as_ptr(), 3).status,
+        0,
+        "feed its stdin"
+    );
+    sys::handle_close(in_w);
+    let out = read_to_end(out_r)?;
+    ensure_eq!(&out[..], &b"args=hello x\nabc"[..], "what it printed");
+    wait_ended(proc, 2000)?;
+    ensure_eq!(
+        sys::process_info(proc).a1 as i64,
+        2,
+        "exit code: the number of arguments"
+    );
+    // a second spawn through the same launcher
+    let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello"])?;
+    let (status, proc) = ask_launcher(ch, bi, 2, off, len, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, 0, "second spawn");
+    sys::handle_close(in_w);
+    ensure_eq!(
+        &read_to_end(out_r)?[..],
+        &b"args=hello\n"[..],
+        "and its output"
+    );
+    wait_ended(proc.ok_or_else(|| msg_at(line!()))?, 2000)?;
+    Ok(())
+}
+
+fn the_process_handle_the_launcher_returns_cannot_manage() -> Outcome {
+    let (_lp, ch, bi) = start_launcher()?;
+    let (off, len) = image_entry(bi, b"hello")?;
+    let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello"])?;
+    let (status, proc) = ask_launcher(ch, bi, 1, off, len, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, 0, "spawn");
+    let proc = proc.ok_or_else(|| msg_at(line!()))?;
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(proc, v, 0x7_0000, 0, 4096, PF_R)),
+        Some(S::AccessDenied),
+        "no MANAGE: the caller cannot map into the child"
+    );
+    ensure_eq!(
+        st(sys::thread_create(proc, 0x10000, 0x20_0000_0000, 0)),
+        Some(S::AccessDenied),
+        "nor add threads"
+    );
+    // the child waits for stdin; the caller can still stop it (KILL) and see it end (WAIT, INSPECT)
+    let _ = (in_w, out_r);
+    ensure_eq!(st(sys::process_kill(proc, 55)), Some(S::Ok), "KILL works");
+    wait_ended(proc, 2000)?;
+    ensure_eq!(sys::process_info(proc).a1 as i64, 55, "its exit code");
+    Ok(())
+}
+
+fn the_launcher_refuses_bad_images_and_requests_without_leaks() -> Outcome {
+    let (lp, ch, bi) = start_launcher()?;
+    let (hoff, hlen) = image_entry(bi, b"hello")?;
+    // not an ELF: a fixture text file
+    let (foff, flen) = image_entry(bi, b"fixtures/hello.txt")?;
+    let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"x"])?;
+    let (status, proc) = ask_launcher(ch, bi, 1, foff, flen, &bytes, &[in_r, out_w])?;
+    ensure_eq!(
+        (status, proc),
+        (proto::file::status::BAD_ELF, None),
+        "a text file is BAD_ELF"
+    );
+    // the forwarded handles were closed: our ends now see the peers gone
+    let w = sys::object_wait(in_w, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(w.status, 0, "the stdin end was released");
+    let w = sys::object_wait(out_r, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(w.status, 0, "the stdout end was released");
+    // extents outside the VMO, or empty
+    let size = sys::vmo_get_size(bi).a1 as u64;
+    let (bytes, _a, in_r, _b, out_w) = hello_startup(&[b"x"])?;
+    let (status, _) = ask_launcher(ch, bi, 2, size - 4, 100, &bytes, &[in_r, out_w])?;
+    ensure_eq!(
+        status,
+        proto::file::status::BAD_REQUEST,
+        "an extent past the end of the VMO"
+    );
+    let (bytes, _a, in_r, _b, out_w) = hello_startup(&[b"x"])?;
+    let (status, _) = ask_launcher(ch, bi, 3, hoff, 0, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, proto::file::status::BAD_REQUEST, "an empty image");
+    // a startup message that does not name every handle that came with it
+    let (bytes, _a, in_r, _b, out_w) = hello_startup(&[b"x"])?;
+    let extra = event()?;
+    let (status, _) = ask_launcher(ch, bi, 4, hoff, hlen, &bytes, &[in_r, out_w, extra])?;
+    ensure_eq!(
+        status,
+        proto::file::status::BAD_REQUEST,
+        "an unreferenced handle"
+    );
+    // garbage bytes
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u32;
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            b"garbage garbage garbage garbage".as_ptr(),
+            31,
+            [image_dup].as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "send garbage"
+    );
+    let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000);
+    ensure_eq!(w.status, 0, "the launcher answers garbage too");
+    let mut buf = [0u8; 16];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    ensure_eq!(r.status, 0, "a reply");
+    let (_, status) = launch::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(
+        status,
+        proto::file::status::BAD_REQUEST,
+        "garbage is BAD_REQUEST"
+    );
+    // a message larger than the launcher reads is a protocol violation: it drops the client
+    let big = alloc::vec![0u8; 20 * 1024];
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            big.as_ptr(),
+            big.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send an oversized request"
+    );
+    wait_ended(lp, 5000)?;
+    ensure_eq!(
+        sys::process_info(lp).a1 as i64,
+        0,
+        "the launcher ended cleanly"
+    );
+    ensure!(
+        sys::object_signals(ch).a1 as u32 & sig::PEER_CLOSED != 0,
+        "and our channel to it is closed"
+    );
+    Ok(())
+}
+
+fn many_launcher_spawns_do_not_leak() -> Outcome {
+    let (_lp, ch, bi) = start_launcher()?;
+    let (off, len) = image_entry(bi, b"hello")?;
+    for i in 0..12u32 {
+        let (bytes, in_w, in_r, out_r, out_w) = hello_startup(&[b"hello"])?;
+        let (status, proc) = ask_launcher(ch, bi, 10 + i, off, len, &bytes, &[in_r, out_w])?;
+        ensure_eq!(status, 0, "spawn {i}");
+        sys::handle_close(in_w);
+        ensure_eq!(&read_to_end(out_r)?[..], &b"args=hello\n"[..], "output {i}");
+        wait_ended(proc.ok_or_else(|| msg_at(line!()))?, 2000)?;
+    }
+    // a failing spawn in the middle must not disturb later ones
+    let (foff, flen) = image_entry(bi, b"fixtures/lines.txt")?;
+    let (bytes, _a, in_r, _b, out_w) = hello_startup(&[b"x"])?;
+    let (status, _) = ask_launcher(ch, bi, 99, foff, flen, &bytes, &[in_r, out_w])?;
+    ensure_eq!(status, proto::file::status::BAD_ELF, "bad image");
+    Ok(())
+}
+
 fn user_cannot_forge_kernel_lines() -> Outcome {
     // The boot harness trusts `##DONE`, `##PANIC` and `##BOOT` lines only from the kernel;
     // the kernel prefixes any such line a user program writes. If these leaked, the whole
@@ -4138,6 +4448,22 @@ pub fn app_main() -> i32 {
         (
             "runtime_io_fails_instead_of_spinning_without_wait",
             runtime_io_fails_instead_of_spinning_without_wait,
+        ),
+        (
+            "launcher_spawns_a_program_from_the_boot_image",
+            launcher_spawns_a_program_from_the_boot_image,
+        ),
+        (
+            "the_process_handle_the_launcher_returns_cannot_manage",
+            the_process_handle_the_launcher_returns_cannot_manage,
+        ),
+        (
+            "the_launcher_refuses_bad_images_and_requests_without_leaks",
+            the_launcher_refuses_bad_images_and_requests_without_leaks,
+        ),
+        (
+            "many_launcher_spawns_do_not_leak",
+            many_launcher_spawns_do_not_leak,
         ),
         (
             "wait_is_woken_by_the_peer_closing",
