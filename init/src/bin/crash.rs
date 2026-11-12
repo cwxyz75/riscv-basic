@@ -148,6 +148,10 @@ pub fn app_main() -> i32 {
         25 => {
             // touch the 4 stack pages the parent mapped at 0x20_0000_0000 (present in the page
             // table, so a thread started on them takes no first-touch fault), then block forever
+            // Give the parent time to map the pages (a scheduler that runs the child first, as
+            // the round-robin class does, would otherwise fault here before they exist).
+            let ev = rt::sys::event_create().a1 as u32;
+            rt::sys::object_wait(ev, rt::abi::signals::USER_MASK, rt::sys::clock_get() + 60);
             for page in 0..4usize {
                 // SAFETY: the parent mapped these pages read-write before starting us.
                 unsafe {
