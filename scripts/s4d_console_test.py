@@ -64,7 +64,8 @@ def main():
     # a second job, killed the same way (the registration slot is reusable)
     s.step(b"spin\n", [b"spin", b"spin: started"], "a second job")
     s.step(b"\x03", [b"^C", b"interrupt", b"job: exit -130"], "Ctrl-C kills the second job")
-    # output flood: more than the queue holds; every byte is either shown or counted as dropped
+    # output flood: far more than the queue, the socket and the serial line's pace can take (the
+    # bridge moves 256 bytes a tick, so some bytes are dropped on any host speed); every byte is either shown or counted as dropped
     s.p.stdin.write(b"flood\n")
     s.p.stdin.flush()
     got = s.next_line("the echo of flood")
@@ -84,12 +85,12 @@ def main():
     dropped = sum(int(m.group(1)) for m in notice.finditer(stream))
     rest = notice.sub(b"", stream)
     if dropped == 0:
-        fail(s, "nothing was dropped by a 100000-byte flood (queue bound not enforced?)")
+        fail(s, "nothing was dropped by a 500000-byte flood (queue bound not enforced?)")
     if set(rest) - set(b"f\r\n"):
         fail(s, f"unexpected bytes in the flood output: {sorted(set(rest) - set(b'f' + bytes([13, 10])))}")
-    # the client wrote 100000 'f' and one '\n' (-> CR LF); every byte is shown or dropped
-    if len(rest) + dropped != 100000 + 2:
-        fail(s, f"accounting: shown {len(rest)} + dropped {dropped} != 100002")
+    # the client wrote 500000 'f' and one '\n' (-> CR LF); every byte is shown or dropped
+    if len(rest) + dropped != 500000 + 2:
+        fail(s, f"accounting: shown {len(rest)} + dropped {dropped} != 500002")
     # end of input
     # (Ctrl-D after "x" is ignored; erasing the x leaves an empty line, where Ctrl-D ends input)
     s.step(b"x\x04\x7f\x04", [b"x\x08 \x08eof"], "Ctrl-D on an empty line is end of input")

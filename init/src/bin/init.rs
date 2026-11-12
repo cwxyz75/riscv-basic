@@ -427,7 +427,7 @@ fn image_entry<'a>(
 /// S4d test aid: start `consoled` with the serial socket, then talk to it on the terminal socket
 /// as a stand-in for the shell. Lines from the terminal are answered like this:
 /// `spin` starts the `spin` program and registers it as the foreground job; `flood` writes
-/// 100000 bytes in one go; `quit` and Ctrl-D (a lone 0x04) end the session; a lone 0x03
+/// 500000 bytes in one go; `quit` and Ctrl-D (a lone 0x04) end the session; a lone 0x03
 /// (Ctrl-C) reports `interrupt` and what became of the job; anything else answers `got: <line>`.
 fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
     use rt::abi::rights::Rights;
@@ -570,7 +570,7 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                         };
                         let _ = io::write_all(tty_mine, msg.as_bytes());
                     } else if cmd.as_slice() == b"flood" {
-                        let data = alloc::vec![b'f'; 100_000];
+                        let data = alloc::vec![b'f'; 500_000];
                         let _ = io::write_all(tty_mine, &data);
                         let _ = io::write_all(tty_mine, b"\nflood: done\n");
                         // let the serial line drain, so the drop notice precedes the end marker
