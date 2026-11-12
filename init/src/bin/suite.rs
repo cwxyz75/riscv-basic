@@ -4642,7 +4642,10 @@ fn memfsd_exits_when_every_client_is_gone() -> Outcome {
 fn syscalls_stay_fast_with_many_live_processes() -> Outcome {
     // Every VMO a process closes after mapping it stays pending until the process dies; the
     // kernel must not rescan all of them on every wake-up (it once cost ~1 ms per syscall with a
-    // dozen service processes alive, found when the filesystem tests were added).
+    // dozen service processes alive, found when the filesystem tests were added). 3000 syscalls
+    // took about 3000 ticks then, 150 to 700 now (a fast machine, a loaded CI runner): the bound
+    // sits between. (A bound relative to a run "without" the processes does not work: earlier
+    // tests leave processes alive, which slows both runs the same.)
     let mut kids = [0u32; 12];
     for k in kids.iter_mut() {
         let (p, _mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
@@ -4654,13 +4657,13 @@ fn syscalls_stay_fast_with_many_live_processes() -> Outcome {
         sys::handle_close(e);
     }
     let took = sys::clock_get() - t0;
-    ensure!(
-        took < 600,
-        "3000 syscalls took {took} ticks with 12 processes alive"
-    );
     for k in kids {
         sys::process_kill(k, 1);
     }
+    ensure!(
+        took < 1800,
+        "3000 syscalls took {took} ticks with live processes around"
+    );
     Ok(())
 }
 
@@ -5256,6 +5259,10 @@ pub fn app_main() -> i32 {
         (
             "memfsd_exits_when_every_client_is_gone",
             memfsd_exits_when_every_client_is_gone,
+        ),
+        (
+            "syscalls_stay_fast_with_many_live_processes",
+            syscalls_stay_fast_with_many_live_processes,
         ),
         (
             "syscalls_stay_fast_with_many_live_processes",
