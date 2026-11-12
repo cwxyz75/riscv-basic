@@ -12,6 +12,7 @@
 //! exactly when the last holder lets go.
 
 use crate::frame::{Pfn, PAGE_SIZE};
+use crate::job::{JobId, Jobs, Resource};
 use crate::pagetable::{is_canonical, MapError, PageTable, Perms, PhysMem};
 use crate::Mm;
 use alloc::collections::BTreeMap;
@@ -68,6 +69,8 @@ pub enum VmoError {
 }
 
 struct Vmo {
+    /// The job charged for this VMO's committed pages (it holds one use of it).
+    job: JobId,
     pages: u64,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
     committed: BTreeMap<u64, Pfn>,
@@ -78,6 +81,9 @@ struct Vmo {
 pub struct Vmos {
     map: BTreeMap<u64, Vmo>,
     next: u64,
+    /// The job ledger lives here because memory is charged at the moment a page is committed,
+    /// which happens in this store (`page_for`) and nowhere else.
+    pub jobs: Jobs,
 }
 
 impl Vmos {
@@ -85,12 +91,20 @@ impl Vmos {
         Vmos::default()
     }
 
-    /// A new lazily committed VMO of `pages` pages (nothing allocated yet).
+    /// A new lazily committed VMO of `pages` pages (nothing allocated yet), charged to the
+    /// root job (the kernel's own VMOs).
     pub fn create(&mut self, pages: u64) -> u64 {
+        self.create_in(pages, JobId::ROOT)
+    }
+
+    /// A new lazily committed VMO whose pages are charged to `job` as they are committed.
+    pub fn create_in(&mut self, pages: u64, job: JobId) -> u64 {
+        self.jobs.retain(job);
         self.next += 1;
         self.map.insert(
             self.next,
             Vmo {
+                job,
                 pages,
                 committed: BTreeMap::new(),
             },
@@ -119,6 +133,9 @@ impl Vmos {
     /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
     pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
         let vmo = self.map.remove(&id).ok_or(VmoGone)?;
+        self.jobs
+            .credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
+        self.jobs.release(vmo.job);
         for (_, pfn) in vmo.committed {
             let dropped = mm.db.dec(pfn);
             debug_assert!(
@@ -219,7 +236,15 @@ impl Vmos {
         if let Some(&pfn) = vmo.committed.get(&page) {
             return Ok(pfn);
         }
-        let pfn = mm.db.alloc().ok_or(FaultError::NoMemory)?;
+        // The job's limit first (a full job is "out of memory" for its own programs only),
+        // then the frame; a frame that cannot be had gives the charge back.
+        self.jobs
+            .charge(vmo.job, Resource::Pages, 1)
+            .map_err(|_| FaultError::NoMemory)?;
+        let Some(pfn) = mm.db.alloc() else {
+            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            return Err(FaultError::NoMemory);
+        };
         mm.mem.zero_frame(pfn);
         vmo.committed.insert(page, pfn);
         Ok(pfn)

@@ -181,6 +181,10 @@ pub mod sys {
     pub fn vmo_create(pages: u64) -> Ret {
         syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
     }
+    /// A VMO whose pages are charged to `job` (a handle with MANAGE) instead of the caller's own.
+    pub fn vmo_create_in(pages: u64, job: u32) -> Ret {
+        syscall(VMO_CREATE, [pages as usize, job as usize, 0, 0, 0, 0])
+    }
     pub fn vmo_read(vmo: u32, offset: u64, buf: *mut u8, len: usize) -> Ret {
         syscall(
             VMO_READ,
@@ -198,6 +202,47 @@ pub mod sys {
     }
     pub fn process_create() -> Ret {
         syscall(PROCESS_CREATE, [0; 6])
+    }
+    /// A process charged to `job` (a handle with MANAGE) instead of the caller's own job.
+    pub fn process_create_in(job: u32) -> Ret {
+        syscall(PROCESS_CREATE, [job as usize, 0, 0, 0, 0, 0])
+    }
+    /// `u64::MAX` means no limit.
+    pub fn job_create(parent: u32, processes: u64, threads: u64, pages: u64) -> Ret {
+        syscall(
+            JOB_CREATE,
+            [
+                parent as usize,
+                processes as usize,
+                threads as usize,
+                pages as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    pub fn job_set_limits(job: u32, processes: u64, threads: u64, pages: u64) -> Ret {
+        syscall(
+            JOB_SET_LIMITS,
+            [
+                job as usize,
+                processes as usize,
+                threads as usize,
+                pages as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    /// `which`: 0 processes, 1 threads, 2 pages. Returns `a1` = used, `a2` = limit.
+    pub fn job_info(job: u32, which: u64) -> Ret {
+        syscall(JOB_INFO, [job as usize, which as usize, 0, 0, 0, 0])
+    }
+    pub fn job_kill(job: u32, code: i32) -> Ret {
+        syscall(JOB_KILL, [job as usize, code as usize, 0, 0, 0, 0])
+    }
+    pub fn job_root() -> Ret {
+        syscall(JOB_ROOT, [0; 6])
     }
     pub fn process_self() -> Ret {
         syscall(PROCESS_SELF, [0; 6])

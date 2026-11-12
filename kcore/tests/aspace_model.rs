@@ -449,3 +449,98 @@ fn running_out_of_frames_changes_nothing_and_leaks_nothing() {
     a.destroy(&mut mm);
     assert_eq!(mm.db.free_count(), 3, "everything came back");
 }
+
+#[test]
+fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
+    use kcore::job::{JobId, Limits, Resource, UNLIMITED};
+    let (mut mm, mut vmos, mut aspace) = setup(200);
+    let job = vmos
+        .jobs
+        .create(
+            JobId::ROOT,
+            Limits {
+                processes: UNLIMITED,
+                threads: UNLIMITED,
+                pages: 3,
+            },
+        )
+        .unwrap();
+    let id = vmos.create_in(8, job);
+    aspace.map_region(&vmos, BASE, 8, id, 0, Perms::RW).unwrap();
+    let free_before = mm.db.free_count();
+    // three pages fit; the fourth fault is refused, allocates nothing and charges nothing
+    for page in 0..3 {
+        aspace
+            .handle_fault(&mut mm, &mut vmos, BASE + page * 4096, Access::Write)
+            .unwrap();
+    }
+    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 3);
+    let free_full = mm.db.free_count();
+    assert_eq!(
+        aspace.handle_fault(&mut mm, &mut vmos, BASE + 3 * 4096, Access::Write),
+        Err(FaultError::NoMemory)
+    );
+    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 3);
+    assert_eq!(mm.db.free_count(), free_full);
+    // a page that is already committed is not charged again, and the root sees the same total
+    aspace
+        .handle_fault(&mut mm, &mut vmos, BASE + 8, Access::Read)
+        .unwrap();
+    assert_eq!(vmos.jobs.usage(JobId::ROOT).unwrap().pages, 3);
+    // another VMO in the same job shares the allowance; one in the root job does not
+    let other = vmos.create_in(2, job);
+    aspace
+        .map_region(&vmos, BASE + 16 * 4096, 2, other, 0, Perms::RW)
+        .unwrap();
+    assert_eq!(
+        aspace.handle_fault(&mut mm, &mut vmos, BASE + 16 * 4096, Access::Write),
+        Err(FaultError::NoMemory)
+    );
+    let free_root = vmos.create(1);
+    aspace
+        .map_region(&vmos, BASE + 32 * 4096, 1, free_root, 0, Perms::RW)
+        .unwrap();
+    aspace
+        .handle_fault(&mut mm, &mut vmos, BASE + 32 * 4096, Access::Write)
+        .unwrap();
+    // destroying a VMO credits what it committed and lets go of the job
+    vmos.destroy(&mut mm, id).unwrap();
+    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 0);
+    assert_eq!(vmos.jobs.usage(JobId::ROOT).unwrap().pages, 1);
+    assert_eq!(
+        aspace.handle_fault(&mut mm, &mut vmos, BASE + 16 * 4096, Access::Write),
+        Ok(()),
+        "room again after the first VMO went"
+    );
+    let _ = (free_before, Resource::Pages);
+    vmos.destroy(&mut mm, other).unwrap();
+    vmos.jobs.release(job);
+    assert!(!vmos.jobs.exists(job), "the last use was the creator's");
+}
+
+#[test]
+fn running_out_of_frames_gives_the_page_charge_back() {
+    use kcore::job::{JobId, Limits};
+    let (mut mm, mut vmos, mut aspace) = setup(7); // enough for the tables, almost nothing else
+    let job = vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(64, job);
+    aspace
+        .map_region(&vmos, BASE, 64, id, 0, Perms::RW)
+        .unwrap();
+    let mut ok = 0;
+    for page in 0..64 {
+        match aspace.handle_fault(&mut mm, &mut vmos, BASE + page * 4096, Access::Write) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                assert_eq!(e, FaultError::NoMemory);
+                break;
+            }
+        }
+    }
+    assert!(ok < 64, "the frames ran out");
+    assert_eq!(
+        vmos.jobs.usage(job).unwrap().pages,
+        ok,
+        "a refused page is not charged"
+    );
+}
