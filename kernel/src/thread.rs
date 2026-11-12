@@ -2,7 +2,7 @@
 //! the pure scheduler core (`kcore::sched`) and the machine (OS-ARCHITECTURE.md, 8).
 //!
 //! All scheduler state lives in one `Kernel` value that is only touched with
-//! interrupts disabled (one hart; S5 turns this into real locks). The core decides
+//! interrupts disabled and the big kernel lock held (`irq::without`). The core decides
 //! which thread *should* run; [`reschedule`] compares that with the thread that *is*
 //! running and switches stacks if they differ. A switch can happen
 //!   * voluntarily (block, sleep, yield, exit, or waking something better), from
@@ -139,7 +139,7 @@ fn kernel() -> &'static mut Kernel {
         !irq::enabled() && crate::bkl::held(),
         "scheduler state touched without the big kernel lock"
     );
-    // SAFETY: one hart, interrupts off (checked above in debug builds), and every
+    // SAFETY: the big kernel lock is held (checked above in debug builds), and every
     // caller drops the reference before any switch, so no two live `&mut` alias.
     unsafe {
         (*addr_of_mut!(KERNEL))

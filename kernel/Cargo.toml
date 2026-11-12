@@ -31,3 +31,4 @@ sched-round-robin = []
 # that guards it must then fail (the harness runs these builds and requires that).
 fault-skip-shootdown = []
 fault-skip-kernel-satp = []
+fault-skip-kill-ipi = []

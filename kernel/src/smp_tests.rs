@@ -25,11 +25,11 @@ pub const TESTS: &[Test] = &[
         a_wake_preempts_a_lower_priority_hart,
     ),
     ("user_threads_run_in_parallel", user_threads_run_in_parallel),
-    ("unmap_while_siblings_touch", unmap_while_siblings_touch),
     (
         "teardown_with_threads_on_other_harts",
         teardown_with_threads_on_other_harts,
     ),
+    ("unmap_while_siblings_touch", unmap_while_siblings_touch),
     (
         "kill_a_spinner_on_another_hart",
         kill_a_spinner_on_another_hart,
@@ -379,15 +379,18 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     Ok(())
 }
 
-/// A spinner in user mode on another hart is ended within a couple of ticks.
+/// A spinner in user mode on another hart is ended promptly: the kill's IPI makes the victim trap
+/// well inside a timer tick (without it the victim would notice at its next 1 ms tick, half a
+/// millisecond later on average). Measured in the `time` counter, from the call to the moment the
+/// victim's process began to end; the median of 15 kills must be under 200 microseconds.
 fn kill_a_spinner_on_another_hart() -> Result<(), String> {
     use crate::user;
     let n = smp::started();
     if n < 2 {
         return Ok(());
     }
-    let mut worst = 0;
-    for _ in 0..10 {
+    let mut cycles = alloc::vec::Vec::new();
+    for _ in 0..15 {
         let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
         // wait until some secondary hart is running user code (the spinner was placed there)
         if !wait_for(1000, || {
@@ -397,24 +400,22 @@ fn kill_a_spinner_on_another_hart() -> Result<(), String> {
             user::finish(pid, tid);
             return Err(String::from("the spinner never ran on a secondary hart"));
         }
-        let start = thread::ticks();
+        let t0 = crate::timer::now();
         user::end_process(pid, -3);
         let code = user::finish(pid, tid);
-        let took = thread::ticks() - start;
-        worst = worst.max(took);
+        let took = user::LAST_EXIT_CYCLES
+            .load(Ordering::SeqCst)
+            .saturating_sub(t0);
         if code != -3 {
             return Err(format!("exit code {code}, wanted -3"));
         }
+        cycles.push(took);
     }
-    // (round-robin has no priorities: the thread that notices the end may wait out a 10-tick slice)
-    let bound = if thread::class_name() == "fixed-priority" {
-        3
-    } else {
-        12
-    };
-    if worst > bound {
+    cycles.sort_unstable();
+    let median = cycles[cycles.len() / 2];
+    if median > 2_000 {
         return Err(format!(
-            "a kill took {worst} ticks to reach a spinner on another hart"
+            "the median kill took {median} cycles (> 200 us) to reach a spinner on another hart"
         ));
     }
     Ok(())

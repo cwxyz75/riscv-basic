@@ -35,13 +35,11 @@ pub struct Kmem {
 
 static mut KMEM: Option<Kmem> = None;
 
-/// The kernel memory state. There is one hart and no interrupts yet, so the only
-/// concurrency is a page fault arriving while code is running; callers must not
-/// keep this reference across an access that can fault (the self-tests drop it
-/// before touching lazily committed memory).
+/// The kernel memory state, protected by the big kernel lock (`get` asserts it is held once the
+/// lock is enforced). Callers must not keep this reference across an access that can fault (the
+/// self-tests drop it before touching lazily committed memory) or across a context switch.
 ///
-/// A safe function only because there is one hart: the aliasing rule above is
-/// enforced by convention, and S2 (threads, interrupts) must replace it with a lock.
+/// A safe function only because the aliasing rule is enforced by the lock and by convention.
 #[track_caller]
 pub fn get() -> &'static mut Kmem {
     debug_assert!(

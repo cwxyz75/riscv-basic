@@ -34,7 +34,7 @@ TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "240"))
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
 REQUIRED = [
-    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "unmap_while_siblings_touch", "teardown_with_threads_on_other_harts", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
+    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "teardown_with_threads_on_other_harts", "unmap_while_siblings_touch", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
     "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
@@ -189,9 +189,18 @@ def negative_control(kernel, test):
         return 1
     _, tests, _, panics, _ = parse(lines)
     failed = [n for n, ok, _ in tests if not ok]
-    if test not in failed and not timed_out and not panics:
-        print(f"negative control FAILED: expected {test} to fail, saw {failed} and {found}", file=sys.stderr)
+    passed = [n for n, ok, _ in tests if ok]
+    if test in passed:
+        print(f"negative control FAILED: {test} passed without its mechanism ({found})", file=sys.stderr)
         return 1
+    if test not in failed:
+        # the kernel crashed or hung: it must have been inside the guarded test, i.e. the named
+        # test is the first required test that was not reported (not an earlier, unrelated hang)
+        order = [n for n in REQUIRED if n not in {x for x, _, _ in tests}]
+        if not order or order[0] != test:
+            print(f"negative control FAILED: the run stopped before {test} (first missing: "
+                  f"{order[:1]}), so the control never reached it", file=sys.stderr)
+            return 1
     how = "failed" if test in failed else "crashed or hung the kernel"
     print(f"negative control passed: {test} {how} without its mechanism ({kernel})")
     return 0

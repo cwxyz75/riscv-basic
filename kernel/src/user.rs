@@ -534,6 +534,9 @@ fn exit_process(code: i32) -> ! {
 /// and the process ends when the last thread does. The process is torn down by its last thread
 /// (a process started by `process_start`), or by `finish` (one the kernel started).
 fn leave(code: i32, whole: bool) -> ! {
+    if whole {
+        LAST_EXIT_CYCLES.store(crate::timer::now(), Ordering::SeqCst);
+    }
     let me = irq::without(|| {
         let s = state();
         let tid = thread::current();
@@ -1218,18 +1221,18 @@ pub fn reset_user_mode_high_water() {
     USER_MAX.store(USER_NOW.load(Ordering::SeqCst), Ordering::SeqCst);
 }
 
+/// The `time` counter when a whole process last began to end (the kill-latency test).
+pub static LAST_EXIT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// End process `pid` with `code` from kernel code (the tests).
 pub fn end_process(pid: u32, code: i32) {
     request_kill(pid, code);
 }
 
 fn request_kill(pid: u32, code: i32) {
-    // a victim running user code on another hart sees the kill at its next trap: send one now
-    // (the next timer tick would do it within a millisecond, this makes it prompt)
-    irq::without(crate::smp::kick_others);
     let direct = irq::without(|| {
         let s = state();
-        match s.procs.get_mut(&pid) {
+        let r = match s.procs.get_mut(&pid) {
             Some(p) if p.state == ProcState::Created => {
                 p.exit_code = Some(code);
                 true
@@ -1239,7 +1242,15 @@ fn request_kill(pid: u32, code: i32) {
                 false
             }
             None => false,
+        };
+        // A victim running user code on another hart sees the kill at its next trap: the flag is
+        // set first and the kick comes in the same locked region, so a hart that handles the IPI
+        // always finds the flag (the next timer tick would do it within a millisecond; this makes
+        // it prompt).
+        if !cfg!(feature = "fault-skip-kill-ipi") {
+            crate::smp::kick_others();
         }
+        r
     });
     if direct {
         teardown(pid);
