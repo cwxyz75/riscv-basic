@@ -1,0 +1,428 @@
+//! The memory filesystem's tree (S4-SPEC section 7), with no I/O: directories as ordered
+//! maps, files as byte vectors, boot-image files as read-only `(offset, length)` extents,
+//! quota accounting, read-only subtrees, and reference counts so a node that is unlinked while
+//! a connection has it open lives on until the last connection lets go. `no_std`,
+//! `forbid(unsafe_code)`, host-tested against an independent path-keyed model.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+pub type NodeId = u32;
+
+/// The root directory.
+pub const ROOT: NodeId = 0;
+
+/// Server-wide ceilings (S4-SPEC section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_nodes: usize,
+    /// Bytes of file data in all files together.
+    pub max_bytes: usize,
+    /// Bytes in one file.
+    pub max_file: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_nodes: 8192,
+            max_bytes: 8 * 1024 * 1024,
+            max_file: 4 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    /// A read-only file whose bytes are an extent of the boot image.
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    NotFound,
+    Exists,
+    NotEmpty,
+    IsDirectory,
+    NotDirectory,
+    /// The node-count or total-bytes quota.
+    Quota,
+    /// One file would exceed its size limit.
+    TooBig,
+    /// A read-only node or a read-only directory.
+    ReadOnly,
+    /// A name that is empty, too long, `.`/`..`, or contains `/` or NUL.
+    BadName,
+    /// An offset or length that overflows.
+    BadRange,
+}
+
+enum Data {
+    File(Vec<u8>),
+    Dir(BTreeMap<Vec<u8>, NodeId>),
+    Image { offset: u64, len: u64 },
+}
+
+struct Node {
+    data: Data,
+    /// Directory entries that name this node (0 once unlinked, 1 while linked).
+    links: u32,
+    /// Open connections holding this node.
+    refs: u32,
+    readonly: bool,
+}
+
+pub struct Fs {
+    limits: Limits,
+    nodes: Vec<Option<Node>>,
+    free: Vec<NodeId>,
+    live: usize,
+    bytes: usize,
+}
+
+fn check_name(n: &[u8]) -> Result<(), Error> {
+    proto::file::valid_name(n).map_err(|_| Error::BadName)
+}
+
+impl Fs {
+    pub fn new(limits: Limits) -> Fs {
+        let root = Node {
+            data: Data::Dir(BTreeMap::new()),
+            links: 1,
+            refs: 0,
+            readonly: false,
+        };
+        Fs {
+            limits,
+            nodes: alloc::vec![Some(root)],
+            free: Vec::new(),
+            live: 1,
+            bytes: 0,
+        }
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Live nodes (including unlinked ones that are still open).
+    pub fn node_count(&self) -> usize {
+        self.live
+    }
+
+    /// Bytes of file data held.
+    pub fn bytes_used(&self) -> usize {
+        self.bytes
+    }
+
+    fn node(&self, id: NodeId) -> Result<&Node, Error> {
+        self.nodes
+            .get(id as usize)
+            .and_then(|n| n.as_ref())
+            .ok_or(Error::NotFound)
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Result<&mut Node, Error> {
+        self.nodes
+            .get_mut(id as usize)
+            .and_then(|n| n.as_mut())
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn kind(&self, id: NodeId) -> Result<Kind, Error> {
+        Ok(match self.node(id)?.data {
+            Data::File(_) => Kind::File,
+            Data::Dir(_) => Kind::Dir,
+            Data::Image { .. } => Kind::Image,
+        })
+    }
+
+    /// Size of a file or image extent in bytes (a directory has the number of its entries).
+    pub fn size(&self, id: NodeId) -> Result<u64, Error> {
+        Ok(match &self.node(id)?.data {
+            Data::File(v) => v.len() as u64,
+            Data::Dir(m) => m.len() as u64,
+            Data::Image { len, .. } => *len,
+        })
+    }
+
+    pub fn is_readonly(&self, id: NodeId) -> Result<bool, Error> {
+        let n = self.node(id)?;
+        Ok(n.readonly || matches!(n.data, Data::Image { .. }))
+    }
+
+    /// Mark a directory or file read-only: no entries may be created in or removed from a
+    /// read-only directory, and a read-only file cannot be written. (Image files always are.)
+    pub fn set_readonly(&mut self, id: NodeId) -> Result<(), Error> {
+        self.node_mut(id)?.readonly = true;
+        Ok(())
+    }
+
+    /// The entry called `name` in directory `dir`.
+    pub fn lookup(&self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
+        check_name(name)?;
+        match &self.node(dir)?.data {
+            Data::Dir(m) => m.get(name).copied().ok_or(Error::NotFound),
+            _ => Err(Error::NotDirectory),
+        }
+    }
+
+    /// Follow `components` from `start` (each must be a directory except the last).
+    pub fn walk(&self, start: NodeId, components: &[&[u8]]) -> Result<NodeId, Error> {
+        let mut at = start;
+        for c in components {
+            at = self.lookup(at, c)?;
+        }
+        Ok(at)
+    }
+
+    fn insert(&mut self, dir: NodeId, name: &[u8], data: Data) -> Result<NodeId, Error> {
+        check_name(name)?;
+        {
+            let d = self.node(dir)?;
+            match &d.data {
+                Data::Dir(m) => {
+                    if m.contains_key(name) {
+                        return Err(Error::Exists);
+                    }
+                }
+                _ => return Err(Error::NotDirectory),
+            }
+            if d.readonly {
+                return Err(Error::ReadOnly);
+            }
+        }
+        if self.live >= self.limits.max_nodes {
+            return Err(Error::Quota);
+        }
+        let node = Node {
+            data,
+            links: 1,
+            refs: 0,
+            readonly: false,
+        };
+        let id = if let Some(id) = self.free.pop() {
+            self.nodes[id as usize] = Some(node);
+            id
+        } else {
+            self.nodes.try_reserve(1).map_err(|_| Error::Quota)?;
+            self.nodes.push(Some(node));
+            (self.nodes.len() - 1) as NodeId
+        };
+        self.live += 1;
+        if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
+            m.insert(name.to_vec(), id);
+        }
+        Ok(id)
+    }
+
+    pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
+        self.insert(dir, name, Data::File(Vec::new()))
+    }
+
+    pub fn mkdir(&mut self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
+        self.insert(dir, name, Data::Dir(BTreeMap::new()))
+    }
+
+    /// A read-only file whose contents are `len` bytes at `offset` of the boot image.
+    pub fn add_image_file(
+        &mut self,
+        dir: NodeId,
+        name: &[u8],
+        offset: u64,
+        len: u64,
+    ) -> Result<NodeId, Error> {
+        offset.checked_add(len).ok_or(Error::BadRange)?;
+        self.insert(dir, name, Data::Image { offset, len })
+    }
+
+    /// The `(offset, length)` of an image file.
+    pub fn image_extent(&self, id: NodeId) -> Result<(u64, u64), Error> {
+        match self.node(id)?.data {
+            Data::Image { offset, len } => Ok((offset, len)),
+            Data::Dir(_) => Err(Error::IsDirectory),
+            Data::File(_) => Err(Error::NotFound),
+        }
+    }
+
+    /// Remove the entry `name` of `dir`. A directory must be empty. The node itself lives on
+    /// while connections hold it.
+    pub fn unlink(&mut self, dir: NodeId, name: &[u8]) -> Result<(), Error> {
+        check_name(name)?;
+        let target = {
+            let d = self.node(dir)?;
+            if d.readonly {
+                return Err(Error::ReadOnly);
+            }
+            match &d.data {
+                Data::Dir(m) => *m.get(name).ok_or(Error::NotFound)?,
+                _ => return Err(Error::NotDirectory),
+            }
+        };
+        if let Data::Dir(m) = &self.node(target)?.data {
+            if !m.is_empty() {
+                return Err(Error::NotEmpty);
+            }
+        }
+        if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
+            m.remove(name);
+        }
+        self.node_mut(target)?.links = 0;
+        self.collect(target);
+        Ok(())
+    }
+
+    /// A connection starts holding `id`.
+    pub fn retain(&mut self, id: NodeId) -> Result<(), Error> {
+        self.node_mut(id)?.refs += 1;
+        Ok(())
+    }
+
+    /// A connection lets go; an unlinked node nobody holds is freed.
+    pub fn release(&mut self, id: NodeId) {
+        if let Ok(n) = self.node_mut(id) {
+            n.refs = n.refs.saturating_sub(1);
+        }
+        self.collect(id);
+    }
+
+    fn collect(&mut self, id: NodeId) {
+        let dead = matches!(self.nodes.get(id as usize), Some(Some(n)) if n.links == 0 && n.refs == 0)
+            && id != ROOT;
+        if dead {
+            if let Some(Some(n)) = self.nodes.get_mut(id as usize).map(|s| s.take()) {
+                if let Data::File(v) = &n.data {
+                    self.bytes -= v.len();
+                }
+            }
+            self.free.push(id);
+            self.live -= 1;
+        }
+    }
+
+    /// Up to `len` bytes of a file at `offset` (fewer at the end; empty past it).
+    pub fn read(&self, id: NodeId, offset: u64, len: usize) -> Result<&[u8], Error> {
+        match &self.node(id)?.data {
+            Data::File(v) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(v.len());
+                let end = start.saturating_add(len).min(v.len());
+                Ok(&v[start..end])
+            }
+            Data::Dir(_) => Err(Error::IsDirectory),
+            Data::Image { .. } => Err(Error::ReadOnly),
+        }
+    }
+
+    /// Write `data` at `offset`, growing the file (a gap is zero-filled and counts against the
+    /// quota). Nothing changes on error. Returns the bytes written.
+    pub fn write(&mut self, id: NodeId, offset: u64, data: &[u8]) -> Result<usize, Error> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(Error::BadRange)?;
+        let n = self.node(id)?;
+        match &n.data {
+            Data::Dir(_) => return Err(Error::IsDirectory),
+            Data::Image { .. } => return Err(Error::ReadOnly),
+            Data::File(_) => {}
+        }
+        if n.readonly {
+            return Err(Error::ReadOnly);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let end = usize::try_from(end).map_err(|_| Error::TooBig)?;
+        self.resize_for(id, end)?;
+        let offset = offset as usize;
+        if let Data::File(v) = &mut self.node_mut(id)?.data {
+            v[offset..offset + data.len()].copy_from_slice(data);
+        }
+        Ok(data.len())
+    }
+
+    /// Make the file `size` bytes long (zero-filled growth, truncating shrink).
+    pub fn set_size(&mut self, id: NodeId, size: u64) -> Result<(), Error> {
+        let n = self.node(id)?;
+        match &n.data {
+            Data::Dir(_) => return Err(Error::IsDirectory),
+            Data::Image { .. } => return Err(Error::ReadOnly),
+            Data::File(_) => {}
+        }
+        if n.readonly {
+            return Err(Error::ReadOnly);
+        }
+        let size = usize::try_from(size).map_err(|_| Error::TooBig)?;
+        if size > self.limits.max_file {
+            return Err(Error::TooBig);
+        }
+        let cur = match &self.node(id)?.data {
+            Data::File(v) => v.len(),
+            _ => 0,
+        };
+        if size > cur {
+            self.resize_for(id, size)
+        } else {
+            if let Data::File(v) = &mut self.node_mut(id)?.data {
+                v.truncate(size);
+            }
+            self.bytes -= cur - size;
+            Ok(())
+        }
+    }
+
+    /// Grow the file to at least `new_len` bytes, checking limits before changing anything.
+    fn resize_for(&mut self, id: NodeId, new_len: usize) -> Result<(), Error> {
+        let cur = match &self.node(id)?.data {
+            Data::File(v) => v.len(),
+            _ => return Err(Error::IsDirectory),
+        };
+        if new_len <= cur {
+            return Ok(());
+        }
+        if new_len > self.limits.max_file {
+            return Err(Error::TooBig);
+        }
+        let grow = new_len - cur;
+        if self.bytes + grow > self.limits.max_bytes {
+            return Err(Error::Quota);
+        }
+        if let Data::File(v) = &mut self.node_mut(id)?.data {
+            v.try_reserve(grow).map_err(|_| Error::Quota)?;
+            v.resize(new_len, 0);
+        }
+        self.bytes += grow;
+        Ok(())
+    }
+
+    /// Entries of `dir` in bytewise name order, strictly after `after` (the last name the caller
+    /// saw; `None` starts at the beginning), at most `max` of them.
+    pub fn read_dir(
+        &self,
+        dir: NodeId,
+        after: Option<&[u8]>,
+        max: usize,
+    ) -> Result<Vec<(Vec<u8>, Kind)>, Error> {
+        let m = match &self.node(dir)?.data {
+            Data::Dir(m) => m,
+            _ => return Err(Error::NotDirectory),
+        };
+        let mut out = Vec::new();
+        let iter: alloc::boxed::Box<dyn Iterator<Item = (&Vec<u8>, &NodeId)>> = match after {
+            Some(a) => alloc::boxed::Box::new(
+                m.range::<[u8], _>((core::ops::Bound::Excluded(a), core::ops::Bound::Unbounded)),
+            ),
+            None => alloc::boxed::Box::new(m.iter()),
+        };
+        for (name, id) in iter.take(max) {
+            out.push((name.clone(), self.kind(*id)?));
+        }
+        Ok(out)
+    }
+}

@@ -24,7 +24,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p kcore -p proto -p basic -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p kcore -p proto -p memfs -p basic -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -34,7 +34,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p kcore -p proto -p basic -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p kcore -p proto -p memfs -p basic -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
