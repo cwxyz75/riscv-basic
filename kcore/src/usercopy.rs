@@ -132,3 +132,38 @@ pub fn verify_writable<M: PhysMem>(
     }
     Ok(())
 }
+
+/// Write `data` at `va` after `verify_writable` has accepted the same range. It allocates nothing
+/// and commits nothing: every page is already mapped, so it cannot fail for lack of memory, and
+/// the data a call has already taken (a channel message) is never lost to a late failure. (It
+/// still reports an error, rather than ignoring it, for the case that a page is no longer there;
+/// with one hart that cannot happen, and with several it is the case the lock must exclude.)
+pub fn copy_to_user_verified<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    va: u64,
+    data: &[u8],
+) -> Result<(), Status> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    check_range(va, data.len())?;
+    let mut done = 0;
+    while done < data.len() {
+        let at = va + done as u64;
+        let n = ((PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize).min(data.len() - done);
+        let t = aspace
+            .table()
+            .translate(mm, at & !(PAGE_SIZE - 1))
+            .ok_or(Status::InvalidArgs)?;
+        if !(t.perms.user && t.perms.write) {
+            return Err(Status::InvalidArgs);
+        }
+        mm.mem.write_bytes(
+            (t.pfn << 12) | (at & (PAGE_SIZE - 1)),
+            &data[done..done + n],
+        );
+        done += n;
+    }
+    Ok(())
+}

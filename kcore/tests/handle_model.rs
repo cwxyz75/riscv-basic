@@ -276,7 +276,10 @@ fn handle_values_encode_slot_and_generation() {
     assert_eq!(h1.0, 1, "first slot, generation 0: value 0x0000_0001");
     t.close(&mut reg, h1).unwrap();
     let h2 = event_create(&mut reg, &mut t).unwrap();
-    assert_eq!(h2.0, 0x0001_0001, "same slot, generation 1");
+    assert_eq!(
+        h2.0, 0x0000_2001,
+        "same slot, generation 1 (shifted past the 13 slot bits)"
+    );
     assert_eq!(
         t.get(h1),
         Err(Status::BadHandle),
@@ -285,9 +288,51 @@ fn handle_values_encode_slot_and_generation() {
     let h3 = event_create(&mut reg, &mut t).unwrap();
     assert_eq!(h3.0, 2, "second slot");
     assert_eq!(
-        t.get(Handle(0x0000_ffff)),
+        t.get(Handle(0x0000_1fff)),
         Err(Status::BadHandle),
         "slot far beyond the table"
+    );
+    t.drain(&mut reg);
+}
+
+#[test]
+fn a_slot_whose_generation_would_wrap_is_retired_so_no_stale_value_comes_back() {
+    // One slot used over and over: the generation counts up, and at the end of its range the
+    // slot is taken out of service instead of wrapping to a value an old handle still holds.
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(4);
+    let first = event_create(&mut reg, &mut t).unwrap();
+    t.close(&mut reg, first).unwrap();
+    let mut seen_slot0 = 1u64;
+    let mut last_slot0 = first;
+    loop {
+        let h = event_create(&mut reg, &mut t).unwrap();
+        if h.0 & 0x1fff != 1 {
+            // slot 0 was retired: the next handle came from another slot
+            assert_eq!(h.0 & 0x1fff, 2, "the replacement slot");
+            t.close(&mut reg, h).unwrap();
+            break;
+        }
+        assert_ne!(h, first, "a generation was reused after {seen_slot0} uses");
+        seen_slot0 += 1;
+        last_slot0 = h;
+        t.close(&mut reg, h).unwrap();
+        assert!(seen_slot0 <= 1 << 19, "the slot was never retired");
+    }
+    assert_eq!(
+        seen_slot0,
+        1 << 19,
+        "every generation of the slot was used once"
+    );
+    assert_eq!(t.get(last_slot0), Err(Status::BadHandle));
+    assert_eq!(t.get(first), Err(Status::BadHandle));
+    // the table still holds its full limit of live handles (it just uses a fresh slot)
+    for _ in 0..4 {
+        event_create(&mut reg, &mut t).unwrap();
+    }
+    assert!(
+        event_create(&mut reg, &mut t).is_err(),
+        "the limit is still 4"
     );
     t.drain(&mut reg);
 }

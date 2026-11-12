@@ -5441,6 +5441,28 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "kill may not set limits"
     );
     ensure_eq!(
+        st(sys::job_set_limits(manage, 1, 1, 1, u64::MAX)),
+        Some(S::AccessDenied),
+        "MANAGE alone may not lift or change limits (T36)"
+    );
+    let setter = only(Rights::SET_LIMITS)?;
+    ensure_eq!(
+        st(sys::job_set_limits(
+            setter,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        )),
+        Some(S::Ok),
+        "SET_LIMITS may set limits"
+    );
+    ensure_eq!(
+        st(sys::job_create(setter, 1, 1, 1, 1)),
+        Some(S::AccessDenied),
+        "SET_LIMITS alone may not create jobs"
+    );
+    ensure_eq!(
         st(sys::job_kill(manage, 0)),
         Some(S::AccessDenied),
         "manage may not kill"
@@ -5471,7 +5493,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         7,
         "the child's three refusals (job_root, a made-up job, a second process)"
     );
-    for h in [root, ev, inspect, manage, kill, j, p] {
+    for h in [root, ev, inspect, manage, kill, setter, j, p] {
         sys::handle_close(h);
     }
     Ok(())
