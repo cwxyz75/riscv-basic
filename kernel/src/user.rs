@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;

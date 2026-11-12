@@ -2,7 +2,7 @@
 //! QEMU `virt`'s `time` counter runs at 10 MHz.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 const EID_TIME: usize = 0x5449_4D45;
 /// Counter cycles per tick: 10 MHz / 1000 = 1 ms.

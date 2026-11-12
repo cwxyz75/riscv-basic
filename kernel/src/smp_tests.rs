@@ -7,7 +7,9 @@ use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::Ordering;
 
-pub const TESTS: &[(&str, fn() -> Result<(), String>)] = &[
+type Test = (&'static str, fn() -> Result<(), String>);
+
+pub const TESTS: &[Test] = &[
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
 ];
@@ -88,9 +90,9 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
     for i in 1..n {
         smp::send_ipi(i, percpu::IPI_RESCHED);
     }
-    for i in 1..n {
+    for (i, &was) in before.iter().enumerate().skip(1) {
         let h = percpu::hart(i);
-        if !wait_for(1000, || h.ipis.load(Ordering::SeqCst) > before[i]) {
+        if !wait_for(1000, || h.ipis.load(Ordering::SeqCst) > was) {
             return Err(format!("hart {i} missed the second IPI"));
         }
     }
