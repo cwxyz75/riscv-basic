@@ -21,6 +21,7 @@ use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
+use kcore::job::{JobError, JobId, Limits, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::sched::Tid;
 use kcore::usercopy::{copy_from_user, copy_to_user, verify_writable};
@@ -63,6 +64,12 @@ struct Process {
     threads_alive: usize,
     /// The thread objects of the live threads, to mark them TERMINATED when they end.
     thread_objs: BTreeMap<Tid, kcore::object::ObjId>,
+    /// The job this process is charged to (it holds one use of it): its process, its threads
+    /// and, through the VMOs made for it, its memory.
+    job: JobId,
+    /// Started by the kernel (`start`): may ask for the root job (`job_root`). Nothing a program
+    /// creates is privileged.
+    privileged: bool,
 }
 
 /// What a new user thread needs to start (looked up by the thread itself: a thread's start
@@ -242,6 +249,8 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         killed: None,
         threads_alive: 1,
         thread_objs: BTreeMap::new(),
+        job: JobId::ROOT,
+        privileged: true,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
@@ -276,6 +285,10 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     let token = irq::without(|| {
         let s = state();
         let (entry, arg) = (process.entry, process.arg);
+        // (the root job has no limits: these charges only keep its usage honest)
+        let jobs = &mut kmem::get().vmos.jobs;
+        let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
+        let _ = jobs.charge(JobId::ROOT, Resource::Threads, 1);
         s.procs.insert(pid, process);
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
@@ -450,6 +463,8 @@ fn teardown(pid: u32) -> i32 {
         for id in process.vmos {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
+        k.vmos.jobs.credit(process.job, Resource::Processes, 1);
+        k.vmos.jobs.release(process.job);
     });
     kmem::flush_tlb();
     REAP_DIRTY.store(true, Ordering::SeqCst); // its mappings are gone: pending VMOs may go
@@ -478,6 +493,7 @@ fn leave(code: i32, whole: bool) -> ! {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;
+        kmem::get().vmos.jobs.credit(p.job, Resource::Threads, 1);
         if whole {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
@@ -611,6 +627,11 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => reply(frame, port_wait(a)),
         nr::PROCESS_CREATE
+        | nr::JOB_CREATE
+        | nr::JOB_SET_LIMITS
+        | nr::JOB_INFO
+        | nr::JOB_KILL
+        | nr::JOB_ROOT
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
         | nr::PROCESS_UNMAP
@@ -711,6 +732,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
+        nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
         nr::SOCKET_WRITE | nr::SOCKET_READ | nr::PORT_UNBIND if over(0) => Some(Status::BadHandle),
         nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
@@ -879,7 +901,13 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {
                 return fail(Status::InvalidArgs);
             }
-            let id = k.vmos.create(a[0]);
+            // a1: the job the memory is charged to (a handle with MANAGE), or 0 for the caller's own
+            let job = if a[1] == 0 {
+                p.job
+            } else {
+                ipc::job_of(objs, &p.handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
+            };
+            let id = k.vmos.create_in(a[0], job);
             match ipc::vmo_object_create(objs, &mut p.handles, id) {
                 Ok(h) => Ok((Some(u64::from(h.0)), None)),
                 Err(e) => {
@@ -1023,6 +1051,7 @@ fn cleanup_dead() {
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
                     request_kill(p.pid, -2000)
                 }
+                ipc::KObj::Job(id) => irq::without(|| kmem::get().vmos.jobs.release(id)),
                 _ => {}
             }
         }
@@ -1564,7 +1593,15 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
     // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
     let wide = |i: usize| a[i] > u64::from(u32::MAX);
     match n {
-        nr::PROCESS_CREATE => process_create(),
+        nr::PROCESS_CREATE if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_CREATE => process_create(a),
+        nr::JOB_CREATE if wide(0) => bad(Status::BadHandle),
+        nr::JOB_CREATE => job_create(a),
+        nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_KILL if wide(0) => bad(Status::BadHandle),
+        nr::JOB_SET_LIMITS => job_set_limits(a),
+        nr::JOB_INFO => job_info(a),
+        nr::JOB_KILL => job_kill(a),
+        nr::JOB_ROOT => job_root(),
         nr::PROCESS_SELF => process_self(),
         nr::PROCESS_MAP if wide(0) || wide(1) => bad(Status::BadHandle),
         nr::PROCESS_MAP => process_map(a),
@@ -1590,19 +1627,41 @@ fn caller_pid(s: &UserState) -> Result<u32, Status> {
         .ok_or(Status::BadState)
 }
 
-fn process_create() -> Reply {
+fn process_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         if s.procs.len() >= abi::limits::MAX_PROCESSES || !kmem::kernel_half_unchanged() {
             return bad(Status::NoMemory);
         }
+        // The job the new process is charged to: the one named by the handle in a0 (MANAGE), or
+        // the caller's own when a0 is 0.
+        let creator = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let job = if a[0] == 0 {
+            creator.job
+        } else {
+            ipc::job_of(
+                &s.objs,
+                &creator.handles,
+                Handle(a[0] as u32),
+                Rights::MANAGE,
+            )
+            .map_err(|e| (e, None, None))?
+        };
         let k = kmem::get();
-        let table = PageTable::new_with_kernel_half(&mut k.mm, k.aspace.table()).ok_or((
-            Status::NoMemory,
-            None,
-            None,
-        ))?;
+        k.vmos
+            .jobs
+            .charge(job, Resource::Processes, 1)
+            .map_err(|e| (job_status(e), None, None))?;
+        k.vmos.jobs.retain(job);
+        let give_back = |k: &mut kmem::Kmem| {
+            k.vmos.jobs.credit(job, Resource::Processes, 1);
+            k.vmos.jobs.release(job);
+        };
+        let Some(table) = PageTable::new_with_kernel_half(&mut k.mm, k.aspace.table()) else {
+            give_back(k);
+            return bad(Status::NoMemory);
+        };
         let pid = s.next_pid;
         s.next_pid += 1;
         let UserState { objs, procs, .. } = s;
@@ -1612,6 +1671,7 @@ fn process_create() -> Reply {
             Ok(x) => x,
             Err(e) => {
                 PageTable::destroy_user(table, &mut k.mm);
+                give_back(k);
                 return bad(e);
             }
         };
@@ -1633,6 +1693,8 @@ fn process_create() -> Reply {
                 killed: None,
                 threads_alive: 0,
                 thread_objs: BTreeMap::new(),
+                job,
+                privileged: false,
             },
         );
         Ok((Some(u64::from(handle.0)), None))
@@ -1837,6 +1899,11 @@ fn process_start(a: [u64; 6]) -> Reply {
         );
         target.entry = entry;
         target.arg = arg;
+        kmem::get()
+            .vmos
+            .jobs
+            .charge(target.job, Resource::Threads, 1)
+            .map_err(|e| (job_status(e), None, None))?;
         target.start_sp = sp;
         target.state = ProcState::Running;
         target.threads_alive = 1;
@@ -1916,10 +1983,19 @@ fn thread_create(a: [u64; 6]) -> Reply {
         {
             return bad(Status::NoMemory).map(|_| (0, 0));
         }
+        let tjob = target.job;
         let UserState { objs, procs, .. } = s;
+        let jobs = &mut kmem::get().vmos.jobs;
+        jobs.charge(tjob, Resource::Threads, 1)
+            .map_err(|e| (job_status(e), None, None))?;
         let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let (handle, obj) = ipc::thread_object_create(objs, &mut caller.handles, tpid)
-            .map_err(|e| (e, None, None))?;
+        let (handle, obj) = match ipc::thread_object_create(objs, &mut caller.handles, tpid) {
+            Ok(x) => x,
+            Err(e) => {
+                jobs.credit(tjob, Resource::Threads, 1);
+                return Err((e, None, None));
+            }
+        };
         procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
         Ok((new_start(s, tpid, entry, sp, arg, Some(obj)), handle.0))
     })?;
@@ -1940,5 +2016,171 @@ fn thread_info(a: [u64; 6]) -> Reply {
             return bad(Status::BadState);
         }
         Ok((Some(code as i64 as u64), None))
+    })
+}
+
+// ---- jobs (S4.5, OD56-OD58) ----
+
+/// What a failed ledger call looks like to a program: running into a limit is "out of memory"
+/// (the one resource-exhausted status), a job that is gone is a bad state.
+fn job_status(e: JobError) -> Status {
+    match e {
+        JobError::Exceeded | JobError::TooManyJobs => Status::NoMemory,
+        JobError::NoSuchJob => Status::BadState,
+    }
+}
+
+/// Limits from three syscall words (`u64::MAX` means no limit).
+fn limits_of(a: [u64; 6], at: usize) -> Limits {
+    Limits {
+        processes: a[at],
+        threads: a[at + 1],
+        pages: a[at + 2],
+    }
+}
+
+/// `job_create(parent, processes, threads, pages) -> handle`: a child job of the job `parent`
+/// (needs MANAGE). The child can never use more than any ancestor allows, whatever its own
+/// limits say.
+fn job_create(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let UserState { objs, procs, .. } = s;
+        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        let parent = ipc::job_of(objs, &caller.handles, Handle(a[0] as u32), Rights::MANAGE)
+            .map_err(|e| (e, None, None))?;
+        let jobs = &mut kmem::get().vmos.jobs;
+        let id = jobs
+            .create(parent, limits_of(a, 1))
+            .map_err(|e| (job_status(e), None, None))?;
+        match ipc::job_object_create(objs, &mut caller.handles, id, Rights::JOB) {
+            Ok(h) => Ok((Some(u64::from(h.0)), None)),
+            Err(e) => {
+                jobs.release(id);
+                Err((e, None, None))
+            }
+        }
+    })
+}
+
+/// `job_set_limits(job, processes, threads, pages)`: needs MANAGE. Usage above a new limit is
+/// not undone: later charges fail until it is back under.
+fn job_set_limits(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let job = ipc::job_of(
+            &s.objs,
+            &caller.handles,
+            Handle(a[0] as u32),
+            Rights::MANAGE,
+        )
+        .map_err(|e| (e, None, None))?;
+        kmem::get()
+            .vmos
+            .jobs
+            .set_limits(job, limits_of(a, 1))
+            .map_err(|e| (job_status(e), None, None))?;
+        Ok((None, None))
+    })
+}
+
+/// `job_info(job, which) -> used, limit` for `which` 0 processes, 1 threads, 2 pages (everything
+/// in the job and below it). Needs INSPECT.
+fn job_info(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let job = ipc::job_of(
+            &s.objs,
+            &caller.handles,
+            Handle(a[0] as u32),
+            Rights::INSPECT,
+        )
+        .map_err(|e| (e, None, None))?;
+        let res = match a[1] {
+            0 => Resource::Processes,
+            1 => Resource::Threads,
+            2 => Resource::Pages,
+            _ => return bad(Status::InvalidArgs),
+        };
+        let jobs = &kmem::get().vmos.jobs;
+        let used = jobs
+            .usage(job)
+            .ok_or((Status::BadState, None, None))?
+            .get(res);
+        let limits = jobs.limits(job).ok_or((Status::BadState, None, None))?;
+        let limit = match res {
+            Resource::Processes => limits.processes,
+            Resource::Threads => limits.threads,
+            Resource::Pages => limits.pages,
+        };
+        Ok((Some(used), Some(limit)))
+    })
+}
+
+/// `job_kill(job, code)`: end every process in the job and its descendants with exit code
+/// `code` and forbid new processes and threads there (their limits become 0). Needs KILL. A
+/// caller inside the job ends too, last.
+fn job_kill(a: [u64; 6]) -> Reply {
+    let code = a[1] as i32;
+    let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u32>, bool, u32), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let job = ipc::job_of(&s.objs, &caller.handles, Handle(a[0] as u32), Rights::KILL)
+            .map_err(|e| (e, None, None))?;
+        let jobs = &mut kmem::get().vmos.jobs;
+        let mut limits = jobs.limits(job).ok_or((Status::BadState, None, None))?;
+        limits.processes = 0;
+        limits.threads = 0;
+        let _ = jobs.set_limits(job, limits);
+        let inside: Vec<u32> = s
+            .procs
+            .iter()
+            .filter(|(_, p)| jobs.is_within(p.job, job))
+            .map(|(&pid, _)| pid)
+            .collect();
+        let me_inside = inside.contains(&me);
+        Ok((
+            inside.into_iter().filter(|&p| p != me).collect(),
+            me_inside,
+            me,
+        ))
+    })?;
+    for pid in victims {
+        request_kill(pid, code);
+    }
+    if me_inside {
+        let _ = me;
+        exit_process(code);
+    }
+    Ok((None, None))
+}
+
+/// `job_root() -> handle`: only a process the kernel started (`init`) may ask; it gets a handle
+/// with every job right to the root job. Everything else a program holds is derived from this one
+/// (or from a job its parent gave it), so no program can name a job it was not given.
+fn job_root() -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let UserState { objs, procs, .. } = s;
+        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        if !caller.privileged {
+            return bad(Status::AccessDenied);
+        }
+        let jobs = &mut kmem::get().vmos.jobs;
+        jobs.retain(JobId::ROOT);
+        match ipc::job_object_create(objs, &mut caller.handles, JobId::ROOT, Rights::JOB) {
+            Ok(h) => Ok((Some(u64::from(h.0)), None)),
+            Err(e) => {
+                jobs.release(JobId::ROOT);
+                Err((e, None, None))
+            }
+        }
     })
 }

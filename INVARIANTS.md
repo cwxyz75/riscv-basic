@@ -56,6 +56,15 @@ get filled in as each area is built.
 | P3 | A user fault the kernel cannot resolve ends the process, never the kernel; the exit code says why (`-1000 - scause`) | QEMU: eight fault kinds, `the_stack_has_a_guard_page`, `a_syscall_with_sp_in_the_kernel_is_harmless` |
 | P4 | A user program can only reach the kernel through syscalls: registers other than a0-a2 are preserved, no kernel value is left in a user register | QEMU `registers_survive_a_syscall`; `enter_user` zeroes every register but a0 and sp |
 
+### Job and limit rules (S4.5)
+
+| # | Invariant | How checked |
+|---|---|---|
+| J1 | A charge applies to a job and every ancestor, all or nothing: no job's usage ever exceeds a limit that was in force when it was charged, and a child never uses more than its parent allows | `kcore::job` unit tests and a random model; QEMU `a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling` |
+| J2 | Every charge is credited back exactly once: a process at teardown, a thread when it ends, a page when its VMO is freed. A job record with usage is never freed (`debug_assert` in `Jobs::release`: a leak is a kernel panic in the tests) | QEMU `jobs_do_not_leak`, `job_*_credited_back`; mutation-checked |
+| J3 | No ambient job authority: no call returns the caller's own job; `job_root` is refused to every process the kernel did not start; a job handle's rights only shrink (H3) | QEMU `job_syscalls_check_handles_rights_and_arguments` (a child proves it) |
+| J4 | A job's memory is charged where the page is committed (`Vmos::page_for`), nowhere else: no path commits a page without the charge | code structure; `committed_pages_are_charged...` |
+
 ### Lock order
 
 (Empty until S5. The first entry added is the big kernel lock; every later lock is

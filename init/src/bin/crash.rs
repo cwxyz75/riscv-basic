@@ -228,6 +228,72 @@ pub fn app_main() -> i32 {
                 }
             }
         }
+        30 => {
+            // S4.5: a memory hog. Write one page after another (new VMOs as needed) until the
+            // job's page limit says no; the exit code is how many pages it got.
+            let mut pages = 0i32;
+            loop {
+                let v = rt::sys::vmo_create(256);
+                if v.status != 0 {
+                    return if v.status == -5 { pages } else { -1 };
+                }
+                let vmo = v.a1 as u32;
+                let buf = [1u8; 4096];
+                for page in 0..256u64 {
+                    let w = rt::sys::vmo_write(vmo, page * 4096, buf.as_ptr(), 4096);
+                    if w.status != 0 {
+                        return if w.status == -5 { pages } else { -2 };
+                    }
+                    pages += 1;
+                }
+            }
+        }
+        31 => {
+            // S4.5: no ambient authority over jobs. Bit 0: `job_root` is refused; bit 1: a job
+            // handle made up from nothing is refused; bit 2: a process cannot be made when the
+            // job allows none beyond this one (the parent sets processes = 1).
+            let mut code = 0;
+            if rt::sys::job_root().status == -3 {
+                code |= 1;
+            }
+            if rt::sys::job_create(77, u64::MAX, u64::MAX, u64::MAX).status == -1 {
+                code |= 2;
+            }
+            if rt::sys::process_create().status == -5 {
+                code |= 4;
+            }
+            return code;
+        }
+        32 => {
+            // S4.5: a process bomb. Create processes until the job says no; the exit code is how
+            // many it made (their handles are kept: they never start, so they cost only slots).
+            let mut made = 0;
+            loop {
+                let r = rt::sys::process_create();
+                if r.status != 0 {
+                    return if r.status == -5 { made } else { -1 };
+                }
+                made += 1;
+            }
+        }
+        33 => {
+            // S4.5: a thread bomb. Threads on two static stacks: the second must be refused when
+            // the job allows only this thread plus one more.
+            let me = rt::sys::process_self().a1 as u32;
+            let top1 = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
+            let first =
+                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+            let second =
+                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+            let mut code = 0;
+            if first.status == 0 {
+                code |= 1;
+            }
+            if second.status == -5 {
+                code |= 2;
+            }
+            return code;
+        }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
             // syscall (the other way a process loses the CPU, so the other return path).

@@ -3,6 +3,7 @@
 //! [`Registry`] and a [`HandleTable`]; the syscall layer only copies bytes in and out.
 
 use crate::handle::{Entry, HandleTable};
+use crate::job::JobId;
 use crate::object::{ObjId, Object, Registry};
 use abi::limits::{
     MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_PORT_BINDINGS,
@@ -100,6 +101,8 @@ pub enum KObj {
     Thread(ThreadObj),
     Socket(SocketEnd),
     Port(PortObj),
+    /// A job (S4.5): the ledger id; the object holds one use of it.
+    Job(JobId),
 }
 
 impl Object for KObj {
@@ -120,7 +123,7 @@ impl Object for KObj {
     }
 
     fn needs_cleanup(&self) -> bool {
-        matches!(self, KObj::Vmo(_) | KObj::Process(_))
+        matches!(self, KObj::Vmo(_) | KObj::Process(_) | KObj::Job(_))
     }
 
     fn meter(&self) -> usize {
@@ -480,7 +483,7 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
-        KObj::Vmo(_) => 0,
+        KObj::Vmo(_) | KObj::Job(_) => 0,
         KObj::Process(p) => {
             if p.terminated {
                 signals::TERMINATED
@@ -858,6 +861,37 @@ pub fn vmo_object_create(
     }
     let obj = reg.create(KObj::Vmo(id));
     Ok(table.insert(obj, Rights::VMO).expect("room was checked"))
+}
+
+/// A job object for ledger job `id` (whose use the object takes over), with a handle in
+/// `table` carrying `rights`.
+pub fn job_object_create(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    id: JobId,
+    rights: Rights,
+) -> Result<Handle, Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    let obj = reg.create(KObj::Job(id));
+    Ok(table.insert(obj, rights).expect("room was checked"))
+}
+
+/// The job behind a job handle that carries `need`.
+pub fn job_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<JobId, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Job(id)) => {
+            if entry.rights.contains(need) {
+                Ok(*id)
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
 }
 
 /// The VMO store id behind a VMO handle that carries `need`.

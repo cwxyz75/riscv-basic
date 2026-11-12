@@ -128,6 +128,11 @@ pub mod rights {
         pub const THREAD: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
+        /// A job: create children and processes in it, set limits (MANAGE), end everything in it
+        /// (KILL), read usage (INSPECT).
+        pub const JOB: Rights = Rights(
+            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::KILL.0 | Self::INSPECT.0,
+        );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
 
@@ -242,6 +247,11 @@ pub mod syscall {
     pub const PORT_BIND: usize = 81;
     pub const PORT_UNBIND: usize = 82;
     pub const PORT_WAIT: usize = 83;
+    pub const JOB_CREATE: usize = 90;
+    pub const JOB_SET_LIMITS: usize = 91;
+    pub const JOB_INFO: usize = 92;
+    pub const JOB_KILL: usize = 93;
+    pub const JOB_ROOT: usize = 94;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").

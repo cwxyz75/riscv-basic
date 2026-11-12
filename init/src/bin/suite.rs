@@ -1634,6 +1634,13 @@ fn launch(arg: u64) -> Result<(u32, u32), Detail> {
 }
 
 fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
+    launch_image_in(image, arg, 0)
+}
+
+/// Build and start a child from `image` charged to `job` (a handle with MANAGE; 0: our own job).
+/// With a job, our handles to the child's memory are closed after mapping, so that the job's
+/// usage can be seen going back to zero when the child ends.
+fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail> {
     ensure!(image != 0, "no image was fetched");
     let mut eh = [0u8; 64];
     ok(
@@ -1647,7 +1654,11 @@ fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
         sys::vmo_read(image, phoff, ph.as_mut_ptr(), 56 * phnum),
         "read the program headers",
     )?;
-    let proc = proc_create()?;
+    let proc = if job == 0 {
+        proc_create()?
+    } else {
+        ok(sys::process_create_in(job), "process_create_in")?.a1 as u32
+    };
     for i in 0..phnum {
         let h = &ph[i * 56..(i + 1) * 56];
         if le(h, 0, 4) != 1 {
@@ -1662,7 +1673,11 @@ fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
         );
         let lead = vaddr % 4096;
         let pages = (lead + memsz).div_ceil(4096);
-        let seg = vmo(pages)?;
+        let seg = if job == 0 {
+            vmo(pages)?
+        } else {
+            ok(sys::vmo_create_in(pages, job), "vmo_create_in")?.a1 as u32
+        };
         let mut done = 0u64;
         let mut chunk = [0u8; 2048];
         while done < filesz {
@@ -1683,12 +1698,22 @@ fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
             sys::process_map(proc, seg, vaddr - lead, 0, pages * 4096, perms),
             "map a segment",
         )?;
+        if job != 0 {
+            sys::handle_close(seg);
+        }
     }
-    let stack = vmo(16)?;
+    let stack = if job == 0 {
+        vmo(16)?
+    } else {
+        ok(sys::vmo_create_in(16, job), "vmo_create_in")?.a1 as u32
+    };
     ok(
         sys::process_map(proc, stack, 0x10_0000_0000, 0, 16 * 4096, PF_R | PF_W),
         "map the stack",
     )?;
+    if job != 0 {
+        sys::handle_close(stack);
+    }
     let (mine, theirs) = channel()?;
     ok(
         sys::process_start(proc, entry, 0x10_0000_0000 + 16 * 4096, theirs, arg),
@@ -3619,7 +3644,21 @@ use proto::bootimg;
 use proto::launch;
 
 /// A read-only VMO of the boot image, from the kernel-side helper.
+/// The boot image VMO, fetched once: the kernel makes a fresh copy of the whole image (about a
+/// thousand pages) for every request, so asking in every test left a dozen copies behind and
+/// the suite ran the machine out of memory on a runner whose image was a little larger.
 fn boot_image_vmo() -> Result<u32, Detail> {
+    static CACHED: AtomicU32 = AtomicU32::new(0);
+    let have = CACHED.load(Ordering::Relaxed);
+    if have != 0 {
+        return Ok(have);
+    }
+    let h = fetch_boot_image_vmo()?;
+    CACHED.store(h, Ordering::Relaxed);
+    Ok(h)
+}
+
+fn fetch_boot_image_vmo() -> Result<u32, Detail> {
     let (m, n) = request(23, b'B', b"");
     let mut reply = [0u8; 16];
     let mut got = [0u32; 2];
@@ -5305,6 +5344,337 @@ fn cycles_do_not_grow_memory() -> Outcome {
     Ok(())
 }
 
+// ---- S4.5: jobs and limits ----
+
+fn root_job() -> Result<u32, Detail> {
+    Ok(ok(sys::job_root(), "job_root")?.a1 as u32)
+}
+
+fn job(parent: u32, procs: u64, threads: u64, pages: u64) -> Result<u32, Detail> {
+    Ok(ok(sys::job_create(parent, procs, threads, pages), "job_create")?.a1 as u32)
+}
+
+/// (used, limit) of a job's resource: 0 processes, 1 threads, 2 pages.
+fn job_use(j: u32, which: u64) -> Result<(u64, u64), Detail> {
+    let r = ok(sys::job_info(j, which), "job_info")?;
+    Ok((r.a1 as u64, r.a2 as u64))
+}
+
+/// Wait (up to `ticks`) for a job's usage of `which` to reach `want`.
+fn job_use_settles(j: u32, which: u64, want: u64, ticks: u64) -> Outcome {
+    let until = sys::clock_get() + ticks;
+    loop {
+        let (used, _) = job_use(j, which)?;
+        if used == want {
+            return Ok(());
+        }
+        ensure!(
+            sys::clock_get() < until,
+            "job usage {which} stayed at {used}, wanted {want}"
+        );
+        rt::io::nap(2);
+    }
+}
+
+fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
+    let root = root_job()?;
+    // a job is a job: the other kinds of handle are the wrong type
+    let ev = ok(sys::event_create(), "event")?.a1 as u32;
+    ensure_eq!(
+        st(sys::job_create(ev, u64::MAX, u64::MAX, u64::MAX)),
+        Some(S::WrongType),
+        "job_create on an event"
+    );
+    ensure_eq!(
+        st(sys::job_info(ev, 0)),
+        Some(S::WrongType),
+        "job_info on an event"
+    );
+    ensure_eq!(
+        st(sys::job_create(0, 1, 1, 1)),
+        Some(S::BadHandle),
+        "job_create on handle 0"
+    );
+    let gone = job(root, 1, 1, 1)?;
+    sys::handle_close(gone);
+    ensure_eq!(
+        st(sys::job_create(gone, 1, 1, 1)),
+        Some(S::BadHandle),
+        "job_create on a closed handle"
+    );
+    ensure_eq!(
+        st(sys::job_info(root, 3)),
+        Some(S::InvalidArgs),
+        "an unknown resource"
+    );
+    // each operation needs its own right
+    let only = |r: Rights| -> Result<u32, Detail> {
+        Ok(ok(sys::handle_duplicate(root, r.0), "duplicate")?.a1 as u32)
+    };
+    let inspect = only(Rights::INSPECT)?;
+    let manage = only(Rights::MANAGE)?;
+    let kill = only(Rights::KILL)?;
+    ensure_eq!(
+        st(sys::job_info(inspect, 0)),
+        Some(S::Ok),
+        "inspect may inspect"
+    );
+    ensure_eq!(
+        st(sys::job_info(manage, 0)),
+        Some(S::AccessDenied),
+        "manage may not inspect"
+    );
+    ensure_eq!(
+        st(sys::job_create(inspect, 1, 1, 1)),
+        Some(S::AccessDenied),
+        "inspect may not create"
+    );
+    ensure_eq!(
+        st(sys::job_set_limits(kill, 1, 1, 1)),
+        Some(S::AccessDenied),
+        "kill may not set limits"
+    );
+    ensure_eq!(
+        st(sys::job_kill(manage, 0)),
+        Some(S::AccessDenied),
+        "manage may not kill"
+    );
+    ensure_eq!(
+        st(sys::process_create_in(inspect)),
+        Some(S::AccessDenied),
+        "a process needs MANAGE on its job"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_in(1, inspect)),
+        Some(S::AccessDenied),
+        "a VMO needs MANAGE on its job"
+    );
+    // rights only shrink: the root handle's rights cannot be widened by duplicating
+    ensure_eq!(
+        st(sys::handle_duplicate(inspect, Rights::JOB.0)),
+        Some(S::AccessDenied),
+        "no widening"
+    );
+    // job_root is for the kernel's first process only: a child is refused, and so is a
+    // child's attempt to name a job it was not given (variant 31 checks bits 0 and 1)
+    let j = job(root, 1, u64::MAX, u64::MAX)?;
+    let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 31, j)?;
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        7,
+        "the child's three refusals (job_root, a made-up job, a second process)"
+    );
+    for h in [root, ev, inspect, manage, kill, j, p] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
+    let root = root_job()?;
+    let (base, _) = job_use(root, 0)?;
+    let j = job(root, 4, u64::MAX, u64::MAX)?;
+    // the child is one process of the four and makes the other three, then is refused
+    let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 32, j)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        3,
+        "processes the bomb managed to make"
+    );
+    // everything it made dies with it (never started: closing their last handles ends them)
+    job_use_settles(j, 0, 0, 500)?;
+    ensure_eq!(
+        job_use(root, 0)?.0,
+        base,
+        "the root job's count is back where it was"
+    );
+    // set_limits works on a live job: raise it and a parent can make processes again
+    ok(sys::job_set_limits(j, 2, u64::MAX, u64::MAX), "raise")?;
+    let a = ok(sys::process_create_in(j), "first")?.a1 as u32;
+    let b = ok(sys::process_create_in(j), "second")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_create_in(j)),
+        Some(S::NoMemory),
+        "a third process is over the limit"
+    );
+    // lowering the limit below usage keeps what exists and refuses more
+    ok(sys::job_set_limits(j, 1, u64::MAX, u64::MAX), "lower")?;
+    ensure_eq!(job_use(j, 0)?, (2, 1), "usage above a lowered limit stays");
+    sys::handle_close(a);
+    sys::handle_close(b);
+    job_use_settles(j, 0, 0, 500)?;
+    ok(sys::process_create_in(j), "room again once usage fell")?;
+    sys::handle_close(p);
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+fn job_limits_stop_a_thread_bomb() -> Outcome {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, 2, u64::MAX)?;
+    // two threads in all: the child's own and one more; the second extra is refused
+    let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 33, j)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        3,
+        "one extra thread allowed, the next refused"
+    );
+    job_use_settles(j, 1, 0, 500)?;
+    // with one thread allowed, a second running process cannot be started
+    ok(sys::job_set_limits(j, u64::MAX, 1, u64::MAX), "one thread")?;
+    let (q, _mq) = launch_image_in(IMAGE.load(Ordering::Relaxed), 15, j)?; // spins
+    let second = launch_image_in(IMAGE.load(Ordering::Relaxed), 15, j);
+    ensure!(
+        second.is_err(),
+        "a second process started although the job allows one thread"
+    );
+    ok(sys::process_kill(q, -1), "end the spinner")?;
+    wait_ended(q, 500)?;
+    job_use_settles(j, 1, 0, 500)?;
+    for h in [p, q, j, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+fn proc_create_in(job: u32) -> Result<u32, Detail> {
+    Ok(ok(sys::process_create_in(job), "process_create_in")?.a1 as u32)
+}
+
+fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
+    let root = root_job()?;
+    // the child's own image and stack count against its job too: 64 pages leave it room for
+    // some of its own, but not for a hog
+    let j = job(root, u64::MAX, u64::MAX, 64)?;
+    let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 30, j)?;
+    wait_ended(p, 3000)?;
+    let got = sys::process_info(p).a1 as i64;
+    ensure!(
+        (1..64).contains(&got),
+        "the hog got {got} pages of a 64-page job (and was told no)"
+    );
+    // all of it is given back when the child is gone
+    job_use_settles(j, 2, 0, 1000)?;
+    // (the root job's own page count is not stable: this program's heap and stack grow too)
+    sys::handle_close(p);
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
+    let root = root_job()?;
+    let parent = job(root, u64::MAX, u64::MAX, 8)?;
+    let a = job(parent, u64::MAX, u64::MAX, u64::MAX)?; // its own limit allows everything
+    let b = job(parent, u64::MAX, u64::MAX, u64::MAX)?;
+    let big = ok(sys::vmo_create_in(100, a), "a VMO in a")?.a1 as u32;
+    let page = [7u8; 4096];
+    let mut got = 0;
+    while sys::vmo_write(big, got * 4096, page.as_ptr(), 4096).status == 0 {
+        got += 1;
+        ensure!(got < 100, "the parent's limit never applied");
+    }
+    ensure_eq!(got, 8, "pages a child could commit under an 8-page parent");
+    ensure_eq!(job_use(parent, 2)?.0, 8, "the parent sees them");
+    ensure_eq!(job_use(a, 2)?.0, 8, "and so does the child");
+    // the sibling shares the same 8 pages: none left
+    let other = ok(sys::vmo_create_in(4, b), "a VMO in b")?.a1 as u32;
+    ensure_eq!(
+        st(sys::vmo_write(other, 0, page.as_ptr(), 4096)),
+        Some(S::NoMemory),
+        "no pages left for the sibling"
+    );
+    ensure_eq!(job_use(b, 2)?.0, 0, "a refused page is not charged");
+    // closing the VMO frees its pages for the sibling
+    sys::handle_close(big);
+    job_use_settles(a, 2, 0, 500)?;
+    ok(
+        sys::vmo_write(other, 0, page.as_ptr(), 4096),
+        "the sibling after the first VMO went",
+    )?;
+    // a limit set after the fact applies to what is committed next
+    ok(
+        sys::job_set_limits(parent, u64::MAX, u64::MAX, 1),
+        "lower the parent",
+    )?;
+    ensure_eq!(
+        st(sys::vmo_write(other, 4096, page.as_ptr(), 4096)),
+        Some(S::NoMemory),
+        "over the lowered limit"
+    );
+    for h in [other, a, b, parent, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+fn job_kill_ends_every_process_below_and_forbids_more() -> Outcome {
+    let root = root_job()?;
+    let top = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let low = job(top, u64::MAX, u64::MAX, u64::MAX)?;
+    let image = IMAGE.load(Ordering::Relaxed);
+    let (p1, _m1) = launch_image_in(image, 15, top)?; // spins
+    let (p2, _m2) = launch_image_in(image, 15, low)?;
+    let (p3, _m3) = launch_image_in(image, 16, low)?; // blocked in a wait
+    let outside = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let (p4, _m4) = launch_image_in(image, 15, outside)?;
+    ensure_eq!(job_use(top, 0)?.0, 3, "three processes at or below top");
+    ok(sys::job_kill(top, -9), "kill top")?;
+    for p in [p1, p2, p3] {
+        wait_ended(p, 500)?;
+        ensure_eq!(sys::process_info(p).a1 as i64, -9, "the code job_kill gave");
+    }
+    ensure_eq!(
+        st(sys::process_info(p4)),
+        Some(S::BadState),
+        "a process in another job is untouched"
+    );
+    // nothing new may start in the killed subtree
+    ensure_eq!(
+        st(sys::process_create_in(top)),
+        Some(S::NoMemory),
+        "no process in the killed job"
+    );
+    ensure_eq!(
+        st(sys::process_create_in(low)),
+        Some(S::NoMemory),
+        "none below it either"
+    );
+    job_use_settles(top, 0, 0, 500)?;
+    ok(sys::process_kill(p4, -1), "end the bystander")?;
+    wait_ended(p4, 500)?;
+    for h in [p1, p2, p3, p4, top, low, outside, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+fn jobs_do_not_leak() -> Outcome {
+    let root = root_job()?;
+    let (procs0, _) = job_use(root, 0)?;
+    // 1,200 jobs, each with a process and some memory, more than ten times the 256 the ledger
+    // can hold at once: every record must be freed for this to get through
+    for i in 0..1_200u32 {
+        let j = job(root, 2, 2, 8).map_err(|mut d| {
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" at round {i}"));
+            d
+        })?;
+        let p = proc_create_in(j)?;
+        let v = ok(sys::vmo_create_in(2, j), "vmo")?.a1 as u32;
+        ok(sys::vmo_write(v, 0, b"x".as_ptr(), 1), "commit a page")?;
+        for h in [v, p, j] {
+            sys::handle_close(h);
+        }
+    }
+    job_use_settles(root, 0, procs0, 500)?;
+    sys::handle_close(root);
+    Ok(())
+}
+
 #[no_mangle]
 pub fn app_main() -> i32 {
     let mut failed = 0;
@@ -5643,6 +6013,31 @@ pub fn app_main() -> i32 {
         ("stack_grows_lazily", stack_grows_lazily),
         ("syscall_layer_bounds", syscall_layer_bounds),
         ("cycles_do_not_grow_memory", cycles_do_not_grow_memory),
+        (
+            "job_syscalls_check_handles_rights_and_arguments",
+            job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "job_limits_stop_a_process_bomb_and_usage_comes_back",
+            job_limits_stop_a_process_bomb_and_usage_comes_back,
+        ),
+        (
+            "job_limits_stop_a_thread_bomb",
+            job_limits_stop_a_thread_bomb,
+        ),
+        (
+            "job_memory_limits_stop_a_hog_and_are_credited_back",
+            job_memory_limits_stop_a_hog_and_are_credited_back,
+        ),
+        (
+            "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling",
+            a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling,
+        ),
+        (
+            "job_kill_ends_every_process_below_and_forbids_more",
+            job_kill_ends_every_process_below_and_forbids_more,
+        ),
+        ("jobs_do_not_leak", jobs_do_not_leak),
         (
             "threads_left_behind_when_init_exits",
             threads_left_behind_when_init_exits,

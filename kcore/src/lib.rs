@@ -13,6 +13,7 @@ pub mod elf;
 pub mod frame;
 pub mod handle;
 pub mod ipc;
+pub mod job;
 pub mod latch;
 pub mod linestate;
 pub mod object;

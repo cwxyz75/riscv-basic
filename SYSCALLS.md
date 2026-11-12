@@ -167,6 +167,11 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
+| 90 | job_create | `a0` parent job, `a1` processes, `a2` threads, `a3` pages | `a1` handle |
+| 91 | job_set_limits | `a0` job, `a1` processes, `a2` threads, `a3` pages | |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages) | `a1` used, `a2` limit |
+| 93 | job_kill | `a0` job, `a1` exit code | |
+| 94 | job_root | | `a1` handle |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
 
@@ -297,10 +302,13 @@ the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle t
 kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
 closing the last handle to a VMO frees it once nothing maps it.
 
-### vmo_create(pages) -> status, handle
+### vmo_create(pages, job) -> status, handle
 
-New zero-filled VMO. Errors: INVALID_ARGS (`pages` is 0 or over the limit); NO_MEMORY (object
-cap or kernel memory). Tests: `vmo_*` in `init`.
+New zero-filled VMO whose pages are charged to a job as they are first touched (S4.5): `job` is
+a job handle with MANAGE, or 0 for the caller's own job. Errors: INVALID_ARGS (`pages` is 0 or
+over the limit); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
+memory). A page that cannot be charged is refused when it is first touched, with NO_MEMORY from
+`vmo_write`, or as a fault that ends the process. Tests: `vmo_*` in `init`.
 
 ### vmo_read(vmo, offset, buffer, length) / vmo_write(vmo, offset, buffer, length) -> status
 
@@ -314,10 +322,12 @@ Nothing is written on an error.
 
 The size in bytes. Errors: BAD_HANDLE; WRONG_TYPE.
 
-### process_create() -> status, handle
+### process_create(job) -> status, handle
 
 A new, empty, not yet started process: an address space with nothing mapped and an empty handle
-table. Errors: NO_MEMORY (kernel memory, or `MAX_PROCESSES` reached).
+table, charged to a job (S4.5): `job` is a job handle with MANAGE, or 0 for the caller's own
+job. Errors: BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (the job or an ancestor is
+at its process limit, kernel memory, or `MAX_PROCESSES` reached).
 
 ### process_self() -> status, handle
 
@@ -363,6 +373,52 @@ A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
 
 The exit code of an ended process (`-1000 - scause` after a fault). Rights: INSPECT.
 Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+
+## Jobs and limits (S4.5, OD56-OD58)
+
+A **job** is an account that processes, threads and memory are charged to; jobs form a tree with
+the kernel's **root job** (no limits) on top. A job has limits on three resources: live
+**processes**, live **threads**, and **pages** of memory committed in VMOs (`u64::MAX` means no
+limit). A charge is applied to the job and **every ancestor**, so a job can never use more than
+any ancestor allows, whatever its own limits say. Every process belongs to the job it was created
+in; the kernel's first process (`init`) is in the root job.
+
+The job rights are DUPLICATE, TRANSFER, MANAGE (create jobs, processes and VMOs in it; set limits),
+KILL (`job_kill`) and INSPECT (`job_info`). **No program can name a job it was not given**: there
+is no call that returns the caller's own job, and `job_root` is for the process the kernel
+started. Limits are exhausted with NO_MEMORY.
+
+What is charged: a process from `process_create` to its teardown; a thread from the moment it is
+created (`process_start` or `thread_create`) until it ends; a VMO page from the moment it is first
+committed (a write, a read through a mapping, a fault) until the VMO is freed (the memory held
+by the page tables and the kernel's own objects is bounded by the global caps, not charged). A job
+record lives while any process, VMO, job object or child job holds it.
+
+### job_create(parent, processes, threads, pages) -> status, handle
+
+A child of `parent` (MANAGE) with these limits. Errors, in order: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; NO_MEMORY (object cap, or 256 jobs exist). The handle carries every job right.
+
+### job_set_limits(job, processes, threads, pages) -> status
+
+Needs MANAGE. Usage above a new limit is not undone; later charges fail until usage is back under
+it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+
+### job_info(job, which) -> status, used, limit
+
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages; `used` counts the job and everything
+below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
+
+### job_kill(job, code) -> status
+
+Needs KILL. Sets the job's process and thread limits to 0 (nothing new may start in it or below
+it) and ends every process in the job and its descendants with exit code `code`, as `process_kill`
+does (a caller inside the job ends too, last). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED.
+
+### job_root() -> status, handle
+
+A handle with every job right to the root job. Only a process started by the kernel may ask
+(`init`); everything else gets ACCESS_DENIED. Tests: `job_*` in `init`.
 
 ## Threads (S3c-2b)
 
@@ -626,4 +682,5 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | thread_create, thread_exit, thread_info | specified (S3c-2b) |
+| job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
