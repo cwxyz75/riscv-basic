@@ -178,6 +178,9 @@ pub fn use_kernel_table() {
 
 /// Load the kernel's own `satp` if the hart has something else in it (a user process's root).
 pub fn use_kernel_table_if_needed() {
+    if cfg!(feature = "fault-skip-kernel-satp") {
+        return; // negative control: a hart keeps a dead process's page table
+    }
     let want = KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
     if satp() != want {
         // SAFETY: the kernel table maps everything the kernel runs from and touches; the flush

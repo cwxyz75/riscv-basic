@@ -187,7 +187,7 @@ read), `teardown_with_threads_on_other_harts`, `kill_a_spinner_on_another_hart` 
 **Negative controls**: kernel features `fault-skip-shootdown` and `fault-skip-kernel-satp` that disable the
 shootdown and the kernel-`satp` switch must make the corresponding tests fail (the harness runs them like
 `fail-demo`).
-**S5e: stress and icount.** A long stress run (random channel/VMO/process/thread/job churn from several
+**S5e: stress and icount (built, without SMP icount).** *(Deviation: the suite is NOT run under `-icount` with more than one hart. QEMU then runs the virtual CPUs one at a time in fixed turns, and a spin lock hands over only when the other CPU gets its turn, so even `-smp 2` did not get through the first tests in 25 minutes; the single-hart icount run stays in the gate. TIDY-UP T21 records it; the negative controls and the churn stress stand in for deterministic interleaving.)* A long stress run (random channel/VMO/process/thread/job churn from several
 processes) with the lock-order checker and the end-of-run leak oracles (`job_ledger`, frames, objects,
 threads); the whole suite in icount mode with `-smp 4`; TIDY-UP T9, T10, T12, T21 updated (T11 recorded
 as worse, pointing at rung 3).

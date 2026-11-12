@@ -34,7 +34,7 @@ TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "240"))
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
 REQUIRED = [
-    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
+    "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "unmap_while_siblings_touch", "teardown_with_threads_on_other_harts", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
     "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
@@ -177,7 +177,30 @@ def round_robin_run(kernel):
     return (kernel, False, generic, "round-robin class kernel (generic tests only)")
 
 
+def negative_control(kernel, test):
+    """A kernel built with a safety mechanism switched off (the `fault-*` features) must fail the
+    test that guards the mechanism: by that test failing, or (when the missing mechanism crashes
+    or hangs the kernel) by the run not completing. A clean run means the guard is vacuous."""
+    lines, status, timed_out, text = run(kernel)
+    found = problems(lines, status, timed_out, False)
+    if not found:
+        print(f"negative control FAILED: {kernel} passed although it lacks the mechanism {test} guards",
+              file=sys.stderr)
+        return 1
+    _, tests, _, panics, _ = parse(lines)
+    failed = [n for n, ok, _ in tests if not ok]
+    if test not in failed and not timed_out and not panics:
+        print(f"negative control FAILED: expected {test} to fail, saw {failed} and {found}", file=sys.stderr)
+        return 1
+    how = "failed" if test in failed else "crashed or hung the kernel"
+    print(f"negative control passed: {test} {how} without its mechanism ({kernel})")
+    return 0
+
+
 def main() -> int:
+    # `--neg KERNEL TEST`: a fault-injection kernel that must be caught
+    if len(sys.argv) == 4 and sys.argv[1] == "--neg":
+        return negative_control(sys.argv[2], sys.argv[3])
     # `--rr KERNEL`: only the round-robin kernel (CI runs it as its own job)
     if len(sys.argv) == 3 and sys.argv[1] == "--rr":
         runs = [round_robin_run(sys.argv[2])]

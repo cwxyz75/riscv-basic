@@ -25,6 +25,16 @@ pub const TESTS: &[Test] = &[
         a_wake_preempts_a_lower_priority_hart,
     ),
     ("user_threads_run_in_parallel", user_threads_run_in_parallel),
+    ("unmap_while_siblings_touch", unmap_while_siblings_touch),
+    (
+        "teardown_with_threads_on_other_harts",
+        teardown_with_threads_on_other_harts,
+    ),
+    (
+        "kill_a_spinner_on_another_hart",
+        kill_a_spinner_on_another_hart,
+    ),
+    ("smp_churn_stress", smp_churn_stress),
 ];
 
 /// Wait up to `ms` milliseconds for `ready`.
@@ -322,6 +332,150 @@ fn user_threads_run_in_parallel() -> Result<(), String> {
     }
     if high < 2 {
         return Err(format!("never more than {high} hart in user mode at once"));
+    }
+    Ok(())
+}
+
+/// A user process whose main thread unmaps and remaps a page over and over while two sibling
+/// threads (on other harts) read it: a stale translation would show the previous mapping's data.
+fn unmap_while_siblings_touch() -> Result<(), String> {
+    use crate::user;
+    let (pid, tid) = user::start(user::CRASH_ELF, 40).map_err(|e| format!("{e:?}"))?;
+    let code = user::finish(pid, tid);
+    if code != 0 {
+        return Err(format!("the process ended with {code}: a worker saw stale data (round {code}) or the protocol broke (9xx)"));
+    }
+    Ok(())
+}
+
+/// Processes with sibling threads running on other harts are ended from outside, over and over:
+/// the kernel must tear them down (page tables and frames freed and reused) without any hart
+/// still translating through a dead root, and nothing may leak.
+fn teardown_with_threads_on_other_harts() -> Result<(), String> {
+    use crate::user;
+    let frames_before = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    for round in 0..120 {
+        let (pid, tid) = user::start(user::CRASH_ELF, 41).map_err(|e| format!("{e:?}"))?;
+        thread::sleep_ticks(1 + (round % 3));
+        user::end_process(pid, -9);
+        let code = user::finish(pid, tid);
+        if code != -9 {
+            return Err(format!("round {round}: exit code {code}, wanted -9"));
+        }
+    }
+    if !wait_for(2000, || user::process_count() == 0) {
+        return Err(String::from("processes are left"));
+    }
+    if user::job_ledger() != (1, 0, 0, 0, 0) {
+        return Err(format!(
+            "the job ledger is not back to the root: {:?}",
+            user::job_ledger()
+        ));
+    }
+    let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    if frames_after + 8 < frames_before {
+        return Err(format!("frames {frames_before} -> {frames_after}"));
+    }
+    Ok(())
+}
+
+/// A spinner in user mode on another hart is ended within a couple of ticks.
+fn kill_a_spinner_on_another_hart() -> Result<(), String> {
+    use crate::user;
+    let n = smp::started();
+    if n < 2 {
+        return Ok(());
+    }
+    let mut worst = 0;
+    for _ in 0..10 {
+        let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
+        // wait until some secondary hart is running user code (the spinner was placed there)
+        if !wait_for(1000, || {
+            (1..n).any(|i| percpu::hart(i).in_user.load(Ordering::SeqCst))
+        }) {
+            user::end_process(pid, -3);
+            user::finish(pid, tid);
+            return Err(String::from("the spinner never ran on a secondary hart"));
+        }
+        let start = thread::ticks();
+        user::end_process(pid, -3);
+        let code = user::finish(pid, tid);
+        let took = thread::ticks() - start;
+        worst = worst.max(took);
+        if code != -3 {
+            return Err(format!("exit code {code}, wanted -3"));
+        }
+    }
+    // (round-robin has no priorities: the thread that notices the end may wait out a 10-tick slice)
+    let bound = if thread::class_name() == "fixed-priority" {
+        3
+    } else {
+        12
+    };
+    if worst > bound {
+        return Err(format!(
+            "a kill took {worst} ticks to reach a spinner on another hart"
+        ));
+    }
+    Ok(())
+}
+
+fn churn_thread(_: usize) {
+    HI_DONE.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Several processes churn objects, memory, mappings and threads at once on different harts,
+/// while the boot hart spawns and joins free kernel threads; then every leak oracle must be clean.
+fn smp_churn_stress() -> Result<(), String> {
+    use crate::user;
+    thread::sleep_ticks(10); // let earlier tests' exited threads be reaped before counting
+    let frames_before = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    let threads_before = thread::thread_count();
+    let vmos_before = crate::irq::without(|| crate::kmem::get().vmos.count());
+    let mut procs = alloc::vec::Vec::new();
+    for seed in 1..=6u64 {
+        procs.push(user::start(user::CRASH_ELF, (seed << 8) | 42).map_err(|e| format!("{e:?}"))?);
+    }
+    // meanwhile: kernel-thread churn on free threads
+    HI_DONE.store(0, Ordering::SeqCst);
+    let mut spawned = 0;
+    for _ in 0..300 {
+        let t = thread::spawn_free("churn", 5, churn_thread, 0);
+        thread::join(t);
+        spawned += 1;
+    }
+    for (i, (pid, tid)) in procs.into_iter().enumerate() {
+        let code = user::finish(pid, tid);
+        if code != 0 {
+            return Err(format!("churn process {} ended with {code}", i + 1));
+        }
+    }
+    if HI_DONE.load(Ordering::SeqCst) != spawned {
+        return Err(String::from("a churn thread was lost"));
+    }
+    if !wait_for(3000, || user::process_count() == 0) {
+        return Err(String::from("processes are left"));
+    }
+    thread::sleep_ticks(5);
+    if user::job_ledger() != (1, 0, 0, 0, 0) {
+        return Err(format!("job ledger {:?}", user::job_ledger()));
+    }
+    if thread::thread_count() > threads_before {
+        return Err(format!(
+            "threads {threads_before} -> {}",
+            thread::thread_count()
+        ));
+    }
+    let vmos_after = crate::irq::without(|| crate::kmem::get().vmos.count());
+    if vmos_after != vmos_before {
+        return Err(format!("VMOs {vmos_before} -> {vmos_after}"));
+    }
+    let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    if frames_after + 8 < frames_before {
+        return Err(format!("frames {frames_before} -> {frames_after}"));
+    }
+    if crate::bkl::VIOLATIONS.load(Ordering::SeqCst) != 0 {
+        return Err(String::from("lock-order violations during the stress"));
     }
     Ok(())
 }

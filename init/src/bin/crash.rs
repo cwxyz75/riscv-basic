@@ -339,6 +339,21 @@ pub fn app_main() -> i32 {
                 made += 1;
             }
         }
+        40 => return unmap_while_siblings_touch(),
+        n if n & 0xff == 42 => return churn((n >> 8) as u64),
+        41 => {
+            // S5d: a process with two spinning sibling threads (and itself spinning): ended from
+            // outside while they run on other harts.
+            let me = rt::sys::process_self().a1 as u32;
+            for k in 0..2 {
+                // SAFETY: only the address of the static stack is taken; each new thread owns its own.
+                let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top, 0);
+            }
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         n if n & 0xff == 13 => {
             // The same isolation check, switching processes through the `thread_yield`
             // syscall (the other way a process loses the CPU, so the other return path).
@@ -385,6 +400,10 @@ pub fn app_main() -> i32 {
 }
 
 #[repr(align(16))]
+struct WorkerStacks([[u8; 8192]; 2]);
+static mut WORKER_STACKS: WorkerStacks = WorkerStacks([[0; 8192]; 2]);
+
+#[repr(align(16))]
 #[allow(dead_code)]
 struct Stack([u8; 8192]);
 static mut STACK: Stack = Stack([0; 8192]);
@@ -429,4 +448,267 @@ extern "C" fn thread_exit_four(_: usize) -> ! {
 
 extern "C" fn exit_eight(_: usize) -> ! {
     rt::sys::thread_exit(8)
+}
+
+// ---- S5d: remote TLB shootdown ----
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Where the changing mapping lives.
+const X: u64 = 0x30_0000_0000;
+const ROUNDS: u64 = 300;
+const READ: u64 = 1;
+const IDLE: u64 = 2;
+
+/// (round << 2) | state: what the workers should be doing.
+static PHASE: AtomicU64 = AtomicU64::new(0);
+static READ_ACKS: AtomicU64 = AtomicU64::new(0);
+static IDLE_ACKS: AtomicU64 = AtomicU64::new(0);
+/// The first round in which a worker read a value that was not the current mapping's.
+static FAIL: AtomicU64 = AtomicU64::new(0);
+
+fn pattern(round: u64) -> u64 {
+    0x5eed_0000_0000_0000 | (round * 0x0101_0101)
+}
+
+/// Two sibling threads read a page that the main thread unmaps and remaps, round after round,
+/// with the harts they run on caching the translation in between. If an unmap did not reach the
+/// other harts' TLBs, a worker would read the *previous* round's data through its stale entry
+/// (a different frame from the new mapping). The exit code is 0, or the first failing round.
+fn unmap_while_siblings_touch() -> i32 {
+    let me = rt::sys::process_self().a1 as u32;
+    for k in 0..2 {
+        // SAFETY: only the address of the static stack is taken; each worker owns its own.
+        let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+        let t = rt::sys::thread_create(me, reader as *const () as usize as u64, top, k as u64);
+        if t.status != 0 {
+            return 900 + (-(t.status as i64)) as i32;
+        }
+    }
+    for round in 1..=ROUNDS {
+        let v = rt::sys::vmo_create(1);
+        if v.status != 0 {
+            return 910;
+        }
+        let vmo = v.a1 as u32;
+        let want = pattern(round).to_le_bytes();
+        if rt::sys::vmo_write(vmo, 0, want.as_ptr(), 8).status != 0 {
+            return 911;
+        }
+        // map it read-only at X (PF_R = 1)
+        if rt::sys::process_map(me, vmo, X, 0, 4096, 1).status != 0 {
+            return 912;
+        }
+        // a second VMO with other contents, to give a freed frame something to be reused for
+        let junk = rt::sys::vmo_create(1).a1 as u32;
+        let _ = rt::sys::vmo_write(junk, 0, [0xee; 8].as_ptr(), 8);
+        PHASE.store((round << 2) | READ, Ordering::Release);
+        let mut spins = 0u64;
+        while READ_ACKS.load(Ordering::Acquire) < 2 * round {
+            spins += 1;
+            if spins > 400_000_000 {
+                return 920;
+            }
+            core::hint::spin_loop();
+        }
+        PHASE.store((round << 2) | IDLE, Ordering::Release);
+        spins = 0;
+        while IDLE_ACKS.load(Ordering::Acquire) < 2 * round {
+            spins += 1;
+            if spins > 400_000_000 {
+                return 921;
+            }
+            core::hint::spin_loop();
+        }
+        // nobody is reading X now; take the mapping away and free the frame
+        if rt::sys::process_unmap(me, X).status != 0 {
+            return 913;
+        }
+        rt::sys::handle_close(vmo);
+        rt::sys::handle_close(junk);
+        if FAIL.load(Ordering::Acquire) != 0 {
+            return FAIL.load(Ordering::Acquire) as i32;
+        }
+    }
+    FAIL.load(Ordering::Acquire) as i32
+}
+
+extern "C" fn reader(_id: usize) -> ! {
+    let mut read_round = 0u64;
+    let mut idle_round = 0u64;
+    loop {
+        let ph = PHASE.load(Ordering::Acquire);
+        let (round, state) = (ph >> 2, ph & 3);
+        if state == READ && round > read_round {
+            let want = pattern(round);
+            for _ in 0..40 {
+                // SAFETY: X is mapped (read-only) by the main thread for this whole phase.
+                let got = unsafe { core::ptr::read_volatile(X as *const u64) };
+                if got != want {
+                    let _ = FAIL.compare_exchange(0, round, Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+            read_round = round;
+            READ_ACKS.fetch_add(1, Ordering::AcqRel);
+        } else if state == IDLE && round > idle_round {
+            idle_round = round;
+            IDLE_ACKS.fetch_add(1, Ordering::AcqRel);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+// ---- S5e: churn ----
+
+#[repr(align(16))]
+struct ChurnStacks([[u8; 4096]; 4]);
+static mut CHURN_STACKS: ChurnStacks = ChurnStacks([[0; 4096]; 4]);
+static CHURN_BUSY: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static CHURN_DONE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn churn_worker(slot: usize) -> ! {
+    CHURN_DONE.fetch_add(1, Ordering::AcqRel);
+    CHURN_BUSY[slot].store(0, Ordering::Release);
+    rt::sys::thread_exit(0)
+}
+
+/// Random object, memory and thread churn from one process (several of them run at once on
+/// different harts); every call must behave. Exit code 0, or 100 + the operation that failed.
+fn churn(seed: u64) -> i32 {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut rnd = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let me = rt::sys::process_self().a1 as u32;
+    let buf = [0x42u8; 4096];
+    let mut out = [0u8; 4096];
+    for _ in 0..1500u32 {
+        match rnd(7) {
+            0 => {
+                let c = rt::sys::channel_create();
+                if c.status != 0 {
+                    return 100;
+                }
+                let (a, b) = (c.a1 as u32, c.a2 as u32);
+                if rt::sys::channel_write(a, buf.as_ptr(), 16, core::ptr::null(), 0).status != 0 {
+                    return 101;
+                }
+                if rt::sys::channel_read(b, out.as_mut_ptr(), 4096, core::ptr::null_mut(), 0).status
+                    != 0
+                {
+                    return 102;
+                }
+                rt::sys::handle_close(a);
+                rt::sys::handle_close(b);
+            }
+            1 => {
+                let v = rt::sys::vmo_create(4);
+                if v.status != 0 {
+                    return 110;
+                }
+                let vmo = v.a1 as u32;
+                if rt::sys::vmo_write(vmo, 0, buf.as_ptr(), 4096).status != 0 {
+                    return 111;
+                }
+                let at = 0x31_0000_0000 + rnd(8) * 0x2_0000;
+                if rt::sys::process_map(me, vmo, at, 0, 4 * 4096, 3).status != 0 {
+                    return 112;
+                }
+                // SAFETY: the page at `at` was just mapped read-write.
+                unsafe { core::ptr::write_volatile(at as *mut u64, 7) };
+                if rt::sys::process_unmap(me, at).status != 0 {
+                    return 113;
+                }
+                rt::sys::handle_close(vmo);
+            }
+            2 => {
+                let p = rt::sys::socket_create();
+                if p.status != 0 {
+                    return 120;
+                }
+                let (a, b) = (p.a1 as u32, p.a2 as u32);
+                if rt::sys::socket_write(a, buf.as_ptr(), 100).status != 0 {
+                    return 121;
+                }
+                if rt::sys::socket_read(b, out.as_mut_ptr(), 4096).status != 0 {
+                    return 122;
+                }
+                rt::sys::handle_close(a);
+                rt::sys::handle_close(b);
+            }
+            3 => {
+                let e = rt::sys::event_create();
+                if e.status != 0 {
+                    return 130;
+                }
+                if rt::sys::event_signal(e.a1 as u32, 0, rt::abi::signals::USER_MASK & 0x0100_0000)
+                    .status
+                    != 0
+                {
+                    return 131;
+                }
+                rt::sys::handle_close(e.a1 as u32);
+            }
+            4 => {
+                let port = rt::sys::port_create();
+                let ev = rt::sys::event_create();
+                if port.status != 0 || ev.status != 0 {
+                    return 140;
+                }
+                let (p, e) = (port.a1 as u32, ev.a1 as u32);
+                rt::sys::event_signal(e, 0, rt::abi::signals::USER_MASK & 0x0100_0000);
+                if rt::sys::port_bind(p, e, rt::abi::signals::USER_MASK, 9).status != 0 {
+                    return 141;
+                }
+                let w = rt::sys::port_wait(p, 0);
+                if w.status != 0 {
+                    return 142;
+                }
+                rt::sys::handle_close(p);
+                rt::sys::handle_close(e);
+            }
+            5 => {
+                // a short-lived sibling thread
+                let slot = rnd(4) as usize;
+                if CHURN_BUSY[slot]
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // SAFETY: the slot's stack is free (the flag was clear).
+                    let top =
+                        unsafe { core::ptr::addr_of_mut!(CHURN_STACKS.0[slot]) } as u64 + 4096;
+                    let t = rt::sys::thread_create(
+                        me,
+                        churn_worker as *const () as usize as u64,
+                        top,
+                        slot as u64,
+                    );
+                    if t.status != 0 {
+                        CHURN_BUSY[slot].store(0, Ordering::Release);
+                        return 150;
+                    }
+                    rt::sys::handle_close(t.a1 as u32);
+                }
+            }
+            _ => {
+                rt::sys::thread_yield();
+            }
+        }
+    }
+    // let the workers finish before the process ends
+    for _ in 0..1_000_000u32 {
+        if CHURN_BUSY.iter().all(|b| b.load(Ordering::Acquire) == 0) {
+            return 0;
+        }
+        rt::sys::thread_yield();
+    }
+    160
 }

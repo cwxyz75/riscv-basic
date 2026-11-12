@@ -13,6 +13,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const EID_HSM: usize = 0x48_534D;
 const FID_HART_START: usize = 0;
 const FID_HART_GET_STATUS: usize = 2;
+const EID_RFENCE: usize = 0x5246_4E43;
+const FID_REMOTE_SFENCE_VMA: usize = 1;
 const EID_IPI: usize = 0x73_5049;
 const FID_SEND_IPI: usize = 0;
 /// `hart_get_status` result for a hart that exists and is waiting to be started.
@@ -38,6 +40,10 @@ struct SbiRet {
 }
 
 fn sbi(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> SbiRet {
+    sbi5(eid, fid, [a0, a1, a2, 0, 0])
+}
+
+fn sbi5(eid: usize, fid: usize, a: [usize; 5]) -> SbiRet {
     let (error, value): (isize, usize);
     // SAFETY: `ecall` from S-mode into OpenSBI with the standard calling convention (a7 =
     // extension, a6 = function, a0-a2 arguments, results in a0/a1); it changes no kernel state.
@@ -46,9 +52,11 @@ fn sbi(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> SbiRet {
             "ecall",
             in("a7") eid,
             in("a6") fid,
-            inlateout("a0") a0 => error,
-            inlateout("a1") a1 => value,
-            in("a2") a2,
+            inlateout("a0") a[0] => error,
+            inlateout("a1") a[1] => value,
+            in("a2") a[2],
+            in("a3") a[3],
+            in("a4") a[4],
         );
     }
     SbiRet { error, value }
@@ -309,4 +317,40 @@ pub fn wait_work(index: usize, timeout_cycles: u64) -> Option<u64> {
         core::hint::spin_loop();
     }
     Some(h.work_result.load(Ordering::SeqCst))
+}
+
+/// Make every other hart forget its cached translations (S5d, spec section 5): the caller has
+/// just changed or removed a live user mapping, and frames or page tables may be freed and reused
+/// as soon as the big kernel lock is released. SBI RFENCE is performed in M-mode and is
+/// synchronous, so it works on a hart that is spinning on the lock with interrupts off. Call it
+/// inside the locked region that made the change.
+pub fn shootdown() {
+    if cfg!(feature = "fault-skip-shootdown") {
+        return; // negative control: the test that guards this must fail
+    }
+    let me = percpu::this().index.load(Ordering::Relaxed);
+    for i in 0..started() {
+        if i == me || !percpu::hart(i).online.load(Ordering::Acquire) {
+            continue;
+        }
+        let id = percpu::hart(i).hart_id.load(Ordering::Relaxed);
+        // a whole-address-space flush (start = 0, size = 0) of every ASID on that hart
+        let r = sbi5(
+            EID_RFENCE,
+            FID_REMOTE_SFENCE_VMA,
+            [1usize << (id % 64), id - id % 64, 0, 0, 0],
+        );
+        assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
+    }
+}
+
+/// Tell every other hart that is part of the scheduler to look at its run state (a kill, for
+/// instance, should reach a victim that is running user code on another hart within a tick).
+pub fn kick_others() {
+    let me = percpu::this().index.load(Ordering::Relaxed);
+    for i in 0..started() {
+        if i != me && percpu::hart(i).in_sched.load(Ordering::Acquire) {
+            send_ipi(i, IPI_RESCHED);
+        }
+    }
 }

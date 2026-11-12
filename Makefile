@@ -80,6 +80,8 @@ home-boot-test: home-kernel
 OS_ELF      := target/$(KERNEL_TARGET)/debug/kernel
 OS_FAIL_ELF := target/os-fail/$(KERNEL_TARGET)/debug/kernel
 OS_RR_ELF   := target/os-rr/$(KERNEL_TARGET)/debug/kernel
+OS_NOSHOOT_ELF := target/os-fault-shootdown/$(KERNEL_TARGET)/debug/kernel
+OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
@@ -138,7 +140,10 @@ os-boot-test-release:
 os-boot-test-smp: kernel os-interactive
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
-	OS_SMP=4 OS_ICOUNT=shift=0,sleep=off OS_BOOT_TIMEOUT=900 python3 scripts/os_boot_test.py $(OS_ELF)
+	cd kernel && cargo build --features fault-skip-shootdown --target-dir ../target/os-fault-shootdown
+	cd kernel && cargo build --features fault-skip-kernel-satp --target-dir ../target/os-fault-satp
+	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSHOOT_ELF) unmap_while_siblings_touch
+	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSATP_ELF) teardown_with_threads_on_other_harts
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	OS_SMP=4 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 

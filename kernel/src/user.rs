@@ -513,6 +513,8 @@ fn teardown(pid: u32) -> i32 {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
         let tables: u64 = process.table_charge.values().sum();
+        // the address space and its page tables are gone: no hart may keep translations through them
+        crate::smp::shootdown();
         k.vmos.jobs.credit(process.job, Resource::Pages, tables);
         k.vmos.jobs.credit(process.job, Resource::Processes, 1);
         k.vmos.jobs.release(process.job);
@@ -1196,12 +1198,14 @@ static USER_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 
 /// A hart is about to return to user mode.
 pub fn user_mode_entered() {
+    crate::percpu::this().in_user.store(true, Ordering::SeqCst);
     let now = USER_NOW.fetch_add(1, Ordering::SeqCst) + 1;
     USER_MAX.fetch_max(now, Ordering::SeqCst);
 }
 
 /// A hart took a trap from user mode.
 pub fn user_mode_left() {
+    crate::percpu::this().in_user.store(false, Ordering::SeqCst);
     USER_NOW.fetch_sub(1, Ordering::SeqCst);
 }
 
@@ -1220,6 +1224,9 @@ pub fn end_process(pid: u32, code: i32) {
 }
 
 fn request_kill(pid: u32, code: i32) {
+    // a victim running user code on another hart sees the kill at its next trap: send one now
+    // (the next timer tick would do it within a millisecond, this makes it prompt)
+    irq::without(crate::smp::kick_others);
     let direct = irq::without(|| {
         let s = state();
         match s.procs.get_mut(&pid) {
@@ -2044,6 +2051,8 @@ fn process_unmap(a: [u64; 6]) -> Reply {
             .aspace
             .unmap_region(&mut k.mm, a[1])
             .map_err(|_| (Status::InvalidArgs, None, None))?;
+        // other harts may still cache the translations of what was just unmapped
+        crate::smp::shootdown();
         if let Some(tables) = target.table_charge.remove(&a[1]) {
             k.vmos.jobs.credit(target.job, Resource::Pages, tables);
         }
