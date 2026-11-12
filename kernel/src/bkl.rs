@@ -26,11 +26,6 @@ pub enum Class {
 
 /// Owner of the BKL: hart index + 1, or 0 when free.
 static OWNER: AtomicUsize = AtomicUsize::new(0);
-/// The ticket lock behind it: harts take a ticket and are served in order, so a hart that spins
-/// cannot be starved by others that keep winning a race (an unfair lock made a latency test miss
-/// its bound under contention).
-static NEXT_TICKET: AtomicU32 = AtomicU32::new(0);
-static NOW_SERVING: AtomicU32 = AtomicU32::new(0);
 static ENFORCED: AtomicBool = AtomicBool::new(false);
 /// Violations of the lock order seen (the checker counts instead of panicking while a test is
 /// deliberately provoking one).
@@ -121,13 +116,21 @@ pub fn order_check(held: Class, probe: Class) -> bool {
 }
 
 // ---- the lock ----
+//
+// The protocol (ticket order, reentrancy, the depth hand-over) is `kcore::ticket`, explored under
+// loom and shuttle on the host (T38); this wraps it with the hart identity and the order checker.
+
+static LOCK: kcore::ticket::Ticket = kcore::ticket::Ticket::new();
+
+fn who() -> u32 {
+    percpu::this().index.load(Ordering::Relaxed) as u32
+}
 
 /// Take the BKL. Interrupts must already be off (a handler taking it while the interrupted code
 /// spun for it with interrupts on would deadlock the hart). Reentrant.
 pub fn lock() {
     debug_assert!(!crate::irq::enabled(), "BKL taken with interrupts on");
-    let hart = percpu::this();
-    let me = me();
+    let me = who();
     // the order check applies to a reentrant take too: a path that holds HEAP or UART and then
     // takes a lock the hart already owns is still taking it in the wrong order
     if violates(Class::Bkl) {
@@ -136,41 +139,23 @@ pub fn lock() {
             panic!("lock order violation: taking the BKL while holding a later lock");
         }
     }
-    if OWNER.load(Ordering::Relaxed) == me {
-        hart.bkl_depth.fetch_add(1, Ordering::Relaxed);
-        return;
+    if !LOCK.held_by(me) {
+        note_acquire(Class::Bkl);
     }
-    note_acquire(Class::Bkl);
-    let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
-    while NOW_SERVING.load(Ordering::Acquire) != ticket {
-        core::hint::spin_loop();
-    }
-    OWNER.store(me, Ordering::Relaxed);
-    hart.bkl_depth.store(1, Ordering::Relaxed);
+    LOCK.lock(me, &percpu::this().bkl_depth, core::hint::spin_loop);
+    OWNER.store(me as usize + 1, Ordering::Relaxed);
 }
 
 /// Take the BKL only if it is free (or already ours).
 pub fn try_lock() -> bool {
     debug_assert!(!crate::irq::enabled());
-    let hart = percpu::this();
-    let me = me();
-    if OWNER.load(Ordering::Relaxed) == me {
-        hart.bkl_depth.fetch_add(1, Ordering::Relaxed);
-        return true;
-    }
-    let serving = NOW_SERVING.load(Ordering::Relaxed);
-    if NEXT_TICKET
-        .compare_exchange(
-            serving,
-            serving.wrapping_add(1),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
-        .is_ok()
-    {
-        OWNER.store(me, Ordering::Relaxed);
-        note_acquire(Class::Bkl);
-        hart.bkl_depth.store(1, Ordering::Relaxed);
+    let me = who();
+    let reentrant = LOCK.held_by(me);
+    if LOCK.try_lock(me, &percpu::this().bkl_depth) {
+        if !reentrant {
+            note_acquire(Class::Bkl);
+        }
+        OWNER.store(me as usize + 1, Ordering::Relaxed);
         true
     } else {
         false
@@ -179,32 +164,29 @@ pub fn try_lock() -> bool {
 
 /// Release one level.
 pub fn unlock() {
-    let hart = percpu::this();
-    debug_assert_eq!(
-        OWNER.load(Ordering::Relaxed),
-        me(),
+    let me = who();
+    debug_assert!(
+        LOCK.held_by(me),
         "BKL released by a hart that does not hold it"
     );
-    let d = hart.bkl_depth.fetch_sub(1, Ordering::Relaxed);
-    debug_assert!(d >= 1, "BKL depth underflow");
-    if d == 1 {
+    // clear the mirror before the release: another hart may take the lock the moment it is out
+    let outermost = percpu::this().bkl_depth.get() == 1;
+    if outermost {
         note_release(Class::Bkl);
         OWNER.store(0, Ordering::Relaxed);
-        NOW_SERVING.fetch_add(1, Ordering::Release);
     }
+    LOCK.unlock(me, &percpu::this().bkl_depth);
 }
 
 /// The context switch's hand-over (K3): this hart keeps the lock, but the nesting depth now
 /// belongs to the incoming thread. Returns the outgoing thread's depth (to be saved in it).
 pub fn swap_depth(incoming: u32) -> u32 {
-    debug_assert!(!ENFORCED.load(Ordering::Relaxed) || OWNER.load(Ordering::Relaxed) == me());
-    let hart = percpu::this();
-    let out = hart.bkl_depth.load(Ordering::Relaxed);
-    hart.bkl_depth.store(incoming, Ordering::Relaxed);
-    out
+    let me = who();
+    debug_assert!(!ENFORCED.load(Ordering::Relaxed) || LOCK.held_by(me));
+    LOCK.swap_depth(me, &percpu::this().bkl_depth, incoming)
 }
 
 /// Is the BKL free (nobody holds it)? For tests, from any hart.
 pub fn is_free() -> bool {
-    NEXT_TICKET.load(Ordering::Relaxed) == NOW_SERVING.load(Ordering::Relaxed)
+    LOCK.is_free()
 }
