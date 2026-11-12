@@ -474,7 +474,9 @@ mod tests {
             limit: std::vec![UNLIMITED],
             own: std::vec![0],
         };
-        for _ in 0..20_000 {
+        // (the model recomputes every total, which is slow under Miri: fewer steps there)
+        let steps = if cfg!(miri) { 300 } else { 20_000 };
+        for _ in 0..steps {
             let i = rnd(ids.len() as u64) as usize;
             match rnd(6) {
                 0 if ids.len() < 40 => {
