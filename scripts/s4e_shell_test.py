@@ -10,6 +10,7 @@ Usage: s4e_shell_test.py INTERACTIVE_KERNEL_ELF [--break-expectation]
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 import s4a_serial_test as base  # noqa: E402
@@ -24,13 +25,55 @@ def fail(session, msg):
 
 base.fail = fail
 
+
+class Session(base.Session):
+    """A session that can tell when the shell is waiting at its prompt. The prompt is an
+    unterminated line (`$ `), so the line reader cannot see it: keep the partial line visible and
+    wait for it before typing. (Typing early is legal, but then the echo of the first characters
+    can come before the prompt, and the expected lines would depend on timing.)"""
+
+    def __init__(self, kernel):
+        self.partial = b""
+        self.wait_for_prompt = True
+        super().__init__(kernel)
+
+    def _pump(self):
+        buf = b""
+        while True:
+            c = self.p.stdout.read(1)
+            if not c:
+                break
+            if c == b"\r":
+                continue
+            if c == b"\n":
+                self.lines.put(buf)
+                buf = b""
+            else:
+                buf += c
+            self.partial = buf
+        if buf:
+            self.lines.put(buf)
+        self.lines.put(None)
+
+    def prompt(self):
+        deadline = time.time() + base.TIMEOUT
+        while self.partial != b"$ ":
+            if time.time() > deadline:
+                fail(self, "timed out waiting for the prompt")
+            time.sleep(0.002)
+
+    def step(self, send, want, what):
+        if self.wait_for_prompt:
+            self.prompt()
+        return super().step(send, want, what)
+
 BANNER = b"riscv-os S4 ready"
 BIN = [b"cat", b"consoled", b"crash", b"echo", b"hello", b"init", b"launcher", b"ls",
        b"memfsd", b"probe", b"sh", b"spin"]
 
 
 def main():
-    s = base.Session(sys.argv[1])
+    s = Session(sys.argv[1])
     s.skip_to(BANNER, "the banner")
     step = s.step
 
@@ -100,12 +143,16 @@ def main():
 
     # Ctrl-C
     step(b"spin\n", [b"$ spin", b"spinning"], "a running job")
+    s.wait_for_prompt = False  # a job is running: there is no prompt until it is gone
     step(b"\x03", [b"^C", b"[exit -130]"], "Ctrl-C kills the job")
+    s.wait_for_prompt = True
     step(b"echo after\n", [b"$ echo after", b"after"], "one prompt after the kill (no extra prompt)")
     step(b"\x03", [b"$ ^C"], "Ctrl-C at an idle prompt")
     step(b"echo idle\n", [b"$ echo idle", b"idle"], "the shell after an idle Ctrl-C")
     step(b"spin | cat\n", [b"$ spin | cat", b"spinning"], "a running pipeline")
+    s.wait_for_prompt = False
     step(b"\x03", [b"^C", b"[exit -130]", b"[exit -130]"], "Ctrl-C kills every stage")
+    s.wait_for_prompt = True
     step(b"echo again\n", [b"$ echo again", b"again"], "the shell after a pipeline kill")
 
     # end of input and exit: the shell ends and a fresh session starts
