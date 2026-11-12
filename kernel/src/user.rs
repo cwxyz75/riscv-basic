@@ -331,7 +331,8 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         s.procs.insert(pid, process);
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
-    let tid = thread::spawn("user", 10, user_thread_main, token);
+    // user threads may run on any hart (kernel threads stay on the boot hart by default)
+    let tid = thread::spawn_free("user", 10, user_thread_main, token);
     Ok((pid, tid))
 }
 
@@ -395,6 +396,7 @@ fn user_thread_main(token: usize) {
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();
+    user_mode_entered();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
     unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
@@ -511,6 +513,8 @@ fn teardown(pid: u32) -> i32 {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
         let tables: u64 = process.table_charge.values().sum();
+        // the address space and its page tables are gone: no hart may keep translations through them
+        crate::smp::shootdown();
         k.vmos.jobs.credit(process.job, Resource::Pages, tables);
         k.vmos.jobs.credit(process.job, Resource::Processes, 1);
         k.vmos.jobs.release(process.job);
@@ -530,6 +534,9 @@ fn exit_process(code: i32) -> ! {
 /// and the process ends when the last thread does. The process is torn down by its last thread
 /// (a process started by `process_start`), or by `finish` (one the kernel started).
 fn leave(code: i32, whole: bool) -> ! {
+    if whole {
+        LAST_EXIT_CYCLES.store(crate::timer::now(), Ordering::SeqCst);
+    }
     let me = irq::without(|| {
         let s = state();
         let tid = thread::current();
@@ -1188,6 +1195,35 @@ fn reap_vmos() {
 /// End process `pid` with `code`, from any other thread: a process with no thread yet is
 /// torn down at once; a running one is told to die and woken (its thread exits at its next
 /// return to user mode).
+/// How many harts are in (or just entering) user mode now, and the most there have been at once.
+static USER_NOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static USER_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A hart is about to return to user mode.
+pub fn user_mode_entered() {
+    crate::percpu::this().in_user.store(true, Ordering::SeqCst);
+    let now = USER_NOW.fetch_add(1, Ordering::SeqCst) + 1;
+    USER_MAX.fetch_max(now, Ordering::SeqCst);
+}
+
+/// A hart took a trap from user mode.
+pub fn user_mode_left() {
+    crate::percpu::this().in_user.store(false, Ordering::SeqCst);
+    USER_NOW.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The most harts that were in user mode at the same moment since the last reset.
+pub fn max_harts_in_user_mode() -> usize {
+    USER_MAX.load(Ordering::SeqCst)
+}
+
+pub fn reset_user_mode_high_water() {
+    USER_MAX.store(USER_NOW.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// The `time` counter when a whole process last began to end (the kill-latency test).
+pub static LAST_EXIT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// End process `pid` with `code` from kernel code (the tests).
 pub fn end_process(pid: u32, code: i32) {
     request_kill(pid, code);
@@ -1196,7 +1232,7 @@ pub fn end_process(pid: u32, code: i32) {
 fn request_kill(pid: u32, code: i32) {
     let direct = irq::without(|| {
         let s = state();
-        match s.procs.get_mut(&pid) {
+        let r = match s.procs.get_mut(&pid) {
             Some(p) if p.state == ProcState::Created => {
                 p.exit_code = Some(code);
                 true
@@ -1206,7 +1242,15 @@ fn request_kill(pid: u32, code: i32) {
                 false
             }
             None => false,
+        };
+        // A victim running user code on another hart sees the kill at its next trap: the flag is
+        // set first and the kick comes in the same locked region, so a hart that handles the IPI
+        // always finds the flag (the next timer tick would do it within a millisecond; this makes
+        // it prompt).
+        if !cfg!(feature = "fault-skip-kill-ipi") {
+            crate::smp::kick_others();
         }
+        r
     });
     if direct {
         teardown(pid);
@@ -2018,6 +2062,8 @@ fn process_unmap(a: [u64; 6]) -> Reply {
             .aspace
             .unmap_region(&mut k.mm, a[1])
             .map_err(|_| (Status::InvalidArgs, None, None))?;
+        // other harts may still cache the translations of what was just unmapped
+        crate::smp::shootdown();
         if let Some(tables) = target.table_charge.remove(&a[1]) {
             k.vmos.jobs.credit(target.job, Resource::Pages, tables);
         }
@@ -2098,7 +2144,7 @@ fn process_start(a: [u64; 6]) -> Reply {
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
-    thread::spawn_detached("user", 10, user_thread_main, started);
+    thread::spawn_free_detached("user", 10, user_thread_main, started);
     Ok((None, None))
 }
 
@@ -2192,7 +2238,7 @@ fn thread_create(a: [u64; 6]) -> Reply {
         Ok((new_start(s, tpid, entry, sp, arg, Some(obj)), handle.0))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
-    thread::spawn_detached("user", 10, user_thread_main, token);
+    thread::spawn_free_detached("user", 10, user_thread_main, token);
     Ok((Some(u64::from(handle)), None))
 }
 

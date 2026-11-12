@@ -26,6 +26,11 @@ pub enum Class {
 
 /// Owner of the BKL: hart index + 1, or 0 when free.
 static OWNER: AtomicUsize = AtomicUsize::new(0);
+/// The ticket lock behind it: harts take a ticket and are served in order, so a hart that spins
+/// cannot be starved by others that keep winning a race (an unfair lock made a latency test miss
+/// its bound under contention).
+static NEXT_TICKET: AtomicU32 = AtomicU32::new(0);
+static NOW_SERVING: AtomicU32 = AtomicU32::new(0);
 static ENFORCED: AtomicBool = AtomicBool::new(false);
 /// Violations of the lock order seen (the checker counts instead of panicking while a test is
 /// deliberately provoking one).
@@ -136,12 +141,11 @@ pub fn lock() {
         return;
     }
     note_acquire(Class::Bkl);
-    while OWNER
-        .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+    while NOW_SERVING.load(Ordering::Acquire) != ticket {
         core::hint::spin_loop();
     }
+    OWNER.store(me, Ordering::Relaxed);
     hart.bkl_depth.store(1, Ordering::Relaxed);
 }
 
@@ -154,10 +158,17 @@ pub fn try_lock() -> bool {
         hart.bkl_depth.fetch_add(1, Ordering::Relaxed);
         return true;
     }
-    if OWNER
-        .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+    let serving = NOW_SERVING.load(Ordering::Relaxed);
+    if NEXT_TICKET
+        .compare_exchange(
+            serving,
+            serving.wrapping_add(1),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
         .is_ok()
     {
+        OWNER.store(me, Ordering::Relaxed);
         note_acquire(Class::Bkl);
         hart.bkl_depth.store(1, Ordering::Relaxed);
         true
@@ -178,7 +189,8 @@ pub fn unlock() {
     debug_assert!(d >= 1, "BKL depth underflow");
     if d == 1 {
         note_release(Class::Bkl);
-        OWNER.store(0, Ordering::Release);
+        OWNER.store(0, Ordering::Relaxed);
+        NOW_SERVING.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -194,5 +206,5 @@ pub fn swap_depth(incoming: u32) -> u32 {
 
 /// Is the BKL free (nobody holds it)? For tests, from any hart.
 pub fn is_free() -> bool {
-    OWNER.load(Ordering::Relaxed) == 0
+    NEXT_TICKET.load(Ordering::Relaxed) == NOW_SERVING.load(Ordering::Relaxed)
 }

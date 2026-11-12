@@ -172,7 +172,8 @@ the lock-order checker with its own failing-order test (`lock_order_violations_a
 N harts each do M increments of a protected counter under `kernel_lock` while the boot hart runs the
 suite), so S5b already contends the lock. Acceptance: host suites, `make os-boot-test` green with
 `-smp 1` and `-smp 4`.
-**S5c1: harts schedule, threads pinned.** Secondaries run the scheduler under the BKL; wake IPIs;
+**S5c1 and S5c2: harts schedule (built together).** *(Deviations: kernel threads (the test suites, helpers, the serial bridge, the reaper) stay pinned to the boot hart by default; only user threads, new test threads made with `spawn_free`, and the secondaries' idle threads migrate. `ticks()` is still the boot hart's tick counter; each hart ticks its own slice. The BKL became a ticket lock.)*
+**S5c1, as specified:** Secondaries run the scheduler under the BKL; wake IPIs;
 `current[hart]`; every existing thread keeps its boot-hart affinity except the new tests' threads.
 Acceptance: the whole suite passes with `-smp 2` and `-smp 4`; `a_wake_preempts_a_lower_priority_hart`;
 `user_threads_run_in_parallel` measured by a kernel counter of **harts concurrently in U-mode** (a
@@ -186,7 +187,7 @@ read), `teardown_with_threads_on_other_harts`, `kill_a_spinner_on_another_hart` 
 **Negative controls**: kernel features `fault-skip-shootdown` and `fault-skip-kernel-satp` that disable the
 shootdown and the kernel-`satp` switch must make the corresponding tests fail (the harness runs them like
 `fail-demo`).
-**S5e: stress and icount.** A long stress run (random channel/VMO/process/thread/job churn from several
+**S5e: stress and icount (built, without SMP icount).** *(Deviation: the suite is NOT run under `-icount` with more than one hart. QEMU then runs the virtual CPUs one at a time in fixed turns, and a spin lock hands over only when the other CPU gets its turn, so even `-smp 2` did not get through the first tests in 25 minutes; the single-hart icount run stays in the gate. TIDY-UP T21 records it; the negative controls and the churn stress stand in for deterministic interleaving.)* A long stress run (random channel/VMO/process/thread/job churn from several
 processes) with the lock-order checker and the end-of-run leak oracles (`job_ledger`, frames, objects,
 threads); the whole suite in icount mode with `-smp 4`; TIDY-UP T9, T10, T12, T21 updated (T11 recorded
 as worse, pointing at rung 3).

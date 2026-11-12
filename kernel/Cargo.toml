@@ -27,3 +27,8 @@ fail-demo = []
 # Boot with the plain round-robin scheduling class instead of fixed-priority (OD32).
 # The priority-specific self-tests are skipped; the generic ones must still pass.
 sched-round-robin = []
+# Negative controls for the SMP tests (S5d): each disables one safety mechanism, and the test
+# that guards it must then fail (the harness runs these builds and requires that).
+fault-skip-shootdown = []
+fault-skip-kernel-satp = []
+fault-skip-kill-ipi = []

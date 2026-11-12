@@ -118,6 +118,13 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     thread::init(sched_tests::MAIN_PRIO);
     // From here the big kernel lock is real: entry points assert that it is held.
     bkl::enforce();
+    // The other harts join the scheduler (each adopts its boot context as its idle thread).
+    {
+        let deadline = timer::now() + 2 * 10_000_000;
+        while thread::joined() < smp::started() && timer::now() < deadline {
+            core::hint::spin_loop();
+        }
+    }
     timer::start();
     irq::enable_timer_interrupt();
     smp::enable_ipi_on_this_hart();
@@ -134,15 +141,15 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
             Err(detail) => tally.record(name, Err(&detail)),
         }
     }
+    // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
+    // kernel); the kernel-side checks are reported here.
+    kmem::snapshot_kernel_half();
     for (name, test) in smp_tests::TESTS {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
         }
     }
-    // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
-    // kernel); the kernel-side checks are reported here.
-    kmem::snapshot_kernel_half();
     let before = user::reported();
     #[cfg(feature = "interactive")]
     let report = interactive::run();

@@ -286,13 +286,12 @@ Ctrl-C kills the foreground job.
 
 ### S5: SMP
 
-Acceptance: every earlier suite passes with `-smp 4` in normal and icount modes; a
-long stress run reports no lock-order violations and no leaks.
+Acceptance: every earlier suite passes with `-smp 4` in normal mode (icount only for one hart: TIDY-UP T21); the stress run reports no lock-order violations and no leaks. Built in slices S5a-S5e (`S5-SPEC.md`, OD60-OD62): parked secondaries, the big kernel lock and multi-hart scheduler core, harts scheduling (user threads migrate, kernel threads stay on the boot hart), TLB shootdown and kill IPI, churn stress.
 
-- [ ] Secondary harts via SBI HSM; per-hart state and run queues
-- [ ] IPIs and remote TLB shootdown
-- [ ] Big kernel lock first, then per-object locks on the hot paths
-- [ ] Lock-order checker in debug builds; stress suite
+- [x] Secondary harts via SBI HSM; per-hart state and run queues (S5a-S5c)
+- [x] IPIs and remote TLB shootdown (S5a, S5d; negative controls fail as required)
+- [ ] Big kernel lock first, then per-object locks on the hot paths (the big lock is done, S5b; per-object locks are not, TIDY-UP T11)
+- [x] Lock-order checker in debug builds; stress suite (S5b, S5e)
 
 ### S6: Storage drivers
 

@@ -32,6 +32,12 @@ pub struct PerHart {
     pub timer_ticks: AtomicU64,
     /// Software interrupts (IPIs) this hart has taken.
     pub ipis: AtomicU64,
+    /// Is the hart in (or entering) user mode right now?
+    pub in_user: AtomicBool,
+    /// Set when this hart is part of the scheduler (its idle thread exists).
+    pub in_sched: AtomicBool,
+    /// Reschedule IPIs this hart has handled.
+    pub resched_ipis: AtomicU64,
     /// Pending IPI reasons.
     pub pending: AtomicU32,
     /// The next timer deadline of this hart (`time` counter value).
@@ -62,6 +68,9 @@ impl PerHart {
             online: AtomicBool::new(false),
             timer_ticks: AtomicU64::new(0),
             ipis: AtomicU64::new(0),
+            in_user: AtomicBool::new(false),
+            in_sched: AtomicBool::new(false),
+            resched_ipis: AtomicU64::new(0),
             pending: AtomicU32::new(0),
             deadline: AtomicU64::new(0),
             tp_seen: AtomicUsize::new(0),
