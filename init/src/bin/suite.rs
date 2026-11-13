@@ -6922,6 +6922,12 @@ fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
     let j = job(root, u64::MAX, 0, u64::MAX)?; // no threads at all
     let p = proc_create_in(j)?;
     let seg = ok(sys::vmo_create_in(1, j), "segment")?.a1 as u32;
+    // one instruction, `jal x0, 0`: a jump to itself. (An empty page is an illegal instruction: the
+    // child would fault and end at once, and "one thread running" below would race with its exit.)
+    ok(
+        sys::vmo_write(seg, 0, 0x0000_006fu32.to_le_bytes().as_ptr(), 4),
+        "write the code",
+    )?;
     ok(
         sys::process_map(p, seg, 0x1_0000, 0, 4096, PF_R | PF_X),
         "map some code",
