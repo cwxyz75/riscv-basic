@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "abi", "cfmt", "init", "kcore", "kernel", "memfs", "proto", "rt", "shell-core",
+    "abi", "cfmt", "init", "kcore", "libc", "kernel", "memfs", "proto", "rt", "shell-core",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
@@ -37,6 +37,12 @@ debug = 0
 opt-level = 2
 # The BASIC interpreter on the target (S7a): soft-float on emulated hardware is slow and unoptimised
 # code is stack-hungry.
+[profile.dev.package.oslibc]
+debug = 0
+opt-level = 2
+[profile.dev.package.cfmt]
+debug = 0
+opt-level = 2
 [profile.dev.package.basic]
 debug = 0
 opt-level = 2

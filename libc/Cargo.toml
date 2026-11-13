@@ -1,0 +1,15 @@
+[package]
+name = "oslibc"
+version = "0.1.0"
+edition = "2021"
+description = "The C library (S7c): the C ABI over the native runtime, cores from `cfmt`; user target only"
+
+[lib]
+name = "oslibc"
+
+[dependencies]
+abi = { path = "../abi" }
+cfmt = { path = "../cfmt" }
+proto = { path = "../proto" }
+rt = { path = "../rt", features = ["heap"] }
+libm = "0.2"
