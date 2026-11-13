@@ -19,6 +19,9 @@ proto = { path = "../proto" }
 # Boot into the interactive system (S4): the supervisor `init`, the serial console bridge and
 # the boot image instead of the user test suite.
 interactive = []
+# The system as it is meant to be used (T48): the interactive boot without the boot self-tests,
+# the banners or the `##` lines for passing checks. Build it optimised (`make os-release`).
+release = ["interactive"]
 # The interactive boot with `init` in its test-command mode (the scripted S4a-S4d checks drive its
 # `run`, `ls`, `console` ... commands) instead of the supervisor that starts the shell.
 repl = ["interactive"]
