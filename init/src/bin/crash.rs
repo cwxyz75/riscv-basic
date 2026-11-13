@@ -214,7 +214,9 @@ pub fn app_main() -> i32 {
         }
         23 => {
             // the first thread leaves at once; the process lives until the second ends
-            spawn(exit_eight, 0);
+            // (the second thread waits a little first: with several harts it could otherwise end
+            // before this one, and then *this* one would be the last thread and set the code)
+            spawn(exit_eight_late, 0);
             rt::sys::thread_exit(1);
         }
         24 => {
@@ -481,6 +483,12 @@ extern "C" fn thread_exit_four(_: usize) -> ! {
 }
 
 extern "C" fn exit_eight(_: usize) -> ! {
+    rt::sys::thread_exit(8)
+}
+
+extern "C" fn exit_eight_late(_: usize) -> ! {
+    let gate = rt::sys::event_create().a1 as u32;
+    rt::sys::object_wait(gate, 1 << 24, rt::sys::clock_get() + 20);
     rt::sys::thread_exit(8)
 }
 

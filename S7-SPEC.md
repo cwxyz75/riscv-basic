@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
-Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a and
-S7b are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
+Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a, S7b
+and the first part of S7c (the `cfmt` cores) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -170,6 +170,14 @@ lives in small `no_std`, `forbid(unsafe_code)` core crates (host-tested) and who
 is thin, with a `// SAFETY:` comment on every `unsafe`. The ABI crate is `#![no_builtins]` (otherwise
 LLVM turns a Rust `strlen` or `memset` body into a call to itself) and does not define `mem*`
 (`compiler_builtins` already exports them).
+
+**As built (S7c-1).** The cores are the crate `cfmt/`: `format` (the printf engine, over an `Args`
+trait the C layer implements on `va_list`), `strtod` (decimal by Rust's correctly rounded parser,
+hexadecimal by our own half-to-even rounding), `strtol`, `strtoul`. `tests/differential.rs` compares
+them with the host's libc over ~78,000 generated `snprintf` conversions and 60,000 generated
+strings each for `strtod` and `strtol`/`strtoul`, all agreeing; two mutants (a dropped sticky bit in
+hex rounding, a wrong `%g` exponent precision) are caught. `%a` with a precision that must round is
+compared only on Linux (Apple's libc truncates where glibc rounds), so CI's glibc checks that corner.
 
 **Variadics (B1).** Stable Rust cannot define a variadic function. `printf`, `fprintf`, `snprintf`,
 `sprintf`, `sscanf` (only if Lua's import list needs it) are entered through **assembly stubs** written
