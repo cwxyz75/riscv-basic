@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
-Status: v2, after a Fable review of v1 against the real code (findings folded in below). Nothing
-here is built yet. One question for the product owner is open (section 10): the C toolchain. This
+Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a is
+built (see its section for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -69,12 +69,21 @@ clock. To make that one implementation the scripted console moves out of the hos
 `<LOAD>` through a file-reading callback instead of `CARGO_MANIFEST_DIR`), used by both the host
 golden test and the userland program. The `.out` files stay the only oracle and are not regenerated.
 
+**As built (S7a).** The suite test `basic_golden_corpus_on_the_target` runs all 68 scripts and reports
+*one* `##TEST` (it lists the first failing names), not 68; its negative control checks that two scripts'
+transcripts are told apart, and a mutation (the clock step 250 to 251) was caught by the `timer` golden.
+The shell passes `Role::Stderr` (a duplicate of stdout, so stdout handles now carry DUPLICATE) and sets
+`STDIN=tty` / `STDOUT=tty` for the stages that are the terminal; `basic` honours `STDIN=tty` for Ctrl-D.
+The interactive session is tested in `s4e_shell_test.py` (start, immediate statement, program, `RUN`,
+Ctrl-D, `BYE`, back at the shell). The `basic` crates build at opt-level 2 for the user build.
+
 **Who judges.** The program does not judge itself: it prints the transcript on stdout and the
 **suite compares** it to `golden/NAME.out`, one `##TEST` per script (68 scripts). A negative
 control runs one script against a deliberately corrupted expected output and must fail.
 
-**Image and namespace.** `kernel/build.rs` copies the corpus into the boot image as `golden/*.bas`,
-`golden/*.out` and `examples/*.bas` (about 160 entries, under the 256-entry cap). The suite starts
+**Image and namespace.** `kernel/build.rs` copies the corpus into the boot image under `etc/basic/golden/`
+(scripts and `.out` files) and `etc/basic/examples/` (about 160 entries, under the 256-entry cap; under
+`etc/` and not `home/` so that `ls /home` and the top level stay as they were; the init banner omits them). The suite starts
 `memfsd` as it does today and hands `basic --golden` a namespace with `/golden` and `/examples`
 read-only; the shell is not involved (the shell gives programs only `.` and, for trusted ones, a
 read-only `/`).

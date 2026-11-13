@@ -25,9 +25,18 @@ checksum = "bfdc70193dadb9d7287fa4b633f15f90c876915b31f6af17da307fc59c9859a8"
 name = "basic"
 version = "0.1.0"
 dependencies = [
+ "basic-script",
  "cartfs",
  "console",
  "libm",
+]
+
+[[package]]
+name = "basic-script"
+version = "0.1.0"
+dependencies = [
+ "basic",
+ "cartfs",
 ]
 
 [[package]]
@@ -126,6 +135,8 @@ dependencies = [
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "basic",
+ "basic-script",
  "kcore",
  "memfs",
  "proto",

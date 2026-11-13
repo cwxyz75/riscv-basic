@@ -43,6 +43,9 @@ pub enum Role {
     Resource = 15,
     /// The channel the device manager serves (`proto::devmgr`).
     ServiceDevmgr = 16,
+    /// Standard error (S7a): a duplicate of the same stream as `Stdout` when nothing separate was
+    /// asked for. A program with no `Stderr` writes errors to `Stdout`.
+    Stderr = 17,
 }
 
 impl Role {
@@ -64,6 +67,7 @@ impl Role {
             14 => Role::ServiceBlk,
             15 => Role::Resource,
             16 => Role::ServiceDevmgr,
+            17 => Role::Stderr,
             _ => return None,
         })
     }

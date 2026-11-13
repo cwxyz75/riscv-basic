@@ -4096,6 +4096,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     ensure_eq!(
         progs,
         vec![
+            b"basic".to_vec(),
             b"blkd".to_vec(),
             b"bomb".to_vec(),
             b"cat".to_vec(),
@@ -5881,6 +5882,95 @@ fn blk_driver_restart() -> Outcome {
     Ok(())
 }
 
+// --- BASIC on the target (S7a) ----------------------------------------------------------------
+
+/// Run `basic --golden NAME` with `/` bound to a read-only clone of `root`, and return everything
+/// it wrote to stdout (the program never judges itself).
+fn run_basic_golden(image: &[u8], root: &mut Fs, name: &[u8]) -> Result<Vec<u8>, Detail> {
+    let (out_mine, out_theirs) = socket()?;
+    let ro = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    let s = Startup {
+        args: vec![b"basic".to_vec(), b"--golden".to_vec(), name.to_vec()],
+        namespace: vec![(b"/".to_vec(), 1)],
+        roles: vec![(Role::Stdout, 0)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(image, &bytes, &[out_theirs, ro.ch]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn basic: {e:?}"));
+        d
+    })?;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match rt::io::read(out_mine, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    wait_ended(p, 60_000)?;
+    let code = sys::process_info(p).a1 as i64;
+    sys::handle_close(p);
+    sys::handle_close(out_mine);
+    ensure_eq!(code, 0, "basic --golden exits 0");
+    Ok(got)
+}
+
+fn basic_golden_corpus_on_the_target() -> Outcome {
+    let (_fsd, mut root, bi) = start_memfsd()?;
+    let mut dir = root
+        .open(b"etc/basic/golden", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let listing = names(&dir.read_dir().map_err(|e| msg_e(e, line!()))?);
+    let scripts: Vec<Vec<u8>> = listing
+        .iter()
+        .filter_map(|n| n.strip_suffix(b".bas").map(|s| s.to_vec()))
+        .collect();
+    ensure_eq!(scripts.len(), 68, "the whole corpus is in the boot image");
+    let (off, len) = image_entry(bi, b"bin/basic")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let mut failed: Vec<Vec<u8>> = Vec::new();
+    let mut first: Option<(Vec<u8>, Vec<u8>)> = None;
+    for name in &scripts {
+        let got = run_basic_golden(&image, &mut root, name)?;
+        let mut path = b"etc/basic/golden/".to_vec();
+        path.extend_from_slice(name);
+        path.extend_from_slice(b".out");
+        let mut f = root
+            .open(&path, 0, prt::READ)
+            .map_err(|e| msg_e(e, line!()))?;
+        let want = f.read_all().map_err(|e| msg_e(e, line!()))?;
+        f.close();
+        if got != want {
+            failed.push(name.clone());
+        }
+        // negative control: a script's transcript is not another script's expected output
+        match &first {
+            None => first = Some((got, want)),
+            Some((g0, w0)) => {
+                ensure!(
+                    *g0 != want && got != *w0,
+                    "the comparison tells two scripts apart"
+                );
+            }
+        }
+    }
+    ensure!(
+        failed.is_empty(),
+        "{} of {} scripts differ: {:?}",
+        failed.len(),
+        scripts.len(),
+        failed
+            .iter()
+            .take(5)
+            .map(|n| core::str::from_utf8(n).unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 // --- The device manager (S6c) -----------------------------------------------------------------
 
 /// One OpenBlock exchange: the status and the block channel that came with an Ok.
@@ -7303,6 +7393,10 @@ pub fn app_main() -> i32 {
         ),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
+        (
+            "basic_golden_corpus_on_the_target",
+            basic_golden_corpus_on_the_target,
+        ),
         (
             "devmgr_starts_blkd_for_the_disk",
             devmgr_starts_blkd_for_the_disk,

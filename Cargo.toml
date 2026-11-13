@@ -2,14 +2,14 @@
 resolver = "2"
 members = [
     "abi", "init", "kcore", "kernel", "memfs", "proto", "rt", "shell-core",
-    "home/basic", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
+    "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
 # host-testable crates. The two kernels target bare-metal RISC-V and are built from
 # inside kernel/ and home/kernel/ (see Makefile), which pick up their .cargo/config.toml.
 default-members = [
     "abi", "kcore", "memfs", "proto", "shell-core",
-    "home/basic", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
+    "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
 
 # The user programs are embedded in the boot image and must stay small (the launcher accepts
@@ -35,6 +35,24 @@ opt-level = 2
 [profile.dev.package.lock_api]
 debug = 0
 opt-level = 2
+# The BASIC interpreter on the target (S7a): soft-float on emulated hardware is slow and unoptimised
+# code is stack-hungry.
+[profile.dev.package.basic]
+debug = 0
+opt-level = 2
+[profile.dev.package.basic-script]
+debug = 0
+opt-level = 2
+[profile.dev.package.cartfs]
+debug = 0
+opt-level = 2
+[profile.dev.package.console]
+debug = 0
+opt-level = 2
+[profile.dev.package.libm]
+debug = 0
+opt-level = 2
+
 [profile.dev.package.scopeguard]
 debug = 0
 opt-level = 2

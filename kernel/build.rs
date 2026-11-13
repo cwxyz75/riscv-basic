@@ -24,7 +24,7 @@ fn main() {
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for name in [
         "suite", "init", "crash", "hello", "launcher", "memfsd", "consoled", "spin", "echo", "cat",
-        "ls", "probe", "sh", "hog", "bomb", "ipchog", "blkd", "devmgr",
+        "ls", "probe", "sh", "hog", "bomb", "ipchog", "blkd", "devmgr", "basic",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
@@ -70,6 +70,16 @@ fn main() {
     }
     let mut files = Vec::new();
     walk(&fixtures, "", &mut files);
+    // The BASIC golden corpus and the demo programs it loads, for `basic --golden` (S7a): the
+    // scripts and their expected outputs under /etc/basic/golden, the examples under /etc/basic/examples.
+    for (src, prefix) in [
+        ("../home/basic/tests/golden", "/etc/basic/golden"),
+        ("../home/examples", "/etc/basic/examples"),
+    ] {
+        let path = PathBuf::from(&dir).join(src);
+        println!("cargo:rerun-if-changed={}", path.display());
+        walk(&path, prefix, &mut files);
+    }
     for (n, d) in files {
         // walk() prefixes every name with "/": drop it
         image_files.push((n[1..].to_vec(), d));

@@ -37,6 +37,14 @@ impl Env {
         self.handles.get(i as usize).copied()
     }
 
+    /// The value of the environment entry `NAME=value` (the first match).
+    pub fn var(&self, name: &[u8]) -> Option<&[u8]> {
+        self.startup.env.iter().find_map(|e| {
+            let rest = e.strip_prefix(name)?;
+            rest.strip_prefix(b"=")
+        })
+    }
+
     /// The handle of the namespace entry with this prefix (`b"."`, `b"/"`).
     pub fn namespace(&self, prefix: &[u8]) -> Option<u32> {
         let (_, i) = self.startup.namespace.iter().find(|(p, _)| p == prefix)?;
