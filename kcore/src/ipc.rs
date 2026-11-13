@@ -75,6 +75,8 @@ pub struct SocketEnd {
     peer: Option<ObjId>,
     buf: VecDeque<u8>,
     peer_closed: bool,
+    /// This end called `socket_shutdown`: it writes no more, its peer reads end-of-stream.
+    shut: bool,
 }
 
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
@@ -617,8 +619,11 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
             if e.peer_closed {
                 s |= signals::PEER_CLOSED;
             } else if let Some(KObj::Socket(p)) = e.peer.and_then(|p| reg.get(p)) {
-                if p.buf.len() < SOCKET_BUFFER {
+                if p.buf.len() < SOCKET_BUFFER && !e.shut {
                     s |= signals::WRITABLE;
+                }
+                if p.shut {
+                    s |= signals::WRITE_CLOSED;
                 }
             }
             s
@@ -668,6 +673,7 @@ pub fn socket_create_in(
         peer: None,
         buf: VecDeque::new(),
         peer_closed: false,
+        shut: false,
     };
     let a = reg.create_charged(KObj::Socket(end()), q.job);
     let b = reg.create_charged(KObj::Socket(end()), q.job);
@@ -710,6 +716,9 @@ pub fn socket_write_in(
         return Err(Status::TooBig);
     }
     let meter = reg.meter();
+    if matches!(reg.get(me), Some(KObj::Socket(s)) if s.shut) {
+        return Err(Status::BadState);
+    }
     let peer = match reg.get(me) {
         Some(KObj::Socket(s)) if !s.peer_closed => s.peer,
         _ => None,
@@ -767,7 +776,8 @@ pub fn socket_peek(
         return Ok(0);
     }
     if s.buf.is_empty() {
-        return Err(if s.peer_closed {
+        let peer_shut = matches!(s.peer.and_then(|p| reg.get(p)), Some(KObj::Socket(p)) if p.shut);
+        return Err(if s.peer_closed || peer_shut {
             Status::PeerClosed
         } else {
             Status::ShouldWait
@@ -797,6 +807,17 @@ pub fn socket_read_in(
     reg.meter_sub(n);
     credit_bytes(reg, jobs, me, n);
     Ok(out)
+}
+
+/// Close this end's write side (half-close): the peer drains what is queued and then reads
+/// end-of-stream; this end can still read; its own writes now fail with BAD_STATE. Idempotent.
+/// Rights: WRITE.
+pub fn socket_shutdown(reg: &mut Kobjs, table: &HandleTable, h: Handle) -> Result<(), Status> {
+    let me = socket_of(reg, table, h, Rights::WRITE)?;
+    if let Some(KObj::Socket(s)) = reg.get_mut(me) {
+        s.shut = true;
+    }
+    Ok(())
 }
 
 // --- ports ---

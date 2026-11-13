@@ -728,6 +728,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
                     // data moved, space freed, or a binding that is ready at once
                     | nr::SOCKET_WRITE
                     | nr::SOCKET_READ
+                    | nr::SOCKET_SHUTDOWN
                     | nr::PORT_BIND
                     | nr::PORT_UNBIND
             ) {
@@ -791,7 +792,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
         nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
-        nr::SOCKET_WRITE | nr::SOCKET_READ | nr::PORT_UNBIND if over(0) => Some(Status::BadHandle),
+        nr::SOCKET_WRITE | nr::SOCKET_READ | nr::SOCKET_SHUTDOWN | nr::PORT_UNBIND if over(0) => {
+            Some(Status::BadHandle)
+        }
         nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
@@ -865,6 +868,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
+        nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, &p.handles, h(0))
+            .map(|()| (None, None))
+            .map_err(|e| (e, None, None)),
         nr::PORT_CREATE => {
             let port = ipc::port_create_in(objs, &mut p.handles, &mut quota(p.job))
                 .map_err(|e| (e, None, None))?;

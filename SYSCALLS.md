@@ -82,6 +82,7 @@ change.
 | WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
 | PEER_CLOSED | 2 | the other end of a channel is gone |
 | TERMINATED | 3 | a process or a thread has ended |
+| WRITE_CLOSED | 4 | the peer socket end called `socket_shutdown`: no data beyond what is queued will arrive |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
 ## Limits
@@ -510,6 +511,16 @@ Remove up to `max` bytes from the own buffer into `buffer`. Rights: READ. `max` 
 SHOULD_WAIT; INVALID_ARGS (the destination is not writable user memory; nothing is removed).
 `max` 0 is OK with `read` 0.
 
+### socket_shutdown(socket) -> status
+
+Half-close: this endpoint writes no more. The peer reads what is queued, then gets end of stream
+(`socket_read` returns PEER_CLOSED) and sees the signal WRITE_CLOSED; PEER_CLOSED itself stays
+clear, because the peer exists and may still write, and this endpoint can still read. After it,
+this endpoint's `socket_write` fails with BAD_STATE and it no longer has WRITABLE. Irreversible
+and idempotent (a second call is OK). Rights: WRITE. Errors, in order: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED. A reader that waits for end of stream waits for READABLE | PEER_CLOSED |
+WRITE_CLOSED.
+
 ### Ports
 
 A port is a wait set: it watches signals on other objects and reports which are asserted.
@@ -703,3 +714,4 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | thread_create, thread_exit, thread_info | specified (S3c-2b) |
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
+| socket_shutdown | specified and implemented (tidy-up, T17) |

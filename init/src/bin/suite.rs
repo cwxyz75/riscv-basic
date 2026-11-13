@@ -2796,6 +2796,84 @@ fn socket_end_of_stream() -> Outcome {
     Ok(())
 }
 
+fn socket_half_close() -> Outcome {
+    let (a, b) = socket()?;
+    let mut buf = [0u8; 8];
+    // argument checks
+    ensure_eq!(
+        st(sys::socket_shutdown(0xdead)),
+        Some(S::BadHandle),
+        "a bad handle"
+    );
+    let (c, _d) = channel()?;
+    ensure_eq!(
+        st(sys::socket_shutdown(c)),
+        Some(S::WrongType),
+        "a channel is not a socket"
+    );
+    let ro = ok(sys::handle_duplicate(b, Rights::READ.0), "dup read-only")?.a1 as u32;
+    ensure_eq!(
+        st(sys::socket_shutdown(ro)),
+        Some(S::AccessDenied),
+        "no WRITE right"
+    );
+    // nothing is closed yet: a wait for WRITE_CLOSED times out
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        st(sys::object_wait(b, sig::WRITE_CLOSED, t0 + 20)),
+        Some(S::TimedOut),
+        "no half-close yet"
+    );
+    sys::socket_write(a, b"req".as_ptr(), 3);
+    ensure_eq!(st(sys::socket_shutdown(a)), Some(S::Ok), "shutdown");
+    ensure_eq!(
+        st(sys::socket_shutdown(a)),
+        Some(S::Ok),
+        "shutdown is idempotent"
+    );
+    let s = sys::object_signals(b).a1 as u32;
+    ensure_eq!(
+        s & (sig::READABLE | sig::WRITE_CLOSED | sig::PEER_CLOSED | sig::WRITABLE),
+        sig::READABLE | sig::WRITE_CLOSED | sig::WRITABLE,
+        "data and WRITE_CLOSED, the peer is not closed and may still write"
+    );
+    ensure_eq!(
+        st(sys::object_wait(b, sig::WRITE_CLOSED, u64::MAX)),
+        Some(S::Ok),
+        "a wait for WRITE_CLOSED returns"
+    );
+    let r = sys::socket_read(b, buf.as_mut_ptr(), 8);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..3]),
+        (0, 3, &b"req"[..]),
+        "the data first"
+    );
+    ensure_eq!(
+        st(sys::socket_read(b, buf.as_mut_ptr(), 8)),
+        Some(S::PeerClosed),
+        "then the end of the stream"
+    );
+    ensure_eq!(
+        st(sys::socket_write(a, b"x".as_ptr(), 1)),
+        Some(S::BadState),
+        "the shut end cannot write"
+    );
+    // the reply direction still works
+    sys::socket_write(b, b"resp".as_ptr(), 4);
+    let r = sys::socket_read(a, buf.as_mut_ptr(), 8);
+    ensure_eq!(
+        (r.status, r.a1, &buf[..4]),
+        (0, 4, &b"resp"[..]),
+        "the reply arrives"
+    );
+    ensure_eq!(
+        st(sys::socket_read(a, buf.as_mut_ptr(), 8)),
+        Some(S::ShouldWait),
+        "no end of stream in the other direction"
+    );
+    Ok(())
+}
+
 fn socket_ends_travel_over_channels() -> Outcome {
     let (a, b) = socket()?;
     let (c, d) = channel()?;
@@ -6106,6 +6184,7 @@ pub fn app_main() -> i32 {
         ),
         ("socket_syscalls", socket_syscalls),
         ("socket_end_of_stream", socket_end_of_stream),
+        ("socket_half_close", socket_half_close),
         (
             "socket_ends_travel_over_channels",
             socket_ends_travel_over_channels,
