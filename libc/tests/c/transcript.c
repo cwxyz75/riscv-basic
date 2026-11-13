@@ -281,7 +281,9 @@ static void files(void) {
     char three[4] = {0};
     fread(three, 1, 3, f);
     int rc = fseek(f, -1000, SEEK_CUR);
-    printf("bad seek %d tell %ld next %c\n", rc, ftell(f), getc(f));
+    long at = ftell(f); /* (the arguments of one call are evaluated in no particular order) */
+    int next = getc(f);
+    printf("bad seek %d tell %ld next %c\n", rc, at, next);
     FILE *same = freopen("s7c-second.txt", "w", f);
     printf("freopen same stream %d\n", same == f);
     fputs("second file", f);
