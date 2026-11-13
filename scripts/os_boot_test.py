@@ -95,6 +95,43 @@ DONE = re.compile(r"^##DONE pass=(\d+) fail=(\d+)$")
 BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
 
 
+LAST_DISK = [None]
+
+
+def check_disk(path):
+    """The independent oracle for the block-driver tests (T44): after QEMU exits, look at the image
+    itself. Expected (see `blk_round_trip` / `blk_driver_restart` in init/src/bin/suite.rs): sector 0
+    untouched; sectors 100..227, 4000..4063 and the last sector hold pattern(s, i) =
+    (s*31 + i*7 + 5) mod 256; sectors 5000..5015 hold zeros or the in-flight write's data
+    ((j*13 + 1) mod 256 at byte j of the 8 KiB); every other sector is zero. Returns problems."""
+    SECTORS = 16 * 1024 * 2
+    try:
+        data = open(path, "rb").read()
+    except OSError as e:
+        return [f"the scratch disk is unreadable: {e}"]
+    if len(data) != SECTORS * 512:
+        return [f"the scratch disk changed size: {len(data)}"]
+    found = []
+    pat = lambda s: bytes((s * 31 + i * 7 + 5) & 0xFF for i in range(512))
+    zero = bytes(512)
+    for s in range(SECTORS):
+        got = data[s * 512:(s + 1) * 512]
+        if s == 0:
+            want = [bytes((i * 7 + 3) & 0xFF for i in range(512))]
+        elif 100 <= s < 228 or 4000 <= s < 4064 or s == SECTORS - 1:
+            want = [pat(s)]
+        elif 5000 <= s < 5016:
+            j = (s - 5000) * 512
+            want = [zero, bytes(((j + i) * 13 + 1) & 0xFF for i in range(512))]
+        else:
+            want = [zero]
+        if got not in want:
+            found.append(f"disk sector {s} holds unexpected data (first bytes {got[:4].hex()})")
+            if len(found) >= 5:
+                break
+    return found
+
+
 def scratch_disk():
     """A 16 MiB raw image whose sector 0 holds a known pattern (byte i = (i * 7 + 3) mod 256), so a
     driver that "reads" zeroes is visible (S6-SPEC section 6). A fresh copy per boot."""
@@ -104,6 +141,7 @@ def scratch_disk():
     f.truncate(16 * 1024 * 1024)
     f.close()
     atexit.register(lambda: os.path.exists(f.name) and os.unlink(f.name))
+    LAST_DISK[0] = f.name
     return f.name
 
 
@@ -263,6 +301,11 @@ def main() -> int:
                 and f"s6: blkd exercised ({'polling' if aia else 'interrupts'})" not in text):
             found.append("the block-driver tests did not run in the expected mode "
                          f"({'polling' if aia else 'interrupts'})")
+        # The disk, looked at from the host once the guest is gone (only when the guest ran the
+        # block-driver tests to the end; a timed-out or failing run leaves it half written).
+        if (not expect_fail and not found and os.environ.get("OS_DISK") != "0"
+                and LAST_DISK[0]):
+            found += check_disk(LAST_DISK[0])
         if found:
             failed = 1
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)
