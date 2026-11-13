@@ -90,6 +90,7 @@ Rules:
 | R6 | T7: 16-bit handle generation. Now 19 bits, and a slot that has used them all is retired, so a stale handle value cannot become valid again | tidy-up PR |
 | R7 | T10: `copy_to_user` results ignored after `verify_writable`. Writes after verification use `copy_to_user_verified` (no allocation, no commit) and report errors | tidy-up PR |
 | R11 | T17: no socket half-close. `socket_shutdown` and the WRITE_CLOSED signal (OD63); the terminal itself still has no permanent end-of-input, which is by design | tidy-up PR |
+| R12 | T45: `a_refused_process_start_changes_nothing_and_can_be_retried` flaked on CI ("one thread running: got 0"): its child's code page was never written, so the child faulted on an illegal instruction and its thread was credited back before the check. It now writes a self-jump | tidy-up PR |
 | R10 | T9: no kernel lock. The big kernel lock (S5b) with per-thread depth hand-over, a lock-order checker, and the SMP suites at -smp 1, 2 and 4 (S5a-S5e) | PRs 70, 71, 72 |
 | R9 | T4: the global IPC budget was shared and ambient; it is now a backstop behind per-job queued-data quotas (S4.5c) | PR 68 |
 | R8 | T36: `MANAGE` on a job covered setting limits. New `SET_LIMITS` right; MANAGE only makes things inside the job | tidy-up PR |
