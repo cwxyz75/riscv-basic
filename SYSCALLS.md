@@ -83,6 +83,7 @@ change.
 | WRITABLE | 1 | a channel's peer exists and its queue has room (fewer than `MAX_QUEUED_MSGS` messages and `MAX_QUEUED_BYTES` queued) |
 | PEER_CLOSED | 2 | the other end of a channel is gone |
 | TERMINATED | 3 | a process or a thread has ended |
+| INTERRUPT | 5 | an interrupt object's source fired and has not been acknowledged |
 | WRITE_CLOSED | 4 | the peer socket end called `socket_shutdown`: no data beyond what is queued will arrive |
 | USER_0 .. USER_7 | 24..31 | set and cleared by `event_signal` |
 
@@ -179,6 +180,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 | 95 | resource_root | | `a1` handle |
+| 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
+| 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
 
@@ -359,6 +362,24 @@ contiguous run is free. The returned handle has VMO rights without EXECUTE plus 
 
 The physical address of a DMA VMO's first byte. Needs the DMA right (ACCESS_DENIED without it, so
 a duplicate made without DMA cannot learn addresses); WRONG_TYPE for a VMO that is not a DMA VMO.
+
+### interrupt_create(resource, source) -> status, handle
+
+An interrupt object for PLIC source `source` (1..=`MAX_IRQ`, 8: the QEMU `virt` virtio-mmio
+slots; slot *n* is source *n*+1). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
+INSPECT, MANAGE (acknowledge). The source is enabled (priority 1) for the boot hart while the object
+lives and masked when it is destroyed. When it fires the kernel claims it, **masks it**, holds the
+claim open and raises INTERRUPT; waiters wake. A source may also be pending from before the object
+existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
+interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
+INVALID_ARGS (source 0 or above the range); NOT_SUPPORTED (a machine without a PLIC: AIA; drivers
+poll); BAD_STATE (a live object already owns the source); NO_MEMORY.
+
+### interrupt_ack(interrupt) -> status, claims
+
+Clear INTERRUPT, complete the held claim and unmask the source; the device condition must be cleared first or a level-triggered
+device fires again. `claims` is how many times the kernel has claimed this source for the object
+(a storm shows here). Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
 
 ### process_create(job) -> status, handle
 
@@ -752,3 +773,4 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | socket_create, socket_write, socket_read | specified (S3c-3) |
 | socket_shutdown | specified and implemented (tidy-up, T17) |
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
+| interrupt_create, interrupt_ack | specified and implemented (S6a-2) |

@@ -118,7 +118,16 @@ pub fn init() {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::RW)
             .expect("direct map");
     }
-    for device in [abi::finisher::BASE as u64, 0x1000_0000] {
+    // The device tree sits in the top 2 MiB, which the frame database does not manage: map it
+    // read-only (the interrupt controller probe reads it).
+    for pfn in end..(RAM_BASE + RAM_SIZE) / PAGE_SIZE {
+        pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
+            .expect("device tree map");
+    }
+    for device in [abi::finisher::BASE as u64, 0x1000_0000]
+        .into_iter()
+        .chain(crate::plic::pages())
+    {
         pt.map(&mut mm, DIRECT_BASE + device, device / PAGE_SIZE, Perms::RW)
             .expect("device page");
     }

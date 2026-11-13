@@ -216,6 +216,15 @@ pub mod sys {
     pub fn vmo_phys_addr(vmo: u32) -> Ret {
         syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
     }
+    pub fn interrupt_create(resource: u32, irq: u32) -> Ret {
+        syscall(
+            INTERRUPT_CREATE,
+            [resource as usize, irq as usize, 0, 0, 0, 0],
+        )
+    }
+    pub fn interrupt_ack(interrupt: u32) -> Ret {
+        syscall(INTERRUPT_ACK, [interrupt as usize, 0, 0, 0, 0, 0])
+    }
     pub fn vmo_get_size(vmo: u32) -> Ret {
         syscall(VMO_GET_SIZE, [vmo as usize, 0, 0, 0, 0, 0])
     }

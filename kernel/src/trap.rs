@@ -317,6 +317,18 @@ fn trap_body(frame: &mut TrapFrame) {
         }
         return;
     }
+    if cause == (1 << 63) | 9 {
+        // Supervisor external interrupt (S6a-2): a device source, owned by an interrupt object.
+        let any = crate::plic::handle(crate::user::irq_fired);
+        if any && crate::thread::scheduler_ready() {
+            crate::user::wake_signal_waiters();
+            crate::thread::reschedule_this_hart();
+            if frame.sstatus & (1 << 8) == 0 {
+                crate::user::activate_current();
+            }
+        }
+        return;
+    }
     if cause == (1 << 63) | 5 && !crate::thread::scheduler_ready() {
         // A secondary hart's timer before the scheduler exists: count and re-arm.
         crate::percpu::this()
