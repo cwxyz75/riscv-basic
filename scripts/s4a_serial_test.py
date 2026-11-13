@@ -30,7 +30,7 @@ BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/lau
 class Session:
     def __init__(self, kernel):
         cmd = ["qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"),
-               "-bios", "default", "-m", "128M", "-display", "none", "-serial", "stdio",
+               "-bios", "default", "-m", "256M", "-display", "none", "-serial", "stdio",
                "-monitor", "none", "-kernel", kernel]
         if os.environ.get("OS_CPU"):
             cmd[1:1] = ["-cpu", os.environ["OS_CPU"]]

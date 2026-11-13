@@ -77,6 +77,8 @@ fn main() {
         ("../home/examples", "/etc/basic/examples"),
         // the Lua acceptance script (S7d)
         ("../tests/lua", "/etc/lua"),
+        // the upstream Lua test suite (S7e)
+        ("../third_party/lua-tests", "/etc/lua-tests"),
     ] {
         let path = PathBuf::from(&dir).join(src);
         println!("cargo:rerun-if-changed={}", path.display());

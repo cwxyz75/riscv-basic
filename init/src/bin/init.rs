@@ -108,7 +108,11 @@ pub fn app_main() -> i32 {
         .iter()
         // the BASIC corpus (S7a) and the Lua script (S7d) are data, not part of the image's
         // shape: keep the banner short
-        .filter(|e| !e.name.starts_with(b"etc/basic/") && !e.name.starts_with(b"etc/lua/"))
+        .filter(|e| {
+            !e.name.starts_with(b"etc/basic/")
+                && !e.name.starts_with(b"etc/lua/")
+                && !e.name.starts_with(b"etc/lua-tests/")
+        })
     {
         banner.push(' ');
         banner.push_str(&String::from_utf8_lossy(&e.name));
@@ -663,13 +667,13 @@ fn start_stack(
         return Err(38);
     }
     let root = root.a1 as u32;
-    let session = sys::job_create(root, &[32, 64, 16384, 40, 4000, 1536 * 1024]);
+    let session = sys::job_create(root, &[32, 64, 49152, 40, 4000, 1536 * 1024]);
     sys::handle_close(root);
     if session.status != 0 {
         return Err(38);
     }
     let session = session.a1 as u32;
-    let apps = sys::job_create(session, &[16, 32, 8192, 20, 1000, 768 * 1024]);
+    let apps = sys::job_create(session, &[16, 32, 40960, 20, 1000, 768 * 1024]);
     if apps.status != 0 {
         sys::handle_close(session);
         return Err(38);

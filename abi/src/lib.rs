@@ -332,7 +332,7 @@ pub mod layout {
     pub const MAX_IRQ: u32 = 8;
     /// RAM size the kernel assumes (the boot test passes `-m 128M`). Reading it
     /// from the device tree arrives with the device manager (S6).
-    pub const RAM_SIZE: u64 = 128 * 1024 * 1024;
+    pub const RAM_SIZE: u64 = 256 * 1024 * 1024;
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
     pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;

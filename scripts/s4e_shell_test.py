@@ -212,9 +212,9 @@ def main():
         if line != b"[exit 7]":
             fail(s, f"the hog ended with {line!r}, wanted [exit 7]")
         counts.append(mib)
-    # the 4096-page job holds the program's image and stack too: about 15 MiB, never more than 16
-    if not 8 <= counts[0] <= 16:
-        fail(s, f"the hog got {counts[0]} MiB of a 16 MiB job")
+    # the heap stops at 128 MiB (some of it is the program's own); the 136 MiB job never has to refuse
+    if not 120 <= counts[0] <= 128:
+        fail(s, f"the hog got {counts[0]} MiB of a 128 MiB heap")
     if counts[0] != counts[1]:
         fail(s, f"the second hog got {counts[1]} MiB, the first {counts[0]}: memory was not given back")
     step(b"echo survived\n", [b"$ echo survived", b"survived"], "the shell after the hog")

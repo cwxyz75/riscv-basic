@@ -14,8 +14,9 @@ use linked_list_allocator::Heap;
 
 /// Start of the reserved range (below `STACK_TOP`, away from the program image).
 pub const HEAP_BASE: u64 = 0x08_0000_0000;
-/// Largest heap: 16 MiB.
-pub const HEAP_LIMIT: usize = 16 * 1024 * 1024;
+/// Largest heap: 128 MiB of address space (committed only as touched, and charged to the job). Lua's
+/// stack-overflow test alone needs about 70 MiB here (S7e).
+pub const HEAP_LIMIT: usize = 128 * 1024 * 1024;
 /// Growth granule: 256 KiB (64 pages, committed lazily).
 const CHUNK: usize = 256 * 1024;
 
