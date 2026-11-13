@@ -84,8 +84,8 @@ impl FrameDb {
                     let taken: alloc::collections::BTreeSet<Pfn> =
                         (first..first + n as u64).collect();
                     self.free.retain(|p| !taken.contains(p));
-                    for i in start..start + n {
-                        self.refs[i] = 1;
+                    for r in &mut self.refs[start..start + n] {
+                        *r = 1;
                     }
                     return Some(first);
                 }
