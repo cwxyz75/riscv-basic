@@ -4111,6 +4111,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ipchog".to_vec(),
             b"launcher".to_vec(),
             b"ls".to_vec(),
+            b"lua".to_vec(),
             b"memfsd".to_vec(),
             b"probe".to_vec(),
             b"sh".to_vec(),
@@ -6364,6 +6365,87 @@ fn c_transcript_matches_the_host() -> Outcome {
     Ok(())
 }
 
+// --- Lua (S7d) ----------------------------------------------------------------------------------
+
+/// Run `lua /etc/lua/s7.lua` (the upstream interpreter, our C library) and hand its transcript to the
+/// harness, which compares it with a Lua built from the same sources and run on the host: every line
+/// goes out as `lua|<line>`. `/` is a read-only root, `.` the writable /tmp.
+fn lua_script_matches_the_host_build() -> Outcome {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/lua")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (out_mine, out_theirs) = socket()?;
+    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u32;
+    let (_fsd, mut root, _bi) = start_memfsd()?;
+    let slash = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    let dot = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let s = Startup {
+        args: vec![b"lua".to_vec(), b"/etc/lua/s7.lua".to_vec()],
+        namespace: vec![(b"/".to_vec(), 2), (b".".to_vec(), 3)],
+        roles: vec![(Role::Stdout, 0), (Role::Stderr, 1)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, err_theirs, slash.ch, dot.ch]).map_err(
+        |e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn lua: {e:?}"));
+            d
+        },
+    )?;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match rt::io::read(out_mine, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    wait_ended(p, 60_000)?;
+    let code = sys::process_info(p).a1 as i64;
+    sys::handle_close(p);
+    sys::handle_close(out_mine);
+    ensure!(
+        code != 99,
+        "lua is a stub: the build had no RISC-V C compiler (set CC_RISCV)"
+    );
+    if code != 0 {
+        // the interpreter's own diagnostics are the best clue
+        let tail = &got[got.len().saturating_sub(120)..];
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "lua exits 0: got {code}, output ends {:?}",
+                core::str::from_utf8(tail).unwrap_or("?")
+            ),
+        );
+        return Err(d);
+    }
+    ensure!(!got.is_empty(), "lua printed nothing");
+    sys::debug_write(b"s7: lua transcript begins\n");
+    // the console shows only printable ASCII: everything else goes out as \xNN (the harness
+    // applies the same rule to the host's output)
+    for line in got.split(|&b| b == b'\n') {
+        let mut l = b"lua|".to_vec();
+        for &b in line {
+            if (0x20..0x7f).contains(&b) {
+                l.push(b);
+            } else {
+                l.extend_from_slice(b"\\x");
+                l.push(b"0123456789abcdef"[(b >> 4) as usize]);
+                l.push(b"0123456789abcdef"[(b & 15) as usize]);
+            }
+        }
+        l.truncate(2000);
+        sys::debug_write(&l);
+    }
+    sys::debug_write(b"s7: lua transcript ends\n");
+    Ok(())
+}
+
 // --- BASIC on the target (S7a) ----------------------------------------------------------------
 
 /// Run `basic --golden NAME` with `/` bound to a read-only clone of `root`, and return everything
@@ -7878,6 +7960,10 @@ pub fn app_main() -> i32 {
         (
             "c_transcript_matches_the_host",
             c_transcript_matches_the_host,
+        ),
+        (
+            "lua_script_matches_the_host_build",
+            lua_script_matches_the_host_build,
         ),
         ("futex_argument_errors", futex_argument_errors),
         ("futex_times_out_not_early", futex_times_out_not_early),

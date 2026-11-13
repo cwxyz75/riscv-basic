@@ -150,6 +150,43 @@ static void memory(void) {
     printf("shrunk %d\n", memcmp(g, "0123", 4));
     free(g);
     free(q);
+    /* size classes: blocks are reused, a grown or shrunk block keeps its contents across every class
+     * boundary (16-byte classes up to 512, then the heap), and nothing overlaps */
+    {
+        unsigned char *live[40];
+        int sizes[40], intact = 1, aligned = 1;
+        for (int round = 0; round < 6; round++) {
+            for (int i = 0; i < 40; i++) {
+                if (round == 0) live[i] = NULL, sizes[i] = 0;
+                int want = (i * 53 + round * 211) % 900 + 1;
+                live[i] = realloc(live[i], (size_t)want);
+                assert(live[i] != NULL);
+                if ((unsigned long)live[i] % 16) aligned = 0;
+                int keep = sizes[i] < want ? sizes[i] : want;
+                for (int j = 0; j < keep; j++) if (live[i][j] != (unsigned char)(i + j)) intact = 0;
+                for (int j = 0; j < want; j++) live[i][j] = (unsigned char)(i + j);
+                sizes[i] = want;
+            }
+            for (int i = 0; i < 40; i += 3) { free(live[i]); live[i] = NULL; sizes[i] = 0; }
+            for (int i = 0; i < 40; i++)
+                for (int j = 0; j < sizes[i]; j++) if (live[i][j] != (unsigned char)(i + j)) intact = 0;
+        }
+        for (int i = 0; i < 40; i++) free(live[i]);
+        /* malloc(0) blocks sit next to small blocks; freeing and reusing them must not touch a
+         * neighbour (a free list link written past a zero-size block would) */
+        unsigned char *nb[16];
+        for (int i = 0; i < 16; i++) { nb[i] = malloc(16); memset(nb[i], 0x5a + i, 16); }
+        for (int round = 0; round < 4; round++) {
+            void *z[16];
+            for (int i = 0; i < 16; i++) z[i] = malloc(0);
+            for (int i = 0; i < 16; i++) free(z[i]);
+        }
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 16; j++) if (nb[i][j] != (unsigned char)(0x5a + i)) intact = 0;
+            free(nb[i]);
+        }
+        printf("classes %d %d\n", intact, aligned);
+    }
     for (int i = 1; i < 64; i += 2) free(p[i]);
     void *fresh = realloc(NULL, 8); /* realloc(NULL, n) is malloc(n) */
     printf("%d\n", fresh != NULL);

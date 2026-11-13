@@ -316,6 +316,29 @@ patterns), `math`, `table.sort`, `utf8`, `os.time`/`os.clock`/`os.getenv`, and `
 two must match byte for byte (clock-dependent lines are normalised by the script). The Lua test also
 checks the exit status and that the per-program job's ledger is back to zero.
 
+**As built (S7d).** Lua 5.4.8 is vendored unmodified in `third_party/lua/` (`SOURCE.md` has the URL and the
+SHA-256, matching lua.org's published value; `LICENSE` is the MIT text). `os_lua.h` (`-include`d by both builds)
+is the only configuration: plain ISO C, no POSIX, so `lua_stdin_is_tty` answers 1 and `popen`/`dlopen` are
+absent. `init/build.rs` compiles every source but `luac.c` with the cross clang into an archive linked into
+`bin/lua` (a stub exiting 99 without a RISC-V clang, like `ctest`); the whole libc import list resolved on the
+first try (`llvm-nm -u`), the soft-float and `mem*` helpers coming from `compiler_builtins`. The suite test
+`lua_script_matches_the_host_build` runs `lua /etc/lua/s7.lua` with `/` read-only and `.` the writable `/tmp`,
+prints the output as `lua|` lines (bytes outside printable ASCII as `\xNN`, the console shows nothing else),
+and `scripts/os_boot_test.py` builds Lua from the same sources with the host `cc`, runs the script and compares
+line by line. `tests/lua/s7.lua` covers arithmetic, strings (`format`, `pack`, patterns, `utf8`), tables and
+`sort`, closures, `goto`, metatables, errors, coroutines, `math`, `os`, `io` on files, the garbage collector
+and `load`; it prints nothing that differs between machines (no addresses, sorted `pairs`, `NaN` signs, clock
+values, `rename` is left out: T46). The interactive REPL is checked by `s4e_shell_test.py` (start, a statement,
+an expression, an error with its traceback, state kept, Ctrl-D, back at the shell). Findings: Lua's allocation
+pattern made the runtime's first-fit heap quadratic (16,000 small tables took 1.4 s, 100,000 would take about a
+minute), so `malloc` now keeps size-class free lists for blocks up to 512 bytes (16-byte classes, never returned to
+the heap); that exposed a bug in the first version (`malloc(0)` blocks too small for the free-list link), caught
+by a mutation check and now pinned by the C transcript (`classes`, `malloc(0)` neighbours). A write-only file
+connection cannot ask the file server for its size, so `seek("end")` on a file opened for writing only fails
+(T51). A program's memory stays capped at 16 MiB, which Lua notices (T53). The kernel gained a `fault-log`
+feature that prints the pc, address and return address of a fatal user fault, which found the `malloc(0)` bug in
+minutes.
+
 ## 7. S7e: the upstream Lua test suite
 
 The upstream test files are a separate tarball and need `_port`/`_soft` set with `-e` and a few

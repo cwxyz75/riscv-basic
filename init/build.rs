@@ -48,41 +48,54 @@ fn archivers(clang: &str) -> Vec<String> {
     v
 }
 
-fn build_c_tests(dir: &str) -> Option<PathBuf> {
+/// Compile `sources` with the cross clang (flags shared by every C program here) into objects under
+/// `OUT_DIR/<name>/` and archive them as `lib<name>.a`.
+fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<PathBuf> {
     let clang = find_clang()?;
-    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
-    let src = Path::new(dir).join("../libc/tests/c/transcript.c");
-    let obj = out.join("transcript.o");
-    let ok = Command::new(&clang)
-        .args([
-            "--target=riscv64-unknown-elf",
-            "-march=rv64imac",
-            "-mabi=lp64",
-            "-ffreestanding",
-            "-nostdlibinc",
-            "-fno-pic",
-            "-fno-stack-protector",
-            "-O2",
-            "-Wall",
-        ])
-        .arg(format!("-I{dir}/../libc/include"))
-        .arg("-c")
-        .arg(&src)
-        .arg("-o")
-        .arg(&obj)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        panic!("the C test program did not compile");
+    let dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?).join(name);
+    std::fs::create_dir_all(&out).ok()?;
+    let mut objs = Vec::new();
+    for src in sources {
+        let obj = out.join(format!(
+            "{}.o",
+            src.file_stem()
+                .expect("a source file name")
+                .to_string_lossy()
+        ));
+        let ok = Command::new(&clang)
+            .args([
+                "--target=riscv64-unknown-elf",
+                "-march=rv64imac",
+                "-mabi=lp64",
+                "-ffreestanding",
+                "-nostdlibinc",
+                "-fno-pic",
+                "-fno-stack-protector",
+                "-O2",
+            ])
+            .args(extra)
+            .arg(format!("-I{dir}/../libc/include"))
+            .arg("-c")
+            .arg(src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            panic!("{} did not compile", src.display());
+        }
+        println!("cargo:rerun-if-changed={}", src.display());
+        objs.push(obj);
     }
-    let archive = out.join("libctests.a");
+    let archive = out.join(format!("lib{name}.a"));
     let _ = std::fs::remove_file(&archive);
     let made = archivers(&clang).iter().any(|ar| {
         Command::new(ar)
             .arg("rcs")
             .arg(&archive)
-            .arg(&obj)
+            .args(&objs)
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -90,8 +103,36 @@ fn build_c_tests(dir: &str) -> Option<PathBuf> {
     if !made {
         panic!("no archiver (llvm-ar or ar) could make the C archive");
     }
-    println!("cargo:rerun-if-changed={}", src.display());
     Some(archive)
+}
+
+fn build_c_tests(dir: &str) -> Option<PathBuf> {
+    build_c_archive(
+        "ctests",
+        &[Path::new(dir).join("../libc/tests/c/transcript.c")],
+        &["-Wall".to_string()],
+    )
+}
+
+/// Lua 5.4 (S7d): every upstream source but the compiler front end `luac.c`, unmodified, built with the
+/// settings header the host oracle also uses.
+fn build_lua(dir: &str) -> Option<PathBuf> {
+    let src = Path::new(dir).join("../third_party/lua/src");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&src)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "c") && p.file_name().is_some_and(|n| n != "luac.c")
+        })
+        .collect();
+    files.sort();
+    let conf = Path::new(dir).join("../third_party/lua/os_lua.h");
+    println!("cargo:rerun-if-changed={}", conf.display());
+    build_c_archive(
+        "lua",
+        &files,
+        &["-w".to_string(), format!("-include{}", conf.display())],
+    )
 }
 
 fn main() {
@@ -106,10 +147,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CC_RISCV");
     println!("cargo:rerun-if-changed=../libc/include");
     println!("cargo:rustc-check-cfg=cfg(have_c)");
+    println!("cargo:rustc-check-cfg=cfg(have_lua)");
     if let Some(archive) = build_c_tests(&dir) {
         println!("cargo:rustc-cfg=have_c");
         println!("cargo:rustc-link-arg-bin=ctest={}", archive.display());
+        if let Some(lua) = build_lua(&dir) {
+            println!("cargo:rustc-cfg=have_lua");
+            println!("cargo:rustc-link-arg-bin=lua={}", lua.display());
+        }
     } else {
-        println!("cargo:warning=no RISC-V C compiler found (set CC_RISCV): `ctest` is a stub");
+        println!(
+            "cargo:warning=no RISC-V C compiler found (set CC_RISCV): `ctest` and `lua` are stubs"
+        );
     }
 }

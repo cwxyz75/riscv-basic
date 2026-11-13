@@ -6,11 +6,42 @@ use core::ffi::{c_char, c_int, c_long, c_longlong, c_ulong, c_ulonglong, c_void}
 
 const HEADER: usize = 16;
 const ALIGN: usize = 16;
+/// Blocks up to this size come from size-class free lists (16-byte classes) that are never given
+/// back to the heap: the runtime's first-fit heap walks its whole free list, which a program
+/// that allocates and frees many small objects (Lua) turns into quadratic time (T50, measured in S7d).
+const SMALL_MAX: usize = 512;
+const CLASSES: usize = SMALL_MAX / 16 + 1;
 
-/// Every block carries its size in a 16-byte header, so `free` and `realloc` need nothing else.
+/// The heads of the free lists, one per class (class `c` holds blocks with `c * 16` bytes of
+/// payload; a free block's first payload word links to the next).
+static BINS: rt::sync::Mutex<[usize; CLASSES]> = rt::sync::Mutex::new([0; CLASSES]);
+
+fn class_of(n: usize) -> usize {
+    // (at least one: a free block holds its link in the first payload word)
+    n.div_ceil(16).max(1)
+}
+
+/// Every block carries its requested size in a 16-byte header, so `free` and `realloc` need nothing else.
 #[no_mangle]
 pub extern "C" fn malloc(n: usize) -> *mut c_void {
-    let Some(total) = n.checked_add(HEADER) else {
+    let small = n <= SMALL_MAX;
+    if small {
+        let c = class_of(n);
+        let mut bins = BINS.lock();
+        let head = bins[c];
+        if head != 0 {
+            // SAFETY: a binned block is a live heap block of this class whose payload's first word
+            // is the next link; it is unlinked here under the lock.
+            unsafe {
+                bins[c] = *(head as *const usize);
+                let base = (head as *mut u8).sub(HEADER);
+                *(base as *mut usize) = n;
+            }
+            return head as *mut c_void;
+        }
+    }
+    let payload = if small { class_of(n) * 16 } else { n };
+    let Some(total) = payload.checked_add(HEADER) else {
         errno::set(errno::ENOMEM);
         return core::ptr::null_mut();
     };
@@ -52,6 +83,13 @@ pub unsafe extern "C" fn free(p: *mut c_void) {
     }
     let base = (p as *mut u8).sub(HEADER);
     let n = *(base as *const usize);
+    if n <= SMALL_MAX {
+        let c = class_of(n);
+        let mut bins = BINS.lock();
+        *(p as *mut usize) = bins[c];
+        bins[c] = p as usize;
+        return;
+    }
     dealloc(base, Layout::from_size_align_unchecked(n + HEADER, ALIGN));
 }
 
@@ -66,25 +104,39 @@ pub unsafe extern "C" fn realloc(p: *mut c_void, n: usize) -> *mut c_void {
     }
     let base = (p as *mut u8).sub(HEADER);
     let old = *(base as *const usize);
-    // the same layout check as `malloc`: an absurd size is ENOMEM, not undefined behaviour
-    let Some(total) = n
-        .checked_add(HEADER)
-        .filter(|t| Layout::from_size_align(*t, ALIGN).is_ok())
-    else {
-        errno::set(errno::ENOMEM);
-        return core::ptr::null_mut();
-    };
-    let q = rust_realloc(
-        base,
-        Layout::from_size_align_unchecked(old + HEADER, ALIGN),
-        total,
-    );
-    if q.is_null() {
-        errno::set(errno::ENOMEM);
-        return core::ptr::null_mut();
+    if old > SMALL_MAX && n > SMALL_MAX {
+        // the same layout check as `malloc`: an absurd size is ENOMEM, not undefined behaviour
+        let Some(total) = n
+            .checked_add(HEADER)
+            .filter(|t| Layout::from_size_align(*t, ALIGN).is_ok())
+        else {
+            errno::set(errno::ENOMEM);
+            return core::ptr::null_mut();
+        };
+        let q = rust_realloc(
+            base,
+            Layout::from_size_align_unchecked(old + HEADER, ALIGN),
+            total,
+        );
+        if q.is_null() {
+            errno::set(errno::ENOMEM);
+            return core::ptr::null_mut();
+        }
+        *(q as *mut usize) = n;
+        return q.add(HEADER) as *mut c_void;
     }
-    *(q as *mut usize) = n;
-    q.add(HEADER) as *mut c_void
+    if old <= SMALL_MAX && n <= SMALL_MAX && class_of(old) == class_of(n) {
+        *(base as *mut usize) = n; // the block already has room
+        return p;
+    }
+    // a size class changes: a new block, a copy, and the old one back
+    let q = malloc(n);
+    if q.is_null() {
+        return q;
+    }
+    core::ptr::copy_nonoverlapping(p as *const u8, q as *mut u8, old.min(n));
+    free(p);
+    q
 }
 
 #[no_mangle]
