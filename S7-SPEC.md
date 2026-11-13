@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
 Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a, S7b
-and the first part of S7c (the `cfmt` cores) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
+and the first two parts of S7c (the `cfmt` cores, the C ABI library with the first C program) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -178,6 +178,23 @@ them with the host's libc over ~78,000 generated `snprintf` conversions and 60,0
 strings each for `strtod` and `strtol`/`strtoul`, all agreeing; two mutants (a dropped sticky bit in
 hex rounding, a wrong `%g` exponent precision) are caught. `%a` with a precision that must round is
 compared only on Linux (Apple's libc truncates where glibc rounds), so CI's glibc checks that corner.
+
+**As built (S7c-2).** The crate `libc/` (package `oslibc`, user target only) exports the C ABI:
+`string.h`, `ctype.h`, `errno.h`, `assert.h`, `setjmp.h`, `stdlib.h` (malloc over the runtime heap with a
+16-byte size header, strto*, qsort as heapsort, bsearch, rand, atexit, exit, getenv), `math.h` (over
+`libm`) and the first part of `stdio.h`: the printf family over `cfmt` and *unbuffered* output to
+`stdout`/`stderr`. The variadic entry points are the assembly stubs described below (no C compiler
+involved in the library itself); `setjmp`/`longjmp` are assembly. Headers are in `libc/include/`.
+The C build: `init/build.rs` compiles `libc/tests/c/transcript.c` with `clang --target=riscv64-unknown-elf
+-march=rv64imac -mabi=lp64 -ffreestanding -nostdlibinc -fno-pic -fno-stack-protector -O2`, archives it
+(llvm-ar, else `ar`) and passes the archive to the final cargo/rust-lld link of the `ctest` binary: no
+separate linker, as planned (OD69). The compiler comes from `CC_RISCV` or the usual places; without one
+`ctest` is a stub that exits 99 and the suite says so. The acceptance test is
+`c_transcript_matches_the_host`: the guest prints the program's output as `c|` lines and the harness
+builds the *same* C file with the host's `cc` and libc, runs it, and compares line by line (86 lines
+covering printf, strings, ctype, stdlib, malloc, math, setjmp and stdio). A mutant that inverts the
+`qsort` comparison is caught at once. Not yet: `FILE` with buffering and files, the fd layer, time,
+pthreads, per-thread `errno` (S7c-3).
 
 **Variadics (B1).** Stable Rust cannot define a variadic function. `printf`, `fprintf`, `snprintf`,
 `sprintf`, `sscanf` (only if Lua's import list needs it) are entered through **assembly stubs** written

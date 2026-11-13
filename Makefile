@@ -36,7 +36,7 @@ fmt-check:
 lint:
 	cargo clippy -p abi -p cfmt -p kcore -p proto -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
-	cd init && cargo clippy -p rt -p init -- -D warnings
+	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
 
 home-kernel:

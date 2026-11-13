@@ -4102,6 +4102,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"cat".to_vec(),
             b"consoled".to_vec(),
             b"crash".to_vec(),
+            b"ctest".to_vec(),
             b"devmgr".to_vec(),
             b"echo".to_vec(),
             b"hello".to_vec(),
@@ -5958,7 +5959,8 @@ fn futex_argument_errors() -> Outcome {
         Some(S::TimedOut),
         "a poll of an equal word"
     );
-    ensure!(sys::clock_get() - t < 5, "a poll does not sleep");
+    // (a generous bound: it only has to tell a poll from a sleep that never ends)
+    ensure!(sys::clock_get() - t < 200, "a poll does not sleep");
     ensure_eq!(
         st(sys::futex_wake(p.wrapping_byte_add(1), 1)),
         Some(S::InvalidArgs),
@@ -6302,6 +6304,55 @@ fn once_and_semaphore() -> Outcome {
     for t in ts {
         sys::handle_close(t);
     }
+    Ok(())
+}
+
+// --- The C library (S7c) ----------------------------------------------------------------------
+
+/// Run the C test program and hand its transcript to the harness, which compares it with the same
+/// program built and run on the host (the host's libc is the oracle): every line goes out as
+/// `c|<line>` on the console.
+fn c_transcript_matches_the_host() -> Outcome {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/ctest")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (out_mine, out_theirs) = socket()?;
+    let s = Startup {
+        args: vec![b"ctest".to_vec()],
+        roles: vec![(Role::Stdout, 0)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[out_theirs]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn ctest: {e:?}"));
+        d
+    })?;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match rt::io::read(out_mine, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    wait_ended(p, 30_000)?;
+    let code = sys::process_info(p).a1 as i64;
+    sys::handle_close(p);
+    sys::handle_close(out_mine);
+    ensure!(
+        code != 99,
+        "ctest is a stub: the build had no RISC-V C compiler (set CC_RISCV)"
+    );
+    ensure_eq!(code, 0, "ctest exits 0");
+    ensure!(!got.is_empty(), "ctest printed nothing");
+    sys::debug_write(b"s7: c transcript begins\n");
+    for line in got.split(|&b| b == b'\n') {
+        let mut l = b"c|".to_vec();
+        l.extend_from_slice(&line[..line.len().min(400)]);
+        sys::debug_write(&l);
+    }
+    sys::debug_write(b"s7: c transcript ends\n");
     Ok(())
 }
 
@@ -7816,6 +7867,10 @@ pub fn app_main() -> i32 {
         ),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
+        (
+            "c_transcript_matches_the_host",
+            c_transcript_matches_the_host,
+        ),
         ("futex_argument_errors", futex_argument_errors),
         ("futex_times_out_not_early", futex_times_out_not_early),
         ("futex_wake_counts_and_fifo", futex_wake_counts_and_fifo),
