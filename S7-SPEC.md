@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
 Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a, S7b
-and the first two parts of S7c (the `cfmt` cores, the C ABI library with the first C program) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
+and the first three parts of S7c (the `cfmt` cores, the C ABI library with the first C program, files and time) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -195,6 +195,30 @@ builds the *same* C file with the host's `cc` and libc, runs it, and compares li
 covering printf, strings, ctype, stdlib, malloc, math, setjmp and stdio). A mutant that inverts the
 `qsort` comparison is caught at once. Not yet: `FILE` with buffering and files, the fd layer, time,
 pthreads, per-thread `errno` (S7c-3).
+
+**As built (S7c-3a).** `FILE` with real buffering (stdout line buffered on a terminal and fully
+buffered otherwise, stderr unbuffered, files fully buffered, `setvbuf`, one push-back for `ungetc`,
+`fseek`/`ftell`/`rewind` that account for read-ahead and pending output, flush of every stream at
+`exit`), `fopen` with all the modes, `freopen`, `tmpfile`, `tmpnam`, `remove`, `perror`; the fd layer
+(`open`, `read`, `write`, `lseek`, `close`, `unlink`, `rmdir`, `mkdir`, `stat`, `isatty`, 64 fds, EACCES
+and friends from the file protocol's statuses; `rename` is ENOSYS, T46); `<time.h>` over a new
+`cfmt::time` (gmtime, timegm/mktime, strftime in the C locale, UTC only) which is differential-tested
+against the host's `gmtime_r`, `timegm` and `strftime`; `signal`/`raise` and `localeconv`/`setlocale`.
+Headers added: `stdio.h` (full), `time.h`, `signal.h`, `locale.h`, `fcntl.h`, `unistd.h`,
+`sys/stat.h`; all of them compile together under the freestanding RISC-V flags. The transcript test
+now gives the program a namespace (`/` the read-only memfsd root, `.` its `/tmp`) and prints 120+
+lines including file round trips, seeks, append, `r+`, `tmpfile`, unbuffered mode and time; the host
+oracle runs in a scratch working directory. Deviations: files are relative to `.` (a program has no
+ambient `/tmp`: `tmpfile` creates its scratch file in the working directory, T51); `struct stat` is
+ours (size and kind); `sscanf` is not provided (nothing in Lua's import list needs it, to be confirmed
+at S7d). Review (Fable) fixes folded in: `stat`/`unlink`/`mkdir` open parents with READ|WRITE only (and `stat`
+uses the server's whole-path STAT), `freopen` reuses the stream object, a terminal's `0x04` is found
+anywhere in a read (bytes before it first, the rest kept), append streams start at the end, each view of
+a namespace connection numbers its requests from its own range, a failed `fseek` changes nothing, paths
+are normalised (`./x`, `a//b`, trailing slash; an empty path is ENOENT), push-back survives a switch to
+writing, and `bkl_is_released_on_user_entry_and_idle` (flaky under load, T49) now only requires the lock
+to be free at least as often as held. Still to do in S7c-3b: pthreads, per-thread `errno`, the 1 MiB
+main stack.
 
 **Variadics (B1).** Stable Rust cannot define a variadic function. `printf`, `fprintf`, `snprintf`,
 `sprintf`, `sscanf` (only if Lua's import list needs it) are entered through **assembly stubs** written

@@ -1,7 +1,6 @@
 //! Program start: read the startup message, set up `argv`, the environment and the standard
 //! streams, run `main`.
 
-use crate::stdio::HANDLES;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 use core::sync::atomic::Ordering;
@@ -32,16 +31,30 @@ pub fn run_main() -> i32 {
         Ok(e) => e,
         Err(_) => return rt::startup::EXIT_BAD_STARTUP,
     };
-    HANDLES[0].store(env.handle(Role::Stdin).unwrap_or(0), Ordering::Relaxed);
     let out = env.handle(Role::Stdout).unwrap_or(0);
-    HANDLES[1].store(out, Ordering::Relaxed);
-    // no separate standard error: it shares standard output
-    HANDLES[2].store(env.handle(Role::Stderr).unwrap_or(out), Ordering::Relaxed);
+    crate::fd::init_std(
+        env.handle(Role::Stdin).unwrap_or(0),
+        out,
+        // no separate standard error: it shares standard output
+        env.handle(Role::Stderr).unwrap_or(out),
+    );
+    crate::fd::ROOT.store(env.namespace(b"/").unwrap_or(0), Ordering::Relaxed);
+    crate::fd::CWD.store(env.namespace(b".").unwrap_or(0), Ordering::Relaxed);
+    crate::fd::TTY_IN.store(
+        u32::from(env.var(b"STDIN") == Some(&b"tty"[..])),
+        Ordering::Relaxed,
+    );
+    crate::fd::TTY_OUT.store(
+        u32::from(env.var(b"STDOUT") == Some(&b"tty"[..])),
+        Ordering::Relaxed,
+    );
+    crate::file::init_std_buffering();
     let argv = leak_array(&env.startup.args);
     // SAFETY: single-threaded start-up; the array is leaked and NULL-terminated.
     unsafe { crate::stdlib::ENVIRON = leak_array(&env.startup.env) };
     // SAFETY: `main` is the C program's entry point.
     let code = unsafe { main(env.startup.args.len() as c_int, argv) };
     crate::stdlib::run_atexit();
+    crate::file::flush_all();
     code
 }

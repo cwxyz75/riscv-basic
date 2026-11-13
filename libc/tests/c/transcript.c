@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <locale.h>
+#include <signal.h>
+#include <time.h>
 
 static void section(const char *name) { printf("== %s\n", name); }
 
@@ -199,6 +202,139 @@ static void jumps(void) {
     printf("loops %d\n", loops);
 }
 
+
+static void files(void) {
+    section("files");
+    const char *path = "s7c-transcript.txt"; /* relative: the working directory is the scratch place */
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fprintf(f, "line one\nline %d\n", 2);
+    fputs("third line\n", f);
+    fwrite("binary\0data", 1, 11, f);
+    fputc('!', f);
+    printf("close %d\n", fclose(f));
+    f = fopen(path, "r");
+    assert(f != NULL);
+    char line[40];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        printf("got [%.*s] %zu\n", (int)(n > 0 && line[n - 1] == '\n' ? n - 1 : n), line, n);
+    }
+    printf("eof %d err %d tell %ld\n", feof(f) != 0, ferror(f) != 0, ftell(f));
+    rewind(f);
+    printf("after rewind: tell %ld eof %d\n", ftell(f), feof(f) != 0);
+    char buf[16];
+    fseek(f, 5, SEEK_SET);
+    size_t got = fread(buf, 1, 6, f);
+    printf("fread %zu [%.6s] tell %ld\n", got, buf, ftell(f));
+    fseek(f, -4, SEEK_END);
+    got = fread(buf, 1, 16, f);
+    printf("tail %zu [%.3s] eof %d\n", got, buf, feof(f) != 0);
+    fseek(f, 0, SEEK_SET);
+    int c = getc(f);
+    ungetc('X', f); /* only one push-back is guaranteed */
+    int a = getc(f), b = getc(f), d = getc(f);
+    printf("unget %c %c %c %c\n", c, a, b, d);
+    fseek(f, 2, SEEK_CUR);
+    c = getc(f);
+    long where = ftell(f);
+    printf("seek cur %d tell %ld\n", c, where);
+    fseek(f, 0, SEEK_END);
+    printf("size %ld\n", ftell(f));
+    fclose(f);
+    f = fopen(path, "a");
+    fputs("appended\n", f);
+    fclose(f);
+    f = fopen(path, "r+");
+    fputc('L', f);
+    fseek(f, 0, SEEK_SET);
+    fgets(line, sizeof line, f);
+    printf("r+ [%s]", line);
+    fseek(f, 0, SEEK_END);
+    printf("size %ld\n", ftell(f));
+    fclose(f);
+    errno = 0;
+    f = fopen("s7c-no-such-file", "r");
+    printf("missing %d %d\n", f == NULL, errno == ENOENT);
+    FILE *t = tmpfile();
+    assert(t != NULL);
+    fprintf(t, "scratch %d", 99);
+    rewind(t);
+    char sb[32] = {0};
+    fread(sb, 1, 31, t);
+    printf("tmpfile [%s]\n", sb);
+    fclose(t);
+    f = fopen(path, "w");
+    setvbuf(f, NULL, _IONBF, 0);
+    fputs("unbuffered", f);
+    fclose(f);
+    f = fopen(path, "r");
+    char ub[16] = {0};
+    fread(ub, 1, 15, f);
+    fclose(f);
+    printf("unbuf [%s]\n", ub);
+    /* a failed seek changes nothing; freopen reuses the stream; paths with ./ and empty paths */
+    f = fopen("./s7c-transcript.txt", "w");
+    fputs("abcdefghij", f);
+    fclose(f);
+    f = fopen(path, "r");
+    char three[4] = {0};
+    fread(three, 1, 3, f);
+    int rc = fseek(f, -1000, SEEK_CUR);
+    printf("bad seek %d tell %ld next %c\n", rc, ftell(f), getc(f));
+    FILE *same = freopen("s7c-second.txt", "w", f);
+    printf("freopen same stream %d\n", same == f);
+    fputs("second file", f);
+    fclose(f);
+    f = fopen("s7c-second.txt", "r");
+    char two[16] = {0};
+    fread(two, 1, 15, f);
+    fclose(f);
+    printf("second [%s]\n", two);
+    printf("empty path %d\n", fopen("", "r") == NULL);
+    remove("s7c-second.txt");
+    printf("remove %d\n", remove(path));
+    printf("gone %d\n", fopen(path, "r") == NULL);
+}
+
+static void times(void) {
+    section("time");
+    time_t t = 1700000000;
+    struct tm *g = gmtime(&t);
+    printf("%d-%02d-%02d %02d:%02d:%02d wday %d yday %d\n", g->tm_year + 1900, g->tm_mon + 1, g->tm_mday, g->tm_hour, g->tm_min, g->tm_sec, g->tm_wday, g->tm_yday);
+    char b[128];
+    size_t n = strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S|%a %A|%b %B|%j|%U %W|%p %I|%y %C|%e|%D|%F|%T|%R", g);
+    printf("%zu [%s]\n", n, b);
+    n = strftime(b, 8, "%Y-%m-%d", g);
+    printf("too small: %zu\n", n);
+    struct tm m;
+    memset(&m, 0, sizeof m);
+    m.tm_year = 100;
+    m.tm_mday = 1;
+    m.tm_hour = 12;
+    time_t u = timegm(&m);
+    printf("timegm %lld wday %d\n", (long long)u, m.tm_wday);
+    m.tm_mday = 32;
+    m.tm_mon = 12;
+    u = timegm(&m);
+    printf("normalised %lld %d-%02d-%02d\n", (long long)u, m.tm_year + 1900, m.tm_mon + 1, m.tm_mday);
+    printf("difftime %g\n", difftime(t, t - 86400));
+    printf("%d %d\n", time(NULL) >= 0, clock() >= 0);
+}
+
+static volatile int got_signal;
+static void on_signal(int sig) { got_signal = sig; }
+
+static void misc(void) {
+    section("signal and locale");
+    printf("%s [%s]\n", setlocale(LC_ALL, "C"), localeconv()->decimal_point);
+    signal(SIGINT, on_signal);
+    raise(SIGINT);
+    printf("handler saw %d\n", got_signal);
+    signal(SIGTERM, SIG_IGN);
+    printf("ignored raise %d\n", raise(SIGTERM));
+}
+
 static void tail(void) { printf("atexit handler\n"); }
 
 static int sum(int count, ...) {
@@ -236,6 +372,9 @@ int main(int argc, char **argv) {
     math_things();
     jumps();
     streams();
+    files();
+    times();
+    misc();
     printf("done\n");
     return 0;
 }

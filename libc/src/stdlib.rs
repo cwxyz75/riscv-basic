@@ -293,6 +293,7 @@ pub fn run_atexit() {
 #[no_mangle]
 pub extern "C" fn exit(code: c_int) -> ! {
     run_atexit();
+    crate::file::flush_all();
     rt::sys::exit(code)
 }
 
@@ -340,6 +341,6 @@ pub unsafe extern "C" fn __assert_fail(expr: *const c_char, file: *const c_char,
     msg.extend_from_slice(text(file));
     msg.extend_from_slice(b", line ");
     msg.extend_from_slice(alloc::format!("{line}\n").as_bytes());
-    crate::stdio::write_fd(2, &msg);
+    crate::file::write_stderr(&msg);
     abort()
 }

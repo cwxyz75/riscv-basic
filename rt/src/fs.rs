@@ -44,6 +44,12 @@ impl Fs {
         Fs { ch, txid: 0 }
     }
 
+    /// Wrap a connection, numbering requests from `txid`: several short-lived views of one shared
+    /// connection must not reuse numbers, or a late reply to one would pass for the answer to the next.
+    pub fn new_at(ch: u32, txid: u32) -> Fs {
+        Fs { ch, txid }
+    }
+
     /// Send one raw request (with an optional handle) and read its reply.
     #[allow(clippy::too_many_arguments)] // the wire format's fields, spelled out
     pub fn call(

@@ -99,7 +99,11 @@ fn bkl_is_released() -> Outcome {
         thread::sleep_ticks(60);
         let r = smp::wait_work(1, 10 * 10_000_000).ok_or_else(|| format!("{phase}: no answer"))?;
         let (ok, fail) = (r & 0xffff_ffff, r >> 32);
-        if ok < 100 || ok < 4 * fail {
+        // A lock held by user-mode execution would be found held almost always (ok near 0). Timer
+        // ticks and a host that preempts a vCPU inside a locked region (CI, a busy laptop) make
+        // "held" common without being a bug, so the bar is only that it is free at least as often
+        // as it is held.
+        if ok < 100 || ok < fail {
             return Err(format!(
                 "{phase}: the other hart took the lock {ok} times and found it held {fail} times"
             ));

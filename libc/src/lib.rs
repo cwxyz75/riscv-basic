@@ -21,11 +21,15 @@ extern crate alloc;
 
 mod ctype;
 mod errno;
+mod fd;
+mod file;
 mod math;
+mod misc;
 mod setjmp;
 mod start;
 mod stdio;
 mod stdlib;
 mod string;
+mod time;
 
 pub use start::run_main;
