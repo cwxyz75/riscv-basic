@@ -56,6 +56,8 @@ static void strings(void) {
     printf("%d %d\n", strncmp("abcd", "abcz", 3), strncmp("abcd", "abcz", 4) < 0);
     const char *s = "the quick brown fox";
     printf("%d %d %d\n", (int)(strchr(s, 'q') - s), (int)(strrchr(s, 'o') - s), strchr(s, '!') == NULL);
+    /* the terminating NUL is part of the string for strchr/strrchr */
+    printf("%d %d\n", (int)(strchr(s, 0) - s) == (int)strlen(s), (int)(strrchr(s, 0) - s) == (int)strlen(s));
     printf("%d %d\n", (int)(strstr(s, "brown") - s), strstr(s, "slow") == NULL);
     printf("%zu %zu %d\n", strspn("aabbcc", "ab"), strcspn("hello world", " "), (int)(strpbrk("find the x", "xyz") - "find the x"));
     char *d = strdup("duplicate");

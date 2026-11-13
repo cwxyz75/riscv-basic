@@ -348,6 +348,19 @@ run under `bin/lua` with the documented flags, each its own `##TEST`. It is the 
 oracle there is and may expose libc bugs S7d did not; its findings are fixed in the libc, not
 patched around in the tests.
 
+**As built (S7e).** The upstream test suite for 5.4.8 (`lua-5.4.8-tests.tar.gz`, checksum in `third_party/lua-tests/SOURCE.md`)
+is vendored unmodified (the `.lua` files; its C libraries are not) and carried in the boot image under
+`/etc/lua-tests`. Each file is its own `##TEST` (`lua_upstream_NAME`): the suite runs `lua -e "package.path=...;
+_port=true _soft=true _nomsg=true" /etc/lua-tests/NAME.lua` with `/` read-only and `.` the writable /tmp, and the
+file's own `assert`s are the judge (exit 0). 23 files run: calls, closure, constructs, events, goto, literals,
+locals, math, nextvar, pm, sort, strings, utf8, vararg, bitwise, tpack, coroutine, errors, db, gc, gengc, cstack,
+attrib. 22 passed the first time; `locals.lua` found the memory ceiling (T53 became R14, OD72): its stack-overflow
+test needs about 70 MiB, so the machine is now 256 MiB, a program's heap 128 MiB and its job 136 MiB, and the shell
+test's hog check follows the new numbers. Left out: `files.lua` (needs `rename` and `popen`, T46), `main.lua` (runs
+the `lua` binary through `os.execute`), `api.lua`, `big.lua`, `heavy.lua`, `verybig.lua`, `tracegc.lua` and
+`ltests/` (need Lua's internal test build or are only for memory-rich hosts), and `all.lua` (the driver the suite
+replaces).
+
 ## 8. Acceptance (runnable checks, written before the code)
 
 *S7a:* `basic_golden_corpus_on_the_target` (68 `##TEST`s, judged by the suite); `basic_golden_negative_control`;

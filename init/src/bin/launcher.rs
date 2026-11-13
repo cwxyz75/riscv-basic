@@ -18,7 +18,9 @@ use rt::sys;
 /// is the only process, it may run a few threads, and its memory (image, stack, heap) is capped.
 const PROGRAM_PROCESSES: u64 = 1;
 const PROGRAM_THREADS: u64 = 4;
-const PROGRAM_PAGES: u64 = 4096;
+// 136 MiB: the runtime heap cap (128 MiB) plus the image, stacks and page tables, so the heap
+// refuses first and exhaustion is a failed allocation, not a fault
+const PROGRAM_PAGES: u64 = 34816;
 /// Kernel objects the program may hold alive (handles are bounded separately), and bytes it may
 /// leave queued in the channels and sockets it creates.
 const PROGRAM_OBJECTS: u64 = 256;

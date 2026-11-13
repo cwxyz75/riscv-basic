@@ -3604,8 +3604,8 @@ fn runtime_heap_stops_at_its_cap() -> Outcome {
     wait_ended(p, 30_000)?;
     let blocks = sys::process_info(p).a1 as i64;
     ensure!(
-        (10..=16).contains(&blocks),
-        "the heap gave {blocks} MiB before refusing (cap 16 MiB, some in use)"
+        (122..=128).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use)"
     );
     let _ = in_w;
     Ok(())
@@ -6446,6 +6446,118 @@ fn lua_script_matches_the_host_build() -> Outcome {
     Ok(())
 }
 
+/// Run one file of the upstream Lua test suite (S7e) under `bin/lua`: `/` is the read-only boot
+/// filesystem (the files are in `/etc/lua-tests`), `.` the writable /tmp. The suite's own `assert`s are
+/// the judge: the test passes if `lua` exits 0, and a failure shows the end of its output.
+fn run_lua_upstream(file: &str) -> Outcome {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/lua")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (out_mine, out_theirs) = socket()?;
+    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u32;
+    let (_fsd, mut root, _bi) = start_memfsd()?;
+    let slash = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    let dot = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let setup = b"package.path='/etc/lua-tests/?.lua' _port=true _soft=true _nomsg=true";
+    let path = alloc::format!("/etc/lua-tests/{file}.lua");
+    let s = Startup {
+        args: vec![
+            b"lua".to_vec(),
+            b"-e".to_vec(),
+            setup.to_vec(),
+            path.into_bytes(),
+        ],
+        namespace: vec![(b"/".to_vec(), 2), (b".".to_vec(), 3)],
+        roles: vec![(Role::Stdout, 0), (Role::Stderr, 1)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, err_theirs, slash.ch, dot.ch]).map_err(
+        |e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn lua: {e:?}"));
+            d
+        },
+    )?;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match rt::io::read(out_mine, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    wait_ended(p, 600_000)?;
+    let code = sys::process_info(p).a1 as i64;
+    sys::handle_close(p);
+    sys::handle_close(out_mine);
+    ensure!(
+        code != 99,
+        "lua is a stub: the build had no RISC-V C compiler (set CC_RISCV)"
+    );
+    if code != 0 {
+        // the whole end of the output, for the log (the verdict line has room for little)
+        for line in got[got.len().saturating_sub(1500)..].split(|&b| b == b'\n') {
+            let mut l = b"lua-fail|".to_vec();
+            l.extend(
+                line.iter()
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b } else { b'.' }),
+            );
+            l.truncate(300);
+            sys::debug_write(&l);
+        }
+        let tail: Vec<u8> = got[got.len().saturating_sub(160)..]
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b } else { b'.' })
+            .collect();
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "{file}.lua exits 0: got {code}, output ends {:?}",
+                core::str::from_utf8(&tail).unwrap_or("?")
+            ),
+        );
+        return Err(d);
+    }
+    Ok(())
+}
+
+macro_rules! lua_upstream_tests {
+    ($($name:ident => $file:literal),* $(,)?) => {
+        $(fn $name() -> Outcome { run_lua_upstream($file) })*
+        const LUA_UPSTREAM: &[(&str, fn() -> Outcome)] = &[$((concat!("lua_upstream_", $file), $name)),*];
+    };
+}
+
+lua_upstream_tests! {
+    lua_up_calls => "calls",
+    lua_up_closure => "closure",
+    lua_up_constructs => "constructs",
+    lua_up_events => "events",
+    lua_up_goto => "goto",
+    lua_up_literals => "literals",
+    lua_up_locals => "locals",
+    lua_up_math => "math",
+    lua_up_nextvar => "nextvar",
+    lua_up_pm => "pm",
+    lua_up_sort => "sort",
+    lua_up_strings => "strings",
+    lua_up_utf8 => "utf8",
+    lua_up_vararg => "vararg",
+    lua_up_bitwise => "bitwise",
+    lua_up_tpack => "tpack",
+    lua_up_coroutine => "coroutine",
+    lua_up_errors => "errors",
+    lua_up_db => "db",
+    lua_up_gc => "gc",
+    lua_up_gengc => "gengc",
+    lua_up_cstack => "cstack",
+    lua_up_attrib => "attrib",
+}
+
 // --- BASIC on the target (S7a) ----------------------------------------------------------------
 
 /// Run `basic --golden NAME` with `/` bound to a read-only clone of `root`, and return everything
@@ -8201,7 +8313,19 @@ pub fn app_main() -> i32 {
         if !report(name, test()) {
             failed += 1;
         }
+        // the upstream Lua test files (S7e) run right after our own Lua test
+        if *name == "lua_script_matches_the_host_build" {
+            for (n, t) in LUA_UPSTREAM {
+                if !report(n, t()) {
+                    failed += 1;
+                }
+            }
+        }
     }
-    println!("init: {} of {} user tests failed", failed, tests.len());
+    println!(
+        "init: {} of {} user tests failed",
+        failed,
+        tests.len() + LUA_UPSTREAM.len()
+    );
     failed
 }
