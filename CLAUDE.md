@@ -65,6 +65,12 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 - Interpreter behaviour is specified by `home/BASIC.md` and pinned by golden tests in
   `home/basic/tests/golden/`. Write the golden test first, watch it fail, then implement.
   Never run `BLESS=1` blindly: read the diff of the `.out` files.
+- **Test cost is the bottleneck, so spend it deliberately.** While iterating run `make quick`
+  (about a minute) or the one targeted test; run the full `make check` once per PR, right before
+  the push, and do not repeat it after trivial fixups (docs, clippy nits). CI runs the full matrix
+  and skips jobs a change cannot affect (docs-only, home-only). Batch related slices into one PR
+  (several commits); keep kernel/security slices that get a Fable review in their own small PR.
+  Run mutation checks once per new test, not once per push.
 - If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
 - Only tick a `ROADMAP.md` box when its acceptance criterion has actually been

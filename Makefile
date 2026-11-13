@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: quick help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -202,5 +202,12 @@ os-serial-test: os-interactive
 # The reference CPU of the OS track (OD47).
 os-boot-test-rva23: kernel
 	OS_CPU=rva23s64 python3 scripts/os_boot_test.py $(OS_ELF)
+
+# The inner-loop gate (about a minute): format, the OS host tests without the model checkers, and a
+# headless boot of the release system to the shell and a BASIC session. Run this while iterating;
+# run `make check` once, before the push (CI repeats the full matrix).
+quick: fmt-check
+	cargo test -p abi -p kcore -p proto -p memfs -p cfmt -p basic-script
+	$(MAKE) os-release-smoke
 
 check: fmt-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-serial-test os-release-smoke
