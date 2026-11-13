@@ -8,11 +8,44 @@ on:
   pull_request:
 
 jobs:
+  # What did this change touch? Documentation-only changes skip the boot matrix; changes under
+  # home/ only skip the OS-track boot jobs and the other way round (shared files run everything).
+  # A skipped job counts as passed for branch protection.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.scan.outputs.os }}
+      home: ${{ steps.scan.outputs.home }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scan
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "os=true" >> "$GITHUB_OUTPUT"; echo "home=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          echo "$files"
+          # anything that is not documentation, not under home/, and not a home-only script
+          os=false; home=false
+          while IFS= read -r f; do
+            case "$f" in
+              *.md) ;;
+              home/*) home=true ;;
+              *) os=true; home=true ;;
+            esac
+          done <<< "$files"
+          # the OS track also uses the shared pure crates under home/
+          case "$files" in *home/basic/*|*home/console/*|*home/basic-script/*|*home/turtle/*|*home/logo/*|*home/rv64/*|*home/cartfs/*) os=true ;; esac
+          echo "os=$os" >> "$GITHUB_OUTPUT"; echo "home=$home" >> "$GITHUB_OUTPUT"
+
   host:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - run: cargo fmt --all -- --check
@@ -27,14 +60,14 @@ jobs:
   # are several times slower than a laptop: TIDY-UP T21) no longer hides the others.
   kernel:
     name: kernel (${{ matrix.name }})
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: home computer
-            targets: home-boot-test
           - name: normal and fail-demo
             targets: os-boot-test-main
           - name: round-robin
@@ -49,6 +82,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
       - name: Install QEMU and OpenSBI
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
@@ -63,7 +99,29 @@ jobs:
           clang --print-targets | grep -i riscv64 || echo "NO RISCV64 CLANG TARGET"
       - run: make ${{ matrix.targets }}
 
+  # The home computer is its own job: it only needs to run when home/ or something shared changed.
+  home-kernel:
+    name: kernel (home computer)
+    needs: changes
+    if: ${{ needs.changes.outputs.home == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: home
+      - name: Install QEMU and OpenSBI
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi
+      - run: make home-boot-test
+
   miri:
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
