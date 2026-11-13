@@ -44,7 +44,7 @@ jobs:
           - name: four harts
             targets: os-boot-test-smp
           - name: AIA, RVA23, serial
-            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-rva23 os-serial-test
+            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml

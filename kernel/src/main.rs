@@ -36,6 +36,11 @@ use core::panic::PanicInfo;
 use kcore::latch::Latch;
 use kcore::testlog;
 
+/// The release build: no boot self-tests, no `##` lines for passing checks, no banners. It boots
+/// straight to the shell (T48). A failing kernel-side check, a panic and the final verdict on a
+/// failure still print, so a broken release build is not silent.
+const RELEASE: bool = cfg!(feature = "release");
+
 /// A zero-initialised static: it lives in .bss, so this checks `_start` cleared it.
 static BSS_PROBE: [u64; 64] = [0; 64];
 
@@ -52,7 +57,9 @@ impl Tally {
     }
 
     fn record(&mut self, name: &str, result: Result<(), &str>) {
-        let _ = testlog::test(&mut console::Console, name, result);
+        if !(RELEASE && result.is_ok()) {
+            let _ = testlog::test(&mut console::Console, name, result);
+        }
         if result.is_ok() {
             self.pass += 1;
         } else {
@@ -70,11 +77,13 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         .online
         .store(true, core::sync::atomic::Ordering::Release);
     let mut out = console::Console;
-    let _ = testlog::boot(&mut out, "kernel", "s3");
-    let _ = writeln!(
-        out,
-        "hello from the OS track, hart {hart_id}, paging via the early table"
-    );
+    if !RELEASE {
+        let _ = testlog::boot(&mut out, "kernel", "s3");
+        let _ = writeln!(
+            out,
+            "hello from the OS track, hart {hart_id}, paging via the early table"
+        );
+    }
 
     let mut tally = Tally { pass: 0, fail: 0 };
     tally.record(
@@ -99,23 +108,25 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     trap::init();
     kmem::init();
     plic::init(hart_id);
-    let _ = writeln!(
-        out,
-        "interrupt controller: {}",
-        if plic::present() { "PLIC" } else { "none" }
-    );
-    let _ = writeln!(
-        out,
-        "kernel page table active; {} frames free",
-        kmem::get().mm.db.free_count()
-    );
+    if !RELEASE {
+        let _ = writeln!(
+            out,
+            "interrupt controller: {}",
+            if plic::present() { "PLIC" } else { "none" }
+        );
+        let _ = writeln!(
+            out,
+            "kernel page table active; {} frames free",
+            kmem::get().mm.db.free_count()
+        );
+    }
     // S5a: start the other harts (they only idle and count interrupts until S5c).
     let harts = smp::start_secondaries(hart_id);
-    if harts > 1 {
+    if harts > 1 && !RELEASE {
         let _ = writeln!(out, "harts online: {}", smp::online());
     }
 
-    for (name, test) in selftest::TESTS {
+    for (name, test) in selftest::TESTS.iter().filter(|_| !RELEASE) {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
@@ -138,12 +149,18 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     smp::enable_ipi_on_this_hart();
     irq::enable();
     let class = thread::class_name();
-    let _ = writeln!(out, "scheduler class: {class}");
+    if !RELEASE {
+        let _ = writeln!(out, "scheduler class: {class}");
+    }
     tally.record(
         &alloc::format!("scheduler_class_is_{}", class.replace('-', "_")),
         Ok(()),
     );
-    for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
+    for (name, test) in sched_tests::TESTS
+        .iter()
+        .chain(sched_tests::PRIORITY_TESTS)
+        .filter(|_| !RELEASE)
+    {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
@@ -152,7 +169,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
     // kernel); the kernel-side checks are reported here.
     kmem::snapshot_kernel_half();
-    for (name, test) in smp_tests::TESTS {
+    for (name, test) in smp_tests::TESTS.iter().filter(|_| !RELEASE) {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
@@ -177,7 +194,11 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         Err("fail-demo build: failing on purpose"),
     );
 
-    let _ = testlog::done(&mut out, tally.pass, tally.fail);
+    if RELEASE && tally.fail == 0 {
+        let _ = writeln!(out, "system halted");
+    } else {
+        let _ = testlog::done(&mut out, tally.pass, tally.fail);
+    }
     finisher::exit(tally.fail == 0)
 }
 
