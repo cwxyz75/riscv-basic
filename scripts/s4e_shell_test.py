@@ -158,15 +158,30 @@ def main():
     s.wait_for_prompt = True
     step(b"lua\n", [b"$ lua", b"Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio"], "lua starts")
     s.wait_for_prompt = False  # lua's own prompt is "> "
+
+    def lua_prompt():  # (typing before the prompt is printed would interleave it with the echo)
+        deadline = time.time() + base.TIMEOUT
+        while s.partial != b"> ":
+            if time.time() > deadline:
+                fail(s, "timed out waiting for lua's prompt")
+            time.sleep(0.002)
+
+    lua_prompt()
     step(b"print(6*7)\n", [b"> print(6*7)", b"42"], "lua evaluates a statement")
+    lua_prompt()
     step(b"x = 5\n", [b"> x = 5"], "lua assigns")
+    lua_prompt()
     step(b"x * 2\n", [b"> x * 2", b"10"], "lua prints the value of an expression")
+    lua_prompt()
     step(b"for i=1,3 do io.write(i, ' ') end print()\n",
          [b"> for i=1,3 do io.write(i, ' ') end print()", b"1 2 3 "], "lua runs a loop")
+    lua_prompt()
     step(b"error('oops')\n", [b"> error('oops')", b"stdin:1: oops", b"stack traceback:",
                               b"\t[C]: in function 'error'", b"\tstdin:1: in main chunk", b"\t[C]: in ?"],
          "lua reports an error and carries on")
+    lua_prompt()
     step(b"print(x)\n", [b"> print(x)", b"5"], "lua kept its state")
+    lua_prompt()
     step(b"\x04", [b"> "], "Ctrl-D at an empty line ends lua")
     s.prompt()
     s.wait_for_prompt = True
