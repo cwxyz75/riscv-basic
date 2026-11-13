@@ -515,11 +515,13 @@ fn strtol_and_strtoul_match_the_host_libc() {
         // SAFETY: as in `libc_strtod`.
         let (lv, lend, lerr, uv, uend, uerr) = unsafe {
             *errno() = 0;
-            let mut end: *mut c_char = std::ptr::null_mut();
+            // (glibc leaves `end` untouched for an invalid base: start from the beginning)
+            let mut end: *mut c_char = c.as_ptr() as *mut c_char;
             let lv = host::strtol(c.as_ptr(), &mut end, *base as c_int);
             let lend = end as usize - c.as_ptr() as usize;
             let lerr = *errno() == 34;
             *errno() = 0;
+            end = c.as_ptr() as *mut c_char;
             let uv = host::strtoul(c.as_ptr(), &mut end, *base as c_int);
             let uend = end as usize - c.as_ptr() as usize;
             (lv as i64, lend, lerr, uv as u64, uend, *errno() == 34)

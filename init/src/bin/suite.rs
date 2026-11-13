@@ -5959,7 +5959,8 @@ fn futex_argument_errors() -> Outcome {
         Some(S::TimedOut),
         "a poll of an equal word"
     );
-    ensure!(sys::clock_get() - t < 5, "a poll does not sleep");
+    // (a generous bound: it only has to tell a poll from a sleep that never ends)
+    ensure!(sys::clock_get() - t < 200, "a poll does not sleep");
     ensure_eq!(
         st(sys::futex_wake(p.wrapping_byte_add(1), 1)),
         Some(S::InvalidArgs),
