@@ -230,7 +230,13 @@ impl Shell {
     }
 
     /// Start one stage; returns the process handle, or the message to print.
-    fn spawn_stage(&mut self, words: &[Vec<u8>], stdin: u32, stdout: u32) -> Result<u32, String> {
+    fn spawn_stage(
+        &mut self,
+        words: &[Vec<u8>],
+        stdin: u32,
+        stdout: u32,
+        tty: (bool, bool),
+    ) -> Result<u32, String> {
         let name = &words[0];
         let shown = String::from_utf8_lossy(name).into_owned();
         let path: Vec<u8> = [&b"bin/"[..], name].concat();
@@ -255,12 +261,28 @@ impl Shell {
         } else {
             None
         };
-        let mut forward: Vec<u32> = alloc::vec![stdin, stdout];
+        // standard error is a duplicate of the same stream as standard output
+        let Some(stderr) = dup(
+            stdout,
+            Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+        ) else {
+            sys::handle_close(vmo);
+            close_all(&[stdin, stdout]);
+            return Err(String::from("sh: could not duplicate standard output\n"));
+        };
+        let mut forward: Vec<u32> = alloc::vec![stdin, stdout, stderr];
         let mut startup = Startup {
             args: words.to_vec(),
-            roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1)],
+            roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
         };
+        // which of the standard streams are the terminal (a program tells a tty from a pipe by this)
+        if tty.0 {
+            startup.env.push(b"STDIN=tty".to_vec());
+        }
+        if tty.1 {
+            startup.env.push(b"STDOUT=tty".to_vec());
+        }
         match cwd {
             Ok(c) => {
                 startup
@@ -317,7 +339,10 @@ impl Shell {
                 return;
             }
             let (a, b) = (s.a1 as u32, s.a2 as u32);
-            let w = dup(a, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
+            let w = dup(
+                a,
+                Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+            );
             let r = dup(b, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
             close_all(&[a, b]);
             let (Some(w), Some(r)) = (w, r) else {
@@ -333,7 +358,8 @@ impl Shell {
             ends.push((w, r));
         }
         let tty_in = Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
-        let tty_out = Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
+        // (DUPLICATE: the shell makes standard error from a duplicate of standard output)
+        let tty_out = Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0;
         let mut procs: Vec<u32> = Vec::new();
         let mut failure: Option<String> = None;
         // which pipe ends were handed to a stage (a stage consumes its handles even when it
@@ -368,7 +394,7 @@ impl Shell {
                     ends[i].0
                 }
             };
-            match self.spawn_stage(words, stdin, stdout) {
+            match self.spawn_stage(words, stdin, stdout, (i == 0, i + 1 == n)) {
                 Ok(p) => procs.push(p),
                 Err(msg) => {
                     failure = Some(msg);

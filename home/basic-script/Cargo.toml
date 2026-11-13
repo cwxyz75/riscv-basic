@@ -1,0 +1,9 @@
+[package]
+name = "basic-script"
+version = "0.1.0"
+edition = "2021"
+description = "The scripted console of the BASIC golden tests, shared by the host test and the userland `basic --golden` program"
+
+[dependencies]
+basic = { path = "../basic" }
+cartfs = { path = "../cartfs" }

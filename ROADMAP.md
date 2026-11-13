@@ -308,7 +308,7 @@ Acceptance: BASIC goldens pass as a userland program; a Lua test script passes.
 Spec: `S7-SPEC.md` (slices S7a BASIC, S7b futexes, S7c libc, S7d Lua, S7e upstream Lua tests).
 
 - [ ] C libc subset; threads on futexes
-- [ ] `basic` crate as a userland program over a stdio-backed `Io`
+- [x] `basic` crate as a userland program over a stdio-backed `Io`
 - [ ] Lua port
 
 ### S8: Network, lower layers

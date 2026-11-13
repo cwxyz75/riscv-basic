@@ -69,7 +69,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"blkd", b"bomb", b"cat", b"consoled", b"crash", b"devmgr", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher",
+BIN = [b"basic", b"blkd", b"bomb", b"cat", b"consoled", b"crash", b"devmgr", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher",
        b"ls", b"memfsd", b"probe", b"sh", b"spin"]
 
 
@@ -136,6 +136,23 @@ def main():
     step(b"ls | cd sub\n", [b"$ ls | cd sub", b"sh: cd: a builtin cannot be piped"], "a piped builtin")
     step(b"echo ok | frob\n", [b"$ echo ok | frob", b"sh: frob: not found"], "an unknown stage")
     step(b"echo still alive\n", [b"$ echo still alive", b"still alive"], "the shell after errors")
+
+    # BASIC (S7a): the home computer's interpreter as an ordinary program on the terminal
+    step(b"basic\n", [b"$ basic", b"READY."], "basic starts and prompts")
+    s.wait_for_prompt = False  # basic has no "$ " prompt: the steps below talk to BASIC
+    step(b"PRINT 6*7\n", [b"PRINT 6*7", b" 42 ", b"READY."], "basic evaluates an immediate statement")
+    step(b'10 PRINT "FROM A PROGRAM"\n', [b'10 PRINT "FROM A PROGRAM"', b"READY."], "basic stores a program line")
+    step(b"RUN\n", [b"RUN", b"FROM A PROGRAM", b"READY."], "basic runs it")
+    step(b"PRINT 2+2\n", [b"PRINT 2+2", b" 4 ", b"READY."], "basic stays alive")
+    step(b"\x04", [], "Ctrl-D at an empty line ends basic")
+    s.prompt()  # (exit 0 prints nothing: the shell is simply back at its prompt)
+    step(b"basic\n", [b"$ basic", b"READY."], "basic again")
+    s.wait_for_prompt = False
+    step(b"BYE\n", [b"BYE"], "BYE ends basic")
+    s.prompt()
+    s.wait_for_prompt = True
+    step(b"echo back at the shell\n", [b"$ echo back at the shell", b"back at the shell"],
+         "the shell after basic")
 
     # confinement: `probe` has only a read-only working directory
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108",
