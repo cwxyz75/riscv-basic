@@ -197,6 +197,25 @@ pub mod sys {
             [vmo as usize, offset as usize, buf as usize, len, 0, 0],
         )
     }
+    /// The root resource (the process the kernel started only).
+    pub fn resource_root() -> Ret {
+        syscall(RESOURCE_ROOT, [0; 6])
+    }
+    pub fn vmo_create_physical(resource: u32, pa: u64, bytes: u64) -> Ret {
+        syscall(
+            VMO_CREATE_PHYSICAL,
+            [resource as usize, pa as usize, bytes as usize, 0, 0, 0],
+        )
+    }
+    pub fn vmo_create_dma(resource: u32, pages: u64) -> Ret {
+        syscall(
+            VMO_CREATE_DMA,
+            [resource as usize, pages as usize, 0, 0, 0, 0],
+        )
+    }
+    pub fn vmo_phys_addr(vmo: u32) -> Ret {
+        syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
+    }
     pub fn vmo_get_size(vmo: u32) -> Ret {
         syscall(VMO_GET_SIZE, [vmo as usize, 0, 0, 0, 0, 0])
     }

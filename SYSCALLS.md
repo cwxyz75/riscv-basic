@@ -66,6 +66,7 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | INSPECT | 9 | reading its properties |
 | KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
 | SET_LIMITS | 11 | changing a job's limits (`job_set_limits`); separate from MANAGE so that making things inside a job does not allow lifting its limits |
+| DMA | 12 | learning a DMA VMO's physical address (`vmo_phys_addr`) |
 
 `SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
 `handle_replace` it means "the same as the source handle".
@@ -151,6 +152,9 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 43 | vmo_get_size | `a0` vmo | `a1` bytes |
+| 44 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
+| 45 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
+| 46 | vmo_phys_addr | `a0` vmo | `a1` physical address |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
 | 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
@@ -174,6 +178,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes) | `a1` used, `a2` limit |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
+| 95 | resource_root | | `a1` handle |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
 
@@ -323,6 +328,37 @@ Nothing is written on an error.
 ### vmo_get_size(vmo) -> status, bytes
 
 The size in bytes. Errors: BAD_HANDLE; WRONG_TYPE.
+
+### Device capabilities (S6a; S6-SPEC.md section 3)
+
+The **root resource** is an object whose handle (rights DUPLICATE, TRANSFER, MANAGE) is the
+authority to mint device memory and DMA buffers. `resource_root()` returns one, **only to the
+process the kernel started** (as `job_root`: ACCESS_DENIED to everyone else); the holder passes
+it on deliberately. A process without it cannot reach device memory.
+
+### vmo_create_physical(resource, pa, bytes) -> status, handle
+
+A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
+non-empty, a whole number of pages and inside one *device window* (`abi::layout::DEVICE_WINDOWS`:
+the eight QEMU `virt` virtio-mmio slots, `0x1000_1000..0x1000_9000`); anything else, RAM
+included, is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
+DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
+and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device
+memory**: a syscall buffer pointer that lands in an MMIO mapping is INVALID_ARGS. Errors, in
+order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS; NO_MEMORY (handle table or object
+quota).
+
+### vmo_create_dma(resource, pages) -> status, handle
+
+A VMO of `pages` physically contiguous, zeroed frames, committed now and charged to the caller's
+job as pages. At most `MAX_DMA_PAGES` (64) per object and `MAX_DMA_TOTAL_PAGES` (1024) in the
+system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of pages or no
+contiguous run is free. The returned handle has VMO rights without EXECUTE plus **DMA**.
+
+### vmo_phys_addr(vmo) -> status, address
+
+The physical address of a DMA VMO's first byte. Needs the DMA right (ACCESS_DENIED without it, so
+a duplicate made without DMA cannot learn addresses); WRONG_TYPE for a VMO that is not a DMA VMO.
 
 ### process_create(job) -> status, handle
 
@@ -715,3 +751,4 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
 | socket_shutdown | specified and implemented (tidy-up, T17) |
+| vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |

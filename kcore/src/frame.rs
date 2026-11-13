@@ -60,6 +60,42 @@ impl FrameDb {
         self.free.len()
     }
 
+    /// Does the database manage this frame (as opposed to device memory, which it never sees)?
+    pub fn is_managed(&self, pfn: Pfn) -> bool {
+        self.index(pfn).is_ok()
+    }
+
+    /// Take `n` physically contiguous free frames (each with reference count 1); the first
+    /// frame number. `None` if no run of that length is free.
+    pub fn alloc_contiguous(&mut self, n: usize) -> Option<Pfn> {
+        if n == 0 || n > self.free.len() {
+            return None;
+        }
+        let mut run = 0usize;
+        let mut start = 0usize;
+        for i in 0..self.refs.len() {
+            if self.refs[i] == 0 {
+                if run == 0 {
+                    start = i;
+                }
+                run += 1;
+                if run == n {
+                    let first = self.base + start as u64;
+                    let taken: alloc::collections::BTreeSet<Pfn> =
+                        (first..first + n as u64).collect();
+                    self.free.retain(|p| !taken.contains(p));
+                    for r in &mut self.refs[start..start + n] {
+                        *r = 1;
+                    }
+                    return Some(first);
+                }
+            } else {
+                run = 0;
+            }
+        }
+        None
+    }
+
     /// Take a free frame (reference count 1).
     pub fn alloc(&mut self) -> Option<Pfn> {
         let pfn = self.free.pop()?;

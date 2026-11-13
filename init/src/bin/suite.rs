@@ -5427,6 +5427,202 @@ fn cycles_do_not_grow_memory() -> Outcome {
 
 // ---- S4.5: jobs and limits ----
 
+// --- Device capabilities (S6a) -------------------------------------------------------------
+
+fn device_caps_need_the_resource() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let ev = event()?;
+    let plain = vmo(1)?;
+    // no resource, no device objects
+    ensure_eq!(
+        st(sys::vmo_create_physical(0xdead, 0x1000_1000, 4096)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_physical(ev, 0x1000_1000, 4096)),
+        Some(S::WrongType),
+        "an event is no resource"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_dma(ev, 1)),
+        Some(S::WrongType),
+        "dma: an event is no resource"
+    );
+    let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u32;
+    ensure_eq!(
+        st(sys::vmo_create_physical(weak, 0x1000_1000, 4096)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_dma(weak, 1)),
+        Some(S::AccessDenied),
+        "dma: no MANAGE"
+    );
+    // device windows only: never RAM, never off-window, never misaligned or empty
+    for (pa, len, what) in [
+        (0x8000_0000u64, 4096u64, "RAM"),
+        (0x8020_0000, 4096, "the kernel image"),
+        (0x1000_0000, 4096, "just below the window"),
+        (0x1000_9000, 4096, "just above the window"),
+        (0x1000_8000, 8192, "straddling the end"),
+        (0x1000_1001, 4096, "misaligned"),
+        (0x1000_1000, 0, "empty"),
+        (0x1000_1000, 100, "not a whole page"),
+        (u64::MAX - 4095, 4096, "wrapping"),
+    ] {
+        let r = sys::vmo_create_physical(res, pa, len);
+        ensure!(st(r) == Some(S::InvalidArgs), "{what}: {:?}", st(r));
+    }
+    // a good one; the kernel will not copy through it
+    let dev = ok(
+        sys::vmo_create_physical(res, 0x1000_1000, 4096),
+        "an MMIO VMO",
+    )?
+    .a1 as u32;
+    let mut b = [0u8; 4];
+    ensure_eq!(
+        st(sys::vmo_read(dev, 0, b.as_mut_ptr(), 4)),
+        Some(S::NotSupported),
+        "no vmo_read of device memory"
+    );
+    ensure_eq!(
+        st(sys::vmo_write(dev, 0, b.as_ptr(), 4)),
+        Some(S::NotSupported),
+        "no vmo_write of device memory"
+    );
+    ensure_eq!(
+        st(sys::vmo_phys_addr(dev)),
+        Some(S::AccessDenied),
+        "an MMIO VMO has no DMA right"
+    );
+    ensure_eq!(
+        st(sys::vmo_phys_addr(plain)),
+        Some(S::AccessDenied),
+        "a plain VMO has no DMA right"
+    );
+    // DMA: limits, charging, the address only through the DMA right
+    ensure_eq!(
+        st(sys::vmo_create_dma(res, 0)),
+        Some(S::InvalidArgs),
+        "zero pages"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_dma(res, 65)),
+        Some(S::InvalidArgs),
+        "over the per-object limit"
+    );
+    let root = root_job()?;
+    let before = job_use(root, 2)?.0;
+    let dma = ok(sys::vmo_create_dma(res, 4), "a DMA VMO")?.a1 as u32;
+    let after = job_use(root, 2)?.0;
+    ensure_eq!(
+        after - before,
+        4,
+        "the pages are charged to the creator's job at creation"
+    );
+    let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
+    ensure!(
+        pa.is_multiple_of(4096) && (0x8000_0000..0x8800_0000).contains(&pa),
+        "a RAM address: {pa:#x}"
+    );
+    ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
+    let lesser = ok(
+        sys::handle_duplicate(dma, Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0),
+        "dup without DMA",
+    )?
+    .a1 as u32;
+    ensure_eq!(
+        st(sys::vmo_phys_addr(lesser)),
+        Some(S::AccessDenied),
+        "a duplicate without DMA cannot learn the address"
+    );
+    // zeroed, readable and writable through the normal calls
+    let mut buf = [0xffu8; 16];
+    ensure_eq!(
+        st(sys::vmo_read(dma, 3 * 4096, buf.as_mut_ptr(), 16)),
+        Some(S::Ok),
+        "read the last page"
+    );
+    ensure!(buf == [0u8; 16], "a DMA buffer starts zeroed");
+    // closing every handle gives the pages back
+    sys::handle_close(dma);
+    sys::handle_close(lesser);
+    job_use_settles(root, 2, before, 1000)?;
+    sys::handle_close(dev);
+    for h in [res, weak, ev, plain, root] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// D3: a process the kernel did not start cannot obtain the resource or mint device objects.
+fn a_child_has_no_device_authority() -> Outcome {
+    let (p, _mine) = launch(50)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        7,
+        "the child was refused every device call"
+    );
+    sys::handle_close(p);
+    Ok(())
+}
+
+fn mmio_reads_the_virtio_magic() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let dev = ok(
+        sys::vmo_create_physical(res, 0x1000_1000, 4096),
+        "an MMIO VMO",
+    )?
+    .a1 as u32;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_map(me, dev, 0x400_0000, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the first virtio-mmio slot"
+    );
+    // SAFETY: 0x400_0000 was just mapped (device memory, 4 KiB) in this process; the registers at
+    // offsets 0, 4 and 8 are read-only magic, version and device id.
+    let (magic, version, device) = unsafe {
+        (
+            core::ptr::read_volatile(0x400_0000 as *const u32),
+            core::ptr::read_volatile(0x400_0004 as *const u32),
+            core::ptr::read_volatile(0x400_0008 as *const u32),
+        )
+    };
+    ensure_eq!(magic, 0x7472_6976, "the virtio magic ('virt')");
+    ensure!(
+        version == 1 || version == 2,
+        "virtio-mmio version {version}"
+    );
+    ensure!(device < 64, "a plausible device id {device}");
+    // the kernel never copies through device memory: a syscall pointing at it is refused
+    let plain = vmo(1)?;
+    ensure_eq!(
+        st(sys::vmo_read(plain, 0, 0x400_0010 as *mut u8, 4)),
+        Some(S::InvalidArgs),
+        "kernel copy into an MMIO mapping"
+    );
+    ensure_eq!(
+        st(sys::debug_write(
+            // SAFETY: the range is mapped (device memory); the slice is only handed to the kernel,
+            // which must refuse it, and never read here.
+            unsafe { core::slice::from_raw_parts(0x400_0000 as *const u8, 4) }
+        )),
+        Some(S::InvalidArgs),
+        "kernel copy out of an MMIO mapping"
+    );
+    ensure_eq!(st(sys::process_unmap(me, 0x400_0000)), Some(S::Ok), "unmap");
+    // the VMO is closable while mapped and after
+    sys::handle_close(dev);
+    sys::handle_close(res);
+    sys::handle_close(me);
+    sys::handle_close(plain);
+    Ok(())
+}
+
 fn root_job() -> Result<u32, Detail> {
     Ok(ok(sys::job_root(), "job_root")?.a1 as u32)
 }
@@ -6185,6 +6381,15 @@ pub fn app_main() -> i32 {
         ("socket_syscalls", socket_syscalls),
         ("socket_end_of_stream", socket_end_of_stream),
         ("socket_half_close", socket_half_close),
+        (
+            "device_caps_need_the_resource",
+            device_caps_need_the_resource,
+        ),
+        (
+            "a_child_has_no_device_authority",
+            a_child_has_no_device_authority,
+        ),
+        ("mmio_reads_the_virtio_magic", mmio_reads_the_virtio_magic),
         (
             "socket_ends_travel_over_channels",
             socket_ends_travel_over_channels,

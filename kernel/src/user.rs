@@ -690,6 +690,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::JOB_INFO
         | nr::JOB_KILL
         | nr::JOB_ROOT
+        | nr::RESOURCE_ROOT
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
         | nr::PROCESS_UNMAP
@@ -790,7 +791,10 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             Some(Status::BadHandle)
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
-        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE if over(0) => Some(Status::BadHandle),
+        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR if over(0) => {
+            Some(Status::BadHandle)
+        }
+        nr::VMO_CREATE_PHYSICAL | nr::VMO_CREATE_DMA if over(0) => Some(Status::BadHandle),
         nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
         nr::SOCKET_WRITE | nr::SOCKET_READ | nr::SOCKET_SHUTDOWN | nr::PORT_UNBIND if over(0) => {
             Some(Status::BadHandle)
@@ -1019,6 +1023,60 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 }
             }
         }
+        nr::VMO_CREATE_PHYSICAL => {
+            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
+            let (pa, bytes) = (a[1], a[2]);
+            if !abi::layout::in_device_window(pa, bytes) {
+                return fail(Status::InvalidArgs);
+            }
+            let id = k.vmos.create_physical(pa >> 12, bytes >> 12);
+            let rights = Rights(
+                Rights::READ.0
+                    | Rights::WRITE.0
+                    | Rights::MAP.0
+                    | Rights::DUPLICATE.0
+                    | Rights::TRANSFER.0,
+            );
+            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
+                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Err(e) => {
+                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    fail(e)
+                }
+            }
+        }
+        nr::VMO_CREATE_DMA => {
+            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
+            let id = match k.vmos.create_dma(&mut k.mm, a[1], p.job) {
+                Ok(id) => id,
+                Err(kcore::aspace::VmoError::OutOfRange) => return fail(Status::InvalidArgs),
+                Err(_) => return fail(Status::NoMemory),
+            };
+            // the creator's handle carries DMA; duplicates may drop it
+            let rights = Rights(
+                Rights::READ.0
+                    | Rights::WRITE.0
+                    | Rights::MAP.0
+                    | Rights::DUPLICATE.0
+                    | Rights::TRANSFER.0
+                    | Rights::DMA.0,
+            );
+            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
+                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Err(e) => {
+                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    fail(e)
+                }
+            }
+        }
+        nr::VMO_PHYS_ADDR => {
+            let id =
+                ipc::vmo_of(objs, &p.handles, h(0), Rights::DMA).map_err(|e| (e, None, None))?;
+            match k.vmos.phys_addr(id) {
+                Some(pa) => Ok((Some(pa), None)),
+                None => fail(Status::WrongType),
+            }
+        }
         nr::VMO_GET_SIZE => {
             let id =
                 ipc::vmo_of(objs, &p.handles, h(0), Rights::NONE).map_err(|e| (e, None, None))?;
@@ -1029,6 +1087,10 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let writing = n == nr::VMO_WRITE;
             let need = if writing { Rights::WRITE } else { Rights::READ };
             let id = ipc::vmo_of(objs, &p.handles, h(0), need).map_err(|e| (e, None, None))?;
+            if k.vmos.kind(id) == Some(kcore::aspace::VmoKind::Device) {
+                // device memory is reached only by mapping it, never through the kernel
+                return fail(Status::NotSupported);
+            }
             let (offset, buf, len) = (a[1], a[2], a[3]);
             if len > MAX_MSG_BYTES as u64 {
                 return fail(Status::TooBig);
@@ -1803,6 +1865,7 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::JOB_INFO => job_info(a),
         nr::JOB_KILL => job_kill(a),
         nr::JOB_ROOT => job_root(),
+        nr::RESOURCE_ROOT => resource_root(),
         nr::PROCESS_SELF => process_self(),
         nr::PROCESS_MAP if wide(0) || wide(1) => bad(Status::BadHandle),
         nr::PROCESS_MAP => process_map(a),
@@ -2444,6 +2507,22 @@ fn job_kill(a: [u64; 6]) -> Reply {
 /// `job_root() -> handle`: only a process the kernel started (`init`) may ask; it gets a handle
 /// with every job right to the root job. Everything else a program holds is derived from this one
 /// (or from a job its parent gave it), so no program can name a job it was not given.
+fn resource_root() -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let UserState { objs, procs, .. } = s;
+        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        if !caller.privileged {
+            return bad(Status::AccessDenied);
+        }
+        match ipc::resource_object_create_in(objs, &mut caller.handles, &mut quota(caller.job)) {
+            Ok(h) => Ok((Some(u64::from(h.0)), None)),
+            Err(e) => Err((e, None, None)),
+        }
+    })
+}
+
 fn job_root() -> Reply {
     irq::without(|| -> Reply {
         let s = state();

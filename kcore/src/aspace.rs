@@ -66,9 +66,24 @@ pub enum VmoError {
     Gone,
     OutOfRange,
     NoMemory,
+    /// Device memory is never read or written through the kernel.
+    Device,
+}
+
+/// What backs a VMO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmoKind {
+    /// Lazily committed anonymous memory.
+    Plain,
+    /// Device memory (MMIO): fixed frames the frame database does not manage; never freed, never
+    /// read or written through the kernel, never charged as pages.
+    Device,
+    /// Physically contiguous RAM committed at creation, whose address a DMA-right holder may learn.
+    Dma,
 }
 
 struct Vmo {
+    kind: VmoKind,
     /// The job charged for this VMO's committed pages (it holds one use of it).
     job: JobId,
     pages: u64,
@@ -84,6 +99,8 @@ pub struct Vmos {
     /// The job ledger lives here because memory is charged at the moment a page is committed,
     /// which happens in this store (`page_for`) and nowhere else.
     pub jobs: Jobs,
+    /// Pages held by live DMA VMOs.
+    dma_pages: u64,
 }
 
 impl Vmos {
@@ -104,12 +121,77 @@ impl Vmos {
         self.map.insert(
             self.next,
             Vmo {
+                kind: VmoKind::Plain,
                 job,
                 pages,
                 committed: BTreeMap::new(),
             },
         );
         self.next
+    }
+
+    /// A VMO over device memory starting at frame `first` (the caller has checked the range is
+    /// inside an allowed device window). Holds one use of the root job.
+    pub fn create_physical(&mut self, first: Pfn, pages: u64) -> u64 {
+        self.jobs.retain(JobId::ROOT);
+        self.next += 1;
+        self.map.insert(
+            self.next,
+            Vmo {
+                kind: VmoKind::Device,
+                job: JobId::ROOT,
+                pages,
+                committed: (0..pages).map(|i| (i, first + i)).collect(),
+            },
+        );
+        self.next
+    }
+
+    /// A VMO of `pages` physically contiguous zeroed frames, charged to `job` now. At most
+    /// `MAX_DMA_PAGES` per object and `MAX_DMA_TOTAL_PAGES` in the system.
+    pub fn create_dma<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        pages: u64,
+        job: JobId,
+    ) -> Result<u64, VmoError> {
+        use abi::limits::{MAX_DMA_PAGES, MAX_DMA_TOTAL_PAGES};
+        if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > MAX_DMA_TOTAL_PAGES {
+            return Err(VmoError::OutOfRange);
+        }
+        self.jobs
+            .charge(job, Resource::Pages, pages)
+            .map_err(|_| VmoError::NoMemory)?;
+        let Some(first) = mm.db.alloc_contiguous(pages as usize) else {
+            self.jobs.credit(job, Resource::Pages, pages);
+            return Err(VmoError::NoMemory);
+        };
+        for i in 0..pages {
+            mm.mem.zero_frame(first + i);
+        }
+        self.jobs.retain(job);
+        self.dma_pages += pages;
+        self.next += 1;
+        self.map.insert(
+            self.next,
+            Vmo {
+                kind: VmoKind::Dma,
+                job,
+                pages,
+                committed: (0..pages).map(|i| (i, first + i)).collect(),
+            },
+        );
+        Ok(self.next)
+    }
+
+    pub fn kind(&self, id: u64) -> Option<VmoKind> {
+        self.map.get(&id).map(|v| v.kind)
+    }
+
+    /// The physical address of a DMA VMO (its first byte).
+    pub fn phys_addr(&self, id: u64) -> Option<u64> {
+        let v = self.map.get(&id).filter(|v| v.kind == VmoKind::Dma)?;
+        v.committed.get(&0).map(|&pfn| pfn << 12)
     }
 
     /// How many VMOs exist (a leak counter for tests).
@@ -133,6 +215,14 @@ impl Vmos {
     /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
     pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
         let vmo = self.map.remove(&id).ok_or(VmoGone)?;
+        if vmo.kind == VmoKind::Device {
+            // device frames are not ours: nothing was charged and nothing is freed
+            self.jobs.release(vmo.job);
+            return Ok(());
+        }
+        if vmo.kind == VmoKind::Dma {
+            self.dma_pages -= vmo.pages;
+        }
         self.jobs
             .credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
         self.jobs.release(vmo.job);
@@ -171,6 +261,9 @@ impl Vmos {
     ) -> Result<(), VmoError> {
         let len = out.len();
         let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        if vmo.kind == VmoKind::Device {
+            return Err(VmoError::Device);
+        }
         let end = offset.checked_add(len as u64).ok_or(VmoError::OutOfRange)?;
         if end > vmo.pages * PAGE_SIZE {
             return Err(VmoError::OutOfRange);
@@ -199,7 +292,11 @@ impl Vmos {
         len: usize,
         mut each: impl FnMut(&mut Mm<M>, u64, core::ops::Range<usize>),
     ) -> Result<(), VmoError> {
-        let pages = self.map.get(&id).ok_or(VmoError::Gone)?.pages;
+        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        if vmo.kind == VmoKind::Device {
+            return Err(VmoError::Device);
+        }
+        let pages = vmo.pages;
         let end = offset.checked_add(len as u64).ok_or(VmoError::OutOfRange)?;
         if end > pages * PAGE_SIZE {
             return Err(VmoError::OutOfRange);
@@ -360,6 +457,9 @@ impl AddressSpace {
         let region = self.regions.remove(&start).ok_or(RegionError::NoRegion)?;
         for p in 0..region.pages {
             if let Some((pfn, _)) = self.table.unmap(mm, start + p * PAGE_SIZE) {
+                if !mm.db.is_managed(pfn) {
+                    continue; // device memory: the mapping holds no reference
+                }
                 let dropped = mm.db.dec(pfn);
                 debug_assert!(
                     dropped.is_ok(),
@@ -411,13 +511,18 @@ impl AddressSpace {
         }
         let (vmo, perms) = (region.vmo, region.perms);
         let pfn = vmos.page_for(mm, vmo, region.vmo_page + page)?;
-        mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
+        let managed = mm.db.is_managed(pfn);
+        if managed {
+            mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
+        }
         if let Err(e) = self.table.map(mm, page_va, pfn, perms) {
-            let dropped = mm.db.dec(pfn);
-            debug_assert!(
-                dropped.is_ok(),
-                "the reference just taken must be droppable"
-            );
+            if managed {
+                let dropped = mm.db.dec(pfn);
+                debug_assert!(
+                    dropped.is_ok(),
+                    "the reference just taken must be droppable"
+                );
+            }
             return Err(match e {
                 MapError::NoMemory => FaultError::NoMemory,
                 other => FaultError::MapFailed(other),

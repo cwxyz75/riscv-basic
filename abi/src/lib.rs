@@ -95,7 +95,9 @@ pub mod rights {
         /// given the power to make things inside a job without the power to lift the job's limits.
         pub const SET_LIMITS: Rights = Rights(1 << 11);
         /// Every assigned right bit.
-        pub const ALL: Rights = Rights(0xfff);
+        pub const ALL: Rights = Rights(0x1fff);
+        /// Learn a DMA VMO's physical address (a DMA VMO handle only).
+        pub const DMA: Rights = Rights(1 << 12);
         /// Not a right: "the same rights as the source", for duplicate and replace.
         pub const SAME: Rights = Rights(1 << 31);
 
@@ -141,6 +143,8 @@ pub mod rights {
                 | Self::INSPECT.0
                 | Self::SET_LIMITS.0,
         );
+        /// The root resource: mint device memory, DMA buffers and interrupts. Held only by early boot code.
+        pub const RESOURCE: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
 
@@ -198,6 +202,9 @@ pub mod limits {
     /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for
     /// per-job quotas (OS-ARCHITECTURE Q9).
     pub const MAX_OBJECTS: usize = 16384;
+    /// Pages in one DMA VMO, and in all DMA VMOs together (S6: a stand-in for per-job DMA quotas).
+    pub const MAX_DMA_PAGES: u64 = 64;
+    pub const MAX_DMA_TOTAL_PAGES: u64 = 1024;
     /// Pages in one VMO (64 MiB).
     pub const MAX_VMO_PAGES: u64 = 16384;
     /// Live processes at once.
@@ -241,6 +248,9 @@ pub mod syscall {
     pub const VMO_READ: usize = 41;
     pub const VMO_WRITE: usize = 42;
     pub const VMO_GET_SIZE: usize = 43;
+    pub const VMO_CREATE_PHYSICAL: usize = 44;
+    pub const VMO_CREATE_DMA: usize = 45;
+    pub const VMO_PHYS_ADDR: usize = 46;
     pub const PROCESS_CREATE: usize = 50;
     pub const PROCESS_SELF: usize = 51;
     pub const PROCESS_MAP: usize = 52;
@@ -264,6 +274,7 @@ pub mod syscall {
     pub const JOB_INFO: usize = 92;
     pub const JOB_KILL: usize = 93;
     pub const JOB_ROOT: usize = 94;
+    pub const RESOURCE_ROOT: usize = 95;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").
@@ -291,6 +302,18 @@ pub mod layout {
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
     /// Physical RAM on QEMU's `virt` board starts here.
     pub const RAM_BASE: u64 = 0x8000_0000;
+    /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots.
+    pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x1000_1000, 0x1000_9000)];
+    /// Is `[pa, pa + bytes)` page aligned, non-empty and inside one device window?
+    pub fn in_device_window(pa: u64, bytes: u64) -> bool {
+        let Some(end) = pa.checked_add(bytes) else {
+            return false;
+        };
+        pa.is_multiple_of(4096)
+            && bytes != 0
+            && bytes.is_multiple_of(4096)
+            && DEVICE_WINDOWS.iter().any(|&(s, e)| pa >= s && end <= e)
+    }
     /// RAM size the kernel assumes (the boot test passes `-m 128M`). Reading it
     /// from the device tree arrives with the device manager (S6).
     pub const RAM_SIZE: u64 = 128 * 1024 * 1024;
