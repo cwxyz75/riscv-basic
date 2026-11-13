@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -337,6 +338,178 @@ static void misc(void) {
     printf("ignored raise %d\n", raise(SIGTERM));
 }
 
+static pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
+static long counter;
+static pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
+static int queue[64], q_head, q_tail, q_closed;
+static long consumed_sum;
+static int consumed_count;
+static pthread_once_t once = PTHREAD_ONCE_INIT;
+static int once_runs;
+static pthread_key_t key;
+static volatile int detached_ran;
+
+static void *count_up(void *arg) {
+    for (int i = 0; i < 1000; i++) {
+        pthread_mutex_lock(&counter_lock);
+        counter++;
+        pthread_mutex_unlock(&counter_lock);
+    }
+    return (void *)((long)arg * (long)arg);
+}
+
+static void *errno_thread(void *arg) {
+    long id = (long)arg;
+    errno = 100 + (int)id;
+    for (int i = 0; i < 50; i++) sched_yield();
+    return (void *)(long)(errno == 100 + (int)id);
+}
+
+static void *consumer(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&counter_lock);
+        while (q_head == q_tail && !q_closed) pthread_cond_wait(&not_empty, &counter_lock);
+        if (q_head == q_tail) {
+            pthread_mutex_unlock(&counter_lock);
+            return NULL;
+        }
+        consumed_sum += queue[q_head++ % 64];
+        consumed_count++;
+        pthread_mutex_unlock(&counter_lock);
+    }
+}
+
+static void init_once(void) { once_runs++; }
+
+static void *once_and_key(void *arg) {
+    pthread_once(&once, init_once);
+    pthread_setspecific(key, arg);
+    for (int i = 0; i < 20; i++) sched_yield();
+    return (void *)(long)(pthread_getspecific(key) == arg);
+}
+
+static void *set_flag(void *arg) {
+    (void)arg;
+    detached_ran = 1;
+    return NULL;
+}
+
+static void *try_lock_thread(void *arg) {
+    return (void *)(long)pthread_mutex_trylock((pthread_mutex_t *)arg);
+}
+
+static int (*volatile deep_fn)(int);
+static int deep_sum(int n) {
+    char pad[1024];
+    memset(pad, n & 0x7f, sizeof pad);
+    __asm__ volatile("" : : "r"(pad) : "memory"); /* the buffer really lives on the stack */
+    if (n == 0) return pad[5];
+    return deep_fn(n - 1) + pad[n % 1024] % 3; /* not a tail call: the stack really grows */
+}
+
+static void threads(void) {
+    section("pthreads");
+    pthread_t t[4];
+    void *ret;
+    for (long i = 0; i < 4; i++) assert(pthread_create(&t[i], NULL, count_up, (void *)(i + 1)) == 0);
+    long sum = 0;
+    for (int i = 0; i < 4; i++) {
+        pthread_join(t[i], &ret);
+        sum += (long)ret;
+    }
+    printf("counter %ld returns %ld\n", counter, sum);
+
+    errno = 7;
+    for (long i = 0; i < 3; i++) assert(pthread_create(&t[i], NULL, errno_thread, (void *)i) == 0);
+    long ok = 0;
+    for (int i = 0; i < 3; i++) {
+        pthread_join(t[i], &ret);
+        ok += (long)ret;
+    }
+    printf("errno per thread %ld, main's errno %d\n", ok, errno);
+
+    pthread_t c1, c2;
+    pthread_create(&c1, NULL, consumer, NULL);
+    pthread_create(&c2, NULL, consumer, NULL);
+    for (int i = 1; i <= 300; i++) {
+        pthread_mutex_lock(&counter_lock);
+        while (q_tail - q_head >= 64) {
+            pthread_mutex_unlock(&counter_lock);
+            sched_yield();
+            pthread_mutex_lock(&counter_lock);
+        }
+        queue[q_tail++ % 64] = i;
+        pthread_cond_signal(&not_empty);
+        pthread_mutex_unlock(&counter_lock);
+    }
+    pthread_mutex_lock(&counter_lock);
+    q_closed = 1;
+    pthread_cond_broadcast(&not_empty);
+    pthread_mutex_unlock(&counter_lock);
+    pthread_join(c1, NULL);
+    pthread_join(c2, NULL);
+    printf("consumed %d items, sum %ld\n", consumed_count, consumed_sum);
+
+    pthread_key_create(&key, NULL);
+    pthread_setspecific(key, (void *)99);
+    long agree = 0;
+    for (long i = 0; i < 4; i++) assert(pthread_create(&t[i], NULL, once_and_key, (void *)(i + 1)) == 0);
+    for (int i = 0; i < 4; i++) {
+        pthread_join(t[i], &ret);
+        agree += (long)ret;
+    }
+    printf("once ran %d, keys agree %ld, main's key %ld\n", once_runs, agree, (long)pthread_getspecific(key));
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_t rec;
+    pthread_mutex_init(&rec, &attr);
+    int a = pthread_mutex_lock(&rec), b = pthread_mutex_lock(&rec);
+    pthread_t tt;
+    pthread_create(&tt, NULL, try_lock_thread, &rec);
+    pthread_join(tt, &ret);
+    printf("recursive %d %d, other thread's trylock was EBUSY %d\n", a, b, (long)ret == EBUSY);
+    pthread_mutex_unlock(&rec);
+    pthread_mutex_unlock(&rec);
+    pthread_create(&tt, NULL, try_lock_thread, &rec);
+    pthread_join(tt, &ret);
+    printf("after unlock: trylock %ld\n", (long)ret);
+    pthread_mutex_unlock(&rec);
+
+    pthread_attr_t da;
+    pthread_attr_init(&da);
+    pthread_attr_setdetachstate(&da, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tt, &da, set_flag, NULL);
+    for (int i = 0; i < 200 && !detached_ran; i++) {
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    /* a timed wait that nobody signals ends with ETIMEDOUT, after the deadline */
+    pthread_mutex_t tm = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t tc = PTHREAD_COND_INITIALIZER;
+    struct timespec before, deadline, after;
+    clock_gettime(CLOCK_REALTIME, &before);
+    deadline = before;
+    deadline.tv_nsec += 30 * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    pthread_mutex_lock(&tm);
+    int trc = pthread_cond_timedwait(&tc, &tm, &deadline);
+    pthread_mutex_unlock(&tm);
+    clock_gettime(CLOCK_REALTIME, &after);
+    long waited_ms = (after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    printf("timedwait timed out %d, waited at least 30ms: %d\n", trc == ETIMEDOUT, waited_ms >= 29);
+    printf("detached ran %d, self equal %d\n", detached_ran, pthread_equal(pthread_self(), pthread_self()));
+
+    /* a recursion that needs more than the loader's 256 KiB stack */
+    deep_fn = deep_sum;
+    printf("deep %d\n", deep_sum(700)); /* about 700 KiB of stack */
+}
+
 static void tail(void) { printf("atexit handler\n"); }
 
 static int sum(int count, ...) {
@@ -377,6 +550,7 @@ int main(int argc, char **argv) {
     files();
     times();
     misc();
+    threads();
     printf("done\n");
     return 0;
 }

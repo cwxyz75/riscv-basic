@@ -30,6 +30,7 @@ mod start;
 mod stdio;
 mod stdlib;
 mod string;
+mod thread;
 mod time;
 
 pub use start::run_main;

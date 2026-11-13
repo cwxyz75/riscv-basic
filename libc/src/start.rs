@@ -24,6 +24,13 @@ fn leak_array(items: &[Vec<u8>]) -> *mut *mut c_char {
     v.leak().as_mut_ptr()
 }
 
+extern "C" fn call_main(arg: usize) -> c_int {
+    // SAFETY: `arg` points to the `(argc, argv)` pair `run_main` keeps alive for the call.
+    let (argc, argv) = unsafe { *(arg as *const (c_int, *mut *mut c_char)) };
+    // SAFETY: `main` is the C program's entry point.
+    unsafe { main(argc, argv) }
+}
+
 /// Start the C program: the exit status of `main`, after the `atexit` handlers have run (the
 /// runtime's entry then exits with it).
 pub fn run_main() -> i32 {
@@ -52,8 +59,12 @@ pub fn run_main() -> i32 {
     let argv = leak_array(&env.startup.args);
     // SAFETY: single-threaded start-up; the array is leaked and NULL-terminated.
     unsafe { crate::stdlib::ENVIRON = leak_array(&env.startup.env) };
-    // SAFETY: `main` is the C program's entry point.
-    let code = unsafe { main(env.startup.args.len() as c_int, argv) };
+    crate::thread::init_main_thread();
+    // main runs on a 1 MiB stack (the loader's is 256 KiB)
+    let code = crate::thread::on_big_stack(
+        call_main,
+        &(env.startup.args.len() as c_int, argv) as *const _ as usize,
+    );
     crate::stdlib::run_atexit();
     crate::file::flush_all();
     code

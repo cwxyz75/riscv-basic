@@ -8,6 +8,8 @@ ssize_t write(int fd, const void *buf, size_t n);
 int close(int fd);
 off_t lseek(int fd, off_t off, int whence);
 int isatty(int fd);
+unsigned sleep(unsigned seconds);
+int usleep(unsigned usec);
 int unlink(const char *path);
 int rmdir(const char *path);
 #endif
