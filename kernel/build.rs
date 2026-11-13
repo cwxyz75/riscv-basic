@@ -24,7 +24,7 @@ fn main() {
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for name in [
         "suite", "init", "crash", "hello", "launcher", "memfsd", "consoled", "spin", "echo", "cat",
-        "ls", "probe", "sh", "hog", "bomb", "ipchog", "blkd", "devmgr", "basic", "ctest",
+        "ls", "probe", "sh", "hog", "bomb", "ipchog", "blkd", "devmgr", "basic", "ctest", "lua",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
@@ -75,6 +75,8 @@ fn main() {
     for (src, prefix) in [
         ("../home/basic/tests/golden", "/etc/basic/golden"),
         ("../home/examples", "/etc/basic/examples"),
+        // the Lua acceptance script (S7d)
+        ("../tests/lua", "/etc/lua"),
     ] {
         let path = PathBuf::from(&dir).join(src);
         println!("cargo:rerun-if-changed={}", path.display());

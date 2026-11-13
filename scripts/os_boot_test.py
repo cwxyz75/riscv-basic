@@ -80,7 +80,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "page_tables_are_charged_to_the_job", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "page_tables_are_charged_to_the_job", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -164,6 +164,51 @@ def c_transcript_problems(text):
         if g != w:
             return [f"C transcript line {i + 1} differs: guest {g!r}, host {w!r}"]
     return [f"C transcript length differs: guest {len(got)} lines, host {len(want)}"]
+
+
+def lua_transcript_problems(text):
+    """Build Lua from `third_party/lua` with the host's compiler (same sources, same settings
+    header) and run `tests/lua/s7.lua` with it; the guest's transcript (lines `lua|...` between the
+    `s7: lua transcript` markers) must be byte-identical. Compared after escaping every byte outside
+    printable ASCII as \\xNN on both sides (the console shows only printable ASCII)."""
+    import glob
+    import tempfile
+    lines = text.split("\n")
+    if "s7: lua transcript begins" not in lines or "s7: lua transcript ends" not in lines:
+        return ["the Lua script test did not run to the end"]
+    a, b = lines.index("s7: lua transcript begins"), lines.index("s7: lua transcript ends")
+    got = [l[4:] for l in lines[a + 1:b] if l.startswith("lua|")]
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    srcs = sorted(f for f in glob.glob(os.path.join(root, "third_party", "lua", "src", "*.c"))
+                  if not f.endswith("luac.c"))
+    conf = os.path.join(root, "third_party", "lua", "os_lua.h")
+    script = os.path.join(root, "tests", "lua", "s7.lua")
+    with tempfile.TemporaryDirectory() as d:
+        exe = os.path.join(d, "lua_host")
+        try:
+            cc = subprocess.run(["cc", "-O1", "-w", "-include", conf, "-o", exe, *srcs, "-lm"],
+                                capture_output=True, text=True)
+            if cc.returncode != 0:
+                return ["could not build the host Lua: " + cc.stderr[-300:]]
+            # (run in the scratch directory: the script's files are relative to it)
+            run_ = subprocess.run([exe, script], capture_output=True, timeout=60, cwd=d)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return [f"the host Lua did not run: {e}"]
+    if run_.returncode != 0:
+        return ["the host Lua failed: " + run_.stderr.decode(errors="replace")[-300:]]
+    def esc(line):  # the guest prints printable ASCII as is and everything else as \\xNN
+        return "".join(chr(c) if 32 <= c < 127 else "\\x%02x" % c for c in line)[:2000 - 4]
+    want = [esc(l) for l in run_.stdout.split(b"\n")]
+    if want and want[-1] == "":
+        want.pop()
+    if got and got[-1] == "":
+        got.pop()
+    if got == want:
+        return []
+    for i, (g, w) in enumerate(zip(got, want)):
+        if g != w:
+            return [f"Lua transcript line {i + 1} differs: guest {g!r}, host {w!r}"]
+    return [f"Lua transcript length differs: guest {len(got)} lines, host {len(want)}"]
 
 
 def scratch_disk():
@@ -349,6 +394,7 @@ def main() -> int:
         # The C library (S7c): the guest's transcript must equal the same C program run on the host.
         if not expect_fail:
             found += c_transcript_problems(text)
+            found += lua_transcript_problems(text)
         if found:
             failed = 1
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)

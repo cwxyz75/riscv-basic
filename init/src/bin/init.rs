@@ -106,8 +106,9 @@ pub fn app_main() -> i32 {
     let mut banner = String::from("riscv-os S4a init ready; image:");
     for e in entries
         .iter()
-        // the BASIC corpus (S7a) is data, not part of the image's shape: keep the banner short
-        .filter(|e| !e.name.starts_with(b"etc/basic/"))
+        // the BASIC corpus (S7a) and the Lua script (S7d) are data, not part of the image's
+        // shape: keep the banner short
+        .filter(|e| !e.name.starts_with(b"etc/basic/") && !e.name.starts_with(b"etc/lua/"))
     {
         banner.push(' ');
         banner.push_str(&String::from_utf8_lossy(&e.name));

@@ -743,6 +743,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD68 | Futexes are process-private, keyed by (process, virtual address), with no rights; `futex_wait` re-checks one aligned atomic 32-bit word under the BKL and sleeps until removed from the table or the deadline (S7-SPEC section 4) | decided (built, S7b) |
 | OD69 | C is compiled to objects with a RISC-V-capable clang, archived with `llvm-ar`, and linked by the existing cargo/`rust-lld` step through `init/link.ld`; the toolchain choice is the product owner's (S7-SPEC section 10) | proposed |
 | OD70 | `basic` runs on the target in a golden mode through a shared `basic-script` crate; the suite, not the program, compares the transcript to the unchanged `.out` files (S7-SPEC section 3) | proposed |
+| OD71 | Lua 5.4 is vendored unmodified under `third_party/lua/` (version and checksum recorded) and built twice from the same sources with one force-included settings header: by the cross clang into `bin/lua`, and by the host `cc` as the oracle for the acceptance script (S7-SPEC section 6). `malloc` keeps size-class free lists for blocks up to 512 bytes because the runtime heap's first-fit walk is quadratic for Lua's allocation pattern | proposed |
 ---
 
 ## 18. Open questions (stop and ask the product owner)

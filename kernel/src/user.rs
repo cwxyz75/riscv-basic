@@ -657,6 +657,19 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
             if resolved {
                 kmem::flush_tlb();
             } else {
+                // a diagnostic for headless debugging (off by default: the tests crash programs
+                // on purpose and the shell tests read the console line by line)
+                if cfg!(feature = "fault-log") {
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut crate::console::Console,
+                        format_args!(
+                            "kernel: user fault, cause {cause}, pc {:#x}, address {va:#x}, ra {:#x}, sp {:#x}\n",
+                            frame.sepc,
+                            frame.arg(1),
+                            frame.arg(2)
+                        ),
+                    );
+                }
                 exit_process(-1000 - cause as i32);
             }
         }
