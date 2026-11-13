@@ -145,6 +145,10 @@ pub mod rights {
         );
         /// The root resource: mint device memory, DMA buffers and interrupts. Held only by early boot code.
         pub const RESOURCE: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
+        /// An interrupt object: wait for it, inspect it, acknowledge it (MANAGE).
+        pub const INTERRUPT: Rights = Rights(
+            Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WAIT.0 | Self::INSPECT.0 | Self::MANAGE.0,
+        );
         pub const EVENT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::SIGNAL.0 | Self::WAIT.0);
 
@@ -178,11 +182,13 @@ pub mod signals {
     pub const TERMINATED: u32 = 1 << 3;
     /// The peer socket end called `socket_shutdown`: no more data will arrive beyond what is queued.
     pub const WRITE_CLOSED: u32 = 1 << 4;
+    /// An interrupt object's source fired and has not been acknowledged.
+    pub const INTERRUPT: u32 = 1 << 5;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
     /// Every signal a wait or a port binding may name.
     pub const WAITABLE: u32 =
-        READABLE | WRITABLE | PEER_CLOSED | TERMINATED | WRITE_CLOSED | USER_MASK;
+        READABLE | WRITABLE | PEER_CLOSED | TERMINATED | WRITE_CLOSED | INTERRUPT | USER_MASK;
 }
 
 /// The handle value of the bootstrap channel every process starts with.
@@ -275,6 +281,8 @@ pub mod syscall {
     pub const JOB_KILL: usize = 93;
     pub const JOB_ROOT: usize = 94;
     pub const RESOURCE_ROOT: usize = 95;
+    pub const INTERRUPT_CREATE: usize = 100;
+    pub const INTERRUPT_ACK: usize = 101;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").
@@ -314,6 +322,9 @@ pub mod layout {
             && bytes.is_multiple_of(4096)
             && DEVICE_WINDOWS.iter().any(|&(s, e)| pa >= s && end <= e)
     }
+    /// Highest PLIC source an interrupt object may name (QEMU `virt`: the eight virtio-mmio slots
+    /// are sources 1..=8; the UART, 10, belongs to the kernel).
+    pub const MAX_IRQ: u32 = 8;
     /// RAM size the kernel assumes (the boot test passes `-m 128M`). Reading it
     /// from the device tree arrives with the device manager (S6).
     pub const RAM_SIZE: u64 = 128 * 1024 * 1024;

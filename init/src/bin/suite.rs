@@ -732,7 +732,7 @@ fn wait_arguments_are_checked() -> Outcome {
         "an empty mask"
     );
     ensure_eq!(
-        st(sys::object_wait(e, 1 << 5, 0)),
+        st(sys::object_wait(e, 1 << 6, 0)),
         Some(S::InvalidArgs),
         "a bit that is no signal"
     );
@@ -5570,6 +5570,263 @@ fn a_child_has_no_device_authority() -> Outcome {
     Ok(())
 }
 
+/// A virtio-blk device found by scanning the eight slots: its mapped page and PLIC source.
+struct Blk {
+    regs: *mut u32,
+    irq: u32,
+}
+
+const MMIO_VA: u64 = 0x600_0000;
+const DMA_VA: u64 = 0x500_0000;
+
+fn rd(b: &Blk, off: usize) -> u32 {
+    // SAFETY: `b.regs` is a mapped virtio-mmio slot (4 KiB of device memory) and `off` is a
+    // register offset inside it.
+    unsafe { core::ptr::read_volatile(b.regs.byte_add(off)) }
+}
+
+fn wr(b: &Blk, off: usize, v: u32) {
+    // SAFETY: as in `rd`.
+    unsafe { core::ptr::write_volatile(b.regs.byte_add(off), v) }
+}
+
+/// Map the virtio-mmio window and find a block device (None when the machine has no disk).
+fn find_blk(res: u32) -> Result<Option<Blk>, Detail> {
+    let dev = ok(
+        sys::vmo_create_physical(res, 0x1000_1000, 8 * 4096),
+        "the MMIO window",
+    )?
+    .a1 as u32;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_map(me, dev, MMIO_VA, 0, 8 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the window"
+    );
+    sys::handle_close(me);
+    for slot in 0..8usize {
+        let b = Blk {
+            regs: (MMIO_VA as usize + slot * 4096) as *mut u32,
+            irq: slot as u32 + 1,
+        };
+        if rd(&b, 0) == 0x7472_6976 && rd(&b, 8) == 2 {
+            ensure_eq!(
+                rd(&b, 4),
+                2,
+                "the modern transport (the harness passes force-legacy=false)"
+            );
+            return Ok(Some(b));
+        }
+    }
+    Ok(None)
+}
+
+/// Bring the device up with one queue of 8 descriptors in the DMA buffer at `pa`; the buffer
+/// layout is: descriptors at 0, available ring at 128, used ring at 256, request header at 512,
+/// data at 1024, status byte at 2048.
+fn blk_up(b: &Blk, pa: u64) -> Outcome {
+    wr(b, 0x70, 0); // reset
+    wr(b, 0x70, 1); // ACKNOWLEDGE
+    wr(b, 0x70, 1 | 2); // DRIVER
+    wr(b, 0x14, 1); // device features, high word
+    ensure!(rd(b, 0x10) & 1 != 0, "the device offers VIRTIO_F_VERSION_1");
+    wr(b, 0x24, 1);
+    wr(b, 0x20, 1); // we accept VERSION_1 and nothing else
+    wr(b, 0x24, 0);
+    wr(b, 0x20, 0);
+    wr(b, 0x70, 1 | 2 | 8); // FEATURES_OK
+    ensure!(rd(b, 0x70) & 8 != 0, "the device accepted our features");
+    wr(b, 0x30, 0); // queue 0
+    ensure!(rd(b, 0x34) >= 8, "queue size");
+    wr(b, 0x38, 8);
+    for (lo, at) in [(0x80, 0u64), (0x90, 128), (0xa0, 256)] {
+        wr(b, lo, (pa + at) as u32);
+        wr(b, lo + 4, ((pa + at) >> 32) as u32);
+    }
+    wr(b, 0x44, 1); // QueueReady
+    wr(b, 0x70, 1 | 2 | 8 | 4); // DRIVER_OK
+    Ok(())
+}
+
+/// Submit one read of sector 0 (3 descriptors) and ring the doorbell. `n` is how many requests
+/// were submitted before (the available index).
+fn blk_read_sector0(b: &Blk, pa: u64, n: u16) {
+    let base = DMA_VA as usize;
+    let put = |off: usize, v: u64, len: usize| {
+        for i in 0..len {
+            // SAFETY: the DMA buffer is mapped read-write at DMA_VA for 4 pages.
+            unsafe { core::ptr::write_volatile((base + off + i) as *mut u8, (v >> (8 * i)) as u8) };
+        }
+    };
+    // header: type 0 (IN), reserved 0, sector 0
+    put(512, 0, 8);
+    put(520, 0, 8);
+    // descriptors: addr (8), len (4), flags (2), next (2)
+    for (d, (addr, len, flags, next)) in [
+        (pa + 512, 16u64, 1u64, 1u64),
+        (pa + 1024, 512, 1 | 2, 2),
+        (pa + 2048, 1, 2, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put(d * 16, addr, 8);
+        put(d * 16 + 8, len | (flags << 32) | (next << 48), 8);
+    }
+    put(2048, 0xff, 1); // status the device must overwrite
+                        // available ring: flags 0, idx n+1, ring[n % 8] = 0
+    put(128 + 4 + 2 * (n as usize % 8), 0, 2);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    put(128 + 2, u64::from(n) + 1, 2);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    wr(b, 0x50, 0); // QueueNotify
+}
+
+fn interrupt_object_fires_and_masks() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    // argument checks that hold on every machine
+    ensure_eq!(
+        st(sys::interrupt_create(res, 0)),
+        Some(S::InvalidArgs),
+        "source 0"
+    );
+    ensure_eq!(
+        st(sys::interrupt_create(res, 9)),
+        Some(S::InvalidArgs),
+        "above the allowed range"
+    );
+    ensure_eq!(
+        st(sys::interrupt_create(0xdead, 1)),
+        Some(S::BadHandle),
+        "no resource"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::interrupt_create(ev, 1)),
+        Some(S::WrongType),
+        "an event is no resource"
+    );
+    let Some(b) = find_blk(res)? else {
+        return Ok(()); // no disk attached (OS_DISK=0): nothing more to provoke
+    };
+    let probe = sys::interrupt_create(res, b.irq);
+    if st(probe) == Some(S::NotSupported) {
+        // no PLIC (AIA machine): drivers poll; the harness checks the machine really is AIA
+        return Ok(());
+    }
+    let irq = ok(probe, "interrupt_create")?.a1 as u32;
+    ensure_eq!(
+        st(sys::interrupt_create(res, b.irq)),
+        Some(S::BadState),
+        "one object per source"
+    );
+    ensure_eq!(
+        st(sys::interrupt_ack(irq)),
+        Some(S::BadState),
+        "nothing to acknowledge yet"
+    );
+    ensure_eq!(
+        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+        0,
+        "quiet before anything happens"
+    );
+    // a DMA buffer for the queue and one request
+    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u32;
+    let pa = ok(sys::vmo_phys_addr(dma), "phys")?.a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_map(me, dma, DMA_VA, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the DMA buffer"
+    );
+    blk_up(&b, pa)?;
+    sys::debug_write(b"s6: interrupt path exercised\n");
+    let t0 = sys::clock_get();
+    blk_read_sector0(&b, pa, 0);
+    let r = sys::object_wait(irq, sig::INTERRUPT, t0 + 1000);
+    ensure_eq!(
+        st(r),
+        Some(S::Ok),
+        "the device's interrupt reaches the object"
+    );
+    // woken by the interrupt, not by the deadline running out (the wait re-reads the signals at
+    // its deadline, so a missing wake-up would still return Ok, a second late)
+    ensure!(sys::clock_get() - t0 < 200, "the waiter was woken late");
+    ensure!(
+        rd(&b, 0x60) & 1 != 0,
+        "the device says a used buffer is pending"
+    );
+    // SAFETY: the status byte and first data bytes of the buffer mapped above.
+    let (status, d0, d1) = unsafe {
+        (
+            core::ptr::read_volatile((DMA_VA + 2048) as *const u8),
+            core::ptr::read_volatile((DMA_VA + 1024) as *const u8),
+            core::ptr::read_volatile((DMA_VA + 1025) as *const u8),
+        )
+    };
+    ensure_eq!(
+        (status, d0, d1),
+        (0, 3, 10),
+        "the sector 0 pattern came through DMA"
+    );
+    // the device line stays asserted until we clear InterruptStatus: the source is masked, so the
+    // kernel is not claiming it again and again (QEMU's PLIC raises on a level *change*, so this
+    // check is weaker than on hardware; TIDY-UP T43). Give it time, then count the claims.
+    let t0 = sys::clock_get();
+    let _ = sys::object_wait(ev, 1 << 24, t0 + 30);
+    ensure_eq!(
+        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+        sig::INTERRUPT,
+        "still pending until acknowledged"
+    );
+    // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
+    wr(&b, 0x64, 1);
+    let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
+    ensure_eq!(ack.a1, 1, "exactly one claim for one request");
+    ensure_eq!(
+        sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
+        0,
+        "the acknowledgement clears the signal"
+    );
+    let r = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 20);
+    ensure_eq!(
+        st(r),
+        Some(S::TimedOut),
+        "nothing more once the device is quiet"
+    );
+    let t1 = sys::clock_get();
+    blk_read_sector0(&b, pa, 1);
+    let r = sys::object_wait(irq, sig::INTERRUPT, t1 + 1000);
+    ensure_eq!(st(r), Some(S::Ok), "a later request interrupts again");
+    ensure!(
+        sys::clock_get() - t1 < 200,
+        "the second waiter was woken late"
+    );
+    wr(&b, 0x64, 1);
+    sys::interrupt_ack(irq);
+    // leave the device quiet and everything released
+    wr(&b, 0x70, 0);
+    ensure_eq!(st(sys::process_unmap(me, DMA_VA)), Some(S::Ok), "unmap DMA");
+    ensure_eq!(
+        st(sys::process_unmap(me, MMIO_VA)),
+        Some(S::Ok),
+        "unmap MMIO"
+    );
+    // closing the object releases the source: a new object can own it, with a pending interrupt
+    // or not, and nothing is left enabled when the last one goes
+    sys::handle_close(irq);
+    let again = ok(
+        sys::interrupt_create(res, b.irq),
+        "the source is free again after close",
+    )?
+    .a1 as u32;
+    sys::handle_close(again);
+    for h in [dma, me, res, ev] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 fn mmio_reads_the_virtio_magic() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
     let dev = ok(
@@ -6390,6 +6647,10 @@ pub fn app_main() -> i32 {
             a_child_has_no_device_authority,
         ),
         ("mmio_reads_the_virtio_magic", mmio_reads_the_virtio_magic),
+        (
+            "interrupt_object_fires_and_masks",
+            interrupt_object_fires_and_masks,
+        ),
         (
             "socket_ends_travel_over_channels",
             socket_ends_travel_over_channels,

@@ -79,6 +79,15 @@ pub struct SocketEnd {
     shut: bool,
 }
 
+/// An interrupt object: one PLIC source. When it fires the kernel masks the source and sets
+/// `fired` (the INTERRUPT signal); `interrupt_ack` clears it and unmasks.
+pub struct IrqObj {
+    pub irq: u32,
+    pub fired: bool,
+    /// How many times the kernel claimed this source (a storm would show here).
+    pub claims: u64,
+}
+
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
 struct Binding {
     obj: ObjId,
@@ -105,6 +114,8 @@ pub enum KObj {
     Port(PortObj),
     /// A job (S4.5): the ledger id; the object holds one use of it.
     Job(JobId),
+    /// An interrupt source (S6a-2): its PLIC source number and whether it fired and awaits `ack`.
+    Interrupt(IrqObj),
     /// The root resource (S6): the authority to mint device memory, DMA buffers and interrupts.
     Resource,
 }
@@ -127,7 +138,10 @@ impl Object for KObj {
     }
 
     fn needs_cleanup(&self) -> bool {
-        matches!(self, KObj::Vmo(_) | KObj::Process(_) | KObj::Job(_))
+        matches!(
+            self,
+            KObj::Vmo(_) | KObj::Process(_) | KObj::Job(_) | KObj::Interrupt(_)
+        )
     }
 
     fn meter(&self) -> usize {
@@ -585,6 +599,13 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
         KObj::Vmo(_) | KObj::Job(_) | KObj::Resource => 0,
+        KObj::Interrupt(i) => {
+            if i.fired {
+                signals::INTERRUPT
+            } else {
+                0
+            }
+        }
         KObj::Process(p) => {
             if p.terminated {
                 signals::TERMINATED
@@ -1023,6 +1044,80 @@ pub fn resource_object_create_in(
     Ok(table
         .insert(obj, Rights::RESOURCE)
         .expect("room was checked"))
+}
+
+/// A new interrupt object for PLIC source `irq` (the caller has checked the resource, the range
+/// and that no live object already owns the source).
+pub fn interrupt_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    irq: u32,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(
+        KObj::Interrupt(IrqObj {
+            irq,
+            fired: false,
+            claims: 0,
+        }),
+        q.job,
+    );
+    let h = table
+        .insert(obj, Rights::INTERRUPT)
+        .expect("room was checked");
+    Ok((h, obj))
+}
+
+/// The source of an interrupt object handle that carries `need`.
+pub fn interrupt_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, u32), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Interrupt(i)) => {
+            if entry.rights.contains(need) {
+                Ok((entry.obj, i.irq))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// The source fired: returns true if `obj` is a live interrupt object for `irq` that was not
+/// already waiting for its ack (so the caller must mask the source).
+pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
+    match reg.get_mut(obj) {
+        Some(KObj::Interrupt(i)) if i.irq == irq => {
+            i.claims += 1;
+            let first = !i.fired;
+            i.fired = true;
+            first
+        }
+        _ => false,
+    }
+}
+
+/// Acknowledge: BAD_STATE unless the source fired. Returns the source to unmask and the number
+/// of claims so far.
+pub fn interrupt_ack(reg: &mut Kobjs, obj: ObjId) -> Result<(u32, u64), Status> {
+    match reg.get_mut(obj) {
+        Some(KObj::Interrupt(i)) if i.fired => {
+            i.fired = false;
+            Ok((i.irq, i.claims))
+        }
+        Some(KObj::Interrupt(_)) => Err(Status::BadState),
+        _ => Err(Status::BadHandle),
+    }
 }
 
 /// Check that `h` is a root resource handle with MANAGE (the right to mint).

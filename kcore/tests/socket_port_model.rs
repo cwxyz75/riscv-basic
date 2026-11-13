@@ -245,7 +245,7 @@ fn port_unbind_destroyed_objects_and_errors() {
         "empty mask"
     );
     assert_eq!(
-        port_bind(&mut reg, &t, port, e, 1 << 5, 1),
+        port_bind(&mut reg, &t, port, e, 1 << 6, 1),
         Err(Status::InvalidArgs),
         "not a signal"
     );

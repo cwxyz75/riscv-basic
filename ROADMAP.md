@@ -298,7 +298,7 @@ Acceptance: every earlier suite passes with `-smp 4` in normal mode (icount only
 Acceptance: a pattern written to the virtual disk reads back identical; the block
 driver can be killed and restarted.
 
-- [ ] Interrupt objects and device-memory VMOs
+- [x] Interrupt objects and device-memory VMOs
 - [ ] Driver manager and device-tree parsing
 - [ ] Userspace virtio-blk driver and block protocol
 

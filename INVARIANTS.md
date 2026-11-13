@@ -74,6 +74,7 @@ get filled in as each area is built.
 | D2 | A physical address is learnable only through a DMA-right handle of a DMA VMO | QEMU `device_caps_need_the_resource` |
 | D3 | Device objects are minted only with the root resource, which only the kernel-started process can obtain | QEMU `device_caps_need_the_resource` |
 | D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |
+| D5 | A fired interrupt source is masked from the claim until `interrupt_ack` or the object's destruction, and a destroyed object leaves its source masked (nothing enabled with nobody listening); one live object per source | QEMU `interrupt_object_fires_and_masks` (QEMU's PLIC is edge-like, so the masking itself is weakly checked: T43) |
 
 ### Hart rules (S5a)
 

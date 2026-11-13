@@ -20,6 +20,7 @@ mod interactive;
 mod irq;
 mod kmem;
 mod percpu;
+mod plic;
 mod sched_tests;
 mod selftest;
 mod smp;
@@ -61,7 +62,8 @@ impl Tally {
 }
 
 #[no_mangle]
-pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
+pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
+    plic::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
     // First of all: this hart's record in `tp` (the trap entry needs it).
     percpu::bind(0, hart_id);
     percpu::this()
@@ -96,6 +98,12 @@ pub extern "C" fn kmain(hart_id: usize, _dtb: usize) -> ! {
     heap::init();
     trap::init();
     kmem::init();
+    plic::init(hart_id);
+    let _ = writeln!(
+        out,
+        "interrupt controller: {}",
+        if plic::present() { "PLIC" } else { "none" }
+    );
     let _ = writeln!(
         out,
         "kernel page table active; {} frames free",

@@ -1,6 +1,6 @@
 # S6: storage drivers (spec, v1)
 
-Status: v1. S6a (section 3 except interrupt objects) is built; the rest is not. This file is the written acceptance contract for S6
+Status: v1. S6a (section 3, including interrupt objects) is built; S6b and S6c are not. This file is the written acceptance contract for S6
 (CLAUDE.md: every milestone needs a runnable acceptance check, written before the code). Decisions
 made here are logged as OD64 and later in `OS-ARCHITECTURE.md` section 17.
 
@@ -69,8 +69,8 @@ fires: the trap handler *claims* it, **masks the source**, and sets the object's
 `INTERRUPT` (bit 5, `abi::signals::INTERRUPT`, included in `WAITABLE`) and wakes waiters. A driver
 `object_wait`s for `INTERRUPT`, services the device, then calls `interrupt_ack(handle)`: clears the
 signal, completes the claim and **unmasks** the source. Level-triggered devices therefore cannot
-storm. The state machine (Idle, Pending, Masked-until-acked, Destroyed) is host-tested in `kcore`
-(`irq_obj`); a destroyed object's pending interrupt is completed and the source masked (nothing is
+storm. The state machine (Idle, Pending-until-acked, Destroyed) is host-tested in `kcore`
+(`kcore/tests/interrupt_obj.rs`; the source-to-object map lives in the kernel); a destroyed object's pending interrupt is completed and the source masked (nothing is
 left enabled with nobody listening).
 
 **Unsupported controllers.** On a machine whose wired interrupts go through AIA (APLIC + IMSIC;

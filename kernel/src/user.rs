@@ -110,6 +110,8 @@ struct UserState {
     /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
     /// a signal wakes it, and each waiter re-checks its own condition.
     signal_queue: usize,
+    /// The interrupt object that owns each PLIC source (S6a-2).
+    irq_objs: [Option<kcore::object::ObjId>; abi::layout::MAX_IRQ as usize + 1],
     /// Output of user programs, assembled into lines.
     line: String,
     pass: u32,
@@ -160,6 +162,7 @@ fn state() -> &'static mut UserState {
             next_token: 1,
             ktable: HandleTable::new(256),
             signal_queue: thread::new_queue(),
+            irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
             line: String::new(),
             pass: 0,
             fail: 0,
@@ -767,7 +770,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
     if matches!(
         n,
-        nr::CHANNEL_CREATE | nr::EVENT_CREATE | nr::SOCKET_CREATE | nr::PORT_CREATE
+        nr::CHANNEL_CREATE
+            | nr::EVENT_CREATE
+            | nr::SOCKET_CREATE
+            | nr::PORT_CREATE
+            | nr::INTERRUPT_CREATE
     ) && s.objs.needs_sweep()
     {
         let roots = s.roots();
@@ -779,6 +786,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         line,
         pass,
         fail: failed,
+        irq_objs,
         ..
     } = s;
     let p = procs.get_mut(&pid).expect("process exists");
@@ -794,7 +802,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR if over(0) => {
             Some(Status::BadHandle)
         }
-        nr::VMO_CREATE_PHYSICAL | nr::VMO_CREATE_DMA if over(0) => Some(Status::BadHandle),
+        nr::VMO_CREATE_PHYSICAL | nr::VMO_CREATE_DMA | nr::INTERRUPT_CREATE | nr::INTERRUPT_ACK
+            if over(0) =>
+        {
+            Some(Status::BadHandle)
+        }
         nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
         nr::SOCKET_WRITE | nr::SOCKET_READ | nr::SOCKET_SHUTDOWN | nr::PORT_UNBIND if over(0) => {
             Some(Status::BadHandle)
@@ -1069,6 +1081,43 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 }
             }
         }
+        nr::INTERRUPT_CREATE => {
+            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
+            let irq = a[1];
+            if irq == 0 || irq > u64::from(abi::layout::MAX_IRQ) {
+                return fail(Status::InvalidArgs);
+            }
+            if !crate::plic::present() {
+                return fail(Status::NotSupported);
+            }
+            let slot = irq as usize;
+            let owned = matches!(*irq_objs.get(slot).unwrap_or(&None), Some(o)
+                if matches!(objs.get(o), Some(ipc::KObj::Interrupt(i)) if i.irq == irq as u32));
+            if owned {
+                return fail(Status::BadState);
+            }
+            match ipc::interrupt_object_create_in(
+                objs,
+                &mut p.handles,
+                irq as u32,
+                &mut quota(p.job),
+            ) {
+                Ok((hd, obj)) => {
+                    irq_objs[slot] = Some(obj);
+                    crate::plic::enable(irq as u32);
+                    Ok((Some(u64::from(hd.0)), None))
+                }
+                Err(e) => fail(e),
+            }
+        }
+        nr::INTERRUPT_ACK => {
+            let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
+                .map_err(|e| (e, None, None))?;
+            let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
+            crate::plic::complete(irq);
+            crate::plic::enable(irq);
+            Ok((Some(claims), None))
+        }
         nr::VMO_PHYS_ADDR => {
             let id =
                 ipc::vmo_of(objs, &p.handles, h(0), Rights::DMA).map_err(|e| (e, None, None))?;
@@ -1177,6 +1226,21 @@ fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
     }
 }
 
+/// A PLIC source fired (trap context, BKL held): hand it to the interrupt object that owns it.
+pub fn irq_fired(irq: u32) -> bool {
+    let s = state();
+    let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {
+        return false;
+    };
+    ipc::interrupt_fire(&mut s.objs, obj, irq)
+}
+
+/// Wake every waiter without the cleanup `notify` does (for the interrupt path).
+pub fn wake_signal_waiters() {
+    let q = state().signal_queue;
+    thread::wake_all(q);
+}
+
 /// Wake every thread waiting on a signal (they re-check their own conditions).
 pub fn notify() {
     cleanup_dead();
@@ -1218,6 +1282,19 @@ fn cleanup_dead() {
                     request_kill(p.pid, -2000)
                 }
                 ipc::KObj::Job(id) => irq::without(|| kmem::get().vmos.jobs.release(id)),
+                ipc::KObj::Interrupt(i) => irq::without(|| {
+                    // mask the source unless a newer object already owns it
+                    let s = state();
+                    let owned = matches!(s.irq_objs[i.irq as usize], Some(o)
+                        if matches!(s.objs.get(o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
+                    if !owned {
+                        s.irq_objs[i.irq as usize] = None;
+                        crate::plic::disable(i.irq);
+                        if i.fired {
+                            crate::plic::complete(i.irq); // the claim was held open for the ack
+                        }
+                    }
+                }),
                 _ => {}
             }
         }
