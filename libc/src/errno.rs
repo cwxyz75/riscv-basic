@@ -2,18 +2,16 @@
 
 use core::ffi::c_int;
 
-static mut ERRNO: c_int = 0;
-
-/// `errno` is `(*__errno_location())` in the header. One per process for now; per-thread storage
-/// arrives with pthreads (S7c-3).
+/// `errno` is `(*__errno_location())` in the header: per thread (the thread control block `tp`
+/// points to), with a process-wide fallback for a thread this library did not create.
 #[no_mangle]
 pub extern "C" fn __errno_location() -> *mut c_int {
-    core::ptr::addr_of_mut!(ERRNO)
+    crate::thread::errno_ptr()
 }
 
 pub fn set(e: c_int) {
-    // SAFETY: a plain integer store to the process's errno (single-threaded until pthreads).
-    unsafe { ERRNO = e }
+    // SAFETY: the calling thread's errno.
+    unsafe { *__errno_location() = e }
 }
 
 pub const ERANGE: c_int = 34;

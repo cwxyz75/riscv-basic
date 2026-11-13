@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
 Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a, S7b
-and the first three parts of S7c (the `cfmt` cores, the C ABI library with the first C program, files and time) are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
+and all of S7c (the `cfmt` cores, the C ABI library with the first C program, files and time, threads) is built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -219,6 +219,25 @@ are normalised (`./x`, `a//b`, trailing slash; an empty path is ENOENT), push-ba
 writing, and `bkl_is_released_on_user_entry_and_idle` (flaky under load, T49) now only requires the lock
 to be free at least as often as held. Still to do in S7c-3b: pthreads, per-thread `errno`, the 1 MiB
 main stack.
+
+**As built (S7c-3b).** `pthread_create`/`join`/`detach`/`exit`/`self`/`equal` and attributes, mutexes
+(normal, recursive, error-checking) and condition variables (with `pthread_cond_timedwait` against
+`CLOCK_REALTIME`, which is time since boot) on the S7b futexes, `pthread_once`, thread-specific keys
+(no destructors run), `sched_yield`, `nanosleep`, `sleep`, `usleep`, `clock_gettime`. A thread's state
+(its `errno`, key values, join state) is a thread control block that `tp` points to: `run_main` sets it
+for the main thread, the thread trampoline for the others (the kernel starts threads with `tp` = 0 and
+keeps a thread's `tp` across traps); a library call from a thread this library did not create uses a
+process-wide fallback `errno`. A thread's stack is 256 KiB mapped lazily at the top of a 512 KiB slot
+(the lower half is an unmapped guard); `pthread_join` waits for the thread to announce its exit and for
+its thread object to terminate, then unmaps the stack. `main` runs on a 1 MiB stack the library maps
+itself. `<pthread.h>`, `<sched.h>` and the `time.h`/`unistd.h` additions are in `libc/include/`. The
+transcript's threads section (a mutex-protected counter, joins with return values, per-thread `errno`,
+a condition-variable queue with two consumers, `pthread_once`, keys, recursive mutex and `trylock`
+from another thread, a detached thread, and a 700 KiB recursion that needs the big stack) matches the
+host program under `-pthread` at one, two and four harts; mutants that make `errno` process-wide or
+drop the big stack are caught. Not done (T52): stdio is not thread safe per stream, detached threads
+and their stacks are reclaimed only at process end, key destructors, `pthread_cancel`, barriers, read-write
+locks, thread stacks other than the default size.
 
 **Variadics (B1).** Stable Rust cannot define a variadic function. `printf`, `fprintf`, `snprintf`,
 `sprintf`, `sscanf` (only if Lua's import list needs it) are entered through **assembly stubs** written
