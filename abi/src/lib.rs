@@ -172,10 +172,13 @@ pub mod signals {
     pub const PEER_CLOSED: u32 = 1 << 2;
     /// A process has ended.
     pub const TERMINATED: u32 = 1 << 3;
+    /// The peer socket end called `socket_shutdown`: no more data will arrive beyond what is queued.
+    pub const WRITE_CLOSED: u32 = 1 << 4;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
     /// Every signal a wait or a port binding may name.
-    pub const WAITABLE: u32 = READABLE | WRITABLE | PEER_CLOSED | TERMINATED | USER_MASK;
+    pub const WAITABLE: u32 =
+        READABLE | WRITABLE | PEER_CLOSED | TERMINATED | WRITE_CLOSED | USER_MASK;
 }
 
 /// The handle value of the bootstrap channel every process starts with.
@@ -251,6 +254,7 @@ pub mod syscall {
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
+    pub const SOCKET_SHUTDOWN: usize = 73;
     pub const PORT_CREATE: usize = 80;
     pub const PORT_BIND: usize = 81;
     pub const PORT_UNBIND: usize = 82;

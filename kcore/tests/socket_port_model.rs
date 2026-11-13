@@ -456,3 +456,34 @@ fn the_system_wide_buffer_budget_is_enforced() {
         "destruction gives the bytes back"
     );
 }
+
+#[test]
+fn half_close_ends_the_stream_one_way_only() {
+    let (mut reg, mut t) = world();
+    let (a, b) = socket_create(&mut reg, &mut t).unwrap();
+    assert_eq!(socket_write(&mut reg, &t, a, b"req"), Ok(3));
+    socket_shutdown(&mut reg, &t, a).unwrap();
+    socket_shutdown(&mut reg, &t, a).unwrap(); // idempotent
+                                               // the peer sees WRITE_CLOSED (not PEER_CLOSED), drains the data, then end of stream
+    let s = signals_of(&reg, &t, b).unwrap();
+    assert_eq!(s & signals::WRITE_CLOSED, signals::WRITE_CLOSED);
+    assert_eq!(s & signals::PEER_CLOSED, 0);
+    assert_eq!(
+        s & signals::WRITABLE,
+        signals::WRITABLE,
+        "the peer may still write"
+    );
+    assert_eq!(socket_read(&mut reg, &t, b, 10).unwrap(), b"req");
+    assert_eq!(socket_read(&mut reg, &t, b, 10), Err(Status::PeerClosed));
+    // the shut end cannot write any more, and is no longer WRITABLE ...
+    assert_eq!(socket_write(&mut reg, &t, a, b"x"), Err(Status::BadState));
+    assert_eq!(signals_of(&reg, &t, a).unwrap() & signals::WRITABLE, 0);
+    // ... but it can still read the reply
+    assert_eq!(socket_write(&mut reg, &t, b, b"resp"), Ok(4));
+    assert_eq!(socket_read(&mut reg, &t, a, 10).unwrap(), b"resp");
+    // the other direction is untouched: no end of stream on the shut end
+    assert_eq!(socket_read(&mut reg, &t, a, 10), Err(Status::ShouldWait));
+    // rights and types
+    let ro = weaker(&mut reg, &mut t, b, Rights::READ);
+    assert_eq!(socket_shutdown(&mut reg, &t, ro), Err(Status::AccessDenied));
+}

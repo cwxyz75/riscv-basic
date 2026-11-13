@@ -288,6 +288,9 @@ pub mod sys {
     pub fn socket_read(socket: u32, buf: *mut u8, max: usize) -> Ret {
         syscall(SOCKET_READ, [socket as usize, buf as usize, max, 0, 0, 0])
     }
+    pub fn socket_shutdown(socket: u32) -> Ret {
+        syscall(SOCKET_SHUTDOWN, [socket as usize, 0, 0, 0, 0, 0])
+    }
     pub fn port_create() -> Ret {
         syscall(PORT_CREATE, [0; 6])
     }

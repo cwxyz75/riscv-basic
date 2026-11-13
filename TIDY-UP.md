@@ -61,7 +61,6 @@ Rules:
 | T14 | M | **Serial access through a kernel bridge thread** (S4 spec, OD52), not a user-mode driver with MMIO and interrupt capabilities. The bridge **polls** the UART every tick (no receive interrupt), drops input bytes when the process is not reading (counted), and a kernel `##` line can still split a forwarded chunk only between chunks. | No device-capability objects until S6. | S6: interrupt object + MMIO VMO; `consoled` drives the UART directly; delete the bridge. |
 | T15 | M | **Service death policy = rebuild the whole stack** (S4): no service discovery, no reconnect, `memfsd` state lost on restart. | Memory filesystem has nothing to keep; keeps S4 small. | A name/registry service with reconnect, and real state recovery with the disk filesystem (S6+). |
 | T16 | M | **memfs keeps file data in the server's heap**, programs are copied through memory objects only for `/bin` (S4 spec section 7). | Simple, host-testable. | Back files with VMOs (`GetVmo` for everything), shared page cache, `mmap` (S11). |
-| T17 | M | **No socket half-close**: a terminal has no end-of-file for programs; `cat` with no arguments ends only with Ctrl-C (S4). | Rare in S4. | Add `socket_shutdown` (or a close-write right) before pipelines of real tools matter. |
 | T18 | L | **Shell has no redirection, variables, globbing, job control**; one foreground pipeline; confined `CWD` is read-only. | Out of S4's acceptance. | A later slice: redirection through a pump in the shell; creation rights on a writable cwd. |
 | T19 | L | **The shell's `PATH` is a fixed `/bin`**; commands are looked up by a plain name; programs are only the boot image. | Boot image is the only program source. | Manifest-driven search paths and a package/installer story (S10). |
 
@@ -86,6 +85,7 @@ Rules:
 | R5 | A user program could panic the kernel with many threads or sockets (reviews of S3c-2b, S3c-3) | PRs 45, 46 |
 | R6 | T7: 16-bit handle generation. Now 19 bits, and a slot that has used them all is retired, so a stale handle value cannot become valid again | tidy-up PR |
 | R7 | T10: `copy_to_user` results ignored after `verify_writable`. Writes after verification use `copy_to_user_verified` (no allocation, no commit) and report errors | tidy-up PR |
+| R11 | T17: no socket half-close. `socket_shutdown` and the WRITE_CLOSED signal (OD63); the terminal itself still has no permanent end-of-input, which is by design | tidy-up PR |
 | R10 | T9: no kernel lock. The big kernel lock (S5b) with per-thread depth hand-over, a lock-order checker, and the SMP suites at -smp 1, 2 and 4 (S5a-S5e) | PRs 70, 71, 72 |
 | R9 | T4: the global IPC budget was shared and ambient; it is now a backstop behind per-job queued-data quotas (S4.5c) | PR 68 |
 | R8 | T36: `MANAGE` on a job covered setting limits. New `SET_LIMITS` right; MANAGE only makes things inside the job | tidy-up PR |

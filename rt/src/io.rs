@@ -38,9 +38,11 @@ pub fn read(h: u32, buf: &mut [u8]) -> Result<usize, IoError> {
         match r.status() {
             Some(Status::Ok) => return Ok(r.a1),
             Some(Status::PeerClosed) => return Ok(0),
-            Some(Status::ShouldWait) => {
-                wait(h, signals::READABLE | signals::PEER_CLOSED, u64::MAX)?
-            }
+            Some(Status::ShouldWait) => wait(
+                h,
+                signals::READABLE | signals::PEER_CLOSED | signals::WRITE_CLOSED,
+                u64::MAX,
+            )?,
             _ => return Err(IoError::Other(r.status)),
         }
     }
