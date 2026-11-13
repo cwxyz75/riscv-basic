@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod blk;
 pub mod bootimg;
 pub mod console;
+pub mod devmgr;
 pub mod file;
 pub mod launch;
 pub mod startup;

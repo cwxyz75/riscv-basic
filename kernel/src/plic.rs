@@ -47,23 +47,36 @@ pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
+/// The device tree OpenSBI handed over, as bytes (None if the address is not inside the top 2 MiB
+/// of RAM that `kmem` direct-maps read-only, or does not hold a tree header).
+pub fn dtb_blob() -> Option<&'static [u8]> {
+    let dtb = DTB.load(Ordering::Relaxed) as u64;
+    let ram_top = abi::layout::RAM_BASE + abi::layout::RAM_SIZE;
+    if dtb < ram_top - 2 * 1024 * 1024 || dtb >= ram_top - 64 {
+        return None;
+    }
+    let head = (abi::layout::DIRECT_BASE + dtb) as *const u8;
+    // SAFETY: `dtb` lies inside the direct-mapped top 2 MiB (checked above), so the 8 header bytes
+    // exist; the total size is then clamped to what is left of that region before the slice is formed.
+    unsafe {
+        if u32::from_be_bytes([*head, *head.add(1), *head.add(2), *head.add(3)]) != 0xd00d_feed {
+            return None;
+        }
+        let total =
+            u32::from_be_bytes([*head.add(4), *head.add(5), *head.add(6), *head.add(7)]) as u64;
+        if total < 40 {
+            return None;
+        }
+        let len = total.min(ram_top - dtb) as usize;
+        Some(core::slice::from_raw_parts(head, len))
+    }
+}
+
 /// Look for a PLIC in the device tree and, if there is one, open the boot hart's context
 /// (threshold 0, no source enabled) and allow supervisor external interrupts on this hart.
 pub fn init(boot_hart: usize) {
-    let dtb = DTB.load(Ordering::Relaxed) as u64;
-    // The top 2 MiB of RAM, where QEMU puts the tree, is direct-mapped read-only by `kmem`.
-    let ram_top = abi::layout::RAM_BASE + abi::layout::RAM_SIZE;
-    if dtb < ram_top - 2 * 1024 * 1024 || dtb >= ram_top - 64 {
+    let Some(blob) = dtb_blob() else {
         return;
-    }
-    let head = (abi::layout::DIRECT_BASE + dtb) as *const u8;
-    // SAFETY: `dtb` lies inside the direct-mapped top 2 MiB (checked above); the header's own
-    // total size is clamped to what is left of that region before the slice is formed.
-    let blob = unsafe {
-        let total =
-            u32::from_be_bytes([*head.add(4), *head.add(5), *head.add(6), *head.add(7)]) as u64;
-        let len = total.min(ram_top - dtb) as usize;
-        core::slice::from_raw_parts(head, len)
     };
     if !kcore::fdt::has_compatible(blob, "riscv,plic0")
         && !kcore::fdt::has_compatible(blob, "sifive,plic-1.0.0")

@@ -802,7 +802,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR if over(0) => {
             Some(Status::BadHandle)
         }
-        nr::VMO_CREATE_PHYSICAL | nr::VMO_CREATE_DMA | nr::INTERRUPT_CREATE | nr::INTERRUPT_ACK
+        nr::VMO_CREATE_PHYSICAL
+        | nr::VMO_CREATE_DMA
+        | nr::RESOURCE_DTB
+        | nr::INTERRUPT_CREATE
+        | nr::INTERRUPT_ACK
             if over(0) =>
         {
             Some(Status::BadHandle)
@@ -1075,6 +1079,29 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             );
             match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
                 Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Err(e) => {
+                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    fail(e)
+                }
+            }
+        }
+        nr::RESOURCE_DTB => {
+            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
+            let Some(blob) =
+                crate::plic::dtb_blob().filter(|b| b.len() <= abi::limits::MAX_DTB_BYTES)
+            else {
+                return fail(Status::NotSupported);
+            };
+            let pages = (blob.len() as u64).div_ceil(4096);
+            let id = k.vmos.create_in(pages, p.job);
+            if k.vmos.write(&mut k.mm, id, 0, blob).is_err() {
+                let _ = k.vmos.destroy(&mut k.mm, id);
+                return fail(Status::NoMemory);
+            }
+            let rights =
+                Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
+                Ok(hd) => Ok((Some(u64::from(hd.0)), Some(blob.len() as u64))),
                 Err(e) => {
                     let _ = k.vmos.destroy(&mut k.mm, id);
                     fail(e)

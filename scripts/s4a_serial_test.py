@@ -23,7 +23,7 @@ import threading
 import time
 
 TIMEOUT = float(os.environ.get("S4_TIMEOUT", "90"))
-BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/launcher bin/memfsd bin/consoled bin/spin bin/echo bin/cat bin/ls bin/probe bin/sh bin/hog bin/bomb bin/ipchog bin/blkd etc/trusted "
+BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/launcher bin/memfsd bin/consoled bin/spin bin/echo bin/cat bin/ls bin/probe bin/sh bin/hog bin/bomb bin/ipchog bin/blkd bin/devmgr etc/trusted "
           b"home/hello.txt home/lines.txt home/sub/inner.txt")
 
 
@@ -125,7 +125,7 @@ def main():
     s.step(b"run hello after-errors\n", [b"args=hello after-errors", b"[exit 2]"], "the launcher still works")
     # S4c: the filesystem server, through init's `ls`, `cat` and `write` test commands
     s.step(b"ls .\n", [b"bin/", b"etc/", b"home/", b"tmp/"], "the top level")
-    s.step(b"ls bin\n", [b"blkd", b"bomb", b"cat", b"consoled", b"crash", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher", b"ls", b"memfsd", b"probe", b"sh", b"spin"], "the programs")
+    s.step(b"ls bin\n", [b"blkd", b"bomb", b"cat", b"consoled", b"crash", b"devmgr", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher", b"ls", b"memfsd", b"probe", b"sh", b"spin"], "the programs")
     s.step(b"ls home\n", [b"hello.txt", b"lines.txt", b"sub/"], "the home directory")
     s.step(b"cat home/hello.txt\n", [b"hello, world"], "a fixture")
     s.step(b"cat home/sub/inner.txt\n", [b"inner"], "a nested fixture")

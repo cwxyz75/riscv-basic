@@ -39,6 +39,10 @@ pub enum Role {
     BlkIrq = 13,
     /// The channel a block driver serves the block protocol on.
     ServiceBlk = 14,
+    /// The root resource (the device manager's authority).
+    Resource = 15,
+    /// The channel the device manager serves (`proto::devmgr`).
+    ServiceDevmgr = 16,
 }
 
 impl Role {
@@ -58,6 +62,8 @@ impl Role {
             12 => Role::BlkDma,
             13 => Role::BlkIrq,
             14 => Role::ServiceBlk,
+            15 => Role::Resource,
+            16 => Role::ServiceDevmgr,
             _ => return None,
         })
     }

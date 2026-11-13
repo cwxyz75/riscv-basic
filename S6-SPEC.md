@@ -1,6 +1,6 @@
 # S6: storage drivers (spec, v1)
 
-Status: v1. S6a (section 3, including interrupt objects) and S6b (the driver and protocol) are built; S6c (device tree and driver manager) is not. This file is the written acceptance contract for S6
+Status: v1. S6a (section 3, including interrupt objects) and S6b (the driver and protocol) and S6c (device tree and driver manager) are built. This file is the written acceptance contract for S6
 (CLAUDE.md: every milestone needs a runnable acceptance check, written before the code). Decisions
 made here are logged as OD64 and later in `OS-ARCHITECTURE.md` section 17.
 
@@ -28,7 +28,7 @@ driver polls there), no change to `consoled` (T14 stays; S6d is optional).
 - **S6c, device tree and driver manager.** A pure DTB parser (`dtb` module in `kcore` or its own
   crate, `forbid(unsafe_code)`, fuzzed: it must not panic on hostile input) and a `devmgr` user
   program that finds virtio-mmio nodes, probes the device id register and starts the matching
-  driver with only its handles. The kernel hands `init` a read-only VMO holding the DTB.
+  driver with only its handles. The kernel gives the holder of the root resource a read-only copy of the DTB (`resource_dtb`).
 
 Each slice is one PR, green on `make check`, with a Fable-or-equivalent independent review before
 merge for S6a (new kernel authority).

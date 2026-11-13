@@ -299,7 +299,7 @@ Acceptance: a pattern written to the virtual disk reads back identical; the bloc
 driver can be killed and restarted.
 
 - [x] Interrupt objects and device-memory VMOs
-- [ ] Driver manager and device-tree parsing
+- [x] Driver manager and device-tree parsing
 - [x] Userspace virtio-blk driver and block protocol
 
 ### S7: libc and ported software
