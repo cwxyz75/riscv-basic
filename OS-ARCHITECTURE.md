@@ -738,6 +738,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD64 | S6 (S6-SPEC.md): device authority is a *root resource* object (only the kernel-started process can obtain it) that mints physical (MMIO) VMOs inside fixed device windows and DMA VMOs (contiguous RAM, physical address gated by a DMA right, system budget 4 MiB); the kernel never copies through device memory. Interrupt objects are PLIC-only; on AIA machines drivers poll. | decided |
 
 | OD65 | Block storage (S6b): the driver (`blkd`) is an ordinary user program that is handed only an MMIO slot, a DMA buffer, an optional interrupt and its service channel; the block protocol is request/reply messages (`proto::blk`, 8 KiB per I/O). A driver's death must not free DMA memory a device may still write: the *supervisor* keeps its own handles to the DMA buffer and slot across driver lifetimes and resets the device before reuse (T42), rather than a kernel quarantine. | decided |
+| OD66 | The device manager (S6c, `devmgr`) is a user program holding the root resource: it reads the device tree through `resource_dtb` (a copy, parsed by the pure `kcore::fdt`), probes the virtio-mmio slots it lists, owns the DMA buffer and MMIO window for the block device and starts `blkd` per client with only those handles (OD65's supervisor role). Clients ask it over `proto::devmgr` for a block channel; one driver at a time. | decided |
 ---
 
 ## 18. Open questions (stop and ask the product owner)

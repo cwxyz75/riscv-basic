@@ -4113,6 +4113,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"cat".to_vec(),
             b"consoled".to_vec(),
             b"crash".to_vec(),
+            b"devmgr".to_vec(),
             b"echo".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
@@ -5892,6 +5893,151 @@ fn blk_driver_restart() -> Outcome {
     Ok(())
 }
 
+// --- The device manager (S6c) -----------------------------------------------------------------
+
+/// One OpenBlock exchange: the status and the block channel that came with an Ok.
+fn devmgr_open(ch: u32, txid: u32) -> Result<(proto::devmgr::Status, Option<u32>), Detail> {
+    let req = proto::devmgr::encode_open_block(txid);
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            req.as_ptr(),
+            req.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send OpenBlock"
+    );
+    let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000);
+    ensure_eq!(st(w), Some(S::Ok), "the manager answers");
+    let mut buf = [0u8; 64];
+    let mut hs = [0u32; 2];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
+    ensure_eq!(st(r), Some(S::Ok), "read the reply");
+    let (t, status) = proto::devmgr::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(t, txid, "the reply answers this transaction");
+    ensure_eq!(
+        r.a2,
+        usize::from(status == proto::devmgr::Status::Ok),
+        "a handle only with Ok"
+    );
+    Ok((status, (r.a2 == 1).then_some(hs[0])))
+}
+
+fn devmgr_starts_blkd_for_the_disk() -> Outcome {
+    use proto::devmgr::Status as D;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let have_disk = match find_blk(res)? {
+        Some(_) => {
+            let me = sys::process_self().a1 as u32;
+            sys::process_unmap(me, MMIO_VA);
+            sys::handle_close(me);
+            true
+        }
+        None => false,
+    };
+    // start the manager
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/devmgr")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let res_dup = ok(
+        sys::handle_duplicate(res, Rights::SAME.0),
+        "dup the resource",
+    )?
+    .a1 as u32;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let s = Startup {
+        args: vec![b"devmgr".to_vec()],
+        roles: vec![
+            (Role::Resource, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceDevmgr, 2),
+        ],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    // in a job of its own: when it and its driver are gone nothing of theirs is left (no leaked
+    // process, thread, page or object)
+    let root = root_job()?;
+    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let mgr = rt::spawn::spawn_in(&image, &bytes, &[res_dup, bi_dup, theirs], mj).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn devmgr: {e:?}"));
+        d
+    })?;
+    // a request that is not OpenBlock is refused with its txid
+    let bad = [5u8, 0, 0, 0, 9, 0, 0, 0];
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            bad.as_ptr(),
+            bad.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send a bad request"
+    );
+    let w = sys::object_wait(mine, sig::READABLE, sys::clock_get() + 5000);
+    ensure_eq!(st(w), Some(S::Ok), "the manager answers a bad request");
+    let mut rb = [0u8; 16];
+    let r = sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        proto::devmgr::decode_reply(&rb[..r.a1]),
+        Some((5, D::BadRequest)),
+        "BAD_REQUEST with its txid"
+    );
+    if !have_disk {
+        // no disk in the device tree's block slot: nothing is started
+        let (status, h) = devmgr_open(mine, 1)?;
+        ensure_eq!((status, h), (D::NoDevice, None), "no block device");
+        sys::debug_write(b"s6: devmgr: no block device\n");
+    } else {
+        sys::debug_write(b"s6: devmgr found the disk\n");
+        let (status, h) = devmgr_open(mine, 1)?;
+        ensure_eq!(status, D::Ok, "the manager opens the disk");
+        let blkch = h.ok_or_else(|| msg_at(line!()))?;
+        write_pattern(blkch, 7000, 32)?;
+        check_pattern(blkch, 7000, 32)?;
+        // one driver at a time
+        let (status, h) = devmgr_open(mine, 2)?;
+        ensure_eq!(
+            (status, h),
+            (D::Busy, None),
+            "a second open while the first is in use"
+        );
+        check_pattern(blkch, 7000, 32)?;
+        // the client lets go: the driver ends, and a new open starts a fresh one on the same data
+        sys::handle_close(blkch);
+        let until = sys::clock_get() + 3000;
+        let again = loop {
+            let (status, h) = devmgr_open(mine, 3)?;
+            if status == D::Ok {
+                break h.ok_or_else(|| msg_at(line!()))?;
+            }
+            ensure_eq!(status, D::Busy, "only Busy while the old driver winds down");
+            ensure!(sys::clock_get() < until, "the old driver never ended");
+            let _ = sys::object_wait(mine, 1 << 24, sys::clock_get() + 5);
+        };
+        check_pattern(again, 7000, 32)?;
+        sys::handle_close(again);
+    }
+    // the client goes away: the manager ends cleanly
+    sys::handle_close(mine);
+    wait_ended(mgr, 3000)?;
+    ensure_eq!(sys::process_info(mgr).a1 as i64, 0, "the manager exits 0");
+    sys::handle_close(mgr);
+    job_use_settles(mj, 0, 0, 3000)?;
+    job_use_settles(mj, 1, 0, 3000)?;
+    job_use_settles(mj, 2, 0, 3000)?;
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -5925,6 +6071,55 @@ fn device_caps_need_the_resource() -> Outcome {
         Some(S::AccessDenied),
         "dma: no MANAGE"
     );
+    // the device tree copy: same gate, and what comes back is a read-only VMO of the right shape
+    ensure_eq!(
+        st(sys::resource_dtb(0xdead)),
+        Some(S::BadHandle),
+        "dtb: bad handle"
+    );
+    ensure_eq!(
+        st(sys::resource_dtb(ev)),
+        Some(S::WrongType),
+        "dtb: an event is no resource"
+    );
+    ensure_eq!(
+        st(sys::resource_dtb(weak)),
+        Some(S::AccessDenied),
+        "dtb: no MANAGE"
+    );
+    let dtb = ok(sys::resource_dtb(res), "resource_dtb")?;
+    let (dvmo, dlen) = (dtb.a1 as u32, dtb.a2);
+    ensure!(
+        (40..=256 * 1024).contains(&dlen),
+        "a plausible length: {dlen}"
+    );
+    ensure_eq!(
+        sys::vmo_get_size(dvmo).a1,
+        dlen.div_ceil(4096) * 4096,
+        "sized in whole pages"
+    );
+    let mut head = [0u8; 8];
+    ensure_eq!(
+        st(sys::vmo_read(dvmo, 0, head.as_mut_ptr(), 8)),
+        Some(S::Ok),
+        "read the header"
+    );
+    ensure_eq!(
+        head[..4],
+        [0xd0, 0x0d, 0xfe, 0xed],
+        "the flattened-tree magic"
+    );
+    ensure_eq!(
+        u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize,
+        dlen,
+        "the header's total size is the length returned"
+    );
+    ensure_eq!(
+        st(sys::vmo_write(dvmo, 0, head.as_ptr(), 8)),
+        Some(S::AccessDenied),
+        "read-only"
+    );
+    sys::handle_close(dvmo);
     // device windows only: never RAM, never off-window, never misaligned or empty
     for (pa, len, what) in [
         (0x8000_0000u64, 4096u64, "RAM"),
@@ -7114,6 +7309,10 @@ pub fn app_main() -> i32 {
         ),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
+        (
+            "devmgr_starts_blkd_for_the_disk",
+            devmgr_starts_blkd_for_the_disk,
+        ),
         (
             "a_child_has_no_device_authority",
             a_child_has_no_device_authority,

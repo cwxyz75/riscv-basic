@@ -208,6 +208,8 @@ pub mod limits {
     /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for
     /// per-job quotas (OS-ARCHITECTURE Q9).
     pub const MAX_OBJECTS: usize = 16384;
+    /// Largest device tree `resource_dtb` will copy.
+    pub const MAX_DTB_BYTES: usize = 256 * 1024;
     /// Pages in one DMA VMO, and in all DMA VMOs together (S6: a stand-in for per-job DMA quotas).
     pub const MAX_DMA_PAGES: u64 = 64;
     pub const MAX_DMA_TOTAL_PAGES: u64 = 1024;
@@ -281,6 +283,7 @@ pub mod syscall {
     pub const JOB_KILL: usize = 93;
     pub const JOB_ROOT: usize = 94;
     pub const RESOURCE_ROOT: usize = 95;
+    pub const RESOURCE_DTB: usize = 102;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

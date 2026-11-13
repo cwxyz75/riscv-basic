@@ -216,6 +216,10 @@ pub mod sys {
     pub fn vmo_phys_addr(vmo: u32) -> Ret {
         syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
     }
+    /// A read-only VMO holding the device tree; `a2` is its length in bytes.
+    pub fn resource_dtb(resource: u32) -> Ret {
+        syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])
+    }
     pub fn interrupt_create(resource: u32, irq: u32) -> Ret {
         syscall(
             INTERRUPT_CREATE,

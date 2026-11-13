@@ -182,6 +182,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 95 | resource_root | | `a1` handle |
 | 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
 | 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
+| 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
 
@@ -362,6 +363,13 @@ contiguous run is free. The returned handle has VMO rights without EXECUTE plus 
 
 The physical address of a DMA VMO's first byte. Needs the DMA right (ACCESS_DENIED without it, so
 a duplicate made without DMA cannot learn addresses); WRONG_TYPE for a VMO that is not a DMA VMO.
+
+### resource_dtb(resource) -> status, handle, length
+
+A read-only VMO (rights READ, MAP, DUPLICATE, TRANSFER) holding a copy of the device tree OpenSBI
+handed to the kernel; `length` is its size in bytes. `resource` needs MANAGE. NOT_SUPPORTED if the
+kernel found no tree (or one over `MAX_DTB_BYTES`, 256 KiB); NO_MEMORY if the caller's job is out of
+pages. The tree is data from the firmware: the reader (`kcore::fdt::parse`) is hostile-input safe.
 
 ### interrupt_create(resource, source) -> status, handle
 
@@ -774,3 +782,4 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | socket_shutdown | specified and implemented (tidy-up, T17) |
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
+| resource_dtb | specified and implemented (S6c) |
