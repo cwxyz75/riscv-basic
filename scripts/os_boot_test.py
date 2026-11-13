@@ -172,6 +172,7 @@ def lua_transcript_problems(text):
     `s7: lua transcript` markers) must be byte-identical. Compared after escaping every byte outside
     printable ASCII as \\xNN on both sides (the console shows only printable ASCII)."""
     import glob
+    import shutil
     import tempfile
     lines = text.split("\n")
     if "s7: lua transcript begins" not in lines or "s7: lua transcript ends" not in lines:
@@ -191,7 +192,10 @@ def lua_transcript_problems(text):
             if cc.returncode != 0:
                 return ["could not build the host Lua: " + cc.stderr[-300:]]
             # (run in the scratch directory: the script's files are relative to it)
-            run_ = subprocess.run([exe, script], capture_output=True, timeout=60, cwd=d)
+            # (a short relative path: Lua abbreviates long chunk names in error messages, and the
+            # script replaces its own name in the transcript)
+            shutil.copy(script, os.path.join(d, "s7.lua"))
+            run_ = subprocess.run([exe, "s7.lua"], capture_output=True, timeout=60, cwd=d)
         except (OSError, subprocess.TimeoutExpired) as e:
             return [f"the host Lua did not run: {e}"]
     if run_.returncode != 0:
