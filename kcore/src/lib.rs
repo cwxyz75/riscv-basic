@@ -12,6 +12,7 @@ pub mod aspace;
 pub mod elf;
 pub mod fdt;
 pub mod frame;
+pub mod futex;
 pub mod handle;
 pub mod ipc;
 pub mod job;

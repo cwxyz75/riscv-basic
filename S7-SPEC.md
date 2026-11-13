@@ -1,7 +1,7 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
-Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a is
-built (see its section for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
+Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a and
+S7b are built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
 file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
 acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
 `OS-ARCHITECTURE.md` section 17 when the spec is accepted.
@@ -132,6 +132,25 @@ decision, not part of S7. A thread's stack is a 64 KiB mapping plus an unmapped 
 `pthread_create`; `pthread_join` waits for the thread object's TERMINATED signal, then unmaps the
 stack (a thread cannot unmap its own); a detached thread's stack is released when the process ends
 (documented leak).
+
+**As built (S7b).** `kcore::futex` (table, random model against a plain list, loom/shuttle test of
+the check-then-enqueue step with a mutant that makes it fail), `futex_wait`/`futex_wake` (syscalls 110
+and 111; the value is read by `usercopy::read_user_u32`, one aligned 64-bit load), a backstop that
+forgets a process's sleepers at teardown, and a kernel check that no futex sleeper survives the test
+run. `rt::sync` has `Mutex`, `Condvar`, `Once` and `Semaphore`, each with a deadline form; replacing
+the spin lock in the `rt` heap (T26) is not done. The tests below pass at `-smp 1`, `2`, `4` and in
+single-hart icount mode; a mutant that never sleeps fails three of them. Differences from the list below:
+`futex_wake_counts` and `futex_wakes_fifo` are one test, `futex_wake_counts_and_fifo` (counts and the
+other-process case first, where only the *set* of the two oldest woken is checked because two harts
+record in either order, then FIFO one wake at a time); `mutex_excludes_across_harts` runs 3 contending
+workers plus the main thread, not 4; `condvar_producer_consumer` moves 2,500 items, not 10,000;
+`kill_a_futex_waiter` has the child say it is about to sleep, and checks the job's ledger plus the
+kernel's end-of-run check that no sleeper survives (the "a later wake returns 0" check is covered by
+`kcore::futex`'s unit tests). The loom/shuttle test models the kernel's check-then-enqueue step with a
+lock; during development a mutant that read the word *before* taking the lock failed it, but it checks
+the model, not `kernel/src/user.rs` (the QEMU tests do that). Review found and fixed a lost-wake bug
+in `Mutex::lock_until` (it gave up on an OK wake past its deadline); the interleaving cannot be forced
+in a test, so the fix is argued in a comment.
 
 **Acceptance (QEMU).** Each proves *blocking*, not just completion (a futex that returns at once
 would pass a spin loop):

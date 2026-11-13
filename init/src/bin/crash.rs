@@ -361,6 +361,20 @@ pub fn app_main() -> i32 {
         }
         40 => return unmap_while_siblings_touch(),
         n if n & 0xff == 42 => return churn((n >> 8) as u64),
+        n if n & 0xff == 51 => {
+            // S7b: a wake from another process on the same address number wakes nobody: the exit
+            // code is 100 plus the number of threads it woke (0 expected), 1 if the call failed.
+            let r = rt::sys::futex_wake((n >> 8) as *const u32, 10);
+            return if r.status == 0 { 100 + r.a1 as i32 } else { 1 };
+        }
+        52 => {
+            // S7b: sleep on a futex forever (until killed): nothing may be left behind
+            static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            // tell the parent we are about to sleep (it then waits a moment and kills us)
+            rt::sys::channel_write(rt::BOOTSTRAP, b"s".as_ptr(), 1, core::ptr::null(), 0);
+            rt::sys::futex_wait(WORD.as_ptr(), 0, u64::MAX);
+            return 3; // not reached unless woken, which nobody does
+        }
         41 => {
             // S5d: a process with two spinning sibling threads (and itself spinning): ended from
             // outside while they run on other harts.

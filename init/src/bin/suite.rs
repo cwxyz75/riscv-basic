@@ -5882,6 +5882,429 @@ fn blk_driver_restart() -> Outcome {
     Ok(())
 }
 
+// --- Futexes and sleeping locks (S7b) -----------------------------------------------------------
+
+use rt::sync::{Condvar, Mutex, Once, Semaphore};
+
+static FW: AtomicU32 = AtomicU32::new(0); // the futex word the tests sleep on
+static ARRIVED: AtomicU32 = AtomicU32::new(0);
+static WOKEN_N: AtomicU32 = AtomicU32::new(0);
+static WOKEN_ORDER: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+/// Worker `arg`: announce, sleep on FW (value 0) for up to 4 s, record that it woke and in what order.
+extern "C" fn futex_sleeper(arg: usize) -> ! {
+    ARRIVED.fetch_add(1, Ordering::SeqCst);
+    let r = sys::futex_wait(FW.as_ptr(), 0, sys::clock_get() + 4000);
+    if r.status == 0 {
+        let i = WOKEN_N.fetch_add(1, Ordering::SeqCst) as usize;
+        if i < 4 {
+            WOKEN_ORDER[i].store(arg as u32, Ordering::SeqCst);
+        }
+    }
+    sys::thread_exit(r.status)
+}
+
+fn nap_ticks(ticks: u64) {
+    sleep_in_thread(ticks);
+}
+
+fn futex_argument_errors() -> Outcome {
+    FW.store(0, Ordering::SeqCst);
+    let p = FW.as_ptr();
+    let wait = |a: u64, e: u64, d: u64| {
+        st(rt::syscall(
+            rt::abi::syscall::FUTEX_WAIT,
+            [a as usize, e as usize, d as usize, 0, 0, 0],
+        ))
+    };
+    ensure_eq!(
+        wait(p as u64 + 1, 0, 5),
+        Some(S::InvalidArgs),
+        "a misaligned address"
+    );
+    ensure_eq!(
+        wait(p as u64 + 2, 0, 5),
+        Some(S::InvalidArgs),
+        "a half-aligned address"
+    );
+    ensure_eq!(
+        wait(0x10, 0, 5),
+        Some(S::InvalidArgs),
+        "an address below user memory"
+    );
+    ensure_eq!(
+        wait(0xffff_ffc0_0000_0000, 0, 5),
+        Some(S::InvalidArgs),
+        "a kernel address"
+    );
+    ensure_eq!(
+        wait(0x7fff_ff00_0000, 0, 5),
+        Some(S::InvalidArgs),
+        "an unmapped address"
+    );
+    ensure_eq!(
+        wait(p as u64, 1 << 32, 5),
+        Some(S::InvalidArgs),
+        "an expected value wider than 32 bits"
+    );
+    ensure_eq!(
+        st(sys::futex_wait(p, 1, sys::clock_get() + 50)),
+        Some(S::ShouldWait),
+        "the word differs: no sleep"
+    );
+    let t = sys::clock_get();
+    ensure_eq!(
+        st(sys::futex_wait(p, 0, 0)),
+        Some(S::TimedOut),
+        "a poll of an equal word"
+    );
+    ensure!(sys::clock_get() - t < 5, "a poll does not sleep");
+    ensure_eq!(
+        st(sys::futex_wake(p.wrapping_byte_add(1), 1)),
+        Some(S::InvalidArgs),
+        "wake: misaligned"
+    );
+    ensure_eq!(
+        st(sys::futex_wake(0x10 as *const u32, 1)),
+        Some(S::InvalidArgs),
+        "wake: below user memory"
+    );
+    let r = sys::futex_wake(p, 5);
+    ensure_eq!((r.status, r.a1), (0, 0), "waking nobody wakes nobody");
+    let r = sys::futex_wake(p, 0);
+    ensure_eq!((r.status, r.a1), (0, 0), "wake with count 0");
+    Ok(())
+}
+
+fn futex_times_out_not_early() -> Outcome {
+    FW.store(0, Ordering::SeqCst);
+    let deadline = sys::clock_get() + 40;
+    let r = sys::futex_wait(FW.as_ptr(), 0, deadline);
+    ensure_eq!(st(r), Some(S::TimedOut), "nobody wakes us");
+    ensure!(sys::clock_get() >= deadline, "not before the deadline");
+    ensure!(sys::clock_get() < deadline + 200, "and not long after it");
+    Ok(())
+}
+
+/// Start `n` sleepers one after the other (so their arrival order is known) and let each reach the
+/// kernel's table.
+fn start_sleepers(n: u32) -> Result<Vec<u32>, Detail> {
+    FW.store(0, Ordering::SeqCst);
+    ARRIVED.store(0, Ordering::SeqCst);
+    WOKEN_N.store(0, Ordering::SeqCst);
+    let mut ts = Vec::new();
+    for k in 0..n {
+        ts.push(new_thread(futex_sleeper, k as usize + 1)?);
+        let until = sys::clock_get() + 2000;
+        while ARRIVED.load(Ordering::SeqCst) < k + 1 {
+            ensure!(sys::clock_get() < until, "a sleeper never started");
+            sys::thread_yield();
+        }
+        nap_ticks(15); // it is in the kernel's table well within this
+    }
+    Ok(ts)
+}
+
+/// Wait until `n` sleepers have recorded that they woke.
+fn woken_reaches(n: u32) -> Outcome {
+    let until = sys::clock_get() + 1000;
+    while WOKEN_N.load(Ordering::SeqCst) < n {
+        ensure!(sys::clock_get() < until, "a woken sleeper never reported");
+        nap_ticks(2);
+    }
+    nap_ticks(10); // and nobody else did
+    ensure_eq!(
+        WOKEN_N.load(Ordering::SeqCst),
+        n,
+        "exactly the expected number woke"
+    );
+    Ok(())
+}
+
+fn futex_wake_counts_and_fifo() -> Outcome {
+    // counts: three asleep, wake(2) wakes exactly two (the two oldest; which of them records first
+    // depends on which hart runs it, so only the set is checked here)
+    let ts = start_sleepers(3)?;
+    let r = sys::futex_wake(FW.as_ptr(), 2);
+    ensure_eq!(
+        (r.status, r.a1),
+        (0, 2),
+        "wake(2) with three asleep wakes exactly two"
+    );
+    woken_reaches(2)?;
+    let mut two = [
+        WOKEN_ORDER[0].load(Ordering::SeqCst),
+        WOKEN_ORDER[1].load(Ordering::SeqCst),
+    ];
+    two.sort();
+    ensure_eq!(two, [1, 2], "the two oldest");
+    // a wake from another process on the same address number reaches nobody
+    let (p, _m) = launch(51 | ((FW.as_ptr() as u64) << 8))?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        100,
+        "the other process woke nobody"
+    );
+    sys::handle_close(p);
+    nap_ticks(20);
+    ensure_eq!(
+        WOKEN_N.load(Ordering::SeqCst),
+        2,
+        "the third is still asleep"
+    );
+    let r = sys::futex_wake(FW.as_ptr(), 1);
+    ensure_eq!((r.status, r.a1), (0, 1), "the last one");
+    woken_reaches(3)?;
+    ensure_eq!(
+        WOKEN_ORDER[2].load(Ordering::SeqCst),
+        3,
+        "the youngest was woken last"
+    );
+    let r = sys::futex_wake(FW.as_ptr(), 9);
+    ensure_eq!((r.status, r.a1), (0, 0), "nobody left");
+    for t in ts {
+        sys::handle_close(t);
+    }
+    // FIFO: one wake at a time, each observed before the next, wakes them in arrival order
+    let ts = start_sleepers(3)?;
+    for k in 1..=3u32 {
+        let r = sys::futex_wake(FW.as_ptr(), 1);
+        ensure_eq!((r.status, r.a1), (0, 1), "one wake, one sleeper");
+        woken_reaches(k)?;
+        ensure_eq!(
+            WOKEN_ORDER[k as usize - 1].load(Ordering::SeqCst),
+            k,
+            "arrival order"
+        );
+    }
+    for t in ts {
+        sys::handle_close(t);
+    }
+    Ok(())
+}
+
+fn kill_a_futex_waiter() -> Outcome {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let (p, mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 52, j)?;
+    // the child says it is about to sleep; a moment later it is in the kernel's table
+    let w = sys::object_wait(mine, sig::READABLE, sys::clock_get() + 5000);
+    ensure_eq!(st(w), Some(S::Ok), "the child reaches its futex");
+    nap_ticks(30);
+    ensure_eq!(st(sys::process_kill(p, 9)), Some(S::Ok), "kill it");
+    wait_ended(p, 2000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 9, "ended by the kill");
+    sys::handle_close(p);
+    // nothing of it is left (the kernel's own check that no sleeper survives runs at the end)
+    job_use_settles(j, 0, 0, 2000)?;
+    job_use_settles(j, 1, 0, 2000)?;
+    job_use_settles(j, 2, 0, 2000)?;
+    sys::handle_close(mine);
+    sys::handle_close(j);
+    Ok(())
+}
+
+static LOCK: Mutex<u64> = Mutex::new(0);
+static DONE: AtomicU32 = AtomicU32::new(0);
+const LOCK_ROUNDS: u64 = 1500;
+
+extern "C" fn mutex_worker(_: usize) -> ! {
+    let deadline = sys::clock_get() + 60_000;
+    let mut code = 0;
+    for _ in 0..LOCK_ROUNDS {
+        match LOCK.lock_until(deadline) {
+            Some(mut g) => {
+                let v = *g;
+                if v % 97 == 0 {
+                    sys::thread_yield(); // let another thread contend while we hold it
+                }
+                *g = v + 1;
+            }
+            None => {
+                code = 1;
+                break;
+            }
+        }
+    }
+    DONE.fetch_add(1, Ordering::SeqCst);
+    sys::thread_exit(code)
+}
+
+fn mutex_excludes_across_harts() -> Outcome {
+    *LOCK.lock() = 0;
+    DONE.store(0, Ordering::SeqCst);
+    let mut ts = [0u32; 3];
+    for t in &mut ts {
+        *t = new_thread(mutex_worker, 0)?;
+    }
+    let until = sys::clock_get() + 70_000;
+    while DONE.load(Ordering::SeqCst) < 3 {
+        ensure!(
+            sys::clock_get() < until,
+            "the workers never finished (a lost wakeup?)"
+        );
+        nap_ticks(5);
+    }
+    ensure_eq!(*LOCK.lock(), 3 * LOCK_ROUNDS, "no increment was lost");
+    for t in ts {
+        sys::handle_close(t);
+    }
+    Ok(())
+}
+
+struct Queue {
+    items: alloc::collections::VecDeque<u64>,
+    closed: bool,
+}
+static QUEUE: Mutex<Queue> = Mutex::new(Queue {
+    items: alloc::collections::VecDeque::new(),
+    closed: false,
+});
+static NOT_EMPTY: Condvar = Condvar::new();
+static SUM: AtomicU64 = AtomicU64::new(0);
+static COUNT: AtomicU32 = AtomicU32::new(0);
+const ITEMS: u64 = 2500;
+
+extern "C" fn consumer(_: usize) -> ! {
+    let deadline = sys::clock_get() + 60_000;
+    loop {
+        let mut g = match QUEUE.lock_until(deadline) {
+            Some(g) => g,
+            None => sys::thread_exit(1),
+        };
+        while g.items.is_empty() && !g.closed {
+            let (ng, timed_out) = NOT_EMPTY.wait_until(g, deadline);
+            g = ng;
+            if timed_out {
+                sys::thread_exit(2);
+            }
+        }
+        match g.items.pop_front() {
+            Some(v) => {
+                SUM.fetch_add(v, Ordering::SeqCst);
+                COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            None => break, // closed and drained
+        }
+    }
+    sys::thread_exit(0)
+}
+
+fn condvar_producer_consumer() -> Outcome {
+    SUM.store(0, Ordering::SeqCst);
+    COUNT.store(0, Ordering::SeqCst);
+    {
+        let mut q = QUEUE.lock();
+        q.items.clear();
+        q.closed = false;
+    }
+    let c1 = new_thread(consumer, 0)?;
+    let c2 = new_thread(consumer, 0)?;
+    for i in 1..=ITEMS {
+        QUEUE.lock().items.push_back(i);
+        NOT_EMPTY.notify_one();
+        if i % 50 == 0 {
+            sys::thread_yield();
+        }
+    }
+    QUEUE.lock().closed = true;
+    NOT_EMPTY.notify_all();
+    let until = sys::clock_get() + 70_000;
+    while COUNT.load(Ordering::SeqCst) < ITEMS as u32 {
+        ensure!(
+            sys::clock_get() < until,
+            "items were never consumed (a lost wakeup?)"
+        );
+        nap_ticks(5);
+    }
+    // both consumers end once the queue is closed and empty
+    for c in [c1, c2] {
+        let r = sys::object_wait(c, sig::TERMINATED, sys::clock_get() + 5000);
+        ensure_eq!(st(r), Some(S::Ok), "a consumer ends");
+        ensure_eq!(sys::thread_info(c).a1 as i64, 0, "cleanly");
+        sys::handle_close(c);
+    }
+    ensure_eq!(
+        COUNT.load(Ordering::SeqCst),
+        ITEMS as u32,
+        "every item exactly once"
+    );
+    ensure_eq!(
+        SUM.load(Ordering::SeqCst),
+        ITEMS * (ITEMS + 1) / 2,
+        "and none twice"
+    );
+    Ok(())
+}
+
+static ONCE: Once = Once::new();
+static ONCE_RUNS: AtomicU32 = AtomicU32::new(0);
+static SEM: Semaphore = Semaphore::new(0);
+static SEM_TAKEN: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn once_worker(_: usize) -> ! {
+    ONCE.call_once(|| {
+        sys::thread_yield();
+        ONCE_RUNS.fetch_add(1, Ordering::SeqCst);
+    });
+    let ok_run = ONCE.is_done();
+    DONE.fetch_add(1, Ordering::SeqCst);
+    sys::thread_exit(i32::from(!ok_run))
+}
+
+extern "C" fn sem_worker(_: usize) -> ! {
+    if SEM.wait_until(sys::clock_get() + 5000) {
+        SEM_TAKEN.fetch_add(1, Ordering::SeqCst);
+    }
+    sys::thread_exit(0)
+}
+
+fn once_and_semaphore() -> Outcome {
+    DONE.store(0, Ordering::SeqCst);
+    let mut ts = vec![];
+    for _ in 0..3 {
+        ts.push(new_thread(once_worker, 0)?);
+    }
+    let until = sys::clock_get() + 5000;
+    while DONE.load(Ordering::SeqCst) < 3 {
+        ensure!(sys::clock_get() < until, "once workers never finished");
+        nap_ticks(5);
+    }
+    ensure_eq!(
+        ONCE_RUNS.load(Ordering::SeqCst),
+        1,
+        "the initialiser ran once"
+    );
+    for t in ts.drain(..) {
+        ensure_eq!(sys::thread_info(t).a1 as i64, 0, "every caller saw it done");
+        sys::handle_close(t);
+    }
+    // a semaphore: three sleepers, two posts release exactly two
+    SEM_TAKEN.store(0, Ordering::SeqCst);
+    for _ in 0..3 {
+        ts.push(new_thread(sem_worker, 0)?);
+    }
+    nap_ticks(30);
+    SEM.post();
+    SEM.post();
+    nap_ticks(60);
+    ensure_eq!(SEM_TAKEN.load(Ordering::SeqCst), 2, "two posts, two taken");
+    SEM.post();
+    nap_ticks(60);
+    ensure_eq!(
+        SEM_TAKEN.load(Ordering::SeqCst),
+        3,
+        "the third post releases the last"
+    );
+    ensure!(!SEM.try_wait(), "nothing left over");
+    for t in ts {
+        sys::handle_close(t);
+    }
+    Ok(())
+}
+
 // --- BASIC on the target (S7a) ----------------------------------------------------------------
 
 /// Run `basic --golden NAME` with `/` bound to a read-only clone of `root`, and return everything
@@ -7393,6 +7816,13 @@ pub fn app_main() -> i32 {
         ),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
+        ("futex_argument_errors", futex_argument_errors),
+        ("futex_times_out_not_early", futex_times_out_not_early),
+        ("futex_wake_counts_and_fifo", futex_wake_counts_and_fifo),
+        ("kill_a_futex_waiter", kill_a_futex_waiter),
+        ("mutex_excludes_across_harts", mutex_excludes_across_harts),
+        ("condvar_producer_consumer", condvar_producer_consumer),
+        ("once_and_semaphore", once_and_semaphore),
         (
             "basic_golden_corpus_on_the_target",
             basic_golden_corpus_on_the_target,

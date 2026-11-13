@@ -284,6 +284,8 @@ pub mod syscall {
     pub const JOB_ROOT: usize = 94;
     pub const RESOURCE_ROOT: usize = 95;
     pub const RESOURCE_DTB: usize = 102;
+    pub const FUTEX_WAIT: usize = 110;
+    pub const FUTEX_WAKE: usize = 111;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

@@ -391,3 +391,61 @@ fn a_verified_copy_needs_no_allocation_and_refuses_pages_that_are_not_there() {
     );
     w.teardown();
 }
+
+#[test]
+fn read_user_u32_reads_both_halves_of_a_word_whole() {
+    use kcore::usercopy::read_user_u32;
+    let mut w = world();
+    region(&mut w, 0x1_0000, 2, Perms::RW.user());
+    // neighbouring words with different values: a read of the wrong half or the wrong word shows
+    w.write(0x1_0000, &0x1111_1111u32.to_le_bytes()).unwrap();
+    w.write(0x1_0004, &0x2222_2222u32.to_le_bytes()).unwrap();
+    w.write(0x1_0008, &0x3333_3333u32.to_le_bytes()).unwrap();
+    w.write(0x1_000c, &0x4444_4444u32.to_le_bytes()).unwrap();
+    let rd = |w: &mut World, va| read_user_u32(&mut w.proc, &mut w.mm, &mut w.vmos, va);
+    assert_eq!(
+        rd(&mut w, 0x1_0000),
+        Ok(0x1111_1111),
+        "low half of a doubleword"
+    );
+    assert_eq!(
+        rd(&mut w, 0x1_0004),
+        Ok(0x2222_2222),
+        "high half of a doubleword"
+    );
+    assert_eq!(rd(&mut w, 0x1_0008), Ok(0x3333_3333));
+    assert_eq!(rd(&mut w, 0x1_000c), Ok(0x4444_4444));
+    // the last word of a page and the first of the next
+    w.write(0x1_0ffc, &0xaaaa_bbbbu32.to_le_bytes()).unwrap();
+    w.write(0x1_1000, &0xccccddddu32.to_le_bytes()).unwrap();
+    assert_eq!(rd(&mut w, 0x1_0ffc), Ok(0xaaaa_bbbb));
+    assert_eq!(rd(&mut w, 0x1_1000), Ok(0xcccc_dddd));
+    // a lazy page reads as zero and is committed by the read
+    region(&mut w, 0x2_0000, 1, Perms::RW.user());
+    assert_eq!(rd(&mut w, 0x2_0004), Ok(0));
+    // misaligned, outside user memory, unmapped, and a page that cannot be read
+    for bad in [
+        0x1_0001u64,
+        0x1_0002,
+        0x1_0003,
+        0x10,
+        KERNEL_VA,
+        TOP,
+        0x9_0000,
+    ] {
+        assert_eq!(rd(&mut w, bad), Err(Status::InvalidArgs), "{bad:#x}");
+    }
+    let no_read = Perms {
+        read: false,
+        write: false,
+        exec: true,
+        user: true,
+    };
+    region(&mut w, 0x3_0000, 1, no_read);
+    assert_eq!(
+        rd(&mut w, 0x3_0000),
+        Err(Status::InvalidArgs),
+        "an unreadable page"
+    );
+    w.teardown();
+}

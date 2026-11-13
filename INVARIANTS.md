@@ -76,6 +76,14 @@ get filled in as each area is built.
 | D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |
 | D5 | A fired interrupt source is masked from the claim until `interrupt_ack` or the object's destruction, and a destroyed object leaves its source masked (nothing enabled with nobody listening); one live object per source | QEMU `interrupt_object_fires_and_masks` (QEMU's PLIC is edge-like, so the masking itself is weakly checked: T43) |
 
+### Futex rules (S7b)
+
+| # | Invariant | How checked |
+|---|---|---|
+| F1 | The futex table (like all shared kernel state) is touched only under the BKL; a thread is in it only between its enqueue in `futex_wait` and its own `forget` on the way out of that call, so a table entry never outlives its thread and a reused thread id cannot inherit one | `kcore::futex` unit and model tests, QEMU `kill_a_futex_waiter`, the end-of-run check `no_process_or_vmo_survives_init` (no sleeper left) |
+| F2 | The user word is read and the sleeper enqueued in one BKL region, so a wake that follows a user-mode store is never lost; the sleep ends only by removal from the table (a wake) or the deadline | loom/shuttle model, QEMU `futex_*` (a never-sleeping mutant fails three) |
+| F3 | A wake reaches only sleepers of the caller's own process, oldest first | `kcore::futex` tests, QEMU `futex_wake_counts_and_fifo` (another process wakes nobody) |
+
 ### Hart rules (S5a)
 
 | # | Invariant | How checked |

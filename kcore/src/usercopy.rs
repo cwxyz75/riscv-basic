@@ -53,6 +53,24 @@ fn check_range(va: u64, len: usize) -> Result<(), Status> {
     Ok(())
 }
 
+/// Read the 32-bit word at user address `va` with **one aligned 64-bit load** (so a store by another
+/// hart's user thread is seen whole, never half: a bytewise copy could tear). `va` must be 4-aligned
+/// and readable (`INVALID_ARGS`); a lazily backed page is committed first.
+pub fn read_user_u32<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    va: u64,
+) -> Result<u32, Status> {
+    if va & 3 != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    check_range(va, 4)?;
+    let pa = resolve(aspace, mm, vmos, va, Access::Read)?;
+    let word = mm.mem.read_u64(pa & !7);
+    Ok((word >> ((pa & 4) * 8)) as u32)
+}
+
 /// Read `len` bytes at user address `va`. A zero length succeeds without looking at `va`.
 pub fn copy_from_user<M: PhysMem>(
     aspace: &mut AddressSpace,
