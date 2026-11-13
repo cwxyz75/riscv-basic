@@ -182,6 +182,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 95 | resource_root | | `a1` handle |
 | 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
 | 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
+| 110 | futex_wait | `a0` address, `a1` expected, `a2` deadline | |
+| 111 | futex_wake | `a0` address, `a1` count | `a1` woken |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 
 A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
@@ -370,6 +372,26 @@ A read-only VMO (rights READ, MAP, DUPLICATE, TRANSFER) holding a copy of the de
 handed to the kernel; `length` is its size in bytes. `resource` needs MANAGE. NOT_SUPPORTED if the
 kernel found no tree (or one over `MAX_DTB_BYTES`, 256 KiB); NO_MEMORY if the caller's job is out of
 pages. The tree is data from the firmware: the reader (`kcore::fdt::parse`) is hostile-input safe.
+
+### futex_wait(address, expected, deadline) -> status
+
+Sleep if the 32-bit word at `address` (in the caller's address space) still equals `expected`. The
+check and the enqueue are one step under the big kernel lock, so a wake that follows a user-mode store
+to the word is never lost; the word is read with one aligned atomic load. `deadline` is an absolute
+tick: `0` polls (equal: TIMED_OUT at once, no sleep), `u64::MAX` waits forever. OK when woken (the
+sleeper left the table because of a `futex_wake`); spurious wakeups are allowed, so callers re-check.
+Errors, in order: INVALID_ARGS (`address` not 4-aligned, outside user memory, not readable or not
+mappable; `expected` wider than 32 bits); SHOULD_WAIT (the word differs from `expected`: nothing
+slept); TIMED_OUT (the deadline passed, never earlier, or a poll of an equal word). A kill ends the
+sleep; the sleeper leaves the table whichever way it ends. No rights are involved: a futex is a
+(process, address) pair and naming one grants nothing the process could not do with its own memory.
+
+### futex_wake(address, count) -> status, woken
+
+Wake up to `count` sleepers on `address` **in the caller's process**, oldest first (FIFO); `woken` is
+how many. Another process sleeping on the same address number is not touched. `count` 0 wakes
+nobody. INVALID_ARGS if `address` is not 4-aligned or outside user memory. (The address need not be
+mapped: nobody can be sleeping on an address the sleeper could not read.)
 
 ### interrupt_create(resource, source) -> status, handle
 
@@ -783,3 +805,4 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | resource_dtb | specified and implemented (S6c) |
+| futex_wait, futex_wake | specified and implemented (S7b) |

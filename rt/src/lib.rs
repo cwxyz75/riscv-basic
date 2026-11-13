@@ -23,6 +23,7 @@ pub mod launch;
 pub mod spawn;
 #[cfg(feature = "heap")]
 pub mod startup;
+pub mod sync;
 
 /// The result of a raw syscall: the status code and the two result registers.
 #[derive(Debug, Clone, Copy)]
@@ -219,6 +220,18 @@ pub mod sys {
     /// A read-only VMO holding the device tree; `a2` is its length in bytes.
     pub fn resource_dtb(resource: u32) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])
+    }
+    /// Sleep if the 32-bit word at `addr` still equals `expected`; `deadline` is an absolute tick
+    /// (0: poll, `u64::MAX`: forever). OK when woken, SHOULD_WAIT if the word differed, TIMED_OUT.
+    pub fn futex_wait(addr: *const u32, expected: u32, deadline: u64) -> Ret {
+        syscall(
+            FUTEX_WAIT,
+            [addr as usize, expected as usize, deadline as usize, 0, 0, 0],
+        )
+    }
+    /// Wake up to `count` threads of this process sleeping on `addr`; returns how many.
+    pub fn futex_wake(addr: *const u32, count: u32) -> Ret {
+        syscall(FUTEX_WAKE, [addr as usize, count as usize, 0, 0, 0, 0])
     }
     pub fn interrupt_create(resource: u32, irq: u32) -> Ret {
         syscall(

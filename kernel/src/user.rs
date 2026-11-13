@@ -110,6 +110,8 @@ struct UserState {
     /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
     /// a signal wakes it, and each waiter re-checks its own condition.
     signal_queue: usize,
+    /// The futex wait table (S7b).
+    futexes: kcore::futex::Futexes,
     /// The interrupt object that owns each PLIC source (S6a-2).
     irq_objs: [Option<kcore::object::ObjId>; abi::layout::MAX_IRQ as usize + 1],
     /// Output of user programs, assembled into lines.
@@ -162,6 +164,7 @@ fn state() -> &'static mut UserState {
             next_token: 1,
             ktable: HandleTable::new(256),
             signal_queue: thread::new_queue(),
+            futexes: kcore::futex::Futexes::new(),
             irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
             line: String::new(),
             pass: 0,
@@ -193,6 +196,11 @@ pub fn job_ledger() -> (usize, u64, u64, u64, u64) {
 
 pub fn process_count() -> usize {
     irq::without(|| state().procs.len())
+}
+
+/// Threads sleeping on a futex (for leak checks).
+pub fn futex_sleepers() -> usize {
+    irq::without(|| state().futexes.len())
 }
 
 /// The number of live kernel objects (for leak checks).
@@ -482,6 +490,9 @@ fn teardown(pid: u32) -> i32 {
     let Some(mut process) = irq::without(|| {
         let s = state();
         s.thread_pid.retain(|_, p| *p != pid);
+        // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
+        // already; this is the backstop)
+        s.futexes.forget_process(pid);
         s.procs.remove(&pid)
     }) else {
         // Another killer got here first (two kills of a never-started process can race): it
@@ -687,6 +698,15 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => reply(frame, port_wait(a)),
+        nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
+        nr::FUTEX_WAKE => {
+            let r = futex_wake(a);
+            // wake the system's sleepers only if a futex sleeper was actually woken
+            if matches!(r, Ok((Some(n), _)) if n > 0) {
+                wake_signal_waiters();
+            }
+            reply(frame, r);
+        }
         nr::PROCESS_CREATE
         | nr::JOB_CREATE
         | nr::JOB_SET_LIMITS
@@ -1493,6 +1513,72 @@ fn object_wait(a: [u64; 6]) -> Reply {
     } else {
         Err((Status::TimedOut, Some(u64::from(seen)), None))
     }
+}
+
+/// `futex_wait(addr, expected, deadline)` (S7b, SYSCALLS.md): sleep on the 32-bit word at `addr`
+/// if it still equals `expected`. The check and the enqueue are one step under the big kernel lock,
+/// so a wake that follows a user-mode store is never lost.
+fn futex_wait(a: [u64; 6]) -> Reply {
+    let (addr, expected, deadline) = (a[0], a[1], a[2]);
+    if expected > u64::from(u32::MAX) {
+        return fail(Status::InvalidArgs);
+    }
+    let tid = thread::current();
+    let who = tid as u64;
+    // check and enqueue, in one step
+    let first = irq::without(|| -> Result<Result<(), Status>, Status> {
+        let s = state();
+        let Some(&pid) = s.thread_pid.get(&tid) else {
+            return Err(Status::BadState);
+        };
+        let k = kmem::get();
+        let UserState { procs, futexes, .. } = s;
+        let p = procs.get_mut(&pid).ok_or(Status::BadState)?;
+        let word = kcore::usercopy::read_user_u32(&mut p.aspace, &mut k.mm, &mut k.vmos, addr)?;
+        if u64::from(word) != expected {
+            return Ok(Err(Status::ShouldWait)); // the word changed: do not sleep
+        }
+        if deadline == 0 {
+            return Ok(Err(Status::TimedOut)); // a poll: equal, and no time to wait
+        }
+        let fresh = futexes.wait((pid, addr), who);
+        debug_assert!(fresh, "a thread sleeps on one futex at a time");
+        Ok(Ok(()))
+    })
+    .map_err(|e| (e, None, None))?;
+    if let Err(status) = first {
+        return fail(status);
+    }
+    // sleep until woken (removed from the table), killed, or the deadline
+    let q = irq::without(|| state().signal_queue);
+    thread::wait_deadline(
+        q,
+        || killed_now().is_some() || !state().futexes.contains(who),
+        deadline,
+    );
+    // still in the table: the deadline (or a kill) ended the wait: leave it
+    let timed_out = irq::without(|| state().futexes.forget(who));
+    if timed_out {
+        fail(Status::TimedOut)
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first.
+fn futex_wake(a: [u64; 6]) -> Reply {
+    let (addr, count) = (a[0], a[1]);
+    if addr & 3 != 0 || addr < abi::user::BASE || addr.saturating_add(4) > abi::user::TOP {
+        return fail(Status::InvalidArgs);
+    }
+    let tid = thread::current();
+    let woken = irq::without(|| {
+        let s = state();
+        let pid = *s.thread_pid.get(&tid)?;
+        Some(s.futexes.wake((pid, addr), count).len())
+    })
+    .ok_or((Status::BadState, None, None))?;
+    Ok((Some(woken as u64), None))
 }
 
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),

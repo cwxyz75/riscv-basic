@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -102,8 +102,10 @@ os-test:
 	cargo test -p abi -p kcore
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.
@@ -167,6 +169,10 @@ OS_REPL_ELF := target/os-repl/$(KERNEL_TARGET)/debug/kernel
 os-interactive: os-user
 	cd kernel && cargo build --features interactive --target-dir ../target/os-interactive
 	cd kernel && cargo build --features repl --target-dir ../target/os-repl
+
+# Boot the OS to its shell in this terminal (type `basic`; Ctrl-A then X leaves QEMU).
+os-run: os-interactive
+	qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
 
 os-serial-test: os-interactive
 	python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)

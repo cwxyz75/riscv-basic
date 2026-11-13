@@ -188,16 +188,18 @@ pub fn run_all() -> Report {
     push(
         "no_process_or_vmo_survives_init",
         if user::process_count() == 0
+            && user::futex_sleepers() == 0
             && crate::irq::without(|| kmem::get().vmos.count()) == vmos_before
             && user::job_ledger() == (1, 0, 0, 0, 0)
         {
             Ok(())
         } else {
             Err(format!(
-                "{} processes and {} VMOs left (wanted 0 and {vmos_before}); (jobs, processes, \
-                 threads) {:?}, wanted (1, 0, 0, 0, 0)",
+                "{} processes and {} VMOs left (wanted 0 and {vmos_before}), {} futex sleepers; (jobs, \
+                 processes, threads) {:?}, wanted (1, 0, 0, 0, 0)",
                 user::process_count(),
                 crate::irq::without(|| kmem::get().vmos.count()),
+                user::futex_sleepers(),
                 user::job_ledger()
             ))
         },
