@@ -542,3 +542,169 @@ fn strtol_and_strtoul_match_the_host_libc() {
     }
     assert!(bad.is_empty(), "strtol/strtoul differ:\n{}", bad.join("\n"));
 }
+
+// ---- time ----
+
+mod host_time {
+    use std::ffi::{c_char, c_int, c_long};
+    #[repr(C)]
+    pub struct Tm {
+        pub sec: c_int,
+        pub min: c_int,
+        pub hour: c_int,
+        pub mday: c_int,
+        pub mon: c_int,
+        pub year: c_int,
+        pub wday: c_int,
+        pub yday: c_int,
+        pub isdst: c_int,
+        pub gmtoff: c_long,
+        pub zone: *const c_char,
+    }
+    extern "C" {
+        pub fn gmtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+        pub fn timegm(tm: *mut Tm) -> i64;
+        pub fn strftime(buf: *mut c_char, max: usize, fmt: *const c_char, tm: *const Tm) -> usize;
+    }
+}
+
+fn host_tm(t: i64) -> host_time::Tm {
+    let mut tm = host_time::Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 0,
+        mon: 0,
+        year: 0,
+        wday: 0,
+        yday: 0,
+        isdst: 0,
+        gmtoff: 0,
+        zone: std::ptr::null(),
+    };
+    // SAFETY: `tm` is a valid out-parameter for the host's gmtime_r.
+    unsafe { host_time::gmtime_r(&t, &mut tm) };
+    tm
+}
+
+fn ours_tm(h: &host_time::Tm) -> cfmt::time::Tm {
+    cfmt::time::Tm {
+        sec: h.sec,
+        min: h.min,
+        hour: h.hour,
+        mday: h.mday,
+        mon: h.mon,
+        year: h.year,
+        wday: h.wday,
+        yday: h.yday,
+    }
+}
+
+fn random_time(r: &mut Rng) -> i64 {
+    match r.below(4) {
+        0 => *r.pick(&[
+            0,
+            -1,
+            86_399,
+            86_400,
+            951_782_400,
+            951_868_800,
+            1_078_012_800,
+            2_147_483_647,
+            2_147_483_648,
+            4_107_542_400,
+            4_107_628_800,
+            -2_208_988_800,
+            253_402_300_799,
+            1_709_164_800,
+        ]),
+        1 => (r.next() % 4_000_000_000) as i64,
+        2 => (r.next() % 280_000_000_000) as i64 - 30_000_000_000,
+        _ => (r.next() % 100_000) as i64 * 86_400 + (r.next() % 86_400) as i64,
+    }
+}
+
+#[test]
+fn gmtime_matches_the_host() {
+    let mut r = Rng(0x1234_5678_9abc_def1);
+    for _ in 0..60_000 {
+        let t = random_time(&mut r);
+        let h = host_tm(t);
+        let o = cfmt::time::gmtime(t).expect("in range");
+        assert_eq!(o, ours_tm(&h), "t = {t}");
+    }
+}
+
+#[test]
+fn timegm_normalises_like_the_host() {
+    let mut r = Rng(0x0fed_cba9_8765_4321);
+    for _ in 0..60_000 {
+        let tm = cfmt::time::Tm {
+            sec: r.below(200) as i32 - 70,
+            min: r.below(200) as i32 - 70,
+            hour: r.below(100) as i32 - 30,
+            mday: r.below(120) as i32 - 40,
+            mon: r.below(60) as i32 - 24,
+            year: r.below(250) as i32 + 10, // (Apple's timegm refuses years before 1900)
+            wday: 0,
+            yday: 0,
+        };
+        let mut h = host_time::Tm {
+            sec: tm.sec,
+            min: tm.min,
+            hour: tm.hour,
+            mday: tm.mday,
+            mon: tm.mon,
+            year: tm.year,
+            wday: 0,
+            yday: 0,
+            isdst: 0,
+            gmtoff: 0,
+            zone: std::ptr::null(),
+        };
+        // SAFETY: `h` is a valid tm for the host's timegm.
+        let want = unsafe { host_time::timegm(&mut h) };
+        assert_eq!(cfmt::time::timegm(&tm), Some(want), "{tm:?}");
+    }
+}
+
+#[test]
+fn strftime_matches_the_host() {
+    let mut r = Rng(0xabcd_ef01_2345_6789);
+    let convs = b"aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYz%";
+    for _ in 0..4000 {
+        let t = (r.next() % 250_000_000_000) as i64 - 30_000_000_000;
+        let h = host_tm(t);
+        let o = ours_tm(&h);
+        for &c in convs {
+            // Apple's %z comes from the local zone, not tm_gmtoff: only glibc is comparable
+            if c == b'z' && cfg!(not(target_os = "linux")) {
+                continue;
+            }
+            let f = CString::new(vec![b'%', c]).unwrap();
+            let mut buf = vec![0u8; 128];
+            // SAFETY: `buf` has room for 128 bytes; `f` is NUL-terminated; `h` is a filled tm.
+            let n = unsafe {
+                host_time::strftime(buf.as_mut_ptr() as *mut c_char, 128, f.as_ptr(), &h)
+            };
+            buf.truncate(n);
+            let mut got = Vec::new();
+            cfmt::time::strftime(&[b'%', c], &o, &mut got).unwrap();
+            assert_eq!(got, buf, "%{} at t = {t}", c as char);
+        }
+    }
+    // an unknown conversion is an error
+    assert!(cfmt::time::strftime(b"%Q", &cfmt::time::gmtime(0).unwrap(), &mut Vec::new()).is_err());
+    // a mixed format
+    let mut v = Vec::new();
+    cfmt::time::strftime(
+        b"%Y-%m-%d %H:%M:%S|%a %b %e|%j|%%",
+        &cfmt::time::gmtime(1_700_000_000).unwrap(),
+        &mut v,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(v).unwrap(),
+        "2023-11-14 22:13:20|Tue Nov 14|318|%"
+    );
+}

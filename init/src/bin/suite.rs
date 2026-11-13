@@ -6317,13 +6317,21 @@ fn c_transcript_matches_the_host() -> Outcome {
     let (off, len) = image_entry(bi, b"bin/ctest")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (out_mine, out_theirs) = socket()?;
+    // a memory filesystem for the program's files: `/` is its root (read-only) and `.` its /tmp (the only
+    // writable place), so the program's relative paths are scratch files
+    let (_fsd, mut root, _bi) = start_memfsd()?;
+    let slash = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    let dot = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
     let s = Startup {
         args: vec![b"ctest".to_vec()],
+        namespace: vec![(b"/".to_vec(), 1), (b".".to_vec(), 2)],
         roles: vec![(Role::Stdout, 0)],
         ..Startup::default()
     };
     let bytes = s.encode().map_err(|_| msg_at(line!()))?;
-    let p = rt::spawn::spawn(&image, &bytes, &[out_theirs]).map_err(|e| {
+    let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, slash.ch, dot.ch]).map_err(|e| {
         let mut d = Detail::new();
         let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn ctest: {e:?}"));
         d

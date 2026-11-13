@@ -146,10 +146,11 @@ def c_transcript_problems(text):
     with tempfile.TemporaryDirectory() as d:
         exe = os.path.join(d, "transcript_host")
         try:
+            # (run in the scratch directory: the program's files are relative to it)
             cc = subprocess.run(["cc", "-O1", "-o", exe, src, "-lm"], capture_output=True, text=True)
             if cc.returncode != 0:
                 return ["could not build the host oracle: " + cc.stderr[-300:]]
-            run_ = subprocess.run([exe], capture_output=True, text=True, timeout=30)
+            run_ = subprocess.run([exe], capture_output=True, text=True, timeout=30, cwd=d)
         except (OSError, subprocess.TimeoutExpired) as e:
             return [f"the host oracle for the C transcript did not run: {e}"]
     want = run_.stdout.split("\n")

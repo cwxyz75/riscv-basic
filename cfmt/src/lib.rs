@@ -9,6 +9,7 @@ extern crate alloc;
 
 mod parse;
 mod printf;
+pub mod time;
 
 pub use parse::{strtod, strtol, strtoul, ParsedFloat, ParsedInt, ParsedUInt};
 pub use printf::{format, Args, FmtError, Len};
