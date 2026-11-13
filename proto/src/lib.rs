@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod blk;
 pub mod bootimg;
 pub mod console;
 pub mod file;

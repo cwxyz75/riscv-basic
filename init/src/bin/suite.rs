@@ -3718,6 +3718,7 @@ fn msg_at(line: u32) -> Detail {
 
 // --- The launcher service (S4b) ----------------------------------------------------------------
 
+use proto::blk;
 use proto::bootimg;
 use proto::launch;
 
@@ -4107,6 +4108,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     ensure_eq!(
         progs,
         vec![
+            b"blkd".to_vec(),
             b"bomb".to_vec(),
             b"cat".to_vec(),
             b"consoled".to_vec(),
@@ -5427,6 +5429,469 @@ fn cycles_do_not_grow_memory() -> Outcome {
 
 // ---- S4.5: jobs and limits ----
 
+// --- The block driver (S6b) -----------------------------------------------------------------
+
+/// Everything a supervisor of `blkd` keeps: the root resource, the mapped MMIO window (to reset the
+/// device), the DMA buffer (kept across driver lifetimes: killing a driver must not free memory the
+/// device may still write to, T42) and the interrupt object when the machine has a PLIC.
+struct BlkRig {
+    res: u32,
+    dev: Blk,
+    dma: u32,
+    irq: Option<u32>,
+    bi: u32,
+    job: u32,
+}
+
+fn blk_rig() -> Result<Option<BlkRig>, Detail> {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let Some(dev) = find_blk(res)? else {
+        return Ok(None);
+    };
+    let made = sys::interrupt_create(res, dev.irq);
+    ensure!(
+        matches!(st(made), Some(S::Ok) | Some(S::NotSupported)),
+        "interrupt_create: {:?}",
+        st(made)
+    );
+    let irq = (st(made) == Some(S::Ok)).then_some(made.a1 as u32);
+    let dma = ok(sys::vmo_create_dma(res, 4), "the DMA buffer")?.a1 as u32;
+    let root = root_job()?;
+    let job = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    Ok(Some(BlkRig {
+        res,
+        dev,
+        dma,
+        irq,
+        bi: boot_image_vmo()?,
+        job,
+    }))
+}
+
+impl BlkRig {
+    /// Start a driver in the rig's job: (its process, our end of its service channel).
+    fn spawn(&self) -> Result<(u32, u32), Detail> {
+        let (off, len) = image_entry(self.bi, b"bin/blkd")?;
+        let image = rt::spawn::read_image(self.bi, off, len).ok_or_else(|| msg_at(line!()))?;
+        let slot = u64::from(self.dev.irq - 1);
+        let mmio = ok(
+            sys::vmo_create_physical(self.res, 0x1000_1000 + slot * 4096, 4096),
+            "the slot's MMIO VMO",
+        )?
+        .a1 as u32;
+        let dma = ok(
+            sys::handle_duplicate(self.dma, Rights::SAME.0),
+            "dup the DMA buffer",
+        )?
+        .a1 as u32;
+        let (mine, theirs) = channel()?;
+        let mut handles = vec![mmio, dma, theirs];
+        let mut roles = vec![(Role::BlkMmio, 0), (Role::BlkDma, 1), (Role::ServiceBlk, 2)];
+        if let Some(irq) = self.irq {
+            let d = ok(
+                sys::handle_duplicate(irq, Rights::SAME.0),
+                "dup the interrupt",
+            )?
+            .a1 as u32;
+            handles.push(d);
+            roles.push((Role::BlkIrq, 3));
+        }
+        let s = Startup {
+            args: vec![b"blkd".to_vec()],
+            roles,
+            ..Startup::default()
+        };
+        let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+        let p = rt::spawn::spawn_in(&image, &bytes, &handles, self.job).map_err(|e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn blkd: {e:?}"));
+            d
+        })?;
+        Ok((p, mine))
+    }
+
+    /// Put the device back to its reset state (a supervisor's job between two drivers).
+    fn reset(&self) {
+        wr(&self.dev, 0x70, 0);
+        wr(&self.dev, 0x64, rd(&self.dev, 0x60));
+    }
+}
+
+impl Drop for BlkRig {
+    fn drop(&mut self) {
+        self.reset();
+        let me = sys::process_self().a1 as u32;
+        sys::process_unmap(me, MMIO_VA);
+        sys::handle_close(me);
+        for h in [self.dma, self.job, self.res] {
+            sys::handle_close(h);
+        }
+        if let Some(i) = self.irq {
+            sys::handle_close(i);
+        }
+    }
+}
+
+/// One raw request/reply exchange on the block service channel.
+fn blk_raw(ch: u32, bytes: &[u8]) -> Result<Vec<u8>, Detail> {
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send the request"
+    );
+    let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000);
+    ensure_eq!(st(w), Some(S::Ok), "the driver answers");
+    let mut buf = vec![0u8; 16 * 1024];
+    let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "read the reply");
+    buf.truncate(r.a1);
+    Ok(buf)
+}
+
+fn blk_call(ch: u32, txid: u32, op: blk::Op<'_>) -> Result<(blk::Status, Vec<u8>), Detail> {
+    let reply = blk_raw(ch, &blk::Request { txid, op }.encode())?;
+    let (t, status, body) = blk::decode_reply(&reply).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(t, txid, "the reply answers this transaction");
+    Ok((status, body.to_vec()))
+}
+
+fn pattern(sector: u64, i: usize) -> u8 {
+    (sector as usize * 31 + i * 7 + 5) as u8
+}
+
+fn write_pattern(ch: u32, first: u64, sectors: u64) -> Outcome {
+    let mut s = 0;
+    while s < sectors {
+        let n = (sectors - s).min(16);
+        let mut data = Vec::new();
+        for k in 0..n {
+            data.extend((0..512).map(|i| pattern(first + s + k, i)));
+        }
+        let (st, _) = blk_call(
+            ch,
+            s as u32 + 1,
+            blk::Op::Write {
+                sector: first + s,
+                count: n as u32,
+                data: &data,
+            },
+        )?;
+        ensure_eq!(st, blk::Status::Ok, "write");
+        s += n;
+    }
+    Ok(())
+}
+
+fn check_pattern(ch: u32, first: u64, sectors: u64) -> Outcome {
+    let mut s = 0;
+    let mut sum = 0u64;
+    while s < sectors {
+        let n = (sectors - s).min(16);
+        let (st, body) = blk_call(
+            ch,
+            s as u32 + 1000,
+            blk::Op::Read {
+                sector: first + s,
+                count: n as u32,
+            },
+        )?;
+        ensure_eq!(st, blk::Status::Ok, "read");
+        ensure_eq!(body.len(), n as usize * 512, "the data length");
+        for k in 0..n {
+            for i in 0..512 {
+                let got = body[k as usize * 512 + i];
+                if got != pattern(first + s + k, i) {
+                    ensure!(false, "sector {} byte {i}: {got:#x}", first + s + k);
+                }
+                sum += u64::from(got);
+            }
+        }
+        s += n;
+    }
+    ensure!(sum > 0, "a checksum of real data");
+    Ok(())
+}
+
+/// `st`, for use where a local named `st` shadows it.
+fn sysst(r: Ret) -> Option<S> {
+    st(r)
+}
+
+fn blk_round_trip() -> Outcome {
+    let Some(rig) = blk_rig()? else {
+        return Ok(()); // no disk attached (OS_DISK=0)
+    };
+    sys::debug_write(if rig.irq.is_some() {
+        b"s6: blkd exercised (interrupts)\n"
+    } else {
+        b"s6: blkd exercised (polling)\n"
+    });
+    let (p, ch) = rig.spawn()?;
+    let (st, body) = blk_call(ch, 1, blk::Op::Info)?;
+    ensure_eq!(st, blk::Status::Ok, "info");
+    let info = blk::decode_info(&body).ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(
+        (info.sectors, info.sector_size, info.read_only, info.max_io),
+        (16 * 1024 * 2, 512, false, 16),
+        "a 16 MiB disk"
+    );
+    // the harness put a known pattern in sector 0 (a driver that reads zeroes would show)
+    let (st, s0) = blk_call(
+        ch,
+        2,
+        blk::Op::Read {
+            sector: 0,
+            count: 1,
+        },
+    )?;
+    ensure_eq!(st, blk::Status::Ok, "read sector 0");
+    ensure_eq!(s0.len(), 512, "a whole sector");
+    ensure!(
+        (0..512).all(|i| s0[i] == ((i * 7 + 3) & 0xff) as u8),
+        "sector 0 holds the harness pattern"
+    );
+    // a request is answered promptly: a dead interrupt path would fall back to the driver's
+    // two-second timeout and pass everything else
+    let t = sys::clock_get();
+    let (status, _) = blk_call(
+        ch,
+        4,
+        blk::Op::Read {
+            sector: 0,
+            count: 16,
+        },
+    )?;
+    ensure_eq!(status, blk::Status::Ok, "an 8 KiB read");
+    ensure!(
+        sys::clock_get() - t < 200,
+        "a read took {} ticks",
+        sys::clock_get() - t
+    );
+    // a 64 KiB pattern in 8 KiB requests, read back identical
+    write_pattern(ch, 100, 128)?;
+    check_pattern(ch, 100, 128)?;
+    ensure_eq!(blk_call(ch, 3, blk::Op::Flush)?.0, blk::Status::Ok, "flush");
+    // the edges of the disk
+    let last = info.sectors - 1;
+    write_pattern(ch, last, 1)?;
+    check_pattern(ch, last, 1)?;
+    // bad requests are refused with the right status and the driver keeps serving
+    let bad = |op, want, what: &str| -> Outcome {
+        let (st, body) = blk_call(ch, 77, op)?;
+        ensure!(st == want && body.is_empty(), "{what}: {st:?}");
+        Ok(())
+    };
+    bad(
+        blk::Op::Read {
+            sector: 0,
+            count: 0,
+        },
+        blk::Status::BadRequest,
+        "count 0",
+    )?;
+    bad(
+        blk::Op::Read {
+            sector: 0,
+            count: 17,
+        },
+        blk::Status::TooBig,
+        "17 sectors",
+    )?;
+    bad(
+        blk::Op::Read {
+            sector: info.sectors,
+            count: 1,
+        },
+        blk::Status::BadRange,
+        "past the end",
+    )?;
+    bad(
+        blk::Op::Read {
+            sector: last,
+            count: 2,
+        },
+        blk::Status::BadRange,
+        "straddling the end",
+    )?;
+    bad(
+        blk::Op::Read {
+            sector: u64::MAX,
+            count: 2,
+        },
+        blk::Status::BadRange,
+        "wrapping",
+    )?;
+    bad(
+        blk::Op::Write {
+            sector: info.sectors,
+            count: 1,
+            data: &[0u8; 512],
+        },
+        blk::Status::BadRange,
+        "write past the end",
+    )?;
+    // malformed bytes: too short with a txid, with none, a write whose data is the wrong length
+    let r = blk_raw(ch, &[9, 0, 0, 0, 2, 0])?;
+    ensure_eq!(
+        blk::decode_reply(&r).map(|(t, s, _)| (t, s)),
+        Some((9, blk::Status::BadRequest)),
+        "a short header is BAD_REQUEST with its txid"
+    );
+    let mut short_write = blk::Request {
+        txid: 10,
+        op: blk::Op::Write {
+            sector: 0,
+            count: 2,
+            data: &[0u8; 1024],
+        },
+    }
+    .encode();
+    short_write.truncate(short_write.len() - 1);
+    let r = blk_raw(ch, &short_write)?;
+    ensure_eq!(
+        blk::decode_reply(&r).map(|(t, s, _)| (t, s)),
+        Some((10, blk::Status::BadRequest)),
+        "a write with the wrong data length"
+    );
+    // a write bigger than any valid request is answered TOO_BIG with its txid (not dropped)
+    let big = vec![0u8; 17 * 512];
+    let r = blk_raw(
+        ch,
+        &blk::Request {
+            txid: 12,
+            op: blk::Op::Write {
+                sector: 0,
+                count: 17,
+                data: &big,
+            },
+        }
+        .encode(),
+    )?;
+    ensure_eq!(
+        blk::decode_reply(&r).map(|(t, s, _)| (t, s)),
+        Some((12, blk::Status::TooBig)),
+        "an oversized write"
+    );
+    // a request that carries a handle is refused and its handle closed; the driver is not wedged
+    let ev = event()?;
+    ensure_eq!(
+        sysst(sys::channel_write(
+            ch,
+            [11u8, 0, 0, 0].as_ptr(),
+            4,
+            [ev].as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "send a request with a handle"
+    );
+    let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 2000);
+    ensure_eq!(sysst(w), Some(S::Ok), "the driver answers it");
+    let mut rb = [0u8; 64];
+    let r = sys::channel_read(ch, rb.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
+    ensure_eq!(sysst(r), Some(S::Ok), "read the answer");
+    ensure_eq!(
+        blk::decode_reply(&rb[..r.a1]).map(|(t, s, _)| (t, s)),
+        Some((11, blk::Status::BadRequest)),
+        "a request with a handle is BAD_REQUEST"
+    );
+    // still serving, and nothing above disturbed the data
+    check_pattern(ch, 100, 128)?;
+    // the client going away ends the driver cleanly
+    sys::handle_close(ch);
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        0,
+        "the driver exits 0 when its client is gone"
+    );
+    sys::handle_close(p);
+    Ok(())
+}
+
+fn blk_driver_restart() -> Outcome {
+    let Some(rig) = blk_rig()? else {
+        return Ok(());
+    };
+    let (p, ch) = rig.spawn()?;
+    write_pattern(ch, 4000, 64)?;
+    check_pattern(ch, 4000, 64)?;
+    // start a write and kill the driver before it can answer: the device may be mid-request
+    let inflight: Vec<u8> = (0..16 * 512).map(|i| (i * 13 + 1) as u8).collect();
+    ensure_eq!(
+        st(sys::channel_write(
+            ch,
+            blk::Request {
+                txid: 99,
+                op: blk::Op::Write {
+                    sector: 5000,
+                    count: 16,
+                    data: &inflight
+                }
+            }
+            .encode()
+            .as_ptr(),
+            blk::REQ_HEADER + inflight.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "queue a write"
+    );
+    // kill the driver: its client channel reports the loss, and the data is on the disk, not in it
+    ensure_eq!(st(sys::process_kill(p, 55)), Some(S::Ok), "kill the driver");
+    wait_ended(p, 2000)?;
+    let w = sys::object_wait(ch, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(st(w), Some(S::Ok), "the client sees PEER_CLOSED");
+    sys::handle_close(p);
+    sys::handle_close(ch);
+    // the supervisor resets the device before the buffer goes to the next driver (T42)
+    rig.reset();
+    let (p2, ch2) = rig.spawn()?;
+    check_pattern(ch2, 4000, 64)?;
+    // the write that was in flight when the driver died happened completely, in part, or not at
+    // all; whichever, every sector holds the old zeros or the new data, and the new driver works
+    let (st5, body) = blk_call(
+        ch2,
+        5,
+        blk::Op::Read {
+            sector: 5000,
+            count: 16,
+        },
+    )?;
+    ensure_eq!(st5, blk::Status::Ok, "read the in-flight sectors");
+    for k in 0..16 {
+        let sec = &body[k * 512..(k + 1) * 512];
+        ensure!(
+            sec.iter().all(|&b| b == 0) || sec == &inflight[k * 512..(k + 1) * 512],
+            "sector {} is neither old nor new",
+            5000 + k
+        );
+    }
+    // it also takes writes: a second generation of data over the first
+    write_pattern(ch2, 4000, 16)?;
+    check_pattern(ch2, 4000, 16)?;
+    ensure_eq!(
+        st(sys::process_kill(p2, 56)),
+        Some(S::Ok),
+        "kill the second driver"
+    );
+    wait_ended(p2, 2000)?;
+    sys::handle_close(p2);
+    sys::handle_close(ch2);
+    // both drivers' processes, threads and memory are gone: the rig's job is back to nothing
+    job_use_settles(rig.job, 0, 0, 2000)?;
+    job_use_settles(rig.job, 2, 0, 2000)?;
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -5603,7 +6068,6 @@ fn find_blk(res: u32) -> Result<Option<Blk>, Detail> {
         Some(S::Ok),
         "map the window"
     );
-    sys::handle_close(me);
     for slot in 0..8usize {
         let b = Blk {
             regs: (MMIO_VA as usize + slot * 4096) as *mut u32,
@@ -5615,9 +6079,15 @@ fn find_blk(res: u32) -> Result<Option<Blk>, Detail> {
                 2,
                 "the modern transport (the harness passes force-legacy=false)"
             );
+            sys::handle_close(dev);
+            sys::handle_close(me);
             return Ok(Some(b));
         }
     }
+    // no block device: leave nothing mapped (a later caller maps the window again)
+    sys::process_unmap(me, MMIO_VA);
+    sys::handle_close(dev);
+    sys::handle_close(me);
     Ok(None)
 }
 
@@ -6642,6 +7112,8 @@ pub fn app_main() -> i32 {
             "device_caps_need_the_resource",
             device_caps_need_the_resource,
         ),
+        ("blk_round_trip", blk_round_trip),
+        ("blk_driver_restart", blk_driver_restart),
         (
             "a_child_has_no_device_authority",
             a_child_has_no_device_authority,
