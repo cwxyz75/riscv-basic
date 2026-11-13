@@ -31,6 +31,14 @@ pub enum Role {
     Tty = 9,
     /// A job handle: for the launcher, the job it makes each program's job under.
     Job = 10,
+    /// A block driver's device memory: the virtio-mmio slot (S6b).
+    BlkMmio = 11,
+    /// A block driver's DMA buffer (a DMA VMO with the DMA right).
+    BlkDma = 12,
+    /// A block driver's interrupt object (absent where the machine has no PLIC: poll).
+    BlkIrq = 13,
+    /// The channel a block driver serves the block protocol on.
+    ServiceBlk = 14,
 }
 
 impl Role {
@@ -46,6 +54,10 @@ impl Role {
             8 => Role::ServiceInit,
             9 => Role::Tty,
             10 => Role::Job,
+            11 => Role::BlkMmio,
+            12 => Role::BlkDma,
+            13 => Role::BlkIrq,
+            14 => Role::ServiceBlk,
             _ => return None,
         })
     }

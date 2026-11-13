@@ -82,10 +82,10 @@ fn startup_rejects_every_kind_of_malformation() {
     let mut c = good.clone();
     c[8] = 9;
     assert!(d(&c, 3).is_err());
-    // unknown role (11) and duplicate role (both Stdin)
+    // unknown role (15) and duplicate role (both Stdin)
     let mut r = good.clone();
     let n = r.len();
-    r[n - 8] = 11;
+    r[n - 8] = 15;
     assert_eq!(d(&r, 3), Err(StartupError::UnknownRole));
     let mut r = good.clone();
     r[n - 8] = 1;

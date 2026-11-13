@@ -737,6 +737,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD63 | Sockets have a half-close, `socket_shutdown` (syscall 73, right WRITE): the peer reads end-of-stream and sees a new signal WRITE_CLOSED (bit 4), PEER_CLOSED keeps meaning "the peer endpoint is gone", and the shut end's writes fail with BAD_STATE. Not used by the terminal: Ctrl-D stays an in-band byte because a terminal's end of input is per line, not permanent. | decided |
 | OD64 | S6 (S6-SPEC.md): device authority is a *root resource* object (only the kernel-started process can obtain it) that mints physical (MMIO) VMOs inside fixed device windows and DMA VMOs (contiguous RAM, physical address gated by a DMA right, system budget 4 MiB); the kernel never copies through device memory. Interrupt objects are PLIC-only; on AIA machines drivers poll. | decided |
 
+| OD65 | Block storage (S6b): the driver (`blkd`) is an ordinary user program that is handed only an MMIO slot, a DMA buffer, an optional interrupt and its service channel; the block protocol is request/reply messages (`proto::blk`, 8 KiB per I/O). A driver's death must not free DMA memory a device may still write: the *supervisor* keeps its own handles to the DMA buffer and slot across driver lifetimes and resets the device before reuse (T42), rather than a kernel quarantine. | decided |
 ---
 
 ## 18. Open questions (stop and ask the product owner)

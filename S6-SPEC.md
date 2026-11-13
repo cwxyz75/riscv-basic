@@ -1,6 +1,6 @@
 # S6: storage drivers (spec, v1)
 
-Status: v1. S6a (section 3, including interrupt objects) is built; S6b and S6c are not. This file is the written acceptance contract for S6
+Status: v1. S6a (section 3, including interrupt objects) and S6b (the driver and protocol) are built; S6c (device tree and driver manager) is not. This file is the written acceptance contract for S6
 (CLAUDE.md: every milestone needs a runnable acceptance check, written before the code). Decisions
 made here are logged as OD64 and later in `OS-ARCHITECTURE.md` section 17.
 
@@ -101,10 +101,11 @@ Nothing else (no resource, no job beyond its own).
   deadline. Both paths are the same code behind one `Wait` trait.
 - **Request path.** One request at a time: header, data (bounce area, at most `MAX_IO` = 16 sectors
   = 8 KiB per request), status byte. Reads copy bounce -> client buffer, writes the reverse.
-- **Kill safety (T42).** A killed driver must not leave its device writing into freed RAM. Before the
-  restart acceptance S6b makes DMA VMO frames survive their holder's death until the device is reset
-  (design chosen at S6b: the DMA VMO's frames are quarantined by the kernel, and the driver manager
-  releases them after resetting the virtio device through its own MMIO VMO).
+- **Kill safety (T42).** A killed driver must not leave its device writing into freed RAM. Decided at
+  S6b: ownership, not a kernel mechanism. The supervisor (S6c: the device manager) holds its own
+  handles to the DMA VMO and the MMIO slot for as long as the device is in use, hands the driver
+  duplicates, and after a driver dies resets the virtio device (`STATUS = 0`) before the buffer goes
+  to the next driver, which zeroes the queue memory itself. The test rig (`BlkRig`) does exactly this.
 - **Failure.** A device error status is returned as I/O error; a device that does not complete
   within 2 seconds is a timeout error and the driver exits (so a supervisor can restart it); every
   malformed client request is refused with an error, never a driver crash.
