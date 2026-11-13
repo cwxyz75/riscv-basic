@@ -3757,31 +3757,19 @@ fn fetch_boot_image_vmo() -> Result<u32, Detail> {
     Ok(got[0])
 }
 
-/// The whole VMO into memory. (`rt::spawn::read_image` refuses more than one program image's
-/// worth, 4 MiB; the whole boot image may be larger.)
-fn read_whole_vmo(vmo: u32, size: u64) -> Option<Vec<u8>> {
-    let mut img: Vec<u8> = Vec::new();
-    img.try_reserve_exact(size as usize).ok()?;
-    img.resize(size as usize, 0);
-    for (i, chunk) in img.chunks_mut(32 * 1024).enumerate() {
-        let r = sys::vmo_read(vmo, (i * 32 * 1024) as u64, chunk.as_mut_ptr(), chunk.len());
-        if r.status != 0 {
-            return None;
-        }
-    }
-    Some(img)
-}
-
 /// (offset, length) of a boot image entry.
 fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
-    let size = sys::vmo_get_size(vmo).a1 as u64;
-    let img = read_whole_vmo(vmo, size).ok_or_else(|| {
+    // only the table at the front is needed, not the whole image (which is megabytes)
+    let size = sys::vmo_get_size(vmo).a1;
+    let prefix = rt::spawn::read_image(vmo, 0, (size as u64).min(128 * 1024)).ok_or_else(|| {
         let mut d = Detail::new();
-        let _ =
-            core::fmt::Write::write_fmt(&mut d, format_args!("read the boot image (size {size})"));
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!("read the boot image table (size {size})"),
+        );
         d
     })?;
-    let entries = bootimg::parse(&img).map_err(|e| {
+    let entries = bootimg::parse_prefix(&prefix, size).map_err(|e| {
         let mut d = Detail::new();
         let _ = core::fmt::Write::write_fmt(&mut d, format_args!("parse: {e:?}"));
         d
