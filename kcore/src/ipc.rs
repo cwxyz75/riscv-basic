@@ -105,6 +105,8 @@ pub enum KObj {
     Port(PortObj),
     /// A job (S4.5): the ledger id; the object holds one use of it.
     Job(JobId),
+    /// The root resource (S6): the authority to mint device memory, DMA buffers and interrupts.
+    Resource,
 }
 
 impl Object for KObj {
@@ -582,7 +584,7 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
-        KObj::Vmo(_) | KObj::Job(_) => 0,
+        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource => 0,
         KObj::Process(p) => {
             if p.terminated {
                 signals::TERMINATED
@@ -1007,10 +1009,53 @@ pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, 
 }
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
+/// The root resource object, with a handle carrying `Rights::RESOURCE`.
+pub fn resource_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    q: &mut Quota,
+) -> Result<Handle, Status> {
+    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Resource, q.job);
+    Ok(table
+        .insert(obj, Rights::RESOURCE)
+        .expect("room was checked"))
+}
+
+/// Check that `h` is a root resource handle with MANAGE (the right to mint).
+pub fn resource_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Resource) => {
+            if entry.rights.contains(Rights::MANAGE) {
+                Ok(())
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
 pub fn vmo_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
     id: u64,
+    q: &mut Quota,
+) -> Result<Handle, Status> {
+    vmo_object_create_with(reg, table, id, Rights::VMO, q)
+}
+
+/// A VMO object with a handle carrying exactly `rights`.
+pub fn vmo_object_create_with(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    id: u64,
+    rights: Rights,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
     if table.room() < 1 || reg.live() >= MAX_OBJECTS {
@@ -1018,7 +1063,7 @@ pub fn vmo_object_create_in(
     }
     q.objects(reg, 1)?;
     let obj = reg.create_charged(KObj::Vmo(id), q.job);
-    Ok(table.insert(obj, Rights::VMO).expect("room was checked"))
+    Ok(table.insert(obj, rights).expect("room was checked"))
 }
 
 /// A job object for ledger job `id` (whose use the object takes over), with a handle in

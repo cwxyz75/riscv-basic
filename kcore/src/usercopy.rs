@@ -37,7 +37,9 @@ fn resolve<M: PhysMem>(
             Access::Write => t.perms.write,
             Access::Exec => t.perms.exec,
         };
-    if !allowed {
+    // device memory (an MMIO mapping) is reachable by user code only, never through the
+    // kernel's direct map
+    if !allowed || !mm.db.is_managed(t.pfn) {
         return Err(Status::InvalidArgs);
     }
     Ok((t.pfn << 12) | (va & (PAGE_SIZE - 1)))
@@ -156,7 +158,7 @@ pub fn copy_to_user_verified<M: PhysMem>(
             .table()
             .translate(mm, at & !(PAGE_SIZE - 1))
             .ok_or(Status::InvalidArgs)?;
-        if !(t.perms.user && t.perms.write) {
+        if !(t.perms.user && t.perms.write) || !mm.db.is_managed(t.pfn) {
             return Err(Status::InvalidArgs);
         }
         mm.mem.write_bytes(

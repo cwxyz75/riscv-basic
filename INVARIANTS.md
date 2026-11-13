@@ -66,6 +66,15 @@ get filled in as each area is built.
 | J4 | A job's memory is charged where the page is committed (`Vmos::page_for`), nowhere else: no path commits a page without the charge | code structure; `committed_pages_are_charged...` |
 | J5 | Objects and queued data are charged exactly once and credited exactly once: an object's creator pays for the object, the creator of an endpoint pays for what is queued in it, and a destroyed object's credit is applied before the next charge; a charged object holds a use of its job until then, so a record never goes while it has usage | `kcore/tests/job_ipc_quota.rs` (a random walk compared with the registry's own counts), QEMU `job_quotas_...`, the end-of-session ledger check; mutation-checked |
 
+### Device rules (S6a)
+
+| # | Invariant | How checked |
+|---|---|---|
+| D1 | A physical VMO never names RAM: its range is inside a device window, so the frame database never sees its frames and no path frees or zeroes them; the kernel never reads or writes through one (`vmo_read`/`vmo_write` and every syscall copy refuse it) | `abi::layout::in_device_window`, `kcore/tests/device_vmo.rs` (mutation-checked), QEMU `device_caps_need_the_resource`, `mmio_reads_the_virtio_magic` |
+| D2 | A physical address is learnable only through a DMA-right handle of a DMA VMO | QEMU `device_caps_need_the_resource` |
+| D3 | Device objects are minted only with the root resource, which only the kernel-started process can obtain | QEMU `device_caps_need_the_resource` |
+| D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |
+
 ### Hart rules (S5a)
 
 | # | Invariant | How checked |

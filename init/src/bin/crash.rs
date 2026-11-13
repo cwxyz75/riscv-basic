@@ -270,6 +270,26 @@ pub fn app_main() -> i32 {
             }
             return code;
         }
+        50 => {
+            // S6a: no ambient device authority. Bit 0: `resource_root` is refused; bit 1: made-up
+            // handles mint nothing; bit 2: neither does an event (a wrong object).
+            let mut code = 0;
+            if rt::sys::resource_root().status == -3 {
+                code |= 1;
+            }
+            if rt::sys::vmo_create_physical(77, 0x1000_1000, 4096).status == -1
+                && rt::sys::vmo_create_dma(77, 1).status == -1
+            {
+                code |= 2;
+            }
+            let ev = rt::sys::event_create().a1 as u32;
+            if rt::sys::vmo_create_physical(ev, 0x1000_1000, 4096).status == -2
+                && rt::sys::vmo_create_dma(ev, 1).status == -2
+            {
+                code |= 4;
+            }
+            return code;
+        }
         32 => {
             // S4.5: a process bomb. Create processes until the job says no; the exit code is how
             // many it made (their handles are kept: they never start, so they cost only slots).
