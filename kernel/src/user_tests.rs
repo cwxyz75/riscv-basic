@@ -222,6 +222,28 @@ pub fn run_all() -> Report {
             ))
         },
     );
+    // Slice T measurement: how deep the kernel stacks of the threads that ended went (they are 16 KiB).
+    {
+        let used = thread::stack_high_water();
+        let _ = core::fmt::Write::write_fmt(
+            &mut crate::console::Console,
+            format_args!(
+                "kernel: deepest kernel stack use among ended threads: {used} of {} bytes\n",
+                thread::STACK_BYTES
+            ),
+        );
+        push(
+            "kernel_stacks_stay_well_inside_their_size",
+            if used < thread::STACK_BYTES * 3 / 4 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a kernel stack went {used} of {} bytes deep",
+                    thread::STACK_BYTES
+                ))
+            },
+        );
+    }
     push(
         "process_exit_releases_all_objects",
         if user::live_objects() == 0 {
