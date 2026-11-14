@@ -1,6 +1,7 @@
 # SCHED-SMP: threads, the scheduler and the SMP execution model (specification, v1, 2026-11-14)
 
-Status: **proposed**. A design for the *final state* of three things that cannot be designed apart (the threading
+Status: **accepted by the owner 2026-11-14 (specified; nothing built)**, with the answers to the open questions of
+section 9 recorded there (Q1 is deferred to this document's recommendation: one object lock). A design for the *final state* of three things that cannot be designed apart (the threading
 model, the scheduler structure, the SMP execution model) and an ordered task list to get there from today's code.
 Nothing in sections 3 to 5 is built unless section 2 says so. The owner's direction is recorded in section 1; the
 choices made here are marked "Chosen here" and are the lead's and the owner's to veto. This document follows the
@@ -858,7 +859,21 @@ impl Donations {
 * **Stage 1** (task 3): the scheduler clock is derived from `time`, not from counting handler runs (T40).
   **Stage 2** (task 13): the per-hart queue and one-shot programming; sleeps and deadlines no longer quantise to
   1 ms; a hart with one runnable thread and no deadline takes no timer interrupt at all.
-* The ABI's time unit is open question Q3 (keep 1 ms ticks as a unit, or move every deadline to nanoseconds).
+* **Timer slack (added by the lead after review; decided 2026-11-14).** Each thread has a `timer_slack` (nanoseconds,
+  in `ThreadSched`, set through the reserved flags of `thread_set_sched`, clamped to at most 1 ms). Default: 50 us
+  for a thread whose effective priority is in the normal band, **0 for the RT band** (the effective priority decides,
+  so a donated server wakes exactly). A deadline entry therefore has a soft expiry (`deadline`) and a hard expiry
+  (`deadline + slack`). The one-shot timer is programmed to the earliest *hard* expiry; when it fires, every entry whose
+  *soft* expiry is already past is expired in the same interrupt. Invariants: an entry never fires before its
+  deadline; it fires no later than `deadline + slack` unless the hart is busy in a longer section (the latency trace
+  watches that). Purpose: bound the interrupt rate a normal-band program can cause with many short sleeps, and
+  coalesce nearby wakes into one interrupt. Model test: random entries and slacks against a reference that checks
+  both bounds and that the number of interrupts never exceeds the number of distinct hard expiries; negative control:
+  a timer that fires at the soft expiry of the first entry only (interrupt count rises).
+* **The ABI time unit (Q3, decided 2026-11-14):** every deadline and `clock_get` is in nanoseconds on the
+  monotonic clock since boot, as absolute values; wall-clock time is a separate later call. The unit is independent
+  of hardware resolution (QEMU's timer is 10 MHz, so 100 ns) and of the wake rate, which the timer queue and slack
+  determine. The change is one flag-day PR folded into task 6.
 
 ### 4.12 Idle and tickless
 
@@ -1103,11 +1118,11 @@ its tests exist and behaviour is unchanged; "Built" means it does what the final
 | 6 | SC | `kcore::sched` v2: `SchedAttr`, `ThreadSched`, the new `SchedClass`, `HartRq` hosting RT + normal + idle, `PrioQueues`, nanosecond clock and accounting hooks. The kernel still runs it in **shared-queue mode** (one set of class queues for all harts, per-hart `cur`, as today) under the BKL | differential test against `sched_v1`; conformance suite per class; AC1; the whole suite unchanged | 700 + 600 | 3 | default | Stub (structure; behaviour as today) |
 | 7 | SC | `kcore::donate`, wired to `HartRq::set_effective`; no producer of edges yet | DN1 to DN3 against the recompute reference, mutation-checked | 300 + 350 | 6 | default | Stub (graph built, unused) |
 | 8 | SC | Authority and the priority API: job `max_prio`, `rt_budget`, `cpu_weight`; `job_set_sched`; `thread_set_sched`, `thread_get_sched`; inheritance and clamping; RT accounting without enforcement; `bin/rtdemo` | PR1, PR2 in the job model; `a_confined_program_cannot_raise_its_priority`; the user-level RT latency demo with its negative control | 500 + 500 | 6 | **Fable** | Built (API, bounds); Stub (budget enforcement) |
-| 9 | TH | `thread_spawn` with a kernel-provisioned stack, the stack arena, tid in `a1`, `tp`; limits from quotas; `MAX_REGIONS` raised; `libc` and `rt` moved to it; launcher default 64 threads | `ten_thousand_threads_leak_nothing`; `two_thousand_threads_live` (after slice T step 2); every error case of the entry; `thread_create_join` at most half the baseline | 500 + 450 | slice T step 2 for the 4096 backstop | **Fable** | Built |
+| 9 | TH | `thread_spawn` with a kernel-provisioned stack, the stack arena, tid in `a1`, `tp`; limits from quotas; `MAX_REGIONS` raised; `libc` and `rt` moved to it; launcher default 128 threads (Q5) | `ten_thousand_threads_leak_nothing`; `two_thousand_threads_live` (after slice T step 2); every error case of the entry; `thread_create_join` at most half the baseline | 500 + 450 | slice T step 2 for the 4096 backstop | **Fable** | Built |
 | 10 | L | `klock` and the generalised order checker; the park protocol in `kcore`; every kernel wait converted to it **while still under the BKL**; the wake token and `WaitQueue` deleted | the loom and shuttle park models with three negative controls; the checker's pair table | 600 + 700 | 4, 6 | **Fable** | Built |
 | 11 | L | Per-hart run queues under `RQ` locks taken *inside* the BKL; push and pull; `need_resched` (X7); `finish_switch`, the dead list and reap by the hart; the idle loop of 3.9; the watchdog | GP1, GP2 on 1 to 8 harts against the independent reference; the idle model updated; `rt_threads_take_the_harts`; negative-control kernels `fault-skip-poke`, `fault-early-reap`, `fault-skip-pull` | 900 + 800 | 10 | **Fable**, soak | Built |
 | 12 | L | The scheduler leaves the BKL: the lock is released at a switch (G4), the timer and IPI traps and `thread_yield`, `clock_get` and pure sleeps stop taking it | `bkl_profile` shows zero BKL acquisitions from the tick; `pair_scaling` for futex-free yield pairs; the suite at 1, 2, 4 | 400 + 300 | 11 | **Fable**, soak | Built: first peel done |
-| 13 | TM | Per-hart timer queues, one-shot programming (Sstc probed, SBI fallback), slice timer only when needed; the ABI time unit if Q3 says so | timers model; `sleep_wakes_on_time` to 100 us; a hart with one runnable thread takes no timer interrupt (counter) | 450 + 350 | 12 | default | Built |
+| 13 | TM | Per-hart timer queues, one-shot programming (Sstc probed, SBI fallback), slice timer only when needed; **timer slack** (4.11); the nanosecond ABI itself is in task 6 | timers model with the slack bounds and the interrupt-count property; `sleep_wakes_on_time` to 100 us for an RT thread; a hart with one runnable thread takes no timer interrupt (counter) | 450 + 350 | 12 | default | Built |
 | 14 | L | Futex peel: bucket locks; `futex_wake` leaves the BKL; `futex_wait` holds it only to translate the address | loom futex model extended (kill, timeout); `pair_scaling` futex ratio at least 3.0 at four harts | 300 + 300 | 12 | **Fable** | Built |
 | 15 | L | Mappings hold a VMO reference; `reap_vmos` deleted (pure `kcore`; slice L's old step 1) | `aspace_model` with the reference count; the leak suites | 250 + 200 | | default | Built |
 | 16 | L | `JOBS`, `VMO`, `FRAME` as their own locks (still nested inside the BKL), the ledger moved out of the VMO store, per-hart frame caches | the existing models; loom for the frame cache; exact frame oracles with caches | 450 + 350 | 10, 15 | default | Built (locks exist, not yet relied on) |
@@ -1157,13 +1172,13 @@ its tests exist and behaviour is unchanged; "Built" means it does what the final
 * **Slice TS**: unchanged; the tiers are used as they are. Step 3 (logic out of QEMU) is helped by task 6 onward
   putting scheduler behaviour in host tests.
 * **Slices R, SD, DM**: independent. Task 27 builds on R's service loop.
-* **S8 and S9.** Nothing here blocks S8's acceptance, and S8's design (one-thread servers in separate processes)
-  does not need the BKL gone. **Recommended before S8:** tasks 1 to 12: the measurement, the paper, the userland-
-  visible ABI (priorities, `thread_spawn`), and the scheduler peel, so that the service runtime and the network
-  servers are written once against the final thread API and so that a network flake is never confused with a new
-  wake protocol landing underneath it. **Can wait until after S8:** 13, 14, 21 to 28. **After S9, in measured
-  order:** 15 to 20, chosen against the load the network stack provides, which was the reason slice L was placed
-  after S9 in the first place. This is open question Q2.
+* **S8 and S9 (decided by the owner, Q2).** Nothing here blocks S8's acceptance, and S8's design (one-thread
+  servers in separate processes) does not need the BKL gone. **Before S8: tasks 1 to 10**: the measurement, the
+  paper, the userland-visible ABI (priorities, `thread_spawn`, nanosecond time) and the block/wake protocol, so that
+  the service runtime and the network servers are written once against the final thread API. **After S8's first
+  milestone: tasks 11 and 12** (per-hart queues, the scheduler out of the BKL), with the network stack as the load
+  and the realistic benchmark. **Can wait until after S8:** 13, 14, 21 to 28. **After S9, in measured order:** 15 to
+  20, chosen against the load the network stack provides.
 
 ---
 
@@ -1171,23 +1186,23 @@ its tests exist and behaviour is unchanged; "Built" means it does what the final
 
 ### 8.1 Decision log (OS-ARCHITECTURE section 17)
 
-The log's next free number is OD84, but `NET-DESIGN.md` section 13 has proposed OD84 to OD87 for the network
-design; these start at OD88 to avoid a collision. Renumber if the network entries land differently.
+The log's last entry is OD84 (the service runtime), so these are OD85 to OD96. `NET-DESIGN.md` section 13
+had proposed OD84 to OD87 for the network design; those proposals are renumbered to OD97 to OD100 there.
 
 | # | Decision | Status |
 |---|---|---|
-| OD88 | **SMP execution model** (`SCHED-SMP-SPEC.md` section 3). Domain spinlocks in one checked global order (`AS`, `OBJ`, `PROCS`, `FUTEX`, `VMO`, `JOBS`, `PI`, `TT`, `RQ`, `KSTACK`, `FRAME`, `HEAP`, `UART`): one lock per pure `kcore` structure, per hart for run queues, per process for address spaces, per bucket for futexes. Interrupts off while a lock is held; no lock across a context switch except the switching hart's run-queue lock; no sleeping locks; kernel code holding no lock is preemptible. The big kernel lock becomes a shrinking legacy lock, outermost in the order, released at a context switch, and ends as the object-domain lock. Rejected: per-hart ownership with message passing (the shared structures are shared by nature); per-object locks with lock-free lookups (deferred behind a measured trigger). Supersedes rung 3 of section 7 and the plan of roadmap slice L; amends OD60 | proposed |
-| OD89 | **One block/wake path** (section 3.7): prepare, check and register under the lock that owns the condition, release, block; a per-thread `park` word makes a wake between the release and the block impossible to lose; wakes never switch, they set `need_resched`. Replaces the wake token of OD34 and the "lock follows the thread" rule K3 of OD60; W-SPEC's W1 becomes "the dirty log is empty whenever the object lock is released", enforced by the guard (amends OD80) | proposed |
-| OD90 | **Scheduler structure** (section 4). Per-hart run queues hosting three bands with strict precedence (RT 32-63, normal 1-31, idle 0), composed statically; the normal-band class is still chosen at build time. A thread has a base priority and an effective priority (base raised by donation); its band is the band of its effective priority. Placement is global fixed priority by push (a mark and an IPI) and pull (the destination hart moves the thread). The normal band keeps today's fixed-priority round robin behind the new `SchedClass`; a hierarchical fair class is deferred with its preconditions listed. Amends OD5, OD32, OD33, OD61 | proposed |
-| OD91 | **Priority donation** (section 4.8). A pure donation graph (`kcore::donate`), one out-edge per blocked thread, chains to depth 8, cycles and longer chains refused so that effective priority is always exact. A `channel_call` caller donates to the thread that holds its transaction until the reply, a timeout or a death; a PI futex (owner tid in the lock word, hand-over on unlock, poisoned on owner death) donates from waiters to the owner. Realises the hook of OD43 | proposed |
-| OD92 | **Authority over priority** (section 4.9). A job has `max_prio`, `rt_budget` and `cpu_weight`, set with SET_LIMITS and never above its parent's; a thread's base priority never exceeds its job's `max_prio`; the RT band is reachable only in a job whose maximum allows it. No new right bit | proposed |
-| OD93 | **The RT band** (section 4.5). FIFO within a level, optional round robin; 100 ms windows; a hart gives the normal band at least 20% of a window when it has work; a job that exhausts its RT budget is demoted to the top of the normal band until the window ends | proposed |
-| OD94 | **Time** (sections 4.10, 4.11). One kernel clock in nanoseconds from the `time` CSR; CPU time accounted per thread at every switch and mirrored per job in lock-free counters; per-hart one-shot timers (Sstc when the device tree lists it, SBI otherwise); the periodic tick remains only as a slice or window event. Closes the Sstc part of Q3 as "used when present" | proposed |
-| OD95 | **Threads** (section 5). `thread_spawn` creates and starts a thread in one call with a kernel-provisioned user stack in a per-process stack arena, freed when the thread is reaped; thread limits are job quotas with a RAM-derived backstop (4096 on 256 MiB); a thread is a reference-counted object freed by the hart that switches away from it; `tp` is the caller's to set. `thread_interrupt` is built; suspend and resume are reserved. Amends OD46, OD73, OD82 | proposed |
-| OD96 | **TLB** (section 3.10). Live processes have unique ASIDs (no flush on an address-space switch); a shootdown is by ASID and range, to the harts in the address space's `ran_on` mask, batched per unmap, and completes before the frames are freed. SBI RFENCE must be synchronous: a platform requirement. Amends OD62 | proposed |
-| OD97 | **Wake placement and direct hand-off** (sections 4.4, 5.5). A wake by a thread that is about to block places the woken thread on the waker's hart with no IPI; other wakes prefer the last hart, then the least urgent hart. `channel_call` uses the first rule and, with donation, is the direct hand-off of OD73 item 4 | proposed |
-| OD98 | **`klock`**: a small crate written here holding the spinlock type over `kcore::ticket`, the only pure-side crate allowed `unsafe`, run under Miri, loom and shuttle; the kernel supplies interrupts, the hart identity and the order checker through a trait | proposed |
-| OD99 | **Measurement** (sections 3.12, 6.1). `##BENCH` lines (amends OD28), `make os-bench` with a checked-in baseline, the `latency-trace` kernel feature, and a stated latency budget that the soak tier compares against | proposed |
+| OD85 | **SMP execution model** (`SCHED-SMP-SPEC.md` section 3). Domain spinlocks in one checked global order (`AS`, `OBJ`, `PROCS`, `FUTEX`, `VMO`, `JOBS`, `PI`, `TT`, `RQ`, `KSTACK`, `FRAME`, `HEAP`, `UART`): one lock per pure `kcore` structure, per hart for run queues, per process for address spaces, per bucket for futexes. Interrupts off while a lock is held; no lock across a context switch except the switching hart's run-queue lock; no sleeping locks; kernel code holding no lock is preemptible. The big kernel lock becomes a shrinking legacy lock, outermost in the order, released at a context switch, and ends as the object-domain lock. Rejected: per-hart ownership with message passing (the shared structures are shared by nature); per-object locks with lock-free lookups (deferred behind a measured trigger). Supersedes rung 3 of section 7 and the plan of roadmap slice L; amends OD60 | decided (specified) |
+| OD86 | **One block/wake path** (section 3.7): prepare, check and register under the lock that owns the condition, release, block; a per-thread `park` word makes a wake between the release and the block impossible to lose; wakes never switch, they set `need_resched`. Replaces the wake token of OD34 and the "lock follows the thread" rule K3 of OD60; W-SPEC's W1 becomes "the dirty log is empty whenever the object lock is released", enforced by the guard (amends OD80) | decided (specified) |
+| OD87 | **Scheduler structure** (section 4). Per-hart run queues hosting three bands with strict precedence (RT 32-63, normal 1-31, idle 0), composed statically; the normal-band class is still chosen at build time. A thread has a base priority and an effective priority (base raised by donation); its band is the band of its effective priority. Placement is global fixed priority by push (a mark and an IPI) and pull (the destination hart moves the thread). The normal band keeps today's fixed-priority round robin behind the new `SchedClass`; a hierarchical fair class is deferred with its preconditions listed. Amends OD5, OD32, OD33, OD61 | decided (specified) |
+| OD88 | **Priority donation** (section 4.8). A pure donation graph (`kcore::donate`), one out-edge per blocked thread, chains to depth 8, cycles and longer chains refused so that effective priority is always exact. A `channel_call` caller donates to the thread that holds its transaction until the reply, a timeout or a death; a PI futex (owner tid in the lock word, hand-over on unlock, poisoned on owner death) donates from waiters to the owner. Realises the hook of OD43 | decided (specified) |
+| OD89 | **Authority over priority** (section 4.9). A job has `max_prio`, `rt_budget` and `cpu_weight`, set with SET_LIMITS and never above its parent's; a thread's base priority never exceeds its job's `max_prio`; the RT band is reachable only in a job whose maximum allows it. No new right bit | decided (specified) |
+| OD90 | **The RT band** (section 4.5). FIFO within a level, optional round robin; 100 ms windows; a hart gives the normal band at least 20% of a window when it has work; a job that exhausts its RT budget is demoted to the top of the normal band until the window ends | decided (specified) |
+| OD91 | **Time** (sections 4.10, 4.11). One kernel clock in nanoseconds from the `time` CSR; CPU time accounted per thread at every switch and mirrored per job in lock-free counters; per-hart one-shot timers (Sstc when the device tree lists it, SBI otherwise); the periodic tick remains only as a slice or window event; per-thread timer slack (50 us default in the normal band, 0 in the RT band) lets nearby deadlines share one interrupt; the ABI's deadlines and `clock_get` are absolute monotonic nanoseconds (one flag-day PR in task 6). Closes the Sstc part of Q3 as "used when present" | decided (specified) |
+| OD92 | **Threads** (section 5). `thread_spawn` creates and starts a thread in one call with a kernel-provisioned user stack in a per-process stack arena, freed when the thread is reaped; thread limits are job quotas (launcher default 128) with a RAM-derived backstop (16 per MiB, 4096 on 256 MiB); a thread is a reference-counted object freed by the hart that switches away from it; `tp` is the caller's to set. `thread_interrupt` is built; suspend and resume are reserved. Amends OD46, OD73, OD82 | decided (specified) |
+| OD93 | **TLB** (section 3.10). Live processes have unique ASIDs (no flush on an address-space switch); a shootdown is by ASID and range, to the harts in the address space's `ran_on` mask, batched per unmap, and completes before the frames are freed. SBI RFENCE must be synchronous: a platform requirement. Amends OD62 | decided (specified) |
+| OD94 | **Wake placement and direct hand-off** (sections 4.4, 5.5). A wake by a thread that is about to block places the woken thread on the waker's hart with no IPI; other wakes prefer the last hart, then the least urgent hart. `channel_call` uses the first rule and, with donation, is the direct hand-off of OD73 item 4 | decided (specified) |
+| OD95 | **`klock`**: a small crate written here holding the spinlock type over `kcore::ticket`, the only pure-side crate allowed `unsafe`, run under Miri, loom and shuttle; the kernel supplies interrupts, the hart identity and the order checker through a trait | decided (specified) |
+| OD96 | **Measurement** (sections 3.12, 6.1). `##BENCH` lines (amends OD28), `make os-bench` with a checked-in baseline, the `latency-trace` kernel feature, and a stated latency budget that the soak tier compares against | decided (specified) |
 
 ### 8.2 TIDY-UP.md
 
@@ -1205,6 +1220,7 @@ New entries (the next free number is T69):
 | T76 | M | **The reachability sweep runs whole under the object lock**: O(live objects) with interrupts off, the known worst case of the latency budget | Rare (process death, pressure) | Incremental marking with an epoch, or a low-priority sweeper thread (task 19 decides) |
 | T77 | L | **Donation gaps**: no boost between a request being queued and a server reading it (until task 24); CPU time and RT budget are not donated; a chain longer than 8 or a cycle gets no boost | The common case (a server blocked in receive) is covered by hand-off | Donate at wake (task 24); budget donation with the fair class |
 | T78 | L | **The scheduler allocates under its lock during the transition** (X8 not yet enforced) | `HEAP` is later in the lock order, so it is safe, only slow | Intrusive queues and reserved capacity by task 13 |
+| T79 | M | **Many hard limits assume QEMU as the target machine** (owner, 2026-11-14): thread, object, handle, region, IPC-byte, binding and stack-size constants (`abi/src/lib.rs`, OD50, T13), the 256 MiB RAM assumption, the 16 KiB kernel stack, the 1 ms and 10 ms scheduler constants. Until reviewed, new limits in this plan are expressed per MiB of RAM or as job-quota defaults, not fresh constants (the thread backstop is 16 per MiB of RAM, 4096 at 256 MiB) | Correct on the one machine that exists; raising them is a one-line change each | A review of every hard limit: classify each as a safety backstop, a policy default or a mechanism constant; derive backstops from RAM and hart count at boot; make policy defaults configurable (boot parameters, manifest) with a tight profile for small embedded machines and a large one for real computers; require that everything scales, with a test that boots at two RAM sizes. Do it before the first non-QEMU target, or when slice T finishes the growable heap, whichever is first |
 
 Changes to existing entries: T11 "resolved step by step by SCHED-SMP-SPEC tasks 12 to 20"; T38 resolved by task 4
 (the model) and kept current by tasks 10 and 11; T39 and T66 resolved by task 18; T64 resolved as a stated platform
@@ -1328,9 +1344,8 @@ same transaction id is written back, the call ends for any reason, or that threa
 ### 8.5 ROADMAP.md
 
 * In "Queue before S8", after item 5 (slice T): "5a. Slices **B** (benchmark and latency instrumentation), **SC**
-  (two-band scheduler, priority API) and the first lock peel of slice **L** (tasks 1 to 12 of `SCHED-SMP-SPEC.md`)",
-  and change item 10 to "S8, then S9; then the measured peels of L (tasks 15 to 20)".
-* Replace the body of "### L: Kernel locking carve-outs" with: "Superseded by `SCHED-SMP-SPEC.md` (OD88). Slice L is
+  (two-band scheduler, priority API) and the first lock peel of slice **L** (tasks 1 to 10 of `SCHED-SMP-SPEC.md`)", then "10a. Tasks 11 and 12 after S8's first milestone", and change item 10 to "S8, then S9; then the measured peels of L (tasks 15 to 20)".
+* Replace the body of "### L: Kernel locking carve-outs" with: "Superseded by `SCHED-SMP-SPEC.md` (OD85). Slice L is
   now the sequence of lock peels there (tasks 10 to 20): the scheduler first, then futexes, memory, process lifecycle
   and finally the object domain, each a small PR with its model and negative control written first, in the order the
   contention profile gives after the first peel." followed by one unticked box per task 10 to 20.
@@ -1347,21 +1362,31 @@ same transaction id is written back, the call ends for any reason, or that threa
    document keeps one lock for the registry, handle tables and wait table, with a measured trigger to split it
    (3.13). You leaned the other way. *Recommendation:* keep one lock; it is the only choice here that can be undone
    cheaply, and your own rule (peel by measured contention) decides it later with data.
-2. **Q2. When is the scheduler peel built relative to S8?** *Recommendation:* tasks 1 to 12 before S8 (measurement,
+2. **Q2. DECIDED (owner, 2026-11-14): tasks 1 to 10 before S8; tasks 11 and 12 (per-hart queues, the scheduler out of
+   the BKL) after S8's first milestone, using the network stack as the load; the rest as in 7.3.** (The original
+   question and recommendation follow, kept for the record.) When is the scheduler peel built relative to S8? *Recommendation:* tasks 1 to 12 before S8 (measurement,
    priority API, `thread_spawn`, the scheduler out of the BKL), the memory and object peels after S9 against real
    load. The alternative, everything after S9 as slice L was first placed, delays the thread API the service runtime
    should be written against.
-3. **Q3. The ABI's time unit.** Deadlines and `clock_get` are in 1 ms ticks. Sub-millisecond sleeps (audio, the
+3. **Q3. DECIDED (owner, 2026-11-14): nanoseconds, absolute monotonic, one flag-day PR in task 6; event-driven timers
+   with per-thread timer slack (4.11).** (Original text follows.) The ABI's time unit. Deadlines and `clock_get` are in 1 ms ticks. Sub-millisecond sleeps (audio, the
    network's retransmit timers later) need a finer unit. *Recommendation:* one flag-day PR that makes every deadline
    and the clock nanoseconds since boot, before slice R and S8 are written; all userland is in this repository and
    rebuilt together.
-4. **Q4. Default priority policy.** *Recommendation:* programs started by the launcher get `max_prio` 20 and no RT
+4. **Q4. DECIDED (owner, 2026-11-14): the recommendation below, with the numbers kept in one overridable place and the
+   driver budget checked against the benchmark before S9.** Default priority policy. *Recommendation:* programs started by the launcher get `max_prio` 20 and no RT
    budget; the session job 31; drivers started by `devmgr` an RT ceiling of 47 and 20 ms per 100 ms; only a manifest
    entry (S10) grants more. And the RT guard rails: 100 ms windows with a 20% floor for the normal band.
-5. **Q5. Thread targets.** *Recommendation:* 4096 live threads as the system backstop on 256 MiB, 2000 as the
-   acceptance figure, 64 per launched program by default. If you want BeOS-scale counts per program (hundreds), the
+5. **Q5. DECIDED (owner, 2026-11-14), amending the recommendation below: the launcher default is 128 threads per
+   program (not 64); the system backstop is stated as 16 live threads per MiB of RAM (4096 at 256 MiB) rather than a
+   constant; 2000 stays the acceptance figure at 256 MiB. QEMU is not the real target: all hard limits are to be
+   reviewed so that everything scales (tight for embedded, large for real computers), recorded as T79. Whether the
+   kernel stack drops to 8 KiB is decided by the task 1 measurement.** Thread targets. *Recommendation:* 4096 live
+   threads as the system backstop on 256 MiB, 2000 as the acceptance figure, 64 per launched program by default. If you want BeOS-scale counts per program (hundreds), the
    launcher default is the number to raise, not the mechanism.
-6. **Q6. Is `thread_interrupt` wanted before S8?** It is cheap after task 10 and scheduled after S8 (task 26).
+6. **Q6. DECIDED (owner, 2026-11-14): after S8 as task 26; design the service runtime's request model around
+   cancellation by closing the reply channel and by deadlines, and pull task 26 forward only if slice R needs it.**
+   Is `thread_interrupt` wanted before S8? It is cheap after task 10 and scheduled after S8 (task 26).
    *Recommendation:* leave it there unless the service runtime (slice R) wants request cancellation in its first
    version.
 

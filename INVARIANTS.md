@@ -132,6 +132,48 @@ list, with the reason for their position, in the change that adds them.
 | K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
 | K5 | Lock order BKL, HEAP, UART | `lock_order_violations_are_detected`, and the checker panics in the real run |
 
+### Planned lock order and invariants (SCHED-SMP-SPEC sections 3 and 8.3; OD85 to OD96; **not built**)
+
+The list above is the order in force. The table below is the order the SMP redo is building towards: a class is real
+once the task that adds it has merged, and until then its state is under `LEGACY`. K1 to K5 are legacy-lock rules,
+retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. Nothing here is checked yet.
+
+| # | Class | Instances | Protects | IRQ | Nested same-class |
+|---|---|---|---|---|---|
+| 1 | `LEGACY` | one | Everything not yet peeled. Transitional (3.5); absent in the final state | timer, external | reentrant (a depth count) until task 20 |
+| 2 | `AS` | per process | The region map, the page table, the ASID and the `ran_on` hart mask of one address space | no (page faults are traps, not interrupts) | never two (a syscall touches one address space) |
+| 3 | `OBJ` | one | The object registry, every handle table, the wait table and dirty log, port and channel state including pending-call records, the IPC meter | external (interrupt objects) | no |
+| 4 | `PROCS` | one | The process table and each process's lifecycle state (state, killed, exit code, thread count) | no | no |
+| 5 | `FUTEX` | 64 buckets, by hash of the key | Futex queues, PI-futex owner and waiter records | no | never two |
+| 6 | `VMO` | one | The VMO store: pages, commit state, mapping references | no | no |
+| 7 | `JOBS` | one | The job ledger, including each job's scheduling limits | no | no |
+| 8 | `PI` | one | The donation graph (4.8) | no | no |
+| 9 | `TT` | one | The thread table: `Tid` to `Arc<Thread>` | timer, IPI | no |
+| 10 | `RQ` | per hart | That hart's run queues (all bands), its current thread, the scheduling records of the threads homed there, its timer queue, its accounting and throttle state, its `resched_pending` flag | timer, IPI | two, ascending hart index (migration, pull) |
+| 11 | `KSTACK` | one | The kernel-stack slot allocator and the kernel page-table entries of the stack window | no | no |
+| 12 | `FRAME` | one | The frame database (the per-hart frame caches need no lock, 3.10) | no | no |
+| 13 | `HEAP` | one | The kernel allocator | yes | no |
+| 14 | `UART` | one | The console line | yes | reentrant per hart (a panic breaks it) |
+
+| # | Invariant | How checked |
+|---|---|---|
+| X3 | No lock is held across a context switch except the switching hart's own run-queue lock, released by the thread that resumes | the checker panics in `schedule()` if the held stack is not empty; shuttle hand-over model |
+| X7 | A wake never switches threads; the switch happens only in `schedule()`, entered with no lock held | code structure; the T62 scenario test |
+| G1 | State not yet peeled is touched only with the legacy lock held; each peel names the state it moves (replaces K1) | the asserts in the accessors; `LEGACY_SYSCALLS` checked against SYSCALLS.md |
+| PK1 | A wake that follows a waiter's registration is never lost (replaces the token rule of C3) | loom and shuttle park models with three negative controls |
+| PK2 | A thread runs on at most one hart and is never queued while running (C4 across harts) | the same models; `Sched::audit` |
+| W1' | The dirty log is empty whenever the object lock is released (replaces W1) | by construction in the guard; loom model; `wait-audit` |
+| ID1 | No runnable thread stays queued while a hart it may run on idles with no IPI pending | shuttle idle model with three negative controls; the starvation watchdog |
+| GP1 | At quiescence no hart runs a thread while a higher-priority thread that may run there is queued (throttled RT excepted) | `Sched::audit` after every model step, against an independent reference |
+| AF1 | A pinned thread's record is homed only on its hart | `Sched::audit` |
+| DN1-DN3 | Effective priority is exactly the maximum of the base and the donors' effective priorities; the donation graph is acyclic; an edge exists only while its donor is in the wait that made it | `Donations::audit` against a recompute reference; the `ipc` and futex model audits |
+| PF1-PF2 | A PI futex with waiters names a live owner that every waiter donates to; unlock hands over to the queue head | futex model, loom, QEMU |
+| PR1-PR2 | A thread's base priority never exceeds its job's maximum; a job's maximum and RT budget never exceed its parent's | job model; QEMU probe from a confined program |
+| NM1 | When RT budgets are enforced, the normal band gets at least 20% of every window on a hart where it has work throughout | simulated-clock property test; QEMU runaway test |
+| AC1 | CPU time is conserved: per hart, thread time plus idle time equals elapsed time | model; QEMU within tolerance |
+| TLB1 | Live address spaces have distinct ASIDs; an ASID is reused only after it was flushed on every hart that ran its last owner | allocator model; `fault-asid-reuse-no-flush` |
+| TLB2 | A frame that was mapped is freed only after every hart in the address space's `ran_on` mask has been flushed for that page (replaces SMP5). **Platform requirement:** SBI remote fence calls return after the target harts have flushed | `unmap_while_siblings_touch`, the negative controls |
+
 ## Namespaces and paths
 
 | # | Invariant | How checked |
