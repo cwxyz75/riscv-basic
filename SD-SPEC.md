@@ -84,7 +84,7 @@ hostile client (floods, malformed frames), with the budgets of OD84; leak checks
 
 0. This document and OD97. 1. (built) The pure directory logic with model tests. 2. (built) The registry service `registryd` on
 `rt::service`: the `PUBLISH` right (bit 16) and ops 16 to 18 in `proto::file` (ops 9 to 15 are the file operations), status `UNAVAILABLE`, a QEMU test with a toy
-service. 3. Arbitrary namespace prefixes in the startup message (`proto`, `rt`, the launcher). 4. The shell grants a
+service. 3. (built) Arbitrary namespace prefixes in the startup message (`proto::startup::valid_prefix`; the launcher validates through the same decoder). 4. The shell grants a
 `/svc` view; `memfsd`, `launcher`, `devmgr`, `blkd` publish themselves; clients (`rt::fs`, the shell) reconnect on
 UNAVAILABLE. 5. Documents; T15 and T30 narrowed.
 
