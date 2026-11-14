@@ -363,6 +363,21 @@ pub fn app_main() -> i32 {
         }
         40 => return unmap_while_siblings_touch(),
         n if n & 0xff == 42 => return churn((n >> 8) as u64),
+        // slice A (OD76): floating-point state. 60: keep a private FP pattern across preemption and
+        // yields (mode in bits 8-15, seed above); 61: read every FP register at first use (all zero
+        // expected, whatever other processes left in the unit); 62: three threads in one process, each
+        // with its own pattern.
+        n if n & 0xff == 60 => return fp_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64),
+        61 => return fp_fresh(),
+        62 => return fp_threads(),
+        // 63: use FP, then run an instruction user mode may not: the process dies (the unit being
+        // enabled must not turn a genuine illegal instruction into anything else)
+        63 => {
+            let mut got = [0u64; 32];
+            fp_store(&mut got);
+            // SAFETY: as variant 5: traps and ends the process.
+            unsafe { asm!("csrr t0, sstatus") };
+        }
         n if n & 0xff == 51 => {
             // S7b: a wake from another process on the same address number wakes nobody: the exit
             // code is 100 plus the number of threads it woke (0 expected), 1 if the call failed.
@@ -494,7 +509,7 @@ extern "C" fn exit_eight_late(_: usize) -> ! {
 
 // ---- S5d: remote TLB shootdown ----
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Where the changing mapping lives.
 const X: u64 = 0x30_0000_0000;
@@ -753,4 +768,140 @@ fn churn(seed: u64) -> i32 {
         rt::sys::thread_yield();
     }
     160
+}
+
+// --- floating point (slice A) ----------------------------------------------------------------------
+// This program is built for the no-FPU user target, so the FP instructions are assembled with the
+// `d` extension switched on for just these blocks.
+
+fn fp_pattern(seed: u64) -> [u64; 32] {
+    let mut p = [0u64; 32];
+    for (i, v) in p.iter_mut().enumerate() {
+        *v = (seed.wrapping_add(i as u64 + 1)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ ((i as u64) << 52);
+    }
+    p
+}
+
+/// Load `f0`-`f31` from `p` and set `fcsr`.
+fn fp_load(p: &[u64; 32], fcsr: u32) {
+    // SAFETY: only reads `p` and writes FP registers and `fcsr`; the kernel enables the unit on the
+    // first instruction.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +d",
+            "fld f0, 0({p})", "fld f1, 8({p})", "fld f2, 16({p})", "fld f3, 24({p})",
+            "fld f4, 32({p})", "fld f5, 40({p})", "fld f6, 48({p})", "fld f7, 56({p})",
+            "fld f8, 64({p})", "fld f9, 72({p})", "fld f10, 80({p})", "fld f11, 88({p})",
+            "fld f12, 96({p})", "fld f13, 104({p})", "fld f14, 112({p})", "fld f15, 120({p})",
+            "fld f16, 128({p})", "fld f17, 136({p})", "fld f18, 144({p})", "fld f19, 152({p})",
+            "fld f20, 160({p})", "fld f21, 168({p})", "fld f22, 176({p})", "fld f23, 184({p})",
+            "fld f24, 192({p})", "fld f25, 200({p})", "fld f26, 208({p})", "fld f27, 216({p})",
+            "fld f28, 224({p})", "fld f29, 232({p})", "fld f30, 240({p})", "fld f31, 248({p})",
+            "fscsr {c}",
+            ".option pop",
+            p = in(reg) p.as_ptr(),
+            c = in(reg) fcsr,
+        );
+    }
+}
+
+/// Read `f0`-`f31` into `out`; returns `fcsr`.
+fn fp_store(out: &mut [u64; 32]) -> u32 {
+    let c: u64;
+    // SAFETY: only writes `out` and reads FP registers and `fcsr`.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +d",
+            "fsd f0, 0({p})", "fsd f1, 8({p})", "fsd f2, 16({p})", "fsd f3, 24({p})",
+            "fsd f4, 32({p})", "fsd f5, 40({p})", "fsd f6, 48({p})", "fsd f7, 56({p})",
+            "fsd f8, 64({p})", "fsd f9, 72({p})", "fsd f10, 80({p})", "fsd f11, 88({p})",
+            "fsd f12, 96({p})", "fsd f13, 104({p})", "fsd f14, 112({p})", "fsd f15, 120({p})",
+            "fsd f16, 128({p})", "fsd f17, 136({p})", "fsd f18, 144({p})", "fsd f19, 152({p})",
+            "fsd f20, 160({p})", "fsd f21, 168({p})", "fsd f22, 176({p})", "fsd f23, 184({p})",
+            "fsd f24, 192({p})", "fsd f25, 200({p})", "fsd f26, 208({p})", "fsd f27, 216({p})",
+            "fsd f28, 224({p})", "fsd f29, 232({p})", "fsd f30, 240({p})", "fsd f31, 248({p})",
+            "frcsr {c}",
+            ".option pop",
+            p = in(reg) out.as_mut_ptr(),
+            c = out(reg) c,
+        );
+    }
+    c as u32
+}
+
+/// Keep a private pattern in the FP registers for a while. Mode 0 mostly spins in user mode (timer
+/// interrupts land on user instructions); mode 1 yields every round (the other way to lose the CPU).
+/// Returns 0 if every register and `fcsr` always held this program's own values, else 1.
+fn fp_keep(seed: u64, mode: u64) -> i32 {
+    let mut want = fp_pattern(seed);
+    let mut fcsr = (seed & 7) as u32; // a different rounding mode per program (the low bits stay clear)
+    fp_load(&want, fcsr << 5);
+    let until = rt::sys::clock_get() + 30;
+    let mut round = 0u64;
+    let mut got = [0u64; 32];
+    while rt::sys::clock_get() < until {
+        for _ in 0..2000 {
+            core::hint::spin_loop();
+        }
+        if mode == 1 {
+            rt::sys::thread_yield();
+        }
+        let c = fp_store(&mut got);
+        if got != want || c != fcsr << 5 {
+            return 1;
+        }
+        round += 1;
+        if round.is_multiple_of(5) {
+            // change the state (dirty the unit again) and keep going
+            want = fp_pattern(seed.wrapping_add(round));
+            fcsr = ((seed + round) & 7) as u32;
+            fp_load(&want, fcsr << 5);
+        }
+    }
+    0
+}
+
+/// First FP use: every register must read as zero.
+fn fp_fresh() -> i32 {
+    let mut got = [0u64; 32];
+    let c = fp_store(&mut got);
+    let nonzero = got.iter().filter(|&&v| v != 0).count() as i32;
+    nonzero + if c != 0 { 100 } else { 0 }
+}
+
+static FP_THREAD_RESULT: [AtomicU32; 2] = [AtomicU32::new(99), AtomicU32::new(99)];
+
+extern "C" fn fp_worker(k: usize) -> ! {
+    let r = fp_keep(1000 + k as u64 * 77, 1) as u32;
+    FP_THREAD_RESULT[k].store(r, Ordering::Release);
+    rt::sys::thread_exit(0)
+}
+
+fn fp_threads() -> i32 {
+    let me = rt::sys::process_self().a1 as u32;
+    for k in 0..2usize {
+        // SAFETY: only the address of the static stack is taken; each worker owns its own.
+        let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+        let t = rt::sys::thread_create(me, fp_worker as *const () as usize as u64, top, k as u64);
+        if t.status != 0 {
+            return 900;
+        }
+    }
+    let mine = fp_keep(5, 0);
+    for _ in 0..1_000_000u32 {
+        if FP_THREAD_RESULT
+            .iter()
+            .all(|r| r.load(Ordering::Acquire) != 99)
+        {
+            let worst = FP_THREAD_RESULT
+                .iter()
+                .map(|r| r.load(Ordering::Acquire) as i32)
+                .max()
+                .unwrap_or(0);
+            return mine.max(worst);
+        }
+        rt::sys::thread_yield();
+    }
+    901
 }

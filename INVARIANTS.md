@@ -44,7 +44,7 @@ get filled in as each area is built.
 | C4 | Each runnable thread is in exactly one place (a run queue, running, or blocked) | `Sched::audit` after every step of the random model test, for every policy; the core rejects a policy pick that is not runnable (`bad_picks`) (S2) |
 | C5 | Atomics and fences live only in `kcore::sync` and the small audited layer; everything else relies on `Send`/`Sync` | Review only so far (a grep gate is **TODO**; the S2 kernel code uses `core::sync::atomic` directly for tick counters and test flags) |
 | C6 | Scheduler state is touched only with the big kernel lock held and interrupts disabled (it was interrupts-off on one hart before S5), and never across a context switch; the kernel heap is interrupt-safe because the tick allocates | `debug_assert` in `thread::kernel()` (K1); heap wrapper (S2); the lock since S5b |
-| C7 | Kernel threads do no floating point and thread switches save no FP state, so `sstatus.FS` stays Off and accidental FP use traps | QEMU `fp_unit_is_off` (S2); user programs are soft-float today; slice A (OD76) turns on user FP and saves it per thread, and this row changes with it |
+| C7 | Kernel threads do no floating point and thread switches save no FP state, so `sstatus.FS` stays Off and accidental FP use traps | QEMU `fp_unit_is_off` (S2); user threads may use FP since slice A: see FP1-FP3 (the kernel itself still does none) |
 
 
 ### Process and address-space rules (S3b)
@@ -93,6 +93,14 @@ get filled in as each area is built.
 | SMP3 | The user's `satp` last written is per hart (`PerHart::active_satp`); every context switch loads the kernel's own `satp` first if the hart has a user process's root in it, so no hart keeps a process's page table across a switch (another hart may tear the process down and reuse the root) | code structure (`reschedule`); `teardown_with_threads_on_other_harts` (S5d) |
 | SMP4 | Only hart h changes the scheduler's `current[h]`; a wake, spawn, tick or priority change elsewhere marks the hart pending and pokes it (reschedule IPI) | `kcore/tests/sched_smp_model.rs` (every pending hart was poked; mutation-checked), `a_wake_preempts_a_lower_priority_hart` |
 | SMP5 | Every unmap of a live user mapping and every process teardown is followed, inside the same locked region, by an SBI remote `sfence.vma` on every other online hart; a stale translation can therefore never reach a frame that has been freed and reused | `unmap_while_siblings_touch`, `teardown_with_threads_on_other_harts`; both have negative-control kernels (`fault-skip-shootdown`, `fault-skip-kernel-satp`) that must fail |
+
+### Floating-point rules (slice A, OD76)
+
+| # | Invariant | How checked |
+|---|---|---|
+| FP1 | A user thread starts with the FP unit off (`sstatus.FS` = Off): it cannot read any FP register, so it never sees another thread's or process's values; its first FP instruction traps as an illegal instruction, the kernel enables it from a zeroed register file, and the instruction is retried. A real illegal instruction traps again with the unit on and ends the process | QEMU `fp_state_is_private_to_each_thread_and_process` (a process's first FP use reads zeros while others keep patterns), `user_vector_instruction_is_fatal` |
+| FP2 | On every trap from user mode the dirty FP registers are saved into the thread before anything else can use the hart's unit, and the kernel runs with the unit off; on every return to user mode a thread with FP state gets exactly that state (loaded unless this hart already holds that exact state, by a unique token) | `kcore/tests/fp_model.rs` (random threads, harts, preemption, migration against a reference; mutation-checked), QEMU test above at one and four harts, mutation: skipping the save fails it |
+| FP3 | The kernel does no floating point and runs with `sstatus.FS` Off (C7); the unit is on only inside `kernel/src/fp.rs`'s save and load | QEMU `fp_unit_is_off` |
 
 ### Lock order
 

@@ -429,6 +429,8 @@ enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 ker
     csrc  sstatus, t0            # SPP = 0: sret goes to U-mode
     li    t0, 32
     csrs  sstatus, t0            # SPIE = 1: interrupts on in U-mode
+    li    t0, 0x6600
+    csrc  sstatus, t0            # FP and vector units off: a new thread has no FP state
     mv    sp, a1
     mv    a0, a2
     li x1, 0
@@ -554,6 +556,7 @@ fn leave(code: i32, whole: bool) -> ! {
     let me = irq::without(|| {
         let s = state();
         let tid = thread::current();
+        crate::fp::thread_gone(tid);
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
@@ -675,6 +678,11 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
                 }
                 exit_process(-1000 - cause as i32);
             }
+        }
+        2 if crate::fp::first_use(frame) => {
+            // The first floating-point instruction of this thread (slice A): the unit is now enabled
+            // for it, from zeros; the instruction is retried. (A real illegal instruction traps again
+            // with the unit on and ends the process below.)
         }
         _ => exit_process(-1000 - cause as i32),
     }

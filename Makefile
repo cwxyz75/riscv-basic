@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: quick docs-check help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -83,6 +83,7 @@ OS_RR_ELF   := target/os-rr/$(KERNEL_TARGET)/debug/kernel
 OS_NOSHOOT_ELF := target/os-fault-shootdown/$(KERNEL_TARGET)/debug/kernel
 OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
+OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
@@ -145,12 +146,19 @@ os-boot-test-release:
 os-boot-test-smp: kernel os-interactive
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
+
+# The SMP negative controls (each disables one safety mechanism and the guarding test must fail) and the
+# serial sessions at four harts. A separate target so CI can run it as its own job: the whole SMP part took
+# about 28 minutes, too close to the job's timeout.
+os-boot-test-smp-neg: kernel os-interactive
 	cd kernel && cargo build --features fault-skip-shootdown --target-dir ../target/os-fault-shootdown
 	cd kernel && cargo build --features fault-skip-kernel-satp --target-dir ../target/os-fault-satp
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSHOOT_ELF) unmap_while_siblings_touch
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSATP_ELF) teardown_with_threads_on_other_harts
 	cd kernel && cargo build --features fault-skip-kill-ipi --target-dir ../target/os-fault-killipi
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) kill_a_spinner_on_another_hart
+	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
+	OS_SMP=2 python3 scripts/os_boot_test.py --neg $(OS_NOFPSAVE_ELF) fp_state_is_private_to_each_thread_and_process
 	OS_SMP=4 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	OS_SMP=4 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 
@@ -214,4 +222,4 @@ quick: fmt-check docs-check
 	cargo test -p abi -p kcore -p proto -p memfs -p cfmt -p basic-script
 	$(MAKE) os-release-smoke
 
-check: fmt-check docs-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-serial-test os-release-smoke
+check: fmt-check docs-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-serial-test os-release-smoke

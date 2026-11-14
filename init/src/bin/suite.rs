@@ -1755,6 +1755,54 @@ fn child_faults_are_contained() -> Outcome {
     Ok(())
 }
 
+/// Floating-point state is private to each thread and process (slice A, OD76): four processes keep
+/// different patterns in the FP registers (and different rounding modes) while they are preempted,
+/// yield and migrate between harts, one process runs three threads with three patterns, and a process
+/// that first touches the FP unit while all that is going on finds zeros.
+fn fp_state_is_private_to_each_thread_and_process() -> Outcome {
+    let mut procs = Vec::new();
+    for seed in 1..=4u64 {
+        let mode = seed % 2;
+        let (p, _mine) = launch(60 | (mode << 8) | (seed << 16))?;
+        procs.push(p);
+    }
+    let (p, _m) = launch(62)?;
+    procs.push(p);
+    nap_ticks(5);
+    let (fresh, _m) = launch(61)?;
+    wait_ended(fresh, 3000)?;
+    ensure_eq!(
+        sys::process_info(fresh).a1 as i64,
+        0,
+        "a process's first FP use sees zero registers"
+    );
+    for (i, p) in procs.into_iter().enumerate() {
+        wait_ended(p, 6000)?;
+        let code = sys::process_info(p).a1 as i64;
+        sys::handle_close(p);
+        ensure_eq!(code, 0, "FP process {i} kept its own registers");
+    }
+    // a process that used FP and then executed a genuinely illegal instruction is still just killed ...
+    let (bad, _m) = launch(63)?;
+    wait_ended(bad, 3000)?;
+    ensure_eq!(
+        sys::process_info(bad).a1 as i64,
+        -1002,
+        "an illegal instruction after FP use is fatal"
+    );
+    sys::handle_close(bad);
+    // ... and what it left in the unit is not seen by the next process
+    let (fresh, _m) = launch(61)?;
+    wait_ended(fresh, 3000)?;
+    ensure_eq!(
+        sys::process_info(fresh).a1 as i64,
+        0,
+        "a killed process's FP registers are not inherited"
+    );
+    sys::handle_close(fresh);
+    Ok(())
+}
+
 // --- The wake path: counters, the bystander baseline, a benchmark (roadmap slice W, step 0) ---------
 
 /// Flips to true when slice W retires the global wait queue: then bystanders are never woken.
@@ -8376,6 +8424,10 @@ pub fn app_main() -> i32 {
         (
             "a_thread_made_by_the_parent_faults_or_exits",
             a_thread_made_by_the_parent_faults_or_exits,
+        ),
+        (
+            "fp_state_is_private_to_each_thread_and_process",
+            fp_state_is_private_to_each_thread_and_process,
         ),
         (
             "wake_baseline_bystanders_and_counters",
