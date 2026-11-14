@@ -84,7 +84,7 @@ fn channel_errors() {
     let (mut reg, mut t) = world();
     let (a, b) = channel_create(&mut reg, &mut t).unwrap();
     let ev = event_create(&mut reg, &mut t).unwrap();
-    let ev_no_transfer = t.replace(ev, Rights(Rights::SIGNAL.0)).unwrap();
+    let ev_no_transfer = t.replace(&mut reg, ev, Rights(Rights::SIGNAL.0)).unwrap();
     // BAD_HANDLE: the channel, then each listed handle
     assert_eq!(
         channel_write(&mut reg, &mut t, Handle(0), b"", &[]),
@@ -109,13 +109,13 @@ fn channel_errors() {
     );
     // ACCESS_DENIED: no WRITE / no READ / handle without TRANSFER
     let dup_a = t.duplicate(&mut reg, a, Rights::SAME).unwrap();
-    let read_only = t.replace(dup_a, Rights(Rights::READ.0)).unwrap();
+    let read_only = t.replace(&mut reg, dup_a, Rights(Rights::READ.0)).unwrap();
     assert_eq!(
         channel_write(&mut reg, &mut t, read_only, b"", &[]),
         Err(Status::AccessDenied)
     );
     let dup_b = t.duplicate(&mut reg, b, Rights::SAME).unwrap();
-    let write_only = t.replace(dup_b, Rights(Rights::WRITE.0)).unwrap();
+    let write_only = t.replace(&mut reg, dup_b, Rights(Rights::WRITE.0)).unwrap();
     assert_eq!(
         channel_read(&mut reg, &mut t, write_only, 1, 1),
         Err(ReadError::Status(Status::AccessDenied))
@@ -788,7 +788,7 @@ fn random_channels_agree_with_the_model() {
                     let h = any(&mut rng);
                     let (o, have) = m.tables[p][&h];
                     let weaker = Rights(have.0 & rng.next() as u32);
-                    let nh = tables[p].replace(h, weaker).unwrap();
+                    let nh = tables[p].replace(&mut reg, h, weaker).unwrap();
                     m.tables[p].remove(&h);
                     m.tables[p].insert(nh, (o, weaker));
                 }
@@ -1004,7 +1004,7 @@ fn channel_write_checks_in_the_documented_order() {
     let (mut reg, mut t) = world();
     let (a, _b) = channel_create(&mut reg, &mut t).unwrap();
     let dup = t.duplicate(&mut reg, a, Rights::SAME).unwrap();
-    let read_only = t.replace(dup, Rights(Rights::READ.0)).unwrap();
+    let read_only = t.replace(&mut reg, dup, Rights(Rights::READ.0)).unwrap();
     let ev = event_create(&mut reg, &mut t).unwrap();
     let forged = Handle(0x1234_0001);
     // BAD_HANDLE (a listed handle) comes before WRONG_TYPE and ACCESS_DENIED on the channel
@@ -1261,7 +1261,7 @@ fn process_and_vmo_handles_check_type_and_rights() {
         Err(Status::BadHandle)
     );
     let dup_v = t.duplicate(&mut reg, v, Rights::SAME).unwrap();
-    let ro = t.replace(dup_v, Rights::READ).unwrap();
+    let ro = t.replace(&mut reg, dup_v, Rights::READ).unwrap();
     assert_eq!(vmo_of(&reg, &t, ro, Rights::READ), Ok(9));
     assert_eq!(
         vmo_of(&reg, &t, ro, Rights::WRITE),
@@ -1280,7 +1280,7 @@ fn process_and_vmo_handles_check_type_and_rights() {
         Some(Status::WrongType)
     );
     let dup_p = t.duplicate(&mut reg, p, Rights::SAME).unwrap();
-    let inspect_less = t.replace(dup_p, Rights::WAIT).unwrap();
+    let inspect_less = t.replace(&mut reg, dup_p, Rights::WAIT).unwrap();
     assert_eq!(
         process_of(&reg, &t, inspect_less, Rights::INSPECT).err(),
         Some(Status::AccessDenied)

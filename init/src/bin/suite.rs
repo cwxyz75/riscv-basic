@@ -1805,8 +1805,9 @@ fn fp_state_is_private_to_each_thread_and_process() -> Outcome {
 
 // --- The wake path: counters, the bystander baseline, a benchmark (roadmap slice W, step 0) ---------
 
-/// Flips to true when slice W retires the global wait queue: then bystanders are never woken.
-const TARGETED_WAKE: bool = false;
+/// True since slice W step 3: `object_wait` and `channel_call` waiters are woken by id, so bystanders are
+/// not woken (the port waits join in step 4). While it was false this test recorded the defect.
+const TARGETED_WAKE: bool = true;
 
 /// A bystander: blocked on an event nobody signals until the test ends it.
 extern "C" fn bystander(arg: usize) -> ! {
@@ -1919,6 +1920,14 @@ fn wake_baseline_bystanders_and_counters() -> Outcome {
             "bystanders are not woken: spurious wakes {} against {} without them",
             busy.2,
             quiet.2
+        );
+        // and the ping-pong itself no longer wakes anyone that is not waiting for it (it was four
+        // spurious wakes per round trip, 241 over the run, before step 3)
+        ensure!(
+            quiet.2 <= 30,
+            "a ping-pong costs almost no spurious wakes: {} over {} round trips",
+            quiet.2,
+            ROUND_TRIPS
         );
     } else {
         ensure!(
@@ -2640,6 +2649,36 @@ extern "C" fn worker_spin(_: usize) -> ! {
 extern "C" fn worker_block_forever(arg: usize) -> ! {
     sys::object_wait(arg as u32, 1 << 24, u64::MAX);
     sys::thread_exit(1)
+}
+
+/// Sending a handle away in a message ends a sibling's wait on it too (a transfer removes the handle from
+/// this process: BAD_HANDLE for the waiter, promptly), review finding H1 of slice W step 3.
+fn sending_a_waited_handle_ends_a_siblings_wait() -> Outcome {
+    let ev = event()?;
+    let (a, b) = channel()?;
+    WOKEN_STATUS.store(99, Ordering::SeqCst);
+    let t = new_thread(worker_wait_event, ev as usize)?;
+    nap(4)?;
+    for _ in 0..3 {
+        sys::thread_yield();
+    }
+    let hs = [ev];
+    ensure_eq!(
+        st(sys::channel_write(a, b"x".as_ptr(), 1, hs.as_ptr(), 1)),
+        Some(S::Ok),
+        "send the event away"
+    );
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 100);
+    let prompt = r.status == 0;
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 3000);
+    ensure!(prompt, "the waiter slept on after its handle was sent away");
+    ensure_eq!(
+        WOKEN_STATUS.load(Ordering::SeqCst) as i32,
+        S::BadHandle.code(),
+        "the wait reports BAD_HANDLE"
+    );
+    sys::handle_close(b);
+    Ok(())
 }
 
 fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
@@ -8432,6 +8471,10 @@ pub fn app_main() -> i32 {
         (
             "wake_baseline_bystanders_and_counters",
             wake_baseline_bystanders_and_counters,
+        ),
+        (
+            "sending_a_waited_handle_ends_a_siblings_wait",
+            sending_a_waited_handle_ends_a_siblings_wait,
         ),
         (
             "futex_sleepers_are_not_woken_by_unrelated_syscalls",

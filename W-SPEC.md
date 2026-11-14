@@ -17,7 +17,8 @@ and without four *bystander* threads blocked on unrelated events. Baseline, QEMU
 | ping-pong alone | 9 | 361 | 241 | 360 |
 | plus 4 bystanders | 10 | 601 | 481 | 600 |
 
-Four spurious wakes per round trip with nobody else around, and exactly four bystanders times 60 round trips
+After step 3 (`object_wait`, `channel_call` and kernel reads woken by id): 7 ticks, 120 blocks, **0 spurious wakes**, and
+0 extra with four bystanders (the futex sleepers of step 2 likewise). Before it: four spurious wakes per round trip with nobody else around, and exactly four bystanders times 60 round trips
 (240) more with them. The cost is O(blocked threads) per syscall: harmless at a dozen threads, quadratic at the thread
 counts the cheap-threads direction (OD73) is for. When this slice lands the same test must show no extra spurious
 wakes for the bystanders (`TARGETED_WAKE = true` in the suite flips its assertion).
@@ -68,8 +69,10 @@ Operations:
 
 ## 4. Invariants (each gets a check)
 
-* **W1** The dirty log is empty whenever the BKL is released or the running thread changes (asserted in `bkl::unlock` at
-  depth 1 and in `reschedule`).
+* **W1** The dirty log is empty whenever the BKL is released or the running thread changes. Enforced by construction
+  rather than asserted so far: every syscall and every trap from user mode commits before the lock goes, and each wait
+  commits before it sleeps (a debug assertion in `bkl::unlock` proved unsound: kernel threads mutate and commit in
+  separate lock regions; the review of step 3 found this).
 * **W2** A thread has at most one registration, and none while in user mode.
 * **W3** Every registration names a live object and a live port (`WaitTable::audit`).
 * **W4** Filter soundness: after a commit no Registered thread's own predicate is true.

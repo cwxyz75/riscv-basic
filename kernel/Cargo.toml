@@ -39,3 +39,6 @@ fault-skip-kernel-satp = []
 fault-skip-kill-ipi = []
 # (slice A) forget to save dirty FP registers at a trap: the FP isolation test must fail.
 fault-skip-fp-save = []
+# (slice W) a handle removed by `replace` or sent away is not told to the wait table: a thread waiting on
+# it must then stay asleep, and the test that guards the forced wake must fail.
+fault-skip-forced-touch = []

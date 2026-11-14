@@ -186,6 +186,11 @@ impl<T: Object> Registry<T> {
         }
     }
 
+    /// The log without draining it (diagnostics).
+    pub fn peek_dirty(&self) -> &[(ObjId, bool)] {
+        &self.dirty
+    }
+
     /// Is anything waiting in the dirty log?
     pub fn has_dirty(&self) -> bool {
         !self.dirty.is_empty() || self.dirty_overflow

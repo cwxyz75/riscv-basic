@@ -401,7 +401,7 @@ pub fn channel_write_in(
     entries.extend(
         handles
             .iter()
-            .map(|&h| table.remove_for_transfer(h).expect("validated")),
+            .map(|&h| table.remove_for_transfer(reg, h).expect("validated")),
     );
     if let Some(KObj::Channel(p)) = reg.get_mut(peer) {
         p.queue.push_back(Message {

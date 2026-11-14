@@ -299,6 +299,13 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         crate::bkl::lock();
         crate::fp::trap_entry(frame);
         trap_body(frame);
+        if from_user {
+            // whatever this trap touched is committed before the lock is released (W1)
+            crate::user::commit_wake();
+            // (waking a higher-priority thread can switch away and back: load this thread's address
+            // space again, as every other path through `trap_body` does)
+            crate::user::activate_current();
+        }
         crate::bkl::unlock();
     }
     // (the trap exit returns to user mode if this frame came from it)

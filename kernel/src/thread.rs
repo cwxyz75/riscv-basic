@@ -618,7 +618,18 @@ pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -
 /// `wake_blocked(tid)` or the deadline ends the sleep early (slice W step 2: futex sleepers and
 /// other waiters that are woken by id). `ready` runs with interrupts off with the big lock held, so
 /// checking and sleeping are one step against any waker. Returns whether `ready()` held.
-pub fn wait_deadline_private(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+pub fn wait_deadline_private(ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    wait_deadline_registered(ready, || {}, deadline)
+}
+
+/// `wait_deadline_private`, calling `register` (in the same interrupts-off region, with the lock held)
+/// just before each sleep: the waiter's registration in the wait table, so that the thread that makes
+/// its condition true wakes exactly it. The caller removes the registration after the wait returns.
+pub fn wait_deadline_registered(
+    mut ready: impl FnMut() -> bool,
+    mut register: impl FnMut(),
+    deadline: u64,
+) -> bool {
     let mut slept = false;
     loop {
         let result = irq::without(|| {
@@ -629,6 +640,7 @@ pub fn wait_deadline_private(mut ready: impl FnMut() -> bool, deadline: u64) -> 
             if k.sched.now() >= deadline {
                 return Some(false);
             }
+            register();
             count_sleep(&mut slept);
             if k.sched
                 .sleep_until_on(hart(), deadline)

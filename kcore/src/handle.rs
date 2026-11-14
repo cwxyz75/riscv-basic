@@ -39,14 +39,7 @@ pub struct HandleTable {
     free: Vec<u16>,
     limit: usize,
     live: usize,
-    /// Objects whose handle was removed by `replace` or `remove_for_transfer` (which have no
-    /// registry to note it in): the owner calls `flush_removed`. Capped; overflow is remembered.
-    removed: Vec<ObjId>,
-    removed_overflow: bool,
 }
-
-/// How many removed handles a table remembers between flushes.
-const REMOVED_CAP: usize = 256;
 
 impl HandleTable {
     /// A table that holds at most `limit` handles (capped at 8191 by the encoding).
@@ -56,19 +49,7 @@ impl HandleTable {
             free: Vec::new(),
             limit: limit.min(SLOT_MASK as usize),
             live: 0,
-            removed: Vec::new(),
-            removed_overflow: false,
         }
-    }
-
-    /// Tell `reg` about every handle removed without it (`replace`, `remove_for_transfer`) since the
-    /// last flush: waiters on those objects must re-validate their handle. Returns false if more were
-    /// removed than the table remembers (the caller should treat every object as touched).
-    pub fn flush_removed<T: Object>(&mut self, reg: &mut Registry<T>) -> bool {
-        for obj in self.removed.drain(..) {
-            reg.touch_forced(obj);
-        }
-        !core::mem::take(&mut self.removed_overflow)
     }
 
     pub fn len(&self) -> usize {
@@ -182,12 +163,18 @@ impl HandleTable {
 
     /// Swap a handle for one with fewer rights; the old value stops working. On an
     /// error the handle is untouched.
-    pub fn replace(&mut self, h: Handle, rights: Rights) -> Result<Handle, Status> {
+    pub fn replace<T: Object>(
+        &mut self,
+        reg: &mut Registry<T>,
+        h: Handle,
+        rights: Rights,
+    ) -> Result<Handle, Status> {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         let old = self.slots[slot].entry.expect("occupied");
         let rights = Self::resolve_rights(old.rights, rights)?;
         let entry = self.remove(slot);
-        self.note_removed(entry.obj);
+        // the old value stops working: waiters on it must re-validate (a forced touch)
+        reg.touch_forced(entry.obj);
         Ok(self
             .insert(entry.obj, rights)
             .expect("a slot was just freed"))
@@ -195,7 +182,11 @@ impl HandleTable {
 
     /// Take a handle out of the table to send it somewhere (needs TRANSFER). The
     /// reference goes with the returned entry.
-    pub fn remove_for_transfer(&mut self, h: Handle) -> Result<Entry, Status> {
+    pub fn remove_for_transfer<T: Object>(
+        &mut self,
+        reg: &mut Registry<T>,
+        h: Handle,
+    ) -> Result<Entry, Status> {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         if !self.slots[slot]
             .entry
@@ -206,16 +197,8 @@ impl HandleTable {
             return Err(Status::AccessDenied);
         }
         let entry = self.remove(slot);
-        self.note_removed(entry.obj);
+        reg.touch_forced(entry.obj);
         Ok(entry)
-    }
-
-    fn note_removed(&mut self, obj: ObjId) {
-        if self.removed.len() < REMOVED_CAP {
-            self.removed.push(obj);
-        } else {
-            self.removed_overflow = true;
-        }
     }
 
     /// Check that `h` is live and transferable without removing it.

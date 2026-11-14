@@ -168,7 +168,7 @@ fn run(seed: u64) {
                     what = "replace_or_duplicate".into();
                     if let Some(h) = pick(&mut rng, &tables[ti]) {
                         if rng.chance(50) {
-                            let _ = tables[ti].replace(h, Rights::SAME);
+                            let _ = tables[ti].replace(reg, h, Rights::SAME);
                         } else {
                             let _ = tables[ti].duplicate(reg, h, Rights::SAME);
                         }
@@ -187,11 +187,8 @@ fn run(seed: u64) {
                 }
             }
         }
-        // the kernel's drain after a syscall: the registry's log plus each table's removed handles
-        let World { reg, tables } = &mut w;
-        for t in tables.iter_mut() {
-            t.flush_removed(reg);
-        }
+        // the kernel's drain after a syscall
+        let World { reg, .. } = &mut w;
         let dirty = reg.take_dirty();
         assert!(!dirty.overflow);
         let logged: BTreeSet<ObjId> = dirty.items.iter().map(|(i, _)| *i).collect();
@@ -234,22 +231,16 @@ fn removing_a_handle_is_a_forced_touch_even_when_the_signals_do_not_change() {
         d.items.contains(&(obj, true)),
         "close is a forced touch: {d:?}"
     );
-    // replace: the table remembers, and flush tells the registry
-    let e3 = t.replace(e2, Rights::SAME).unwrap();
-    assert!(
-        reg.take_dirty().items.is_empty(),
-        "replace alone has no registry to tell"
-    );
-    assert!(t.flush_removed(&mut reg));
+    // replace: the old value stops working, a forced touch
+    let e3 = t.replace(&mut reg, e2, Rights::SAME).unwrap();
     assert!(
         reg.take_dirty().items.contains(&(obj, true)),
-        "replace is a forced touch once flushed"
+        "replace is a forced touch"
     );
     // a transfer out of the table likewise
     let (c1, c2) = channel_create(&mut reg, &mut t).unwrap();
     reg.take_dirty();
     channel_write(&mut reg, &mut t, c1, b"x", &[e3]).unwrap();
-    t.flush_removed(&mut reg);
     assert!(
         reg.take_dirty().items.contains(&(obj, true)),
         "a transferred handle is a forced touch"
