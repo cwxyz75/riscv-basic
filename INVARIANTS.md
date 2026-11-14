@@ -102,6 +102,14 @@ get filled in as each area is built.
 | FP2 | On every trap from user mode the dirty FP registers are saved into the thread before anything else can use the hart's unit, and the kernel runs with the unit off; on every return to user mode a thread with FP state gets exactly that state (loaded unless this hart already holds that exact state, by a unique token) | `kcore/tests/fp_model.rs` (random threads, harts, preemption, migration against a reference; mutation-checked), QEMU test above at one and four harts, mutation: skipping the save fails it |
 | FP3 | The kernel does no floating point and runs with `sstatus.FS` Off (C7); the unit is on only inside `kernel/src/fp.rs`'s save and load | QEMU `fp_unit_is_off` |
 
+### Memory commit rules (slice V)
+
+| # | Invariant | How checked |
+|---|---|---|
+| V1 | A VMO charged to a job that is neither the caller's nor the address space owner's is mapped only over a range that is already committed: its *data pages* are paid for, so a touch of a mapping never charges a stranger or fails on the VMO's job's quota. Scope, stated plainly (TIDY-UP T58): it separates *jobs*; a hostile peer in the same job, or in a sibling job under a shared ancestor limit, can still hand over a lazy VMO; and the page-table frames a first touch needs are taken at fault time, so a touch can still fail when frames themselves run out | QEMU `vmo_commit_charges_up_front_and_foreign_maps_need_it` (a mutation that removes the check fails it) |
+| V2 | `vmo_commit` is all or nothing: a refusal leaves the VMO, the frame count and the job ledger exactly as before; committed pages are charged once and credited exactly when the VMO is destroyed | `kcore/tests/vmo_commit.rs` (mutation-checked: no rollback fails it), QEMU test above |
+| V3 | Only a holder of COMMIT can `vmo_commit`, and the charge is to the VMO's creating job, never the caller's: a creator narrows COMMIT away before handing a VMO on. (A WRITE holder's `vmo_write` also commits pages, charged the same way, lazily and with no kill: the creator pays for what it let a writer write) | QEMU test above (a handle without COMMIT is refused) |
+
 ### Lock order
 
 1. **BKL** (`kernel/src/bkl.rs`): protects all shared kernel state. Taken by `irq::without` and by
