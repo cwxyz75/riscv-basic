@@ -95,7 +95,7 @@ change.
 `MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
 alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
 data (message bytes, headers, queued handles, port bindings) in the whole system;
-`MAX_REGIONS` 1024 per address space; `MAX_THREADS_PER_PROCESS` 8 and `MAX_USER_THREADS` 128;
+`MAX_REGIONS` 1024 per address space; `MAX_THREADS_PER_PROCESS` 256 and `MAX_USER_THREADS` 1024;
 `MAX_PROCESSES` 64.
 
 These keep the kernel from panicking and from running out of its fixed heap (OD50); they are
@@ -560,7 +560,7 @@ A process runs one or more user threads, all sharing its address space and handl
 The first thread starts at `process_start` (or at load, for a kernel-started process); more
 are made with `thread_create`. A thread is a kernel object (kind THREAD): a handle to it can
 be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
-INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (8) live threads per process.
+INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (256) live threads per process. A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
 
 Ending. `thread_exit(code)` ends the calling thread only. When the last live thread of a
 process ends, the process ends, with exit code `code` of that last thread unless the
@@ -578,9 +578,9 @@ provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
 dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
 aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
-threads, the system already has `MAX_USER_THREADS` (128; each thread costs a kernel stack), the
+threads, the system already has `MAX_USER_THREADS` (1024; each thread costs a kernel stack), the
 caller's handle table is full, the system-wide object cap `MAX_OBJECTS` is reached, or the process's
-job or an ancestor is at its thread limit). The process handle may be the caller's
+job or an ancestor is at its thread limit, or has fewer than four pages of its page limit left for the stack). The process handle may be the caller's
 `process_self` handle. On error nothing changes. Tests: `thread_create_*`.
 
 ### thread_exit(code) -> does not return
