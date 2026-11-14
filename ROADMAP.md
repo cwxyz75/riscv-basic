@@ -523,7 +523,7 @@ silent corruption (a negative control that removes the guard must fail the test)
 (returns frames) under an allocation churn test; every OD50 cap test still ends in NO_MEMORY and never a panic;
 the thread and `channel_call` benchmark before and after; the whole suite at one, two and four harts.
 
-- [ ] Step 0: spec and OD (the allocator, the stack region and size, kernel memory charging, the reserved interrupt stubs), measurement of stack use, acceptance tests first
+- [~] Step 0: measurement done (`thread::stack_high_water`, test `kernel_stacks_stay_well_inside_their_size`): the deepest kernel stack in the whole suite, debug build, was about 5.6 KiB of 32 KiB, so kernel stacks are now **16 KiB** (halving the thread cost; the heap is still the 8 MiB fixed region). Still to write: spec and OD (the allocator, the stack region, kernel memory charging, the reserved interrupt stubs) and its acceptance tests
 - [ ] Step 1: kernel stacks from their own region with guard pages
 - [ ] Step 2: the slab allocator over frames replaces the fixed heap (interrupt-safe, fallible)
 - [ ] Step 3: kernel memory charged to jobs; OD50 caps revisited

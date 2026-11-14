@@ -61,7 +61,7 @@ REQUIRED = [
     "rights_cannot_be_widened", "stack_grows_lazily", "syscall_layer_bounds",
     "cycles_do_not_grow_memory",
     "user_programs_are_embedded", "init_runs_in_user_mode_and_passes",
-    "process_teardown_returns_every_frame", "process_exit_releases_all_objects",
+    "process_teardown_returns_every_frame", "kernel_stacks_stay_well_inside_their_size", "process_exit_releases_all_objects",
     "user_store_to_kernel_memory_is_fatal", "user_load_from_kernel_memory_is_fatal",
     "user_store_to_own_text_is_fatal", "user_jump_to_data_is_fatal",
     "user_privileged_instruction_is_fatal", "user_jump_to_unmapped_memory_is_fatal",

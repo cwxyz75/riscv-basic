@@ -44,7 +44,7 @@ fn ensure_eq<T: PartialEq + core::fmt::Debug>(got: T, want: T, what: &str) -> Ou
 /// Run `body`, then require that the heap got everything back (threads and their
 /// stacks included) and no stack overflowed. The kernel's own containers (the thread
 /// table, the timer set, wait queues) grow lazily and keep a node or two, so the
-/// comparison allows a little; a leaked thread costs its 32 KiB stack.
+/// comparison allows a little; a leaked thread costs its 16 KiB stack.
 fn clean(body: impl FnOnce() -> Outcome) -> Outcome {
     let before = thread::heap_free();
     let threads = (thread::thread_count(), thread::sched_thread_count());
