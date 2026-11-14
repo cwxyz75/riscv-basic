@@ -88,8 +88,9 @@ impl Service for Server {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], handle: Option<u32>) {
-        self.handle_request(key, msg, handle);
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+        // (the runtime reads at most one handle: more is a protocol violation it has already ended)
+        self.handle_request(key, msg, handles.first().copied());
     }
 
     fn closed(&mut self, conn: Conn) {
@@ -634,7 +635,7 @@ pub fn app_main() -> i32 {
     }
     let mut server = Server {
         fs,
-        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, HOLD_TIMEOUT),
+        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         image_vmo,
     };
     // The service channel is the root directory connection with every right.

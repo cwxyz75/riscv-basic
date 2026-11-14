@@ -46,6 +46,7 @@ impl Server { fn run(&mut self, deadline policy) -> ExitReason }
 * **Request/reply is real**: the typed client side (`rt::service::Client`) does `channel_call` with a transaction
   id, so the call path the kernel can optimise (OD73's hand-off) has callers.
 * **Held-handle and endpoint hygiene** (`add_conn`'s probe, both-ends-of-one-channel) lives in the library once.
+* **`consoled` is not ported** (decided while building): it is a bridge between two byte streams with its own drop-oldest output policy and a handful of fixed objects on its port; only its control channel is request/reply. The runtime serves request/reply services; a stream bridge keeps its loop.
 * **Supervision is not in this slice**: restart strategies come with the registry (slice SD).
 
 ## 3. Accounted connections (OD77, finding D11)
