@@ -123,7 +123,7 @@ fn random_walk_against_the_reference() {
                     let i = rng.below(m.conns.len() as u64) as usize;
                     let (k, a, held) = m.conns[i];
                     let n = 1 + rng.below(1500) as usize;
-                    let r = table.hold(&mut acc, k, vec![7; n], step);
+                    let r = table.hold(&mut acc, k, vec![7; n], None, step);
                     if held.is_some() {
                         assert_eq!(r, Err(Refuse::Invalid));
                     } else {

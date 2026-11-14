@@ -199,6 +199,21 @@ impl Accounts {
         }
     }
 
+    /// Would one more connection be admitted to `id` right now (no limit along the chain is reached)?
+    pub fn would_admit_conn(&self, id: AccountId) -> bool {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let Ok(a) = self.rec(c) else {
+                return false;
+            };
+            if a.conns >= a.limits.conns {
+                return false;
+            }
+            cur = a.parent;
+        }
+        true
+    }
+
     pub fn charge_conn(&mut self, id: AccountId) -> Result<(), Refuse> {
         self.charge(id, 1, |a| (&mut a.conns, a.limits.conns))
     }

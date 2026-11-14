@@ -147,6 +147,7 @@ dependencies = [
  "proto",
  "rt",
  "shell-core",
+ "svc",
 ]
 
 [[package]]
@@ -397,6 +398,7 @@ dependencies = [
  "kcore",
  "linked_list_allocator",
  "proto",
+ "svc",
 ]
 
 [[package]]

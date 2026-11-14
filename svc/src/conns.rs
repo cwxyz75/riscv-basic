@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 #[derive(Debug)]
 pub struct Held {
     pub bytes: Vec<u8>,
+    /// A handle travelling with the reply (the runtime closes it if the reply is dropped).
+    pub handle: Option<u32>,
     /// When it was first held (the runtime's clock), for the timeout.
     pub since: u64,
 }
@@ -107,6 +109,7 @@ impl<C> ConnTable<C> {
         accounts: &mut Accounts,
         key: u64,
         bytes: Vec<u8>,
+        handle: Option<u32>,
         now: u64,
     ) -> Result<(), Refuse> {
         let c = self.map.get_mut(&key).ok_or(Refuse::NoSuchConn)?;
@@ -115,7 +118,11 @@ impl<C> ConnTable<C> {
         }
         let n = u32::try_from(bytes.len()).map_err(|_| Refuse::Quota)?;
         accounts.charge_held(c.account, n)?;
-        c.held = Some(Held { bytes, since: now });
+        c.held = Some(Held {
+            bytes,
+            handle,
+            since: now,
+        });
         Ok(())
     }
 

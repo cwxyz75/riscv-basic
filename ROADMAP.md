@@ -493,9 +493,9 @@ single backpressure policy; the same protocol-violation behaviour for every port
 exact; the benchmark for a request/reply round trip.
 
 - [x] Step 0: spec (`R-SPEC.md`; the five open questions were answered by the owner on 2026-11-14, all as recommended) and OD84
-- [~] Step 1: the pure core is built: the `svc` crate (accounts with nesting and all-or-nothing charges along the chain, the connection table with never-reused keys, held replies with a first-held-first order and a timeout), model-tested against an independent recomputation of usage and mutation-checked. **Not done**: the runtime around it in `rt` (`Service` trait, port loop, held-reply polling, the typed client)
-- [ ] Step 2: accounted connections in the file protocol and `memfsd`; per-account quotas
-- [ ] Step 3: `memfsd` on the library; then `consoled`, `launcher`, `devmgr`, `blkd`
+- [x] Step 1: the pure core and the runtime. The pure core is built: the `svc` crate (accounts with nesting and all-or-nothing charges along the chain, the connection table with never-reused keys, held replies with a first-held-first order and a timeout), model-tested against an independent recomputation of usage and mutation-checked. The runtime is `rt::service` (`Core`: port, connections, accounts, the one hold-and-poll backpressure policy, the one violation policy, `add_conn`'s endpoint hygiene; the `Service` trait and `run`). **Not done**: the typed request/reply client (`channel_call` callers)
+- [ ] Step 2: accounted connections: the `Account(limits)` op (op 8) in the file protocol and in `memfsd`; per-account quotas; the two-client QEMU test
+- [~] Step 3: `memfsd` is on the library (251 suite tests pass unchanged at one and four harts; every connection is in the root account, the pool 200 connections and 2 MiB held); `consoled`, `launcher`, `devmgr`, `blkd` are not
 - [ ] Step 4: documents; T28, T30 (launcher single client) and D11 resolved or narrowed
 
 Estimated size (not measured): 4 to 6 PRs; a Fable review.

@@ -7,35 +7,28 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use memfs::{Error, Fs, Kind, Limits, NodeId, ROOT};
 use proto::file::{self, flags, op, rights as pr, status};
 use proto::startup::Role;
 use rt::abi::rights::Rights;
-use rt::abi::signals;
 use rt::abi::status::Status;
+use rt::service::{self, Core, Sent, Service};
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
+use svc::Limits as Limits2;
 
-/// At most this many live connections (one port holds 256 bindings; one is the service channel).
-const MAX_CONNECTIONS: usize = 200;
+/// The server's total pool (R-SPEC.md, OD84): at most this many live connections, and this many bytes of
+/// replies held for clients that have no room (all connections together). With the file quota (8 MiB), the
+/// name budget (2 MiB) and this, the worst case fits the heap; a connection that would push the total over is
+/// dropped. (Per-account limits come with the `Account` op; every connection is in the root account for now.)
+const POOL: Limits2 = Limits2 {
+    conns: 200,
+    held_bytes: 2 * 1024 * 1024,
+    inflight: 16,
+};
 /// A reply the client has no room for is kept this long (ticks) before the connection is dropped.
-const PENDING_TIMEOUT: u64 = 30_000;
-/// Requests handled per wake-up of one connection (the port rotates, so none starves).
-const BATCH: usize = 4;
-/// Bytes of replies held for clients that have no room (all connections together). With the file
-/// quota (8 MiB), the name budget (2 MiB) and this, the worst case fits the 16 MiB heap; a
-/// connection that would push the total over is dropped.
-const PENDING_CAP: usize = 2 * 1024 * 1024;
-
-/// A copy that reports running out of memory instead of aborting the server.
-fn try_copy(src: &[u8]) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(src.len()).ok()?;
-    v.extend_from_slice(src);
-    Some(v)
-}
+const HOLD_TIMEOUT: u64 = 30_000;
 
 /// The bytes of a reply (`proto::file` layout), built without aborting on allocation failure.
 fn encode_reply(txid: u32, status: i32, a: u64, payload: &[u8]) -> Option<Vec<u8>> {
@@ -53,34 +46,16 @@ fn encode_reply(txid: u32, status: i32, a: u64, payload: &[u8]) -> Option<Vec<u8
     Some(v)
 }
 
-struct Pending {
-    bytes: Vec<u8>,
-    handle: Option<u32>,
-    deadline: u64,
-}
-
 struct Conn {
-    ch: u32,
-    /// The kernel object id of `ch` (to spot a client that hands over both ends of one channel).
-    koid: u64,
     node: NodeId,
     rights: u32,
     is_dir: bool,
-    /// A reply that did not fit the client's queue: no further requests are read until it is sent.
-    pending: Option<Pending>,
 }
 
 struct Server {
     fs: Fs,
-    conns: BTreeMap<u64, Conn>,
-    next_key: u64,
-    port: u32,
+    core: Core<Conn>,
     image_vmo: u32,
-    rx: Vec<u8>,
-    /// Kernel object ids of the channel ends we serve.
-    own: alloc::collections::BTreeSet<u64>,
-    /// Bytes of replies held in `Conn::pending`.
-    pending_bytes: usize,
 }
 
 fn err_status(e: Error, name_len: usize) -> i32 {
@@ -106,79 +81,54 @@ fn kind_byte(k: Kind) -> u8 {
     }
 }
 
-impl Server {
-    /// Watch a connection for requests, or (`pending`) stop watching it: a connection with a reply
-    /// waiting is polled on a timer instead. Its WRITABLE signal cannot be trusted for this: a
-    /// channel is "writable" while it has room for *some* message, not for a 32 KiB one, so a
-    /// binding on it would be ready all the time and the loop would spin.
-    fn bind(&self, key: u64, ch: u32, pending: bool) {
-        sys::port_unbind(self.port, key);
-        if !pending {
-            sys::port_bind(self.port, ch, signals::READABLE | signals::PEER_CLOSED, key);
-        }
+impl Service for Server {
+    type Conn = Conn;
+
+    fn core(&mut self) -> &mut Core<Conn> {
+        &mut self.core
     }
 
-    /// Start serving `ch` as a connection to `node`. `None` if the port refuses to watch it (the
-    /// handle is not a channel, or the port is full): nothing changes then, and the handle is
-    /// still the caller's to close.
+    fn request(&mut self, key: u64, msg: &[u8], handle: Option<u32>) {
+        self.handle_request(key, msg, handle);
+    }
+
+    fn closed(&mut self, conn: Conn) {
+        self.fs.release(conn.node);
+    }
+}
+
+impl Server {
+    /// Start serving `ch` as a connection to `node` (root account for now). `None` if the runtime refuses
+    /// it (not a channel end we may read and write, both ends of one channel, the pool is full): nothing
+    /// changes then, and the handle is still the caller's to close.
     fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> Option<u64> {
-        // Only a channel end we may read and write can be served: probe with a zero-sized read
-        // (an event or a VMO answers WRONG_TYPE; a channel says SHOULD_WAIT, PEER_CLOSED or
-        // BUFFER_TOO_SMALL and loses nothing).
-        let probe = sys::channel_read(ch, core::ptr::null_mut(), 0, core::ptr::null_mut(), 0);
-        if matches!(
-            probe.status(),
-            Some(Status::WrongType) | Some(Status::AccessDenied) | Some(Status::BadHandle)
-        ) {
-            return None;
-        }
-        // Both ends of one channel must never be served at once: neither would ever see
-        // PEER_CLOSED, the connections could not be reclaimed, and a reply sent on one end would be
-        // read back as a request on the other (an endless exchange).
-        let info = sys::object_info(ch);
-        if info.status != 0 || (info.a2 != 0 && self.own.contains(&(info.a2 as u64))) {
-            return None;
-        }
-        let koid = info.a1 as u64;
-        let key = self.next_key;
-        let b = sys::port_bind(self.port, ch, signals::READABLE | signals::PEER_CLOSED, key);
-        if b.status != 0 {
-            return None;
-        }
-        self.next_key += 1;
-        self.own.insert(koid);
-        let _ = self.fs.retain(node);
-        self.conns.insert(
-            key,
+        let key = self.core.add_conn(
+            ch,
+            svc::ROOT,
             Conn {
-                ch,
-                koid,
                 node,
                 rights,
                 is_dir,
-                pending: None,
             },
-        );
+        )?;
+        let _ = self.fs.retain(node);
         Some(key)
     }
 
+    /// End a connection and release what it held.
     fn close_conn(&mut self, key: u64) {
-        if let Some(c) = self.conns.remove(&key) {
-            sys::port_unbind(self.port, key);
-            sys::handle_close(c.ch);
-            self.own.remove(&c.koid);
-            if let Some(p) = c.pending {
-                self.pending_bytes -= p.bytes.len();
-                if let Some(h) = p.handle {
-                    sys::handle_close(h);
-                }
-            }
+        self.core.close_conn(key);
+        self.release_closed();
+    }
+
+    fn release_closed(&mut self) {
+        for c in self.core.drain_closed() {
             self.fs.release(c.node);
         }
     }
 
-    /// Send a reply on `key`'s channel; if the client has no room, hold it and stop reading
-    /// that connection until it drains (backpressure: a client that never reads stalls itself).
+    /// Send a reply on `key`'s channel; the runtime holds it if the client has no room (backpressure: a
+    /// client that never reads stalls itself) and ends the connection if it cannot.
     fn send(
         &mut self,
         key: u64,
@@ -188,108 +138,16 @@ impl Server {
         payload: &[u8],
         handle: Option<u32>,
     ) {
-        let close_handle = |h: Option<u32>| {
-            if let Some(h) = h {
-                sys::handle_close(h);
-            }
-        };
         let Some(bytes) = encode_reply(txid, status, a, payload) else {
             // out of memory (or a payload that cannot be a reply): drop the connection
-            close_handle(handle);
+            if let Some(h) = handle {
+                sys::handle_close(h);
+            }
             self.close_conn(key);
             return;
         };
-        let Some(c) = self.conns.get_mut(&key) else {
-            close_handle(handle);
-            return;
-        };
-        let hs = [handle.unwrap_or(0)];
-        let n = usize::from(handle.is_some());
-        let r = sys::channel_write(c.ch, bytes.as_ptr(), bytes.len(), hs.as_ptr(), n);
-        match r.status() {
-            Some(Status::Ok) => {}
-            Some(Status::ShouldWait) | Some(Status::NoMemory) => {
-                if self.pending_bytes + bytes.len() > PENDING_CAP {
-                    // too much is already waiting on clients that do not read: this one goes
-                    close_handle(handle);
-                    self.close_conn(key);
-                    return;
-                }
-                self.pending_bytes += bytes.len();
-                c.pending = Some(Pending {
-                    bytes,
-                    handle,
-                    deadline: sys::clock_get() + PENDING_TIMEOUT,
-                });
-                let ch = c.ch;
-                self.bind(key, ch, true);
-            }
-            _ => {
-                // the client is gone or the write is hopeless
-                close_handle(handle);
-                self.close_conn(key);
-            }
-        }
-    }
-
-    fn retry_pending(&mut self, key: u64) {
-        let Some(c) = self.conns.get_mut(&key) else {
-            return;
-        };
-        let Some(p) = c.pending.take() else {
-            return;
-        };
-        let hs = [p.handle.unwrap_or(0)];
-        let n = usize::from(p.handle.is_some());
-        let r = sys::channel_write(c.ch, p.bytes.as_ptr(), p.bytes.len(), hs.as_ptr(), n);
-        match r.status() {
-            Some(Status::Ok) => {
-                self.pending_bytes -= p.bytes.len();
-                let ch = c.ch;
-                self.bind(key, ch, false);
-            }
-            Some(Status::ShouldWait) | Some(Status::NoMemory) if sys::clock_get() < p.deadline => {
-                c.pending = Some(p);
-            }
-            _ => {
-                // too late, or the client is gone: close_conn releases the reply and its handle
-                c.pending = Some(p);
-                self.close_conn(key);
-            }
-        }
-    }
-
-    fn on_readable(&mut self, key: u64) {
-        for _ in 0..BATCH {
-            let Some(c) = self.conns.get(&key) else {
-                return;
-            };
-            if c.pending.is_some() {
-                return;
-            }
-            let ch = c.ch;
-            let mut hs = [0u32; 1];
-            let r = sys::channel_read(ch, self.rx.as_mut_ptr(), self.rx.len(), hs.as_mut_ptr(), 1);
-            match r.status() {
-                Some(Status::Ok) => {}
-                Some(Status::ShouldWait) => return,
-                // PEER_CLOSED, BUFFER_TOO_SMALL (a message with more handles than any request
-                // may carry, or too many bytes: a protocol violation) or an error
-                _ => {
-                    self.close_conn(key);
-                    return;
-                }
-            }
-            let (nb, nh) = (r.a1, r.a2);
-            let endpoint = (nh == 1).then_some(hs[0]);
-            let Some(msg) = try_copy(&self.rx[..nb]) else {
-                if let Some(h) = endpoint {
-                    sys::handle_close(h);
-                }
-                self.close_conn(key);
-                return;
-            };
-            self.handle_request(key, &msg, endpoint);
+        if self.core.send(key, bytes, handle) == Sent::Closed {
+            self.release_closed();
         }
     }
 
@@ -315,7 +173,10 @@ impl Server {
             return;
         }
         let (is_dir, conn_rights, node) = {
-            let c = &self.conns[&key];
+            let c = self
+                .core
+                .conn(key)
+                .expect("a request came from a live connection");
             (c.is_dir, c.rights, c.node)
         };
         if req.op != op::CLONE && op::is_directory_op(req.op) != is_dir {
@@ -557,7 +418,7 @@ impl Server {
         let denied = Status::AccessDenied.code();
         // The connection limit comes first: nothing may be created or truncated for an open that
         // is going to be refused.
-        if self.conns.len() >= MAX_CONNECTIONS {
+        if !self.core.would_admit(svc::ROOT) {
             return Err(status::QUOTA);
         }
         // A clone (or an open of an empty path) names the node it is on: no flag applies.
@@ -709,50 +570,12 @@ pub fn app_main() -> i32 {
     }
     let mut server = Server {
         fs,
-        conns: BTreeMap::new(),
-        next_key: 1,
-        port: p.a1 as u32,
+        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, HOLD_TIMEOUT),
         image_vmo,
-        rx: alloc::vec![0u8; file::MAX_MESSAGE],
-        own: alloc::collections::BTreeSet::new(),
-        pending_bytes: 0,
     };
     // The service channel is the root directory connection with every right.
     if server.add_conn(root_ch, ROOT, pr::ALL, true).is_none() {
         return 9;
     }
-    loop {
-        let any_pending = server.conns.values().any(|c| c.pending.is_some());
-        let deadline = if any_pending {
-            sys::clock_get() + 10
-        } else {
-            u64::MAX
-        };
-        let r = sys::port_wait(server.port, deadline);
-        match r.status() {
-            Some(Status::Ok) => {
-                let (key, observed) = (r.a1 as u64, r.a2 as u32);
-                if observed & signals::READABLE != 0 {
-                    server.on_readable(key);
-                } else if observed & signals::PEER_CLOSED != 0 {
-                    server.close_conn(key);
-                }
-                if server.conns.is_empty() {
-                    return 0; // every client is gone, the root connection included
-                }
-            }
-            Some(Status::TimedOut) => {}
-            _ => return 8,
-        }
-        // retry replies that were waiting, drop the ones that waited too long
-        let keys: Vec<u64> = server
-            .conns
-            .iter()
-            .filter(|(_, c)| c.pending.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-        for k in keys {
-            server.retry_pending(k);
-        }
-    }
+    service::run(&mut server)
 }
