@@ -16,6 +16,9 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'soak') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # the baseline is from a laptop; hosted runners are several times slower (SCHED-SMP-SPEC T75)
+      BENCH_RATIO: "10"
     strategy:
       fail-fast: false
       matrix:
