@@ -172,9 +172,10 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
 | 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
 | 80 | port_create | | `a1` handle |
-| 81 | port_bind | `a0` port, `a1` object, `a2` mask, `a3` key | |
+| 81 | port_bind | `a0` port, `a1` object, `a2` mask, `a3` key, `a4` flags | |
 | 82 | port_unbind | `a0` port, `a1` key | |
 | 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
+| 84 | port_rearm | `a0` port, `a1` key | |
 | 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
@@ -642,18 +643,22 @@ A port is a wait set: it watches signals on other objects and reports which are 
 Rights: DUPLICATE, TRANSFER, MANAGE (bind, unbind), WAIT (port_wait, object_wait). Its own
 signal READABLE is set while any binding is ready, so a port can be waited on with
 `object_wait`; a port cannot be bound to a port. A binding is *level-triggered*: it is ready
-exactly while `signals(object) & mask != 0`, and reporting it consumes nothing. A binding
+exactly while `signals(object) & mask != 0`, and reporting it consumes nothing; a binding made with `ONESHOT` is *disarmed* when `port_wait` reports it and stays quiet, whatever the level, until `port_rearm`. A binding
 holds no reference: when the object is destroyed the binding disappears.
 
 ### port_create() -> status, handle
 
-### port_bind(port, object, mask, key) -> status
+### port_bind(port, object, mask, key, flags) -> status
 
 Watch `object` for `mask`; report it under `key` (chosen by the caller, unique within the
 port). Rights: MANAGE on `port`, WAIT on `object`. `mask` must be non-empty and within the
 waitable signals. Errors, in order: BAD_HANDLE (port, then object); WRONG_TYPE (`port` is not
 a port); ACCESS_DENIED; INVALID_ARGS (bad mask; `object` is a port; `key` already bound);
-NO_MEMORY (`MAX_PORT_BINDINGS` (256) bindings).
+NO_MEMORY (no room for the binding: it costs 32 bytes of the port's job queued-data quota and of the system-wide budget; there is no fixed count). `flags` is `0` or `ONESHOT` (`abi::port_flags`, 1); any other bit is INVALID_ARGS (checked with the mask).
+
+### port_rearm(port, key) -> status
+
+Arm binding `key` again after a `ONESHOT` delivery (harmless on one that is armed). It is ready at once if its object's signals match now, and a thread blocked in `port_wait` is woken for it. Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such key).
 
 ### port_unbind(port, key) -> status
 

@@ -6,8 +6,8 @@ use crate::handle::{Entry, HandleTable};
 use crate::job::{JobId, Jobs, Resource};
 use crate::object::{ObjId, Object, Registry};
 use abi::limits::{
-    MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_PORT_BINDINGS,
-    MAX_QUEUED_BYTES, MAX_QUEUED_MSGS, SOCKET_BUFFER,
+    MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_QUEUED_BYTES, MAX_QUEUED_MSGS,
+    SOCKET_BUFFER,
 };
 use abi::rights::Rights;
 use abi::signals;
@@ -93,6 +93,10 @@ struct Binding {
     obj: ObjId,
     mask: u32,
     key: u64,
+    /// Disarm on delivery (`port_flags::ONESHOT`).
+    oneshot: bool,
+    /// A disarmed binding is never ready until `port_rearm`.
+    armed: bool,
 }
 
 /// A wait set. Bindings hold no references: a destroyed object's binding is pruned.
@@ -678,7 +682,7 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
 /// Is the binding's object alive with a watched signal asserted? (Ports cannot be bound,
 /// so this never recurses.)
 fn binding_ready(reg: &Kobjs, b: &Binding) -> bool {
-    matches!(object_signals(reg, b.obj), Some(s) if s & b.mask != 0)
+    b.armed && matches!(object_signals(reg, b.obj), Some(s) if s & b.mask != 0)
 }
 
 // --- sockets ---
@@ -928,6 +932,22 @@ pub fn port_bind_in(
     key: u64,
     jobs: &mut Jobs,
 ) -> Result<(), Status> {
+    port_bind_flags_in(reg, table, port, object, mask, key, 0, jobs)
+}
+
+/// `port_bind` with flags (`abi::port_flags`; any other bit is INVALID_ARGS). The number of bindings
+/// is limited by the port's job quota (each costs `BINDING_COST`), not by a fixed count.
+#[allow(clippy::too_many_arguments)]
+pub fn port_bind_flags_in(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    object: Handle,
+    mask: u64,
+    key: u64,
+    flags: u64,
+    jobs: &mut Jobs,
+) -> Result<(), Status> {
     settle(reg, jobs);
     let pe = table.get(port)?;
     let oe = table.get(object)?;
@@ -947,6 +967,9 @@ pub fn port_bind_in(
     {
         return Err(Status::InvalidArgs);
     }
+    if flags & !abi::port_flags::ONESHOT != 0 {
+        return Err(Status::InvalidArgs);
+    }
     let mask = mask as u32;
     prune_port(reg, jobs, port_obj);
     let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
@@ -954,9 +977,6 @@ pub fn port_bind_in(
     };
     if p.bindings.iter().any(|b| b.key == key) {
         return Err(Status::InvalidArgs);
-    }
-    if p.bindings.len() >= MAX_PORT_BINDINGS {
-        return Err(Status::NoMemory);
     }
     p.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
     // a binding costs queued-data budget of the port's job, like a queued message would
@@ -968,6 +988,8 @@ pub fn port_bind_in(
         obj: oe.obj,
         mask,
         key,
+        oneshot: flags & abi::port_flags::ONESHOT != 0,
+        armed: true,
     });
     reg.meter_add(BINDING_COST);
     Ok(())
@@ -1026,8 +1048,34 @@ pub fn port_poll_in(
     };
     if let Some((i, ..)) = picked {
         p.next = i + 1;
+        if p.bindings[i].oneshot {
+            p.bindings[i].armed = false; // delivered: stays quiet until `port_rearm`
+        }
     }
     Ok(observed)
+}
+
+/// Arm binding `key` again (a one-shot binding that was delivered; harmless on one that is armed): it
+/// is ready at once if its object's signals match now. Rights: MANAGE on the port.
+pub fn port_rearm_in(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    key: u64,
+    jobs: &mut Jobs,
+) -> Result<(), Status> {
+    let port_obj = port_of(reg, table, port, Rights::MANAGE)?;
+    prune_port(reg, jobs, port_obj);
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    let b = p
+        .bindings
+        .iter_mut()
+        .find(|b| b.key == key)
+        .ok_or(Status::InvalidArgs)?;
+    b.armed = true;
+    Ok(())
 }
 
 /// The identity of the object a handle names, and of its peer (0 if it has none or the peer is

@@ -179,6 +179,12 @@ pub mod rights {
 }
 
 /// Signal bits (SYSCALLS.md, "Signals").
+/// Flags for `port_bind` (its fifth argument).
+pub mod port_flags {
+    /// The binding disarms itself when `port_wait` reports it, until `port_rearm`.
+    pub const ONESHOT: u64 = 1;
+}
+
 pub mod signals {
     pub const READABLE: u32 = 1 << 0;
     pub const WRITABLE: u32 = 1 << 1;
@@ -236,8 +242,6 @@ pub mod limits {
     pub const SOCKET_BUFFER: usize = 65536;
     /// Mapped regions in one address space.
     pub const MAX_REGIONS: usize = 1024;
-    /// Bindings in one port.
-    pub const MAX_PORT_BINDINGS: usize = 256;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
@@ -287,6 +291,7 @@ pub mod syscall {
     pub const PORT_BIND: usize = 81;
     pub const PORT_UNBIND: usize = 82;
     pub const PORT_WAIT: usize = 83;
+    pub const PORT_REARM: usize = 84;
     pub const JOB_CREATE: usize = 90;
     pub const JOB_SET_LIMITS: usize = 91;
     pub const JOB_INFO: usize = 92;
