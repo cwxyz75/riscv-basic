@@ -98,13 +98,20 @@ impl Service for Server {
 }
 
 impl Server {
-    /// Start serving `ch` as a connection to `node` (root account for now). `None` if the runtime refuses
+    /// Start serving `ch` as a connection to `node` in `account`. `None` if the runtime refuses
     /// it (not a channel end we may read and write, both ends of one channel, the pool is full): nothing
     /// changes then, and the handle is still the caller's to close.
-    fn add_conn(&mut self, ch: u32, node: NodeId, rights: u32, is_dir: bool) -> Option<u64> {
+    fn add_conn(
+        &mut self,
+        account: svc::AccountId,
+        ch: u32,
+        node: NodeId,
+        rights: u32,
+        is_dir: bool,
+    ) -> Option<u64> {
         let key = self.core.add_conn(
             ch,
-            svc::ROOT,
+            account,
             Conn {
                 node,
                 rights,
@@ -179,7 +186,7 @@ impl Server {
                 .expect("a request came from a live connection");
             (c.is_dir, c.rights, c.node)
         };
-        if req.op != op::CLONE && op::is_directory_op(req.op) != is_dir {
+        if req.op != op::CLONE && req.op != op::ACCOUNT && op::is_directory_op(req.op) != is_dir {
             close_ep(endpoint);
             let st = if is_dir {
                 status::IS_DIRECTORY
@@ -199,8 +206,12 @@ impl Server {
                     self.send(key, txid, denied, 0, &[], None);
                     return;
                 }
+                let account = self
+                    .core
+                    .account_of(key)
+                    .expect("a live connection has an account");
                 let st = self.open(
-                    key,
+                    account,
                     node,
                     conn_rights,
                     path,
@@ -211,6 +222,59 @@ impl Server {
                 match st {
                     Ok(kind) => self.send(key, txid, 0, u64::from(kind), &[], None),
                     Err(s) => {
+                        close_ep(endpoint);
+                        self.send(key, txid, s, 0, &[], None);
+                    }
+                }
+            }
+            op::ACCOUNT => {
+                // A clone that is the root of a new account (R-SPEC.md section 3): `a` is the connection
+                // limit (low 32 bits) and the in-flight limit (high 32), `b` the bytes held for slow readers.
+                if req.rights & !conn_rights != 0 {
+                    close_ep(endpoint);
+                    self.send(key, txid, denied, 0, &[], None);
+                    return;
+                }
+                let Ok(held_bytes) = u32::try_from(req.b) else {
+                    close_ep(endpoint);
+                    self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                    return;
+                };
+                let limits = Limits2 {
+                    conns: req.a as u32,
+                    held_bytes,
+                    inflight: (req.a >> 32) as u32,
+                };
+                let parent = self
+                    .core
+                    .account_of(key)
+                    .expect("a live connection has an account");
+                let account = match self.core.accounts().open(parent, limits) {
+                    Ok(a) => a,
+                    Err(svc::Refuse::Quota) => {
+                        close_ep(endpoint);
+                        self.send(key, txid, status::QUOTA, 0, &[], None);
+                        return;
+                    }
+                    Err(_) => {
+                        // looser than the connection's own account allows
+                        close_ep(endpoint);
+                        self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                        return;
+                    }
+                };
+                match self.open(
+                    account,
+                    node,
+                    conn_rights,
+                    &[],
+                    0,
+                    req.rights,
+                    endpoint.unwrap(),
+                ) {
+                    Ok(kind) => self.send(key, txid, 0, u64::from(kind), &[], None),
+                    Err(s) => {
+                        let _ = self.core.accounts().close(account);
                         close_ep(endpoint);
                         self.send(key, txid, s, 0, &[], None);
                     }
@@ -407,7 +471,7 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
-        _key: u64,
+        account: svc::AccountId,
         dir: NodeId,
         dir_rights: u32,
         path: &[u8],
@@ -418,7 +482,7 @@ impl Server {
         let denied = Status::AccessDenied.code();
         // The connection limit comes first: nothing may be created or truncated for an open that
         // is going to be refused.
-        if !self.core.would_admit(svc::ROOT) {
+        if !self.core.would_admit(account) {
             return Err(status::QUOTA);
         }
         // A clone (or an open of an empty path) names the node it is on: no flag applies.
@@ -482,7 +546,7 @@ impl Server {
         if fl & flags::TRUNCATE != 0 && (is_dir || want & pr::WRITE == 0) {
             return undo(self, status::BAD_REQUEST);
         }
-        let Some(key) = self.add_conn(endpoint, target, want, is_dir) else {
+        let Some(key) = self.add_conn(account, endpoint, target, want, is_dir) else {
             // not something the port can watch (an event or a VMO passed as the "endpoint")
             return undo(self, status::BAD_REQUEST);
         };
@@ -574,7 +638,10 @@ pub fn app_main() -> i32 {
         image_vmo,
     };
     // The service channel is the root directory connection with every right.
-    if server.add_conn(root_ch, ROOT, pr::ALL, true).is_none() {
+    if server
+        .add_conn(svc::ROOT, root_ch, ROOT, pr::ALL, true)
+        .is_none()
+    {
         return 9;
     }
     service::run(&mut server)

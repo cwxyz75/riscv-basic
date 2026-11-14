@@ -196,6 +196,43 @@ impl Fs {
         }
     }
 
+    /// A new connection to the same node that is the root of a **new account** with these limits (slice R):
+    /// everything opened or cloned from it is charged to it, and to this connection's own account above it.
+    /// The limits may not exceed this connection's account's (BAD_REQUEST).
+    pub fn account(
+        &mut self,
+        conns: u32,
+        inflight: u32,
+        held_bytes: u32,
+        rights: u32,
+    ) -> Result<Fs, i32> {
+        let c = sys::channel_create();
+        if c.status != 0 {
+            return Err(c.status);
+        }
+        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let a = u64::from(conns) | (u64::from(inflight) << 32);
+        match self.call(
+            file::op::ACCOUNT,
+            0,
+            rights,
+            a,
+            u64::from(held_bytes),
+            &[],
+            Some(theirs),
+        ) {
+            Ok(r) if r.status == 0 => Ok(Fs::new(mine)),
+            Ok(r) => {
+                sys::handle_close(mine);
+                Err(r.status)
+            }
+            Err(e) => {
+                sys::handle_close(mine);
+                Err(e)
+            }
+        }
+    }
+
     pub fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
         Ok(self
             .simple(file::op::READ, offset, len as u64, &[])?

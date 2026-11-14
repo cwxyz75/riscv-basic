@@ -5063,6 +5063,66 @@ fn memfsd_protocol_violations() -> Outcome {
     Ok(())
 }
 
+/// Slice R: an account confines a client. A connection that is the root of a new account may open only its
+/// own limit of connections; sibling accounts and the root are untouched; accounts nest (a child may only be
+/// tighter than its parent, and what it uses counts against the parent too); and an account's room comes back
+/// when its connections close.
+fn memfsd_accounts_confine_a_client() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let all = prt::READ | prt::ENUMERATE;
+    // an account of 3 connections (itself, and two more)
+    let mut a = root
+        .account(3, 8, 64 * 1024, all)
+        .map_err(|e| msg_e(e, line!()))?;
+    let a1 = a.clone_conn(all).map_err(|e| msg_e(e, line!()))?;
+    let a2 = a.clone_conn(all).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(a.clone_conn(all)),
+        Some(pst::QUOTA),
+        "a fourth connection of a three-connection account"
+    );
+    // opening files counts too (every connection is charged to its account)
+    ensure_eq!(
+        code(a.open(b"bin", pfl::DIRECTORY, all)),
+        Some(pst::QUOTA),
+        "an open is a connection"
+    );
+    // another account, and the root, are not affected
+    let mut b = root
+        .account(3, 8, 64 * 1024, all)
+        .map_err(|e| msg_e(e, line!()))?;
+    let _b1 = b.clone_conn(all).map_err(|e| msg_e(e, line!()))?;
+    let _r1 = root.clone_conn(all).map_err(|e| msg_e(e, line!()))?;
+    // a child account may only be tighter than its parent, and uses the parent's room too
+    ensure_eq!(
+        code(b.account(5, 8, 64 * 1024, all)),
+        Some(pst::BAD_REQUEST),
+        "a looser child"
+    );
+    let mut c = b.account(2, 4, 1024, all).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(c.clone_conn(all)),
+        Some(pst::QUOTA),
+        "b has 3 connections: itself, one clone, and the child's root; the child's second would be a fourth"
+    );
+    // closing connections gives the room back
+    a1.close();
+    a2.close();
+    let mut back = false;
+    for _ in 0..50 {
+        if a.clone_conn(all).is_ok() {
+            back = true;
+            break;
+        }
+        rt::io::nap(2);
+    }
+    ensure!(
+        back,
+        "the account's room came back after its connections closed"
+    );
+    Ok(())
+}
+
 fn memfsd_quotas_and_connection_limit() -> Outcome {
     let (_p, mut root, _bi) = start_memfsd()?;
     let mut tmp = root
@@ -9066,6 +9126,10 @@ pub fn app_main() -> i32 {
         ),
         ("memfsd_rights_only_shrink", memfsd_rights_only_shrink),
         ("memfsd_protocol_violations", memfsd_protocol_violations),
+        (
+            "memfsd_accounts_confine_a_client",
+            memfsd_accounts_confine_a_client,
+        ),
         (
             "memfsd_quotas_and_connection_limit",
             memfsd_quotas_and_connection_limit,

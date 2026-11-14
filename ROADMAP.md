@@ -494,7 +494,7 @@ exact; the benchmark for a request/reply round trip.
 
 - [x] Step 0: spec (`R-SPEC.md`; the five open questions were answered by the owner on 2026-11-14, all as recommended) and OD84
 - [x] Step 1: the pure core and the runtime. The pure core is built: the `svc` crate (accounts with nesting and all-or-nothing charges along the chain, the connection table with never-reused keys, held replies with a first-held-first order and a timeout), model-tested against an independent recomputation of usage and mutation-checked. The runtime is `rt::service` (`Core`: port, connections, accounts, the one hold-and-poll backpressure policy, the one violation policy, `add_conn`'s endpoint hygiene; the `Service` trait and `run`). **Not done**: the typed request/reply client (`channel_call` callers)
-- [ ] Step 2: accounted connections: the `Account(limits)` op (op 8) in the file protocol and in `memfsd`; per-account quotas; the two-client QEMU test
+- [x] Step 2: accounted connections: the `Account` op (op 8) in the file protocol (`proto::file`, S4-SPEC), in `memfsd` (every Open/Clone is charged to the connection's account; accounts are reaped when idle) and in `rt::fs` (`Fs::account`); `memfsd_accounts_confine_a_client` (mutation-checked). The launcher handing a program an accounted root connection is not done
 - [~] Step 3: `memfsd` is on the library (251 suite tests pass unchanged at one and four harts; every connection is in the root account, the pool 200 connections and 2 MiB held); `consoled`, `launcher`, `devmgr`, `blkd` are not
 - [ ] Step 4: documents; T28, T30 (launcher single client) and D11 resolved or narrowed
 

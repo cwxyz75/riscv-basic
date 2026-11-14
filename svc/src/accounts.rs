@@ -135,6 +135,11 @@ impl Accounts {
         Ok(())
     }
 
+    /// The account an account was opened under (`None` for the root).
+    pub fn parent(&self, id: AccountId) -> Option<AccountId> {
+        self.rec(id).ok().and_then(|a| a.parent)
+    }
+
     /// The account's limits.
     pub fn limits(&self, id: AccountId) -> Result<Limits, Refuse> {
         Ok(self.rec(id)?.limits)
