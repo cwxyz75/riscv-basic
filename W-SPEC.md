@@ -109,7 +109,7 @@ that evaluates every blocked waiter's real predicate after each commit and panic
 0. Counters, baseline, this document (built). 1. (built) The dirty log and touch rules in `kcore`, no behaviour change, with the
 completeness property test. 2. Wake by thread id for futex and kill (built; the T38 shuttle model and the `channel_call` benchmark move to step 3). 3. `kcore::wait` with thread waiters (`object_wait`,
 `channel_call`, kernel reads, IRQ); ports still use the global queue, woken only when a port could be affected. 4. Ports as
-registrations, quotas, per-handle binding lifetime. 5. Retire the queue and the hand-kept syscall list; documents
+registrations (built in part: port waits are woken by id; the exact ready set, wake-one baton, quotas and per-handle lifetime are not). 5. Retire the queue (built) and the hand-kept syscall list; documents
 (SYSCALLS execution model, `object_wait`, ports; INVARIANTS C3b rewritten, W1-W4, P1, PW; T12 and the futex half of T49
 resolved). 6. One-shot bindings and `port_rearm`.
 

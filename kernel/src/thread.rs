@@ -584,36 +584,6 @@ pub fn new_queue() -> usize {
     })
 }
 
-/// Block on queue `q` until `ready()` holds or the clock reaches `deadline` (absolute
-/// ticks). Returns whether `ready()` held. `ready` runs with interrupts off, like
-/// `wait_until`, so checking and sleeping are one atomic step.
-pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
-    let mut slept = false;
-    loop {
-        let result = irq::without(|| {
-            if ready() {
-                return Some(true);
-            }
-            let k = kernel();
-            if k.sched.now() >= deadline {
-                return Some(false);
-            }
-            count_sleep(&mut slept);
-            let Kernel { sched, queues, .. } = k;
-            if queues[q]
-                .wait_until_on(sched, hart(), deadline)
-                .expect("running thread")
-            {
-                reschedule();
-            }
-            None
-        });
-        if let Some(r) = result {
-            return r;
-        }
-    }
-}
-
 /// Sleep until `ready()` holds or `deadline` (absolute ticks), **not queued anywhere**: only
 /// `wake_blocked(tid)` or the deadline ends the sleep early (slice W step 2: futex sleepers and
 /// other waiters that are woken by id). `ready` runs with interrupts off with the big lock held, so
