@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -84,6 +84,8 @@ OS_NOSHOOT_ELF := target/os-fault-shootdown/$(KERNEL_TARGET)/debug/kernel
 OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
+OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
+OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
@@ -169,8 +171,17 @@ os-boot-test-smp-neg: kernel os-interactive
 os-boot-test-nodisk: kernel
 	OS_DISK=0 python3 scripts/os_boot_test.py $(OS_ELF)
 
+# The AIA is the default machine (OD75): this adds two harts and the negative control for the acknowledgement.
+# The plain board has only a PLIC, which the kernel no longer drives: no interrupt controller, drivers poll.
+os-boot-test-polling: kernel
+	OS_MACHINE=virt python3 scripts/os_boot_test.py $(OS_ELF)
+
 os-boot-test-aia: kernel
-	OS_MACHINE=virt,aia=aplic-imsic python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
+	cd kernel && cargo build --features fault-aia-no-unmask --target-dir ../target/os-fault-unmask
+	python3 scripts/os_boot_test.py --neg $(OS_NOUNMASK_ELF) interrupt_object_fires_and_masks
+	cd kernel && cargo build --features fault-aia-no-repend --target-dir ../target/os-fault-repend
+	python3 scripts/os_boot_test.py --neg $(OS_NOREPEND_ELF) interrupt_object_fires_and_masks
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.
@@ -183,7 +194,7 @@ os-interactive: os-user
 
 # Boot the OS to its shell in this terminal (type `basic`; Ctrl-A then X leaves QEMU).
 os-run: os-interactive
-	qemu-system-riscv64 -machine virt -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
 
 # The system as it is meant to be used (T48): optimised kernel and programs, no boot self-tests, no
 # test banners. `make os-release-run` boots it in this terminal; `os-release-smoke` boots it
@@ -195,7 +206,7 @@ os-release:
 	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --features release --target-dir ../target/os-release-run
 
 os-release-run: os-release
-	qemu-system-riscv64 -machine virt -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
 
 os-release-smoke: os-release
 	python3 scripts/release_smoke_test.py $(OS_RELEASE_ELF)
@@ -225,4 +236,4 @@ quick: fmt-check docs-check
 	cargo test -p abi -p kcore -p proto -p memfs -p cfmt -p basic-script
 	$(MAKE) os-release-smoke
 
-check: fmt-check docs-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-rva23 os-serial-test os-release-smoke
+check: fmt-check docs-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test os-release-smoke

@@ -477,7 +477,7 @@ Builds on slices R (the service loop) and I (interrupts); the existing block-dri
 
 Estimated size (not measured): 2 to 3 PRs.
 
-### I: AIA interrupts (planned; not started)
+### I: AIA interrupts (done; Fable review pending)
 
 Decision (2026-11-14, owner, OD75): AIA is the target, full stop. Today interrupt objects are PLIC-only, AIA
 machines fall back to polling, and delivery goes to the boot hart only (design review D5, T43). Plan: interrupt
@@ -489,12 +489,14 @@ Acceptance (written first): the block-driver interrupt test on the AIA machine t
 on a non-boot hart; the interrupt object tests (mask, ack, level and edge) pass on AIA; the whole suite on AIA
 at one, two and four harts; a negative control that drops the interrupt acknowledgement.
 
-- [ ] Step 0: spec (AIA topology, interrupt object semantics, per-hart delivery), tests first
-- [ ] Step 1: APLIC/IMSIC support in the kernel and the device-tree parser (`kcore::fdt`)
-- [ ] Step 2: interrupt objects on AIA with per-hart delivery; the block driver off polling
-- [ ] Step 3: switch the default test machine and `make os-run`; retire the PLIC path; T43 resolved
+- [x] Step 0: spec (SYSCALLS.md interrupt_create/ack, OD75) and the acceptance checks, written first (counters, the boot-script check, the negative control)
+- [x] Step 1: APLIC/IMSIC support in the kernel (`kernel/src/aia.rs`; the tree is read with `kcore::fdt::parse`)
+- [x] Step 2: interrupt objects on AIA with per-hart delivery; the block driver off polling (verified in QEMU at one, two and four harts)
+- [x] Step 3: the default test machine and `make os-run` on AIA; the PLIC path deleted; plain `virt` is the polling fallback (`make os-boot-test-polling`); T43 resolved, its residual is T59
 
-Estimated size (not measured): 3 to 4 PRs; a Fable review.
+Done as one PR rather than three (it was small). The Fable review is still to do.
+
+Measured: one PR.
 
 ### T: Kernel memory and threads (planned; not started)
 

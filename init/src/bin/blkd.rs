@@ -3,7 +3,7 @@
 //!
 //! Authority, all of it handed over in the startup message: the device's virtio-mmio slot
 //! (`BlkMmio`, a physical VMO), one DMA buffer (`BlkDma`, with the DMA right), optionally the
-//! slot's interrupt (`BlkIrq`: absent on machines without a PLIC, then it polls), and the channel
+//! slot's interrupt (`BlkIrq`: absent on machines without an AIA, then it polls), and the channel
 //! it serves (`ServiceBlk`). It never owns the memory: its supervisor keeps its own handles to the
 //! DMA buffer and the MMIO slot, so killing the driver frees nothing the device may still write
 //! to; the supervisor resets the device before it hands the buffer to the next driver (TIDY-UP T42).

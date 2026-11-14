@@ -1148,7 +1148,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::RESOURCE_DTB => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
             let Some(blob) =
-                crate::plic::dtb_blob().filter(|b| b.len() <= abi::limits::MAX_DTB_BYTES)
+                crate::dtb::dtb_blob().filter(|b| b.len() <= abi::limits::MAX_DTB_BYTES)
             else {
                 return fail(Status::NotSupported);
             };
@@ -1174,7 +1174,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if irq == 0 || irq > u64::from(abi::layout::MAX_IRQ) {
                 return fail(Status::InvalidArgs);
             }
-            if !crate::plic::present() {
+            if !crate::aia::present() {
                 return fail(Status::NotSupported);
             }
             let slot = irq as usize;
@@ -1191,7 +1191,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             ) {
                 Ok((hd, obj)) => {
                     irq_objs[slot] = Some(obj);
-                    crate::plic::enable(irq as u32);
+                    crate::aia::enable(irq as u32);
                     Ok((Some(u64::from(hd.0)), None))
                 }
                 Err(e) => fail(e),
@@ -1201,8 +1201,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
                 .map_err(|e| (e, None, None))?;
             let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
-            crate::plic::complete(irq);
-            crate::plic::enable(irq);
+            crate::aia::reenable(irq);
             Ok((Some(claims), None))
         }
         nr::VMO_PHYS_ADDR => {
@@ -1417,10 +1416,7 @@ fn cleanup_dead() {
                         if matches!(s.objs.get(o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
                     if !owned {
                         s.irq_objs[i.irq as usize] = None;
-                        crate::plic::disable(i.irq);
-                        if i.fired {
-                            crate::plic::complete(i.irq); // the claim was held open for the ack
-                        }
+                        crate::aia::disable(i.irq);
                     }
                 }),
                 _ => {}
