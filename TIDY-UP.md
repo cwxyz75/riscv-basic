@@ -81,6 +81,7 @@ Rules:
 | T16 | M | **memfs keeps file data in the server's heap**, programs are copied through memory objects only for `/bin` (S4 spec section 7). | Simple, host-testable. | Back files with VMOs (`GetVmo` for everything), shared page cache, `mmap` (S11). |
 | T18 | L | **Shell has no redirection, variables, globbing, job control**; one foreground pipeline; confined `CWD` is read-only. | Out of S4's acceptance. | A later slice: redirection through a pump in the shell; creation rights on a writable cwd. |
 | T19 | L | **The shell's `PATH` is a fixed `/bin`**; commands are looked up by a plain name; programs are only the boot image. | Boot image is the only program source. | Manifest-driven search paths and a package/installer story (S10). |
+| T67 | L | **The network server (`netd`) is one thread with every connection a state machine, not a thread per connection** (`NET-DESIGN.md` section 8). | Threads are one-to-one kernel threads with small per-job limits and are not cheap yet (OD73 is a direction); TCP connections share tables and timers; wake-one on ports is unbuilt (T60). Isolation comes from accounts and fuzzed, model-tested state machines instead. | When threads become cheap (the OD73 benchmark target is met, with wake-one and cheap creation), reconsider **one thread per connection** (an actor wrapping one core instance; the core's events-in, actions-out interface was kept so its tests carry over). Measure first, and weigh against the shared-state cost. |
 
 ### Platform and build
 
