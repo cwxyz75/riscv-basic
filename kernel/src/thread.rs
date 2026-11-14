@@ -729,6 +729,10 @@ pub fn wake_stat(which: u64) -> u64 {
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
         3..=5 => crate::aia::stat(which),
+        // 6: the `time` counter (10 MHz on QEMU `virt`), so a benchmark need not depend on user-mode counter access
+        // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
+        6 => crate::timer::now(),
+        7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
         _ => 0,
     }
 }
