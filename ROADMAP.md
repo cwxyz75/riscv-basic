@@ -359,7 +359,7 @@ a shuttle/loom model of the wake/sleep protocol (retires T38); model tests of `k
 old wake-everyone behaviour as the oracle; mutation checks (drop a touch, no baton hand-over, deadline
 before poll); a `fault-skip-touch` negative-control kernel; every existing test still green.
 
-- [ ] Step 0: spec and an OD, acceptance machinery (counters, bystander test, benchmark, T38 model)
+- [x] Step 0: spec (`W-SPEC.md`, OD80), wake counters (`debug_stat`) and the measured bystander baseline (`wake_baseline_bystanders_and_counters`); the `channel_call` benchmark and the T38 shuttle model move to step 2, where the wake path is first rewritten
 - [ ] Step 1: the dirty log and touch rules in `kcore`, no behaviour change, with a completeness property test
 - [ ] Step 2: wake by thread id for futex and kill
 - [ ] Step 3: `kcore::wait` thread waiters (`object_wait`, `channel_call`, kernel reads, IRQ)
