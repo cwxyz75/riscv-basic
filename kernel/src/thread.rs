@@ -614,6 +614,49 @@ pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -
     }
 }
 
+/// Sleep until `ready()` holds or `deadline` (absolute ticks), **not queued anywhere**: only
+/// `wake_blocked(tid)` or the deadline ends the sleep early (slice W step 2: futex sleepers and
+/// other waiters that are woken by id). `ready` runs with interrupts off with the big lock held, so
+/// checking and sleeping are one step against any waker. Returns whether `ready()` held.
+pub fn wait_deadline_private(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    let mut slept = false;
+    loop {
+        let result = irq::without(|| {
+            if ready() {
+                return Some(true);
+            }
+            let k = kernel();
+            if k.sched.now() >= deadline {
+                return Some(false);
+            }
+            count_sleep(&mut slept);
+            if k.sched
+                .sleep_until_on(hart(), deadline)
+                .expect("running thread")
+            {
+                reschedule();
+            }
+            None
+        });
+        if let Some(r) = result {
+            return r;
+        }
+    }
+}
+
+/// Wake thread `tid` if it is blocked (and leave a token if it is not, which a later queue wait
+/// consumes; harmless to waiters that re-check). Counts a wake only for a thread that was blocked.
+pub fn wake_blocked(tid: Tid) {
+    irq::without(|| {
+        let k = kernel();
+        if k.sched.state(tid) == Some(State::Blocked) {
+            WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = k.sched.wake_on(hart(), tid);
+        reschedule();
+    });
+}
+
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts
 /// off, so checking and queueing are one atomic step with respect to wakers: this is
 /// the "no lost wakeup" path.

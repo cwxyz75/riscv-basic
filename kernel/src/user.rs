@@ -576,7 +576,10 @@ fn leave(code: i32, whole: bool) -> ! {
         Some((pid, p.detached, p.threads_alive))
     });
     match me {
-        Some((_, _, alive)) if alive > 0 => notify(), // siblings and waiters on this thread
+        Some((pid, _, alive)) if alive > 0 => {
+            notify(); // waiters on this thread
+            wake_threads_of(pid); // siblings (a futex sleeper is on no queue)
+        }
         Some((pid, true, _)) => {
             teardown(pid);
         }
@@ -722,10 +725,10 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::PORT_WAIT => reply(frame, port_wait(a)),
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
         nr::FUTEX_WAKE => {
-            let r = futex_wake(a);
-            // wake the system's sleepers only if a futex sleeper was actually woken
-            if matches!(r, Ok((Some(n), _)) if n > 0) {
-                wake_signal_waiters();
+            let (r, woken) = futex_wake(a);
+            // wake exactly the sleepers that were removed from the table, by id (not everyone)
+            for t in woken {
+                thread::wake_blocked(t as Tid);
             }
             reply(frame, r);
         }
@@ -780,6 +783,11 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 notify();
             }
+            // (slice W step 1: nothing consumes the dirty log yet; drop what this syscall logged so it
+            // does not pile up. Step 3 wakes by it instead.)
+            irq::without(|| {
+                state().objs.take_dirty();
+            });
             reply(frame, result);
         }
     }
@@ -1443,6 +1451,22 @@ pub fn end_process(pid: u32, code: i32) {
     request_kill(pid, code);
 }
 
+/// Wake every blocked thread of process `pid` by id (a kill must reach sleepers that are on no
+/// queue: futex sleepers).
+fn wake_threads_of(pid: u32) {
+    let tids: Vec<Tid> = irq::without(|| {
+        state()
+            .thread_pid
+            .iter()
+            .filter(|(_, p)| **p == pid)
+            .map(|(t, _)| *t)
+            .collect()
+    });
+    for t in tids {
+        thread::wake_blocked(t);
+    }
+}
+
 fn request_kill(pid: u32, code: i32) {
     let direct = irq::without(|| {
         let s = state();
@@ -1468,6 +1492,8 @@ fn request_kill(pid: u32, code: i32) {
     });
     if direct {
         teardown(pid);
+    } else {
+        wake_threads_of(pid);
     }
 }
 
@@ -1571,10 +1597,9 @@ fn futex_wait(a: [u64; 6]) -> Reply {
     if let Err(status) = first {
         return fail(status);
     }
-    // sleep until woken (removed from the table), killed, or the deadline
-    let q = irq::without(|| state().signal_queue);
-    thread::wait_deadline(
-        q,
+    // sleep until woken (removed from the table), killed, or the deadline: not on the global queue,
+    // only `futex_wake` and a kill wake this thread (by id)
+    thread::wait_deadline_private(
         || killed_now().is_some() || !state().futexes.contains(who),
         deadline,
     );
@@ -1588,19 +1613,21 @@ fn futex_wait(a: [u64; 6]) -> Reply {
 }
 
 /// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first.
-fn futex_wake(a: [u64; 6]) -> Reply {
+fn futex_wake(a: [u64; 6]) -> (Reply, Vec<u64>) {
     let (addr, count) = (a[0], a[1]);
     if addr & 3 != 0 || addr < abi::user::BASE || addr.saturating_add(4) > abi::user::TOP {
-        return fail(Status::InvalidArgs);
+        return (fail(Status::InvalidArgs), Vec::new());
     }
     let tid = thread::current();
     let woken = irq::without(|| {
         let s = state();
         let pid = *s.thread_pid.get(&tid)?;
-        Some(s.futexes.wake((pid, addr), count).len())
-    })
-    .ok_or((Status::BadState, None, None))?;
-    Ok((Some(woken as u64), None))
+        Some(s.futexes.wake((pid, addr), count))
+    });
+    match woken {
+        Some(ids) => (Ok((Some(ids.len() as u64), None)), ids),
+        None => (Err((Status::BadState, None, None)), Vec::new()),
+    }
 }
 
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
