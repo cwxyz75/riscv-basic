@@ -239,6 +239,8 @@ pub mod syscall {
     pub const PROCESS_EXIT: usize = 1;
     pub const THREAD_YIELD: usize = 2;
     pub const CLOCK_GET: usize = 3;
+    /// A kernel counter by index (a measuring aid for the boot-time suite, like `DEBUG_WRITE`).
+    pub const DEBUG_STAT: usize = 4;
     pub const HANDLE_CLOSE: usize = 10;
     pub const HANDLE_DUPLICATE: usize = 11;
     pub const HANDLE_REPLACE: usize = 12;

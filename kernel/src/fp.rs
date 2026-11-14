@@ -148,6 +148,13 @@ pub fn return_to_user(frame: &mut TrapFrame) {
     if frame.sstatus & (1 << 8) != 0 {
         return;
     }
+    // A thread with no FP state has `FS` Off in its frame (a thread that has state always returns
+    // with Clean or Dirty, and `first_use` sets Initial), so the common case takes no lock at all:
+    // taking the big lock on every return to user mode made syscalls with many live processes at four
+    // harts several times slower (found by `syscalls_stay_fast_with_many_live_processes` in CI).
+    if frame.sstatus & FS_MASK == 0 {
+        return;
+    }
     crate::bkl::lock();
     let s = state();
     let tid = crate::thread::current();
@@ -178,7 +185,7 @@ pub fn return_to_user(frame: &mut TrapFrame) {
 /// An illegal instruction from user mode: if the unit is off for a thread that has not used it, this
 /// may be its first FP instruction. Enable it and say so (the instruction is then retried; if it traps
 /// again the unit is on and the trap is a real illegal instruction).
-pub fn first_use(frame: &TrapFrame) -> bool {
+pub fn first_use(frame: &mut TrapFrame) -> bool {
     if frame.sstatus & FS_MASK != 0 {
         return false;
     }
@@ -187,7 +194,12 @@ pub fn first_use(frame: &TrapFrame) -> bool {
     let FpState {
         tokens, threads, ..
     } = s;
-    threads.entry(tid).or_default().enable(tokens)
+    let enabled = threads.entry(tid).or_default().enable(tokens);
+    if enabled {
+        // not Off any more: the return path then loads its (zero) state and sets Clean
+        frame.sstatus |= 1 << 13;
+    }
+    enabled
 }
 
 /// A thread has ended: forget its FP state.

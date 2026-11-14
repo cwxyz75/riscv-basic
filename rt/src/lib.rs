@@ -87,6 +87,11 @@ pub mod sys {
     pub fn clock_get() -> u64 {
         syscall(CLOCK_GET, [0; 6]).a1 as u64
     }
+    /// A kernel counter (see SYSCALLS.md `debug_stat`): 0 blocking waits entered, 1 waits that were woken
+    /// without being satisfied (spurious wakes), 2 threads woken.
+    pub fn debug_stat(which: u64) -> u64 {
+        syscall(DEBUG_STAT, [which as usize, 0, 0, 0, 0, 0]).a1 as u64
+    }
     pub fn handle_close(h: u32) -> Ret {
         syscall(HANDLE_CLOSE, [h as usize, 0, 0, 0, 0, 0])
     }

@@ -139,6 +139,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 1 | process_exit | `a0` code | does not return |
 | 2 | thread_yield | | |
 | 3 | clock_get | | `a1` ticks since boot (1 ms each) |
+| 4 | debug_stat | `a0` which | `a1` the kernel counter |
 | 10 | handle_close | `a0` handle | |
 | 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
 | 12 | handle_replace | `a0` handle, `a1` rights | `a1` new handle |
@@ -214,6 +215,15 @@ and copies through the direct map. Anything else is `INVALID_ARGS`; a zero lengt
 touches memory, whatever the pointer. A call that fails on a pointer changes nothing.
 `debug_write` is limited to 4096 bytes per call (TOO_BIG beyond). It is a debugging aid for
 the trusted boot-time suite: nothing ties a `##TEST` line to the program that wrote it.
+
+### debug_stat(which) -> value
+
+A measuring aid for the boot-time suite (like `debug_write`; no rights, no effect on the system): `a1` is
+a kernel counter, `which` 0 the number of times a thread blocked in a wait, 1 how many of those blocks
+were by a thread that had been woken without being satisfied (a *spurious wake*), 2 how many threads
+were woken. Any other index reads 0. The counters only grow. They exist to measure the wake path
+(roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
+nearly every syscall.
 
 ### debug_write(ptr, len) -> status
 
