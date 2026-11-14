@@ -136,7 +136,7 @@ os-boot-test-rr: kernel
 OS_REL_ELF := target/os-release/$(KERNEL_TARGET)/release/kernel
 os-boot-test-release:
 	cd init && cargo build --release
-	cd kernel && OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-release
+	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --target-dir ../target/os-release
 	python3 scripts/os_boot_test.py $(OS_REL_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_REL_ELF)
 
@@ -181,7 +181,7 @@ OS_RELEASE_ELF := target/os-release-run/$(KERNEL_TARGET)/release/kernel
 
 os-release:
 	cd init && cargo build --release
-	cd kernel && OS_USER_PROFILE=release cargo build --release --features release --target-dir ../target/os-release-run
+	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --features release --target-dir ../target/os-release-run
 
 os-release-run: os-release
 	qemu-system-riscv64 -machine virt -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)

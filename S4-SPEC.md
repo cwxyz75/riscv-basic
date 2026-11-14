@@ -153,7 +153,7 @@ defines (0, except `Open`/`Clone` which carry exactly 1); anything else is a pro
 
 Ops on a **directory** connection: `1 Open(path, flags, rights)+endpoint`, `2 Clone(rights)+
 endpoint`, `3 ReadDir(cookie = last name seen, empty = start)`, `4 Mkdir(name)`, `5 Unlink(name)`,
-`6 Stat(path)`; `2 Clone` is also valid on a file connection. Ops on a **file** connection: `10 Read(offset, len)`, `11 Write(offset, data)`,
+`6 Stat(path)`, `7 Rename(a = old path length; payload = old path then new path, both relative to the connection)` (S7e: an existing file, or empty directory over a directory, is replaced; a directory cannot move below itself, `BAD_REQUEST`; the node and its open connections survive); `2 Clone` is also valid on a file connection. Ops on a **file** connection: `10 Read(offset, len)`, `11 Write(offset, data)`,
 `12 GetSize`, `13 SetSize(n)`, `14 Stat`, `15 GetVmo` (no arguments; for every boot-image file, `/bin` programs included: the reply carries a
 read-only handle to the *whole* boot image VMO, `a` = the file's offset and the 8-byte payload
 its length, so no program is ever copied through channels; any other file is `BAD_REQUEST`). Flags for `Open`: `CREATE`, `EXCLUSIVE`, `TRUNCATE`,
@@ -184,8 +184,8 @@ Rules:
   plus message copies) fits the server's 16 MiB heap; **at most 200 live connections in all** (one port holds 256 bindings,
   leaving room for the service channel); excess `Open`/`Clone` is `QUOTA`. Servers cannot tell
   clients apart (INVARIANTS H5), so per-client limits are not specified.
-- `Open` needs READ on the directory connection (it traverses), `Mkdir`/`Unlink`/`SetSize`/`Write`
-  need WRITE, `ReadDir` needs ENUMERATE, everything else READ. The server also refuses an endpoint
+- `Open` needs READ on the directory connection (it traverses), `Mkdir`/`Unlink`/`Rename`/`SetSize`/`Write`
+  need WRITE, `GetSize` needs READ or WRITE (S7e: append and `lseek(SEEK_END)` on a write-only file need it), `ReadDir` needs ENUMERATE, everything else READ. The server also refuses an endpoint
   whose peer end it already serves (`object_info`): both ends of one channel handed over would
   make connections nobody could close and a reply/request echo that never ends. A request with the wrong number
   of handles for its op is answered `BAD_REQUEST` and its handles are closed; only a structurally

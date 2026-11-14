@@ -74,3 +74,10 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.shell-core]
 opt-level = 2
+
+# The release build (T54). One codegen unit lets the compiler inline across a crate's modules.
+# (No LTO here: the C library crate is `no_builtins` and cannot take part in it. The Makefile turns
+# fat LTO on for the kernel build alone, which links no C library.)
+[profile.release]
+opt-level = 3
+codegen-units = 1

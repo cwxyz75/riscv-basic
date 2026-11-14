@@ -94,7 +94,7 @@ fn err_status(e: Error, name_len: usize) -> i32 {
         Error::TooBig => Status::TooBig.code(),
         Error::ReadOnly => Status::AccessDenied.code(),
         Error::BadName if name_len > file::MAX_COMPONENT => status::NAME_TOO_LONG,
-        Error::BadName | Error::BadRange => status::BAD_REQUEST,
+        Error::BadName | Error::BadRange | Error::Invalid => status::BAD_REQUEST,
     }
 }
 
@@ -393,6 +393,34 @@ impl Server {
                 let st = r.map_or_else(|e| err_status(e, req.payload.len()), |_| 0);
                 self.send(key, txid, st, 0, &[], None);
             }
+            op::RENAME => {
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                // `a` bytes of old path, then the new path (the payload holds nothing else)
+                let split = usize::try_from(req.a)
+                    .ok()
+                    .filter(|n| *n <= req.payload.len());
+                let Some(n) = split else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let (old, new) = req.payload.split_at(n);
+                let (Ok(old), Ok(new)) = (file::split_path(old), file::split_path(new)) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let (old_last, old_parents) =
+                    old.split_last().expect("a split path is never empty");
+                let (new_last, new_parents) =
+                    new.split_last().expect("a split path is never empty");
+                let r = self
+                    .fs
+                    .walk(node, old_parents)
+                    .and_then(|from| Ok((from, self.fs.walk(node, new_parents)?)))
+                    .and_then(|(from, to)| self.fs.rename(from, old_last, to, new_last));
+                let st =
+                    r.map_or_else(|e| err_status(e, new_last.len().max(old_last.len())), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
+            }
             op::STAT => {
                 if !need(pr::READ) {
                     return self.send(key, txid, denied, 0, &[], None);
@@ -414,7 +442,8 @@ impl Server {
                 self.stat_reply(key, txid, Ok(node));
             }
             op::GETSIZE => {
-                if !need(pr::READ) {
+                // (a writer may learn the size too: `lseek(SEEK_END)` and append need it)
+                if !need(pr::READ) && !need(pr::WRITE) {
                     return self.send(key, txid, denied, 0, &[], None);
                 }
                 match self.fs.size(node) {

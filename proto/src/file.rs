@@ -39,6 +39,9 @@ pub mod op {
     pub const READDIR: u16 = 3;
     pub const MKDIR: u16 = 4;
     pub const UNLINK: u16 = 5;
+    /// Move or replace an entry. `a` is the length of the old path; the payload is the old path
+    /// followed by the new one (both relative to the directory connection).
+    pub const RENAME: u16 = 7;
     pub const STAT: u16 = 6;
     pub const READ: u16 = 10;
     pub const WRITE: u16 = 11;
@@ -51,9 +54,8 @@ pub mod op {
     pub fn handles(op: u16) -> Option<usize> {
         match op {
             OPEN | CLONE => Some(1),
-            READDIR | MKDIR | UNLINK | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT | GETVMO => {
-                Some(0)
-            }
+            READDIR | MKDIR | UNLINK | RENAME | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT
+            | GETVMO => Some(0),
             _ => None,
         }
     }
@@ -61,7 +63,7 @@ pub mod op {
     /// Does this op belong to a directory connection only? (`CLONE` is valid on both kinds; every
     /// other op that is not listed here belongs to file connections.)
     pub fn is_directory_op(op: u16) -> bool {
-        matches!(op, OPEN | READDIR | MKDIR | UNLINK | STAT)
+        matches!(op, OPEN | READDIR | MKDIR | UNLINK | RENAME | STAT)
     }
 }
 
