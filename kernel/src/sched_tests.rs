@@ -364,6 +364,70 @@ mod priority {
         })
     }
 
+    static GO: AtomicBool = AtomicBool::new(false);
+    static H2: AtomicU64 = AtomicU64::new(0);
+    static SAW_H2_BLOCKED: AtomicBool = AtomicBool::new(false);
+    static RAN: AtomicU64 = AtomicU64::new(0);
+
+    /// T62 (SMP review finding 1): a waker that wakes two higher-priority waiters must make both runnable
+    /// before either runs. If it woke and rescheduled one at a time, the first would preempt the waker and
+    /// the second would still be blocked (with a mid-priority hog on the hart it would stay so). Pinned to
+    /// the boot hart like every kernel thread, so the order is deterministic.
+    pub fn wake_many_makes_every_waiter_runnable_before_any_runs() -> Outcome {
+        clean(|| {
+            GO.store(false, SeqCst);
+            SAW_H2_BLOCKED.store(false, SeqCst);
+            RAN.store(0, SeqCst);
+            let h1 = thread::spawn(
+                "h1",
+                20,
+                |_| {
+                    thread::wait_deadline_private(|| GO.load(SeqCst), u64::MAX);
+                    if thread::is_blocked(H2.load(SeqCst) as u32) {
+                        SAW_H2_BLOCKED.store(true, SeqCst);
+                    }
+                    RAN.fetch_add(1, SeqCst);
+                },
+                0,
+            );
+            let h2 = thread::spawn(
+                "h2",
+                20,
+                |_| {
+                    thread::wait_deadline_private(|| GO.load(SeqCst), u64::MAX);
+                    RAN.fetch_add(1, SeqCst);
+                },
+                0,
+            );
+            H2.store(u64::from(h2), SeqCst);
+            // main (priority 40) sleeps: both waiters run to their wait and block
+            thread::sleep_ticks(3);
+            ensure(
+                thread::is_blocked(h1) && thread::is_blocked(h2),
+                "the two waiters did not block",
+            )?;
+            let low = thread::spawn(
+                "low",
+                5,
+                |h1| {
+                    GO.store(true, SeqCst);
+                    thread::wake_many(&[h1 as u32, H2.load(SeqCst) as u32]);
+                },
+                h1 as usize,
+            );
+            thread::sleep_ticks(5);
+            ensure_eq(RAN.load(SeqCst), 2, "waiters that ran after the batch wake")?;
+            ensure(
+                !SAW_H2_BLOCKED.load(SeqCst),
+                "the second waiter was still blocked when the first ran (one wake and reschedule at a time)",
+            )?;
+            thread::join(h1);
+            thread::join(h2);
+            thread::join(low);
+            Ok(())
+        })
+    }
+
     pub fn lower_priority_waits_for_higher() -> Outcome {
         clean(|| {
             STOP.store(false, SeqCst);
@@ -545,6 +609,10 @@ pub const PRIORITY_TESTS: &[Test] = &[
     (
         "higher_priority_runs_at_once_on_spawn",
         priority::higher_priority_runs_at_once_on_spawn,
+    ),
+    (
+        "wake_many_makes_every_waiter_runnable_before_any_runs",
+        priority::wake_many_makes_every_waiter_runnable_before_any_runs,
     ),
     (
         "lower_priority_waits_for_higher",
