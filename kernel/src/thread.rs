@@ -247,6 +247,9 @@ pub fn join_scheduler() -> ! {
             .in_sched
             .store(true, Ordering::Release);
         JOINED.fetch_add(1, Ordering::SeqCst);
+        // Anything that became runnable for this hart while it was starting (its poke was forgotten or
+        // arrived before it was ready) is looked at now, not at the next tick (T65).
+        reschedule_this_hart();
     });
     irq::enable();
     idle_main(0);
@@ -358,7 +361,7 @@ fn reschedule() {
         let k = kernel();
         let h = hart();
         let pokes = k.sched.take_pokes();
-        send_pokes(pokes, h);
+        send_pokes(&mut k.sched, pokes, h);
         let next = k
             .sched
             .current_on(h)
@@ -410,13 +413,17 @@ fn reschedule() {
 }
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
-fn send_pokes(mut pokes: u32, me: usize) {
+fn send_pokes(sched: &mut Sched<Class>, mut pokes: u32, me: usize) {
     pokes &= !(1 << me);
     while pokes != 0 {
         let i = pokes.trailing_zeros() as usize;
         pokes &= pokes - 1;
         if i < crate::smp::started() && crate::percpu::hart(i).online.load(Ordering::Acquire) {
             crate::smp::send_ipi(i, crate::percpu::IPI_RESCHED);
+        } else {
+            // a hart that is not up: forget the mark, or it would suppress every later poke until the hart
+            // reschedules itself (T65); it makes its designation right when it joins (`join_scheduler`)
+            sched.clear_resched_pending(i);
         }
     }
 }
