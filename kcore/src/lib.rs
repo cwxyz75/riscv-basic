@@ -26,6 +26,7 @@ pub mod sync;
 pub mod testlog;
 pub mod ticket;
 pub mod usercopy;
+pub mod wait;
 
 use frame::FrameDb;
 use pagetable::PhysMem;

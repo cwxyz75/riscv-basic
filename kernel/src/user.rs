@@ -112,6 +112,9 @@ struct UserState {
     signal_queue: usize,
     /// The futex wait table (S7b).
     futexes: kcore::futex::Futexes,
+    /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
+    /// signals match, instead of by the global queue.
+    waits: kcore::wait::WaitTable,
     /// The interrupt object that owns each PLIC source (S6a-2).
     irq_objs: [Option<kcore::object::ObjId>; abi::layout::MAX_IRQ as usize + 1],
     /// Output of user programs, assembled into lines.
@@ -165,6 +168,7 @@ fn state() -> &'static mut UserState {
             ktable: HandleTable::new(256),
             signal_queue: thread::new_queue(),
             futexes: kcore::futex::Futexes::new(),
+            waits: kcore::wait::WaitTable::new(),
             irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
             line: String::new(),
             pass: 0,
@@ -722,7 +726,12 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
         nr::DEBUG_STAT => frame.set_return(0, Some(thread::wake_stat(a[0])), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
-        nr::PORT_WAIT => reply(frame, port_wait(a)),
+        nr::PORT_WAIT => {
+            // (a poll moves the port's cursor, which counts as a touch)
+            let r = port_wait(a);
+            commit_wake();
+            reply(frame, r);
+        }
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
         nr::FUTEX_WAKE => {
             let (r, woken) = futex_wake(a);
@@ -783,11 +792,14 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 notify();
             }
-            // (slice W step 1: nothing consumes the dirty log yet; drop what this syscall logged so it
-            // does not pile up. Step 3 wakes by it instead.)
-            irq::without(|| {
-                state().objs.take_dirty();
-            });
+            // Slice W step 3: wake the threads whose wait this syscall ended, by id. A handle removed
+            // by `replace` or sent away in a message is told to the registry first (forced touch).
+            if matches!(n, nr::HANDLE_REPLACE | nr::CHANNEL_WRITE | nr::CHANNEL_CALL)
+                && !cfg!(feature = "fault-skip-forced-touch")
+            {
+                let _ = with_proc(|objs, p, _| p.handles.flush_removed(objs));
+            }
+            commit_wake();
             reply(frame, result);
         }
     }
@@ -1314,14 +1326,45 @@ pub fn irq_fired(irq: u32) -> bool {
 
 /// Wake every waiter without the cleanup `notify` does (for the interrupt path).
 pub fn wake_signal_waiters() {
+    commit_wake();
     let q = state().signal_queue;
     thread::wake_all(q);
+}
+
+/// Wake exactly the threads whose wait the objects touched since the last call can have ended (slice W,
+/// W-SPEC section 3): drain the registry's dirty log (and the handles removed without it), let the wait
+/// table decide, and wake those threads by id. Called after every syscall and wherever a signal can have
+/// changed outside one.
+pub fn commit_wake() {
+    let woken = irq::without(|| {
+        let s = state();
+        let UserState {
+            objs,
+            waits,
+            ktable,
+            ..
+        } = s;
+        ktable.flush_removed(objs);
+        let dirty = objs.take_dirty();
+        if dirty.items.is_empty() && !dirty.overflow {
+            return Vec::new();
+        }
+        waits.commit(
+            |id| ipc::signals_of_object(objs, id),
+            |id| matches!(objs.get(id), Some(ipc::KObj::Port(_))),
+            dirty,
+        )
+    });
+    for t in woken {
+        thread::wake_blocked(t);
+    }
 }
 
 /// Wake every thread waiting on a signal (they re-check their own conditions).
 pub fn notify() {
     cleanup_dead();
     reap_vmos();
+    commit_wake();
     let q = irq::without(|| state().signal_queue);
     thread::wake_all(q);
 }
@@ -1528,6 +1571,27 @@ fn signals_now(h: Handle) -> Result<u32, Status> {
 
 const WAITABLE_SIGNALS: u32 = abi::signals::WAITABLE;
 
+/// Register `thread` as waiting for `mask` on the object the calling process's handle `h` names (just
+/// before it sleeps; interrupts off, lock held). A handle that names nothing has no registration (its
+/// wait ended already: the predicate was true).
+fn register_wait(thread: Tid, h: Handle, mask: u32) {
+    let s = state();
+    debug_assert!(
+        !s.objs.has_dirty(),
+        "a thread is about to sleep with uncommitted signal changes in the log: {:?}",
+        s.objs.peek_dirty()
+    );
+    let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        return;
+    };
+    let Some(p) = s.procs.get(&pid) else {
+        return;
+    };
+    if let Ok(entry) = p.handles.get(h) {
+        s.waits.register(thread, entry.obj, mask);
+    }
+}
+
 fn object_wait(a: [u64; 6]) -> Reply {
     if a[0] > u64::from(u32::MAX) {
         return fail(Status::BadHandle);
@@ -1546,13 +1610,17 @@ fn object_wait(a: [u64; 6]) -> Reply {
     let mask = a[1] as u32;
     let observed = || irq::without(|| signals_now(h));
     if deadline != 0 {
-        let q = irq::without(|| state().signal_queue);
         // A handle that stops naming anything ends the wait (the check below then reports it).
-        thread::wait_deadline(
-            q,
+        let me = thread::current();
+        // (anything a kernel thread touched without committing goes first: a thread must not sleep
+        // while a change it should have seen is still in the log)
+        commit_wake();
+        thread::wait_deadline_registered(
             || killed_now().is_some() || signals_now(h).map_or(true, |s| s & mask != 0),
+            || register_wait(me, h, mask),
             deadline,
         );
+        irq::without(|| state().waits.forget(me));
     }
     // The handle may have gone while we slept: BAD_HANDLE, not a wait that quietly times out.
     let seen = observed().map_err(|e| (e, None, None))?;
@@ -1651,6 +1719,9 @@ fn port_wait(a: [u64; 6]) -> Reply {
         && thread::ticks() < deadline
         && irq::without(killed_now).is_none()
     {
+        // (the poll above may have touched the port; tell the wait table before sleeping, so that no
+        // thread goes to sleep, and the lock is released, with signal changes still in the log)
+        commit_wake();
         let q = irq::without(|| state().signal_queue);
         // Ready, killed, or the handle stopped naming a port (the poll then says so).
         thread::wait_deadline(
@@ -1741,7 +1812,7 @@ fn channel_call(a: [u64; 6]) -> Reply {
     .map_err(|e| (e, None, None))?;
     notify();
     // Wait for the reply with that transaction id (or the peer closing, or the deadline).
-    let q = irq::without(|| state().signal_queue);
+    let me = thread::current();
     let ready = || {
         let s = state();
         let Some(&pid) = s.thread_pid.get(&thread::current()) else {
@@ -1765,7 +1836,13 @@ fn channel_call(a: [u64; 6]) -> Reply {
             Err(ReadError::Status(Status::ShouldWait))
         )
     };
-    thread::wait_deadline(q, ready, deadline);
+    commit_wake();
+    thread::wait_deadline_registered(
+        ready,
+        || register_wait(me, ch, abi::signals::READABLE | abi::signals::PEER_CLOSED),
+        deadline,
+    );
+    irq::without(|| state().waits.forget(me));
     let out = with_proc(|objs, p, k| -> Reply {
         match ipc::channel_peek(
             objs,
@@ -1944,18 +2021,30 @@ impl KernelEnd {
 
     /// Wait until a message is readable or the peer has closed; false on timeout.
     pub fn wait_readable(&self, deadline: u64) -> bool {
-        let q = irq::without(|| state().signal_queue);
         let h = self.handle;
-        thread::wait_deadline(
-            q,
+        let me = thread::current();
+        commit_wake();
+        let r = thread::wait_deadline_registered(
             || {
                 let s = state();
                 ipc::signals_of(&s.objs, &s.ktable, h)
                     .map(|sig| sig & (abi::signals::READABLE | abi::signals::PEER_CLOSED) != 0)
                     .unwrap_or(true)
             },
+            || {
+                let s = state();
+                if let Ok(entry) = s.ktable.get(h) {
+                    s.waits.register(
+                        me,
+                        entry.obj,
+                        abi::signals::READABLE | abi::signals::PEER_CLOSED,
+                    );
+                }
+            },
             deadline,
-        )
+        );
+        irq::without(|| state().waits.forget(me));
+        r
     }
 
     /// Close the end (the same as dropping it).

@@ -1805,8 +1805,9 @@ fn fp_state_is_private_to_each_thread_and_process() -> Outcome {
 
 // --- The wake path: counters, the bystander baseline, a benchmark (roadmap slice W, step 0) ---------
 
-/// Flips to true when slice W retires the global wait queue: then bystanders are never woken.
-const TARGETED_WAKE: bool = false;
+/// True since slice W step 3: `object_wait` and `channel_call` waiters are woken by id, so bystanders are
+/// not woken (the port waits join in step 4). While it was false this test recorded the defect.
+const TARGETED_WAKE: bool = true;
 
 /// A bystander: blocked on an event nobody signals until the test ends it.
 extern "C" fn bystander(arg: usize) -> ! {
@@ -1919,6 +1920,14 @@ fn wake_baseline_bystanders_and_counters() -> Outcome {
             "bystanders are not woken: spurious wakes {} against {} without them",
             busy.2,
             quiet.2
+        );
+        // and the ping-pong itself no longer wakes anyone that is not waiting for it (it was four
+        // spurious wakes per round trip, 241 over the run, before step 3)
+        ensure!(
+            quiet.2 <= 30,
+            "a ping-pong costs almost no spurious wakes: {} over {} round trips",
+            quiet.2,
+            ROUND_TRIPS
         );
     } else {
         ensure!(

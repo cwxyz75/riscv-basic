@@ -17,7 +17,8 @@ and without four *bystander* threads blocked on unrelated events. Baseline, QEMU
 | ping-pong alone | 9 | 361 | 241 | 360 |
 | plus 4 bystanders | 10 | 601 | 481 | 600 |
 
-Four spurious wakes per round trip with nobody else around, and exactly four bystanders times 60 round trips
+After step 3 (`object_wait`, `channel_call` and kernel reads woken by id): 7 ticks, 120 blocks, **0 spurious wakes**, and
+0 extra with four bystanders (the futex sleepers of step 2 likewise). Before it: four spurious wakes per round trip with nobody else around, and exactly four bystanders times 60 round trips
 (240) more with them. The cost is O(blocked threads) per syscall: harmless at a dozen threads, quadratic at the thread
 counts the cheap-threads direction (OD73) is for. When this slice lands the same test must show no extra spurious
 wakes for the bystanders (`TARGETED_WAKE = true` in the suite flips its assertion).
