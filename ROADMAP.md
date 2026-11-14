@@ -455,7 +455,7 @@ floods a server with connections exhausts only its own account; a slow client st
 single backpressure policy; the same protocol-violation behaviour for every ported server; leak checks
 exact; the benchmark for a request/reply round trip.
 
-- [ ] Step 0: spec and OD (the loop, the accounted-connection protocol change, the backpressure policy)
+- [~] Step 0: spec: a draft v0 is in `R-SPEC.md` (written unattended; the open questions need the owner) and OD (the loop, the accounted-connection protocol change, the backpressure policy) is still to be logged once they are answered
 - [ ] Step 1: the service-loop library with its own tests (host-testable pieces pure)
 - [ ] Step 2: accounted connections in the file protocol and `memfsd`; per-account quotas
 - [ ] Step 3: `memfsd` on the library; then `consoled`, `launcher`, `devmgr`, `blkd`
