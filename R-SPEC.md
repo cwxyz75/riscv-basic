@@ -1,6 +1,6 @@
 # R: the service runtime (specification draft, v0)
 
-Status: **draft v0, written unattended on 2026-11-14 for discussion; nothing here is built or decided.** Decisions
+Status: **decided 2026-11-14 (OD84; the owner answered section 4: yes to every recommendation). The pure core (`svc`) is built; the runtime, the file-protocol change and the ports are not.** Originally a draft written unattended. Decisions
 OD77 (a shared service runtime, accounted connections) fixes the direction; this file proposes the shape and
 lists what needs the owner. Basis: design review findings D7, D8, D11, D12 (`reviews/2026-11-14-design-review.md`)
 and a reading of the five server loops (`memfsd`, `consoled`, `launcher`, `devmgr`, `blkd`).
