@@ -9,3 +9,6 @@ debts in `TIDY-UP.md`, plans in `ROADMAP.md`.
 |---|---|---|
 | `2026-11-14-design-review.md` | Design review of the whole OS (findings D1-D18) against the directions in `ROADMAP.md`, ahead of S8 | 2026-11-14 |
 | `2026-11-14-wake-path-design.md` | Recommended design for finding D1: targeted wake, ports as registrations, exclusive wakes, retiring the global wait queue. Basis of the roadmap slice "W" | 2026-11-14 |
+| `2026-11-14-slice-i-aia.md` | Fable review of slice I (AIA interrupts) | 2026-11-14 |
+| `2026-11-14-security-review.md` | Fable security pass over the syscall surface (4 confirmed bugs, 6 suspicions; fixes in the sec-fixes PR) | 2026-11-14 |
+| `2026-11-14-smp-review.md` | Fable SMP and locking review (no memory-safety bug; scheduling-order and latent findings, T62-T66) | 2026-11-14 |

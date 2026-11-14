@@ -2332,7 +2332,14 @@ fn process_self() -> Reply {
         if p.handles.room() < 1 {
             return bad(Status::NoMemory);
         }
-        match p.obj.filter(|&o| objs.is_alive(o)) {
+        // A process its parent created has a kill-on-close object (the parent's handle to it); the
+        // child's own view must not be another reference to *that* object, or the parent closing its
+        // handle would never destroy it and the child would not be killed (review 2026-11-14). Such a
+        // child gets a separate view object; the view is only ever held by the child.
+        let own = p.obj.filter(|&o| objs.is_alive(o));
+        let kill_on_close = matches!(own.and_then(|o| objs.get(o)),
+            Some(ipc::KObj::Process(po)) if po.kill_on_close);
+        match own.filter(|_| !kill_on_close) {
             Some(obj) => {
                 // another view of the same process object
                 objs.retain(obj);
@@ -2350,7 +2357,9 @@ fn process_self() -> Reply {
                 .map_err(|e| (e, None, None))?;
                 // narrow the default rights: a self handle cannot be sent away
                 let h = p.handles.replace(objs, h, rights).expect("just created");
-                p.obj = Some(obj);
+                if own.is_none() {
+                    p.obj = Some(obj);
+                }
                 Ok((Some(u64::from(h.0)), None))
             }
         }

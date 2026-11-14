@@ -898,26 +898,23 @@ pub fn port_create_in(
 /// Drop the bindings whose object has been destroyed (the spec says they disappear at once,
 /// so every operation that looks at the binding set prunes first).
 fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
-    let dead: Vec<u64> = match reg.get(port_obj) {
-        Some(KObj::Port(p)) => p
-            .bindings
-            .iter()
-            .filter(|b| !reg.is_alive(b.obj))
-            .map(|b| b.key)
-            .collect(),
+    // One pass (not a search and a shift per dead binding: quadratic under the big kernel lock when
+    // thousands of bindings die at once, review 2026-11-14). `next` keeps pointing at the same
+    // surviving binding.
+    let keep: Vec<bool> = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => p.bindings.iter().map(|b| reg.is_alive(b.obj)).collect(),
         _ => return,
     };
     let mut removed = 0;
     if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
-        for k in dead {
-            if let Some(at) = p.bindings.iter().position(|b| b.key == k) {
-                p.bindings.remove(at);
-                removed += 1;
-                if p.next > at {
-                    p.next -= 1;
-                }
-            }
-        }
+        let before_next = keep.iter().take(p.next).filter(|&&k| !k).count();
+        let mut i = 0;
+        p.bindings.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        removed = keep.len() - p.bindings.len();
+        p.next -= before_next.min(p.next);
     }
     reg.meter_sub(removed * BINDING_COST);
     credit_bytes(reg, jobs, port_obj, removed * BINDING_COST);

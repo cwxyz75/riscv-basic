@@ -2853,6 +2853,21 @@ fn closing_handles_early_and_kill_on_close() -> Outcome {
     Ok(())
 }
 
+/// A child that has taken its own process handle is still killed when its parent closes the last
+/// handle the parent holds (the self handle must not keep the kill-on-close object alive).
+fn kill_on_close_holds_after_the_child_took_a_self_handle() -> Outcome {
+    let (p, mine) = launch(64)?;
+    nap(5)?; // let the child run process_self and start spinning
+    ensure_eq!(st(sys::handle_close(p)), Some(S::Ok), "drop the process");
+    let r = sys::object_wait(mine, sig::PEER_CLOSED, sys::clock_get() + 1000);
+    ensure_eq!(
+        r.status,
+        0,
+        "the child was killed although it held a self handle"
+    );
+    Ok(())
+}
+
 fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let (p, _m) = launch(16)?;
     nap(3)?;
@@ -8737,6 +8752,10 @@ pub fn app_main() -> i32 {
         (
             "kill_a_child_with_blocked_and_spinning_threads",
             kill_a_child_with_blocked_and_spinning_threads,
+        ),
+        (
+            "kill_on_close_holds_after_the_child_took_a_self_handle",
+            kill_on_close_holds_after_the_child_took_a_self_handle,
         ),
         (
             "closing_handles_early_and_kill_on_close",
