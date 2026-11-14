@@ -20,7 +20,7 @@ const SWEEP_MIN: usize = 256;
 
 /// An object id: a slot and the generation of that slot, so an id to a destroyed
 /// object never resolves to whatever reuses the slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjId {
     index: u32,
     gen: u32,
@@ -86,6 +86,25 @@ pub struct Registry<T: Object> {
     /// Credits for charged objects that were destroyed since the last `take_credits`:
     /// (job, bytes the object still held). One object per entry.
     credits: Vec<(JobId, usize)>,
+    /// Objects whose signals or liveness may have changed since the last `take_dirty`, with a
+    /// *forced* flag (a handle to the object was removed: waiters must re-validate). Slice W step 1;
+    /// nothing consumes it yet.
+    dirty: Vec<(ObjId, bool)>,
+    /// The log filled up and was dropped: the consumer must treat every object as touched.
+    dirty_overflow: bool,
+}
+
+/// How many log entries are kept before the log is compacted and, failing that, dropped (the
+/// kernel drains it at the end of every syscall, so this is a safety net).
+const DIRTY_CAP: usize = 4096;
+
+/// What `take_dirty` returns.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Dirty {
+    /// The touched objects (live or since destroyed) and whether the touch was forced.
+    pub items: Vec<(ObjId, bool)>,
+    /// The log overflowed: assume every object was touched.
+    pub overflow: bool,
 }
 
 impl<T: Object> Default for Registry<T> {
@@ -108,7 +127,68 @@ impl<T: Object> Registry<T> {
             graveyard: Vec::new(),
             meter: 0,
             credits: Vec::new(),
+            dirty: Vec::new(),
+            dirty_overflow: false,
         }
+    }
+
+    fn log(&mut self, id: ObjId, forced: bool) {
+        if self.dirty.len() >= DIRTY_CAP {
+            self.dirty
+                .sort_unstable_by_key(|(i, f)| (i.index, i.gen, !*f));
+            self.dirty.dedup_by(|b, a| {
+                if a.0 == b.0 {
+                    a.1 |= b.1;
+                    true
+                } else {
+                    false
+                }
+            });
+            if self.dirty.len() >= DIRTY_CAP {
+                self.dirty.clear();
+                self.dirty_overflow = true;
+            }
+        }
+        if !self.dirty_overflow {
+            self.dirty.push((id, forced));
+        }
+    }
+
+    fn dirty_log_doomed(&mut self, id: ObjId) {
+        self.log(id, false);
+    }
+
+    /// Note that `id`'s signals may have changed: it and, since a channel or socket end's signals
+    /// derive from its peer, its peer (if alive). An id that is already gone is logged too (its
+    /// waiters must learn it died).
+    pub fn touch(&mut self, id: ObjId) {
+        self.log(id, false);
+        if let Some(peer) = self
+            .slot(id)
+            .and_then(|s| s.obj.as_ref())
+            .and_then(|o| o.peer())
+        {
+            self.log(peer, false);
+        }
+    }
+
+    /// Note that a handle to `id` was removed (closed, replaced, transferred away): waiters on it
+    /// wake whatever its signals say, to re-validate their handle.
+    pub fn touch_forced(&mut self, id: ObjId) {
+        self.log(id, true);
+    }
+
+    /// Everything touched since the last call, oldest first (duplicates possible).
+    pub fn take_dirty(&mut self) -> Dirty {
+        Dirty {
+            items: core::mem::take(&mut self.dirty),
+            overflow: core::mem::take(&mut self.dirty_overflow),
+        }
+    }
+
+    /// Is anything waiting in the dirty log?
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty.is_empty() || self.dirty_overflow
     }
 
     /// Store an object with one reference (the caller's, to be moved into a handle). It is not
@@ -165,7 +245,12 @@ impl<T: Object> Registry<T> {
         self.slot(id)?.obj.as_ref()
     }
 
+    /// Mutable access. Handing it out counts as a touch (the object and its peer), so a mutation
+    /// made through it cannot be missed by the consumer of the dirty log; a caller that only reads
+    /// should use `get`.
     pub fn get_mut(&mut self, id: ObjId) -> Option<&mut T> {
+        self.slot(id)?;
+        self.touch(id);
         self.slot_mut(id)?.obj.as_mut()
     }
 
@@ -197,6 +282,19 @@ impl<T: Object> Registry<T> {
     }
 
     /// The number of live objects: the leak counter of the tests.
+    /// Every live object's id (for tests and audits; O(slots)).
+    pub fn live_ids(&self) -> Vec<ObjId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.obj.is_some())
+            .map(|(i, s)| ObjId {
+                index: i as u32,
+                gen: s.gen,
+            })
+            .collect()
+    }
+
     pub fn live(&self) -> usize {
         self.live
     }
@@ -231,6 +329,7 @@ impl<T: Object> Registry<T> {
             let obj = slot.obj.take().expect("slot was live");
             let charged = slot.job.take();
             slot.gen = slot.gen.wrapping_add(1);
+            self.log(id, false);
             if let Some(job) = charged {
                 self.credits.push((job, obj.charged_bytes()));
             }
@@ -296,7 +395,13 @@ impl<T: Object> Registry<T> {
         let mut peers: Vec<ObjId> = Vec::new();
         for &index in &doomed {
             let slot = &mut self.slots[index as usize];
+            let id = ObjId {
+                index,
+                gen: slot.gen,
+            };
             let obj = slot.obj.take().expect("live");
+            self.dirty_log_doomed(id);
+            let slot = &mut self.slots[index as usize];
             if let Some(job) = slot.job.take() {
                 self.credits.push((job, obj.charged_bytes()));
             }

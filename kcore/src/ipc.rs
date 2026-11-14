@@ -594,6 +594,20 @@ pub fn signals_of(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<u32, St
     object_signals(reg, entry.obj).ok_or(Status::BadHandle)
 }
 
+/// The signal word of the object `obj` (None if it is gone): what a waiter on it evaluates. Public for the
+/// wake path (slice W) and its tests.
+pub fn signals_of_object(reg: &Kobjs, obj: ObjId) -> Option<u32> {
+    object_signals(reg, obj)
+}
+
+/// The objects a port binds (empty for anything that is not a live port).
+pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
+    match reg.get(port) {
+        Some(KObj::Port(p)) => p.bindings.iter().map(|b| b.obj).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The signal word of a live object (None if it is gone).
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
