@@ -66,8 +66,8 @@ fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<
         let ok = Command::new(&clang)
             .args([
                 "--target=riscv64-unknown-elf",
-                "-march=rv64imac",
-                "-mabi=lp64",
+                "-march=rv64gc",
+                "-mabi=lp64d",
                 "-ffreestanding",
                 "-nostdlibinc",
                 "-fno-pic",

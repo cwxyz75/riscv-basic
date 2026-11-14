@@ -431,9 +431,9 @@ and after; a negative control that skips the FP save.
 
 - [x] Step 0: the protocol spec (`kcore::fp`, INVARIANTS FP1-FP3) and the acceptance tests first (the ABI text, extensions and flags, comes with step 2)
 - [x] Step 1: kernel FP enable, save/restore (lazy: unit off until first use, saved on trap when dirty, reloaded only when the hart does not already hold the state), per-thread state, tests (`kcore/tests/fp_model.rs`, QEMU `fp_state_is_private_to_each_thread_and_process`)
-- [ ] Step 2: Rust user target and flags; `rt`; programs
-- [ ] Step 3: C: `-march`/`-mabi`, assembly stubs, `setjmp`, thread control block, libc; Lua and the C transcript
-- [ ] Step 4: documents (INVARIANTS C7, OD40/OD50 superseded), T20 resolved
+- [x] Step 2: Rust user target (`riscv64gc-unknown-none-elf`) for `rt`, `init` and every program; the kernel build embeds them from the new path
+- [x] Step 3: C: `-march=rv64gc -mabi=lp64d` (the C test program and Lua), `setjmp`/`longjmp` save `fs0`-`fs11` (`jmp_buf` is 26 words; the C transcript checks a callee-saved FP register survives a `longjmp`, mutation-checked); the variadic stubs and `os_call_on_stack` needed no change; Lua float workload 5.2 times faster
+- [x] Step 4: documents (OD40/OD50 superseded in OD76, S7-SPEC), T20 resolved (R18). Not done, deliberately: the scalar bit-manipulation extensions and vector (no measured gain; default QEMU CPU lacks them)
 
 Estimated size (not measured): 3 to 5 PRs; a Fable review (kernel context switching).
 

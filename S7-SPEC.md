@@ -23,7 +23,7 @@ libc (S8/S9); no `dlopen`; no `rename` (the file protocol has none: it returns `
 no locale beyond `"C"`; no wide characters or `long double` (the `L` length modifier is rejected);
 no `__thread` / `PT_TLS`, no `.init_array` constructors (the loader and libc do not run them; C code
 must not rely on them); no floating-point hardware use (the user target stays `riscv64imac`, floats
-are soft-float, which is bit-exact IEEE); no cross-process futexes; no Rust `std` port. The home
+are soft-float, which is bit-exact IEEE; **superseded by slice A: user code is `rv64gc`/`lp64d` with hardware float, OD76**); no cross-process futexes; no Rust `std` port. The home
 computer's *contract* (`home/BASIC.md`, the golden `.out` files, the boot menu) is untouched; its
 crates may be refactored to share code (section 3).
 
