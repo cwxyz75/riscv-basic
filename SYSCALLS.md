@@ -99,8 +99,10 @@ data (message bytes, headers, queued handles, port bindings) in the whole system
 
 These keep the kernel from panicking and from running out of its fixed heap (OD50); they are
 not per-process limits. A real bound needs per-job quotas (OS-ARCHITECTURE Q9, `TIDY-UP.md`
-T1), which do not exist yet: one process can still use a whole cap and starve the others. Stated
-plainly so nobody relies on more than this.
+T1). Per-job limits exist since S4.5 (processes, threads, memory pages, child jobs, objects and queued IPC
+bytes, enforced through the job tree: OD54-OD59), and every program the launcher starts runs in a job of its own;
+the system-wide caps above remain as the safety net for the kernel's own memory (kernel stacks and kernel
+heap use are not yet charged to a job, T1). Stated plainly so nobody relies on more than this.
 
 The syscall layer must reject `nbytes > MAX_MSG_BYTES` and `nhandles > MAX_MSG_HANDLES`
 with TOO_BIG *before* copying anything from user memory, so a user-chosen length never
@@ -565,8 +567,9 @@ The exit code of an ended thread (`-1000 - scause` is *not* used: a fault ends t
 and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 
-The kernel takes no lock: syscalls run with interrupts off on the one hart (S5 revisits this
-with SMP; OD46).
+Syscalls run under the big kernel lock (OD60, S5): a thread holds it from the trap until it returns to user
+mode or goes idle, and the lock follows the thread across a context switch (INVARIANTS K1-K5, lock order).
+With several harts, syscalls on different harts serialise on it (TIDY-UP T11).
 
 ## Sockets and ports (S3c-3)
 

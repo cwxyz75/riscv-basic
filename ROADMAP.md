@@ -203,10 +203,11 @@ every `to` definition is compiled before it runs.
 
 Spec: `OS-ARCHITECTURE.md` (design in sections 2-16, decisions in 17, open
 questions in 18). A separate kernel binary and new crates; the home computer above
-is untouched. **S0, S1 and S2 are built; S3 onwards is not.** Each milestone ends in a demo and has a
+is untouched. **S0 through S7 are built (see the boxes); S8 onwards is not.** Each milestone ends in a demo and has a
 runnable acceptance check, written before the code. Tick a box only when verified in
-QEMU (for SMP work, in both normal and icount modes). Crate names are fixed by S0:
-`abi`, `kcore`, `os-kernel`; more arrive with their milestones.
+QEMU (for SMP work, in normal mode; icount runs only one hart, TIDY-UP T21; say plainly which was run). The crates
+are `abi`, `kcore`, `proto`, `memfs`, `rt`, `libc`, `cfmt`, `shell-core`, `init` and the kernel binary `kernel/`
+(it was `os-kernel` in the older entries below).
 
 ### S0: Foundation
 
@@ -270,27 +271,29 @@ Acceptance: a user test suite passes; every syscall's error cases are covered pe
 `SYSCALLS.md`; killing a process leaks no objects.
 
 - [x] User mode, syscall entry, handle table with rights (S3a/S3b; verified in QEMU: 18 user-level tests over the real ABI, 7 fault kinds, teardown leak checks)
-- [ ] Channels (with `call`), ports, events, sockets (channels and events done and tested in S3a/S3b; `call`, ports, sockets are S3c)
-- [ ] Process, address-space and VMO objects; minimal ELF loader starts `init` from the boot image (the loader and `init` from the embedded image are done in S3b; process/VMO objects as handles are S3c)
-- [ ] Process death releases everything (leak check)
+- [x] Channels (with `call`), ports, events, sockets (S3a-S3c; `channel_call` S3c-1, sockets and ports S3c-3)
+- [x] Process, address-space and VMO objects; minimal ELF loader starts `init` from the boot image (S3b, S3c-2a)
+- [x] Process death releases everything (leak check: `many_children_do_not_leak`, `process_teardown_returns_every_frame`, and the init-exit checks)
 
 ### S4: First interactive system
 
 Acceptance: a scripted shell session passes (`ls`, `cat`, `echo`, a pipeline);
 Ctrl-C kills the foreground job.
 
-- [ ] Launcher and startup message
-- [ ] Memory filesystem server
-- [ ] Console server; shell with builtins and external commands
-- [ ] Pipes through the socket object
+- [x] Launcher and startup message (S4b)
+- [x] Memory filesystem server (S4c)
+- [x] Console server; shell with builtins and external commands (S4d, S4e)
+- [x] Pipes through the socket object (S4e; the scripted shell session in `scripts/s4e_shell_test.py` is the acceptance check, with Ctrl-C killing the foreground job)
+- [x] Jobs and per-program limits (S4.5a-S4.5c, OD54-OD59)
 
 ### S5: SMP
 
 Acceptance: every earlier suite passes with `-smp 4` in normal mode (icount only for one hart: TIDY-UP T21); the stress run reports no lock-order violations and no leaks. Built in slices S5a-S5e (`S5-SPEC.md`, OD60-OD62): parked secondaries, the big kernel lock and multi-hart scheduler core, harts scheduling (user threads migrate, kernel threads stay on the boot hart), TLB shootdown and kill IPI, churn stress.
 
-- [x] Secondary harts via SBI HSM; per-hart state and run queues (S5a-S5c)
+- [x] Secondary harts via SBI HSM; per-hart state (`satp`, timers, idle threads) and a multi-hart scheduler core with **one global run queue per priority under the big kernel lock** (S5a-S5c; per-hart run queues are slice L)
 - [x] IPIs and remote TLB shootdown (S5a, S5d; negative controls fail as required)
-- [ ] Big kernel lock first, then per-object locks on the hot paths (the big lock is done, S5b; per-object locks are not, TIDY-UP T11)
+- [x] Big kernel lock (S5b)
+- [ ] Finer locking on the hot paths (not done, TIDY-UP T11; the plan is slice L, which keeps one lock for object state and carves out only what measurement justifies)
 - [x] Lock-order checker in debug builds; stress suite (S5b, S5e)
 
 ### S6: Storage drivers
@@ -312,9 +315,252 @@ Spec: `S7-SPEC.md` (slices S7a BASIC, S7b futexes, S7c libc, S7d Lua, S7e upstre
 - [x] Lua port (S7d: Lua 5.4.8, acceptance script against a host build)
 - [x] Upstream Lua test suite under `bin/lua` (S7e: 24 files, each its own test)
 
+### Queue before S8 (proposed order; set 2026-11-14 after the design review)
+
+The design review (`reviews/2026-11-14-design-review.md`) found a handful of structural things worth
+settling before the network stack is built on them. This is the proposed order; the owner can reorder.
+Slices A, W, V, T, R, SD, DM and I below each have a plan. L (locking) stays after S9.
+
+1. Tidy the stale contract documents (T55, design review D14): cheap, and everything else leans on them.
+2. Slice A: the RVA23 user ABI (hardware floating point). A flag day for all user code and C, so first,
+   before more is ported and before the thread benchmark fixes its baseline.
+3. Slice W: targeted wake and ports as registrations.
+4. Slice V: VMO commit and the shared-memory rule.
+5. Slice T: kernel memory and threads (a frame-backed kernel allocator, kernel stacks outside the heap,
+   cheap creation); the structural part of cheap threads.
+6. Slice R: the service runtime (service loop, accounted connections, one backpressure policy); `memfsd`
+   ported to it.
+7. Slice SD: the service directory and namespaces (goes with R).
+8. Slice DM: the device manager overhauled (table-driven, several devices and clients).
+9. Slice I: AIA interrupts.
+10. S8, then S9; then L (locking carve-outs).
+
+### W: Targeted wake and ports as registrations (planned, before S8; not started)
+
+Why: the design review (finding D1) found that the kernel wakes every blocked thread after almost
+every syscall (one global wait queue, OD43), and that signals and ports leave nowhere to attach a
+targeted wake. With the cheap-threads direction (OD73) that is a design defect, and a network server
+makes it worse, so it is fixed before S8, not after S9. Basis: the Fable design recommendation (kept in
+`reviews/2026-11-14-wake-path-design.md`, with `reviews/2026-11-14-design-review.md` for the findings), to be turned into a
+spec and an OD (superseding OD43, amending OD48) as step 0.
+
+Decisions taken (2026-11-14, owner): keep signals derived and the single big kernel lock, no new lock;
+a dirty log in `kcore::Registry` plus a pure `kcore::wait::WaitTable` (weak registrations, thread waiters
+and port bindings, a `commit()` that returns exactly the threads to wake); ports become registrations
+with level-triggered semantics kept and a first-come ready list (the report order changes from rotation
+to oldest-ready-first, accepted); a port wakes one waiter, first in first out; opt-in one-shot bindings
+with `port_rearm` **in this slice**; closing, narrowing or sending the handle a binding was made through
+ends the binding (D17); the 256-binding cap goes in favour of per-job quotas that can be set; the global
+wait queue is retired completely (futex, kill, IRQ, kernel reads, thread join all wake by thread id).
+
+Acceptance (written first): wake counters in the `##` output and a deterministic QEMU test that bystander
+waiters are not woken; the thread and `channel_call` benchmark with 0 and N bystanders (before and after);
+a shuttle/loom model of the wake/sleep protocol (retires T38); model tests of `kcore::wait` against the
+old wake-everyone behaviour as the oracle; mutation checks (drop a touch, no baton hand-over, deadline
+before poll); a `fault-skip-touch` negative-control kernel; every existing test still green.
+
+- [ ] Step 0: spec and an OD, acceptance machinery (counters, bystander test, benchmark, T38 model)
+- [ ] Step 1: the dirty log and touch rules in `kcore`, no behaviour change, with a completeness property test
+- [ ] Step 2: wake by thread id for futex and kill
+- [ ] Step 3: `kcore::wait` thread waiters (`object_wait`, `channel_call`, kernel reads, IRQ)
+- [ ] Step 4: ports as registrations, binding quotas, D17
+- [ ] Step 5: delete the global queue and the hand-kept syscall list; documents (SYSCALLS, INVARIANTS W1-W4, P1, PW); T12 and the futex half of T49 resolved
+- [ ] Step 6: one-shot bindings and `port_rearm`
+
+Estimated size (not measured): 6 to 7 PRs, comparable to S5c or S7b. The kernel review of this slice is a
+Fable review.
+
+### V: VMO commit and the shared-memory rule (planned, before S8; not started)
+
+Why: the design review (finding D3) found that a page fault on a VMO whose creator's job is over its
+limit ends the process that touched it, whoever owns the VMO, and that there is no way to commit pages
+ahead of time. That is latent today (nobody maps a foreign VMO) but a driver and a network stack passing
+packets through shared rings depends on it, so it is fixed before S8. Basis:
+`reviews/2026-11-14-design-review.md` (D3). Independent of slice W: either order.
+
+Decision taken (2026-11-14, owner): **the creator pays, up front.** The creator commits a VMO's pages
+before sharing it; the charge (job quota and physical frames) happens then, when the creator can still
+handle a refusal, and recipients touch pages that are already paid for, so they can never fault on
+quota. Rejected: toucher pays and mapper pays (a client could drain a server's budget). Deferred to
+S11 (`mmap`, T16): who pays when a client dirties pages of a server's file mapped writable (likely
+private copy-on-write pages to the mapper's job, shared pages to the VMO's owner).
+
+Questions for step 0 (spec), with my leanings: (1) **a COMMIT right**, so a recipient cannot force the
+creator's job to be charged by calling `vmo_commit` on a VMO it was given (duplicate narrowing drops it);
+(2) **the rule enforced by the kernel, not only written down**: mapping a VMO created by another job
+requires the mapped range to be already committed (a new error, not a fault later), which removes the
+fault-kill of a foreign toucher by construction; (3) commit allocates the frames now (so a later frame
+shortage cannot fault either), zero-fill on commit or on first use; (4) atomic: a refused commit changes
+nothing and the quota is credited back exactly.
+
+Acceptance (written first): a client at its page limit hands a server a VMO and the server maps and touches
+it without dying (the client's commit is what is refused); `vmo_commit` over the limit returns an error with
+nothing changed and the job ledger exact; the runtime heap under a tight job returns a failed allocation
+instead of a fault (a variant of the hog test; retires the heap half of T26); a recipient without COMMIT
+cannot commit; mapping a foreign uncommitted range is refused; destroy credits exactly; model tests of the
+commit logic in `kcore` (commit then touch never charges again; commit atomic; partial ranges); mutation
+checks; a negative-control kernel that skips the commit charge.
+
+- [ ] Step 0: spec and OD (the creator-pays rule, the COMMIT right, kernel enforcement, error codes), `SYSCALLS.md` entry, INVARIANTS rule, acceptance tests written first
+- [ ] Step 1: `kcore` commit logic (charge and frames, atomic, credit on destroy), model-tested
+- [ ] Step 2: the `vmo_commit` syscall and the COMMIT right; the mapping check for foreign VMOs
+- [ ] Step 3: the runtime heap commits each chunk it grows (exhaustion becomes a failed allocation); the suite's cross-process tests
+- [ ] Step 4: documents (T26 narrowed to stacks, which still fault in their own job), D3 resolved
+
+Estimated size (not measured): 3 to 4 PRs. Kernel and security sensitive: a Fable review.
+
+### A: The RVA23 user ABI (planned; not started)
+
+Decision (2026-11-14, owner, OD76): user code follows RVA23. Today user programs and all C are soft-float
+`rv64imac`/`lp64`, the kernel keeps FP and vector state off (OD40, OD50), and the Rust user target is
+`riscv64imac` (design review D13, T20). Soft float makes Lua and BASIC slow, and moving later is a flag day
+for all ported code, so this goes first.
+
+Plan: the kernel enables the FP state and saves and restores it per thread (lazily using the dirty bit, so
+threads that never touch FP pay nothing; the cost enters the thread benchmark baseline); user Rust moves to
+the hardware-float target with the RVA23 scalar extensions; C and the C library move to the matching
+`-march` and `lp64d` (the variadic assembly stubs, `setjmp`/`longjmp`, `va_list` and the thread control
+block all change shape); the vector extension stays off for user code until a program needs it. Because
+this is an ABI change, all of it lands together.
+
+Acceptance (written first): every existing test, with the FP-using suites doing real hardware float; a test
+that FP state survives context switches, preemption by another thread, and SMP migration (two threads
+interleaving FP computations that must match a reference); a test that FP use by one process cannot be seen
+by another; the Lua and C transcripts unchanged (they compare against the host); the Lua benchmark before
+and after; a negative control that skips the FP save.
+
+- [ ] Step 0: spec and OD (the ABI, extensions, vector policy), acceptance tests first
+- [ ] Step 1: kernel FP enable, save/restore (lazy), per-thread state, tests
+- [ ] Step 2: Rust user target and flags; `rt`; programs
+- [ ] Step 3: C: `-march`/`-mabi`, assembly stubs, `setjmp`, thread control block, libc; Lua and the C transcript
+- [ ] Step 4: documents (INVARIANTS C7, OD40/OD50 superseded), T20 resolved
+
+Estimated size (not measured): 3 to 5 PRs; a Fable review (kernel context switching).
+
+### R: The service runtime (planned; not started)
+
+Decision (2026-11-14, owner, OD77): one service loop in `rt`, and accounted connections. Fixes design review
+D7 (nobody uses `channel_call`), D8 (backpressure solved five ways), D11 (servers cannot tell clients apart)
+and D12 (five hand-rolled loops, the network stack would be the sixth).
+
+Plan: a library for servers (port, per-connection state, held replies, a single backpressure policy that
+settles T28, a protocol-violation policy, timeouts); a typed client side that makes the request/reply path
+real so that later optimisations such as direct hand-off have something to attach to; accounted
+connections (a server hands out a fresh account for a root connection and per-account limits apply to
+everything opened or cloned from it); then `memfsd` ported to it as the proof, with `consoled`, `launcher`
+and the others after; supervisor restart is a later step, not this slice.
+
+Acceptance (written first): `memfsd` passes all its existing tests unchanged on the library; a client that
+floods a server with connections exhausts only its own account; a slow client stalls only itself under the
+single backpressure policy; the same protocol-violation behaviour for every ported server; leak checks
+exact; the benchmark for a request/reply round trip.
+
+- [ ] Step 0: spec and OD (the loop, the accounted-connection protocol change, the backpressure policy)
+- [ ] Step 1: the service-loop library with its own tests (host-testable pieces pure)
+- [ ] Step 2: accounted connections in the file protocol and `memfsd`; per-account quotas
+- [ ] Step 3: `memfsd` on the library; then `consoled`, `launcher`, `devmgr`, `blkd`
+- [ ] Step 4: documents; T28, T30 (launcher single client) and D11 resolved or narrowed
+
+Estimated size (not measured): 4 to 6 PRs; a Fable review.
+
+### DM: The device manager overhaul (planned; not started)
+
+Design review D6: `devmgr` handles one device type, one client and one driver at a time. It becomes
+table-driven (devices from the device tree, a driver per matching device, started and supervised), serves
+several clients, and hands each driver exactly the authority its device needs. Needed before virtio-net.
+Builds on slices R (the service loop) and I (interrupts); the existing block-driver tests stay green.
+
+- [ ] Step 0: spec (device table, driver binding, client protocol, authority handed to a driver)
+- [ ] Step 1: table-driven discovery and driver start; the block driver as the first entry
+- [ ] Step 2: several clients; tests for two drivers at once (a second virtio-blk device as the first test)
+- [ ] Step 3: documents; T41 (device stand-ins) narrowed
+
+Estimated size (not measured): 2 to 3 PRs.
+
+### I: AIA interrupts (planned; not started)
+
+Decision (2026-11-14, owner, OD75): AIA is the target, full stop. Today interrupt objects are PLIC-only, AIA
+machines fall back to polling, and delivery goes to the boot hart only (design review D5, T43). Plan: interrupt
+objects for APLIC and IMSIC (message-signalled, delivered to the hart that asked), the device tree parsed for
+the AIA topology, the boot test machine and `make os-run` switched to AIA, the PLIC path removed once AIA does
+everything it does; the block driver uses real interrupts on AIA instead of polling.
+
+Acceptance (written first): the block-driver interrupt test on the AIA machine takes interrupts (not polling)
+on a non-boot hart; the interrupt object tests (mask, ack, level and edge) pass on AIA; the whole suite on AIA
+at one, two and four harts; a negative control that drops the interrupt acknowledgement.
+
+- [ ] Step 0: spec (AIA topology, interrupt object semantics, per-hart delivery), tests first
+- [ ] Step 1: APLIC/IMSIC support in the kernel and the device-tree parser (`kcore::fdt`)
+- [ ] Step 2: interrupt objects on AIA with per-hart delivery; the block driver off polling
+- [ ] Step 3: switch the default test machine and `make os-run`; retire the PLIC path; T43 resolved
+
+Estimated size (not measured): 3 to 4 PRs; a Fable review.
+
+### T: Kernel memory and threads (planned; not started)
+
+Decision (2026-11-14, owner, OD79): design review D9. The fixed 8 MiB kernel heap, chosen in S1 for simplicity
+(OD29), is half the problem: every kernel cap (OD50) is hand-tuned to fit it (T13), and 32 KiB kernel stacks
+taken from it mean 128 threads use half of it. The machine has 256 MiB. Plan: kernel memory comes from frames,
+kernel stacks are not heap, kernel memory is charged to the job that causes it (T1), and creating a thread
+becomes cheap. Cancellation and interruptible waits are wanted but deferred (T56); this slice only reserves
+their places.
+
+Decided (owner, 2026-11-14): a kernel stack is allocated by the kernel from frames and **billed to the creating job**, with a per-job free list so creation stays cheap; the alternative of the creator handing the kernel its own (kernel-only) VMO was considered and rejected as not worth the extra object kind and lifetime handling.
+
+Plan: (1) measure the real kernel stack high-water mark in the existing tests, then give kernel stacks their
+own frame-backed region with a guard page and a size decided from the measurement; (2) replace the fixed-region
+heap with a size-class (slab) allocator over frames that grows on demand (it must stay usable from interrupt
+context, and every kernel allocation path must fail with NO_MEMORY, never panic: OD50); (3) charge kernel
+memory (starting with stacks) to jobs so the OD50 caps become quotas where possible (T1, T13); (4) a deferred reaper frees a thread's
+own stack and thread object; (5) creating a thread in one syscall with pooled stacks, and the per-process and
+per-job thread limits raised (8 and 4 today); (6) reserve, not implement: an `INTERRUPTED` status that waits
+may return, a per-thread interrupt flag, a `thread_interrupt` call returning `NOT_SUPPORTED`, written into
+`SYSCALLS.md`.
+
+Acceptance (written first): create and destroy ten thousand threads with no leak (frames, objects, ledger);
+two thousand live threads fit and run; a kernel stack overflow hits the guard page and is reported, not
+silent corruption (a negative control that removes the guard must fail the test); the heap grows and shrinks
+(returns frames) under an allocation churn test; every OD50 cap test still ends in NO_MEMORY and never a panic;
+the thread and `channel_call` benchmark before and after; the whole suite at one, two and four harts.
+
+- [ ] Step 0: spec and OD (the allocator, the stack region and size, kernel memory charging, the reserved interrupt stubs), measurement of stack use, acceptance tests first
+- [ ] Step 1: kernel stacks from their own region with guard pages
+- [ ] Step 2: the slab allocator over frames replaces the fixed heap (interrupt-safe, fallible)
+- [ ] Step 3: kernel memory charged to jobs; OD50 caps revisited
+- [ ] Step 4: deferred reaper; thread creation in one syscall; pooled stacks; raised limits
+- [ ] Step 5: the reserved interrupt stubs and documents; T13 resolved, T1 narrowed
+
+Estimated size (not measured): 5 to 6 PRs; a Fable review.
+
+### SD: Service directory and namespaces (planned; not started)
+
+Decision (2026-11-14, owner, OD78): design review D10. A **registry service** (not `init`) holds the directory.
+A service publishes a name by handing the registry a listener channel; a client opens `/svc/<name>` with the file
+protocol's open-with-endpoint, which the registry forwards to the listener; a dead service's entry goes stale
+(its listener closes) and the client sees `UNAVAILABLE` and retries (no queueing in the registry); a program is
+handed a *view* with only the names it may use (that is the grant); the startup message's closed `Role` enum
+gives way to generic named entries with arbitrary prefixes (a few kernel-recognised roles stay); for now the
+shell hardcodes what it grants. **Deliberately undecided, to revisit with Q10:** passing a service connection to
+another program, and revocation. Builds on slice R.
+
+Acceptance (written first): publish, open, unpublish; a client sees `UNAVAILABLE` while a service is down and
+succeeds after it republishes; a program whose view lacks a name cannot open it; arbitrary namespace prefixes
+in the startup message; the registry itself tolerates a hostile publisher and a hostile client (limits per
+account, OD77); leak checks exact; the existing programs unchanged.
+
+- [ ] Step 0: spec and OD (registry protocol, views, startup message change, `UNAVAILABLE`), tests first
+- [ ] Step 1: the registry (pure directory logic in a host-tested crate, then the service on the service runtime)
+- [ ] Step 2: generic named entries in the startup message; `rt` and the launcher; the closed `Role` enum retired for services
+- [ ] Step 3: the shell grants a `/svc` view; existing servers publish themselves (`memfsd`, `consoled`, `launcher`)
+- [ ] Step 4: clients reconnect on `UNAVAILABLE` in the service runtime; documents (T15, T30 narrowed)
+
+Estimated size (not measured): 4 to 5 PRs; a Fable review.
+
 ### S8: Network, lower layers
 
 Acceptance: the guest pings its gateway; UDP echo works through `hostfwd`.
+
+Design rule decided ahead of the spec (OD74, direction): a network endpoint is a native control channel plus, for streams, a data socket the client creates and passes in, so the client pays for its buffers; datagrams are control-channel messages; BSD sockets are a shim over that. The message formats, flow control and the driver/stack split are still to be specified. Depends on slices W and V.
 
 - [ ] virtio-net driver
 - [ ] ARP, IPv4, ICMP, UDP
@@ -329,6 +575,46 @@ in-OS HTTP server serving memory-filesystem files; the lossy-link suite passes.
 - [ ] Sockets interface in the libc
 - [ ] Simulated lossy/reordering link suite
 - [ ] HTTP server demo; DNS resolver
+
+### L: Kernel locking carve-outs (planned, proposed after S9; not started)
+
+Why: the design review (finding D2) found that kernel state is global by construction (one `UserState`,
+one registry of all objects, a job ledger inside the VMO store, a reachability sweep that needs every
+handle table at once, a global run queue), so "push per-object locks down" is not an incremental step.
+The recommended direction keeps **one lock for object, handle, VMO and job state** (short, pure code,
+and it keeps the model tests' shape) and carves out only what measurably hurts. Basis:
+`reviews/2026-11-14-design-review.md` (D2). Replaces the "rung 3, per-object locks" plan in
+`OS-ARCHITECTURE.md` section 7 (as an OD, step 0). This is the "redo SMP" direction made concrete, in a
+smaller form than first imagined.
+
+Placement: after slice W (it needs W's prepare/commit/cancel wait API) and, as proposed, after S8/S9, so
+that the carve-outs are chosen against a realistic multi-threaded load instead of our own test suite.
+The owner may move it earlier.
+
+Decisions taken (2026-11-14, owner): follow the reviewer's recommendations. The reachability sweep
+**stays** (it is compatible with one retained object lock; revisit only if a later measurement says
+otherwise). Carve-outs, each only if step 0's measurements show it pays: (1) the scheduler and wait/wake
+path with real per-hart run queues under their own leaf lock; (2) user copies and page zeroing done
+outside the big lock (pin, copy, re-lock); (3) mappings hold a reference on their VMO, so `reap_vmos`,
+the scan of every address space, disappears; (4) candidates for lock-free fast paths that touch only
+scheduler or futex state (`yield`, `sleep`, `clock_get`, futex wait and wake with a leaf table lock),
+decided by the measurements.
+
+Acceptance (written first): contention counters (BKL wait and hold time per syscall class, at `-smp 4`)
+and a scaling test (N independent process pairs doing `channel_call` ping-pong, throughput against one
+hart); a target set after the first measurement; a loom/shuttle model for every new lock (the order
+BKL then scheduler lock, the scheduler lock a leaf); negative-control kernels that skip each new lock
+and must fail their guarding test; the full existing suite, at `-smp 1, 2 and 4`.
+
+- [ ] Step 0: spec and OD (supersedes rung 3; the sweep stays; where each new lock sits in the order), contention counters, the scaling test and the first measurement
+- [ ] Step 1: mappings hold a VMO reference; `reap_vmos` removed (pure `kcore` change, model-tested)
+- [ ] Step 2: per-hart run queues under a scheduler leaf lock, work placement and balancing (uses W's wake API)
+- [ ] Step 3: user copies and page zeroing outside the big lock (needs a pin discipline against concurrent unmap, TLB shootdown and VMO commit, D3)
+- [ ] Step 4: lock-free or leaf-locked fast paths chosen by the measurements
+- [ ] Step 5: documents (INVARIANTS lock ordering, SYSCALLS execution model); T11, T38, T40 (and the range-shootdown idea, T39) revisited or resolved
+
+Risks: step 3 is the dangerous one (a copy racing an unmap or a kill); every step is a Fable review.
+Estimated size (not measured): 5 to 7 PRs, comparable to S5.
 
 ### S10: Namespaces and attributes
 
@@ -345,6 +631,32 @@ Acceptance: ported software that needs `fork` runs.
 - [ ] `fork` shim over copy-on-write snapshot VMOs
 - [ ] `mmap` private and shared; pager-backed VMOs
 - [ ] `posix_spawn`, a signals subset, the process server
+
+### Directions under discussion (not committed)
+
+**These are directions, not finished plans.** They came out of design conversations after S7 and are
+written down so they are not lost. Some have since been logged in `OS-ARCHITECTURE.md` section 17 as
+"decided (direction)" (OD73, OD74 and OD76-OD79): the owner has chosen the direction, but the spec, the
+acceptance checks and the place in the slice order are still to be written. The planned slices above (A, W,
+V, T, R, SD, DM, I, L) are the concrete versions; the items below are the original wording.
+
+- **Cheap kernel threads.** One-to-one kernel threads made cheap (creation in one syscall, small
+  kernel stacks, higher limits, direct hand-off on `channel_call`), pthreads as the POSIX shim over
+  them, a native message-loop library for programs written for this OS. Measure first.
+- **Redo SMP and the scheduler** (now planned as slice L above, in a smaller form than first imagined; kept here as the original direction). Replace the big kernel lock with finer locking or per-hart state
+  with messages between harts; per-hart run queues and a wake path that wakes one thread (T11, T12,
+  T38, T39). Better done after S8 and S9 give a realistic multi-threaded load to tune against.
+- **A layered API.** The native API (handles, rights, ports, VMOs, jobs, protocols) is the real one;
+  a POSIX-ish library is a shim over it. Decide which POSIX features get a shim and which are
+  refused (candidates to refuse or keep outside the core: `fork`, asynchronous signals, users and
+  permission bits, ambient paths, ptys). Note S11 above still plans a `fork` shim; this direction
+  would keep it a library feature, not a kernel one. Rule for S8/S9: the network server gets a native
+  protocol and BSD sockets are a shim over it, not the reverse.
+- **Borrow from OTP for the userland services.** A shared service-loop library (like `gen_server`),
+  a supervisor library with restart strategies and a restart-intensity limit instead of rebuilding the
+  whole stack (T15), a name registry and reconnecting clients (T30), state that outlives a service
+  restart (T16), and the TCP stack as a state machine (like `gen_statem`) under a connection
+  supervisor. The kernel side of the idea is "share nothing, send messages between harts".
 
 Longer-term backlog (see `OS-ARCHITECTURE.md` section 16): a real on-disk
 filesystem with crash-injection tests, a 9P bridge, graphics and input, scheduler

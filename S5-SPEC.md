@@ -1,7 +1,7 @@
 # S5: SMP (spec, v2)
 
 Status: v2, after a Fable review of v1 against the real code (findings folded in below and
-marked *[R#]*). Nothing here is built yet. This file is the written acceptance
+marked *[R#]*). S5a-S5e are built (2026-11-13; as-built notes and later amendments are in the decision log, OD60-OD62). This file is the written acceptance
 contract for S5 (CLAUDE.md: every milestone needs a runnable acceptance check written before
 the code). Decisions made here are logged as OD60 and later in `OS-ARCHITECTURE.md` section 17
 when the spec is accepted.

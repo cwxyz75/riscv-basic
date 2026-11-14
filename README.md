@@ -167,9 +167,11 @@ live only until the machine is switched off.
 | `home/kernel/` | The home computer's boot code, UART driver, traps, timer, heap, framebuffer. Hosts the interpreter. |
 | `home/examples/`, `home/docs/`, `home/scripts/` | Demo programs, the screenshot, and the home computer's QEMU boot tests. |
 | `home/DESIGN.md`, `home/BASIC.md`, `home/LOGO.md` | Architecture and decision log; the two language specs. |
-| `kernel/` | The OS track's kernel (S-series): boots, threads, user mode, syscalls. |
-| `abi/`, `kcore/`, `rt/`, `init/` | The OS track's other crates: syscall ABI, pure kernel core, user runtime, user programs. |
-| `scripts/` | The OS track's headless boot test. |
+| `kernel/` | The OS track's kernel (S-series): multicore, virtual memory, user mode, capability syscalls, jobs and quotas, drivers' device authority. |
+| `abi/`, `kcore/`, `proto/`, `memfs/`, `rt/`, `libc/`, `cfmt/`, `shell-core/`, `init/` | The OS track's other crates: syscall ABI, pure kernel core, wire protocols, memory filesystem, user runtime, C library (Rust, exporting the C ABI) and its printf core, shell core, user programs and servers. |
+| `scripts/` | The OS track's headless boot and serial tests, and the other harness scripts. |
+| `third_party/` | Vendored upstream sources, unmodified: Lua 5.4 and its test suite (`SOURCE.md` in each says where from, with checksums). |
+| `tests/`, `reviews/` | The Lua acceptance script; independent design reviews and their reports. |
 | `OS-ARCHITECTURE.md`, `SYSCALLS.md`, `INVARIANTS.md` | The OS track's spec, syscall reference and invariants. |
 | `ROADMAP.md` | Milestones with acceptance criteria; the task tracker. |
 | `CLAUDE.md` | Working agreement for AI coding sessions. |

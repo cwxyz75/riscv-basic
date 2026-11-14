@@ -9,7 +9,7 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
   human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it, plus the S-series in
-  `ROADMAP.md`, before working on it. S0 through S6 (foundation, memory, threads, user mode and handles, servers and the shell, jobs and quotas, SMP, storage drivers) are done; S7 (libc, futexes, BASIC and Lua as userland programs) is specified in `S7-SPEC.md`.
+  `ROADMAP.md`, before working on it. S0 through S7 (foundation, memory, threads, user mode and handles, servers and the shell, jobs and quotas, SMP, storage drivers, libc, futexes, BASIC and Lua as userland programs) are done. A queue of design-review slices comes before S8 (network); it is in `ROADMAP.md`, and the reviews are in `reviews/`.
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").
@@ -108,8 +108,8 @@ boots, `// SAFETY:` comments, `make check`). In addition:
   fix and when). Fixed ones move to its Resolved table.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
-- Tick an S-series box only when verified in QEMU. For SMP work that means both
-  normal and icount modes; say plainly if only one was run.
+- Tick an S-series box only when verified in QEMU. For SMP work that means the
+  normal mode at `-smp 2` and `-smp 4`; icount runs only one hart (TIDY-UP T21). Say plainly which was run.
 - Always leave a bootable, green system. No big-bang rewrites.
 - Small utility crates are allowed (the repo already uses `linked_list_allocator` and
   `libm`), each with its own OS decision-log entry. The kernel, network stack,
