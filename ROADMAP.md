@@ -401,11 +401,11 @@ cannot commit; mapping a foreign uncommitted range is refused; destroy credits e
 commit logic in `kcore` (commit then touch never charges again; commit atomic; partial ranges); mutation
 checks; a negative-control kernel that skips the commit charge.
 
-- [ ] Step 0: spec and OD (the creator-pays rule, the COMMIT right, kernel enforcement, error codes), `SYSCALLS.md` entry, INVARIANTS rule, acceptance tests written first
-- [ ] Step 1: `kcore` commit logic (charge and frames, atomic, credit on destroy), model-tested
-- [ ] Step 2: the `vmo_commit` syscall and the COMMIT right; the mapping check for foreign VMOs
-- [ ] Step 3: the runtime heap commits each chunk it grows (exhaustion becomes a failed allocation); the suite's cross-process tests
-- [ ] Step 4: documents (T26 narrowed to stacks, which still fault in their own job), D3 resolved
+- [x] Step 0: spec and OD81, `SYSCALLS.md` entry, INVARIANTS V1-V3, acceptance tests (`kcore/tests/vmo_commit.rs`, QEMU `vmo_commit_charges_up_front_and_foreign_maps_need_it`)
+- [x] Step 1: `kcore` commit logic (`Vmos::commit`, atomic, credit on destroy; mutation-checked)
+- [x] Step 2: the `vmo_commit` syscall (47) and the COMMIT right (bit 13); `process_map` refuses an uncommitted stranger's VMO (BAD_STATE). Decision I took: "stranger" means a VMO charged to a job that is neither the caller's nor the target process's, so a parent building a child (VMOs charged to the parent or to the child's job) stays lazy
+- [x] Step 3: the runtime heap commits each chunk it grows (exhaustion is a failed allocation)
+- [x] Step 4: documents (T26 narrowed to stacks, which still fault in their own job), D3 resolved
 
 Estimated size (not measured): 3 to 4 PRs. Kernel and security sensitive: a Fable review.
 

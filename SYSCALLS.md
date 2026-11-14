@@ -159,6 +159,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 44 | vmo_create_physical | `a0` resource, `a1` physical address, `a2` bytes | `a1` handle |
 | 45 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
 | 46 | vmo_phys_addr | `a0` vmo | `a1` physical address |
+| 47 | vmo_commit | `a0` vmo, `a1` offset, `a2` length | |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
 | 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
@@ -343,6 +344,17 @@ inside the VMO: `offset + length` wraps or exceeds its size; a zero `length` is 
 anywhere inside or at the end). `length` is limited to `MAX_MSG_BYTES` per call (TOO_BIG).
 Nothing is written on an error.
 
+### vmo_commit(vmo, offset, length) -> status
+
+Commit the pages `[offset, offset + length)` of a VMO **now** (slice V): the VMO's *creating job* is charged for
+each page that is not already committed and the frames are taken, so that a later touch can neither fail nor
+charge anyone. All or nothing: if the job's page limit or the frames run out, everything this call committed is
+given back and the call returns NO_MEMORY with the VMO and the job ledger exactly as before. Rights: COMMIT
+(a new right; creating a VMO gives its handle COMMIT, and a creator narrows it away before handing the VMO to
+someone else, since a holder with COMMIT spends the creator's quota). `offset` and `length` must be page
+aligned (INVALID_ARGS), inside the VMO (INVALID_ARGS), and the VMO must be ordinary memory (device and DMA VMOs
+are INVALID_ARGS). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no COMMIT); INVALID_ARGS; NO_MEMORY.
+
 ### vmo_get_size(vmo) -> status, bytes
 
 The size in bytes. Errors: BAD_HANDLE; WRONG_TYPE.
@@ -438,7 +450,9 @@ A handle to the calling process, with MANAGE, INSPECT, WAIT and DUPLICATE (not T
 
 Map `length` bytes of `vmo` starting at byte `vmo_offset` into `process` at `vaddr`, with
 permissions `flags` (R = 1, W = 2, X = 4; read is always implied; W and X together is
-INVALID_ARGS, INVARIANTS M2). Pages are committed on first touch.
+INVALID_ARGS, INVARIANTS M2). Pages are committed on first touch, **except** that a VMO charged to a job that is
+neither the caller's nor the target process's must already be committed over the mapped range (BAD_STATE
+otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger charged, by memory it was handed.
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
 process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or

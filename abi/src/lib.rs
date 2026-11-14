@@ -95,9 +95,13 @@ pub mod rights {
         /// given the power to make things inside a job without the power to lift the job's limits.
         pub const SET_LIMITS: Rights = Rights(1 << 11);
         /// Every assigned right bit.
-        pub const ALL: Rights = Rights(0x1fff);
+        pub const ALL: Rights = Rights(0x3fff);
         /// Learn a DMA VMO's physical address (a DMA VMO handle only).
         pub const DMA: Rights = Rights(1 << 12);
+        /// Commit a VMO's pages now (`vmo_commit`): the pages are charged to the VMO's creating job, so a
+        /// holder with this right spends the creator's quota (slice V). A creator narrows it away before
+        /// handing a VMO to someone else.
+        pub const COMMIT: Rights = Rights(1 << 13);
         /// Not a right: "the same rights as the source", for duplicate and replace.
         pub const SAME: Rights = Rights(1 << 31);
 
@@ -115,7 +119,8 @@ pub mod rights {
                 | Self::READ.0
                 | Self::WRITE.0
                 | Self::EXECUTE.0
-                | Self::MAP.0,
+                | Self::MAP.0
+                | Self::COMMIT.0,
         );
         pub const PROCESS: Rights = Rights(
             Self::DUPLICATE.0
@@ -261,6 +266,7 @@ pub mod syscall {
     pub const VMO_CREATE_PHYSICAL: usize = 44;
     pub const VMO_CREATE_DMA: usize = 45;
     pub const VMO_PHYS_ADDR: usize = 46;
+    pub const VMO_COMMIT: usize = 47;
     pub const PROCESS_CREATE: usize = 50;
     pub const PROCESS_SELF: usize = 51;
     pub const PROCESS_MAP: usize = 52;

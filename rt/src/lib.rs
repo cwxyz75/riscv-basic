@@ -197,6 +197,13 @@ pub mod sys {
             [vmo as usize, offset as usize, buf as usize, len, 0, 0],
         )
     }
+    /// Commit pages `[offset, offset + len)` of a VMO now (needs the COMMIT right); the creator's job pays.
+    pub fn vmo_commit(vmo: u32, offset: u64, len: u64) -> Ret {
+        syscall(
+            VMO_COMMIT,
+            [vmo as usize, offset as usize, len as usize, 0, 0, 0],
+        )
+    }
     pub fn vmo_write(vmo: u32, offset: u64, buf: *const u8, len: usize) -> Ret {
         syscall(
             VMO_WRITE,

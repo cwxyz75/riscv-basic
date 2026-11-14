@@ -7973,6 +7973,82 @@ fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
     Ok(())
 }
 
+/// Slice V: `vmo_commit` charges the VMO's job now and fails cleanly; a recipient without the COMMIT right
+/// cannot spend the creator's quota; a VMO charged to a stranger's job must be committed before it can be
+/// mapped, after which touching it is free and safe.
+fn vmo_commit_charges_up_front_and_foreign_maps_need_it() -> Outcome {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, 6)?; // six pages
+    let v = ok(
+        sys::vmo_create_in(8, j),
+        "a VMO of 8 pages in a six-page job",
+    )?
+    .a1 as u32;
+    ensure_eq!(job_use(j, 2)?.0, 0, "creation is lazy");
+    ensure_eq!(
+        st(sys::vmo_commit(v, 0, 4 * 4096)),
+        Some(S::Ok),
+        "commit four pages"
+    );
+    ensure_eq!(job_use(j, 2)?.0, 4, "charged now");
+    ensure_eq!(
+        st(sys::vmo_commit(v, 4 * 4096, 4 * 4096)),
+        Some(S::NoMemory),
+        "four more pages would pass the six-page limit (all or nothing)"
+    );
+    ensure_eq!(job_use(j, 2)?.0, 4, "a refused commit changes nothing");
+    ensure_eq!(
+        st(sys::vmo_commit(v, 100, 4096)),
+        Some(S::InvalidArgs),
+        "an unaligned offset"
+    );
+    ensure_eq!(
+        st(sys::vmo_commit(v, 6 * 4096, 4 * 4096)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    // a recipient without COMMIT cannot commit, and cannot spend the creator's quota
+    let weak = ok(
+        sys::handle_duplicate(v, (Rights::VMO.0 & !Rights::COMMIT.0) & !Rights::SAME.0),
+        "a duplicate without COMMIT",
+    )?
+    .a1 as u32;
+    ensure_eq!(
+        st(sys::vmo_commit(weak, 4 * 4096, 4096)),
+        Some(S::AccessDenied),
+        "no COMMIT, no commit"
+    );
+    // mapping a stranger's VMO (it is charged to job `j`, we are neither `j` nor in it) needs it committed
+    let me = me()?;
+    let base = NEXT_STACK.fetch_add(0x10_0000, Ordering::SeqCst);
+    ensure_eq!(
+        st(sys::process_map(me, v, base, 0, 8 * 4096, PF_R | PF_W)),
+        Some(S::BadState),
+        "an uncommitted stranger's VMO cannot be mapped over its whole length"
+    );
+    ensure_eq!(
+        st(sys::process_map(me, v, base, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "the committed four pages can"
+    );
+    // touching them charges nothing more and cannot fail
+    // SAFETY: the pages were just mapped read-write at `base` and are ours alone.
+    unsafe { core::ptr::write_volatile(base as *mut u8, 7) };
+    unsafe { core::ptr::write_volatile((base + 3 * 4096) as *mut u8, 7) };
+    ensure_eq!(
+        job_use(j, 2)?.0,
+        4,
+        "touching committed pages costs nothing"
+    );
+    sys::process_unmap(me, base);
+    sys::handle_close(weak);
+    sys::handle_close(v);
+    job_use_settles(j, 2, 0, 1000)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
 fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
     let root = root_job()?;
     let parent = job(root, u64::MAX, u64::MAX, 8)?;
@@ -8695,6 +8771,10 @@ pub fn app_main() -> i32 {
         (
             "job_memory_limits_stop_a_hog_and_are_credited_back",
             job_memory_limits_stop_a_hog_and_are_credited_back,
+        ),
+        (
+            "vmo_commit_charges_up_front_and_foreign_maps_need_it",
+            vmo_commit_charges_up_front_and_foreign_maps_need_it,
         ),
         (
             "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling",

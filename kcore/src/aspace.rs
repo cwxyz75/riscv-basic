@@ -321,6 +321,69 @@ impl Vmos {
         Ok(())
     }
 
+    /// Commit pages `first .. first + pages` of VMO `id` now: charge the VMO's job and take frames, so that
+    /// later touches can neither fail nor be charged (slice V: the creator pays, up front). All or
+    /// nothing: if the job's limit or the frames run out, everything this call committed is given back
+    /// and `NoMemory` is returned, with the VMO and the ledger exactly as before. Pages already
+    /// committed are left as they are. Device memory is never committed this way.
+    pub fn commit<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        id: u64,
+        first: u64,
+        pages: u64,
+    ) -> Result<(), VmoError> {
+        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        if vmo.kind == VmoKind::Device {
+            return Err(VmoError::Device);
+        }
+        let end = first.checked_add(pages).ok_or(VmoError::OutOfRange)?;
+        if end > vmo.pages {
+            return Err(VmoError::OutOfRange);
+        }
+        let mut done: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for page in first..end {
+            if self.map[&id].committed.contains_key(&page) {
+                continue;
+            }
+            match self.page_for(mm, id, page) {
+                Ok(_) => done.push(page),
+                Err(_) => {
+                    // undo this call's commits: frames back, charges back
+                    let vmo = self.map.get_mut(&id).expect("checked above");
+                    for p in done {
+                        if let Some(pfn) = vmo.committed.remove(&p) {
+                            let _ = mm.db.dec(pfn);
+                            self.jobs.credit(vmo.job, Resource::Pages, 1);
+                        }
+                    }
+                    return Err(VmoError::NoMemory);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Are all pages `first .. first + pages` of VMO `id` committed? (Device memory counts as
+    /// committed: it is fixed.) False for an unknown VMO or a range past its end.
+    pub fn is_committed(&self, id: u64, first: u64, pages: u64) -> bool {
+        let Some(vmo) = self.map.get(&id) else {
+            return false;
+        };
+        let Some(end) = first.checked_add(pages) else {
+            return false;
+        };
+        if end > vmo.pages {
+            return false;
+        }
+        vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains_key(&p))
+    }
+
+    /// The job a VMO's pages are charged to.
+    pub fn job_of(&self, id: u64) -> Option<JobId> {
+        self.map.get(&id).map(|v| v.job)
+    }
+
     /// "Give me a page for this offset": the committed frame, allocating a zeroed
     /// one on first touch. The VMO keeps its own reference.
     fn page_for<M: PhysMem>(

@@ -856,7 +856,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             Some(Status::BadHandle)
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
-        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR if over(0) => {
+        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR | nr::VMO_COMMIT
+            if over(0) =>
+        {
             Some(Status::BadHandle)
         }
         nr::VMO_CREATE_PHYSICAL
@@ -1213,6 +1215,21 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             match k.vmos.phys_addr(id) {
                 Some(pa) => Ok((Some(pa), None)),
                 None => fail(Status::WrongType),
+            }
+        }
+        nr::VMO_COMMIT => {
+            // (offset, length) in bytes, page aligned: commit those pages now (slice V)
+            let id =
+                ipc::vmo_of(objs, &p.handles, h(0), Rights::COMMIT).map_err(|e| (e, None, None))?;
+            let (offset, len) = (a[1], a[2]);
+            if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+                return fail(Status::InvalidArgs);
+            }
+            match k.vmos.commit(&mut k.mm, id, offset / 4096, len / 4096) {
+                Ok(()) => Ok((None, None)),
+                Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
+                Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
+                Err(_) => fail(Status::InvalidArgs),
             }
         }
         nr::VMO_GET_SIZE => {
@@ -2373,6 +2390,7 @@ fn process_map(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tpid, vid) = resolve_map_args(s, me, ph, vh, flags).map_err(|e| (e, None, None))?;
         let k = kmem::get();
+        let caller_job = s.procs.get(&me).ok_or((Status::BadState, None, None))?.job;
         let target = s
             .procs
             .get_mut(&tpid)
@@ -2399,6 +2417,17 @@ fn process_map(a: [u64; 6]) -> Reply {
             || !inside_vmo
         {
             return bad(Status::InvalidArgs);
+        }
+        // A VMO charged to a job that is neither the caller's nor the address space owner's must already
+        // be committed over the range (slice V, INVARIANTS V1): its pages are paid for, so a touch can
+        // neither fail nor charge a stranger, and a process cannot be killed by a VMO it was handed.
+        // A parent mapping its own VMO, or one charged to the child's job, into a child stays lazy.
+        let vmo_job = k.vmos.job_of(vid);
+        if vmo_job != Some(caller_job)
+            && vmo_job != Some(target.job)
+            && !k.vmos.is_committed(vid, offset / 4096, length / 4096)
+        {
+            return bad(Status::BadState);
         }
         let perms = Perms {
             read: true,

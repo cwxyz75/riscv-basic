@@ -97,6 +97,12 @@ impl State {
             return false;
         }
         let vmo = v.a1 as u32;
+        // Commit the chunk now, so that exhaustion (the job's page limit, or the frames) is a failed
+        // allocation here and not a fault on first touch that ends the program (slice V).
+        if sys::vmo_commit(vmo, 0, by as u64).status != 0 {
+            sys::handle_close(vmo);
+            return false;
+        }
         let at = HEAP_BASE + self.mapped as u64;
         let m = sys::process_map(self.me, vmo, at, 0, by as u64, PROT_RW);
         // The mapping holds the memory; our handle is not needed any more.
