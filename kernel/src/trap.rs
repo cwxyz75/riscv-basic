@@ -293,11 +293,13 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         trap_body(frame);
     } else {
         crate::bkl::lock();
+        crate::fp::trap_entry(frame);
         trap_body(frame);
         crate::bkl::unlock();
     }
     // (the trap exit returns to user mode if this frame came from it)
     if from_user {
+        crate::fp::return_to_user(frame);
         crate::user::user_mode_entered();
     }
 }
@@ -309,6 +311,7 @@ fn trap_body(frame: &mut TrapFrame) {
         let reasons = crate::smp::ipi_interrupt();
         if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
             crate::bkl::lock();
+            crate::fp::trap_entry(frame);
             crate::thread::reschedule_this_hart();
             if frame.sstatus & (1 << 8) == 0 {
                 crate::user::activate_current();

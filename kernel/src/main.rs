@@ -14,6 +14,7 @@ mod bkl;
 mod boot;
 mod console;
 mod finisher;
+mod fp;
 mod heap;
 #[cfg(feature = "interactive")]
 mod interactive;

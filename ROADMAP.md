@@ -429,8 +429,8 @@ interleaving FP computations that must match a reference); a test that FP use by
 by another; the Lua and C transcripts unchanged (they compare against the host); the Lua benchmark before
 and after; a negative control that skips the FP save.
 
-- [ ] Step 0: spec and OD (the ABI, extensions, vector policy), acceptance tests first
-- [ ] Step 1: kernel FP enable, save/restore (lazy), per-thread state, tests
+- [x] Step 0: spec (OD76; the protocol is in `kcore::fp` and INVARIANTS FP1-FP3), acceptance tests first
+- [x] Step 1: kernel FP enable, save/restore (lazy: unit off until first use, saved on trap when dirty, reloaded only when the hart does not already hold the state), per-thread state, tests (`kcore/tests/fp_model.rs`, QEMU `fp_state_is_private_to_each_thread_and_process`)
 - [ ] Step 2: Rust user target and flags; `rt`; programs
 - [ ] Step 3: C: `-march`/`-mabi`, assembly stubs, `setjmp`, thread control block, libc; Lua and the C transcript
 - [ ] Step 4: documents (INVARIANTS C7, OD40/OD50 superseded), T20 resolved
