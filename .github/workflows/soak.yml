@@ -1,0 +1,64 @@
+name: soak
+
+# Tier 2 of TESTING.md / OD83: the full matrix, every negative control, the serial sessions, Miri.
+# Never required to merge. It runs nightly on main (a red night means "fix next"), when a pull request
+# carries the `soak` label (recommended for kernel, SMP and security slices), and on demand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  kernel:
+    name: soak (${{ matrix.name }})
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'soak') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: normal and fail-demo
+            targets: os-boot-test-main
+          - name: round-robin
+            targets: os-boot-test-rr
+          - name: release build
+            targets: os-boot-test-release
+          - name: smp
+            targets: os-boot-test-smp
+          - name: negative controls and serial at four harts
+            targets: os-boot-test-smp-neg
+          - name: AIA, RVA23, polling, no disk, serial
+            targets: os-boot-test-aia os-boot-test-polling os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: soak-${{ matrix.name }}
+      - name: Install QEMU and OpenSBI
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
+        run: |
+          qemu-system-riscv64 --version | head -1
+          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
+          qemu-system-riscv64 -cpu help | grep -i rva23 || echo "NO RVA23 CPU"
+          dpkg -l opensbi | tail -1
+          clang --version | head -1
+      - run: make ${{ matrix.targets }}
+
+  miri:
+    name: soak (miri)
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'soak') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - run: make os-miri

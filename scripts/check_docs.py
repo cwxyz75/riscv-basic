@@ -32,6 +32,52 @@ STALE = [
 ]
 
 
+GATE_BUDGET_MINUTES = 10  # TESTING.md: every job of the merge gate (ci.yml) may take at most this long
+# Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
+SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
+# Targets besides the smoke ones that the gate may run, conditionally (see ci.yml): the harness check.
+GATE_EXTRA = {"os-boot-test-main"}
+
+
+def make_var(makefile, name):
+    m = re.search(rf"^{name}\s*:?=\s*(.*)$", makefile, re.M)
+    return m.group(1).split() if m else []
+
+
+def check_tiers():
+    """The testing tiers (OD83, TESTING.md) are enforced mechanically, so they cannot drift back: the gate
+    (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget; every soak target
+    is run by soak.yml."""
+    out = []
+    makefile = read("Makefile")
+    smoke, soak = make_var(makefile, "SMOKE_TARGETS"), make_var(makefile, "SOAK_TARGETS")
+    if not smoke or not soak:
+        return ["Makefile: SMOKE_TARGETS or SOAK_TARGETS is missing"]
+    if set(smoke) & set(soak):
+        out.append(f"Makefile: targets in both tiers: {sorted(set(smoke) & set(soak))}")
+    m = re.search(r"^check:\s*(.*)$", makefile, re.M)
+    if not m or m.group(1).split() != ["smoke"]:
+        out.append("Makefile: `check` must be exactly the smoke tier (`check: smoke`); everything else is `soak` / `check-all`")
+    ci, soakyml = read(".github/workflows/ci.yml"), read(".github/workflows/soak.yml")
+    allowed = set(smoke) | GATE_EXTRA
+    for line in re.findall(r"^\s*(?:- )?run: make (.*)$", ci, re.M):
+        for t in line.split():
+            if t not in allowed:
+                out.append(f"ci.yml (the merge gate) runs `make {t}`, which is not a smoke target (TESTING.md)")
+    for n in re.findall(r"timeout-minutes:\s*(\d+)", ci):
+        if int(n) > GATE_BUDGET_MINUTES:
+            out.append(f"ci.yml: a gate job's timeout is {n} minutes; the budget is {GATE_BUDGET_MINUTES} (TESTING.md)")
+    if "matrix:" in ci:
+        out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
+    for t in soak:
+        names = SOAK_SPLIT.get(t, []) + [t]
+        if not any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", soakyml) for n in names):
+            out.append(f"soak.yml does not run the soak target {t}")
+    if "TESTING.md" not in os.listdir(ROOT):
+        out.append("TESTING.md is missing")
+    return out
+
+
 def main():
     problems = []
     for name, phrase, why in STALE:
@@ -67,6 +113,7 @@ def main():
         if not os.path.exists(os.path.join(ROOT, name)):
             problems.append(f"{name} is missing")
 
+    problems += check_tiers()
     if problems:
         print("docs check FAILED:")
         for p in problems:
