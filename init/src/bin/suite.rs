@@ -2441,7 +2441,7 @@ fn a_user_signal_wakes_a_blocked_thread() -> Outcome {
 
 fn thread_limit_and_slots_are_reused() -> Outcome {
     let ev = event()?;
-    let mut ts = [0u32; 8];
+    let mut ts = [0u32; rt::abi::limits::MAX_THREADS_PER_PROCESS];
     let mut n = 0;
     loop {
         let top = own_stack()?;
@@ -2455,12 +2455,16 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
             ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
             break;
         }
-        ensure!(n < ts.len(), "more than 8 threads were allowed");
+        ensure!(n < ts.len(), "more than the limit of threads was allowed");
         ts[n] = r.a1 as u32;
         n += 1;
     }
-    // this thread plus `n` others: the limit is 8 in all
-    ensure_eq!(n, 7, "threads created on top of the one we are");
+    // this thread plus `n` others: the limit is `MAX_THREADS_PER_PROCESS` in all
+    ensure_eq!(
+        n,
+        rt::abi::limits::MAX_THREADS_PER_PROCESS - 1,
+        "threads created on top of the one we are"
+    );
     ensure_eq!(
         st(sys::event_signal(ev, 0, 1 << 24)),
         Some(S::Ok),
@@ -2790,16 +2794,8 @@ fn kill_a_child_whose_threads_never_ran() -> Outcome {
     for (i, t) in ts.iter_mut().enumerate() {
         *t = child_thread(p, i as u64, 15)?;
     }
-    ensure_eq!(
-        st(sys::thread_create(
-            p,
-            child_entry()?,
-            0x20_0000_0000 + 0x4000,
-            15
-        )),
-        Some(S::NoMemory),
-        "a ninth thread"
-    );
+    // (the per-process thread limit is checked by `thread_limit_and_slots_are_reused`; filling it
+    // with spinning threads would now take every hart)
     ensure_eq!(st(sys::process_kill(p, 55)), Some(S::Ok), "kill");
     wait_ended(p, 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, 55, "exit code");
@@ -8447,6 +8443,90 @@ fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
     Ok(())
 }
 
+/// Slice T: a thread's kernel stack (four frames) is billed to the job that owns the thread while the thread
+/// lives, and credited back when it ends.
+fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    let (p, _m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 16, j)?;
+    nap(5)?;
+    // map a stack for the thread first (its page-table charge is not what is measured)
+    let base = 0x20_0000_0000u64;
+    let v = vmo(4)?;
+    ok(
+        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
+        "map a child stack",
+    )?;
+    sys::handle_close(v);
+    let (used, _) = job_use(j, 2)?;
+    let limits = |pages: u64| [u64::MAX, u64::MAX, pages, u64::MAX, u64::MAX, u64::MAX];
+    // three pages of room: the four-page stack does not fit, and nothing changes
+    ensure_eq!(
+        st(sys::job_set_limits(j, &limits(used + 3))),
+        Some(S::Ok),
+        "set the page limit"
+    );
+    let entry = child_entry()?;
+    ensure_eq!(
+        st(sys::thread_create(p, entry, base + 4 * 4096, 16)),
+        Some(S::NoMemory),
+        "a thread whose stack does not fit the job"
+    );
+    ensure_eq!(job_use(j, 2)?.0, used, "a refused thread charged nothing");
+    ensure_eq!(
+        job_use(j, 1)?.0,
+        1,
+        "and no thread slot either (the main thread only)"
+    );
+    ensure_eq!(
+        st(sys::job_set_limits(j, &limits(used + 4))),
+        Some(S::Ok),
+        "four pages of room"
+    );
+    let t = ok(
+        sys::thread_create(p, entry, base + 4 * 4096, 16),
+        "the thread now fits",
+    )?
+    .a1 as u32;
+    ensure_eq!(
+        job_use(j, 2)?.0,
+        used + 4,
+        "the stack's four pages are charged"
+    );
+    // ending the process credits the stack back (everything settles to zero)
+    ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill");
+    wait_ended(p, 1000)?;
+    sys::handle_close(t);
+    sys::handle_close(p);
+    job_use_settles(j, 2, 0, 500)?;
+    job_use_settles(j, 1, 0, 500)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+/// Slice T: creating and ending threads over and over leaks nothing (the thread slots, the objects and the
+/// kernel stacks are all recycled; the end-of-suite checks see that no kernel thread or object is left).
+fn thousands_of_threads_come_and_go() -> Outcome {
+    // one stack, mapped once and reused: each thread has ended before the next starts
+    let top = own_stack()?;
+    let me = me()?;
+    let entry = worker_set as *const () as usize as u64;
+    for round in 0..2000u32 {
+        let r = sys::thread_create(me, entry, top, u64::from(round));
+        ensure!(
+            r.status == 0,
+            "thread_create: status {} in round {round}",
+            r.status
+        );
+        let t = r.a1 as u32;
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(t);
+    }
+    Ok(())
+}
+
 fn page_tables_are_charged_to_the_job() -> Outcome {
     // Page-table frames are memory too: a program must not be able to spend its machine's frames
     // on tables for scattered mappings while its page count stays tiny (found by the review).
@@ -9044,6 +9124,14 @@ pub fn app_main() -> i32 {
         (
             "page_tables_are_charged_to_the_job",
             page_tables_are_charged_to_the_job,
+        ),
+        (
+            "thread_stacks_are_charged_to_the_job_and_credited_back",
+            thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "thousands_of_threads_come_and_go",
+            thousands_of_threads_come_and_go,
         ),
         (
             "a_job_limits_how_many_jobs_may_exist_below_it",

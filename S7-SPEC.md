@@ -126,7 +126,7 @@ Kill, process teardown and SMP wake-up reuse the existing paths (the wake IPI of
 replacing the spin-and-yield locks in `rt` (the heap lock, T26) where a thread may sleep.
 
 **Threads and limits.** A launcher-started program is limited to 4 threads in all (`PROGRAM_THREADS`,
-the main thread counts) and a process to 8 (`MAX_THREADS_PER_PROCESS`). Threaded tests therefore run
+the main thread counts) and a process to 8 at the time (`MAX_THREADS_PER_PROCESS`, 256 since slice T). Threaded tests therefore run
 under a **job the suite creates with room for 8**; raising the launcher's limit is a deliberate later
 decision, not part of S7. A thread's stack is a 64 KiB mapping plus an unmapped guard page made by
 `pthread_create`; `pthread_join` waits for the thread object's TERMINATED signal, then unmaps the

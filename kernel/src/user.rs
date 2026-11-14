@@ -338,7 +338,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         // (the root job has no limits: these charges only keep its usage honest)
         let jobs = &mut kmem::get().vmos.jobs;
         let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
-        let _ = jobs.charge(JobId::ROOT, Resource::Threads, 1);
+        let _ = charge_thread(jobs, JobId::ROOT);
         s.procs.insert(pid, process);
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
@@ -566,7 +566,7 @@ fn leave(code: i32, whole: bool) -> ! {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;
-        kmem::get().vmos.jobs.credit(p.job, Resource::Threads, 1);
+        credit_thread(&mut kmem::get().vmos.jobs, p.job);
         if whole {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
@@ -2547,10 +2547,7 @@ fn process_start(a: [u64; 6]) -> Reply {
         // The thread's charge comes before anything changes: a refusal must leave the caller's
         // handle with the caller and the process exactly as it was (SYSCALLS.md: on any error
         // nothing changes), or a retry would find handle 1 taken.
-        kmem::get()
-            .vmos
-            .jobs
-            .charge(target.job, Resource::Threads, 1)
+        charge_thread(&mut kmem::get().vmos.jobs, target.job)
             .map_err(|e| (job_status(e), None, None))?;
         // Commit: the channel end moves into the new process as its handle 1.
         let UserState { procs, objs, .. } = s;
@@ -2624,6 +2621,25 @@ fn total_threads(s: &UserState) -> usize {
     s.procs.values().map(|p| p.threads_alive).sum()
 }
 
+/// What one more thread costs a job (slice T, T1): a thread slot, and the four pages of its kernel stack
+/// (billed to the job that owns the thread, for as long as it lives). All or nothing.
+fn charge_thread(jobs: &mut kcore::job::Jobs, job: JobId) -> Result<(), JobError> {
+    jobs.charge(job, Resource::Threads, 1)?;
+    if let Err(e) = jobs.charge(job, Resource::Pages, KSTACK_PAGES) {
+        jobs.credit(job, Resource::Threads, 1);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn credit_thread(jobs: &mut kcore::job::Jobs, job: JobId) {
+    jobs.credit(job, Resource::Threads, 1);
+    jobs.credit(job, Resource::Pages, KSTACK_PAGES);
+}
+
+/// Frames in a kernel stack.
+const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
+
 fn thread_create(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0] as u32);
     let (entry, sp, arg) = (a[1], a[2], a[3]);
@@ -2653,8 +2669,7 @@ fn thread_create(a: [u64; 6]) -> Reply {
         let tjob = target.job;
         let UserState { objs, procs, .. } = s;
         let jobs = &mut kmem::get().vmos.jobs;
-        jobs.charge(tjob, Resource::Threads, 1)
-            .map_err(|e| (job_status(e), None, None))?;
+        charge_thread(jobs, tjob).map_err(|e| (job_status(e), None, None))?;
         let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
         let (handle, obj) = match ipc::thread_object_create_in(
             objs,
@@ -2664,7 +2679,7 @@ fn thread_create(a: [u64; 6]) -> Reply {
         ) {
             Ok(x) => x,
             Err(e) => {
-                jobs.credit(tjob, Resource::Threads, 1);
+                credit_thread(jobs, tjob);
                 return Err((e, None, None));
             }
         };

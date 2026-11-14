@@ -14,7 +14,7 @@ model-tested, then deleted as unused). What remains of section 3 is a growable h
 window whose pages come from the frame database at safe points; `linked_list_allocator`'s `extend` already supports it);
 it is the last step of the slice, because the thread limits and the per-job charging (steps 4 and 5) matter more and need
 only the stacks off the heap. Stack slots keep their frames and mapping once made (a recycled slot can never meet a stale
-remote translation); returning them needs a shootdown and is deferred (T67).
+remote translation); returning them needs a shootdown and is deferred (T68).
 
 ## 1. The problem, measured
 
