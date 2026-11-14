@@ -7729,12 +7729,15 @@ fn interrupt_object_fires_and_masks() -> Outcome {
                      // level the AIA re-pends when the source is enabled): one spurious interrupt after create is allowed
                      // (SYSCALLS.md). Take it if it came, then the object must be idle.
     nap_ticks(3);
+    let mut base = 0; // claims taken before the real request (the spurious one counts)
     if sys::object_signals(irq).a1 as u32 & sig::INTERRUPT != 0 {
+        let spurious = sys::interrupt_ack(irq);
         ensure_eq!(
-            st(sys::interrupt_ack(irq)),
+            st(spurious),
             Some(S::Ok),
             "acknowledge the spurious interrupt"
         );
+        base = spurious.a1;
         nap_ticks(3);
     }
     ensure_eq!(
@@ -7791,7 +7794,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         sys::interrupt_ack(irq),
         "acknowledge with the line still high",
     )?;
-    ensure_eq!(ack.a1, 1, "exactly one claim for one request");
+    ensure_eq!(ack.a1, base + 1, "exactly one claim for one request");
     let again = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 200);
     ensure_eq!(
         st(again),
@@ -7801,7 +7804,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
     wr(&b, 0x64, 1);
     let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
-    ensure_eq!(ack.a1, 2, "the re-fire was the second claim");
+    ensure_eq!(ack.a1, base + 2, "the re-fire was the second claim");
     ensure_eq!(
         sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
         0,
