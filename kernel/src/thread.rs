@@ -30,8 +30,10 @@ fn new_class() -> Class {
     Class::default()
 }
 
-/// Kernel stack size per thread.
-pub const STACK_BYTES: usize = 32 * 1024;
+/// Kernel stack size per thread. 16 KiB since slice T: the deepest any stack went in the whole suite (debug
+/// build, every test and the Lua test suite) was about 5.6 KiB (`stack_high_water`), and a test fails if one
+/// ever passes three quarters of this.
+pub const STACK_BYTES: usize = 16 * 1024;
 const STACK_WORDS: usize = STACK_BYTES / 8;
 const CANARY: u64 = 0xdead_c0de_5ca1_ab1e;
 /// Words of guard pattern at the bottom of every stack (the overflow detector).
@@ -557,7 +559,9 @@ pub fn join(tid: Tid) -> bool {
                 None => Some(false),
                 Some(State::Exited) => {
                     k.sched.reap(tid).expect("exited thread");
-                    k.threads.remove(&tid);
+                    if let Some(t) = k.threads.remove(&tid) {
+                        note_stack_use(&t);
+                    }
                     Some(true)
                 }
                 Some(_) => {
@@ -789,11 +793,34 @@ fn reaper_main(_: usize) {
             let dead: Vec<Tid> = core::mem::take(&mut k.zombies);
             for tid in dead {
                 if k.sched.reap(tid).is_ok() {
-                    k.threads.remove(&tid);
+                    if let Some(t) = k.threads.remove(&tid) {
+                        note_stack_use(&t);
+                    }
                 }
             }
         });
     }
+}
+
+/// The deepest any kernel stack has been, in bytes (a measurement for slice T: stacks start zeroed, so
+/// the lowest non-zero word past the guard is the deepest write; a stack that held zeros there reads as
+/// shallower, so this is a lower bound, close in practice).
+static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn note_stack_use(t: &KThread) {
+    if let Some(stack) = t.stack.as_ref() {
+        let used = stack
+            .iter()
+            .skip(GUARD_WORDS)
+            .position(|&w| w != 0)
+            .map_or(0, |first| STACK_BYTES - (GUARD_WORDS + first) * 8);
+        STACK_HIGH_WATER.fetch_max(used, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The deepest kernel stack use seen so far among threads that have ended.
+pub fn stack_high_water() -> usize {
+    STACK_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// The scheduler's view of a thread (diagnostics for the SMP tests).
