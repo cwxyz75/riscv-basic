@@ -1,7 +1,8 @@
-//! `devmgr`: the device manager (S6c, S6-SPEC section 2). It reads the device tree through the root
-//! resource, finds the virtio block device, and starts `blkd` for a client that asks, handing the
-//! driver only what it needs: that slot's MMIO window, one DMA buffer and (on a PLIC machine) the
-//! slot's interrupt.
+//! `devmgr`: the device manager (S6c, S6-SPEC section 2; slice DM). It reads the device tree through the
+//! root resource, finds *every* virtio block device (a table, in device-tree order), and starts `blkd`
+//! for a client that asks for device `index` (lowest address first), handing the driver only what it needs: that slot's MMIO
+//! window, one DMA buffer and (on a PLIC machine) the slot's interrupt. Each device has its own driver
+//! slot, so two devices can be in use at once.
 //!
 //! The manager is the *supervisor* of the driver in the sense of TIDY-UP T42: it holds its own
 //! handles to the MMIO window and the DMA buffer for as long as it runs, so killing or losing a
@@ -29,7 +30,12 @@ const PF_R: u64 = 1;
 const PF_RW: u64 = 3;
 /// Where the device tree and the probed slot are mapped in this process.
 const DTB_VA: u64 = 0x300_0000;
+/// Where device `i`'s register page stays mapped in this process (for the reset): one page each.
 const MMIO_VA: u64 = 0x600_0000;
+
+fn mmio_va(i: usize) -> u64 {
+    MMIO_VA + (i as u64) * 4096
+}
 
 const STATUS: usize = 0x070;
 const INTERRUPT_STATUS: usize = 0x060;
@@ -39,7 +45,9 @@ const DEVICE_ID: usize = 0x008;
 const ID_BLOCK: u32 = 2;
 
 struct Block {
-    /// The slot's MMIO page, mapped at `MMIO_VA` (for the reset), and its VMO.
+    /// Where the slot's MMIO page is mapped in this process (for the reset).
+    va: u64,
+    /// The slot's MMIO VMO.
     mmio: u32,
     dma: u32,
     irq: Option<u32>,
@@ -47,25 +55,25 @@ struct Block {
     driver: Option<u32>,
 }
 
-fn rd(off: usize) -> u32 {
-    // SAFETY: MMIO_VA maps the block device's 4 KiB register page in this process.
-    unsafe { core::ptr::read_volatile((MMIO_VA as usize + off) as *const u32) }
+fn rd(va: u64, off: usize) -> u32 {
+    // SAFETY: `va` maps a block device's 4 KiB register page in this process.
+    unsafe { core::ptr::read_volatile((va as usize + off) as *const u32) }
 }
 
-fn wr(off: usize, v: u32) {
+fn wr(va: u64, off: usize, v: u32) {
     // SAFETY: as in `rd`.
-    unsafe { core::ptr::write_volatile((MMIO_VA as usize + off) as *mut u32, v) }
+    unsafe { core::ptr::write_volatile((va as usize + off) as *mut u32, v) }
 }
 
 /// Put the device back to its reset state and quiet its interrupt line.
-fn reset() {
-    wr(STATUS, 0);
+fn reset(va: u64) {
+    wr(va, STATUS, 0);
     for _ in 0..1_000_000 {
-        if rd(STATUS) == 0 {
+        if rd(va, STATUS) == 0 {
             break;
         }
     }
-    wr(INTERRUPT_ACK, rd(INTERRUPT_STATUS));
+    wr(va, INTERRUPT_ACK, rd(va, INTERRUPT_STATUS));
 }
 
 fn read_dtb(res: u32, me: u32) -> Option<Vec<u8>> {
@@ -86,20 +94,20 @@ fn read_dtb(res: u32, me: u32) -> Option<Vec<u8>> {
     Some(blob)
 }
 
-/// Is the slot at `pa` a block device? (Maps its page briefly.)
-fn probe(res: u32, me: u32, pa: u64) -> Option<u32> {
+/// Is the slot at `pa` a block device? If so its page stays mapped at `va`.
+fn probe(res: u32, me: u32, pa: u64, va: u64) -> Option<u32> {
     let vmo = sys::vmo_create_physical(res, pa, 4096);
     if vmo.status != 0 {
         return None;
     }
     let vmo = vmo.a1 as u32;
-    let mapped = sys::process_map(me, vmo, MMIO_VA, 0, 4096, PF_RW).status == 0;
-    let found = mapped && rd(MAGIC) == 0x7472_6976 && rd(DEVICE_ID) == ID_BLOCK;
+    let mapped = sys::process_map(me, vmo, va, 0, 4096, PF_RW).status == 0;
+    let found = mapped && rd(va, MAGIC) == 0x7472_6976 && rd(va, DEVICE_ID) == ID_BLOCK;
     if mapped && !found {
-        sys::process_unmap(me, MMIO_VA);
+        sys::process_unmap(me, va);
     }
     if found {
-        Some(vmo) // stays mapped at MMIO_VA
+        Some(vmo) // stays mapped at `va`
     } else {
         sys::handle_close(vmo);
         None
@@ -131,7 +139,7 @@ impl Block {
         if let Some(p) = self.driver.take() {
             sys::handle_close(p);
         }
-        reset();
+        reset(self.va);
         let pair = sys::channel_create();
         if pair.status != 0 {
             return Err(Status::Failed);
@@ -216,13 +224,17 @@ pub fn app_main() -> i32 {
     let Ok(nodes) = kcore::fdt::parse(&blob) else {
         return 5;
     };
-    // the first virtio slot that really is a block device
-    let mut block: Option<Block> = None;
-    for slot in kcore::fdt::virtio_mmio(&nodes) {
+    // every virtio slot that really is a block device, lowest address first (the device tree lists the
+    // slots in no promised order)
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut slots = kcore::fdt::virtio_mmio(&nodes);
+    slots.sort_by_key(|s| s.base);
+    for slot in slots {
         if slot.size != 4096 {
             continue;
         }
-        if let Some(mmio) = probe(res, me, slot.base) {
+        let va = mmio_va(blocks.len());
+        if let Some(mmio) = probe(res, me, slot.base, va) {
             let dma = sys::vmo_create_dma(res, 4);
             if dma.status != 0 {
                 return 6;
@@ -230,13 +242,13 @@ pub fn app_main() -> i32 {
             // an interrupt where the machine has a PLIC; NOT_SUPPORTED (AIA) means the driver polls
             let i = sys::interrupt_create(res, slot.irq);
             let irq = (i.status == 0).then_some(i.a1 as u32);
-            block = Some(Block {
+            blocks.push(Block {
+                va,
                 mmio,
                 dma: dma.a1 as u32,
                 irq,
                 driver: None,
             });
-            break;
         }
     }
     let image = blkd_image(bi);
@@ -273,7 +285,7 @@ pub fn app_main() -> i32 {
         match devmgr::decode_request(&rx[..r.a1]) {
             Err(Some(t)) => reply(chan, t, Status::BadRequest, None),
             Err(None) => {}
-            Ok(txid) => match (&mut block, &image) {
+            Ok((txid, index)) => match (blocks.get_mut(usize::from(index)), &image) {
                 (None, _) => reply(chan, txid, Status::NoDevice, None),
                 (Some(_), None) => reply(chan, txid, Status::Failed, None),
                 (Some(b), Some(img)) => match b.open(img) {
@@ -285,12 +297,12 @@ pub fn app_main() -> i32 {
     };
     // the client is gone (or the manager failed): end the driver, wait until it is really gone,
     // and only then leave the device quiet (T42: reset after the driver has stopped)
-    if let Some(b) = &mut block {
+    for b in &mut blocks {
         if let Some(p) = b.driver {
             sys::process_kill(p, -1);
             let _ = sys::object_wait(p, signals::TERMINATED, sys::clock_get() + 2000);
         }
-        reset();
+        reset(b.va);
     }
     code
 }

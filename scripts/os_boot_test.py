@@ -228,6 +228,18 @@ def scratch_disk():
     return f.name
 
 
+def second_disk():
+    """A 1 MiB raw image with its own sector-0 pattern (byte i = (i * 11 + 5) mod 256): the device manager
+    must tell it apart from the first disk (slice DM). A fresh copy per boot."""
+    import atexit, tempfile
+    f = tempfile.NamedTemporaryFile(prefix="os-disk2-", suffix=".img", delete=False)
+    f.write(bytes((i * 11 + 5) & 0xFF for i in range(512)))
+    f.truncate(1024 * 1024)
+    f.close()
+    atexit.register(lambda: os.path.exists(f.name) and os.unlink(f.name))
+    return f.name
+
+
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
@@ -243,6 +255,11 @@ def run(kernel: str, extra=()):
         # never touches it; OS_DISK=0 leaves it off.
         *([] if os.environ.get("OS_DISK") == "0" else [
             "-global", "virtio-mmio.force-legacy=false",
+            # (QEMU gives the first device the highest virtio-mmio slot and the device tree lists the
+            # slots lowest first, so the second disk is attached first: the 16 MiB scratch disk is
+            # then device 0 for the suite, and the small one is device 1)
+            "-drive", f"file={second_disk()},if=none,format=raw,id=hd1",
+            "-device", "virtio-blk-device,drive=hd1",
             "-drive", f"file={scratch_disk()},if=none,format=raw,id=hd0",
             "-device", "virtio-blk-device,drive=hd0"]),
         *extra, "-kernel", kernel,
@@ -395,6 +412,9 @@ def main() -> int:
                        else "s6: devmgr found the disk")
             if want_dm not in text:
                 found.append(f"the device manager test did not report '{want_dm}'")
+            if (os.environ.get("OS_DISK") != "0"
+                    and "s6: devmgr served two block devices" not in text):
+                found.append("the device manager did not serve two block devices at once")
         # The C library (S7c): the guest's transcript must equal the same C program run on the host.
         if not expect_fail:
             found += c_transcript_problems(text)

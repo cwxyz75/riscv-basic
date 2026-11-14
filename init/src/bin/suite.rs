@@ -7106,7 +7106,16 @@ fn basic_golden_corpus_on_the_target() -> Outcome {
 
 /// One OpenBlock exchange: the status and the block channel that came with an Ok.
 fn devmgr_open(ch: u32, txid: u32) -> Result<(proto::devmgr::Status, Option<u32>), Detail> {
-    let req = proto::devmgr::encode_open_block(txid);
+    devmgr_open_at(ch, txid, 0)
+}
+
+/// OpenBlock for the device `index` (in device-tree order).
+fn devmgr_open_at(
+    ch: u32,
+    txid: u32,
+    index: u16,
+) -> Result<(proto::devmgr::Status, Option<u32>), Detail> {
+    let req = proto::devmgr::encode_open_block_at(txid, index);
     ensure_eq!(
         st(sys::channel_write(
             ch,
@@ -7232,6 +7241,51 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
             let _ = sys::object_wait(mine, 1 << 24, sys::clock_get() + 5);
         };
         check_pattern(again, 7000, 32)?;
+        // slice DM: the manager serves every block device it finds. A second disk (the harness
+        // attaches one with a different sector-0 pattern) has its own driver, in use at the same time
+        // as the first; a device number past the last is NoDevice.
+        let (status, h) = devmgr_open_at(mine, 20, 1)?;
+        if status == D::Ok {
+            let second = h.ok_or_else(|| msg_at(line!()))?;
+            let first = again;
+            // both are open now (the first driver is still the one from `again`)
+            let (_, sector0_b) = blk_call(
+                second,
+                1,
+                blk::Op::Read {
+                    sector: 0,
+                    count: 1,
+                },
+            )?;
+            let (_, sector0_a) = blk_call(
+                first,
+                2,
+                blk::Op::Read {
+                    sector: 0,
+                    count: 1,
+                },
+            )?;
+            let want_a: Vec<u8> = (0..512).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
+            let want_b: Vec<u8> = (0..512).map(|i| ((i * 11 + 5) & 0xff) as u8).collect();
+            ensure!(
+                sector0_a == want_a,
+                "device 0 shows the first disk's sector 0"
+            );
+            ensure!(
+                sector0_b == want_b,
+                "device 1 shows the second disk's sector 0"
+            );
+            let (status, h) = devmgr_open_at(mine, 21, 2)?;
+            ensure_eq!((status, h), (D::NoDevice, None), "there is no third device");
+            let (status, h) = devmgr_open_at(mine, 22, 1)?;
+            ensure_eq!(
+                (status, h),
+                (D::Busy, None),
+                "the second device is in use, independently of the first"
+            );
+            sys::handle_close(second);
+            sys::debug_write(b"s6: devmgr served two block devices\n");
+        }
         sys::handle_close(again);
     }
     // the client goes away: the manager ends cleanly

@@ -1,8 +1,10 @@
 //! The device manager's protocol (S6c): a client asks for a block device and gets a channel to a
 //! driver for it.
 //!
-//! Request: `txid u32 | op u16 | 0 u16`. Reply: `txid u32 | status i32`, and for `Ok` the message
-//! carries one handle: the client's end of the block protocol channel (`proto::blk`).
+//! Request: `txid u32 | op u16 | index u16`. `index` names the block device in ascending address order of its
+//! virtio-mmio slot (0 is the lowest; slice DM: the manager serves every block device it finds, one
+//! driver each). Reply: `txid u32 | status i32`, and for `Ok` the message carries one handle: the
+//! client's end of the block protocol channel (`proto::blk`).
 
 use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
@@ -38,21 +40,30 @@ impl Status {
     }
 }
 
+/// Ask for the first block device.
 pub fn encode_open_block(txid: u32) -> Vec<u8> {
+    encode_open_block_at(txid, 0)
+}
+
+/// Ask for the block device number `index` (lowest slot address first).
+pub fn encode_open_block_at(txid: u32, index: u16) -> Vec<u8> {
     let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
     b.extend_from_slice(&OP_OPEN_BLOCK.to_le_bytes());
-    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&index.to_le_bytes());
     b
 }
 
-/// `Ok(txid)` for an OpenBlock request; `Err(txid if there was one)` otherwise.
-pub fn decode_request(b: &[u8]) -> Result<u32, Option<u32>> {
+/// `Ok((txid, index))` for an OpenBlock request; `Err(txid if there was one)` otherwise.
+pub fn decode_request(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
     let txid = rd_u32(b, 0);
-    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_OPEN_BLOCK) || rd_u16(b, 6) != Some(0) {
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_OPEN_BLOCK) {
         return Err(txid);
     }
-    txid.ok_or(None)
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(i)) => Ok((t, i)),
+        _ => Err(None),
+    }
 }
 
 pub fn encode_reply(txid: u32, status: Status) -> Vec<u8> {
@@ -76,7 +87,9 @@ mod tests {
     #[test]
     fn golden_and_round_trip() {
         assert_eq!(encode_open_block(7), [7, 0, 0, 0, 1, 0, 0, 0]);
-        assert_eq!(decode_request(&encode_open_block(7)), Ok(7));
+        assert_eq!(decode_request(&encode_open_block(7)), Ok((7, 0)));
+        assert_eq!(encode_open_block_at(7, 3), [7, 0, 0, 0, 1, 0, 3, 0]);
+        assert_eq!(decode_request(&encode_open_block_at(7, 3)), Ok((7, 3)));
         assert_eq!(encode_reply(7, Status::Busy), [7, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(
             decode_reply(&encode_reply(9, Status::NoDevice)),
@@ -89,7 +102,6 @@ mod tests {
         assert_eq!(decode_request(&[]), Err(None));
         assert_eq!(decode_request(&[1, 2, 3, 4]), Err(Some(0x0403_0201)));
         assert_eq!(decode_request(&[5, 0, 0, 0, 9, 0, 0, 0]), Err(Some(5)));
-        assert_eq!(decode_request(&[5, 0, 0, 0, 1, 0, 1, 0]), Err(Some(5)));
         assert_eq!(decode_request(&[5, 0, 0, 0, 1, 0, 0, 0, 0]), Err(Some(5)));
         assert_eq!(decode_reply(&[0; 7]), None);
         assert_eq!(decode_reply(&[0, 0, 0, 0, 99, 0, 0, 0]), None);
