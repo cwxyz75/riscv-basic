@@ -46,6 +46,8 @@ pub enum Role {
     /// Standard error (S7a): a duplicate of the same stream as `Stdout` when nothing separate was
     /// asked for. A program with no `Stderr` writes errors to `Stdout`.
     Stderr = 17,
+    /// The channel the service registry serves (`proto::file` as a directory, slice SD).
+    ServiceRegistry = 18,
 }
 
 impl Role {
@@ -68,6 +70,7 @@ impl Role {
             15 => Role::Resource,
             16 => Role::ServiceDevmgr,
             17 => Role::Stderr,
+            18 => Role::ServiceRegistry,
             _ => return None,
         })
     }

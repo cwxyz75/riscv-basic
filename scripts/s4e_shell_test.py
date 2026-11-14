@@ -70,7 +70,7 @@ class Session(base.Session):
 
 BANNER = b"riscv-os S4 ready"
 BIN = [b"basic", b"blkd", b"bomb", b"cat", b"consoled", b"crash", b"ctest", b"devmgr", b"echo", b"hello", b"hog", b"init", b"ipchog", b"launcher",
-       b"ls", b"lua", b"memfsd", b"probe", b"sh", b"spin"]
+       b"ls", b"lua", b"memfsd", b"probe", b"registryd", b"sh", b"spin"]
 
 
 def main():

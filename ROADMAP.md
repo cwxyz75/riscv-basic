@@ -593,7 +593,8 @@ in the startup message; the registry itself tolerates a hostile publisher and a 
 account, OD77); leak checks exact; the existing programs unchanged.
 
 - [x] Step 0: spec (`SD-SPEC.md`) and OD97
-- [~] Step 1: the pure directory logic is built (`svc::directory`: names, listeners, stale entries, views; model tests, mutation-checked). **Not done**: the registry service on the service runtime, the `PUBLISH` right and ops 9 to 11, `UNAVAILABLE`
+- [x] Step 1: the pure directory logic (`svc::directory`: names, listeners, stale entries, views; model tests, mutation-checked)
+- [x] Step 2 (the registry service): `registryd` on `rt::service`, the `PUBLISH` right (bit 16), ops 16 to 18 (`Publish`, `Unpublish`, `View`) and status `UNAVAILABLE` (-109) in `proto::file`, `Role::ServiceRegistry`, `Fs::publish/unpublish/view`, and `registry_publish_open_unavailable_and_views` (publish, forwarded open answered by the service, no hijack, views list and hide, stale then UNAVAILABLE then republished, unpublish; mutation-checked). `rt::service` gained `other_event`, `Core::port` and `has_conn`
 - [ ] Step 2: generic named entries in the startup message; `rt` and the launcher; the closed `Role` enum retired for services
 - [ ] Step 3: the shell grants a `/svc` view; existing servers publish themselves (`memfsd`, `consoled`, `launcher`)
 - [ ] Step 4: clients reconnect on `UNAVAILABLE` in the service runtime; documents (T15, T30 narrowed)

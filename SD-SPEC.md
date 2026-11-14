@@ -25,9 +25,9 @@ cannot be re-found by its clients (T30). A directory makes finding a service a l
   It owns the `svc::Directory`.
 * **A name** is a path component under `/svc`: 1 to 64 printable ASCII bytes, no `/` and no space (`valid_name`). The
   directory holds at most 256.
-* **Publishing.** A directory connection with the new right `PUBLISH` may send `op 9 Publish(name; listener endpoint)`:
+* **Publishing.** A directory connection with the new right `PUBLISH` may send `op 16 Publish(name; listener endpoint)`:
   the service hands the registry the *registry's end* of a fresh channel it listens on. A name whose service is alive
-  cannot be taken (no hijacking: unpublish first); a **stale** name is replaced. `op 10 Unpublish(name)` removes one.
+  cannot be taken (no hijacking: unpublish first); a **stale** name is replaced. `op 17 Unpublish(name)` removes one.
   `PUBLISH` is a right like any other: it only shrinks, and whoever starts a service gives it a connection that has it
   (the shell or `init`), not the services' clients.
 * **Connecting.** `Open(name, flags, rights)+endpoint` on a connection whose **view** allows `name`: the registry
@@ -38,7 +38,7 @@ cannot be re-found by its clients (T30). A directory makes finding a service a l
   retries. A name that was never published, or that the view does not allow, is `NOT_FOUND`: a hidden name is
   indistinguishable from a missing one (it does not even answer UNAVAILABLE).
 * **Views** are the capability attenuation (`svc::View`): a directory connection has a set of names it may use, or all.
-  `op 11 View(names...)` is a `Clone` whose new connection allows exactly the listed names, each of which must already be
+  `op 18 View(names...)` is a `Clone` whose new connection allows exactly the listed names, each of which must already be
   allowed (a view cannot grant what its parent could not use: `BAD_REQUEST`). Views only narrow. **Handing a program a
   view is the grant**: the shell gives each program the view for the services that program may use.
 * **Budgets** (OD77, OD84): every connection to the registry, listeners included, is charged to its budget; the
@@ -82,8 +82,8 @@ hostile client (floods, malformed frames), with the budgets of OD84; leak checks
 
 ## 6. Steps
 
-0. This document and OD97. 1. (built) The pure directory logic with model tests. 2. The registry service on
-`rt::service`: the `PUBLISH` right and ops 9 to 11 in `proto::file`, status `UNAVAILABLE`, a QEMU test with a toy
+0. This document and OD97. 1. (built) The pure directory logic with model tests. 2. (built) The registry service `registryd` on
+`rt::service`: the `PUBLISH` right (bit 16) and ops 16 to 18 in `proto::file` (ops 9 to 15 are the file operations), status `UNAVAILABLE`, a QEMU test with a toy
 service. 3. Arbitrary namespace prefixes in the startup message (`proto`, `rt`, the launcher). 4. The shell grants a
 `/svc` view; `memfsd`, `launcher`, `devmgr`, `blkd` publish themselves; clients (`rt::fs`, the shell) reconnect on
 UNAVAILABLE. 5. Documents; T15 and T30 narrowed.

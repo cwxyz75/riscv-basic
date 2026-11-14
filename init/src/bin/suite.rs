@@ -4522,6 +4522,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"lua".to_vec(),
             b"memfsd".to_vec(),
             b"probe".to_vec(),
+            b"registryd".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec()
         ],
@@ -5067,6 +5068,193 @@ fn memfsd_protocol_violations() -> Outcome {
 /// own limit of connections; sibling accounts and the root are untouched; accounts nest (a child may only be
 /// tighter than its parent, and what it uses counts against the parent too); and an account's room comes back
 /// when its connections close.
+/// Start the service registry (slice SD): the connection to it is the full directory connection.
+fn start_registry() -> Result<(u32, Fs), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/registryd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"registryd".to_vec()],
+        roles: vec![(Role::ServiceRegistry, 0)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[theirs]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn registryd: {e:?}"));
+        d
+    })?;
+    Ok((p, Fs::new(mine)))
+}
+
+/// Take the connection the registry forwarded to a listener (an `Open` frame carrying the client's endpoint)
+/// and answer on it, as a service would: `reply` is written to the client.
+fn serve_one_forwarded(listener: u32, reply: &[u8]) -> Outcome {
+    let w = sys::object_wait(listener, sig::READABLE, sys::clock_get() + 2000);
+    ensure_eq!(st(w), Some(S::Ok), "the registry forwarded the connection");
+    let mut buf = [0u8; 64];
+    let mut hs = [0u32; 2];
+    let r = sys::channel_read(listener, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), 2);
+    ensure_eq!(st(r), Some(S::Ok), "read the forwarded open");
+    ensure_eq!(r.a2, 1, "it carries the client's endpoint");
+    let req = proto::file::decode_request(&buf[..r.a1]).map_err(|_| msg_at(line!()))?;
+    ensure_eq!(req.op, proto::file::op::OPEN, "an Open");
+    ensure!(
+        req.payload.is_empty(),
+        "with an empty path: it is the service itself"
+    );
+    let ep = hs[0];
+    ensure_eq!(
+        st(sys::channel_write(
+            ep,
+            reply.as_ptr(),
+            reply.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "the service answers the client directly"
+    );
+    sys::handle_close(ep);
+    Ok(())
+}
+
+/// Slice SD: publish, open, hijack refused, stale then UNAVAILABLE then republished, views, unpublish.
+fn registry_publish_open_unavailable_and_views() -> Outcome {
+    use proto::file::status as fst;
+    let (_p, mut root) = start_registry()?;
+    let all = prt::READ | prt::ENUMERATE;
+    // a service publishes a name by handing the registry a listener channel
+    let (svc_end, listener) = channel()?;
+    ensure_eq!(root.publish(b"toy", listener), Ok(()), "publish");
+    let (svc2, listener2) = channel()?;
+    ensure_eq!(
+        code(root.publish(b"toy", listener2)),
+        Some(fst::EXISTS),
+        "a live name cannot be taken"
+    );
+    sys::handle_close(listener2);
+    sys::handle_close(svc2);
+    ensure_eq!(
+        code(root.publish(b"bad/name", {
+            let (a, b) = channel()?;
+            sys::handle_close(a);
+            b
+        })),
+        Some(fst::BAD_REQUEST),
+        "names are checked"
+    );
+    // a client opens /svc/toy: the registry forwards its endpoint to the service, which answers directly
+    let client = root
+        .open(b"toy", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    serve_one_forwarded(svc_end, b"hello")?;
+    let mut got = [0u8; 8];
+    let w = sys::object_wait(client.ch, sig::READABLE, sys::clock_get() + 2000);
+    ensure_eq!(st(w), Some(S::Ok), "the service's greeting arrives");
+    let r = sys::channel_read(client.ch, got.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        &got[..r.a1],
+        b"hello",
+        "the client talks to the service, not the registry"
+    );
+    ensure_eq!(
+        code(root.open(b"nothing", 0, prt::READ)),
+        Some(fst::NOT_FOUND),
+        "an unpublished name"
+    );
+    // views: a connection that sees only some names; the rest do not exist for it
+    let (other_svc, other_l) = channel()?;
+    ensure_eq!(
+        root.publish(b"other", other_l),
+        Ok(()),
+        "publish a second name"
+    );
+    let mut v = root.view(&[b"toy"], all).map_err(|e| msg_e(e, line!()))?;
+    let listing: Vec<Vec<u8>> = names(&v.read_dir().map_err(|e| msg_e(e, line!()))?);
+    ensure_eq!(
+        listing,
+        vec![b"toy".to_vec()],
+        "the view lists only its names"
+    );
+    ensure_eq!(
+        names(&root.read_dir().map_err(|e| msg_e(e, line!()))?),
+        vec![b"other".to_vec(), b"toy".to_vec()],
+        "the full connection lists both"
+    );
+    ensure_eq!(
+        code(v.open(b"other", 0, prt::READ)),
+        Some(fst::NOT_FOUND),
+        "a name outside the view is not found, whatever it is"
+    );
+    ensure_eq!(
+        code(v.view(&[b"other"], all)),
+        Some(fst::BAD_REQUEST),
+        "a view cannot grant a name its parent cannot use"
+    );
+    ensure_eq!(
+        code(v.publish(b"x", {
+            let (a, b) = channel()?;
+            sys::handle_close(a);
+            b
+        })),
+        Some(S::AccessDenied.code()),
+        "a view has no PUBLISH right"
+    );
+    let via_view = v
+        .open(b"toy", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    serve_one_forwarded(svc_end, b"again")?;
+    sys::handle_close(via_view.ch);
+    sys::handle_close(client.ch);
+    // the service goes away: its name goes stale and clients are told to retry, not that it is missing
+    sys::handle_close(svc_end);
+    let mut seen = false;
+    for _ in 0..50 {
+        if code(root.open(b"toy", 0, prt::READ)) == Some(fst::UNAVAILABLE) {
+            seen = true;
+            break;
+        }
+        rt::io::nap(2);
+    }
+    ensure!(seen, "a dead service's name answers UNAVAILABLE");
+    ensure_eq!(
+        code(v.open(b"toy", 0, prt::READ)),
+        Some(fst::UNAVAILABLE),
+        "and through a view that allows it"
+    );
+    ensure_eq!(
+        code(v.open(b"other", 0, prt::READ)),
+        Some(fst::NOT_FOUND),
+        "while a hidden name still looks missing"
+    );
+    // it restarts and republishes: the stale entry is replaced, and clients succeed again
+    let (svc3, listener3) = channel()?;
+    ensure_eq!(
+        root.publish(b"toy", listener3),
+        Ok(()),
+        "republish over the stale entry"
+    );
+    let again = root
+        .open(b"toy", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    serve_one_forwarded(svc3, b"back")?;
+    sys::handle_close(again.ch);
+    // unpublish
+    ensure_eq!(root.unpublish(b"toy"), Ok(()), "unpublish");
+    ensure_eq!(code(root.unpublish(b"toy")), Some(fst::NOT_FOUND), "twice");
+    ensure_eq!(
+        code(root.open(b"toy", 0, prt::READ)),
+        Some(fst::NOT_FOUND),
+        "gone"
+    );
+    for h in [svc3, other_svc, v.ch, root.ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 fn memfsd_accounts_confine_a_client() -> Outcome {
     let (_p, mut root, _bi) = start_memfsd()?;
     let all = prt::READ | prt::ENUMERATE;
@@ -9126,6 +9314,10 @@ pub fn app_main() -> i32 {
         ),
         ("memfsd_rights_only_shrink", memfsd_rights_only_shrink),
         ("memfsd_protocol_violations", memfsd_protocol_violations),
+        (
+            "registry_publish_open_unavailable_and_views",
+            registry_publish_open_unavailable_and_views,
+        ),
         (
             "memfsd_accounts_confine_a_client",
             memfsd_accounts_confine_a_client,

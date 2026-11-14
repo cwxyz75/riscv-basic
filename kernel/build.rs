@@ -22,8 +22,28 @@ fn main() {
     let built = PathBuf::from(&dir).join(format!("../target/riscv64gc-unknown-none-elf/{profile}"));
     let mut image_files: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for name in [
-        "suite", "init", "crash", "hello", "launcher", "memfsd", "consoled", "spin", "echo", "cat",
-        "ls", "probe", "sh", "hog", "bomb", "ipchog", "blkd", "devmgr", "basic", "ctest", "lua",
+        "suite",
+        "init",
+        "crash",
+        "hello",
+        "launcher",
+        "memfsd",
+        "consoled",
+        "spin",
+        "echo",
+        "cat",
+        "ls",
+        "probe",
+        "sh",
+        "hog",
+        "bomb",
+        "ipchog",
+        "blkd",
+        "devmgr",
+        "basic",
+        "ctest",
+        "lua",
+        "registryd",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
