@@ -315,7 +315,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         };
         let entry = s
             .ktable
-            .remove_for_transfer(process_end)
+            .remove_for_transfer(&mut s.objs, process_end)
             .expect("a fresh handle can be transferred");
         let first = process
             .handles
@@ -792,13 +792,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 notify();
             }
-            // Slice W step 3: wake the threads whose wait this syscall ended, by id. A handle removed
-            // by `replace` or sent away in a message is told to the registry first (forced touch).
-            if matches!(n, nr::HANDLE_REPLACE | nr::CHANNEL_WRITE | nr::CHANNEL_CALL)
-                && !cfg!(feature = "fault-skip-forced-touch")
-            {
-                let _ = with_proc(|objs, p, _| p.handles.flush_removed(objs));
-            }
+            // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed
+            // by `replace` or sent away is a forced touch, made where it happens)
             commit_wake();
             reply(frame, result);
         }
@@ -914,8 +909,13 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::HANDLE_REPLACE => {
             let nh = p
                 .handles
-                .replace(h(0), Rights(a[1] as u32))
+                .replace(objs, h(0), Rights(a[1] as u32))
                 .map_err(|e| (e, None, None))?;
+            // (the negative-control kernel forgets the forced touch: a waiter on the replaced handle
+            // must then sleep on, and the test that guards the wake must fail)
+            if cfg!(feature = "fault-skip-forced-touch") {
+                objs.take_dirty();
+            }
             Ok((Some(u64::from(nh.0)), None))
         }
         nr::CHANNEL_CREATE => {
@@ -1338,13 +1338,7 @@ pub fn wake_signal_waiters() {
 pub fn commit_wake() {
     let woken = irq::without(|| {
         let s = state();
-        let UserState {
-            objs,
-            waits,
-            ktable,
-            ..
-        } = s;
-        ktable.flush_removed(objs);
+        let UserState { objs, waits, .. } = s;
         let dirty = objs.take_dirty();
         if dirty.items.is_empty() && !dirty.overflow {
             return Vec::new();
@@ -1576,11 +1570,6 @@ const WAITABLE_SIGNALS: u32 = abi::signals::WAITABLE;
 /// wait ended already: the predicate was true).
 fn register_wait(thread: Tid, h: Handle, mask: u32) {
     let s = state();
-    debug_assert!(
-        !s.objs.has_dirty(),
-        "a thread is about to sleep with uncommitted signal changes in the log: {:?}",
-        s.objs.peek_dirty()
-    );
     let Some(pid) = s.thread_pid.get(&thread).copied() else {
         return;
     };
@@ -2116,6 +2105,7 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         };
         s.ktable
             .replace(
+                &mut s.objs,
                 h,
                 Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0),
             )
@@ -2333,7 +2323,7 @@ fn process_self() -> Reply {
                 )
                 .map_err(|e| (e, None, None))?;
                 // narrow the default rights: a self handle cannot be sent away
-                let h = p.handles.replace(h, rights).expect("just created");
+                let h = p.handles.replace(objs, h, rights).expect("just created");
                 p.obj = Some(obj);
                 Ok((Some(u64::from(h.0)), None))
             }
@@ -2516,11 +2506,11 @@ fn process_start(a: [u64; 6]) -> Reply {
             .charge(target.job, Resource::Threads, 1)
             .map_err(|e| (job_status(e), None, None))?;
         // Commit: the channel end moves into the new process as its handle 1.
-        let UserState { procs, .. } = s;
+        let UserState { procs, objs, .. } = s;
         let caller = procs.get_mut(&me).expect("caller exists");
         let moved = caller
             .handles
-            .remove_for_transfer(bh)
+            .remove_for_transfer(objs, bh)
             .map_err(|e| (e, None, None))?;
         let target = procs.get_mut(&tpid).expect("target exists");
         let first = target

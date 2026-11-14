@@ -104,7 +104,7 @@ fn run(seed: u64) {
             }
             12 => {
                 if let Some(h) = pick(&mut rng, &tables[ti]) {
-                    let _ = tables[ti].replace(h, Rights::SAME);
+                    let _ = tables[ti].replace(&mut reg, h, Rights::SAME);
                 }
             }
             _ => {
@@ -117,9 +117,6 @@ fn run(seed: u64) {
             }
         }
         // the kernel's commit
-        for t in tables.iter_mut() {
-            t.flush_removed(&mut reg);
-        }
         let dirty = reg.take_dirty();
         let forced: BTreeSet<ObjId> = dirty
             .items
@@ -229,4 +226,26 @@ fn register_replaces_and_forget_is_idempotent() {
         vec![1]
     );
     assert!(!w.forget(1));
+}
+
+#[test]
+fn an_overflowed_log_releases_every_registration() {
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(16);
+    let e = event_create(&mut reg, &mut t).unwrap();
+    let obj = t.get(e).unwrap().obj;
+    let mut w = WaitTable::new();
+    w.register(7, obj, 1 << 24);
+    reg.take_dirty();
+    // (the cap is a safety net the kernel's per-syscall drain never reaches; force the flag directly)
+    let overflowed = kcore::object::Dirty {
+        items: Vec::new(),
+        overflow: true,
+    };
+    let woken = w.commit(|i| signals_of_object(&reg, i), |_| false, overflowed);
+    assert_eq!(
+        woken,
+        vec![7],
+        "everyone is released: a forced touch may have been lost"
+    );
 }

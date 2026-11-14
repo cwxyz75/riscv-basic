@@ -69,8 +69,10 @@ Operations:
 
 ## 4. Invariants (each gets a check)
 
-* **W1** The dirty log is empty whenever the BKL is released or the running thread changes (asserted in `bkl::unlock` at
-  depth 1 and in `reschedule`).
+* **W1** The dirty log is empty whenever the BKL is released or the running thread changes. Enforced by construction
+  rather than asserted so far: every syscall and every trap from user mode commits before the lock goes, and each wait
+  commits before it sleeps (a debug assertion in `bkl::unlock` proved unsound: kernel threads mutate and commit in
+  separate lock regions; the review of step 3 found this).
 * **W2** A thread has at most one registration, and none while in user mode.
 * **W3** Every registration names a live object and a live port (`WaitTable::audit`).
 * **W4** Filter soundness: after a commit no Registered thread's own predicate is true.

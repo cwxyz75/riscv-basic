@@ -66,8 +66,8 @@ impl WaitTable {
     /// The threads released by `dirty`: for every touched object, each registration whose object is
     /// gone (`signals` returns `None`), whose touch was forced (a handle to the object was removed: the
     /// waiter must re-validate), or whose mask matches the object's signals now. Their registrations
-    /// are removed. An overflowed log releases every registration whose predicate holds (or whose
-    /// object is gone), forced or not.
+    /// are removed. An overflowed log releases every registration (the lost entries may have been forced
+    /// touches); each waiter re-checks its own condition.
     ///
     /// `derived` says which objects' signals follow *other* objects' (a port's READABLE follows the
     /// objects bound to it, which are touched, not the port): their registrations are evaluated on
@@ -81,9 +81,10 @@ impl WaitTable {
         let mut woken = Vec::new();
         let touched = dirty.overflow || !dirty.items.is_empty();
         if dirty.overflow {
+            // the log lost entries (forced touches among them): release everyone, they re-check
             let all: Vec<ObjId> = self.regs.keys().copied().collect();
             for obj in all {
-                self.fire(obj, false, &signals, &mut woken);
+                self.fire(obj, true, &signals, &mut woken);
             }
         }
         for (obj, forced) in dirty.items {

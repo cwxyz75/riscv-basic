@@ -98,7 +98,7 @@ fn random_operations_agree_with_the_model() {
                     let h = pick(&mut rng);
                     let want = random_rights(&mut rng);
                     let (o, have) = live[&h];
-                    let result = table.replace(h, want);
+                    let result = table.replace(&mut reg, h, want);
                     let new = if want == Rights::SAME {
                         Some(have)
                     } else if want.is_valid() && want.is_subset_of(have) {
@@ -127,7 +127,7 @@ fn random_operations_agree_with_the_model() {
                     // transfer out and straight back in (what a channel message does)
                     let h = pick(&mut rng);
                     let (o, have) = live[&h];
-                    match table.remove_for_transfer(h) {
+                    match table.remove_for_transfer(&mut reg, h) {
                         Ok(entry) => {
                             assert!(have.contains(Rights::TRANSFER), "{ctx}");
                             assert_eq!(entry.rights, have, "{ctx}");
@@ -213,23 +213,29 @@ fn rights_escalation_is_refused() {
         "unassigned bit"
     );
     // drop DUPLICATE with replace: the new handle cannot duplicate
-    let weak = t.replace(e, Rights(Rights::SIGNAL.0)).unwrap();
+    let weak = t.replace(&mut reg, e, Rights(Rights::SIGNAL.0)).unwrap();
     assert_eq!(
         t.duplicate(&mut reg, weak, Rights::SAME),
         Err(Status::AccessDenied),
         "no DUPLICATE right"
     );
     // replace cannot widen either, and an error leaves the handle valid
-    assert_eq!(t.replace(weak, Rights::EVENT), Err(Status::AccessDenied));
+    assert_eq!(
+        t.replace(&mut reg, weak, Rights::EVENT),
+        Err(Status::AccessDenied)
+    );
     assert!(t.get(weak).is_ok());
     // transfer needs the TRANSFER right
-    assert_eq!(t.remove_for_transfer(weak), Err(Status::AccessDenied));
+    assert_eq!(
+        t.remove_for_transfer(&mut reg, weak),
+        Err(Status::AccessDenied)
+    );
     assert!(
         t.get(weak).is_ok(),
         "a refused transfer leaves the handle in place"
     );
     // signalling needs SIGNAL
-    let wait_only = t.replace(weak, Rights::NONE).unwrap();
+    let wait_only = t.replace(&mut reg, weak, Rights::NONE).unwrap();
     assert_eq!(
         event_signal(&mut reg, &t, wait_only, 0, 1 << 24),
         Err(Status::AccessDenied)

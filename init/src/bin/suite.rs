@@ -2651,6 +2651,36 @@ extern "C" fn worker_block_forever(arg: usize) -> ! {
     sys::thread_exit(1)
 }
 
+/// Sending a handle away in a message ends a sibling's wait on it too (a transfer removes the handle from
+/// this process: BAD_HANDLE for the waiter, promptly), review finding H1 of slice W step 3.
+fn sending_a_waited_handle_ends_a_siblings_wait() -> Outcome {
+    let ev = event()?;
+    let (a, b) = channel()?;
+    WOKEN_STATUS.store(99, Ordering::SeqCst);
+    let t = new_thread(worker_wait_event, ev as usize)?;
+    nap(4)?;
+    for _ in 0..3 {
+        sys::thread_yield();
+    }
+    let hs = [ev];
+    ensure_eq!(
+        st(sys::channel_write(a, b"x".as_ptr(), 1, hs.as_ptr(), 1)),
+        Some(S::Ok),
+        "send the event away"
+    );
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 100);
+    let prompt = r.status == 0;
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 3000);
+    ensure!(prompt, "the waiter slept on after its handle was sent away");
+    ensure_eq!(
+        WOKEN_STATUS.load(Ordering::SeqCst) as i32,
+        S::BadHandle.code(),
+        "the wait reports BAD_HANDLE"
+    );
+    sys::handle_close(b);
+    Ok(())
+}
+
 fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
     let ev = event()?;
     WOKEN_STATUS.store(99, Ordering::SeqCst);
@@ -8441,6 +8471,10 @@ pub fn app_main() -> i32 {
         (
             "wake_baseline_bystanders_and_counters",
             wake_baseline_bystanders_and_counters,
+        ),
+        (
+            "sending_a_waited_handle_ends_a_siblings_wait",
+            sending_a_waited_handle_ends_a_siblings_wait,
         ),
         (
             "futex_sleepers_are_not_woken_by_unrelated_syscalls",
