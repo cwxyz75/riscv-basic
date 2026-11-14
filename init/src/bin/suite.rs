@@ -77,9 +77,9 @@ fn unknown_syscalls_are_refused() -> Outcome {
         "syscall 999"
     );
     ensure_eq!(
-        st(rt::syscall(4, [0; 6])),
+        st(rt::syscall(5, [0; 6])),
         Some(S::BadSyscall),
-        "unassigned number 4"
+        "unassigned number 5"
     );
     ensure_eq!(
         st(rt::syscall(usize::MAX, [0; 6])),
@@ -1750,6 +1750,134 @@ fn child_faults_are_contained() -> Outcome {
             (r.status, r.a1 as i64),
             (0, want),
             "exit code of variant {variant}"
+        );
+    }
+    Ok(())
+}
+
+// --- The wake path: counters, the bystander baseline, a benchmark (roadmap slice W, step 0) ---------
+
+/// Flips to true when slice W retires the global wait queue: then bystanders are never woken.
+const TARGETED_WAKE: bool = false;
+
+/// A bystander: blocked on an event nobody signals until the test ends it.
+extern "C" fn bystander(arg: usize) -> ! {
+    sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + 60_000);
+    sys::thread_exit(0)
+}
+
+/// Echoes `ROUND_TRIPS` eight-byte messages on its end of a channel.
+extern "C" fn pong(arg: usize) -> ! {
+    let mut buf = [0u8; 8];
+    for _ in 0..ROUND_TRIPS {
+        sys::object_wait(arg as u32, sig::READABLE, sys::clock_get() + 60_000);
+        let r = sys::channel_read(arg as u32, buf.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+        if r.status != 0 {
+            break;
+        }
+        sys::channel_write(arg as u32, buf.as_ptr(), 8, core::ptr::null(), 0);
+    }
+    sys::thread_exit(0)
+}
+
+const ROUND_TRIPS: usize = 60;
+
+/// One ping-pong run of `ROUND_TRIPS` round trips between this thread and a partner thread; returns
+/// (guest ticks, blocks, spurious wakes, wakes) it took.
+fn ping_pong() -> Result<(u64, u64, u64, u64), Detail> {
+    let (mine, theirs) = channel()?;
+    let t = new_thread(pong, theirs as usize)?;
+    nap_ticks(2);
+    let before = (
+        sys::clock_get(),
+        sys::debug_stat(0),
+        sys::debug_stat(1),
+        sys::debug_stat(2),
+    );
+    let mut buf = [0u8; 8];
+    for i in 0..ROUND_TRIPS {
+        let msg = (i as u64).to_le_bytes();
+        ensure_eq!(
+            st(sys::channel_write(
+                mine,
+                msg.as_ptr(),
+                8,
+                core::ptr::null(),
+                0
+            )),
+            Some(S::Ok),
+            "ping"
+        );
+        let w = sys::object_wait(mine, sig::READABLE, sys::clock_get() + 5000);
+        ensure_eq!(w.status, 0, "the pong answered");
+        ensure_eq!(
+            st(sys::channel_read(
+                mine,
+                buf.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0
+            )),
+            Some(S::Ok),
+            "pong"
+        );
+    }
+    let after = (
+        sys::clock_get(),
+        sys::debug_stat(0),
+        sys::debug_stat(1),
+        sys::debug_stat(2),
+    );
+    sys::handle_close(t);
+    sys::handle_close(mine);
+    Ok((
+        after.0 - before.0,
+        after.1 - before.1,
+        after.2 - before.2,
+        after.3 - before.3,
+    ))
+}
+
+/// The counters count, and today's design wakes bystanders: the same ping-pong with four threads
+/// blocked on unrelated events costs spurious wakes (and time) that the quiet run does not. The numbers
+/// go to the log (`s7: wake baseline ...`) as the before-picture for slice W; when `TARGETED_WAKE` is
+/// true the same measurement must show no extra spurious wakes at all.
+fn wake_baseline_bystanders_and_counters() -> Outcome {
+    let quiet = ping_pong()?;
+    let mut evs = Vec::new();
+    for _ in 0..4 {
+        let e = event()?;
+        new_thread(bystander, e as usize)?;
+        evs.push(e);
+    }
+    nap_ticks(5); // let them block
+    let busy = ping_pong()?;
+    for e in &evs {
+        sys::event_signal(*e, 0, 1 << 24);
+    }
+    nap_ticks(3);
+    let line = alloc::format!(
+        "s7: wake baseline: 0 bystanders {} ticks {} blocks {} spurious {} wakes; 4 bystanders {} ticks {} blocks {} spurious {} wakes",
+        quiet.0, quiet.1, quiet.2, quiet.3, busy.0, busy.1, busy.2, busy.3
+    );
+    sys::debug_write(line.as_bytes());
+    ensure!(
+        quiet.1 > 0 && quiet.3 > 0,
+        "the counters count blocks and wakes"
+    );
+    if TARGETED_WAKE {
+        ensure!(
+            busy.2 <= quiet.2 + 4,
+            "bystanders are not woken: spurious wakes {} against {} without them",
+            busy.2,
+            quiet.2
+        );
+    } else {
+        ensure!(
+            busy.2 > quiet.2,
+            "the baseline shows the defect: bystanders cost spurious wakes ({} against {})",
+            busy.2,
+            quiet.2
         );
     }
     Ok(())
@@ -8203,6 +8331,10 @@ pub fn app_main() -> i32 {
         (
             "a_thread_made_by_the_parent_faults_or_exits",
             a_thread_made_by_the_parent_faults_or_exits,
+        ),
+        (
+            "wake_baseline_bystanders_and_counters",
+            wake_baseline_bystanders_and_counters,
         ),
         ("socket_syscalls", socket_syscalls),
         ("socket_end_of_stream", socket_end_of_stream),

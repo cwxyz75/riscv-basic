@@ -588,6 +588,7 @@ pub fn new_queue() -> usize {
 /// ticks). Returns whether `ready()` held. `ready` runs with interrupts off, like
 /// `wait_until`, so checking and sleeping are one atomic step.
 pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    let mut slept = false;
     loop {
         let result = irq::without(|| {
             if ready() {
@@ -597,6 +598,7 @@ pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -
             if k.sched.now() >= deadline {
                 return Some(false);
             }
+            count_sleep(&mut slept);
             let Kernel { sched, queues, .. } = k;
             if queues[q]
                 .wait_until_on(sched, hart(), deadline)
@@ -616,12 +618,14 @@ pub fn wait_deadline(q: usize, mut ready: impl FnMut() -> bool, deadline: u64) -
 /// off, so checking and queueing are one atomic step with respect to wakers: this is
 /// the "no lost wakeup" path.
 pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
+    let mut slept = false;
     loop {
         let go = irq::without(|| {
             if ready() {
                 return true;
             }
             let k = kernel();
+            count_sleep(&mut slept);
             let Kernel { sched, queues, .. } = k;
             if queues[q].wait_on(sched, hart()).expect("running thread") {
                 reschedule();
@@ -648,9 +652,38 @@ pub fn wake_all(q: usize) {
     irq::without(|| {
         let k = kernel();
         let Kernel { sched, queues, .. } = k;
-        queues[q].wake_all_on(sched, hart());
+        let n = queues[q].wake_all_on(sched, hart());
+        WAKES.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
         reschedule();
     });
+}
+
+// Wake-path counters (slice W step 0): how often a thread blocks, how often it is woken and finds its
+// condition still false (a spurious wake: what targeted wake removes), and how many threads are woken.
+static SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RESLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A thread is about to block; `slept` says it already blocked once in this wait (so it was woken
+/// without being satisfied).
+fn count_sleep(slept: &mut bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    SLEEPS.fetch_add(1, Relaxed);
+    if *slept {
+        RESLEEPS.fetch_add(1, Relaxed);
+    }
+    *slept = true;
+}
+
+/// The counter `which` (0 sleeps, 1 spurious wakes, 2 wakes); 0 for an unknown index.
+pub fn wake_stat(which: u64) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    match which {
+        0 => SLEEPS.load(Relaxed),
+        1 => RESLEEPS.load(Relaxed),
+        2 => WAKES.load(Relaxed),
+        _ => 0,
+    }
 }
 
 /// Every thread's stack guard is intact.
