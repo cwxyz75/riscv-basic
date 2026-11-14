@@ -45,7 +45,7 @@ impl Env {
         })
     }
 
-    /// The handle of the namespace entry with this prefix (`b"."`, `b"/"`).
+    /// The handle of the namespace entry with this prefix (`b"."`, `b"/"`, or an absolute path such as `b"/svc"`).
     pub fn namespace(&self, prefix: &[u8]) -> Option<u32> {
         let (_, i) = self.startup.namespace.iter().find(|(p, _)| p == prefix)?;
         self.handles.get(*i as usize).copied()

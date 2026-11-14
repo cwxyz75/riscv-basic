@@ -12,7 +12,7 @@ pub const MAX_HANDLES: usize = 32;
 pub const MAX_STRING: usize = 1024;
 pub const MAX_ARGS: usize = 64;
 pub const MAX_ENV: usize = 16;
-pub const MAX_NAMESPACE: usize = 4;
+pub const MAX_NAMESPACE: usize = 8;
 pub const MAX_ROLES: usize = 16;
 
 /// What a handle is for.
@@ -76,6 +76,21 @@ impl Role {
     }
 }
 
+/// Is `prefix` a namespace prefix? `"."` (the working directory), `"/"` (the root), or an absolute path of
+/// components of printable ASCII (no `/` inside, no `..` or `.`), such as `"/svc"` (slice SD: service
+/// connections are named entries, not roles). No trailing slash, no empty component.
+pub fn valid_prefix(prefix: &[u8]) -> bool {
+    if prefix == b"." || prefix == b"/" {
+        return true;
+    }
+    if prefix.len() > MAX_STRING || prefix.first() != Some(&b'/') {
+        return false;
+    }
+    prefix[1..].split(|&b| b == b'/').all(|c| {
+        !c.is_empty() && c != b"." && c != b".." && c.iter().all(|&b| (0x21..0x7f).contains(&b))
+    })
+}
+
 /// A decoded startup message. Handle indices index the message's handle array.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Startup {
@@ -123,7 +138,7 @@ impl Startup {
             }
         }
         for (i, (prefix, idx)) in self.namespace.iter().enumerate() {
-            if prefix != b"." && prefix != b"/" {
+            if !valid_prefix(prefix) {
                 return Err(StartupError::BadNamespace);
             }
             if self.namespace[..i].iter().any(|(p, _)| p == prefix) {
@@ -224,7 +239,7 @@ impl Startup {
         };
         for _ in 0..nsc {
             let prefix = get_str(b, &mut at)?;
-            if (prefix != b"." && prefix != b"/") || s.namespace.iter().any(|(p, _)| *p == prefix) {
+            if !valid_prefix(&prefix) || s.namespace.iter().any(|(p, _)| *p == prefix) {
                 return Err(StartupError::BadNamespace);
             }
             let idx = rd_u32(b, at).ok_or(StartupError::Truncated)?;

@@ -243,3 +243,42 @@ fn boot_images_refuse_names_that_are_both_file_and_directory() {
     let fine: [(&[u8], &[u8]); 2] = [(b"bin/ls", b"1"), (b"binary", b"2")];
     assert!(bootimg::build(&fine).is_ok());
 }
+
+#[test]
+fn startup_namespace_prefixes_are_checked_paths() {
+    use proto::startup::valid_prefix;
+    for ok in [&b"."[..], b"/", b"/svc", b"/dev/net", b"/a.b/c-d"] {
+        assert!(valid_prefix(ok), "{:?}", core::str::from_utf8(ok));
+    }
+    for bad in [
+        &b""[..],
+        b"svc",
+        b"./x",
+        b"/svc/",
+        b"//x",
+        b"/a//b",
+        b"/a/../b",
+        b"/a/./b",
+        b"/a b",
+        b"/nul\0",
+        &[b'/'; 1025][..],
+    ] {
+        assert!(!valid_prefix(bad), "{:?}", bad);
+    }
+    // a message with a /svc entry round-trips, and eight entries is the limit
+    let s = Startup {
+        namespace: vec![
+            (b"/".to_vec(), 0),
+            (b"/svc".to_vec(), 1),
+            (b"/dev".to_vec(), 2),
+        ],
+        ..Startup::default()
+    };
+    let bytes = s.encode().unwrap();
+    assert_eq!(Startup::decode(&bytes, 3).unwrap(), s);
+    let many = Startup {
+        namespace: (0..9).map(|i| (format!("/n{i}").into_bytes(), i)).collect(),
+        ..Startup::default()
+    };
+    assert_eq!(many.encode(), Err(StartupError::Limit));
+}

@@ -595,9 +595,8 @@ account, OD77); leak checks exact; the existing programs unchanged.
 - [x] Step 0: spec (`SD-SPEC.md`) and OD97
 - [x] Step 1: the pure directory logic (`svc::directory`: names, listeners, stale entries, views; model tests, mutation-checked)
 - [x] Step 2 (the registry service): `registryd` on `rt::service`, the `PUBLISH` right (bit 16), ops 16 to 18 (`Publish`, `Unpublish`, `View`) and status `UNAVAILABLE` (-109) in `proto::file`, `Role::ServiceRegistry`, `Fs::publish/unpublish/view`, and `registry_publish_open_unavailable_and_views` (publish, forwarded open answered by the service, no hijack, views list and hide, stale then UNAVAILABLE then republished, unpublish; mutation-checked). `rt::service` gained `other_event`, `Core::port` and `has_conn`
-- [ ] Step 2: generic named entries in the startup message; `rt` and the launcher; the closed `Role` enum retired for services
-- [ ] Step 3: the shell grants a `/svc` view; existing servers publish themselves (`memfsd`, `consoled`, `launcher`)
-- [ ] Step 4: clients reconnect on `UNAVAILABLE` in the service runtime; documents (T15, T30 narrowed)
+- [x] Step 3 (was 2 here; numbering follows SD-SPEC): the startup message's namespace accepts arbitrary absolute prefixes (`proto::startup::valid_prefix`, up to 8 entries; `/svc` is the one the registry uses); `rt::startup` already looks entries up by prefix, and the launcher validates the message through the same decoder. The closed `Role` enum is **not** retired for services yet
+- [ ] Step 4: the shell grants a `/svc` view; existing servers publish themselves and serve forwarded opens on a listener (`memfsd`, `launcher`, `devmgr`, `blkd`); clients (`rt::fs`, the shell) reconnect on `UNAVAILABLE`; documents (T15, T30 narrowed). **Deliberately deferred** until the first new service (the network stack, S8) needs it: migrating `init`, `sh` and every server now would rewire the whole boot path for no new capability, and the first real client of the directory should shape the reconnect policy
 
 Estimated size (not measured): 4 to 5 PRs; a Fable review.
 
