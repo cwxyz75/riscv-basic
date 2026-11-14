@@ -36,6 +36,12 @@ pub mod flags {
 pub mod op {
     pub const OPEN: u16 = 1;
     pub const CLONE: u16 = 2;
+    /// Like `CLONE`, but the new connection is the root of a **new account** with the limits in the request
+    /// (`a`: connections in the low 32 bits and requests in flight in the high 32; `b`: bytes held for slow
+    /// readers). Valid on a connection of either kind. The new account's limits may not exceed the
+    /// connection's own account's (BAD_REQUEST), and everything it uses is also charged to that account.
+    /// A server that does not support accounts answers NOT_SUPPORTED. (Slice R, OD84, R-SPEC.md section 3.)
+    pub const ACCOUNT: u16 = 8;
     pub const READDIR: u16 = 3;
     pub const MKDIR: u16 = 4;
     pub const UNLINK: u16 = 5;
@@ -53,14 +59,14 @@ pub mod op {
     /// How many handles a request with this op carries (`None`: unknown op).
     pub fn handles(op: u16) -> Option<usize> {
         match op {
-            OPEN | CLONE => Some(1),
+            OPEN | CLONE | ACCOUNT => Some(1),
             READDIR | MKDIR | UNLINK | RENAME | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT
             | GETVMO => Some(0),
             _ => None,
         }
     }
 
-    /// Does this op belong to a directory connection only? (`CLONE` is valid on both kinds; every
+    /// Does this op belong to a directory connection only? (`CLONE` and `ACCOUNT` are valid on both kinds; every
     /// other op that is not listed here belongs to file connections.)
     pub fn is_directory_op(op: u16) -> bool {
         matches!(op, OPEN | READDIR | MKDIR | UNLINK | RENAME | STAT)

@@ -179,11 +179,30 @@ impl<C> Core<C> {
                 sys::handle_close(handle);
             }
         }
+        let account = self.conns.account(key);
         if let Some(slot) = self.conns.remove(&mut self.accounts, key) {
             sys::port_unbind(self.port, key);
             sys::handle_close(slot.ch);
             self.own.remove(&slot.koid);
             self.closed.push(slot.state);
+            if let Some(a) = account {
+                self.reap_account(a);
+            }
+        }
+    }
+
+    /// Close an account that has no connections and no sub-accounts left, and its parents that become
+    /// idle too (an account is only "the connections descended from one root"; with none left it is gone).
+    fn reap_account(&mut self, mut a: AccountId) {
+        while a != svc::ROOT {
+            let parent = self.accounts.parent(a);
+            if self.accounts.close(a).is_err() {
+                break;
+            }
+            match parent {
+                Some(p) => a = p,
+                None => break,
+            }
         }
     }
 

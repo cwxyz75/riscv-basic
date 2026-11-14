@@ -183,7 +183,7 @@ Rules:
   dropped); every allocation a client can drive is fallible, so the worst case (8 + 2 + 2 MiB
   plus message copies) fits the server's 16 MiB heap; **at most 200 live connections in all** (one port holds 256 bindings,
   leaving room for the service channel); excess `Open`/`Clone` is `QUOTA`. Servers cannot tell
-  clients apart (INVARIANTS H5), so per-client limits are not specified.
+  clients apart (INVARIANTS H5), so the limits above are a pool; **`8 Account(rights; a = connections | in-flight << 32, b = held bytes)+endpoint`** (slice R, OD84; valid on either kind of connection) is a `Clone` whose new connection is the root of a new *account*: a set of limits, no identity. Everything opened or cloned from it is charged to it and to the account above it; its limits may not exceed its parent's (`BAD_REQUEST`); excess is `QUOTA`; the account is gone when its last connection closes. A holder of a connection can therefore confine whatever it hands its own connections to, by handing over an accounted one.
 - `Open` needs READ on the directory connection (it traverses), `Mkdir`/`Unlink`/`Rename`/`SetSize`/`Write`
   need WRITE, `GetSize` needs READ or WRITE (S7e: append and `lseek(SEEK_END)` on a write-only file need it), `ReadDir` needs ENUMERATE, everything else READ. The server also refuses an endpoint
   whose peer end it already serves (`object_info`): both ends of one channel handed over would
