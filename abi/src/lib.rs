@@ -36,6 +36,9 @@ pub mod status {
         NotSupported = -11,
         TimedOut = -12,
         BadSyscall = -13,
+        /// Reserved (slice T, T56): a blocking call that was told to stop by `thread_interrupt`. Nothing
+        /// returns it yet; callers should treat it like a retry.
+        Interrupted = -14,
     }
 
     impl Status {
@@ -59,6 +62,7 @@ pub mod status {
                 -11 => Status::NotSupported,
                 -12 => Status::TimedOut,
                 -13 => Status::BadSyscall,
+                -14 => Status::Interrupted,
                 _ => return None,
             })
         }
@@ -283,6 +287,9 @@ pub mod syscall {
     pub const THREAD_CREATE: usize = 60;
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
+    /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then
+    /// answers NOT_SUPPORTED.
+    pub const THREAD_INTERRUPT: usize = 63;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;

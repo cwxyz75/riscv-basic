@@ -751,7 +751,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_KILL
         | nr::PROCESS_INFO
         | nr::THREAD_CREATE
-        | nr::THREAD_INFO => {
+        | nr::THREAD_INFO
+        | nr::THREAD_INTERRUPT => {
             let r = process_call(n, a);
             notify();
             reply(frame, r);
@@ -2224,6 +2225,8 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::THREAD_CREATE => thread_create(a),
         nr::THREAD_INFO if wide(0) => bad(Status::BadHandle),
         nr::THREAD_INFO => thread_info(a),
+        nr::THREAD_INTERRUPT if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_INTERRUPT => thread_interrupt(a),
         _ => bad(Status::BadSyscall),
     }
 }
@@ -2689,6 +2692,21 @@ fn thread_create(a: [u64; 6]) -> Reply {
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     thread::spawn_free_detached("user", 10, user_thread_main, token);
     Ok((Some(u64::from(handle)), None))
+}
+
+/// `thread_interrupt(thread)`: reserved (T56). The place exists so nothing built meanwhile assumes a wait cannot
+/// be interrupted; it checks the handle the way the real call will (a thread handle with MANAGE) and then
+/// says NOT_SUPPORTED.
+fn thread_interrupt(a: [u64; 6]) -> Reply {
+    let th = Handle(a[0] as u32);
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        ipc::thread_of(&s.objs, &caller.handles, th, Rights::MANAGE)
+            .map_err(|e| (e, None, None))?;
+        bad(Status::NotSupported)
+    })
 }
 
 fn thread_info(a: [u64; 6]) -> Reply {

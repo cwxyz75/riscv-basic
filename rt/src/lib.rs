@@ -400,6 +400,10 @@ pub mod sys {
             ],
         )
     }
+    /// Reserved (T56): always NOT_SUPPORTED for a valid thread handle.
+    pub fn thread_interrupt(thread: u32) -> Ret {
+        syscall(THREAD_INTERRUPT, [thread as usize, 0, 0, 0, 0, 0])
+    }
     pub fn thread_exit(code: i32) -> ! {
         syscall(THREAD_EXIT, [code as usize, 0, 0, 0, 0, 0]);
         loop {

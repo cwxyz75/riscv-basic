@@ -43,6 +43,7 @@ entries before their implementation (S3b, S3c).
 | BUFFER_TOO_SMALL | -8 | the caller's buffer cannot hold the result (sizes are returned) |
 | TOO_BIG | -9 | a message or list is over a limit |
 | BAD_STATE | -10 | the object is not in a state that allows this |
+| INTERRUPTED | -14 | **reserved** (T56): a blocking call that was told to stop; nothing returns it yet |
 | NOT_SUPPORTED | -11 | valid request the kernel will not do (e.g. a channel endpoint sent over itself) |
 | TIMED_OUT | -12 | a wait reached its deadline |
 | BAD_SYSCALL | -13 | no such syscall number |
@@ -179,6 +180,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
+| 63 | thread_interrupt | `a0` thread | reserved: NOT_SUPPORTED |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 | 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
 | 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
@@ -598,6 +600,15 @@ mode or goes idle, and the lock follows the thread across a context switch (INVA
 With several harts, syscalls on different harts serialise on it (TIDY-UP T11).
 
 ## Sockets and ports (S3c-3)
+
+### thread_interrupt(thread) -> status
+
+**Reserved** (slice T, T56; cancellation is wanted and deliberately deferred). It will tell a thread to stop what it is
+blocked in; today it validates the handle (BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED, the right being MANAGE) and answers
+NOT_SUPPORTED, so nothing built meanwhile can assume a wait cannot be interrupted. When it is built, every blocking
+call (`object_wait`, `port_wait`, `channel_call`, `futex_wait`) may return INTERRUPTED (-14): callers must treat that
+status like a retry, and the C library's `pthread_cancel` and the service runtime's request cancellation will be built on
+it. Tests: `thread_interrupt_is_reserved`.
 
 ### Sockets
 

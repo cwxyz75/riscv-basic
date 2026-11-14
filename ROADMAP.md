@@ -567,7 +567,7 @@ the thread and `channel_call` benchmark before and after; the whole suite at one
 - [ ] Step 2: a growable heap window replaces the fixed heap's limit (grown at safe points from the frame database; T-SPEC revision: no pool, no slab)
 - [x] Step 3 (partly): kernel stacks are charged to the thread's job (four pages per live thread; `thread_stacks_are_charged_to_the_job_and_credited_back`). The memory of kernel objects themselves is still not charged and the OD50 caps are not revisited (T1, T13 stay open)
 - [x] Step 4: thread creation was already one syscall (`thread_create` starts the thread); stacks are pooled (slots recycled); the deferred reaper already frees detached threads; the limits are raised from 8 and 128 to 256 per process and 1024 in all; `thousands_of_threads_come_and_go` creates and ends 2000 threads in one process with the end-of-suite leak checks watching
-- [ ] Step 5: the reserved interrupt stubs and documents; T13 resolved, T1 narrowed
+- [x] Step 5: the reserved cancellation places: `INTERRUPTED` (-14) in the status table and `thread_interrupt` (syscall 63, validates its handle, answers NOT_SUPPORTED; `thread_interrupt_is_reserved`), SYSCALLS.md says every wait may one day return INTERRUPTED. T1 narrowed (stacks charged). **Not done**: step 2 (the growable heap) and with it T13, which stays open
 
 Estimated size (not measured): 5 to 6 PRs; a Fable review.
 
