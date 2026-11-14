@@ -15,9 +15,11 @@ extern crate alloc;
 
 pub mod accounts;
 pub mod conns;
+pub mod directory;
 
 pub use accounts::{AccountId, Accounts, Limits, DEFAULT_LIMITS, ROOT};
 pub use conns::{ConnTable, Held};
+pub use directory::{Directory, Lookup, View};
 
 /// Why the runtime refused something. Never a client's fault to retry blindly: it is a policy answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
