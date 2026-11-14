@@ -64,7 +64,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +77,8 @@ jobs:
             targets: os-boot-test-release
           - name: four harts
             targets: os-boot-test-smp
+          - name: four harts (negative controls, serial)
+            targets: os-boot-test-smp-neg
           - name: AIA, RVA23, serial
             targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
     steps:
