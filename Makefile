@@ -195,11 +195,13 @@ os-boot-test-overflow: kernel-main
 # harts, compared with the checked-in baseline (a 3x slowdown fails). The numbers are QEMU debug-build costs on whatever
 # machine runs them: look at the printed ratios, and update `bench/baseline.tsv` on purpose (and the table in
 # TESTING.md) when a change is meant to move them.
+# (3x on the machine that made the baseline; CI runners are several times slower, so soak.yml sets BENCH_RATIO=10)
+BENCH_RATIO ?= 3
 os-bench: kernel-main
 	rm -f target/bench.tsv
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
-	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv
+	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
 
 os-boot-test-polling: kernel
 	OS_MACHINE=virt python3 scripts/os_boot_test.py $(OS_ELF)
