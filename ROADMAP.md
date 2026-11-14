@@ -474,7 +474,7 @@ and after; a negative control that skips the FP save.
 
 Estimated size (not measured): 3 to 5 PRs; a Fable review (kernel context switching).
 
-### R: The service runtime (planned; not started)
+### R: The service runtime (specified, OD84; step 1 partly built)
 
 Decision (2026-11-14, owner, OD77): one service loop in `rt`, and accounted connections. Fixes design review
 D7 (nobody uses `channel_call`), D8 (backpressure solved five ways), D11 (servers cannot tell clients apart)
@@ -492,8 +492,8 @@ floods a server with connections exhausts only its own account; a slow client st
 single backpressure policy; the same protocol-violation behaviour for every ported server; leak checks
 exact; the benchmark for a request/reply round trip.
 
-- [~] Step 0: spec: a draft v0 is in `R-SPEC.md` (written unattended; the open questions need the owner) and OD (the loop, the accounted-connection protocol change, the backpressure policy) is still to be logged once they are answered
-- [ ] Step 1: the service-loop library with its own tests (host-testable pieces pure)
+- [x] Step 0: spec (`R-SPEC.md`; the five open questions were answered by the owner on 2026-11-14, all as recommended) and OD84
+- [~] Step 1: the pure core is built: the `svc` crate (accounts with nesting and all-or-nothing charges along the chain, the connection table with never-reused keys, held replies with a first-held-first order and a timeout), model-tested against an independent recomputation of usage and mutation-checked. **Not done**: the runtime around it in `rt` (`Service` trait, port loop, held-reply polling, the typed client)
 - [ ] Step 2: accounted connections in the file protocol and `memfsd`; per-account quotas
 - [ ] Step 3: `memfsd` on the library; then `consoled`, `launcher`, `devmgr`, `blkd`
 - [ ] Step 4: documents; T28, T30 (launcher single client) and D11 resolved or narrowed
