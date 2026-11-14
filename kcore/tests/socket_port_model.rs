@@ -1,7 +1,7 @@
 //! Sockets and ports: hand-derived scenarios for every status in SYSCALLS.md, and a random
 //! test of socket streams and port readiness against an independent reference model.
 mod common;
-use abi::limits::{MAX_PORT_BINDINGS, SOCKET_BUFFER};
+use abi::limits::SOCKET_BUFFER;
 use abi::rights::Rights;
 use abi::signals;
 use abi::status::Status;
@@ -286,19 +286,83 @@ fn port_unbind_destroyed_objects_and_errors() {
 }
 
 #[test]
-fn port_binding_limit() {
+fn port_bindings_have_no_fixed_cap() {
+    // the limit is the job's quota (`job_ipc_quota.rs`), not a count: far more than the old 256 bind
     let (mut reg, mut t) = world();
     let port = port_create(&mut reg, &mut t).unwrap();
     let e = event_create(&mut reg, &mut t).unwrap();
-    for k in 0..MAX_PORT_BINDINGS as u64 {
+    for k in 0..2000u64 {
         port_bind(&mut reg, &t, port, e, 1 << 24, k).unwrap();
     }
-    assert_eq!(
-        port_bind(&mut reg, &t, port, e, 1 << 24, 9999),
-        Err(Status::NoMemory)
-    );
     port_unbind(&mut reg, &t, port, 7).unwrap();
-    port_bind(&mut reg, &t, port, e, 1 << 24, 9999).unwrap();
+    port_bind(&mut reg, &t, port, e, 1 << 24, 7).unwrap();
+}
+
+#[test]
+fn oneshot_bindings_deliver_once_until_rearmed() {
+    let (mut reg, mut t) = world();
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let e = event_create(&mut reg, &mut t).unwrap();
+    let mut jobs = kcore::job::Jobs::new();
+    let m = 1u32 << 24;
+    port_bind_flags_in(
+        &mut reg,
+        &t,
+        port,
+        e,
+        u64::from(m),
+        1,
+        abi::port_flags::ONESHOT,
+        &mut jobs,
+    )
+    .unwrap();
+    port_bind(&mut reg, &t, port, e, m, 2).unwrap(); // a level-triggered one on the same signal
+    event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
+    // both are ready: the one-shot is reported once, the level binding keeps reporting
+    let mut seen = vec![];
+    for _ in 0..4 {
+        seen.push(
+            port_poll_in(&mut reg, &t, port, &mut jobs)
+                .unwrap()
+                .unwrap()
+                .0,
+        );
+    }
+    assert_eq!(seen.iter().filter(|&&k| k == 1).count(), 1, "{seen:?}");
+    assert!(seen.iter().filter(|&&k| k == 2).count() >= 3, "{seen:?}");
+    // while disarmed it is quiet even though the level is still high; re-arming makes it ready again
+    port_unbind(&mut reg, &t, port, 2).unwrap();
+    assert_eq!(port_poll_in(&mut reg, &t, port, &mut jobs).unwrap(), None);
+    port_rearm_in(&mut reg, &t, port, 1, &mut jobs).unwrap();
+    assert_eq!(
+        port_poll_in(&mut reg, &t, port, &mut jobs)
+            .unwrap()
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(port_poll_in(&mut reg, &t, port, &mut jobs).unwrap(), None);
+    // re-arming while the level is low delivers nothing until it rises
+    event_signal(&mut reg, &t, e, 1 << 24, 0).unwrap();
+    port_rearm_in(&mut reg, &t, port, 1, &mut jobs).unwrap();
+    assert_eq!(port_poll_in(&mut reg, &t, port, &mut jobs).unwrap(), None);
+    event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
+    assert_eq!(
+        port_poll_in(&mut reg, &t, port, &mut jobs)
+            .unwrap()
+            .unwrap()
+            .0,
+        1
+    );
+    // errors: unknown key, unknown flag bits
+    assert_eq!(
+        port_rearm_in(&mut reg, &t, port, 77, &mut jobs),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        port_bind_flags_in(&mut reg, &t, port, e, u64::from(m), 3, 2, &mut jobs),
+        Err(Status::InvalidArgs)
+    );
 }
 
 /// A random walk over two sockets and a port bound to the readable end, against a

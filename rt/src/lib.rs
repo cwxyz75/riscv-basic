@@ -364,6 +364,23 @@ pub mod sys {
             ],
         )
     }
+    /// `port_bind` with flags (`abi::port_flags::ONESHOT`).
+    pub fn port_bind_flags(port: u32, object: u32, mask: u32, key: u64, flags: u64) -> Ret {
+        syscall(
+            PORT_BIND,
+            [
+                port as usize,
+                object as usize,
+                mask as usize,
+                key as usize,
+                flags as usize,
+                0,
+            ],
+        )
+    }
+    pub fn port_rearm(port: u32, key: u64) -> Ret {
+        syscall(PORT_REARM, [port as usize, key as usize, 0, 0, 0, 0])
+    }
     pub fn port_unbind(port: u32, key: u64) -> Ret {
         syscall(PORT_UNBIND, [port as usize, key as usize, 0, 0, 0, 0])
     }

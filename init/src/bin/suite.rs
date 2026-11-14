@@ -2920,6 +2920,11 @@ extern "C" fn worker_signal_later(arg: usize) -> ! {
     sys::thread_exit(0)
 }
 
+extern "C" fn worker_port_wait_then_report(arg: usize) -> ! {
+    let r = sys::port_wait(arg as u32, sys::clock_get() + 1000);
+    sys::thread_exit(if r.status == 0 { 0 } else { 1 })
+}
+
 extern "C" fn worker_write_later(arg: usize) -> ! {
     sleep_in_thread(6);
     // Let the waiter that the set-up calls woke go back to sleep: with one global wait queue a
@@ -3389,15 +3394,7 @@ fn port_argument_checks() -> Outcome {
         "wide handle"
     );
     ensure_eq!(st(sys::port_unbind(p, 1)), Some(S::Ok), "unbind");
-    // the binding limit
-    for k in 0..256u64 {
-        ensure_eq!(st(sys::port_bind(p, e, m, k)), Some(S::Ok), "binding {k}");
-    }
-    ensure_eq!(
-        st(sys::port_bind(p, e, m, 1000)),
-        Some(S::NoMemory),
-        "257th binding"
-    );
+    // (there is no fixed binding limit any more: `port_oneshot_rearm_and_many_bindings`)
     Ok(())
 }
 
@@ -3482,6 +3479,61 @@ fn port_wait_blocks_until_an_object_is_ready() -> Outcome {
         sys::clock_get() - t0
     );
     sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    Ok(())
+}
+
+/// Slice W step 6: a one-shot binding is delivered once and stays quiet (though its level is still
+/// high) until `port_rearm`; a blocked waiter is woken by the re-arm; and a port takes far more
+/// bindings than the old fixed cap of 256 (the job quota is the limit).
+fn port_oneshot_rearm_and_many_bindings() -> Outcome {
+    let p = port()?;
+    let ev = event()?;
+    let m = 1u32 << 24;
+    ensure_eq!(
+        st(sys::port_bind_flags(
+            p,
+            ev,
+            m,
+            5,
+            rt::abi::port_flags::ONESHOT
+        )),
+        Some(S::Ok),
+        "a one-shot binding"
+    );
+    ensure_eq!(
+        st(sys::port_bind_flags(p, ev, m, 6, 2)),
+        Some(S::InvalidArgs),
+        "an unknown flag"
+    );
+    ensure_eq!(
+        st(sys::port_rearm(p, 99)),
+        Some(S::InvalidArgs),
+        "unknown key"
+    );
+    sys::event_signal(ev, 0, m);
+    let r = sys::port_wait(p, 0);
+    ensure_eq!((r.status, r.a1), (0, 5), "delivered once");
+    let r = sys::port_wait(p, sys::clock_get() + 10);
+    ensure_eq!(
+        st(r),
+        Some(S::TimedOut),
+        "quiet until re-armed, the level is still high"
+    );
+    // a waiter blocked in port_wait is woken by the re-arm (the thread waits, we re-arm)
+    let t = new_thread(worker_port_wait_then_report, p as usize)?;
+    nap_ticks(5);
+    ensure_eq!(st(sys::port_rearm(p, 5)), Some(S::Ok), "re-arm");
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 100);
+    ensure_eq!(
+        st(r),
+        Some(S::Ok),
+        "the blocked waiter was woken by the re-arm"
+    );
+    // far more than 256 bindings
+    let p2 = port()?;
+    for k in 0..600u64 {
+        ensure_eq!(st(sys::port_bind(p2, ev, m, k)), Some(S::Ok), "binding {k}");
+    }
     Ok(())
 }
 
@@ -8720,6 +8772,10 @@ pub fn app_main() -> i32 {
         (
             "device_caps_need_the_resource",
             device_caps_need_the_resource,
+        ),
+        (
+            "port_oneshot_rearm_and_many_bindings",
+            port_oneshot_rearm_and_many_bindings,
         ),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),

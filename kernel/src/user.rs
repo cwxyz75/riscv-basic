@@ -785,6 +785,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::SOCKET_SHUTDOWN
                     | nr::PORT_BIND
                     | nr::PORT_UNBIND
+                    | nr::PORT_REARM
             ) {
                 notify();
             }
@@ -867,7 +868,13 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             Some(Status::BadHandle)
         }
         nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
-        nr::SOCKET_WRITE | nr::SOCKET_READ | nr::SOCKET_SHUTDOWN | nr::PORT_UNBIND if over(0) => {
+        nr::SOCKET_WRITE
+        | nr::SOCKET_READ
+        | nr::SOCKET_SHUTDOWN
+        | nr::PORT_UNBIND
+        | nr::PORT_REARM
+            if over(0) =>
+        {
             Some(Status::BadHandle)
         }
         nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
@@ -956,17 +963,23 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             Ok((Some(u64::from(port.0)), None))
         }
-        nr::PORT_BIND => ipc::port_bind_in(
+        nr::PORT_BIND => ipc::port_bind_flags_in(
             objs,
             &p.handles,
             h(0),
             h(1),
             a[2],
             a[3],
+            a[4],
             &mut kmem::get().vmos.jobs,
         )
         .map(|_| (None, None))
         .map_err(|e| (e, None, None)),
+        nr::PORT_REARM => {
+            ipc::port_rearm_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
+                .map(|_| (None, None))
+                .map_err(|e| (e, None, None))
+        }
         nr::PORT_UNBIND => {
             ipc::port_unbind_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
                 .map(|_| (None, None))
