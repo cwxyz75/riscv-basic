@@ -630,17 +630,27 @@ pub fn wait_deadline_registered(
     }
 }
 
-/// Wake thread `tid` if it is blocked (and leave a token if it is not, which a later queue wait
-/// consumes; harmless to waiters that re-check). Counts a wake only for a thread that was blocked.
-pub fn wake_blocked(tid: Tid) {
+/// Wake every thread in `tids` that is blocked, **then** reschedule once (SMP review finding 1, T62): all of
+/// them are runnable before any of them can run, so a woken high-priority thread cannot preempt the waker
+/// before the next one was woken (which, with a mid-priority hog on the hart, would leave the next one
+/// blocked until the waker ran again). A thread that is not blocked is left alone (harmless to waiters that
+/// re-check).
+pub fn wake_many(tids: &[Tid]) {
     irq::without(|| {
         let k = kernel();
-        if k.sched.state(tid) == Some(State::Blocked) {
-            WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        for &tid in tids {
+            if k.sched.state(tid) == Some(State::Blocked) {
+                WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = k.sched.wake_on(hart(), tid);
         }
-        let _ = k.sched.wake_on(hart(), tid);
         reschedule();
     });
+}
+
+/// Is `tid` blocked right now (a test hook)?
+pub fn is_blocked(tid: Tid) -> bool {
+    irq::without(|| kernel().sched.state(tid) == Some(State::Blocked))
 }
 
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts

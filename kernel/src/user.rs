@@ -102,6 +102,9 @@ struct UserState {
     /// VMOs whose last handle is gone but that some address space still maps: freed when the
     /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
     pending_vmos: Vec<u64>,
+    /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
+    /// hart skip the cleanup while one cleaner was preempted).
+    cleaning: alloc::collections::BTreeSet<Tid>,
     /// Thread starts waiting for their thread to run, by token.
     starts: BTreeMap<usize, ThreadStart>,
     next_token: usize,
@@ -160,6 +163,7 @@ fn state() -> &'static mut UserState {
             thread_pid: BTreeMap::new(),
             next_pid: 1,
             pending_vmos: Vec::new(),
+            cleaning: alloc::collections::BTreeSet::new(),
             starts: BTreeMap::new(),
             next_token: 1,
             ktable: HandleTable::new(256),
@@ -732,9 +736,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::FUTEX_WAKE => {
             let (r, woken) = futex_wake(a);
             // wake exactly the sleepers that were removed from the table, by id (not everyone)
-            for t in woken {
-                thread::wake_blocked(t as Tid);
-            }
+            let tids: Vec<Tid> = woken.into_iter().map(|t| t as Tid).collect();
+            thread::wake_many(&tids);
             reply(frame, r);
         }
         nr::PROCESS_CREATE
@@ -1364,22 +1367,22 @@ pub fn wake_signal_waiters() {
 /// table decide, and wake those threads by id. Called after every syscall and wherever a signal can have
 /// changed outside one.
 pub fn commit_wake() {
-    let woken = irq::without(|| {
+    // (the wakes are made in the same critical section as the commit, and as one batch: every woken thread
+    // is runnable before any of them runs, T62)
+    irq::without(|| {
         let s = state();
         let UserState { objs, waits, .. } = s;
         let dirty = objs.take_dirty();
         if dirty.items.is_empty() && !dirty.overflow {
-            return Vec::new();
+            return;
         }
-        waits.commit(
+        let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
             |id| matches!(objs.get(id), Some(ipc::KObj::Port(_))),
             dirty,
-        )
+        );
+        thread::wake_many(&woken);
     });
-    for t in woken {
-        thread::wake_blocked(t);
-    }
 }
 
 /// Clean up what the syscall destroyed and wake exactly the threads whose wait it ended (slice W: the
@@ -1390,27 +1393,23 @@ pub fn notify() {
     commit_wake();
 }
 
-static CLEANING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// Do the kernel work that destroying objects calls for: free the pages of a VMO that has
 /// no handle left, and kill a process whose last handle was closed. (The registry cannot
 /// reach the frame database or the process table, so it hands the dead objects back.)
+///
+/// Every thread may clean (each drain takes its objects out of the registry atomically and every step
+/// below is its own locked section); what a thread must not do is recurse into itself, so a thread
+/// already cleaning skips, and its loop sees the work the nested call would have done (T63: the guard used
+/// to be one global flag, so while a cleaner was preempted every other hart skipped the cleanup).
 fn cleanup_dead() {
-    if CLEANING.swap(true, Ordering::SeqCst) {
-        return; // a cleanup is already running further up the stack; it will see our work
+    let me = thread::current();
+    if !irq::without(|| state().cleaning.insert(me)) {
+        return; // a cleanup is already running further up this thread's stack; it will see our work
     }
     loop {
         let dead = irq::without(|| state().objs.drain_dead());
         if dead.is_empty() {
-            // Clear the flag and look once more in the same interrupts-off step, so work
-            // pushed between the last drain and the clear is not stranded.
-            let again = irq::without(|| {
-                CLEANING.store(false, Ordering::SeqCst);
-                state().objs.has_dead()
-            });
-            if again && !CLEANING.swap(true, Ordering::SeqCst) {
-                continue;
-            }
+            irq::without(|| state().cleaning.remove(&me));
             return;
         }
         for obj in dead {
@@ -1523,9 +1522,7 @@ fn wake_threads_of(pid: u32) {
             .map(|(t, _)| *t)
             .collect()
     });
-    for t in tids {
-        thread::wake_blocked(t);
-    }
+    thread::wake_many(&tids);
 }
 
 fn request_kill(pid: u32, code: i32) {

@@ -51,7 +51,7 @@ REQUIRED = [
     "equal_priority_hogs_share_the_cpu", "two_waiters_on_one_queue_wake_in_order",
     "a_thread_can_spawn_threads", "joining_nothing_does_not_hang",
     "stack_guard_damage_is_detected", "fp_unit_is_off", "scheduler_class_is_fixed_priority",
-    "higher_priority_runs_at_once_on_spawn", "lower_priority_waits_for_higher",
+    "higher_priority_runs_at_once_on_spawn", "wake_many_makes_every_waiter_runnable_before_any_runs", "lower_priority_waits_for_higher",
     "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
     "the_latency_test_can_fail",
     # S3b: user mode (the first group is reported by the user-level suite `init`, the second
@@ -89,7 +89,7 @@ REQUIRED = [
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
 # round-robin class must pass everything else.
 PRIORITY_ONLY = {
-    "higher_priority_runs_at_once_on_spawn", "lower_priority_waits_for_higher",
+    "higher_priority_runs_at_once_on_spawn", "wake_many_makes_every_waiter_runnable_before_any_runs", "lower_priority_waits_for_higher",
     "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
     "the_latency_test_can_fail",
 }
