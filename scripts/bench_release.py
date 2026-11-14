@@ -15,6 +15,7 @@ WORK = {
     "sort": "local t = {} for i = 1, 200000 do t[i] = (i * 7919) % 100003 end table.sort(t)",
     "string": "local s = 0 for i = 1, 200000 do s = s + #(tostring(i) .. string.rep('x', i % 7)) end",
     "syscalls": "io.stdout:setvbuf('no') for i = 1, 30000 do io.write(' ') end io.write('\\n')",
+    "float": "local s = 0.0 for i = 1, 100000 do s = s + math.sin(i) * 1.5 + i / 3 end",
     "alloc": "local x = {} for i = 1, 100000 do x[i] = {i, tostring(i)} end",
 }
 

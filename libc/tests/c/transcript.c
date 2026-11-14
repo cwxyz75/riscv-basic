@@ -240,6 +240,21 @@ static void jumps(void) {
         }
     }
     printf("loops %d\n", loops);
+    /* the callee-saved floating-point registers survive a longjmp (lp64d): set fs0, jump, clobber, jump */
+    {
+        int same = 1;
+#if defined(__riscv) && defined(__riscv_flen)
+        unsigned long before = 0x4008000000000000UL, after = 0; /* 3.0 */
+        __asm__ volatile("fmv.d.x fs0, %0" ::"r"(before) : "fs0");
+        if (setjmp(env) == 0) {
+            __asm__ volatile("fmv.d.x fs0, zero" ::: "fs0");
+            longjmp(env, 1);
+        }
+        __asm__ volatile("fmv.x.d %0, fs0" : "=r"(after));
+        same = after == before;
+#endif
+        printf("fp registers survive longjmp %d\n", same);
+    }
 }
 
 
