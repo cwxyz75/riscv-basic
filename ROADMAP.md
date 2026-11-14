@@ -498,7 +498,7 @@ Done as one PR rather than three (it was small). The Fable review is still to do
 
 Measured: one PR.
 
-### T: Kernel memory and threads (planned; not started)
+### T: Kernel memory and threads (specified in T-SPEC.md; steps 1 to 6 not started)
 
 Decision (2026-11-14, owner, OD79): design review D9. The fixed 8 MiB kernel heap, chosen in S1 for simplicity
 (OD29), is half the problem: every kernel cap (OD50) is hand-tuned to fit it (T13), and 32 KiB kernel stacks
@@ -525,7 +525,7 @@ silent corruption (a negative control that removes the guard must fail the test)
 (returns frames) under an allocation churn test; every OD50 cap test still ends in NO_MEMORY and never a panic;
 the thread and `channel_call` benchmark before and after; the whole suite at one, two and four harts.
 
-- [~] Step 0: measurement done (`thread::stack_high_water`, test `kernel_stacks_stay_well_inside_their_size`): the deepest kernel stack in the whole suite, debug build, was about 5.6 KiB of 32 KiB, so kernel stacks are now **16 KiB** (halving the thread cost; the heap is still the 8 MiB fixed region). Still to write: spec and OD (the allocator, the stack region, kernel memory charging, the reserved interrupt stubs) and its acceptance tests
+- [~] Step 0: measurement done (`thread::stack_high_water`, test `kernel_stacks_stay_well_inside_their_size`): the deepest kernel stack in the whole suite, debug build, was about 5.6 KiB of 32 KiB, so kernel stacks are now **16 KiB** (halving the thread cost; the heap is still the 8 MiB fixed region). Spec and OD written: `T-SPEC.md`, OD82 (a pool with its own lock refilled at safe points, slab classes, guard-paged stacks with an emergency stack, a kernel-memory level in the job quota, deferred reaper, one-syscall creation). The acceptance tests are written with each step
 - [ ] Step 1: kernel stacks from their own region with guard pages
 - [ ] Step 2: the slab allocator over frames replaces the fixed heap (interrupt-safe, fallible)
 - [ ] Step 3: kernel memory charged to jobs; OD50 caps revisited
