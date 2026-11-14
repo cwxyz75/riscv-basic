@@ -378,6 +378,14 @@ pub fn app_main() -> i32 {
             // SAFETY: as variant 5: traps and ends the process.
             unsafe { asm!("csrr t0, sstatus") };
         }
+        // 64: take our own process handle (every runtime program does, on its first heap growth), then
+        // spin: the parent closing its handle must still kill us (review 2026-11-14: it did not)
+        64 => {
+            let _ = rt::sys::process_self();
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         n if n & 0xff == 51 => {
             // S7b: a wake from another process on the same address number wakes nobody: the exit
             // code is 100 plus the number of threads it woke (0 expected), 1 if the call failed.

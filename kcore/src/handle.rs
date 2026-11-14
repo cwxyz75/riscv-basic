@@ -60,9 +60,17 @@ impl HandleTable {
         self.live == 0
     }
 
-    /// How many more handles fit.
+    /// How many more handles fit: the limit, and also the slots that can still be handed out
+    /// (a slot that has been through every generation is retired for good, so a table can run out of
+    /// slots while far below its limit; `insert` must then fail, and callers that checked `room`
+    /// must not find it failing).
     pub fn room(&self) -> usize {
-        self.limit - self.live
+        (self.limit - self.live).min(self.slots_left())
+    }
+
+    /// Slots that can still be handed out (free ones and unused ones).
+    fn slots_left(&self) -> usize {
+        self.free.len() + (SLOT_MASK as usize).saturating_sub(self.slots.len())
     }
 
     fn decode(&self, h: Handle) -> Option<usize> {
@@ -152,7 +160,7 @@ impl HandleTable {
             return Err(Status::AccessDenied);
         }
         let rights = Self::resolve_rights(entry.rights, rights)?;
-        if self.live >= self.limit {
+        if self.room() == 0 {
             return Err(Status::NoMemory);
         }
         if !reg.retain(entry.obj) {
@@ -172,6 +180,11 @@ impl HandleTable {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         let old = self.slots[slot].entry.expect("occupied");
         let rights = Self::resolve_rights(old.rights, rights)?;
+        // Removing may retire this slot (its last generation); then the new handle needs another
+        // one, and if there is none the replace must fail with the old handle untouched.
+        if self.slots[slot].gen + 1 >= GENERATIONS && self.slots_left() == 0 {
+            return Err(Status::NoMemory);
+        }
         let entry = self.remove(slot);
         // the old value stops working: waiters on it must re-validate (a forced touch)
         reg.touch_forced(entry.obj);
@@ -225,5 +238,55 @@ impl HandleTable {
                 reg.release(entry.obj);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{event_create, Kobjs};
+
+    /// A table whose slot vector is full of retired slots (the state `handle_replace` can drive a
+    /// table to after 2^31 calls, review 2026-11-14): `room` must say so and nothing that checked it
+    /// may panic; a replace that would retire the last usable slot fails with the handle untouched.
+    #[test]
+    fn a_table_out_of_slots_refuses_instead_of_panicking() {
+        let mut reg = Kobjs::new();
+        let mut t = HandleTable::new(64);
+        // slot 0 is free but on its last generation; every other slot is retired
+        t.slots.push(Slot {
+            gen: GENERATIONS - 1,
+            entry: None,
+        });
+        t.free.push(0);
+        for _ in 1..SLOT_MASK as usize {
+            t.slots.push(Slot {
+                gen: GENERATIONS,
+                entry: None,
+            });
+        }
+        assert_eq!(t.room(), 1, "one usable slot, far below the limit");
+        let h = event_create(&mut reg, &mut t).unwrap();
+        assert_eq!(t.room(), 0, "no slot left");
+        assert_eq!(
+            event_create(&mut reg, &mut t),
+            Err(Status::NoMemory),
+            "create"
+        );
+        assert_eq!(
+            t.duplicate(&mut reg, h, Rights::SAME),
+            Err(Status::NoMemory),
+            "duplicate"
+        );
+        assert_eq!(
+            t.replace(&mut reg, h, Rights::SAME),
+            Err(Status::NoMemory),
+            "replace would retire the slot with nowhere to go"
+        );
+        assert!(t.get(h).is_ok(), "the handle survived the failed replace");
+        let live_before = reg.live();
+        let _ = t.duplicate(&mut reg, h, Rights::SAME);
+        assert_eq!(reg.live(), live_before, "no object leaked");
+        t.drain(&mut reg);
     }
 }

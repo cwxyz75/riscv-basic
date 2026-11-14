@@ -61,7 +61,9 @@ Proposed wire change (file protocol, S4-SPEC section 7): a new op `Account(limit
 (`op 8`) answered with a fresh root connection to the same node; `Open`/`Clone` from an accounted connection are
 charged to its account. Rights are unchanged. A server that does not support accounts answers `NOT_SUPPORTED`.
 
-## 4. Open questions for the owner
+## 4. Open questions for the owner (all answered 2026-11-14: yes to every recommendation)
+
+Decided: (1) a fixed default per account, about 16 connections and 64 KiB held, overridable per program by the launcher, the parent job's limits as the outer cap; (2) accounts nest, a child's limits only shrink and are charged to the parent's; (3) the `Service` trait, with a service free to opt out of the default reply policy (`consoled`); (4) one thread per port until the wake-one baton exists, then a thread pool per port (T60); (5) port `memfsd` first, then `consoled`, `launcher`, `devmgr`, `blkd`; and the `Account(limits)` op (op 8) of section 3 is approved.
 
 1. **Account limits and defaults**: what are the per-account connection and held-byte limits, and who sets them
    (the launcher per program, a fixed default, the parent's job limits)?
