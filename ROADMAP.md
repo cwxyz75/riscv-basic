@@ -293,7 +293,7 @@ Acceptance: every earlier suite passes with `-smp 4` in normal mode (icount only
 - [x] Secondary harts via SBI HSM; per-hart state (`satp`, timers, idle threads) and a multi-hart scheduler core with **one global run queue per priority under the big kernel lock** (S5a-S5c; per-hart run queues are slice L)
 - [x] IPIs and remote TLB shootdown (S5a, S5d; negative controls fail as required)
 - [x] Big kernel lock (S5b)
-- [ ] Finer locking on the hot paths (not done, TIDY-UP T11; the plan is slice L, which keeps one lock for object state and carves out only what measurement justifies)
+- [ ] Finer locking on the hot paths (not done, TIDY-UP T11; the plan is slice L, `SCHED-SMP-SPEC.md` tasks 10 to 20)
 - [x] Lock-order checker in debug builds; stress suite (S5b, S5e)
 
 ### S6: Storage drivers
@@ -355,7 +355,8 @@ Estimated size (not measured): steps 0 to 2 a day of work in two or three PRs; s
 
 The design review (`reviews/2026-11-14-design-review.md`) found a handful of structural things worth
 settling before the network stack is built on them. This is the proposed order; the owner can reorder.
-Slices A, W, V, T, R, SD, DM and I below each have a plan. L (locking) stays after S9.
+Slices A, W, V, T, R, SD, DM and I below each have a plan. L (locking) is redefined by `SCHED-SMP-SPEC.md` (OD85 to OD96): its
+first tasks come before S8 and the measured lock peels after S9, as set out in the slice below.
 
 0. **Slice TS: tiered testing** (steps 0 to 2 done; step 3 spread over later slices).
 1. Tidy the stale contract documents (T55, design review D14): cheap, and everything else leans on them.
@@ -370,7 +371,11 @@ Slices A, W, V, T, R, SD, DM and I below each have a plan. L (locking) stays aft
 7. Slice SD: the service directory and namespaces (goes with R).
 8. Slice DM: the device manager overhauled (table-driven, several devices and clients).
 9. Slice I: AIA interrupts.
-10. S8, then S9; then L (locking carve-outs).
+9a. Slices **B** (benchmark and latency instrumentation), **SC** (two-band scheduler, priority API, nanosecond time), the
+    thread API (`thread_spawn`) and the block/wake protocol: tasks 1 to 10 of `SCHED-SMP-SPEC.md`, so the service runtime and the
+    network servers are written once against the final thread API.
+10. S8; then tasks 11 and 12 (per-hart queues, the scheduler out of the big kernel lock) after its first milestone, with the
+    network stack as the load; then S9; then the measured lock peels (tasks 15 to 20).
 
 ### W: Targeted wake and ports as registrations (planned, before S8; not started)
 
@@ -615,45 +620,53 @@ in-OS HTTP server serving memory-filesystem files; the lossy-link suite passes.
 - [ ] Simulated lossy/reordering link suite
 - [ ] HTTP server demo; DNS resolver
 
-### L: Kernel locking carve-outs (planned, proposed after S9; not started)
+### L: Scheduler, SMP and threads (specified in SCHED-SMP-SPEC.md, OD85 to OD96; not started)
 
-Why: the design review (finding D2) found that kernel state is global by construction (one `UserState`,
-one registry of all objects, a job ledger inside the VMO store, a reachability sweep that needs every
-handle table at once, a global run queue), so "push per-object locks down" is not an incremental step.
-The recommended direction keeps **one lock for object, handle, VMO and job state** (short, pure code,
-and it keeps the model tests' shape) and carves out only what measurably hurts. Basis:
-`reviews/2026-11-14-design-review.md` (D2). Replaces the "rung 3, per-object locks" plan in
-`OS-ARCHITECTURE.md` section 7 (as an OD, step 0). This is the "redo SMP" direction made concrete, in a
-smaller form than first imagined.
+Supersedes the earlier plan for this slice (the design review's D2 carve-outs, kept as history in the review). The whole
+design is `SCHED-SMP-SPEC.md`: domain spinlocks in one checked order with the big kernel lock shrinking to the object lock
+(OD85), one block/wake path (OD86), per-hart run queues with RT and normal bands (OD87), priority donation and a PI futex
+(OD88), priority as a job capability (OD89), RT budgets (OD90), nanosecond time with one-shot timers and timer slack (OD91),
+`thread_spawn` and quota-derived thread limits (OD92), ASIDs and ranged shootdowns (OD93), direct hand-off (OD94), the `klock`
+crate (OD95) and measurement (OD96). Slices named in the list: **B** benchmark, **SC** two-band scheduler, **TH** threads,
+**TM** timers, **RT** real-time, **L** lock peels, **W** the remainder of targeted wake.
 
-Placement: after slice W (it needs W's prepare/commit/cancel wait API) and, as proposed, after S8/S9, so
-that the carve-outs are chosen against a realistic multi-threaded load instead of our own test suite.
-The owner may move it earlier.
+**Gate (owner, 2026-11-14):** tasks 1 to 10 before S8; tasks 11 and 12 after S8's first milestone; tasks 13, 14 and 21 to 28
+may follow S8; tasks 15 to 20 after S9, in the order the contention profile gives (the order given is a prediction). Stopping
+after task 12 leaves a coherent system; stopping after task 20 leaves the final execution model. **Deferred:** the EEVDF-style
+hierarchical fair class (only its stubs and preconditions are built), splitting the object lock, shared futexes, suspend and
+resume. The object lock stays one lock (owner defers to the spec; revisit on its measured trigger).
 
-Decisions taken (2026-11-14, owner): follow the reviewer's recommendations. The reachability sweep
-**stays** (it is compatible with one retained object lock; revisit only if a later measurement says
-otherwise). Carve-outs, each only if step 0's measurements show it pays: (1) the scheduler and wait/wake
-path with real per-hart run queues under their own leaf lock; (2) user copies and page zeroing done
-outside the big lock (pin, copy, re-lock); (3) mappings hold a reference on their VMO, so `reap_vmos`,
-the scan of every address space, disappears; (4) candidates for lock-free fast paths that touch only
-scheduler or futex state (`yield`, `sleep`, `clock_get`, futex wait and wake with a leaf table lock),
-decided by the measurements.
+- [ ] Task 1 (slice B, Built): Benchmark suite, `##BENCH`, `make os-bench`, the baseline table in `TESTING.md`; restate 5.2's targets as absolute numbers. *Acceptance, written first:* the harness rejects a malformed `##BENCH`; the baseline file exists; a deliberate 3x slowdown fails `bench_compare.py`. *Needs:* nothing. *Review:* default.
+- [ ] Task 2 (slice B, Built): `latency-trace`: interrupts-off maximum with site, BKL wait and hold per syscall, the RT histogram (kernel-thread probe). *Acceptance, written first:* `the_latency_trace_can_see_a_long_section` (a test section of known length is reported within 20%); restate 3.12's budget with measured values. *Needs:* 1. *Review:* default.
+- [ ] Task 3 (slice B, Built): Debts the peels would inherit: `wake_many` (T62), the cleanup guard (T63), the scheduler clock from `time` (T40). *Acceptance, written first:* the T62 scenario (one low waker, two high waiters, a hog, one hart) as a failing test first; `ticks_do_not_stretch_under_lock_contention`. *Needs:* nothing. *Review:* Fable (small).
+- [ ] Task 4 (slice B, Built): The T38 shuttle model of today's idle/wake/IPI protocol; fix T65; `wfi_returns_with_interrupts_masked`. *Acceptance, written first:* the model fails on each of its three negative controls and passes on the code. *Needs:* nothing. *Review:* default.
+- [ ] Task 5 (slice paper, ): Accept this document: the ODs, the planned lock table in INVARIANTS, reserved syscall numbers, ROADMAP, TIDY-UP (section 8). *Acceptance, written first:* `check_docs.py` passes; no code. *Needs:* nothing. *Review:* owner.
+- [ ] Task 6 (slice SC, Stub (structure; behaviour as today)): `kcore::sched` v2: `SchedAttr`, `ThreadSched`, the new `SchedClass`, `HartRq` hosting RT + normal + idle, `PrioQueues`, nanosecond clock and accounting hooks. The kernel still runs it in **shared-queue mode** (one set of class queues for all harts, per-hart `cur`, as today) under the BKL. *Acceptance, written first:* differential test against `sched_v1`; conformance suite per class; AC1; the whole suite unchanged. *Needs:* 3. *Review:* default.
+- [ ] Task 7 (slice SC, Stub (graph built, unused)): `kcore::donate`, wired to `HartRq::set_effective`; no producer of edges yet. *Acceptance, written first:* DN1 to DN3 against the recompute reference, mutation-checked. *Needs:* 6. *Review:* default.
+- [ ] Task 8 (slice SC, Built (API, bounds); Stub (budget enforcement)): Authority and the priority API: job `max_prio`, `rt_budget`, `cpu_weight`; `job_set_sched`; `thread_set_sched`, `thread_get_sched`; inheritance and clamping; RT accounting without enforcement; `bin/rtdemo`. *Acceptance, written first:* PR1, PR2 in the job model; `a_confined_program_cannot_raise_its_priority`; the user-level RT latency demo with its negative control. *Needs:* 6. *Review:* Fable.
+- [ ] Task 9 (slice TH, Built): `thread_spawn` with a kernel-provisioned stack, the stack arena, tid in `a1`, `tp`; limits from quotas; `MAX_REGIONS` raised; `libc` and `rt` moved to it; launcher default 128 threads (Q5). *Acceptance, written first:* `ten_thousand_threads_leak_nothing`; `two_thousand_threads_live` (after slice T step 2); every error case of the entry; `thread_create_join` at most half the baseline. *Needs:* slice T step 2 for the 4096 backstop. *Review:* Fable.
+- [ ] Task 10 (slice L, Built): `klock` and the generalised order checker; the park protocol in `kcore`; every kernel wait converted to it **while still under the BKL**; the wake token and `WaitQueue` deleted. *Acceptance, written first:* the loom and shuttle park models with three negative controls; the checker's pair table. *Needs:* 4, 6. *Review:* Fable.
+- [ ] Task 11 (slice L, Built): Per-hart run queues under `RQ` locks taken *inside* the BKL; push and pull; `need_resched` (X7); `finish_switch`, the dead list and reap by the hart; the idle loop of 3.9; the watchdog. *Acceptance, written first:* GP1, GP2 on 1 to 8 harts against the independent reference; the idle model updated; `rt_threads_take_the_harts`; negative-control kernels `fault-skip-poke`, `fault-early-reap`, `fault-skip-pull`. *Needs:* 10. *Review:* Fable, soak.
+- [ ] Task 12 (slice L, Built: first peel done): The scheduler leaves the BKL: the lock is released at a switch (G4), the timer and IPI traps and `thread_yield`, `clock_get` and pure sleeps stop taking it. *Acceptance, written first:* `bkl_profile` shows zero BKL acquisitions from the tick; `pair_scaling` for futex-free yield pairs; the suite at 1, 2, 4. *Needs:* 11. *Review:* Fable, soak.
+- [ ] Task 13 (slice TM, Built): Per-hart timer queues, one-shot programming (Sstc probed, SBI fallback), slice timer only when needed; **timer slack** (4.11); the nanosecond ABI itself is in task 6. *Acceptance, written first:* timers model with the slack bounds and the interrupt-count property; `sleep_wakes_on_time` to 100 us for an RT thread; a hart with one runnable thread takes no timer interrupt (counter). *Needs:* 12. *Review:* default.
+- [ ] Task 14 (slice L, Built): Futex peel: bucket locks; `futex_wake` leaves the BKL; `futex_wait` holds it only to translate the address. *Acceptance, written first:* loom futex model extended (kill, timeout); `pair_scaling` futex ratio at least 3.0 at four harts. *Needs:* 12. *Review:* Fable.
+- [ ] Task 15 (slice L, Built): Mappings hold a VMO reference; `reap_vmos` deleted (pure `kcore`; slice L's old step 1). *Acceptance, written first:* `aspace_model` with the reference count; the leak suites. *Needs:* nothing. *Review:* default.
+- [ ] Task 16 (slice L, Built (locks exist, not yet relied on)): `JOBS`, `VMO`, `FRAME` as their own locks (still nested inside the BKL), the ledger moved out of the VMO store, per-hart frame caches. *Acceptance, written first:* the existing models; loom for the frame cache; exact frame oracles with caches. *Needs:* 10, 15. *Review:* default.
+- [ ] Task 17 (slice L, Built): Memory peel: per-process `AS`; page faults and user copies leave the BKL; chunked copies with preemption points. *Acceptance, written first:* loom: two faults, fault against unmap; `fault-skip-as-lock`; `pair_scaling` for faults and 64 KiB copies; B1 restated. *Needs:* 16. *Review:* Fable, soak.
+- [ ] Task 18 (slice L, Built): TLB: the ASID allocator, `ran_on`, batched range and ASID shootdown before the free, no flush on switch. *Acceptance, written first:* TLB1, TLB2; `fault-asid-reuse-no-flush`; the two existing negative controls. *Needs:* 17. *Review:* Fable, soak.
+- [ ] Task 19 (slice L, Built): `PROCS` and `TT`; process lifecycle, kill and teardown out of the BKL, chunked; preemption points in the remaining long legacy operations; the sweep decision (section 10). *Acceptance, written first:* `kill_a_spinner_on_another_hart`, teardown suites; `rt_latency` under teardown and sweep churn within B3. *Needs:* 17. *Review:* Fable, soak.
+- [ ] Task 20 (slice L, Built: final SMP model): The end of the BKL: `LEGACY` becomes `OBJ` with a commit-on-drop guard; object syscalls take it explicitly; syscalls run with interrupts on; K1 to K5 retired. *Acceptance, written first:* W-SPEC's loom model over the real guard; `wait-audit`; the whole budget of 3.12 asserted in soak; `pair_scaling` for channels at least 2.5 or T70's trigger evaluated. *Needs:* 19. *Review:* Fable, soak.
+- [ ] Task 21 (slice W, Built): The W remainder: `Call{txid}` registrations, the exact ready set and wake-one baton (T60), binding lifetime (T61). *Acceptance, written first:* W-SPEC section 5's port model and mutations. *Needs:* nothing. *Review:* Fable.
+- [ ] Task 22 (slice RT, Built): Donation through `channel_call` at receive. *Acceptance, written first:* `a_call_lends_its_priority_to_the_server`; the `ipc_model` edge audit; loom reply/timeout/kill. *Needs:* 7, 8, 21. *Review:* Fable.
+- [ ] Task 23 (slice RT, Built): PI futex. *Acceptance, written first:* PF1, PF2; the three QEMU tests of 6.2. *Needs:* 7, 8, 14. *Review:* Fable.
+- [ ] Task 24 (slice TH, Built): Direct hand-off: the sync wake hint and donation at wake. *Acceptance, written first:* `channel_call_rt` at most 60% of the baseline on one hart; no IPI counted on a same-hart call. *Needs:* 11, 21, 22. *Review:* default.
+- [ ] Task 25 (slice RT, Built): RT budgets enforced: hart throttle, job demotion, window events; `rr` rotation. *Acceptance, written first:* NM1 and demotion on the simulated clock; `a_runaway_rt_thread_does_not_hang_the_system`. *Needs:* 8, 13. *Review:* Fable.
+- [ ] Task 26 (slice TH, Built): `thread_interrupt` built; INTERRUPTED from every wait (T56). *Acceptance, written first:* each blocking call interrupted while blocked and before blocking; the flag is not lost between waits. *Needs:* 10. *Review:* default.
+- [ ] Task 27 (slice TH, Built): `rt::looper` and the debug deadlock checks; pthread mapping of priorities and PI mutexes. *Acceptance, written first:* a looper test program; a held-lock `call` panics in debug; the libc thread tests. *Needs:* 9, slice R. *Review:* default.
+- [ ] Task 28 (slice TM, Built): Tickless idle and tickless single-runner. *Acceptance, written first:* the idle model with the periodic tick removed; idle harts take zero timer interrupts over a second (counter). *Needs:* 13, 11. *Review:* default.
 
-Acceptance (written first): contention counters (BKL wait and hold time per syscall class, at `-smp 4`)
-and a scaling test (N independent process pairs doing `channel_call` ping-pong, throughput against one
-hart); a target set after the first measurement; a loom/shuttle model for every new lock (the order
-BKL then scheduler lock, the scheduler lock a leaf); negative-control kernels that skip each new lock
-and must fail their guarding test; the full existing suite, at `-smp 1, 2 and 4`.
-
-- [ ] Step 0: spec and OD (supersedes rung 3; the sweep stays; where each new lock sits in the order), contention counters, the scaling test and the first measurement
-- [ ] Step 1: mappings hold a VMO reference; `reap_vmos` removed (pure `kcore` change, model-tested)
-- [ ] Step 2: per-hart run queues under a scheduler leaf lock, work placement and balancing (uses W's wake API)
-- [ ] Step 3: user copies and page zeroing outside the big lock (needs a pin discipline against concurrent unmap, TLB shootdown and VMO commit, D3)
-- [ ] Step 4: lock-free or leaf-locked fast paths chosen by the measurements
-- [ ] Step 5: documents (INVARIANTS lock ordering, SYSCALLS execution model); T11, T38, T40 (and the range-shootdown idea, T39) revisited or resolved
-
-Risks: step 3 is the dangerous one (a copy racing an unmap or a kill); every step is a Fable review.
-Estimated size (not measured): 5 to 7 PRs, comparable to S5.
+Every task keeps the system bootable and green; every kernel or security task marked Fable gets an independent review in its
+own small PR, and the lock-peel tasks also get a soak run (`make soak`), at `-smp 1, 2 and 4`.
 
 ### S10: Namespaces and attributes
 
@@ -679,10 +692,10 @@ written down so they are not lost. Some have since been logged in `OS-ARCHITECTU
 acceptance checks and the place in the slice order are still to be written. The planned slices above (A, W,
 V, T, R, SD, DM, I, L) are the concrete versions; the items below are the original wording.
 
-- **Cheap kernel threads.** One-to-one kernel threads made cheap (creation in one syscall, small
+- **Cheap kernel threads.** *(Specified: `SCHED-SMP-SPEC.md`.)* One-to-one kernel threads made cheap (creation in one syscall, small
   kernel stacks, higher limits, direct hand-off on `channel_call`), pthreads as the POSIX shim over
   them, a native message-loop library for programs written for this OS. Measure first.
-- **Redo SMP and the scheduler** (now planned as slice L above, in a smaller form than first imagined; kept here as the original direction). Replace the big kernel lock with finer locking or per-hart state
+- **Redo SMP and the scheduler** *(Specified: `SCHED-SMP-SPEC.md`.)* (now planned as slice L above, in a smaller form than first imagined; kept here as the original direction). Replace the big kernel lock with finer locking or per-hart state
   with messages between harts; per-hart run queues and a wake path that wakes one thread (T11, T12,
   T38, T39). Better done after S8 and S9 give a realistic multi-threaded load to tune against.
 - **A layered API.** The native API (handles, rights, ports, VMOs, jobs, protocols) is the real one;

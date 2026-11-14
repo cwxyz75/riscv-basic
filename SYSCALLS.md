@@ -850,3 +850,95 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | resource_dtb | specified and implemented (S6c) |
 | futex_wait, futex_wake | specified and implemented (S7b) |
+
+## Planned changes (SCHED-SMP-SPEC.md; **none of this is implemented**)
+
+These calls and amendments are specified, not built. A call here answers BAD_SYSCALL until the task that adds it has
+merged (task 8 for the priority calls, 9 for `thread_spawn`, 22 and 23 for donation and the PI futex, 26 for
+`thread_interrupt`); the reserved numbers are in `SCHED-SMP-SPEC.md` section 5. The time unit of every deadline and of
+`clock_get` changes from 1 ms ticks to nanoseconds in one flag-day change (task 6).
+
+**Limits** (will replace the thread sentence): "`MAX_REGIONS` 16384 per address space; live threads are limited by the
+job's thread and page limits, with a system-wide backstop of `RAM_SIZE / 64 KiB` (4096)."
+
+**Execution model** (will replace the section when task 20 lands): "A syscall runs on
+the calling thread's kernel stack. Calls marked *legacy* in the Locks column run with interrupts off under the legacy
+kernel lock; the others run with interrupts on, take the locks named for short sections, and can be preempted between
+them. A call is atomic with respect to other threads only where its entry says so."
+
+**Copying** (will be added): "A copy of more than 16 KiB is done in sections. If another thread of the same process unmaps the
+destination buffer of a read while the read is copying, the read fails with INVALID_ARGS and the message or bytes it
+had taken are lost: that race is the program's."
+
+### thread_spawn(process, args) -> status, handle, tid
+
+Create and start a thread in a running process, with its stack. `args` points to a 64-byte record (little endian):
+
+| offset | field |
+|---|---|
+| 0 | `u64` entry |
+| 8 | `u64` argument (the thread's `a0`) |
+| 16 | `u64` `tp` value (opaque to the kernel) |
+| 24 | `u64` stack bytes (0: 256 KiB; rounded up to a page; at most 64 MiB) |
+| 32 | `u64` guard bytes (0: one page; rounded up to a page) |
+| 40 | `u32` priority (0: the creator's base priority, clamped to the new thread's job) |
+| 44 | `u32` flags: bit 0 round robin; bit 1 detached (no handle is returned); bit 2 caller stack (use offset 48, provision nothing) |
+| 48 | `u64` stack pointer (caller stack only; otherwise 0) |
+| 56 | `u64` reserved, 0 |
+
+The thread starts at `entry` with `sp` at the top of its stack, `a0` the argument, `a1` its tid, `tp` as given, every
+other register zero. A kernel-provisioned stack is mapped in the process's stack arena, is charged to the process's
+job as it is touched, and is unmapped and freed when the thread has ended. Rights: MANAGE on `process`. Errors, in
+order: INVALID_ARGS (bad `args` pointer); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no MANAGE; or the priority asked is
+above the job's maximum); BAD_STATE (the process is not running); INVALID_ARGS (entry not executable; sizes out of
+range; reserved bits or fields set; a caller stack pointer not 16-aligned or outside user memory); NO_MEMORY (a job
+limit: threads, pages, regions, objects; the caller's handle table; the system backstop; no room in the stack arena).
+On error nothing changes. Locks: legacy until task 19.
+
+### thread_set_sched(thread, priority, flags) -> status
+
+Set a thread's base priority (1 to 63) and flags (bit 0: round robin within its level; other bits reserved, zero).
+`thread` 0 names the caller. Rights: MANAGE on the handle (none for 0). Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED (no MANAGE; or `priority` above the thread's job's `max_prio`); INVALID_ARGS (priority 0 or above 63,
+reserved flags); BAD_STATE (the thread has ended). The effective priority may be higher while other threads donate.
+
+### thread_get_sched(thread) -> status, sched, tid
+
+`sched` packs the base priority (bits 0-7), the flags (bits 8-15) and the effective priority (bits 16-23): a syscall
+returns two values besides the status. Rights: INSPECT (none for 0, the caller). Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED.
+
+### thread_suspend(thread) / thread_resume(thread) -> status
+
+**Reserved.** Validate the handle (MANAGE) and answer NOT_SUPPORTED.
+
+### thread_interrupt(thread) -> status   (replaces the reserved entry at task 26)
+
+Make the target's current blocking call, or its next one, return INTERRUPTED. Rights: MANAGE. Errors: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED; BAD_STATE (ended). Every blocking call lists INTERRUPTED among its errors; a
+`channel_call` interrupted after its request was sent leaves the request in flight, as a timeout does.
+
+### job_set_sched(job, max_prio, rt_budget_ns, cpu_weight) -> status
+
+Set a job's scheduling limits. Rights: SET_LIMITS. `max_prio` 0 to 63 and `rt_budget_ns` (per 100 ms window) must not
+exceed the parent job's; `cpu_weight` 1 to 65536 (reserved for the fair class; stored). Lowering `max_prio` lowers the
+base priority of every thread in the job and its descendants that is above it. Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED (no SET_LIMITS; or a value above the parent's); INVALID_ARGS. `job_info` gains selectors 6 (`max_prio`),
+7 (RT time used this window, budget), 8 (CPU nanoseconds used by the job's subtree, 0).
+
+### futex_lock_pi(address, deadline) -> status   and   futex_unlock_pi(address) -> status
+
+The word at `address` holds 0 (free) or the owner's tid in bits 0-29, with bit 31 set while threads wait in the
+kernel and bit 30 if an owner died holding it. A thread takes a free lock in user mode by compare-and-swap from 0 to
+its tid and releases an uncontended one by compare-and-swap back to 0; it calls the kernel only when either fails.
+`futex_lock_pi` returns OK when the caller owns the lock; while it waits, the owner runs at least at the caller's
+effective priority. Errors: INVALID_ARGS (as `futex_wait`); BAD_STATE (the word names no live thread of this process;
+the lock is poisoned; or waiting would close a cycle of waiting threads: a deadlock); TIMED_OUT; INTERRUPTED.
+`futex_unlock_pi` hands the lock to the highest-priority waiter (first come among equals) or frees it. Errors:
+INVALID_ARGS; ACCESS_DENIED (the caller does not own it). `futex_wait` and `futex_wake` gain a flags argument whose
+bit 0 (shared key) is reserved: NOT_SUPPORTED.
+
+### channel_call (will amend the last paragraph, task 22)
+
+"From task 22 the caller lends its effective priority to the thread that reads its request, until a message with the
+same transaction id is written back, the call ends for any reason, or that thread ends."

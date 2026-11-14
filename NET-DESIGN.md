@@ -493,13 +493,13 @@ S8 can use a hard-coded name until it lands, as the shell does today), **DM** (t
 serves more than one client), **I** (AIA interrupt delivery: built). T28/T30/T60/T61 should be re-read when S8's spec is
 written; none blocks.
 
-Proposed decision-log entries once the owner accepts the corresponding sections (numbers continue from OD83):
+Proposed decision-log entries once the owner accepts the corresponding sections (numbers continue from OD96):
 
-* **OD84** the process architecture: supervisor, driver, stack server, DHCP client, the config capability (sections 4, 6.3).
-* **OD85** the driver/stack data path: offset rings, signal on edge, the rights table (section 5).
-* **OD86** the native network protocol and the datagram drop rule (section 7), including that S9's stream data path is a
+* **OD97** the process architecture: supervisor, driver, stack server, DHCP client, the config capability (sections 4, 6.3).
+* **OD98** the driver/stack data path: offset rings, signal on edge, the rights table (section 5).
+* **OD99** the native network protocol and the datagram drop rule (section 7), including that S9's stream data path is a
   prototype, not a given.
-* **OD87** the failure contracts and the one_for_one plus re-attach strategy (section 9).
+* **OD100** the failure contracts and the one_for_one plus re-attach strategy (section 9).
 * A **`TIDY-UP.md`** entry for the hand-rolled supervisor, and one for "client-creates-the-socket is unproven".
 
 Suggested slice shape for S8 (to be turned into `NET-SPEC.md`): step 0 the spec and acceptance tests; 1 `netwire` and `netsim`;
