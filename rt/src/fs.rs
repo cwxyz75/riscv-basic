@@ -233,6 +233,48 @@ impl Fs {
         }
     }
 
+    /// Registry: publish `name`, handing the registry `listener` (the end of a channel the service listens
+    /// on). The registry owns it once the call succeeds; on failure it is still the caller's.
+    pub fn publish(&mut self, name: &[u8], listener: u32) -> Result<(), i32> {
+        match self.call(file::op::PUBLISH, 0, 0, 0, 0, name, Some(listener)) {
+            Ok(r) if r.status == 0 => Ok(()),
+            Ok(r) => Err(r.status),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Registry: remove a published name.
+    pub fn unpublish(&mut self, name: &[u8]) -> Result<(), i32> {
+        self.simple(file::op::UNPUBLISH, 0, 0, name).map(|_| ())
+    }
+
+    /// Registry: a new connection whose view allows only `names` (each already allowed here).
+    pub fn view(&mut self, names: &[&[u8]], rights: u32) -> Result<Fs, i32> {
+        let c = sys::channel_create();
+        if c.status != 0 {
+            return Err(c.status);
+        }
+        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let mut payload = Vec::new();
+        for (i, n) in names.iter().enumerate() {
+            if i > 0 {
+                payload.push(0);
+            }
+            payload.extend_from_slice(n);
+        }
+        match self.call(file::op::VIEW, 0, rights, 0, 0, &payload, Some(theirs)) {
+            Ok(r) if r.status == 0 => Ok(Fs::new(mine)),
+            Ok(r) => {
+                sys::handle_close(mine);
+                Err(r.status)
+            }
+            Err(e) => {
+                sys::handle_close(mine);
+                Err(e)
+            }
+        }
+    }
+
     pub fn read(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
         Ok(self
             .simple(file::op::READ, offset, len as u64, &[])?

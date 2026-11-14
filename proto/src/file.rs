@@ -20,7 +20,9 @@ pub mod rights {
     pub const WRITE: u32 = 2;
     pub const ENUMERATE: u32 = 4;
     pub const CREATE: u32 = 8;
-    pub const ALL: u32 = 15;
+    /// May publish and unpublish service names (the registry, slice SD). Meaningless on a filesystem.
+    pub const PUBLISH: u32 = 16;
+    pub const ALL: u32 = 31;
 }
 
 /// `Open` flags.
@@ -42,6 +44,14 @@ pub mod op {
     /// connection's own account's (BAD_REQUEST), and everything it uses is also charged to that account.
     /// A server that does not support accounts answers NOT_SUPPORTED. (Slice R, OD84, R-SPEC.md section 3.)
     pub const ACCOUNT: u16 = 8;
+    /// Registry (slice SD, SD-SPEC.md): publish a service name; `payload` is the name, the endpoint is the
+    /// listener channel the registry will forward connections to. Needs the `PUBLISH` right.
+    pub const PUBLISH: u16 = 16;
+    /// Registry: remove a name (`payload`). Needs `PUBLISH`.
+    pub const UNPUBLISH: u16 = 17;
+    /// Registry: a clone whose view allows only the names in `payload` (separated by NUL bytes), each of which
+    /// must already be allowed. The endpoint is the new connection.
+    pub const VIEW: u16 = 18;
     pub const READDIR: u16 = 3;
     pub const MKDIR: u16 = 4;
     pub const UNLINK: u16 = 5;
@@ -59,9 +69,9 @@ pub mod op {
     /// How many handles a request with this op carries (`None`: unknown op).
     pub fn handles(op: u16) -> Option<usize> {
         match op {
-            OPEN | CLONE | ACCOUNT => Some(1),
+            OPEN | CLONE | ACCOUNT | PUBLISH | VIEW => Some(1),
             READDIR | MKDIR | UNLINK | RENAME | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT
-            | GETVMO => Some(0),
+            | GETVMO | UNPUBLISH => Some(0),
             _ => None,
         }
     }
@@ -69,7 +79,10 @@ pub mod op {
     /// Does this op belong to a directory connection only? (`CLONE` and `ACCOUNT` are valid on both kinds; every
     /// other op that is not listed here belongs to file connections.)
     pub fn is_directory_op(op: u16) -> bool {
-        matches!(op, OPEN | READDIR | MKDIR | UNLINK | RENAME | STAT)
+        matches!(
+            op,
+            OPEN | READDIR | MKDIR | UNLINK | RENAME | STAT | PUBLISH | UNPUBLISH | VIEW
+        )
     }
 }
 
@@ -84,6 +97,9 @@ pub mod status {
     pub const QUOTA: i32 = -106;
     pub const BAD_ELF: i32 = -107;
     pub const BAD_REQUEST: i32 = -108;
+    /// The service behind a published name is gone (its listener closed): try again later. Never says that a
+    /// name exists to a connection whose view hides it.
+    pub const UNAVAILABLE: i32 = -109;
 }
 
 /// A request, borrowing its payload.

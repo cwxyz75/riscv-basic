@@ -174,7 +174,7 @@ fn file_framing_is_strict() {
     .unwrap();
     assert_eq!(file::decode_request(&bad_flags), Err(FrameError::BadBits));
     let bad_rights = Request {
-        rights: 0x10,
+        rights: 0x20, // (0x10 is PUBLISH since slice SD)
         payload: b"",
         ..req.clone()
     }

@@ -31,6 +31,9 @@ pub trait Service {
     fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]);
     /// A connection ended (its state is handed back so the server can release what it held).
     fn closed(&mut self, conn: Self::Conn);
+    /// An event on something that is not a connection (a key the server bound itself on the port, for example
+    /// a listener it watches). Keys the runtime hands out count up from 1; use keys with the top bit set.
+    fn other_event(&mut self, _key: u64, _observed: u32) {}
 }
 
 struct Slot<C> {
@@ -114,6 +117,15 @@ impl<C> Core<C> {
     /// anything for an open that will be refused asks first.)
     pub fn would_admit(&self, account: AccountId) -> bool {
         self.accounts.would_admit_conn(account)
+    }
+
+    /// The port (a server may bind its own objects on it, with keys that have the top bit set).
+    pub fn port(&self) -> u32 {
+        self.port
+    }
+
+    pub fn has_conn(&self, key: u64) -> bool {
+        self.conns.get(key).is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -398,7 +410,9 @@ pub fn run<S: Service>(service: &mut S) -> i32 {
         match r.status() {
             Some(Status::Ok) => {
                 let (key, observed) = (r.a1 as u64, r.a2 as u32);
-                if observed & signals::READABLE != 0 {
+                if !service.core().has_conn(key) {
+                    service.other_event(key, observed);
+                } else if observed & signals::READABLE != 0 {
                     for _ in 0..BATCH {
                         match service.core().read(key) {
                             Read::Msg(msg, handles) => service.request(key, &msg, &handles),
