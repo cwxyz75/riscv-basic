@@ -304,6 +304,14 @@ pub fn flush_tlb() {
 
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
+    // (a trap runs with interrupts off from entry to return, except where a thread sleeps inside it: the latency
+    // trace closes the span at every context switch, so only the stretches really spent with interrupts off count)
+    let span = crate::latency::off_begin(true);
+    trap_handler_inner(frame);
+    crate::latency::off_end(span, core::panic::Location::caller());
+}
+
+fn trap_handler_inner(frame: &mut TrapFrame) {
     let from_user = frame.sstatus & (1 << 8) == 0;
     if from_user {
         crate::user::user_mode_left();

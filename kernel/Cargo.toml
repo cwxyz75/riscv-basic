@@ -32,6 +32,9 @@ fail-demo = []
 # A kernel thread that overflows its stack on purpose: the guard page and the emergency stack must turn it
 # into a `##PANIC kernel stack overflow` report (`make os-boot-test-overflow`).
 stack-overflow-demo = []
+# The latency trace (slice B, SCHED-SMP-SPEC 3.12): per hart the longest interrupts-off span and its site, and per syscall
+# the big-lock hold and wait times; printed at the end of the run (`make os-latency`). Off: no code at all.
+latency-trace = []
 # Boot with the plain round-robin scheduling class instead of fixed-priority (OD32).
 # The priority-specific self-tests are skipped; the generic ones must still pass.
 sched-round-robin = []

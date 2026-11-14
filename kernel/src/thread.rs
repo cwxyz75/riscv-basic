@@ -270,6 +270,7 @@ fn idle_main(_: usize) {
 extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
     // A new thread starts inside a context switch, with interrupts off and the big kernel lock
     // handed over at depth 1: it leaves that region now and runs outside the lock (K4).
+    crate::latency::switch_in();
     crate::bkl::unlock();
     irq::enable();
     // SAFETY: `entry` is the `fn(usize)` that `spawn` stored, round-tripped through
@@ -409,7 +410,9 @@ fn reschedule() {
     // switch saves this thread's state and resumes the other's, as `context_switch`
     // documents. Interrupts are off, the big kernel lock is held (and handed over), and no
     // reference to KERNEL is live.
+    crate::latency::switch_out();
     unsafe { context_switch(old, new) };
+    crate::latency::switch_in();
 }
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
@@ -732,6 +735,8 @@ pub fn wake_stat(which: u64) -> u64 {
         // 6: the `time` counter (10 MHz on QEMU `virt`), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),
+        // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
+        8 => crate::latency::irq_off_max().0,
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
         _ => 0,
     }

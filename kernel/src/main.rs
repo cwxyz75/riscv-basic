@@ -23,6 +23,7 @@ mod interactive;
 mod irq;
 mod kmem;
 mod kstack;
+mod latency;
 mod percpu;
 mod sched_tests;
 mod selftest;
@@ -207,6 +208,14 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         match outcome {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(detail)),
+        }
+    }
+    #[cfg(feature = "latency-trace")]
+    {
+        latency::report(); // (before the check below resets the maximum)
+        match latency::the_latency_trace_can_see_a_long_section() {
+            Ok(()) => tally.record("the_latency_trace_can_see_a_long_section", Ok(())),
+            Err(d) => tally.record("the_latency_trace_can_see_a_long_section", Err(&d)),
         }
     }
     #[cfg(feature = "fail-demo")]

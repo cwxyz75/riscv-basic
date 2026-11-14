@@ -22,7 +22,9 @@ pub fn restore(was_enabled: bool) {
     }
 }
 
+#[track_caller]
 pub fn enable() {
+    crate::latency::interrupts_on();
     // SAFETY: sets sstatus.SIE; callers only do so where a timer interrupt may be taken.
     unsafe { asm!("csrsi sstatus, 2") };
 }
@@ -41,11 +43,15 @@ pub fn enable_timer_interrupt() {
 }
 
 /// Run `f` with interrupts disabled, restoring the previous state after.
+#[track_caller]
 pub fn without<R>(f: impl FnOnce() -> R) -> R {
+    let site = core::panic::Location::caller();
     let was = save_and_disable();
+    let started = crate::latency::off_begin(was);
     crate::bkl::lock();
     let r = f();
     crate::bkl::unlock();
+    crate::latency::off_end(started, site);
     restore(was);
     r
 }

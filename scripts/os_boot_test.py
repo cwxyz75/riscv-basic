@@ -464,6 +464,10 @@ def main() -> int:
     for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
         found = problems(lines, status, timed_out, expect_fail, required)
+        if os.environ.get("OS_SHOW"):
+            for l in text.split("\n"):
+                if l.startswith(os.environ["OS_SHOW"]):
+                    print(l)
         if os.environ.get("OS_BENCH") and not found:
             bench_label = f"smp{os.environ.get('OS_SMP', '1')}"
             with open(os.environ["OS_BENCH"], "a") as f:

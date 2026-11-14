@@ -9,7 +9,7 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-bench os-boot-test-overflow
+.PHONY: os-latency os-bench os-boot-test-overflow
 .PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
@@ -203,6 +203,14 @@ os-bench: kernel-main
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
 
+# The latency trace (slice B task 2; soak tier): a kernel built with `latency-trace` runs the suite at four harts and
+# prints the longest interrupts-off span (with its site) and the big-lock holds and waits per syscall; the test
+# `the_latency_trace_can_see_a_long_section` proves the instrumentation sees a 5 ms section within 20%.
+OS_LATENCY_ELF := target/os-latency/$(KERNEL_TARGET)/debug/kernel
+os-latency: kernel-main
+	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
+	OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
+
 os-boot-test-polling: kernel
 	OS_MACHINE=virt python3 scripts/os_boot_test.py $(OS_ELF)
 
@@ -275,7 +283,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required; run it on demand,
 # on a label, nightly (CI), and before a release. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
