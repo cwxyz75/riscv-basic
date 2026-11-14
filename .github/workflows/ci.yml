@@ -80,7 +80,7 @@ jobs:
           - name: four harts (negative controls, serial)
             targets: os-boot-test-smp-neg
           - name: AIA, RVA23, serial
-            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
+            targets: os-boot-test-aia os-boot-test-polling os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml

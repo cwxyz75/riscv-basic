@@ -121,6 +121,9 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     timer::start();
     irq::enable_timer_interrupt();
     enable_software_interrupt();
+    if crate::aia::present() {
+        crate::aia::init_hart();
+    }
     percpu::this().online.store(true, Ordering::Release);
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
     // shared), then this hart joins it for good.

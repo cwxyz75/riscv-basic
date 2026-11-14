@@ -223,7 +223,7 @@ the trusted boot-time suite: nothing ties a `##TEST` line to the program that wr
 A measuring aid for the boot-time suite (like `debug_write`; no rights, no effect on the system): `a1` is
 a kernel counter, `which` 0 the number of times a thread blocked in a wait, 1 how many of those blocks
 were by a thread that had been woken without being satisfied (a *spurious wake*), 2 how many threads
-were woken. Any other index reads 0. The counters only grow. They exist to measure the wake path
+were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart other than the boot hart, 5 how many on a hart they were not aimed at (always 0). Any other index reads 0. The counters only grow. They exist to measure the wake path
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 
@@ -422,19 +422,17 @@ mapped: nobody can be sleeping on an address the sleeper could not read.)
 
 ### interrupt_create(resource, source) -> status, handle
 
-An interrupt object for PLIC source `source` (1..=`MAX_IRQ`, 8: the QEMU `virt` virtio-mmio
+An interrupt object for AIA source `source` (1..=`MAX_IRQ`, 8: the QEMU `virt` virtio-mmio
 slots; slot *n* is source *n*+1). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
-INSPECT, MANAGE (acknowledge). The source is enabled (priority 1) for the boot hart while the object
-lives and masked when it is destroyed. When it fires the kernel claims it, **masks it**, holds the
-claim open and raises INTERRUPT; waiters wake. A source may also be pending from before the object
+INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`**, and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` re-aims the source at the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
 existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
 interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
-INVALID_ARGS (source 0 or above the range); NOT_SUPPORTED (a machine without a PLIC: AIA; drivers
+INVALID_ARGS (source 0 or above the range); NOT_SUPPORTED (a machine without an AIA, such as plain `virt`; drivers
 poll); BAD_STATE (a live object already owns the source); NO_MEMORY.
 
 ### interrupt_ack(interrupt) -> status, claims
 
-Clear INTERRUPT, complete the held claim and unmask the source; the device condition must be cleared first or a level-triggered
+Clear INTERRUPT and unmask the source (a level still asserted fires again at once); the device condition must be cleared first or a level-triggered
 device fires again. `claims` is how many times the kernel has claimed this source for the object
 (a storm shows here). Rights: MANAGE. BAD_STATE if the source has not fired since the last ack.
 

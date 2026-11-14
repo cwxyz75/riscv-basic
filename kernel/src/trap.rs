@@ -333,7 +333,7 @@ fn trap_body(frame: &mut TrapFrame) {
     }
     if cause == (1 << 63) | 9 {
         // Supervisor external interrupt (S6a-2): a device source, owned by an interrupt object.
-        let any = crate::plic::handle(crate::user::irq_fired);
+        let any = crate::aia::handle(crate::user::irq_fired);
         if any && crate::thread::scheduler_ready() {
             crate::user::wake_signal_waiters();
             crate::thread::reschedule_this_hart();

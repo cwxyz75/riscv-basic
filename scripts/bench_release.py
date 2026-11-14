@@ -23,7 +23,7 @@ WORK = {
 def main():
     kernel = sys.argv[1]
     size = os.path.getsize(kernel)
-    cmd = ["qemu-system-riscv64", "-machine", "virt", "-bios", "default", "-m", "256M", "-display", "none",
+    cmd = ["qemu-system-riscv64", "-machine", "virt,aia=aplic-imsic", "-bios", "default", "-m", "256M", "-display", "none",
            "-serial", "stdio", "-monitor", "none", "-icount", "shift=0,sleep=off", "-kernel", kernel]
     if os.environ.get("OS_CPU"):
         cmd[1:1] = ["-cpu", os.environ["OS_CPU"]]

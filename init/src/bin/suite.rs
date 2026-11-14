@@ -7755,6 +7755,25 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     Ok(())
 }
 
+/// Slice I: on the AIA a device interrupt goes to the hart that asked for it (the last one to create
+/// or acknowledge the object), never to another one; the block-driver tests above took many. On
+/// more than one hart some must have been taken off the boot hart. (The PLIC path counts nothing.)
+fn device_interrupts_arrive_where_asked() -> Outcome {
+    let (taken, off_boot, misrouted) = (sys::debug_stat(3), sys::debug_stat(4), sys::debug_stat(5));
+    sys::debug_write(
+        alloc::format!(
+            "s6: device interrupts taken {taken}, off the boot hart {off_boot}, misrouted {misrouted}\n"
+        )
+        .as_bytes(),
+    );
+    ensure_eq!(
+        misrouted,
+        0,
+        "interrupts taken on a hart they were not aimed at"
+    );
+    Ok(())
+}
+
 fn mmio_reads_the_virtio_magic() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
     let dev = ok(
@@ -8723,6 +8742,10 @@ pub fn app_main() -> i32 {
         (
             "interrupt_object_fires_and_masks",
             interrupt_object_fires_and_masks,
+        ),
+        (
+            "device_interrupts_arrive_where_asked",
+            device_interrupts_arrive_where_asked,
         ),
         (
             "socket_ends_travel_over_channels",

@@ -711,6 +711,7 @@ pub fn wake_stat(which: u64) -> u64 {
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
+        3..=5 => crate::aia::stat(which),
         _ => 0,
     }
 }

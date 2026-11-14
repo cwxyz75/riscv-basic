@@ -126,7 +126,7 @@ pub fn init() {
     }
     for device in [abi::finisher::BASE as u64, 0x1000_0000]
         .into_iter()
-        .chain(crate::plic::pages())
+        .chain(crate::aia::pages())
     {
         pt.map(&mut mm, DIRECT_BASE + device, device / PAGE_SIZE, Perms::RW)
             .expect("device page");

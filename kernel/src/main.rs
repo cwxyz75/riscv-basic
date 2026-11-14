@@ -10,9 +10,11 @@
 
 extern crate alloc;
 
+mod aia;
 mod bkl;
 mod boot;
 mod console;
+mod dtb;
 mod finisher;
 mod fp;
 mod heap;
@@ -21,7 +23,6 @@ mod interactive;
 mod irq;
 mod kmem;
 mod percpu;
-mod plic;
 mod sched_tests;
 mod selftest;
 mod smp;
@@ -71,7 +72,7 @@ impl Tally {
 
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
-    plic::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
+    dtb::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
     // First of all: this hart's record in `tp` (the trap entry needs it).
     percpu::bind(0, hart_id);
     percpu::this()
@@ -108,12 +109,12 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     heap::init();
     trap::init();
     kmem::init();
-    plic::init(hart_id);
+    aia::init();
     if !RELEASE {
         let _ = writeln!(
             out,
             "interrupt controller: {}",
-            if plic::present() { "PLIC" } else { "none" }
+            if aia::present() { "AIA" } else { "none" }
         );
         let _ = writeln!(
             out,

@@ -12,8 +12,8 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##PANIC <message>
     ##DONE pass=<n> fail=<n>
 
-The machine type comes from $OS_MACHINE (default `virt`; `make os-boot-test-aia` uses
-`virt,aia=aplic-imsic`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
+`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -29,6 +29,9 @@ import re
 import subprocess
 import sys
 
+# The machine the OS track runs on (OD75): AIA (APLIC + IMSIC). A plain `virt` has only a PLIC, which the
+# kernel does not drive: no interrupt controller, drivers poll (`make os-boot-test-polling`).
+DEFAULT_MACHINE = "virt,aia=aplic-imsic"
 TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "600"))
 
 # Tests the kernel must report, by name. A kernel that silently drops a test must
@@ -243,7 +246,7 @@ def second_disk():
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
-        "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt"), "-bios", "default",
+        "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
         "-m", "256M", "-display", "none", "-serial", "stdio", "-monitor", "none",
         *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
@@ -386,21 +389,32 @@ def main() -> int:
         if want_harts > 1 and f"harts online: {want_harts}" not in text.split("\n"):
             found.append(f"the kernel did not report 'harts online: {want_harts}'")
         # The interrupt controller the kernel found must be the one the machine has (S6a-2): a PLIC on
-        # the default board, none on AIA (where drivers poll). Otherwise the interrupt-object test
+        # the default board, the AIA (APLIC + IMSIC, OD75) on the aia machine. Otherwise the interrupt-object test
         # could pass by skipping.
-        aia = "aia" in os.environ.get("OS_MACHINE", "virt")
-        want_ic = "interrupt controller: none" if aia else "interrupt controller: PLIC"
+        aia = "aia" in os.environ.get("OS_MACHINE", DEFAULT_MACHINE)
+        want_ic = "interrupt controller: AIA" if aia else "interrupt controller: none"
         if not expect_fail and want_ic not in text.split("\n"):
             found.append(f"the kernel did not report '{want_ic}'")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (not expect_fail and os.environ.get("OS_DISK") != "0" and not aia
+        if (not expect_fail and os.environ.get("OS_DISK") != "0" and aia
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
-        # The block-driver tests must have found the disk and run (also in polling mode on AIA).
+        # The block-driver tests must have found the disk and run (with interrupts on both machines, OD75).
         if (not expect_fail and os.environ.get("OS_DISK") != "0"
-                and f"s6: blkd exercised ({'polling' if aia else 'interrupts'})" not in text):
+                and f"s6: blkd exercised ({'interrupts' if aia else 'polling'})" not in text):
             found.append("the block-driver tests did not run in the expected mode "
-                         f"({'polling' if aia else 'interrupts'})")
+                         f"({'interrupts' if aia else 'polling'})")
+        # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
+        # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
+        if not expect_fail and aia and os.environ.get("OS_DISK") != "0":
+            m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
+            if not m:
+                found.append("the kernel did not report the device interrupt counts")
+            else:
+                taken, off, mis = map(int, m.groups())
+                if taken == 0 or mis != 0 or (want_harts > 1 and off == 0):
+                    found.append(f"AIA interrupt delivery: taken {taken}, off the boot hart {off}, "
+                                 f"misrouted {mis} (harts {want_harts})")
         # The disk, looked at from the host once the guest is gone (only when the guest ran the
         # block-driver tests to the end; a timed-out or failing run leaves it half written).
         if (not expect_fail and not found and os.environ.get("OS_DISK") != "0"
