@@ -107,9 +107,6 @@ struct UserState {
     next_token: usize,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     ktable: HandleTable,
-    /// The one wait queue every blocked thread sleeps on (OD43): any syscall that can change
-    /// a signal wakes it, and each waiter re-checks its own condition.
-    signal_queue: usize,
     /// The futex wait table (S7b).
     futexes: kcore::futex::Futexes,
     /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
@@ -166,7 +163,6 @@ fn state() -> &'static mut UserState {
             starts: BTreeMap::new(),
             next_token: 1,
             ktable: HandleTable::new(256),
-            signal_queue: thread::new_queue(),
             futexes: kcore::futex::Futexes::new(),
             waits: kcore::wait::WaitTable::new(),
             irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
@@ -1341,11 +1337,9 @@ pub fn irq_fired(irq: u32) -> bool {
     ipc::interrupt_fire(&mut s.objs, obj, irq)
 }
 
-/// Wake every waiter without the cleanup `notify` does (for the interrupt path).
+/// Wake the waiters whose condition the interrupt path changed, without the cleanup `notify` does.
 pub fn wake_signal_waiters() {
     commit_wake();
-    let q = state().signal_queue;
-    thread::wake_all(q);
 }
 
 /// Wake exactly the threads whose wait the objects touched since the last call can have ended (slice W,
@@ -1371,13 +1365,12 @@ pub fn commit_wake() {
     }
 }
 
-/// Wake every thread waiting on a signal (they re-check their own conditions).
+/// Clean up what the syscall destroyed and wake exactly the threads whose wait it ended (slice W: the
+/// global wait queue that used to be woken here, OD43, is gone).
 pub fn notify() {
     cleanup_dead();
     reap_vmos();
     commit_wake();
-    let q = irq::without(|| state().signal_queue);
-    thread::wake_all(q);
 }
 
 static CLEANING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1728,16 +1721,19 @@ fn port_wait(a: [u64; 6]) -> Reply {
         // (the poll above may have touched the port; tell the wait table before sleeping, so that no
         // thread goes to sleep, and the lock is released, with signal changes still in the log)
         commit_wake();
-        let q = irq::without(|| state().signal_queue);
-        // Ready, killed, or the handle stopped naming a port (the poll then says so).
-        thread::wait_deadline(
-            q,
+        // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
+        // registered on the port: the wait table re-evaluates a port's signal (which follows its
+        // bindings) whenever anything was touched.
+        let me = thread::current();
+        thread::wait_deadline_registered(
             || {
                 killed_now().is_some()
                     || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
             },
+            || register_wait(me, h, abi::signals::READABLE),
             deadline,
         );
+        irq::without(|| state().waits.forget(me));
         got = poll()?;
     }
     match got {

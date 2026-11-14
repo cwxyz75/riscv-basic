@@ -1985,6 +1985,57 @@ fn futex_sleepers_are_not_woken_by_unrelated_syscalls() -> Outcome {
     Ok(())
 }
 
+/// A port bystander: blocked in `port_wait` on a port nobody binds.
+extern "C" fn port_bystander(arg: usize) -> ! {
+    sys::port_wait(arg as u32, sys::clock_get() + 60_000);
+    sys::thread_exit(0)
+}
+
+/// Slice W step 5: port waiters are woken by id too, so four threads blocked in `port_wait` through a
+/// ping-pong cost no spurious wakes (the global wait queue, OD43, is gone), and a binding that becomes
+/// ready still wakes its waiter.
+fn port_waiters_are_not_woken_by_unrelated_syscalls() -> Outcome {
+    let quiet = ping_pong()?;
+    let mut ports = Vec::new();
+    for _ in 0..4 {
+        let p = port()?;
+        new_thread(port_bystander, p as usize)?;
+        ports.push(p);
+    }
+    nap_ticks(5);
+    let busy = ping_pong()?;
+    let line = alloc::format!(
+        "s7: port bystanders: quiet {} spurious, with 4 port waiters {} spurious",
+        quiet.2,
+        busy.2
+    );
+    sys::debug_write(line.as_bytes());
+    ensure!(
+        busy.2 <= quiet.2 + 30,
+        "port waiters are not woken by unrelated syscalls: {} spurious wakes against {} without them",
+        busy.2,
+        quiet.2
+    );
+    // a ready binding still wakes its waiter: bind an event to the first port and signal it
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::port_bind(ports[0], ev, 1 << 24, 9)),
+        Some(S::Ok),
+        "bind"
+    );
+    sys::event_signal(ev, 0, 1 << 24);
+    nap_ticks(5);
+    let r = sys::port_wait(ports[0], 0);
+    ensure_eq!((r.status, r.a1), (0, 9), "the bound event is reported");
+    // release the other bystanders by signalling nothing: they end at their deadline in the log of
+    // the process; close the ports to end their waits now
+    for p in &ports[1..] {
+        sys::handle_close(*p);
+    }
+    nap_ticks(3);
+    Ok(())
+}
+
 fn parent_and_child_talk() -> Outcome {
     let (p, mine) = launch(14)?;
     ensure_eq!(
@@ -8551,6 +8602,10 @@ pub fn app_main() -> i32 {
         (
             "sending_a_waited_handle_ends_a_siblings_wait",
             sending_a_waited_handle_ends_a_siblings_wait,
+        ),
+        (
+            "port_waiters_are_not_woken_by_unrelated_syscalls",
+            port_waiters_are_not_woken_by_unrelated_syscalls,
         ),
         (
             "futex_sleepers_are_not_woken_by_unrelated_syscalls",
