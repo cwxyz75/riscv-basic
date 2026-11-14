@@ -21,6 +21,7 @@ use proto::blk::{self, Op, Status};
 use proto::startup::Role;
 use rt::abi::signals;
 use rt::abi::status::Status as Sys;
+use rt::service::{self, Core, Service};
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
@@ -357,65 +358,86 @@ pub fn app_main() -> i32 {
     }
     // room for any message the kernel can queue, handles included: nothing a client sends can be
     // left stuck at the head of the queue
-    let mut rx = vec![0u8; abi_max_msg()];
-    let mut hs = [0u32; rt::abi::limits::MAX_MSG_HANDLES];
-    loop {
-        let w = sys::object_wait(chan, signals::READABLE | signals::PEER_CLOSED, u64::MAX);
-        if w.status() != Some(Sys::Ok) {
-            return 7;
-        }
-        let r = sys::channel_read(chan, rx.as_mut_ptr(), rx.len(), hs.as_mut_ptr(), hs.len());
-        match r.status() {
-            Some(Sys::Ok) => {}
-            Some(Sys::ShouldWait) => continue,
-            Some(Sys::PeerClosed) => return 0, // the client is gone and nothing is queued
-            _ => return 8,
-        }
+    let p = sys::port_create();
+    if p.status != 0 {
+        return 7;
+    }
+    let mut server = BlkServer {
+        core: Core::new(
+            p.a1 as u32,
+            POOL,
+            abi_max_msg(),
+            rt::abi::limits::MAX_MSG_HANDLES,
+            HOLD_TIMEOUT,
+        ),
+        dev,
+    };
+    if server.core.add_conn(chan, svc::ROOT, ()).is_none() {
+        return 9;
+    }
+    service::run(&mut server)
+}
+
+/// The service's total pool: one client, with room for a supervisor's probe.
+const POOL: svc::Limits = svc::Limits {
+    conns: 4,
+    held_bytes: 1024 * 1024,
+    inflight: 1,
+};
+/// A reply the client has no room for is kept this long (ticks) before the connection is dropped.
+const HOLD_TIMEOUT: u64 = 30_000;
+
+struct BlkServer {
+    core: Core<()>,
+    dev: Dev,
+}
+
+impl Service for BlkServer {
+    type Conn = ();
+
+    fn core(&mut self) -> &mut Core<()> {
+        &mut self.core
+    }
+
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
         // a request carries no handles: close whatever came (authority we did not ask for)
-        let nh = r.a2;
-        for &h in &hs[..nh] {
+        for &h in hs {
             sys::handle_close(h);
         }
-        let decoded = if nh == 0 {
-            blk::decode_request(&rx[..r.a1])
+        let decoded = if hs.is_empty() {
+            blk::decode_request(msg)
         } else {
             Err(blk::Malformed {
-                txid: rx[..r.a1]
+                txid: msg
                     .get(..4)
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             })
         };
         let reply = match decoded {
-            Ok(req) => match dev.serve(&req) {
+            Ok(req) => match self.dev.serve(&req) {
                 Ok((st, body)) => blk::encode_reply(req.txid, st, &body),
                 Err(()) => {
-                    let _ = send(chan, &blk::encode_reply(req.txid, Status::Timeout, &[]));
-                    return 10; // the device is not answering: end, so a supervisor restarts us
+                    let _ = self.core.send(
+                        key,
+                        blk::encode_reply(req.txid, Status::Timeout, &[]),
+                        None,
+                    );
+                    // the device is not answering: end, so a supervisor restarts us
+                    self.core.exit_with(10);
+                    return;
                 }
             },
             Err(m) => match m.txid {
                 Some(t) => blk::encode_reply(t, Status::BadRequest, &[]),
-                None => continue,
+                None => return,
             },
         };
-        if send(chan, &reply).is_err() {
-            // the client's queue is full or gone: drop the reply
-            if sys::object_info(chan).status != 0 {
-                return 9;
-            }
-        }
+        let _ = self.core.send(key, reply, None);
     }
+
+    fn closed(&mut self, _conn: ()) {}
 }
 
 fn abi_max_msg() -> usize {
     rt::abi::limits::MAX_MSG_BYTES
-}
-
-fn send(chan: u32, bytes: &[u8]) -> Result<(), i32> {
-    let r = sys::channel_write(chan, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
-    if r.status == 0 {
-        Ok(())
-    } else {
-        Err(r.status)
-    }
 }

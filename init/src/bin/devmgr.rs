@@ -22,7 +22,7 @@ use proto::devmgr::{self, Status};
 use proto::startup::{Role, Startup};
 use rt::abi::rights::Rights;
 use rt::abi::signals;
-use rt::abi::status::Status as Sys;
+use rt::service::{self, Core, Service};
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
@@ -186,21 +186,65 @@ impl Block {
     }
 }
 
-fn reply(chan: u32, txid: u32, status: Status, handle: Option<u32>) {
-    let b = devmgr::encode_reply(txid, status);
-    let hs = [handle.unwrap_or(0)];
-    let r = sys::channel_write(
-        chan,
-        b.as_ptr(),
-        b.len(),
-        hs.as_ptr(),
-        usize::from(handle.is_some()),
-    );
-    if r.status != 0 {
-        if let Some(h) = handle {
-            sys::handle_close(h); // the client is not taking it
+/// The service's total pool (OD84): a supervisor and a few more.
+const POOL: svc::Limits = svc::Limits {
+    conns: 16,
+    held_bytes: 64 * 1024,
+    inflight: 16,
+};
+/// A reply the client has no room for is kept this long (ticks) before the connection is dropped.
+const HOLD_TIMEOUT: u64 = 30_000;
+
+struct DevMgr {
+    core: Core<()>,
+    blocks: Vec<Block>,
+    image: Option<Vec<u8>>,
+}
+
+impl DevMgr {
+    fn reply(&mut self, key: u64, txid: u32, status: Status, handle: Option<u32>) {
+        let _ = self
+            .core
+            .send(key, devmgr::encode_reply(txid, status), handle);
+    }
+}
+
+impl Service for DevMgr {
+    type Conn = ();
+
+    fn core(&mut self) -> &mut Core<()> {
+        &mut self.core
+    }
+
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+        // a request carries no handles: close whatever came (authority we did not ask for)
+        for &h in hs {
+            sys::handle_close(h);
+        }
+        if !hs.is_empty() {
+            let txid = msg
+                .get(..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            return self.reply(key, txid, Status::BadRequest, None);
+        }
+        match devmgr::decode_request(msg) {
+            Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
+            Err(None) => {}
+            Ok((txid, index)) => {
+                let (st, handle) = match (self.blocks.get_mut(usize::from(index)), &self.image) {
+                    (None, _) => (Status::NoDevice, None),
+                    (Some(_), None) => (Status::Failed, None),
+                    (Some(b), Some(img)) => match b.open(img) {
+                        Ok(h) => (Status::Ok, Some(h)),
+                        Err(s) => (s, None),
+                    },
+                };
+                self.reply(key, txid, st, handle);
+            }
         }
     }
+
+    fn closed(&mut self, _conn: ()) {}
 }
 
 #[no_mangle]
@@ -252,52 +296,29 @@ pub fn app_main() -> i32 {
         }
     }
     let image = blkd_image(bi);
-    let mut rx = [0u8; 64];
-    let code = loop {
-        let w = sys::object_wait(chan, signals::READABLE | signals::PEER_CLOSED, u64::MAX);
-        if w.status() != Some(Sys::Ok) {
-            break 7;
-        }
-        let r = sys::channel_read(chan, rx.as_mut_ptr(), rx.len(), core::ptr::null_mut(), 0);
-        match r.status() {
-            Some(Sys::Ok) => {}
-            Some(Sys::ShouldWait) => continue,
-            Some(Sys::PeerClosed) => break 0,
-            _ => {
-                // too big for the buffer (or a handle came with it): not ours to serve; drain it
-                let mut big = alloc::vec![0u8; rt::abi::limits::MAX_MSG_BYTES];
-                let mut hs = [0u32; rt::abi::limits::MAX_MSG_HANDLES];
-                let d =
-                    sys::channel_read(chan, big.as_mut_ptr(), big.len(), hs.as_mut_ptr(), hs.len());
-                if d.status == 0 {
-                    for &h in &hs[..d.a2] {
-                        sys::handle_close(h);
-                    }
-                    let txid = big
-                        .get(..4)
-                        .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                    reply(chan, txid, Status::BadRequest, None);
-                    continue;
-                }
-                break 8;
-            }
-        }
-        match devmgr::decode_request(&rx[..r.a1]) {
-            Err(Some(t)) => reply(chan, t, Status::BadRequest, None),
-            Err(None) => {}
-            Ok((txid, index)) => match (blocks.get_mut(usize::from(index)), &image) {
-                (None, _) => reply(chan, txid, Status::NoDevice, None),
-                (Some(_), None) => reply(chan, txid, Status::Failed, None),
-                (Some(b), Some(img)) => match b.open(img) {
-                    Ok(h) => reply(chan, txid, Status::Ok, Some(h)),
-                    Err(s) => reply(chan, txid, s, None),
-                },
-            },
-        }
+    let p = sys::port_create();
+    if p.status != 0 {
+        return 7;
+    }
+    let mut mgr = DevMgr {
+        core: Core::new(
+            p.a1 as u32,
+            POOL,
+            rt::abi::limits::MAX_MSG_BYTES,
+            rt::abi::limits::MAX_MSG_HANDLES,
+            HOLD_TIMEOUT,
+        ),
+        blocks,
+        image,
     };
+    if mgr.core.add_conn(chan, svc::ROOT, ()).is_none() {
+        return 3;
+    }
+    let code = service::run(&mut mgr);
+    let blocks = &mut mgr.blocks;
     // the client is gone (or the manager failed): end the driver, wait until it is really gone,
     // and only then leave the device quiet (T42: reset after the driver has stopped)
-    for b in &mut blocks {
+    for b in blocks.iter_mut() {
         if let Some(p) = b.driver {
             sys::process_kill(p, -1);
             let _ = sys::object_wait(p, signals::TERMINATED, sys::clock_get() + 2000);

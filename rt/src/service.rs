@@ -26,9 +26,9 @@ pub trait Service {
     type Conn;
     /// The runtime the server owns (the server keeps its `Core` next to its own state).
     fn core(&mut self) -> &mut Core<Self::Conn>;
-    /// One request arrived on connection `key`, with the handle that came with it, if any (the callee owns
-    /// the handle: it must close it or keep it). Replies go out through `core().send`.
-    fn request(&mut self, key: u64, msg: &[u8], handle: Option<u32>);
+    /// One request arrived on connection `key`, with the handles that came with it (the callee owns them:
+    /// it must close or keep each). Replies go out through `core().send`.
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]);
     /// A connection ended (its state is handed back so the server can release what it held).
     fn closed(&mut self, conn: Self::Conn);
 }
@@ -42,8 +42,8 @@ struct Slot<C> {
 
 /// How a read from a connection ended.
 pub enum Read {
-    /// A message (and the handle that came with it, if any).
-    Msg(Vec<u8>, Option<u32>),
+    /// A message and the handles that came with it.
+    Msg(Vec<u8>, Vec<u32>),
     /// Nothing to read now (or a reply is being held, so nothing is read).
     Nothing,
     /// The connection ended (the peer closed, or the message broke the protocol: it has been closed).
@@ -68,24 +68,42 @@ pub struct Core<C> {
     /// Kernel object ids of the channel ends we serve.
     own: BTreeSet<u64>,
     rx: Vec<u8>,
+    max_handles: usize,
     hold_timeout: u64,
     /// Connections that ended since the server last looked (see `drain_closed`).
     closed: Vec<C>,
+    /// Set by `exit_with`: the loop returns this once the current request is done.
+    exit: Option<i32>,
 }
 
 impl<C> Core<C> {
     /// A runtime on `port`: `pool` is the server's total (the root account's limits), `max_msg` the largest
-    /// request, `hold_timeout` how long (ticks) a reply may be held before its connection ends.
-    pub fn new(port: u32, pool: Limits, max_msg: usize, hold_timeout: u64) -> Core<C> {
+    /// request in bytes, `max_handles` the most handles one request may carry (a message with more is a
+    /// protocol violation), `hold_timeout` how long (ticks) a reply may be held before its connection ends.
+    pub fn new(
+        port: u32,
+        pool: Limits,
+        max_msg: usize,
+        max_handles: usize,
+        hold_timeout: u64,
+    ) -> Core<C> {
         Core {
             port,
             accounts: Accounts::new(pool),
             conns: ConnTable::new(),
             own: BTreeSet::new(),
             rx: alloc::vec![0u8; max_msg],
+            max_handles,
             hold_timeout,
             closed: Vec::new(),
+            exit: None,
         }
+    }
+
+    /// End the service after the current request (a server whose device stopped answering, say): `run`
+    /// returns `code`.
+    pub fn exit_with(&mut self, code: i32) {
+        self.exit = Some(code);
     }
 
     pub fn accounts(&mut self) -> &mut Accounts {
@@ -313,8 +331,14 @@ impl<C> Core<C> {
             return Read::Nothing;
         }
         let ch = slot.ch;
-        let mut hs = [0u32; 1];
-        let r = sys::channel_read(ch, self.rx.as_mut_ptr(), self.rx.len(), hs.as_mut_ptr(), 1);
+        let mut hs = [0u32; svc_max_handles()];
+        let r = sys::channel_read(
+            ch,
+            self.rx.as_mut_ptr(),
+            self.rx.len(),
+            hs.as_mut_ptr(),
+            self.max_handles.min(hs.len()),
+        );
         match r.status() {
             Some(Status::Ok) => {}
             Some(Status::ShouldWait) => return Read::Nothing,
@@ -330,18 +354,23 @@ impl<C> Core<C> {
             }
         }
         let (nb, nh) = (r.a1, r.a2);
-        let handle = (nh == 1).then_some(hs[0]);
+        let handles: Vec<u32> = hs[..nh].to_vec();
         let mut msg = Vec::new();
         if msg.try_reserve_exact(nb).is_err() {
-            if let Some(h) = handle {
+            for &h in &handles {
                 sys::handle_close(h);
             }
             self.close_conn(key);
             return Read::Ended;
         }
         msg.extend_from_slice(&self.rx[..nb]);
-        Read::Msg(msg, handle)
+        Read::Msg(msg, handles)
     }
+}
+
+/// The most handles one request may carry through the runtime (a message channel's own maximum).
+const fn svc_max_handles() -> usize {
+    crate::abi::limits::MAX_MSG_HANDLES
 }
 
 /// A copy that reports running out of memory instead of aborting the server.
@@ -372,8 +401,11 @@ pub fn run<S: Service>(service: &mut S) -> i32 {
                 if observed & signals::READABLE != 0 {
                     for _ in 0..BATCH {
                         match service.core().read(key) {
-                            Read::Msg(msg, handle) => service.request(key, &msg, handle),
+                            Read::Msg(msg, handles) => service.request(key, &msg, &handles),
                             Read::Nothing | Read::Ended => break,
+                        }
+                        if service.core().exit.is_some() {
+                            break;
                         }
                     }
                 } else if observed & signals::PEER_CLOSED != 0 {
@@ -386,6 +418,9 @@ pub fn run<S: Service>(service: &mut S) -> i32 {
         service.core().poll_held();
         for c in service.core().drain_closed() {
             service.closed(c);
+        }
+        if let Some(code) = service.core().exit {
+            return code;
         }
         if service.core().is_empty() {
             return 0;
