@@ -286,6 +286,13 @@ impl<C: SchedClass> Sched<C> {
         self.resched_pending[hart]
     }
     /// The harts to send a reschedule IPI to (bitmask by hart index), clearing the set.
+    /// Forget that hart `hart` was marked: the poke for it was not (and will not be) sent because the hart is not
+    /// part of the scheduler yet. Without this the mark would suppress every later poke until the hart called
+    /// `reschedule_on` itself (T65).
+    pub fn clear_resched_pending(&mut self, hart: usize) {
+        self.resched_pending[hart] = false;
+    }
+
     pub fn take_pokes(&mut self) -> u32 {
         core::mem::take(&mut self.pokes)
     }

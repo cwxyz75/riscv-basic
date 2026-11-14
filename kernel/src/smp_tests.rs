@@ -9,7 +9,28 @@ use core::sync::atomic::Ordering;
 
 type Test = (&'static str, fn() -> Result<(), String>);
 
+/// `wfi` must return when an enabled interrupt is pending even though `sstatus.SIE` is clear (privileged spec): the
+/// idle protocol relies on it to close the window between "nothing to run" and "sleep" (SCHED-SMP-SPEC 3.9, task 4).
+fn wfi_returns_with_interrupts_masked() -> Result<(), String> {
+    let start = crate::timer::now();
+    crate::irq::without(|| {
+        // the timer interrupt is enabled (STIE) but globally masked here; program it one tick ahead
+        crate::timer::next_tick();
+        // SAFETY: `wfi` idles until an interrupt is pending (it returns at once if one already is); no memory.
+        unsafe { core::arch::asm!("wfi") };
+    });
+    let waited = crate::timer::now() - start;
+    if waited > 200 * crate::timer::TICK_CYCLES {
+        return Err(alloc::format!("wfi took {waited} cycles to return"));
+    }
+    Ok(())
+}
+
 pub const TESTS: &[Test] = &[
+    (
+        "wfi_returns_with_interrupts_masked",
+        wfi_returns_with_interrupts_masked,
+    ),
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
     (
