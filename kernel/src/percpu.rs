@@ -14,7 +14,7 @@ pub const IPI_RESCHED: u32 = 1;
 /// Run the hart's `work_kind` job in its IPI handler (tests of the lock).
 pub const IPI_WORK: u32 = 2;
 
-/// The layout of the first two fields is used by the trap assembly (`trap.rs`, `user.rs`).
+/// The layout of the first three fields is used by the trap assembly (`trap.rs`, `user.rs`).
 #[repr(C)]
 pub struct PerHart {
     /// Offset 0: the top of the kernel stack the next trap from user mode will use; written on
@@ -22,6 +22,9 @@ pub struct PerHart {
     pub kstack_top: AtomicU64,
     /// Offset 8: scratch for the user's `sp` while the trap entry switches stacks.
     pub scratch_sp: AtomicU64,
+    /// Offset 16: the top of this hart's emergency stack, which the trap entry switches to when a trap
+    /// is taken with `sp` inside a kernel stack's guard region (a kernel stack overflow).
+    pub emergency_top: AtomicU64,
     /// Dense index of this hart (0 is the boot hart).
     pub index: AtomicUsize,
     /// The SBI hart id.
@@ -63,6 +66,7 @@ impl PerHart {
         PerHart {
             kstack_top: AtomicU64::new(0),
             scratch_sp: AtomicU64::new(0),
+            emergency_top: AtomicU64::new(0),
             index: AtomicUsize::new(0),
             hart_id: AtomicUsize::new(0),
             online: AtomicBool::new(false),
@@ -86,6 +90,14 @@ impl PerHart {
 }
 
 static HARTS: [PerHart; MAX_HARTS] = [const { PerHart::new() }; MAX_HARTS];
+
+/// One emergency stack per hart (8 KiB: enough to print the overflow report and stop).
+pub const EMERGENCY_BYTES: usize = 8192;
+#[repr(align(16))]
+struct Emergency(#[allow(dead_code)] [u8; EMERGENCY_BYTES]);
+// (`static mut`, so it lives in writable memory: an immutable all-zero static would be placed in `.rodata`)
+static mut EMERGENCY: [Emergency; MAX_HARTS] =
+    [const { Emergency([0; EMERGENCY_BYTES]) }; MAX_HARTS];
 
 /// The record of hart `index`.
 pub fn hart(index: usize) -> &'static PerHart {
@@ -111,6 +123,11 @@ pub fn bind(index: usize, hart_id: usize) {
     let h = &HARTS[index];
     h.index.store(index, Ordering::Relaxed);
     h.hart_id.store(hart_id, Ordering::Relaxed);
+    h.emergency_top.store(
+        // SAFETY: only the address of the hart's own emergency stack is taken; nothing is read or written.
+        unsafe { core::ptr::addr_of_mut!(EMERGENCY[index]) } as u64 + EMERGENCY_BYTES as u64,
+        Ordering::Relaxed,
+    );
     // SAFETY: sets `tp`, which kernel code reserves for this purpose (LLVM never allocates it).
     unsafe {
         core::arch::asm!("mv tp, {}", in(reg) h as *const PerHart as usize, options(nomem, nostack, preserves_flags))

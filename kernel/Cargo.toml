@@ -29,6 +29,9 @@ repl = ["interactive"]
 fault-log = []
 # Make one self-test fail on purpose, so the boot test can prove it sees failures.
 fail-demo = []
+# A kernel thread that overflows its stack on purpose: the guard page and the emergency stack must turn it
+# into a `##PANIC kernel stack overflow` report (`make os-boot-test-overflow`).
+stack-overflow-demo = []
 # Boot with the plain round-robin scheduling class instead of fixed-priority (OD32).
 # The priority-specific self-tests are skipped; the generic ones must still pass.
 sched-round-robin = []

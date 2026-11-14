@@ -1,8 +1,20 @@
 # T: kernel memory and cheap threads (specification, v1, 2026-11-14)
 
-Status: design for roadmap slice T (OD79 direction, OD82 this document). Step 0 measurement is built (stacks are
-16 KiB, `thread::stack_high_water`, test `kernel_stacks_stay_well_inside_their_size`). Everything below is to be built
-in the steps of section 7. Tests come first, as always.
+Status: design for roadmap slice T (OD79 direction, OD82 this document). Step 0 (measurement, 16 KiB stacks) and
+step 3 (kernel stacks from frames with a guard page and an emergency stack) are built; see "Revision" below for what
+changed from the first draft and why. Tests come first, as always.
+
+**Revision (2026-11-14, while building).** Sections 3 and 7 below were drafted around a *kernel frame pool with its own
+lock*, because the allocator can be called without the big kernel lock. Building the first piece showed the pool is not
+needed: (1) **kernel stacks** are created and freed by thread creation and exit, which hold the big kernel lock, so they
+take frames from the frame database directly (`kernel/src/kstack.rs`); (2) a growable **heap** does not need frames inside
+`alloc` either: it can grow at safe points under the big lock, and any allocation that must not fail inline is made
+headroom for. So the pool and the slab allocator are dropped from this slice (the frame-pool crate was written and
+model-tested, then deleted as unused). What remains of section 3 is a growable heap window (a virtually contiguous
+window whose pages come from the frame database at safe points; `linked_list_allocator`'s `extend` already supports it);
+it is the last step of the slice, because the thread limits and the per-job charging (steps 4 and 5) matter more and need
+only the stacks off the heap. Stack slots keep their frames and mapping once made (a recycled slot can never meet a stale
+remote translation); returning them needs a shootdown and is deferred (T67).
 
 ## 1. The problem, measured
 

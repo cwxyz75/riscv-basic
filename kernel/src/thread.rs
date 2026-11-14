@@ -33,8 +33,7 @@ fn new_class() -> Class {
 /// Kernel stack size per thread. 16 KiB since slice T: the deepest any stack went in the whole suite (debug
 /// build, every test and the Lua test suite) was about 5.6 KiB (`stack_high_water`), and a test fails if one
 /// ever passes three quarters of this.
-pub const STACK_BYTES: usize = 16 * 1024;
-const STACK_WORDS: usize = STACK_BYTES / 8;
+pub const STACK_BYTES: usize = abi::layout::KSTACK_BYTES as usize;
 const CANARY: u64 = 0xdead_c0de_5ca1_ab1e;
 /// Words of guard pattern at the bottom of every stack (the overflow detector).
 const GUARD_WORDS: usize = 8;
@@ -106,7 +105,7 @@ extern "C" {
 struct KThread {
     ctx: Box<Context>,
     /// `None` for the boot thread, which runs on the boot stack.
-    stack: Option<Box<[u64]>>,
+    stack: Option<crate::kstack::KStack>,
     name: &'static str,
     /// Nobody will `join` this thread: when it exits the reaper frees it.
     detached: bool,
@@ -320,9 +319,10 @@ fn spawn_with_affinity(
     detached: bool,
     affinity: Option<usize>,
 ) -> Tid {
-    let mut stack: Box<[u64]> = alloc::vec![0u64; STACK_WORDS].into_boxed_slice();
+    // The stack comes from frames, not the heap, and has a guard page below it (`kstack.rs`).
+    let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
     stack[..GUARD_WORDS].fill(CANARY);
-    let top = stack.as_ptr() as usize + STACK_BYTES;
+    let top = stack.top();
     let mut ctx = Box::<Context>::default();
     ctx.ra = thread_trampoline as *const () as u64;
     ctx.sp = (top & !15) as u64;
@@ -777,7 +777,7 @@ pub fn current_stack_top() -> u64 {
             .stack
             .as_ref()
             .expect("a user thread has its own kernel stack");
-        ((stack.as_ptr() as usize + STACK_BYTES) & !15) as u64
+        (stack.top() & !15) as u64
     })
 }
 

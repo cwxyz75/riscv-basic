@@ -22,6 +22,7 @@ mod heap;
 mod interactive;
 mod irq;
 mod kmem;
+mod kstack;
 mod percpu;
 mod sched_tests;
 mod selftest;
@@ -109,6 +110,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     heap::init();
     trap::init();
     kmem::init();
+    kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
     aia::init();
     if !RELEASE {
         let _ = writeln!(
@@ -171,6 +173,23 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // S3b: user mode. The user suite reports its own `##TEST` lines (counted by the
     // kernel); the kernel-side checks are reported here.
     kmem::snapshot_kernel_half();
+    #[cfg(feature = "stack-overflow-demo")]
+    {
+        fn recurse(depth: usize) -> usize {
+            let pad = [depth as u8; 512];
+            core::hint::black_box(&pad);
+            recurse(depth + 1) + usize::from(pad[0])
+        }
+        let t = thread::spawn(
+            "overflow",
+            10,
+            |n| {
+                recurse(n);
+            },
+            0,
+        );
+        thread::join(t);
+    }
     for (name, test) in smp_tests::TESTS.iter().filter(|_| !RELEASE) {
         match test() {
             Ok(()) => tally.record(name, Ok(())),

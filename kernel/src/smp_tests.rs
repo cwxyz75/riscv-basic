@@ -353,7 +353,7 @@ fn unmap_while_siblings_touch() -> Result<(), String> {
 /// still translating through a dead root, and nothing may leak.
 fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     use crate::user;
-    let frames_before = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    let frames_before = crate::irq::without(crate::kmem::free_frames_accounted);
     for round in 0..120 {
         let (pid, tid) = user::start(user::CRASH_ELF, 41).map_err(|e| format!("{e:?}"))?;
         thread::sleep_ticks(1 + (round % 3));
@@ -372,7 +372,7 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
             user::job_ledger()
         ));
     }
-    let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    let frames_after = crate::irq::without(crate::kmem::free_frames_accounted);
     if frames_after != frames_before {
         return Err(format!("frames {frames_before} -> {frames_after}"));
     }
@@ -447,7 +447,7 @@ fn churn_thread(_: usize) {
 fn smp_churn_stress() -> Result<(), String> {
     use crate::user;
     thread::sleep_ticks(10); // let earlier tests' exited threads be reaped before counting
-    let frames_before = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    let frames_before = crate::irq::without(crate::kmem::free_frames_accounted);
     let threads_before = thread::thread_count();
     let vmos_before = crate::irq::without(|| crate::kmem::get().vmos.count());
     let mut procs = alloc::vec::Vec::new();
@@ -488,7 +488,7 @@ fn smp_churn_stress() -> Result<(), String> {
     if vmos_after != vmos_before {
         return Err(format!("VMOs {vmos_before} -> {vmos_after}"));
     }
-    let frames_after = crate::irq::without(|| crate::kmem::get().mm.db.free_count());
+    let frames_after = crate::irq::without(crate::kmem::free_frames_accounted);
     if frames_after != frames_before {
         return Err(format!("frames {frames_before} -> {frames_after}"));
     }

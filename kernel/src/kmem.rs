@@ -231,3 +231,10 @@ pub fn kernel_half_unchanged() -> bool {
     // SAFETY: read of a static written once by `snapshot_kernel_half`.
     kernel_half_now() == unsafe { *addr_of!(KERNEL_HALF) }
 }
+
+/// Free frames, plus the frames held by kernel stack slots (which keep theirs for ever once made, so
+/// a leak check that compares before and after must not count a slot made in between as a leak).
+/// Must be called with the big kernel lock held, like `get`.
+pub fn free_frames_accounted() -> usize {
+    get().mm.db.free_count() + crate::kstack::frames_held()
+}
