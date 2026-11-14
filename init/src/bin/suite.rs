@@ -8078,6 +8078,24 @@ fn vmo_commit_charges_up_front_and_foreign_maps_need_it() -> Outcome {
         "an uncommitted stranger's VMO cannot be mapped over its whole length"
     );
     ensure_eq!(
+        st(sys::process_map(me, v, base, 4 * 4096, 4096, PF_R | PF_W)),
+        Some(S::BadState),
+        "an offset into the uncommitted part is refused too"
+    );
+    ensure_eq!(
+        st(sys::process_map(
+            me,
+            v,
+            base,
+            2 * 4096,
+            2 * 4096,
+            PF_R | PF_W
+        )),
+        Some(S::Ok),
+        "pages 2 and 3 are committed, so they can be mapped at an offset"
+    );
+    sys::process_unmap(me, base);
+    ensure_eq!(
         st(sys::process_map(me, v, base, 0, 4 * 4096, PF_R | PF_W)),
         Some(S::Ok),
         "the committed four pages can"

@@ -139,3 +139,24 @@ fn destroying_credits_exactly_what_was_committed() {
     assert_eq!(used(&vmos, j), 0, "credited back");
     assert_eq!(mm.db.free_count(), free, "frames back");
 }
+
+#[test]
+fn a_failed_commit_over_already_committed_pages_keeps_them_and_double_credits_nothing() {
+    let mut mm = mm(100);
+    let mut vmos = Vmos::new();
+    let j = job(&mut vmos, 5);
+    let id = vmos.create_in(8, j);
+    vmos.commit(&mut mm, id, 0, 3).unwrap();
+    // pages 0-2 are already ours; 0..8 would need five more (total 8 > 5): refused, nothing changes
+    assert_eq!(vmos.commit(&mut mm, id, 0, 8), Err(VmoError::NoMemory));
+    assert_eq!(
+        used(&vmos, j),
+        3,
+        "the earlier pages are still charged exactly once"
+    );
+    assert!(vmos.is_committed(id, 0, 3));
+    let free = mm.db.free_count();
+    vmos.destroy(&mut mm, id).unwrap();
+    assert_eq!(used(&vmos, j), 0);
+    assert_eq!(mm.db.free_count(), free + 3);
+}

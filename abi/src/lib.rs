@@ -220,6 +220,8 @@ pub mod limits {
     pub const MAX_DMA_TOTAL_PAGES: u64 = 1024;
     /// Pages in one VMO (64 MiB).
     pub const MAX_VMO_PAGES: u64 = 16384;
+    /// Most pages one `vmo_commit` call may commit (the kernel zeroes them with the big lock held).
+    pub const MAX_COMMIT_PAGES: u64 = 1024;
     /// Live processes at once.
     pub const MAX_PROCESSES: usize = 64;
     /// Live user threads in one process.

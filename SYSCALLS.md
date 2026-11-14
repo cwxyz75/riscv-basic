@@ -67,6 +67,7 @@ its object kind defines; rights can only be removed, never added (INVARIANTS H3)
 | KILL | 10 | ending a process with `process_kill` (so a service can be given the power to stop a job without being able to map memory into it or add threads) |
 | SET_LIMITS | 11 | changing a job's limits (`job_set_limits`); separate from MANAGE so that making things inside a job does not allow lifting its limits |
 | DMA | 12 | learning a DMA VMO's physical address (`vmo_phys_addr`) |
+| COMMIT | 13 | committing a VMO's pages now (`vmo_commit`); the pages are charged to the VMO's creating job |
 
 `SAME_RIGHTS` (bit 31) is not a right: as the `rights` argument of `handle_duplicate` or
 `handle_replace` it means "the same as the source handle".
@@ -352,8 +353,10 @@ charge anyone. All or nothing: if the job's page limit or the frames run out, ev
 given back and the call returns NO_MEMORY with the VMO and the job ledger exactly as before. Rights: COMMIT
 (a new right; creating a VMO gives its handle COMMIT, and a creator narrows it away before handing the VMO to
 someone else, since a holder with COMMIT spends the creator's quota). `offset` and `length` must be page
-aligned (INVALID_ARGS), inside the VMO (INVALID_ARGS), and the VMO must be ordinary memory (device and DMA VMOs
-are INVALID_ARGS). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no COMMIT); INVALID_ARGS; NO_MEMORY.
+aligned (INVALID_ARGS), inside the VMO (INVALID_ARGS) and at most 1024 pages (TOO_BIG); a device or DMA VMO's
+handle has no COMMIT (ACCESS_DENIED: those VMOs are fixed memory, already "committed"). Pages that fit neither
+the job's room nor the free frames are refused up front (NO_MEMORY, nothing changed). Errors: BAD_HANDLE;
+WRONG_TYPE; ACCESS_DENIED (no COMMIT); INVALID_ARGS; TOO_BIG; NO_MEMORY.
 
 ### vmo_get_size(vmo) -> status, bytes
 

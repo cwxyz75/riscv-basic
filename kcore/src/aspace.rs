@@ -341,6 +341,14 @@ impl Vmos {
         if end > vmo.pages {
             return Err(VmoError::OutOfRange);
         }
+        // Refuse at once what cannot fit (no frames taken and given back for nothing): count the pages
+        // this call would commit and compare with the job's room and the free frames.
+        let needed = (first..end)
+            .filter(|p| !vmo.committed.contains_key(p))
+            .count() as u64;
+        if needed > self.jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
+            return Err(VmoError::NoMemory);
+        }
         let mut done: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
         for page in first..end {
             if self.map[&id].committed.contains_key(&page) {

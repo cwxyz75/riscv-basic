@@ -1221,6 +1221,10 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
                 return fail(Status::InvalidArgs);
             }
+            // (bounded: the call zeroes every frame it takes with the big lock held)
+            if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
+                return fail(Status::TooBig);
+            }
             match k.vmos.commit(&mut k.mm, id, offset / 4096, len / 4096) {
                 Ok(()) => Ok((None, None)),
                 Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
