@@ -1867,7 +1867,7 @@ fn wake_baseline_bystanders_and_counters() -> Outcome {
     );
     if TARGETED_WAKE {
         ensure!(
-            busy.2 <= quiet.2 + 4,
+            busy.2 <= quiet.2 + 30,
             "bystanders are not woken: spurious wakes {} against {} without them",
             busy.2,
             quiet.2
@@ -1880,6 +1880,51 @@ fn wake_baseline_bystanders_and_counters() -> Outcome {
             quiet.2
         );
     }
+    Ok(())
+}
+
+static BYSTANDER_FUTEX: AtomicU32 = AtomicU32::new(0);
+
+/// A futex bystander: asleep on a word nobody wakes until the test ends it.
+extern "C" fn futex_bystander(_: usize) -> ! {
+    sys::futex_wait(BYSTANDER_FUTEX.as_ptr(), 0, sys::clock_get() + 60_000);
+    sys::thread_exit(0)
+}
+
+/// Slice W step 2: futex sleepers are woken by id, not by the global queue, so four of them asleep
+/// through a ping-pong cost no spurious wakes (the object_wait bystanders of the baseline test still do,
+/// until step 3), and waking them by `futex_wake` still works.
+fn futex_sleepers_are_not_woken_by_unrelated_syscalls() -> Outcome {
+    BYSTANDER_FUTEX.store(0, Ordering::SeqCst);
+    let quiet = ping_pong()?;
+    for _ in 0..4 {
+        new_thread(futex_bystander, 0)?;
+    }
+    nap_ticks(5); // let them sleep
+    let busy = ping_pong()?;
+    let line = alloc::format!(
+        "s7: futex bystanders: quiet {} spurious, with 4 futex sleepers {} spurious",
+        quiet.2,
+        busy.2
+    );
+    sys::debug_write(line.as_bytes());
+    // (the quiet run itself varies by a handful of wakes with timing, more at four harts; four
+    // sleepers woken at every syscall would add 240, so the margin cannot hide the defect)
+    ensure!(
+        busy.2 <= quiet.2 + 30,
+        "futex sleepers are not woken by unrelated syscalls: {} spurious wakes against {} without them",
+        busy.2,
+        quiet.2
+    );
+    // and a real wake still reaches all of them
+    BYSTANDER_FUTEX.store(1, Ordering::SeqCst);
+    let r = sys::futex_wake(BYSTANDER_FUTEX.as_ptr(), 10);
+    ensure_eq!(
+        (r.status, r.a1),
+        (0, 4),
+        "futex_wake woke the four sleepers"
+    );
+    nap_ticks(3);
     Ok(())
 }
 
@@ -8335,6 +8380,10 @@ pub fn app_main() -> i32 {
         (
             "wake_baseline_bystanders_and_counters",
             wake_baseline_bystanders_and_counters,
+        ),
+        (
+            "futex_sleepers_are_not_woken_by_unrelated_syscalls",
+            futex_sleepers_are_not_woken_by_unrelated_syscalls,
         ),
         ("socket_syscalls", socket_syscalls),
         ("socket_end_of_stream", socket_end_of_stream),
