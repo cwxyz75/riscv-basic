@@ -243,6 +243,53 @@ def second_disk():
     return f.name
 
 
+def run_profiled(cmd, kernel):
+    """Like the plain run, but stamps every output line with the host time it arrived, and appends one
+    row per test to $OS_PROFILE (TSV: label, test, host seconds the test took, guest ticks it took).
+    The host time of a test is the gap between its `##TEST` line and the previous one (the first test
+    is measured from the boot line). Slice TS step 0: used by `scripts/profile_tests.py`."""
+    import threading
+    import time
+    label = os.environ.get("OS_PROFILE_LABEL") or (
+        f"{kernel.split('/')[1] if kernel.startswith('target/') else kernel}"
+        f"|smp{os.environ.get('OS_SMP', '1')}|{os.environ.get('OS_MACHINE', DEFAULT_MACHINE)}"
+        f"|{os.environ.get('OS_CPU', 'default-cpu')}")
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    stamped = []
+
+    def pump():
+        for raw in proc.stdout:
+            stamped.append((time.monotonic(), raw))
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    try:
+        status = proc.wait(timeout=TIMEOUT)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        status, timed_out = None, True
+    t.join(timeout=5)
+    total = time.monotonic() - start
+    out = b"".join(raw for _, raw in stamped)
+    prev, ticks, rows = start, {}, []
+    for when, raw in stamped:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line.startswith("tt: "):
+            _, name, n = line.split()
+            ticks[name] = n
+        elif m := TEST.match(line):
+            rows.append((m[1], when - prev))
+            prev = when
+    with open(os.environ["OS_PROFILE"], "a") as f:
+        f.write(f"#boot\t{label}\t{total:.1f}\n")
+        for name, secs in rows:
+            f.write(f"{label}\t{name}\t{secs:.2f}\t{ticks.get(name, '')}\n")
+    return out, status, timed_out
+
+
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
@@ -267,11 +314,14 @@ def run(kernel: str, extra=()):
             "-device", "virtio-blk-device,drive=hd0"]),
         *extra, "-kernel", kernel,
     ]
-    try:
-        done = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT)
-        out, status, timed_out = done.stdout, done.returncode, False
-    except subprocess.TimeoutExpired as e:
-        out, status, timed_out = e.stdout or b"", None, True
+    if os.environ.get("OS_PROFILE"):
+        out, status, timed_out = run_profiled(cmd, kernel)
+    else:
+        try:
+            done = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT)
+            out, status, timed_out = done.stdout, done.returncode, False
+        except subprocess.TimeoutExpired as e:
+            out, status, timed_out = e.stdout or b"", None, True
     text = out.decode("utf-8", errors="replace").replace("\r\n", "\n")
     return [l for l in text.split("\n") if l.startswith("##")], status, timed_out, text
 

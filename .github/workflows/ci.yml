@@ -1,5 +1,9 @@
 name: ci
 
+# The merge gate (tiers 0 and 1 of TESTING.md / OD83): host tests and lint, one boot of the suite at four
+# harts, the release smoke, the home computer's boot. Every job's timeout is its budget; a job that
+# outgrows it fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The
+# full matrix (tier 2) is `soak.yml`: nightly, on the `soak` label and on demand, never required.
 # Pull requests run the suite once; pushes only matter on main (a branch push with an open PR would
 # run exactly the same jobs a second time).
 on:
@@ -42,7 +46,7 @@ jobs:
 
   host:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -57,37 +61,23 @@ jobs:
       - name: Check the demo pictures against the independent renderer
         run: python3 home/scripts/verify_demo_images.py
 
-  # The boot tests, as parallel jobs: a slow or flaky one (they follow the host clock and CI runners
-  # are several times slower than a laptop: TIDY-UP T21) no longer hides the others.
+  # Tier 1: one boot of the whole suite on the default (AIA) machine at four harts, and the release smoke.
+  # Budget: 10 minutes. (If the harness itself changed, the fail-demo check that proves it can see a failure runs too.)
   kernel:
-    name: kernel (${{ matrix.name }})
+    name: kernel (smoke)
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: normal and fail-demo
-            targets: os-boot-test-main
-          - name: round-robin
-            targets: os-boot-test-rr
-          - name: release build
-            targets: os-boot-test-release
-          - name: four harts
-            targets: os-boot-test-smp
-          - name: four harts (negative controls, serial)
-            targets: os-boot-test-smp-neg
-          - name: AIA, RVA23, serial
-            targets: os-boot-test-aia os-boot-test-polling os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          key: smoke
       - name: Install QEMU and OpenSBI
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
@@ -96,11 +86,14 @@ jobs:
         run: |
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
-          qemu-system-riscv64 -cpu help | grep -i rva23 || echo "NO RVA23 CPU"
           dpkg -l opensbi | tail -1
-          clang --version | head -1
-          clang --print-targets | grep -i riscv64 || echo "NO RISCV64 CLANG TARGET"
-      - run: make ${{ matrix.targets }}
+      - run: make os-boot-test-smoke os-release-smoke
+      - name: "The harness changed, so prove it still sees a failure (fail-demo)"
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -qE '^(scripts/os_boot_test.py|Makefile)$'; then
+            make os-boot-test-main
+          fi
 
   # The home computer is its own job: it only needs to run when home/ or something shared changed.
   home-kernel:
@@ -108,7 +101,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.home == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -121,13 +114,3 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi
       - run: make home-boot-test
-
-  miri:
-    needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install nightly with Miri
-        run: rustup toolchain install nightly --profile minimal --component miri
-      - run: make os-miri

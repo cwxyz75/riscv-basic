@@ -8,7 +8,7 @@ QEMU_FLAGS    := -machine virt -nographic -bios default
 DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
-.PHONY: quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -95,8 +95,11 @@ OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 os-user:
 	cd init && cargo build
 
-kernel: os-user
+# Only the normal kernel (what the smoke boot needs); `kernel` adds the fail-demo and round-robin builds.
+kernel-main: os-user
 	cd kernel && cargo build
+
+kernel: kernel-main
 	cd kernel && cargo build --features fail-demo --target-dir ../target/os-fail
 	cd kernel && cargo build --features sched-round-robin --target-dir ../target/os-rr
 
@@ -121,6 +124,11 @@ os-test:
 # so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
+
+# Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
+# kernel at four harts is also the fastest full run (35 s: waits overlap).
+os-boot-test-smoke: kernel-main
+	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
@@ -227,7 +235,7 @@ os-boot-test-rva23: kernel
 
 # The inner-loop gate (about a minute): format, the OS host tests without the model checkers, and a
 # headless boot of the release system to the shell and a BASIC session. Run this while iterating;
-# run `make check` once, before the push (CI repeats the full matrix).
+# run `make smoke` before the push if you want the whole gate locally (CI runs it); the soak tier is on demand.
 # Contract-document checks (TIDY-UP T55): known-stale statements and the decision log's bookkeeping.
 docs-check:
 	python3 scripts/check_docs.py
@@ -236,4 +244,21 @@ quick: fmt-check docs-check
 	cargo test -p abi -p kcore -p proto -p memfs -p cfmt -p basic-script
 	$(MAKE) os-release-smoke
 
-check: fmt-check docs-check test lint home-boot-test os-test os-boot-test os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test os-release-smoke
+# Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
+# the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
+SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-release-smoke
+smoke: $(SMOKE_TARGETS)
+
+# Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required; run it on demand,
+# on a label, nightly (CI), and before a release. The boots are independent (each makes its own disk), so they run
+# in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
+SOAK_TARGETS := os-boot-test os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
+SOAK_JOBS ?= 3
+soak:
+	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
+
+# `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).
+check: smoke
+
+# Everything: smoke, then soak.
+check-all: smoke soak

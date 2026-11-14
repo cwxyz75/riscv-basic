@@ -19,10 +19,10 @@ boundaries").
 - `make test`: host tests for the home-computer crates (`home/basic/`, `home/console/`, ...). Fast; run constantly.
 - `make home-kernel` / `make home-run` / `make home-debug`: build / boot / boot-paused-for-gdb.
 - `make home-boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
-- `make check`: fmt, tests, clippy, boot test. Run before calling anything done.
+- `make check` (an alias of `make smoke`, tiers 0 and 1: fmt, tests, clippy, one boot of the suite at four harts, the home boot, the release smoke; about three minutes warm). `make soak` is the full matrix (on demand, tier 2); `make check-all` is both. The testing tiers and their rules are in `TESTING.md` (OD83).
 - OS track: `make kernel` / `make os-test` (host tests plus loom and shuttle) /
   `make os-boot-test` (headless QEMU, structured output) / `make os-miri` (needs
-  nightly; CI runs it). `make check` covers all but Miri. OS-track cargo commands
+  nightly; the soak workflow runs it). OS-track cargo commands
   run from inside `kernel/`, like `home/kernel/`.
 - Kernel cargo commands must run from inside the kernel's own directory (each has its
   own `.cargo/config.toml` that sets the target). The Makefile handles this. The two
@@ -65,12 +65,14 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 - Interpreter behaviour is specified by `home/BASIC.md` and pinned by golden tests in
   `home/basic/tests/golden/`. Write the golden test first, watch it fail, then implement.
   Never run `BLESS=1` blindly: read the diff of the `.out` files.
-- **Test cost is the bottleneck, so spend it deliberately.** While iterating run `make quick`
-  (about a minute) or the one targeted test; run the full `make check` once per PR, right before
-  the push, and do not repeat it after trivial fixups (docs, clippy nits). CI runs the full matrix
-  and skips jobs a change cannot affect (docs-only, home-only). Batch related slices into one PR
-  (several commits); keep kernel/security slices that get a Fable review in their own small PR.
-  Run mutation checks once per new test, not once per push.
+- **Test cost is the bottleneck, so spend it deliberately (tiers: `TESTING.md`).** While iterating run
+  `make quick` or the one targeted test. The merge gate is tiers 0 and 1 (`make smoke`, which CI runs
+  too); merge on a green gate. The soak tier (`make soak`, `soak.yml`: the full matrix, negative controls,
+  Miri) is on demand, nightly and on the `soak` label, never required: run it by hand only for kernel,
+  SMP, memory or security changes. Do not run the whole matrix before every push. Batch related slices
+  into one PR (several commits); keep kernel/security slices that get a Fable review in their own small
+  PR. Run mutation checks once per new test, not once per push. New tests go where `TESTING.md` says:
+  logic on the host, syscall behaviour in the suite, only what the machine shows in QEMU.
 - If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
 - Only tick a `ROADMAP.md` box when its acceptance criterion has actually been
@@ -83,7 +85,7 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 ## OS track (S-series)
 
 Everything above still applies (one milestone per PR, `main` always builds and
-boots, `// SAFETY:` comments, `make check`). In addition:
+boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
 
 - The spec is `OS-ARCHITECTURE.md`. Design decisions are logged in its section 17
   (OD numbers), not in `home/DESIGN.md`. Open questions are in its section 18: stop and
