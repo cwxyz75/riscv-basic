@@ -514,7 +514,7 @@ Builds on slices R (the service loop) and I (interrupts); the existing block-dri
 
 - [~] Step 0: spec: the request carries a device `index` (lowest virtio-mmio slot address first); authority handed to each driver is unchanged (its own MMIO window, one DMA buffer, its interrupt)
 - [x] Step 1: table-driven discovery: `devmgr` finds every virtio block device and keeps a table, one driver slot per device, a per-device register mapping, and resets every device at the end
-- [~] Step 2: two devices in use at once, from one client, are tested (the harness attaches a second disk with its own sector-0 pattern; `s6: devmgr served two block devices`); **not done**: several *clients* of the manager (it still serves one channel and exits when it closes) and other device kinds (`virtio-net` comes with S8)
+- [x] Step 2: two devices in use at once, from one client, are tested (the harness attaches a second disk with its own sector-0 pattern; `s6: devmgr served two block devices`); **several clients**: `Connect` (op 2, carrying the new client's endpoint) adds a connection through any existing one, served by the same loop, limited by the pool (16) and `Quota`; the manager lives until the last client goes (in `devmgr_starts_blkd_for_the_disk`). Other device kinds (`virtio-net`) come with S8
 - [~] Step 3: documents: partly (this note); T41 stays open (the device windows are still the QEMU `virt` ones)
 
 Estimated size (not measured): 2 to 3 PRs.

@@ -217,15 +217,39 @@ impl Service for DevMgr {
     }
 
     fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
-        // a request carries no handles: close whatever came (authority we did not ask for)
+        let txid_of = |m: &[u8]| {
+            m.get(..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        // Connect carries exactly one handle (the new client's end); OpenBlock carries none. Anything else
+        // is refused, and whatever came is closed (authority we did not ask for).
+        if devmgr::op_of(msg) == Some(devmgr::OP_CONNECT) {
+            let Ok(txid) = devmgr::decode_connect(msg) else {
+                for &h in hs {
+                    sys::handle_close(h);
+                }
+                return self.reply(key, txid_of(msg), Status::BadRequest, None);
+            };
+            if hs.len() != 1 {
+                for &h in hs {
+                    sys::handle_close(h);
+                }
+                return self.reply(key, txid, Status::BadRequest, None);
+            }
+            let account = self.core.account_of(key).unwrap_or(svc::ROOT);
+            return match self.core.add_conn(hs[0], account, ()) {
+                Some(_) => self.reply(key, txid, Status::Ok, None),
+                None => {
+                    sys::handle_close(hs[0]);
+                    self.reply(key, txid, Status::Quota, None)
+                }
+            };
+        }
         for &h in hs {
             sys::handle_close(h);
         }
         if !hs.is_empty() {
-            let txid = msg
-                .get(..4)
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-            return self.reply(key, txid, Status::BadRequest, None);
+            return self.reply(key, txid_of(msg), Status::BadRequest, None);
         }
         match devmgr::decode_request(msg) {
             Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),

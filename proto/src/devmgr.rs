@@ -10,6 +10,9 @@ use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
 
 pub const OP_OPEN_BLOCK: u16 = 1;
+/// Connect another client: the request carries one handle, the new client's end of a channel, and the manager
+/// serves it as one more connection (slice DM). Same layout as OpenBlock; `index` must be 0.
+pub const OP_CONNECT: u16 = 2;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -25,6 +28,8 @@ pub enum Status {
     /// The driver could not be started.
     Failed = 3,
     BadRequest = 4,
+    /// The manager's connection limit is reached (`Connect`).
+    Quota = 5,
 }
 
 impl Status {
@@ -35,6 +40,7 @@ impl Status {
             2 => Status::Busy,
             3 => Status::Failed,
             4 => Status::BadRequest,
+            5 => Status::Quota,
             _ => return None,
         })
     }
@@ -52,6 +58,29 @@ pub fn encode_open_block_at(txid: u32, index: u16) -> Vec<u8> {
     b.extend_from_slice(&OP_OPEN_BLOCK.to_le_bytes());
     b.extend_from_slice(&index.to_le_bytes());
     b
+}
+
+/// A `Connect` request (the client's endpoint travels with it).
+pub fn encode_connect(txid: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_CONNECT.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b
+}
+
+/// The operation of a request, if the message is long enough to have one.
+pub fn op_of(b: &[u8]) -> Option<u16> {
+    rd_u16(b, 4)
+}
+
+/// `Ok(txid)` for a well-formed `Connect` request.
+pub fn decode_connect(b: &[u8]) -> Result<u32, Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_CONNECT) || rd_u16(b, 6) != Some(0) {
+        return Err(txid);
+    }
+    txid.ok_or(None)
 }
 
 /// `Ok((txid, index))` for an OpenBlock request; `Err(txid if there was one)` otherwise.
@@ -99,6 +128,16 @@ mod tests {
 
     #[test]
     fn malformed_input_is_an_error_never_a_panic() {
+        // Connect: same layout, its own op, index 0
+        assert_eq!(decode_connect(&encode_connect(9)), Ok(9));
+        assert_eq!(op_of(&encode_connect(9)), Some(OP_CONNECT));
+        assert_eq!(decode_connect(&encode_open_block_at(9, 0)), Err(Some(9)));
+        assert_eq!(decode_request(&encode_connect(9)), Err(Some(9)));
+        let mut bad = encode_connect(9);
+        bad[6] = 1; // a nonzero index
+        assert_eq!(decode_connect(&bad), Err(Some(9)));
+        assert_eq!(decode_connect(&[]), Err(None));
+        assert_eq!(Status::from_i32(5), Some(Status::Quota));
         assert_eq!(decode_request(&[]), Err(None));
         assert_eq!(decode_request(&[1, 2, 3, 4]), Err(Some(0x0403_0201)));
         assert_eq!(decode_request(&[5, 0, 0, 0, 9, 0, 0, 0]), Err(Some(5)));

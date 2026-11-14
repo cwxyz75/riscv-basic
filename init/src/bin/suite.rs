@@ -7633,8 +7633,61 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
         }
         sys::handle_close(again);
     }
-    // the client goes away: the manager ends cleanly
-    sys::handle_close(mine);
+    // slice DM: several clients. A second client connects through the first; both are served, and the manager
+    // lives until the last one goes.
+    {
+        use proto::devmgr as dm;
+        let (c2, c2_theirs) = channel()?;
+        let req = dm::encode_connect(40);
+        let hs = [c2_theirs];
+        ensure_eq!(
+            st(sys::channel_write(
+                mine,
+                req.as_ptr(),
+                req.len(),
+                hs.as_ptr(),
+                1
+            )),
+            Some(S::Ok),
+            "send Connect"
+        );
+        let w = sys::object_wait(mine, sig::READABLE, sys::clock_get() + 5000);
+        ensure_eq!(st(w), Some(S::Ok), "the manager answers Connect");
+        let mut rb = [0u8; 16];
+        let r = sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+        ensure_eq!(
+            dm::decode_reply(&rb[..r.a1]),
+            Some((40, D::Ok)),
+            "a second client was accepted"
+        );
+        let (status, h) = devmgr_open_at(c2, 41, 9)?;
+        ensure_eq!(
+            (status, h),
+            (D::NoDevice, None),
+            "the second client is served"
+        );
+        // Connect without its handle, and OpenBlock with one, are refused
+        let bare = dm::encode_connect(42);
+        sys::channel_write(c2, bare.as_ptr(), bare.len(), core::ptr::null(), 0);
+        let w = sys::object_wait(c2, sig::READABLE, sys::clock_get() + 5000);
+        ensure_eq!(st(w), Some(S::Ok), "answered");
+        let r = sys::channel_read(c2, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+        ensure_eq!(
+            dm::decode_reply(&rb[..r.a1]),
+            Some((42, D::BadRequest)),
+            "Connect needs its handle"
+        );
+        // the first client lets go: the manager lives on for the second
+        sys::handle_close(mine);
+        let (status, h) = devmgr_open_at(c2, 43, 9)?;
+        ensure_eq!(
+            (status, h),
+            (D::NoDevice, None),
+            "still served after the first client left"
+        );
+        sys::handle_close(c2);
+    }
+    // the last client goes away: the manager ends cleanly
     wait_ended(mgr, 3000)?;
     ensure_eq!(sys::process_info(mgr).a1 as i64, 0, "the manager exits 0");
     sys::handle_close(mgr);
