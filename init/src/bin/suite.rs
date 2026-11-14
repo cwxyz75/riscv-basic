@@ -2439,6 +2439,40 @@ fn a_user_signal_wakes_a_blocked_thread() -> Outcome {
     Ok(())
 }
 
+/// The reserved cancellation call (T56): it checks its handle like the real one will, then says NOT_SUPPORTED.
+fn thread_interrupt_is_reserved() -> Outcome {
+    ensure_eq!(
+        st(sys::thread_interrupt(0xdead)),
+        Some(S::BadHandle),
+        "no such handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::thread_interrupt(ev)),
+        Some(S::WrongType),
+        "an event is no thread"
+    );
+    let t = new_thread(worker_set, 1)?;
+    ensure_eq!(
+        st(sys::thread_interrupt(t)),
+        Some(S::NotSupported),
+        "reserved: not supported yet"
+    );
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    // a thread handle without MANAGE is refused (the right the real call will need)
+    let weak = ok(
+        sys::handle_duplicate(t, Rights::INSPECT.0),
+        "a thread handle without MANAGE",
+    )?
+    .a1 as u32;
+    ensure_eq!(
+        st(sys::thread_interrupt(weak)),
+        Some(S::AccessDenied),
+        "MANAGE is needed"
+    );
+    Ok(())
+}
+
 fn thread_limit_and_slots_are_reused() -> Outcome {
     let ev = event()?;
     let mut ts = [0u32; rt::abi::limits::MAX_THREADS_PER_PROCESS];
@@ -9121,6 +9155,7 @@ pub fn app_main() -> i32 {
             "a_refused_process_start_changes_nothing_and_can_be_retried",
             a_refused_process_start_changes_nothing_and_can_be_retried,
         ),
+        ("thread_interrupt_is_reserved", thread_interrupt_is_reserved),
         (
             "page_tables_are_charged_to_the_job",
             page_tables_are_charged_to_the_job,
