@@ -576,7 +576,7 @@ the thread and `channel_call` benchmark before and after; the whole suite at one
 
 Estimated size (not measured): 5 to 6 PRs; a Fable review.
 
-### SD: Service directory and namespaces (planned; not started)
+### SD: Service directory and namespaces (specified, OD97; step 1 partly built)
 
 Decision (2026-11-14, owner, OD78): design review D10. A **registry service** (not `init`) holds the directory.
 A service publishes a name by handing the registry a listener channel; a client opens `/svc/<name>` with the file
@@ -592,8 +592,8 @@ succeeds after it republishes; a program whose view lacks a name cannot open it;
 in the startup message; the registry itself tolerates a hostile publisher and a hostile client (limits per
 account, OD77); leak checks exact; the existing programs unchanged.
 
-- [ ] Step 0: spec and OD (registry protocol, views, startup message change, `UNAVAILABLE`), tests first
-- [ ] Step 1: the registry (pure directory logic in a host-tested crate, then the service on the service runtime)
+- [x] Step 0: spec (`SD-SPEC.md`) and OD97
+- [~] Step 1: the pure directory logic is built (`svc::directory`: names, listeners, stale entries, views; model tests, mutation-checked). **Not done**: the registry service on the service runtime, the `PUBLISH` right and ops 9 to 11, `UNAVAILABLE`
 - [ ] Step 2: generic named entries in the startup message; `rt` and the launcher; the closed `Role` enum retired for services
 - [ ] Step 3: the shell grants a `/svc` view; existing servers publish themselves (`memfsd`, `consoled`, `launcher`)
 - [ ] Step 4: clients reconnect on `UNAVAILABLE` in the service runtime; documents (T15, T30 narrowed)
