@@ -39,7 +39,14 @@ pub struct HandleTable {
     free: Vec<u16>,
     limit: usize,
     live: usize,
+    /// Objects whose handle was removed by `replace` or `remove_for_transfer` (which have no
+    /// registry to note it in): the owner calls `flush_removed`. Capped; overflow is remembered.
+    removed: Vec<ObjId>,
+    removed_overflow: bool,
 }
+
+/// How many removed handles a table remembers between flushes.
+const REMOVED_CAP: usize = 256;
 
 impl HandleTable {
     /// A table that holds at most `limit` handles (capped at 8191 by the encoding).
@@ -49,7 +56,19 @@ impl HandleTable {
             free: Vec::new(),
             limit: limit.min(SLOT_MASK as usize),
             live: 0,
+            removed: Vec::new(),
+            removed_overflow: false,
         }
+    }
+
+    /// Tell `reg` about every handle removed without it (`replace`, `remove_for_transfer`) since the
+    /// last flush: waiters on those objects must re-validate their handle. Returns false if more were
+    /// removed than the table remembers (the caller should treat every object as touched).
+    pub fn flush_removed<T: Object>(&mut self, reg: &mut Registry<T>) -> bool {
+        for obj in self.removed.drain(..) {
+            reg.touch_forced(obj);
+        }
+        !core::mem::take(&mut self.removed_overflow)
     }
 
     pub fn len(&self) -> usize {
@@ -125,6 +144,7 @@ impl HandleTable {
     pub fn close<T: Object>(&mut self, reg: &mut Registry<T>, h: Handle) -> Result<(), Status> {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         let entry = self.remove(slot);
+        reg.touch_forced(entry.obj);
         reg.release(entry.obj);
         Ok(())
     }
@@ -167,6 +187,7 @@ impl HandleTable {
         let old = self.slots[slot].entry.expect("occupied");
         let rights = Self::resolve_rights(old.rights, rights)?;
         let entry = self.remove(slot);
+        self.note_removed(entry.obj);
         Ok(self
             .insert(entry.obj, rights)
             .expect("a slot was just freed"))
@@ -184,7 +205,17 @@ impl HandleTable {
         {
             return Err(Status::AccessDenied);
         }
-        Ok(self.remove(slot))
+        let entry = self.remove(slot);
+        self.note_removed(entry.obj);
+        Ok(entry)
+    }
+
+    fn note_removed(&mut self, obj: ObjId) {
+        if self.removed.len() < REMOVED_CAP {
+            self.removed.push(obj);
+        } else {
+            self.removed_overflow = true;
+        }
     }
 
     /// Check that `h` is live and transferable without removing it.
@@ -207,6 +238,7 @@ impl HandleTable {
         for slot in 0..self.slots.len() {
             if self.slots[slot].entry.is_some() {
                 let entry = self.remove(slot);
+                reg.touch_forced(entry.obj);
                 reg.release(entry.obj);
             }
         }

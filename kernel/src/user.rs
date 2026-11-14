@@ -772,6 +772,11 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 notify();
             }
+            // (slice W step 1: nothing consumes the dirty log yet; drop what this syscall logged so it
+            // does not pile up. Step 3 wakes by it instead.)
+            irq::without(|| {
+                state().objs.take_dirty();
+            });
             reply(frame, result);
         }
     }

@@ -360,7 +360,7 @@ old wake-everyone behaviour as the oracle; mutation checks (drop a touch, no bat
 before poll); a `fault-skip-touch` negative-control kernel; every existing test still green.
 
 - [x] Step 0: spec (`W-SPEC.md`, OD80), wake counters (`debug_stat`) and the measured bystander baseline (`wake_baseline_bystanders_and_counters`); the `channel_call` benchmark and the T38 shuttle model move to step 2, where the wake path is first rewritten
-- [ ] Step 1: the dirty log and touch rules in `kcore`, no behaviour change, with a completeness property test
+- [x] Step 1: the dirty log and touch rules in `kcore` (`Registry::touch`, `touch_forced`, `take_dirty`; `get_mut` touches the object and its peer; handle removal is a forced touch), no behaviour change, with a completeness property test (`kcore/tests/touch_complete.rs`, mutation-checked); the kernel drops the log after each syscall until step 3
 - [ ] Step 2: wake by thread id for futex and kill
 - [ ] Step 3: `kcore::wait` thread waiters (`object_wait`, `channel_call`, kernel reads, IRQ)
 - [ ] Step 4: ports as registrations, binding quotas, D17
