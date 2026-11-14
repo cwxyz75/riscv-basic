@@ -315,12 +315,48 @@ Spec: `S7-SPEC.md` (slices S7a BASIC, S7b futexes, S7c libc, S7d Lua, S7e upstre
 - [x] Lua port (S7d: Lua 5.4.8, acceptance script against a host build)
 - [x] Upstream Lua test suite under `bin/lua` (S7e: 24 files, each its own test)
 
+### TS: Tiered testing (decided 2026-11-14; to be done immediately, before the rest of the queue resumes; not started)
+
+Why: one PR now takes over an hour from first run to merge, and it grows with every test. The cause is mostly structural: `make check`
+boots QEMU about 18 to 20 times, each boot running the same roughly 250-test suite (including the upstream Lua scripts, the BASIC
+corpus and the C transcript, whose results do not depend on the hart count, the interrupt controller or the scheduler); I run it locally
+(about 27 minutes) and then CI runs it again (10 to 12 minutes in parallel); and the local boots run one after another on a 10-core
+machine. The previous adjustment (the `quick` target, "full check once per PR") drifted back because nothing enforced it.
+
+Decisions (owner, 2026-11-14, OD83): the tiers below; one thin Ubuntu CI job as the merge gate (host tests plus the smoke boot), the full
+Linux matrix only at tier 2; a nightly tier-2 run on `main` and a recommended (never required) soak label on kernel, SMP and security
+slices; the independent oracles (upstream Lua, the C transcript against the host, the BASIC corpus) move to tier 2, run in smoke only
+when their own component changed.
+
+| Tier | When | Budget | Contents |
+|---|---|---|---|
+| 0, unit | every edit | under 1 minute | host unit, model and property tests; fmt, clippy, docs checks |
+| 1, smoke | every PR, the merge gate | about 8 to 10 minutes of wall clock | one QEMU boot (default AIA machine, 2 harts) of the kernel-focused subset of the suite; the release smoke; the home-computer boot; path-triggered extras (a change under `third_party/lua`, `libc` or `basic` also runs that component's group) |
+| 2, soak | on demand: PR label, manual dispatch, nightly on `main`, before a release; never mandatory | none | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, polling, no disk), negative controls and mutation checks (also when the guarded files change), upstream Lua, the BASIC corpus, churn and leak tests, benchmarks, Miri, loom and shuttle with large seed counts |
+
+Principles: logic goes to the host wherever it can (pure `kcore` and `proto` crates, model and property tests, mock machines and in-memory
+channels); QEMU is kept for what only the machine shows (traps, MMU and TLB, SMP races, the AIA, FP state, boot, real drivers). A new test
+declares its tier; the default rule is pure logic on the host, syscall semantics in smoke, long or exhaustive in soak. The rules are
+enforced mechanically (below), not by habit.
+
+Acceptance (written first): the measured table of step 0 exists; a PR that changes only a kernel source file passes its gate in the smoke
+budget; `make check` as a name is gone or means tier 0 and 1 only; `check_docs.py` fails if `TESTING.md`, the Makefile and the CI file disagree
+or if a soak target appears in the PR gate; a test with no declared tier fails the suite's registry check.
+
+- [ ] Step 0: measure. Per-test guest ticks and host wall time in the boot output, and a profile table (which tests and which boots cost what), kept in `TESTING.md`
+- [ ] Step 1: the quick wins, no coverage lost: `-j` parallel boots locally; QEMU icount with `sleep=off` where it works (single hart, T21); sharding the suite across parallel instances; the CI job split into the thin gate and the on-demand soak workflows (label, dispatch, nightly); tier tags in the suite registry
+- [ ] Step 2: `TESTING.md` (the strategy, the tier rules, the budgets) and its mechanical enforcement (CI timeouts equal to the budgets; `check_docs.py` consistency checks; the registry tier check); `CLAUDE.md`, the memory notes and the roadmap rules updated: locally only tier 0 and the targeted test, CI smoke is the gate, auto-merge on green
+- [ ] Step 3: move logic out of QEMU, incrementally: the syscall layer behind a small `Machine` trait so argument errors, rights, quotas and accounting run on the host against the real code with a fake machine (moving the matching suite tests over as each piece lands); host harnesses driving server protocols over in-memory channels (with slice R's `Service` trait); optional bounded model checking of small pure pieces (handle table, the slice T pool)
+
+Estimated size (not measured): steps 0 to 2 a day of work in two or three PRs; step 3 spread over the following slices.
+
 ### Queue before S8 (proposed order; set 2026-11-14 after the design review)
 
 The design review (`reviews/2026-11-14-design-review.md`) found a handful of structural things worth
 settling before the network stack is built on them. This is the proposed order; the owner can reorder.
 Slices A, W, V, T, R, SD, DM and I below each have a plan. L (locking) stays after S9.
 
+0. **Slice TS: tiered testing** (steps 0 to 2 first, immediately; step 3 spread over later slices), before development resumes.
 1. Tidy the stale contract documents (T55, design review D14): cheap, and everything else leans on them.
 2. Slice A: the RVA23 user ABI (hardware floating point). A flag day for all user code and C, so first,
    before more is ported and before the thread benchmark fixes its baseline.
