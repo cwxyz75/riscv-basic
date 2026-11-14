@@ -111,6 +111,14 @@ impl FpHart {
         FpHart { owner: 0 }
     }
 
+    /// Does this hart's register file hold exactly `thread`'s current state?
+    pub fn holds(&self, thread: &FpThread) -> bool {
+        thread
+            .state
+            .as_ref()
+            .is_some_and(|(_, token)| *token == self.owner)
+    }
+
     /// A trap from user mode: if the thread dirtied the registers, save them into the thread. Returns
     /// false if the unit claims dirty state for a thread that was never enabled (the hardware cannot
     /// do that; the kernel treats it as a bug).

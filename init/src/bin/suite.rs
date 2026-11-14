@@ -1782,6 +1782,24 @@ fn fp_state_is_private_to_each_thread_and_process() -> Outcome {
         sys::handle_close(p);
         ensure_eq!(code, 0, "FP process {i} kept its own registers");
     }
+    // a process that used FP and then executed a genuinely illegal instruction is still just killed ...
+    let (bad, _m) = launch(63)?;
+    wait_ended(bad, 3000)?;
+    ensure_eq!(
+        sys::process_info(bad).a1 as i64,
+        -1002,
+        "an illegal instruction after FP use is fatal"
+    );
+    sys::handle_close(bad);
+    // ... and what it left in the unit is not seen by the next process
+    let (fresh, _m) = launch(61)?;
+    wait_ended(fresh, 3000)?;
+    ensure_eq!(
+        sys::process_info(fresh).a1 as i64,
+        0,
+        "a killed process's FP registers are not inherited"
+    );
+    sys::handle_close(fresh);
     Ok(())
 }
 

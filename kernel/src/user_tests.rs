@@ -193,6 +193,7 @@ pub fn run_all() -> Report {
         "no_process_or_vmo_survives_init",
         if user::process_count() == 0
             && user::futex_sleepers() == 0
+            && crate::fp::entry_count() == 0
             && crate::irq::without(|| kmem::get().vmos.count()) == vmos_before
             && user::job_ledger() == (1, 0, 0, 0, 0)
         {

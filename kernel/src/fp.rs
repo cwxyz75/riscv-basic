@@ -77,7 +77,11 @@ impl FpUnit for HartUnit {
 
     fn load(&mut self, r: &FpRegs) {
         let (f, fcsr) = (r.f.as_ptr(), u64::from(r.fcsr));
-        // SAFETY: as `save`, reading instead of writing.
+        // SAFETY: as `save`, reading instead of writing. The FP registers are deliberately *not*
+        // declared clobbered: the kernel executes no FP instruction of its own (it runs with the unit
+        // off, INVARIANTS FP3), so the compiler holds nothing in them; declaring them would make it
+        // save and restore the callee-saved ones with FP instructions in this function's prologue,
+        // which trap with the unit off (found the hard way).
         unsafe {
             core::arch::asm!(
                 "csrs sstatus, {on}",
@@ -115,7 +119,8 @@ pub fn trap_entry(frame: &mut TrapFrame) {
         return; // from the kernel
     }
     let dirty = frame.sstatus & FS_MASK == FS_DIRTY;
-    if dirty {
+    // (the negative-control kernel forgets to save: the test that guards the save must then fail)
+    if dirty && !cfg!(feature = "fault-skip-fp-save") {
         let s = state();
         let tid = crate::thread::current();
         let FpState {
@@ -147,7 +152,15 @@ pub fn return_to_user(frame: &mut TrapFrame) {
     let s = state();
     let tid = crate::thread::current();
     let fs = match s.threads.get(&tid) {
-        Some(t) => s.harts[hart()].return_to_user(t, &mut HartUnit),
+        Some(t) => {
+            let fs = s.harts[hart()].return_to_user(t, &mut HartUnit);
+            // dirty state still in the unit (a trap that skipped `trap_entry`) is the thread's own
+            debug_assert!(
+                frame.sstatus & FS_MASK != FS_DIRTY || s.harts[hart()].holds(t),
+                "returning to a thread with unsaved dirty FP state that is not in this hart's unit"
+            );
+            fs
+        }
         None => Fs::Off,
     };
     crate::bkl::unlock();
@@ -180,4 +193,14 @@ pub fn first_use(frame: &TrapFrame) -> bool {
 /// A thread has ended: forget its FP state.
 pub fn thread_gone(tid: u32) {
     state().threads.remove(&tid);
+}
+
+/// How many threads hold FP state (the end-of-suite leak check: none may survive their process).
+pub fn entry_count() -> usize {
+    crate::irq::without(|| {
+        crate::bkl::lock();
+        let n = state().threads.len();
+        crate::bkl::unlock();
+        n
+    })
 }

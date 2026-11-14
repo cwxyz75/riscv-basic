@@ -370,6 +370,14 @@ pub fn app_main() -> i32 {
         n if n & 0xff == 60 => return fp_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64),
         61 => return fp_fresh(),
         62 => return fp_threads(),
+        // 63: use FP, then run an instruction user mode may not: the process dies (the unit being
+        // enabled must not turn a genuine illegal instruction into anything else)
+        63 => {
+            let mut got = [0u64; 32];
+            fp_store(&mut got);
+            // SAFETY: as variant 5: traps and ends the process.
+            unsafe { asm!("csrr t0, sstatus") };
+        }
         n if n & 0xff == 51 => {
             // S7b: a wake from another process on the same address number wakes nobody: the exit
             // code is 100 plus the number of threads it woke (0 expected), 1 if the call failed.

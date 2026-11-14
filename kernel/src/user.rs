@@ -556,8 +556,8 @@ fn leave(code: i32, whole: bool) -> ! {
     let me = irq::without(|| {
         let s = state();
         let tid = thread::current();
-        let pid = s.thread_pid.remove(&tid)?;
         crate::fp::thread_gone(tid);
+        let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
         // A code the process was already given by a kill wins over this thread's own.

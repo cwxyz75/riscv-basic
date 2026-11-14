@@ -37,3 +37,5 @@ sched-round-robin = []
 fault-skip-shootdown = []
 fault-skip-kernel-satp = []
 fault-skip-kill-ipi = []
+# (slice A) forget to save dirty FP registers at a trap: the FP isolation test must fail.
+fault-skip-fp-save = []

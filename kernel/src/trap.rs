@@ -279,6 +279,10 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let from_user = frame.sstatus & (1 << 8) == 0;
     if from_user {
         crate::user::user_mode_left();
+        // The kernel runs with the FP unit off (INVARIANTS FP3) on every path, including the light
+        // IPI one that saves nothing: the frame keeps the user's FS for the return.
+        // SAFETY: clears sstatus.FS only.
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
     }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
