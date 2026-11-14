@@ -49,6 +49,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - run: cargo fmt --all -- --check
+      - run: python3 scripts/check_docs.py
       - run: cargo clippy -p abi -p cfmt -p kcore -p proto -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
       - run: cargo test -p abi -p cfmt -p kcore -p proto -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
       - name: OS crates under the loom and shuttle model checkers

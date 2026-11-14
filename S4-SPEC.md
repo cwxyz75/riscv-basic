@@ -1,6 +1,6 @@
 # S4: the first interactive system (specification, v2)
 
-Status: v2, revised after an independent spec review (Fable, 2026-11-11) that found the draft
+Status: v2, built (S4a-S4e and the jobs of S4.5; 2026-11-13), revised after an independent spec review (Fable, 2026-11-11) that found the draft
 contradicted the real syscall contract in several places. Written before any S4 code (OS track
 rule: spec, then acceptance checks, then code, then independent review). Parent documents:
 `OS-ARCHITECTURE.md` (sections 9, 10, 12, 14), `SYSCALLS.md`, `INVARIANTS.md`. Decisions
