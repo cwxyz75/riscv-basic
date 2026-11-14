@@ -351,6 +351,16 @@ pub mod layout {
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
     pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;
+    /// The kernel-stack window (slice T): one top-level slot (1 GiB) of its own, carved into slots of
+    /// `KSTACK_SLOT_BYTES`. In each slot the lower half is **unmapped** (the guard: a stack that
+    /// overflows runs into it and faults) and the upper half is the stack. The trap entry recognises
+    /// a stack pointer in the guard half by arithmetic alone (see `kernel/src/trap.rs`), so the slot
+    /// size and the guard/stack split must stay powers of two.
+    pub const KSTACK_WINDOW_BASE: u64 = 0xffff_ffe0_0000_0000;
+    pub const KSTACK_WINDOW_SIZE: u64 = 1 << 30;
+    pub const KSTACK_SLOT_BYTES: u64 = 32 * 1024;
+    /// The mapped, usable part of a slot (the top half).
+    pub const KSTACK_BYTES: u64 = KSTACK_SLOT_BYTES / 2;
 }
 
 #[cfg(test)]
@@ -375,6 +385,13 @@ mod tests {
         assert_eq!(slot(DIRECT_BASE), 256);
         assert_eq!(slot(KERNEL_PHYS + KERNEL_OFFSET), 510);
         assert_eq!(slot(LAZY_TEST_BASE), 320);
+        assert_eq!(slot(KSTACK_WINDOW_BASE), 384);
+        assert_eq!((KSTACK_WINDOW_BASE as i64) >> 38, -1);
+        // the trap entry's guard test: `srai 30` of an address in the window is -128, and the window is
+        // exactly one top-level slot
+        assert_eq!((KSTACK_WINDOW_BASE as i64) >> 30, -128);
+        assert_eq!(KSTACK_WINDOW_SIZE, 1 << 30);
+        assert!(KSTACK_SLOT_BYTES.is_power_of_two() && KSTACK_BYTES * 2 == KSTACK_SLOT_BYTES);
         assert_eq!(RAM_BASE % 4096, 0);
     }
 

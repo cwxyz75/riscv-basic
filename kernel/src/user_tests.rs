@@ -18,7 +18,7 @@ const LOAD_PAGE_FAULT: i32 = 13;
 const STORE_PAGE_FAULT: i32 = 15;
 
 fn free_frames() -> usize {
-    crate::irq::without(|| kmem::get().mm.db.free_count())
+    crate::irq::without(kmem::free_frames_accounted)
 }
 
 fn run(image: &[u8], arg: u64) -> Result<i32, String> {

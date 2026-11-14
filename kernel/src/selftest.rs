@@ -33,9 +33,9 @@ fn ensure_eq<T: PartialEq + core::fmt::Debug>(got: T, want: T, what: &str) -> Ou
 
 /// Run `body`, then require that no frame leaked.
 fn balanced(body: impl FnOnce() -> Outcome) -> Outcome {
-    let before = kmem::get().mm.db.free_count();
+    let before = kmem::free_frames_accounted();
     body()?;
-    let after = kmem::get().mm.db.free_count();
+    let after = kmem::free_frames_accounted();
     ensure_eq(
         after,
         before,
@@ -237,7 +237,7 @@ fn teardown(vmo: u64, starts: &[u64]) {
 }
 
 fn free() -> usize {
-    kmem::get().mm.db.free_count()
+    kmem::free_frames_accounted()
 }
 
 fn lazy_commit_on_read() -> Outcome {

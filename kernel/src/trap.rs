@@ -37,6 +37,14 @@ impl TrapFrame {
     }
 }
 
+/// A trap was taken with `sp` in a kernel stack's guard: a kernel stack overflow. Runs on the hart's
+/// emergency stack; reports through the panic handler (the structured `##PANIC` line the boot harness
+/// reads) and ends the run.
+#[no_mangle]
+extern "C" fn stack_overflow(sepc: u64, stval: u64, sp: u64) -> ! {
+    panic!("kernel stack overflow: sp {sp:#x} in a guard page (sepc {sepc:#x}, stval {stval:#x})")
+}
+
 global_asm!(
     r#"
     .section .text
@@ -47,6 +55,26 @@ trap_entry:
                                  # kernel: tp = 0 (sscratch is 0 in the kernel), sscratch = &PerHart
     bnez  tp, 2f                 # nonzero: we came from user mode
     csrrw tp, sscratch, tp       # from the kernel: undo (tp = &PerHart again, sscratch = 0)
+    # Kernel stack overflow check (slice T): is sp inside the guard half of a kernel-stack slot? Pure
+    # arithmetic, no memory: the window is the top-level slot 0xffffffe000000000 (arithmetic shift by 30
+    # gives -128 for every address in it), and in a 32 KiB slot the lower 16 KiB are the unmapped guard
+    # (bit 14 of the address is clear). t0 is parked in sscratch (0 in the kernel) while it is used.
+    csrw sscratch, t0
+    srai t0, sp, 30
+    addi t0, t0, 128
+    bnez t0, 5f                  # not in the window: a normal kernel trap
+    slli t0, sp, 49
+    srli t0, t0, 63              # bit 14 of sp (0: guard half, 1: stack half)
+    bnez t0, 5f
+    # a kernel stack has overflowed: the stack cannot take a trap frame. Report on the emergency stack.
+    csrw sscratch, zero          # (a trap from here on must still look like a kernel trap)
+    csrr a0, sepc
+    csrr a1, stval
+    mv   a2, sp
+    ld   sp, 16(tp)              # PerHart.emergency_top
+    call stack_overflow
+5:  csrr t0, sscratch
+    csrw sscratch, zero
     addi sp, sp, -288
     sd   x1, 8(sp)
     sd   x3, 24(sp)

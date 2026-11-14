@@ -7715,6 +7715,31 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         Some(S::BadState),
         "one object per source"
     );
+    // a DMA buffer for the queue and one request
+    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u32;
+    let pa = ok(sys::vmo_phys_addr(dma), "phys")?.a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    ensure_eq!(
+        st(sys::process_map(me, dma, DMA_VA, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the DMA buffer"
+    );
+    blk_up(&b, pa)?; // resets the device, so its line is low from here on
+                     // A source can be asserted from before the object existed (an earlier driver's last request, a
+                     // level the AIA re-pends when the source is enabled): one spurious interrupt after create is allowed
+                     // (SYSCALLS.md). Take it if it came, then the object must be idle.
+    nap_ticks(3);
+    let mut base = 0; // claims taken before the real request (the spurious one counts)
+    if sys::object_signals(irq).a1 as u32 & sig::INTERRUPT != 0 {
+        let spurious = sys::interrupt_ack(irq);
+        ensure_eq!(
+            st(spurious),
+            Some(S::Ok),
+            "acknowledge the spurious interrupt"
+        );
+        base = spurious.a1;
+        nap_ticks(3);
+    }
     ensure_eq!(
         st(sys::interrupt_ack(irq)),
         Some(S::BadState),
@@ -7725,16 +7750,6 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         0,
         "quiet before anything happens"
     );
-    // a DMA buffer for the queue and one request
-    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u32;
-    let pa = ok(sys::vmo_phys_addr(dma), "phys")?.a1 as u64;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
-    ensure_eq!(
-        st(sys::process_map(me, dma, DMA_VA, 0, 4 * 4096, PF_R | PF_W)),
-        Some(S::Ok),
-        "map the DMA buffer"
-    );
-    blk_up(&b, pa)?;
     sys::debug_write(b"s6: interrupt path exercised\n");
     let t0 = sys::clock_get();
     blk_read_sector0(&b, pa, 0);
@@ -7779,7 +7794,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         sys::interrupt_ack(irq),
         "acknowledge with the line still high",
     )?;
-    ensure_eq!(ack.a1, 1, "exactly one claim for one request");
+    ensure_eq!(ack.a1, base + 1, "exactly one claim for one request");
     let again = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 200);
     ensure_eq!(
         st(again),
@@ -7789,7 +7804,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
     wr(&b, 0x64, 1);
     let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
-    ensure_eq!(ack.a1, 2, "the re-fire was the second claim");
+    ensure_eq!(ack.a1, base + 2, "the re-fire was the second claim");
     ensure_eq!(
         sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
         0,

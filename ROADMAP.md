@@ -563,8 +563,8 @@ silent corruption (a negative control that removes the guard must fail the test)
 the thread and `channel_call` benchmark before and after; the whole suite at one, two and four harts.
 
 - [~] Step 0: measurement done (`thread::stack_high_water`, test `kernel_stacks_stay_well_inside_their_size`): the deepest kernel stack in the whole suite, debug build, was about 5.6 KiB of 32 KiB, so kernel stacks are now **16 KiB** (halving the thread cost; the heap is still the 8 MiB fixed region). Spec and OD written: `T-SPEC.md`, OD82 (a pool with its own lock refilled at safe points, slab classes, guard-paged stacks with an emergency stack, a kernel-memory level in the job quota, deferred reaper, one-syscall creation). The acceptance tests are written with each step
-- [ ] Step 1: kernel stacks from their own region with guard pages
-- [ ] Step 2: the slab allocator over frames replaces the fixed heap (interrupt-safe, fallible)
+- [x] Step 1 (was 3 in T-SPEC): kernel stacks from frames: a 1 GiB window of its own (`abi::layout::KSTACK_WINDOW_BASE`), 32 KiB slots with an unmapped 16 KiB guard below a 16 KiB stack, slots recycled on a free list (their frames stay), the trap entry recognises a stack pointer in a guard by arithmetic and switches to a per-hart emergency stack to report `##PANIC kernel stack overflow` (`make os-boot-test-overflow`, `--expect-panic`; the canary words stay as a second line); leak checks account for slots (`kmem::free_frames_accounted`). Smoke green; soak run on the PR
+- [ ] Step 2: a growable heap window replaces the fixed heap's limit (grown at safe points from the frame database; T-SPEC revision: no pool, no slab)
 - [ ] Step 3: kernel memory charged to jobs; OD50 caps revisited
 - [ ] Step 4: deferred reaper; thread creation in one syscall; pooled stacks; raised limits
 - [ ] Step 5: the reserved interrupt stubs and documents; T13 resolved, T1 narrowed

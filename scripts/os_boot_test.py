@@ -415,7 +415,27 @@ def negative_control(kernel, test):
     return 0
 
 
+def expect_panic(kernel, needle):
+    """A kernel built to fail in one specific way (the `stack-overflow-demo` feature) must stop with a
+    `##PANIC` line containing `needle`, a nonzero exit status and no hang: the mechanism that reports the
+    failure works (a kernel without it would pass its tests or hang silently)."""
+    lines, status, timed_out, _ = run(kernel)
+    _, _, _, panics, _ = parse(lines)
+    if timed_out:
+        print(f"expected panic FAILED: {kernel} hung instead of reporting {needle!r}", file=sys.stderr)
+        return 1
+    if not any(needle in p for p in panics) or status in (0, None):
+        print(f"expected panic FAILED: no ##PANIC containing {needle!r} with a failing exit status "
+              f"(panics {panics}, status {status})", file=sys.stderr)
+        return 1
+    print(f"expected panic seen: {needle!r} ({kernel})")
+    return 0
+
+
 def main() -> int:
+    # `--expect-panic NEEDLE KERNEL`: a kernel that must stop with a panic containing NEEDLE
+    if len(sys.argv) == 4 and sys.argv[1] == "--expect-panic":
+        return expect_panic(sys.argv[3], sys.argv[2])
     # `--neg KERNEL TEST`: a fault-injection kernel that must be caught
     if len(sys.argv) == 4 and sys.argv[1] == "--neg":
         return negative_control(sys.argv[2], sys.argv[3])
