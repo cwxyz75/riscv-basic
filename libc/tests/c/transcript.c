@@ -352,7 +352,8 @@ static void files(void) {
     fclose(f);
     printf("replaced [%s]\n", repl);
     errno = 0;
-    printf("missing %d %d\n", rename("s7c-nothing.txt", "s7c-x.txt"), errno == ENOENT);
+    int miss = rename("s7c-nothing.txt", "s7c-x.txt"); /* (separate statements: argument order is unspecified) */
+    printf("missing %d %d\n", miss, errno == ENOENT);
     remove("s7c-victim.txt");
     printf("remove %d\n", remove(path));
     printf("gone %d\n", fopen(path, "r") == NULL);
