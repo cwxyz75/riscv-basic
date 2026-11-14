@@ -142,8 +142,14 @@ pub fn lock() {
     if !LOCK.held_by(me) {
         note_acquire(Class::Bkl);
     }
+    #[cfg(feature = "latency-trace")]
+    let (outermost_take, asked) = (!LOCK.held_by(me), crate::timer::now());
     LOCK.lock(me, &percpu::this().bkl_depth, core::hint::spin_loop);
     OWNER.store(me as usize + 1, Ordering::Relaxed);
+    #[cfg(feature = "latency-trace")]
+    if outermost_take {
+        crate::latency::bkl_acquired(crate::timer::now().saturating_sub(asked));
+    }
 }
 
 /// Take the BKL only if it is free (or already ours).
@@ -174,6 +180,7 @@ pub fn unlock() {
     if outermost {
         note_release(Class::Bkl);
         OWNER.store(0, Ordering::Relaxed);
+        crate::latency::bkl_released();
     }
     LOCK.unlock(me, &percpu::this().bkl_depth);
 }

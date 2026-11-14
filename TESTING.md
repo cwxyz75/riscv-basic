@@ -148,3 +148,24 @@ four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare
 
 First measurement 2026-11-14 (the baseline). Not built yet (later tasks, as their mechanisms land): `pair_scaling` (N independent
 pairs on N harts), `bkl_profile` and `irq_off_max` (task 2, the latency trace), `rt_latency` (task 8, a user-level real-time probe).
+
+## The latency trace (slice B task 2, SCHED-SMP-SPEC 3.12)
+
+`make os-latency` (soak tier) builds the kernel with the `latency-trace` feature (no code at all without it), runs the suite at
+four harts and prints, from the guest: the longest **interrupts-off span** of any hart and where it began, and per syscall
+number the big-kernel-lock **hold** (maximum, count, total) and **wait**. Spans are measured at `irq::without` and around every
+trap, and end at every context switch (a thread that sleeps inside a critical section does not count as holding interrupts
+off); the test `the_latency_trace_can_see_a_long_section` proves a 5 ms section is reported within 20%, at the right file.
+
+First measurements (2026-11-14, QEMU, debug build, four harts, the whole suite; costs of the emulated machine, not a real one):
+
+| What | Worst | Where |
+|---|---|---|
+| longest interrupts-off span | 308 ms | a trap handler (`trap.rs`; the long operations of SCHED-SMP-SPEC 3.12 are in it) |
+| BKL hold, syscall 47 (`vmo_commit`) | 87 ms | commit zeroes and maps up to 1024 pages under the lock |
+| BKL hold, syscall 1 (`process_exit`) | 37 ms | teardown |
+| BKL hold, syscall 0 (kernel threads and traps outside a syscall) | 34 ms; wait up to 87 ms | |
+| BKL hold, syscall 10 (`handle_close`) | 34 ms | closing a handle that destroys a large object |
+
+These are the numbers the lock peels (tasks 14 to 20) are judged against; the budget stated in SCHED-SMP-SPEC 3.12 is to be
+restated from them once a release build and, ideally, hardware numbers exist (T75).

@@ -705,6 +705,7 @@ fn handle_list(args: &[u8]) -> Vec<Handle> {
 }
 
 fn syscall(frame: &mut crate::trap::TrapFrame) {
+    crate::latency::set_syscall(frame.arg(17) as usize);
     let (n, a) = (
         frame.arg(17) as usize,
         [
@@ -1507,6 +1508,7 @@ static USER_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 
 /// A hart is about to return to user mode.
 pub fn user_mode_entered() {
+    crate::latency::interrupts_on(); // (the return to user mode turns interrupts on: the span ends)
     crate::percpu::this().in_user.store(true, Ordering::SeqCst);
     let now = USER_NOW.fetch_add(1, Ordering::SeqCst) + 1;
     USER_MAX.fetch_max(now, Ordering::SeqCst);
