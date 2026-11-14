@@ -44,3 +44,5 @@ fault-skip-fp-save = []
 fault-skip-forced-touch = []
 # Negative control for the AIA: an acknowledged source is never unmasked again (needs the AIA machine).
 fault-aia-no-unmask = []
+# Negative control for the AIA: an acknowledged source whose line is still high is not re-pended.
+fault-aia-no-repend = []

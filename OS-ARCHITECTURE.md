@@ -123,7 +123,7 @@ The full log is in section 17. The shape of the system:
              traps, timer, IPIs, TLB shootdown | debug console (panics)
  -----------------------------------------------------------------------------
  firmware    OpenSBI (M-mode): timer, IPI, remote fence, hart start, reset
- hardware    QEMU virt: RV64GC x N harts, PLIC (or AIA), virtio-mmio, fw_cfg
+ hardware    QEMU virt: RV64GC x N harts, AIA (APLIC + IMSIC), virtio-mmio, fw_cfg
 ```
 
 ---
@@ -481,7 +481,7 @@ Plan 9-like per-process namespaces, but capability-based.
 - **In the kernel:** the trap handler, timer, IPIs and interrupt routing. Plus a
   minimal in-kernel debug console that works even if every userspace driver is dead.
 - **Interrupt objects:** each interrupt line is an object. When it fires, the kernel
-  masks it at the PLIC and raises a signal; a userspace driver thread wakes,
+  masks it at the APLIC and raises a signal; a userspace driver thread wakes,
   services the device, then acknowledges (which unmasks). Masking until
   acknowledgement prevents interrupt storms from level-triggered devices. Driver
   interrupt threads run in the real-time band for low latency.

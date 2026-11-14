@@ -1201,7 +1201,7 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let (obj, _) = ipc::interrupt_of(objs, &p.handles, h(0), Rights::MANAGE)
                 .map_err(|e| (e, None, None))?;
             let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
-            crate::aia::enable(irq);
+            crate::aia::reenable(irq);
             Ok((Some(claims), None))
         }
         nr::VMO_PHYS_ADDR => {

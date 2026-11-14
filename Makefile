@@ -84,6 +84,7 @@ OS_NOSHOOT_ELF := target/os-fault-shootdown/$(KERNEL_TARGET)/debug/kernel
 OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
+OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
 
@@ -179,6 +180,8 @@ os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	cd kernel && cargo build --features fault-aia-no-unmask --target-dir ../target/os-fault-unmask
 	python3 scripts/os_boot_test.py --neg $(OS_NOUNMASK_ELF) interrupt_object_fires_and_masks
+	cd kernel && cargo build --features fault-aia-no-repend --target-dir ../target/os-fault-repend
+	python3 scripts/os_boot_test.py --neg $(OS_NOREPEND_ELF) interrupt_object_fires_and_masks
 
 # The interactive system (S4): the kernel built with the `interactive` feature, and the scripted
 # serial check of it.

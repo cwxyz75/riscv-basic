@@ -7639,7 +7639,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     };
     let probe = sys::interrupt_create(res, b.irq);
     if st(probe) == Some(S::NotSupported) {
-        // no PLIC (AIA machine): drivers poll; the harness checks the machine really is AIA
+        // no interrupt controller (plain `virt`): drivers poll; the harness checks which machine this is
         return Ok(());
     }
     let irq = ok(probe, "interrupt_create")?.a1 as u32;
@@ -7698,8 +7698,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         "the sector 0 pattern came through DMA"
     );
     // the device line stays asserted until we clear InterruptStatus: the source is masked, so the
-    // kernel is not claiming it again and again (QEMU's PLIC raises on a level *change*, so this
-    // check is weaker than on hardware; TIDY-UP T43). Give it time, then count the claims.
+    // kernel is not taking it again and again. Give it time, then count the claims.
     let t0 = sys::clock_get();
     let _ = sys::object_wait(ev, 1 << 24, t0 + 30);
     ensure_eq!(
@@ -7707,10 +7706,23 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         sig::INTERRUPT,
         "still pending until acknowledged"
     );
+    // acknowledge with the line still high: the source is unmasked and the level fires again at
+    // once (an AIA source in MSI mode pends only on a rising edge, so the kernel must re-pend it)
+    let ack = ok(
+        sys::interrupt_ack(irq),
+        "acknowledge with the line still high",
+    )?;
+    ensure_eq!(ack.a1, 1, "exactly one claim for one request");
+    let again = sys::object_wait(irq, sig::INTERRUPT, sys::clock_get() + 200);
+    ensure_eq!(
+        st(again),
+        Some(S::Ok),
+        "an acknowledged source whose line is still high fires again"
+    );
     // quiet the device, then acknowledge: the source is unmasked and nothing more arrives
     wr(&b, 0x64, 1);
     let ack = ok(sys::interrupt_ack(irq), "acknowledge")?;
-    ensure_eq!(ack.a1, 1, "exactly one claim for one request");
+    ensure_eq!(ack.a1, 2, "the re-fire was the second claim");
     ensure_eq!(
         sys::object_signals(irq).a1 as u32 & sig::INTERRUPT,
         0,

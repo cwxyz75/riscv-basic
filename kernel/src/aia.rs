@@ -10,7 +10,7 @@
 //! high is re-pended with `setipnum`, so a level that outlived the handler fires again.
 
 use core::arch::asm;
-use core::ptr::write_volatile;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The supervisor-domain APLIC of the `virt` board (checked against the device tree at start).
@@ -41,8 +41,6 @@ pub fn stat(which: u64) -> u64 {
         _ => 0,
     }
 }
-/// How many sources the APLIC has (from the device tree); sources above are never enabled.
-static SOURCES: AtomicUsize = AtomicUsize::new(0);
 
 const DOMAINCFG: u64 = 0x0000;
 const SOURCECFG: u64 = 0x0004; // + 4 * (source - 1)
@@ -84,11 +82,15 @@ pub fn init() {
     if node.reg().map(|r| r.0) != Some(APLIC_BASE) {
         return;
     }
+    // Message-signalled delivery needs an IMSIC to send to: an APLIC without `msi-parent` (QEMU
+    // `aia=aplic`) is direct-mode only, and the IMSIC CSRs below would not exist.
+    if node.prop("msi-parent").is_none() {
+        return;
+    }
     let sources = node.u32_prop("riscv,num-sources").unwrap_or(0) as usize;
     if sources <= abi::layout::MAX_IRQ as usize {
         return;
     }
-    SOURCES.store(sources, Ordering::Relaxed);
     // SAFETY: the APLIC pages are direct-mapped device memory (`kmem::init`); these are its
     // documented registers: per-source configuration (level high), the target, the enable-clear
     // number register (masked until an interrupt object owns the source), then the domain config.
@@ -98,6 +100,10 @@ pub fn init() {
             write_volatile(reg(CLRIENUM), s as u32);
         }
         write_volatile(reg(DOMAINCFG), DOMAINCFG_IE_MSI);
+        // DM is read-only 0 on an APLIC that cannot do MSI mode: then there is nothing to use.
+        if read_volatile(reg(DOMAINCFG)) & (1 << 2) == 0 {
+            return;
+        }
     }
     init_hart();
     PRESENT.store(true, Ordering::SeqCst);
@@ -129,21 +135,35 @@ pub fn init_hart() {
     }
 }
 
-/// Deliver source `irq` to the calling hart and unmask it; a still-asserted level re-fires.
+/// Deliver source `irq` to the calling hart and unmask it (`interrupt_create`).
 pub fn enable(irq: u32) {
-    let hart = crate::percpu::this().hart_id.load(Ordering::Relaxed) as u32;
-    // SAFETY: the source's target word (hart index in bits 31:18, message id in bits 10:0), then
-    // the enable-set and set-pending number registers of the supervisor APLIC. Setting pending on
-    // a level source whose line is low is ignored by the hardware.
-    AIMED[irq as usize].store(hart as usize, Ordering::Relaxed);
+    aim_and_unmask(irq);
+}
+
+/// `interrupt_ack`: aim the source at the acknowledging hart and unmask it; a level that is still
+/// asserted fires again.
+pub fn reenable(irq: u32) {
     #[cfg(feature = "fault-aia-no-unmask")]
-    if TAKEN.load(Ordering::Relaxed) > 0 {
-        return; // negative control: after the first interrupt a source stays masked for good
+    {
+        let _ = irq;
+        return; // negative control: an acknowledged source stays masked for good
     }
+    #[cfg(not(feature = "fault-aia-no-unmask"))]
+    aim_and_unmask(irq);
+}
+
+fn aim_and_unmask(irq: u32) {
+    let hart = crate::percpu::this().hart_id.load(Ordering::Relaxed) as u32;
+    AIMED[irq as usize].store(hart as usize, Ordering::Relaxed);
+    // SAFETY: the source's target word (hart index in bits 31:18, message id in bits 10:0), then
+    // the set-pending and enable-set number registers of the supervisor APLIC. Pending goes first:
+    // set while masked it is forwarded exactly once when the enable follows (the reverse order could
+    // forward twice). Setting pending on a level source whose line is low is ignored by the hardware.
     unsafe {
         write_volatile(reg(TARGET + 4 * (u64::from(irq) - 1)), hart << 18 | irq);
-        write_volatile(reg(SETIENUM), irq);
+        #[cfg(not(feature = "fault-aia-no-repend"))]
         write_volatile(reg(SETIPNUM), irq);
+        write_volatile(reg(SETIENUM), irq);
     }
 }
 

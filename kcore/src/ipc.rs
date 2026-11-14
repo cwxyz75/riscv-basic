@@ -1108,7 +1108,7 @@ pub fn interrupt_of(
 }
 
 /// The source fired: returns true if `obj` is a live interrupt object for `irq` that was not
-/// already waiting for its ack (so the caller must mask the source).
+/// already waiting for its ack (the caller has already masked the source).
 pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
     match reg.get_mut(obj) {
         Some(KObj::Interrupt(i)) if i.irq == irq => {
