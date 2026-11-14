@@ -9047,14 +9047,24 @@ pub fn app_main() -> i32 {
             threads_left_behind_when_init_exits,
         ),
     ];
+    // Each test's guest time (1 ms ticks) goes out as a plain `tt:` line, which the boot script's
+    // profiler (`OS_PROFILE`) reads; the verdict harness ignores it (slice TS step 0).
+    let timed = |name: &str, test: fn() -> Outcome| -> bool {
+        let t0 = sys::clock_get();
+        let r = test();
+        let ticks = sys::clock_get() - t0;
+        let ok = report(name, r);
+        println!("tt: {name} {ticks}");
+        ok
+    };
     for (name, test) in tests {
-        if !report(name, test()) {
+        if !timed(name, *test) {
             failed += 1;
         }
         // the upstream Lua test files (S7e) run right after our own Lua test
         if *name == "lua_script_matches_the_host_build" {
             for (n, t) in LUA_UPSTREAM {
-                if !report(n, t()) {
+                if !timed(n, *t) {
                     failed += 1;
                 }
             }
