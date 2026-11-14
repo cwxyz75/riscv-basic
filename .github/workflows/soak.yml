@@ -27,7 +27,7 @@ jobs:
           - name: release build
             targets: os-boot-test-release
           - name: smp
-            targets: os-boot-test-smp os-boot-test-overflow
+            targets: os-boot-test-smp os-boot-test-overflow os-bench
           - name: negative controls and serial at four harts
             targets: os-boot-test-smp-neg
           - name: AIA, RVA23, polling, no disk, serial

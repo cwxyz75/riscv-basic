@@ -1293,6 +1293,25 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     }
 }
 
+/// `##BENCH <name> <decimal value> <unit>`: names and units are single words of letters, digits, `_` and `/`.
+fn is_bench_line(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("##BENCH ") else {
+        return false;
+    };
+    let mut w = rest.split(' ');
+    let word = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'/')
+    };
+    match (w.next(), w.next(), w.next(), w.next()) {
+        (Some(n), Some(v), Some(u), None) => {
+            word(n) && !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && word(u)
+        }
+        _ => false,
+    }
+}
+
 /// Write user output to the console as whole lines. Each `debug_write` call is flushed at
 /// its end (a call that does not finish with a newline gets one), and a line longer than
 /// 512 bytes is cut, so a program can never leave a half line behind to swallow its next
@@ -1301,6 +1320,11 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
 /// verdict lines (`##DONE`, `##PANIC`, `##BOOT`).
 fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
     let mut flush = |text: String| {
+        // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
+        if is_bench_line(&text) {
+            let _ = writeln!(Console, "{text}");
+            return;
+        }
         let verdict = text.strip_prefix("##TEST ").and_then(|rest| {
             let mut words = rest.split_whitespace();
             words.next()?;

@@ -9,7 +9,7 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-boot-test-overflow
+.PHONY: os-bench os-boot-test-overflow
 .PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
@@ -191,6 +191,16 @@ os-boot-test-overflow: kernel-main
 	cd kernel && cargo build --features stack-overflow-demo --target-dir ../target/os-overflow
 	python3 scripts/os_boot_test.py --expect-panic "kernel stack overflow" $(OS_OVERFLOW_ELF)
 
+# Benchmarks (slice B, SCHED-SMP-SPEC 6.1; soak tier): the suite's `##BENCH` lines at full length at one and four
+# harts, compared with the checked-in baseline (a 3x slowdown fails). The numbers are QEMU debug-build costs on whatever
+# machine runs them: look at the printed ratios, and update `bench/baseline.tsv` on purpose (and the table in
+# TESTING.md) when a change is meant to move them.
+os-bench: kernel-main
+	rm -f target/bench.tsv
+	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv
+
 os-boot-test-polling: kernel
 	OS_MACHINE=virt python3 scripts/os_boot_test.py $(OS_ELF)
 
@@ -249,6 +259,7 @@ os-boot-test-rva23: kernel
 # Contract-document checks (TIDY-UP T55): known-stale statements and the decision log's bookkeeping.
 docs-check:
 	python3 scripts/check_docs.py
+	python3 scripts/bench_compare.py --self-test
 
 quick: fmt-check docs-check
 	cargo test -p abi -p kcore -p proto -p svc -p memfs -p cfmt -p basic-script
@@ -262,7 +273,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required; run it on demand,
 # on a label, nightly (CI), and before a release. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
+SOAK_TARGETS := os-bench os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)

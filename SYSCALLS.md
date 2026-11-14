@@ -226,7 +226,7 @@ the trusted boot-time suite: nothing ties a `##TEST` line to the program that wr
 A measuring aid for the boot-time suite (like `debug_write`; no rights, no effect on the system): `a1` is
 a kernel counter, `which` 0 the number of times a thread blocked in a wait, 1 how many of those blocks
 were by a thread that had been woken without being satisfied (a *spurious wake*), 2 how many threads
-were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart other than the boot hart, 5 how many on a hart they were not aimed at (always 0). Any other index reads 0. The counters only grow. They exist to measure the wake path
+were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart other than the boot hart, 5 how many on a hart they were not aimed at (always 0). 6 the `time` counter (10 MHz on QEMU `virt`: the benchmarks' clock), 7 whether the kernel command line has `bench=full` (1) or not (0). Any other index reads 0. The counters only grow. They exist to measure the wake path
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 

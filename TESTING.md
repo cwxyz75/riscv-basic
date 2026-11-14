@@ -129,3 +129,22 @@ What this says:
 | `make smoke` (tiers 0 and 1: host tests, clippy, `os-test`, home boot, one boot at four harts, release smoke) | 2 min 33 s |
 | `make soak` (`-j3`; everything else: round-robin, 1 and 2 harts, release, RVA23, polling, no disk, every negative control, the serial sessions) | 9 min 46 s, all green |
 | `make check` before slice TS | 29 min 45 s |
+
+## Benchmarks (slice B, SCHED-SMP-SPEC 6.1, OD96)
+
+The suite measures a few costs and prints them as `##BENCH <name> <ns> ns` lines (smaller is better; a well-formed line passes
+the kernel's `debug_write` filter like a `##TEST` result, a malformed one fails the boot). The clock is the `time` counter
+through `debug_stat(6)`. Every boot runs them at a tenth of the iterations with sanity assertions only (so they cannot rot);
+`make os-bench` (soak tier, in `soak.yml`) runs them in full (`-append bench=full`, which `debug_stat(7)` reports) at one and
+four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare.py` (a 3x slowdown fails; the self-test in
+`make docs-check` proves it). The numbers are QEMU debug-build costs and move with the machine (T75): read the printed ratios.
+
+| Benchmark | What it runs | smp1 | smp4 |
+|---|---|---|---|
+| `thread_create_join` | create, run an empty body, exit, join | 155 us | 234 us |
+| `wake_latency_event` | two threads hand a baton through two events: a round trip (two wakes) | 142 us | 237 us |
+| `channel_call_rt` | `channel_call` to a server thread, no bystanders | 165 us | 273 us |
+| `channel_call_rt_100_bystanders` | the same with 100 threads blocked on an unrelated event | 205 us | 269 us |
+
+First measurement 2026-11-14 (the baseline). Not built yet (later tasks, as their mechanisms land): `pair_scaling` (N independent
+pairs on N harts), `bkl_profile` and `irq_off_max` (task 2, the latency trace), `rt_latency` (task 8, a user-level real-time probe).

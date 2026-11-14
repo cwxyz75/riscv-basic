@@ -29,3 +29,22 @@ pub fn dtb_blob() -> Option<&'static [u8]> {
         Some(core::slice::from_raw_parts(head, len))
     }
 }
+
+/// Does the kernel command line (`/chosen/bootargs`, from QEMU's `-append`) contain the word `arg`? Used by the
+/// benchmark switch (`bench=full`, SCHED-SMP-SPEC 6.1); false if there is no tree or no such property.
+pub fn boot_arg_present(arg: &str) -> bool {
+    let Some(blob) = dtb_blob() else {
+        return false;
+    };
+    let Ok(nodes) = kcore::fdt::parse(blob) else {
+        return false;
+    };
+    nodes
+        .iter()
+        .find(|n| n.path == "/chosen")
+        .and_then(|n| n.prop("bootargs"))
+        .is_some_and(|v| {
+            v.split(|&b| b == 0 || b == b' ')
+                .any(|w| w == arg.as_bytes())
+        })
+}

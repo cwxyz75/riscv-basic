@@ -9013,6 +9013,180 @@ fn job_create_sees_the_credit_of_a_job_closed_just_before() -> Outcome {
     Ok(())
 }
 
+// --- Benchmarks (slice B, SCHED-SMP-SPEC 6.1) ------------------------------------------------------------------
+
+/// The `time` counter (10 MHz on QEMU `virt`: one cycle is 100 ns).
+fn cycles() -> u64 {
+    sys::debug_stat(6)
+}
+
+/// Report one benchmark as a structured line: ns per operation (smaller is better).
+fn bench_line(name: &str, cycles: u64, ops: u64) -> u64 {
+    let ns = cycles * 100 / ops.max(1);
+    println!("##BENCH {name} {ns} ns");
+    ns
+}
+
+static BENCH_ITERS: AtomicU32 = AtomicU32::new(0);
+// (handle values carry a generation in their high bits: too wide to pack into a thread argument)
+static BENCH_A: AtomicU32 = AtomicU32::new(0);
+static BENCH_B: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn bench_exit(_: usize) -> ! {
+    sys::thread_exit(0)
+}
+
+/// Create, run an empty body, exit and join threads, `n` times: ns per thread.
+fn bench_thread_create_join(n: u32) -> Result<u64, Detail> {
+    let top = own_stack()?;
+    let me = me()?;
+    let entry = bench_exit as *const () as usize as u64;
+    let t0 = cycles();
+    for round in 0..n {
+        let r = sys::thread_create(me, entry, top, u64::from(round));
+        ensure!(
+            r.status == 0,
+            "thread_create: status {} in round {round}",
+            r.status
+        );
+        let t = r.a1 as u32;
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(t);
+    }
+    Ok(bench_line(
+        "thread_create_join",
+        cycles() - t0,
+        u64::from(n),
+    ))
+}
+
+/// The partner of the event ping-pong: wait for A, clear it, raise B; `BENCH_ITERS` times.
+extern "C" fn bench_event_partner(_: usize) -> ! {
+    let (a, b) = (
+        BENCH_A.load(Ordering::SeqCst),
+        BENCH_B.load(Ordering::SeqCst),
+    );
+    for _ in 0..BENCH_ITERS.load(Ordering::SeqCst) {
+        sys::object_wait(a, 1 << 24, u64::MAX);
+        sys::event_signal(a, 1 << 24, 0);
+        sys::event_signal(b, 0, 1 << 24);
+    }
+    sys::thread_exit(0)
+}
+
+/// Two threads handing a baton through two events: ns per round trip (two wakes).
+fn bench_wake_latency_event(n: u32) -> Result<u64, Detail> {
+    let (a, b) = (event()?, event()?);
+    BENCH_ITERS.store(n, Ordering::SeqCst);
+    BENCH_A.store(a, Ordering::SeqCst);
+    BENCH_B.store(b, Ordering::SeqCst);
+    let t = new_thread(bench_event_partner, 0)?;
+    nap_ticks(2); // the partner reaches its wait
+    let t0 = cycles();
+    for _ in 0..n {
+        sys::event_signal(a, 0, 1 << 24);
+        sys::object_wait(b, 1 << 24, u64::MAX);
+        sys::event_signal(b, 1 << 24, 0);
+    }
+    let ns = bench_line("wake_latency_event", cycles() - t0, u64::from(n));
+    sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+    for h in [t, a, b] {
+        sys::handle_close(h);
+    }
+    Ok(ns)
+}
+
+/// The server of the call benchmark: echo every request (the first four bytes are the transaction id).
+extern "C" fn bench_call_server(arg: usize) -> ! {
+    let ch = arg as u32;
+    let mut buf = [0u8; 16];
+    loop {
+        let w = sys::object_wait(ch, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
+        if w.status != 0 {
+            break;
+        }
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+        if r.status != 0 {
+            break;
+        }
+        sys::channel_write(ch, buf.as_ptr(), r.a1, core::ptr::null(), 0);
+    }
+    sys::thread_exit(0)
+}
+
+extern "C" fn bench_bystander(arg: usize) -> ! {
+    sys::object_wait(arg as u32, 1 << 25, u64::MAX); // never raised until the end
+    sys::thread_exit(0)
+}
+
+/// `channel_call` round trips to a server thread, with `bystanders` threads blocked on an unrelated event.
+fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail> {
+    let (mine, theirs) = channel()?;
+    let idle = event()?;
+    let mut by = Vec::new();
+    for _ in 0..bystanders {
+        by.push(new_thread(bench_bystander, idle as usize)?);
+    }
+    let server = new_thread(bench_call_server, theirs as usize)?;
+    nap_ticks(3);
+    let mut reply = [0u8; 16];
+    let t0 = cycles();
+    for i in 0..n {
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&(i + 1).to_le_bytes());
+        let args = CallArgs {
+            req_bytes: req.as_ptr() as u64,
+            req_handles: 0,
+            req_nbytes: 8,
+            req_nhandles: 0,
+            rep_bytes: reply.as_mut_ptr() as u64,
+            rep_handles: 0,
+            rep_max_bytes: 16,
+            rep_max_handles: 0,
+            deadline: u64::MAX,
+        };
+        let r = sys::channel_call(mine, &args);
+        ensure!(r.status == 0, "channel_call: status {} at {i}", r.status);
+    }
+    let ns = bench_line(name, cycles() - t0, u64::from(n));
+    sys::handle_close(mine); // ends the server
+    sys::object_wait(server, sig::TERMINATED, sys::clock_get() + 5000);
+    sys::event_signal(idle, 0, 1 << 25); // releases the bystanders
+    for t in by {
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        sys::handle_close(t);
+    }
+    for h in [server, idle] {
+        sys::handle_close(h);
+    }
+    Ok(ns)
+}
+
+/// The benchmarks (a tenth of the iterations unless the kernel command line says `bench=full`): they run on every
+/// boot so they cannot rot, and `make os-bench` runs them in full and compares with `bench/baseline.tsv`.
+fn benchmarks() -> Outcome {
+    let full = sys::debug_stat(7) != 0;
+    let k = if full { 10 } else { 1 };
+    let t = bench_thread_create_join(100 * k)?;
+    let w = bench_wake_latency_event(200 * k)?;
+    let c0 = bench_channel_call("channel_call_rt", 1000 * k, 0)?;
+    let c100 = bench_channel_call("channel_call_rt_100_bystanders", 1000 * k, 100)?;
+    // sanity only (the numbers are for the baseline): every operation took some time, and was not absurd
+    for (what, ns) in [
+        ("thread", t),
+        ("wake", w),
+        ("call", c0),
+        ("call with bystanders", c100),
+    ] {
+        ensure!(
+            ns > 0 && ns < 1_000_000_000,
+            "{what}: {ns} ns per operation"
+        );
+    }
+    Ok(())
+}
+
 #[no_mangle]
 pub fn app_main() -> i32 {
     let mut failed = 0;
@@ -9226,6 +9400,7 @@ pub fn app_main() -> i32 {
             "port_oneshot_rearm_and_many_bindings",
             port_oneshot_rearm_and_many_bindings,
         ),
+        ("benchmarks_run_and_report", benchmarks),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
         (
