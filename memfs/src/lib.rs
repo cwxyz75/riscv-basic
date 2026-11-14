@@ -69,6 +69,8 @@ pub enum Error {
     BadName,
     /// An offset or length that overflows.
     BadRange,
+    /// A directory cannot be moved into itself or below itself.
+    Invalid,
 }
 
 /// File contents: fixed-size chunks, so a file holds (about) the bytes it counts. One growing
@@ -399,6 +401,99 @@ impl Fs {
         self.node_mut(target)?.links = 0;
         self.collect(target);
         Ok(())
+    }
+
+    /// Move the entry `from_name` of `from_dir` to `to_dir` as `to_name` (`rename(2)`): an existing
+    /// target is replaced if it is a file and the source is a file, or an empty directory and the
+    /// source is a directory; the node (and so any open connection to it) is the same afterwards.
+    /// Both directories must be writable. A directory cannot be moved below itself.
+    pub fn rename(
+        &mut self,
+        from_dir: NodeId,
+        from_name: &[u8],
+        to_dir: NodeId,
+        to_name: &[u8],
+    ) -> Result<(), Error> {
+        check_name(from_name)?;
+        check_name(to_name)?;
+        let src = self.lookup(from_dir, from_name)?;
+        for d in [from_dir, to_dir] {
+            let n = self.node(d)?;
+            if !matches!(n.data, Data::Dir(_)) {
+                return Err(Error::NotDirectory);
+            }
+            if n.readonly {
+                return Err(Error::ReadOnly);
+            }
+            if n.links == 0 {
+                return Err(Error::NotFound); // an orphaned directory takes no entries
+            }
+        }
+        let dst = match self.lookup(to_dir, to_name) {
+            Ok(id) => Some(id),
+            Err(Error::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        if dst == Some(src) {
+            return Ok(()); // the same node under the same name: nothing to do
+        }
+        let src_is_dir = matches!(self.node(src)?.data, Data::Dir(_));
+        if src_is_dir && self.is_within(src, to_dir)? {
+            return Err(Error::Invalid);
+        }
+        let mut freed = 0;
+        if let Some(d) = dst {
+            match (&self.node(d)?.data, src_is_dir) {
+                (Data::Dir(m), true) if !m.is_empty() => return Err(Error::NotEmpty),
+                (Data::Dir(_), false) => return Err(Error::IsDirectory),
+                (Data::Dir(_), true) => {}
+                (_, true) => return Err(Error::NotDirectory),
+                (_, false) => {}
+            }
+            freed = self.node(d)?.cost;
+        }
+        let old_cost = self.node(src)?.cost;
+        let new_cost = to_name.len() + NODE_OVERHEAD;
+        // the replaced target's cost comes back once nothing holds it (not before: a connection
+        // may keep it alive), so count it only if it is freed at once
+        let credit = match dst {
+            Some(d) if self.node(d)?.refs == 0 => freed,
+            _ => 0,
+        };
+        if new_cost > old_cost && self.meta - credit + (new_cost - old_cost) > self.limits.max_meta
+        {
+            return Err(Error::Quota);
+        }
+        if let Some(d) = dst {
+            if let Data::Dir(m) = &mut self.node_mut(to_dir)?.data {
+                m.remove(to_name);
+            }
+            self.node_mut(d)?.links = 0;
+            self.collect(d);
+        }
+        if let Data::Dir(m) = &mut self.node_mut(from_dir)?.data {
+            m.remove(from_name);
+        }
+        if let Data::Dir(m) = &mut self.node_mut(to_dir)?.data {
+            m.insert(to_name.to_vec(), src);
+        }
+        self.meta = self.meta - old_cost + new_cost;
+        self.node_mut(src)?.cost = new_cost;
+        Ok(())
+    }
+
+    /// Is `target` the directory `root` itself or somewhere below it?
+    fn is_within(&self, root: NodeId, target: NodeId) -> Result<bool, Error> {
+        let mut work = alloc::vec![root];
+        while let Some(d) = work.pop() {
+            if d == target {
+                return Ok(true);
+            }
+            if let Data::Dir(m) = &self.node(d)?.data {
+                work.extend(m.values().copied());
+            }
+        }
+        Ok(false)
     }
 
     /// A connection starts holding `id`.

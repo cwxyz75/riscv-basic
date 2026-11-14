@@ -310,7 +310,7 @@ Spec: `S7-SPEC.md` (slices S7a BASIC, S7b futexes, S7c libc, S7d Lua, S7e upstre
 - [x] C libc subset; threads on futexes
 - [x] `basic` crate as a userland program over a stdio-backed `Io`
 - [x] Lua port (S7d: Lua 5.4.8, acceptance script against a host build)
-- [x] Upstream Lua test suite under `bin/lua` (S7e: 23 files, each its own test; `files.lua` waits for `rename`, T46)
+- [x] Upstream Lua test suite under `bin/lua` (S7e: 24 files, each its own test)
 
 ### S8: Network, lower layers
 

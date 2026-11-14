@@ -131,7 +131,11 @@ fn build_lua(dir: &str) -> Option<PathBuf> {
     build_c_archive(
         "lua",
         &files,
-        &["-w".to_string(), format!("-include{}", conf.display())],
+        &[
+            "-w".to_string(),
+            "-O3".to_string(),
+            format!("-include{}", conf.display()),
+        ],
     )
 }
 

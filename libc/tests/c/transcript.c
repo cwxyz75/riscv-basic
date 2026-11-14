@@ -334,7 +334,26 @@ static void files(void) {
     fclose(f);
     printf("second [%s]\n", two);
     printf("empty path %d\n", fopen("", "r") == NULL);
-    remove("s7c-second.txt");
+    /* rename: the data moves with the name, an existing file is replaced, a missing source is ENOENT */
+    printf("rename %d\n", rename("s7c-second.txt", "s7c-moved.txt"));
+    printf("old name gone %d\n", fopen("s7c-second.txt", "r") == NULL);
+    f = fopen("s7c-moved.txt", "r");
+    char moved[16] = {0};
+    fread(moved, 1, 15, f);
+    fclose(f);
+    printf("moved [%s]\n", moved);
+    f = fopen("s7c-victim.txt", "w");
+    fputs("victim", f);
+    fclose(f);
+    printf("replace %d\n", rename("s7c-moved.txt", "s7c-victim.txt"));
+    f = fopen("s7c-victim.txt", "r");
+    char repl[16] = {0};
+    fread(repl, 1, 15, f);
+    fclose(f);
+    printf("replaced [%s]\n", repl);
+    errno = 0;
+    printf("missing %d %d\n", rename("s7c-nothing.txt", "s7c-x.txt"), errno == ENOENT);
+    remove("s7c-victim.txt");
     printf("remove %d\n", remove(path));
     printf("gone %d\n", fopen(path, "r") == NULL);
 }

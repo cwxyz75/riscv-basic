@@ -333,9 +333,7 @@ an expression, an error with its traceback, state kept, Ctrl-D, back at the shel
 pattern made the runtime's first-fit heap quadratic (16,000 small tables took 1.4 s, 100,000 would take about a
 minute), so `malloc` now keeps size-class free lists for blocks up to 512 bytes (16-byte classes, never returned to
 the heap); that exposed a bug in the first version (`malloc(0)` blocks too small for the free-list link), caught
-by a mutation check and now pinned by the C transcript (`classes`, `malloc(0)` neighbours). A write-only file
-connection cannot ask the file server for its size, so `seek("end")` on a file opened for writing only fails
-(T51). A program's memory stays capped at 16 MiB, which Lua notices (T53). The kernel gained a `fault-log`
+by a mutation check and now pinned by the C transcript (`classes`, `malloc(0)` neighbours). A write-only file connection could not ask the file server for its size, so `seek("end")` on a file opened for writing failed; `GetSize` now allows WRITE too (S7e/tidy-up). A program's memory stays capped at 16 MiB, which Lua notices (T53). The kernel gained a `fault-log`
 feature that prints the pc, address and return address of a fatal user fault, which found the `malloc(0)` bug in
 minutes.
 
@@ -352,11 +350,11 @@ patched around in the tests.
 is vendored unmodified (the `.lua` files; its C libraries are not) and carried in the boot image under
 `/etc/lua-tests`. Each file is its own `##TEST` (`lua_upstream_NAME`): the suite runs `lua -e "package.path=...;
 _port=true _soft=true _nomsg=true" /etc/lua-tests/NAME.lua` with `/` read-only and `.` the writable /tmp, and the
-file's own `assert`s are the judge (exit 0). 23 files run: calls, closure, constructs, events, goto, literals,
+file's own `assert`s are the judge (exit 0). 24 files run (`files.lua` joined once `rename` existed, T46): calls, closure, constructs, events, goto, literals,
 locals, math, nextvar, pm, sort, strings, utf8, vararg, bitwise, tpack, coroutine, errors, db, gc, gengc, cstack,
-attrib. 22 passed the first time; `locals.lua` found the memory ceiling (T53 became R14, OD72): its stack-overflow
+attrib, files. 22 of the first 23 passed the first time; `locals.lua` found the memory ceiling (T53 became R14, OD72): its stack-overflow
 test needs about 70 MiB, so the machine is now 256 MiB, a program's heap 128 MiB and its job 136 MiB, and the shell
-test's hog check follows the new numbers. Left out: `files.lua` (needs `rename` and `popen`, T46), `main.lua` (runs
+test's hog check follows the new numbers. Left out: `main.lua` (runs
 the `lua` binary through `os.execute`), `api.lua`, `big.lua`, `heavy.lua`, `verybig.lua`, `tracegc.lua` and
 `ltests/` (need Lua's internal test build or are only for memory-rich hosts), and `all.lua` (the driver the suite
 replaces).

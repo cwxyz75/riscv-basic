@@ -262,6 +262,15 @@ impl Fs {
         self.simple(file::op::MKDIR, 0, 0, name).map(|_| ())
     }
 
+    /// Move `old` to `new` (paths relative to this directory); an existing file or empty directory
+    /// at `new` is replaced.
+    pub fn rename(&mut self, old: &[u8], new: &[u8]) -> Result<(), i32> {
+        let mut both = old.to_vec();
+        both.extend_from_slice(new);
+        self.simple(file::op::RENAME, old.len() as u64, 0, &both)
+            .map(|_| ())
+    }
+
     pub fn unlink(&mut self, name: &[u8]) -> Result<(), i32> {
         self.simple(file::op::UNLINK, 0, 0, name).map(|_| ())
     }

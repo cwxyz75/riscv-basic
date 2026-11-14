@@ -4254,6 +4254,144 @@ fn memfsd_tmp_is_the_only_writable_place() -> Outcome {
     Ok(())
 }
 
+/// `rename` through the file server (T46): within a directory, across subdirectories by path, over an
+/// existing file, the error cases, rights, and the read-only tree.
+fn memfsd_rename() -> Outcome {
+    let (_p, mut root, _bi) = start_memfsd()?;
+    let mut tmp = root
+        .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(tmp.mkdir(b"d"), Ok(()), "mkdir d");
+    ensure_eq!(tmp.mkdir(b"e"), Ok(()), "mkdir e");
+    let mut f = tmp
+        .open(b"a", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(f.write(0, b"contents"), Ok(8), "write");
+    ensure_eq!(tmp.rename(b"a", b"b"), Ok(()), "rename in place");
+    ensure_eq!(
+        code(tmp.open(b"a", 0, prt::READ)),
+        Some(pst::NOT_FOUND),
+        "the old name is gone"
+    );
+    // the open connection follows the node to its new name
+    ensure_eq!(
+        f.read_all(),
+        Ok(b"contents".to_vec()),
+        "an open file survives a rename"
+    );
+    ensure_eq!(
+        tmp.rename(b"b", b"d/c"),
+        Ok(()),
+        "into a subdirectory by path"
+    );
+    ensure_eq!(tmp.rename(b"d/c", b"e/z"), Ok(()), "between subdirectories");
+    let mut z = tmp
+        .open(b"e/z", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        z.read_all(),
+        Ok(b"contents".to_vec()),
+        "the moved file's data"
+    );
+    // replacing an existing file
+    let mut other = tmp
+        .open(b"e/other", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(other.write(0, b"old"), Ok(3), "another file");
+    ensure_eq!(tmp.rename(b"e/z", b"e/other"), Ok(()), "replace a file");
+    let mut again = tmp
+        .open(b"e/other", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        again.read_all(),
+        Ok(b"contents".to_vec()),
+        "the replacement's data"
+    );
+    ensure_eq!(
+        other.read_all(),
+        Ok(b"old".to_vec()),
+        "the replaced file lives while held"
+    );
+    // errors
+    ensure_eq!(
+        code(tmp.rename(b"nope", b"x")),
+        Some(pst::NOT_FOUND),
+        "missing source"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"d", b"e/other")),
+        Some(pst::NOT_DIRECTORY),
+        "a directory over a file"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"e/other", b"d")),
+        Some(pst::IS_DIRECTORY),
+        "a file over a directory"
+    );
+    let mut dd = tmp
+        .open(b"d", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        dd.mkdir(b"inner"),
+        Ok(()),
+        "a directory with something in it"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"e", b"d")),
+        Some(pst::NOT_EMPTY),
+        "over a non-empty directory"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"d", b"d/inner/x")),
+        Some(pst::BAD_REQUEST),
+        "a directory below itself"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"d", b"../x")),
+        Some(pst::BAD_REQUEST),
+        "a path with .."
+    );
+    ensure_eq!(
+        code(tmp.rename(b"d", b"")),
+        Some(pst::BAD_REQUEST),
+        "an empty new path"
+    );
+    ensure_eq!(
+        code(tmp.rename(b"", b"x")),
+        Some(pst::BAD_REQUEST),
+        "an empty old path"
+    );
+    ensure_eq!(
+        tmp.call(pop::RENAME, 0, 0, 99, 0, b"ab", None)
+            .map(|a| a.status),
+        Ok(pst::BAD_REQUEST),
+        "a split point past the payload"
+    );
+    // rights: a read-only connection cannot rename
+    let mut ro = tmp.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(ro.rename(b"d", b"d2")),
+        Some(DENIED),
+        "no WRITE, no rename"
+    );
+    // the boot filesystem is read-only
+    let mut etc = root
+        .open(b"etc", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()));
+    if let Ok(etc) = etc.as_mut() {
+        ensure!(
+            etc.rename(b"trusted", b"x").is_err(),
+            "the boot image cannot be renamed"
+        );
+    }
+    ensure_eq!(
+        code(root.rename(b"tmp", b"tmp2")),
+        Some(DENIED),
+        "nor the root"
+    );
+    Ok(())
+}
+
 fn memfsd_paths_cannot_escape_a_directory_handle() -> Outcome {
     let (_p, mut root, _bi) = start_memfsd()?;
     for bad in [
@@ -4368,7 +4506,11 @@ fn memfsd_rights_only_shrink() -> Outcome {
         "read-only connection, set_size"
     );
     ensure_eq!(code(w.read(0, 1)), Some(DENIED), "write-only connection");
-    ensure_eq!(code(w.size()), Some(DENIED), "write-only connection, size");
+    ensure_eq!(
+        w.size(),
+        Ok(3),
+        "a write-only connection may ask the size (append, seek)"
+    );
     ensure_eq!(w.write(3, b"d"), Ok(1), "but it writes");
     ensure_eq!(r.read_all(), Ok(b"abcd".to_vec()), "and the reader sees it");
     // a file connection cannot be given directory rights
@@ -4870,7 +5012,7 @@ fn memfsd_rights_are_checked_op_by_op() -> Outcome {
     let mut wo = f.clone_conn(prt::WRITE).map_err(|e| msg_e(e, line!()))?;
     ensure_eq!(code(wo.fstat()), Some(DENIED), "fstat without READ");
     ensure_eq!(code(wo.get_vmo()), Some(DENIED), "get_vmo without READ");
-    ensure_eq!(code(wo.size()), Some(DENIED), "size without READ");
+    ensure_eq!(wo.size(), Ok(0), "a writer may ask the size");
     // a file connection never gets directory rights
     ensure_eq!(
         code(tmp_rw.open(b"f", 0, prt::READ | prt::ENUMERATE)),
@@ -6469,9 +6611,10 @@ fn run_lua_upstream(file: &str) -> Outcome {
             setup.to_vec(),
             path.into_bytes(),
         ],
+        // (the upstream tests expect a PATH, though this OS has nothing to run through one)
+        env: vec![b"PATH=/bin".to_vec()],
         namespace: vec![(b"/".to_vec(), 2), (b".".to_vec(), 3)],
         roles: vec![(Role::Stdout, 0), (Role::Stderr, 1)],
-        ..Startup::default()
     };
     let bytes = s.encode().map_err(|_| msg_at(line!()))?;
     let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, err_theirs, slash.ch, dot.ch]).map_err(
@@ -6556,6 +6699,7 @@ lua_upstream_tests! {
     lua_up_gengc => "gengc",
     lua_up_cstack => "cstack",
     lua_up_attrib => "attrib",
+    lua_up_files => "files",
 }
 
 // --- BASIC on the target (S7a) ----------------------------------------------------------------
@@ -8197,6 +8341,7 @@ pub fn app_main() -> i32 {
             "memfsd_tmp_is_the_only_writable_place",
             memfsd_tmp_is_the_only_writable_place,
         ),
+        ("memfsd_rename", memfsd_rename),
         (
             "memfsd_paths_cannot_escape_a_directory_handle",
             memfsd_paths_cannot_escape_a_directory_handle,

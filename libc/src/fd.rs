@@ -398,9 +398,21 @@ pub unsafe extern "C" fn stat(path: *const c_char, out: *mut Stat) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn rename(_from: *const c_char, _to: *const c_char) -> c_int {
-    errno::set(38); // ENOSYS: the file protocol has no rename (TIDY-UP T46)
-    -1
+pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
+    let _guard = FDS.lock();
+    let (Some((d1, old)), Some((d2, new))) = (resolve(path_bytes(from)), resolve(path_bytes(to)))
+    else {
+        errno::set(2); // ENOENT
+        return -1;
+    };
+    if d1 != d2 {
+        errno::set(18); // EXDEV: the two paths are in different namespace entries
+        return -1;
+    }
+    match dir_view(d1).rename(&old, &new) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
+    }
 }
 
 /// A scratch name no other open file of this process has, in the working directory (`.`): the
