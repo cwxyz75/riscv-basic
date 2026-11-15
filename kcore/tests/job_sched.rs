@@ -35,7 +35,9 @@ fn random_walk_keeps_every_job_within_its_parent() {
                     let before: Vec<_> = ids.iter().map(|&j| jobs.sched(j)).collect();
                     let parent_s = jobs.parent(id).and_then(|p| jobs.sched(p));
                     let r = jobs.set_sched(id, want);
-                    let bad_value = want.max_prio > 63 || !(1..=65536).contains(&want.cpu_weight);
+                    let bad_value = want.max_prio > 63
+                        || !(1..=65536).contains(&want.cpu_weight)
+                        || want.rt_budget > 100_000_000;
                     let above = parent_s.is_some_and(|p| {
                         want.max_prio > p.max_prio || want.rt_budget > p.rt_budget
                     });
