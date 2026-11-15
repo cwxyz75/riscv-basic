@@ -1,0 +1,702 @@
+//! The scheduler of SCHED-SMP-SPEC section 4, **stage one** (task 6): the new structure, with behaviour as today.
+//!
+//! What is new compared with [`crate::sched`]: one priority number orders everything and its **band** (idle,
+//! normal 1 to 31, real-time 32 to 63) picks the class that queues the thread ([`band`], [`SchedAttr`]); every
+//! thread has the spec's record ([`ThreadSched`]); time is in **nanoseconds**; the class interface is the spec's
+//! (`enqueue(how)`, `dequeue(why)`, `pick`, `top`, `preempts`, `account`, `next_event`); and a hart's run queue,
+//! [`HartRq`], hosts an RT class, a normal class and the hart's idle thread with **strict precedence in the core**
+//! (`pick`: RT, then normal, then idle). The RT class is FIFO within a level (a preempted thread returns to the
+//! front; optional round robin with `rr`); the normal class is today's fixed priority with a 10 ms round robin
+//! slice. RT budgets, throttling and donation exist as constants and fields only (`RT_ENFORCE` is false).
+//!
+//! This stage runs **one hart's queue** (the model the differential test drives against the old scheduler
+//! `sched::Sched`, which stays as the oracle: for priorities in the normal band the two must have the same
+//! `current` after every operation). Wiring it into the kernel, the per-hart queues of several harts, push and pull
+//! belong to the later tasks (6b, 11). Pure: no locks, a simulated clock.
+
+use crate::sched::{State, Tid, PRIO_MAX};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::string::String;
+use alloc::vec::Vec;
+
+pub type Prio = u8;
+pub type Time = u64;
+
+pub const MS: Time = 1_000_000;
+/// The normal band's round robin slice (OD33's 10 ticks, now in nanoseconds).
+pub const TIMESLICE: Time = 10 * MS;
+/// RT window and limits (SCHED-SMP-SPEC 4.5); accounted, not enforced yet.
+pub const RT_WINDOW: Time = 100 * MS;
+pub const RT_HART_MAX: Time = 80 * MS;
+pub const RT_RR_SLICE: Time = 10 * MS;
+pub const RT_ENFORCE: bool = false;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Band {
+    Idle,
+    Normal,
+    Rt,
+}
+
+/// The band of a priority: 0 idle, 1 to 31 normal, 32 to 63 real-time.
+pub fn band(p: Prio) -> Band {
+    match p {
+        0 => Band::Idle,
+        1..=31 => Band::Normal,
+        _ => Band::Rt,
+    }
+}
+
+/// A thread's base scheduling attribute. `rr`: rotate among equals (real-time only; the normal band always does).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SchedAttr {
+    pub prio: Prio,
+    pub rr: bool,
+}
+
+/// The per-thread record (SCHED-SMP-SPEC 4.3).
+#[derive(Clone, Debug)]
+pub struct ThreadSched {
+    pub tid: Tid,
+    pub base: SchedAttr,
+    /// Copy of the donation graph's answer (`kcore::donate`, task 7); equal to `base.prio` until then.
+    pub eff: Prio,
+    pub demoted_window: u64,
+    pub state: State,
+    pub affinity: Option<u8>,
+    pub last_hart: u8,
+    pub slice_left: Time,
+    pub deadline: Option<Time>,
+    pub runnable_since: Time,
+    pub started: Time,
+    pub cpu: Time,
+    pub group: u32,
+    pub job: u32,
+    pub class_words: [u64; 4],
+    /// The wake token (INVARIANTS C3): a wake that finds the thread not blocked.
+    pub token: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enq {
+    New,
+    Wake { slept: Time },
+    Preempted,
+    SliceEnd,
+    Yield,
+    Migrated,
+    AttrChanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Deq {
+    Migrate,
+    AttrChange,
+    Gone,
+}
+
+/// One deque per level and a 64-bit occupancy mask (best level in one instruction).
+#[derive(Default)]
+pub struct PrioQueues {
+    levels: Vec<VecDeque<Tid>>,
+    mask: u64,
+}
+
+impl PrioQueues {
+    pub fn new() -> PrioQueues {
+        PrioQueues {
+            levels: (0..=PRIO_MAX as usize).map(|_| VecDeque::new()).collect(),
+            mask: 0,
+        }
+    }
+    pub fn push_back(&mut self, p: Prio, t: Tid) {
+        self.levels[p as usize].push_back(t);
+        self.mask |= 1 << p;
+    }
+    pub fn push_front(&mut self, p: Prio, t: Tid) {
+        self.levels[p as usize].push_front(t);
+        self.mask |= 1 << p;
+    }
+    /// The best queued level.
+    pub fn top(&self) -> Option<Prio> {
+        (self.mask != 0).then(|| 63 - self.mask.leading_zeros() as Prio)
+    }
+    pub fn pop_best(&mut self) -> Option<Tid> {
+        let p = self.top()?;
+        let t = self.levels[p as usize].pop_front();
+        if self.levels[p as usize].is_empty() {
+            self.mask &= !(1 << p);
+        }
+        t
+    }
+    pub fn remove(&mut self, t: Tid) -> bool {
+        for p in 0..=PRIO_MAX as usize {
+            if let Some(i) = self.levels[p].iter().position(|&x| x == t) {
+                self.levels[p].remove(i);
+                if self.levels[p].is_empty() {
+                    self.mask &= !(1 << p);
+                }
+                return true;
+            }
+        }
+        false
+    }
+    pub fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
+        (0..=PRIO_MAX).rev().find_map(|p| {
+            self.levels[p as usize]
+                .iter()
+                .find(|&&t| ok(t))
+                .map(|&t| (t, p))
+        })
+    }
+    pub fn contains(&self, t: Tid) -> bool {
+        self.levels.iter().any(|l| l.contains(&t))
+    }
+    pub fn len(&self) -> usize {
+        self.levels.iter().map(VecDeque::len).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+}
+
+/// A band's class (SCHED-SMP-SPEC 4.3).
+pub trait Class {
+    fn name(&self) -> &'static str;
+    /// `t` is runnable here. `Preempted` goes to the front of its level (keeping its slice), everything else to the back.
+    fn enqueue(&mut self, t: &mut ThreadSched, how: Enq, now: Time);
+    fn dequeue(&mut self, t: &mut ThreadSched, why: Deq, now: Time);
+    /// Remove and return the best queued thread.
+    fn pick(&mut self, now: Time) -> Option<Tid>;
+    /// The effective priority of the best queued thread.
+    fn top(&self) -> Option<Prio>;
+    fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)>;
+    /// Should a queued thread of this class replace `cur` right now?
+    fn preempts(&self, cur: &ThreadSched, now: Time) -> bool;
+    /// Charge `ran` to the running thread; true: its slice is over and an equal or better peer waits.
+    fn account(&mut self, cur: &mut ThreadSched, ran: Time, now: Time) -> bool;
+    /// When this class next needs the hart's timer while `cur` runs (slice end), if at all.
+    fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time>;
+    fn contains(&self, tid: Tid) -> bool;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+fn enqueue_common(q: &mut PrioQueues, t: &mut ThreadSched, how: Enq, slice: Time) {
+    match how {
+        Enq::Preempted => {
+            t.slice_left = t.slice_left.max(1);
+            q.push_front(t.eff, t.tid);
+        }
+        // a priority change keeps the slice the thread had (it moves to the back of its new level, not a new turn)
+        Enq::AttrChanged => {
+            t.slice_left = t.slice_left.max(1);
+            q.push_back(t.eff, t.tid);
+        }
+        _ => {
+            t.slice_left = slice;
+            q.push_back(t.eff, t.tid);
+        }
+    }
+}
+
+/// The normal band today: fixed priority, round robin within a level, a 10 ms slice (OD33).
+pub struct FixedPrio {
+    q: PrioQueues,
+}
+
+impl FixedPrio {
+    pub fn new() -> FixedPrio {
+        FixedPrio {
+            q: PrioQueues::new(),
+        }
+    }
+}
+
+impl Default for FixedPrio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Class for FixedPrio {
+    fn name(&self) -> &'static str {
+        "fixed-prio"
+    }
+    fn enqueue(&mut self, t: &mut ThreadSched, how: Enq, _now: Time) {
+        enqueue_common(&mut self.q, t, how, TIMESLICE);
+    }
+    fn dequeue(&mut self, t: &mut ThreadSched, _why: Deq, _now: Time) {
+        self.q.remove(t.tid);
+    }
+    fn pick(&mut self, _now: Time) -> Option<Tid> {
+        self.q.pop_best()
+    }
+    fn top(&self) -> Option<Prio> {
+        self.q.top()
+    }
+    fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
+        self.q.top_where(ok)
+    }
+    fn preempts(&self, cur: &ThreadSched, _now: Time) -> bool {
+        self.q.top().is_some_and(|p| p > cur.eff)
+    }
+    fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
+        cur.cpu += ran;
+        cur.slice_left = cur.slice_left.saturating_sub(ran);
+        if cur.slice_left > 0 {
+            return false;
+        }
+        if self.q.top().is_some_and(|p| p >= cur.eff) {
+            true
+        } else {
+            cur.slice_left = TIMESLICE;
+            false
+        }
+    }
+    fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
+        Some(now + cur.slice_left)
+    }
+    fn contains(&self, tid: Tid) -> bool {
+        self.q.contains(tid)
+    }
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+}
+
+/// The real-time band: fixed priority 32 to 63, FIFO within a level; a preempted thread returns to the front of its
+/// level; with `rr` a thread also rotates every `RT_RR_SLICE` when an equal-priority peer waits.
+pub struct RtClass {
+    q: PrioQueues,
+}
+
+impl RtClass {
+    pub fn new() -> RtClass {
+        RtClass {
+            q: PrioQueues::new(),
+        }
+    }
+}
+
+impl Default for RtClass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Class for RtClass {
+    fn name(&self) -> &'static str {
+        "rt"
+    }
+    fn enqueue(&mut self, t: &mut ThreadSched, how: Enq, _now: Time) {
+        enqueue_common(&mut self.q, t, how, RT_RR_SLICE);
+    }
+    fn dequeue(&mut self, t: &mut ThreadSched, _why: Deq, _now: Time) {
+        self.q.remove(t.tid);
+    }
+    fn pick(&mut self, _now: Time) -> Option<Tid> {
+        self.q.pop_best()
+    }
+    fn top(&self) -> Option<Prio> {
+        self.q.top()
+    }
+    fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
+        self.q.top_where(ok)
+    }
+    fn preempts(&self, cur: &ThreadSched, _now: Time) -> bool {
+        self.q.top().is_some_and(|p| p > cur.eff)
+    }
+    fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
+        cur.cpu += ran;
+        if !cur.base.rr {
+            return false; // FIFO: runs until it blocks, yields or is preempted
+        }
+        cur.slice_left = cur.slice_left.saturating_sub(ran);
+        if cur.slice_left > 0 {
+            return false;
+        }
+        if self.q.top().is_some_and(|p| p >= cur.eff) {
+            true
+        } else {
+            cur.slice_left = RT_RR_SLICE;
+            false
+        }
+    }
+    fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
+        cur.base.rr.then(|| now + cur.slice_left)
+    }
+    fn contains(&self, tid: Tid) -> bool {
+        self.q.contains(tid)
+    }
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    NoSuchThread,
+    NoCurrent,
+    BadPriority,
+    NotExited,
+}
+
+/// One hart's run queue: an RT class, a normal class and the hart's idle thread, strict precedence in `pick`.
+pub struct HartRq<N: Class> {
+    rt: RtClass,
+    normal: N,
+    idle: Option<Tid>,
+    cur: Option<Tid>,
+    threads: BTreeMap<Tid, ThreadSched>,
+    now: Time,
+    timers: BTreeSet<(Time, Tid)>,
+    next_tid: Tid,
+    pub bad_picks: u32,
+}
+
+impl<N: Class> HartRq<N> {
+    pub fn new(normal: N) -> HartRq<N> {
+        HartRq {
+            rt: RtClass::new(),
+            normal,
+            idle: None,
+            cur: None,
+            threads: BTreeMap::new(),
+            now: 0,
+            timers: BTreeSet::new(),
+            next_tid: 1,
+            bad_picks: 0,
+        }
+    }
+
+    pub fn now(&self) -> Time {
+        self.now
+    }
+
+    /// The thread that should be running now (the idle thread when nothing else is runnable).
+    pub fn current(&self) -> Option<Tid> {
+        self.cur
+    }
+
+    pub fn state(&self, tid: Tid) -> Option<State> {
+        self.threads.get(&tid).map(|t| t.state)
+    }
+
+    pub fn record(&self, tid: Tid) -> Option<&ThreadSched> {
+        self.threads.get(&tid)
+    }
+
+    fn fresh(&mut self, attr: SchedAttr, state: State) -> Result<Tid, Error> {
+        if attr.prio > PRIO_MAX {
+            return Err(Error::BadPriority);
+        }
+        let tid = self.next_tid;
+        self.next_tid += 1;
+        self.threads.insert(
+            tid,
+            ThreadSched {
+                tid,
+                base: attr,
+                eff: attr.prio,
+                demoted_window: 0,
+                state,
+                affinity: None,
+                last_hart: 0,
+                slice_left: TIMESLICE,
+                deadline: None,
+                runnable_since: self.now,
+                started: self.now,
+                cpu: 0,
+                group: 0,
+                job: 0,
+                class_words: [0; 4],
+                token: false,
+            },
+        );
+        Ok(tid)
+    }
+
+    /// The hart's idle thread: it runs when nothing else can, is never queued, and is pinned here.
+    pub fn adopt_idle(&mut self) -> Tid {
+        let tid = self
+            .fresh(SchedAttr { prio: 0, rr: false }, State::Running)
+            .expect("priority 0 is valid");
+        self.idle = Some(tid);
+        self.cur = Some(tid);
+        tid
+    }
+
+    fn class_enqueue(&mut self, tid: Tid, how: Enq) {
+        let mut t = self.threads.remove(&tid).expect("thread exists");
+        match band(t.eff) {
+            Band::Rt => self.rt.enqueue(&mut t, how, self.now),
+            Band::Normal => self.normal.enqueue(&mut t, how, self.now),
+            Band::Idle => unreachable!("the idle thread is never queued"),
+        }
+        self.threads.insert(tid, t);
+    }
+
+    fn class_dequeue(&mut self, tid: Tid, why: Deq) {
+        let mut t = self.threads.remove(&tid).expect("thread exists");
+        match band(t.eff) {
+            Band::Rt => self.rt.dequeue(&mut t, why, self.now),
+            Band::Normal => self.normal.dequeue(&mut t, why, self.now),
+            Band::Idle => {}
+        }
+        self.threads.insert(tid, t);
+    }
+
+    /// Strict precedence (core mechanism, not policy): RT, then normal, then idle. Rejects a pick that is not a
+    /// runnable thread (the guard against a faulty class).
+    fn pick(&mut self) {
+        debug_assert!(self.cur.is_none() || self.cur == self.idle);
+        loop {
+            let picked = self
+                .rt
+                .pick(self.now)
+                .or_else(|| self.normal.pick(self.now));
+            let Some(tid) = picked else {
+                self.cur = self.idle;
+                return;
+            };
+            match self.threads.get_mut(&tid) {
+                Some(t) if t.state == State::Runnable => {
+                    t.state = State::Running;
+                    t.started = self.now;
+                    self.cur = Some(tid);
+                    return;
+                }
+                _ => self.bad_picks += 1,
+            }
+        }
+    }
+
+    /// Anything queued that should run instead of the current thread? (An idle current is replaced by anything.)
+    fn better_waits(&self) -> bool {
+        let Some(c) = self.cur else {
+            return true;
+        };
+        if Some(c) == self.idle {
+            return !self.rt.q.is_empty() || self.normal.top().is_some();
+        }
+        let t = &self.threads[&c];
+        self.rt.preempts(t, self.now) || self.normal.preempts(t, self.now)
+    }
+
+    /// Make the designation right after something changed: dispatch if there is no current thread, preempt the
+    /// current one (to the front of its level, keeping its slice) if something better waits.
+    fn reschedule(&mut self) {
+        if !self.better_waits() {
+            return;
+        }
+        if let Some(c) = self.cur.filter(|&c| Some(c) != self.idle) {
+            let t = self.threads.get_mut(&c).expect("current exists");
+            t.state = State::Runnable;
+            self.cur = None;
+            self.class_enqueue(c, Enq::Preempted);
+        }
+        self.cur = None;
+        self.pick();
+    }
+
+    pub fn spawn(&mut self, attr: SchedAttr) -> Result<Tid, Error> {
+        let tid = self.fresh(attr, State::Runnable)?;
+        self.class_enqueue(tid, Enq::New);
+        self.reschedule();
+        Ok(tid)
+    }
+
+    pub fn wake(&mut self, tid: Tid) -> Result<(), Error> {
+        let t = self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?;
+        match t.state {
+            State::Blocked => {
+                if let Some(d) = t.deadline.take() {
+                    self.timers.remove(&(d, tid));
+                }
+                let slept = self.now.saturating_sub(t.started);
+                t.state = State::Runnable;
+                t.runnable_since = self.now;
+                self.class_enqueue(tid, Enq::Wake { slept });
+                self.reschedule();
+            }
+            State::Running | State::Runnable => t.token = true,
+            State::Exited => {}
+        }
+        Ok(())
+    }
+
+    /// Block the current thread unless a wake token is waiting (then it is consumed). Returns whether it blocked.
+    pub fn block_current(&mut self) -> Result<bool, Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        let t = self.threads.get_mut(&c).expect("current exists");
+        if core::mem::take(&mut t.token) {
+            return Ok(false);
+        }
+        t.state = State::Blocked;
+        self.cur = None;
+        self.pick();
+        Ok(true)
+    }
+
+    /// Sleep until `deadline` (a passed deadline does not block; a stale token is discarded).
+    pub fn sleep_until(&mut self, deadline: Time) -> Result<bool, Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        let t = self.threads.get_mut(&c).expect("current exists");
+        t.token = false;
+        if deadline <= self.now {
+            return Ok(false);
+        }
+        t.deadline = Some(deadline);
+        self.timers.insert((deadline, c));
+        self.block_current()
+    }
+
+    pub fn yield_now(&mut self) -> Result<(), Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
+        self.cur = None;
+        self.class_enqueue(c, Enq::Yield);
+        self.pick();
+        Ok(())
+    }
+
+    pub fn exit_current(&mut self) -> Result<(), Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        let t = self.threads.get_mut(&c).expect("current exists");
+        t.state = State::Exited;
+        t.token = false;
+        self.cur = None;
+        self.pick();
+        Ok(())
+    }
+
+    pub fn reap(&mut self, tid: Tid) -> Result<(), Error> {
+        match self.threads.get(&tid) {
+            Some(t) if t.state == State::Exited => {
+                self.threads.remove(&tid);
+                Ok(())
+            }
+            Some(_) => Err(Error::NotExited),
+            None => Err(Error::NoSuchThread),
+        }
+    }
+
+    /// Change a thread's base priority (its band may change; `eff` follows until donation exists).
+    pub fn set_priority(&mut self, tid: Tid, prio: Prio) -> Result<(), Error> {
+        if prio > PRIO_MAX {
+            return Err(Error::BadPriority);
+        }
+        let t = self.threads.get(&tid).ok_or(Error::NoSuchThread)?;
+        let (state, old) = (t.state, t.eff);
+        if state == State::Runnable && old != prio {
+            self.class_dequeue(tid, Deq::AttrChange);
+        }
+        let t = self.threads.get_mut(&tid).expect("exists");
+        t.base.prio = prio;
+        t.eff = prio;
+        match state {
+            State::Runnable if old != prio => {
+                self.class_enqueue(tid, Enq::AttrChanged);
+                self.reschedule();
+            }
+            State::Running => self.reschedule(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Advance the clock by `dt`: fire the timers that are due, account the running thread's slice (rotating it
+    /// when its slice is over and an equal or better peer waits), then make the designation right.
+    pub fn advance(&mut self, dt: Time) {
+        self.now += dt;
+        let due: Vec<(Time, Tid)> = self.timers.range(..(self.now + 1, 0)).copied().collect();
+        for (d, tid) in due {
+            self.timers.remove(&(d, tid));
+            if let Some(t) = self.threads.get_mut(&tid) {
+                t.deadline = None;
+                if t.state == State::Blocked {
+                    t.state = State::Runnable;
+                    t.runnable_since = self.now;
+                    self.class_enqueue(tid, Enq::Wake { slept: 0 });
+                }
+            }
+        }
+        // (v1 fires the timers, makes the designation right for them, then accounts the slice; the order matters
+        // for which thread owns the tick that ends a slice)
+        self.reschedule();
+        if let Some(c) = self.cur.filter(|&c| Some(c) != self.idle) {
+            let now = self.now;
+            let mut t = self.threads.remove(&c).expect("current exists");
+            let rotate = match band(t.eff) {
+                Band::Rt => self.rt.account(&mut t, dt, now),
+                _ => self.normal.account(&mut t, dt, now),
+            };
+            self.threads.insert(c, t);
+            if rotate {
+                self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
+                self.cur = None;
+                self.class_enqueue(c, Enq::SliceEnd);
+                self.pick();
+            }
+        }
+        self.reschedule();
+    }
+
+    /// The per-hart rules (the single-hart form of GP2): every thread is in exactly one place.
+    pub fn audit(&self) -> Result<(), String> {
+        let mut running = 0;
+        for (&tid, t) in &self.threads {
+            if Some(tid) == self.idle {
+                continue; // the idle thread is never queued and runs when nothing else does
+            }
+            let queued = self.rt.contains(tid) || self.normal.contains(tid);
+            let timed = self.timers.iter().filter(|&&(_, x)| x == tid).count();
+            match t.state {
+                State::Running => {
+                    running += 1;
+                    if self.cur != Some(tid) || queued || timed != 0 {
+                        return Err(alloc::format!("running thread {tid} is also elsewhere"));
+                    }
+                }
+                State::Runnable if !queued => {
+                    return Err(alloc::format!("runnable thread {tid} is not queued"));
+                }
+                State::Blocked if queued => {
+                    return Err(alloc::format!("blocked thread {tid} is queued"));
+                }
+                State::Blocked if timed > 1 || (timed == 1) != t.deadline.is_some() => {
+                    return Err(alloc::format!("blocked thread {tid}: timer bookkeeping"));
+                }
+                State::Exited if queued || timed != 0 => {
+                    return Err(alloc::format!(
+                        "exited thread {tid} is still queued or timed"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let want = usize::from(self.cur != self.idle);
+        if running != want {
+            return Err(alloc::format!("{running} running threads, expected {want}"));
+        }
+        if self.bad_picks != 0 {
+            return Err(alloc::format!("{} bad picks", self.bad_picks));
+        }
+        Ok(())
+    }
+}
