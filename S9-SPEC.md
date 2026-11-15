@@ -94,29 +94,33 @@ relay:        scripts/net_lossy_relay.py --seed N --loss P --dup P --reorder P -
 
 ### 3.2 Facts checked against slirp on QEMU 11.1.3 (macOS, 2026-11-14)
 
-Checked with a scripted fake guest in the style of `scripts/net_probe_slirp.py` (no guest code: slirp and a socket netdev on a
-hub, the script sends real frames). The script and its capture (334 TCP frames, every TCP checksum verified by the script) were
-kept outside the repository because this PR is documents only; **step 0 commits them** and re-runs them, and until then the
-table is the record. The most important line is the first: **in user-mode networking the guest's TCP peer is slirp's own TCP,
+**Re-verified by step 0 (QEMU 11.1.3, macOS, 2026-11-15)** with the committed `scripts/net_probe_slirp_tcp.py` (a scripted fake
+guest in the style of `scripts/net_probe_slirp.py`; `--long` adds the two slow rows), whose capture is
+`net/tests/data/slirp-tcp-probe.pcap` (221 frames, 217 TCP segments, every checksum verified by `scripts/net_pcap_check.py`,
+which now checks TCP and is run by `make docs-check`). Rows that step 0's script reproduced say so; rows it does not cover are
+marked "not re-run" and keep the 2026-11-14 value. The original 2026-11-14 run used throwaway scripts, which this replaces. The most important line is the first: **in user-mode networking the guest's TCP peer is slirp's own TCP,
 not the host kernel's.** Every option decision in 5.3 follows from what that peer does.
 
 | Question | Answer observed |
 |---|---|
 | Guest SYN to 10.0.2.2:HPORT carrying MSS 1460, window scale 7, SACK-permitted and timestamps | SYN-ACK from 10.0.2.2 carries **only MSS 1460**; window 65535; TTL 64; DF clear. **slirp negotiates no window scaling, no SACK and no timestamps**, so none of them can be exercised in QEMU |
-| Bulk, host to guest, 200,000 bytes, guest ACKs each segment | 140 segments, **1440 bytes each** (not 1460), largest frame 1494 bytes, never an IP fragment; the hash of what the fake guest received matched; then FIN |
-| Guest announces MSS 536 and window 4096, never ACKs data | slirp **ignores the small MSS** (it sent 1440-byte segments) but respects the window (2,880 bytes then stops); it retransmits the first segment after **1.5 s, then 3 s, then 6 s** |
-| How slirp ACKs guest data | **every segment at once** (40 segments, 40 ACKs, the first 0.1 ms after the data); no delayed ACK |
-| Three segments after a hole | **three duplicate ACKs** (no SACK blocks); filling the hole advances the ACK over all four |
-| Host program does not read | slirp accepted about 685 KB, then advertised **window 0**; a 1-byte probe is answered with window 0 and the ACK unchanged; when the program reads, slirp sends a window update **unprompted** |
-| Guest SYN to a closed host port | **RST+ACK at once** (`seq 0, ack = our seq + 1`), so "connection refused" is testable |
-| A stray ACK with data for no connection | **RST** with `seq` = our ACK number, the RFC 9293 form |
-| Host connects to the forwarded port | the guest sees a SYN **from 10.0.2.2**, an ephemeral source port, MSS 1460 only, window 65535, to its own MAC |
-| The guest does not answer that SYN | slirp retries after **6 s** (one retry seen in 8 s): a dropped inbound SYN is expensive |
-| The guest answers that SYN with RST | the host's `connect` has **already succeeded** (slirp accepts first), then the host reads end-of-file. `curl` reports exit 52, "Empty reply from server", not "connection refused" |
-| The guest resets an established forwarded connection | the host reads **end-of-file, not an error**: through slirp the host cannot tell a guest RST from a FIN |
-| slirp sending to the guest before any ACK | one segment in one run and two in another, then it waits: its initial window is small, so a delayed ACK on the first segment would cost its whole delay (5.6) |
+| Bulk, host to guest, guest ACKs each segment | re-run with 60,000 bytes (the capture is kept small): 42 segments, **1440 bytes each** (the last 960), not 1460, largest frame 1494 bytes, never an IP fragment, hash matched, then FIN; the guest's FIN after it is ACKed. (2026-11-14, 200,000 bytes: 140 segments of 1440.) |
+| Guest announces MSS 536 and window 4096, never ACKs data | slirp **ignores the small MSS** (it sent 1440-byte segments) but respects the window (2,880 bytes then stops); it retransmits the first segment after **1.5 s, then 3 s, then 6 s** (re-run: at 1.52, 4.55 and 10.62 s from the first transmission, so gaps of 1.5, 3 and 6 s; 2,880 distinct bytes sent, two segments, before it stopped) |
+| How slirp ACKs guest data | **every segment at once** (re-run: ten 1000-byte segments, each ACKed 0.1 ms after it was sent); no delayed ACK |
+| Three segments after a hole | **three duplicate ACKs** (no SACK blocks); filling the hole advances the ACK over all four (re-run: three ACKs all for the hole, then the ACK moved 400 bytes) |
+| Host program does not read | slirp accepted about 685 KB (re-run, `--long`: window 0 after **684,600 bytes** sent), then advertised **window 0**; a 1-byte probe is answered with window 0 and the ACK unchanged; when the program reads, slirp sends a window update **unprompted** (the probe and the update were from 2026-11-14; not re-run) |
+| The guest announces window 0 and later opens it (**new**, step 0) | slirp sends nothing for about 4.6 s, then **one 1-byte segment** (its persist probe); after the guest opens its window, all 8000 bytes arrive |
+| The guest sends a TCP datagram as two IP fragments (**new**, step 0) | slirp **reassembles** it: the 2,920-byte segment is ACKed in full. (Whether slirp *sends* fragments for TCP: never seen, it keeps to 1440-byte segments) |
+| The guest drops three data segments of a 30,000-byte transfer (**new**, step 0) | the whole transfer completes with matching hash in 4.6 s: slirp retransmits on its own timer (7 segments resent), with no help from selective acknowledgement |
+| Guest SYN to a closed host port | **RST+ACK at once** (`seq 0, ack = our seq + 1`), so "connection refused" is testable (re-run: flags `0x14`, seq 0, ack our seq + 1) |
+| A stray ACK with data for no connection | **RST** with `seq` = our ACK number, the RFC 9293 form (re-run: flags `0x04`, seq = our ACK, ack 0) |
+| Host connects to the forwarded port | the guest sees a SYN **from 10.0.2.2**, an ephemeral source port, MSS 1460 only, window 65535, to its own MAC (re-run: confirmed) |
+| The guest does not answer that SYN | slirp retries after **6 s** (re-run, `--long`: SYNs at 0 and 6.1 s): a dropped inbound SYN is expensive |
+| The guest answers that SYN with RST | the host's `connect` has **already succeeded** (re-run: it returned after 0.0 s, before the guest said anything), then the host reads end-of-file (re-run: EOF). `curl` reports exit 52, "Empty reply from server", not "connection refused" (the curl line: not re-run) |
+| The guest resets an established connection to a host server (the other direction, re-run) | the host server read the bytes sent so far and then ended. The forwarded-connection variant (host client) was from 2026-11-14: the host reads **end-of-file, not an error**: through slirp the host cannot tell a guest RST from a FIN |
+| slirp sending to the guest before any ACK (not re-run) | one segment in one run and two in another, then it waits: its initial window is small, so a delayed ACK on the first segment would cost its whole delay (5.6) |
 | DNS: UDP query to 10.0.2.3:53 | answered from 10.0.2.3 port 53: `example.com` A in 12 ms (61 bytes, two answers), AAAA (85 bytes), a nonexistent name NXDOMAIN with one authority record (112 bytes); none fragmented. `localhost` is NXDOMAIN: **no name resolves without the host having a working resolver**, so hermetic DNS tests need their own server (11.4) |
-| TCP SYN to 10.0.2.3:53 | answered with SYN-ACK: DNS over TCP is reachable (not used, 11.3) |
+| TCP SYN to 10.0.2.3:53 (not re-run) | answered with SYN-ACK: DNS over TCP is reachable (not used, 11.3) |
 | `-netdev socket,connect=` with `virtio-net-device` on `virt` | accepted, QEMU connects to the relay: the lossy-relay topology of 3.1 is possible |
 | `virtio-rng-device` | listed by this QEMU (`-device help`): an entropy device exists if the owner wants one (5.10) |
 
@@ -125,8 +129,8 @@ HTTP/1.0 and an HTTP/1.1 request alike, and `404` with a `Content-Length`; `curl
 `GET /a.txt HTTP/1.1`, `Host`, `User-Agent`, `Accept: */*` and accepts an HTTP/1.0 reply with a `Content-Length`. `smoltcp`'s
 current release is 0.14.0 (`cargo search`).
 
-Still **not** checked: anything through a real guest driver; slirp's behaviour when the guest's window is zero for a long time
-(its persist timing); slirp's handling of a simultaneous open; how the relay topology behaves under load; the Linux CI host
+Still **not** checked: anything through a real guest driver; slirp's persist probe beyond its first (only the first, at about
+4.6 s, was seen); slirp's handling of a simultaneous open; how the relay topology behaves under load; the Linux CI host
 (the table is from macOS).
 
 ### 3.3 Facts checked in this repository
@@ -1340,8 +1344,9 @@ benchmark).
 QEMU 11.1.3's slirp; the capture has 334 TCP segments, all with correct checksums according to both the script and
 `tcpdump -vv`); the `python3 -m http.server` and `curl` behaviour quoted in 3.2; that QEMU accepts the relay topology's flags
 and lists `virtio-rng-device`; smoltcp's current version number; the SHA-256 values of `abc` and the empty string (H23).
-The probe scripts and the capture are **not in this commit** (documents only); they were in a scratch directory and step 0
-must recreate and commit them. Nothing was run in a guest: no guest code for S8 exists yet.
+The probe script and the capture are now committed (step 0: `scripts/net_probe_slirp_tcp.py`, `net/tests/data/slirp-tcp-probe.pcap`,
+221 frames, checked by `scripts/net_pcap_check.py`, run in `make docs-check`) and every row of 3.2 marked "re-run" above was
+reproduced on QEMU 11.1.3 on macOS on 2026-11-15. Nothing was run in a guest: no guest code for S8 exists yet.
 
 **Verified by reading this repository:** every row of 3.3 (the kernel's socket write path and its two refusals, the WRITABLE
 rule, the limits, the launcher's quotas, the C library's descriptor table and errno list, the absence of a hash or entropy
