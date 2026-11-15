@@ -22,6 +22,7 @@ pub mod linestate;
 pub mod object;
 pub mod pagetable;
 pub mod sched;
+pub mod sched2;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;
