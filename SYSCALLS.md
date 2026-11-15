@@ -96,7 +96,7 @@ change.
 `MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
 alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
 data (message bytes, headers, queued handles, port bindings) in the whole system;
-`MAX_REGIONS` 1024 per address space; `MAX_THREADS_PER_PROCESS` 2048 and `MAX_USER_THREADS` 4096;
+`MAX_REGIONS` 16384 per address space; `MAX_THREADS_PER_PROCESS` 2048 and `MAX_USER_THREADS` 4096;
 `MAX_PROCESSES` 64.
 
 These keep the kernel from panicking and from running out of heap (OD50; the heap grows at safe points, slice T step 2, so the caps also bound its growth); they are
@@ -588,7 +588,7 @@ A handle with every job right to the root job. Only a process started by the ker
 
 A process runs one or more user threads, all sharing its address space and handle table.
 The first thread starts at `process_start` (or at load, for a kernel-started process); more
-are made with `thread_create`. A thread is a kernel object (kind THREAD): a handle to it can
+are made with `thread_spawn` (the kernel provisions the stack) or `thread_create` (the caller's). A thread is a kernel object (kind THREAD): a handle to it can
 be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
 INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (2048) live threads per process. A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
 
@@ -601,6 +601,8 @@ is TERMINATED only after the last of its threads has gone and its memory is free
 that was killed before it ever ran never runs user code.
 
 ### thread_create(process, entry, sp, arg) -> status, handle
+
+(The older call: the stack is the caller's, and a thread that used a mapped stack never frees it. New code uses `thread_spawn`, below in this file and in `SCHED-SMP-SPEC.md` 5.3.)
 
 Start a new thread in a running process: it begins at `entry` in U-mode with `a0 = arg`, the
 stack pointer `sp`, and every other register zero. The new thread's stack is the caller's to
@@ -922,6 +924,16 @@ above the job's maximum); BAD_STATE (the process is not running); INVALID_ARGS (
 range; reserved bits or fields set; a caller stack pointer not 16-aligned or outside user memory); NO_MEMORY (a job
 limit: threads, pages, regions, objects; the caller's handle table; the system backstop; no room in the stack arena).
 On error nothing changes. Locks: legacy until task 19.
+
+**Built (task 9).** `a1` of the reply is the handle (0 for a detached thread), `a2` the tid. The stack arena is
+`0x30_0000_0000` to `0x38_0000_0000`; the kernel looks for the lowest gap that holds the guard and the stack at or after
+a per-process hint (just above the last stack it gave), wrapping once, and maps an anonymous VMO (charged to the
+target's job as it is touched, with the page-table estimate charged at once like `process_map`) read-write above the
+guard. A priority above the job's maximum is ACCESS_DENIED, one above 63 is INVALID_ARGS. When the thread ends the
+region is unmapped, other harts' translations are shot down and the VMO is freed before the frames can be reused; a
+whole-process exit leaves the stacks to the teardown. `MAX_THREADS_PER_PROCESS` (2048) and `MAX_USER_THREADS` (4096)
+still apply (the per-process one goes with the job-quota work, T83). Tests: `thread_spawn_*`,
+`two_thousand_threads_live`, `ten_thousand_threads_leak_nothing`, `find_gap_agrees_with_a_scan` (host).
 
 ### thread_set_sched(thread, priority, flags) -> status
 

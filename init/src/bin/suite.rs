@@ -2264,7 +2264,8 @@ fn many_children_do_not_leak() -> Outcome {
 
 use core::sync::atomic::AtomicU64;
 
-static NEXT_STACK: AtomicU64 = AtomicU64::new(0x30_0000_0000);
+// (below the stack arena, which `thread_spawn` hands out: 0x30_0000_0000 and up)
+static NEXT_STACK: AtomicU64 = AtomicU64::new(0x28_0000_0000);
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static WOKEN_AT: AtomicU64 = AtomicU64::new(0);
 static WOKEN_STATUS: AtomicU32 = AtomicU32::new(99);
@@ -2596,6 +2597,26 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
     let (p, m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 67, j)?;
     let w = sys::object_wait(m, sig::READABLE, sys::clock_get() + 3000);
     ensure_eq!(st(w), Some(S::Ok), "the child raised its priority");
+    // thread_spawn into the confined process: a priority above its job's maximum is refused
+    {
+        let entry = worker_set as *const () as usize as u64;
+        let rec = |priority: u32| rt::SpawnArgs {
+            entry,
+            priority,
+            ..Default::default()
+        };
+        ensure_eq!(
+            st(sys::thread_spawn(p, &rec(40))),
+            Some(S::AccessDenied),
+            "thread_spawn above the job's maximum"
+        );
+        // (the child is another program: our function is no code there, which is the next check after the priority's)
+        ensure_eq!(
+            st(sys::thread_spawn(p, &rec(12))),
+            Some(S::InvalidArgs),
+            "a priority within the maximum passes; the entry is not code in the child"
+        );
+    }
     let mut b = [0u8; 1];
     sys::channel_read(m, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0);
     ensure_eq!(
@@ -3913,13 +3934,15 @@ fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
 }
 
 fn mappings_per_process_are_bounded() -> Outcome {
-    let me = me()?;
+    // in a process of its own that never starts: closing it frees every region at once (unmapping thousands of
+    // regions one by one costs a shootdown each)
+    let p = proc_create()?;
     let v = vmo(1)?;
     let base = 0x10_0000_0000u64;
     let mut n = 0u64;
     let mut refused = None;
-    while n < 3000 {
-        let r = sys::process_map(me, v, base + n * 8192, 0, 4096, PF_R);
+    while n < 20_000 {
+        let r = sys::process_map(p, v, base + n * 8192, 0, 4096, PF_R);
         if r.status != 0 {
             refused = st(r);
             break;
@@ -3932,14 +3955,14 @@ fn mappings_per_process_are_bounded() -> Outcome {
         "a limit on regions (reached at {n})"
     );
     ensure!(n >= 512, "the limit is not absurdly low ({n})");
-    for i in 0..n {
-        sys::process_unmap(me, base + i * 8192);
-    }
+    ok(sys::process_unmap(p, base), "unmap one")?;
     ensure_eq!(
-        st(sys::process_map(me, v, base, 0, 4096, PF_R)),
+        st(sys::process_map(p, v, base, 0, 4096, PF_R)),
         Some(S::Ok),
         "room again"
     );
+    sys::handle_close(p);
+    sys::handle_close(v);
     Ok(())
 }
 
@@ -9008,6 +9031,360 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     Ok(())
 }
 
+// --- thread_spawn (SCHED-SMP-SPEC task 9) ---
+
+/// How deep `spawn_probe` recurses (a kilobyte a level): 0 for a small caller-provided stack.
+static SPAWN_DIG: AtomicU32 = AtomicU32::new(40);
+static SPAWN_SEEN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// What a spawned thread starts with: `a0` the argument, `a1` its tid; `tp` and `sp` are whatever it holds.
+extern "C" fn spawn_probe(arg: u64, tid: u64) -> ! {
+    let (tp, sp): (u64, u64);
+    // SAFETY: reads two registers.
+    unsafe {
+        core::arch::asm!("mv {}, tp", "mv {}, sp", out(reg) tp, out(reg) sp, options(nomem, nostack))
+    };
+    // use some stack, so the pages under it exist (a recursion that keeps a kilobyte per level)
+    fn dig(n: u32) -> u8 {
+        let pad = [n as u8; 1024];
+        core::hint::black_box(&pad);
+        if n == 0 {
+            0
+        } else {
+            dig(n - 1).wrapping_add(pad[0])
+        }
+    }
+    let _ = core::hint::black_box(dig(SPAWN_DIG.load(Ordering::SeqCst)));
+    SPAWN_SEEN[0].store(arg, Ordering::SeqCst);
+    SPAWN_SEEN[1].store(tid, Ordering::SeqCst);
+    SPAWN_SEEN[2].store(tp, Ordering::SeqCst);
+    SPAWN_SEEN[3].store(sp, Ordering::SeqCst);
+    SPAWN_SEEN[4].store(1, Ordering::SeqCst);
+    sys::thread_exit(3)
+}
+
+fn spawn_rec(entry: extern "C" fn(u64, u64) -> !) -> rt::SpawnArgs {
+    rt::SpawnArgs {
+        entry: entry as *const () as usize as u64,
+        ..Default::default()
+    }
+}
+
+fn thread_spawn_starts_with_the_documented_state() -> Outcome {
+    let me = me()?;
+    for a in &SPAWN_SEEN {
+        a.store(0, Ordering::SeqCst);
+    }
+    let rec = rt::SpawnArgs {
+        arg: 0xfeed,
+        tp: 0x1234_5678,
+        ..spawn_rec(spawn_probe)
+    };
+    let r = ok(sys::thread_spawn(me, &rec), "thread_spawn")?;
+    let (h, tid) = (r.a1 as u32, r.a2 as u64);
+    ensure!(h != 0 && tid != 0, "a handle and a tid");
+    let w = sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 1000);
+    ensure_eq!(w.status, 0, "the thread ended");
+    ensure_eq!(sys::thread_info(h).a1 as i64, 3, "its exit code");
+    ensure_eq!(
+        SPAWN_SEEN[0].load(Ordering::SeqCst),
+        0xfeed,
+        "a0 is the argument"
+    );
+    ensure_eq!(
+        SPAWN_SEEN[1].load(Ordering::SeqCst),
+        tid,
+        "a1 is the tid thread_spawn returned"
+    );
+    ensure_eq!(
+        SPAWN_SEEN[2].load(Ordering::SeqCst),
+        0x1234_5678,
+        "tp as given"
+    );
+    let sp = SPAWN_SEEN[3].load(Ordering::SeqCst);
+    ensure!(
+        (rt::abi::user::STACK_ARENA_BASE..rt::abi::user::STACK_ARENA_END).contains(&sp),
+        "the stack is in the arena ({sp:#x})"
+    );
+    ensure!(sp.is_multiple_of(16), "sp is 16-byte aligned");
+    sys::handle_close(h);
+    // a detached thread returns no handle
+    SPAWN_SEEN[4].store(0, Ordering::SeqCst);
+    let d = rt::SpawnArgs {
+        flags: rt::abi::spawn::DETACHED,
+        ..spawn_rec(spawn_probe)
+    };
+    let r = ok(sys::thread_spawn(me, &d), "a detached thread")?;
+    ensure_eq!(r.a1, 0, "no handle for a detached thread");
+    ensure!(r.a2 != 0, "but a tid");
+    let until = sys::clock_get() + 1000;
+    while SPAWN_SEEN[4].load(Ordering::SeqCst) == 0 && sys::clock_get() < until {
+        sys::thread_yield();
+    }
+    ensure_eq!(
+        SPAWN_SEEN[4].load(Ordering::SeqCst),
+        1,
+        "the detached thread ran"
+    );
+    // a caller-provided stack: nothing is provisioned, sp is the caller's
+    let top = own_stack()?;
+    SPAWN_SEEN[4].store(0, Ordering::SeqCst);
+    SPAWN_DIG.store(0, Ordering::SeqCst);
+    let c = rt::SpawnArgs {
+        flags: rt::abi::spawn::CALLER_STACK,
+        sp: top,
+        ..spawn_rec(spawn_probe)
+    };
+    let r = ok(sys::thread_spawn(me, &c), "a caller stack")?;
+    let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 1000);
+    SPAWN_DIG.store(40, Ordering::SeqCst);
+    ensure_eq!(w.status, 0, "it ended");
+    let sp = SPAWN_SEEN[3].load(Ordering::SeqCst);
+    ensure!(
+        sp <= top && sp > top - 4 * 4096,
+        "it ran on the caller's stack ({sp:#x})"
+    );
+    sys::handle_close(r.a1 as u32);
+    Ok(())
+}
+
+fn thread_spawn_error_cases() -> Outcome {
+    let me = me()?;
+    let go = |p: u32, rec: &rt::SpawnArgs| st(sys::thread_spawn(p, rec));
+    let good = spawn_rec(spawn_probe);
+    ensure_eq!(
+        st(rt::syscall(abi_nr_spawn(), [me as usize, 8, 0, 0, 0, 0])),
+        Some(S::InvalidArgs),
+        "a bad args pointer"
+    );
+    ensure_eq!(go(BAD, &good), Some(S::BadHandle), "a bad handle");
+    let ev = event()?;
+    ensure_eq!(go(ev, &good), Some(S::WrongType), "an event as the process");
+    let weak = weaker(me, Rights::WAIT.0)?;
+    ensure_eq!(go(weak, &good), Some(S::AccessDenied), "no MANAGE");
+    sys::handle_close(weak);
+    let fresh = proc_create()?;
+    ensure_eq!(
+        go(fresh, &good),
+        Some(S::BadState),
+        "a process that is not running"
+    );
+    sys::handle_close(fresh);
+    static DATA: u64 = 5;
+    let bad_entry = rt::SpawnArgs {
+        entry: &DATA as *const u64 as u64,
+        ..good
+    };
+    ensure_eq!(
+        go(me, &bad_entry),
+        Some(S::InvalidArgs),
+        "an entry that is not executable"
+    );
+    let nothing = rt::SpawnArgs { entry: 0, ..good };
+    ensure_eq!(go(me, &nothing), Some(S::InvalidArgs), "entry 0");
+    let cases: [(&str, rt::SpawnArgs); 8] = [
+        (
+            "stack bytes over 64 MiB",
+            rt::SpawnArgs {
+                stack_bytes: 64 * 1024 * 1024 + 4096,
+                ..good
+            },
+        ),
+        (
+            "a huge stack",
+            rt::SpawnArgs {
+                stack_bytes: u64::MAX,
+                ..good
+            },
+        ),
+        (
+            "a huge guard",
+            rt::SpawnArgs {
+                guard_bytes: u64::MAX,
+                ..good
+            },
+        ),
+        ("a reserved flag", rt::SpawnArgs { flags: 8, ..good }),
+        (
+            "the reserved word",
+            rt::SpawnArgs {
+                reserved: 1,
+                ..good
+            },
+        ),
+        (
+            "priority 64",
+            rt::SpawnArgs {
+                priority: 64,
+                ..good
+            },
+        ),
+        (
+            "a stack pointer without CALLER_STACK",
+            rt::SpawnArgs { sp: 0x1000, ..good },
+        ),
+        (
+            "a misaligned caller stack",
+            rt::SpawnArgs {
+                flags: rt::abi::spawn::CALLER_STACK,
+                sp: 0x28_0000_0008,
+                ..good
+            },
+        ),
+    ];
+    for (what, rec) in &cases {
+        ensure_eq!(go(me, rec), Some(S::InvalidArgs), "{what}");
+    }
+    let outside = rt::SpawnArgs {
+        flags: rt::abi::spawn::CALLER_STACK,
+        sp: rt::abi::user::TOP + 16,
+        ..good
+    };
+    ensure_eq!(
+        go(me, &outside),
+        Some(S::InvalidArgs),
+        "a caller stack outside user memory"
+    );
+    // nothing changed: the thread count is as it was (a later spawn still works)
+    let r = ok(
+        sys::thread_spawn(me, &good),
+        "a valid spawn after the errors",
+    )?;
+    sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 1000);
+    sys::handle_close(r.a1 as u32);
+    Ok(())
+}
+
+fn abi_nr_spawn() -> usize {
+    rt::abi::syscall::THREAD_SPAWN
+}
+
+/// Stacks come back: after many spawn-and-join rounds (some detached) the root job's page use is where it began.
+fn thread_spawn_gives_every_stack_back() -> Outcome {
+    let root = root_job()?;
+    let me = me()?;
+    let base = job_use(root, 2)?.0;
+    for round in 0..200u32 {
+        let rec = spawn_rec(spawn_probe);
+        let r = ok(sys::thread_spawn(me, &rec), "thread_spawn")?;
+        let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 500);
+        ensure!(w.status == 0, "a thread ended (round {round})");
+        sys::handle_close(r.a1 as u32);
+    }
+    for _ in 0..50 {
+        let rec = rt::SpawnArgs {
+            flags: rt::abi::spawn::DETACHED,
+            ..spawn_rec(spawn_probe)
+        };
+        ok(sys::thread_spawn(me, &rec), "a detached thread")?;
+    }
+    job_use_settles(root, 2, base, 1000)?;
+    sys::handle_close(root);
+    Ok(())
+}
+
+extern "C" fn spawn_wait_event(arg: u64, _tid: u64) -> ! {
+    worker_wait_event(arg as usize)
+}
+
+/// The arena holds a bounded number of the biggest stacks; when they end, the space is reused.
+fn thread_spawn_arena_is_bounded_and_reused() -> Outcome {
+    let me = me()?;
+    let ev = event()?;
+    let big = rt::SpawnArgs {
+        arg: u64::from(ev),
+        stack_bytes: 64 * 1024 * 1024,
+        ..spawn_rec(spawn_wait_event)
+    };
+    let mut ts: Vec<u32> = Vec::new();
+    loop {
+        let r = sys::thread_spawn(me, &big);
+        if r.status != 0 {
+            ensure_eq!(st(r), Some(S::NoMemory), "a full arena is NO_MEMORY");
+            break;
+        }
+        ts.push(r.a1 as u32);
+        ensure!(ts.len() <= 512, "more stacks than the arena can hold");
+    }
+    ensure!(ts.len() >= 400, "{} 64 MiB stacks fit the arena", ts.len());
+    ensure_eq!(
+        st(sys::event_signal(ev, 0, 1 << 24)),
+        Some(S::Ok),
+        "release them"
+    );
+    for &t in &ts {
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(t);
+    }
+    ensure_eq!(st(sys::event_signal(ev, 1 << 24, 0)), Some(S::Ok), "clear");
+    let r = ok(
+        sys::thread_spawn(me, &big),
+        "after they ended there is room again",
+    )?;
+    sys::event_signal(ev, 0, 1 << 24);
+    sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 2000);
+    sys::handle_close(r.a1 as u32);
+    sys::handle_close(ev);
+    Ok(())
+}
+
+/// Two thousand threads alive at once, each on its own kernel-provisioned stack.
+fn two_thousand_threads_live() -> Outcome {
+    let me = me()?;
+    let ev = event()?;
+    let rec = rt::SpawnArgs {
+        arg: u64::from(ev),
+        ..spawn_rec(spawn_wait_event)
+    };
+    let mut ts: Vec<u32> = Vec::new();
+    for _ in 0..2000 {
+        let r = sys::thread_spawn(me, &rec);
+        ensure!(
+            r.status == 0,
+            "thread_spawn: status {} after {} threads",
+            r.status,
+            ts.len()
+        );
+        ts.push(r.a1 as u32);
+    }
+    ensure_eq!(
+        st(sys::event_signal(ev, 0, 1 << 24)),
+        Some(S::Ok),
+        "wake them all"
+    );
+    for &t in &ts {
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 8000);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(t);
+    }
+    sys::handle_close(ev);
+    Ok(())
+}
+
+/// Spawning and joining ten thousand times leaks nothing: page use, and (at the end of the suite) kernel threads,
+/// objects and frames, are where they began.
+fn ten_thousand_threads_leak_nothing() -> Outcome {
+    let root = root_job()?;
+    let me = me()?;
+    let base = job_use(root, 2)?.0;
+    let rec = spawn_rec(spawn_probe);
+    for round in 0..10_000u32 {
+        let r = sys::thread_spawn(me, &rec);
+        ensure!(
+            r.status == 0,
+            "thread_spawn: status {} in round {round}",
+            r.status
+        );
+        let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 500);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(r.a1 as u32);
+    }
+    job_use_settles(root, 2, base, 1000)?;
+    sys::handle_close(root);
+    Ok(())
+}
+
 /// Slice T: creating and ending threads over and over leaks nothing (the thread slots, the objects and the
 /// kernel stacks are all recycled; the end-of-suite checks see that no kernel thread or object is left).
 fn thousands_of_threads_come_and_go() -> Outcome {
@@ -9819,6 +10196,24 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "thread_spawn_starts_with_the_documented_state",
+            thread_spawn_starts_with_the_documented_state,
+        ),
+        ("thread_spawn_error_cases", thread_spawn_error_cases),
+        (
+            "thread_spawn_gives_every_stack_back",
+            thread_spawn_gives_every_stack_back,
+        ),
+        (
+            "thread_spawn_arena_is_bounded_and_reused",
+            thread_spawn_arena_is_bounded_and_reused,
+        ),
+        ("two_thousand_threads_live", two_thousand_threads_live),
+        (
+            "ten_thousand_threads_leak_nothing",
+            ten_thousand_threads_leak_nothing,
         ),
         (
             "thousands_of_threads_come_and_go",

@@ -501,6 +501,30 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// The lowest page-aligned address at or after `from` where `bytes` bytes fit between regions and inside
+    /// `[lo, hi)`: the stack arena search (`thread_spawn`). `from` below `lo` starts at `lo`. `None` when no gap at or
+    /// after `from` is big enough; callers wrap by asking again from `lo`.
+    pub fn find_gap(&self, lo: u64, hi: u64, bytes: u64, from: u64) -> Option<u64> {
+        if bytes == 0 || !bytes.is_multiple_of(PAGE_SIZE) || hi < lo {
+            return None;
+        }
+        let mut at = from.max(lo).next_multiple_of(PAGE_SIZE);
+        // a region that starts before `at` may reach past it
+        if let Some((&s, r)) = self.regions.range(..=at).next_back() {
+            at = at.max(s + r.pages * PAGE_SIZE);
+        }
+        if at >= hi {
+            return None;
+        }
+        for (&s, r) in self.regions.range(at..hi) {
+            if s >= at.checked_add(bytes)? {
+                break;
+            }
+            at = at.max(s + r.pages * PAGE_SIZE);
+        }
+        (at.checked_add(bytes)? <= hi).then_some(at)
+    }
+
     /// Add the ids of every VMO this address space maps to `out`.
     pub fn collect_vmos(&self, out: &mut alloc::collections::BTreeSet<u64>) {
         out.extend(self.regions.values().map(|r| r.vmo));

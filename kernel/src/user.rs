@@ -72,6 +72,10 @@ struct Process {
     /// when the region goes or the process ends. Table frames are not VMO pages, so without this
     /// a program could spend memory the page limit never sees.
     table_charge: BTreeMap<u64, u64>,
+    /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process).
+    stacks: BTreeMap<Tid, SpawnStack>,
+    /// Where the next stack search in the arena starts (just above the last stack handed out).
+    stack_hint: u64,
     /// Started by the kernel (`start`): may ask for the root job (`job_root`). Nothing a program
     /// creates is privileged.
     privileged: bool,
@@ -85,6 +89,18 @@ struct ThreadStart {
     sp: u64,
     arg: u64,
     obj: Option<kcore::object::ObjId>,
+    /// `thread_spawn` extras: the `tp` register, the stack the kernel provisioned, round robin, and whether `a1` is the tid.
+    tp: u64,
+    stack: Option<SpawnStack>,
+    rr: bool,
+    spawned: bool,
+}
+
+/// A stack `thread_spawn` mapped for a thread: its region (start of the mapped stack) and the VMO behind it.
+#[derive(Clone, Copy)]
+struct SpawnStack {
+    region: u64,
+    vmo: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -305,6 +321,8 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
         table_charge: BTreeMap::new(),
+        stacks: BTreeMap::new(),
+        stack_hint: abi::user::STACK_ARENA_BASE,
         privileged: true,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
@@ -336,6 +354,9 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         process.aspace.destroy_user(&mut k.mm);
         for id in process.vmos {
             let _ = k.vmos.destroy(&mut k.mm, id);
+        }
+        for st in process.stacks.values() {
+            let _ = k.vmos.destroy(&mut k.mm, st.vmo);
         }
         return Err(LoadError::NoMemory);
     }
@@ -373,6 +394,10 @@ fn new_start(
             sp,
             arg,
             obj,
+            tp: 0,
+            stack: None,
+            rr: false,
+            spawned: false,
         },
     );
     token
@@ -402,6 +427,12 @@ fn user_thread_main(token: usize) {
         if let Some(o) = ts.obj {
             p.thread_objs.insert(thread::current(), o);
         }
+        if let Some(st) = ts.stack {
+            p.stacks.insert(thread::current(), st);
+        }
+        if ts.rr {
+            s.sched_flags.insert(thread::current(), 1);
+        }
         let satp = satp_of(p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
@@ -429,7 +460,21 @@ fn user_thread_main(token: usize) {
     user_mode_entered();
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
-    unsafe { enter_user(ts.entry, ts.sp, ts.arg, satp, top) }
+    unsafe {
+        enter_user(
+            ts.entry,
+            ts.sp,
+            ts.arg,
+            satp,
+            top,
+            ts.tp,
+            if ts.spawned {
+                u64::from(thread::current())
+            } else {
+                0
+            },
+        )
+    }
 }
 
 core::arch::global_asm!(
@@ -437,7 +482,7 @@ core::arch::global_asm!(
     .section .text
     .globl enter_user
     .balign 4
-enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 kernel stack top
+enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 kernel stack top, a5 tp, a6 a1 for the thread
     csrci sstatus, 2             # interrupts off until we are in U-mode
     csrw  satp, a3
     sfence.vma zero, zero
@@ -454,13 +499,13 @@ enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 ker
     mv    a0, a2
     li x1, 0
     li x3, 0
-    li x4, 0
+    mv x4, a5
     li x5, 0
     li x6, 0
     li x7, 0
     li x8, 0
     li x9, 0
-    li x11, 0
+    mv x11, a6
     li x12, 0
     li x13, 0
     li x14, 0
@@ -486,7 +531,8 @@ enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 ker
 );
 
 extern "C" {
-    fn enter_user(entry: u64, sp: u64, arg: u64, satp: u64, kernel_top: u64) -> !;
+    fn enter_user(entry: u64, sp: u64, arg: u64, satp: u64, kernel_top: u64, tp: u64, a1: u64)
+        -> !;
 }
 
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.
@@ -560,6 +606,22 @@ fn teardown(pid: u32) -> i32 {
     code
 }
 
+/// Unmap and free the stack `thread_spawn` gave thread `tid`, if it has one. The thread is in the kernel, on its
+/// kernel stack, so the stack it stood on in user mode is nobody's; the shootdown comes before the frames can be reused.
+fn free_spawn_stack(p: &mut Process, tid: Tid) {
+    let Some(st) = p.stacks.remove(&tid) else {
+        return;
+    };
+    let k = kmem::get();
+    let _ = p.aspace.unmap_region(&mut k.mm, st.region);
+    if let Some(tables) = p.table_charge.remove(&st.region) {
+        k.vmos.jobs.credit(p.job, Resource::Pages, tables);
+    }
+    let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+    crate::smp::shootdown();
+    kmem::flush_tlb();
+}
+
 fn exit_process(code: i32) -> ! {
     leave(code, true)
 }
@@ -587,6 +649,10 @@ fn leave(code: i32, whole: bool) -> ! {
         }
         p.threads_alive -= 1;
         credit_thread(&mut kmem::get().vmos.jobs, p.job);
+        if !whole {
+            // (a whole-process exit leaves the stacks to the teardown)
+            free_spawn_stack(p, tid);
+        }
         if whole {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
@@ -774,6 +840,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_KILL
         | nr::PROCESS_INFO
         | nr::THREAD_CREATE
+        | nr::THREAD_SPAWN
         | nr::THREAD_INFO
         | nr::THREAD_INTERRUPT => {
             let r = process_call(n, a);
@@ -2273,6 +2340,8 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_INFO => process_info(a),
         nr::THREAD_CREATE if wide(0) => bad(Status::BadHandle),
         nr::THREAD_CREATE => thread_create(a),
+        nr::THREAD_SPAWN if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_SPAWN => thread_spawn(a),
         nr::THREAD_INFO if wide(0) => bad(Status::BadHandle),
         nr::THREAD_INFO => thread_info(a),
         nr::THREAD_INTERRUPT if wide(0) => bad(Status::BadHandle),
@@ -2367,6 +2436,8 @@ fn process_create(a: [u64; 6]) -> Reply {
                 thread_objs: BTreeMap::new(),
                 job,
                 table_charge: BTreeMap::from([(u64::MAX, 1)]),
+                stacks: BTreeMap::new(),
+                stack_hint: abi::user::STACK_ARENA_BASE,
                 privileged: false,
             },
         );
@@ -2750,6 +2821,176 @@ fn thread_create(a: [u64; 6]) -> Reply {
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     thread::spawn_free_detached("user", new_prio, user_thread_main, token);
     Ok((Some(u64::from(handle)), None))
+}
+
+/// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a
+/// stack the kernel maps in the process's stack arena (freed when the thread ends) unless the caller brings its own.
+fn thread_spawn(a: [u64; 6]) -> Reply {
+    use abi::spawn as sp;
+    let ph = Handle(a[0] as u32);
+    let (token, handle, tid_prio) = irq::without(|| -> Result<(usize, u32, u8), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        // the record first (a bad pointer is the first error), then the handle
+        let raw = {
+            let k = kmem::get();
+            let c = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+            copy_from_user(&mut c.aspace, &mut k.mm, &mut k.vmos, a[1], sp::ARGS_BYTES)
+                .map_err(|e| (e, None, None))?
+        };
+        let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+        let (entry, arg, tp, stack_bytes, guard_bytes) = (w(0), w(1), w(2), w(3), w(4));
+        let prio_req = (w(5) & 0xffff_ffff) as u32;
+        let flags = (w(5) >> 32) as u32;
+        let (caller_sp, reserved) = (w(6), w(7));
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, tpid, _, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
+            .map_err(|e| (e, None, None))?;
+        let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
+        let tjob = target.job;
+        // a priority above the job's maximum is refused (ACCESS_DENIED), not clamped: the program asked for it
+        let max = kmem::get().vmos.jobs.sched(tjob).map_or(63, |j| j.max_prio);
+        if (1..=63).contains(&prio_req) && prio_req as u8 > max {
+            return bad(Status::AccessDenied).map(|_| (0, 0, 0));
+        }
+        if target.state != ProcState::Running
+            || target.exit_code.is_some()
+            || target.killed.is_some()
+        {
+            return bad(Status::BadState).map(|_| (0, 0, 0));
+        }
+        let own_stack = flags & sp::CALLER_STACK != 0;
+        let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+        let sizes_ok = stack_bytes <= sp::MAX_STACK && guard_bytes <= sp::MAX_STACK;
+        let sp_ok = if own_stack {
+            caller_sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&caller_sp)
+        } else {
+            caller_sp == 0
+        };
+        if !entry_ok
+            || !sizes_ok
+            || !sp_ok
+            || reserved != 0
+            || prio_req > 63
+            || flags & !(sp::ROUND_ROBIN | sp::DETACHED | sp::CALLER_STACK) != 0
+        {
+            return bad(Status::InvalidArgs).map(|_| (0, 0, 0));
+        }
+        if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
+            || total_threads(s) >= abi::limits::MAX_USER_THREADS
+        {
+            return bad(Status::NoMemory).map(|_| (0, 0, 0));
+        }
+        // where the stack goes: a gap in the arena for the guard and the stack, at or after the hint, wrapping once
+        let stack_len = if stack_bytes == 0 {
+            sp::DEFAULT_STACK
+        } else {
+            stack_bytes.next_multiple_of(4096)
+        };
+        let guard_len = if guard_bytes == 0 {
+            4096
+        } else {
+            guard_bytes.next_multiple_of(4096)
+        };
+        let place = if own_stack {
+            None
+        } else {
+            let (lo, hi) = (abi::user::STACK_ARENA_BASE, abi::user::STACK_ARENA_END);
+            let total = stack_len + guard_len;
+            let at = target
+                .aspace
+                .find_gap(lo, hi, total, target.stack_hint)
+                .or_else(|| target.aspace.find_gap(lo, hi, total, lo));
+            match at {
+                Some(at) => Some(at + guard_len),
+                None => return bad(Status::NoMemory).map(|_| (0, 0, 0)),
+            }
+        };
+        let prio = if prio_req == 0 {
+            clamp_prio(tjob, creator_prio(s))
+        } else {
+            prio_req as u8
+        };
+        let detached = flags & sp::DETACHED != 0;
+        let UserState { objs, procs, .. } = s;
+        let jobs = &mut kmem::get().vmos.jobs;
+        charge_thread(jobs, tjob).map_err(|e| (job_status(e), None, None))?;
+        // the thread's object and handle (not for a detached thread)
+        let made = if detached {
+            None
+        } else {
+            let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+            match ipc::thread_object_create_in(
+                objs,
+                &mut caller.handles,
+                tpid,
+                &mut quota(caller.job),
+            ) {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    credit_thread(jobs, tjob);
+                    return Err((e, None, None));
+                }
+            }
+        };
+        // the stack: a VMO of its own (nobody holds a handle), mapped read-write; its table pages are charged like any mapping's
+        let mut stack = None;
+        let mut top = caller_sp;
+        if let Some(region) = place {
+            let k = kmem::get();
+            let t = procs.get_mut(&tpid).expect("target exists");
+            let tables = stack_len / 4096 / 512 + 4;
+            let undo = |made: Option<(Handle, kcore::object::ObjId)>,
+                        procs: &mut BTreeMap<u32, Process>,
+                        objs: &mut Kobjs,
+                        jobs: &mut kcore::job::Jobs| {
+                if let Some((h, _)) = made {
+                    if let Some(c) = procs.get_mut(&me) {
+                        let _ = c.handles.close(objs, h);
+                    }
+                }
+                credit_thread(jobs, tjob);
+            };
+            if let Err(e) = k.vmos.jobs.charge(tjob, Resource::Pages, tables) {
+                undo(made, procs, objs, &mut k.vmos.jobs);
+                return Err((job_status(e), None, None));
+            }
+            let vmo = k.vmos.create_in(stack_len / 4096, tjob);
+            let perms = Perms {
+                read: true,
+                write: true,
+                exec: false,
+                user: true,
+            };
+            if let Err(e) = t
+                .aspace
+                .map_region(&k.vmos, region, stack_len / 4096, vmo, 0, perms)
+            {
+                let _ = k.vmos.destroy(&mut k.mm, vmo);
+                k.vmos.jobs.credit(tjob, Resource::Pages, tables);
+                undo(made, procs, objs, &mut k.vmos.jobs);
+                return Err(match e {
+                    kcore::aspace::RegionError::TooMany => (Status::NoMemory, None, None),
+                    _ => (Status::InvalidArgs, None, None),
+                });
+            }
+            t.table_charge.insert(region, tables);
+            t.stack_hint = region + stack_len;
+            stack = Some(SpawnStack { region, vmo });
+            top = region + stack_len;
+        }
+        procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
+        let token = new_start(s, tpid, entry, top, arg, made.map(|(_, o)| o));
+        let st = s.starts.get_mut(&token).expect("just registered");
+        st.tp = tp;
+        st.stack = stack;
+        st.rr = flags & sp::ROUND_ROBIN != 0;
+        st.spawned = true;
+        Ok((token, made.map_or(0, |(h, _)| h.0), prio))
+    })?;
+    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
+    let tid = thread::spawn_free_detached("user", tid_prio, user_thread_main, token);
+    Ok((Some(u64::from(handle)), Some(u64::from(tid))))
 }
 
 /// `thread_interrupt(thread)`: reserved (T56). The place exists so nothing built meanwhile assumes a wait cannot
