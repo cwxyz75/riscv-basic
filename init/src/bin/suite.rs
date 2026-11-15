@@ -2473,6 +2473,148 @@ fn thread_interrupt_is_reserved() -> Outcome {
     Ok(())
 }
 
+/// Slice SC task 8: priority is bounded by the job (PR1, PR2). Argument errors, own priority up and down, the job's
+/// limits (a child may not exceed its parent), a confined program that cannot raise its priority, and lowering a job's
+/// maximum clamps a live thread at once.
+fn thread_priority_is_bounded_by_the_job() -> Outcome {
+    // argument errors and the caller's own priority
+    ensure_eq!(
+        st(sys::thread_set_sched(0, 0, 0)),
+        Some(S::InvalidArgs),
+        "priority 0"
+    );
+    ensure_eq!(
+        st(sys::thread_set_sched(0, 64, 0)),
+        Some(S::InvalidArgs),
+        "priority 64"
+    );
+    ensure_eq!(
+        st(sys::thread_set_sched(0, 10, 2)),
+        Some(S::InvalidArgs),
+        "a reserved flag"
+    );
+    ensure_eq!(
+        st(sys::thread_set_sched(0xdead, 10, 0)),
+        Some(S::BadHandle),
+        "no such handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::thread_set_sched(ev, 10, 0)),
+        Some(S::WrongType),
+        "an event is no thread"
+    );
+    ensure_eq!(
+        st(sys::thread_get_sched(ev)),
+        Some(S::WrongType),
+        "get on an event"
+    );
+    let before = ok(sys::thread_get_sched(0), "thread_get_sched")?;
+    ensure_eq!(
+        before.a1 & 0xff,
+        10,
+        "user threads start at the default priority"
+    );
+    ensure_eq!(
+        st(sys::thread_set_sched(0, 14, 1)),
+        Some(S::Ok),
+        "set own priority (round robin)"
+    );
+    let after = ok(sys::thread_get_sched(0), "thread_get_sched")?;
+    ensure_eq!(
+        after.a1 & 0xffff,
+        14 | 1 << 8,
+        "priority and flag read back"
+    );
+    ensure_eq!(
+        st(sys::thread_set_sched(0, 10, 0)),
+        Some(S::Ok),
+        "back to the default"
+    );
+    // a job's limits: SET_LIMITS needed, a child cannot exceed its parent, a bad value is refused
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    ensure_eq!(
+        st(sys::job_set_sched(j, 15, 0, 1024)),
+        Some(S::Ok),
+        "set a job's maximum priority"
+    );
+    ensure_eq!(job_use(j, 6)?, (15, 0), "job_info says so");
+    let g = job(j, u64::MAX, u64::MAX, u64::MAX)?;
+    ensure_eq!(
+        job_use(g, 6)?.0,
+        15,
+        "a child starts at its parent's maximum"
+    );
+    ensure_eq!(
+        st(sys::job_set_sched(g, 16, 0, 1024)),
+        Some(S::AccessDenied),
+        "above the parent"
+    );
+    ensure_eq!(
+        st(sys::job_set_sched(g, 15, 1, 1024)),
+        Some(S::AccessDenied),
+        "a budget above the parent's"
+    );
+    ensure_eq!(
+        st(sys::job_set_sched(g, 64, 0, 1024)),
+        Some(S::InvalidArgs),
+        "priority 64"
+    );
+    ensure_eq!(
+        st(sys::job_set_sched(g, 10, 0, 0)),
+        Some(S::InvalidArgs),
+        "weight 0"
+    );
+    let weak = ok(
+        sys::handle_duplicate(g, Rights::INSPECT.0),
+        "a job handle without SET_LIMITS",
+    )?
+    .a1 as u32;
+    ensure_eq!(
+        st(sys::job_set_sched(weak, 5, 0, 1024)),
+        Some(S::AccessDenied),
+        "needs SET_LIMITS"
+    );
+    ensure_eq!(
+        st(sys::job_set_sched(ev, 5, 0, 1024)),
+        Some(S::WrongType),
+        "an event is no job"
+    );
+    // a confined program cannot raise its priority above its job's maximum (and can within it)
+    let (p, _m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 66, j)?;
+    wait_ended(p, 3000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        0,
+        "the confined program's checks"
+    );
+    sys::handle_close(p);
+    // lowering the maximum clamps a live thread of the job at once
+    let (p, m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 67, j)?;
+    let w = sys::object_wait(m, sig::READABLE, sys::clock_get() + 3000);
+    ensure_eq!(st(w), Some(S::Ok), "the child raised its priority");
+    let mut b = [0u8; 1];
+    sys::channel_read(m, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        st(sys::job_set_sched(j, 8, 0, 1024)),
+        Some(S::Ok),
+        "lower the job's maximum"
+    );
+    ensure_eq!(job_use(g, 6)?.0, 8, "and its child's");
+    sys::channel_write(m, b"g".as_ptr(), 1, core::ptr::null(), 0);
+    wait_ended(p, 3000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        8,
+        "the live thread was clamped to the new maximum"
+    );
+    for h in [p, m, g, weak, j, root, ev] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 fn thread_limit_and_slots_are_reused() -> Outcome {
     let ev = event()?;
     let mut ts = [0u32; rt::abi::limits::MAX_THREADS_PER_PROCESS];
@@ -8322,7 +8464,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 6)),
+        st(sys::job_info(root, 9)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -9640,6 +9782,10 @@ pub fn app_main() -> i32 {
             a_refused_process_start_changes_nothing_and_can_be_retried,
         ),
         ("thread_interrupt_is_reserved", thread_interrupt_is_reserved),
+        (
+            "thread_priority_is_bounded_by_the_job",
+            thread_priority_is_bounded_by_the_job,
+        ),
         (
             "page_tables_are_charged_to_the_job",
             page_tables_are_charged_to_the_job,

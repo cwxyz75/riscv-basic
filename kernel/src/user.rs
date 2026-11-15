@@ -98,6 +98,8 @@ struct UserState {
     objs: Kobjs,
     procs: BTreeMap<u32, Process>,
     thread_pid: BTreeMap<Tid, u32>,
+    /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
+    sched_flags: BTreeMap<Tid, u8>,
     next_pid: u32,
     /// VMOs whose last handle is gone but that some address space still maps: freed when the
     /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
@@ -161,6 +163,7 @@ fn state() -> &'static mut UserState {
             objs: Kobjs::new(),
             procs: BTreeMap::new(),
             thread_pid: BTreeMap::new(),
+            sched_flags: BTreeMap::new(),
             next_pid: 1,
             pending_vmos: Vec::new(),
             cleaning: alloc::collections::BTreeSet::new(),
@@ -400,6 +403,18 @@ fn user_thread_main(token: usize) {
             p.thread_objs.insert(thread::current(), o);
         }
         let satp = satp_of(p);
+        // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
+        // no table yet): clamp it now (PR1; review of task 8).
+        let max = kmem::get()
+            .vmos
+            .jobs
+            .sched(p.job)
+            .map_or(63, |j| j.max_prio)
+            .max(1);
+        let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
+        if late_clamp {
+            thread::set_priority(thread::current(), max);
+        }
         (ts, satp, p.killed)
     };
     // Killed before it ever ran: it never runs user code.
@@ -561,6 +576,7 @@ fn leave(code: i32, whole: bool) -> ! {
         let s = state();
         let tid = thread::current();
         crate::fp::thread_gone(tid);
+        s.sched_flags.remove(&tid);
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
@@ -744,6 +760,9 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::PROCESS_CREATE
         | nr::JOB_CREATE
         | nr::JOB_SET_LIMITS
+        | nr::JOB_SET_SCHED
+        | nr::THREAD_SET_SCHED
+        | nr::THREAD_GET_SCHED
         | nr::JOB_INFO
         | nr::JOB_KILL
         | nr::JOB_ROOT
@@ -2228,7 +2247,13 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_CREATE => process_create(a),
         nr::JOB_CREATE if wide(0) => bad(Status::BadHandle),
         nr::JOB_CREATE => job_create(a),
-        nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_KILL if wide(0) => bad(Status::BadHandle),
+        nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_KILL | nr::JOB_SET_SCHED if wide(0) => {
+            bad(Status::BadHandle)
+        }
+        nr::JOB_SET_SCHED => job_set_sched(a),
+        nr::THREAD_SET_SCHED | nr::THREAD_GET_SCHED if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_SET_SCHED => thread_set_sched(a),
+        nr::THREAD_GET_SCHED => thread_get_sched(a),
         nr::JOB_SET_LIMITS => job_set_limits(a),
         nr::JOB_INFO => job_info(a),
         nr::JOB_KILL => job_kill(a),
@@ -2539,7 +2564,7 @@ fn process_unmap(a: [u64; 6]) -> Reply {
 fn process_start(a: [u64; 6]) -> Reply {
     let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
-    let started = irq::without(|| -> Result<usize, (Status, Option<u64>, Option<u64>)> {
+    let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
@@ -2547,28 +2572,28 @@ fn process_start(a: [u64; 6]) -> Reply {
         let be = caller.handles.get(bh).map_err(|e| (e, None, None))?;
         let tpid = match s.objs.get(pe.obj) {
             Some(ipc::KObj::Process(p)) => p.pid,
-            _ => return bad(Status::WrongType).map(|_| 0),
+            _ => return bad(Status::WrongType).map(|_| (0, 0)),
         };
         if !matches!(s.objs.get(be.obj), Some(ipc::KObj::Channel(_))) {
-            return bad(Status::WrongType).map(|_| 0);
+            return bad(Status::WrongType).map(|_| (0, 0));
         }
         if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
-            return bad(Status::AccessDenied).map(|_| 0);
+            return bad(Status::AccessDenied).map(|_| (0, 0));
         }
         let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
         if target.state != ProcState::Created
             || target.exit_code.is_some()
             || target.killed.is_some()
         {
-            return bad(Status::BadState).map(|_| 0);
+            return bad(Status::BadState).map(|_| (0, 0));
         }
         if total_threads(s) >= abi::limits::MAX_USER_THREADS {
-            return bad(Status::NoMemory).map(|_| 0);
+            return bad(Status::NoMemory).map(|_| (0, 0));
         }
         let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
         let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
         if !entry_ok || !sp_ok {
-            return bad(Status::InvalidArgs).map(|_| 0);
+            return bad(Status::InvalidArgs).map(|_| (0, 0));
         }
         // The thread's charge comes before anything changes: a refusal must leave the caller's
         // handle with the caller and the process exactly as it was (SYSCALLS.md: on any error
@@ -2597,11 +2622,13 @@ fn process_start(a: [u64; 6]) -> Reply {
         target.start_sp = sp;
         target.state = ProcState::Running;
         target.threads_alive = 1;
-        Ok(new_start(s, tpid, entry, sp, arg, None))
+        // the first thread of a process starts at the default priority, clamped to its job's maximum
+        let first_prio = clamp_prio(target.job, 10);
+        Ok((new_start(s, tpid, entry, sp, arg, None), first_prio))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
-    thread::spawn_free_detached("user", 10, user_thread_main, started);
+    thread::spawn_free_detached("user", first_prio, user_thread_main, started);
     Ok((None, None))
 }
 
@@ -2669,7 +2696,7 @@ const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 fn thread_create(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0] as u32);
     let (entry, sp, arg) = (a[1], a[2], a[3]);
-    let (token, handle) = irq::without(|| -> Result<(usize, u32), ReplyErr> {
+    let (token, handle, new_prio) = irq::without(|| -> Result<(usize, u32, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
@@ -2680,19 +2707,21 @@ fn thread_create(a: [u64; 6]) -> Reply {
             || target.exit_code.is_some()
             || target.killed.is_some()
         {
-            return bad(Status::BadState).map(|_| (0, 0));
+            return bad(Status::BadState).map(|_| (0, 0, 0));
         }
         let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
         let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
         if !entry_ok || !sp_ok {
-            return bad(Status::InvalidArgs).map(|_| (0, 0));
+            return bad(Status::InvalidArgs).map(|_| (0, 0, 0));
         }
         if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
             || total_threads(s) >= abi::limits::MAX_USER_THREADS
         {
-            return bad(Status::NoMemory).map(|_| (0, 0));
+            return bad(Status::NoMemory).map(|_| (0, 0, 0));
         }
         let tjob = target.job;
+        // a new thread inherits its creator's base priority, clamped to its job's maximum
+        let prio = clamp_prio(tjob, creator_prio(s));
         let UserState { objs, procs, .. } = s;
         let jobs = &mut kmem::get().vmos.jobs;
         charge_thread(jobs, tjob).map_err(|e| (job_status(e), None, None))?;
@@ -2710,10 +2739,14 @@ fn thread_create(a: [u64; 6]) -> Reply {
             }
         };
         procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
-        Ok((new_start(s, tpid, entry, sp, arg, Some(obj)), handle.0))
+        Ok((
+            new_start(s, tpid, entry, sp, arg, Some(obj)),
+            handle.0,
+            prio,
+        ))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
-    thread::spawn_free_detached("user", 10, user_thread_main, token);
+    thread::spawn_free_detached("user", new_prio, user_thread_main, token);
     Ok((Some(u64::from(handle)), None))
 }
 
@@ -2845,6 +2878,137 @@ fn job_set_limits(a: [u64; 6]) -> Reply {
     })
 }
 
+/// The base priority a new thread starts at (SCHED-SMP-SPEC 4.9): `want`, clamped to the job's `max_prio` (and at
+/// least 1: a user thread is never the idle priority).
+fn clamp_prio(job: JobId, want: u8) -> u8 {
+    let max = kmem::get().vmos.jobs.sched(job).map_or(10, |s| s.max_prio);
+    want.min(max).max(1)
+}
+
+/// The priority a thread created by the calling thread inherits: the caller's own base if it is a user thread, else
+/// the default (10).
+fn creator_prio(s: &UserState) -> u8 {
+    let me = thread::current();
+    if s.thread_pid.contains_key(&me) {
+        thread::priority_of(me).unwrap_or(10)
+    } else {
+        10
+    }
+}
+
+/// The kernel thread behind a thread handle with `need`, and the process it belongs to.
+fn thread_target(s: &UserState, me: u32, h: u64, need: Rights) -> Result<(Tid, u32), ReplyErr> {
+    if h == 0 {
+        return Ok((thread::current(), me));
+    }
+    let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+    let handle = Handle(h as u32);
+    ipc::thread_of(&s.objs, &caller.handles, handle, need).map_err(|e| (e, None, None))?;
+    let obj = caller.handles.get(handle).map_err(|e| (e, None, None))?.obj;
+    let pid = match s.objs.get(obj) {
+        Some(ipc::KObj::Thread(t)) => t.pid,
+        _ => return Err((Status::WrongType, None, None)),
+    };
+    let tid = s.procs.get(&pid).and_then(|p| {
+        p.thread_objs
+            .iter()
+            .find(|(_, o)| **o == obj)
+            .map(|(t, _)| *t)
+    });
+    match tid {
+        Some(t) => Ok((t, pid)),
+        None => Err((Status::BadState, None, None)), // the thread has ended (or never started)
+    }
+}
+
+/// `thread_set_sched(thread, priority, flags)`: set a thread's base priority (1 to 63) and flags (bit 0: round robin
+/// within its level). Needs MANAGE on the handle (none for 0, the caller), and the priority may not exceed the
+/// thread's job's `max_prio`.
+fn thread_set_sched(a: [u64; 6]) -> Reply {
+    let (prio, flags) = (a[1], a[2]);
+    if !(1..=63).contains(&prio) || flags & !1 != 0 {
+        return bad(Status::InvalidArgs);
+    }
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, pid) = thread_target(s, me, a[0], Rights::MANAGE)?;
+        let job = s.procs.get(&pid).ok_or((Status::BadState, None, None))?.job;
+        let max = kmem::get()
+            .vmos
+            .jobs
+            .sched(job)
+            .ok_or((Status::BadState, None, None))?
+            .max_prio;
+        if prio as u8 > max {
+            return bad(Status::AccessDenied);
+        }
+        s.sched_flags.insert(tid, flags as u8);
+        thread::set_priority(tid, prio as u8);
+        Ok((None, None))
+    })
+}
+
+/// `thread_get_sched(thread) -> sched, tid`: `sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and
+/// the effective priority (16 to 23; equal to the base until donation exists). Needs INSPECT (none for 0).
+fn thread_get_sched(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
+        let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
+        let flags = u64::from(s.sched_flags.get(&tid).copied().unwrap_or(0));
+        Ok((Some(prio | flags << 8 | prio << 16), Some(u64::from(tid))))
+    })
+}
+
+/// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
+/// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
+fn job_set_sched(a: [u64; 6]) -> Reply {
+    if a[1] > 63 || a[3] > 65536 {
+        return bad(Status::InvalidArgs);
+    }
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let job = ipc::job_of(
+            &s.objs,
+            &caller.handles,
+            Handle(a[0] as u32),
+            Rights::SET_LIMITS,
+        )
+        .map_err(|e| (e, None, None))?;
+        let limits = kcore::job::SchedLimits {
+            max_prio: a[1] as u8,
+            rt_budget: a[2],
+            cpu_weight: a[3] as u32,
+        };
+        let jobs = &mut kmem::get().vmos.jobs;
+        jobs.set_sched(job, limits).map_err(|e| {
+            let st = match e {
+                kcore::job::SchedError::NoSuchJob => Status::BadState,
+                kcore::job::SchedError::AboveParent => Status::AccessDenied,
+                kcore::job::SchedError::Invalid => Status::InvalidArgs,
+            };
+            (st, None, None)
+        })?;
+        // PR1: clamp the threads of the job and everything below it
+        let clamp: Vec<(Tid, u8)> = s
+            .thread_pid
+            .iter()
+            .filter_map(|(&tid, pid)| {
+                let pj = s.procs.get(pid)?.job;
+                let max = jobs.sched(pj)?.max_prio;
+                let now = thread::priority_of(tid)?;
+                (jobs.is_within(pj, job) && now > max).then_some((tid, max.max(1)))
+            })
+            .collect();
+        thread::set_priorities(&clamp);
+        Ok((None, None))
+    })
+}
+
 /// `job_info(job, which) -> used, limit` for `which` 0 processes, 1 threads, 2 pages (everything
 /// in the job and below it). Needs INSPECT.
 fn job_info(a: [u64; 6]) -> Reply {
@@ -2866,6 +3030,15 @@ fn job_info(a: [u64; 6]) -> Reply {
             3 => Resource::Jobs,
             4 => Resource::Objects,
             5 => Resource::IpcBytes,
+            // 6: the job's scheduling limits: `max_prio` and `rt_budget` (nanoseconds per 100 ms window)
+            6 => {
+                let s = kmem::get()
+                    .vmos
+                    .jobs
+                    .sched(job)
+                    .ok_or((Status::BadState, None, None))?;
+                return Ok((Some(u64::from(s.max_prio)), Some(s.rt_budget)));
+            }
             _ => return bad(Status::InvalidArgs),
         };
         let jobs = &kmem::get().vmos.jobs;

@@ -287,6 +287,31 @@ pub mod sys {
     pub fn job_info(job: u32, which: u64) -> Ret {
         syscall(JOB_INFO, [job as usize, which as usize, 0, 0, 0, 0])
     }
+    /// Set a job's scheduling limits (`max_prio`, RT budget in ns per 100 ms window, CPU weight): SET_LIMITS.
+    pub fn job_set_sched(job: u32, max_prio: u8, rt_budget_ns: u64, cpu_weight: u32) -> Ret {
+        syscall(
+            JOB_SET_SCHED,
+            [
+                job as usize,
+                max_prio as usize,
+                rt_budget_ns as usize,
+                cpu_weight as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Set a thread's base priority (1 to 63) and flags (bit 0: round robin); `thread` 0 is the caller.
+    pub fn thread_set_sched(thread: u32, priority: u8, flags: u8) -> Ret {
+        syscall(
+            THREAD_SET_SCHED,
+            [thread as usize, priority as usize, flags as usize, 0, 0, 0],
+        )
+    }
+    /// `a1` packs the base priority (bits 0-7), flags (8-15) and effective priority (16-23); `a2` is the thread id.
+    pub fn thread_get_sched(thread: u32) -> Ret {
+        syscall(THREAD_GET_SCHED, [thread as usize, 0, 0, 0, 0, 0])
+    }
     pub fn job_kill(job: u32, code: i32) -> Ret {
         syscall(JOB_KILL, [job as usize, code as usize, 0, 0, 0, 0])
     }
