@@ -305,7 +305,9 @@ impl Jobs {
     /// `is_within`).
     pub fn set_sched(&mut self, id: JobId, s: SchedLimits) -> Result<(), SchedError> {
         let parent = self.rec(id).ok_or(SchedError::NoSuchJob)?.parent;
-        if s.max_prio > 63 || !(1..=65536).contains(&s.cpu_weight) {
+        // (an RT budget is a share of a 100 ms window: more than the window is meaningless, and without this the
+        // root, which has no parent to bound it, could be given anything)
+        if s.max_prio > 63 || !(1..=65536).contains(&s.cpu_weight) || s.rt_budget > 100_000_000 {
             return Err(SchedError::Invalid);
         }
         if let Some(p) = parent.and_then(|p| self.rec(p)) {

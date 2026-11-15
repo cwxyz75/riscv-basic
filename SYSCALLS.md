@@ -555,7 +555,7 @@ priority any thread of the job may have (the real-time band, 32 to 63, therefore
 it); `rt_budget_ns` is real-time CPU per 100 ms window (accounted, **not yet enforced**); `cpu_weight` (1 to 65536) is stored
 for a later fair class. No value may exceed the parent job's (PR2: ACCESS_DENIED); a new job starts with its parent's values;
 **lowering `max_prio` lowers the base priority of every live thread in the job and below it that is above it, at once**
-(PR1) and lowers every descendant job's values. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no SET_LIMITS, or a value above
+(PR1: a job with maximum 0 still runs its threads at priority 1, the lowest a user thread has) and lowers every descendant job's values; a thread created but not yet run is clamped when it first runs. `rt_budget_ns` above the 100 ms window is INVALID_ARGS. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no SET_LIMITS, or a value above
 the parent's); INVALID_ARGS (`max_prio` above 63, `cpu_weight` outside 1 to 65536). Tests: `thread_priority_is_bounded_by_the_job`,
 `kcore/tests/job_sched.rs`.
 

@@ -403,6 +403,18 @@ fn user_thread_main(token: usize) {
             p.thread_objs.insert(thread::current(), o);
         }
         let satp = satp_of(p);
+        // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
+        // no table yet): clamp it now (PR1; review of task 8).
+        let max = kmem::get()
+            .vmos
+            .jobs
+            .sched(p.job)
+            .map_or(63, |j| j.max_prio)
+            .max(1);
+        let late_clamp = thread::priority_of(thread::current()).is_some_and(|now| now > max);
+        if late_clamp {
+            thread::set_priority(thread::current(), max);
+        }
         (ts, satp, p.killed)
     };
     // Killed before it ever ran: it never runs user code.
@@ -2992,9 +3004,7 @@ fn job_set_sched(a: [u64; 6]) -> Reply {
                 (jobs.is_within(pj, job) && now > max).then_some((tid, max.max(1)))
             })
             .collect();
-        for (tid, max) in clamp {
-            thread::set_priority(tid, max);
-        }
+        thread::set_priorities(&clamp);
         Ok((None, None))
     })
 }

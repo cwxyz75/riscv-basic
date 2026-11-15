@@ -525,6 +525,17 @@ pub fn priority_of(tid: Tid) -> Option<Prio> {
     irq::without(|| kernel().sched.priority(tid))
 }
 
+/// Set several threads' priorities in one critical section and reschedule once (a clamp must reach every thread
+/// before anything can run on the new, lower limit; review of task 8).
+pub fn set_priorities(changes: &[(Tid, Prio)]) {
+    irq::without(|| {
+        for &(tid, prio) in changes {
+            let _ = kernel().sched.set_priority_on(hart(), tid, prio);
+        }
+        reschedule();
+    });
+}
+
 pub fn set_priority(tid: Tid, prio: Prio) {
     irq::without(|| {
         let _ = kernel().sched.set_priority_on(hart(), tid, prio);
