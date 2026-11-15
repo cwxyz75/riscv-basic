@@ -1,6 +1,7 @@
 # NET-DESIGN: an architecture proposal for the network stack (S8 and S9)
 
-Status: **draft v1, 2026-11-14, a proposal for discussion; nothing here is decided or built.** v1 folds in the scheduler,
+Status: **draft v1, 2026-11-14, a proposal for discussion; nothing here is decided or built.** The concrete contract for S8, with
+every message, constant and acceptance check, is `NET-SPEC.md`; this file is the architecture and its reasons. v1 folds in the scheduler,
 threads and service-directory work that landed after v0 (`SCHED-SMP-SPEC.md`, slices R, SD, DM, T) and three owner
 settlements: doorbells are events, the threading model is left alone for now, and priorities are allowed for but not set
 (section 15 lists exactly what changed). It is design only (no code
@@ -232,6 +233,10 @@ buys fault isolation inside one failure domain that restarts together anyway.
 ## 5. The driver/stack data path
 
 ### 5.1 Memory
+
+(`NET-SPEC.md` 5.1 and 4.3 fix the sizes, and one detail differs from the sentence below: only the root resource can create DMA VMOs, so
+`devmgr` creates the three DMA VMOs and they are charged to its job, a recorded shortcut; `netsup` creates the ring VMO, the config blob and
+the flight recorder.)
 
 Two DMA pools (RX and TX), each one DMA VMO of up to 64 pages, which gives **128 slots of 2 KiB** (a 1514-byte frame plus the
 12-byte virtio header fit with room). A third DMA VMO holds the virtqueues themselves (descriptors, avail and used rings: the
