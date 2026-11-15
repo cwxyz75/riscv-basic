@@ -556,7 +556,12 @@ impl Netd {
                     now_ns(),
                 );
                 if let Some(b) = &self.blob {
-                    b.write_iface(Some(netblob::Iface { addr, mask, gateway, dns }));
+                    b.write_iface(Some(netblob::Iface {
+                        addr,
+                        mask,
+                        gateway,
+                        dns,
+                    }));
                 }
                 self.reply(key, txid, pn::status::OK, &[]);
                 self.more = true;
@@ -836,10 +841,17 @@ pub fn app_main() -> i32 {
     // a restart re-applies the interface configuration the previous incarnation left in the blob (no waiting for DHCP)
     if let Some(bv) = env.handle(Role::NetConfigBlob) {
         if sys::process_map(me, bv, BLOB_VA, 0, 4096, PF_RW).status == 0 {
-            let b = netblob::Blob { base: BLOB_VA as usize };
+            let b = netblob::Blob {
+                base: BLOB_VA as usize,
+            };
             if let Some(i) = b.read_iface() {
                 d.net.configure(
-                    Config { addr: i.addr, mask: i.mask, gateway: i.gateway, dns: i.dns },
+                    Config {
+                        addr: i.addr,
+                        mask: i.mask,
+                        gateway: i.gateway,
+                        dns: i.dns,
+                    },
                     now_ns(),
                 );
             }

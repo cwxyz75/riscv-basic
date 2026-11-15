@@ -514,7 +514,11 @@ fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
     let sup = spawn_prog(
         bi,
         b"bin/netsup",
-        if dhcp { &[b"netsup"] } else { &[b"netsup", b"nodhcp"] },
+        if dhcp {
+            &[b"netsup"]
+        } else {
+            &[b"netsup", b"nodhcp"]
+        },
         vec![
             (Role::ServiceDevmgr, 0),
             (Role::BootImage, 1),
@@ -658,9 +662,18 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
     let r = (|| -> Outcome {
         let t = |n: u64| sys::clock_get() + n;
         let mut cfg = f.connect(b"net-config")?;
-        cfg.set_config([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2], [10, 0, 2, 3], t(3000)).map_err(|_| msg_at(line!()))?;
+        cfg.set_config(
+            [10, 0, 2, 15],
+            [255, 255, 255, 0],
+            [10, 0, 2, 2],
+            [10, 0, 2, 3],
+            t(3000),
+        )
+        .map_err(|_| msg_at(line!()))?;
         let mut net = f.connect(b"net")?;
-        let mut udp = net.open_udp(7777, 0, t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut udp = net
+            .open_udp(7777, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
         ensure_eq!(udp.port, 7777, "the port asked for");
         // (until the host has a reason to send, wait for the link: the stack's first frame lets slirp learn our address)
         let until = t(8000);
@@ -674,11 +687,51 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
         sys::debug_write(b"s8: udpecho ready\n");
         let end = sys::clock_get() + 60_000;
         let mut echoed = 0u32;
+        let mut flood_checked = false;
         while sys::clock_get() < end {
             match udp.recv(t(1000)) {
+                Ok(d) if d.payload == b"##stall" => {
+                    // Q8: stop reading while the host floods this endpoint: the stack must stay responsive, bound its
+                    // memory (drop and count) and never wait for us
+                    let mut probe = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+                    let mut answered = 0;
+                    for seq in 0..3u16 {
+                        if probe.ping([10, 0, 2, 2], seq, b"alive", t(700)).is_ok() {
+                            answered += 1;
+                        }
+                        nap(300)?;
+                    }
+                    ensure!(answered >= 2, "the stack still answers pings while an endpoint is flooded and stalled ({answered} of 3)");
+                    // drain what was queued, then take the host's tail datagram: the count of what was dropped rides on the
+                    // next datagram delivered (7.2), which the host sends once the flood is over
+                    let (mut n, mut dropped) = (0u32, 0u64);
+                    loop {
+                        match udp.recv(t(8000)) {
+                            Ok(d) => {
+                                n += 1;
+                                dropped += u64::from(d.dropped);
+                                if d.payload == b"##tail" {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    ensure!(n > 0 && n < 3000, "some of the flood was delivered and not all ({n} delivered, dropped {dropped})");
+                    ensure!(dropped > 0, "the endpoint's dropped count says datagrams were discarded ({dropped}; {n} delivered; tail seen: {})", flood_checked);
+                    let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
+                    ensure!(
+                        counter(&stats, "udp_delivered") >= u64::from(n),
+                        "the counters agree"
+                    );
+                    udp.send_to(d.src, d.port, b"##drained")
+                        .map_err(|_| msg_at(line!()))?;
+                    flood_checked = true;
+                }
                 Ok(d) => {
                     let stop = d.payload == b"##stop";
-                    udp.send_to(d.src, d.port, &d.payload).map_err(|_| msg_at(line!()))?;
+                    udp.send_to(d.src, d.port, &d.payload)
+                        .map_err(|_| msg_at(line!()))?;
                     echoed += 1;
                     if stop {
                         nap(200)?; // let the reply leave
@@ -689,7 +742,11 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
                 Err(_) => return Err(msg_at(line!())),
             }
         }
-        ensure!(echoed >= 200, "the host's datagrams arrived and were echoed ({echoed})");
+        ensure!(flood_checked, "the flood test ran");
+        ensure!(
+            echoed >= 200,
+            "the host's datagrams arrived and were echoed ({echoed})"
+        );
         let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
         ensure!(stats.iter().any(|s| s.1 > 0), "the counters moved");
         Ok(())
@@ -700,8 +757,13 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
 
 /// The value of the named counter in a `GetStats` answer.
 fn counter(stats: &[(u16, u64)], name: &str) -> u64 {
-    let id = netcore::Counters::default().pairs().iter().find(|p| p.1 == name).map(|p| p.0);
-    id.and_then(|id| stats.iter().find(|s| s.0 == id)).map_or(0, |s| s.1)
+    let id = netcore::Counters::default()
+        .pairs()
+        .iter()
+        .find(|p| p.1 == name)
+        .map(|p| p.0);
+    id.and_then(|id| stats.iter().find(|s| s.0 == id))
+        .map_or(0, |s| s.1)
 }
 
 /// Q3: the DHCP client configures the interface from QEMU's own server (an independent implementation), and the S8 "ping the
@@ -721,24 +783,377 @@ pub fn net_dhcp_configures_the_interface() -> Outcome {
             nap(100)?;
             info = net.info(t(3000)).map_err(|_| msg_at(line!()))?;
         }
-        ensure!(info.configured, "the interface was configured by DHCP within 25 s");
-        ensure_eq!((info.addr, info.mask, info.gateway, info.dns), ([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2], [10, 0, 2, 3]), "what QEMU's server leases");
+        ensure!(
+            info.configured,
+            "the interface was configured by DHCP within 25 s"
+        );
+        ensure_eq!(
+            (info.addr, info.mask, info.gateway, info.dns),
+            (
+                [10, 0, 2, 15],
+                [255, 255, 255, 0],
+                [10, 0, 2, 2],
+                [10, 0, 2, 3]
+            ),
+            "what QEMU's server leases"
+        );
         let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
         let mut got = 0;
         for seq in 1..=5u16 {
-            if echo.ping([10, 0, 2, 2], seq, &[seq as u8; 16], t(1500)).is_ok() {
+            if echo
+                .ping([10, 0, 2, 2], seq, &[seq as u8; 16], t(1500))
+                .is_ok()
+            {
                 got += 1;
             }
         }
-        ensure!(got >= 4, "the gateway answers pings after DHCP ({got} of 5)");
-        ensure!(echo.ping([10, 0, 2, 3], 9, b"dns", t(1500)).is_ok(), "slirp's DNS address answers pings too");
+        ensure!(
+            got >= 4,
+            "the gateway answers pings after DHCP ({got} of 5)"
+        );
+        ensure!(
+            echo.ping([10, 0, 2, 3], 9, b"dns", t(1500)).is_ok(),
+            "slirp's DNS address answers pings too"
+        );
         // nobody answers for 10.0.2.99: three ARP requests, then NoRoute, and no echo reply
         let mut cfg = f.connect(b"net-config")?;
-        let before = counter(&cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?, "arp_requests_sent");
+        let before = counter(
+            &cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?,
+            "arp_requests_sent",
+        );
         let r = echo.ping([10, 0, 2, 99], 1, b"x", t(6000));
         ensure!(r.is_err(), "no reply from an address nobody answers for");
-        let after = counter(&cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?, "arp_requests_sent");
+        let after = counter(
+            &cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?,
+            "arp_requests_sent",
+        );
         ensure_eq!(after - before, 3, "exactly three ARP requests");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+// ---- confinement and supervision ----
+
+/// `netsup`'s control channel: `Status` as `(running, restarts, last_exit)` for the driver, the stack and the DHCP client, then whether
+/// the network is marked down and the driver generation.
+fn sup_status(f: &Full) -> Option<([(bool, u32, i32); 3], bool, u64)> {
+    let req = [1, 0, 0, 0, 1, 0, 0, 0];
+    sys::channel_write(f.ctl, req.as_ptr(), req.len(), core::ptr::null(), 0);
+    if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
+        return None;
+    }
+    let mut b = [0u8; 64];
+    let r = sys::channel_read(f.ctl, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
+    if r.status != 0 || r.a1 < 8 + 27 + 9 {
+        return None;
+    }
+    let mut kids = [(false, 0u32, 0i32); 3];
+    for (i, k) in kids.iter_mut().enumerate() {
+        let o = 8 + i * 9;
+        *k = (
+            b[o] != 0,
+            u32::from_le_bytes(b[o + 1..o + 5].try_into().ok()?),
+            i32::from_le_bytes(b[o + 5..o + 9].try_into().ok()?),
+        );
+    }
+    Some((
+        kids,
+        b[35] != 0,
+        u64::from_le_bytes(b[36..44].try_into().ok()?),
+    ))
+}
+
+/// Ask `netsup` to kill and restart a child (0 driver, 1 stack, 2 DHCP client).
+fn sup_restart(f: &Full, child: u8) {
+    let req = [2, 0, 0, 0, 2, 0, 0, 0, child];
+    sys::channel_write(f.ctl, req.as_ptr(), req.len(), core::ptr::null(), 0);
+    let _ = sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000);
+    let mut b = [0u8; 16];
+    sys::channel_read(f.ctl, b.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+}
+
+fn configure_static(cfg: &mut rt::net::Net) -> Outcome {
+    cfg.set_config(
+        [10, 0, 2, 15],
+        [255, 255, 255, 0],
+        [10, 0, 2, 2],
+        [10, 0, 2, 3],
+        sys::clock_get() + 3000,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let until = sys::clock_get() + 8000;
+    loop {
+        let i = cfg
+            .info(sys::clock_get() + 3000)
+            .map_err(|_| msg_at(line!()))?;
+        if i.link || sys::clock_get() > until {
+            return Ok(());
+        }
+        nap(20)?;
+    }
+}
+
+/// Q6, Q7 and Q10: an account confines a client; authority is the name a program's view contains; an endpoint lives exactly as long
+/// as its channel.
+pub fn net_clients_are_confined() -> Outcome {
+    use rt::net::NetError::Stack;
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let refused = pn_status(2);
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        // Q7: the normal class
+        let mut net = f.connect(b"net")?;
+        ensure_eq!(
+            net.open_udp(80, 0, t(3000)).err(),
+            Some(Stack(refused)),
+            "port 80 on /svc/net"
+        );
+        ensure_eq!(
+            net.open_udp(7001, proto::net::oflags::BROADCAST, t(3000))
+                .err(),
+            Some(Stack(refused)),
+            "broadcast on /svc/net"
+        );
+        ensure_eq!(
+            net.open_udp(7001, proto::net::oflags::SRC_ANY, t(3000))
+                .err(),
+            Some(Stack(refused)),
+            "source 0.0.0.0 on /svc/net"
+        );
+        ensure_eq!(
+            net.set_config([1, 2, 3, 4], [255, 0, 0, 0], [0; 4], [0; 4], t(3000))
+                .err(),
+            Some(Stack(refused)),
+            "SetConfig on /svc/net"
+        );
+        ensure_eq!(
+            net.arp(t(3000)).err(),
+            Some(Stack(refused)),
+            "the ARP table needs the configure class"
+        );
+        ensure!(net.info(t(3000)).is_ok(), "Info is for everyone");
+        // the privileged class
+        let mut privileged = f.connect(b"net-priv")?;
+        let p80 = privileged.open_udp(80, 0, t(3000));
+        ensure!(p80.is_ok(), "port 80 on /svc/net-priv");
+        ensure!(
+            privileged
+                .open_udp(
+                    7002,
+                    proto::net::oflags::BROADCAST | proto::net::oflags::SRC_ANY,
+                    t(3000)
+                )
+                .is_ok(),
+            "broadcast and source 0.0.0.0 on /svc/net-priv"
+        );
+        ensure_eq!(
+            privileged
+                .set_config([1, 2, 3, 4], [255, 0, 0, 0], [0; 4], [0; 4], t(3000))
+                .err(),
+            Some(Stack(refused)),
+            "but not SetConfig"
+        );
+        // the configure class opens no endpoints
+        ensure_eq!(
+            cfg.open_udp(7003, 0, t(3000)).err(),
+            Some(Stack(refused)),
+            "Open on /svc/net-config"
+        );
+        ensure_eq!(
+            cfg.open_echo(t(3000)).err(),
+            Some(Stack(refused)),
+            "an echo endpoint on /svc/net-config"
+        );
+        // a program whose view lacks a name cannot open it
+        let mut only_net = f.view(b"net")?;
+        ensure!(
+            only_net
+                .open(b"net-priv", 0, proto::file::rights::READ)
+                .is_err(),
+            "a view without /svc/net-priv cannot open it"
+        );
+        // Q6: thirty-one endpoints, then Quota; a second client is unaffected; closing releases exactly
+        let mut held = Vec::new();
+        let quota = pn_status(6);
+        loop {
+            match net.open_udp(0, 0, t(3000)) {
+                Ok(u) => held.push(u),
+                Err(e) => {
+                    ensure_eq!(e, Stack(quota), "the endpoint beyond the account's limit");
+                    break;
+                }
+            }
+            ensure!(held.len() <= 40, "no limit was enforced");
+        }
+        ensure_eq!(
+            held.len(),
+            31,
+            "exactly 31 endpoints beside the service connection"
+        );
+        let mut second = f.connect(b"net")?;
+        ensure!(
+            second.open_udp(0, 0, t(3000)).is_ok(),
+            "a second client's endpoints are unaffected"
+        );
+        held.pop();
+        // (the stack notices the closed channel on its next pass)
+        let mut again = None;
+        for _ in 0..50 {
+            match net.open_udp(0, 0, t(3000)) {
+                Ok(u) => {
+                    again = Some(u);
+                    break;
+                }
+                Err(_) => nap(20)?,
+            }
+        }
+        ensure!(
+            again.is_some(),
+            "closing one endpoint freed exactly one place"
+        );
+        ensure_eq!(
+            net.open_udp(0, 0, t(3000)).err(),
+            Some(Stack(quota)),
+            "and only one"
+        );
+        // Q10: a closed endpoint frees its port at once
+        drop(held);
+        drop(again);
+        let first = privileged
+            .open_udp(7010, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        ensure_eq!(
+            privileged.open_udp(7010, 0, t(3000)).err(),
+            Some(Stack(pn_status(3))),
+            "a bound port is in use"
+        );
+        drop(first);
+        let mut ok2 = false;
+        for _ in 0..50 {
+            if privileged.open_udp(7010, 0, t(3000)).is_ok() {
+                ok2 = true;
+                break;
+            }
+            nap(20)?;
+        }
+        ensure!(
+            ok2,
+            "the port is free again after the endpoint's channel closed"
+        );
+        drop(p80);
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+fn pn_status(v: i32) -> i32 {
+    v
+}
+
+/// Q11, Q12 and Q13: killing each of the three processes under traffic leaves a working network within a bounded time.
+pub fn net_children_restart() -> Outcome {
+    let Some(mut f) = start_full_with(true)? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut net = f.connect(b"net")?;
+        let until = t(25_000);
+        while !net.info(t(3000)).map_err(|_| msg_at(line!()))?.configured
+            && sys::clock_get() < until
+        {
+            nap(100)?;
+        }
+        ensure!(
+            net.info(t(3000)).map_err(|_| msg_at(line!()))?.configured,
+            "configured by DHCP"
+        );
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(
+            echo.ping([10, 0, 2, 2], 1, b"a", t(2000)).is_ok(),
+            "the network works to begin with"
+        );
+        let (_, down, gen0) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
+        ensure!(!down && gen0 >= 1, "the supervisor is up");
+        // Q11: kill the driver under a ping loop: pings resume within three seconds, the generation is one higher, the endpoint
+        // that was open before still works
+        sup_restart(&f, 0);
+        let t0 = sys::clock_get();
+        let mut seq = 2u16;
+        let mut resumed = None;
+        while sys::clock_get() < t0 + 6000 {
+            if echo.ping([10, 0, 2, 2], seq, b"b", t(700)).is_ok() {
+                resumed = Some(sys::clock_get() - t0);
+                break;
+            }
+            seq += 1;
+        }
+        ensure!(
+            resumed.is_some_and(|ms| ms <= 3500),
+            "pings resumed within about three seconds of the driver's death ({resumed:?} ms)"
+        );
+        let (kids, down, gen1) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(gen1, gen0 + 1, "the generation is one higher");
+        ensure!(kids[0].0 && !down, "the driver runs again");
+        ensure_eq!(kids[0].1, 1, "one restart of the driver");
+        // Q13: kill the DHCP client: the address stays (it was applied already) and a new client resumes from the lease
+        sup_restart(&f, 2);
+        nap(1500)?;
+        let i = net.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(
+            i.configured && i.addr == [10, 0, 2, 15],
+            "the address survives a restart of the DHCP client"
+        );
+        ensure!(
+            sup_status(&f).is_some_and(|s| s.0[2].0),
+            "the DHCP client runs again"
+        );
+        // Q12: kill the stack: the client's endpoint is closed, the registry says UNAVAILABLE and then answers, the address is
+        // back with no new DISCOVER (the blob), and pings work again
+        sup_restart(&f, 1);
+        let t1 = sys::clock_get();
+        let mut closed = false;
+        while sys::clock_get() < t1 + 3000 {
+            if let Err(e) = echo.ping([10, 0, 2, 2], 99, b"c", t(300)) {
+                if e == rt::net::NetError::Closed {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        ensure!(
+            closed,
+            "the old endpoint's channel was closed when the stack died"
+        );
+        let mut net2 = f.connect(b"net")?;
+        let i2 = net2.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(
+            i2.configured && i2.addr == [10, 0, 2, 15],
+            "the address is back without waiting for DHCP"
+        );
+        let mut echo2 = net2.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut ok = false;
+        let t2 = sys::clock_get();
+        while sys::clock_get() < t2 + 8000 {
+            if echo2.ping([10, 0, 2, 2], 7, b"d", t(700)).is_ok() {
+                ok = true;
+                break;
+            }
+        }
+        ensure!(ok, "pings work again after the stack's restart");
+        ensure!(
+            sup_status(&f).is_some_and(|s| !s.1),
+            "the supervisor is not down after three single restarts"
+        );
         Ok(())
     })();
     f.close();

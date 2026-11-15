@@ -10239,6 +10239,11 @@ pub fn app_main() -> i32 {
             thread_stacks_are_charged_to_the_job_and_credited_back,
         ),
         (
+            "net_clients_are_confined",
+            net_tests::net_clients_are_confined,
+        ),
+        ("net_children_restart", net_tests::net_children_restart),
+        (
             "net_dhcp_configures_the_interface",
             net_tests::net_dhcp_configures_the_interface,
         ),

@@ -199,7 +199,12 @@ pub fn app_main() -> i32 {
         .get(1)
         .is_some_and(|a| a.as_slice() == b"stackless");
     let parent = env.handle(Role::ServiceInit);
-    let want_dhcp = !env.startup.args.iter().skip(1).any(|a| a.as_slice() == b"nodhcp");
+    let want_dhcp = !env
+        .startup
+        .args
+        .iter()
+        .skip(1)
+        .any(|a| a.as_slice() == b"nodhcp");
 
     let (hs, c) = match claim(devmgr_ch) {
         Ok(x) => x,

@@ -31,7 +31,13 @@ fn dotted(a: [u8; 4]) -> alloc::string::String {
     format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
 }
 
-fn apply(actions: alloc::vec::Vec<Action>, udp: &mut Udp, cfg: &mut Net, blob: &netblob::Blob, acquired_ns: u64) {
+fn apply(
+    actions: alloc::vec::Vec<Action>,
+    udp: &mut Udp,
+    cfg: &mut Net,
+    blob: &netblob::Blob,
+    acquired_ns: u64,
+) {
     for a in actions {
         match a {
             Action::Send { payload, to } => {
@@ -51,7 +57,14 @@ fn apply(actions: alloc::vec::Vec<Action>, udp: &mut Udp, cfg: &mut Net, blob: &
                     t2_s: l.t2_s,
                     acquired_ns,
                 }));
-                rt::println!("dhcpc: bound {} mask {} router {} dns {} lease {} s", dotted(l.addr), dotted(l.mask), dotted(l.router), dotted(l.dns), l.lease_s);
+                rt::println!(
+                    "dhcpc: bound {} mask {} router {} dns {} lease {} s",
+                    dotted(l.addr),
+                    dotted(l.mask),
+                    dotted(l.router),
+                    dotted(l.dns),
+                    l.lease_s
+                );
             }
             Action::Deconfigure => {
                 let _ = cfg.clear_config(sys::clock_get() + 3000);
@@ -68,19 +81,29 @@ pub fn app_main() -> i32 {
         Ok(p) => p,
         Err(c) => return c,
     };
-    let (Some(svc), Some(blob_vmo)) = (p.env.namespace(b"/svc"), p.env.handle(Role::NetConfigBlob)) else {
+    let (Some(svc), Some(blob_vmo)) = (p.env.namespace(b"/svc"), p.env.handle(Role::NetConfigBlob))
+    else {
         return 3;
     };
     let me = sys::process_self().a1 as u32;
     if sys::process_map(me, blob_vmo, BLOB_VA, 0, 4096, 3).status != 0 {
         return 4;
     }
-    let blob = netblob::Blob { base: BLOB_VA as usize };
+    let blob = netblob::Blob {
+        base: BLOB_VA as usize,
+    };
     let mut fs = Fs::new(svc);
-    let (Ok(mut priv_net), Ok(mut cfg)) = (Net::connect(&mut fs, b"net-priv", sys::clock_get() + 30_000), Net::connect(&mut fs, b"net-config", sys::clock_get() + 30_000)) else {
+    let (Ok(mut priv_net), Ok(mut cfg)) = (
+        Net::connect(&mut fs, b"net-priv", sys::clock_get() + 30_000),
+        Net::connect(&mut fs, b"net-config", sys::clock_get() + 30_000),
+    ) else {
         return 5;
     };
-    let Ok(mut udp) = priv_net.open_udp(68, proto::net::oflags::BROADCAST | proto::net::oflags::SRC_ANY, sys::clock_get() + 5000) else {
+    let Ok(mut udp) = priv_net.open_udp(
+        68,
+        proto::net::oflags::BROADCAST | proto::net::oflags::SRC_ANY,
+        sys::clock_get() + 5000,
+    ) else {
         return 6;
     };
     // wait for the link (the driver attaches a moment after the stack starts)
@@ -102,7 +125,16 @@ pub fn app_main() -> i32 {
     let first = match blob.read_lease() {
         Some(l) => {
             acquired_ns = l.acquired_ns;
-            let lease = Lease { addr: l.addr, mask: l.mask, router: l.router, dns: l.dns, server: l.server, lease_s: l.lease_s, t1_s: l.t1_s, t2_s: l.t2_s };
+            let lease = Lease {
+                addr: l.addr,
+                mask: l.mask,
+                router: l.router,
+                dns: l.dns,
+                server: l.server,
+                lease_s: l.lease_s,
+                t1_s: l.t1_s,
+                t2_s: l.t2_s,
+            };
             rt::println!("dhcpc: resuming a lease for {}", dotted(l.addr));
             client.resume(lease, l.acquired_ns, now_ns())
         }
@@ -111,7 +143,9 @@ pub fn app_main() -> i32 {
     apply(first, &mut udp, &mut cfg, &blob, acquired_ns);
     loop {
         let now_t = sys::clock_get();
-        let deadline = client.next_deadline().map_or(now_t + 1000, |ns| (ns / 1_000_000).max(now_t));
+        let deadline = client
+            .next_deadline()
+            .map_or(now_t + 1000, |ns| (ns / 1_000_000).max(now_t));
         match udp.recv(deadline.min(now_t + 1000)) {
             Ok(d) => {
                 let acts = client.on_packet(&d.payload, now_ns());

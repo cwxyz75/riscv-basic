@@ -55,9 +55,11 @@ impl Blob {
     /// Run `f` as the single writer of the half at `off`: seq odd during, even after.
     fn write(&self, off: usize, f: impl FnOnce(&dyn Fn(usize, u32))) {
         let seq = self.word(off, 0).load(Ordering::Relaxed);
-        self.word(off, 0).store(seq.wrapping_add(1) | 1, Ordering::Release);
+        self.word(off, 0)
+            .store(seq.wrapping_add(1) | 1, Ordering::Release);
         f(&|i, v| self.word(off, i).store(v, Ordering::Relaxed));
-        self.word(off, 0).store((seq.wrapping_add(1) | 1).wrapping_add(1), Ordering::Release);
+        self.word(off, 0)
+            .store((seq.wrapping_add(1) | 1).wrapping_add(1), Ordering::Release);
     }
 
     /// Read the half at `off` as words, retrying until the sequence number is even and unchanged.
@@ -94,13 +96,32 @@ impl Blob {
 
     pub fn read_iface(&self) -> Option<Iface> {
         let r = self.read::<6>(IFACE)?;
-        (r[1] == 1).then(|| Iface { addr: b(r[2]), mask: b(r[3]), gateway: b(r[4]), dns: b(r[5]) })
+        (r[1] == 1).then(|| Iface {
+            addr: b(r[2]),
+            mask: b(r[3]),
+            gateway: b(r[4]),
+            dns: b(r[5]),
+        })
     }
 
     pub fn write_lease(&self, l: Option<Lease>) {
         self.write(LEASE, |set| match l {
             Some(l) => {
-                for (i, v) in [w(l.server), w(l.addr), w(l.mask), w(l.router), w(l.dns), l.lease_s, l.t1_s, l.t2_s, l.acquired_ns as u32, (l.acquired_ns >> 32) as u32].into_iter().enumerate() {
+                for (i, v) in [
+                    w(l.server),
+                    w(l.addr),
+                    w(l.mask),
+                    w(l.router),
+                    w(l.dns),
+                    l.lease_s,
+                    l.t1_s,
+                    l.t2_s,
+                    l.acquired_ns as u32,
+                    (l.acquired_ns >> 32) as u32,
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     set(2 + i, v);
                 }
                 set(1, 1);
