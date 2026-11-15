@@ -676,7 +676,7 @@ resume. The object lock stays one lock (owner defers to the spec; revisit on its
 Every task keeps the system bootable and green; every kernel or security task marked Fable gets an independent review in its
 own small PR, and the lock-peel tasks also get a soak run (`make soak`), at `-smp 1, 2 and 4`.
 
-### F: The disk filesystem (draft spec in `FS-SPEC.md`; not started; after S9)
+### F: Cambium, the disk filesystem (draft spec in `FS-SPEC.md`; not started; after S9)
 
 Acceptance: the eight checks in `FS-SPEC.md` section 9 (tree model, exhaustive crash testing, `memfs` differential, corruption,
 independent `fsck`, full volume, QEMU restart, confinement). Steps 0 to 6 are listed there; step 0 (attributes, indexes and

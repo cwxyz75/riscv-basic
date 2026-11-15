@@ -1,4 +1,6 @@
-# FS-SPEC: the disk filesystem (specification, draft v0, 2026-11-15)
+# FS-SPEC: Cambium, the disk filesystem (specification, draft v0, 2026-11-15)
+
+**Name:** Cambium (the growing layer of a tree: new wood added, old rings untouched). Chosen by the owner 2026-11-15 as a working name that may change. Tools follow the Unix convention: `mkfs.cambium`, `fsck.cambium`, `dump.cambium`; crates `cambium` (pure format) and `cambiumd` (server) are proposed, nothing claims the bare `fsck`.
 
 Status: **draft v0; the four decisions in section 2 are the owner's (2026-11-15); everything else is a proposal.** Nothing is
 built. This is the written acceptance contract for slice F (CLAUDE.md: spec, acceptance checks, code, independent review). Basis:
