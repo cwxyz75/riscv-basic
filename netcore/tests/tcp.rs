@@ -737,3 +737,57 @@ fn a_connection_whose_owner_has_unread_data_stays_in_the_table_until_it_has_read
         "and the release came last"
     );
 }
+
+#[test]
+fn a_half_open_connection_that_dies_gives_its_posted_accept_back() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 1, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("the SYN took the accept", |n| {
+        n.b.core.tcp_conn_count() == 1
+    });
+    assert_eq!(n.b.core.tcp_posted_accepts(l), 0);
+    // the initiator vanishes (a restart): its fresh stack resets the SYN-ACK
+    n.a = Host::new(MAC_A, IP_A);
+    n.run_until("the accept is back", |n| {
+        n.b.core.tcp_posted_accepts(l) == 1
+    });
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+    // and it still works for a real connection
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), n.now).unwrap();
+    n.run_until("accepted", |n| {
+        has_event(&n.b, |e| matches!(e, TcpEvent::Accepted { .. }))
+    });
+}
+
+#[test]
+fn a_syn_ack_that_times_out_gives_its_posted_accept_back() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 1, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("took", |n| n.b.core.tcp_conn_count() == 1);
+    // a is silenced: it never answers the SYN-ACK
+    n.a = Host::new(MAC_A, IP_A);
+    n.a.core.link(false); // (its link is down: the SYN-ACK is never answered, not even with a reset)
+    n.run_for(8_000 * MS);
+    assert_eq!(
+        n.b.core.tcp_posted_accepts(l),
+        1,
+        "the accept came back after the SYN-ACK gave up"
+    );
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+}
+
+#[test]
+fn cancelling_an_accept_a_syn_already_took_drops_the_half_open_connection() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 7, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("took", |n| n.b.core.tcp_conn_count() == 1);
+    assert!(n.b.core.tcp_cancel_accept(l, 7));
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+    assert_eq!(n.b.core.tcp_posted_accepts(l), 0, "and it was not put back");
+}

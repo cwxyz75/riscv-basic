@@ -457,7 +457,7 @@ pub struct Listener {
     ch: u32,
     pub port: u16,
     /// `(cookie, the new stream's channel, its socket end)` for each accept the stack holds.
-    posted: Vec<(u32, u32, u32)>,
+    posted: Vec<(u32, u32, u32, u32, u32)>,
     next_cookie: u32,
 }
 
@@ -491,7 +491,7 @@ impl Listener {
                 NetError::Sys(w.status)
             });
         }
-        self.posted.push((cookie, cmine, smine));
+        self.posted.push((cookie, cmine, smine, snd_buf, rcv_buf));
         Ok(())
     }
 
@@ -509,11 +509,25 @@ impl Listener {
                     let Some(i) = self.posted.iter().position(|p| p.0 == cookie) else {
                         continue;
                     };
-                    let (_, ch, sock) = self.posted.swap_remove(i);
+                    let (_, ch, sock, snd, rcv) = self.posted.swap_remove(i);
                     let mut s = Stream::new(ch, sock);
                     s.connected = Some((local, remote));
-                    let _ = self.post(0, 0);
+                    // (a replacement with the same buffers, so the backlog keeps its size in bytes)
+                    let _ = self.post(snd, rcv);
                     return Ok(s);
+                }
+                // a refused post (quota, a bad handle): forget that accept and give its handles back
+                Some(EpEvent::Notice {
+                    code: pn::notice::CONNECT_FAILED,
+                    cookie,
+                    ..
+                }) => {
+                    if let Some(i) = self.posted.iter().position(|p| p.0 == cookie) {
+                        let (_, c, s, _, _) = self.posted.swap_remove(i);
+                        sys::handle_close(c);
+                        sys::handle_close(s);
+                    }
+                    continue;
                 }
                 Some(EpEvent::Notice { .. }) => continue,
                 _ => return Err(NetError::Garbled),
@@ -528,7 +542,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        for (_, c, s) in self.posted.drain(..) {
+        for (_, c, s, _, _) in self.posted.drain(..) {
             sys::handle_close(c);
             sys::handle_close(s);
         }

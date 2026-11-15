@@ -1545,6 +1545,26 @@ pub fn net_streams_over_loopback() -> Outcome {
         );
         let _ = &mut c;
         drop((c, s));
+        // ---- write and leave: the stack keeps what was queued and finishes it as an orphan (review 2026-11-15, finding 3)
+        let (mut c, mut s, _l3) = pair(&mut net, 7002)?;
+        let blob: Vec<u8> = (0..60_000usize).map(|i| pattern(5, i)).collect();
+        c.write_all(&blob, t(5000)).map_err(|_| msg_at(line!()))?;
+        drop(c);
+        let mut got = Vec::new();
+        let mut piece = [0u8; 4096];
+        loop {
+            match s.read(&mut piece, t(5000)) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&piece[..n]),
+                Err(_) => return Err(msg_at(line!())),
+            }
+        }
+        ensure!(
+            got == blob,
+            "all 60,000 bytes arrived, and then a clean end of stream ({} bytes)",
+            got.len()
+        );
+        drop(s);
         // ---- refused: nothing listens
         ensure_eq!(
             net.connect_stream([10, 0, 2, 15], 7999, 0, 0, 0, t(5000))
@@ -1637,7 +1657,56 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
             "the reservations came back when the streams were closed"
         );
         drop(again);
+        // ---- accepts reserve at the SYN, not at the post: six big accepts post fine, and only as many as the account can pay for
+        // are taken (4 of about 128 KiB in 512 KiB); the fifth connect gets no answer until a stream is gone
+        drop(l); // (its posted accepts and the connection `again` took go with it)
+        nap(1500)?; // (the orphans of the streams above finish and give their reservations back)
+        let mut big = server
+            .listen_stream(7101, 0, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        for _ in 0..6 {
+            big.post(65536, 65535).map_err(|_| msg_at(line!()))?;
+        }
+        let mut cs = Vec::new();
+        for i in 0..4 {
+            match client.connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(5000)) {
+                Ok(c) => cs.push(c),
+                Err(e) => {
+                    let mut d = Detail::new();
+                    let _ =
+                        core::fmt::Write::write_fmt(&mut d, format_args!("big accept {i}: {e:?}"));
+                    return Err(d);
+                }
+            }
+        }
+        let mut ss = Vec::new();
+        for _ in 0..4 {
+            ss.push(big.accept(t(5000)).map_err(|_| msg_at(line!()))?);
+        }
+        ensure!(
+            client
+                .connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(2500))
+                .is_err(),
+            "a fifth big accept does not fit the server's account: its SYN is dropped"
+        );
+        drop(ss.pop());
+        drop(cs.pop());
+        let mut fourth = None;
+        for _ in 0..4 {
+            if let Ok(c) = client.connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(9000)) {
+                fourth = Some(c);
+                break;
+            }
+        }
+        ensure!(
+            fourth.is_some(),
+            "once a stream is gone the next SYN is taken"
+        );
+        drop((fourth, cs, ss, big));
         // ---- bad handles: a channel where a socket belongs, one socket used twice, both ends of one pair
+        let _lb = server
+            .listen_stream(7102, 2, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
         let open_raw = |net: &mut rt::net::Net| -> Result<u32, Detail> {
             let c = sys::channel_create();
             ensure_eq!(c.status, 0, "an endpoint channel");
@@ -1656,7 +1725,7 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
         };
         // sends Connect with `h` and returns what the stack answered first: Ok(true) Connected, Ok(false) failed with `status`
         let try_connect = |mine: u32, h: u32| -> Result<Result<(), i32>, Detail> {
-            let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7100, 0, 0);
+            let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7102, 0, 0);
             let w = sys::channel_write(mine, msg.as_ptr(), msg.len(), [h].as_ptr(), 1);
             ensure_eq!(w.status, 0, "the connect request was sent");
             let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(3000));

@@ -179,6 +179,9 @@ struct Netd {
     held_socks: Vec<(u64, u64)>,
     /// What each live core connection reserved against its account (released when the connection leaves the table).
     charged: BTreeMap<ConnId, (AccountId, u32)>,
+    /// Streams whose channel closed while established: the socket is kept and read into the connection until the client's
+    /// end is gone and empty (then the connection is released as an orphan), at most 20 s. `(socket, since in ticks)`.
+    draining: BTreeMap<ConnId, (u32, u64)>,
     stream_rr: usize,
     more: bool,
     blob: Option<netblob::Blob>,
@@ -361,6 +364,7 @@ impl Netd {
                 self.detach();
             }
             // nothing to move: sleep until an event or the next timer (not a busy loop while there is no driver)
+            self.refresh_accept_gates();
             let ev = self.net.poll(now_ns());
             self.apply(ev);
             self.drain_tcp();
@@ -371,6 +375,7 @@ impl Netd {
             return;
         }
         netring::Mem::store(&self.shm, ctl::NET_WAITING, 0);
+        self.refresh_accept_gates();
         let mut moved = false;
         let now = now_ns();
         // reclaim finished transmits
@@ -1103,11 +1108,8 @@ impl Netd {
         let account = self.account_of_key(key);
         let (snd, rcv) = clamp_bufs(snd_buf, rcv_buf);
         let bytes = (snd + rcv) as u32;
-        // (S9-SPEC 6.2 reserves when a SYN takes the accept; this reserves when it is posted: TIDY-UP T97)
-        if self.core.accounts().charge_stream(account, bytes).is_err() {
-            self.forget_socket(sock);
-            return refuse(self, pn::status::QUOTA);
-        }
+        // nothing is reserved yet: the buffers are committed when a SYN takes this accept (S9-SPEC 6.2), and a SYN takes it only
+        // if `refresh_accept_gates` found room for them
         let acc = self.next_accept;
         self.next_accept = self.next_accept.wrapping_add(1).max(1);
         let mut st = StreamState::new(account);
@@ -1119,7 +1121,6 @@ impl Netd {
         st.listener = Some(key);
         st.lid = Some(lid);
         let Some(skey) = self.core.add_conn(ch, account, Conn::Stream(Box::new(st))) else {
-            self.core.accounts().release_stream(account, bytes);
             self.forget_socket(sock);
             return refuse(self, pn::status::QUOTA);
         };
@@ -1129,7 +1130,10 @@ impl Netd {
             mss: TCP_MSS,
             nodelay: false,
         };
-        if self.net.tcp_post_accept(lid, acc, cfg).is_err() {
+        if self.net.tcp_post_accept(lid, acc, cfg).is_ok() {
+            self.net.tcp_set_accept_ok(lid, acc, false);
+            self.more = true;
+        } else {
             // (closing the stream's connection runs `stream_closed`, which gives the reservation and the socket back)
             self.core.close_conn(skey);
             self.notice(
@@ -1152,34 +1156,31 @@ impl Netd {
                     self.net.tcp_cancel_accept(lid, st.accept_cookie);
                 }
                 self.accepts.remove(&st.accept_cookie);
-                self.core.accounts().release_stream(st.account, st.reserved);
-                let _ = self.core.accounts().close(st.account);
+                // (a posted accept holds no reservation; a half-open connection it was taken by went with `tcp_cancel_accept`)
                 if let Some(sock) = st.sock {
                     self.forget_socket(sock);
                     sys::handle_close(sock);
                 }
             }
             Phase::Connecting | Phase::Established | Phase::Over => {
-                if let (Some(id), Some(sock)) = (st.core, st.sock) {
-                    // take what the client had already written, then let the connection finish what it can as an orphan
-                    for _ in 0..4 {
-                        let space = self.net.tcp_send_space(id);
-                        if space == 0 {
-                            break;
-                        }
-                        let mut buf = [0u8; PIECE];
-                        let r = sys::socket_read(sock, buf.as_mut_ptr(), space.min(PIECE));
-                        if r.status != 0 || r.a1 == 0 {
-                            break;
-                        }
-                        self.net.tcp_write(id, &buf[..r.a1]);
+                match (st.core, st.sock) {
+                    // an established stream: keep its socket and read what the client wrote into the connection as room
+                    // appears (a program that writes 100 KiB and exits must not lose most of it); `pump_draining` releases
+                    // the connection as an orphan when the socket is empty and the client's end gone
+                    (Some(id), Some(sock)) if st.phase == Phase::Established => {
+                        self.draining.insert(id, (sock, sys::clock_get()));
+                        self.more = true;
                     }
-                    self.net.tcp_release(id, now_ns());
-                    self.more = true;
-                }
-                if let Some(sock) = st.sock {
-                    self.forget_socket(sock);
-                    sys::handle_close(sock);
+                    (core, sock) => {
+                        if let Some(id) = core {
+                            self.net.tcp_release(id, now_ns());
+                            self.more = true;
+                        }
+                        if let Some(sock) = sock {
+                            self.forget_socket(sock);
+                            sys::handle_close(sock);
+                        }
+                    }
                 }
             }
         }
@@ -1192,6 +1193,42 @@ impl Netd {
     }
 
     // ---- what the core reports
+
+    /// Tell the core which posted accepts a SYN may take: those whose owner's account (and the pool) has room for their
+    /// buffers right now, counting the ones admitted before them in this pass.
+    fn refresh_accept_gates(&mut self) {
+        if self.accepts.is_empty() {
+            return;
+        }
+        let list: Vec<(u32, u64)> = self.accepts.iter().map(|(&c, &k)| (c, k)).collect();
+        let head = |d: &mut Netd, a: AccountId| -> u64 {
+            let acc = d.core.accounts();
+            let lim = acc.limits(a).map_or(0, |l| u64::from(l.stream_bytes));
+            lim.saturating_sub(u64::from(acc.stream_usage(a).unwrap_or(u32::MAX)))
+        };
+        let mut pool = head(self, svc::ROOT);
+        let mut used: BTreeMap<AccountId, u64> = BTreeMap::new();
+        for (cookie, skey) in list {
+            let (account, lid, bytes) = match self.core.conn(skey) {
+                Some(Conn::Stream(st)) if st.phase == Phase::Posted => {
+                    (st.account, st.lid, u64::from(st.reserved))
+                }
+                _ => continue,
+            };
+            let Some(lid) = lid else { continue };
+            let taken = *used.get(&account).unwrap_or(&0);
+            let room = head(self, account).saturating_sub(taken);
+            let ok = bytes <= room && bytes <= pool;
+            if ok {
+                *used.entry(account).or_insert(0) += bytes;
+                pool -= bytes;
+            }
+            rt::println!(
+                "netd: gate cookie {cookie} bytes {bytes} room {room} pool {pool} ok {ok}"
+            );
+            self.net.tcp_set_accept_ok(lid, cookie, ok);
+        }
+    }
 
     fn drain_tcp(&mut self) {
         for ev in self.net.take_tcp_events() {
@@ -1242,19 +1279,16 @@ impl Netd {
                     return;
                 };
                 self.streams.insert(conn, skey);
-                let (account, reserved, lkey) = match self.core.conn_mut(skey) {
+                let lkey = match self.core.conn_mut(skey) {
                     Some(Conn::Stream(st)) => {
                         st.core = Some(conn);
-                        let r = (st.account, core::mem::take(&mut st.reserved), st.listener);
-                        st.listener = None;
-                        r
+                        st.listener.take()
                     }
                     _ => {
                         self.net.tcp_abort(conn);
                         return;
                     }
                 };
-                self.charged.insert(conn, (account, reserved));
                 let cookie = self.establish(skey);
                 if let Some(lkey) = lkey {
                     let _ = self.core.send(
@@ -1287,10 +1321,11 @@ impl Netd {
             }
             TcpEvent::PeerFin { conn } => {
                 if let Some(&key) = self.streams.get(&conn) {
+                    // (the notice goes out just before the socket is shut down, when every byte before the FIN has been
+                    // delivered: a client that sees PeerFin may take end-of-file as the clean end: S9-SPEC 8.5)
                     if let Some(Conn::Stream(st)) = self.core.conn_mut(key) {
                         st.fin_seen = true;
                     }
-                    self.notice(key, pn::notice::PEER_FIN, 0, 0);
                 }
             }
             TcpEvent::Reset { conn, reason } => {
@@ -1319,15 +1354,46 @@ impl Netd {
                     self.notice(lkey, pn::notice::ACCEPT_STARVED, 0, 0);
                 }
             }
+            TcpEvent::AcceptTaken {
+                cookie,
+                conn,
+                bytes,
+                ..
+            } => {
+                // a SYN took a posted accept: the buffers are committed now, so they are charged now (S9-SPEC 6.2)
+                let account = self
+                    .accepts
+                    .get(&cookie)
+                    .and_then(|&k| match self.core.conn(k) {
+                        Some(Conn::Stream(st)) => Some(st.account),
+                        _ => None,
+                    });
+                match account {
+                    Some(a) if self.core.accounts().charge_stream(a, bytes as u32).is_ok() => {
+                        self.charged.insert(conn, (a, bytes as u32));
+                    }
+                    // no room after all (another stream took it first): reset it; the accept goes back to its listener
+                    _ => self.net.tcp_abort(conn),
+                }
+            }
             TcpEvent::Released { conn } => {
+                if let Some((sock, _)) = self.draining.remove(&conn) {
+                    self.forget_socket(sock);
+                    sys::handle_close(sock);
+                }
                 // the connection left the table: if its peer's FIN was delivered but the socket not yet shut down, do it now
                 // (a FIN that arrives with nothing before it ends the connection in one step: the pump never sees it)
                 if let Some(&key) = self.streams.get(&conn) {
                     if let Some(Conn::Stream(st)) = self.core.conn_mut(key) {
                         if st.phase == Phase::Established && st.fin_seen && !st.sock_shut {
                             if let Some(sock) = st.sock {
-                                sys::socket_shutdown(sock);
                                 st.sock_shut = true;
+                                let _ = self.core.send(
+                                    key,
+                                    pn::encode_notice(pn::notice::PEER_FIN, 0, 0),
+                                    None,
+                                );
+                                sys::socket_shutdown(sock);
                             }
                         }
                     }
@@ -1407,17 +1473,62 @@ impl Netd {
     /// One pass over the streams: at most P of them (round robin), moving bytes between the core and the client sockets.
     /// Returns whether anything moved.
     fn pump_streams(&mut self) -> bool {
+        let mut moved = self.pump_draining();
         let ids: Vec<u64> = self.streams.values().copied().collect();
         if ids.is_empty() {
-            return false;
+            return moved;
         }
         let n = ids.len().min(P_STREAMS);
         let start = self.stream_rr % ids.len();
         self.stream_rr = self.stream_rr.wrapping_add(n);
-        let mut moved = false;
         let now = sys::clock_get();
         for i in 0..n {
             moved |= self.pump_stream(ids[(start + i) % ids.len()], now);
+        }
+        moved
+    }
+
+    /// Streams whose owner is gone: move what the client had written, then release the connection as an orphan.
+    fn pump_draining(&mut self) -> bool {
+        if self.draining.is_empty() {
+            return false;
+        }
+        let now = sys::clock_get();
+        let ids: Vec<ConnId> = self.draining.keys().copied().collect();
+        let mut moved = false;
+        for id in ids {
+            let Some(&(sock, since)) = self.draining.get(&id) else {
+                continue;
+            };
+            let mut done = self.net.tcp_info(id).is_none() || now.saturating_sub(since) > 20_000;
+            if !done {
+                for _ in 0..4 {
+                    let space = self.net.tcp_send_space(id);
+                    if space == 0 {
+                        break;
+                    }
+                    let mut buf = [0u8; PIECE];
+                    let r = sys::socket_read(sock, buf.as_mut_ptr(), space.min(PIECE));
+                    match r.status() {
+                        Some(Sys::Ok) if r.a1 > 0 => {
+                            self.net.tcp_write(id, &buf[..r.a1]);
+                            moved = true;
+                        }
+                        Some(Sys::PeerClosed) => {
+                            done = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            if done {
+                self.draining.remove(&id);
+                self.net.tcp_release(id, now_ns());
+                self.forget_socket(sock);
+                sys::handle_close(sock);
+                moved = true;
+            }
         }
         moved
     }
@@ -1476,10 +1587,12 @@ impl Netd {
         }
         // the peer's FIN and every byte before it delivered: now the client may read end-of-file (PeerFin went first)
         if !sock_shut && self.net.tcp_eof(id) {
-            sys::socket_shutdown(sock);
             if let Some(Conn::Stream(st)) = self.core.conn_mut(key) {
                 st.sock_shut = true;
             }
+            // PeerFin first (it queues behind nothing the client has not seen), then the end of the byte stream
+            self.notice(key, pn::notice::PEER_FIN, 0, 0);
+            sys::socket_shutdown(sock);
             moved = true;
         }
         // the send path: bytes the client wrote, from its socket into S
@@ -1735,6 +1848,7 @@ pub fn app_main() -> i32 {
         next_accept: 1,
         held_socks: Vec::new(),
         charged: BTreeMap::new(),
+        draining: BTreeMap::new(),
         stream_rr: 0,
         more: true,
         blob: None,
