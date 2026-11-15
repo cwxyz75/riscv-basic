@@ -1834,3 +1834,107 @@ pub fn net_streams_survive_a_stack_restart() -> Outcome {
     f.close();
     r
 }
+
+/// S9 step 4c: the host's own TCP (through `hostfwd=tcp`) as the independent client of a guest listener. The guest echoes until
+/// the host's end of stream, then ends its own side; the harness checks 200,000 bytes came back byte for byte and cleanly.
+pub fn net_tcp_echo_for_the_host() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let mut l = net
+            .listen_stream(7778, 2, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        sys::debug_write(b"s9: tcpecho ready\n");
+        let Ok(mut s) = l.accept(t(40_000)) else {
+            sys::debug_write(
+                b"s9: no host TCP client came (the harness did not start one): skipped\n",
+            );
+            return Ok(());
+        };
+        let mut buf = [0u8; 8192];
+        let mut total = 0usize;
+        loop {
+            match s.read(&mut buf, t(30_000)) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    s.write_all(&buf[..n], t(30_000))
+                        .map_err(|_| msg_at(line!()))?;
+                }
+                Err(_) => return Err(msg_at(line!())),
+            }
+        }
+        s.shutdown_write();
+        ensure_eq!(total, 200_000, "the host's 200,000 bytes were echoed");
+        nap(300)?;
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// The other direction: the guest connects to a TCP server on the host (10.0.2.2 through slirp), reads a greeting and 300,000
+/// bytes, sends 100,000 bytes back and shuts its side down. The harness checks what the server received.
+pub fn net_tcp_to_the_host_server() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let mut s = match net.connect_stream([10, 0, 2, 2], 47802, 0, 0, 0, t(8000)) {
+            Ok(s) => s,
+            Err(Stack(10)) | Err(NetError::TimedOut) => {
+                sys::debug_write(
+                    b"s9: no host TCP server on 47802 (the harness did not start one): skipped\n",
+                );
+                return Ok(());
+            }
+            Err(_) => return Err(msg_at(line!())),
+        };
+        let mut greeting = [0u8; 16];
+        read_exact(&mut s, &mut greeting, t(10_000)).map_err(|_| msg_at(line!()))?;
+        ensure_eq!(&greeting, b"HELLO-FROM-HOST\n", "the server's greeting");
+        let mut got = 0usize;
+        let mut buf = [0u8; 8192];
+        while got < 300_000 {
+            let n = s.read(&mut buf, t(30_000)).map_err(|_| msg_at(line!()))?;
+            ensure!(n > 0, "the stream did not end early");
+            for (k, &b) in buf[..n].iter().enumerate() {
+                if b != pattern(3, got + k) {
+                    return Err(msg_at(line!()));
+                }
+            }
+            got += n;
+        }
+        ensure_eq!(
+            s.read(&mut buf, t(30_000)).map_err(|_| msg_at(line!()))?,
+            0,
+            "a clean end of stream after the 300,000 bytes"
+        );
+        let out: Vec<u8> = (0..100_000usize).map(|i| pattern(4, i)).collect();
+        if let Err(e) = s.write_all(&out, t(30_000)) {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut d,
+                format_args!("writing to the host server: {e:?}"),
+            );
+            return Err(d);
+        }
+        s.shutdown_write();
+        nap(500)?;
+        sys::debug_write(b"s9: host-tcp-server done\n");
+        Ok(())
+    })();
+    f.close();
+    r
+}

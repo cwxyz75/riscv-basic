@@ -709,7 +709,9 @@ impl Stream {
             return Ok(0);
         }
         loop {
-            let w = sys::socket_write(self.sock, data.as_ptr(), data.len());
+            // (one call takes at most the socket's buffer size)
+            let n = data.len().min(abi::limits::SOCKET_BUFFER);
+            let w = sys::socket_write(self.sock, data.as_ptr(), n);
             match w.status() {
                 Some(Status::Ok) if w.a1 > 0 => return Ok(w.a1),
                 Some(Status::Ok) | Some(Status::ShouldWait) => {
