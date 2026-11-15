@@ -48,27 +48,22 @@ pub mod status {
     pub const NOT_CONFIGURED: i32 = 7;
     pub const NO_BUFFERS: i32 = 8;
     pub const NOT_SUPPORTED: i32 = 9;
+    // S9 (stream endpoints, S9-SPEC 8)
+    pub const CONN_REFUSED: i32 = 10;
+    pub const TIMED_OUT: i32 = 11;
+    pub const CONN_RESET: i32 = 12;
+    pub const NOT_CONNECTED: i32 = 13;
+    pub const ALREADY_CONNECTED: i32 = 14;
+    pub const HOST_UNREACHABLE: i32 = 15;
+    /// A passed handle is not a usable socket (S9-SPEC 8.3).
+    pub const BAD_HANDLE: i32 = 16;
 }
 
 pub mod kind {
     pub const UDP: u16 = 1;
     pub const ICMP_ECHO: u16 = 2;
-}
-
-/// Values S8 leaves unused and S9 will define (S9-SPEC 8, S8-FOLLOWUP-SPEC item 1). Reserving them now means no S8
-/// decoder, client or test treats them as ordinary garbage that a later slice has to re-classify: the stack answers a
-/// reserved `Open` kind `NOT_SUPPORTED` (and any other unknown kind `BAD_REQUEST`), a reserved endpoint op is a violation
-/// like any unknown op, and a client skips a notice code it does not know.
-pub mod reserved {
-    use core::ops::RangeInclusive;
-    /// `Open` kinds 3 (`TcpStream`) and 4 (`TcpListener`).
-    pub const KINDS: RangeInclusive<u16> = 3..=4;
-    /// Reply statuses 10 to 16 (`ConnRefused` .. `BadHandle`).
-    pub const STATUSES: RangeInclusive<i32> = 10..=16;
-    /// Client-to-stack endpoint ops 16 to 19 (`Connect`, `Abort`, `SetOption`, `Accept`).
-    pub const EP_OPS: RangeInclusive<u8> = 16..=19;
-    /// Notice codes 16 to 21 (`Connected` .. `AcceptStarved`).
-    pub const NOTICES: RangeInclusive<u16> = 16..=21;
+    pub const TCP_STREAM: u16 = 3;
+    pub const TCP_LISTENER: u16 = 4;
 }
 
 /// How the stack sees the `kind` of an `Open`.
@@ -76,8 +71,8 @@ pub mod reserved {
 pub enum OpenKind {
     Udp,
     IcmpEcho,
-    /// Defined by a later slice: `NOT_SUPPORTED`.
-    Reserved,
+    TcpStream,
+    TcpListener,
     /// Nothing: `BAD_REQUEST`.
     Invalid,
 }
@@ -86,7 +81,8 @@ pub fn classify_open_kind(k: u16) -> OpenKind {
     match k {
         kind::UDP => OpenKind::Udp,
         kind::ICMP_ECHO => OpenKind::IcmpEcho,
-        k if reserved::KINDS.contains(&k) => OpenKind::Reserved,
+        kind::TCP_STREAM => OpenKind::TcpStream,
+        kind::TCP_LISTENER => OpenKind::TcpListener,
         _ => OpenKind::Invalid,
     }
 }
@@ -97,7 +93,9 @@ pub mod oflags {
     pub const BROADCAST: u32 = 1;
     /// May send from 0.0.0.0 while unconfigured (privileged only).
     pub const SRC_ANY: u32 = 2;
-    pub const ALL: u32 = BROADCAST | SRC_ANY;
+    /// Streams: send segments at once, do not wait to coalesce (S9-SPEC 5.4).
+    pub const NODELAY: u32 = 4;
+    pub const ALL: u32 = BROADCAST | SRC_ANY | NODELAY;
 }
 
 /// Limits in one place (NET-SPEC 7.4, 10).
@@ -114,6 +112,13 @@ pub mod limits {
     pub const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
     /// The most ARP entries `GetArp` returns.
     pub const ARP_MAX: usize = 64;
+    /// Stream buffers: the default each, the range, and the cap on the receive buffer (no window scaling).
+    pub const STREAM_BUF_DEFAULT: u32 = 16 * 1024;
+    pub const STREAM_BUF_MIN: u32 = 4 * 1024;
+    pub const STREAM_BUF_MAX: u32 = 64 * 1024;
+    pub const STREAM_RCV_BUF_MAX: u32 = 65_535;
+    /// Posted accepts one listener may hold.
+    pub const POSTED_ACCEPTS_MAX: usize = 16;
 }
 
 pub const REQUEST_HEADER: usize = 8;
@@ -297,10 +302,18 @@ pub mod ep {
     /// Client to stack.
     pub const SEND_UDP: u8 = 1;
     pub const SEND_ECHO: u8 = 2;
+    /// Streams (S9): `Connect` carries one handle, the client's socket end; `Accept` carries two, the client's end of a new
+    /// endpoint channel and its socket end.
+    pub const CONNECT: u8 = 16;
+    pub const ABORT: u8 = 17;
+    pub const SET_OPTION: u8 = 18;
+    pub const ACCEPT: u8 = 19;
     /// Stack to client.
     pub const RECV: u8 = 0x81;
     pub const ECHO_REPLY: u8 = 0x82;
     pub const NOTICE: u8 = 0x83;
+    /// `Connected` and `Accepted`: a notice that also carries the four-tuple.
+    pub const CONN_INFO: u8 = 0x84;
 }
 
 /// `Notice` codes (a `netcore::notice` subset).
@@ -308,6 +321,27 @@ pub mod notice {
     pub const SEND_FAILED: u16 = 1;
     pub const LINK_DOWN: u16 = 2;
     pub const LINK_UP: u16 = 3;
+    // S9 (stream endpoints): the codes ride on `Notice` (detail below) or, for the two that name a tuple, on `CONN_INFO`
+    /// `CONN_INFO`: an active open completed.
+    pub const CONNECTED: u16 = 16;
+    /// `detail` is a status: `CONN_REFUSED`, `TIMED_OUT`, `HOST_UNREACHABLE`, ...
+    pub const CONNECT_FAILED: u16 = 17;
+    /// The peer closed its side; end-of-file on the socket after this is clean.
+    pub const PEER_FIN: u16 = 18;
+    /// `detail`: 1 the peer reset, 2 retransmission gave up, 3 aborted locally, 4 the link or configuration went away.
+    pub const RESET: u16 = 19;
+    /// `CONN_INFO` on a listener's channel: a posted accept became an established connection (`cookie` names it).
+    pub const ACCEPTED: u16 = 20;
+    /// SYNs are being dropped for want of posted accepts.
+    pub const ACCEPT_STARVED: u16 = 21;
+}
+
+/// `Reset` reasons (the `detail` of a `RESET` notice).
+pub mod reset_reason {
+    pub const PEER_RESET: u32 = 1;
+    pub const TIMED_OUT: u32 = 2;
+    pub const ABORTED: u32 = 3;
+    pub const LINK_LOST: u32 = 4;
 }
 
 /// Messages a client sends on an endpoint channel.
@@ -325,6 +359,30 @@ pub enum EpRequest<'a> {
         seq: u16,
         payload: &'a [u8],
     },
+    /// On a stream endpoint, with one handle (a socket end). Buffer sizes 0 mean the default.
+    Connect {
+        cookie: u32,
+        dst: [u8; 4],
+        port: u16,
+        snd_buf: u32,
+        rcv_buf: u32,
+    },
+    Abort,
+    SetOption {
+        option: u16,
+        value: u32,
+    },
+    /// On a listener endpoint, with two handles (a new endpoint channel's client end, a socket end).
+    Accept {
+        cookie: u32,
+        snd_buf: u32,
+        rcv_buf: u32,
+    },
+}
+
+/// Stream options for `SetOption`.
+pub mod option {
+    pub const NODELAY: u16 = 1;
 }
 
 /// `kind u8 | pad[3] | cookie u32 | dst_addr u32 | dst_port_or_seq u16 | pad u16 | payload`.
@@ -346,26 +404,88 @@ pub fn encode_send_echo(cookie: u32, dst: [u8; 4], seq: u16, payload: &[u8]) -> 
 
 pub const EP_SEND_HEADER: usize = 16;
 
+/// `Connect`: `op u8 | pad[3] | cookie u32 | dst u32 | port u16 | pad u16 | snd_buf u32 | rcv_buf u32` (24 bytes).
+pub fn encode_connect(cookie: u32, dst: [u8; 4], port: u16, snd_buf: u32, rcv_buf: u32) -> Vec<u8> {
+    let mut b = alloc::vec![ep::CONNECT, 0, 0, 0];
+    b.extend_from_slice(&cookie.to_le_bytes());
+    b.extend_from_slice(&dst);
+    b.extend_from_slice(&port.to_le_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&snd_buf.to_le_bytes());
+    b.extend_from_slice(&rcv_buf.to_le_bytes());
+    b
+}
+
+pub fn encode_abort() -> Vec<u8> {
+    alloc::vec![ep::ABORT, 0, 0, 0]
+}
+
+/// `SetOption`: `op u8 | pad[3] | option u16 | pad u16 | value u32` (12 bytes).
+pub fn encode_set_option(option: u16, value: u32) -> Vec<u8> {
+    let mut b = alloc::vec![ep::SET_OPTION, 0, 0, 0];
+    b.extend_from_slice(&option.to_le_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&value.to_le_bytes());
+    b
+}
+
+/// `Accept`: `op u8 | pad[3] | cookie u32 | snd_buf u32 | rcv_buf u32` (16 bytes).
+pub fn encode_accept(cookie: u32, snd_buf: u32, rcv_buf: u32) -> Vec<u8> {
+    let mut b = alloc::vec![ep::ACCEPT, 0, 0, 0];
+    b.extend_from_slice(&cookie.to_le_bytes());
+    b.extend_from_slice(&snd_buf.to_le_bytes());
+    b.extend_from_slice(&rcv_buf.to_le_bytes());
+    b
+}
+
+/// Decode a client message on an endpoint channel. Total: anything malformed is `None`.
 pub fn decode_ep_request(b: &[u8]) -> Option<EpRequest<'_>> {
-    if b.len() < EP_SEND_HEADER || b[1..4] != [0, 0, 0] || b[14..16] != [0, 0] {
+    if b.len() < 4 || b[1..4] != [0, 0, 0] {
         return None;
     }
-    let cookie = rd_u32(b, 4)?;
-    let dst: [u8; 4] = b.get(8..12)?.try_into().ok()?;
-    let n = rd_u16(b, 12)?;
-    let payload = b.get(EP_SEND_HEADER..)?;
     match b[0] {
-        ep::SEND_UDP if payload.len() <= limits::UDP_MAX => Some(EpRequest::SendUdp {
-            cookie,
-            dst,
-            port: n,
-            payload,
+        ep::SEND_UDP | ep::SEND_ECHO => {
+            if b.len() < EP_SEND_HEADER || b[14..16] != [0, 0] {
+                return None;
+            }
+            let cookie = rd_u32(b, 4)?;
+            let dst: [u8; 4] = b.get(8..12)?.try_into().ok()?;
+            let n = rd_u16(b, 12)?;
+            let payload = b.get(EP_SEND_HEADER..)?;
+            match b[0] {
+                ep::SEND_UDP if payload.len() <= limits::UDP_MAX => Some(EpRequest::SendUdp {
+                    cookie,
+                    dst,
+                    port: n,
+                    payload,
+                }),
+                ep::SEND_ECHO if payload.len() <= limits::UDP_MAX - 8 => {
+                    Some(EpRequest::SendEcho {
+                        cookie,
+                        dst,
+                        seq: n,
+                        payload,
+                    })
+                }
+                _ => None,
+            }
+        }
+        ep::CONNECT if b.len() == 24 && b[14..16] == [0, 0] => Some(EpRequest::Connect {
+            cookie: rd_u32(b, 4)?,
+            dst: b.get(8..12)?.try_into().ok()?,
+            port: rd_u16(b, 12)?,
+            snd_buf: rd_u32(b, 16)?,
+            rcv_buf: rd_u32(b, 20)?,
         }),
-        ep::SEND_ECHO if payload.len() <= limits::UDP_MAX - 8 => Some(EpRequest::SendEcho {
-            cookie,
-            dst,
-            seq: n,
-            payload,
+        ep::ABORT if b.len() == 4 => Some(EpRequest::Abort),
+        ep::SET_OPTION if b.len() == 12 && b[6..8] == [0, 0] => Some(EpRequest::SetOption {
+            option: rd_u16(b, 4)?,
+            value: rd_u32(b, 8)?,
+        }),
+        ep::ACCEPT if b.len() == 16 => Some(EpRequest::Accept {
+            cookie: rd_u32(b, 4)?,
+            snd_buf: rd_u32(b, 8)?,
+            rcv_buf: rd_u32(b, 12)?,
         }),
         _ => None,
     }
@@ -391,6 +511,13 @@ pub enum EpEvent<'a> {
         code: u16,
         cookie: u32,
         detail: u32,
+    },
+    /// `Connected` (on a stream's channel) or `Accepted` (on a listener's): the four-tuple of the connection.
+    ConnInfo {
+        code: u16,
+        cookie: u32,
+        local: ([u8; 4], u16),
+        remote: ([u8; 4], u16),
     },
 }
 
@@ -422,6 +549,25 @@ pub fn encode_notice(code: u16, cookie: u32, detail: u32) -> Vec<u8> {
     b.extend_from_slice(&[0, 0]);
     b.extend_from_slice(&cookie.to_le_bytes());
     b.extend_from_slice(&detail.to_le_bytes());
+    b
+}
+
+/// `CONN_INFO`: `op u8 | pad[3] | code u16 | pad u16 | cookie u32 | local_addr u32 | local_port u16 | remote_port u16 |
+/// remote_addr u32` (24 bytes).
+pub fn encode_conn_info(
+    code: u16,
+    cookie: u32,
+    local: ([u8; 4], u16),
+    remote: ([u8; 4], u16),
+) -> Vec<u8> {
+    let mut b = alloc::vec![ep::CONN_INFO, 0, 0, 0];
+    b.extend_from_slice(&code.to_le_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&cookie.to_le_bytes());
+    b.extend_from_slice(&local.0);
+    b.extend_from_slice(&local.1.to_le_bytes());
+    b.extend_from_slice(&remote.1.to_le_bytes());
+    b.extend_from_slice(&remote.0);
     b
 }
 
@@ -462,6 +608,17 @@ pub fn decode_ep_event(b: &[u8]) -> Option<EpEvent<'_>> {
                 code: rd_u16(b, 4)?,
                 cookie: rd_u32(b, 8)?,
                 detail: rd_u32(b, 12)?,
+            })
+        }
+        ep::CONN_INFO => {
+            if b.len() != 24 || b[1..4] != [0, 0, 0] || b[6..8] != [0, 0] {
+                return None;
+            }
+            Some(EpEvent::ConnInfo {
+                code: rd_u16(b, 4)?,
+                cookie: rd_u32(b, 8)?,
+                local: (b.get(12..16)?.try_into().ok()?, rd_u16(b, 16)?),
+                remote: (b.get(20..24)?.try_into().ok()?, rd_u16(b, 18)?),
             })
         }
         _ => None,

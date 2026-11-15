@@ -1068,7 +1068,7 @@ pub fn net_clients_are_confined() -> Outcome {
             "the port is free again after the endpoint's channel closed"
         );
         drop(p80);
-        // S8 follow-up item 1: a reserved Open kind is NotSupported, a request with two handles is BadRequest, an
+        // S8 follow-up item 1 (kinds 3 and 4 are streams since S9): a request with two handles is BadRequest, an
         // unknown kind is BadRequest, and none of them leaves a handle or a connection behind
         let open = |net: &mut rt::net::Net, kind: u16, n_handles: usize| -> Result<i32, Detail> {
             let mut mine = Vec::new();
@@ -1097,23 +1097,18 @@ pub fn net_clients_are_confined() -> Outcome {
                 Err(_) => Err(msg_at(line!())),
             }
         };
-        let (bad, unsupported) = (pn_status(1), pn_status(9));
-        for kind in [3u16, 4] {
-            ensure_eq!(
-                open(&mut net, kind, 1)?,
-                unsupported,
-                "reserved kind {kind}"
-            );
-        }
+        let bad = pn_status(1);
         for kind in [0u16, 5, 99] {
             ensure_eq!(open(&mut net, kind, 1)?, bad, "unknown kind {kind}");
         }
         ensure_eq!(open(&mut net, 1, 2)?, bad, "UDP with two handles");
         ensure_eq!(
             open(&mut net, 3, 2)?,
-            unsupported,
-            "reserved kind with two handles"
+            bad,
+            "a stream endpoint with two handles"
         );
+        ensure_eq!(open(&mut net, 4, 2)?, bad, "a listener with two handles");
+        ensure_eq!(open(&mut net, 4, 1)?, bad, "a listener without a port");
         ensure_eq!(open(&mut net, 1, 0)?, bad, "UDP with no handle");
         let mut once = false;
         for _ in 0..50 {
@@ -1396,6 +1391,444 @@ pub fn net_ping_round_trip_is_measured() -> Outcome {
         let (p50, p99) = (rtts[rtts.len() / 2], rtts[rtts.len() * 99 / 100]);
         println!("##BENCH net_ping_rtt_p50 {p50} ns");
         println!("##BENCH net_ping_rtt_p99 {p99} ns");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+// ---------------------------------------------------------------------------------------------------- S9 streams
+
+use rt::net::NetError;
+use rt::net::NetError::Stack;
+
+fn pattern(seed: u32, i: usize) -> u8 {
+    (i as u32)
+        .wrapping_mul(2654435761)
+        .wrapping_add(seed)
+        .wrapping_shr(24) as u8
+}
+
+/// Read exactly `buf.len()` bytes from `s` (until `deadline`).
+fn read_exact(s: &mut rt::net::Stream, buf: &mut [u8], deadline: u64) -> Result<(), NetError> {
+    let mut got = 0;
+    while got < buf.len() {
+        let n = s.read(&mut buf[got..], deadline)?;
+        if n == 0 {
+            return Err(NetError::Closed);
+        }
+        got += n;
+    }
+    Ok(())
+}
+
+/// A connected loopback pair on `port`: (client, server, the listener that must stay open).
+fn pair(
+    net: &mut rt::net::Net,
+    port: u16,
+) -> Result<(rt::net::Stream, rt::net::Stream, rt::net::Listener), Detail> {
+    let t = |n: u64| sys::clock_get() + n;
+    let mut l = net
+        .listen_stream(port, 4, 0, t(3000))
+        .map_err(|_| msg_at(line!()))?;
+    let c = net
+        .connect_stream([10, 0, 2, 15], port, 0, 0, 0, t(5000))
+        .map_err(|e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("connect: {e:?}"));
+            d
+        })?;
+    let s = l.accept(t(5000)).map_err(|_| msg_at(line!()))?;
+    Ok((c, s, l))
+}
+
+/// Streams over loopback: echo in lockstep, a megabyte one way with both ends pumped from this thread, half-close, abort,
+/// refusal, the end-of-file rule, bad handles, and the quotas.
+pub fn net_streams_over_loopback() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        // ---- lockstep echo: 64 blocks of 4 KiB through the stack and back
+        let (mut c, mut s, _l) = pair(&mut net, 7000)?;
+        ensure_eq!(
+            c.remote(),
+            Some(([10, 0, 2, 15], 7000)),
+            "the client's view of the connection"
+        );
+        ensure_eq!(s.local(), Some(([10, 0, 2, 15], 7000)), "the server's view");
+        let mut block = [0u8; 4096];
+        let mut back = [0u8; 4096];
+        for i in 0..64usize {
+            for (k, b) in block.iter_mut().enumerate() {
+                *b = pattern(i as u32, k);
+            }
+            c.write_all(&block, t(5000)).map_err(|_| msg_at(line!()))?;
+            read_exact(&mut s, &mut back, t(5000)).map_err(|_| msg_at(line!()))?;
+            ensure!(back == block, "block {i} arrived intact at the server");
+            s.write_all(&back, t(5000)).map_err(|_| msg_at(line!()))?;
+            read_exact(&mut c, &mut back, t(5000)).map_err(|_| msg_at(line!()))?;
+            ensure!(back == block, "block {i} came back intact");
+        }
+        // ---- a megabyte one way, both ends pumped from here with immediate deadlines
+        let total = 1024 * 1024usize;
+        let (mut sent, mut got) = (0usize, 0usize);
+        let mut chunk = [0u8; 8192];
+        let mut rbuf = [0u8; 8192];
+        let until = sys::clock_get() + 60_000;
+        while got < total {
+            ensure!(
+                sys::clock_get() < until,
+                "the megabyte moved in a minute ({sent} sent, {got} received)"
+            );
+            if sent < total {
+                let n = (total - sent).min(chunk.len());
+                for (k, b) in chunk[..n].iter_mut().enumerate() {
+                    *b = pattern(9, sent + k);
+                }
+                if let Ok(w) = c.write(&chunk[..n], sys::clock_get()) {
+                    sent += w;
+                    // (a partial write: the unwritten tail is rewritten next time from the same offset)
+                }
+            }
+            if let Ok(n) = s.read(&mut rbuf, sys::clock_get()) {
+                for (k, &b) in rbuf[..n].iter().enumerate() {
+                    if b != pattern(9, got + k) {
+                        return Err(msg_at(line!()));
+                    }
+                }
+                got += n;
+            } else {
+                nap(1)?;
+            }
+        }
+        // ---- half-close both ways: end-of-file is clean only because PeerFin came first
+        c.shutdown_write();
+        let mut one = [0u8; 8];
+        let r = s.read(&mut one, t(5000));
+        if !matches!(r, Ok(0)) {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut d,
+                format_args!("server read after the client's shutdown: {r:?}"),
+            );
+            return Err(d);
+        }
+        s.write_all(b"still open", t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        let mut ten = [0u8; 10];
+        read_exact(&mut c, &mut ten, t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure_eq!(
+            &ten,
+            b"still open",
+            "a half-closed connection still carries the other direction"
+        );
+        s.shutdown_write();
+        ensure_eq!(
+            c.read(&mut one, t(5000)).map_err(|_| msg_at(line!()))?,
+            0,
+            "and the client reads the server's"
+        );
+        drop((c, s));
+        // ---- abort: the peer sees a reset, never a clean end
+        let (mut c, mut s, _l2) = pair(&mut net, 7001)?;
+        c.abort();
+        ensure_eq!(
+            s.read(&mut one, t(5000)).err(),
+            Some(Stack(proto::net::status::CONN_RESET)),
+            "an abort is a reset at the peer"
+        );
+        let _ = &mut c;
+        drop((c, s));
+        // ---- write and leave: the stack keeps what was queued and finishes it as an orphan (review 2026-11-15, finding 3)
+        let (mut c, mut s, _l3) = pair(&mut net, 7002)?;
+        let blob: Vec<u8> = (0..60_000usize).map(|i| pattern(5, i)).collect();
+        c.write_all(&blob, t(5000)).map_err(|_| msg_at(line!()))?;
+        drop(c);
+        let mut got = Vec::new();
+        let mut piece = [0u8; 4096];
+        loop {
+            match s.read(&mut piece, t(5000)) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&piece[..n]),
+                Err(_) => return Err(msg_at(line!())),
+            }
+        }
+        ensure!(
+            got == blob,
+            "all 60,000 bytes arrived, and then a clean end of stream ({} bytes)",
+            got.len()
+        );
+        drop(s);
+        // ---- refused: nothing listens
+        ensure_eq!(
+            net.connect_stream([10, 0, 2, 15], 7999, 0, 0, 0, t(5000))
+                .err(),
+            Some(Stack(proto::net::status::CONN_REFUSED)),
+            "connect to a closed port"
+        );
+        // ---- an unconfigured destination and a port in use
+        ensure_eq!(
+            net.listen_stream(7000, 1, 0, t(3000)).err(),
+            Some(Stack(pn_status(3))),
+            "a second listener on the port"
+        );
+        ensure_eq!(
+            net.listen_stream(80, 1, 0, t(3000)).err(),
+            Some(Stack(pn_status(2))),
+            "a low port needs /svc/net-priv"
+        );
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// The quotas of the stream path (S9-SPEC 6): `stream_bytes` per account, the connection limit, and everything coming back.
+pub fn net_stream_quotas_and_bad_handles() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut server = f.connect(b"net")?;
+        let mut client = f.connect(b"net")?;
+        let mut l = server
+            .listen_stream(7100, 16, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        // sixteen default streams (32 KiB each) fill the client's 512 KiB; the seventeenth is Quota
+        let mut held = Vec::new();
+        for i in 0..16 {
+            match client.connect_stream([10, 0, 2, 15], 7100, 0, 0, 0, t(5000)) {
+                Ok(s) => held.push(s),
+                Err(e) => {
+                    let mut d = Detail::new();
+                    let _ = core::fmt::Write::write_fmt(&mut d, format_args!("stream {i}: {e:?}"));
+                    return Err(d);
+                }
+            }
+        }
+        ensure_eq!(
+            client
+                .connect_stream([10, 0, 2, 15], 7100, 0, 0, 0, t(5000))
+                .err(),
+            Some(Stack(pn_status(6))),
+            "the seventeenth default stream is over the account's stream_bytes"
+        );
+        // another client is not affected: it gets the posted accepts that are left over (none: the server's are used up), so
+        // its connect is dropped at the listener and ends by refusal or timeout rather than Quota
+        let mut other = f.connect(b"net")?;
+        let e = other
+            .connect_stream([10, 0, 2, 15], 7100, 0, 0, 0, t(2500))
+            .err();
+        ensure!(
+            e != Some(Stack(pn_status(6))),
+            "a second client has its own account: {e:?}"
+        );
+        // the accepted side: all sixteen connections arrived at the listener
+        let mut accepted = Vec::new();
+        for _ in 0..16 {
+            accepted.push(l.accept(t(5000)).map_err(|_| msg_at(line!()))?);
+        }
+        // everything comes back: close it all, and a fresh connect works again
+        drop(held);
+        drop(accepted);
+        let mut again = None;
+        for _ in 0..100 {
+            match client.connect_stream([10, 0, 2, 15], 7100, 0, 0, 0, t(5000)) {
+                Ok(s) => {
+                    again = Some(s);
+                    break;
+                }
+                Err(Stack(6)) => nap(30)?,
+                Err(_) => nap(30)?,
+            }
+        }
+        ensure!(
+            again.is_some(),
+            "the reservations came back when the streams were closed"
+        );
+        drop(again);
+        // ---- accepts reserve at the SYN, not at the post: six big accepts post fine, and only as many as the account can pay for
+        // are taken (4 of about 128 KiB in 512 KiB); the fifth connect gets no answer until a stream is gone
+        drop(l); // (its posted accepts and the connection `again` took go with it)
+        nap(1500)?; // (the orphans of the streams above finish and give their reservations back)
+        let mut big = server
+            .listen_stream(7101, 0, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        for _ in 0..6 {
+            big.post(65536, 65535).map_err(|_| msg_at(line!()))?;
+        }
+        let mut cs = Vec::new();
+        for i in 0..4 {
+            match client.connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(5000)) {
+                Ok(c) => cs.push(c),
+                Err(e) => {
+                    let mut d = Detail::new();
+                    let _ =
+                        core::fmt::Write::write_fmt(&mut d, format_args!("big accept {i}: {e:?}"));
+                    return Err(d);
+                }
+            }
+        }
+        let mut ss = Vec::new();
+        for _ in 0..4 {
+            ss.push(big.accept(t(5000)).map_err(|_| msg_at(line!()))?);
+        }
+        ensure!(
+            client
+                .connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(2500))
+                .is_err(),
+            "a fifth big accept does not fit the server's account: its SYN is dropped"
+        );
+        drop(ss.pop());
+        drop(cs.pop());
+        let mut fourth = None;
+        for _ in 0..4 {
+            if let Ok(c) = client.connect_stream([10, 0, 2, 15], 7101, 0, 4096, 4096, t(9000)) {
+                fourth = Some(c);
+                break;
+            }
+        }
+        ensure!(
+            fourth.is_some(),
+            "once a stream is gone the next SYN is taken"
+        );
+        drop((fourth, cs, ss, big));
+        // ---- bad handles: a channel where a socket belongs, one socket used twice, both ends of one pair
+        let _lb = server
+            .listen_stream(7102, 2, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        let open_raw = |net: &mut rt::net::Net| -> Result<u32, Detail> {
+            let c = sys::channel_create();
+            ensure_eq!(c.status, 0, "an endpoint channel");
+            let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+            let req = proto::net::Request::Open {
+                kind: 3,
+                local_port: 0,
+                local_addr: [0; 4],
+                oflags: 0,
+            };
+            let (st, _) = net
+                .call_with(&req, &[theirs], t(3000))
+                .map_err(|_| msg_at(line!()))?;
+            ensure_eq!(st, 0, "a stream endpoint opened");
+            Ok(mine)
+        };
+        // sends Connect with `h` and returns what the stack answered first: Ok(true) Connected, Ok(false) failed with `status`
+        let try_connect = |mine: u32, h: u32| -> Result<Result<(), i32>, Detail> {
+            let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7102, 0, 0);
+            let w = sys::channel_write(mine, msg.as_ptr(), msg.len(), [h].as_ptr(), 1);
+            ensure_eq!(w.status, 0, "the connect request was sent");
+            let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(3000));
+            ensure_eq!(wait.status, 0, "an answer");
+            let mut b = [0u8; 64];
+            let r = sys::channel_read(mine, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
+            ensure_eq!(r.status, 0, "the notice");
+            match proto::net::decode_ep_event(&b[..r.a1]) {
+                Some(proto::net::EpEvent::ConnInfo { code, .. })
+                    if code == proto::net::notice::CONNECTED =>
+                {
+                    Ok(Ok(()))
+                }
+                Some(proto::net::EpEvent::Notice { code, detail, .. })
+                    if code == proto::net::notice::CONNECT_FAILED =>
+                {
+                    Ok(Err(detail as i32))
+                }
+                other => {
+                    let mut d = Detail::new();
+                    let _ =
+                        core::fmt::Write::write_fmt(&mut d, format_args!("unexpected {other:?}"));
+                    Err(d)
+                }
+            }
+        };
+        let bad = proto::net::status::BAD_HANDLE;
+        // a channel
+        let chan = sys::channel_create();
+        ensure_eq!(chan.status, 0, "a channel to pass by mistake");
+        let e1 = open_raw(&mut client)?;
+        ensure_eq!(
+            try_connect(e1, chan.a2 as u32)?,
+            Err(bad),
+            "a channel instead of a socket"
+        );
+        // one socket used twice
+        let pr = sys::socket_create();
+        ensure_eq!(pr.status, 0, "a socket pair");
+        let (pa, pb) = (pr.a1 as u32, pr.a2 as u32);
+        let dup = sys::handle_duplicate(pa, 1 << 31);
+        ensure_eq!(dup.status, 0, "a duplicate of the same socket");
+        let e2 = open_raw(&mut client)?;
+        ensure_eq!(
+            try_connect(e2, pa)?,
+            Ok(()),
+            "the first use of a socket is fine"
+        );
+        let e3 = open_raw(&mut client)?;
+        ensure_eq!(
+            try_connect(e3, dup.a1 as u32)?,
+            Err(bad),
+            "the same socket again"
+        );
+        // the peer of a socket the stack holds
+        let e4 = open_raw(&mut client)?;
+        ensure_eq!(try_connect(e4, pb)?, Err(bad), "both ends of one pair");
+        for h in [e1, e2, e3, e4] {
+            sys::handle_close(h);
+        }
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// Kill the stack under live streams: each client sees a reset, never end-of-file; the stack comes back and streams work again.
+pub fn net_streams_survive_a_stack_restart() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let (mut c, mut s, _l) = pair(&mut net, 7200)?;
+        c.write_all(b"before", t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        let mut six = [0u8; 6];
+        read_exact(&mut s, &mut six, t(3000)).map_err(|_| msg_at(line!()))?;
+        sup_restart(&f, 1);
+        let mut one = [0u8; 8];
+        ensure_eq!(
+            s.read(&mut one, t(5000)).err(),
+            Some(Stack(proto::net::status::CONN_RESET)),
+            "the server end sees a reset when the stack dies, not end-of-file"
+        );
+        ensure_eq!(
+            c.read(&mut one, t(5000)).err(),
+            Some(Stack(proto::net::status::CONN_RESET)),
+            "and so does the client end"
+        );
+        drop((c, s));
+        // the stack is back: a new connection works (the address came back from the blob)
+        let mut net2 = f.connect(b"net")?;
+        let (mut c, mut s, _l2) = pair(&mut net2, 7201)?;
+        c.write_all(b"after", t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        let mut five = [0u8; 5];
+        read_exact(&mut s, &mut five, t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure_eq!(&five, b"after", "streams work after the restart");
         Ok(())
     })();
     f.close();

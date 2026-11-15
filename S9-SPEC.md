@@ -640,6 +640,12 @@ Stack to client (all `Notice`-shaped, op 0x83 with these codes, `cookie` echoing
 | 18 | `PeerFin` | the peer closed its side; the socket's end-of-file after this is clean |
 | 19 | `Reset` | a reason: 1 the peer reset, 2 retransmission gave up, 3 aborted locally, 4 the link or configuration went away |
 
+**As built (step 4b):** `Connected` and `Accepted` carry the four-tuple, which a `Notice` (`cookie`, `detail`) cannot, so they ride on a
+second stack-to-client message, `CONN_INFO` (op `0x84`: `code u16, cookie u32, local addr/port, remote port/addr`, 24 bytes); the other
+codes are ordinary `Notice`s. A refused `Connect` or `Accept` (bad handle, quota, no route) is answered with a `CONNECT_FAILED` notice
+whose `detail` is the status, on the stream's channel for `Connect` and on the listener's for `Accept`. The kinds, statuses, ops and
+notice codes of this section are in `proto::net` and are golden-tested.
+
 There is no data op and no shutdown op: **bytes travel only on the socket**, and half-close is the kernel's `socket_shutdown` on
 the client's end, which the stack sees as end-of-stream after draining A and turns into a FIN. Closing the channel and the
 socket is a normal close (5.8).

@@ -10270,6 +10270,18 @@ pub fn app_main() -> i32 {
             stream_proto::stream_budgets_with_the_launcher_defaults,
         ),
         (
+            "net_streams_over_loopback",
+            net_tests::net_streams_over_loopback,
+        ),
+        (
+            "net_stream_quotas_and_bad_handles",
+            net_tests::net_stream_quotas_and_bad_handles,
+        ),
+        (
+            "net_streams_survive_a_stack_restart",
+            net_tests::net_streams_survive_a_stack_restart,
+        ),
+        (
             "net_ping_round_trip_is_measured",
             net_tests::net_ping_round_trip_is_measured,
         ),

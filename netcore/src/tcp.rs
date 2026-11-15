@@ -87,6 +87,16 @@ pub enum TcpEvent {
     Closed { conn: ConnId },
     /// SYNs are being dropped for want of posted accepts (at most one a second per listener).
     AcceptStarved { listener: ListenerId },
+    /// A SYN took a posted accept: the connection exists (half-open) and its buffers are committed now.
+    AcceptTaken {
+        listener: ListenerId,
+        cookie: u32,
+        conn: ConnId,
+        bytes: usize,
+    },
+    /// The connection left the table, whatever the reason and whether or not anybody was told (an orphan's end, a failed
+    /// open, a TIME-WAIT conversion): exactly once per connection, last. The adapter releases what it charged for it.
+    Released { conn: ConnId },
 }
 
 struct Entry {
@@ -97,12 +107,18 @@ struct Entry {
     /// The owner's channel closed; the connection drains until this long after `Some(t)`.
     orphan_since: Option<Instant>,
     soft_unreach: bool,
+    /// Both FINs are done but the owner has not read everything yet: the entry stays until it has.
+    closed_pending: bool,
+    /// The buffers of the posted accept this passive connection took, to put the accept back if it dies half-open.
+    accept_cfg: Option<TcpConfig>,
 }
 
 struct Listener {
     addr: Option<Ip>,
     port: u16,
-    posted: VecDeque<(u32, TcpConfig)>,
+    /// `(cookie, buffers, admitted)`: an accept the adapter has not admitted (its owner has no room for the buffers) is not
+    /// taken by a SYN. `tcp_post_accept` admits by default.
+    posted: VecDeque<(u32, TcpConfig, bool)>,
     last_starved: Option<Instant>,
 }
 
@@ -262,7 +278,7 @@ impl Core {
         if l.posted.len() >= MAX_POSTED_ACCEPTS {
             return Err(AcceptError::TooMany);
         }
-        l.posted.push_back((cookie, cfg));
+        l.posted.push_back((cookie, cfg, true));
         Ok(())
     }
 
@@ -339,6 +355,8 @@ impl Core {
                 established: false,
                 orphan_since: None,
                 soft_unreach: false,
+                closed_pending: false,
+                accept_cfg: None,
             },
         );
         Ok(id)
@@ -357,6 +375,15 @@ impl Core {
     pub fn tcp_readable(&self, id: ConnId) -> usize {
         self.tcp.conns.get(&id).map_or(0, |e| e.conn.readable())
     }
+    /// The bytes `tcp_read` would return, without taking them (the adapter writes them into a socket that may take less).
+    pub fn tcp_peek(&self, id: ConnId, out: &mut [u8]) -> usize {
+        self.tcp.conns.get(&id).map_or(0, |e| e.conn.peek(out))
+    }
+    pub fn tcp_consume(&mut self, id: ConnId, n: usize) {
+        if let Some(e) = self.tcp.conns.get_mut(&id) {
+            e.conn.consume(n);
+        }
+    }
     pub fn tcp_read(&mut self, id: ConnId, out: &mut [u8]) -> usize {
         self.tcp.conns.get_mut(&id).map_or(0, |e| e.conn.read(out))
     }
@@ -369,8 +396,45 @@ impl Core {
             e.conn.shutdown_write();
         }
     }
-    pub fn tcp_set_nodelay(&mut self, _id: ConnId, _on: bool) {
-        // (the option is fixed at connect time in this core: TcpConfig::nodelay)
+    pub fn tcp_set_nodelay(&mut self, id: ConnId, on: bool) {
+        if let Some(e) = self.tcp.conns.get_mut(&id) {
+            e.conn.set_nodelay(on);
+        }
+    }
+
+    /// Admit or hold back a posted accept: a SYN takes only admitted ones (memory is committed when a SYN takes the accept, as
+    /// in every stack, so the adapter says whether the owner could pay for it now).
+    pub fn tcp_set_accept_ok(&mut self, l: ListenerId, cookie: u32, ok: bool) {
+        if let Some(l) = self.tcp.listeners.get_mut(&l) {
+            if let Some(p) = l.posted.iter_mut().find(|p| p.0 == cookie) {
+                p.2 = ok;
+            }
+        }
+    }
+
+    /// Withdraw a posted accept that no SYN has taken yet (its owner closed it). Returns whether it was still posted.
+    pub fn tcp_cancel_accept(&mut self, lid: ListenerId, cookie: u32) -> bool {
+        let Some(l) = self.tcp.listeners.get_mut(&lid) else {
+            return false;
+        };
+        let before = l.posted.len();
+        l.posted.retain(|(c, _, _)| *c != cookie);
+        let was_posted = l.posted.len() != before;
+        // a SYN may already have taken it: drop that half-open connection too, without putting the accept back
+        let taken: Vec<ConnId> = self
+            .tcp
+            .conns
+            .iter()
+            .filter(|(_, e)| !e.established && e.from == Some((lid, cookie)))
+            .map(|(&i, _)| i)
+            .collect();
+        for id in &taken {
+            if let Some(e) = self.tcp.conns.get_mut(id) {
+                e.from = None;
+            }
+            self.tcp_remove(*id);
+        }
+        was_posted || !taken.is_empty()
     }
 
     /// Reset the connection now (the client's abort, or `SO_LINGER` zero).
@@ -414,10 +478,20 @@ impl Core {
 
     fn tcp_remove(&mut self, id: ConnId) {
         if let Some(e) = self.tcp.conns.remove(&id) {
+            // a passive connection that never became established (a RST, or the SYN-ACK timing out) frees its accept: put
+            // it back, so a remote host cannot use up a listener's posted accepts with half-open connections (S9-SPEC 5.9)
+            if !e.established {
+                if let (Some((lid, cookie)), Some(cfg)) = (e.from, e.accept_cfg) {
+                    if let Some(l) = self.tcp.listeners.get_mut(&lid) {
+                        l.posted.push_front((cookie, cfg, true));
+                    }
+                }
+            }
             let t = e.conn.tuple;
             self.tcp
                 .by_tuple
                 .remove(&(t.local, t.lport, t.remote, t.rport));
+            self.tcp.events.push(TcpEvent::Released { conn: id });
         }
     }
 
@@ -483,11 +557,10 @@ impl Core {
                 .find(|(_, l)| l.port == seg.dst_port && l.addr.is_none_or(|a| a == dst))
                 .map(|(&id, _)| id);
             if let Some(lid) = lid {
-                let taken = self
-                    .tcp
-                    .listeners
-                    .get_mut(&lid)
-                    .and_then(|l| l.posted.pop_front());
+                let taken = self.tcp.listeners.get_mut(&lid).and_then(|l| {
+                    let i = l.posted.iter().position(|p| p.2)?;
+                    l.posted.remove(i).map(|(c, cfg, _)| (c, cfg))
+                });
                 match taken {
                     None => {
                         self.counters.tcp_listen_overflow += 1;
@@ -502,7 +575,7 @@ impl Core {
                     Some((cookie, cfg)) => {
                         if self.tcp.conns.len() >= MAX_CONNS {
                             if let Some(l) = self.tcp.listeners.get_mut(&lid) {
-                                l.posted.push_front((cookie, cfg));
+                                l.posted.push_front((cookie, cfg, true));
                             }
                             self.counters.tcp_listen_overflow += 1;
                             return;
@@ -532,8 +605,16 @@ impl Core {
                                 established: false,
                                 orphan_since: None,
                                 soft_unreach: false,
+                                closed_pending: false,
+                                accept_cfg: Some(cfg),
                             },
                         );
+                        self.tcp.events.push(TcpEvent::AcceptTaken {
+                            listener: lid,
+                            cookie,
+                            conn: id,
+                            bytes: cfg.snd_buf + cfg.rcv_buf,
+                        });
                     }
                 }
                 return;
@@ -621,6 +702,13 @@ impl Core {
 
     /// Translate what a connection reported into events for the application, and free it if it is over.
     fn tcp_collect(&mut self, id: ConnId, now: Instant) {
+        if let Some(e) = self.tcp.conns.get(&id) {
+            if e.closed_pending && e.conn.readable() == 0 {
+                self.tcp.events.push(TcpEvent::Closed { conn: id });
+                self.tcp_remove(id);
+                return;
+            }
+        }
         let Some(e) = self.tcp.conns.get_mut(&id) else {
             return;
         };
@@ -686,10 +774,15 @@ impl Core {
                     gone = true;
                 }
                 CEvent::Closed => {
-                    if e.orphan_since.is_none() {
-                        self.tcp.events.push(TcpEvent::Closed { conn: id });
+                    if e.orphan_since.is_none() && e.conn.readable() > 0 {
+                        // the owner has not read everything yet: keep the entry until it has
+                        e.closed_pending = true;
+                    } else {
+                        if e.orphan_since.is_none() {
+                            self.tcp.events.push(TcpEvent::Closed { conn: id });
+                        }
+                        gone = true;
                     }
-                    gone = true;
                 }
             }
         }
@@ -699,7 +792,9 @@ impl Core {
         }
         // TIME-WAIT keeps no buffers and no owner: a small record replaces the connection
         if let Some(e) = self.tcp.conns.get(&id) {
-            if e.conn.state() == State::TimeWait {
+            if e.conn.state() == State::TimeWait
+                && (e.orphan_since.is_some() || e.conn.readable() == 0)
+            {
                 let rec = TimeWaitRec {
                     tuple: e.conn.tuple,
                     snd_nxt: e.conn.snd_nxt(),
@@ -719,16 +814,16 @@ impl Core {
                     netwire::tcp::ACK,
                     now,
                 );
-                // the port stays reserved through the record; the connection's own entry goes
-                self.tcp_remove(id);
                 if announce {
                     self.tcp.events.push(TcpEvent::Closed { conn: id });
                 }
+                // the port stays reserved through the record; the connection's own entry goes
+                self.tcp_remove(id);
                 if self.tcp.time_wait.len() >= TIME_WAIT_RECORDS {
                     self.tcp.time_wait.pop_front();
                 }
                 self.tcp.time_wait.push_back(rec);
-            } else if e.conn.state() == State::Closed {
+            } else if e.conn.state() == State::Closed && !e.closed_pending {
                 self.tcp_remove(id);
             }
         }

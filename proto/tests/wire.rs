@@ -446,104 +446,206 @@ fn request_fuzz_never_panics() {
     }
 }
 
-// ---- S8 follow-up item 1: the reserved values ----
+// ---- S9: stream endpoints (S9-SPEC 8) ----
 
-mod reserved_values {
-    use proto::net::{self as pn, reserved, OpenKind};
+mod streams {
+    use proto::net::{self as pn, EpEvent, EpRequest, OpenKind};
 
     #[test]
-    fn reserved_open_kinds_are_told_apart_from_garbage() {
+    fn open_kinds_are_classified() {
         assert_eq!(pn::classify_open_kind(pn::kind::UDP), OpenKind::Udp);
         assert_eq!(
             pn::classify_open_kind(pn::kind::ICMP_ECHO),
             OpenKind::IcmpEcho
         );
-        for k in [3u16, 4] {
-            assert_eq!(pn::classify_open_kind(k), OpenKind::Reserved, "{k}");
-        }
+        assert_eq!(pn::classify_open_kind(3), OpenKind::TcpStream);
+        assert_eq!(pn::classify_open_kind(4), OpenKind::TcpListener);
         for k in [0u16, 5, 6, 255, 256, 0xffff] {
             assert_eq!(pn::classify_open_kind(k), OpenKind::Invalid, "{k}");
         }
-        // the decoder itself is structural: a reserved kind decodes, and it is the stack that answers NOT_SUPPORTED
-        for k in [3u16, 4] {
-            let r = pn::Request::Open {
-                kind: k,
-                local_port: 0,
-                local_addr: [0; 4],
-                oflags: 0,
-            };
-            let b = pn::encode_request(7, 0, &r);
-            assert_eq!(pn::decode_request(&b).unwrap().2, r);
-        }
     }
 
     #[test]
-    fn no_defined_value_sits_in_a_reserved_range() {
-        for s in [
-            pn::status::OK,
-            pn::status::BAD_REQUEST,
-            pn::status::REFUSED,
-            pn::status::ADDR_IN_USE,
-            pn::status::TOO_BIG,
-            pn::status::NO_ROUTE,
-            pn::status::QUOTA,
-            pn::status::NOT_CONFIGURED,
-            pn::status::NO_BUFFERS,
-            pn::status::NOT_SUPPORTED,
-        ] {
-            assert!(!reserved::STATUSES.contains(&s), "status {s}");
-        }
-        for o in [pn::ep::SEND_UDP, pn::ep::SEND_ECHO] {
-            assert!(!reserved::EP_OPS.contains(&o));
-        }
-        for c in [
-            pn::notice::SEND_FAILED,
-            pn::notice::LINK_DOWN,
-            pn::notice::LINK_UP,
-        ] {
-            assert!(!reserved::NOTICES.contains(&c));
-        }
-        for o in [
-            pn::op::INFO,
-            pn::op::OPEN,
-            pn::op::SET_CONFIG,
-            pn::op::CLEAR_CONFIG,
-            pn::op::GET_ARP,
-            pn::op::GET_STATS,
-        ] {
-            assert!(!(3..16).contains(&o), "service op {o}");
-        }
+    fn stream_values_are_the_documented_numbers() {
+        assert_eq!(
+            [
+                pn::status::CONN_REFUSED,
+                pn::status::TIMED_OUT,
+                pn::status::CONN_RESET,
+                pn::status::NOT_CONNECTED,
+                pn::status::ALREADY_CONNECTED,
+                pn::status::HOST_UNREACHABLE,
+                pn::status::BAD_HANDLE
+            ],
+            [10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(
+            [
+                pn::ep::CONNECT,
+                pn::ep::ABORT,
+                pn::ep::SET_OPTION,
+                pn::ep::ACCEPT
+            ],
+            [16, 17, 18, 19]
+        );
+        assert_eq!(
+            [
+                pn::notice::CONNECTED,
+                pn::notice::CONNECT_FAILED,
+                pn::notice::PEER_FIN,
+                pn::notice::RESET,
+                pn::notice::ACCEPTED,
+                pn::notice::ACCEPT_STARVED
+            ],
+            [16, 17, 18, 19, 20, 21]
+        );
+        assert_eq!(pn::oflags::NODELAY, 4);
+        // no S8 value was disturbed
+        assert_eq!(
+            [
+                pn::ep::SEND_UDP,
+                pn::ep::SEND_ECHO,
+                pn::ep::RECV,
+                pn::ep::ECHO_REPLY,
+                pn::ep::NOTICE
+            ],
+            [1, 2, 0x81, 0x82, 0x83]
+        );
     }
 
     #[test]
-    fn a_reserved_endpoint_op_is_rejected_by_the_decoder_like_any_unknown_op() {
-        for op in reserved::EP_OPS {
-            let mut b = pn::encode_send_udp(1, [10, 0, 2, 2], 9, b"x");
-            b[0] = op;
-            assert_eq!(pn::decode_ep_request(&b), None, "op {op}");
-        }
+    fn requests_round_trip_and_match_their_goldens() {
+        let c = pn::encode_connect(7, [10, 0, 2, 2], 8080, 16384, 32768);
+        assert_eq!(
+            c,
+            [
+                16, 0, 0, 0, 7, 0, 0, 0, 10, 0, 2, 2, 0x90, 0x1f, 0, 0, 0, 0x40, 0, 0, 0, 0x80, 0,
+                0
+            ]
+        );
+        assert_eq!(
+            pn::decode_ep_request(&c),
+            Some(EpRequest::Connect {
+                cookie: 7,
+                dst: [10, 0, 2, 2],
+                port: 8080,
+                snd_buf: 16384,
+                rcv_buf: 32768
+            })
+        );
+        assert_eq!(pn::encode_abort(), [17, 0, 0, 0]);
+        assert_eq!(
+            pn::decode_ep_request(&pn::encode_abort()),
+            Some(EpRequest::Abort)
+        );
+        let o = pn::encode_set_option(pn::option::NODELAY, 1);
+        assert_eq!(o, [18, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            pn::decode_ep_request(&o),
+            Some(EpRequest::SetOption {
+                option: 1,
+                value: 1
+            })
+        );
+        let a = pn::encode_accept(9, 0, 0);
+        assert_eq!(a, [19, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            pn::decode_ep_request(&a),
+            Some(EpRequest::Accept {
+                cookie: 9,
+                snd_buf: 0,
+                rcv_buf: 0
+            })
+        );
     }
 
     #[test]
-    fn a_reserved_notice_code_decodes_so_a_client_can_skip_it() {
-        for c in reserved::NOTICES {
-            let b = pn::encode_notice(c, 5, 6);
+    fn the_stream_messages_are_total_over_every_truncation_and_bit_flip() {
+        let msgs = [
+            pn::encode_connect(1, [1, 2, 3, 4], 5, 6, 7),
+            pn::encode_abort(),
+            pn::encode_set_option(1, 1),
+            pn::encode_accept(1, 2, 3),
+            pn::encode_conn_info(
+                pn::notice::CONNECTED,
+                4,
+                ([10, 0, 2, 15], 40000),
+                ([10, 0, 2, 2], 80),
+            ),
+        ];
+        for m in &msgs {
+            for n in 0..=m.len() {
+                let _ = pn::decode_ep_request(&m[..n]);
+                let _ = pn::decode_ep_event(&m[..n]);
+            }
+            for i in 0..m.len() {
+                for bit in 0..8 {
+                    let mut x = m.clone();
+                    x[i] ^= 1 << bit;
+                    let _ = pn::decode_ep_request(&x);
+                    let _ = pn::decode_ep_event(&x);
+                }
+            }
+        }
+        // a wrong length or a non-zero pad is refused, never half-read
+        let mut c = pn::encode_connect(1, [1, 2, 3, 4], 5, 6, 7);
+        c.push(0);
+        assert_eq!(pn::decode_ep_request(&c), None);
+        let mut c = pn::encode_connect(1, [1, 2, 3, 4], 5, 6, 7);
+        c[2] = 1;
+        assert_eq!(pn::decode_ep_request(&c), None);
+        assert_eq!(pn::decode_ep_request(&[16, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn conn_info_round_trips() {
+        let b = pn::encode_conn_info(
+            pn::notice::ACCEPTED,
+            0xdead_beef,
+            ([10, 0, 2, 15], 80),
+            ([10, 0, 2, 2], 51234),
+        );
+        assert_eq!(b.len(), 24);
+        assert_eq!(
+            pn::decode_ep_event(&b),
+            Some(EpEvent::ConnInfo {
+                code: pn::notice::ACCEPTED,
+                cookie: 0xdead_beef,
+                local: ([10, 0, 2, 15], 80),
+                remote: ([10, 0, 2, 2], 51234)
+            })
+        );
+    }
+
+    #[test]
+    fn notices_and_replies_with_stream_codes_decode() {
+        for code in 16..=21u16 {
+            let b = pn::encode_notice(code, 5, 6);
             assert_eq!(
                 pn::decode_ep_event(&b),
-                Some(pn::EpEvent::Notice {
-                    code: c,
+                Some(EpEvent::Notice {
+                    code,
                     cookie: 5,
                     detail: 6
                 })
             );
         }
+        for s in 10..=16 {
+            assert_eq!(
+                pn::decode_reply(&pn::encode_reply(9, s, &[])),
+                Some((9, s, &[][..]))
+            );
+        }
     }
 
     #[test]
-    fn a_reply_with_a_reserved_status_decodes() {
-        for s in reserved::STATUSES {
-            let b = pn::encode_reply(9, s, &[]);
-            assert_eq!(pn::decode_reply(&b), Some((9, s, &[][..])));
-        }
+    fn stream_limits_are_the_documented_ones() {
+        assert_eq!(pn::limits::STREAM_BUF_DEFAULT, 16384);
+        assert_eq!(
+            (pn::limits::STREAM_BUF_MIN, pn::limits::STREAM_BUF_MAX),
+            (4096, 65536)
+        );
+        assert_eq!(pn::limits::STREAM_RCV_BUF_MAX, 65535);
+        assert_eq!(pn::limits::POSTED_ACCEPTS_MAX, 16);
     }
 }

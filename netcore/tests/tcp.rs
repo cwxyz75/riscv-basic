@@ -196,6 +196,8 @@ fn a_connection_carries_data_both_ways_and_closes_cleanly_leaving_time_wait_reco
     assert_eq!(&buf[..k], b"hello server");
     n.b.core.tcp_write(b, b"hello client");
     n.run_until("client read", |n| n.a.core.tcp_readable(a) == 12);
+    let k = n.a.core.tcp_read(a, &mut buf);
+    assert_eq!(&buf[..k], b"hello client");
     // the client shuts down its write side; the server sees the FIN, then closes too
     n.a.core.tcp_shutdown_write(a);
     n.run_until("server sees the FIN", |n| n.b.core.tcp_eof(b));
@@ -701,4 +703,91 @@ fn the_side_in_time_wait_accepts_a_new_syn_with_a_higher_sequence_number() {
         0,
         "the record made way for the new connection"
     );
+}
+
+#[test]
+fn a_connection_whose_owner_has_unread_data_stays_in_the_table_until_it_has_read_it() {
+    let mut n = Net::clean();
+    let (a, b) = connected(&mut n);
+    n.b.core.tcp_write(b, b"left unread");
+    n.run_until("it arrived", |n| n.a.core.tcp_readable(a) == 11);
+    // both sides close; a still holds 11 unread bytes
+    n.b.core.tcp_shutdown_write(b);
+    n.run_until("a sees the FIN", |n| {
+        has_event(&n.a, |e| matches!(e, TcpEvent::PeerFin { .. }))
+    });
+    n.a.core.tcp_shutdown_write(a);
+    n.run_for(50 * MS);
+    assert!(
+        n.a.core.tcp_info(a).is_some(),
+        "the entry waits for its owner to read"
+    );
+    assert!(!has_event(&n.a, |e| matches!(e, TcpEvent::Closed { .. })));
+    let mut buf = [0u8; 32];
+    let k = n.a.core.tcp_read(a, &mut buf);
+    assert_eq!(&buf[..k], b"left unread");
+    n.run_for(50 * MS);
+    assert!(
+        has_event(&n.a, |e| matches!(e, TcpEvent::Closed { .. })),
+        "closed once everything was read"
+    );
+    assert!(n.a.core.tcp_info(a).is_none());
+    assert!(
+        has_event(&n.a, |e| matches!(e, TcpEvent::Released { .. })),
+        "and the release came last"
+    );
+}
+
+#[test]
+fn a_half_open_connection_that_dies_gives_its_posted_accept_back() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 1, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("the SYN took the accept", |n| {
+        n.b.core.tcp_conn_count() == 1
+    });
+    assert_eq!(n.b.core.tcp_posted_accepts(l), 0);
+    // the initiator vanishes (a restart): its fresh stack resets the SYN-ACK
+    n.a = Host::new(MAC_A, IP_A);
+    n.run_until("the accept is back", |n| {
+        n.b.core.tcp_posted_accepts(l) == 1
+    });
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+    // and it still works for a real connection
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), n.now).unwrap();
+    n.run_until("accepted", |n| {
+        has_event(&n.b, |e| matches!(e, TcpEvent::Accepted { .. }))
+    });
+}
+
+#[test]
+fn a_syn_ack_that_times_out_gives_its_posted_accept_back() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 1, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("took", |n| n.b.core.tcp_conn_count() == 1);
+    // a is silenced: it never answers the SYN-ACK
+    n.a = Host::new(MAC_A, IP_A);
+    n.a.core.link(false); // (its link is down: the SYN-ACK is never answered, not even with a reset)
+    n.run_for(8_000 * MS);
+    assert_eq!(
+        n.b.core.tcp_posted_accepts(l),
+        1,
+        "the accept came back after the SYN-ACK gave up"
+    );
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+}
+
+#[test]
+fn cancelling_an_accept_a_syn_already_took_drops_the_half_open_connection() {
+    let mut n = Net::clean();
+    let l = n.b.core.tcp_listen(None, 80).unwrap();
+    n.b.core.tcp_post_accept(l, 7, cfg()).unwrap();
+    n.a.core.tcp_connect(IP_B, 80, None, cfg(), 0).unwrap();
+    n.run_until("took", |n| n.b.core.tcp_conn_count() == 1);
+    assert!(n.b.core.tcp_cancel_accept(l, 7));
+    assert_eq!(n.b.core.tcp_conn_count(), 0);
+    assert_eq!(n.b.core.tcp_posted_accepts(l), 0, "and it was not put back");
 }
