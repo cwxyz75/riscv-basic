@@ -342,6 +342,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             // space again, as every other path through `trap_body` does)
             crate::user::activate_current();
         }
+        crate::heap::service(); // (a safe point: headroom for the next allocations, see heap.rs)
         crate::bkl::unlock();
     }
     // (the trap exit returns to user mode if this frame came from it)

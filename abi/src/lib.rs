@@ -235,10 +235,10 @@ pub mod limits {
     /// Live processes at once.
     pub const MAX_PROCESSES: usize = 64;
     /// Live user threads in one process.
-    pub const MAX_THREADS_PER_PROCESS: usize = 256;
+    pub const MAX_THREADS_PER_PROCESS: usize = 2048;
     /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
-    /// 8 MiB kernel heap; a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
-    pub const MAX_USER_THREADS: usize = 1024;
+    /// kernel heap (an 8 MiB boot heap that grows from the frame database); a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
+    pub const MAX_USER_THREADS: usize = 4096;
     /// Bytes buffered in all channels and sockets together (another stand-in for per-job
     /// quotas, Q9): a write that would exceed it fails with NO_MEMORY.
     pub const MAX_IPC_BYTES: usize = 2 * 1024 * 1024;
@@ -373,6 +373,10 @@ pub mod layout {
     pub const KSTACK_SLOT_BYTES: u64 = 32 * 1024;
     /// The mapped, usable part of a slot (the top half).
     pub const KSTACK_BYTES: u64 = KSTACK_SLOT_BYTES / 2;
+    /// The grown kernel heap's window (slice T step 2): the pages the heap adds after boot are mapped here,
+    /// contiguously, so the allocator can extend. One top-level slot of its own.
+    pub const HEAP_WINDOW_BASE: u64 = 0xffff_ffe8_0000_0000;
+    pub const HEAP_WINDOW_SIZE: u64 = 256 * 1024 * 1024;
 }
 
 #[cfg(test)]
@@ -398,6 +402,8 @@ mod tests {
         assert_eq!(slot(KERNEL_PHYS + KERNEL_OFFSET), 510);
         assert_eq!(slot(LAZY_TEST_BASE), 320);
         assert_eq!(slot(KSTACK_WINDOW_BASE), 384);
+        assert_eq!(slot(HEAP_WINDOW_BASE), 416);
+        assert_eq!((HEAP_WINDOW_BASE as i64) >> 38, -1);
         assert_eq!((KSTACK_WINDOW_BASE as i64) >> 38, -1);
         // the trap entry's guard test: `srai 30` of an address in the window is -128, and the window is
         // exactly one top-level slot

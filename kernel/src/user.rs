@@ -1435,6 +1435,8 @@ pub fn notify() {
     cleanup_dead();
     reap_vmos();
     commit_wake();
+    // the safe point where the kernel heap may grow (heap.rs)
+    irq::without(crate::heap::service);
 }
 
 /// Do the kernel work that destroying objects calls for: free the pages of a VMO that has

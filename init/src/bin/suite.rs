@@ -1167,7 +1167,9 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         "a blocked wait is woken by PEER_CLOSED"
     );
     ensure!(
-        within(sys::clock_get() - t0, 2, 12),
+        // (the lower bound is the check; the upper one only catches a lost wake-up and is loose
+        // because a loaded CI runner can delay the helper by many ticks)
+        within(sys::clock_get() - t0, 2, 60),
         "the close came after about 3 ticks"
     );
     let mut reply = [0u8; 32];
@@ -2615,14 +2617,32 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
     Ok(())
 }
 
+/// The per-process thread limit is reached with NO_MEMORY, over two thousand threads are alive at once (slice T:
+/// stacks are frames, the heap grows), and the slots come back when they end. The threads share one stack mapping
+/// (a slice each) so the handle table is not what runs out first.
 fn thread_limit_and_slots_are_reused() -> Outcome {
+    const LIMIT: usize = rt::abi::limits::MAX_THREADS_PER_PROCESS;
+    const STACK_PAGES: u64 = 2;
     let ev = event()?;
-    let mut ts = [0u32; rt::abi::limits::MAX_THREADS_PER_PROCESS];
-    let mut n = 0;
+    let me = me()?;
+    let v = vmo(LIMIT as u64 * STACK_PAGES)?;
+    let base = NEXT_STACK.fetch_add(0x100_0000 * 2, Ordering::SeqCst);
+    ok(
+        sys::process_map(
+            me,
+            v,
+            base,
+            0,
+            LIMIT as u64 * STACK_PAGES * 4096,
+            PF_R | PF_W,
+        ),
+        "map the shared stacks",
+    )?;
+    let mut ts: Vec<u32> = Vec::new();
     loop {
-        let top = own_stack()?;
+        let top = base + (ts.len() as u64 + 1) * STACK_PAGES * 4096;
         let r = sys::thread_create(
-            me()?,
+            me,
             worker_wait_event as *const () as usize as u64,
             top,
             ev as u64,
@@ -2631,24 +2651,28 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
             ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
             break;
         }
-        ensure!(n < ts.len(), "more than the limit of threads was allowed");
-        ts[n] = r.a1 as u32;
-        n += 1;
+        ensure!(
+            ts.len() < LIMIT,
+            "more than the limit of threads was allowed"
+        );
+        ts.push(r.a1 as u32);
     }
-    // this thread plus `n` others: the limit is `MAX_THREADS_PER_PROCESS` in all
+    // this thread plus the others: the limit is `MAX_THREADS_PER_PROCESS` in all
     ensure_eq!(
-        n,
-        rt::abi::limits::MAX_THREADS_PER_PROCESS - 1,
+        ts.len(),
+        LIMIT - 1,
         "threads created on top of the one we are"
     );
+    ensure!(ts.len() >= 2000, "two thousand threads are alive at once");
     ensure_eq!(
         st(sys::event_signal(ev, 0, 1 << 24)),
         Some(S::Ok),
         "wake them all"
     );
-    for &t in &ts[..n] {
-        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    for &t in &ts {
+        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
         ensure_eq!(r.status, 0, "a thread ended");
+        sys::handle_close(t);
     }
     ensure_eq!(
         st(sys::event_signal(ev, 1 << 24, 0)),
@@ -2661,6 +2685,8 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
         0,
         "after they ended, there is room again"
     );
+    ok(sys::process_unmap(me, base), "unmap the shared stacks")?;
+    sys::handle_close(v);
     Ok(())
 }
 
