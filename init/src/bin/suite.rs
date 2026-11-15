@@ -10238,6 +10238,10 @@ pub fn app_main() -> i32 {
             thread_stacks_are_charged_to_the_job_and_credited_back,
         ),
         (
+            "net_udp_echo_through_hostfwd",
+            net_tests::net_udp_echo_through_hostfwd,
+        ),
+        (
             "net_static_config_and_ping_the_gateway",
             net_tests::net_static_config_and_ping_the_gateway,
         ),

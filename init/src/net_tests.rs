@@ -642,3 +642,53 @@ pub fn net_static_config_and_ping_the_gateway() -> Outcome {
     f.close();
     r
 }
+
+/// Q4 (the guest side): `udpecho` on port 7777 through the real stack. The harness's host-side client (the host's own UDP
+/// stack, through QEMU's `hostfwd`) sends it datagrams and checks what comes back; this test echoes until the host says stop.
+pub fn net_udp_echo_through_hostfwd() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        cfg.set_config([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2], [10, 0, 2, 3], t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut net = f.connect(b"net")?;
+        let mut udp = net.open_udp(7777, 0, t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure_eq!(udp.port, 7777, "the port asked for");
+        // (until the host has a reason to send, wait for the link: the stack's first frame lets slirp learn our address)
+        let until = t(8000);
+        loop {
+            let i = cfg.info(t(3000)).map_err(|_| msg_at(line!()))?;
+            if i.link || sys::clock_get() > until {
+                break;
+            }
+            nap(20)?;
+        }
+        sys::debug_write(b"s8: udpecho ready\n");
+        let end = sys::clock_get() + 60_000;
+        let mut echoed = 0u32;
+        while sys::clock_get() < end {
+            match udp.recv(t(1000)) {
+                Ok(d) => {
+                    let stop = d.payload == b"##stop";
+                    udp.send_to(d.src, d.port, &d.payload).map_err(|_| msg_at(line!()))?;
+                    echoed += 1;
+                    if stop {
+                        nap(200)?; // let the reply leave
+                        break;
+                    }
+                }
+                Err(rt::net::NetError::TimedOut) => {}
+                Err(_) => return Err(msg_at(line!())),
+            }
+        }
+        ensure!(echoed >= 200, "the host's datagrams arrived and were echoed ({echoed})");
+        let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(stats.iter().any(|s| s.1 > 0), "the counters moved");
+        Ok(())
+    })();
+    f.close();
+    r
+}
