@@ -1875,6 +1875,36 @@ pub fn app_main() -> i32 {
             d.blob = Some(b);
         }
     }
+    // the secret that keys initial sequence numbers and ephemeral ports (`netsup` derived it from the system's generator)
+    if let Some(hex) = env.var(b"SECRET") {
+        let mut key = [0u8; 16];
+        let ok = hex.len() == 32
+            && hex.chunks(2).zip(key.iter_mut()).all(|(c, k)| {
+                let v = |x: u8| (x as char).to_digit(16);
+                match (v(c[0]), v(c[1])) {
+                    (Some(a), Some(b)) => {
+                        *k = (a * 16 + b) as u8;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        if ok {
+            d.net.set_tcp_secret(key);
+            rt::println!(
+                "netd: tcp secret from {}",
+                if env.var(b"SECRET_SRC") == Some(&b"rngd"[..]) {
+                    "rngd"
+                } else {
+                    "stand-in"
+                }
+            );
+        } else {
+            rt::println!("netd: WARNING no usable TCP secret in the environment: initial sequence numbers are not secret");
+        }
+    } else {
+        rt::println!("netd: WARNING no TCP secret in the environment: initial sequence numbers are not secret");
+    }
     let port = d.core.port();
     let _ = sys::port_bind(port, to_stack, 1 << 24, KEY_DOORBELL);
     let _ = sys::port_bind(

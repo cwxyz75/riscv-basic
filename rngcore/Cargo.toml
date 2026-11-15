@@ -1,0 +1,7 @@
+[package]
+name = "rngcore"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S9 step 5: the pure randomness primitives (SHA-256, HMAC, HKDF, ChaCha20 and a fast-key-erasure generator), written here and checked against their RFC vectors"
+
+[dependencies]

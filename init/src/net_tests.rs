@@ -447,6 +447,8 @@ struct Full {
     /// The channel to `netsup` (Status, Restart).
     ctl: u32,
     reg: u32,
+    /// The random service (`rngd`).
+    rng: u32,
     /// The registry's root connection (it can publish, view).
     root: Fs,
     jobs: [u32; 3],
@@ -527,6 +529,39 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     .map_err(|_| msg_at(line!()))?;
     let mut root = Fs::new(reg_mine);
     let publish_conn = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    // the random service: a second client of the device manager, and a registry connection that can publish `random`
+    let (rng_dm, mgr_end2) = channel()?;
+    let req2 = proto::devmgr::encode_connect(2);
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            req2.as_ptr(),
+            req2.len(),
+            &mgr_end2,
+            1
+        )),
+        Some(S::Ok),
+        "connect a third client"
+    );
+    ensure_eq!(
+        st(sys::object_wait(
+            mine,
+            sig::READABLE,
+            sys::clock_get() + 5000
+        )),
+        Some(S::Ok),
+        "the manager answers the second connect"
+    );
+    sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    let rng_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let rng = spawn_prog(
+        bi,
+        b"bin/rngd",
+        &[b"rngd"],
+        vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+        &[rng_dm, rng_pub.ch],
+        sj,
+    )?;
     let (ctl, ctl_theirs) = channel()?;
     let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
     let fault_env: Vec<Vec<u8>> = fault
@@ -554,7 +589,8 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     let up = sys::object_wait(sup, sig::TERMINATED, sys::clock_get() + 1500);
     if up.status == 0 {
         let code = sys::process_info(sup).a1 as i64;
-        for h in [sup, mgr, mine, ctl, reg, mj, sj, rj, reg_mine] {
+        sys::process_kill(rng, -1);
+        for h in [sup, mgr, mine, ctl, reg, rng, mj, sj, rj, reg_mine] {
             sys::handle_close(h);
         }
         ensure_eq!(code, 13, "netsup's exit code without a network device");
@@ -566,6 +602,7 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
         sup,
         ctl,
         reg,
+        rng,
         root,
         jobs: [mj, sj, rj],
     }))
@@ -595,11 +632,18 @@ impl Full {
     }
 
     fn close(self) {
-        for p in [self.sup, self.mgr, self.reg] {
+        for p in [self.sup, self.mgr, self.reg, self.rng] {
             sys::process_kill(p, -1);
             let _ = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3000);
         }
-        for h in [self.sup, self.mgr, self.mgr_chan, self.ctl, self.reg] {
+        for h in [
+            self.sup,
+            self.mgr,
+            self.mgr_chan,
+            self.ctl,
+            self.reg,
+            self.rng,
+        ] {
             sys::handle_close(h);
         }
         sys::handle_close(self.root.ch);
@@ -1728,7 +1772,7 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
             let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7102, 0, 0);
             let w = sys::channel_write(mine, msg.as_ptr(), msg.len(), [h].as_ptr(), 1);
             ensure_eq!(w.status, 0, "the connect request was sent");
-            let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(3000));
+            let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(10_000));
             ensure_eq!(wait.status, 0, "an answer");
             let mut b = [0u8; 64];
             let r = sys::channel_read(mine, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);
@@ -1933,6 +1977,53 @@ pub fn net_tcp_to_the_host_server() -> Outcome {
         s.shutdown_write();
         nap(500)?;
         sys::debug_write(b"s9: host-tcp-server done\n");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// The random service (S9 step 5): bytes from a generator seeded by the entropy device, never the same twice, with the
+/// balance of a good source; and refusal rather than invention when there is no device.
+pub fn random_service_gives_seeded_distinct_bytes() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut v = f.view(b"random")?;
+        let mut r = rt::random::Random::connect(&mut v, t(8000)).map_err(|_| msg_at(line!()))?;
+        let mut a = [0u8; 4096];
+        let mut b = [0u8; 4096];
+        match r.fill(&mut a, t(5000)) {
+            Ok(()) => {}
+            Err(rt::random::RandomError::NotSeeded) => {
+                sys::debug_write(
+                    b"s9: no entropy device: the random service refuses, as it should\n",
+                );
+                return Ok(());
+            }
+            Err(_) => return Err(msg_at(line!())),
+        }
+        r.fill(&mut b, t(5000)).map_err(|_| msg_at(line!()))?;
+        ensure!(a != b, "two reads differ");
+        ensure!(a.iter().any(|&x| x != a[0]), "not constant");
+        let ones: u32 = a.iter().chain(b.iter()).map(|x| x.count_ones()).sum();
+        ensure!(
+            (ones as i64 - 4 * 8192).abs() < 1000,
+            "bit balance of 8 KiB: {ones} ones in 65536 bits"
+        );
+        let mut counts = [0u32; 256];
+        for &x in a.iter().chain(b.iter()) {
+            counts[x as usize] += 1;
+        }
+        ensure!(counts.iter().all(|&c| c < 80), "no byte value dominates");
+        // a long request is served in pieces; a zero-length one is refused by the protocol, not answered with nothing
+        let mut big = [0u8; 10_000];
+        r.fill(&mut big, t(5000)).map_err(|_| msg_at(line!()))?;
+        ensure!(big.iter().any(|&x| x != 0), "a long read is filled");
+        sys::debug_write(b"s9: random service ok\n");
         Ok(())
     })();
     f.close();

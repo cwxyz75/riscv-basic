@@ -62,6 +62,9 @@ struct Held {
     next_gen: core::cell::Cell<u64>,
     /// A deliberate fault for the negative-control tests (`FAULT=name` in our own environment), passed to the children.
     fault: Option<Vec<u8>>,
+    /// The environment entries that give `netd` its TCP secret and say where it came from (`SECRET=<32 hex>`,
+    /// `SECRET_SRC=rngd|standin`); empty in the stackless mode, where there is no `netd`.
+    secret_env: Vec<Vec<u8>>,
     #[allow(dead_code)] // (read by the status and flight-recorder code of the full supervisor)
     shm: Shm,
 }
@@ -265,6 +268,11 @@ pub fn app_main() -> i32 {
     let held = Held {
         next_gen: core::cell::Cell::new(1),
         fault: env.var(b"FAULT").map(|v| v.to_vec()),
+        secret_env: if stackless {
+            Vec::new()
+        } else {
+            secret_env(env.handle(Role::ServiceRegistry))
+        },
         blob: blob.a1 as u32,
         mmio: hs[0],
         rx: hs[1],
@@ -637,7 +645,11 @@ fn spawn_netd(
     let s = Startup {
         args: alloc::vec![b"netd".to_vec()],
         roles,
-        env: fault_env(h),
+        env: {
+            let mut e = fault_env(h);
+            e.extend(h.secret_env.iter().cloned());
+            e
+        },
         ..Startup::default()
     };
     let Ok(bytes) = s.encode() else {
@@ -650,6 +662,54 @@ fn spawn_netd(
             Err(23)
         }
     }
+}
+
+/// The TCP secret for `netd` (S9-SPEC 5.10), derived with HKDF-SHA256 from 32 bytes of the system's generator
+/// (`/svc/random`, seeded by the entropy device). Without it (no entropy device, or `rngd` not running) a stand-in is used
+/// and said so in the entry `SECRET_SRC=standin`: a hash of the clock, which an observer of the boot could guess
+/// (TIDY-UP T99); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
+fn secret_env(registry: Option<u32>) -> Vec<Vec<u8>> {
+    let mut seed = [0u8; 32];
+    let mut from_rngd = false;
+    if let Some(reg) = registry {
+        let mut fs = rt::fs::Fs::new(reg);
+        if let Ok(mut r) = rt::random::Random::connect(&mut fs, sys::clock_get() + 15_000) {
+            from_rngd = r.fill(&mut seed, sys::clock_get() + 10_000).is_ok();
+        }
+    }
+    if !from_rngd {
+        let t = sys::clock_get().to_le_bytes();
+        seed = rngcore::sha256(&[&b"netsup stand-in"[..], &t].concat());
+    }
+    let mut key = [0u8; 16];
+    let _ = rngcore::hkdf(b"riscv-os netd v1", &seed, b"tcp isn and ports", &mut key);
+    rngcore::drbg::wipe(&mut seed);
+    let hex: Vec<u8> = key
+        .iter()
+        .flat_map(|b| {
+            [
+                b"0123456789abcdef"[usize::from(b >> 4)],
+                b"0123456789abcdef"[usize::from(b & 15)],
+            ]
+        })
+        .collect();
+    rt::println!(
+        "##NETSUP tcp secret from {}",
+        if from_rngd {
+            "rngd"
+        } else {
+            "stand-in (no entropy source)"
+        }
+    );
+    alloc::vec![
+        [&b"SECRET="[..], &hex].concat(),
+        (if from_rngd {
+            &b"SECRET_SRC=rngd"[..]
+        } else {
+            &b"SECRET_SRC=standin"[..]
+        })
+        .to_vec()
+    ]
 }
 
 /// The environment entry that tells a child which deliberate fault to run (empty normally).

@@ -19,3 +19,4 @@ netwire = { path = "../netwire" }
 netcore = { path = "../netcore" }
 dhcp = { path = "../dhcp" }
 supervise = { path = "../supervise" }
+rngcore = { path = "../rngcore" }

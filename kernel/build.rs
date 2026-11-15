@@ -51,6 +51,7 @@ fn main() {
         "ping",
         "udpecho",
         "netinfo",
+        "rngd",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
