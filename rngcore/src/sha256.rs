@@ -157,8 +157,12 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; DIGEST] {
     outer.finish()
 }
 
-/// HKDF-SHA256 (RFC 5869): extract with `salt`, expand with `info`, fill `out` (at most 255 * 32 bytes; longer is cut).
-pub fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
+/// HKDF-SHA256 (RFC 5869): extract with `salt`, expand with `info`, fill `out`. `false` (and nothing written) if `out` is
+/// longer than the 255 * 32 bytes the construction allows.
+pub fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) -> bool {
+    if out.len() > 255 * DIGEST {
+        return false;
+    }
     let prk = hmac_sha256(salt, &[ikm]);
     let mut t = [0u8; DIGEST];
     let mut have = 0usize;
@@ -172,4 +176,5 @@ pub fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
         have = DIGEST;
         chunk.copy_from_slice(&t[..chunk.len()]);
     }
+    true
 }

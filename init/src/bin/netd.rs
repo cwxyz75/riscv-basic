@@ -1899,7 +1899,11 @@ pub fn app_main() -> i32 {
                     "stand-in"
                 }
             );
+        } else {
+            rt::println!("netd: WARNING no usable TCP secret in the environment: initial sequence numbers are not secret");
         }
+    } else {
+        rt::println!("netd: WARNING no TCP secret in the environment: initial sequence numbers are not secret");
     }
     let port = d.core.port();
     let _ = sys::port_bind(port, to_stack, 1 << 24, KEY_DOORBELL);

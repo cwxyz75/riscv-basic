@@ -5,6 +5,17 @@
 use crate::chacha;
 use crate::sha256::{hmac_sha256, sha256};
 
+/// Overwrite `b` with zeros in a way the optimiser may not drop.
+pub fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY-free volatile-like write: `write_volatile` needs unsafe, so use an atomic fence after a plain fill and
+        // `black_box`, which the compiler must treat as reading the buffer
+        *x = 0;
+    }
+    core::hint::black_box(&*b);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// The most one request may ask for (the key is replaced after each).
 pub const MAX_REQUEST: usize = 64 * 1024;
 
@@ -54,7 +65,9 @@ impl Drbg {
         }
         // erase: the next key is the first half of block 0; the key that made this output is overwritten
         self.key.copy_from_slice(&first[..32]);
-        old.fill(0);
+        wipe(&mut old);
+        let mut first = first;
+        wipe(&mut first);
         true
     }
 
@@ -65,6 +78,12 @@ impl Drbg {
             return None;
         }
         Some(hmac_sha256(&base, &[label]))
+    }
+}
+
+impl Drop for Drbg {
+    fn drop(&mut self) {
+        wipe(&mut self.key);
     }
 }
 

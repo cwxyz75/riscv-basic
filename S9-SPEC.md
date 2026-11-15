@@ -422,7 +422,7 @@ SYN costs the peer 6 s under slirp (3.2), so the C library posts the whole `list
 
 `ISN = M + F(local address, local port, remote address, remote port, secret)` (RFC 6528), where `M` is the kernel's monotonic
 clock in 4-microsecond units and `F` is SipHash-2-4 truncated to 32 bits. The **secret** is 16 bytes in a one-page **secret
-VMO** that `netsup` creates at boot and holds for the whole boot; `netd` gets a read-only handle and nobody else gets any.
+VMO** that `netsup` creates at boot and holds for the whole boot; `netd` gets a read-only handle and nobody else gets any. (As built the key travels in `netd`'s startup environment instead: see the note at the end of this section and TIDY-UP T99.)
 Because `M` is the kernel's clock and the secret outlives `netd`, **a restarted stack continues the same ISN sequence**: for
 any connection four-tuple the ISN only moves forward within a boot, which is the property NET-DESIGN section 9 asked the
 supervisor to keep, with no TCP state persisted. Ephemeral ports (49152 to 65535) are chosen with RFC 6056's hash-based

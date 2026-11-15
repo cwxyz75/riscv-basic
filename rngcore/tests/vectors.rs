@@ -81,11 +81,21 @@ fn hkdf_matches_rfc_5869_test_case_1() {
     let salt: Vec<u8> = (0..13u8).collect();
     let info: Vec<u8> = (0xf0..=0xf9u8).collect();
     let mut okm = [0u8; 42];
-    hkdf(&salt, &ikm, &info, &mut okm);
+    assert!(hkdf(&salt, &ikm, &info, &mut okm));
     assert_eq!(
         hex(&okm),
         "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
     );
+}
+
+#[test]
+fn hkdf_refuses_more_than_the_construction_allows() {
+    let mut big = vec![0xaau8; 255 * 32 + 1];
+    assert!(!hkdf(b"s", b"k", b"i", &mut big));
+    assert!(big.iter().all(|&b| b == 0xaa), "nothing written");
+    let mut max = vec![0u8; 255 * 32];
+    assert!(hkdf(b"s", b"k", b"i", &mut max));
+    assert!(max[8000..].iter().any(|&b| b != 0));
 }
 
 #[test]

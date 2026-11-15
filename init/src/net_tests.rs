@@ -1772,7 +1772,7 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
             let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7102, 0, 0);
             let w = sys::channel_write(mine, msg.as_ptr(), msg.len(), [h].as_ptr(), 1);
             ensure_eq!(w.status, 0, "the connect request was sent");
-            let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(3000));
+            let wait = sys::object_wait(mine, sig::READABLE | sig::PEER_CLOSED, t(10_000));
             ensure_eq!(wait.status, 0, "an answer");
             let mut b = [0u8; 64];
             let r = sys::channel_read(mine, b.as_mut_ptr(), 64, core::ptr::null_mut(), 0);

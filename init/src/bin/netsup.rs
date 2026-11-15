@@ -667,14 +667,14 @@ fn spawn_netd(
 /// The TCP secret for `netd` (S9-SPEC 5.10), derived with HKDF-SHA256 from 32 bytes of the system's generator
 /// (`/svc/random`, seeded by the entropy device). Without it (no entropy device, or `rngd` not running) a stand-in is used
 /// and said so in the entry `SECRET_SRC=standin`: a hash of the clock, which an observer of the boot could guess
-/// (TIDY-UP T96); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
+/// (TIDY-UP T99); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
 fn secret_env(registry: Option<u32>) -> Vec<Vec<u8>> {
     let mut seed = [0u8; 32];
     let mut from_rngd = false;
     if let Some(reg) = registry {
         let mut fs = rt::fs::Fs::new(reg);
-        if let Ok(mut r) = rt::random::Random::connect(&mut fs, sys::clock_get() + 4000) {
-            from_rngd = r.fill(&mut seed, sys::clock_get() + 4000).is_ok();
+        if let Ok(mut r) = rt::random::Random::connect(&mut fs, sys::clock_get() + 15_000) {
+            from_rngd = r.fill(&mut seed, sys::clock_get() + 10_000).is_ok();
         }
     }
     if !from_rngd {
@@ -682,8 +682,8 @@ fn secret_env(registry: Option<u32>) -> Vec<Vec<u8>> {
         seed = rngcore::sha256(&[&b"netsup stand-in"[..], &t].concat());
     }
     let mut key = [0u8; 16];
-    rngcore::hkdf(b"riscv-os netd v1", &seed, b"tcp isn and ports", &mut key);
-    seed.fill(0);
+    let _ = rngcore::hkdf(b"riscv-os netd v1", &seed, b"tcp isn and ports", &mut key);
+    rngcore::drbg::wipe(&mut seed);
     let hex: Vec<u8> = key
         .iter()
         .flat_map(|b| {

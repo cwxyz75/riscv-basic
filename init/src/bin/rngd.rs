@@ -89,10 +89,15 @@ struct Device {
     pa: u64,
     avail_idx: u16,
     last_used: u16,
+    /// A request timed out: the queue's state is unknown, so the next read resets the device and starts clean.
+    broken: bool,
 }
 
 impl Device {
     fn init(&mut self) -> Result<(), i32> {
+        self.avail_idx = 0;
+        self.last_used = 0;
+        self.broken = false;
         if rd(MAGIC) != 0x7472_6976 || rd(VERSION) != 2 || rd(DEVICE_ID) != 4 {
             return Err(20);
         }
@@ -140,6 +145,9 @@ impl Device {
 
     /// Ask the device for up to `CHUNK` bytes; the count it actually wrote, or `None` if it never answered.
     fn read(&mut self, out: &mut [u8; CHUNK]) -> Option<usize> {
+        if self.broken && self.init().is_err() {
+            return None;
+        }
         // one device-writable descriptor
         let mut d = [0u8; 16];
         d[..8].copy_from_slice(&(self.pa + DATA as u64).to_le_bytes());
@@ -162,6 +170,8 @@ impl Device {
                 break;
             }
             if sys::clock_get() >= deadline {
+                // whatever the device does later, it must not find a half-used queue: reset and start over next time
+                self.broken = true;
                 return None;
             }
             nap();
@@ -205,7 +215,8 @@ impl Rngd {
         };
         let mut buf = [0u8; CHUNK];
         match dev.read(&mut buf) {
-            Some(n) if n > 0 => {
+            // an all-zero block is not entropy (a stuck device): it is not counted
+            Some(n) if n > 0 && buf[..n].iter().any(|&b| b != 0) => {
                 self.drbg.reseed(&buf[..n]);
                 buf.fill(0);
                 true
@@ -263,8 +274,7 @@ impl Service for Rngd {
             }
             Err(None) => return self.core.violation(key),
         };
-        if self.served >= RESEED_AFTER {
-            self.pull();
+        if self.served >= RESEED_AFTER && self.pull() {
             self.served = 0;
         }
         // not yet seeded: try the device again (it may have been slow at boot)
@@ -331,6 +341,7 @@ pub fn app_main() -> i32 {
                                 pa: pa.a1 as u64,
                                 avail_idx: 0,
                                 last_used: 0,
+                                broken: false,
                             };
                             if d.init().is_ok() {
                                 dev = Some(d);
