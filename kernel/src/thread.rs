@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kcore::sched::{Prio, Sched, State, Tid, WaitQueue, PRIO_IDLE};
+use kcore::sched::{Prio, Sched, State, Tid, Waiters, PRIO_IDLE};
 
 #[cfg(not(feature = "sched-round-robin"))]
 pub type Class = kcore::sched2::TwoBand;
@@ -120,8 +120,8 @@ struct Kernel {
     threads: BTreeMap<Tid, KThread>,
     /// The thread running on each hart (by dense hart index).
     running: Vec<Tid>,
-    exits: WaitQueue,
-    queues: Vec<WaitQueue>,
+    exits: Waiters,
+    queues: Vec<Waiters>,
     /// Exited detached threads waiting for the reaper.
     zombies: Vec<Tid>,
     reaper_queue: usize,
@@ -181,7 +181,7 @@ pub fn init(boot_prio: Prio) {
             sched,
             threads,
             running: alloc::vec![boot; harts],
-            exits: WaitQueue::new(),
+            exits: Waiters::new(),
             queues: Vec::new(),
             zombies: Vec::new(),
             reaper_queue: 0,
@@ -475,7 +475,23 @@ pub fn yield_now() {
     });
 }
 
-/// Block until woken (or return at once if a wake already arrived).
+/// About to wait (SCHED-SMP-SPEC 3.7 step 1): from now on a wake counts. Call it before registering anywhere; end the
+/// wait with `block` (which returns at once if a wake arrived meanwhile).
+pub fn prepare_block() {
+    irq::without(|| {
+        kernel()
+            .sched
+            .prepare_block_on(hart())
+            .expect("running thread");
+    });
+}
+
+/// The park word of a thread (a test hook).
+pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
+    irq::without(|| kernel().sched.park_state(tid))
+}
+
+/// Block until woken (or return at once if a wake already arrived after `prepare_block`).
 pub fn block() {
     irq::without(|| {
         if kernel()
@@ -488,7 +504,8 @@ pub fn block() {
     });
 }
 
-/// Wake a thread (or leave it a token if it is not blocked yet).
+/// Wake a thread: a blocked one runs again; one that has prepared to wait will not block; otherwise nothing happens
+/// (a wake is never remembered).
 pub fn wake(tid: Tid) {
     irq::without(|| {
         let _ = kernel().sched.wake_on(hart(), tid);
@@ -610,7 +627,7 @@ pub fn join(tid: Tid) -> bool {
 pub fn new_queue() -> usize {
     irq::without(|| {
         let k = kernel();
-        k.queues.push(WaitQueue::new());
+        k.queues.push(Waiters::new());
         k.queues.len() - 1
     })
 }
@@ -641,6 +658,9 @@ pub fn wait_deadline_registered(
             if k.sched.now() >= deadline {
                 return Some(false);
             }
+            // (prepared before registering: the order of 3.7 — under the big lock nothing can interleave, but the
+            // protocol is the one the later locks need)
+            let _ = k.sched.prepare_block_on(hart());
             register();
             count_sleep(&mut slept);
             if k.sched

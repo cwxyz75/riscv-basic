@@ -135,6 +135,17 @@ mod on {
         best
     }
 
+    /// The longest interrupts-off span of hart `h` since the last `reset`.
+    pub fn irq_off_max_on(h: usize) -> (u64, Option<&'static Location<'static>>) {
+        let p = OFF_SITE[h].load(Relaxed);
+        // SAFETY: as in `irq_off_max`.
+        (OFF_MAX[h].load(Relaxed), unsafe { p.as_ref() })
+    }
+
+    pub fn this_hart() -> usize {
+        hart()
+    }
+
     pub fn reset() {
         for h in 0..MAX_HARTS {
             OFF_MAX[h].store(0, Relaxed);
@@ -216,13 +227,16 @@ pub use off::*;
 pub fn the_latency_trace_can_see_a_long_section() -> Result<(), alloc::string::String> {
     const LEN: u64 = 50_000; // 5 ms of the 10 MHz counter
     reset();
-    crate::irq::without(|| {
+    // (this hart's maximum: another hart waiting for the big lock with interrupts off can record a longer span of its
+    // own between the reset and the read, which says nothing about this section)
+    let h = crate::irq::without(|| {
         let start = crate::timer::now();
         while crate::timer::now() < start + LEN {
             core::hint::spin_loop();
         }
+        this_hart()
     });
-    let (cycles, site) = irq_off_max();
+    let (cycles, site) = irq_off_max_on(h);
     if !(LEN..=LEN + LEN / 5).contains(&cycles) {
         return Err(alloc::format!(
             "a {LEN}-cycle interrupts-off section was reported as {cycles} cycles"

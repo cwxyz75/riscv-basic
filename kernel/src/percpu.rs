@@ -14,6 +14,19 @@ pub const IPI_RESCHED: u32 = 1;
 /// Run the hart's `work_kind` job in its IPI handler (tests of the lock).
 pub const IPI_WORK: u32 = 2;
 
+/// The lock-order checker's record of what a hart holds. Touched only by its own hart with interrupts off (X6).
+pub struct HeldCell(core::cell::UnsafeCell<klock::Held>);
+
+// SAFETY: only the owning hart reads or writes it, with interrupts off, so there is never a concurrent access.
+unsafe impl Sync for HeldCell {}
+
+impl HeldCell {
+    pub fn with<R>(&self, f: impl FnOnce(&mut klock::Held) -> R) -> R {
+        // SAFETY: see the `Sync` impl: one hart, interrupts off, no re-entry (the closure takes no locks).
+        f(unsafe { &mut *self.0.get() })
+    }
+}
+
 /// The layout of the first three fields is used by the trap assembly (`trap.rs`, `user.rs`).
 #[repr(C)]
 pub struct PerHart {
@@ -50,8 +63,8 @@ pub struct PerHart {
     /// The nesting depth of the big kernel lock held on this hart (the lock follows the thread:
     /// `bkl::swap_depth`).
     pub bkl_depth: kcore::ticket::Depth,
-    /// The lock classes this hart holds (bit per `bkl::Class`), for the lock-order checker.
-    pub locks_held: AtomicU32,
+    /// What this hart holds (a stack of lock classes), for the lock-order checker.
+    pub held: HeldCell,
     /// Work for the hart's IPI handler (S5b tests): kind, argument, result and a done flag.
     pub work_kind: AtomicU32,
     pub work_arg: AtomicU64,
@@ -79,7 +92,7 @@ impl PerHart {
             deadline: AtomicU64::new(0),
             tp_seen: AtomicUsize::new(0),
             bkl_depth: kcore::ticket::Depth::new(),
-            locks_held: AtomicU32::new(0),
+            held: HeldCell(core::cell::UnsafeCell::new(klock::Held::new())),
             work_kind: AtomicU32::new(0),
             work_arg: AtomicU64::new(0),
             work_result: AtomicU64::new(0),

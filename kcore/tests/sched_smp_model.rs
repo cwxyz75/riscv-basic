@@ -251,14 +251,28 @@ fn a_rotated_thread_is_offered_to_the_other_harts() {
 }
 
 #[test]
-fn a_wake_leaves_a_token_for_a_thread_running_on_another_hart() {
-    // (C3, across harts) a wake that arrives while the thread is still Running elsewhere must not
-    // be lost: its next block consumes the token and does not block
+fn a_wake_after_prepare_is_not_lost_across_harts() {
+    // (PK1, across harts) the thread prepared to wait on hart 1; a wake from hart 0 arrives before it blocks: its
+    // block does not happen. A wake that finds it not prepared is not remembered.
     let (mut s, _idle) = world(FixedPriority::new(), 2);
     let t = s.spawn_on(1, 6, Some(1)).unwrap();
     assert_eq!(s.current_on(1), Some(t));
-    s.wake_on(0, t).unwrap(); // not blocked: leaves a token
-    assert_eq!(s.block_current_on(1), Ok(false), "the token let it through");
+    s.wake_on(0, t).unwrap(); // not prepared: dropped
+    assert_eq!(
+        s.block_current_on(1),
+        Ok(true),
+        "a wake before the prepare is not remembered"
+    );
+    s.wake_on(0, t).unwrap();
+    s.reschedule_on(1); // hart 1 serves its poke
+    assert_eq!(s.current_on(1), Some(t));
+    s.prepare_block_on(1).unwrap();
+    s.wake_on(0, t).unwrap(); // prepared, still running: counts
+    assert_eq!(
+        s.block_current_on(1),
+        Ok(false),
+        "the notification let it through"
+    );
     assert_eq!(s.block_current_on(1), Ok(true), "and only once");
     s.audit().unwrap();
 }
