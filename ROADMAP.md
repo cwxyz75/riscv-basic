@@ -619,7 +619,9 @@ Progress (NET-SPEC steps; boxes tick only when verified in QEMU at `-smp 2` and 
 Acceptance: a hash-verified fetch from a host HTTP server; host `curl` against an
 in-OS HTTP server serving memory-filesystem files; the lossy-link suite passes.
 
-Draft specification with the acceptance checks written first: `S9-SPEC.md` (a proposal; not accepted by the owner yet).
+Draft specification with the acceptance checks written first: `S9-SPEC.md` (accepted by the owner 2026-11-15, with the recommendations of its section 17).
+
+Progress (2026-11-15): step 0 (slirp TCP probe and capture) and step 1 (the data-path prototype, `S9-STEP1-RESULT.md`) are done and merged. Step 2 is in progress: `netwire::tcp` (segment view, builder, options; goldens from the real capture) and `nettcp` part 1 (sequence arithmetic, reassembly and send buffers, the RTO estimator, the connection state machine with RFC 9293's figures as packet scripts, RFC 5961 checks, delayed and quick ACKs, persist, Nagle, retransmission with backoff and the 100 s limit). Not yet: congestion control and fast retransmit (step 3), the listener and connection tables, TIME-WAIT SYN reuse, ICMP soft errors, integration into `netcore`/`netd` (step 4).
 
 - [ ] TCP (state machine, retransmission, congestion control) with packet-script tests
 - [ ] Sockets interface in the libc
@@ -674,6 +676,15 @@ resume. The object lock stays one lock (owner defers to the spec; revisit on its
 Every task keeps the system bootable and green; every kernel or security task marked Fable gets an independent review in its
 own small PR, and the lock-peel tasks also get a soak run (`make soak`), at `-smp 1, 2 and 4`.
 
+### F: The disk filesystem (draft spec in `FS-SPEC.md`; not started; after S9)
+
+Acceptance: the eight checks in `FS-SPEC.md` section 9 (tree model, exhaustive crash testing, `memfs` differential, corruption,
+independent `fsck`, full volume, QEMU restart, confinement). Steps 0 to 6 are listed there; step 0 (attributes, indexes and
+queries in `memfs`) is S10's first bullet moved ahead.
+
+- [ ] Step 0: attributes, indexes and `query` in `memfs` and `proto::file`
+- [ ] Steps 1 to 6 as in `FS-SPEC.md` section 6
+
 ### S10: Namespaces and attributes
 
 Acceptance: scripted attribute queries pass; a union-backed `/bin` demo works.
@@ -719,4 +730,4 @@ V, T, R, SD, DM, I, L) are the concrete versions; the items below are the origin
 Longer-term backlog (see `OS-ARCHITECTURE.md` section 16): a real on-disk
 filesystem with crash-injection tests, a 9P bridge, graphics and input, scheduler
 alternatives against the conformance suite, capability revocation, quotas,
-self-hosting.
+self-hosting; **IPv6** (distant future, added at the owner's request 2026-11-15: NET-SPEC and S9 are IPv4 only on purpose, and `netwire`, `netcore` and `nettcp` should keep addresses behind small types so it stays possible).

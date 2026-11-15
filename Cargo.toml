@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "abi", "cfmt", "dhcp", "init", "kcore", "klock", "libc", "kernel", "memfs", "netcore", "netring", "netsim", "netwire", "proto", "rt", "shell-core", "supervise", "svc",
+    "abi", "cfmt", "dhcp", "init", "kcore", "klock", "libc", "kernel", "memfs", "netcore", "netring", "netsim", "nettcp", "netwire", "proto", "rt", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/kernel", "home/logo", "home/rv64", "home/turtle",
 ]
 # Plain `cargo test` / `cargo build` at the root only touches the host-testable
 # host-testable crates. The two kernels target bare-metal RISC-V and are built from
 # inside kernel/ and home/kernel/ (see Makefile), which pick up their .cargo/config.toml.
 default-members = [
-    "abi", "cfmt", "dhcp", "kcore", "klock", "memfs", "netcore", "netring", "netsim", "netwire", "proto", "shell-core", "supervise", "svc",
+    "abi", "cfmt", "dhcp", "kcore", "klock", "memfs", "netcore", "netring", "netsim", "nettcp", "netwire", "proto", "shell-core", "supervise", "svc",
     "home/basic", "home/basic-script", "home/cartfs", "home/console", "home/logo", "home/rv64", "home/turtle",
 ]
 
@@ -78,6 +78,8 @@ opt-level = 2
 [profile.dev.package.netwire]
 opt-level = 2
 [profile.dev.package.netcore]
+opt-level = 2
+[profile.dev.package.nettcp]
 opt-level = 2
 [profile.dev.package.netring]
 opt-level = 2

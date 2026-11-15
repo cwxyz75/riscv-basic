@@ -11,6 +11,7 @@ pub mod dhcp;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
+pub mod tcp;
 pub mod udp;
 
 /// Why a parse or a build failed. Each parser documents which it returns; the stack counts them by kind.
