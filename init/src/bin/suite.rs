@@ -2599,7 +2599,8 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
     ensure_eq!(st(w), Some(S::Ok), "the child raised its priority");
     // thread_spawn into the confined process: a priority above its job's maximum is refused
     {
-        let entry = worker_set as *const () as usize as u64;
+        // (entry 0 is no code in any process: the check after the priority's)
+        let entry = 0;
         let rec = |priority: u32| rt::SpawnArgs {
             entry,
             priority,
@@ -2610,11 +2611,11 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
             Some(S::AccessDenied),
             "thread_spawn above the job's maximum"
         );
-        // (the child is another program: our function is no code there, which is the next check after the priority's)
+        // (a priority within the maximum passes the priority check)
         ensure_eq!(
             st(sys::thread_spawn(p, &rec(12))),
             Some(S::InvalidArgs),
-            "a priority within the maximum passes; the entry is not code in the child"
+            "a priority within the maximum passes; the entry (0) is refused"
         );
     }
     let mut b = [0u8; 1];
