@@ -4,6 +4,7 @@ use crate::{arr, be16, out, Ip, WireError};
 
 pub const HEADER: usize = 20;
 pub const PROTO_ICMP: u8 = 1;
+pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 /// "Don't fragment".
 pub const FLAG_DF: u16 = 0x4000;

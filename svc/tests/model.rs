@@ -63,6 +63,7 @@ fn random_walk_against_the_reference() {
             conns: 40,
             held_bytes: 4096,
             inflight: 8,
+            stream_bytes: 0,
         };
         let mut acc = Accounts::new(pool);
         let mut table: ConnTable<u32> = ConnTable::new();
@@ -82,6 +83,7 @@ fn random_walk_against_the_reference() {
                         conns: rng.below(u64::from(pl.conns) + 1) as u32 + u32::from(over),
                         held_bytes: rng.below(u64::from(pl.held_bytes) + 1) as u32,
                         inflight: rng.below(u64::from(pl.inflight) + 1) as u32,
+                        stream_bytes: 0,
                     };
                     let r = acc.open(AccountId(parent), lim);
                     if lim.conns > pl.conns {
@@ -218,6 +220,7 @@ fn inflight_and_violations_and_keys() {
         conns: 4,
         held_bytes: 100,
         inflight: 2,
+        stream_bytes: 0,
     });
     let child = acc
         .open(
@@ -226,6 +229,7 @@ fn inflight_and_violations_and_keys() {
                 conns: 2,
                 held_bytes: 50,
                 inflight: 1,
+                stream_bytes: 0,
             },
         )
         .unwrap();
@@ -265,7 +269,8 @@ fn inflight_and_violations_and_keys() {
             Limits {
                 conns: 3,
                 held_bytes: 1,
-                inflight: 1
+                inflight: 1,
+                stream_bytes: 0,
             }
         ),
         Err(Refuse::Invalid)
@@ -276,7 +281,8 @@ fn inflight_and_violations_and_keys() {
             Limits {
                 conns: 1,
                 held_bytes: 1,
-                inflight: 1
+                inflight: 1,
+                stream_bytes: 0,
             }
         ),
         Err(Refuse::NoSuchAccount)

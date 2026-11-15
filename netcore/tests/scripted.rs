@@ -601,6 +601,76 @@ fn with_no_address_only_dhcp_is_accepted_and_sends_need_one() {
     assert_eq!(ip.header.src, [0; 4]);
 }
 
+// ---- S8 follow-up item 4: transports are dispatched, and an ICMP error reaches the one it quotes ----
+
+/// A destination-unreachable from `from` to us, quoting the first 28 bytes of a packet `quoted_src` -> `quoted_dst`.
+fn unreachable_frame(from: [u8; 4], code: u8, quoted: &[u8]) -> Vec<u8> {
+    let mut m = vec![0u8; 8 + 28];
+    let n = icmp::write_unreachable(&mut m, code, quoted).unwrap();
+    m.truncate(n);
+    ip_frame(ME, GW_MAC, hdr(from, MY_IP, 1), &m)
+}
+
+/// The IP packet (header and 8 bytes of payload) that we sent: protocol `proto`, ports `sport` and `dport`.
+fn our_packet(proto: u8, dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+    let mut p = vec![0u8; 20 + 8];
+    ipv4::write_header(&mut p, &hdr(MY_IP, dst, proto), 8).unwrap();
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p
+}
+
+#[test]
+fn a_tcp_segment_reaches_the_tcp_dispatch_which_in_s8_counts_it() {
+    let mut c = up();
+    c.ingress(&ip_frame(ME, PEER_MAC, hdr(PEER, MY_IP, 6), &[0; 20]), 0);
+    assert_eq!(c.counters().rx_unknown_protocol, 1);
+    assert!(
+        drain(&mut c, 0).is_empty(),
+        "and nothing is sent back: no RST in S8"
+    );
+}
+
+#[test]
+fn an_icmp_error_goes_to_the_transport_it_quotes() {
+    let mut c = up();
+    c.ingress(&unreachable_frame(GW, 3, &our_packet(17, FAR, 5000, 53)), 0);
+    c.ingress(&unreachable_frame(GW, 1, &our_packet(17, FAR, 5001, 53)), 0);
+    c.ingress(&unreachable_frame(GW, 3, &our_packet(6, FAR, 40000, 80)), 0);
+    c.ingress(&unreachable_frame(GW, 3, &our_packet(1, FAR, 0, 0)), 0);
+    let k = c.counters();
+    assert_eq!(k.icmp_unreachable_received, 4);
+    assert_eq!(
+        (
+            k.icmp_error_udp,
+            k.icmp_error_tcp,
+            k.icmp_error_other_protocol
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(k.icmp_error_malformed, 0);
+}
+
+#[test]
+fn an_icmp_error_quoting_something_we_did_not_send_is_not_passed_on() {
+    let mut c = up();
+    // quoting a packet from somebody else's address
+    let mut theirs = our_packet(17, FAR, 5000, 53);
+    theirs[12..16].copy_from_slice(&PEER);
+    c.ingress(&unreachable_frame(GW, 3, &theirs), 0);
+    // too short to hold the ports, and not IPv4 at all
+    c.ingress(
+        &unreachable_frame(GW, 3, &our_packet(17, FAR, 5000, 53)[..22]),
+        0,
+    );
+    let mut v6 = our_packet(17, FAR, 5000, 53);
+    v6[0] = 0x65;
+    c.ingress(&unreachable_frame(GW, 3, &v6), 0);
+    let k = c.counters();
+    assert_eq!(k.icmp_error_malformed, 3);
+    assert_eq!((k.icmp_error_udp, k.icmp_error_tcp), (0, 0));
+}
+
 // ---- drops, each with exactly its counter ----
 
 fn only(c: &Core, f: impl Fn(&Counters) -> u64, what: &str) {

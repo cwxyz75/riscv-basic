@@ -169,6 +169,7 @@ fn run_seed(seed: u64, steps: usize) -> u64 {
         reorder_pct: rng.below(30),
         min_delay: 0,
         max_delay: 3 * MS,
+        ..Faults::NONE
     };
     let mut w = World::new(seed, faults);
     let mut counter = 0u32;

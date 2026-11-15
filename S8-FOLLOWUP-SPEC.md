@@ -61,15 +61,15 @@ in, in the PR description too.
 
 | # | Class (A/B/C/D) | What changed or the evidence | Test |
 |---|---|---|---|
-| 1 | | | |
-| 2 | | | |
-| 3 | | | |
-| 4 | | | |
-| 5 | | | |
-| 6 | | | |
-| 7 | | | |
-| 8 | | | |
-| 9 | | | |
-| 10 | | | |
-| 11 | | | |
-| 12 | | | |
+| 1 | B | `proto::net::reserved` (kinds 3-4, statuses 10-16, endpoint ops 16-19, notices 16-21) and `classify_open_kind`; `netd` answers a reserved kind `NotSupported` and any other unknown kind `BadRequest`; `rt::net::Net::call_with` sends any number of handles; the stack closes every handle it is sent | `proto/tests/wire.rs` `reserved_values::*` (5 host tests); QEMU suite `net_clients_are_confined` (reserved kind, unknown kind, two handles, no handle: each status, each handle seen closed, account untouched) |
+| 2 | B | `svc::Limits.stream_bytes` with `charge_stream`/`release_stream`/`stream_usage`, parent cap, close refused while charged; `limits::STREAM_BYTES_PER_ACCOUNT` 512 KiB, `POOL_STREAM_BYTES` 4 MiB; netd's accounts carry them; S8 charges none | `proto/tests/net_accounts.rs` `stream_bytes_are_charged_and_refunded_exactly_down_the_chain`; existing accounting tests unchanged |
+| 3 | A | `NET-SPEC.md` 6.6: the sequence is not a promise; UDP and TCP port spaces are separate. No S8 test pins a sequence. | none needed |
+| 4 | B | `netcore`: `PROTO_TCP` dispatch (`rx_tcp`, counts `rx_unknown_protocol`); a received destination-unreachable is checked (ours: IPv4, whole header, our source address, room for ports) and handed to the UDP, TCP or other hook; S8 hooks count (`icmp_error_udp/tcp/other_protocol/malformed`, appended so counter ids are stable) | `netcore/tests/scripted.rs`: `a_tcp_segment_reaches_the_tcp_dispatch_which_in_s8_counts_it`, `an_icmp_error_goes_to_the_transport_it_quotes`, `an_icmp_error_quoting_something_we_did_not_send_is_not_passed_on` (two mutations checked) |
+| 5 | A | `NET-SPEC.md` 11 and `INVARIANTS.md` NET6 reworded (client's control; TCP orphans drain, charged) | none (wording) |
+| 6 | A | `NET-SPEC.md` 8.1 notes the two extra phases and the constant P | none |
+| 7 | A | `NET-SPEC.md` 4.2: `netsup` also holds the secret VMO, passes it read-only to `netd` only; flight-recorder kinds 32-63 reserved for TCP (S8 has no kind enum: one `##NETFR` line) | none |
+| 8 | A + D | A: `NET-SPEC.md` 6.2 states what is built: the identification is a counter from 1, **DF is set on everything sent** (this contradicts S9-SPEC's "DF clear": flagged there for S9 step 2). D: no loopback path (not small, and nothing uses it yet): T89 | none; T89 |
+| 9 | B | `netsim`: `corrupt_pct` (one bit), `rate` + `queue_limit` per direction with tail drop, `Link::replace_endpoint`; counters `corrupted`, `tail_dropped`, `orphaned`; H6 text extended | three `netsim` tests, each mutation-checked (queue bound, replace, bit flip) |
+| 10 | B (part) | harness netdev line gains `hostfwd=tcp:127.0.0.1:TCPHOSTPORT-:7778` (a free port, `OS_NET_TCP_HOSTPORT` overrides); the capture checker's docs-check line is S9 step 0's | the net boot tests at `-smp 2` and `-smp 4` (273 tests, capture check clean) |
+| 11 | A | two rows added to `NET-SPEC.md` 3.2, marked "from the S9 probe, 2026-11-14", pending S9 step 0 | none |
+| 12 | A | the row was **not** written: T90 now states it and points at `S9-SPEC.md` section 4 and step 1 | none |

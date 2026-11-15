@@ -20,6 +20,7 @@ fn limits_for(conns: u32) -> Limits {
         conns,
         held_bytes: 64 * 1024,
         inflight: 16,
+        stream_bytes: limits::STREAM_BYTES_PER_ACCOUNT,
     }
 }
 
@@ -97,4 +98,55 @@ fn random_charges_and_refunds_match_a_recount() {
             assert_eq!(a.usage(svc::ROOT).unwrap().0, held.iter().sum::<u32>());
         }
     }
+}
+
+/// S8 follow-up item 2 (S9-SPEC 18.2): the account carries a byte reservation, `stream_bytes`, beside its connections. S8
+/// charges none, but the model is in place and exact before S9's tests are built on it.
+#[test]
+fn stream_bytes_are_charged_and_refunded_exactly_down_the_chain() {
+    assert_eq!(limits::STREAM_BYTES_PER_ACCOUNT, 512 * 1024);
+    assert_eq!(limits::POOL_STREAM_BYTES, 4 * 1024 * 1024);
+    let mut pool = limits_for(limits::POOL_CONNS);
+    pool.stream_bytes = limits::POOL_STREAM_BYTES;
+    let mut a = Accounts::new(pool);
+    let c1 = a.open(svc::ROOT, limits_for(32)).unwrap();
+    let c2 = a.open(svc::ROOT, limits_for(32)).unwrap();
+    let kib = 1024;
+    // 16 default streams (32 KiB each) fill one account exactly
+    for _ in 0..16 {
+        a.charge_stream(c1, 32 * kib).unwrap();
+    }
+    assert_eq!(a.charge_stream(c1, 1), Err(Refuse::Quota));
+    assert_eq!(a.stream_usage(c1), Ok(512 * kib));
+    assert_eq!(
+        a.stream_usage(svc::ROOT),
+        Ok(512 * kib),
+        "the pool sees it too"
+    );
+    // a second client is unaffected
+    a.charge_stream(c2, 32 * kib).unwrap();
+    // the pool limit binds even when the client's own does not: 4 MiB in all
+    let mut c = vec![];
+    for _ in 0..8 {
+        c.push(a.open(svc::ROOT, limits_for(32)).unwrap());
+    }
+    let mut charged = 512 * kib + 32 * kib;
+    'fill: for &id in &c {
+        for _ in 0..16 {
+            if a.charge_stream(id, 32 * kib).is_err() {
+                break 'fill;
+            }
+            charged += 32 * kib;
+        }
+    }
+    assert_eq!(charged, limits::POOL_STREAM_BYTES);
+    assert_eq!(a.stream_usage(svc::ROOT), Ok(charged));
+    // a refusal charged nothing; a refund is exact
+    a.release_stream(c1, 512 * kib);
+    assert_eq!(a.stream_usage(c1), Ok(0));
+    assert_eq!(a.stream_usage(svc::ROOT), Ok(charged - 512 * kib));
+    // a child may not be given more than its parent
+    let mut big = limits_for(32);
+    big.stream_bytes = limits::POOL_STREAM_BYTES + 1;
+    assert_eq!(a.open(svc::ROOT, big), Err(Refuse::Invalid));
 }

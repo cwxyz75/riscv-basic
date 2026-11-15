@@ -834,11 +834,64 @@ impl Core {
                 ip.header_len,
                 now,
             ),
+            // the dispatch point for TCP (S9). Until a TCP layer exists a segment is, honestly, an unknown protocol.
+            ipv4::PROTO_TCP => self.rx_tcp(),
             _ => {
                 self.counters.rx_unknown_protocol += 1;
                 Vec::new()
             }
         }
+    }
+
+    /// A TCP segment addressed to us. S8 has no TCP: counted as an unknown protocol and dropped.
+    fn rx_tcp(&mut self) -> Vec<Event> {
+        self.counters.rx_unknown_protocol += 1;
+        Vec::new()
+    }
+
+    /// A destination-unreachable quotes the start of a packet *we sent*: the IP header and the first 8 bytes of its
+    /// payload. Pass it to the transport named by the quoted protocol, which is the only layer that knows what the
+    /// quoted ports mean. In S8 the UDP and TCP hooks only count; S9's TCP uses its hook for hard errors (RFC 5927).
+    fn rx_icmp_error(&mut self, code: u8, quoted: &[u8]) -> Vec<Event> {
+        let Some(cfg) = self.cfg else {
+            return Vec::new();
+        };
+        let ihl = usize::from(quoted.first().map_or(0, |b| b & 0x0f)) * 4;
+        // the quoted packet must look like one of ours: IPv4, a whole header, our source address, and room for the ports
+        let ours = quoted.first().is_some_and(|b| b >> 4 == 4)
+            && ihl >= ipv4::HEADER
+            && quoted.len() >= ihl + 4
+            && quoted[12..16] == cfg.addr;
+        if !ours {
+            self.counters.icmp_error_malformed += 1;
+            return Vec::new();
+        }
+        let ports = &quoted[ihl..ihl + 4];
+        let (src_port, dst_port) = (
+            u16::from_be_bytes([ports[0], ports[1]]),
+            u16::from_be_bytes([ports[2], ports[3]]),
+        );
+        let dst: Ip = [quoted[16], quoted[17], quoted[18], quoted[19]];
+        match quoted[9] {
+            ipv4::PROTO_UDP => self.udp_error(src_port, dst, dst_port, code),
+            ipv4::PROTO_TCP => self.tcp_error(src_port, dst, dst_port, code),
+            _ => {
+                self.counters.icmp_error_other_protocol += 1;
+                Vec::new()
+            }
+        }
+    }
+
+    /// The UDP layer's hook: our datagram from `src_port` to `dst:dst_port` drew an unreachable of `code`.
+    fn udp_error(&mut self, _src_port: u16, _dst: Ip, _dst_port: u16, _code: u8) -> Vec<Event> {
+        self.counters.icmp_error_udp += 1;
+        Vec::new()
+    }
+
+    /// The TCP layer's hook (S9 fills it in).
+    fn tcp_error(&mut self, _src_port: u16, _dst: Ip, _dst_port: u16, _code: u8) -> Vec<Event> {
+        self.counters.icmp_error_tcp += 1;
+        Vec::new()
     }
 
     fn rx_icmp(&mut self, src_mac: Mac, h: &ipv4::Header, body: &[u8], now: Instant) -> Vec<Event> {
@@ -894,7 +947,7 @@ impl Core {
             }
             icmp::TYPE_UNREACHABLE => {
                 self.counters.icmp_unreachable_received += 1;
-                Vec::new()
+                self.rx_icmp_error(m.code, m.body)
             }
             _ => {
                 self.counters.icmp_other += 1;

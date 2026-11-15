@@ -86,18 +86,23 @@ impl Net {
         send: Option<u32>,
         deadline: u64,
     ) -> Result<(i32, Vec<u8>), NetError> {
+        let hs = [send.unwrap_or(0)];
+        self.call_with(r, &hs[..usize::from(send.is_some())], deadline)
+    }
+
+    /// As `call`, with any number of handles (S9's `Accept` carries two). On a failed send every handle is closed here;
+    /// on a sent request the stack owns them.
+    pub fn call_with(
+        &mut self,
+        r: &Request,
+        send: &[u32],
+        deadline: u64,
+    ) -> Result<(i32, Vec<u8>), NetError> {
         self.txid = self.txid.wrapping_add(1);
         let req = pn::encode_request(self.txid, 0, r);
-        let hs = [send.unwrap_or(0)];
-        let w = sys::channel_write(
-            self.ch,
-            req.as_ptr(),
-            req.len(),
-            hs.as_ptr(),
-            usize::from(send.is_some()),
-        );
+        let w = sys::channel_write(self.ch, req.as_ptr(), req.len(), send.as_ptr(), send.len());
         if w.status != 0 {
-            if let Some(h) = send {
+            for &h in send {
                 sys::handle_close(h);
             }
             return Err(if w.status == Status::PeerClosed.code() {
