@@ -70,14 +70,11 @@ fn run(seed: u64) {
         match rng.below(8) {
             // the device finishes a posted receive: the driver holds it
             0 => {
+                let start = rng.below(SLOTS);
                 if let Some(s) = (0..SLOTS)
-                    .find(|&s| rx[(s + rng.below(SLOTS)) % SLOTS] == Rx::Device)
-                    .map(|s| (s + 0) % SLOTS)
+                    .map(|k| (k + start) % SLOTS)
+                    .find(|&k| rx[k] == Rx::Device)
                 {
-                    let s = (0..SLOTS)
-                        .map(|k| (k + s) % SLOTS)
-                        .find(|&k| rx[k] == Rx::Device)
-                        .unwrap();
                     rx[s] = Rx::Driver;
                     drv_rx
                         .mv(s as u32, Slot::DeviceHas, Slot::DriverHas)
@@ -229,7 +226,7 @@ fn run(seed: u64) {
         // the stack's own accounting agrees with the reference
         assert_eq!(
             stack_tx.count(Slot::StackFree),
-            m(Tx::Free) + m(Tx::Stack) * 0,
+            m(Tx::Free),
             "{ctx}: the stack's free list"
         );
     }

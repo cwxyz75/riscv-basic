@@ -151,7 +151,7 @@ impl<'a, M: Mem> Ring<'a, M> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len().map_or(false, |n| n == 0)
+        self.len() == Ok(0)
     }
 
     /// Publish an entry (the producer). The entry words are written before the index (release).
