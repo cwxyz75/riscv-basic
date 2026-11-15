@@ -609,8 +609,18 @@ static void streams(void) {
     printf("va_arg %d\n", sum(4, 10, 20, 30, 40));
 }
 
+/* the socket test exists only in the OS build (a strong reference pulls its object out of the archive); the host oracle
+ * has no such function and never takes this branch */
+#ifdef __riscv
+int sockets_test(void);
+#define RUN_SOCKETS(argc, argv) ((argc) > 1 && strcmp((argv)[1], "sockets") == 0)
+#else
+static int sockets_test(void) { return 0; }
+#define RUN_SOCKETS(argc, argv) 0
+#endif
+
 int main(int argc, char **argv) {
-    (void)argv;
+    if (RUN_SOCKETS(argc, argv)) return sockets_test();
     atexit(tail);
     printf("argc %d\n", argc);
     formats();

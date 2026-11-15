@@ -398,6 +398,22 @@ impl Net {
         rcv_buf: u32,
         deadline: u64,
     ) -> Result<Stream, NetError> {
+        let mut s = self.begin_connect(dst, port, oflags, snd_buf, rcv_buf, deadline)?;
+        s.finish_connect(deadline)?;
+        Ok(s)
+    }
+
+    /// Start a TCP connection without waiting for it: the stream exists, `Connect` has been sent, and `finish_connect` (or
+    /// `connect_outcome`, which never waits) says how it ended. `deadline` bounds the request to the stack only.
+    pub fn begin_connect(
+        &mut self,
+        dst: [u8; 4],
+        port: u16,
+        oflags: u32,
+        snd_buf: u32,
+        rcv_buf: u32,
+        deadline: u64,
+    ) -> Result<Stream, NetError> {
         let (ch, _) = self.open_endpoint(pn::kind::TCP_STREAM, 0, [0; 4], oflags, deadline)?;
         let pair = sys::socket_create();
         if pair.status != 0 {
@@ -413,19 +429,7 @@ impl Net {
             sys::handle_close(ch);
             return Err(NetError::Sys(w.status));
         }
-        let mut s = Stream::new(ch, mine);
-        loop {
-            match s.next_notice(deadline) {
-                Ok(()) => {}
-                Err(e) => return Err(e),
-            }
-            if let Some(st) = s.connect_failed {
-                return Err(NetError::Stack(st));
-            }
-            if s.connected.is_some() {
-                return Ok(s);
-            }
-        }
+        Ok(Stream::new(ch, mine))
     }
 
     /// Listen on `port` and post `backlog` accepts (at most 16).
@@ -642,6 +646,45 @@ impl Stream {
             buf.truncate(rd.a1);
             self.apply(&buf);
         }
+    }
+
+    /// Wait (until `deadline`) for the outcome of `begin_connect`.
+    pub fn finish_connect(&mut self, deadline: u64) -> Result<(), NetError> {
+        loop {
+            if let Some(st) = self.connect_failed {
+                return Err(NetError::Stack(st));
+            }
+            if self.connected.is_some() {
+                return Ok(());
+            }
+            self.next_notice(deadline)?;
+        }
+    }
+
+    /// The outcome of a connect in progress, without waiting: `None` while it is still going on.
+    pub fn connect_outcome(&mut self) -> Option<Result<(), i32>> {
+        self.drain_channel();
+        if let Some(st) = self.connect_failed {
+            return Some(Err(st));
+        }
+        if self.connected.is_some() {
+            return Some(Ok(()));
+        }
+        if self.chan_closed {
+            return Some(Err(pn::status::CONN_RESET));
+        }
+        None
+    }
+
+    /// Has the connection failed (a reset arrived, or the channel closed without a clean end)?
+    pub fn failed(&mut self) -> bool {
+        self.drain_channel();
+        self.reset.is_some() || (self.chan_closed && !self.peer_fin)
+    }
+
+    /// Did a reset (not a clean close) end the connection?
+    pub fn was_reset(&self) -> bool {
+        self.reset.is_some() || (self.chan_closed && !self.peer_fin)
     }
 
     pub fn local(&self) -> Option<([u8; 4], u16)> {

@@ -141,6 +141,8 @@ pub struct Tcp {
     events: Vec<TcpEvent>,
     /// Packets to ourselves: `(src, dst, tcp bytes)`.
     loopback: VecDeque<(Ip, Ip, Vec<u8>)>,
+    /// UDP datagrams to ourselves: `(src, dst, udp bytes)`, delivered on the next poll, never through the device.
+    pub(crate) udp_loop: VecDeque<(Ip, Ip, Vec<u8>)>,
     port_counter: u32,
     rr: usize,
 }
@@ -158,6 +160,7 @@ impl Tcp {
             challenge_limiter: RateLimit::new(AMOUNT_RST_PER_SEC),
             events: Vec::new(),
             loopback: VecDeque::new(),
+            udp_loop: VecDeque::new(),
             port_counter: 0,
             rr: 0,
         }
@@ -830,7 +833,29 @@ impl Core {
     }
 
     /// Timers, loopback delivery and segment output. Called from the core's `poll`.
-    pub(crate) fn tcp_poll(&mut self, now: Instant) {
+    pub(crate) fn tcp_poll(&mut self, now: Instant) -> Vec<Event> {
+        let mut events = Vec::new();
+        // datagrams we sent to ourselves
+        let n = self.tcp.udp_loop.len();
+        for _ in 0..n {
+            let Some((src, dst, bytes)) = self.tcp.udp_loop.pop_front() else {
+                break;
+            };
+            let h = ipv4::Header {
+                tos: 0,
+                id: 0,
+                flags_frag: 0,
+                ttl: 64,
+                proto: ipv4::PROTO_UDP,
+                src,
+                dst,
+            };
+            let mut whole = vec![0u8; ipv4::HEADER + bytes.len()];
+            if ipv4::write_header(&mut whole, &h, bytes.len()).is_ok() {
+                whole[ipv4::HEADER..].copy_from_slice(&bytes);
+                events.extend(self.rx_udp(self.mac, &h, &whole, ipv4::HEADER, now));
+            }
+        }
         // loopback packets queued before this call: deliver (anything they cause is queued for the next call)
         let n = self.tcp.loopback.len();
         for _ in 0..n {
@@ -867,7 +892,7 @@ impl Core {
         let ids: Vec<ConnId> = self.tcp.conns.keys().copied().collect();
         let len = ids.len();
         if len == 0 {
-            return;
+            return events;
         }
         let start = self.tcp.rr % len;
         self.tcp.rr = self.tcp.rr.wrapping_add(1);
@@ -893,13 +918,14 @@ impl Core {
             }
             self.tcp_collect(id, now);
         }
+        events
     }
 
     /// The earliest TCP deadline (connection timers, TIME-WAIT, orphans), or `now` when loopback packets wait.
     pub(crate) fn tcp_next_deadline(&self) -> Option<Instant> {
         let mut d: Option<Instant> = None;
         let mut take = |t: Instant| d = Some(d.map_or(t, |x| x.min(t)));
-        if !self.tcp.loopback.is_empty() {
+        if !self.tcp.loopback.is_empty() || !self.tcp.udp_loop.is_empty() {
             take(0);
         }
         for e in self.tcp.conns.values() {

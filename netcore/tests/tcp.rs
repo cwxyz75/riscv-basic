@@ -791,3 +791,32 @@ fn cancelling_an_accept_a_syn_already_took_drops_the_half_open_connection() {
     assert_eq!(n.b.core.tcp_conn_count(), 0);
     assert_eq!(n.b.core.tcp_posted_accepts(l), 0, "and it was not put back");
 }
+
+#[test]
+fn a_datagram_to_our_own_address_or_127_is_delivered_without_touching_the_device() {
+    let mut n = Net::clean();
+    n.run_for(5 * MS); // (the gratuitous ARP and anything else the interface says first)
+    let (rx, port) = n.a.core.open_udp(7000, None, false).unwrap();
+    let (tx, tport) = n.a.core.open_udp(0, None, false).unwrap();
+    let before = n.a.core.counters().tx_frames;
+    for dst in [IP_A, [127, 0, 0, 1]] {
+        n.a.core
+            .send_udp(tx, dst, port, b"to myself", 1, n.now)
+            .unwrap();
+        let ev = n.a.core.poll(n.now);
+        assert!(
+            ev.iter().any(|e| matches!(e, Event::Deliver { ep, src_port, payload, .. } if *ep == rx && *src_port == tport && payload == b"to myself")),
+            "delivered to {dst:?}: {ev:?}"
+        );
+    }
+    n.run_for(5 * MS);
+    assert_eq!(
+        n.a.core.counters().tx_frames,
+        before,
+        "nothing reached the device"
+    );
+    // a datagram to a closed local port is an ICMP error to ourselves in a real stack; here it is only counted
+    n.a.core.send_udp(tx, IP_A, 9, b"x", 2, n.now).unwrap();
+    n.a.core.poll(n.now);
+    assert_eq!(n.a.core.counters().udp_no_port, 1);
+}

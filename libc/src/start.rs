@@ -47,6 +47,7 @@ pub fn run_main() -> i32 {
     );
     crate::fd::ROOT.store(env.namespace(b"/").unwrap_or(0), Ordering::Relaxed);
     crate::fd::CWD.store(env.namespace(b".").unwrap_or(0), Ordering::Relaxed);
+    crate::socket::SVC.store(env.namespace(b"/svc").unwrap_or(0), Ordering::Relaxed);
     crate::fd::TTY_IN.store(
         u32::from(env.var(b"STDIN") == Some(&b"tty"[..])),
         Ordering::Relaxed,
