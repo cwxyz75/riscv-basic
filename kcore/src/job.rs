@@ -124,9 +124,41 @@ pub enum JobError {
     TooManyJobs,
 }
 
+/// What a job may do with priority (SCHED-SMP-SPEC 4.9). Invariants (PR1, PR2): a job's values never exceed its
+/// parent's, so a thread's base priority (bounded by its job's `max_prio`) is bounded by every ancestor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedLimits {
+    /// The highest base priority a thread of this job may have (0 to 63; above 31 is the real-time band).
+    pub max_prio: u8,
+    /// Real-time CPU nanoseconds per 100 ms window (0: none). Accounted, not yet enforced.
+    pub rt_budget: u64,
+    /// Reserved for the fair class (1 to 65536); stored.
+    pub cpu_weight: u32,
+}
+
+impl SchedLimits {
+    /// The root job's: everything.
+    pub const ROOT: SchedLimits = SchedLimits {
+        max_prio: 63,
+        rt_budget: 100_000_000,
+        cpu_weight: 1024,
+    };
+}
+
+/// Why `set_sched` refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedError {
+    NoSuchJob,
+    /// A value above the parent's (PR2).
+    AboveParent,
+    /// `max_prio` above 63 or `cpu_weight` outside 1 to 65536.
+    Invalid,
+}
+
 struct Rec {
     parent: Option<JobId>,
     limits: Limits,
+    sched: SchedLimits,
     usage: Usage,
     /// Holders of this id (see the module comment).
     uses: u32,
@@ -151,6 +183,7 @@ impl Jobs {
         recs.push(Some(Rec {
             parent: None,
             limits: Limits::UNLIMITED,
+            sched: SchedLimits::ROOT,
             usage: Usage::default(),
             uses: 1,
         }));
@@ -189,9 +222,11 @@ impl Jobs {
         }
         // a job below `parent` counts against the parent's limit on jobs, and every ancestor's
         self.charge(parent, Resource::Jobs, 1)?;
+        let inherited = self.rec(parent).expect("checked").sched;
         let rec = Rec {
             parent: Some(parent),
             limits,
+            sched: inherited,
             usage: Usage::default(),
             uses: 1,
         };
@@ -259,6 +294,37 @@ impl Jobs {
 
     pub fn limits(&self, id: JobId) -> Option<Limits> {
         Some(self.rec(id)?.limits)
+    }
+
+    pub fn sched(&self, id: JobId) -> Option<SchedLimits> {
+        Some(self.rec(id)?.sched)
+    }
+
+    /// Set a job's scheduling limits. Each value may not exceed the parent's (PR2); lowering one lowers it in every
+    /// descendant too (PR1), so the caller must then clamp the base priority of the threads in the subtree (see
+    /// `is_within`).
+    pub fn set_sched(&mut self, id: JobId, s: SchedLimits) -> Result<(), SchedError> {
+        let parent = self.rec(id).ok_or(SchedError::NoSuchJob)?.parent;
+        if s.max_prio > 63 || !(1..=65536).contains(&s.cpu_weight) {
+            return Err(SchedError::Invalid);
+        }
+        if let Some(p) = parent.and_then(|p| self.rec(p)) {
+            if s.max_prio > p.sched.max_prio || s.rt_budget > p.sched.rt_budget {
+                return Err(SchedError::AboveParent);
+            }
+        }
+        for i in 0..self.recs.len() as u32 {
+            let within = self.is_within(JobId(i), id);
+            if let Some(r) = self.recs[i as usize].as_mut().filter(|_| within) {
+                if JobId(i) == id {
+                    r.sched = s;
+                } else {
+                    r.sched.max_prio = r.sched.max_prio.min(s.max_prio);
+                    r.sched.rt_budget = r.sched.rt_budget.min(s.rt_budget);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn usage(&self, id: JobId) -> Option<Usage> {

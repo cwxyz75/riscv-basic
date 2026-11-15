@@ -290,6 +290,9 @@ pub mod syscall {
     /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then
     /// answers NOT_SUPPORTED.
     pub const THREAD_INTERRUPT: usize = 63;
+    /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
+    pub const THREAD_SET_SCHED: usize = 65;
+    pub const THREAD_GET_SCHED: usize = 66;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -302,6 +305,8 @@ pub mod syscall {
     pub const JOB_CREATE: usize = 90;
     pub const JOB_SET_LIMITS: usize = 91;
     pub const JOB_INFO: usize = 92;
+    /// Set a job's `max_prio`, `rt_budget` and `cpu_weight`.
+    pub const JOB_SET_SCHED: usize = 96;
     pub const JOB_KILL: usize = 93;
     pub const JOB_ROOT: usize = 94;
     pub const RESOURCE_ROOT: usize = 95;

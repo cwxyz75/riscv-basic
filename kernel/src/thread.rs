@@ -520,6 +520,11 @@ pub fn sleep_ticks(n: u64) {
     }
 }
 
+/// A thread's current priority (its base: nothing donates yet).
+pub fn priority_of(tid: Tid) -> Option<Prio> {
+    irq::without(|| kernel().sched.priority(tid))
+}
+
 pub fn set_priority(tid: Tid, prio: Prio) {
     irq::without(|| {
         let _ = kernel().sched.set_priority_on(hart(), tid, prio);

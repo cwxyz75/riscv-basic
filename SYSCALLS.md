@@ -181,10 +181,13 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 63 | thread_interrupt | `a0` thread | reserved: NOT_SUPPORTED |
+| 65 | thread_set_sched | `a0` thread (0: the caller), `a1` priority 1-63, `a2` flags | |
+| 66 | thread_get_sched | `a0` thread (0: the caller) | `a1` packed priorities, `a2` tid |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 | 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
 | 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes) | `a1` used, `a2` limit |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns) |
+| 96 | job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 | |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 | 95 | resource_root | | `a1` handle |
@@ -542,8 +545,33 @@ read). The rights are checked before the pointer is touched.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes; `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
+
+### job_set_sched(job, max_prio, rt_budget_ns, cpu_weight) -> status
+
+Set a job's scheduling limits (slice SC, SCHED-SMP-SPEC 4.9). Needs SET_LIMITS. `max_prio` (0 to 63) is the highest **base**
+priority any thread of the job may have (the real-time band, 32 to 63, therefore only exists in a job whose maximum reaches
+it); `rt_budget_ns` is real-time CPU per 100 ms window (accounted, **not yet enforced**); `cpu_weight` (1 to 65536) is stored
+for a later fair class. No value may exceed the parent job's (PR2: ACCESS_DENIED); a new job starts with its parent's values;
+**lowering `max_prio` lowers the base priority of every live thread in the job and below it that is above it, at once**
+(PR1) and lowers every descendant job's values. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no SET_LIMITS, or a value above
+the parent's); INVALID_ARGS (`max_prio` above 63, `cpu_weight` outside 1 to 65536). Tests: `thread_priority_is_bounded_by_the_job`,
+`kcore/tests/job_sched.rs`.
+
+### thread_set_sched(thread, priority, flags) -> status
+
+Set a thread's base priority (1 to 63) and flags (bit 0: round robin within its level; today every level rotates, so the flag
+is stored and reported only). `thread` 0 names the caller (no right needed and still bounded). Otherwise MANAGE on the thread
+handle. ACCESS_DENIED if `priority` exceeds the thread's job's `max_prio`. A new user thread inherits its creator's base
+priority clamped to its job's maximum; the first thread of a process starts at 10, clamped. Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; INVALID_ARGS (priority 0 or above 63, a reserved flag bit); BAD_STATE (the thread has ended or has not started).
+
+### thread_get_sched(thread) -> status, sched, tid
+
+`sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and the effective priority (16 to 23; equal to the base until
+donation exists, task 22); `tid` is the kernel thread id. `thread` 0 names the caller. Needs INSPECT on a handle. Errors:
+BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE.
 
 ### job_kill(job, code) -> status
 

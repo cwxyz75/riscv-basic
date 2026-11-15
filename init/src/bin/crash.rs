@@ -392,6 +392,35 @@ pub fn app_main() -> i32 {
             let r = rt::sys::futex_wake((n >> 8) as *const u32, 10);
             return if r.status == 0 { 100 + r.a1 as i32 } else { 1 };
         }
+        // 66: a confined program tries to raise its priority (slice SC): above its job's maximum is refused with
+        // ACCESS_DENIED, within it works and reads back. Exit code 0 if all of that holds; else a code that says which.
+        66 => {
+            use rt::abi::status::Status as S;
+            let denied = rt::sys::thread_set_sched(0, 63, 0).status;
+            if denied != S::AccessDenied.code() {
+                return 1;
+            }
+            if rt::sys::thread_set_sched(0, 12, 0).status != 0 {
+                return 2;
+            }
+            let got = rt::sys::thread_get_sched(0);
+            if got.status != 0 || got.a1 & 0xff != 12 || (got.a1 >> 16) & 0xff != 12 {
+                return 3;
+            }
+            return 0;
+        }
+        // 67: raise the own priority to the job's limit, say so, wait to be told, report the priority then (the
+        // parent lowers the job's maximum in between: PR1, every thread of the job is clamped at once).
+        67 => {
+            if rt::sys::thread_set_sched(0, 15, 0).status != 0 {
+                return 1;
+            }
+            rt::sys::channel_write(rt::BOOTSTRAP, b"r".as_ptr(), 1, core::ptr::null(), 0);
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
+            let mut b = [0u8; 1];
+            rt::sys::channel_read(rt::BOOTSTRAP, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0);
+            return (rt::sys::thread_get_sched(0).a1 & 0xff) as i32;
+        }
         52 => {
             // S7b: sleep on a futex forever (until killed): nothing may be left behind
             static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
