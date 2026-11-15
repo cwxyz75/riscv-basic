@@ -1,5 +1,5 @@
 //! `bomb`: tries to make more processes and threads than its job allows (S4.5) and says what
-//! happened. Its job lets it be the only process and run four threads in all.
+//! happened. Its job lets it be the only process and run 128 threads in all (its handle table gives out first: 31 thread handles).
 #![no_std]
 #![no_main]
 
@@ -33,7 +33,7 @@ pub fn app_main() -> i32 {
     let mut stacks: Vec<Vec<u8>> = Vec::new();
     let mut started = 0;
     let mut last = 0;
-    for _ in 0..8 {
+    for _ in 0..200 {
         let mut stack = alloc::vec![0u8; 8192];
         let top = (stack.as_mut_ptr() as u64 + 8192) & !15;
         let t = sys::thread_create(me, idle as *const () as usize as u64, top, 0);

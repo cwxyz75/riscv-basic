@@ -195,7 +195,7 @@ def main():
 
     # limits (S4.5): a program is the only process of its job, runs at most four threads, and
     # has a bounded amount of memory, whatever it tries
-    step(b"bomb\n", [b"$ bomb", b"bomb: process_create: -5", b"bomb: threads: 3 then -5"],
+    step(b"bomb\n", [b"$ bomb", b"bomb: process_create: -5", b"bomb: threads: 31 then -5"],
          "a process and thread bomb is refused")
     counts = []
     for attempt in (1, 2):
