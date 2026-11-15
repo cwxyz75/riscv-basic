@@ -137,6 +137,22 @@ impl Reasm {
         r
     }
 
+    /// Copy up to `out.len()` in-order bytes without removing them; returns how many.
+    pub fn peek(&self, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.ready);
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            *o = self.buf[(self.head + i) % self.buf.len()];
+        }
+        n
+    }
+
+    /// Drop `n` in-order bytes the caller has taken (after `peek`).
+    pub fn consume(&mut self, n: usize) {
+        let n = n.min(self.ready);
+        self.head = (self.head + n) % self.buf.len().max(1);
+        self.ready -= n;
+    }
+
     /// Copy up to `out.len()` in-order bytes out; returns how many.
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         let n = out.len().min(self.ready);

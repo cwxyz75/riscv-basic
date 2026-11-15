@@ -383,3 +383,370 @@ impl Drop for Echo {
         sys::handle_close(self.ch);
     }
 }
+
+// ---------------------------------------------------------------------------------------------- streams (S9, 8.6)
+
+impl Net {
+    /// Open a TCP connection (S9-SPEC 8.6). `snd_buf` and `rcv_buf` of 0 take the stack's defaults; `deadline` bounds the whole
+    /// connect (the stack's own SYN limit is 15 s, so a deadline above that sees the stack's answer, not this timeout).
+    pub fn connect_stream(
+        &mut self,
+        dst: [u8; 4],
+        port: u16,
+        oflags: u32,
+        snd_buf: u32,
+        rcv_buf: u32,
+        deadline: u64,
+    ) -> Result<Stream, NetError> {
+        let (ch, _) = self.open_endpoint(pn::kind::TCP_STREAM, 0, [0; 4], oflags, deadline)?;
+        let pair = sys::socket_create();
+        if pair.status != 0 {
+            sys::handle_close(ch);
+            return Err(NetError::Sys(pair.status));
+        }
+        let (mine, theirs) = (pair.a1 as u32, pair.a2 as u32);
+        let msg = pn::encode_connect(1, dst, port, snd_buf, rcv_buf);
+        let w = sys::channel_write(ch, msg.as_ptr(), msg.len(), [theirs].as_ptr(), 1);
+        if w.status != 0 {
+            sys::handle_close(theirs);
+            sys::handle_close(mine);
+            sys::handle_close(ch);
+            return Err(NetError::Sys(w.status));
+        }
+        let mut s = Stream::new(ch, mine);
+        loop {
+            match s.next_notice(deadline) {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(st) = s.connect_failed {
+                return Err(NetError::Stack(st));
+            }
+            if s.connected.is_some() {
+                return Ok(s);
+            }
+        }
+    }
+
+    /// Listen on `port` and post `backlog` accepts (at most 16).
+    pub fn listen_stream(
+        &mut self,
+        port: u16,
+        backlog: usize,
+        oflags: u32,
+        deadline: u64,
+    ) -> Result<Listener, NetError> {
+        let (ch, body) =
+            self.open_endpoint(pn::kind::TCP_LISTENER, port, [0; 4], oflags, deadline)?;
+        let (port, _) = pn::decode_open_reply(&body).ok_or(NetError::Garbled)?;
+        let mut l = Listener {
+            ch,
+            port,
+            posted: Vec::new(),
+            next_cookie: 1,
+        };
+        for _ in 0..backlog.min(pn::limits::POSTED_ACCEPTS_MAX) {
+            l.post(0, 0)?;
+        }
+        Ok(l)
+    }
+}
+
+/// A listening endpoint with its posted accepts.
+pub struct Listener {
+    ch: u32,
+    pub port: u16,
+    /// `(cookie, the new stream's channel, its socket end)` for each accept the stack holds.
+    posted: Vec<(u32, u32, u32)>,
+    next_cookie: u32,
+}
+
+impl Listener {
+    /// Post one more accept: a fresh channel and socket pair, whose client ends stay here until a SYN takes them.
+    pub fn post(&mut self, snd_buf: u32, rcv_buf: u32) -> Result<(), NetError> {
+        let chan = sys::channel_create();
+        if chan.status != 0 {
+            return Err(NetError::Sys(chan.status));
+        }
+        let (cmine, ctheirs) = (chan.a1 as u32, chan.a2 as u32);
+        let pair = sys::socket_create();
+        if pair.status != 0 {
+            sys::handle_close(cmine);
+            sys::handle_close(ctheirs);
+            return Err(NetError::Sys(pair.status));
+        }
+        let (smine, stheirs) = (pair.a1 as u32, pair.a2 as u32);
+        let cookie = self.next_cookie;
+        self.next_cookie = self.next_cookie.wrapping_add(1).max(1);
+        let msg = pn::encode_accept(cookie, snd_buf, rcv_buf);
+        let hs = [ctheirs, stheirs];
+        let w = sys::channel_write(self.ch, msg.as_ptr(), msg.len(), hs.as_ptr(), 2);
+        if w.status != 0 {
+            for h in [cmine, ctheirs, smine, stheirs] {
+                sys::handle_close(h);
+            }
+            return Err(if w.status == Status::PeerClosed.code() {
+                NetError::Closed
+            } else {
+                NetError::Sys(w.status)
+            });
+        }
+        self.posted.push((cookie, cmine, smine));
+        Ok(())
+    }
+
+    /// Wait for the next connection and re-post the accept it used.
+    pub fn accept(&mut self, deadline: u64) -> Result<Stream, NetError> {
+        loop {
+            let b = next_event(self.ch, deadline)?;
+            match pn::decode_ep_event(&b) {
+                Some(EpEvent::ConnInfo {
+                    code: pn::notice::ACCEPTED,
+                    cookie,
+                    local,
+                    remote,
+                }) => {
+                    let Some(i) = self.posted.iter().position(|p| p.0 == cookie) else {
+                        continue;
+                    };
+                    let (_, ch, sock) = self.posted.swap_remove(i);
+                    let mut s = Stream::new(ch, sock);
+                    s.connected = Some((local, remote));
+                    let _ = self.post(0, 0);
+                    return Ok(s);
+                }
+                Some(EpEvent::Notice { .. }) => continue,
+                _ => return Err(NetError::Garbled),
+            }
+        }
+    }
+
+    pub fn channel(&self) -> u32 {
+        self.ch
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        for (_, c, s) in self.posted.drain(..) {
+            sys::handle_close(c);
+            sys::handle_close(s);
+        }
+        sys::handle_close(self.ch);
+    }
+}
+
+/// (local address and port, remote address and port) of a connection.
+type Tuple4 = (([u8; 4], u16), ([u8; 4], u16));
+
+/// A TCP connection: its endpoint channel (control and the end-of-file rule) and its socket (the bytes).
+pub struct Stream {
+    ch: u32,
+    sock: u32,
+    connected: Option<Tuple4>,
+    connect_failed: Option<i32>,
+    peer_fin: bool,
+    reset: Option<u32>,
+    chan_closed: bool,
+}
+
+impl Stream {
+    fn new(ch: u32, sock: u32) -> Stream {
+        Stream {
+            ch,
+            sock,
+            connected: None,
+            connect_failed: None,
+            peer_fin: false,
+            reset: None,
+            chan_closed: false,
+        }
+    }
+
+    /// Wait for and apply one channel message.
+    fn next_notice(&mut self, deadline: u64) -> Result<(), NetError> {
+        let b = next_event(self.ch, deadline).inspect_err(|e| {
+            if *e == NetError::Closed {
+                self.chan_closed = true;
+            }
+        })?;
+        self.apply(&b);
+        Ok(())
+    }
+
+    fn apply(&mut self, b: &[u8]) {
+        match pn::decode_ep_event(b) {
+            Some(EpEvent::ConnInfo {
+                code: pn::notice::CONNECTED,
+                local,
+                remote,
+                ..
+            }) => {
+                self.connected = Some((local, remote));
+            }
+            Some(EpEvent::Notice {
+                code: pn::notice::CONNECT_FAILED,
+                detail,
+                ..
+            }) => {
+                self.connect_failed = Some(detail as i32);
+            }
+            Some(EpEvent::Notice {
+                code: pn::notice::PEER_FIN,
+                ..
+            }) => self.peer_fin = true,
+            Some(EpEvent::Notice {
+                code: pn::notice::RESET,
+                detail,
+                ..
+            }) => self.reset = Some(detail),
+            _ => {}
+        }
+    }
+
+    /// Apply whatever is waiting on the channel, without blocking.
+    fn drain_channel(&mut self) {
+        loop {
+            let mut buf = alloc::vec![0u8; 256];
+            let rd = sys::channel_read(
+                self.ch,
+                buf.as_mut_ptr(),
+                buf.len(),
+                core::ptr::null_mut(),
+                0,
+            );
+            if rd.status == Status::ShouldWait.code() {
+                if sys::object_signals(self.ch).a1 as u32 & signals::PEER_CLOSED != 0 {
+                    self.chan_closed = true;
+                }
+                return;
+            }
+            if rd.status != 0 {
+                self.chan_closed = true;
+                return;
+            }
+            buf.truncate(rd.a1);
+            self.apply(&buf);
+        }
+    }
+
+    pub fn local(&self) -> Option<([u8; 4], u16)> {
+        self.connected.map(|c| c.0)
+    }
+    pub fn remote(&self) -> Option<([u8; 4], u16)> {
+        self.connected.map(|c| c.1)
+    }
+    pub fn socket(&self) -> u32 {
+        self.sock
+    }
+    pub fn channel(&self) -> u32 {
+        self.ch
+    }
+
+    /// Read up to `buf.len()` bytes, waiting until `deadline`. `Ok(0)` is a **clean** end of the stream (the peer's FIN
+    /// arrived); a reset, a retransmission give-up or the stack's death is `Err(Stack(CONN_RESET))`, never end-of-file
+    /// (S9-SPEC 8.5).
+    pub fn read(&mut self, buf: &mut [u8], deadline: u64) -> Result<usize, NetError> {
+        loop {
+            let r = sys::socket_read(self.sock, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(Status::Ok) if r.a1 > 0 => return Ok(r.a1),
+                Some(Status::Ok) => return Ok(0),
+                Some(Status::ShouldWait) => {
+                    let w = sys::object_wait(
+                        self.sock,
+                        signals::READABLE | signals::PEER_CLOSED | signals::WRITE_CLOSED,
+                        deadline,
+                    );
+                    if w.status != 0 {
+                        return Err(NetError::TimedOut);
+                    }
+                }
+                Some(Status::PeerClosed) => return self.end_of_stream(deadline),
+                _ => return Err(NetError::Sys(r.status)),
+            }
+        }
+    }
+
+    /// The socket ended: clean only if `PeerFin` arrived on the channel (the stack sends it before it shuts the socket).
+    fn end_of_stream(&mut self, deadline: u64) -> Result<usize, NetError> {
+        loop {
+            self.drain_channel();
+            if self.reset.is_some() {
+                return Err(NetError::Stack(pn::status::CONN_RESET));
+            }
+            if self.peer_fin {
+                return Ok(0);
+            }
+            if self.chan_closed {
+                return Err(NetError::Stack(pn::status::CONN_RESET));
+            }
+            // neither yet: the notice may still be on its way; wait for the channel to say something
+            let w = sys::object_wait(self.ch, signals::READABLE | signals::PEER_CLOSED, deadline);
+            if w.status != 0 {
+                return Err(NetError::TimedOut);
+            }
+        }
+    }
+
+    /// Write some of `data`, waiting until `deadline` for room. `Err(Stack(CONN_RESET))` if the stack closed its end.
+    pub fn write(&mut self, data: &[u8], deadline: u64) -> Result<usize, NetError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let w = sys::socket_write(self.sock, data.as_ptr(), data.len());
+            match w.status() {
+                Some(Status::Ok) if w.a1 > 0 => return Ok(w.a1),
+                Some(Status::Ok) | Some(Status::ShouldWait) => {
+                    let o = sys::object_wait(
+                        self.sock,
+                        signals::WRITABLE | signals::PEER_CLOSED,
+                        deadline,
+                    );
+                    if o.status != 0 {
+                        return Err(NetError::TimedOut);
+                    }
+                }
+                // our own job's quota is spent: wait a little for the stack to drain what is queued
+                Some(Status::NoMemory) => {
+                    if sys::clock_get() >= deadline {
+                        return Err(NetError::TimedOut);
+                    }
+                    crate::io::nap(2);
+                }
+                Some(Status::PeerClosed) => {
+                    self.drain_channel();
+                    return Err(NetError::Stack(pn::status::CONN_RESET));
+                }
+                _ => return Err(NetError::Sys(w.status)),
+            }
+        }
+    }
+
+    /// Write all of `data` (until `deadline`).
+    pub fn write_all(&mut self, mut data: &[u8], deadline: u64) -> Result<(), NetError> {
+        while !data.is_empty() {
+            let n = self.write(data, deadline)?;
+            data = &data[n..];
+        }
+        Ok(())
+    }
+
+    /// Half-close: we send no more; the stack sends a FIN after the data.
+    pub fn shutdown_write(&mut self) {
+        sys::socket_shutdown(self.sock);
+    }
+
+    /// Reset the connection now.
+    pub fn abort(&mut self) {
+        let _ = send_msg(self.ch, &pn::encode_abort());
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        sys::handle_close(self.sock);
+        sys::handle_close(self.ch);
+    }
+}

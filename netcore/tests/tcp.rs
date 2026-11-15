@@ -196,6 +196,8 @@ fn a_connection_carries_data_both_ways_and_closes_cleanly_leaving_time_wait_reco
     assert_eq!(&buf[..k], b"hello server");
     n.b.core.tcp_write(b, b"hello client");
     n.run_until("client read", |n| n.a.core.tcp_readable(a) == 12);
+    let k = n.a.core.tcp_read(a, &mut buf);
+    assert_eq!(&buf[..k], b"hello client");
     // the client shuts down its write side; the server sees the FIN, then closes too
     n.a.core.tcp_shutdown_write(a);
     n.run_until("server sees the FIN", |n| n.b.core.tcp_eof(b));
@@ -700,5 +702,38 @@ fn the_side_in_time_wait_accepts_a_new_syn_with_a_higher_sequence_number() {
         n.b.core.tcp_time_wait_count(),
         0,
         "the record made way for the new connection"
+    );
+}
+
+#[test]
+fn a_connection_whose_owner_has_unread_data_stays_in_the_table_until_it_has_read_it() {
+    let mut n = Net::clean();
+    let (a, b) = connected(&mut n);
+    n.b.core.tcp_write(b, b"left unread");
+    n.run_until("it arrived", |n| n.a.core.tcp_readable(a) == 11);
+    // both sides close; a still holds 11 unread bytes
+    n.b.core.tcp_shutdown_write(b);
+    n.run_until("a sees the FIN", |n| {
+        has_event(&n.a, |e| matches!(e, TcpEvent::PeerFin { .. }))
+    });
+    n.a.core.tcp_shutdown_write(a);
+    n.run_for(50 * MS);
+    assert!(
+        n.a.core.tcp_info(a).is_some(),
+        "the entry waits for its owner to read"
+    );
+    assert!(!has_event(&n.a, |e| matches!(e, TcpEvent::Closed { .. })));
+    let mut buf = [0u8; 32];
+    let k = n.a.core.tcp_read(a, &mut buf);
+    assert_eq!(&buf[..k], b"left unread");
+    n.run_for(50 * MS);
+    assert!(
+        has_event(&n.a, |e| matches!(e, TcpEvent::Closed { .. })),
+        "closed once everything was read"
+    );
+    assert!(n.a.core.tcp_info(a).is_none());
+    assert!(
+        has_event(&n.a, |e| matches!(e, TcpEvent::Released { .. })),
+        "and the release came last"
     );
 }

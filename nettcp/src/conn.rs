@@ -402,6 +402,24 @@ impl Conn {
         n
     }
 
+    /// Set or clear NODELAY (Nagle's algorithm off).
+    pub fn set_nodelay(&mut self, on: bool) {
+        self.cfg.nodelay = on;
+    }
+
+    /// The in-order bytes waiting, without taking them.
+    pub fn peek(&self, out: &mut [u8]) -> usize {
+        self.rbuf.peek(out)
+    }
+
+    /// Take `n` bytes that `peek` showed (the application has them now). Freeing space may call for a window update.
+    pub fn consume(&mut self, n: usize) {
+        self.rbuf.consume(n);
+        if n > 0 && self.window_update_due() {
+            self.ack_now = true;
+        }
+    }
+
     /// The application is done writing: a FIN follows the data. With unread data the connection is reset instead (RFC 1122
     /// 4.2.2.13).
     pub fn close(&mut self) {
