@@ -133,6 +133,8 @@ struct Drv {
     rx: Pool,
     tx: Pool,
     txid: u32,
+    /// Negative control (`FAULT=bad-slot`, first generation only): publish a slot number out of range, once.
+    fault_bad_slot: bool,
 }
 
 impl Drv {
@@ -194,6 +196,14 @@ impl Drv {
                     len: frame as u16,
                 }) {
                     Ok(()) => {
+                        if self.fault_bad_slot {
+                            // negative control: a slot number the stack must refuse
+                            self.fault_bad_slot = false;
+                            let _ = self.ring(RingId::RxUsed).push(Entry {
+                                slot: 200,
+                                len: 60,
+                            });
+                        }
                         self.rx
                             .mv(id, Slot::DriverHas, Slot::InRing(RingId::RxUsed))
                             .map_err(|_| EXIT_VIOLATION)?;
@@ -519,6 +529,7 @@ pub fn app_main() -> i32 {
         rx: Pool::rx_posted(),
         tx: Pool::tx_free(),
         txid: 1,
+        fault_bad_slot: env.var(b"FAULT") == Some(&b"bad-slot"[..]) && generation == 1,
     };
     for i in 0..SLOTS as u32 {
         d.post_rx(i);

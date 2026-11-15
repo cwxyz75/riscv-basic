@@ -29,21 +29,14 @@ struct Net {
     jobs: [u32; 2],
 }
 
-fn spawn_prog(
-    bi: u32,
-    name: &[u8],
-    args: &[&[u8]],
-    roles: Vec<(Role, u32)>,
-    handles: &[u32],
-    job: u32,
-) -> Result<u32, Detail> {
+fn spawn_prog(bi: u32, name: &[u8], args: &[&[u8]], roles: Vec<(Role, u32)>, handles: &[u32], job: u32) -> Result<u32, Detail> {
+    spawn_prog_env(bi, name, args, roles, Vec::new(), handles, job)
+}
+
+fn spawn_prog_env(bi: u32, name: &[u8], args: &[&[u8]], roles: Vec<(Role, u32)>, env: Vec<Vec<u8>>, handles: &[u32], job: u32) -> Result<u32, Detail> {
     let (off, len) = image_entry(bi, name)?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let s = Startup {
-        args: args.iter().map(|a| a.to_vec()).collect(),
-        roles,
-        ..Startup::default()
-    };
+    let s = Startup { args: args.iter().map(|a| a.to_vec()).collect(), roles, env, ..Startup::default() };
     let bytes = s.encode().map_err(|_| msg_at(line!()))?;
     rt::spawn::spawn_in(&image, &bytes, handles, job).map_err(|e| {
         let mut d = Detail::new();
@@ -445,6 +438,11 @@ fn start_full() -> Result<Option<Full>, Detail> {
 
 /// `dhcp`: let `netsup` start the DHCP client too (the static-configuration tests leave it out).
 fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
+    start_full_opts(dhcp, None)
+}
+
+/// `fault`: a deliberate fault for the children to run (`FAULT=name`; the negative controls of NET-SPEC 12.4).
+fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Detail> {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
     let bi = boot_image_vmo()?;
     let root_j = root_job()?;
@@ -511,7 +509,8 @@ fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
     let publish_conn = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
     let (ctl, ctl_theirs) = channel()?;
     let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
-    let sup = spawn_prog(
+    let fault_env: Vec<Vec<u8>> = fault.map(|f| vec![[&b"FAULT="[..], f].concat()]).unwrap_or_default();
+    let sup = spawn_prog_env(
         bi,
         b"bin/netsup",
         if dhcp {
@@ -525,6 +524,7 @@ fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
             (Role::ServiceInit, 2),
             (Role::ServiceRegistry, 3),
         ],
+        fault_env,
         &[sup_dm, bi2, ctl_theirs, publish_conn.ch],
         sj,
     )?;
@@ -1152,6 +1152,98 @@ pub fn net_children_restart() -> Outcome {
             sup_status(&f).is_some_and(|s| !s.1),
             "the supervisor is not down after three single restarts"
         );
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// Q14, Q15 and Q17 (the negative controls of NET-SPEC 12.4): each fault is survived as the contract says.
+pub fn net_faults_are_survived() -> Outcome {
+    // Q15: the driver publishes a slot out of range: the stack counts the violation, refuses the entry, detaches; the driver is
+    // restarted (generation + 1) and the network works again
+    let Some(mut f) = start_full_opts(false, Some(b"bad-slot"))? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        // traffic: the first received frame makes the faulty driver publish the bad slot
+        let mut ok = false;
+        let start = sys::clock_get();
+        let mut seq = 1u16;
+        while sys::clock_get() < start + 12_000 {
+            let _ = echo.ping([10, 0, 2, 2], seq, b"x", t(500));
+            seq += 1;
+            let (kids, down, gen) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
+            ensure!(!down, "the supervisor stays up");
+            if gen >= 2 && kids[0].1 >= 1 {
+                ok = true;
+                break;
+            }
+        }
+        ensure!(ok, "the faulty driver was restarted (a new generation)");
+        // (the old stack connection survived the driver's death: same endpoint, pings flow again)
+        let mut again = false;
+        for _ in 0..20 {
+            if echo.ping([10, 0, 2, 2], 900, b"y", t(700)).is_ok() {
+                again = true;
+                break;
+            }
+        }
+        ensure!(again, "pings flow again after the violation");
+        let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
+        let violations = stats.last().map(|_| stats[stats.len() - 4].1).unwrap_or(0);
+        ensure!(violations >= 1, "the stack counted the ring violation ({violations})");
+        Ok(())
+    })();
+    f.close();
+    r?;
+    // Q17: the stack never signals the driver: traffic still flows, within the safety poll
+    let Some(mut f) = start_full_opts(false, Some(b"no-doorbell"))? else { return Ok(()) };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut got = 0;
+        for seq in 1..=10u16 {
+            if echo.ping([10, 0, 2, 2], seq, b"z", t(1500)).is_ok() {
+                got += 1;
+            }
+        }
+        ensure!(got >= 9, "traffic flows without any doorbell from the stack ({got} of 10): the safety poll covers it");
+        Ok(())
+    })();
+    f.close();
+    r?;
+    // Q14: a stack that dies on a marked datagram, fed the marker until the supervisor gives up: the network is marked down, and
+    // nothing keeps restarting
+    let Some(mut f) = start_full_opts(false, Some(b"crash-on-magic"))? else { return Ok(()) };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        drop(cfg);
+        for round in 0..6 {
+            let Ok(mut net) = f.connect(b"net") else { break };
+            let Ok(mut udp) = net.open_udp(0, 0, t(3000)) else { break };
+            let _ = udp.send_to([10, 0, 2, 2], 9, b"##crash please");
+            nap(600)?;
+            let (_, down, _) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
+            if down {
+                break;
+            }
+            ensure!(round < 5, "the supervisor never gave up");
+        }
+        let (kids, down, _) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
+        ensure!(down, "the supervisor marked the network down after repeated crashes");
+        ensure!(kids[1].1 <= 4, "a bounded number of restarts ({})", kids[1].1);
         Ok(())
     })();
     f.close();

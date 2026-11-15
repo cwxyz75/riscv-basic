@@ -83,6 +83,9 @@ struct Netd {
     eps: BTreeMap<EpId, u64>,
     more: bool,
     blob: Option<netblob::Blob>,
+    /// Negative controls (`FAULT=` in the environment): never signal the driver; crash on a marked datagram.
+    fault_no_doorbell: bool,
+    fault_crash: bool,
 }
 
 fn now_ns() -> u64 {
@@ -356,7 +359,9 @@ impl Netd {
         if (published && must_signal(&self.shm, ctl::DRV_WAITING, was_empty))
             || (returned && must_signal(&self.shm, ctl::DRV_WAITING, rx_free_was_empty))
         {
-            let _ = sys::event_signal(self.to_driver, 0, 1 << 24);
+            if !self.fault_no_doorbell {
+                let _ = sys::event_signal(self.to_driver, 0, 1 << 24);
+            }
             self.shm.count(stat::DOORBELLS_SENT);
         } else if published || returned {
             self.shm.count(stat::DOORBELLS_SUPPRESSED);
@@ -628,10 +633,15 @@ impl Netd {
                 dst,
                 port,
                 payload,
-            } => (
-                cookie,
-                self.net.send_udp(ep, dst, port, payload, cookie, now),
-            ),
+            } => {
+                if self.fault_crash && payload.starts_with(b"##crash") {
+                    panic!("fault-crash-on-magic");
+                }
+                (
+                    cookie,
+                    self.net.send_udp(ep, dst, port, payload, cookie, now),
+                )
+            }
             EpRequest::SendEcho {
                 cookie,
                 dst,
@@ -837,6 +847,8 @@ pub fn app_main() -> i32 {
         eps: BTreeMap::new(),
         more: true,
         blob: None,
+        fault_no_doorbell: env.var(b"FAULT") == Some(&b"no-doorbell"[..]),
+        fault_crash: env.var(b"FAULT") == Some(&b"crash-on-magic"[..]),
     };
     // a restart re-applies the interface configuration the previous incarnation left in the blob (no waiting for DHCP)
     if let Some(bv) = env.handle(Role::NetConfigBlob) {

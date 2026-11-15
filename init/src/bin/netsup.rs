@@ -58,6 +58,8 @@ struct Held {
     to_driver: u32,
     /// The configuration blob (one page): netd's interface half and dhcpc's lease half.
     blob: u32,
+    /// A deliberate fault for the negative-control tests (`FAULT=name` in our own environment), passed to the children.
+    fault: Option<Vec<u8>>,
     #[allow(dead_code)] // (read by the status and flight-recorder code of the full supervisor)
     shm: Shm,
 }
@@ -140,6 +142,7 @@ fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u32, u32), i32> {
     let s = Startup {
         args: alloc::vec![b"netdrv".to_vec()],
         roles,
+        env: fault_env(h),
         ..Startup::default()
     };
     let Ok(bytes) = s.encode() else {
@@ -244,6 +247,7 @@ pub fn app_main() -> i32 {
         return 28;
     }
     let held = Held {
+        fault: env.var(b"FAULT").map(|v| v.to_vec()),
         blob: blob.a1 as u32,
         mmio: hs[0],
         rx: hs[1],
@@ -581,6 +585,7 @@ fn spawn_netd(
     let s = Startup {
         args: alloc::vec![b"netd".to_vec()],
         roles,
+        env: fault_env(h),
         ..Startup::default()
     };
     let Ok(bytes) = s.encode() else {
@@ -592,6 +597,18 @@ fn spawn_netd(
             rt::println!("##NETSUP cannot start netd: {e:?}");
             Err(23)
         }
+    }
+}
+
+/// The environment entry that tells a child which deliberate fault to run (empty normally).
+fn fault_env(h: &Held) -> Vec<Vec<u8>> {
+    match &h.fault {
+        Some(f) => {
+            let mut e = b"FAULT=".to_vec();
+            e.extend_from_slice(f);
+            alloc::vec![e]
+        }
+        None => Vec::new(),
     }
 }
 
