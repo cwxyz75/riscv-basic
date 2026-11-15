@@ -43,6 +43,11 @@ const INTERRUPT_ACK: usize = 0x064;
 const MAGIC: usize = 0x000;
 const DEVICE_ID: usize = 0x008;
 const ID_BLOCK: u32 = 2;
+const ID_NET: u32 = 1;
+/// The network device's DMA (NET-SPEC 4.3, 5.1): two 64-page packet pools and a two-page virtqueue area.
+const NET_RX_PAGES: u64 = 64;
+const NET_TX_PAGES: u64 = 64;
+const NET_QUEUE_PAGES: u64 = 2;
 
 struct Block {
     /// Where the slot's MMIO page is mapped in this process (for the reset).
@@ -94,15 +99,15 @@ fn read_dtb(res: u32, me: u32) -> Option<Vec<u8>> {
     Some(blob)
 }
 
-/// Is the slot at `pa` a block device? If so its page stays mapped at `va`.
-fn probe(res: u32, me: u32, pa: u64, va: u64) -> Option<u32> {
+/// Is the slot at `pa` a virtio device of `want` (a device id)? If so its page stays mapped at `va`.
+fn probe(res: u32, me: u32, pa: u64, va: u64, want: u32) -> Option<u32> {
     let vmo = sys::vmo_create_physical(res, pa, 4096);
     if vmo.status != 0 {
         return None;
     }
     let vmo = vmo.a1 as u32;
     let mapped = sys::process_map(me, vmo, va, 0, 4096, PF_RW).status == 0;
-    let found = mapped && rd(va, MAGIC) == 0x7472_6976 && rd(va, DEVICE_ID) == ID_BLOCK;
+    let found = mapped && rd(va, MAGIC) == 0x7472_6976 && rd(va, DEVICE_ID) == want;
     if mapped && !found {
         sys::process_unmap(me, va);
     }
@@ -111,6 +116,27 @@ fn probe(res: u32, me: u32, pa: u64, va: u64) -> Option<u32> {
     } else {
         sys::handle_close(vmo);
         None
+    }
+}
+
+/// A virtio network device, claimable by one client at a time (S8). The DMA memory exists only while it is claimed.
+struct Net {
+    va: u64,
+    mmio: u32,
+    irq: Option<u32>,
+    /// While claimed: the claimant's connection key and the manager's own handles to the three DMA VMOs.
+    claim: Option<(u64, [u32; 3])>,
+}
+
+impl Net {
+    fn release(&mut self) {
+        if let Some((_, dmas)) = self.claim.take() {
+            // the claimant is gone: quiet the device before its memory can be freed or handed out again (T42)
+            reset(self.va);
+            for h in dmas {
+                sys::handle_close(h);
+            }
+        }
     }
 }
 
@@ -196,8 +222,10 @@ const POOL: svc::Limits = svc::Limits {
 const HOLD_TIMEOUT: u64 = 30_000;
 
 struct DevMgr {
-    core: Core<()>,
+    core: Core<u64>,
+    res: u32,
     blocks: Vec<Block>,
+    nets: Vec<Net>,
     image: Option<Vec<u8>>,
 }
 
@@ -210,9 +238,10 @@ impl DevMgr {
 }
 
 impl Service for DevMgr {
-    type Conn = ();
+    /// A connection's own key (so `closed` can tell which claim to release).
+    type Conn = u64;
 
-    fn core(&mut self) -> &mut Core<()> {
+    fn core(&mut self) -> &mut Core<u64> {
         &mut self.core
     }
 
@@ -237,8 +266,13 @@ impl Service for DevMgr {
                 return self.reply(key, txid, Status::BadRequest, None);
             }
             let account = self.core.account_of(key).unwrap_or(svc::ROOT);
-            return match self.core.add_conn(hs[0], account, ()) {
-                Some(_) => self.reply(key, txid, Status::Ok, None),
+            return match self.core.add_conn(hs[0], account, 0) {
+                Some(k) => {
+                    if let Some(c) = self.core.conn_mut(k) {
+                        *c = k;
+                    }
+                    self.reply(key, txid, Status::Ok, None)
+                }
                 None => {
                     sys::handle_close(hs[0]);
                     self.reply(key, txid, Status::Quota, None)
@@ -250,6 +284,13 @@ impl Service for DevMgr {
         }
         if !hs.is_empty() {
             return self.reply(key, txid_of(msg), Status::BadRequest, None);
+        }
+        if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_NET) {
+            return match devmgr::decode_claim_net(msg) {
+                Ok((txid, index)) => self.claim_net(key, txid, index),
+                Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
+                Err(None) => {}
+            };
         }
         match devmgr::decode_request(msg) {
             Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
@@ -268,7 +309,83 @@ impl Service for DevMgr {
         }
     }
 
-    fn closed(&mut self, _conn: ()) {}
+    fn closed(&mut self, conn: u64) {
+        self.drop_claims_of(conn);
+    }
+}
+
+impl DevMgr {
+    /// `ClaimNet`: hand the claimant the device and its DMA memory (NET-SPEC 4.3). The DMA VMOs are made here (only the
+    /// root resource can) and are charged to this manager (TIDY-UP T84).
+    fn claim_net(&mut self, key: u64, txid: u32, index: u16) {
+        let fail = |this: &mut DevMgr, st: Status| {
+            let _ = this.core.send(key, devmgr::encode_reply(txid, st), None);
+        };
+        let res = self.res;
+        let Some(n) = self.nets.get_mut(usize::from(index)) else {
+            return fail(self, Status::NoDevice);
+        };
+        if n.claim.is_some() {
+            return fail(self, Status::Busy);
+        }
+        let mk = |pages: u64| {
+            let r = sys::vmo_create_dma(res, pages);
+            (r.status == 0).then_some(r.a1 as u32)
+        };
+        let (rx, tx, q) = (mk(NET_RX_PAGES), mk(NET_TX_PAGES), mk(NET_QUEUE_PAGES));
+        let (Some(rx), Some(tx), Some(q)) = (rx, tx, q) else {
+            for h in [rx, tx, q].into_iter().flatten() {
+                sys::handle_close(h);
+            }
+            return fail(self, Status::Failed);
+        };
+        reset(n.va);
+        let dup = |h: u32| {
+            let r = sys::handle_duplicate(h, Rights::SAME.0);
+            (r.status == 0).then_some(r.a1 as u32)
+        };
+        let mut give: Vec<u32> = Vec::new();
+        let mut ok = true;
+        for h in [n.mmio, rx, tx, q].into_iter().chain(n.irq) {
+            match dup(h) {
+                Some(d) => give.push(d),
+                None => ok = false,
+            }
+        }
+        if !ok {
+            for h in give.into_iter().chain([rx, tx, q]) {
+                sys::handle_close(h);
+            }
+            return fail(self, Status::Failed);
+        }
+        let flags = if n.irq.is_some() {
+            devmgr::NET_FLAG_IRQ
+        } else {
+            0
+        };
+        n.claim = Some((key, [rx, tx, q]));
+        let reply = devmgr::encode_claim_net_reply(
+            txid,
+            Status::Ok,
+            &devmgr::NetClaim {
+                flags,
+                rx_pages: NET_RX_PAGES as u32,
+                tx_pages: NET_TX_PAGES as u32,
+                queue_pages: NET_QUEUE_PAGES as u32,
+            },
+        );
+        // (the handles travel in one message: the channel carries up to MAX_MSG_HANDLES)
+        let _ = self.core.send_handles(key, reply, give);
+    }
+
+    /// A connection ended: if it held a network claim, release it.
+    fn drop_claims_of(&mut self, key: u64) {
+        for n in &mut self.nets {
+            if n.claim.as_ref().is_some_and(|(k, _)| *k == key) {
+                n.release();
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -295,27 +412,37 @@ pub fn app_main() -> i32 {
     // every virtio slot that really is a block device, lowest address first (the device tree lists the
     // slots in no promised order)
     let mut blocks: Vec<Block> = Vec::new();
+    let mut nets: Vec<Net> = Vec::new();
     let mut slots = kcore::fdt::virtio_mmio(&nodes);
     slots.sort_by_key(|s| s.base);
     for slot in slots {
         if slot.size != 4096 {
             continue;
         }
-        let va = mmio_va(blocks.len());
-        if let Some(mmio) = probe(res, me, slot.base, va) {
+        let va = mmio_va(blocks.len() + nets.len());
+        // an interrupt where the machine has a controller we drive; NOT_SUPPORTED (AIA) means the driver polls
+        let irq_of = || {
+            let i = sys::interrupt_create(res, slot.irq);
+            (i.status == 0).then_some(i.a1 as u32)
+        };
+        if let Some(mmio) = probe(res, me, slot.base, va, ID_BLOCK) {
             let dma = sys::vmo_create_dma(res, 4);
             if dma.status != 0 {
                 return 6;
             }
-            // an interrupt where the machine has a PLIC; NOT_SUPPORTED (AIA) means the driver polls
-            let i = sys::interrupt_create(res, slot.irq);
-            let irq = (i.status == 0).then_some(i.a1 as u32);
             blocks.push(Block {
                 va,
                 mmio,
                 dma: dma.a1 as u32,
-                irq,
+                irq: irq_of(),
                 driver: None,
+            });
+        } else if let Some(mmio) = probe(res, me, slot.base, va, ID_NET) {
+            nets.push(Net {
+                va,
+                mmio,
+                irq: irq_of(),
+                claim: None,
             });
         }
     }
@@ -332,13 +459,23 @@ pub fn app_main() -> i32 {
             rt::abi::limits::MAX_MSG_HANDLES,
             HOLD_TIMEOUT,
         ),
+        res,
         blocks,
+        nets,
         image,
     };
-    if mgr.core.add_conn(chan, svc::ROOT, ()).is_none() {
-        return 3;
+    match mgr.core.add_conn(chan, svc::ROOT, 0) {
+        Some(k) => {
+            if let Some(c) = mgr.core.conn_mut(k) {
+                *c = k;
+            }
+        }
+        None => return 3,
     }
     let code = service::run(&mut mgr);
+    for n in &mut mgr.nets {
+        n.release();
+    }
     let blocks = &mut mgr.blocks;
     // the client is gone (or the manager failed): end the driver, wait until it is really gone,
     // and only then leave the device quiet (T42: reset after the driver has stopped)

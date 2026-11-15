@@ -44,6 +44,8 @@ fn main() {
         "ctest",
         "lua",
         "registryd",
+        "netsup",
+        "netdrv",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

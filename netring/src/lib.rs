@@ -286,3 +286,92 @@ impl Pool {
         Ok(())
     }
 }
+
+/// The control channel between the stack and the driver (NET-SPEC 5.6): `txid u32 | op u16 | pad u16 | body`.
+pub mod msg {
+    pub const OP_READY: u16 = 1;
+    pub const OP_LINK: u16 = 2;
+    pub const OP_ATTACH: u16 = 3;
+    pub const OP_DETACH: u16 = 4;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Msg {
+        Ready {
+            generation: u64,
+            mac: [u8; 6],
+            link: bool,
+        },
+        Link {
+            link: bool,
+        },
+        Attach {
+            generation: u64,
+        },
+        Detach,
+    }
+
+    pub const READY_LEN: usize = 24;
+    pub const LINK_LEN: usize = 12;
+    pub const ATTACH_LEN: usize = 16;
+    pub const DETACH_LEN: usize = 8;
+
+    fn head(b: &mut [u8], txid: u32, op: u16) {
+        b[0..4].copy_from_slice(&txid.to_le_bytes());
+        b[4..6].copy_from_slice(&op.to_le_bytes());
+        b[6..8].copy_from_slice(&[0, 0]);
+    }
+
+    pub fn encode_ready(txid: u32, generation: u64, mac: [u8; 6], link: bool) -> [u8; READY_LEN] {
+        let mut b = [0u8; READY_LEN];
+        head(&mut b, txid, OP_READY);
+        b[8..16].copy_from_slice(&generation.to_le_bytes());
+        b[16..22].copy_from_slice(&mac);
+        b[22] = u8::from(link);
+        b
+    }
+
+    pub fn encode_link(txid: u32, link: bool) -> [u8; LINK_LEN] {
+        let mut b = [0u8; LINK_LEN];
+        head(&mut b, txid, OP_LINK);
+        b[8] = u8::from(link);
+        b
+    }
+
+    pub fn encode_attach(txid: u32, generation: u64) -> [u8; ATTACH_LEN] {
+        let mut b = [0u8; ATTACH_LEN];
+        head(&mut b, txid, OP_ATTACH);
+        b[8..16].copy_from_slice(&generation.to_le_bytes());
+        b
+    }
+
+    pub fn encode_detach(txid: u32) -> [u8; DETACH_LEN] {
+        let mut b = [0u8; DETACH_LEN];
+        head(&mut b, txid, OP_DETACH);
+        b
+    }
+
+    /// Decode a control message. Total: any other length, op or a non-zero padding is `None`.
+    pub fn decode(b: &[u8]) -> Option<(u32, Msg)> {
+        let txid = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?);
+        let op = u16::from_le_bytes(b.get(4..6)?.try_into().ok()?);
+        if b.get(6..8)? != [0, 0] {
+            return None;
+        }
+        let m = match (op, b.len()) {
+            (OP_READY, READY_LEN) => Msg::Ready {
+                generation: u64::from_le_bytes(b.get(8..16)?.try_into().ok()?),
+                mac: b.get(16..22)?.try_into().ok()?,
+                link: *b.get(22)? != 0,
+            },
+            (OP_LINK, LINK_LEN) => Msg::Link {
+                link: *b.get(8)? != 0,
+            },
+            (OP_ATTACH, ATTACH_LEN) => Msg::Attach {
+                generation: u64::from_le_bytes(b.get(8..16)?.try_into().ok()?),
+            },
+            (OP_DETACH, DETACH_LEN) => Msg::Detach,
+            _ => return None,
+        };
+        Some((txid, m))
+    }
+}

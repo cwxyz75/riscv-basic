@@ -329,3 +329,55 @@ fn the_layout_constants_are_the_documented_ones() {
     assert_eq!(HDR_LEN + FRAME_MAX, 1526);
     const { assert!(HDR_LEN + FRAME_MAX <= SLOT_SIZE) }
 }
+
+#[test]
+fn control_messages_round_trip_and_reject_everything_else() {
+    use netring::msg::*;
+    let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    for (bytes, want) in [
+        (
+            encode_ready(1, 7, mac, true).to_vec(),
+            Msg::Ready {
+                generation: 7,
+                mac,
+                link: true,
+            },
+        ),
+        (encode_link(2, false).to_vec(), Msg::Link { link: false }),
+        (
+            encode_attach(3, u64::MAX).to_vec(),
+            Msg::Attach {
+                generation: u64::MAX,
+            },
+        ),
+        (encode_detach(4).to_vec(), Msg::Detach),
+    ] {
+        assert_eq!(decode(&bytes).map(|d| d.1), Some(want));
+    }
+    assert_eq!(
+        &encode_attach(9, 1)[..8],
+        &[9, 0, 0, 0, 3, 0, 0, 0],
+        "golden header"
+    );
+    let good = encode_ready(1, 7, mac, true);
+    for cut in 0..good.len() {
+        assert_eq!(decode(&good[..cut]), None, "truncated at {cut}");
+    }
+    let mut pad = good;
+    pad[6] = 1;
+    assert_eq!(decode(&pad), None, "padding must be zero");
+    assert_eq!(decode(&[0, 0, 0, 0, 9, 0, 0, 0]), None, "an unknown op");
+    let mut long = good.to_vec();
+    long.push(0);
+    assert_eq!(decode(&long), None);
+    // random bytes never panic
+    let mut x = 0x1234_5678_9abc_def1u64;
+    for _ in 0..50_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let n = (x % 40) as usize;
+        let b: Vec<u8> = (0..n).map(|i| (x >> (i % 8 * 8)) as u8).collect();
+        let _ = decode(&b);
+    }
+}

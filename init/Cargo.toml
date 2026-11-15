@@ -14,3 +14,8 @@ basic-script = { path = "../home/basic-script" }
 memfs = { path = "../memfs" }
 rt = { path = "../rt", features = ["heap"] }
 shell-core = { path = "../shell-core" }
+netring = { path = "../netring" }
+netwire = { path = "../netwire" }
+netcore = { path = "../netcore" }
+dhcp = { path = "../dhcp" }
+supervise = { path = "../supervise" }

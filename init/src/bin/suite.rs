@@ -4715,6 +4715,8 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ls".to_vec(),
             b"lua".to_vec(),
             b"memfsd".to_vec(),
+            b"netdrv".to_vec(),
+            b"netsup".to_vec(),
             b"probe".to_vec(),
             b"registryd".to_vec(),
             b"sh".to_vec(),
@@ -9034,6 +9036,11 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     Ok(())
 }
 
+// --- the network (S8) ---
+
+#[path = "../net_tests.rs"]
+mod net_tests;
+
 // --- thread_spawn (SCHED-SMP-SPEC task 9) ---
 
 /// A process that ends (exits, faults, is killed) with spawned threads alive gives every stack back: its job's page
@@ -10225,6 +10232,10 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "net_driver_attaches_and_exchanges_a_frame",
+            net_tests::net_driver_attaches_and_exchanges_a_frame,
         ),
         (
             "a_process_ending_with_spawned_threads_leaks_nothing",
