@@ -800,7 +800,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 - **Q4: Pager-backed VMOs:** when (S11 as listed, or earlier if `mmap` pain shows up).
 - **Q5: `exec` model:** spawn-and-replace vs a kernel "reset process" operation.
 - **Q6: Executable mappings** for the LOGO JIT: a VMO/VMAR permission and policy.
-- **Q7 (resolved 2026-11-15, drafted in `FS-SPEC.md`): real filesystem format.** Named Cambium (working name). Our own copy-on-write B+tree, no ext2, no journal; flash-first; attributes and indexes native; no hard links; `fsync` is a full commit. Timing: slice F, after S9.
+- **Q7 (resolved 2026-11-15, drafted in `FS-SPEC.md`): real filesystem format.** Named doofs (working name; the serious alternative is Cambium, see `FS-SPEC.md`). Our own copy-on-write B+tree, no ext2, no journal; flash-first; attributes and indexes native; no hard links; `fsync` is a full commit. Timing: slice F, after S9.
 - **Q8 (resolved, OD20): Confinement default.** The shell is confined by default;
   trusted programs listed in a config file get broader namespaces.
 - **Q9: Quotas and resource accounting:** how far to take job limits.
