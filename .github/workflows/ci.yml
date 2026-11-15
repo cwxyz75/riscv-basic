@@ -62,14 +62,13 @@ jobs:
         run: python3 home/scripts/verify_demo_images.py
 
   # Tier 1: one boot of the whole suite on the default (AIA) machine at four harts, and the release smoke.
-  # Budget: 10 minutes normally; 20 because a PR that changes the harness or the Makefile also runs the fail-demo check
-  # (a second full boot, about five more minutes) that proves the harness can still see a failure.
+  # Budget: 10 minutes. (If the harness itself changed, the fail-demo check that proves it can see a failure runs too.)
   kernel:
     name: kernel (smoke)
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
