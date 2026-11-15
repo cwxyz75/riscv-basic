@@ -13,6 +13,8 @@ pub struct Limits {
     pub held_bytes: u32,
     /// Requests being served at once.
     pub inflight: u32,
+    /// Bytes of stream buffers reserved (S9; a server with no streams sets 0 and never charges it).
+    pub stream_bytes: u32,
 }
 
 /// The default for a program that does not ask for something else (R-SPEC.md section 4, question 1): 16
@@ -22,6 +24,7 @@ pub const DEFAULT_LIMITS: Limits = Limits {
     conns: 16,
     held_bytes: 64 * 1024,
     inflight: 16,
+    stream_bytes: 0,
 };
 
 /// The most accounts a server keeps at once (accounts cost memory too).
@@ -40,6 +43,7 @@ struct Acct {
     conns: u32,
     held: u32,
     inflight: u32,
+    stream: u32,
     /// Protocol violations by connections of this account (a statistic, for the server's policy).
     violations: u32,
     /// Live child accounts (an account with children, or connections, cannot be closed).
@@ -64,6 +68,7 @@ impl Accounts {
                 conns: 0,
                 held: 0,
                 inflight: 0,
+                stream: 0,
                 violations: 0,
                 children: 0,
                 alive: true,
@@ -91,6 +96,7 @@ impl Accounts {
         if limits.conns > p.limits.conns
             || limits.held_bytes > p.limits.held_bytes
             || limits.inflight > p.limits.inflight
+            || limits.stream_bytes > p.limits.stream_bytes
         {
             return Err(Refuse::Invalid);
         }
@@ -103,6 +109,7 @@ impl Accounts {
             conns: 0,
             held: 0,
             inflight: 0,
+            stream: 0,
             violations: 0,
             children: 0,
             alive: true,
@@ -125,7 +132,13 @@ impl Accounts {
     /// Close an account with no connections and no children.
     pub fn close(&mut self, id: AccountId) -> Result<(), Refuse> {
         let a = self.rec(id)?;
-        if id == ROOT || a.conns != 0 || a.children != 0 || a.held != 0 || a.inflight != 0 {
+        if id == ROOT
+            || a.conns != 0
+            || a.children != 0
+            || a.held != 0
+            || a.inflight != 0
+            || a.stream != 0
+        {
             return Err(Refuse::Invalid);
         }
         let parent = a.parent.expect("only the root has no parent");
@@ -230,6 +243,17 @@ impl Accounts {
     }
     pub fn release_held(&mut self, id: AccountId, bytes: u32) {
         self.credit(id, bytes, |a| (&mut a.held, a.limits.held_bytes));
+    }
+    /// Reserve `bytes` of stream buffers (S9); all or nothing down the chain.
+    pub fn charge_stream(&mut self, id: AccountId, bytes: u32) -> Result<(), Refuse> {
+        self.charge(id, bytes, |a| (&mut a.stream, a.limits.stream_bytes))
+    }
+    pub fn release_stream(&mut self, id: AccountId, bytes: u32) {
+        self.credit(id, bytes, |a| (&mut a.stream, a.limits.stream_bytes));
+    }
+    /// Stream bytes reserved by the account, descendants included.
+    pub fn stream_usage(&self, id: AccountId) -> Result<u32, Refuse> {
+        Ok(self.rec(id)?.stream)
     }
     pub fn charge_inflight(&mut self, id: AccountId) -> Result<(), Refuse> {
         self.charge(id, 1, |a| (&mut a.inflight, a.limits.inflight))

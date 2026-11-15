@@ -26,6 +26,7 @@ const POOL: Limits2 = Limits2 {
     conns: 200,
     held_bytes: 2 * 1024 * 1024,
     inflight: 16,
+    stream_bytes: 0,
 };
 /// A reply the client has no room for is kept this long (ticks) before the connection is dropped.
 const HOLD_TIMEOUT: u64 = 30_000;
@@ -245,6 +246,7 @@ impl Server {
                     conns: req.a as u32,
                     held_bytes,
                     inflight: (req.a >> 32) as u32,
+                    stream_bytes: 0,
                 };
                 let parent = self
                     .core

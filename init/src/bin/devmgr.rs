@@ -217,6 +217,7 @@ const POOL: svc::Limits = svc::Limits {
     conns: 16,
     held_bytes: 64 * 1024,
     inflight: 16,
+    stream_bytes: 0,
 };
 /// A reply the client has no room for is kept this long (ticks) before the connection is dropped.
 const HOLD_TIMEOUT: u64 = 30_000;

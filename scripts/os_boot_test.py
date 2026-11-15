@@ -433,17 +433,27 @@ def free_udp_port():
         return s.getsockname()[1]
 
 
+def free_tcp_port():
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 NET_PCAP = os.environ.get("OS_NET_PCAP")
 
 
 def net_args():
     port = int(os.environ.get("OS_NET_HOSTPORT") or free_udp_port())
     pcap = os.environ.get("OS_NET_PCAP") or os.path.join(tempfile.gettempdir(), f"os-net-{os.getpid()}-{port}.pcap")
+    # the TCP forward is ready for S9 (guest port 7778; nothing listens there in S8, so a connect would be reset)
+    tcp_port = int(os.environ.get("OS_NET_TCP_HOSTPORT") or free_tcp_port())
     os.environ["OS_NET_LAST_HOSTPORT"] = str(port)
+    os.environ["OS_NET_LAST_TCP_HOSTPORT"] = str(tcp_port)
     os.environ["OS_NET_PCAP_USED"] = pcap
     return [
         "-global", "virtio-mmio.force-legacy=false",
-        "-netdev", f"user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:{port}-:7777",
+        "-netdev", f"user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:{port}-:7777,hostfwd=tcp:127.0.0.1:{tcp_port}-:7778",
         "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56",
         "-object", f"filter-dump,id=f0,netdev=n0,file={pcap}",
     ]

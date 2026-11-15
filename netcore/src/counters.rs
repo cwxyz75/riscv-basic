@@ -53,4 +53,9 @@ counters!(
     tx_link_down,
     tx_queue_full,
     tx_too_big,
+    // S8 follow-up: a received destination-unreachable is routed to the transport it quotes (S9-SPEC 18.4)
+    icmp_error_udp,
+    icmp_error_tcp,
+    icmp_error_other_protocol,
+    icmp_error_malformed,
 );

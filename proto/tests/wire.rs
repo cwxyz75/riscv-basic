@@ -445,3 +445,105 @@ fn request_fuzz_never_panics() {
         let _ = console::decode(&b, 1);
     }
 }
+
+// ---- S8 follow-up item 1: the reserved values ----
+
+mod reserved_values {
+    use proto::net::{self as pn, reserved, OpenKind};
+
+    #[test]
+    fn reserved_open_kinds_are_told_apart_from_garbage() {
+        assert_eq!(pn::classify_open_kind(pn::kind::UDP), OpenKind::Udp);
+        assert_eq!(
+            pn::classify_open_kind(pn::kind::ICMP_ECHO),
+            OpenKind::IcmpEcho
+        );
+        for k in [3u16, 4] {
+            assert_eq!(pn::classify_open_kind(k), OpenKind::Reserved, "{k}");
+        }
+        for k in [0u16, 5, 6, 255, 256, 0xffff] {
+            assert_eq!(pn::classify_open_kind(k), OpenKind::Invalid, "{k}");
+        }
+        // the decoder itself is structural: a reserved kind decodes, and it is the stack that answers NOT_SUPPORTED
+        for k in [3u16, 4] {
+            let r = pn::Request::Open {
+                kind: k,
+                local_port: 0,
+                local_addr: [0; 4],
+                oflags: 0,
+            };
+            let b = pn::encode_request(7, 0, &r);
+            assert_eq!(pn::decode_request(&b).unwrap().2, r);
+        }
+    }
+
+    #[test]
+    fn no_defined_value_sits_in_a_reserved_range() {
+        for s in [
+            pn::status::OK,
+            pn::status::BAD_REQUEST,
+            pn::status::REFUSED,
+            pn::status::ADDR_IN_USE,
+            pn::status::TOO_BIG,
+            pn::status::NO_ROUTE,
+            pn::status::QUOTA,
+            pn::status::NOT_CONFIGURED,
+            pn::status::NO_BUFFERS,
+            pn::status::NOT_SUPPORTED,
+        ] {
+            assert!(!reserved::STATUSES.contains(&s), "status {s}");
+        }
+        for o in [pn::ep::SEND_UDP, pn::ep::SEND_ECHO] {
+            assert!(!reserved::EP_OPS.contains(&o));
+        }
+        for c in [
+            pn::notice::SEND_FAILED,
+            pn::notice::LINK_DOWN,
+            pn::notice::LINK_UP,
+        ] {
+            assert!(!reserved::NOTICES.contains(&c));
+        }
+        for o in [
+            pn::op::INFO,
+            pn::op::OPEN,
+            pn::op::SET_CONFIG,
+            pn::op::CLEAR_CONFIG,
+            pn::op::GET_ARP,
+            pn::op::GET_STATS,
+        ] {
+            assert!(!(3..16).contains(&o), "service op {o}");
+        }
+    }
+
+    #[test]
+    fn a_reserved_endpoint_op_is_rejected_by_the_decoder_like_any_unknown_op() {
+        for op in reserved::EP_OPS {
+            let mut b = pn::encode_send_udp(1, [10, 0, 2, 2], 9, b"x");
+            b[0] = op;
+            assert_eq!(pn::decode_ep_request(&b), None, "op {op}");
+        }
+    }
+
+    #[test]
+    fn a_reserved_notice_code_decodes_so_a_client_can_skip_it() {
+        for c in reserved::NOTICES {
+            let b = pn::encode_notice(c, 5, 6);
+            assert_eq!(
+                pn::decode_ep_event(&b),
+                Some(pn::EpEvent::Notice {
+                    code: c,
+                    cookie: 5,
+                    detail: 6
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_with_a_reserved_status_decodes() {
+        for s in reserved::STATUSES {
+            let b = pn::encode_reply(9, s, &[]);
+            assert_eq!(pn::decode_reply(&b), Some((9, s, &[][..])));
+        }
+    }
+}

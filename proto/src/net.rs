@@ -55,6 +55,42 @@ pub mod kind {
     pub const ICMP_ECHO: u16 = 2;
 }
 
+/// Values S8 leaves unused and S9 will define (S9-SPEC 8, S8-FOLLOWUP-SPEC item 1). Reserving them now means no S8
+/// decoder, client or test treats them as ordinary garbage that a later slice has to re-classify: the stack answers a
+/// reserved `Open` kind `NOT_SUPPORTED` (and any other unknown kind `BAD_REQUEST`), a reserved endpoint op is a violation
+/// like any unknown op, and a client skips a notice code it does not know.
+pub mod reserved {
+    use core::ops::RangeInclusive;
+    /// `Open` kinds 3 (`TcpStream`) and 4 (`TcpListener`).
+    pub const KINDS: RangeInclusive<u16> = 3..=4;
+    /// Reply statuses 10 to 16 (`ConnRefused` .. `BadHandle`).
+    pub const STATUSES: RangeInclusive<i32> = 10..=16;
+    /// Client-to-stack endpoint ops 16 to 19 (`Connect`, `Abort`, `SetOption`, `Accept`).
+    pub const EP_OPS: RangeInclusive<u8> = 16..=19;
+    /// Notice codes 16 to 21 (`Connected` .. `AcceptStarved`).
+    pub const NOTICES: RangeInclusive<u16> = 16..=21;
+}
+
+/// How the stack sees the `kind` of an `Open`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenKind {
+    Udp,
+    IcmpEcho,
+    /// Defined by a later slice: `NOT_SUPPORTED`.
+    Reserved,
+    /// Nothing: `BAD_REQUEST`.
+    Invalid,
+}
+
+pub fn classify_open_kind(k: u16) -> OpenKind {
+    match k {
+        kind::UDP => OpenKind::Udp,
+        kind::ICMP_ECHO => OpenKind::IcmpEcho,
+        k if reserved::KINDS.contains(&k) => OpenKind::Reserved,
+        _ => OpenKind::Invalid,
+    }
+}
+
 /// `oflags` of `Open`.
 pub mod oflags {
     /// May send the limited broadcast (privileged only).
@@ -70,6 +106,9 @@ pub mod limits {
     pub const CONNS_PER_ACCOUNT: u32 = 32;
     /// Connections in the whole pool.
     pub const POOL_CONNS: u32 = 256;
+    /// Bytes of stream buffers one client may reserve, and the pool (S9-SPEC 12). S8 charges none; the model carries them.
+    pub const STREAM_BYTES_PER_ACCOUNT: u32 = 512 * 1024;
+    pub const POOL_STREAM_BYTES: u32 = 4 * 1024 * 1024;
     pub const UDP_MAX: usize = 1472;
     /// The lowest port a normal connection may bind.
     pub const FIRST_UNPRIVILEGED_PORT: u16 = 1024;

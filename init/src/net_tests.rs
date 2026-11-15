@@ -1068,6 +1068,62 @@ pub fn net_clients_are_confined() -> Outcome {
             "the port is free again after the endpoint's channel closed"
         );
         drop(p80);
+        // S8 follow-up item 1: a reserved Open kind is NotSupported, a request with two handles is BadRequest, an
+        // unknown kind is BadRequest, and none of them leaves a handle or a connection behind
+        let open = |net: &mut rt::net::Net, kind: u16, n_handles: usize| -> Result<i32, Detail> {
+            let mut mine = Vec::new();
+            let mut theirs = Vec::new();
+            for _ in 0..n_handles {
+                let c = sys::channel_create();
+                ensure_eq!(c.status, 0, "channel_create");
+                mine.push(c.a1 as u32);
+                theirs.push(c.a2 as u32);
+            }
+            let req = proto::net::Request::Open {
+                kind,
+                local_port: 0,
+                local_addr: [0; 4],
+                oflags: 0,
+            };
+            let r = net.call_with(&req, &theirs, t(3000));
+            // the stack closed what it was sent: our ends see the peer gone
+            for &m in &mine {
+                let w = sys::object_wait(m, sig::PEER_CLOSED, t(3000));
+                ensure_eq!(w.status, 0, "the stack closed the handle it was sent");
+                sys::handle_close(m);
+            }
+            match r {
+                Ok((s, _)) => Ok(s),
+                Err(_) => Err(msg_at(line!())),
+            }
+        };
+        let (bad, unsupported) = (pn_status(1), pn_status(9));
+        for kind in [3u16, 4] {
+            ensure_eq!(
+                open(&mut net, kind, 1)?,
+                unsupported,
+                "reserved kind {kind}"
+            );
+        }
+        for kind in [0u16, 5, 99] {
+            ensure_eq!(open(&mut net, kind, 1)?, bad, "unknown kind {kind}");
+        }
+        ensure_eq!(open(&mut net, 1, 2)?, bad, "UDP with two handles");
+        ensure_eq!(
+            open(&mut net, 3, 2)?,
+            unsupported,
+            "reserved kind with two handles"
+        );
+        ensure_eq!(open(&mut net, 1, 0)?, bad, "UDP with no handle");
+        let mut once = false;
+        for _ in 0..50 {
+            if net.open_udp(0, 0, t(3000)).is_ok() {
+                once = true;
+                break;
+            }
+            nap(20)?;
+        }
+        ensure!(once, "the refusals left the account untouched");
         Ok(())
     })();
     f.close();

@@ -55,14 +55,15 @@ first numbers.
 The S8 boot tests add one device to the existing QEMU command line (`scripts/os_boot_test.py`, `Makefile`):
 
 ```text
--netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:HOSTPORT-:7777
+-netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:HOSTPORT-:7777,hostfwd=tcp:127.0.0.1:TCPHOSTPORT-:7778
 -device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56
 -object filter-dump,id=f0,netdev=n0,file=OUT.pcap
 ```
 
 plus the existing `-global virtio-mmio.force-legacy=false` (the transport is modern virtio-mmio, version 2, exactly as `blkd`).
 The network, host and DHCP start addresses and the MAC are **set explicitly** so no test depends on a default that was only
-remembered. `HOSTPORT` is chosen by the harness (a free port, not a constant).
+remembered. `HOSTPORT` and `TCPHOSTPORT` are chosen by the harness (free ports, not constants). The TCP forward (to guest port 7778) was added by
+the S8 follow-up slice so that S9's host-initiated connections need no change to the harness line; S8 has no TCP, so nothing listens there.
 
 ### 3.2 Facts checked on QEMU 11.1.3 (macOS, 2026-11-14) and facts still to check
 
@@ -89,6 +90,8 @@ share a hub, and the script is a fake guest that sends real frames and records w
 | host datagram of 1473 and 3000 bytes | **slirp fragments them** (a first fragment of 1514 bytes with MF set, then a 60-byte fragment, etc.); slirp also accepts guest frames above 1514 bytes (it echoed 1515 and 3042), so the stack must itself never exceed 1514 |
 | slirp ARPing for the guest | **never observed**: slirp learned the guest's MAC from the guest's own frames; the stack must still answer ARP requests (6.4), and it always speaks first (ARP or DHCP) before anything is forwarded to it |
 | MTU | frames up to 1514 pass; 1500 IP MTU |
+| slirp is itself a TCP endpoint (from the S9 probe, 2026-11-14; S9 step 0 re-verifies it) | slirp terminates the guest's TCP connection and opens its own to the host: the two connections are independent, so what the guest sees (window, retransmission, close) is slirp's behaviour and not the host's |
+| a host `connect` through `hostfwd=tcp` (from the S9 probe, 2026-11-14; S9 step 0 re-verifies it) | **succeeds at once, before the guest has answered**: slirp accepts on the host side first. A host client therefore learns nothing about the guest from `connect` succeeding; only data or a close shows what the guest did |
 
 Still **not** checked (step 0 or later): which virtio-mmio slot the net device takes when disks are attached too (found by device id regardless);
 behaviour of a real guest driver (nothing here exercises virtio); slirp's lease renewal behaviour (a renewing REQUEST in state `Renewing`); the
@@ -138,7 +141,10 @@ stops and the owner decides** (a kernel change would make step 3 a kernel slice 
 ### 4.2 What `netsup` holds across child lifetimes (T42's rule)
 
 The MMIO slot and interrupt (from `devmgr`), the three DMA VMOs, the ring VMO, the two doorbell events, the config blob VMO, the
-flight-recorder VMO, the stats page (inside the ring VMO's header). It resets the device (virtio status 0) before any new driver
+flight-recorder VMO, the stats page (inside the ring VMO's header). S9 (`S9-SPEC.md` 18.7) adds one more thing it holds: the secret
+VMO (the key for sequence numbers and ephemeral ports), which `netsup` passes read-only to `netd` and to nothing else. The flight
+recorder's event kinds are numbered with a reserved block (kinds 32 to 63) for TCP; S8 as built prints one `##NETFR` line and has no
+enum to extend. It resets the device (virtio status 0) before any new driver
 starts, exactly as OD65 describes for `blkd`.
 
 ### 4.3 The `devmgr` net claim
@@ -341,6 +347,14 @@ core.configure(cfg) / core.clear_config() / core.link(up: bool)
 trait Device { fn rx(&mut self) -> Option<RxFrame>; fn tx_slot(&mut self) -> Option<TxFrame>; }   // none = full
 ```
 
+**As built, stated here because S9 depends on it** (`S9-SPEC.md` 18.8): the IP identification field is a counter, starting at 1 and
+increasing by one for every IP packet the core builds (wrapping at 65536), and **the DF bit is set on everything the core sends**
+(`S9-SPEC.md` assumed DF clear: S9 step 2 must decide, and DF set is the ordinary choice for TCP at MSS 1460 on MTU 1500). There is no
+loopback path (a send to our own address goes to the ARP and gateway logic and fails or leaves the machine); S9 adds one in `netcore`
+(`TIDY-UP.md` T89). A received destination-unreachable is routed by the protocol it quotes (UDP, TCP and others each have a hook;
+in S8 each only counts: `icmp_error_udp`, `icmp_error_tcp`, `icmp_error_other_protocol`, `icmp_error_malformed`), and a received TCP
+segment reaches a dispatch point that counts it as `rx_unknown_protocol`.
+
 `Instant` is an opaque monotonic nanosecond count (NET-DESIGN 6.2). The core reads no clock, allocates only the fixed tables
 and the bounded queues of section 10, and never blocks.
 
@@ -379,7 +393,9 @@ The receive path **never allocates in proportion to anything the packet claims**
 ### 6.6 UDP and endpoints
 
 * An endpoint is `(local port, optional local address)`; the first to bind a port gets it; a second bind to a bound port is
-  `AddrInUse`. Ephemeral ports are allocated from 49152 to 65535, scanning from a rotating start so a freed port is not reused at once.
+  `AddrInUse`. Ephemeral ports are allocated from 49152 to 65535, scanning from a rotating start so a freed port is not reused at once. **The
+sequence is not a promise:** nothing may depend on which port comes next (S9 chooses from a keyed hash once the secret exists), and
+the UDP and TCP port spaces are separate (a UDP endpoint on port 5000 does not stop a TCP connection using 5000).
 * A datagram for a bound port becomes a `Deliver` event; payload is at most 1472 bytes (MTU 1500 less 28).
 * A send of more than 1472 bytes is `TooBig`. A send with no address configured (source needed) is `NotConfigured` unless the
   endpoint is privileged and the destination is the limited broadcast.
@@ -403,7 +419,7 @@ Request: `txid u32 | op u16 | flags u16 | body`. Reply: `txid u32 | status i32 |
 | Op | Name | Classes | Request body | Reply body |
 |---|---|---|---|---|
 | 1 | `Info` | all | none | `addr u32, mask u32, gateway u32, dns u32, mac[6], mtu u16, link u8, configured u8, pad u16` (26 bytes) |
-| 2 | `Open` | normal, priv | `kind u16 (1 Udp, 2 IcmpEcho), local_port u16 (0 ephemeral), local_addr u32 (0 any), oflags u32`, plus **one handle: the client's end of a new endpoint channel** | `port u16, pad u16, addr u32` (the binding made) |
+| 2 | `Open` | normal, priv | `kind u16 (1 Udp, 2 IcmpEcho; 3 and 4 reserved), local_port u16 (0 ephemeral), local_addr u32 (0 any), oflags u32`, plus **one handle: the client's end of a new endpoint channel** | `port u16, pad u16, addr u32` (the binding made) |
 | 16 | `SetConfig` | config | `addr u32, mask u32, gateway u32, dns u32` | none |
 | 17 | `ClearConfig` | config | none | none |
 | 18 | `GetArp` | config | none | up to 64 entries of `ip u32, mac[6], pad u16, age_ms u32` |
@@ -414,6 +430,13 @@ or flag the connection's class does not allow is `Refused`.
 
 Status (`i32`): 0 `Ok`, 1 `BadRequest`, 2 `Refused`, 3 `AddrInUse`, 4 `TooBig`, 5 `NoRoute`, 6 `Quota`, 7 `NotConfigured`,
 8 `NoBuffers`, 9 `NotSupported`. (`UNAVAILABLE` is the registry's, `proto::file` -109, not ours.)
+
+**Reserved for S9 (`proto::net::reserved`):** `Open` kinds 3 and 4, statuses 10 to 16, client-to-stack endpoint ops 16 to 19, notice codes
+16 to 21. A reserved `Open` kind is answered `NotSupported` (any other unknown kind is `BadRequest`); a reserved endpoint op is a
+violation like any unknown op; a client skips a notice code it does not know; a reply with a reserved status decodes. **A request
+may carry more than one handle** (S9's `Accept` carries two): the decoders and the typed client (`Net::call_with`) allow it, and the
+stack closes every handle it is sent whether or not it accepts the request (S8's `Open` wants exactly one: anything else is
+`BadRequest`). The `Info` reply is 28 bytes as built (the 26 above counted the padding short).
 
 ### 7.2 Endpoint channel
 
@@ -460,7 +483,9 @@ Connections, including endpoint channels, are charged to the account of the serv
 Slice R's file-protocol defaults (about 16 connections per account, 200 in the pool) are **not** used: `netd` sets **32 connections per
 account** (one is the service connection) and a pool of **256**, and a stack-side per-endpoint state (ARP queue entries are shared and bounded
 globally; an endpoint's own state is its port binding and a small record) is charged as one connection each. These constants are in
-one place (`proto::net::limits`) and overridable by the launcher per program.
+one place (`proto::net::limits`) and overridable by the launcher per program. The account record also carries **`stream_bytes`** (default
+512 KiB per account, 4 MiB in the pool; S9's reservation for stream buffers). S8 charges nothing against it; it exists, with its own
+charge, refund, parent-cap and close-refusal rules, so S9 does not change the account model under existing tests (H9).
 
 ### 7.5 The client library (`rt::net`)
 
@@ -482,7 +507,7 @@ has the default 128 threads (it uses one).
 
 One thread, one port, built on `rt::service::Core`. Bound on the port: the three listener channels (names of 4.4), each service
 connection and endpoint channel (R's keys), the `drv_to_net` event and the driver control channel (`other_event`, keys with the top bit
-set). Each iteration, in order, with the limits N = 32, K = 16, M = 32:
+set). Each iteration, in order, with the limits N = 32, K = 16, M = 32 (S9 adds two bounded phases, `S9-SPEC.md` 7.2, and a fourth constant P, the connections served each way per pass):
 
 1. read at most N receive frames from `rx_used`, hand each to `core.ingress`, return each slot through `rx_free` as soon as the core
    has finished with it (the core copies nothing it needs beyond the frame's lifetime);
@@ -591,7 +616,7 @@ All of this is `##` text through the existing serial path (OD52), so the headles
 * **N3** The driver never maps a packet pool. *Check:* its handle table and address space contain no pool mapping (a test inspects `process_info`/region count).
 * **N4** No value read from a shared ring, the control header or a packet is trusted without validation (5.4). *Check:* the violation tests (12, Q16, Q17).
 * **N5** Every queue and table is bounded, and its full behaviour is the stated drop or error (section 10). *Check:* flood and storm tests.
-* **N6** An endpoint exists exactly as long as its channel; closing or dying frees the port, the identifier and the account charge. *Check:* leak and
+* **N6** An endpoint exists exactly as long as its channel, as far as the client's control of it goes; closing or dying frees the port, the identifier and the account charge. (S9: a TCP connection whose channel closed may drain as an *orphan* for a bounded time, `S9-SPEC.md` 5.8 and 6.3; it keeps its charge until then. UDP and echo endpoints have no orphans.) *Check:* leak and
   port-reuse tests.
 * **N7** Everything an endpoint holds is charged to its account; one account cannot exhaust another's (7.4). *Check:* Q6.
 * **N8** `netd` and `netdrv` never block on a client or on each other (only on their own port with a deadline). *Check:* the stalled-client flood test, and the safety-poll test.
@@ -630,7 +655,8 @@ pass.** "Mutation check" means: introduce the stated bug by hand once, confirm t
   link our core and smoltcp exchange ARP, ICMP echo (each pings the other) and UDP in both directions, including 1472-byte datagrams and
   an address on each side of the gateway. Any disagreement is a failing test whose frames are printed as hex.
 * **H6 deterministic simulation.** For seeds 1 to 500 (in tier 0; 20,000 in tier 2): two cores and a link with seeded loss, duplication, reordering
-  and delay, a mix of sends and receives, endpoints opened and closed; properties: every delivered datagram equals one that was sent, none is
+  and delay (and, since the S8 follow-up, one-bit corruption, a rate limit with a tail-drop queue per direction, and replacing one end of the link
+  as a restart; each fault has a test of its own in `netsim` that checks it does what it says), a mix of sends and receives, endpoints opened and closed; properties: every delivered datagram equals one that was sent, none is
   delivered to the wrong endpoint, ARP always converges when frames get through, and no table or queue ever exceeds its bound. A failing seed
   prints and reproduces exactly.
 
@@ -642,7 +668,7 @@ pass.** "Mutation check" means: introduce the stated bug by hand once, confirm t
 * **H8 `supervise`:** against a reference that recomputes the intensity from the full history: the per-child and overall limits, the delay sequence,
   `Down` stays down. *Mutation check:* off-by-one in the window.
 * **H9 `proto::net`:** goldens for every message; every decoder total; an account model for 7.4 against an independent recomputation (32 per account,
-  256 in the pool, charges and refunds exact). *Mutation check:* skip the refund on close.
+  256 in the pool, charges and refunds exact; `stream_bytes` 512 KiB and 4 MiB, charged and refunded exact down the chain, reserved values decode as 7.1 says). *Mutation check:* skip the refund on close.
 * **H10 ring model:** `netring`'s model of the four rings and the 256 slots against a reference that tracks each slot's state: random operations from both sides,
   after each one N1 holds; a malformed entry (slot out of range, length too big, a slot in the wrong state) is rejected and counted. Under loom and shuttle: the waiting-flag
   handshake of 5.5 with a producer and a consumer never loses a wakeup. *Negative control:* setting the waiting flag *after* the re-check

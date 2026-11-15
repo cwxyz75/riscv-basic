@@ -485,10 +485,17 @@ impl Netd {
                     close_all(hs);
                     return self.reply(key, txid, pn::status::REFUSED, &[]);
                 }
-                if hs.len() != 1
-                    || oflags & !pn::oflags::ALL != 0
-                    || (kind != pn::kind::UDP && kind != pn::kind::ICMP_ECHO)
-                {
+                // a reserved kind is not supported (yet); anything else unknown, a wrong handle count (a later slice's
+                // requests may carry two) or unknown flags are malformed. Every handle passed is closed either way.
+                let known = matches!(
+                    pn::classify_open_kind(kind),
+                    pn::OpenKind::Udp | pn::OpenKind::IcmpEcho
+                );
+                if pn::classify_open_kind(kind) == pn::OpenKind::Reserved {
+                    close_all(hs);
+                    return self.reply(key, txid, pn::status::NOT_SUPPORTED, &[]);
+                }
+                if hs.len() != 1 || oflags & !pn::oflags::ALL != 0 || !known {
                     close_all(hs);
                     return self.reply(key, txid, pn::status::BAD_REQUEST, &[]);
                 }
@@ -723,6 +730,7 @@ impl Service for Netd {
                     conns: pn::limits::CONNS_PER_ACCOUNT,
                     held_bytes: 64 * 1024,
                     inflight: 16,
+                    stream_bytes: pn::limits::STREAM_BYTES_PER_ACCOUNT,
                 };
                 let Ok(account) = self.core.accounts().open(svc::ROOT, limits) else {
                     sys::handle_close(hs[0]);
@@ -823,6 +831,7 @@ pub fn app_main() -> i32 {
         conns: pn::limits::POOL_CONNS,
         held_bytes: 256 * 1024,
         inflight: 64,
+        stream_bytes: pn::limits::POOL_STREAM_BYTES,
     };
     let mut d = Netd {
         core: Core::new(

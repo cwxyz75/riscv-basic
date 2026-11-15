@@ -25,6 +25,7 @@ const POOL: svc::Limits = svc::Limits {
     conns: 256,
     held_bytes: 256 * 1024,
     inflight: 16,
+    stream_bytes: 0,
 };
 const HOLD_TIMEOUT: u64 = 30_000;
 /// Port keys with this bit set are listeners the registry watches (the runtime's connection keys count up
