@@ -37,7 +37,7 @@ preference for kernel and security slices).
 
 | Step | Contents | Needs | Review |
 |---|---|---|---|
-| 0 | This spec; the harness additions that need no guest code (the QEMU flags, the host UDP client and the pcap checker, tested against a canned capture); the acceptance tests written and failing | nothing | owner |
+| 0 | This spec; the harness additions that need no guest code (**built in this PR**: the slirp probe, the capture checker with its self-test, the first real capture; still to do: the QEMU flags in the boot harness and the host UDP client for Q4); the acceptance tests written and failing | nothing | owner |
 | 1 | `netwire` (parsers, builders, checksum) and `netsim` (clock, link, fault injection), host-only, with goldens from a real capture | 0 | default |
 | 2 | `netcore` (interface, ARP, IPv4, ICMP echo, UDP, timers, counters, the `Device` seam) tested against smoltcp as a peer; the pure `supervise` (restart-intensity) module | 1 | default |
 | 3 | The ring layout and the ring model (`netring`), `netdrv`, the `devmgr` net claim, `netsup`'s device half (pools, rings, events, attach/re-attach); a loopback test of the whole data path with no stack | 2, DM | **Fable** |
@@ -75,11 +75,30 @@ Checked by starting QEMU with these options:
 * the device tree of the `virt` machine lists all eight virtio-mmio slots (`0x10001000` to `0x10008000`) whether or not a device is
   attached, so which slot the net device occupies is **not** assumed: `devmgr` finds it by device id, as it already does for disks.
 
-**To check in step 0** (not verified; the spec below assumes the stated value and the step-0 check either confirms it or changes
-this file): the slirp DHCP lease option set (router, DNS, subnet mask, lease time, server id) and the default lease length;
-which slot the net device occupies when disks are attached too (expected: the highest free one, found by device id regardless); that slirp answers ARP for 10.0.2.2 and 10.0.2.3; that it replies to an ICMP echo to 10.0.2.2; that a host datagram sent to
-`HOSTPORT` arrives with source 10.0.2.2 and the right destination port; MTU 1500; whether slirp ever fragments a reply (the
-stack drops fragments, section 6.3); and the guest-visible behaviour on a frame larger than 1514 bytes.
+**Checked against slirp itself** with `scripts/net_probe_slirp.py` (step 0, built in this PR): QEMU runs with no guest, slirp and a socket netdev
+share a hub, and the script is a fake guest that sends real frames and records what slirp answers. Its capture is committed as
+`net/tests/data/slirp-probe.pcap` (28 frames), the first real golden data for `netwire`. Results (QEMU 11.1.3, the flags of 3.1):
+
+| Question | Answer observed |
+|---|---|
+| ARP for 10.0.2.2, 10.0.2.3 | answered, MACs **52:55:0a:00:02:02** and **52:55:0a:00:02:03**; 10.0.2.4 and an unused address get **no** answer |
+| DHCP | OFFER and ACK both sent to **ff:ff:ff:ff:ff:ff / 255.255.255.255** (the client set the broadcast flag); `yiaddr` 10.0.2.15; options present are exactly **53, 54 (server 10.0.2.2), 1 (255.255.255.0), 3 (router 10.0.2.2), 6 (DNS 10.0.2.3, one address), 51 (lease 86400 s)**; **no options 58 or 59**, so the client must compute T1 and T2 |
+| ICMP echo to 10.0.2.2 and to 10.0.2.3 | both answered, **TTL 255**, identifier and data preserved |
+| UDP to 10.0.2.2 port 9 (closed) | **no answer**: slirp sends no ICMP unreachable, so nothing may depend on one |
+| host datagram to `HOSTPORT`, 1, 100 and 1472 bytes | arrives as UDP from **10.0.2.2** to 10.0.2.15 port 7777 (source port is the host socket's, constant per host socket); sizes 1, 100, 1472 give frames of **60 (padded), 142 and 1514 bytes**, no fragmentation; a reply addressed back through slirp reaches the host intact |
+| host datagram of 1473 and 3000 bytes | **slirp fragments them** (a first fragment of 1514 bytes with MF set, then a 60-byte fragment, etc.); slirp also accepts guest frames above 1514 bytes (it echoed 1515 and 3042), so the stack must itself never exceed 1514 |
+| slirp ARPing for the guest | **never observed**: slirp learned the guest's MAC from the guest's own frames; the stack must still answer ARP requests (6.4), and it always speaks first (ARP or DHCP) before anything is forwarded to it |
+| MTU | frames up to 1514 pass; 1500 IP MTU |
+
+Still **not** checked (step 0 or later): which virtio-mmio slot the net device takes when disks are attached too (found by device id regardless);
+behaviour of a real guest driver (nothing here exercises virtio); slirp's lease renewal behaviour (a renewing REQUEST in state `Renewing`); the
+`tcpdump` and capture facts below.
+
+**`tcpdump` as an oracle, and why there is a second one.** `tcpdump -nn -vv -r` reports a wrong IPv4 header checksum (`bad cksum`), but it only verifies a UDP
+checksum for protocols it dissects (it printed `[udp sum ok]` for DHCP and nothing for an arbitrary port), and prints no ICMP verdict. So the capture checks use
+`scripts/net_pcap_check.py` (standard library only: IPv4 header, ICMP and UDP checksums, using the IP length so Ethernet padding is not summed), with
+`tcpdump -vv` as a second opinion. The checker has a `--self-test` that corrupts one byte of each kind in a copy of the capture and requires all three
+corruptions to be reported, so it is known to be able to fail; the committed capture passes with 22 IPv4 frames, 4 ICMP and 13 UDP checked.
 
 ### 3.3 Existing pieces this relies on
 
@@ -477,7 +496,8 @@ set). Each iteration, in order, with the limits N = 32, K = 16, M = 32:
 
 The state machine is the RFC 2131 client: `Init` → `Selecting` (DISCOVER broadcast, wait for OFFER) → `Requesting` (REQUEST, wait for ACK)
 → `Bound` → `Renewing` (at T1 = lease/2, unicast REQUEST) → `Rebinding` (at T2 = 7/8 lease, broadcast) → `Init` on expiry or NAK.
-Retransmission: 4 s, 8 s, 16 s, then 32 s, with the jitter supplied by the caller from a seeded source (so tests are deterministic),
+The client sets the BOOTP **broadcast flag** (it cannot receive a unicast reply before it has an address; slirp then answers to 255.255.255.255, as observed), and
+because slirp sends no options 58 or 59 it **computes T1 and T2** (lease/2 and 7/8 of the lease) when they are absent. Retransmission: 4 s, 8 s, 16 s, then 32 s, with the jitter supplied by the caller from a seeded source (so tests are deterministic),
 never more than 4 packets in any 10 s while unconfigured. It uses options 53 (message type), 54 (server id), 51 (lease), 1 (mask), 3
 (router), 6 (DNS, first only), 58 and 59 (T1, T2, when present), 50 (requested address), 61 (client id) and ignores every other option. Parsing never
 trusts a length. It does **not** probe the offered address with ARP (non-goal) and it does not implement INFORM, release
@@ -589,8 +609,10 @@ pass.** "Mutation check" means: introduce the stated bug by hand once, confirm t
 **`netwire`** (step 1)
 * **H1 goldens from a real capture.** A pcap captured from QEMU (`filter-dump`) of an ARP exchange, a ping, DHCP discover/offer/request/ack
   and UDP in both directions is committed as `net/tests/data/*.pcap`; every frame parses to the expected fields and **rebuilds to the same bytes**.
-  The same pcap is passed to host `tcpdump -nn -vv -r`: the test script fails if any line says `bad cksum` or `bad udp cksum`, and
-  requires the packet counts it expects. This is an oracle the author did not write.
+  The same pcap is checked by `scripts/net_pcap_check.py` (the IPv4, ICMP and UDP checksums; its `--self-test` proves it can fail) and by host
+  `tcpdump -nn -vv -r` as a second opinion (any `bad cksum` fails; see 3.2 for what tcpdump can and cannot verify). The first real capture,
+  `net/tests/data/slirp-probe.pcap`, exists already and must parse and rebuild byte for byte, including the 60-byte padded frames (the payload comes
+  from the IP length, never the frame length).
 * **H2 properties.** `parse(build(x)) == x` for every message; the checksum equals a naive reference (a bytewise one's-complement sum written
   separately in the test) and the RFC 1071 example; flipping any single bit of a built frame makes the checksum check fail or the parse reject.
 * **H3 totality.** Random bytes, random truncations and random mutations of valid frames (at least 200,000 cases in the test, a `cargo-fuzz` target per
@@ -602,7 +624,7 @@ pass.** "Mutation check" means: introduce the stated bug by hand once, confirm t
   used; the pending queue and its overflow and expiry; cache full eviction; three unanswered ARP requests report `NoRoute`; echo request answered
   with identical data; the echo rate limit; UDP delivered to the bound endpoint; UDP to a closed port gets port unreachable (rate-limited, never
   for broadcast); bad IP checksum, a fragment, TTL 0, wrong destination and a runt are each dropped with exactly their counter; the broadcast and
-  subnet-broadcast rules; gateway versus on-link routing; no address configured; a 1473-byte send is `TooBig`; link down drops everything.
+  subnet-broadcast rules; gateway versus on-link routing; no address configured; a 1473-byte send is `TooBig`; a frame padded to 60 bytes whose IP length says 29 delivers a 1-byte payload (not the padding); the first fragment and the next fragment of a 3000-byte datagram (taken from the capture) are each dropped and counted `rx_fragment`; link down drops everything.
   *Mutation checks:* drop the checksum verification; accept fragments; reuse an echo identifier; never evict.
 * **H5 interop with smoltcp as an independent peer** (a test-only crate; OD18 allows smoltcp as a test peer, OD27 test-time crates): over `netsim`'s
   link our core and smoltcp exchange ARP, ICMP echo (each pings the other) and UDP in both directions, including 1472-byte datagrams and
@@ -636,11 +658,13 @@ objects, job pages, handles, all 256 pool slots) the suite already applies at it
 * **Q2 `net_static_config_and_ping_gateway`:** configure 10.0.2.15/24 gateway 10.0.2.2 through `/svc/net-config`; `ping` the gateway: at least 4 of 5 echo
   replies within 1 s each, correct identifier, sequence and data.
 * **Q3 `net_dhcp_configures_the_interface`:** `dhcpc` gets an address from QEMU's server and `Info` reports it (10.0.2.15, mask 255.255.255.0, gateway
-  10.0.2.2, a DNS address); then Q2's ping succeeds. (This is the S8 "ping the gateway" acceptance, over the real flow.)
+  10.0.2.2, DNS 10.0.2.3, lease 86400 s, the values observed in 3.2, with T1 and T2 computed because slirp sends neither); then Q2's ping succeeds. Also: a `ping` of
+  10.0.2.3 (slirp answers) succeeds, and a `ping` of an unanswered address (10.0.2.99) gets no reply, with exactly three ARP requests sent (6.4) and the `NoRoute` outcome. (This is the S8 "ping the gateway" acceptance, over the real flow.)
 * **Q4 `net_udp_echo_through_hostfwd`** (harness script, independent client): `udpecho 7777` runs in the guest; the **host script** sends datagrams of
   1, 100, 512 and 1472 bytes (random content) to `127.0.0.1:HOSTPORT` and requires each echoed back byte for byte from the same address and port; sends 200 in
-  a row and requires all 200.
-* **Q5 `net_capture_is_clean`** (harness script): the pcap written by `filter-dump` during Q3 and Q4 is read by `tcpdump -nn -vv -r`: no checksum is wrong, the guest's ARP
+  a row and requires all 200. It then sends 1473 and 3000 bytes: slirp fragments them (3.2), the stack drops the fragments, nothing is echoed, the guest
+  stays responsive and `rx_fragment` counts them (no reassembly in S8 is a stated limit, not a bug).
+* **Q5 `net_capture_is_clean`** (harness script): the pcap written by `filter-dump` during Q3 and Q4 is read by `scripts/net_pcap_check.py` (and `tcpdump -nn -vv -r` as a second opinion): no checksum is wrong, the guest's ARP
   request, DHCP DISCOVER and REQUEST, the echo requests and the UDP replies are all present with the expected counts; the guest never sent a frame
   longer than 1514 bytes or an IP fragment.
 * **Q6 `net_account_confines_a_client`:** a client opens endpoints until refused: exactly 31 succeed (the 32nd connection is the service connection) and the
@@ -708,11 +732,11 @@ rows; they are the load tasks 11 and 12 of `SCHED-SMP-SPEC.md` are planned to us
   tighter than the 10 ms safety poll.
 * **No fragmentation** may bite a real DNS reply or a large UDP application in S9; the stack counts every fragment it drops so the need would be visible.
 
-## 15. Open points for the owner
+## 15. Open points (answered by the owner on 2026-11-14; kept for the record)
 
 1. **Names:** `netsup`, `netdrv`, `netd`, `dhcpc`, `ping`, `udpecho`, `netinfo` and the registry names `/svc/net`, `/svc/net-priv`, `/svc/net-config`: fine, or others?
 2. **Limits:** 32 connections per account and 256 in the pool (7.4), the 100 and 10 per second reply limits (6.5), 128 slots (5.1): accept as starting values, to be measured?
 3. **DMA charged to `devmgr`** (4.3): accept as a recorded shortcut, or should a claim take the claimant's job (needs a small `devmgr` and possibly kernel change)?
 4. **Both QEMU variants:** smoke runs only the default AIA machine at four harts and the rest is soak (12.2 Q18), matching `TESTING.md`; is that enough to tick the roadmap box, or do you want one plain-`virt`
    run in smoke as well?
-5. **Step 0's first checks** (3.2) may be done by me as part of the PR that adds the harness; confirm that is wanted before any code is written.
+5. **Resolved (2026-11-14):** step 0's slirp checks were wanted and are done (3.2); what remains unchecked is listed there. Owner answers recorded: 1 names yes, 2 limits yes, 3 DMA charged to `devmgr` accepted as a shortcut (TIDY-UP T84), 4 one smoke boot yes.
