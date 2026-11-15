@@ -1619,7 +1619,12 @@ impl Netd {
                         break;
                     }
                     Some(Sys::PeerClosed) => {
-                        // the client shut its write side down (or closed): a FIN follows what was written
+                        // the client shut its write side down (or closed): a FIN follows what was written. A client that
+                        // sends Abort on the endpoint channel and then closes its socket (SO_LINGER {1,0}) must be seen
+                        // as a reset, not a FIN: serve whatever is queued on the channel before choosing
+                        while let service::Read::Msg(m, hs) = self.core.read(key) {
+                            self.stream_request(key, &m, &hs);
+                        }
                         self.net.tcp_shutdown_write(id);
                         if let Some(Conn::Stream(st)) = self.core.conn_mut(key) {
                             st.client_eof = true;

@@ -2053,7 +2053,7 @@ pub fn c_sockets_over_the_stack() -> Outcome {
             args: vec![b"ctest".to_vec(), b"sockets".to_vec()],
             namespace: vec![(b"/svc".to_vec(), 1)],
             roles: vec![(Role::Stdout, 0)],
-            ..Startup::default()
+            env: vec![b"RESOLVER=10.0.2.2:47803".to_vec()],
         };
         let bytes = s.encode().map_err(|_| msg_at(line!()))?;
         let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, svc_view.ch]).map_err(|e| {
@@ -2110,6 +2110,221 @@ pub fn c_sockets_over_the_stack() -> Outcome {
         ensure_eq!(failed, 0, "no C socket check failed");
         ensure_eq!(code, 0, "ctest sockets exits 0");
         ensure!(got.windows(8).any(|w| w == b"ok: bind"), "the checks ran");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+// ---------------------------------------------------------------------------------------------------- S9 step 7b
+
+/// Run a program from the boot image with `/svc` = a view of `net` (and extra namespace entries), collect its standard output
+/// until it ends or `limit` ticks pass, and return `(exit code, output)`; the code is -9999 if it had to be killed.
+fn run_with_svc(
+    f: &mut Full,
+    name: &[u8],
+    args: &[&[u8]],
+    extra_ns: Vec<(Vec<u8>, u32)>,
+    limit: u64,
+) -> Result<(i64, Vec<u8>), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, name)?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (out_mine, out_theirs) = socket()?;
+    let svc_view = f.view(b"net")?;
+    let mut handles = vec![out_theirs, svc_view.ch];
+    let mut namespace = vec![(b"/svc".to_vec(), 1u32)];
+    for (i, (n, h)) in extra_ns.into_iter().enumerate() {
+        namespace.push((n, 2 + i as u32));
+        handles.push(h);
+    }
+    let s = Startup {
+        args: args.iter().map(|a| a.to_vec()).collect(),
+        namespace,
+        roles: vec![(Role::Stdout, 0)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &handles).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn: {e:?}"));
+        d
+    })?;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 2048];
+    let until = sys::clock_get() + limit;
+    let mut timed_out = false;
+    loop {
+        if sys::clock_get() >= until {
+            timed_out = true;
+            sys::process_kill(p, -1);
+            break;
+        }
+        let w = sys::object_wait(
+            out_mine,
+            sig::READABLE | sig::PEER_CLOSED,
+            sys::clock_get() + 500,
+        );
+        if w.status != 0 {
+            continue;
+        }
+        match rt::io::read(out_mine, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    wait_ended(p, 5000)?;
+    let code = if timed_out {
+        -9999
+    } else {
+        sys::process_info(p).a1 as i64
+    };
+    sys::handle_close(p);
+    sys::handle_close(out_mine);
+    Ok((code, got))
+}
+
+fn relay(tag: &str, out: &[u8]) {
+    for line in out.split(|&b| b == b'\n') {
+        if line.starts_with(b"##FETCH") {
+            let mut l = alloc::format!("s9: fetch|{tag}|").into_bytes();
+            l.extend_from_slice(&line[..line.len().min(200)]);
+            sys::debug_write(&l);
+        }
+    }
+}
+
+/// `fetch` against the host's own HTTP server (10.0.2.2:47804, started by the harness): the digest of a 256 KiB file comes out
+/// the same as the host computed, by address, by name through the harness's DNS server (A, CNAME, a dropped first query that
+/// the resolver retries), and the failure exits: 404, no such name, connection refused.
+pub fn net_fetch_from_a_host_server() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let _warm = f.connect(b"net")?;
+        // is there a host server? (a harness without one skips this test, saying so)
+        let probe = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"-m", b"4", b"http://10.0.2.2:47804/file.bin"],
+            vec![],
+            12_000,
+        )?;
+        if probe.0 == 4 || probe.0 == 7 {
+            sys::debug_write(b"s9: no host HTTP server on 47804 (the harness did not start one): fetch tests skipped\n");
+            return Ok(());
+        }
+        ensure_eq!(probe.0, 0, "a plain fetch by address");
+        relay("addr", &probe.1);
+        let dns: &[u8] = b"10.0.2.2:47803";
+        for (tag, url) in [
+            ("name", &b"http://files.test:47804/file.bin"[..]),
+            ("cname", b"http://alias.test:47804/file.bin"),
+            ("retry", b"http://slow.test:47804/file.bin"),
+        ] {
+            let (code, out) = run_with_svc(
+                &mut f,
+                b"bin/fetch",
+                &[b"fetch", b"--sha256", b"--dns", dns, url],
+                vec![],
+                30_000,
+            )?;
+            relay(tag, &out);
+            ensure_eq!(code, 0, "fetch by name ({tag})");
+        }
+        let (code, out) = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"--sha256", b"http://10.0.2.2:47804/file.bin"],
+            vec![],
+            30_000,
+        )?;
+        relay("addr", &out);
+        ensure_eq!(code, 0, "fetch by address with a digest");
+        let (code, _) = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"http://10.0.2.2:47804/nosuch"],
+            vec![],
+            15_000,
+        )?;
+        ensure_eq!(code, 5, "a 404 is exit 5");
+        let (code, _) = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"--dns", dns, b"http://nosuch.test/"],
+            vec![],
+            15_000,
+        )?;
+        ensure_eq!(code, 3, "NXDOMAIN is exit 3");
+        let (code, _) = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"http://10.0.2.2:47899/"],
+            vec![],
+            20_000,
+        )?;
+        ensure_eq!(code, 4, "a refused connection is exit 4");
+        let (code, _) = run_with_svc(
+            &mut f,
+            b"bin/fetch",
+            &[b"fetch", b"https://10.0.2.2/"],
+            vec![],
+            5000,
+        )?;
+        ensure_eq!(code, 2, "https is refused");
+        sys::debug_write(b"s9: fetch tests done\n");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// `httpd` serving a directory of the memory filesystem for the host's own HTTP client (through `hostfwd=tcp`): the harness
+/// downloads a 200,000-byte file, reads the index, gets 404, 405, 400 (`..`, an encoded `..`, a body), 414, 431 and 505, sends
+/// HEAD, hangs up mid-head, and downloads four files at once; then `httpd` quits after its 16 connections.
+pub fn net_httpd_for_the_host() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let _warm = f.connect(b"net")?;
+        // the files: a memory filesystem's /tmp is the web root
+        let (_fsd, mut root, _bi) = start_memfsd()?;
+        let mut tmp = root
+            .open(b"tmp", pfl::DIRECTORY, RW_DIR)
+            .map_err(|e| msg_e(e, line!()))?;
+        let blob: Vec<u8> = (0..200_000usize).map(|i| pattern(13, i)).collect();
+        let mut file = tmp
+            .open(b"file.bin", pfl::CREATE, prt::READ | prt::WRITE)
+            .map_err(|e| msg_e(e, line!()))?;
+        let mut off = 0u64;
+        for c in blob.chunks(8192) {
+            file.write(off, c).map_err(|e| msg_e(e, line!()))?;
+            off += c.len() as u64;
+        }
+        let mut idx = tmp
+            .open(b"index.html", pfl::CREATE, prt::READ | prt::WRITE)
+            .map_err(|e| msg_e(e, line!()))?;
+        idx.write(0, b"<html>hello from the OS</html>")
+            .map_err(|e| msg_e(e, line!()))?;
+        let www = tmp.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
+        sys::debug_write(b"s9: httpd ready\n");
+        let (code, _) = run_with_svc(
+            &mut f,
+            b"bin/httpd",
+            &[b"httpd", b"-p", b"7778", b"--quit-after", b"16"],
+            vec![(b"/www".to_vec(), www.ch)],
+            60_000,
+        )?;
+        ensure_eq!(code, 0, "httpd served its 16 connections and quit");
         Ok(())
     })();
     f.close();

@@ -84,7 +84,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -266,11 +266,18 @@ def run_profiled(cmd, kernel):
     HOST_NET.clear()
     client = []
     tcp_client = []
+    http_client = []
     tcp_server = HostTcpServer(HOST_NET.append)
+    web = HostWeb()
 
     def pump():
         for raw in proc.stdout:
             stamped.append((time.monotonic(), raw))
+            if b"httpd: listening on" in raw and not http_client:
+                tp = int(os.environ.get("OS_NET_LAST_TCP_HOSTPORT", "0"))
+                th = threading.Thread(target=host_httpd_client, args=(tp, HOST_NET.append), daemon=True)
+                http_client.append(th)
+                th.start()
             if b"s8: udpecho ready" in raw and not client:
                 port = int(os.environ.get("OS_NET_LAST_HOSTPORT", "0"))
                 th = threading.Thread(target=host_udp_client, args=(port, HOST_NET.append), daemon=True)
@@ -292,9 +299,10 @@ def run_profiled(cmd, kernel):
         proc.wait()
         status, timed_out = None, True
     t.join(timeout=5)
-    for c in client + tcp_client:
+    for c in client + tcp_client + http_client:
         c.join(timeout=60)
     tcp_server.close()
+    web.close()
     total = time.monotonic() - start
     out = b"".join(raw for _, raw in stamped)
     prev, ticks, rows = start, {}, []
@@ -366,6 +374,196 @@ def host_tcp_client(tcp_port, emit):
     if bytes(got) != want:
         bad.append("echoed %d of %d bytes%s" % (len(got), len(want), "" if bytes(got) == want[:len(got)] else " (and wrong)"))
     emit("##HOSTNET tcp_echo " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
+
+
+HTTP_SERVER_PORT = 47804   # the host HTTP server `fetch` talks to (10.0.2.2:47804)
+DNS_SERVER_PORT = 47803    # the scripted DNS server (10.0.2.2:47803, UDP)
+FILE21 = None
+
+
+def file21():
+    """The 256 KiB file the host HTTP server serves (and whose digest the guest's `fetch` must reproduce)."""
+    global FILE21
+    if FILE21 is None:
+        FILE21 = tcp_pattern(21, 262144)
+    return FILE21
+
+
+class HostWeb:
+    """The host side of the fetch tests (S9 step 7b): an HTTP/1.0 server on HTTP_SERVER_PORT and a scripted DNS server on
+    DNS_SERVER_PORT (UDP). `files.test` is 10.0.2.2, `alias.test` is a CNAME to it, `slow.test` drops its first query (the
+    resolver must retry), `nosuch.test` is NXDOMAIN."""
+
+    def __init__(self):
+        import socket, socketserver, threading, http.server
+        self.stop = threading.Event()
+        data = file21()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):
+                if self.path == "/file.bin":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, *a):
+                pass
+
+        class S(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.http = None
+        self.dns = None
+        try:
+            self.http = S(("127.0.0.1", HTTP_SERVER_PORT), H)
+            threading.Thread(target=self.http.serve_forever, daemon=True).start()
+        except OSError:
+            self.http = None
+        try:
+            self.dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.dns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.dns.bind(("127.0.0.1", DNS_SERVER_PORT))
+            self.dns.settimeout(0.3)
+            self.seen = {}
+            threading.Thread(target=self.dns_loop, daemon=True).start()
+        except OSError:
+            self.dns = None
+
+    def dns_loop(self):
+        import socket, struct
+        while not self.stop.is_set():
+            try:
+                q, who = self.dns.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if len(q) < 17:
+                continue
+            ident = q[:2]
+            i, labels = 12, []
+            while i < len(q) and q[i]:
+                labels.append(q[i + 1:i + 1 + q[i]])
+                i += 1 + q[i]
+            name = b".".join(labels).decode().lower()
+            question = q[12:i + 5]
+            self.seen[name] = self.seen.get(name, 0) + 1
+            if name == "slow.test" and self.seen[name] == 1:
+                continue  # drop the first query: the resolver retries after a second
+            def a_rr(owner_ptr=b"\xc0\x0c"):
+                return owner_ptr + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 0, 2, 2])
+            if name in ("files.test", "slow.test"):
+                resp = ident + b"\x81\x80" + struct.pack("!HHHH", 1, 1, 0, 0) + question + a_rr()
+            elif name == "alias.test":
+                target = b"\x05files\x04test\x00"
+                cn = b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 60, len(target)) + target
+                resp = ident + b"\x81\x80" + struct.pack("!HHHH", 1, 2, 0, 0) + question + cn + target + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 0, 2, 2])
+            else:
+                resp = ident + b"\x81\x83" + struct.pack("!HHHH", 1, 0, 0, 0) + question
+            self.dns.sendto(resp, who)
+
+    def close(self):
+        self.stop.set()
+        if self.http:
+            self.http.shutdown()
+            self.http.server_close()
+        if self.dns:
+            self.dns.close()
+
+
+def host_httpd_client(tcp_port, emit):
+    """S9 step 7b: the host's own HTTP client against the guest's `httpd` through hostfwd=tcp: 16 connections (a download whose
+    digest is checked, the index, 404, HEAD, 405, three kinds of 400, 414, 431, 505, a hang-up in mid-head, and four downloads
+    at once). Every answer is checked; the server must then quit on its own after the 16th."""
+    import hashlib, socket, threading, time
+    want_sha = hashlib.sha256(tcp_pattern(13, 200_000)).hexdigest()
+    bad = []
+
+    def raw(data, hangup=False, timeout=20):
+        for _ in range(60):
+            try:
+                s = socket.create_connection(("127.0.0.1", tcp_port), timeout=timeout)
+                break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            return None, b""
+        try:
+            s.sendall(data)
+            if hangup:
+                s.close()
+                return None, b""
+            buf = b""
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    break
+                buf += d
+            return buf.split(b"\r\n", 1)[0], buf
+        except OSError as e:
+            bad.append("socket error: %s" % e)
+            return None, b""
+        finally:
+            s.close()
+
+    def status(line):
+        try:
+            return int(line.split()[1])
+        except Exception:
+            return -1
+
+    def get(path, extra=b"", method=b"GET", version=b"HTTP/1.1"):
+        return raw(method + b" " + path + b" " + version + b"\r\nHost: x\r\n" + extra + b"\r\n")
+
+    def check(name, cond):
+        if not cond:
+            bad.append(name)
+
+    line, body = get(b"/file.bin")
+    head, _, payload = body.partition(b"\r\n\r\n")
+    check("GET /file.bin: 200 and the digest", status(line) == 200 and hashlib.sha256(payload).hexdigest() == want_sha
+          and b"Content-Length: 200000" in head and b"Connection: close" in head)
+    line, body = get(b"/")
+    check("GET /: index.html", status(line) == 200 and body.endswith(b"<html>hello from the OS</html>") and b"text/html" in body)
+    line, _ = get(b"/nosuch")
+    check("404", status(line) == 404)
+    line, body = get(b"/file.bin", method=b"HEAD")
+    check("HEAD: head only", status(line) == 200 and body.endswith(b"\r\n\r\n") and b"Content-Length: 200000" in body)
+    line, body = get(b"/", method=b"POST")
+    check("405 with Allow", status(line) == 405 and b"Allow: GET, HEAD" in body)
+    line, _ = get(b"/../etc/passwd")
+    check("400 for ..", status(line) == 400)
+    line, _ = get(b"/%2e%2e/x")
+    check("400 for an encoded ..", status(line) == 400)
+    line, _ = get(b"/", extra=b"Content-Length: 5\r\n")
+    check("400 for a body", status(line) == 400)
+    line, _ = get(b"/" + b"a" * 1100)
+    check("414", status(line) == 414)
+    line, _ = get(b"/", extra=b"".join(b"H%d: v\r\n" % i for i in range(40)))
+    check("431", status(line) == 431)
+    line, _ = get(b"/", version=b"HTTP/2.0")
+    check("505", status(line) == 505)
+    raw(b"GET / HT", hangup=True)
+    results = []
+
+    def dl():
+        l, b = get(b"/file.bin")
+        results.append(status(l) == 200 and hashlib.sha256(b.partition(b"\r\n\r\n")[2]).hexdigest() == want_sha)
+
+    ts = [threading.Thread(target=dl) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=60)
+    check("four downloads at once", len(results) == 4 and all(results))
+    emit("##HOSTNET httpd " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
 
 
 class HostTcpServer:
@@ -493,11 +691,18 @@ def run_streaming(cmd):
     chunks = []
     client = []
     tcp_client = []
+    http_client = []
     tcp_server = HostTcpServer(HOST_NET.append)
+    web = HostWeb()
 
     def pump():
         for raw in proc.stdout:
             chunks.append(raw)
+            if b"httpd: listening on" in raw and not http_client:
+                tp = int(os.environ.get("OS_NET_LAST_TCP_HOSTPORT", "0"))
+                t = threading.Thread(target=host_httpd_client, args=(tp, HOST_NET.append), daemon=True)
+                http_client.append(t)
+                t.start()
             if b"s8: udpecho ready" in raw and not client:
                 port = int(os.environ.get("OS_NET_LAST_HOSTPORT", "0"))
                 t = threading.Thread(target=host_udp_client, args=(port, HOST_NET.append), daemon=True)
@@ -519,9 +724,10 @@ def run_streaming(cmd):
         proc.wait()
         status, timed_out = None, True
     t.join(timeout=5)
-    for c in client + tcp_client:
+    for c in client + tcp_client + http_client:
         c.join(timeout=60)
     tcp_server.close()
+    web.close()
     return b"".join(chunks), status, timed_out
 
 
@@ -546,6 +752,27 @@ def net_problems(text):
                 found.append("the host TCP client reported nothing")
             elif not r[0].endswith("PASS"):
                 found.append(r[0])
+        if "s9: httpd ready" in text:
+            r = [l for l in HOST_NET if l.startswith("##HOSTNET httpd")]
+            if not r:
+                found.append("the host HTTP client reported nothing")
+            elif not r[0].endswith("PASS"):
+                found.append(r[0])
+        if "s9: fetch|" in text:
+            import hashlib
+            want = hashlib.sha256(file21()).hexdigest()
+            tags = {}
+            for l in text.split("\n"):
+                if "s9: fetch|" in l:
+                    parts = l.strip().split("|", 2)
+                    if len(parts) == 3:
+                        tags[parts[1]] = parts[2]
+            for tag in ("name", "cname", "retry", "addr"):
+                line = tags.get(tag, "")
+                if "status=200" not in line or "bytes=262144" not in line or ("sha256=" + want) not in line:
+                    found.append("fetch %s: %r (wanted the host's digest %s)" % (tag, line, want[:12]))
+            if "s9: fetch tests done" not in text:
+                found.append("the fetch tests did not finish")
         if "s9: host-tcp-server done" in text:
             r = [l for l in HOST_NET if l.startswith("##HOSTNET tcp_server")]
             if not r:

@@ -20,3 +20,4 @@ netcore = { path = "../netcore" }
 dhcp = { path = "../dhcp" }
 supervise = { path = "../supervise" }
 rngcore = { path = "../rngcore" }
+http1 = { path = "../http1" }

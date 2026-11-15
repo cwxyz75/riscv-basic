@@ -66,6 +66,11 @@ fn with_net<R>(f: impl FnOnce(&mut Net) -> Result<R, NetError>) -> Result<R, c_i
     }
 }
 
+/// `with_net` for the other modules of the library (`getaddrinfo`), with the stack's own errors as plain values.
+pub(crate) fn with_net_pub<R>(f: impl FnOnce(&mut Net) -> Result<R, NetError>) -> Result<R, c_int> {
+    with_net(f)
+}
+
 fn errno_of_net(e: NetError) -> c_int {
     match e {
         NetError::Stack(s) => sockshim::errno_of_status(s),

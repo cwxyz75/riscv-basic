@@ -4708,8 +4708,10 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"devmgr".to_vec(),
             b"dhcpc".to_vec(),
             b"echo".to_vec(),
+            b"fetch".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
+            b"httpd".to_vec(),
             b"init".to_vec(),
             b"ipchog".to_vec(),
             b"launcher".to_vec(),
@@ -10278,6 +10280,11 @@ pub fn app_main() -> i32 {
             "c_sockets_over_the_stack",
             net_tests::c_sockets_over_the_stack,
         ),
+        (
+            "net_fetch_from_a_host_server",
+            net_tests::net_fetch_from_a_host_server,
+        ),
+        ("net_httpd_for_the_host", net_tests::net_httpd_for_the_host),
         (
             "net_streams_over_loopback",
             net_tests::net_streams_over_loopback,
