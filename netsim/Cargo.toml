@@ -1,0 +1,7 @@
+[package]
+name = "netsim"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S8: a deterministic simulated Ethernet link with a seeded fault injector (loss, duplication, reordering, delay) and a simulated clock, host-only (NET-SPEC 12.1 H6)"
+
+[dependencies]

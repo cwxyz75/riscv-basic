@@ -1,0 +1,8 @@
+[package]
+name = "dhcp"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S8: the pure DHCP client state machine (RFC 2131) driven by packets and a clock (NET-SPEC 8.2)"
+
+[dependencies]
+netwire = { path = "../netwire" }

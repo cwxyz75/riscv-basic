@@ -1,0 +1,11 @@
+[package]
+name = "netcore"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S8: the pure network core (interface, ARP, IPv4, ICMP echo, UDP, timers, counters) behind a Device seam (NET-SPEC 6)"
+
+[dependencies]
+netwire = { path = "../netwire" }
+
+[dev-dependencies]
+netsim = { path = "../netsim" }

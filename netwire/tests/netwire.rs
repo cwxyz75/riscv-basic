@@ -1,0 +1,571 @@
+//! H1 to H3 of NET-SPEC 12.1: goldens from a real capture (parse and rebuild byte for byte), properties against an
+//! independent checksum, and totality over random and mutated input.
+use netwire::{arp, checksum, dhcp, eth, icmp, ipv4, udp, WireError};
+
+// ---- helpers ----
+
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+}
+
+/// The frames of a classic little-endian pcap.
+fn pcap(path: &str) -> Vec<Vec<u8>> {
+    let d = std::fs::read(path).expect("the capture exists");
+    assert_eq!(
+        &d[..4],
+        &[0xd4, 0xc3, 0xb2, 0xa1],
+        "a little-endian classic pcap"
+    );
+    let mut i = 24;
+    let mut out = vec![];
+    while i + 16 <= d.len() {
+        let cl = u32::from_le_bytes(d[i + 8..i + 12].try_into().unwrap()) as usize;
+        out.push(d[i + 16..i + 16 + cl].to_vec());
+        i += 16 + cl;
+    }
+    out
+}
+
+fn capture() -> Vec<Vec<u8>> {
+    pcap(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../net/tests/data/slirp-probe.pcap"
+    ))
+}
+
+/// A bytewise one's-complement checksum written separately from the library's (the reference).
+fn naive_checksum(data: &[u8]) -> u16 {
+    let mut sum: u64 = 0;
+    let mut i = 0;
+    while i < data.len() {
+        let hi = u64::from(data[i]);
+        let lo = if i + 1 < data.len() {
+            u64::from(data[i + 1])
+        } else {
+            0
+        };
+        sum += hi * 256 + lo;
+        i += 2;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    (!sum & 0xffff) as u16
+}
+
+// ---- H1: goldens ----
+
+/// Rebuild an Ethernet frame from its parsed fields; the capture's padding (zeros to 60 bytes) is added back.
+fn rebuild(frame: &[u8]) -> Vec<u8> {
+    let e = eth::parse(frame).expect("an Ethernet frame");
+    let mut out = vec![0u8; 4096];
+    let mut n = eth::write_header(&mut out, e.dst, e.src, e.ethertype).unwrap();
+    match e.ethertype {
+        eth::ETHERTYPE_ARP => {
+            let a = arp::parse(e.payload).expect("ARP");
+            n += arp::write(&mut out[n..], &a).unwrap();
+        }
+        eth::ETHERTYPE_IPV4 => match ipv4::parse(e.payload) {
+            Ok(ip) => {
+                let h = ip.header;
+                let mut payload = vec![0u8; 4096];
+                let pl = match h.proto {
+                    ipv4::PROTO_ICMP => {
+                        let m = icmp::parse(ip.payload).expect("ICMP");
+                        if m.kind == icmp::TYPE_ECHO_REQUEST || m.kind == icmp::TYPE_ECHO_REPLY {
+                            icmp::write_echo(
+                                &mut payload,
+                                m.kind == icmp::TYPE_ECHO_REPLY,
+                                m.id,
+                                m.seq,
+                                m.body,
+                            )
+                            .unwrap()
+                        } else {
+                            payload[..ip.payload.len()].copy_from_slice(ip.payload);
+                            ip.payload.len()
+                        }
+                    }
+                    ipv4::PROTO_UDP => {
+                        let u = udp::parse(ip.payload, h.src, h.dst).expect("UDP");
+                        if u.had_checksum {
+                            udp::write(
+                                &mut payload,
+                                h.src,
+                                h.dst,
+                                u.src_port,
+                                u.dst_port,
+                                u.payload,
+                            )
+                            .unwrap()
+                        } else {
+                            payload[..ip.payload.len()].copy_from_slice(ip.payload);
+                            ip.payload.len()
+                        }
+                    }
+                    _ => {
+                        payload[..ip.payload.len()].copy_from_slice(ip.payload);
+                        ip.payload.len()
+                    }
+                };
+                n += ipv4::write_header(&mut out[n..], &h, pl).unwrap();
+                out[n..n + pl].copy_from_slice(&payload[..pl]);
+                n += pl;
+            }
+            Err(WireError::Fragment) => {
+                // a fragment is refused by the parser: copy it (the stack drops these)
+                out[n..n + e.payload.len()].copy_from_slice(e.payload);
+                n += e.payload.len();
+            }
+            Err(e) => panic!("IPv4: {e:?}"),
+        },
+        _ => {
+            out[n..n + e.payload.len()].copy_from_slice(e.payload);
+            n += e.payload.len();
+        }
+    }
+    assert!(
+        n <= frame.len(),
+        "rebuilt {n} bytes, the frame has {}",
+        frame.len()
+    );
+    out.truncate(frame.len()); // (the capture's Ethernet padding is zeros)
+    out
+}
+
+#[test]
+fn every_captured_frame_parses_and_rebuilds_to_the_same_bytes() {
+    let frames = capture();
+    assert!(
+        frames.len() >= 28,
+        "the committed capture has its 28 frames"
+    );
+    for (i, f) in frames.iter().enumerate() {
+        let r = rebuild(f);
+        assert_eq!(&r, f, "frame {i} did not rebuild to the same bytes");
+    }
+}
+
+#[test]
+fn the_capture_holds_what_the_probe_saw() {
+    let frames = capture();
+    let (mut arps, mut icmps, mut udps, mut dhcps, mut padded) = (0, 0, 0, 0, 0);
+    for f in &frames {
+        let e = eth::parse(f).unwrap();
+        if f.len() == 60 {
+            padded += 1;
+        }
+        if e.ethertype == eth::ETHERTYPE_ARP {
+            arps += 1;
+        } else if let Ok(ip) = ipv4::parse(e.payload) {
+            match ip.header.proto {
+                ipv4::PROTO_ICMP => icmps += 1,
+                ipv4::PROTO_UDP => {
+                    udps += 1;
+                    let u = udp::parse(ip.payload, ip.header.src, ip.header.dst).unwrap();
+                    if u.dst_port == dhcp::PORT_CLIENT || u.dst_port == dhcp::PORT_SERVER {
+                        let m = dhcp::parse(u.payload).expect("DHCP");
+                        let s = m.summary();
+                        assert!(
+                            s.msg_type.is_some(),
+                            "every DHCP message in the capture has a type"
+                        );
+                        if s.msg_type == Some(dhcp::msg::OFFER)
+                            || s.msg_type == Some(dhcp::msg::ACK)
+                        {
+                            assert_eq!(m.yiaddr, [10, 0, 2, 15]);
+                            assert_eq!(s.server_id, Some([10, 0, 2, 2]));
+                            assert_eq!(s.mask, Some([255, 255, 255, 0]));
+                            assert_eq!(s.router, Some([10, 0, 2, 2]));
+                            assert_eq!(s.dns, Some([10, 0, 2, 3]));
+                            assert_eq!(s.lease, Some(86400));
+                            assert_eq!((s.t1, s.t2), (None, None), "slirp sends no T1 or T2");
+                        }
+                        dhcps += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        arps >= 4 && icmps >= 4 && udps >= 10 && dhcps >= 2,
+        "{arps} {icmps} {udps} {dhcps}"
+    );
+    assert!(
+        padded >= 1,
+        "short frames are padded to 60 bytes: the payload comes from the IP length"
+    );
+}
+
+#[test]
+fn a_padded_frame_delivers_only_the_ip_length() {
+    // the capture has 60-byte frames whose IP total length is smaller than the bytes after the Ethernet header
+    let mut checked = 0;
+    for f in capture() {
+        if f.len() != 60 {
+            continue;
+        }
+        let e = eth::parse(&f).unwrap();
+        if let Ok(ip) = ipv4::parse(e.payload) {
+            assert!(
+                ip.header_len + ip.payload.len() < e.payload.len(),
+                "padding follows the datagram"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 1);
+}
+
+// ---- H2: properties ----
+
+#[test]
+fn the_checksum_matches_the_rfc_example_and_the_reference() {
+    // RFC 1071 section 3: 00 01 f2 03 f4 f5 f6 f7 sums to ddf2; its checksum is 220d
+    let d = [0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+    assert_eq!(checksum::fold(checksum::sum16(&d, 0)), 0xddf2);
+    assert_eq!(checksum::checksum(&d), 0x220d);
+    let mut rng = Rng::new(1);
+    for _ in 0..20_000 {
+        let n = rng.below(200) as usize;
+        let b = rng.bytes(n);
+        assert_eq!(checksum::checksum(&b), naive_checksum(&b), "len {n}");
+    }
+}
+
+#[test]
+fn built_messages_parse_back_to_what_was_built() {
+    let mut rng = Rng::new(2);
+    for _ in 0..5_000 {
+        let src = [
+            rng.next() as u8,
+            rng.next() as u8,
+            rng.next() as u8,
+            rng.next() as u8,
+        ];
+        let dst = [
+            rng.next() as u8,
+            rng.next() as u8,
+            rng.next() as u8,
+            rng.next() as u8,
+        ];
+        let n = rng.below(1473) as usize;
+        let data = rng.bytes(n);
+        // UDP
+        let mut b = vec![0u8; 2000];
+        let (sp, dp) = (rng.next() as u16, rng.next() as u16);
+        let l = udp::write(&mut b, src, dst, sp, dp, &data).unwrap();
+        let u = udp::parse(&b[..l], src, dst).unwrap();
+        assert_eq!((u.src_port, u.dst_port, u.payload), (sp, dp, &data[..]));
+        assert_ne!(
+            u32::from(u16::from_be_bytes([b[6], b[7]])),
+            0,
+            "a sent UDP checksum is never zero"
+        );
+        // ICMP echo
+        let (id, seq) = (rng.next() as u16, rng.next() as u16);
+        let reply = rng.below(2) == 0;
+        let l = icmp::write_echo(&mut b, reply, id, seq, &data).unwrap();
+        let m = icmp::parse(&b[..l]).unwrap();
+        assert_eq!((m.id, m.seq, m.body), (id, seq, &data[..]));
+        assert_eq!(m.kind, if reply { 0 } else { 8 });
+        // IPv4
+        let h = ipv4::Header {
+            tos: rng.next() as u8,
+            id: rng.next() as u16,
+            flags_frag: if rng.below(2) == 0 { ipv4::FLAG_DF } else { 0 },
+            ttl: rng.next() as u8,
+            proto: rng.next() as u8,
+            src,
+            dst,
+        };
+        let mut pkt = vec![0u8; 2000];
+        let hl = ipv4::write_header(&mut pkt, &h, data.len()).unwrap();
+        pkt[hl..hl + data.len()].copy_from_slice(&data);
+        let ip = ipv4::parse(&pkt[..hl + data.len()]).unwrap();
+        assert_eq!((ip.header, ip.payload), (h, &data[..]));
+    }
+}
+
+#[test]
+fn a_single_flipped_bit_is_rejected_or_changes_the_parse() {
+    let mut rng = Rng::new(3);
+    let (src, dst) = ([10, 0, 2, 15], [10, 0, 2, 2]);
+    let payload = rng.bytes(64);
+    let mut ud = vec![0u8; 200];
+    let ul = udp::write(&mut ud, src, dst, 1234, 7777, &payload).unwrap();
+    let h = ipv4::Header {
+        tos: 0,
+        id: 7,
+        flags_frag: ipv4::FLAG_DF,
+        ttl: 64,
+        proto: 17,
+        src,
+        dst,
+    };
+    let mut pkt = vec![0u8; 200];
+    let hl = ipv4::write_header(&mut pkt, &h, ul).unwrap();
+    pkt[hl..hl + ul].copy_from_slice(&ud[..ul]);
+    let good = &pkt[..hl + ul];
+    let want = ipv4::parse(good).unwrap();
+    for bit in 0..good.len() * 8 {
+        let mut m = good.to_vec();
+        m[bit / 8] ^= 1 << (bit % 8);
+        match ipv4::parse(&m) {
+            Err(_) => {}
+            Ok(ip) => {
+                // the header verified: the flip was in the payload, which the UDP checksum must then catch
+                assert_eq!(ip.header, want.header, "bit {bit}");
+                assert!(
+                    udp::parse(ip.payload, src, dst).is_err(),
+                    "a flipped bit in the UDP part must fail its checksum or length (bit {bit})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn builders_refuse_a_buffer_that_is_too_small() {
+    let mut tiny = [0u8; 5];
+    assert_eq!(
+        eth::write_header(&mut tiny, [0; 6], [0; 6], 0),
+        Err(WireError::NoSpace)
+    );
+    assert_eq!(
+        icmp::write_echo(&mut tiny, false, 1, 1, &[1, 2, 3]),
+        Err(WireError::NoSpace)
+    );
+    assert_eq!(
+        udp::write(&mut tiny, [0; 4], [0; 4], 1, 2, &[]),
+        Err(WireError::NoSpace)
+    );
+    assert_eq!(
+        arp::write(
+            &mut tiny,
+            &arp::Arp {
+                op: 1,
+                sha: [0; 6],
+                spa: [0; 4],
+                tha: [0; 6],
+                tpa: [0; 4]
+            }
+        ),
+        Err(WireError::NoSpace)
+    );
+    let h = ipv4::Header {
+        tos: 0,
+        id: 0,
+        flags_frag: 0,
+        ttl: 1,
+        proto: 1,
+        src: [0; 4],
+        dst: [0; 4],
+    };
+    let mut big = [0u8; 100];
+    assert_eq!(
+        ipv4::write_header(&mut big, &h, 70_000),
+        Err(WireError::NoSpace),
+        "a total length over 65535"
+    );
+}
+
+#[test]
+fn parse_errors_name_the_reason() {
+    assert_eq!(ipv4::parse(&[0x45; 10]).unwrap_err(), WireError::Truncated);
+    let mut d = vec![0u8; 40];
+    let h = ipv4::Header {
+        tos: 0,
+        id: 0,
+        flags_frag: 0,
+        ttl: 64,
+        proto: 17,
+        src: [1; 4],
+        dst: [2; 4],
+    };
+    ipv4::write_header(&mut d, &h, 20).unwrap();
+    let mut v6 = d.clone();
+    v6[0] = 0x65;
+    assert_eq!(ipv4::parse(&v6).unwrap_err(), WireError::Malformed);
+    let mut ihl4 = d.clone();
+    ihl4[0] = 0x44;
+    assert_eq!(ipv4::parse(&ihl4).unwrap_err(), WireError::Malformed);
+    assert_eq!(
+        ipv4::parse(&d[..30]).unwrap_err(),
+        WireError::BadLength,
+        "total length beyond the bytes present"
+    );
+    let mut bad = d.clone();
+    bad[10] ^= 1;
+    assert_eq!(ipv4::parse(&bad).unwrap_err(), WireError::BadChecksum);
+    let mut frag = d.clone();
+    let hf = ipv4::Header {
+        flags_frag: 0x2000,
+        ..h
+    };
+    ipv4::write_header(&mut frag, &hf, 20).unwrap();
+    assert_eq!(
+        ipv4::parse(&frag).unwrap_err(),
+        WireError::Fragment,
+        "more-fragments"
+    );
+    let hf = ipv4::Header {
+        flags_frag: 0x00b9,
+        ..h
+    };
+    ipv4::write_header(&mut frag, &hf, 20).unwrap();
+    assert_eq!(
+        ipv4::parse(&frag).unwrap_err(),
+        WireError::Fragment,
+        "a non-zero offset"
+    );
+}
+
+#[test]
+fn dhcp_options_are_bounds_checked() {
+    let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    let mut b = vec![0u8; 400];
+    let n = dhcp::write_client(
+        &mut b,
+        dhcp::msg::DISCOVER,
+        0xdead_beef,
+        mac,
+        dhcp::FLAG_BROADCAST,
+        0,
+        [0; 4],
+        None,
+        None,
+    )
+    .unwrap();
+    let m = dhcp::parse(&b[..n]).unwrap();
+    assert_eq!((m.xid, m.flags, m.chaddr), (0xdead_beef, 0x8000, mac));
+    assert_eq!(m.summary().msg_type, Some(dhcp::msg::DISCOVER));
+    // an option whose length runs past the end ends the list without reading beyond it
+    let mut hostile = b[..dhcp::FIXED].to_vec();
+    hostile.extend_from_slice(&[53, 1, 5, 54, 200, 1, 2, 3]);
+    let mut hostile2 = b[..dhcp::FIXED].to_vec();
+    hostile2.extend_from_slice(&[53, 1, 5, 3, 8, 10, 0, 2, 2]);
+    assert_eq!(
+        dhcp::parse(&hostile2).unwrap().summary().router,
+        None,
+        "an option whose length passes the end is not returned truncated"
+    );
+    let m = dhcp::parse(&hostile).unwrap();
+    let s = m.summary();
+    assert_eq!(
+        s.msg_type,
+        Some(5),
+        "an option before the bad one still counts"
+    );
+    assert_eq!(s.server_id, None, "the over-long option is ignored");
+    // END early hides what follows; duplicates: the first wins; a wrong-sized option is ignored
+    let mut dup = b[..dhcp::FIXED].to_vec();
+    dup.extend_from_slice(&[
+        53, 1, 2, 53, 1, 5, 1, 3, 10, 0, 0, 1, 255, 54, 4, 9, 9, 9, 9,
+    ]);
+    let s = dhcp::parse(&dup).unwrap().summary();
+    assert_eq!(s.msg_type, Some(2));
+    assert_eq!(s.mask, None, "a mask option of three bytes is ignored");
+    assert_eq!(s.server_id, None, "nothing after END is read");
+    // a truncated fixed part, a bad cookie
+    assert_eq!(dhcp::parse(&b[..100]).unwrap_err(), WireError::Truncated);
+    let mut cookie = b[..n].to_vec();
+    cookie[236] ^= 1;
+    assert_eq!(dhcp::parse(&cookie).unwrap_err(), WireError::Malformed);
+}
+
+// ---- H3: totality ----
+
+/// Run every parser on `b`; none may panic (the test is that this returns).
+fn everything(b: &[u8]) {
+    let _ = eth::parse(b);
+    let _ = arp::parse(b);
+    let _ = ipv4::parse(b);
+    let _ = icmp::parse(b);
+    let _ = udp::parse(b, [1, 2, 3, 4], [5, 6, 7, 8]);
+    if let Ok(m) = dhcp::parse(b) {
+        let _ = m.summary();
+    }
+    for _ in dhcp::options(b) {}
+}
+
+#[test]
+fn no_parser_panics_on_random_truncated_or_mutated_input() {
+    let valid: Vec<Vec<u8>> = {
+        let mut v = capture();
+        let mut b = vec![0u8; 400];
+        let n = dhcp::write_client(
+            &mut b,
+            3,
+            1,
+            [1; 6],
+            0,
+            0,
+            [0; 4],
+            Some([10, 0, 2, 15]),
+            Some([10, 0, 2, 2]),
+        )
+        .unwrap();
+        v.push(b[..n].to_vec());
+        v
+    };
+    let mut rng = Rng::new(4);
+    let mut cases = 0u32;
+    for _ in 0..60_000 {
+        let n = rng.below(1600) as usize;
+        everything(&rng.bytes(n));
+        cases += 1;
+    }
+    for f in &valid {
+        for cut in 0..f.len() {
+            everything(&f[..cut]);
+            // the same cut, taken from every layer's start
+            for start in [14usize, 34, 42] {
+                if cut > start {
+                    everything(&f[start..cut]);
+                }
+            }
+            cases += 1;
+        }
+    }
+    for _ in 0..140_000 {
+        let f = &valid[rng.below(valid.len() as u64) as usize];
+        let mut m = f.clone();
+        for _ in 0..1 + rng.below(4) {
+            let i = rng.below(m.len() as u64) as usize;
+            m[i] = rng.next() as u8;
+        }
+        let start = [0usize, 14, 34, 42][rng.below(4) as usize];
+        if start < m.len() {
+            everything(&m[start..]);
+        }
+        cases += 1;
+    }
+    assert!(cases >= 200_000, "{cases} cases");
+}
+
+#[test]
+fn no_parser_allocates() {
+    // the crate is `no_std` and has no `alloc`: N9 holds by construction. (A length taken from a packet is only ever
+    // used to slice the bytes already present.)
+    let src = include_str!("../src/lib.rs");
+    assert!(src.contains("#![no_std]") && !src.contains("extern crate alloc"));
+}

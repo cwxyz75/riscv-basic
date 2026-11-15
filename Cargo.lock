@@ -80,6 +80,13 @@ name = "console"
 version = "0.1.0"
 
 [[package]]
+name = "dhcp"
+version = "0.1.0"
+dependencies = [
+ "netwire",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -265,6 +272,22 @@ version = "0.1.0"
 dependencies = [
  "proto",
 ]
+
+[[package]]
+name = "netcore"
+version = "0.1.0"
+dependencies = [
+ "netsim",
+ "netwire",
+]
+
+[[package]]
+name = "netsim"
+version = "0.1.0"
+
+[[package]]
+name = "netwire"
+version = "0.1.0"
 
 [[package]]
 name = "nu-ansi-term"
@@ -486,6 +509,10 @@ checksum = "5b9eb1a2f4c41445a3a0ff9abc5221c5fcd28e1f13cd7c0397706f9ac938ddb0"
 dependencies = [
  "lock_api",
 ]
+
+[[package]]
+name = "supervise"
+version = "0.1.0"
 
 [[package]]
 name = "svc"
