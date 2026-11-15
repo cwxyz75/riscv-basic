@@ -1,6 +1,6 @@
-# FS-SPEC: Cambium, the disk filesystem (specification, draft v0, 2026-11-15)
+# FS-SPEC: doofs, the disk filesystem (specification, draft v0, 2026-11-15)
 
-**Name:** Cambium (the growing layer of a tree: new wood added, old rings untouched). Chosen by the owner 2026-11-15 as a working name that may change. Tools follow the Unix convention: `mkfs.cambium`, `fsck.cambium`, `dump.cambium`; crates `cambium` (pure format) and `cambiumd` (server) are proposed, nothing claims the bare `fsck`.
+**Name:** doofs (a deliberately silly working name, chosen by the owner 2026-11-15). **If we ever want a serious name, the proposal is Cambium** (the growing layer of a tree: new wood added, old rings untouched, which is copy-on-write and generations); switching is a rename in docs, crates and tool names. Tools follow the Unix convention: `mkfs.doofs`, `fsck.doofs`, `dump.doofs`; crates `doofs` (pure format) and `doofsd` (server) are proposed, nothing claims the bare `fsck`.
 
 Status: **draft v0; the four decisions in section 2 are the owner's (2026-11-15); everything else is a proposal.** Nothing is
 built. This is the written acceptance contract for slice F (CLAUDE.md: spec, acceptance checks, code, independent review). Basis:
