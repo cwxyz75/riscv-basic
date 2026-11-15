@@ -47,6 +47,7 @@ fn main() {
         "netsup",
         "netdrv",
         "netd",
+        "dhcpc",
         "ping",
         "udpecho",
         "netinfo",

@@ -56,6 +56,8 @@ struct Held {
     /// The doorbell events: the driver signals `to_stack`, the stack signals `to_driver`.
     to_stack: u32,
     to_driver: u32,
+    /// The configuration blob (one page): netd's interface half and dhcpc's lease half.
+    blob: u32,
     #[allow(dead_code)] // (read by the status and flight-recorder code of the full supervisor)
     shm: Shm,
 }
@@ -197,6 +199,7 @@ pub fn app_main() -> i32 {
         .get(1)
         .is_some_and(|a| a.as_slice() == b"stackless");
     let parent = env.handle(Role::ServiceInit);
+    let want_dhcp = !env.startup.args.iter().skip(1).any(|a| a.as_slice() == b"nodhcp");
 
     let (hs, c) = match claim(devmgr_ch) {
         Ok(x) => x,
@@ -231,7 +234,12 @@ pub fn app_main() -> i32 {
     if e1.status != 0 || e2.status != 0 {
         return 18;
     }
+    let blob = sys::vmo_create(1);
+    if blob.status != 0 || sys::vmo_commit(blob.a1 as u32, 0, 4096).status != 0 {
+        return 28;
+    }
     let held = Held {
+        blob: blob.a1 as u32,
         mmio: hs[0],
         rx: hs[1],
         tx: hs[2],
@@ -295,6 +303,13 @@ pub fn app_main() -> i32 {
         return 27;
     }
     let (sup_end, netd_sup_end) = (pair.a1 as u32, pair.a2 as u32);
+    let mut dhcpc = Child {
+        proc: None,
+        seq: 0,
+        name: "dhcpc",
+        restarts: 0,
+        last_exit: 0,
+    };
     let mut netd = Child {
         proc: None,
         seq: 0,
@@ -311,7 +326,7 @@ pub fn app_main() -> i32 {
         port,
         ctl_parent,
         signals::READABLE | signals::PEER_CLOSED,
-        3,
+        8,
     );
     // exit events: key = (incarnation << 4) | child index + 1 (children: 0 driver, 1 stack)
     let bind = |p: u32, c: &mut Child, idx: u64| {
@@ -326,6 +341,18 @@ pub fn app_main() -> i32 {
     };
     bind(drv.proc.unwrap_or(0), &mut drv, 0);
     bind(netd.proc.unwrap_or(0), &mut netd, 1);
+    let dhcp_image = read_bin(bi, b"bin/dhcpc");
+    if want_dhcp {
+        if let Some(img) = &dhcp_image {
+            match spawn_dhcpc(&held, img, registry) {
+                Ok(p) => {
+                    dhcpc.proc = Some(p);
+                    bind(p, &mut dhcpc, 2);
+                }
+                Err(code) => rt::println!("##NETSUP dhcpc not started ({code})"),
+            }
+        }
+    }
     rt::println!("##NETSUP up");
     let mut pending: Vec<(u64, usize)> = Vec::new(); // (restart at, child)
     let mut down = false;
@@ -345,6 +372,17 @@ pub fn app_main() -> i32 {
             }
         });
         for c in due {
+            if c == 2 {
+                if let Some(img) = &dhcp_image {
+                    match spawn_dhcpc(&held, img, registry) {
+                        Ok(p) => {
+                            dhcpc.proc = Some(p);
+                            bind(p, &mut dhcpc, 2);
+                        }
+                        Err(_) => down = true,
+                    }
+                }
+            }
             if c == 0 {
                 match spawn_driver(&held, &drv_image) {
                     Ok((p, ctl_end)) => {
@@ -367,9 +405,13 @@ pub fn app_main() -> i32 {
         let key = r.a1 as u64;
         let (seq, which) = (key >> 4, key & 15);
         match which {
-            1 | 2 => {
+            1..=3 => {
                 let idx = which - 1;
-                let child = if idx == 0 { &mut drv } else { &mut netd };
+                let child = match idx {
+                    0 => &mut drv,
+                    1 => &mut netd,
+                    _ => &mut dhcpc,
+                };
                 if child.seq != seq {
                     continue; // a killed predecessor's late event
                 }
@@ -388,8 +430,8 @@ pub fn app_main() -> i32 {
                 let restartable = !(20..=24).contains(&code);
                 match sup.on_exit(idx as usize, now2, restartable) {
                     Action::Restart { delay } => {
-                        if idx == 0 {
-                            pending.push((now2 + delay / 1_000_000, 0));
+                        if idx == 0 || idx == 2 {
+                            pending.push((now2 + delay / 1_000_000, idx as usize));
                         } else {
                             // the stack restarted: a fresh driver goes with it (it re-attaches as generation + 1), and the new
                             // stack gets its control channel in its startup message
@@ -423,7 +465,7 @@ pub fn app_main() -> i32 {
                     }
                 }
             }
-            3 => {
+            8 => {
                 // the control channel: Status and Restart
                 let mut b = [0u8; 32];
                 loop {
@@ -448,7 +490,7 @@ pub fn app_main() -> i32 {
                     reply[..4].copy_from_slice(&txid.to_le_bytes());
                     match op {
                         1 => {
-                            for c in [&drv, &netd] {
+                            for c in [&drv, &netd, &dhcpc] {
                                 reply.push(u8::from(c.proc.is_some()));
                                 reply.extend_from_slice(&c.restarts.to_le_bytes());
                                 reply.extend_from_slice(&c.last_exit.to_le_bytes());
@@ -459,7 +501,11 @@ pub fn app_main() -> i32 {
                         }
                         2 => {
                             let which = b[8];
-                            let target = if which == 0 { drv.proc } else { netd.proc };
+                            let target = match which {
+                                0 => drv.proc,
+                                1 => netd.proc,
+                                _ => dhcpc.proc,
+                            };
                             match target {
                                 Some(p) => {
                                     sys::process_kill(p, -3000);
@@ -479,7 +525,7 @@ pub fn app_main() -> i32 {
                 }
                 if sys::object_signals(ctl_parent).a1 as u32 & signals::PEER_CLOSED != 0 {
                     // whoever started us is gone: end the stack and leave
-                    for c in [&drv, &netd] {
+                    for c in [&drv, &netd, &dhcpc] {
                         if let Some(p) = c.proc {
                             sys::process_kill(p, -1);
                             let _ =
@@ -488,7 +534,7 @@ pub fn app_main() -> i32 {
                     }
                     return 0;
                 }
-                let _ = sys::port_rearm(port, 3);
+                let _ = sys::port_rearm(port, 8);
             }
             _ => {}
         }
@@ -506,11 +552,16 @@ fn spawn_netd(
     let Some(mut hs) = stack_handles(h, ctl_end) else {
         return Err(24);
     };
-    let Some(reg) = dup(registry, Rights::SAME) else {
+    // a connection of its own to the registry (a duplicate of the handle would share one channel with us)
+    let Ok(reg) = rt::fs::Fs::new(registry).clone_conn(proto::file::rights::ALL) else {
         return Err(25);
     };
-    hs.push(reg);
+    hs.push(reg.ch);
     hs.push(sup_end);
+    let Some(blob) = dup(h.blob, Rights::SAME) else {
+        return Err(25);
+    };
+    hs.push(blob);
     let roles = alloc::vec![
         (Role::NetRing, 0),
         (Role::NetRxPool, 1),
@@ -519,7 +570,8 @@ fn spawn_netd(
         (Role::NetEventToDriver, 4),
         (Role::NetCtl, 5),
         (Role::ServiceRegistry, 6),
-        (Role::ServiceInit, 7)
+        (Role::ServiceInit, 7),
+        (Role::NetConfigBlob, 8)
     ];
     let s = Startup {
         args: alloc::vec![b"netd".to_vec()],
@@ -533,6 +585,33 @@ fn spawn_netd(
         Ok(p) => Ok(p),
         Err(e) => {
             rt::println!("##NETSUP cannot start netd: {e:?}");
+            Err(23)
+        }
+    }
+}
+
+/// Start the DHCP client with a view of `/svc` holding only the two names it needs.
+fn spawn_dhcpc(h: &Held, image: &[u8], registry: u32) -> Result<u32, i32> {
+    let mut reg = rt::fs::Fs::new(registry);
+    let Ok(view) = reg.view(&[b"net-priv", b"net-config"], proto::file::rights::READ) else {
+        return Err(25);
+    };
+    let Some(blob) = dup(h.blob, Rights::SAME) else {
+        return Err(25);
+    };
+    let s = Startup {
+        args: alloc::vec![b"dhcpc".to_vec()],
+        roles: alloc::vec![(Role::NetConfigBlob, 1)],
+        namespace: alloc::vec![(b"/svc".to_vec(), 0)],
+        ..Startup::default()
+    };
+    let Ok(bytes) = s.encode() else {
+        return Err(21);
+    };
+    match rt::spawn::spawn(image, &bytes, &[view.ch, blob]) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            rt::println!("##NETSUP cannot start dhcpc: {e:?}");
             Err(23)
         }
     }

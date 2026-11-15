@@ -4706,6 +4706,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"crash".to_vec(),
             b"ctest".to_vec(),
             b"devmgr".to_vec(),
+            b"dhcpc".to_vec(),
             b"echo".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
@@ -10236,6 +10237,10 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "net_dhcp_configures_the_interface",
+            net_tests::net_dhcp_configures_the_interface,
         ),
         (
             "net_udp_echo_through_hostfwd",

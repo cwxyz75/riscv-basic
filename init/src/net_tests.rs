@@ -440,6 +440,11 @@ struct Full {
 }
 
 fn start_full() -> Result<Option<Full>, Detail> {
+    start_full_with(false)
+}
+
+/// `dhcp`: let `netsup` start the DHCP client too (the static-configuration tests leave it out).
+fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
     let bi = boot_image_vmo()?;
     let root_j = root_job()?;
@@ -509,7 +514,7 @@ fn start_full() -> Result<Option<Full>, Detail> {
     let sup = spawn_prog(
         bi,
         b"bin/netsup",
-        &[b"netsup"],
+        if dhcp { &[b"netsup"] } else { &[b"netsup", b"nodhcp"] },
         vec![
             (Role::ServiceDevmgr, 0),
             (Role::BootImage, 1),
@@ -687,6 +692,53 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
         ensure!(echoed >= 200, "the host's datagrams arrived and were echoed ({echoed})");
         let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
         ensure!(stats.iter().any(|s| s.1 > 0), "the counters moved");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// The value of the named counter in a `GetStats` answer.
+fn counter(stats: &[(u16, u64)], name: &str) -> u64 {
+    let id = netcore::Counters::default().pairs().iter().find(|p| p.1 == name).map(|p| p.0);
+    id.and_then(|id| stats.iter().find(|s| s.0 == id)).map_or(0, |s| s.1)
+}
+
+/// Q3: the DHCP client configures the interface from QEMU's own server (an independent implementation), and the S8 "ping the
+/// gateway" acceptance then holds over the real flow; a ping to an address nobody answers for gets no reply after exactly three
+/// ARP requests.
+pub fn net_dhcp_configures_the_interface() -> Outcome {
+    let Some(mut f) = start_full_with(true)? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut net = f.connect(b"net")?;
+        let until = t(25_000);
+        let mut info = net.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        while !info.configured && sys::clock_get() < until {
+            nap(100)?;
+            info = net.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        }
+        ensure!(info.configured, "the interface was configured by DHCP within 25 s");
+        ensure_eq!((info.addr, info.mask, info.gateway, info.dns), ([10, 0, 2, 15], [255, 255, 255, 0], [10, 0, 2, 2], [10, 0, 2, 3]), "what QEMU's server leases");
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut got = 0;
+        for seq in 1..=5u16 {
+            if echo.ping([10, 0, 2, 2], seq, &[seq as u8; 16], t(1500)).is_ok() {
+                got += 1;
+            }
+        }
+        ensure!(got >= 4, "the gateway answers pings after DHCP ({got} of 5)");
+        ensure!(echo.ping([10, 0, 2, 3], 9, b"dns", t(1500)).is_ok(), "slirp's DNS address answers pings too");
+        // nobody answers for 10.0.2.99: three ARP requests, then NoRoute, and no echo reply
+        let mut cfg = f.connect(b"net-config")?;
+        let before = counter(&cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?, "arp_requests_sent");
+        let r = echo.ping([10, 0, 2, 99], 1, b"x", t(6000));
+        ensure!(r.is_err(), "no reply from an address nobody answers for");
+        let after = counter(&cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?, "arp_requests_sent");
+        ensure_eq!(after - before, 3, "exactly three ARP requests");
         Ok(())
     })();
     f.close();

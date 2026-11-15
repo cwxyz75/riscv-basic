@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+#[path = "../netblob.rs"]
+mod netblob;
 #[path = "../netshm.rs"]
 mod netshm;
 
@@ -35,6 +37,7 @@ use svc::Limits;
 const RING_VA: u64 = 0x510_0000;
 const RX_VA: u64 = 0x520_0000;
 const TX_VA: u64 = 0x530_0000;
+const BLOB_VA: u64 = 0x540_0000;
 const PF_R: u64 = 1;
 const PF_RW: u64 = 3;
 
@@ -79,6 +82,7 @@ struct Netd {
     tx_free: Vec<u32>,
     eps: BTreeMap<EpId, u64>,
     more: bool,
+    blob: Option<netblob::Blob>,
 }
 
 fn now_ns() -> u64 {
@@ -551,6 +555,9 @@ impl Netd {
                     },
                     now_ns(),
                 );
+                if let Some(b) = &self.blob {
+                    b.write_iface(Some(netblob::Iface { addr, mask, gateway, dns }));
+                }
                 self.reply(key, txid, pn::status::OK, &[]);
                 self.more = true;
             }
@@ -559,6 +566,9 @@ impl Netd {
                     return self.reply(key, txid, pn::status::REFUSED, &[]);
                 }
                 self.net.clear_config();
+                if let Some(b) = &self.blob {
+                    b.write_iface(None);
+                }
                 self.reply(key, txid, pn::status::OK, &[]);
             }
             Request::GetArp => {
@@ -821,7 +831,21 @@ pub fn app_main() -> i32 {
         tx_free: Vec::new(),
         eps: BTreeMap::new(),
         more: true,
+        blob: None,
     };
+    // a restart re-applies the interface configuration the previous incarnation left in the blob (no waiting for DHCP)
+    if let Some(bv) = env.handle(Role::NetConfigBlob) {
+        if sys::process_map(me, bv, BLOB_VA, 0, 4096, PF_RW).status == 0 {
+            let b = netblob::Blob { base: BLOB_VA as usize };
+            if let Some(i) = b.read_iface() {
+                d.net.configure(
+                    Config { addr: i.addr, mask: i.mask, gateway: i.gateway, dns: i.dns },
+                    now_ns(),
+                );
+            }
+            d.blob = Some(b);
+        }
+    }
     let port = d.core.port();
     let _ = sys::port_bind(port, to_stack, 1 << 24, KEY_DOORBELL);
     let _ = sys::port_bind(

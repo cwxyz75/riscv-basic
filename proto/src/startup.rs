@@ -67,6 +67,8 @@ pub enum Role {
     /// The stack's views of the pools: no DMA right (the stack never learns a physical address); the receive pool is read-only.
     NetRxPool = 28,
     NetTxPool = 29,
+    /// The one-page configuration blob `netsup` holds across restarts (NET-SPEC 8.4).
+    NetConfigBlob = 30,
 }
 
 impl Role {
@@ -101,6 +103,7 @@ impl Role {
             27 => Role::NetCtl,
             28 => Role::NetRxPool,
             29 => Role::NetTxPool,
+            30 => Role::NetConfigBlob,
             _ => return None,
         })
     }
