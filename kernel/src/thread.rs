@@ -777,7 +777,8 @@ pub fn fp_off() -> bool {
 }
 
 pub fn heap_free() -> usize {
-    heap::free_bytes()
+    // (growth at a safe point adds free bytes that are not a leak)
+    heap::free_bytes() - heap::grown_bytes()
 }
 
 pub fn thread_count() -> usize {

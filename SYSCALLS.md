@@ -99,7 +99,7 @@ data (message bytes, headers, queued handles, port bindings) in the whole system
 `MAX_REGIONS` 1024 per address space; `MAX_THREADS_PER_PROCESS` 2048 and `MAX_USER_THREADS` 4096;
 `MAX_PROCESSES` 64.
 
-These keep the kernel from panicking and from running out of its fixed heap (OD50); they are
+These keep the kernel from panicking and from running out of heap (OD50; the heap grows at safe points, slice T step 2, so the caps also bound its growth); they are
 not per-process limits. A real bound needs per-job quotas (OS-ARCHITECTURE Q9, `TIDY-UP.md`
 T1). Per-job limits exist since S4.5 (processes, threads, memory pages, child jobs, objects and queued IPC
 bytes, enforced through the job tree: OD54-OD59), and every program the launcher starts runs in a job of its own;

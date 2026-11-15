@@ -237,7 +237,7 @@ pub mod limits {
     /// Live user threads in one process.
     pub const MAX_THREADS_PER_PROCESS: usize = 2048;
     /// Live user threads in the whole system (each costs a 32 KiB kernel stack from the
-    /// 8 MiB kernel heap; a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
+    /// kernel heap (an 8 MiB boot heap that grows from the frame database); a stand-in for per-job quotas, OS-ARCHITECTURE Q9).
     pub const MAX_USER_THREADS: usize = 4096;
     /// Bytes buffered in all channels and sockets together (another stand-in for per-job
     /// quotas, Q9): a write that would exceed it fails with NO_MEMORY.

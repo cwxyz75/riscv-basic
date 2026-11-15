@@ -401,6 +401,7 @@ type Test = (&'static str, fn() -> Outcome);
 fn heap_grows_at_a_safe_point() -> Outcome {
     use alloc::vec::Vec;
     let grown_before = crate::heap::grown_bytes();
+    let frames_before = crate::kmem::free_frames_accounted();
     let window = abi::layout::HEAP_WINDOW_BASE as usize
         ..(abi::layout::HEAP_WINDOW_BASE + abi::layout::HEAP_WINDOW_SIZE) as usize;
     // take nearly everything that is free in both heaps, in 256 KiB blocks
@@ -426,6 +427,11 @@ fn heap_grows_at_a_safe_point() -> Outcome {
     ensure(
         crate::heap::free_bytes() >= 1024 * 1024,
         "and has room again",
+    )?;
+    // (the frames it took are accounted for: held by the heap, not lost)
+    ensure(
+        crate::kmem::free_frames_accounted() == frames_before,
+        "growth moves frames to the heap without losing any",
     )?;
     let big: Vec<u8> = alloc::vec![7u8; 1024 * 1024];
     ensure(

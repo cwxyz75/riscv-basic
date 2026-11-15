@@ -5,7 +5,7 @@
 //! Allocation tries the boot heap, then the grown one. It never grows by itself: the allocator runs with
 //! interrupts off, from the timer interrupt and with or without the big kernel lock, and the frame database is
 //! under the big lock. Growth happens at **safe points** (`service`, called with the big lock held at the tail
-//! of every syscall and trap and by the idle loop): when the free bytes fall below `LOW_WATER` the heap is extended
+//! of every trap that takes the big lock and by the idle loop): when the free bytes fall below `LOW_WATER` the heap is extended
 //! by `GROW_STEP`. A single syscall allocates far less than `LOW_WATER`, so an allocation cannot find both heaps
 //! empty unless something allocates without bound (which the caps of OD50 and the job quotas forbid). The grown
 //! heap does not shrink (the frames stay; T-SPEC revision).
@@ -67,6 +67,17 @@ static HEAPS: Lock<Heaps> = Lock {
     }),
 };
 
+/// Set when the free bytes in both heaps are below `LOW_WATER`: `service` reads it before taking any lock, so the
+/// safe points cost one load when the heap is healthy.
+static LOW: AtomicBool = AtomicBool::new(false);
+
+fn note_free(h: &Heaps) {
+    LOW.store(
+        h.boot.free() + h.grown.free() < LOW_WATER,
+        Ordering::Relaxed,
+    );
+}
+
 /// Bytes of the window mapped so far (the grown heap's size).
 static GROWN_BYTES: AtomicUsize = AtomicUsize::new(0);
 
@@ -79,12 +90,15 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
         let was = irq::save_and_disable();
         crate::bkl::lock_taken(crate::bkl::Class::Heap);
         let p = HEAPS.with(|h| {
-            if let Ok(p) = h.boot.allocate_first_fit(layout) {
-                return p.as_ptr();
-            }
-            h.grown
-                .allocate_first_fit(layout)
-                .map_or(core::ptr::null_mut(), |p| p.as_ptr())
+            let p = match h.boot.allocate_first_fit(layout) {
+                Ok(p) => p.as_ptr(),
+                Err(()) => h
+                    .grown
+                    .allocate_first_fit(layout)
+                    .map_or(core::ptr::null_mut(), |p| p.as_ptr()),
+            };
+            note_free(h);
+            p
         });
         crate::bkl::lock_released(crate::bkl::Class::Heap);
         irq::restore(was);
@@ -108,6 +122,7 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
                         .deallocate(core::ptr::NonNull::new_unchecked(ptr), layout);
                 }
             }
+            note_free(h);
         });
         crate::bkl::lock_released(crate::bkl::Class::Heap);
         irq::restore(was);
@@ -193,6 +208,7 @@ pub fn grow(bytes: usize) -> usize {
                     h.grown.extend(added);
                 }
             }
+            note_free(h);
         });
     });
     GROWN_BYTES.store(have + added, Ordering::Relaxed);
@@ -201,8 +217,11 @@ pub fn grow(bytes: usize) -> usize {
 
 /// The safe point: with the big kernel lock held, make sure the heap has headroom (see the module comment).
 pub fn service() {
-    if free_bytes() < LOW_WATER {
-        grow(GROW_STEP);
+    // (until the heap is back above the low-water mark, or nothing more can be added)
+    while LOW.load(Ordering::Relaxed) && free_bytes() < LOW_WATER {
+        if grow(GROW_STEP) == 0 {
+            break;
+        }
     }
 }
 

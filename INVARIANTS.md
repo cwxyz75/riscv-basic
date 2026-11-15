@@ -132,6 +132,7 @@ list, with the reason for their position, in the change that adds them.
 | K3 | A thread's nesting depth is saved at a context switch and restored when it resumes, on whatever hart; the lock itself never leaves the hart that switches | the suite (a lost or doubled level panics on the assert in `unlock`) |
 | K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
 | K5 | Lock order BKL, HEAP, UART | `lock_order_violations_are_detected`, and the checker panics in the real run |
+| K6 | The heap grows only at safe points holding the BKL (`heap::service`, tail of a BKL-taking trap, idle): `grow` takes frames and maps window pages under BKL, then the HEAP lock innermost; the allocator itself never calls the frame database | `heap_grows_at_a_safe_point`, the debug assert in `grow` |
 
 ### Planned lock order and invariants (SCHED-SMP-SPEC sections 3 and 8.3; OD85 to OD96; **not built**)
 
