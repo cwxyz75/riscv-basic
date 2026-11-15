@@ -381,7 +381,8 @@ extra mechanism, and the kernel already does the cleanup when a process dies (OS
 ### 7.4 The stream data path (S9; flagged now because it constrains S8's protocol)
 
 OD74: the client creates the data socket and passes it in `Connect` or `Accept`, so the kernel's 64 KiB buffers are the
-client's. Three honest problems, to be settled in the S9 spec, none blocking S8:
+client's. Three honest problems, to be settled in the S9 spec, none blocking S8 (the draft S9 spec, `S9-SPEC.md` section 4, proposes
+an answer and a prototype step that tests it):
 
 1. **No precedent** (Fuchsia, Genode, Redox all make the server pay). It is justified by OD59 alone; it needs a prototype.
 2. **The stack cannot see how much the client has read** (no fill level). Either the kernel gains a small call (`socket_info`
