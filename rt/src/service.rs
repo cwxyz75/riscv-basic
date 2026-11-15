@@ -34,6 +34,16 @@ pub trait Service {
     /// An event on something that is not a connection (a key the server bound itself on the port, for example
     /// a listener it watches). Keys the runtime hands out count up from 1; use keys with the top bit set.
     fn other_event(&mut self, _key: u64, _observed: u32) {}
+
+    /// The latest time (`sys::clock_get` ticks) the loop may sleep to even if nothing arrives (a server with timers, like
+    /// the network stack's ARP retries and its safety poll). `None`: sleep until an event.
+    fn next_deadline(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Called once per loop iteration, after the events of that wake-up were dispatched (and after a timeout): the place
+    /// for work that is not driven by a connection.
+    fn tick(&mut self) {}
 }
 
 struct Slot<C> {
@@ -290,6 +300,50 @@ impl<C> Core<C> {
         }
     }
 
+    /// Send a datagram without holding it: if the client has no room (or no memory) the message is **dropped** and
+    /// `Sent::Held` says so (nothing is kept). A server that must not wait for a slow client (the network stack's
+    /// endpoints, NET-SPEC 7.3) uses this instead of `send`. A client that is gone ends the connection.
+    pub fn send_datagram(&mut self, key: u64, bytes: &[u8]) -> Sent {
+        let Some(slot) = self.conns.get(key) else {
+            return Sent::Closed;
+        };
+        let r = sys::channel_write(slot.ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
+        match r.status() {
+            Some(Status::Ok) => Sent::Sent,
+            Some(Status::ShouldWait) | Some(Status::NoMemory) => Sent::Held,
+            _ => {
+                self.close_conn(key);
+                Sent::Closed
+            }
+        }
+    }
+
+    /// Send one reply that carries several handles (a device claim). No hold: if the client has no room or is gone, the
+    /// handles are closed and the connection ends (a claim reply is only ever the answer to a request just read).
+    pub fn send_handles(&mut self, key: u64, bytes: Vec<u8>, handles: Vec<u32>) -> Sent {
+        let Some(slot) = self.conns.get(key) else {
+            for h in handles {
+                sys::handle_close(h);
+            }
+            return Sent::Closed;
+        };
+        let r = sys::channel_write(
+            slot.ch,
+            bytes.as_ptr(),
+            bytes.len(),
+            handles.as_ptr(),
+            handles.len(),
+        );
+        if r.status() == Some(Status::Ok) {
+            return Sent::Sent;
+        }
+        for h in handles {
+            sys::handle_close(h);
+        }
+        self.close_conn(key);
+        Sent::Closed
+    }
+
     fn retry_held(&mut self, key: u64) {
         let Some(slot) = self.conns.get(key) else {
             return;
@@ -400,11 +454,12 @@ pub const BATCH: usize = 4;
 /// Returns 0 when every connection is gone (the root one included), 8 if the port itself fails.
 pub fn run<S: Service>(service: &mut S) -> i32 {
     loop {
-        let deadline = if service.core().any_held() {
+        let held = if service.core().any_held() {
             sys::clock_get() + HOLD_POLL_TICKS
         } else {
             u64::MAX
         };
+        let deadline = held.min(service.next_deadline().unwrap_or(u64::MAX));
         let port = service.core().port;
         let r = sys::port_wait(port, deadline);
         match r.status() {
@@ -429,6 +484,7 @@ pub fn run<S: Service>(service: &mut S) -> i32 {
             Some(Status::TimedOut) => {}
             _ => return 8,
         }
+        service.tick();
         service.core().poll_held();
         for c in service.core().drain_closed() {
             service.closed(c);

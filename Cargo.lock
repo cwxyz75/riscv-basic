@@ -148,12 +148,17 @@ version = "0.1.0"
 dependencies = [
  "basic",
  "basic-script",
+ "dhcp",
  "kcore",
  "memfs",
+ "netcore",
+ "netring",
+ "netwire",
  "oslibc",
  "proto",
  "rt",
  "shell-core",
+ "supervise",
  "svc",
 ]
 
@@ -359,6 +364,7 @@ name = "proto"
 version = "0.1.0"
 dependencies = [
  "console",
+ "svc",
 ]
 
 [[package]]

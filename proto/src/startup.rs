@@ -48,6 +48,27 @@ pub enum Role {
     Stderr = 17,
     /// The channel the service registry serves (`proto::file` as a directory, slice SD).
     ServiceRegistry = 18,
+    /// The network driver's device memory: the virtio-mmio slot (S8).
+    NetMmio = 19,
+    /// The network driver's DMA memory, each with the DMA right: the receive pool, the transmit pool and the virtqueue page(s).
+    NetRxDma = 20,
+    NetTxDma = 21,
+    NetQueueDma = 22,
+    /// The network device's interrupt (absent where the machine has no controller to drive: the driver polls).
+    NetIrq = 23,
+    /// The shared ring VMO (control header and the four rings) of the driver/stack data path.
+    NetRing = 24,
+    /// The two doorbell events: the driver signals `NetEventToStack` (the stack waits on it) and the stack signals
+    /// `NetEventToDriver`.
+    NetEventToStack = 25,
+    NetEventToDriver = 26,
+    /// The control channel between the driver and the stack (READY, ATTACH, DETACH).
+    NetCtl = 27,
+    /// The stack's views of the pools: no DMA right (the stack never learns a physical address); the receive pool is read-only.
+    NetRxPool = 28,
+    NetTxPool = 29,
+    /// The one-page configuration blob `netsup` holds across restarts (NET-SPEC 8.4).
+    NetConfigBlob = 30,
 }
 
 impl Role {
@@ -71,6 +92,18 @@ impl Role {
             16 => Role::ServiceDevmgr,
             17 => Role::Stderr,
             18 => Role::ServiceRegistry,
+            19 => Role::NetMmio,
+            20 => Role::NetRxDma,
+            21 => Role::NetTxDma,
+            22 => Role::NetQueueDma,
+            23 => Role::NetIrq,
+            24 => Role::NetRing,
+            25 => Role::NetEventToStack,
+            26 => Role::NetEventToDriver,
+            27 => Role::NetCtl,
+            28 => Role::NetRxPool,
+            29 => Role::NetTxPool,
+            30 => Role::NetConfigBlob,
             _ => return None,
         })
     }

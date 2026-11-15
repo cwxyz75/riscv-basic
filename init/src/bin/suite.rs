@@ -4206,8 +4206,8 @@ fn runtime_heap_stops_at_its_cap() -> Outcome {
     wait_ended(p, 30_000)?;
     let blocks = sys::process_info(p).a1 as i64;
     ensure!(
-        (122..=128).contains(&blocks),
-        "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use)"
+        (112..=128).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use: the boot image and the programs take memory from the machine's 256 MiB)"
     );
     let _ = in_w;
     Ok(())
@@ -4706,6 +4706,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"crash".to_vec(),
             b"ctest".to_vec(),
             b"devmgr".to_vec(),
+            b"dhcpc".to_vec(),
             b"echo".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
@@ -4715,10 +4716,16 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ls".to_vec(),
             b"lua".to_vec(),
             b"memfsd".to_vec(),
+            b"netd".to_vec(),
+            b"netdrv".to_vec(),
+            b"netinfo".to_vec(),
+            b"netsup".to_vec(),
+            b"ping".to_vec(),
             b"probe".to_vec(),
             b"registryd".to_vec(),
             b"sh".to_vec(),
-            b"spin".to_vec()
+            b"spin".to_vec(),
+            b"udpecho".to_vec()
         ],
         "the programs"
     );
@@ -9034,6 +9041,11 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     Ok(())
 }
 
+// --- the network (S8) ---
+
+#[path = "../net_tests.rs"]
+mod net_tests;
+
 // --- thread_spawn (SCHED-SMP-SPEC task 9) ---
 
 /// A process that ends (exits, faults, is killed) with spawned threads alive gives every stack back: its job's page
@@ -10225,6 +10237,35 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "net_ping_round_trip_is_measured",
+            net_tests::net_ping_round_trip_is_measured,
+        ),
+        (
+            "net_faults_are_survived",
+            net_tests::net_faults_are_survived,
+        ),
+        (
+            "net_clients_are_confined",
+            net_tests::net_clients_are_confined,
+        ),
+        ("net_children_restart", net_tests::net_children_restart),
+        (
+            "net_dhcp_configures_the_interface",
+            net_tests::net_dhcp_configures_the_interface,
+        ),
+        (
+            "net_udp_echo_through_hostfwd",
+            net_tests::net_udp_echo_through_hostfwd,
+        ),
+        (
+            "net_static_config_and_ping_the_gateway",
+            net_tests::net_static_config_and_ping_the_gateway,
+        ),
+        (
+            "net_driver_attaches_and_exchanges_a_frame",
+            net_tests::net_driver_attaches_and_exchanges_a_frame,
         ),
         (
             "a_process_ending_with_spawned_threads_leaks_nothing",

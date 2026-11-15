@@ -13,6 +13,16 @@ pub const OP_OPEN_BLOCK: u16 = 1;
 /// Connect another client: the request carries one handle, the new client's end of a channel, and the manager
 /// serves it as one more connection (slice DM). Same layout as OpenBlock; `index` must be 0.
 pub const OP_CONNECT: u16 = 2;
+/// Claim virtio network device number `index` (S8, NET-SPEC 4.3): same request layout as `OpenBlock`. The reply is a
+/// [`NetClaim`] and carries the handles in [`NET_CLAIM_HANDLES`] order. Released when the claimant's connection closes.
+pub const OP_CLAIM_NET: u16 = 3;
+/// A `ClaimNet` reply: `txid u32 | status i32 | flags u32 | rx_pages u32 | tx_pages u32 | queue_pages u32`.
+pub const NET_CLAIM_REPLY_LEN: usize = 24;
+/// Flag: the last handle is the device's interrupt.
+pub const NET_FLAG_IRQ: u32 = 1;
+/// The handles of a successful claim, in order: the MMIO VMO (read-write), the receive-pool DMA VMO, the
+/// transmit-pool DMA VMO, the virtqueue DMA VMO (each with the DMA right) and, if `NET_FLAG_IRQ`, the interrupt.
+pub const NET_CLAIM_HANDLES: usize = 4;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -95,6 +105,67 @@ pub fn decode_request(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
     }
 }
 
+/// Ask for network device number `index` (lowest slot address first).
+pub fn encode_claim_net(txid: u32, index: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_CLAIM_NET.to_le_bytes());
+    b.extend_from_slice(&index.to_le_bytes());
+    b
+}
+
+/// `Ok((txid, index))` for a well-formed `ClaimNet` request; `Err(txid if there was one)` otherwise.
+pub fn decode_claim_net(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_CLAIM_NET) {
+        return Err(txid);
+    }
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(i)) => Ok((t, i)),
+        _ => Err(None),
+    }
+}
+
+/// The sizes a claim reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetClaim {
+    pub flags: u32,
+    pub rx_pages: u32,
+    pub tx_pages: u32,
+    pub queue_pages: u32,
+}
+
+pub fn encode_claim_net_reply(txid: u32, status: Status, c: &NetClaim) -> Vec<u8> {
+    let mut b = Vec::with_capacity(NET_CLAIM_REPLY_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&(status as i32).to_le_bytes());
+    for v in [c.flags, c.rx_pages, c.tx_pages, c.queue_pages] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// A `ClaimNet` reply, or the plain 8-byte error reply (`Err` carries it).
+pub fn decode_claim_net_reply(b: &[u8]) -> Option<(u32, Status, Option<NetClaim>)> {
+    if b.len() == REPLY_LEN {
+        let (t, s) = decode_reply(b)?;
+        return Some((t, s, None));
+    }
+    if b.len() != NET_CLAIM_REPLY_LEN {
+        return None;
+    }
+    Some((
+        rd_u32(b, 0)?,
+        Status::from_i32(rd_u32(b, 4)? as i32)?,
+        Some(NetClaim {
+            flags: rd_u32(b, 8)?,
+            rx_pages: rd_u32(b, 12)?,
+            tx_pages: rd_u32(b, 16)?,
+            queue_pages: rd_u32(b, 20)?,
+        }),
+    ))
+}
+
 pub fn encode_reply(txid: u32, status: Status) -> Vec<u8> {
     let mut b = Vec::with_capacity(REPLY_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
@@ -124,6 +195,40 @@ mod tests {
             decode_reply(&encode_reply(9, Status::NoDevice)),
             Some((9, Status::NoDevice))
         );
+    }
+
+    #[test]
+    fn claim_net_golden_and_round_trip() {
+        assert_eq!(encode_claim_net(7, 1), [7, 0, 0, 0, 3, 0, 1, 0]);
+        assert_eq!(decode_claim_net(&encode_claim_net(7, 1)), Ok((7, 1)));
+        assert_eq!(
+            decode_claim_net(&encode_open_block(7)),
+            Err(Some(7)),
+            "another op"
+        );
+        assert_eq!(
+            decode_request(&encode_claim_net(7, 0)),
+            Err(Some(7)),
+            "OpenBlock refuses it too"
+        );
+        assert_eq!(decode_claim_net(&[1, 2]), Err(None));
+        assert_eq!(decode_claim_net(&[5, 0, 0, 0, 3, 0, 0, 0, 0]), Err(Some(5)));
+        let c = NetClaim {
+            flags: NET_FLAG_IRQ,
+            rx_pages: 64,
+            tx_pages: 64,
+            queue_pages: 2,
+        };
+        let r = encode_claim_net_reply(9, Status::Ok, &c);
+        assert_eq!(r.len(), NET_CLAIM_REPLY_LEN);
+        assert_eq!(decode_claim_net_reply(&r), Some((9, Status::Ok, Some(c))));
+        assert_eq!(
+            decode_claim_net_reply(&encode_reply(9, Status::NoDevice)),
+            Some((9, Status::NoDevice, None)),
+            "an error is the short reply"
+        );
+        assert_eq!(decode_claim_net_reply(&[0; 12]), None);
+        assert_eq!(decode_claim_net_reply(&r[..23]), None);
     }
 
     #[test]

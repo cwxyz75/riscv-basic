@@ -246,6 +246,10 @@ impl Core {
     pub fn mac(&self) -> Mac {
         self.mac
     }
+    /// The interface's hardware address (learned from the driver at attach).
+    pub fn set_mac(&mut self, mac: Mac) {
+        self.mac = mac;
+    }
     pub fn config(&self) -> Option<Config> {
         self.cfg
     }

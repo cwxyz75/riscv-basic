@@ -60,7 +60,8 @@ fn consumer(w: Arc<World>) {
     let r = Ring::new(&w.mem, RingId::RxUsed);
     match w.v {
         Variant::Right => {
-            if announce_waiting(&w.mem, WAITING, RingId::RxUsed) {
+            // step 1 to 3 of 5.5 as a loop: drain, announce, re-check; only an empty re-check may sleep
+            while announce_waiting(&w.mem, WAITING, RingId::RxUsed) {
                 drain(&w);
             }
         }
@@ -84,9 +85,25 @@ fn consumer(w: Arc<World>) {
 }
 
 fn producer(w: Arc<World>) {
+    producer_n(w, 1);
+}
+
+/// `n` entries published one after another, each followed by the doorbell decision (a ring that already holds an entry the
+/// consumer has not seen is the case the review of S8 showed the old "only when empty" rule loses).
+fn producer_n(w: Arc<World>, n: u32) {
+    for i in 0..n {
+        producer_one(&w, i);
+    }
+}
+
+fn producer_one(w: &World, i: u32) {
     let r = Ring::new(&w.mem, RingId::RxUsed);
     let was_empty = r.is_empty();
-    r.push(Entry { slot: 1, len: 60 }).unwrap();
+    r.push(Entry {
+        slot: 1 + i,
+        len: 60,
+    })
+    .unwrap();
     let signal = if w.v == Variant::NoFences {
         was_empty && w.mem.load(WAITING) == 1
     } else {
@@ -98,6 +115,10 @@ fn producer(w: Arc<World>) {
 }
 
 fn model(v: Variant) {
+    model_n(v, 1)
+}
+
+fn model_n(v: Variant, entries: u32) {
     let words = (2 * 4096) / 4;
     let w = Arc::new(World {
         mem: Shm((0..words).map(|_| AtomicU32::new(0)).collect()),
@@ -112,13 +133,13 @@ fn model(v: Variant) {
     };
     let p = {
         let w = w.clone();
-        thread::spawn(move || producer(w))
+        thread::spawn(move || producer_n(w, entries))
     };
     c.join().unwrap();
     p.join().unwrap();
     // the consumer decided to sleep: either it already has the entry, or a doorbell is pending
     let r = Ring::new(&w.mem, RingId::RxUsed);
-    let got = w.consumed.load(Ordering::SeqCst) == 1;
+    let got = w.consumed.load(Ordering::SeqCst) == entries;
     let pending_doorbell = w.event.load(Ordering::SeqCst) == 1;
     assert!(
         got || pending_doorbell || r.is_empty(),
@@ -129,10 +150,14 @@ fn model(v: Variant) {
 }
 
 fn explore(v: Variant) {
+    explore_n(v, 1);
+}
+
+fn explore_n(v: Variant, entries: u32) {
     #[cfg(loom)]
-    loom::model(move || model(v));
+    loom::model(move || model_n(v, entries));
     #[cfg(shuttle)]
-    shuttle::check_random(move || model(v), 3000);
+    shuttle::check_random(move || model_n(v, entries), 3000);
 }
 
 #[test]
@@ -147,6 +172,11 @@ fn the_handshake_loses_no_wakeup() {
 fn leaving_out_the_fences_is_caught() {
     let caught = std::panic::catch_unwind(|| explore(Variant::NoFences)).is_err();
     assert!(caught, "the negative control must fail the model");
+}
+
+#[test]
+fn the_handshake_loses_no_wakeup_with_several_entries() {
+    explore_n(Variant::Right, 2);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # NET-SPEC: S8, the network stack's lower layers (specification, draft v0)
 
-Status: **draft v0, 2026-11-14; nothing here is built.** This is the written acceptance contract for S8 (CLAUDE.md: spec,
+Status: **draft v0, 2026-11-14; steps 1 to 5 built on 2026-11-15 (see ROADMAP S8 and TIDY-UP T86, T87 for what differs).** This is the written acceptance contract for S8 (CLAUDE.md: spec,
 then acceptance checks, then code, then an independent review). It makes `NET-DESIGN.md` (the architecture and its reasons)
 concrete: every message, constant, state machine and check an implementer needs. Where the two disagree, `NET-DESIGN.md`
 is the intent and this file is the contract; fix the other one in the same PR. Decisions made here are logged as OD98 and
