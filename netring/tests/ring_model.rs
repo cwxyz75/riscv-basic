@@ -324,8 +324,8 @@ fn the_layout_constants_are_the_documented_ones() {
         2 * 4096,
         "four rings fill page 1 exactly"
     );
-    assert!(ctl::INDICES + 4 * 128 <= 1024, "indices fit before 1024");
-    assert!(ctl::STATS + 8 * stat::COUNT <= ctl::STATS_END);
+    const { assert!(ctl::INDICES + 4 * 128 <= 1024, "indices fit before 1024") }
+    const { assert!(ctl::STATS + 8 * stat::COUNT <= ctl::STATS_END) }
     assert_eq!(HDR_LEN + FRAME_MAX, 1526);
-    assert!(HDR_LEN + FRAME_MAX <= SLOT_SIZE);
+    const { assert!(HDR_LEN + FRAME_MAX <= SLOT_SIZE) }
 }
