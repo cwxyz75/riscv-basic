@@ -282,6 +282,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "netring"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "loom",
+ "shuttle",
+]
+
+[[package]]
 name = "netsim"
 version = "0.1.0"
 
