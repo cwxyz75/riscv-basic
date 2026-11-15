@@ -254,6 +254,8 @@ How the stack uses the socket (the rules that make option 1 safe):
 
 ### 4.7 The prototype (step 1): what must be built and measured before TCP is wired in
 
+**Done 2026-11-15: P1 to P7 pass and their numbers are in `S9-STEP1-RESULT.md`; the recommendation of 4.4 stands (no kernel change).**
+
 A throwaway server on `rt::service` in the suite (`streamproto`), with no TCP in it: it takes a client-created socket in a
 request and echoes, sinks or sources bytes. It is built in both variants (client creates, server creates) so the numbers
 compare options 1 and 3 directly. Each line is a test with a pass condition, written before the code:

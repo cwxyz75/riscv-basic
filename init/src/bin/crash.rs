@@ -361,6 +361,11 @@ pub fn app_main() -> i32 {
                 made += 1;
             }
         }
+        // S9 step 1 (the stream data-path prototype, S9-SPEC 4.7): a socket hand. It obeys commands on the bootstrap channel and
+        // keeps one socket end: 'C' create a pair, keep one end and send the other back (the reply carries the handle);
+        // 'H' take the end that comes with the message; 'W' n: write 4*n KiB into the kept end (reply: bytes written, the last
+        // status, the end's signals); 'R' drain the kept end (reply: bytes read); 'X' exit.
+        70 => return socket_hand(),
         40 => return unmap_while_siblings_touch(),
         n if n & 0xff == 42 => return churn((n >> 8) as u64),
         // slice A (OD76): floating-point state. 60: keep a private FP pattern across preemption and
@@ -976,4 +981,94 @@ fn fp_threads() -> i32 {
         rt::sys::thread_yield();
     }
     901
+}
+
+fn socket_hand() -> i32 {
+    use rt::abi::signals as sig;
+    let reply = |tag: u8, a: u32, b: i32, c: u32, h: Option<u32>| {
+        let mut m = [0u8; 13];
+        m[0] = tag;
+        m[1..5].copy_from_slice(&a.to_le_bytes());
+        m[5..9].copy_from_slice(&b.to_le_bytes());
+        m[9..13].copy_from_slice(&c.to_le_bytes());
+        let hs = [h.unwrap_or(0)];
+        rt::sys::channel_write(
+            rt::BOOTSTRAP,
+            m.as_ptr(),
+            m.len(),
+            hs.as_ptr(),
+            usize::from(h.is_some()),
+        );
+    };
+    let mut kept = 0u32;
+    loop {
+        let w = rt::sys::object_wait(rt::BOOTSTRAP, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
+        let mut m = [0u8; 8];
+        let mut h = [0u32; 1];
+        let r = rt::sys::channel_read(rt::BOOTSTRAP, m.as_mut_ptr(), 8, h.as_mut_ptr(), 1);
+        if r.status != 0 {
+            if w.a1 as u32 & sig::PEER_CLOSED != 0 {
+                return 0;
+            }
+            continue;
+        }
+        match m[0] {
+            b'C' => {
+                let p = rt::sys::socket_create();
+                if p.status != 0 {
+                    reply(b'C', 0, p.status as i32, 0, None);
+                    continue;
+                }
+                kept = p.a1 as u32;
+                reply(b'C', 0, 0, 0, Some(p.a2 as u32));
+            }
+            b'H' => {
+                if r.a2 == 1 {
+                    kept = h[0];
+                }
+                reply(b'H', 0, 0, 0, None);
+            }
+            b'W' => {
+                let block = [7u8; 1024];
+                let (mut done, mut last) = (0u32, 0i32);
+                for _ in 0..usize::from(m[1]) * 4 {
+                    // (m[1] counts 4 KiB units; writes go in 1 KiB pieces so a short write shows)
+                    let mut left = 1024;
+                    while left > 0 {
+                        let w = rt::sys::socket_write(kept, block.as_ptr(), left);
+                        last = w.status as i32;
+                        if w.status != 0 {
+                            break;
+                        }
+                        done += w.a1 as u32;
+                        left -= w.a1;
+                    }
+                    if last != 0 {
+                        break;
+                    }
+                }
+                reply(
+                    b'W',
+                    done,
+                    last,
+                    rt::sys::object_signals(kept).a1 as u32,
+                    None,
+                );
+            }
+            b'R' => {
+                let mut buf = [0u8; 1024];
+                let mut total = 0u32;
+                loop {
+                    let r = rt::sys::socket_read(kept, buf.as_mut_ptr(), 1024);
+                    if r.status != 0 || r.a1 == 0 {
+                        break;
+                    }
+                    total += r.a1 as u32;
+                }
+                reply(b'R', total, 0, 0, None);
+            }
+            b'X' => return 0,
+            _ => {}
+        }
+    }
 }

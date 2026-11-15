@@ -9045,6 +9045,8 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
 
 #[path = "../net_tests.rs"]
 mod net_tests;
+#[path = "../stream_proto.rs"]
+mod stream_proto;
 
 // --- thread_spawn (SCHED-SMP-SPEC task 9) ---
 
@@ -10237,6 +10239,31 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "stream_buffers_are_charged_to_the_client",
+            stream_proto::stream_buffers_are_charged_to_the_client,
+        ),
+        (
+            "a_client_at_quota_stalls_only_itself",
+            stream_proto::a_client_at_quota_stalls_only_itself,
+        ),
+        (
+            "one_socket_two_one_shot_bindings",
+            stream_proto::one_socket_two_one_shot_bindings,
+        ),
+        ("stream_pipe_numbers", stream_proto::stream_pipe_numbers),
+        (
+            "a_dead_client_frees_everything",
+            stream_proto::a_dead_client_frees_everything,
+        ),
+        (
+            "a_bad_stream_handle_is_refused",
+            stream_proto::a_bad_stream_handle_is_refused,
+        ),
+        (
+            "stream_budgets_with_the_launcher_defaults",
+            stream_proto::stream_budgets_with_the_launcher_defaults,
         ),
         (
             "net_ping_round_trip_is_measured",
