@@ -51,6 +51,7 @@ A script runs with the authority of the shell that started it, so a ported `sh` 
    error; a native script run as a command follows command rules, loaded in-process it follows local rules.
 10. **The two exits are `ok` and `fail`; `if` is strict-boolean with `succeeds` (and `try`/`catch`); scripts are
     loaded with `import` only** (Decided 2026-11-15; section 5).
+11. **The shell is named `ish`** ("improved shell"), scripts `.ish` (Decided 2026-11-15; Q6).
 
 ## 3. Non-goals
 
@@ -246,7 +247,11 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
    like a closure? It makes the powerbox far more expressive, and it needs a rule for what a closure captures.
 4. **Q4: number details**: division (integer or decimal), decimal scale and rounding, size suffixes.
 5. **Q5: failure default** for scripts (stop on any uncaught failure, or only inside an explicit block).
-6. **Q6: the name** of the binary, keeping `sh` free for the compat shell.
+6. **Q6 (resolved 2026-11-15): the shell is named `ish`**: "improved shell", and an honest "POSIX-ish" (it is only
+   *ish* about POSIX). The script extension is `.ish`; `sh` stays free for the compat shell. Three characters. No command
+   of that name exists on the machine checked; the known cost is search noise from the iSH iOS app (about 20,000 stars).
+   Considered and set aside: `dunsh` (a pun on *dunce*, to go with *doofs*; the most distinctive), `mush`, `usher`, and
+   `trash` (ruled out: `/usr/bin/trash` is a real command).
 7. **Q7: shell-level job control** shape, once the terminal's foreground-job protocol exists.
 8. **Q8 (resolved 2026-11-15): `ok` and `fail`.** There is no bare `return` (a POSIX `return 1` is a status; here it
    would return the value 1, a muscle-memory trap), and the diagnostic for it says to use `ok` or `fail`. `fail value

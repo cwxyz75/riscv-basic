@@ -6,7 +6,7 @@ find out where the model is awkward *before* the grammar is chosen. Everything i
 provisional; the findings at the end are the point. When the grammar exists (step SH0), these scripts become its first
 golden transcripts.
 
-The shell is called `xsh` here (the name is SHELL-SPEC Q6). Scripts are `.xsh`.
+The shell is called `ish` (SHELL-SPEC Q6, resolved: "improved shell", and "POSIX-ish"). Scripts are `.ish`.
 
 ## 0. The placeholder syntax (what the examples assume)
 
@@ -37,7 +37,7 @@ structural equality of any two values. The scripts below use them (rewritten 202
 
 Library functions used and not yet specified are collected in finding 17.
 
-## 1. `boot.xsh`: start services from a manifest and check they came up
+## 1. `boot.ish`: start services from a manifest and check they came up
 
 ```
 manifest = from-json (read-file /etc/boot.json)
@@ -61,7 +61,7 @@ print 'all services up:' (join ', ' (keys $started))
 
 Exercises: JSON in, maps, `fail` with a map and a code, a job value stored inside a map.
 
-## 2. `edit-config.xsh`: change two nested keys and write the file back atomically
+## 2. `edit-config.ish`: change two nested keys and write the file back atomically
 
 ```
 path = /etc/profiles/alice.json
@@ -76,7 +76,7 @@ mv $tmp $path                                   # rename over: atomic (FS-SPEC F
 Exercises: immutable update by rebinding, a value printed into a file, atomic replace. (Note the unquoted words in
 `[shell history size]`: a list literal of bare words is a list of strings; see finding 12.)
 
-## 3. `testrun.xsh`: run every test in parallel and summarise the failures
+## 3. `testrun.ish`: run every test in parallel and summarise the failures
 
 ```
 tests = /tests/*.test                            # GLOB
@@ -100,7 +100,7 @@ print 'all' (len $tests) 'passed'
 
 Exercises: a glob as a list, background jobs and `wait`, numeric comparison, exit code from a summary.
 
-## 4. `bigscan.xsh`: count ERROR lines per hour in a gigantic compressed log, streaming
+## 4. `bigscan.ish`: count ERROR lines per hour in a gigantic compressed log, streaming
 
 ```
 counts = zcat /var/log/big.log.gz | fold {} @ acc line do
@@ -114,7 +114,7 @@ print (to-json $counts)
 Exercises: the large-output design (an external stage feeding an in-process `fold`), the pipeline's value being its
 last stage's value, an early `ok` inside a function body.
 
-## 5. `probe.xsh`: a configure-style loop that tests which C functions exist
+## 5. `probe.ish`: a configure-style loop that tests which C functions exist
 
 ```
 tmp = mktemp-dir
@@ -131,7 +131,7 @@ print (to-json $results { "indent": 2 }) > config.json
 
 Exercises: `succeeds` in a loop, quoting C source, temp files, cleanup on exit.
 
-## 6. `sandboxed.xsh`: run an untrusted tool with narrow grants
+## 6. `sandboxed.ish`: run an untrusted tool with narrow grants
 
 ```
 grants = { "/work": "rw", "/tmp": "rw", "/svc/net": "r" }
@@ -148,7 +148,7 @@ end
 
 Exercises: grants as a JSON map (a natural fit), a block yielding a value, `run` with an options map, if/else.
 
-## 7. `profile.xsh`: what a session runs at login
+## 7. `profile.ish`: what a session runs at login
 
 ```
 export EDITOR kilo
@@ -164,7 +164,7 @@ greet
 
 Exercises: a hook function whose result is a value, a function that prints, environment export.
 
-## 8. `deploy-check.xsh`: query a JSON endpoint and compare versions
+## 8. `deploy-check.ish`: query a JSON endpoint and compare versions
 
 ```
 url  = http://localhost:8080/version
@@ -187,7 +187,7 @@ print 'version ok' $have
 
 Exercises: failure kinds as data, `try` as an expression, string equality distinct from numeric `==`.
 
-## 9. `report.xsh`: CSV in, grouped totals out as TSV, with exact decimals
+## 9. `report.ish`: CSV in, grouped totals out as TSV, with exact decimals
 
 ```
 rows   = from-csv (read-file sales.csv) { "header": true }      # a list of maps; every value is a string
@@ -203,10 +203,10 @@ print (to-tsv $table { "columns": [region total] })
 
 Exercises: CSV and TSV round trip, exact decimal arithmetic, a map built from expressions.
 
-## 10. `slug.xsh`: a small CLI tool with arguments, a usage error and an imported library
+## 10. `slug.ish`: a small CLI tool with arguments, a usage error and an imported library
 
 ```
-import lib/text.xsh as text
+import lib/text.ish as text
 fn usage do
     eprint 'usage: slug [-u] NAME...'
     fail null 2
