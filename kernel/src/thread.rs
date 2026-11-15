@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::sched::{Prio, Sched, State, Tid, WaitQueue, PRIO_IDLE};
 
 #[cfg(not(feature = "sched-round-robin"))]
-pub type Class = kcore::sched::FixedPriority;
+pub type Class = kcore::sched2::TwoBand;
 #[cfg(feature = "sched-round-robin")]
 pub type Class = kcore::sched::RoundRobin;
 
