@@ -246,7 +246,7 @@ mode, no window size, no terminal types, and no notion of a session.
 
 ## 11. The shell
 
-See **`SHELL-SPEC.md`**. In one paragraph: the native shell is es-style (closures, exceptions, hook functions), with the
+See **`SHELL-SPEC.md`**. In one paragraph: the native shell, **ish** ("improved shell"), is es-style (closures, exceptions, hook functions), with the
 JSON data model plus closures, byte-stream pipelines, capability verbs (`ns`, `bind`, `mount`, `confine`), spawn-native
 process starts, and a raw-mode interactive layer; dash or BusyBox ash is `/bin/sh` for ported software. It amends OD20.
 
