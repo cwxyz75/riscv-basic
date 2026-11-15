@@ -27,6 +27,21 @@ pub mod spawn;
 pub mod startup;
 pub mod sync;
 
+/// The argument record of `thread_spawn` (SYSCALLS.md): 64 bytes, little endian. Zero a field to take its default.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpawnArgs {
+    pub entry: u64,
+    pub arg: u64,
+    pub tp: u64,
+    pub stack_bytes: u64,
+    pub guard_bytes: u64,
+    pub priority: u32,
+    pub flags: u32,
+    pub sp: u64,
+    pub reserved: u64,
+}
+
 /// The result of a raw syscall: the status code and the two result registers.
 #[derive(Debug, Clone, Copy)]
 pub struct Ret {
@@ -68,7 +83,7 @@ pub fn syscall(number: usize, args: [usize; 6]) -> Ret {
 }
 
 pub mod sys {
-    use super::{syscall, Ret};
+    use super::{syscall, Ret, SpawnArgs};
     use abi::syscall::*;
 
     pub fn debug_write(bytes: &[u8]) -> Ret {
@@ -422,6 +437,20 @@ pub mod sys {
                 entry as usize,
                 sp as usize,
                 arg as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Create and start a thread (SYSCALLS.md `thread_spawn`): `a1` is its handle (0 if detached), `a2` its tid.
+    pub fn thread_spawn(process: u32, rec: &SpawnArgs) -> Ret {
+        syscall(
+            THREAD_SPAWN,
+            [
+                process as usize,
+                rec as *const SpawnArgs as usize,
+                0,
+                0,
                 0,
                 0,
             ],

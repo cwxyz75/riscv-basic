@@ -1,9 +1,9 @@
-//! Threads (S7c-3b, S7-SPEC section 5): `pthread` on the kernel's futexes and `thread_create`,
+//! Threads (S7c-3b, S7-SPEC section 5): `pthread` on the kernel's futexes and `thread_spawn` (task 9: the kernel provisions and frees the stack),
 //! per-thread `errno` and keys through a thread control block (TCB) that `tp` points to, and the
 //! big main stack.
 //!
-//! The kernel saves and restores a user thread's `tp` across traps and starts new threads with
-//! `tp` = 0: `run_main` and the thread trampoline set it, so library calls from a thread this
+//! The kernel saves and restores a user thread's `tp` across traps and starts a spawned thread with the
+//! `tp` it was given (the thread's TCB); `run_main` sets the main thread's, so library calls from a thread this
 //! library did not create fall back to process-wide state (a single static `errno`).
 
 use alloc::boxed::Box;
@@ -21,12 +21,8 @@ pub const EPERM: c_int = 1;
 pub const ETIMEDOUT: c_int = 110;
 
 const KEYS: usize = 32;
-/// Thread stacks: 256 KiB mapped (committed lazily) at the top of a 512 KiB slot, so the lower half
-/// of every slot is an unmapped guard.
+/// The default thread stack: 256 KiB (the kernel maps it in the stack arena, committed lazily, with a guard below).
 const STACK_BYTES: u64 = 256 * 1024;
-const SLOT_BYTES: u64 = 512 * 1024;
-const SLOT_BASE: u64 = 0x10_0100_0000;
-const MAX_SLOTS: usize = 64;
 /// The main thread's stack: 1 MiB, mapped lazily below `MAIN_STACK_TOP`.
 const MAIN_STACK_BYTES: u64 = 1024 * 1024;
 const MAIN_STACK_TOP: u64 = 0x10_0100_0000;
@@ -43,8 +39,6 @@ pub struct Tcb {
     /// The thread object's handle: 0 until the creator has stored it (a thread can start, and even
     /// exit, before `pthread_create` returns).
     handle: AtomicU32,
-    slot: usize,
-    stack_base: u64,
     start: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
     arg: *mut c_void,
     keys: [*mut c_void; KEYS],
@@ -86,15 +80,13 @@ pub fn errno_ptr() -> *mut c_int {
     }
 }
 
-fn new_tcb(main: bool, handle: u32, slot: usize) -> *mut Tcb {
+fn new_tcb(main: bool, handle: u32) -> *mut Tcb {
     Box::into_raw(Box::new(Tcb {
         me: core::ptr::null_mut(),
         errno: 0,
         state: AtomicU32::new(0),
         retval: core::ptr::null_mut(),
         handle: AtomicU32::new(handle),
-        slot,
-        stack_base: 0,
         start: None,
         arg: core::ptr::null_mut(),
         keys: [core::ptr::null_mut(); KEYS],
@@ -104,7 +96,7 @@ fn new_tcb(main: bool, handle: u32, slot: usize) -> *mut Tcb {
 
 /// Give the calling (main) thread its TCB.
 pub fn init_main_thread() {
-    let t = new_tcb(true, 0, usize::MAX);
+    let t = new_tcb(true, 0);
     // SAFETY: fresh allocation.
     unsafe { (*t).me = t };
     set_tcb(t);
@@ -157,17 +149,6 @@ pub fn on_big_stack(f: extern "C" fn(usize) -> c_int, arg: usize) -> c_int {
 
 // ---- thread creation ----
 
-struct Slots {
-    used: [bool; MAX_SLOTS],
-}
-static SLOTS: Mutex<Slots> = Mutex::new(Slots {
-    used: [false; MAX_SLOTS],
-});
-
-fn slot_top(slot: usize) -> u64 {
-    SLOT_BASE + (slot as u64 + 1) * SLOT_BYTES
-}
-
 #[repr(C)]
 pub struct Attr {
     stacksize: u64,
@@ -178,17 +159,23 @@ pub type PthreadT = usize;
 
 extern "C" fn thread_main(tcb_addr: usize) -> ! {
     let t = tcb_addr as *mut Tcb;
-    set_tcb(t);
-    // SAFETY: `t` was filled by `pthread_create` before the thread started.
+    set_tcb(t); // (the kernel already set `tp` from the spawn record; this is the same value)
+                // SAFETY: `t` was filled by `pthread_create` before the thread started.
     let ret = unsafe { ((*t).start.expect("a thread has an entry"))((*t).arg) };
     // SAFETY: as above.
     unsafe { exit_thread(t, ret) }
 }
 
+/// End the calling thread. Whoever sets the second of EXITED and DETACHED owns the TCB's memory: the thread (if it was
+/// already detached) or `pthread_detach` (if the thread had already exited). The kernel frees the stack.
 unsafe fn exit_thread(t: *mut Tcb, ret: *mut c_void) -> ! {
     (*t).retval = ret;
-    (*t).state.fetch_or(EXITED, Ordering::SeqCst);
-    rt::sys::futex_wake((*t).state.as_ptr(), u32::MAX);
+    let word = (*t).state.as_ptr();
+    let old = (*t).state.fetch_or(EXITED, Ordering::SeqCst);
+    rt::sys::futex_wake(word, u32::MAX);
+    if old & DETACHED != 0 {
+        drop(Box::from_raw(t));
+    }
     rt::sys::thread_exit(0)
 }
 
@@ -211,39 +198,12 @@ pub unsafe extern "C" fn pthread_create(
             },
         )
     };
-    if size > STACK_BYTES {
+    if size > rt::abi::spawn::MAX_STACK {
         return EINVAL;
     }
     let size = size.max(16 * 1024).next_multiple_of(4096);
-    let slot = {
-        let mut s = SLOTS.lock();
-        match s.used.iter().position(|u| !u) {
-            Some(i) => {
-                s.used[i] = true;
-                i
-            }
-            None => return EAGAIN,
-        }
-    };
-    let release = |slot: usize| SLOTS.lock().used[slot] = false;
-    let top = slot_top(slot);
-    let base = top - size;
-    let vmo = rt::sys::vmo_create(size / 4096);
-    if vmo.status != 0 {
-        release(slot);
-        return EAGAIN;
-    }
-    let me = rt::sys::process_self().a1 as u32;
-    let m = rt::sys::process_map(me, vmo.a1 as u32, base, 0, size, 3);
-    rt::sys::handle_close(vmo.a1 as u32);
-    if m.status != 0 {
-        rt::sys::handle_close(me);
-        release(slot);
-        return EAGAIN;
-    }
-    let t = new_tcb(false, 0, slot);
+    let t = new_tcb(false, 0);
     (*t).me = t;
-    (*t).stack_base = base;
     (*t).start = Some(start);
     (*t).arg = arg;
     if detached {
@@ -251,18 +211,42 @@ pub unsafe extern "C" fn pthread_create(
     }
     // the creator's `pthread_t` is stored before the thread can run (a thread may read it at once)
     *out = t as PthreadT;
-    let r = rt::sys::thread_create(me, thread_main as *const () as usize as u64, top, t as u64);
+    let rec = rt::SpawnArgs {
+        entry: thread_main as *const () as usize as u64,
+        arg: t as u64,
+        tp: t as u64,
+        stack_bytes: size,
+        flags: if detached {
+            rt::abi::spawn::DETACHED
+        } else {
+            0
+        },
+        ..Default::default()
+    };
+    let me = rt::sys::process_self().a1 as u32;
+    let r = rt::sys::thread_spawn(me, &rec);
     rt::sys::handle_close(me);
     if r.status != 0 {
-        let me = rt::sys::process_self().a1 as u32;
-        rt::sys::process_unmap(me, base);
-        rt::sys::handle_close(me);
-        release(slot);
         drop(Box::from_raw(t));
         return EAGAIN;
     }
-    (*t).handle.store(r.a1 as u32, Ordering::SeqCst);
+    // (a detached thread may already have run and freed `t`: it is not touched again)
+    if !detached {
+        (*t).handle.store(r.a1 as u32, Ordering::SeqCst);
+    }
     0
+}
+
+/// The thread object's handle, once the creator has stored it (a thread can start, and even exit, before
+/// `pthread_create` returns).
+unsafe fn handle_of(t: *mut Tcb) -> u32 {
+    loop {
+        let h = (*t).handle.load(Ordering::SeqCst);
+        if h != 0 {
+            return h;
+        }
+        rt::sys::thread_yield();
+    }
 }
 
 #[no_mangle]
@@ -281,15 +265,8 @@ pub unsafe extern "C" fn pthread_join(th: PthreadT, retval: *mut *mut c_void) ->
         }
         rt::sys::futex_wait((*t).state.as_ptr(), s, u64::MAX);
     }
-    // it announced its exit; wait until the thread object is really finished before its stack goes
-    // (the creator publishes the handle right after `thread_create`; a joiner can beat it)
-    let handle = loop {
-        let h = (*t).handle.load(Ordering::SeqCst);
-        if h != 0 {
-            break h;
-        }
-        rt::sys::thread_yield();
-    };
+    // it announced its exit; wait until the thread object is really finished (its stack is freed by the kernel then)
+    let handle = handle_of(t);
     loop {
         let w = rt::sys::object_wait(handle, signals::TERMINATED, u64::MAX);
         if w.status == 0 && w.a1 as u32 & signals::TERMINATED != 0 {
@@ -299,22 +276,23 @@ pub unsafe extern "C" fn pthread_join(th: PthreadT, retval: *mut *mut c_void) ->
     if !retval.is_null() {
         *retval = (*t).retval;
     }
-    let me = rt::sys::process_self().a1 as u32;
-    rt::sys::process_unmap(me, (*t).stack_base);
-    rt::sys::handle_close(me);
     rt::sys::handle_close(handle);
-    SLOTS.lock().used[(*t).slot] = false;
     drop(Box::from_raw(t));
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_detach(th: PthreadT) -> c_int {
-    // (a detached thread's stack and TCB are not reclaimed before the process ends: a thread cannot
-    // unmap its own stack, and nobody joins it; TIDY-UP T52)
-    (*(th as *mut Tcb))
-        .state
-        .fetch_or(DETACHED, Ordering::SeqCst);
+    let t = th as *mut Tcb;
+    // (the thread's stack is the kernel's to free; its TCB is freed by whoever comes second: see `exit_thread`)
+    let old = (*t).state.fetch_or(DETACHED, Ordering::SeqCst);
+    if old & DETACHED != 0 {
+        return EINVAL; // already detached (a second detach, or a thread made detached): nothing to do
+    }
+    rt::sys::handle_close(handle_of(t));
+    if old & EXITED != 0 {
+        drop(Box::from_raw(t));
+    }
     0
 }
 

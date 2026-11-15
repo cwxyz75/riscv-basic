@@ -245,7 +245,7 @@ pub mod limits {
     /// Bytes buffered per socket endpoint.
     pub const SOCKET_BUFFER: usize = 65536;
     /// Mapped regions in one address space.
-    pub const MAX_REGIONS: usize = 1024;
+    pub const MAX_REGIONS: usize = 16384;
 }
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
@@ -290,6 +290,8 @@ pub mod syscall {
     /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then
     /// answers NOT_SUPPORTED.
     pub const THREAD_INTERRUPT: usize = 63;
+    /// Create and start a thread with a kernel-provisioned stack (SCHED-SMP-SPEC 5.3, task 9).
+    pub const THREAD_SPAWN: usize = 64;
     /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
     pub const THREAD_SET_SCHED: usize = 65;
     pub const THREAD_GET_SCHED: usize = 66;
@@ -329,6 +331,25 @@ pub mod user {
     pub const STACK_PAGES: u64 = 64;
     /// Longest `debug_write`.
     pub const MAX_DEBUG_WRITE: usize = 4096;
+    /// The stack arena: where `thread_spawn` maps the stacks it provisions (32 GiB nothing else is given).
+    pub const STACK_ARENA_BASE: u64 = 0x30_0000_0000;
+    pub const STACK_ARENA_END: u64 = 0x38_0000_0000;
+}
+
+/// `thread_spawn` (SYSCALLS.md): the argument record and its limits.
+pub mod spawn {
+    /// Bytes in the argument record.
+    pub const ARGS_BYTES: usize = 64;
+    /// Stack bytes when the record says 0.
+    pub const DEFAULT_STACK: u64 = 256 * 1024;
+    /// The most stack bytes one thread may ask for.
+    pub const MAX_STACK: u64 = 64 * 1024 * 1024;
+    /// Flag: round robin within the priority level.
+    pub const ROUND_ROBIN: u32 = 1;
+    /// Flag: no handle is returned (nothing to join).
+    pub const DETACHED: u32 = 2;
+    /// Flag: the stack is the caller's (`sp` at offset 48); the kernel provisions nothing.
+    pub const CALLER_STACK: u32 = 4;
 }
 
 /// The kernel's address-space layout (Sv39, kernel in the upper half).

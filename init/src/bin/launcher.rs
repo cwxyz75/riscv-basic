@@ -16,9 +16,9 @@ use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
 /// What a program started by the launcher may use (the job made for it, S4-SPEC section 6): it
-/// is the only process, it may run a few threads, and its memory (image, stack, heap) is capped.
+/// is the only process, it may run up to 128 threads (a looper per connection, SCHED-SMP-SPEC Q5), and its memory (image, stack, heap) is capped.
 const PROGRAM_PROCESSES: u64 = 1;
-const PROGRAM_THREADS: u64 = 4;
+const PROGRAM_THREADS: u64 = 128;
 // 136 MiB: the runtime heap cap (128 MiB) plus the image, stacks and page tables, so the heap
 // refuses first and exhaustion is a failed allocation, not a fault
 const PROGRAM_PAGES: u64 = 34816;
