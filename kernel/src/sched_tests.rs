@@ -135,15 +135,23 @@ fn idle_runs_when_nothing_else_does() -> Outcome {
 
 fn wake_before_block_is_not_lost() -> Outcome {
     let me = thread::current();
+    // a wake that finds nobody waiting is not remembered (SCHED-SMP-SPEC 3.7)
+    thread::wake(me);
+    ensure(
+        thread::park_state(me) == Some(kcore::park::ParkState::Idle),
+        "a wake with nobody waiting left something behind",
+    )?;
+    // a thread that has prepared to wait does get the wake: its block does not happen (and wakes do not queue)
     let t0 = thread::ticks();
-    thread::wake(me); // nobody is blocked: this leaves a token
-    thread::wake(me); // and a second wake does not queue
-    thread::block(); // consumes the token
+    thread::prepare_block();
+    thread::wake(me);
+    thread::wake(me);
+    thread::block(); // consumes the notification
     ensure(
         thread::ticks() - t0 <= 1,
         "block waited although a wake had already arrived",
     )?;
-    // The token is gone: now block for real, woken by a thread that wakes us after 3 ticks.
+    // Nothing is left over: now block for real, woken by a thread that wakes us after 3 ticks.
     let waker = thread::spawn(
         "waker",
         NORMAL,

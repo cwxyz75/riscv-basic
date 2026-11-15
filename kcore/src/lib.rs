@@ -22,6 +22,7 @@ pub mod latch;
 pub mod linestate;
 pub mod object;
 pub mod pagetable;
+pub mod park;
 pub mod sched;
 pub mod sched2;
 pub mod sync;

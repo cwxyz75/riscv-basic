@@ -115,10 +115,12 @@ os-test:
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
 # nightly --profile minimal --component miri); CI runs it, `make check` does not.

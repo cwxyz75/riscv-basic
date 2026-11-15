@@ -73,8 +73,9 @@ pub struct ThreadSched {
     pub group: u32,
     pub job: u32,
     pub class_words: [u64; 4],
-    /// The wake token (INVARIANTS C3): a wake that finds the thread not blocked.
-    pub token: bool,
+    /// The park word (SCHED-SMP-SPEC 3.7): whether a wake counts. (Plain here: this core runs under one lock; the
+    /// atomic protocol is `kcore::park`.)
+    pub park: crate::park::ParkState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -494,7 +495,7 @@ impl<N: Class> HartRq<N> {
                 group: 0,
                 job: 0,
                 class_words: [0; 4],
-                token: false,
+                park: crate::park::ParkState::Idle,
             },
         );
         Ok(tid)
@@ -598,42 +599,61 @@ impl<N: Class> HartRq<N> {
                     self.timers.remove(&(d, tid));
                 }
                 let slept = self.now.saturating_sub(t.started);
+                t.park = crate::park::ParkState::Idle;
                 t.state = State::Runnable;
                 t.runnable_since = self.now;
                 self.class_enqueue(tid, Enq::Wake { slept });
                 self.reschedule();
             }
-            State::Running | State::Runnable => t.token = true,
+            // counts only for a prepared thread; nothing is remembered otherwise
+            State::Running | State::Runnable => {
+                if t.park == crate::park::ParkState::Prepared {
+                    t.park = crate::park::ParkState::Notified;
+                }
+            }
             State::Exited => {}
         }
         Ok(())
     }
 
-    /// Block the current thread unless a wake token is waiting (then it is consumed). Returns whether it blocked.
+    /// The current thread is about to wait: a wake now counts (`prepare` before registering, as in 3.7).
+    pub fn prepare_block(&mut self) -> Result<(), Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        self.threads.get_mut(&c).expect("current exists").park = crate::park::ParkState::Prepared;
+        Ok(())
+    }
+
+    /// Block the current thread unless a notification is waiting (then it is consumed). Returns whether it blocked.
     pub fn block_current(&mut self) -> Result<bool, Error> {
         let c = self
             .cur
             .filter(|&c| Some(c) != self.idle)
             .ok_or(Error::NoCurrent)?;
         let t = self.threads.get_mut(&c).expect("current exists");
-        if core::mem::take(&mut t.token) {
+        if t.park == crate::park::ParkState::Notified {
+            t.park = crate::park::ParkState::Idle;
             return Ok(false);
         }
+        t.park = crate::park::ParkState::Prepared;
         t.state = State::Blocked;
         self.cur = None;
         self.pick();
         Ok(true)
     }
 
-    /// Sleep until `deadline` (a passed deadline does not block; a stale token is discarded).
+    /// Sleep until `deadline` (a passed deadline does not block and leaves nothing prepared).
     pub fn sleep_until(&mut self, deadline: Time) -> Result<bool, Error> {
         let c = self
             .cur
             .filter(|&c| Some(c) != self.idle)
             .ok_or(Error::NoCurrent)?;
         let t = self.threads.get_mut(&c).expect("current exists");
-        t.token = false;
+        t.park = crate::park::ParkState::Prepared;
         if deadline <= self.now {
+            t.park = crate::park::ParkState::Idle;
             return Ok(false);
         }
         t.deadline = Some(deadline);
@@ -660,7 +680,7 @@ impl<N: Class> HartRq<N> {
             .ok_or(Error::NoCurrent)?;
         let t = self.threads.get_mut(&c).expect("current exists");
         t.state = State::Exited;
-        t.token = false;
+        t.park = crate::park::ParkState::Idle;
         self.cur = None;
         self.pick();
         Ok(())
@@ -737,6 +757,7 @@ impl<N: Class> HartRq<N> {
             if let Some(t) = self.threads.get_mut(&tid) {
                 t.deadline = None;
                 if t.state == State::Blocked {
+                    t.park = crate::park::ParkState::Idle;
                     t.state = State::Runnable;
                     t.runnable_since = self.now;
                     self.class_enqueue(tid, Enq::Wake { slept: 0 });

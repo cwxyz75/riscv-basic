@@ -13,13 +13,19 @@
 //! place: running, in the class's run queue, blocked (possibly with a timer), or
 //! exited. [`Sched::audit`] checks that.
 //!
-//! Wake/block semantics (INVARIANTS.md C3): [`Sched::wake`] of a thread that is not
-//! blocked leaves a *wake token*; the thread's next [`Sched::block_current`] consumes
-//! the token and does not block. So a wake that races ahead of the block is never
-//! lost, and several wakes before one block count once (wakeups do not queue).
-//! The one exception is [`Sched::sleep_until`], which discards a token left from
+//! Wake/block semantics (SCHED-SMP-SPEC 3.7, INVARIANTS PK1; the wake token of C3 is gone): a thread **prepares**
+//! to block ([`Sched::prepare_block_on`]: its [`crate::park::Park`] word becomes `Prepared`) before it registers in
+//! any wait structure. A [`Sched::wake`] of a thread that is blocked makes it runnable; of one that is not blocked
+//! but prepared, it marks the park word `Notified`, and the thread's next [`Sched::block_current`] consumes that
+//! and does not block; of one that is neither (idle park word), it does nothing: **a wake is never remembered**.
+//! ([`Sched::block_current`] and [`Sched::sleep_until`] prepare for a caller that has not: under one lock the two
+//! are the same step.)
+//!
+//! ---- the remainder of the old text, about the token, no longer applies: ----
+//! The one exception is [`Sched::sleep_until`], which used to discard a token left from
 //! before the call: a sleep is for *time*, and a stale wake must not cut it short.
 
+use crate::park::Park;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -207,7 +213,8 @@ pub enum SchedError {
 struct Thread {
     prio: Prio,
     state: State,
-    token: bool,
+    /// The park word (3.7): whether a wake counts for this thread.
+    park: Park,
     timer: Option<u64>,
     /// Ticks left of its time slice when it next runs: a full slice, except for a
     /// thread that was preempted, which keeps what it had left (so a periodic
@@ -332,7 +339,7 @@ impl<C: SchedClass> Sched<C> {
             Thread {
                 prio,
                 state,
-                token: false,
+                park: Park::new(),
                 timer: None,
                 slice: TIMESLICE_TICKS,
                 affinity,
@@ -484,9 +491,11 @@ impl<C: SchedClass> Sched<C> {
     pub fn block_current_on(&mut self, hart: usize) -> Result<bool, SchedError> {
         let c = self.cur[hart].ok_or(SchedError::NoCurrent)?;
         let t = self.threads.get_mut(&c).expect("current exists");
-        if core::mem::take(&mut t.token) {
+        if t.park.take_notified() {
             return Ok(false);
         }
+        // (a caller that did not prepare is prepared here: one lock covers both)
+        t.park.prepare();
         t.state = State::Blocked;
         t.hart = None;
         self.cur[hart] = None;
@@ -494,16 +503,39 @@ impl<C: SchedClass> Sched<C> {
         Ok(true)
     }
 
+    /// The current thread is about to wait (step 1 of 3.7): from now on a wake counts. Call it **before**
+    /// registering in any wait structure; end the wait with [`Sched::block_current`] or, if the condition turned out
+    /// true, [`Sched::cancel_block_on`].
+    pub fn prepare_block_on(&mut self, hart: usize) -> Result<(), SchedError> {
+        let c = self.cur[hart].ok_or(SchedError::NoCurrent)?;
+        self.threads.get(&c).expect("current exists").park.prepare();
+        Ok(())
+    }
+
+    /// The condition was already true: not waiting after all (a wake that arrived meanwhile is dropped).
+    pub fn cancel_block_on(&mut self, hart: usize) -> Result<(), SchedError> {
+        let c = self.cur[hart].ok_or(SchedError::NoCurrent)?;
+        self.threads.get(&c).expect("current exists").park.cancel();
+        Ok(())
+    }
+
+    /// The park word of a thread (tests and the audit).
+    pub fn park_state(&self, tid: Tid) -> Option<crate::park::ParkState> {
+        self.threads.get(&tid).map(|t| t.park.state())
+    }
+
     /// Sleep until tick `deadline` or an earlier wake. A deadline that has passed
-    /// does not block. Any wake token left from before is discarded.
+    /// does not block (and leaves nothing prepared).
     pub fn sleep_until(&mut self, deadline: u64) -> Result<bool, SchedError> {
         self.sleep_until_on(0, deadline)
     }
 
     pub fn sleep_until_on(&mut self, hart: usize, deadline: u64) -> Result<bool, SchedError> {
         let c = self.cur[hart].ok_or(SchedError::NoCurrent)?;
-        self.threads.get_mut(&c).expect("current exists").token = false;
+        let park = &self.threads.get(&c).expect("current exists").park;
+        park.prepare();
         if deadline <= self.now {
+            park.cancel();
             return Ok(false);
         }
         self.threads.get_mut(&c).expect("current exists").timer = Some(deadline);
@@ -511,7 +543,7 @@ impl<C: SchedClass> Sched<C> {
         self.block_current_on(hart)
     }
 
-    /// Wake a thread (see the module comment for the token rule); hart 0 is the caller.
+    /// Wake a thread (see the module comment: nothing is remembered); hart 0 is the caller.
     pub fn wake(&mut self, tid: Tid) -> Result<(), SchedError> {
         self.wake_on(0, tid)
     }
@@ -523,12 +555,16 @@ impl<C: SchedClass> Sched<C> {
                 if let Some(deadline) = t.timer.take() {
                     self.timers.remove(&(deadline, tid));
                 }
+                t.park.cancel();
                 t.state = State::Runnable;
                 let prio = t.prio;
                 self.class.enqueue_tail(tid, prio);
                 self.resched_all(caller);
             }
-            State::Running | State::Runnable => t.token = true,
+            // counts only if the thread is prepared; otherwise nothing is left behind
+            State::Running | State::Runnable => {
+                let _ = t.park.notify();
+            }
             State::Exited => {}
         }
         Ok(())
@@ -563,7 +599,7 @@ impl<C: SchedClass> Sched<C> {
         let t = self.threads.get_mut(&c).expect("current exists");
         t.state = State::Exited;
         t.hart = None;
-        t.token = false;
+        t.park.cancel();
         self.cur[hart] = None;
         self.dispatch(hart);
         Ok(())
@@ -648,6 +684,7 @@ impl<C: SchedClass> Sched<C> {
             if let Some(t) = self.threads.get_mut(&tid) {
                 t.timer = None;
                 if t.state == State::Blocked {
+                    t.park.cancel();
                     t.state = State::Runnable;
                     let prio = t.prio;
                     self.class.enqueue_tail(tid, prio);
@@ -735,8 +772,8 @@ impl<C: SchedClass> Sched<C> {
                     "thread {tid}: timer record disagrees with the timer set"
                 ));
             }
-            if t.state == State::Exited && t.token {
-                return Err(alloc::format!("exited thread {tid} holds a wake token"));
+            if t.state == State::Exited && t.park.state() != crate::park::ParkState::Idle {
+                return Err(alloc::format!("exited thread {tid} has a park word set"));
             }
         }
         let designated: Vec<Tid> = self.cur.iter().flatten().copied().collect();
@@ -777,114 +814,5 @@ impl<C: SchedClass> Sched<C> {
             }
         }
         Ok(())
-    }
-}
-
-/// A FIFO of threads waiting for something, built on `block_current`/`wake`.
-/// `wait` and `wake_one` are called with the scheduler's lock held (interrupts off
-/// in the kernel), so adding oneself and blocking is atomic with respect to wakers:
-/// there is no window for a lost wakeup.
-#[derive(Default)]
-pub struct WaitQueue {
-    waiters: VecDeque<Tid>,
-}
-
-impl WaitQueue {
-    pub fn new() -> WaitQueue {
-        WaitQueue::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.waiters.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.waiters.is_empty()
-    }
-
-    /// Queue the current thread and block it. Returns whether it blocked (false if a
-    /// wake token let it through; it is then no longer queued).
-    pub fn wait<C: SchedClass>(&mut self, sched: &mut Sched<C>) -> Result<bool, SchedError> {
-        self.wait_on(sched, 0)
-    }
-
-    /// `wait` for the thread running on `hart`.
-    pub fn wait_on<C: SchedClass>(
-        &mut self,
-        sched: &mut Sched<C>,
-        hart: usize,
-    ) -> Result<bool, SchedError> {
-        let me = sched.current_on(hart).ok_or(SchedError::NoCurrent)?;
-        // A thread is queued at most once: a stale entry (it was woken some other
-        // way) must not stay behind to swallow a later wake_one.
-        self.waiters.retain(|&t| t != me);
-        self.waiters.push_back(me);
-        let blocked = sched.block_current_on(hart)?;
-        if !blocked {
-            self.waiters.retain(|&t| t != me);
-        }
-        Ok(blocked)
-    }
-
-    /// Like `wait`, but also wakes at tick `deadline` (a timeout). Returns whether it
-    /// blocked; after waking the caller tells a wake from a timeout by re-checking its
-    /// condition and the clock. A thread woken by the deadline leaves a stale entry here,
-    /// which `wake_one` skips (it is not blocked) and the thread's next wait replaces.
-    pub fn wait_until<C: SchedClass>(
-        &mut self,
-        sched: &mut Sched<C>,
-        deadline: u64,
-    ) -> Result<bool, SchedError> {
-        self.wait_until_on(sched, 0, deadline)
-    }
-
-    pub fn wait_until_on<C: SchedClass>(
-        &mut self,
-        sched: &mut Sched<C>,
-        hart: usize,
-        deadline: u64,
-    ) -> Result<bool, SchedError> {
-        let me = sched.current_on(hart).ok_or(SchedError::NoCurrent)?;
-        self.waiters.retain(|&t| t != me);
-        self.waiters.push_back(me);
-        let blocked = sched.sleep_until_on(hart, deadline)?;
-        if !blocked {
-            self.waiters.retain(|&t| t != me);
-        }
-        Ok(blocked)
-    }
-
-    /// Wake the longest-waiting thread, if any.
-    pub fn wake_one<C: SchedClass>(&mut self, sched: &mut Sched<C>) -> Option<Tid> {
-        self.wake_one_on(sched, 0)
-    }
-
-    /// `wake_one`, done by code running on `caller`.
-    pub fn wake_one_on<C: SchedClass>(
-        &mut self,
-        sched: &mut Sched<C>,
-        caller: usize,
-    ) -> Option<Tid> {
-        while let Some(tid) = self.waiters.pop_front() {
-            // Only a thread that is actually blocked counts as woken. Anything else is
-            // stale (woken some other way, or gone) and is dropped: a waiter that is
-            // merely running re-checks its condition before it waits again.
-            if sched.state(tid) == Some(State::Blocked) && sched.wake_on(caller, tid).is_ok() {
-                return Some(tid);
-            }
-        }
-        None
-    }
-
-    pub fn wake_all<C: SchedClass>(&mut self, sched: &mut Sched<C>) -> usize {
-        self.wake_all_on(sched, 0)
-    }
-
-    pub fn wake_all_on<C: SchedClass>(&mut self, sched: &mut Sched<C>, caller: usize) -> usize {
-        let mut n = 0;
-        while self.wake_one_on(sched, caller).is_some() {
-            n += 1;
-        }
-        n
     }
 }
