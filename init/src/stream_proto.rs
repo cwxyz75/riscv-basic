@@ -127,7 +127,7 @@ fn charged_to(client_creates: bool) -> Outcome {
         o1 as i64 - o0 as i64
     );
     ensure!(
-        c1 >= c0 + 128 * KIB && c1 <= c0 + 128 * KIB + 8 * KIB,
+        c1 == c0 + 128 * KIB,
         "the creator's job holds both directions' 64 KiB ({c0} -> {c1})"
     );
     ensure!(
@@ -211,7 +211,7 @@ pub fn a_client_at_quota_stalls_only_itself() -> Outcome {
         "the poor client's quota, not its buffer, ended the writes"
     );
     ensure!(
-        n1 > 0 && n1 <= 40 * KIB,
+        (24 * KIB..=40 * KIB).contains(&n1),
         "the poor client took {n1} bytes of a 40 KiB quota"
     );
     ensure!(
@@ -348,18 +348,24 @@ pub fn stream_pipe_numbers() -> Outcome {
         for _ in 0..rounds {
             hand.send(b'W', units, None)?;
             let mut got = 0usize;
+            let deadline = sys::clock_get() + 10_000;
             while (got as u64) < round {
+                ensure!(
+                    sys::clock_get() < deadline,
+                    "the hand wrote the round in time"
+                );
                 let r = sys::socket_read(end, buf.as_mut_ptr(), chunk);
                 calls += 1;
                 match r.status() {
                     Some(S::Ok) => got += r.a1,
                     Some(S::ShouldWait) => {
                         wakes += 1;
-                        sys::object_wait(
+                        let w = sys::object_wait(
                             end,
                             sig::READABLE | sig::PEER_CLOSED,
                             sys::clock_get() + 2000,
                         );
+                        ensure_eq!(w.status, 0, "the hand wrote something");
                     }
                     _ => return Err(msg_at(line!())),
                 }
@@ -399,8 +405,8 @@ pub fn stream_pipe_numbers() -> Outcome {
     Ok(())
 }
 
-/// P5: kill the client in the middle of a transfer: the server's end sees PEER_CLOSED, what was queued is still readable,
-/// and the client's ledger returns to nothing.
+/// P5: kill the client in the middle of a transfer, with bytes queued both ways: the server's end sees PEER_CLOSED, what the
+/// client had queued is still delivered, and every ledger of the client's job returns to nothing once the server lets go.
 pub fn a_dead_client_frees_everything() -> Outcome {
     let root = root_job()?;
     let j = ipc_job(root, 1024 * KIB)?;
@@ -414,12 +420,27 @@ pub fn a_dead_client_frees_everything() -> Outcome {
         64 * KIB,
         "64 KiB queued toward the server"
     );
-    ensure!(ipc_used(j)? >= 64 * KIB, "the client's job holds the bytes");
+    // and 32 KiB queued toward the client, which it never reads
+    let chunk = [3u8; 4096];
+    for _ in 0..8 {
+        ok(
+            sys::socket_write(end, chunk.as_ptr(), chunk.len()),
+            "queue toward the client",
+        )?;
+    }
+    ensure!(
+        ipc_used(j)? >= 96 * KIB,
+        "the client's job holds both queues"
+    );
     ok(sys::process_kill(hand.proc, 9), "kill the client")?;
     let r = sys::object_wait(end, sig::PEER_CLOSED, sys::clock_get() + 2000);
     ensure!(
         r.status == 0 && r.a1 as u32 & sig::PEER_CLOSED != 0,
         "the server's end saw PEER_CLOSED"
+    );
+    ensure!(
+        ipc_used(j)? >= 64 * KIB,
+        "what the client queued toward the server is still held for it"
     );
     let mut buf = [0u8; 4096];
     let mut total = 0usize;
@@ -438,16 +459,14 @@ pub fn a_dead_client_frees_everything() -> Outcome {
     ensure_eq!(
         total as u64,
         64 * KIB,
-        "what the client queued before it died is still delivered"
+        "what the client queued before it died is delivered"
     );
+    // the dead client's own inbound bytes went with it; once the server lets go too, nothing is left
     sys::handle_close(end);
-    job_use_settles(j, 5, 0, 2000)?;
-    job_use_settles(j, 4, 0, 2000).or_else(|_| {
-        // the process object lives while we hold its handle
-        sys::handle_close(hand.proc);
-        job_use_settles(j, 4, 0, 2000)
-    })?;
+    sys::handle_close(hand.proc);
     sys::handle_close(hand.ch);
+    job_use_settles(j, 5, 0, 2000)?;
+    job_use_settles(j, 4, 0, 2000)?;
     sys::handle_close(j);
     sys::handle_close(root);
     Ok(())
@@ -598,6 +617,10 @@ pub fn stream_budgets_with_the_launcher_defaults() -> Outcome {
         }
     }
     println!("##PROTO p7 empty_pairs_before_the_object_quota={pairs}");
+    ensure!(
+        (64..=200).contains(&pairs),
+        "{pairs} empty pairs in 256 objects"
+    );
     for h in ends.drain(..) {
         sys::handle_close(h);
     }
@@ -621,6 +644,10 @@ pub fn stream_budgets_with_the_launcher_defaults() -> Outcome {
             break;
         }
     }
+    ensure!(
+        (1..=3).contains(&stalled),
+        "{stalled} one-direction-full streams in 192 KiB"
+    );
     println!(
         "##PROTO p7 full_64k_streams_in_192k={stalled} system_budget_streams={}",
         rt::abi::limits::MAX_IPC_BYTES / (64 * 1024)
@@ -631,5 +658,58 @@ pub fn stream_budgets_with_the_launcher_defaults() -> Outcome {
     hand.finish();
     sys::handle_close(j);
     sys::handle_close(root);
+    Ok(())
+}
+
+/// P8: the bystander cost (T60). A thread sleeps in `port_wait` on a port with many one-shot bindings while two unrelated
+/// threads ping-pong over a channel; the ping-pong's time with 0, 64, 256 and 768 bindings is the cost, printed for the
+/// owner. The pass condition is only that the sleeper is not woken for nothing (spurious wakes stay near the quiet run's).
+pub fn bystander_cost_of_sleeping_bindings() -> Outcome {
+    let quiet = ping_pong()?;
+    println!(
+        "##PROTO p8 bindings=0 ticks={} spurious={}",
+        quiet.0, quiet.2
+    );
+    for want in [64usize, 256, 768] {
+        let port = port()?;
+        let mut socks = Vec::new();
+        let mut bound = 0usize;
+        // two bindings per socket end (READABLE and WRITABLE-after-full is not needed: two one-shot READABLE-class masks
+        // with different keys), so 768 bindings need 384 sockets
+        'outer: while bound < want {
+            let r = sys::socket_create();
+            if r.status != 0 {
+                break;
+            }
+            let (a, b) = (r.a1 as u32, r.a2 as u32);
+            socks.push((a, b));
+            for (mask, key) in [(sig::READABLE, 1u64), (sig::PEER_CLOSED, 2)] {
+                let k = ((socks.len() as u64) << 8) | key;
+                if sys::port_bind_flags(port, a, mask, k, abi_oneshot()).status != 0 {
+                    break 'outer;
+                }
+                bound += 1;
+            }
+        }
+        new_thread(port_bystander, port as usize)?;
+        nap_ticks(5);
+        let busy = ping_pong()?;
+        println!(
+            "##PROTO p8 bindings={bound} ticks={} spurious={} blocks={}",
+            busy.0, busy.2, busy.1
+        );
+        ensure!(
+            busy.2 <= quiet.2 + 30,
+            "{bound} sleeping bindings caused {} spurious wakes against {}",
+            busy.2,
+            quiet.2
+        );
+        sys::handle_close(port);
+        nap_ticks(3);
+        for (a, b) in socks {
+            sys::handle_close(a);
+            sys::handle_close(b);
+        }
+    }
     Ok(())
 }

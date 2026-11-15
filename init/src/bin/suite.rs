@@ -10254,6 +10254,10 @@ pub fn app_main() -> i32 {
         ),
         ("stream_pipe_numbers", stream_proto::stream_pipe_numbers),
         (
+            "bystander_cost_of_sleeping_bindings",
+            stream_proto::bystander_cost_of_sleeping_bindings,
+        ),
+        (
             "a_dead_client_frees_everything",
             stream_proto::a_dead_client_frees_everything,
         ),
