@@ -608,6 +608,8 @@ Architecture proposal: `NET-DESIGN.md`; draft specification with the acceptance 
 
 Design rule decided ahead of the spec (OD74, direction): a network endpoint is a native control channel plus, for streams, a data socket the client creates and passes in, so the client pays for its buffers; datagrams are control-channel messages; BSD sockets are a shim over that. The message formats, flow control and the driver/stack split are still to be specified. Depends on slices W and V.
 
+Progress (NET-SPEC steps; boxes tick only when verified in QEMU at `-smp 2` and `-smp 4`): step 1 (`netwire`, `netsim`) and step 2 (`netcore`, `supervise`) are built and host-tested (goldens from the real slirp capture, scripted packet tests, a seeded simulation, mutation checks; H5 smoltcp interop is not done: TIDY-UP T86); the pure `dhcp` client (step 5's core) is built; steps 3, 4, 5's programs and 6 are not.
+
 - [ ] virtio-net driver
 - [ ] ARP, IPv4, ICMP, UDP
 - [ ] DHCP client

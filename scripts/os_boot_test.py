@@ -451,6 +451,9 @@ def main() -> int:
     # `--rr KERNEL`: only the round-robin kernel (CI runs it as its own job)
     if len(sys.argv) == 3 and sys.argv[1] == "--rr":
         runs = [round_robin_run(sys.argv[2])]
+    # `--fail-demo KERNEL`: only the fail-demo kernel, which must be detected as failing (CI runs it when the harness changed)
+    elif len(sys.argv) == 3 and sys.argv[1] == "--fail-demo":
+        runs = [(sys.argv[2], True, None, "fail-demo kernel (must be detected as failing)")]
     else:
         if len(sys.argv) not in (2, 3, 4):
             print(__doc__, file=sys.stderr)

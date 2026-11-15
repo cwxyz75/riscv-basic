@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow
-.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -26,7 +26,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p cfmt -p kcore -p klock -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -36,7 +36,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p cfmt -p kcore -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
@@ -111,7 +111,9 @@ kernel: kernel-main
 os-test:
 	cargo test -p abi -p kcore -p klock
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p netring --release --test doorbell_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --target-dir target/loom
@@ -146,6 +148,11 @@ os-boot-test: kernel
 # others): the normal and fail-demo kernels, and the round-robin kernel.
 os-boot-test-main: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF)
+
+# Only the fail-demo kernel: the check that the harness still sees a failure (CI runs it when the harness changed; the
+# normal kernel was just booted by the smoke run).
+os-boot-test-fail-demo: kernel
+	python3 scripts/os_boot_test.py --fail-demo $(OS_FAIL_ELF)
 
 os-boot-test-rr: kernel
 	python3 scripts/os_boot_test.py --rr $(OS_RR_ELF)

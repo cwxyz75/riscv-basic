@@ -1,0 +1,7 @@
+[package]
+name = "netwire"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S8: zero-allocation parsers and builders for Ethernet, ARP, IPv4, ICMPv4, UDP and DHCP, and the Internet checksum (NET-SPEC section 6.1)"
+
+[dependencies]

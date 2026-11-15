@@ -1,0 +1,17 @@
+[package]
+name = "netring"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S8: the driver/stack shared-memory data path as pure logic: layout, the four rings, and the slot ownership state machines (NET-SPEC 5.3 to 5.5)"
+
+[dependencies]
+kcore = { path = "../kcore" }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.8"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
