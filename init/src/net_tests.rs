@@ -2029,3 +2029,89 @@ pub fn random_service_gives_seeded_distinct_bytes() -> Outcome {
     f.close();
     r
 }
+
+/// S9 step 6, Q28: a C program using BSD sockets (`ctest sockets`, `libc/tests/c/sockets.c`) over loopback and the stack:
+/// refusals with the right errno, TCP echo of 100,000 bytes through nonblocking calls and `poll`, `select`, a connect in
+/// progress and its `SO_ERROR`, a reset by `SO_LINGER {1,0}`, UDP, and `SO_RCVTIMEO`. Its output goes to the serial log; the
+/// test fails if any line says FAIL or the exit code is not 0.
+pub fn c_sockets_over_the_stack() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        // wait until the stack serves `net`
+        let _warm = f.connect(b"net")?;
+        let bi = boot_image_vmo()?;
+        let (off, len) = image_entry(bi, b"bin/ctest")?;
+        let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+        let (out_mine, out_theirs) = socket()?;
+        let svc_view = f.view(b"net")?;
+        let s = Startup {
+            args: vec![b"ctest".to_vec(), b"sockets".to_vec()],
+            namespace: vec![(b"/svc".to_vec(), 1)],
+            roles: vec![(Role::Stdout, 0)],
+            ..Startup::default()
+        };
+        let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+        let p = rt::spawn::spawn(&image, &bytes, &[out_theirs, svc_view.ch]).map_err(|e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn ctest: {e:?}"));
+            d
+        })?;
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        let limit = sys::clock_get() + 40_000;
+        let mut timed_out = false;
+        loop {
+            if sys::clock_get() >= limit {
+                timed_out = true;
+                sys::process_kill(p, -1);
+                break;
+            }
+            let w = sys::object_wait(
+                out_mine,
+                sig::READABLE | sig::PEER_CLOSED,
+                sys::clock_get() + 500,
+            );
+            if w.status != 0 {
+                continue;
+            }
+            match rt::io::read(out_mine, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        wait_ended(p, 5000)?;
+        let code = if timed_out {
+            -9999
+        } else {
+            sys::process_info(p).a1 as i64
+        };
+        sys::handle_close(p);
+        sys::handle_close(out_mine);
+        ensure!(
+            code != 99,
+            "ctest is a stub: the build had no RISC-V C compiler (set CC_RISCV)"
+        );
+        let mut failed = 0;
+        for line in got.split(|&b| b == b'\n') {
+            if line.starts_with(b"FAIL") {
+                failed += 1;
+            }
+            if code != 0 || line.starts_with(b"FAIL") || line.starts_with(b"sockets:") {
+                let mut l = b"s9: c|".to_vec();
+                l.extend_from_slice(&line[..line.len().min(300)]);
+                sys::debug_write(&l);
+            }
+        }
+        ensure_eq!(failed, 0, "no C socket check failed");
+        ensure_eq!(code, 0, "ctest sockets exits 0");
+        ensure!(got.windows(8).any(|w| w == b"ok: bind"), "the checks ran");
+        Ok(())
+    })();
+    f.close();
+    r
+}

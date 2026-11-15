@@ -20,7 +20,7 @@ pub const O_EXCL: c_int = 0x80;
 pub const O_TRUNC: c_int = 0x200;
 pub const O_APPEND: c_int = 0x400;
 
-const MAX_FDS: usize = 64;
+const MAX_FDS: usize = 256;
 const CHUNK: usize = 16 * 1024;
 
 pub struct OpenFile {
@@ -35,6 +35,8 @@ enum Entry {
     /// A standard stream: the handle of a socket.
     Stream(u32),
     File(OpenFile),
+    /// A socket (S9 step 6): shared, so a blocking call does not hold the descriptor table.
+    Socket(crate::socket::SockRef),
 }
 
 struct Table {
@@ -59,6 +61,24 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
         if h != 0 {
             t.fds[i] = Some(Entry::Stream(h));
         }
+    }
+}
+
+/// Put a socket in the lowest free descriptor slot (3 and up).
+pub fn install_socket(s: crate::socket::SockRef) -> Option<c_int> {
+    let mut t = FDS.lock();
+    let slot = (3..MAX_FDS).find(|&i| t.fds[i].is_none())?;
+    t.fds[slot] = Some(Entry::Socket(s));
+    Some(slot as c_int)
+}
+
+/// The socket behind `fd`: `Ok(None)` for a descriptor that is not a socket, `Err(())` for one that is not open.
+pub fn socket_of(fd: c_int) -> Result<Option<crate::socket::SockRef>, ()> {
+    let t = FDS.lock();
+    match t.fds.get(fd as usize).and_then(Option::as_ref) {
+        Some(Entry::Socket(s)) => Ok(Some(s.clone())),
+        Some(_) => Ok(None),
+        None => Err(()),
     }
 }
 
@@ -179,6 +199,11 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             0
         }
         Some(Entry::Stream(_)) => 0, // the handle belongs to the startup message
+        Some(Entry::Socket(s)) => {
+            drop(t);
+            crate::socket::sock_close(s);
+            0
+        }
         None => {
             errno::set(9); // EBADF
             -1
@@ -201,6 +226,12 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
             let h = *h;
             drop(t); // a blocking read must not hold the table
             read_stream(fd, h, buf as *mut u8, n)
+        }
+        Entry::Socket(s) => {
+            let s = s.clone();
+            drop(t); // a blocking read must not hold the table
+            let out = core::slice::from_raw_parts_mut(buf as *mut u8, n);
+            crate::socket::sock_recv(&s, out, false, None)
         }
         Entry::File(f) => {
             if !f.readable {
@@ -241,6 +272,11 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, n: usize) -> isize
                 errno::set(32); // EPIPE
                 -1
             }
+        }
+        Entry::Socket(s) => {
+            let s = s.clone();
+            drop(t);
+            crate::socket::sock_send(&s, data, false, None)
         }
         Entry::File(f) => {
             if !f.writable {
@@ -305,6 +341,22 @@ pub extern "C" fn lseek(fd: c_int, off: c_long, whence: c_int) -> c_long {
         }
         None => {
             errno::set(22);
+            -1
+        }
+    }
+}
+
+/// `fcntl`: the descriptor flags a socket supports (`O_NONBLOCK`); other descriptors answer the harmless defaults.
+#[no_mangle]
+pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+    match socket_of(fd) {
+        Ok(Some(s)) => crate::socket::sock_fcntl(&s, cmd, arg),
+        Ok(None) => match cmd {
+            1..=4 => 0,
+            _ => fail(-4),
+        },
+        Err(()) => {
+            errno::set(9);
             -1
         }
     }

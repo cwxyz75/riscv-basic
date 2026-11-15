@@ -10275,6 +10275,10 @@ pub fn app_main() -> i32 {
             net_tests::random_service_gives_seeded_distinct_bytes,
         ),
         (
+            "c_sockets_over_the_stack",
+            net_tests::c_sockets_over_the_stack,
+        ),
+        (
             "net_streams_over_loopback",
             net_tests::net_streams_over_loopback,
         ),

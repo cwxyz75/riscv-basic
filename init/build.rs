@@ -109,7 +109,10 @@ fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<
 fn build_c_tests(dir: &str) -> Option<PathBuf> {
     build_c_archive(
         "ctests",
-        &[Path::new(dir).join("../libc/tests/c/transcript.c")],
+        &[
+            Path::new(dir).join("../libc/tests/c/transcript.c"),
+            Path::new(dir).join("../libc/tests/c/sockets.c"),
+        ],
         &["-Wall".to_string()],
     )
 }

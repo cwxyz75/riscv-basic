@@ -503,6 +503,18 @@ impl Core {
         broadcast: bool,
         now: Instant,
     ) -> Result<(), SendError> {
+        // a datagram to ourselves (our own address or 127.x) is delivered on the next poll and never reaches the device
+        if proto == ipv4::PROTO_UDP
+            && !broadcast
+            && (dst[0] == 127 || self.cfg.is_some_and(|c| c.addr == dst))
+        {
+            if self.tcp.udp_loop.len() >= tcp::LOOPBACK_QUEUE {
+                self.counters.tcp_loopback_dropped += 1;
+            } else {
+                self.tcp.udp_loop.push_back((src, dst, payload));
+            }
+            return Ok(());
+        }
         let packet = self.ip_packet(src, dst, proto, 64, &payload);
         if broadcast {
             self.queue_frame(BROADCAST_MAC, eth::ETHERTYPE_IPV4, &packet);
@@ -698,8 +710,7 @@ impl Core {
     /// Run the timers due at `now` (ARP retries; after the third unanswered request the queue is dropped and each
     /// cookie-tagged send gets a `NoRoute` notice).
     pub fn poll(&mut self, now: Instant) -> Vec<Event> {
-        self.tcp_poll(now);
-        let mut events = Vec::new();
+        let mut events = self.tcp_poll(now);
         let mut i = 0;
         while i < self.resolving.len() {
             if self.resolving[i].next > now {

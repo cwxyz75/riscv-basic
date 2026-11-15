@@ -1,0 +1,7 @@
+[package]
+name = "sockshim"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S9 step 6: the pure decisions of the BSD socket shim (errno table, sockaddr and inet_* formats, option rules, poll masks), host-tested; the C library applies them (S9-SPEC 9)"
+
+[dependencies]
