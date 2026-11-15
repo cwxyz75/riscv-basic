@@ -617,6 +617,8 @@ Design rule decided ahead of the spec (OD74, direction): a network endpoint is a
 Acceptance: a hash-verified fetch from a host HTTP server; host `curl` against an
 in-OS HTTP server serving memory-filesystem files; the lossy-link suite passes.
 
+Draft specification with the acceptance checks written first: `S9-SPEC.md` (a proposal; not accepted by the owner yet).
+
 - [ ] TCP (state machine, retransmission, congestion control) with packet-script tests
 - [ ] Sockets interface in the libc
 - [ ] Simulated lossy/reordering link suite

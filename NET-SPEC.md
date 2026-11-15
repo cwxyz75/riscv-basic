@@ -4,7 +4,7 @@ Status: **draft v0, 2026-11-14; nothing here is built.** This is the written acc
 then acceptance checks, then code, then an independent review). It makes `NET-DESIGN.md` (the architecture and its reasons)
 concrete: every message, constant, state machine and check an implementer needs. Where the two disagree, `NET-DESIGN.md`
 is the intent and this file is the contract; fix the other one in the same PR. Decisions made here are logged as OD98 and
-later in `OS-ARCHITECTURE.md` section 17 once the owner accepts them (section 13 lists them). Open points are in section 15.
+later in `OS-ARCHITECTURE.md` section 17 once the owner accepts them (section 13 lists them). Open points are in section 15. The draft for S9, `S9-SPEC.md`, lists in its section 18 what it would like this file to leave room for.
 
 Reading order: section 1 (what S8 is), 2 (steps), 3 (the environment, with facts checked), 4 to 9 (the parts), 10 (limits), 11
 (invariants), 12 (acceptance: the part that matters most), 13 to 15 (records, risks, open points).
