@@ -2,8 +2,8 @@
 //! (`write`, `read`, `close`, `abort`) and time (`on_timer`), producing segments on request (`poll`). Sans-IO: it reads no
 //! clock and sends nothing by itself.
 //!
-//! Congestion control is step 3's: here the send window is the peer's alone (`cwnd` is `u32::MAX`). Window scaling, SACK
-//! and timestamps are not negotiated (5.3).
+//! Congestion control is RFC 5681 with NewReno recovery (RFC 6582), counted in bytes (5.7). Window scaling, SACK and
+//! timestamps are not negotiated (5.3).
 use crate::reasm::Reasm;
 use crate::rto::{Rto, MS};
 use crate::sendbuf::SendBuf;
@@ -138,6 +138,8 @@ pub struct Stats {
     pub delayed_acks: u64,
     pub ooo_dropped: u64,
     pub dup_acks_received: u64,
+    pub fast_retransmits: u64,
+    pub partial_acks: u64,
 }
 
 pub struct Conn {
@@ -188,6 +190,15 @@ pub struct Conn {
     events: Vec<Event>,
     pub stats: Stats,
     dup_acks: u32,
+    // ---- congestion control (5.7) ----
+    cwnd: u32,
+    ssthresh: u32,
+    /// NewReno's `recover`: the highest sequence number sent when loss was detected.
+    recover: u32,
+    in_recovery: bool,
+    /// A SYN or SYN-ACK was retransmitted: the initial window is one segment (RFC 5681).
+    syn_retransmitted: bool,
+    last_send: Instant,
 }
 
 impl Conn {
@@ -234,7 +245,37 @@ impl Conn {
             events: Vec::new(),
             stats: Stats::default(),
             dup_acks: 0,
+            cwnd: u32::MAX,
+            ssthresh: u32::MAX,
+            recover: iss,
+            in_recovery: false,
+            syn_retransmitted: false,
+            last_send: now,
         }
+    }
+
+    /// RFC 5681's initial window for the segment size in use.
+    fn initial_window(&self) -> u32 {
+        let mss = self.send_mss() as u32;
+        if self.syn_retransmitted {
+            mss
+        } else if mss > 2190 {
+            2 * mss
+        } else if mss > 1095 {
+            3 * mss
+        } else {
+            4 * mss
+        }
+    }
+
+    pub fn cwnd(&self) -> u32 {
+        self.cwnd
+    }
+    pub fn ssthresh(&self) -> u32 {
+        self.ssthresh
+    }
+    pub fn in_recovery(&self) -> bool {
+        self.in_recovery
     }
 
     /// An active open: the first `poll` sends the SYN.
@@ -333,6 +374,9 @@ impl Conn {
         self.pending_close = false;
         self.events.push(Event::Connected);
         self.last_activity = now;
+        self.last_send = now;
+        self.cwnd = self.initial_window();
+        self.ssthresh = u32::MAX;
     }
 
     // ---------------------------------------------------------------- application
@@ -635,6 +679,8 @@ impl Conn {
     fn process_ack(&mut self, s: &Tcp<'_>, now: Instant) {
         let was_outstanding = self.snd_una != self.snd_nxt;
         if seq::gt(s.ack, self.snd_una) {
+            let newly = seq::dist(self.snd_una, s.ack);
+            self.ack_congestion(newly, s.ack);
             let fin_acked = self.fin_seq.is_some_and(|f| seq::gt(s.ack, f));
             let acked_data = {
                 let upto = if fin_acked {
@@ -698,6 +744,7 @@ impl Conn {
         {
             self.stats.dup_acks_received += 1;
             self.dup_acks += 1;
+            self.dup_ack_congestion();
         }
         // the window: take it from the newest segment (RFC 9293 3.10.7.4)
         if seq::lt(self.snd_wl1, s.seq) || (self.snd_wl1 == s.seq && seq::le(self.snd_wl2, s.ack)) {
@@ -709,6 +756,50 @@ impl Conn {
                 self.persist_deadline = None;
                 self.persist_count = 0;
             }
+        }
+    }
+
+    /// New data was acknowledged: grow the window, or take part in NewReno recovery.
+    fn ack_congestion(&mut self, newly: u32, ack: u32) {
+        let mss = self.send_mss() as u32;
+        if self.in_recovery {
+            if seq::ge(ack, self.recover) {
+                // a full ACK: recovery is over
+                self.cwnd = self.ssthresh;
+                self.in_recovery = false;
+            } else {
+                // a partial ACK: retransmit the next hole, deflate by what was acknowledged, add one segment back
+                self.stats.partial_acks += 1;
+                self.cwnd = self
+                    .cwnd
+                    .saturating_sub(newly)
+                    .saturating_add(if newly >= mss { mss } else { 0 });
+                self.rtx_pending = true;
+            }
+            return;
+        }
+        if self.cwnd < self.ssthresh {
+            self.cwnd = self.cwnd.saturating_add(newly.min(mss));
+        } else {
+            let grow = (mss.saturating_mul(mss) / self.cwnd.max(1)).max(1);
+            self.cwnd = self.cwnd.saturating_add(grow);
+        }
+    }
+
+    /// A duplicate ACK: the third starts fast retransmit and recovery; later ones inflate the window.
+    fn dup_ack_congestion(&mut self) {
+        let mss = self.send_mss() as u32;
+        if self.in_recovery {
+            self.cwnd = self.cwnd.saturating_add(mss);
+        } else if self.dup_acks == 3 && seq::gt(self.snd_una, self.recover) {
+            let flight = seq::dist(self.snd_una, self.snd_nxt);
+            self.ssthresh = (flight / 2).max(2 * mss);
+            self.cwnd = self.ssthresh.saturating_add(3 * mss);
+            self.recover = self.snd_nxt;
+            self.in_recovery = true;
+            self.rtx_pending = true;
+            self.timed = None;
+            self.stats.fast_retransmits += 1;
         }
     }
 
@@ -838,6 +929,7 @@ impl Conn {
                 }
                 self.rtx_count += 1;
                 self.syn_pending = true;
+                self.syn_retransmitted = true;
                 self.rto.after_syn_retransmit();
                 self.rtx_deadline = Some(now + self.rto_backed_off_syn());
             }
@@ -847,6 +939,7 @@ impl Conn {
                 }
                 self.rtx_count += 1;
                 self.synack_pending = true;
+                self.syn_retransmitted = true;
                 self.rto.after_syn_retransmit();
                 self.rtx_deadline = Some(now + self.rto_backed_off_syn());
             }
@@ -854,6 +947,14 @@ impl Conn {
                 if now.saturating_sub(self.oldest_outstanding_since) >= GIVE_UP {
                     return self.fail(Reason::TimedOut);
                 }
+                // RFC 5681 3.1: the window collapses to one segment and the threshold halves
+                let mss = self.send_mss() as u32;
+                let flight = seq::dist(self.snd_una, self.snd_nxt);
+                self.ssthresh = (flight / 2).max(2 * mss);
+                self.cwnd = mss;
+                self.in_recovery = false;
+                self.dup_acks = 0;
+                self.recover = self.snd_nxt;
                 self.rtx_count += 1;
                 self.rtx_pending = true;
                 self.timed = None; // Karn: a retransmitted segment is never timed
@@ -1034,7 +1135,11 @@ impl Conn {
                 f == self.snd_nxt.wrapping_add(unsent as u32) && !seq::gt(self.snd_nxt, f)
             });
             let in_flight = seq::dist(self.snd_una, self.snd_nxt);
-            let usable = self.snd_wnd.saturating_sub(in_flight) as usize;
+            // after an idle period longer than the RTO the window restarts from the initial window (RFC 5681 4.1)
+            if in_flight == 0 && now.saturating_sub(self.last_send) > self.rto.rto() {
+                self.cwnd = self.cwnd.min(self.initial_window());
+            }
+            let usable = self.snd_wnd.min(self.cwnd).saturating_sub(in_flight) as usize;
             if (unsent > 0 || fin_unsent)
                 && self.snd_wnd == 0
                 && in_flight == 0
@@ -1060,6 +1165,7 @@ impl Conn {
                     flags |= tcp::FIN;
                 }
                 let seq_no = self.snd_nxt;
+                self.last_send = now;
                 let n = self.build(flags, seq_no, if send_data { len } else { 0 }, &[], out)?;
                 let advance = (if send_data { len } else { 0 }) as u32 + u32::from(carries_fin);
                 if self.snd_una == self.snd_nxt {
