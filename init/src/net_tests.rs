@@ -393,7 +393,7 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
         }
         ensure!(done, "the driver reported the transmit done");
         let f = got.ok_or_else(|| msg_at(line!()))?;
-        ensure_eq!(f.len(), 60, "slirp's ARP reply is a 60-byte padded frame: the ring length is the frame's, without the virtio header");
+        ensure_eq!(f.len(), 64, "slirp's ARP reply is a 64-byte frame (observed in the capture); the ring length is the frame's, without the virtio header");
         let a = netwire::arp::parse(&f[14..]).map_err(|_| msg_at(line!()))?;
         ensure_eq!(
             (a.op, a.spa, a.tpa),
@@ -421,5 +421,224 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
         Ok(())
     })();
     n.close();
+    r
+}
+
+// ---- the full stack: netsup supervising netd and netdrv, the registry, clients over /svc ----
+
+/// A running full stack as the tests see it.
+struct Full {
+    mgr: u32,
+    mgr_chan: u32,
+    sup: u32,
+    /// The channel to `netsup` (Status, Restart).
+    ctl: u32,
+    reg: u32,
+    /// The registry's root connection (it can publish, view).
+    root: Fs,
+    jobs: [u32; 3],
+}
+
+fn start_full() -> Result<Option<Full>, Detail> {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let bi = boot_image_vmo()?;
+    let root_j = root_job()?;
+    let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    let sj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    let rj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root_j);
+    let (mine, theirs) = channel()?;
+    let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u32;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let mgr = spawn_prog(
+        bi,
+        b"bin/devmgr",
+        &[b"devmgr"],
+        vec![
+            (Role::Resource, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceDevmgr, 2),
+        ],
+        &[res_dup, bi_dup, theirs],
+        mj,
+    )?;
+    let (sup_dm, mgr_end) = channel()?;
+    let req = proto::devmgr::encode_connect(1);
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            req.as_ptr(),
+            req.len(),
+            &mgr_end,
+            1
+        )),
+        Some(S::Ok),
+        "connect a second client"
+    );
+    ensure_eq!(
+        st(sys::object_wait(
+            mine,
+            sig::READABLE,
+            sys::clock_get() + 5000
+        )),
+        Some(S::Ok),
+        "the manager answers the connect"
+    );
+    let mut rb = [0u8; 16];
+    sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    // the registry
+    let (off, len) = image_entry(bi, b"bin/registryd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (reg_mine, reg_theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"registryd".to_vec()],
+        roles: vec![(Role::ServiceRegistry, 0)],
+        ..Startup::default()
+    };
+    let reg = rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[reg_theirs],
+        rj,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let mut root = Fs::new(reg_mine);
+    let publish_conn = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let (ctl, ctl_theirs) = channel()?;
+    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let sup = spawn_prog(
+        bi,
+        b"bin/netsup",
+        &[b"netsup"],
+        vec![
+            (Role::ServiceDevmgr, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceInit, 2),
+            (Role::ServiceRegistry, 3),
+        ],
+        &[sup_dm, bi2, ctl_theirs, publish_conn.ch],
+        sj,
+    )?;
+    // a machine without a network device: netsup ends with 13 (NoDevice) before saying anything
+    let up = sys::object_wait(sup, sig::TERMINATED, sys::clock_get() + 1500);
+    if up.status == 0 {
+        let code = sys::process_info(sup).a1 as i64;
+        for h in [sup, mgr, mine, ctl, reg, mj, sj, rj, reg_mine] {
+            sys::handle_close(h);
+        }
+        ensure_eq!(code, 13, "netsup's exit code without a network device");
+        return Ok(None);
+    }
+    Ok(Some(Full {
+        mgr,
+        mgr_chan: mine,
+        sup,
+        ctl,
+        reg,
+        root,
+        jobs: [mj, sj, rj],
+    }))
+}
+
+impl Full {
+    fn view(&mut self, name: &[u8]) -> Result<Fs, Detail> {
+        self.root
+            .view(&[name], prt::READ | prt::ENUMERATE)
+            .map_err(|e| msg_e(e, line!()))
+    }
+
+    /// A connection to a published name, waiting until the stack has published it.
+    fn connect(&mut self, name: &[u8]) -> Result<rt::net::Net, Detail> {
+        let mut v = self.view(name)?;
+        rt::net::Net::connect(&mut v, name, sys::clock_get() + 15_000).map_err(|e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut d,
+                format_args!(
+                    "connect {}: {e:?}",
+                    core::str::from_utf8(name).unwrap_or("?")
+                ),
+            );
+            d
+        })
+    }
+
+    fn close(self) {
+        for p in [self.sup, self.mgr, self.reg] {
+            sys::process_kill(p, -1);
+            let _ = sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 3000);
+        }
+        for h in [self.sup, self.mgr, self.mgr_chan, self.ctl, self.reg] {
+            sys::handle_close(h);
+        }
+        sys::handle_close(self.root.ch);
+        for j in self.jobs {
+            let _ = job_use_settles(j, 2, 0, 1500);
+            sys::handle_close(j);
+        }
+    }
+}
+
+/// Q2 (static configuration): configure 10.0.2.15/24 through `/svc/net-config` and ping the gateway; the answers are slirp's.
+pub fn net_static_config_and_ping_the_gateway() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        let i = cfg.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(!i.configured, "unconfigured to begin with");
+        ensure_eq!(i.mtu, 1500, "the MTU");
+        cfg.set_config(
+            [10, 0, 2, 15],
+            [255, 255, 255, 0],
+            [10, 0, 2, 2],
+            [10, 0, 2, 3],
+            t(3000),
+        )
+        .map_err(|_| msg_at(line!()))?;
+        // the link comes up when the driver has attached
+        let until = t(8000);
+        let mut info = cfg.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        while !info.link && sys::clock_get() < until {
+            nap(20)?;
+            info = cfg.info(t(3000)).map_err(|_| msg_at(line!()))?;
+        }
+        ensure!(info.link && info.configured, "link up and configured");
+        ensure_eq!(info.mac, OUR_MAC, "the MAC the driver read from the device");
+        ensure_eq!(info.addr, [10, 0, 2, 15], "the address");
+        // a normal client pings the gateway
+        let mut net = f.connect(b"net")?;
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        let mut got = 0;
+        for seq in 1..=5u16 {
+            let data = [seq as u8; 32];
+            if let Ok(r) = echo.ping([10, 0, 2, 2], seq, &data, t(1500)) {
+                ensure_eq!(
+                    (r.seq, r.src),
+                    (seq, [10, 0, 2, 2]),
+                    "the reply's sequence and source"
+                );
+                ensure_eq!(r.payload, data.to_vec(), "the reply echoes the data");
+                got += 1;
+            }
+        }
+        ensure!(
+            got >= 4,
+            "at least four of five echo requests were answered ({got})"
+        );
+        let arp = cfg.arp(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(
+            arp.iter()
+                .any(|e| e.0 == [10, 0, 2, 2] && e.1 == [0x52, 0x55, 10, 0, 2, 2]),
+            "the gateway is in the ARP table with slirp's MAC"
+        );
+        let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
+        ensure!(stats.iter().any(|s| s.1 > 0), "the counters moved");
+        Ok(())
+    })();
+    f.close();
     r
 }

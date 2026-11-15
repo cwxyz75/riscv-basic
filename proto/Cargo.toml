@@ -6,3 +6,6 @@ description = "OS track: wire formats of the S4 userland protocols (startup mess
 
 [dependencies]
 console = { path = "../home/console" }
+
+[dev-dependencies]
+svc = { path = "../svc" }

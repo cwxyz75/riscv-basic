@@ -300,6 +300,24 @@ impl<C> Core<C> {
         }
     }
 
+    /// Send a datagram without holding it: if the client has no room (or no memory) the message is **dropped** and
+    /// `Sent::Held` says so (nothing is kept). A server that must not wait for a slow client (the network stack's
+    /// endpoints, NET-SPEC 7.3) uses this instead of `send`. A client that is gone ends the connection.
+    pub fn send_datagram(&mut self, key: u64, bytes: &[u8]) -> Sent {
+        let Some(slot) = self.conns.get(key) else {
+            return Sent::Closed;
+        };
+        let r = sys::channel_write(slot.ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
+        match r.status() {
+            Some(Status::Ok) => Sent::Sent,
+            Some(Status::ShouldWait) | Some(Status::NoMemory) => Sent::Held,
+            _ => {
+                self.close_conn(key);
+                Sent::Closed
+            }
+        }
+    }
+
     /// Send one reply that carries several handles (a device claim). No hold: if the client has no room or is gone, the
     /// handles are closed and the connection ends (a claim reply is only ever the answer to a request just read).
     pub fn send_handles(&mut self, key: u64, bytes: Vec<u8>, handles: Vec<u32>) -> Sent {

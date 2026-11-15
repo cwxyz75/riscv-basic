@@ -46,6 +46,10 @@ fn main() {
         "registryd",
         "netsup",
         "netdrv",
+        "netd",
+        "ping",
+        "udpecho",
+        "netinfo",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

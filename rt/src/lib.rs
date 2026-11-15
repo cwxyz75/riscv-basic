@@ -20,6 +20,8 @@ pub mod io;
 #[cfg(feature = "heap")]
 pub mod launch;
 #[cfg(feature = "heap")]
+pub mod net;
+#[cfg(feature = "heap")]
 pub mod service;
 #[cfg(feature = "heap")]
 pub mod spawn;

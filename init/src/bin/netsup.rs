@@ -63,6 +63,8 @@ struct Held {
 /// A running child: its process handle.
 struct Child {
     proc: Option<u32>,
+    /// Which incarnation: the port key of its exit event carries it, so a late event of a killed predecessor is ignored.
+    seq: u64,
     name: &'static str,
     restarts: u32,
     last_exit: i32,
@@ -246,6 +248,7 @@ pub fn app_main() -> i32 {
     let mut sup = Supervisor::new(Policy::NET);
     let mut drv = Child {
         proc: None,
+        seq: 0,
         name: "netdrv",
         restarts: 0,
         last_exit: 0,
@@ -280,11 +283,290 @@ pub fn app_main() -> i32 {
             }
         }
     }
-    // the full system arrives with `netd` (step 4)
-    let _ = (&mut sup, &mut drv, Action::Down);
-    drv.restarts += 0;
-    drv.last_exit += 0;
-    let _ = drv.name;
-    let _ = stack_end;
-    7
+    // ---- the full system: netd as well, and the supervision loop ----
+    let (Some(registry), Some(ctl_parent)) = (env.handle(Role::ServiceRegistry), parent) else {
+        return 3;
+    };
+    let Some(netd_image) = read_bin(bi, b"bin/netd") else {
+        return 26;
+    };
+    let pair = sys::channel_create();
+    if pair.status != 0 {
+        return 27;
+    }
+    let (sup_end, netd_sup_end) = (pair.a1 as u32, pair.a2 as u32);
+    let mut netd = Child {
+        proc: None,
+        seq: 0,
+        name: "netd",
+        restarts: 0,
+        last_exit: 0,
+    };
+    match spawn_netd(&held, &netd_image, stack_end, registry, netd_sup_end) {
+        Ok(p) => netd.proc = Some(p),
+        Err(code) => return code,
+    }
+    let port = sys::port_create().a1 as u32;
+    let _ = sys::port_bind(
+        port,
+        ctl_parent,
+        signals::READABLE | signals::PEER_CLOSED,
+        3,
+    );
+    // exit events: key = (incarnation << 4) | child index + 1 (children: 0 driver, 1 stack)
+    let bind = |p: u32, c: &mut Child, idx: u64| {
+        c.seq += 1;
+        let _ = sys::port_bind_flags(
+            port,
+            p,
+            signals::TERMINATED,
+            c.seq << 4 | (idx + 1),
+            rt::abi::port_flags::ONESHOT,
+        );
+    };
+    bind(drv.proc.unwrap_or(0), &mut drv, 0);
+    bind(netd.proc.unwrap_or(0), &mut netd, 1);
+    rt::println!("##NETSUP up");
+    let mut pending: Vec<(u64, usize)> = Vec::new(); // (restart at, child)
+    let mut down = false;
+    loop {
+        let now = sys::clock_get();
+        let deadline = pending.iter().map(|p| p.0).min().unwrap_or(u64::MAX);
+        let r = sys::port_wait(port, deadline);
+        let now2 = sys::clock_get();
+        // restarts that are due
+        let mut due: Vec<usize> = Vec::new();
+        pending.retain(|&(t, c)| {
+            if t <= now2 {
+                due.push(c);
+                false
+            } else {
+                true
+            }
+        });
+        for c in due {
+            if c == 0 {
+                match spawn_driver(&held, &drv_image) {
+                    Ok((p, ctl_end)) => {
+                        drv.proc = Some(p);
+                        bind(p, &mut drv, 0);
+                        // the running stack gets the new control channel's end
+                        let hs = [ctl_end];
+                        let _ = sys::channel_write(sup_end, b"ctl".as_ptr(), 3, hs.as_ptr(), 1);
+                    }
+                    Err(code) => {
+                        rt::println!("##NETSUP down reason=spawn driver={code}");
+                        down = true;
+                    }
+                }
+            }
+        }
+        if r.status != 0 {
+            continue;
+        }
+        let key = r.a1 as u64;
+        let (seq, which) = (key >> 4, key & 15);
+        match which {
+            1 | 2 => {
+                let idx = which - 1;
+                let child = if idx == 0 { &mut drv } else { &mut netd };
+                if child.seq != seq {
+                    continue; // a killed predecessor's late event
+                }
+                let Some(p) = child.proc.take() else { continue };
+                let code = sys::process_info(p).a1 as i32;
+                sys::handle_close(p);
+                child.last_exit = code;
+                child.restarts += 1;
+                let name = child.name;
+                let restarts = child.restarts;
+                let gen = held.shm.load64(ctl::GENERATION);
+                rt::println!("##NETSUP child={name} exit={code} restarts={restarts} gen={gen}");
+                if down {
+                    continue;
+                }
+                let restartable = !(20..=24).contains(&code);
+                match sup.on_exit(idx as usize, now2, restartable) {
+                    Action::Restart { delay } => {
+                        if idx == 0 {
+                            pending.push((now2 + delay / 1_000_000, 0));
+                        } else {
+                            // the stack restarted: a fresh driver goes with it (it re-attaches as generation + 1), and the new
+                            // stack gets its control channel in its startup message
+                            if let Some(dp) = drv.proc.take() {
+                                sys::process_kill(dp, -1);
+                                let _ = sys::object_wait(
+                                    dp,
+                                    signals::TERMINATED,
+                                    sys::clock_get() + 2000,
+                                );
+                                sys::handle_close(dp);
+                            }
+                            pending.retain(|&(_, c)| c != 0);
+                            if !restart_both(
+                                &held,
+                                &drv_image,
+                                &netd_image,
+                                &mut drv,
+                                &mut netd,
+                                registry,
+                                &bind,
+                            ) {
+                                down = true;
+                                rt::println!("##NETSUP down reason=restart");
+                            }
+                        }
+                    }
+                    Action::Down => {
+                        down = true;
+                        rt::println!("##NETSUP down reason={:?}", sup.down_reason());
+                    }
+                }
+            }
+            3 => {
+                // the control channel: Status and Restart
+                let mut b = [0u8; 32];
+                loop {
+                    let rd = sys::channel_read(
+                        ctl_parent,
+                        b.as_mut_ptr(),
+                        b.len(),
+                        core::ptr::null_mut(),
+                        0,
+                    );
+                    if rd.status != 0 {
+                        break;
+                    }
+                    let Some(txid) = b
+                        .get(..4)
+                        .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
+                    else {
+                        continue;
+                    };
+                    let op = u16::from_le_bytes([b[4], b[5]]);
+                    let mut reply = alloc::vec![0u8; 8];
+                    reply[..4].copy_from_slice(&txid.to_le_bytes());
+                    match op {
+                        1 => {
+                            for c in [&drv, &netd] {
+                                reply.push(u8::from(c.proc.is_some()));
+                                reply.extend_from_slice(&c.restarts.to_le_bytes());
+                                reply.extend_from_slice(&c.last_exit.to_le_bytes());
+                            }
+                            reply.push(u8::from(down));
+                            reply
+                                .extend_from_slice(&held.shm.load64(ctl::GENERATION).to_le_bytes());
+                        }
+                        2 => {
+                            let which = b[8];
+                            let target = if which == 0 { drv.proc } else { netd.proc };
+                            match target {
+                                Some(p) => {
+                                    sys::process_kill(p, -3000);
+                                }
+                                None => reply[4..8].copy_from_slice(&(-10i32).to_le_bytes()),
+                            }
+                        }
+                        _ => reply[4..8].copy_from_slice(&(-4i32).to_le_bytes()),
+                    }
+                    let _ = sys::channel_write(
+                        ctl_parent,
+                        reply.as_ptr(),
+                        reply.len(),
+                        core::ptr::null(),
+                        0,
+                    );
+                }
+                if sys::object_signals(ctl_parent).a1 as u32 & signals::PEER_CLOSED != 0 {
+                    // whoever started us is gone: end the stack and leave
+                    for c in [&drv, &netd] {
+                        if let Some(p) = c.proc {
+                            sys::process_kill(p, -1);
+                            let _ =
+                                sys::object_wait(p, signals::TERMINATED, sys::clock_get() + 2000);
+                        }
+                    }
+                    return 0;
+                }
+                let _ = sys::port_rearm(port, 3);
+            }
+            _ => {}
+        }
+        let _ = now;
+    }
+}
+
+fn spawn_netd(
+    h: &Held,
+    image: &[u8],
+    ctl_end: u32,
+    registry: u32,
+    sup_end: u32,
+) -> Result<u32, i32> {
+    let Some(mut hs) = stack_handles(h, ctl_end) else {
+        return Err(24);
+    };
+    let Some(reg) = dup(registry, Rights::SAME) else {
+        return Err(25);
+    };
+    hs.push(reg);
+    hs.push(sup_end);
+    let roles = alloc::vec![
+        (Role::NetRing, 0),
+        (Role::NetRxPool, 1),
+        (Role::NetTxPool, 2),
+        (Role::NetEventToStack, 3),
+        (Role::NetEventToDriver, 4),
+        (Role::NetCtl, 5),
+        (Role::ServiceRegistry, 6),
+        (Role::ServiceInit, 7)
+    ];
+    let s = Startup {
+        args: alloc::vec![b"netd".to_vec()],
+        roles,
+        ..Startup::default()
+    };
+    let Ok(bytes) = s.encode() else {
+        return Err(21);
+    };
+    match rt::spawn::spawn(image, &bytes, &hs) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            rt::println!("##NETSUP cannot start netd: {e:?}");
+            Err(23)
+        }
+    }
+}
+
+/// After the stack died: start a new driver and a new stack together (a new control channel, generation + 1). `false`:
+/// something could not be started.
+fn restart_both(
+    held: &Held,
+    drv_image: &[u8],
+    netd_image: &[u8],
+    drv: &mut Child,
+    netd: &mut Child,
+    registry: u32,
+    bind: &dyn Fn(u32, &mut Child, u64),
+) -> bool {
+    let Ok((dp, ctl_end)) = spawn_driver(held, drv_image) else {
+        return false;
+    };
+    drv.proc = Some(dp);
+    bind(dp, drv, 0);
+    let pair = sys::channel_create();
+    if pair.status != 0 {
+        return false;
+    }
+    // (a fresh supervisor channel for the new stack; the old one died with it)
+    match spawn_netd(held, netd_image, ctl_end, registry, pair.a2 as u32) {
+        Ok(p) => {
+            netd.proc = Some(p);
+            bind(p, netd, 1);
+            // our end of the new supervisor channel must outlive this call: it is leaked on purpose (one per restart)
+            let _ = pair.a1;
+            true
+        }
+        Err(_) => false,
+    }
 }

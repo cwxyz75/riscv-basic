@@ -13,6 +13,7 @@ pub mod console;
 pub mod devmgr;
 pub mod file;
 pub mod launch;
+pub mod net;
 pub mod startup;
 pub mod tty;
 

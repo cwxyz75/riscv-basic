@@ -4715,12 +4715,16 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ls".to_vec(),
             b"lua".to_vec(),
             b"memfsd".to_vec(),
+            b"netd".to_vec(),
             b"netdrv".to_vec(),
+            b"netinfo".to_vec(),
             b"netsup".to_vec(),
+            b"ping".to_vec(),
             b"probe".to_vec(),
             b"registryd".to_vec(),
             b"sh".to_vec(),
-            b"spin".to_vec()
+            b"spin".to_vec(),
+            b"udpecho".to_vec()
         ],
         "the programs"
     );
@@ -10232,6 +10236,10 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "net_static_config_and_ping_the_gateway",
+            net_tests::net_static_config_and_ping_the_gateway,
         ),
         (
             "net_driver_attaches_and_exchanges_a_frame",
