@@ -96,10 +96,15 @@ pub enum Deq {
 }
 
 /// One deque per level and a 64-bit occupancy mask (best level in one instruction).
-#[derive(Default)]
 pub struct PrioQueues {
     levels: Vec<VecDeque<Tid>>,
     mask: u64,
+}
+
+impl Default for PrioQueues {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PrioQueues {
@@ -333,6 +338,82 @@ impl Class for RtClass {
     }
     fn len(&self) -> usize {
         self.q.len()
+    }
+}
+
+/// Shared-queue mode (task 6b): the two bands as one [`crate::sched::SchedClass`], so the kernel's multi-hart core
+/// (`sched::Sched`, one set of queues for all harts, a per-hart current thread) runs the spec's band structure until
+/// per-hart queues (task 11). Real-time (32 to 63) above normal (0 to 31, idle at 0) with strict precedence; the
+/// normal band rotates at the end of a slice as before; a **real-time thread never rotates** (FIFO within its level:
+/// it runs until it blocks, yields or is preempted by a higher level; the round-robin flag arrives with the per-hart
+/// classes).
+pub struct TwoBand {
+    rt: PrioQueues,
+    normal: PrioQueues,
+}
+
+impl Default for TwoBand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TwoBand {
+    pub fn new() -> TwoBand {
+        TwoBand {
+            rt: PrioQueues::new(),
+            normal: PrioQueues::new(),
+        }
+    }
+
+    fn best_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<Prio> {
+        let rt = self.rt.top_where(ok).map(|(_, p)| p);
+        rt.or_else(|| self.normal.top_where(ok).map(|(_, p)| p))
+    }
+}
+
+impl crate::sched::SchedClass for TwoBand {
+    fn name(&self) -> &'static str {
+        "fixed-priority"
+    }
+    fn enqueue_tail(&mut self, tid: Tid, prio: Prio) {
+        match band(prio) {
+            Band::Rt => self.rt.push_back(prio, tid),
+            _ => self.normal.push_back(prio, tid),
+        }
+    }
+    fn enqueue_head(&mut self, tid: Tid, prio: Prio) {
+        match band(prio) {
+            Band::Rt => self.rt.push_front(prio, tid),
+            _ => self.normal.push_front(prio, tid),
+        }
+    }
+    fn pick_next_where(&mut self, ok: &dyn Fn(Tid) -> bool) -> Option<Tid> {
+        if let Some((t, _)) = self.rt.top_where(ok) {
+            self.rt.remove(t);
+            return Some(t);
+        }
+        let (t, _) = self.normal.top_where(ok)?;
+        self.normal.remove(t);
+        Some(t)
+    }
+    fn remove(&mut self, tid: Tid) {
+        if !self.rt.remove(tid) {
+            self.normal.remove(tid);
+        }
+    }
+    fn contains(&self, tid: Tid) -> bool {
+        self.rt.contains(tid) || self.normal.contains(tid)
+    }
+    fn len(&self) -> usize {
+        self.rt.len() + self.normal.len()
+    }
+    fn would_preempt_where(&self, running: Prio, ok: &dyn Fn(Tid) -> bool) -> bool {
+        self.best_where(ok).is_some_and(|p| p > running)
+    }
+    fn would_rotate_where(&self, running: Prio, ok: &dyn Fn(Tid) -> bool) -> bool {
+        // a real-time thread runs until it blocks, yields or is preempted: no slice rotation
+        band(running) != Band::Rt && self.best_where(ok).is_some_and(|p| p >= running)
     }
 }
 

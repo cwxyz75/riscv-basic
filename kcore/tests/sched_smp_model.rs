@@ -215,6 +215,12 @@ fn random_operations_keep_every_per_hart_rule_fixed_priority() {
 }
 
 #[test]
+fn random_operations_keep_every_per_hart_rule_two_band() {
+    // (priorities 1 to 8: the normal band, where the two-band class must keep every rule of fixed priority)
+    random_run(kcore::sched2::TwoBand::new, true);
+}
+
+#[test]
 fn random_operations_keep_every_per_hart_rule_round_robin() {
     random_run(RoundRobin::new, false);
 }
