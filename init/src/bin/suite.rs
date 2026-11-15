@@ -1166,11 +1166,13 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
         (0, sig::PEER_CLOSED),
         "a blocked wait is woken by PEER_CLOSED"
     );
+    let waited = sys::clock_get() - t0;
     ensure!(
-        // (the lower bound is the check; the upper one only catches a lost wake-up and is loose
-        // because a loaded CI runner can delay the helper by many ticks)
-        within(sys::clock_get() - t0, 2, 60),
-        "the close came after about 3 ticks"
+        // (the lower bound is the check, with a tick of slack for the helper's clock starting at its read of the
+        // request; the upper one only catches a lost wake-up and is loose because a loaded CI runner can delay
+        // the helper by many ticks)
+        within(waited, 1, 60),
+        "the close came after about 3 ticks (waited {waited})"
     );
     let mut reply = [0u8; 32];
     let (m, n) = request(10, b'E', b"");
