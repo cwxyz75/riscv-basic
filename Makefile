@@ -275,6 +275,7 @@ os-boot-test-rva23: kernel
 docs-check:
 	python3 scripts/check_docs.py
 	python3 scripts/bench_compare.py --self-test
+	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-probe.pcap --self-test
 
 quick: fmt-check docs-check
 	cargo test -p abi -p kcore -p proto -p svc -p memfs -p cfmt -p basic-script

@@ -604,6 +604,8 @@ Estimated size (not measured): 4 to 5 PRs; a Fable review.
 
 Acceptance: the guest pings its gateway; UDP echo works through `hostfwd`.
 
+Architecture proposal: `NET-DESIGN.md`; draft specification with the acceptance checks written first: `NET-SPEC.md` (steps 0 to 6 there). Neither is accepted by the owner yet.
+
 Design rule decided ahead of the spec (OD74, direction): a network endpoint is a native control channel plus, for streams, a data socket the client creates and passes in, so the client pays for its buffers; datagrams are control-channel messages; BSD sockets are a shim over that. The message formats, flow control and the driver/stack split are still to be specified. Depends on slices W and V.
 
 - [ ] virtio-net driver

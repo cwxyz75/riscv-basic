@@ -1,12 +1,16 @@
 # NET-DESIGN: an architecture proposal for the network stack (S8 and S9)
 
-Status: **draft v0, 2026-11-14, a proposal for discussion; nothing here is decided or built.** It is design only (no code
+Status: **draft v1, 2026-11-14, a proposal for discussion; nothing here is decided or built.** The concrete contract for S8, with
+every message, constant and acceptance check, is `NET-SPEC.md`; this file is the architecture and its reasons. v1 folds in the scheduler,
+threads and service-directory work that landed after v0 (`SCHED-SMP-SPEC.md`, slices R, SD, DM, T) and three owner
+settlements: doorbells are events, the threading model is left alone for now, and priorities are allowed for but not set
+(section 15 lists exactly what changed). It is design only (no code
 was written for it). It turns OD74's direction into something concrete enough to write an S8 spec from, and it
 records what a survey of existing stacks suggests we keep and avoid. When the owner accepts parts of it they become
-ODs (section 11) and `NET-SPEC.md` (the S8 slice spec, with its acceptance checks, written before any code).
+ODs (section 13) and `NET-SPEC.md` (the S8 slice spec, with its acceptance checks, written before any code).
 
-Sources of constraint: `OS-ARCHITECTURE.md` section 13 and OD18, OD59, OD64-OD66, OD73-OD83; `R-SPEC.md`; `W-SPEC.md`;
-`S6-SPEC.md`; `SYSCALLS.md`; `reviews/2026-11-14-design-review.md` (D4, D8, D10, D11, D12).
+Sources of constraint: `OS-ARCHITECTURE.md` section 13 and OD18, OD59, OD64-OD66, OD73-OD97; `R-SPEC.md`; `W-SPEC.md`;
+`SD-SPEC.md`; `SCHED-SMP-SPEC.md`; `S6-SPEC.md`; `SYSCALLS.md`; `reviews/2026-11-14-design-review.md` (D4, D8, D10, D11, D12).
 
 ## 1. What the platform gives us, and what it does not
 
@@ -27,7 +31,8 @@ This is the box the design has to fit in. Each line is read from the specs, not 
   addresses. A driver gets only an MMIO slot, a DMA VMO and an interrupt (OD65); the supervisor keeps the handles across
   driver lifetimes and resets the device (T42).
 * **Port**: after slice W, registrations woken by thread id, level-triggered by default, one-shot bindings with
-  `port_rearm`, per-job binding quota. **One thread per port** until the wake-one baton exists (R-SPEC question 4, T60).
+  `port_rearm`, per-job binding quota. **One thread per port** until the wake-one baton exists (R-SPEC question 4, T60; it is task 21 of `SCHED-SMP-SPEC.md`,
+  after S8).
 * **Interrupts** (OD75): AIA, delivered to the hart that asked; plain `virt` has none and drivers poll.
 
 **Service structure (slices R, SD, DM, before S8)**
@@ -38,6 +43,22 @@ This is the box the design has to fit in. Each line is read from the specs, not 
 * **Accounted connections** (OD77): a root connection per program, descendants inherit its account; limits per account.
 * A **registry** names services (`/svc/net`); a program sees only the names in its view; a dead service leaves a stale
   entry and clients see `UNAVAILABLE` and retry (OD78). Restart strategies are *not* in R; they come with SD.
+* **Where those slices stand now:** the service runtime exists (`rt::service`, with `other_event` for a non-channel wake
+  source; **not done: the typed request/reply client**, which S8 needs) and its defaults are about 16 connections per account and a
+  pool of 200; the registry service is built (`Publish`, `View`, `UNAVAILABLE`, the `PUBLISH` right) but **step 4, servers
+  publishing themselves and clients reconnecting, is deliberately deferred until S8 needs it**, so S8 is the first real client
+  of the directory; the device manager serves several clients and several devices (a net device kind is still to come).
+* **Threads and scheduling** (`SCHED-SMP-SPEC.md`): `thread_spawn` with a kernel-provisioned stack is built (default 128 threads
+  per launched program; thousands fit); each thread costs about 25 to 30 KiB, **charged to the job that creates it**; the
+  scheduler has a real-time and a normal band run from shared queues under the big kernel lock. **Not before S8, and
+  therefore not assumed:** per-hart run queues and the scheduler out of the big lock (tasks 11, 12, planned with the network stack
+  as their load), wake-one on ports (21), donation through `channel_call` (22), direct hand-off (24), timer slack and one-shot
+  timers (13), real-time budget enforcement (25), `thread_interrupt` (26) and `rt::looper` (27).
+* **Time**: `clock_get` and deadlines are 1 ms ticks today; the move to nanoseconds is one flag-day change in task 6 of
+  `SCHED-SMP-SPEC.md` (check its status when the S8 spec is written).
+* **Priorities**: threads have a band and a priority bounded by their job (`max_prio`); the planned defaults are 20 for launched
+  programs and an RT ceiling of 47 with a 20 ms in 100 ms budget for drivers started by `devmgr`. **There is no real-time
+  budget enforcement and no launcher or `devmgr` policy yet**, so nothing about real-time behaviour can be tested today.
 * **Jobs** charge objects and queued IPC bytes to the creator (OD59). A server's own heap is the server's problem, which
   is why OD74 makes the client create what holds its data.
 
@@ -46,7 +67,8 @@ This is the box the design has to fit in. Each line is read from the specs, not 
 * A scatter-gather or zero-copy path between a client and a server other than a shared VMO the client chose to share.
 * A way for a server to learn that a peer has read from a socket (no fill level; only `WRITABLE`).
 * `WRITABLE` precise for a given size (T28).
-* Threads cheap enough to give every connection one (OD73 is a direction; the benchmark target is not met).
+* Threads cheap to *run* in numbers (creation is cheap now, but wake-one, per-hart queues and hand-off come after S8), and
+  threads that are charged to a *client*: a thread made inside `netd` is charged to `netd`'s job.
 * Identities. Everything is a handle and, with accounts, a *set of connections*.
 * A way for the shell to grant "the network" to a program (D10, slice SD).
 
@@ -212,6 +234,10 @@ buys fault isolation inside one failure domain that restarts together anyway.
 
 ### 5.1 Memory
 
+(`NET-SPEC.md` 5.1 and 4.3 fix the sizes, and one detail differs from the sentence below: only the root resource can create DMA VMOs, so
+`devmgr` creates the three DMA VMOs and they are charged to its job, a recorded shortcut; `netsup` creates the ring VMO, the config blob and
+the flight recorder.)
+
 Two DMA pools (RX and TX), each one DMA VMO of up to 64 pages, which gives **128 slots of 2 KiB** (a 1514-byte frame plus the
 12-byte virtio header fit with room). A third DMA VMO holds the virtqueues themselves (descriptors, avail and used rings: the
 device reads them). One ordinary shared VMO holds the **index rings and a control header**. The system DMA budget is 4 MiB; this
@@ -247,12 +273,13 @@ the same in the other direction.
 
 ### 5.3 Doorbells
 
-Two **events**, one per direction (events are our only cross-process wake object; futexes are process-private). Following
+Two **events**, one per direction (decided by the owner, 2026-11-14: events, not channels; events are our only cross-process
+wake object that carries no queued bytes, and futexes are process-private; `SCHED-SMP-SPEC.md` 5.7 now says the same). Following
 sDDF, a producer signals **only when the ring went from empty to non-empty and the consumer has set its `waiting` flag**;
 the consumer sets the flag, re-checks the ring, then sleeps (the classic way to avoid a lost wakeup, and the same trick the
 virtio spec recommends for interrupt suppression). The `netd` loop binds the event to its port (one-shot binding and
 `port_rearm`, from slice W, suit this). The driver's own wake source is the device interrupt (AIA, OD75) or, on a machine
-with no controller, a poll on the 1 ms tick.
+with no controller, a poll on the timer tick.
 
 ### 5.4 Full queues, drops and counters
 
@@ -293,12 +320,15 @@ The core exposes, in smoltcp's spirit (an idea, not its code):
 ```text
 core.ingress(frame: &[u8], now)               // one received frame, parsed in place
 core.egress(dev: &mut impl Device, now) -> n  // build and queue outgoing frames, bounded
-core.next_deadline() -> Option<Tick>          // when it next wants to run
+core.next_deadline() -> Option<Instant>      // when it next wants to run
 trait Device { fn rx(&mut self) -> Option<RxFrame>; fn tx_slot(&mut self) -> Option<TxFrame>; }  // none = full
 ```
 
-Time is the kernel's 1 ms `clock_get` tick passed in by the adapter; the only timer is `next_deadline`, which becomes the
-deadline of `port_wait`. The `netd` loop is bounded in every phase: drain at most *N* receive frames, serve at most *K* client
+`Instant` is an opaque monotonic nanosecond count: the core never assumes a resolution, so the ABI's move from 1 ms ticks to
+nanoseconds (task 6) is a change in the adapter alone, which converts today's ticks; the only timer is `next_deadline`, which
+becomes the deadline of `port_wait`. The adapter is built on `rt::service`'s `Core`, with the ring doorbell arriving as its
+`other_event` (the way `consoled` bridges its streams), and every call a client library makes carries a deadline (the
+message-loop rule of `SCHED-SMP-SPEC.md` 5.8). The `netd` loop is bounded in every phase: drain at most *N* receive frames, serve at most *K* client
 messages, run the core, flush at most *M* transmit frames, then wait on the doorbell, the service port and the deadline. A
 receive flood therefore cannot starve client requests and the reverse.
 
@@ -368,6 +398,16 @@ and one out of the kernel queue. Transmit mirrors it. OD74 and section 13 of the
 copying and move to shared rings when throughput matters; this design leaves a place for them (an endpoint kind whose data
 path is a client-created ring VMO, the Genode shape) without needing them for S8 or the first S9.
 
+### 7.6 Endpoints in the service runtime's accounts
+
+A channel per endpoint means every open socket is a connection in the server's table, so **slice R's defaults (about 16 connections
+per account, 200 in the pool) would cap a program at about 16 sockets and the whole machine at 200**. The net service therefore
+sets its own per-account and pool limits for endpoints, and the S8 spec must choose them (starting points: a few dozen per account,
+a few hundred in all, each endpoint also charged its stack-side state). The accounts themselves are R's (OD77, OD84): a client's
+root connection comes from whoever launches it, and every endpoint it opens is charged to that account. `rt` gains a small
+client library for the service (typed requests with a mandatory deadline, reconnect on `UNAVAILABLE`), which is the typed
+request/reply client slice R has not yet built.
+
 ## 8. Threads, and how far OTP goes
 
 The question was whether an OTP-like model helps given our threading limits. The answer splits in two.
@@ -381,17 +421,41 @@ The question was whether an OTP-like model helps given our threading limits. The
 * **A message-loop shape** for every process, which slice R's service loop provides.
 * **Connections are temporary**: never restarted by the supervisor; the client reconnects.
 
-**What we do not take: a process or thread per connection.** Reasons: TCP connections share tables and timers, so the
-per-connection actor needs the shared structure anyway; threads are one-to-one kernel threads with a per-job limit and not yet
-cheap (OD73 is a direction); per-thread kernel stacks and a shared big kernel lock make lots of mostly idle threads costly
-and *wake-one* on ports is unbuilt (T60). What OTP's per-connection process buys is **fault isolation**, and we get it by a
-different route: each connection is a state machine whose faults are *program errors we fuzz and model-test away*, the
-account bounds what any one client can consume, and a crash is a restart of a supervised process, not a hang.
-This is worth revisiting when OD73's benchmark is met: the core's interface (events in, actions out) means a per-connection
-actor could later wrap a core instance without changing its tests.
+**What we do not take (for now): a process or thread per connection.** Owner decision, 2026-11-14: leave the threading model
+alone; T67 in `TIDY-UP.md` records that we want to reconsider it. Reasons as they stand after the scheduler work:
+
+* Thread *creation* is now cheap and thousands fit, but each thread costs about 25 to 30 KiB of memory **charged to the job that
+  makes it**, which for a thread inside `netd` is `netd`'s job, not the client's. A thread per connection would put the memory
+  for every connection on the server's account, which is the opposite of principle P2. Only a thread made in a *client's* job
+  (a client-side library) would keep that rule.
+* Running many threads cheaply needs wake-one on ports (task 21), per-hart run queues and the scheduler out of the big kernel
+  lock (tasks 11 and 12) and direct hand-off (task 24), all planned *after* S8, the first two with this stack as their load.
+* TCP connections share tables and timers, so a per-connection actor needs the shared structure anyway.
+
+What OTP's per-connection process buys is **fault isolation**, and we get it by a different route: each connection is a state
+machine whose faults are *program errors we fuzz and model-test away*, the account bounds what any one client can consume, and
+a crash is a restart of a supervised process, not a hang. The core's interface (events in, actions out) means a per-connection or
+per-account actor could later wrap a core instance without changing its tests; the question to ask at S9, once tasks 11, 12 and 24
+exist, is whether front-end loopers (`rt::looper`) in client-charged threads would pay for themselves.
 
 **SMP:** `netdrv` and `netd` are separate processes, so they run on different harts without any new locking in the kernel.
-Inside `netd` there is one thread; if one thread ever limits throughput the measured answer comes after OD73, not before.
+Inside `netd` there is one thread; if one thread ever limits throughput, the measured answer comes after tasks 11, 12 and 24, which
+use this stack as their load (section 11).
+
+### 8.1 Priorities
+
+Owner decision, 2026-11-14: **the design allows the driver to run in the real-time band, but S8 does not set it.** There is no
+real-time budget enforcement before task 25 and no launcher or `devmgr` policy, so a real-time driver could not be tested
+and a runaway one would not be bounded. So:
+
+* `netdrv`, `netd` and `dhcpc` start at the default priority of any launched program. Their priority comes from the job policy at
+  start, never from a constant in the code, so making `netdrv` real-time later is a policy change (the planned ceiling for a
+  `devmgr` driver is 47 with a 20 ms in 100 ms budget), not a design change.
+* **Nothing depends on priority for correctness.** Every queue is bounded and every full queue drops or fails by a stated rule
+  (P3), so a slow or starved process degrades throughput, never safety.
+* When real-time exists, the questions are: does a real-time `netdrv` plus donation through `channel_call` (task 22) to `netd`
+  keep receive latency flat under a normal-band flood, and does budget enforcement (task 25) bound a looping driver. Tests with
+  negative controls come with those tasks, not before.
 
 ## 9. Supervision and failure contracts
 
@@ -431,9 +495,11 @@ the restart-intensity logic as a pure, host-tested module and a `TIDY-UP.md` ent
 
 ## 10. Time
 
-Ticks are 1 ms. ARP timeouts (about 1 s, 3 tries), ARP entry ageing, the ICMP echo timeout, DHCP retransmission and renewal
-and (S9) the TCP timers all come out of one `next_deadline`. A tick of 1 ms is also the poll period for a machine with no
-interrupt controller. The core never reads a clock.
+The core's time is an opaque monotonic nanosecond `Instant` (6.2); the kernel's clock is 1 ms ticks until the task-6 flag day,
+and the adapter converts. ARP timeouts (about 1 s, 3 tries), ARP entry ageing, the ICMP echo timeout, DHCP retransmission and
+renewal and (S9) the TCP timers all come out of one `next_deadline`. The poll period on a machine with no interrupt controller
+is the timer tick. Per-thread timer slack and one-shot timers (task 13, after S8) will let nearby ARP, DHCP and TCP timers
+coalesce into fewer wakes; nothing here depends on them. The core never reads a clock.
 
 ## 11. Testing (acceptance is written before code, per the project rule)
 
@@ -457,6 +523,10 @@ Placed by `TESTING.md` (logic on the host; syscall and wiring behaviour in the Q
   tool that checks every checksum independently, and the structured output carries the drop counters.
 
 **Tier 2, soak**
+* **A network benchmark workload**, in the `##BENCH` format and `bench/baseline.tsv` (`make os-bench`, `bench_compare.py`): a
+  UDP echo flood (packets per second and the drop counters), ping round-trip latency, and the big-lock profile and wake counters
+  (`debug_stat`) during both. Tasks 11 and 12 of `SCHED-SMP-SPEC.md` are planned to use the network stack as their load and
+  benchmark, so S8 must leave them one.
 * Child-kill churn (kill `netdrv`/`netd`/`dhcpc` at random points under traffic; check the contracts of section 9 and a leak
   check of slots, handles and frames), the driver-and-stack race tests at `-smp 2` and `-smp 4`, negative controls (a `netd`
   with checksum verification removed, a driver that violates ring rules), and a flooding client (the account bounds it).
@@ -480,39 +550,71 @@ contracts are the parts most worth attacking), and of the finished slice against
 7. **DMA budget:** 4 MiB system-wide, 64 pages per object. S8 needs about 0.6 MiB. S9 throughput work may want a bigger one.
 8. **Ping sockets rather than raw ICMP?** Recommend yes (7.1).
 9. **IPv6:** out of scope; the crate layout leaves room.
-10. **Verify before writing the spec** (all marked *memory* above): the QEMU `filter-dump` syntax and the exact flags for
+10. **Account limits for endpoints** (7.6): per-account and pool values for the net service, chosen in the S8 spec.
+11. **Settled by the owner, 2026-11-14:** doorbells are events (5.3); the threading model is left alone and T67 stands (section
+    8); priorities are allowed for but not set (8.1).
+12. **Verify before writing the spec** (all marked *memory* above): the QEMU `filter-dump` syntax and the exact flags for
     modern virtio-mmio on the net device; slirp's MACs, lease time and fragmentation behaviour; whether `virtio-net-device`
     needs `-global virtio-mmio.force-legacy=false` as `blkd` does; Fuchsia's current data-socket API; the sDDF queue
     details beyond the paper.
 
 ## 13. Dependencies, order and proposed records
 
-Needs before S8 starts (already queued): **W** (targeted wake: a doorbell must wake one waiter by id; built), **V** (creator-pays
-commit and the read-only mapping of a foreign VMO: built), **R** (service loop and accounts), **SD** (registry and views;
-S8 can use a hard-coded name until it lands, as the shell does today), **DM** (the net device kind and a device manager that
-serves more than one client), **I** (AIA interrupt delivery: built). T28/T30/T60/T61 should be re-read when S8's spec is
-written; none blocks.
+Needs before S8 starts, and where each stands (re-read from the roadmap):
 
-Proposed decision-log entries once the owner accepts the corresponding sections (numbers continue from OD96):
+* **W** (targeted wake, so a doorbell wakes one waiter by id): built. Wake-one on ports (task 21) is *not* needed.
+* **V** (creator-pays commit, the read-only mapping of a foreign VMO): built.
+* **R** (service loop and accounts): built, with `memfsd` and four other servers on it. **Needed and not done: the typed
+  request/reply client**; the endpoint limits of 7.6 are a net-service setting.
+* **SD** (registry and views): the registry service is built; **step 4 (publishing, the shell's `/svc` view, reconnect on
+  `UNAVAILABLE`) is deliberately left until the first new service needs it, so it becomes part of S8**, and S8's use shapes the
+  reconnect policy.
+* **DM**: several devices and several clients are served; the net device kind is S8's.
+* **I** (AIA): built. **T** (kernel memory and threads): built to the extent S8 needs.
+* **Scheduler tasks 1 to 10** of `SCHED-SMP-SPEC.md` (measurement, the two-band scheduler, `thread_spawn`, nanosecond time,
+  the block/wake protocol): planned before S8 so that the service runtime and the network servers are written once against the
+  final thread API. **Tasks 11 and 12** follow S8's first milestone, using this stack as the load.
+* T28/T30/T60/T61 should be re-read when S8's spec is written; none blocks.
 
-* **OD97** the process architecture: supervisor, driver, stack server, DHCP client, the config capability (sections 4, 6.3).
-* **OD98** the driver/stack data path: offset rings, signal on edge, the rights table (section 5).
-* **OD99** the native network protocol and the datagram drop rule (section 7), including that S9's stream data path is a
-  prototype, not a given.
-* **OD100** the failure contracts and the one_for_one plus re-attach strategy (section 9).
-* A **`TIDY-UP.md`** entry for the hand-rolled supervisor, and one for "client-creates-the-socket is unproven".
+Proposed decision-log entries once the owner accepts the corresponding sections (the log's last entry is OD97, the service
+directory, so numbers continue from OD98):
+
+* **OD98** the process architecture: supervisor, driver, stack server, DHCP client, the config capability (sections 4, 6.3).
+* **OD99** the driver/stack data path: offset rings, events as doorbells, signal on edge, the rights table (section 5).
+* **OD100** the native network protocol, the datagram drop rule and the endpoint accounting (section 7), including that S9's
+  stream data path is a prototype, not a given.
+* **OD101** the failure contracts and the one_for_one plus re-attach strategy (section 9).
+* A **`TIDY-UP.md`** entry for the hand-rolled supervisor, and one for "client-creates-the-socket is unproven". (T67, one
+  thread per connection, already exists.)
 
 Suggested slice shape for S8 (to be turned into `NET-SPEC.md`): step 0 the spec and acceptance tests; 1 `netwire` and `netsim`;
-2 `netcore` (ARP, IPv4, ICMP, UDP) against smoltcp; 3 the rings and `netdrv`; 4 `netd`, `netsup` and the endpoint protocol;
-5 `dhcpc`; 6 documents, tick the boxes only after the QEMU run at `-smp 2` and `-smp 4`.
+2 `netcore` (ARP, IPv4, ICMP, UDP) against smoltcp; 3 the rings and `netdrv`; 4 `netd`, `netsup`, the endpoint protocol, the typed client and SD step 4 (publishing `/svc/net`);
+5 `dhcpc`; 6 the network benchmark workload, documents, tick the boxes only after the QEMU run at `-smp 2` and `-smp 4`.
 
 ## 14. Risks and what would change this design
 
 * **The client-creates-the-socket idea fails its prototype** (7.4). Then streams fall back to Fuchsia's shape (the stack creates
   the pipe) with the stack's job charged per account, which changes S9 but not S8.
-* **A single `netd` thread is too slow.** Measure after OD73's benchmark; the core's interface allows sharding later.
+* **A single `netd` thread is too slow.** Measure under tasks 11, 12 and 24 (which use this stack as their load); the core's
+  interface allows wrapping instances in front-end loopers later (T67).
+* **Priority behaviour cannot be tested before real-time scheduling is enforced** (8.1). Mitigation: nothing depends on it, the
+  policy is configuration, and the tests are written with the tasks that make it testable.
+* **The nanosecond flag day lands under us.** Mitigation: the core takes an opaque `Instant` (6.2), so only the adapter changes.
 * **Re-attachment proves fragile.** Fall back to `rest_for_one` (everything restarts together) and accept lost connections on a
   driver crash.
 * **The ring protocol costs more than it saves at S8's traffic.** Mitigation: the `Device` seam allows the one-process build.
 * **Memory-sourced survey claims are wrong** (section 12, Q10): the cost of checking them is small and it is the first task
   of the spec.
+
+## 15. Revision notes (v0 to v1, 2026-11-14)
+
+Why: the roadmap changed after v0 (the scheduler, SMP and threads work in `SCHED-SMP-SPEC.md`, and slices R, SD, DM and T moving).
+What changed, and what did not:
+
+* **Changed:** doorbells are events, settled by the owner (5.3; `SCHED-SMP-SPEC.md` 5.7 corrected to match). Time is an opaque
+  nanosecond `Instant` (6.2, 10). Endpoint accounting against slice R's connection limits (7.6, a gap v0 missed). Threads:
+  the reasoning is restated (8) with the client-pays problem made explicit; the decision is unchanged and T67 stands. Priorities:
+  allowed for, not set (8.1). The network benchmark workload for tasks 11 and 12 (11). SD step 4 and the typed client become part of
+  S8 (13). The proposed ODs are renumbered to OD98 to OD101 because OD97 is the service directory.
+* **Unchanged:** the driver and stack split, the rings, the sans-IO core, the supervision contracts, the datagram drop rule,
+  the open question about client-created sockets, and the testing plan.
