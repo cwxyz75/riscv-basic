@@ -409,6 +409,12 @@ impl Conn {
             self.abort();
             return;
         }
+        self.shutdown_write();
+    }
+
+    /// Half-close: a FIN follows the data, and what the peer sends is still received (the unread-data rule of `close`
+    /// does not apply).
+    pub fn shutdown_write(&mut self) {
         match self.state {
             State::SynSent => {
                 self.state = State::Closed;

@@ -621,13 +621,19 @@ fn our_packet(proto: u8, dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
 }
 
 #[test]
-fn a_tcp_segment_reaches_the_tcp_dispatch_which_in_s8_counts_it() {
+fn a_tcp_segment_reaches_the_tcp_layer_which_counts_a_bad_one_and_sends_nothing() {
     let mut c = up();
     c.ingress(&ip_frame(ME, PEER_MAC, hdr(PEER, MY_IP, 6), &[0; 20]), 0);
-    assert_eq!(c.counters().rx_unknown_protocol, 1);
+    assert_eq!(
+        (
+            c.counters().tcp_bad_header,
+            c.counters().rx_unknown_protocol
+        ),
+        (1, 0)
+    );
     assert!(
         drain(&mut c, 0).is_empty(),
-        "and nothing is sent back: no RST in S8"
+        "a malformed segment draws no reset"
     );
 }
 

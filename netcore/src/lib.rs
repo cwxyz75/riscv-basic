@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 use netwire::{arp, dhcp, eth, icmp, ipv4, udp, Ip, Mac, WireError, BROADCAST_IP, BROADCAST_MAC};
 
 pub mod counters;
+pub mod tcp;
 pub use counters::Counters;
+pub use tcp::*;
 
 /// A monotonic time in nanoseconds (opaque to the core).
 pub type Instant = u64;
@@ -220,6 +222,7 @@ pub struct Core {
     echo_bucket: Bucket,
     unreach_bucket: Bucket,
     counters: Counters,
+    tcp: tcp::Tcp,
 }
 
 impl Core {
@@ -240,6 +243,7 @@ impl Core {
             echo_bucket: Bucket::new(ECHO_REPLIES_PER_SEC),
             unreach_bucket: Bucket::new(UNREACHABLES_PER_SEC),
             counters: Counters::default(),
+            tcp: tcp::Tcp::new(),
         }
     }
 
@@ -682,12 +686,19 @@ impl Core {
 
     /// The earliest time something needs the core again (an ARP retry), if any.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.resolving.iter().map(|r| r.next).min()
+        [
+            self.resolving.iter().map(|r| r.next).min(),
+            self.tcp_next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Run the timers due at `now` (ARP retries; after the third unanswered request the queue is dropped and each
     /// cookie-tagged send gets a `NoRoute` notice).
     pub fn poll(&mut self, now: Instant) -> Vec<Event> {
+        self.tcp_poll(now);
         let mut events = Vec::new();
         let mut i = 0;
         while i < self.resolving.len() {
@@ -835,18 +846,15 @@ impl Core {
                 now,
             ),
             // the dispatch point for TCP (S9). Until a TCP layer exists a segment is, honestly, an unknown protocol.
-            ipv4::PROTO_TCP => self.rx_tcp(),
+            ipv4::PROTO_TCP => {
+                self.rx_tcp_segment(&h, ip.payload, now);
+                Vec::new()
+            }
             _ => {
                 self.counters.rx_unknown_protocol += 1;
                 Vec::new()
             }
         }
-    }
-
-    /// A TCP segment addressed to us. S8 has no TCP: counted as an unknown protocol and dropped.
-    fn rx_tcp(&mut self) -> Vec<Event> {
-        self.counters.rx_unknown_protocol += 1;
-        Vec::new()
     }
 
     /// A destination-unreachable quotes the start of a packet *we sent*: the IP header and the first 8 bytes of its
@@ -889,8 +897,9 @@ impl Core {
     }
 
     /// The TCP layer's hook (S9 fills it in).
-    fn tcp_error(&mut self, _src_port: u16, _dst: Ip, _dst_port: u16, _code: u8) -> Vec<Event> {
+    fn tcp_error(&mut self, src_port: u16, dst: Ip, dst_port: u16, _code: u8) -> Vec<Event> {
         self.counters.icmp_error_tcp += 1;
+        self.tcp_soft_error(src_port, dst, dst_port);
         Vec::new()
     }
 

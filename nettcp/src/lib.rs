@@ -11,3 +11,4 @@ pub mod reasm;
 pub mod rto;
 pub mod sendbuf;
 pub mod seq;
+pub mod siphash;

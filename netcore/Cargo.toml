@@ -6,6 +6,7 @@ description = "OS track S8: the pure network core (interface, ARP, IPv4, ICMP ec
 
 [dependencies]
 netwire = { path = "../netwire" }
+nettcp = { path = "../nettcp" }
 
 [dev-dependencies]
 netsim = { path = "../netsim" }

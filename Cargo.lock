@@ -283,6 +283,7 @@ name = "netcore"
 version = "0.1.0"
 dependencies = [
  "netsim",
+ "nettcp",
  "netwire",
 ]
 
