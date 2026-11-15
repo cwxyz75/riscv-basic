@@ -14,15 +14,8 @@
 use crate::percpu;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-/// The lock classes, in acquisition order: a hart that holds one class may take a class with a
-/// *higher* number, never a lower one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u32)]
-pub enum Class {
-    Bkl = 1,
-    Heap = 2,
-    Uart = 3,
-}
+/// The lock classes (`klock`, SCHED-SMP-SPEC 3.3): the big kernel lock is `Legacy`.
+pub use klock::Class;
 
 /// Owner of the BKL: hart index + 1, or 0 when free.
 static OWNER: AtomicUsize = AtomicUsize::new(0);
@@ -50,25 +43,28 @@ pub fn held() -> bool {
 
 /// Would taking `class` now break the order (the hart holds a class with a higher number)?
 pub fn violates(class: Class) -> bool {
-    percpu::this().locks_held.load(Ordering::Relaxed) >> (class as u32 + 1) != 0
+    percpu::this().held.with(|h| h.check(class, 0).is_err())
 }
 
 fn note_acquire(class: Class) {
-    if violates(class) {
+    let bad = percpu::this().held.with(|h| {
+        let bad = h.check(class, 0);
+        h.push(class, 0);
+        bad
+    });
+    if let Err(v) = bad {
         VIOLATIONS.fetch_add(1, Ordering::SeqCst);
         if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
-            panic!("lock order violation: taking {class:?} while holding a later lock");
+            panic!(
+                "lock order violation: taking {:?} while holding {:?}",
+                v.taking, v.held
+            );
         }
     }
-    percpu::this()
-        .locks_held
-        .fetch_or(1 << class as u32, Ordering::Relaxed);
 }
 
 fn note_release(class: Class) {
-    percpu::this()
-        .locks_held
-        .fetch_and(!(1 << class as u32), Ordering::Relaxed);
+    percpu::this().held.with(|h| h.pop(class, 0));
 }
 
 /// The heap and UART locks tell the checker when they are held.
@@ -87,11 +83,11 @@ pub fn order_check(held: Class, probe: Class) -> bool {
     let was = crate::irq::save_and_disable();
     PANIC_ON_VIOLATION.store(false, Ordering::SeqCst);
     let me = percpu::this();
-    let saved = me.locks_held.load(Ordering::Relaxed);
-    me.locks_held.fetch_or(1 << held as u32, Ordering::Relaxed);
+    let saved = me.held.with(|h| *h);
+    me.held.with(|h| h.push(held, 0));
     let before = VIOLATIONS.load(Ordering::SeqCst);
     match probe {
-        Class::Bkl => {
+        Class::Legacy => {
             lock();
             unlock();
         }
@@ -106,10 +102,12 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             let _ = write!(crate::console::Console, "");
             crate::console::with_uart_for_test();
         }
+        // (the other classes have no lock in the kernel yet: the pure pair table covers them, `klock/tests/order.rs`)
+        other => note_acquire(other),
     }
     let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
     VIOLATIONS.store(before, Ordering::SeqCst);
-    me.locks_held.store(saved, Ordering::Relaxed);
+    me.held.with(|h| *h = saved);
     PANIC_ON_VIOLATION.store(true, Ordering::SeqCst);
     crate::irq::restore(was);
     flagged
@@ -133,14 +131,14 @@ pub fn lock() {
     let me = who();
     // the order check applies to a reentrant take too: a path that holds HEAP or UART and then
     // takes a lock the hart already owns is still taking it in the wrong order
-    if violates(Class::Bkl) {
+    if violates(Class::Legacy) {
         VIOLATIONS.fetch_add(1, Ordering::SeqCst);
         if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
             panic!("lock order violation: taking the BKL while holding a later lock");
         }
     }
     if !LOCK.held_by(me) {
-        note_acquire(Class::Bkl);
+        note_acquire(Class::Legacy);
     }
     #[cfg(feature = "latency-trace")]
     let (outermost_take, asked) = (!LOCK.held_by(me), crate::timer::now());
@@ -159,7 +157,7 @@ pub fn try_lock() -> bool {
     let reentrant = LOCK.held_by(me);
     if LOCK.try_lock(me, &percpu::this().bkl_depth) {
         if !reentrant {
-            note_acquire(Class::Bkl);
+            note_acquire(Class::Legacy);
         }
         OWNER.store(me as usize + 1, Ordering::Relaxed);
         true
@@ -178,7 +176,7 @@ pub fn unlock() {
     // clear the mirror before the release: another hart may take the lock the moment it is out
     let outermost = percpu::this().bkl_depth.get() == 1;
     if outermost {
-        note_release(Class::Bkl);
+        note_release(Class::Legacy);
         OWNER.store(0, Ordering::Relaxed);
         crate::latency::bkl_released();
     }
@@ -196,4 +194,28 @@ pub fn swap_depth(incoming: u32) -> u32 {
 /// Is the BKL free (nobody holds it)? For tests, from any hart.
 pub fn is_free() -> bool {
     LOCK.is_free()
+}
+
+/// The machine `klock`'s locks run on: this kernel's interrupt control, hart identity and order checker.
+pub struct Machine;
+
+impl klock::Machine for Machine {
+    fn irq_save() -> bool {
+        crate::irq::save_and_disable()
+    }
+    fn irq_restore(was: bool) {
+        crate::irq::restore(was);
+    }
+    fn hart() -> u32 {
+        who()
+    }
+    fn relax() {
+        core::hint::spin_loop();
+    }
+    fn acquired(class: Class, _instance: u32) {
+        note_acquire(class);
+    }
+    fn released(class: Class, _instance: u32) {
+        note_release(class);
+    }
 }

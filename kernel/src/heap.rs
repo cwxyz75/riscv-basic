@@ -17,7 +17,6 @@
 use crate::irq;
 use abi::layout::{HEAP_WINDOW_BASE, HEAP_WINDOW_SIZE};
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kcore::frame::PAGE_SIZE;
@@ -35,37 +34,19 @@ struct Heaps {
     grown: Heap,
 }
 
-struct Lock<T> {
-    locked: AtomicBool,
-    v: UnsafeCell<T>,
-}
-
-// SAFETY: access to `v` is serialised by the `locked` flag (a test-and-set spinlock), taken only with interrupts off.
-unsafe impl<T: Send> Sync for Lock<T> {}
-
-impl<T> Lock<T> {
-    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        // SAFETY: the flag is held, so no other reference to the contents exists.
-        let r = f(unsafe { &mut *self.v.get() });
-        self.locked.store(false, Ordering::Release);
-        r
-    }
-}
-
-static HEAPS: Lock<Heaps> = Lock {
-    locked: AtomicBool::new(false),
-    v: UnsafeCell::new(Heaps {
+/// The heap lock: a `klock` spinlock of class `Heap` (interrupts off while held; the order checker sees every take).
+static HEAPS: klock::Spin<Heaps, crate::bkl::Machine> = klock::Spin::new(
+    klock::Class::Heap,
+    0,
+    Heaps {
         boot: Heap::empty(),
         grown: Heap::empty(),
-    }),
-};
+    },
+);
+
+fn with_heaps<R>(f: impl FnOnce(&mut Heaps) -> R) -> R {
+    f(&mut HEAPS.lock())
+}
 
 /// Set when the free bytes in both heaps are below `LOW_WATER`: `service` reads it before taking any lock, so the
 /// safe points cost one load when the heap is healthy.
@@ -87,9 +68,7 @@ struct IrqSafeHeap;
 // (so the timer interrupt cannot re-enter it); `dealloc` returns a block to the heap it came from, told apart by address.
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let was = irq::save_and_disable();
-        crate::bkl::lock_taken(crate::bkl::Class::Heap);
-        let p = HEAPS.with(|h| {
+        with_heaps(|h| {
             let p = match h.boot.allocate_first_fit(layout) {
                 Ok(p) => p.as_ptr(),
                 Err(()) => h
@@ -99,16 +78,11 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
             };
             note_free(h);
             p
-        });
-        crate::bkl::lock_released(crate::bkl::Class::Heap);
-        irq::restore(was);
-        p
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let was = irq::save_and_disable();
-        crate::bkl::lock_taken(crate::bkl::Class::Heap);
-        HEAPS.with(|h| {
+        with_heaps(|h| {
             let a = ptr as usize;
             let base = HEAP_WINDOW_BASE as usize;
             // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract; the block came from the heap whose
@@ -124,8 +98,6 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
             }
             note_free(h);
         });
-        crate::bkl::lock_released(crate::bkl::Class::Heap);
-        irq::restore(was);
     }
 }
 
@@ -136,7 +108,7 @@ static mut HEAP_MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 /// Hand the boot heap region to the allocator. Call once, before anything allocates.
 pub fn init() {
-    HEAPS.with(|h| {
+    with_heaps(|h| {
         // SAFETY: `HEAP_MEMORY` is a private static that nothing else touches; after this call it is used only
         // through the allocator. `init` is called once at boot, before the first allocation, as `Heap::init`
         // requires.
@@ -149,7 +121,7 @@ pub fn init() {
 
 /// Free bytes in both heaps (for leak checks in the self-tests).
 pub fn free_bytes() -> usize {
-    irq::without(|| HEAPS.with(|h| h.boot.free() + h.grown.free()))
+    irq::without(|| with_heaps(|h| h.boot.free() + h.grown.free()))
 }
 
 /// Bytes of the grown heap (zero until the first growth).
@@ -198,7 +170,7 @@ pub fn grow(bytes: usize) -> usize {
     unsafe { core::arch::asm!("sfence.vma zero, zero") };
     let added = mapped * PAGE_SIZE as usize;
     irq::without(|| {
-        HEAPS.with(|h| {
+        with_heaps(|h| {
             // SAFETY: the pages `[window + have, window + have + added)` were just mapped read-write, are
             // contiguous with the grown heap (or start it), and nothing else uses them.
             unsafe {

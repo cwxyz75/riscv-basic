@@ -131,7 +131,7 @@ list, with the reason for their position, in the change that adds them.
 | K2 | The BKL is released at `sret`, in `enter_user`, and before idle `wfi`: another hart can take it while this one runs user code or idles | `bkl_is_released_on_user_entry_and_idle` (a probing hart; mutation-checked) |
 | K3 | A thread's nesting depth is saved at a context switch and restored when it resumes, on whatever hart; the lock itself never leaves the hart that switches | the suite (a lost or doubled level panics on the assert in `unlock`) |
 | K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
-| K5 | Lock order BKL, HEAP, UART | `lock_order_violations_are_detected`, and the checker panics in the real run |
+| K5 | Lock order BKL, HEAP, UART (since task 10 part 1 the checker is `klock`'s `Held` over the full 14-class table of SCHED-SMP-SPEC 3.3; the heap lock is a `klock::Spin` of class HEAP, the BKL is class LEGACY) | `lock_order_violations_are_detected`, the pair table in `klock/tests/order.rs`, and the checker panics in the real run |
 | K6 | The heap grows only at safe points holding the BKL (`heap::service`, tail of a BKL-taking trap, idle): `grow` takes frames and maps window pages under BKL, then the HEAP lock innermost; the allocator itself never calls the frame database | `heap_grows_at_a_safe_point`, the debug assert in `grow` |
 
 ### Planned lock order and invariants (SCHED-SMP-SPEC sections 3 and 8.3; OD85 to OD96; **not built**)

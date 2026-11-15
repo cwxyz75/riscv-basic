@@ -215,12 +215,17 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
     // the order is BKL, then HEAP, then UART: taking an earlier class while holding a later one
     // is flagged, taking a later one while holding an earlier one is not
     for (held, probe, bad) in [
-        (Class::Heap, Class::Bkl, true),
-        (Class::Uart, Class::Bkl, true),
+        (Class::Heap, Class::Legacy, true),
+        (Class::Uart, Class::Legacy, true),
         (Class::Uart, Class::Heap, true),
-        (Class::Bkl, Class::Heap, false),
-        (Class::Bkl, Class::Uart, false),
+        (Class::Legacy, Class::Heap, false),
+        (Class::Legacy, Class::Uart, false),
         (Class::Heap, Class::Uart, false),
+        // the planned classes, through the same checker (the pure table is in `klock/tests/order.rs`)
+        (Class::Heap, Class::Frame, true),
+        (Class::Frame, Class::Heap, false),
+        (Class::Obj, Class::Futex, false),
+        (Class::Futex, Class::Obj, true),
     ] {
         if order_check(held, probe) != bad {
             return Err(format!(
