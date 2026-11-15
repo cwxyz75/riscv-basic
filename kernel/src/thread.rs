@@ -259,8 +259,9 @@ pub fn join_scheduler() -> ! {
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
-        // here (thread_bootstrap enabled them).
+        irq::without(crate::heap::service); // an idle hart is a safe point too
+                                            // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
+                                            // here (thread_bootstrap enabled them).
         unsafe { core::arch::asm!("wfi") };
     }
 }

@@ -111,6 +111,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     heap::init();
     trap::init();
     kmem::init();
+    heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
     aia::init();
     if !RELEASE {

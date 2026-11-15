@@ -396,7 +396,54 @@ fn churn_does_not_leak() -> Outcome {
 /// Every test, in order. The boot test requires exactly these names.
 type Test = (&'static str, fn() -> Outcome);
 
+/// The heap grows at a safe point when it runs low: fill the boot heap's free space, call `service`, and a block
+/// that no longer fits the boot heap is allocated in the grown one (in the window), then everything is freed.
+fn heap_grows_at_a_safe_point() -> Outcome {
+    use alloc::vec::Vec;
+    let grown_before = crate::heap::grown_bytes();
+    let window = abi::layout::HEAP_WINDOW_BASE as usize
+        ..(abi::layout::HEAP_WINDOW_BASE + abi::layout::HEAP_WINDOW_SIZE) as usize;
+    // take nearly everything that is free in both heaps, in 256 KiB blocks
+    let mut hold: Vec<Vec<u8>> = Vec::new();
+    while crate::heap::free_bytes() > 600 * 1024 {
+        let mut v = Vec::new();
+        if v.try_reserve_exact(256 * 1024).is_err() {
+            break;
+        }
+        v.resize(256 * 1024, 1);
+        hold.push(v);
+    }
+    ensure(
+        crate::heap::free_bytes() < crate::heap::LOW_WATER,
+        "the heap is low",
+    )?;
+    // the safe point: the heap grows
+    irq_service();
+    ensure(
+        crate::heap::grown_bytes() > grown_before,
+        "the heap grew at the safe point",
+    )?;
+    ensure(
+        crate::heap::free_bytes() >= 1024 * 1024,
+        "and has room again",
+    )?;
+    let big: Vec<u8> = alloc::vec![7u8; 1024 * 1024];
+    ensure(
+        window.contains(&(big.as_ptr() as usize)),
+        "a block taken after the boot heap ran out lives in the window",
+    )?;
+    ensure(big.iter().all(|&b| b == 7), "and holds what was written")?;
+    drop(big);
+    drop(hold);
+    Ok(())
+}
+
+fn irq_service() {
+    crate::irq::without(crate::heap::service);
+}
+
 pub const TESTS: &[Test] = &[
+    ("heap_grows_at_a_safe_point", heap_grows_at_a_safe_point),
     ("paging_enabled", paging_enabled),
     ("runs_in_the_upper_half", runs_in_the_upper_half),
     ("low_half_is_empty", low_half_is_empty),

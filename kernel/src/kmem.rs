@@ -236,5 +236,5 @@ pub fn kernel_half_unchanged() -> bool {
 /// a leak check that compares before and after must not count a slot made in between as a leak).
 /// Must be called with the big kernel lock held, like `get`.
 pub fn free_frames_accounted() -> usize {
-    get().mm.db.free_count() + crate::kstack::frames_held()
+    get().mm.db.free_count() + crate::kstack::frames_held() + crate::heap::frames_held()
 }
