@@ -1,0 +1,13 @@
+# Third-party sources fetched on demand by `make fetch-third-party` (scripts/fetch_third_party.sh).
+# They go into third_party/fetched/ which is ignored by git: downloads are never committed.
+# (Vendored, committed sources such as third_party/lua are separate and described by their SOURCE.md.)
+#
+# name       url                                                                              file                              sha256 ("-" = not pinned yet)
+busybox      https://busybox.net/downloads/busybox-1.36.1.tar.bz2                              busybox-1.36.1.tar.bz2            b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
+dash         https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-0.5.12.tar.gz    dash-0.5.12.tar.gz                0d632f6b945058d84809cac7805326775bd60cb4a316907d0bd4228ff7107154
+tcc          https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27.tar.bz2              tcc-0.9.27.tar.bz2                de23af78fca90ce32dff2dd45b3432b2334740bb9bb7b05bf60fdbfc396ceb9c
+kilo         https://raw.githubusercontent.com/antirez/kilo/master/kilo.c                      kilo.c                            4a44dd0e41670a9e49ecccb338ee199334f0dd472fc7f86467569cf99c391abe
+coreutils    https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz                            coreutils-9.5.tar.xz              cd328edeac92f6a665de9f323c93b712af1858bc2e0d88f3f7100469470a1b8a
+gnutar       https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz                                       tar-1.35.tar.xz                   4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16
+gzip         https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz                                     gzip-1.13.tar.xz                  7454eb6935db17c6655576c2e1b0fabefd38b4d0936e0f87f48cd062ce91a057
+sqlite       https://www.sqlite.org/2024/sqlite-amalgamation-3450100.zip                       sqlite-amalgamation-3450100.zip   5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4

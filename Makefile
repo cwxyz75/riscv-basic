@@ -9,7 +9,7 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-latency os-bench os-boot-test-overflow
+.PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
 .PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
@@ -278,6 +278,16 @@ os-boot-test-rva23: kernel
 # The inner-loop gate (about a minute): format, the OS host tests without the model checkers, and a
 # headless boot of the release system to the shell and a BASIC session. Run this while iterating;
 # run `make smoke` before the push if you want the whole gate locally (CI runs it); the soak tier is on demand.
+# Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
+# third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
+fetch-third-party:
+	bash scripts/fetch_third_party.sh
+
+# The libc gap survey (UV0): compile real sources syntax-only against libc/include and list what is undeclared.
+# Output in target/libc-gap/. `make libc-gap LIBC_GAP_ARGS="kilo tcc --check"` runs a subset as a gate.
+libc-gap: fetch-third-party
+	python3 -I scripts/libc_gap_survey.py $(LIBC_GAP_ARGS)
+
 # Contract-document checks (TIDY-UP T55): known-stale statements and the decision log's bookkeeping.
 docs-check:
 	python3 scripts/check_docs.py

@@ -2,4 +2,6 @@
 *.swp
 .DS_Store
 /disk.img
+# Third-party downloads (make fetch-third-party) are never committed; vendored sources live elsewhere in third_party/.
+/third_party/fetched/
 .claude/worktrees/
