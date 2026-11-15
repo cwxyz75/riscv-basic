@@ -52,6 +52,8 @@ fn main() {
         "udpecho",
         "netinfo",
         "rngd",
+        "fetch",
+        "httpd",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

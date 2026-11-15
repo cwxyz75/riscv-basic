@@ -12,6 +12,7 @@
 #include <sys/random.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 static int failures;
 
@@ -223,6 +224,40 @@ static void abort_and_reset(void) {
     close(l);
 }
 
+static void names(void) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    CHECK(getaddrinfo("10.0.2.15", "8080", &hints, &res) == 0 && res != NULL, "getaddrinfo of a dotted quad");
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    CHECK(res->ai_family == AF_INET && res->ai_socktype == SOCK_STREAM && ntohs(sin->sin_port) == 8080 && ntohl(sin->sin_addr.s_addr) == 0x0a00020f && res->ai_next == NULL, "with the address, port and one stream entry");
+    freeaddrinfo(res);
+    CHECK(getaddrinfo("localhost", NULL, NULL, &res) == 0 && res->ai_next != NULL, "localhost, both socket types when none is asked for");
+    freeaddrinfo(res);
+    hints.ai_flags = AI_PASSIVE;
+    CHECK(getaddrinfo(NULL, "7000", &hints, &res) == 0 && ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr == 0, "AI_PASSIVE with no node is the wildcard");
+    freeaddrinfo(res);
+    hints.ai_flags = AI_NUMERICHOST;
+    CHECK(getaddrinfo("example.com", "80", &hints, &res) == EAI_NONAME, "AI_NUMERICHOST refuses a name");
+    hints.ai_flags = 0;
+    hints.ai_family = AF_INET6;
+    CHECK(getaddrinfo("::1", "80", &hints, &res) == EAI_FAMILY, "IPv6 is EAI_FAMILY");
+    hints.ai_family = 0;
+    CHECK(getaddrinfo("127.0.0.1", "http", &hints, &res) == EAI_SERVICE, "a service name is EAI_SERVICE (numeric only)");
+    CHECK(gai_strerror(EAI_NONAME) != NULL, "gai_strerror");
+    /* through the harness's scripted DNS server (RESOLVER in the environment), when there is one */
+    hints.ai_flags = 0;
+    hints.ai_socktype = SOCK_STREAM;
+    int r = getaddrinfo("files.test", "80", &hints, &res);
+    if (r == 0) {
+        CHECK(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr == htonl(0x0a000202), "getaddrinfo asks the DNS server and gets 10.0.2.2");
+        freeaddrinfo(res);
+    } else {
+        CHECK(r == EAI_AGAIN, "(no DNS server on the host: getaddrinfo times out as EAI_AGAIN, skipped)");
+    }
+    CHECK(getaddrinfo("nosuch.test", "80", &hints, &res) == (r == 0 ? EAI_NONAME : EAI_AGAIN), "an unknown name is EAI_NONAME");
+}
+
 static void udp(void) {
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in a = addr_of("0.0.0.0", 7303);
@@ -250,6 +285,7 @@ int sockets_test(void) {
     tcp_loopback();
     nonblocking_and_poll();
     abort_and_reset();
+    names();
     udp();
     printf("sockets: %d failures\n", failures);
     return failures;

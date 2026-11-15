@@ -22,6 +22,7 @@ pub mod launch;
 #[cfg(feature = "heap")]
 pub mod net;
 pub mod random;
+pub mod resolve;
 #[cfg(feature = "heap")]
 pub mod service;
 #[cfg(feature = "heap")]

@@ -25,6 +25,7 @@ mod fd;
 mod file;
 mod math;
 mod misc;
+mod netdb;
 mod random;
 mod setjmp;
 mod socket;

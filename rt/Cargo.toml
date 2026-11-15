@@ -8,10 +8,11 @@ description = "OS track: the native userland runtime: syscall wrappers, panic ha
 abi = { path = "../abi" }
 proto = { path = "../proto", optional = true }
 svc = { path = "../svc", optional = true }
+dns = { path = "../dns", optional = true }
 kcore = { path = "../kcore", optional = true }
 linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"], optional = true }
 
 [features]
 # A global allocator that grows by mapping VMOs into a reserved virtual range, the
 # startup-message reader and blocking socket helpers. Programs that use it get `alloc`.
-heap = ["dep:proto", "dep:kcore", "dep:linked_list_allocator", "dep:svc"]
+heap = ["dep:proto", "dep:kcore", "dep:linked_list_allocator", "dep:svc", "dep:dns"]
