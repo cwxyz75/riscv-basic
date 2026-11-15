@@ -421,6 +421,41 @@ pub fn app_main() -> i32 {
             rt::sys::channel_read(rt::BOOTSTRAP, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0);
             return (rt::sys::thread_get_sched(0).a1 & 0xff) as i32;
         }
+        // 68: spawn three threads that sleep for ever, then (mode in the high bits) exit, fault or wait to be killed:
+        // everything the process held, spawned stacks included, must come back (review 2026-11-15, finding 1).
+        n if n & 0xff == 68 => {
+            extern "C" fn sleeper(_a: u64, _tid: u64) -> ! {
+                static W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                loop {
+                    rt::sys::futex_wait(W.as_ptr(), 0, u64::MAX);
+                }
+            }
+            let me = rt::sys::process_self().a1 as u32;
+            for _ in 0..3 {
+                let rec = rt::SpawnArgs {
+                    entry: sleeper as *const () as usize as u64,
+                    flags: rt::abi::spawn::DETACHED,
+                    ..Default::default()
+                };
+                if rt::sys::thread_spawn(me, &rec).status != 0 {
+                    return 1;
+                }
+            }
+            match n >> 8 {
+                0 => return 0,
+                1 => {
+                    // SAFETY: a deliberate fault.
+                    unsafe { core::ptr::write_volatile(8 as *mut u32, 1) };
+                    return 2;
+                }
+                _ => {
+                    rt::sys::channel_write(rt::BOOTSTRAP, b"r".as_ptr(), 1, core::ptr::null(), 0);
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
         52 => {
             // S7b: sleep on a futex forever (until killed): nothing may be left behind
             static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

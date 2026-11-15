@@ -932,7 +932,8 @@ Task 1 records the baseline in `TESTING.md` and this table is restated with abso
   never given a handle, mapped read-write at an address the kernel chooses inside the process's **stack arena**
   (`0x30_0000_0000` to `0x38_0000_0000`, 32 GiB of the user half that nothing else uses), with `guard_bytes`
   (default one page) left unmapped below it. The search is "lowest free gap at or after a per-process hint, wrapping
-  once", O(log regions) on the existing `BTreeMap`. The stack is unmapped and its VMO freed when the thread is
+  once" (a guard below the stack and one above it are part of the gap, so two stacks are never flush; linear in the
+  regions after the hint, bounded by the thread limit). The stack is unmapped and its VMO freed when the thread is
   reaped, so detached threads no longer leak (T52) and a thread never has to unmap the stack it stands on.
 * One region per thread remains. `MAX_REGIONS` is raised to 16,384 as a backstop; each region is already charged to
   the job (the page-table estimate of OD56), so the job's page limit is the real bound. Rejected: one big sparse VMO

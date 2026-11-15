@@ -9033,6 +9033,32 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
 
 // --- thread_spawn (SCHED-SMP-SPEC task 9) ---
 
+/// A process that ends (exits, faults, is killed) with spawned threads alive gives every stack back: its job's page
+/// and thread use return to zero (the review of task 9 found the stacks leaked on a whole-process end).
+fn a_process_ending_with_spawned_threads_leaks_nothing() -> Outcome {
+    let root = root_job()?;
+    for mode in 0..3u64 {
+        let j = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+        let (p, m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 68 | mode << 8, j)?;
+        if mode == 2 {
+            let w = sys::object_wait(m, sig::READABLE, sys::clock_get() + 3000);
+            ensure_eq!(st(w), Some(S::Ok), "the child spawned its threads");
+            ok(sys::process_kill(p, 9), "kill it")?;
+        }
+        wait_ended(p, 3000)?;
+        let code = sys::process_info(p).a1 as i64;
+        let want = [0, -1015, 9][mode as usize];
+        ensure_eq!(code, want, "exit code, mode {mode}");
+        job_use_settles(j, 2, 0, 1000)?;
+        job_use_settles(j, 1, 0, 1000)?;
+        sys::handle_close(p);
+        sys::handle_close(m);
+        sys::handle_close(j);
+    }
+    sys::handle_close(root);
+    Ok(())
+}
+
 /// How deep `spawn_probe` recurses (a kilobyte a level): 0 for a small caller-provided stack.
 static SPAWN_DIG: AtomicU32 = AtomicU32::new(40);
 static SPAWN_SEEN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -10196,6 +10222,10 @@ pub fn app_main() -> i32 {
         (
             "thread_stacks_are_charged_to_the_job_and_credited_back",
             thread_stacks_are_charged_to_the_job_and_credited_back,
+        ),
+        (
+            "a_process_ending_with_spawned_threads_leaks_nothing",
+            a_process_ending_with_spawned_threads_leaks_nothing,
         ),
         (
             "thread_spawn_starts_with_the_documented_state",

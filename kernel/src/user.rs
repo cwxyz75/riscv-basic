@@ -355,9 +355,6 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         for id in process.vmos {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
-        for st in process.stacks.values() {
-            let _ = k.vmos.destroy(&mut k.mm, st.vmo);
-        }
         return Err(LoadError::NoMemory);
     }
     let token = irq::without(|| {
@@ -593,6 +590,10 @@ fn teardown(pid: u32) -> i32 {
         for id in process.vmos {
             let _ = k.vmos.destroy(&mut k.mm, id);
         }
+        // the stacks `thread_spawn` mapped for threads that were still alive (their mappings went with the address space)
+        for st in process.stacks.values() {
+            let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+        }
         let tables: u64 = process.table_charge.values().sum();
         // the address space and its page tables are gone: no hart may keep translations through them
         crate::smp::shootdown();
@@ -617,9 +618,10 @@ fn free_spawn_stack(p: &mut Process, tid: Tid) {
     if let Some(tables) = p.table_charge.remove(&st.region) {
         k.vmos.jobs.credit(p.job, Resource::Pages, tables);
     }
-    let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+    // other harts may cache translations of the stack: they go before the frames can be reused
     crate::smp::shootdown();
     kmem::flush_tlb();
+    let _ = k.vmos.destroy(&mut k.mm, st.vmo);
 }
 
 fn exit_process(code: i32) -> ! {
@@ -2849,7 +2851,7 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
         let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
         let tjob = target.job;
         // a priority above the job's maximum is refused (ACCESS_DENIED), not clamped: the program asked for it
-        let max = kmem::get().vmos.jobs.sched(tjob).map_or(63, |j| j.max_prio);
+        let max = kmem::get().vmos.jobs.sched(tjob).map_or(10, |j| j.max_prio);
         if (1..=63).contains(&prio_req) && prio_req as u8 > max {
             return bad(Status::AccessDenied).map(|_| (0, 0, 0));
         }
@@ -2867,6 +2869,8 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
         } else {
             caller_sp == 0
         };
+        // (with a caller stack the sizes mean nothing: asking for some is a mistake)
+        let sizes_ok = sizes_ok && (!own_stack || (stack_bytes == 0 && guard_bytes == 0));
         if !entry_ok
             || !sizes_ok
             || !sp_ok
@@ -2896,7 +2900,9 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
             None
         } else {
             let (lo, hi) = (abi::user::STACK_ARENA_BASE, abi::user::STACK_ARENA_END);
-            let total = stack_len + guard_len;
+            // the stack's guard below it, and one more guard above it: the next stack up has a guard of its own
+            // below *its* start, so two stacks are never flush (a neighbour's overflow always faults)
+            let total = guard_len + stack_len + guard_len;
             let at = target
                 .aspace
                 .find_gap(lo, hi, total, target.stack_hint)

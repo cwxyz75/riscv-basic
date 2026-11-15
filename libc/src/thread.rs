@@ -285,9 +285,11 @@ pub unsafe extern "C" fn pthread_join(th: PthreadT, retval: *mut *mut c_void) ->
 pub unsafe extern "C" fn pthread_detach(th: PthreadT) -> c_int {
     let t = th as *mut Tcb;
     // (the thread's stack is the kernel's to free; its TCB is freed by whoever comes second: see `exit_thread`)
-    let h = handle_of(t);
     let old = (*t).state.fetch_or(DETACHED, Ordering::SeqCst);
-    rt::sys::handle_close(h);
+    if old & DETACHED != 0 {
+        return EINVAL; // already detached (a second detach, or a thread made detached): nothing to do
+    }
+    rt::sys::handle_close(handle_of(t));
     if old & EXITED != 0 {
         drop(Box::from_raw(t));
     }
