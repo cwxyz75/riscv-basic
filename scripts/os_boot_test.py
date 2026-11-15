@@ -84,7 +84,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -265,6 +265,8 @@ def run_profiled(cmd, kernel):
     stamped = []
     HOST_NET.clear()
     client = []
+    tcp_client = []
+    tcp_server = HostTcpServer(HOST_NET.append)
 
     def pump():
         for raw in proc.stdout:
@@ -273,6 +275,11 @@ def run_profiled(cmd, kernel):
                 port = int(os.environ.get("OS_NET_LAST_HOSTPORT", "0"))
                 th = threading.Thread(target=host_udp_client, args=(port, HOST_NET.append), daemon=True)
                 client.append(th)
+                th.start()
+            if b"s9: tcpecho ready" in raw and not tcp_client:
+                tp = int(os.environ.get("OS_NET_LAST_TCP_HOSTPORT", "0"))
+                th = threading.Thread(target=host_tcp_client, args=(tp, HOST_NET.append), daemon=True)
+                tcp_client.append(th)
                 th.start()
 
     t = threading.Thread(target=pump, daemon=True)
@@ -285,8 +292,9 @@ def run_profiled(cmd, kernel):
         proc.wait()
         status, timed_out = None, True
     t.join(timeout=5)
-    for c in client:
-        c.join(timeout=5)
+    for c in client + tcp_client:
+        c.join(timeout=60)
+    tcp_server.close()
     total = time.monotonic() - start
     out = b"".join(raw for _, raw in stamped)
     prev, ticks, rows = start, {}, []
@@ -306,6 +314,111 @@ def run_profiled(cmd, kernel):
 
 
 HOST_NET = []  # lines the host-side network client produced during the last run
+
+TCP_SERVER_PORT = 47802   # the host TCP server the guest connects to (10.0.2.2:47802 through slirp)
+
+
+def tcp_pattern(seed, n, start=0):
+    """The byte pattern the guest's `pattern(seed, i)` makes: ((i * 2654435761) + seed) >> 24, 32-bit arithmetic."""
+    return bytes(((((i * 2654435761) & 0xffffffff) + seed) & 0xffffffff) >> 24 for i in range(start, start + n))
+
+
+def host_tcp_client(tcp_port, emit):
+    """S9 step 4c: the host's own TCP as an independent client of the guest's echo listener, through `hostfwd=tcp`. 200,000
+    bytes go out while the echo comes back on another thread; the host shuts down its write side; the echo must be complete,
+    byte for byte, and end with a clean end-of-file (not a reset)."""
+    import socket, threading, time
+    want = tcp_pattern(11, 200_000)
+    got = bytearray()
+    bad = []
+    s = None
+    for _ in range(50):
+        try:
+            s = socket.create_connection(("127.0.0.1", tcp_port), timeout=10)
+            break
+        except OSError:
+            time.sleep(0.2)
+    if s is None:
+        emit("##HOSTNET tcp_echo FAIL cannot connect to the forwarded port")
+        return
+
+    def reader():
+        s.settimeout(30)
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    return
+                got.extend(d)
+        except OSError as e:
+            bad.append("read: %s" % e)
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    try:
+        for i in range(0, len(want), 8192):
+            s.sendall(want[i:i + 8192])
+        s.shutdown(socket.SHUT_WR)
+    except OSError as e:
+        bad.append("write: %s" % e)
+    th.join(timeout=40)
+    s.close()
+    if bytes(got) != want:
+        bad.append("echoed %d of %d bytes%s" % (len(got), len(want), "" if bytes(got) == want[:len(got)] else " (and wrong)"))
+    emit("##HOSTNET tcp_echo " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
+
+
+class HostTcpServer:
+    """The host TCP server a guest test connects to (10.0.2.2:TCP_SERVER_PORT through slirp): it sends a greeting and 300,000
+    bytes, shuts down its write side, and checks the 100,000 bytes the guest sends back. Reports once, if the guest came."""
+
+    def __init__(self, emit):
+        import socket, threading
+        self.emit = emit
+        self.stop = threading.Event()
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.srv.bind(("127.0.0.1", TCP_SERVER_PORT))
+            self.srv.listen(4)
+            self.th = threading.Thread(target=self.run, daemon=True)
+            self.th.start()
+        except OSError as e:
+            self.th = None
+            emit("##HOSTNET tcp_server NOTRUN cannot bind %d: %s" % (TCP_SERVER_PORT, e))
+
+    def run(self):
+        import socket
+        self.srv.settimeout(0.5)
+        while not self.stop.is_set():
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                continue
+            bad = []
+            try:
+                c.settimeout(30)
+                c.sendall(b"HELLO-FROM-HOST\n" + tcp_pattern(3, 300_000))
+                c.shutdown(socket.SHUT_WR)
+                got = bytearray()
+                while True:
+                    d = c.recv(65536)
+                    if not d:
+                        break
+                    got.extend(d)
+                if bytes(got) != tcp_pattern(4, 100_000):
+                    bad.append("received %d of 100000 bytes%s" % (len(got), "" if bytes(got) == tcp_pattern(4, len(got)) else " (and wrong)"))
+            except OSError as e:
+                bad.append(str(e))
+            c.close()
+            self.emit("##HOSTNET tcp_server " + ("FAIL " + "; ".join(bad) if bad else "PASS"))
+            return
+
+    def close(self):
+        self.stop.set()
+        if self.th:
+            self.th.join(timeout=3)
+        self.srv.close()
 
 
 def host_udp_client(hostport, emit):
@@ -379,6 +492,8 @@ def run_streaming(cmd):
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     chunks = []
     client = []
+    tcp_client = []
+    tcp_server = HostTcpServer(HOST_NET.append)
 
     def pump():
         for raw in proc.stdout:
@@ -387,6 +502,11 @@ def run_streaming(cmd):
                 port = int(os.environ.get("OS_NET_LAST_HOSTPORT", "0"))
                 t = threading.Thread(target=host_udp_client, args=(port, HOST_NET.append), daemon=True)
                 client.append(t)
+                t.start()
+            if b"s9: tcpecho ready" in raw and not tcp_client:
+                tp = int(os.environ.get("OS_NET_LAST_TCP_HOSTPORT", "0"))
+                t = threading.Thread(target=host_tcp_client, args=(tp, HOST_NET.append), daemon=True)
+                tcp_client.append(t)
                 t.start()
 
     t = threading.Thread(target=pump, daemon=True)
@@ -399,8 +519,9 @@ def run_streaming(cmd):
         proc.wait()
         status, timed_out = None, True
     t.join(timeout=5)
-    for c in client:
-        c.join(timeout=5)
+    for c in client + tcp_client:
+        c.join(timeout=60)
+    tcp_server.close()
     return b"".join(chunks), status, timed_out
 
 
@@ -417,6 +538,18 @@ def net_problems(text):
             found.append("the host UDP client reported nothing")
         elif not res[0].endswith("PASS"):
             found.append(res[0])
+        if "s9: tcpecho ready" in text:
+            r = [l for l in HOST_NET if l.startswith("##HOSTNET tcp_echo")]
+            if not r:
+                found.append("the host TCP client reported nothing")
+            elif not r[0].endswith("PASS"):
+                found.append(r[0])
+        if "s9: host-tcp-server done" in text:
+            r = [l for l in HOST_NET if l.startswith("##HOSTNET tcp_server")]
+            if not r:
+                found.append("the host TCP server reported nothing")
+            elif not r[0].endswith("PASS"):
+                found.append(r[0])
         pcap = os.environ.get("OS_NET_PCAP_USED")
         if pcap and os.path.exists(pcap):
             r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "net_pcap_check.py"), pcap], capture_output=True, text=True)

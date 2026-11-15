@@ -10278,6 +10278,14 @@ pub fn app_main() -> i32 {
             net_tests::net_stream_quotas_and_bad_handles,
         ),
         (
+            "net_tcp_echo_for_the_host",
+            net_tests::net_tcp_echo_for_the_host,
+        ),
+        (
+            "net_tcp_to_the_host_server",
+            net_tests::net_tcp_to_the_host_server,
+        ),
+        (
             "net_streams_survive_a_stack_restart",
             net_tests::net_streams_survive_a_stack_restart,
         ),
