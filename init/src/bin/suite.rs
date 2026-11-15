@@ -10239,6 +10239,10 @@ pub fn app_main() -> i32 {
             thread_stacks_are_charged_to_the_job_and_credited_back,
         ),
         (
+            "net_ping_round_trip_is_measured",
+            net_tests::net_ping_round_trip_is_measured,
+        ),
+        (
             "net_faults_are_survived",
             net_tests::net_faults_are_survived,
         ),

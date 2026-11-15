@@ -433,6 +433,18 @@ pub fn app_main() -> i32 {
                 let restarts = child.restarts;
                 let gen = held.shm.load64(ctl::GENERATION);
                 rt::println!("##NETSUP child={name} exit={code} restarts={restarts} gen={gen}");
+                // the flight record (NET-SPEC 9.4, reduced): the shared counters at the moment a child died
+                let c = |i: usize| held.shm.load64(ctl::STATS + 8 * i);
+                rt::println!(
+                    "##NETFR rx={} tx={} rx_ring_full={} rx_bad_header={} violations={} doorbells={}/{}",
+                    c(netring::stat::RX_FRAMES),
+                    c(netring::stat::TX_FRAMES),
+                    c(netring::stat::RX_DROPPED_RING_FULL),
+                    c(netring::stat::RX_BAD_HEADER),
+                    c(netring::stat::RING_VIOLATIONS),
+                    c(netring::stat::DOORBELLS_SENT),
+                    c(netring::stat::DOORBELLS_SUPPRESSED)
+                );
                 if down {
                     continue;
                 }

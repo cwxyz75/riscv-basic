@@ -183,6 +183,21 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | N1 | `..` in a path never escapes a directory handle | Property test (S4) |
 | N2 | Servers never follow symlinks themselves; the client resolves them in its own namespace | Protocol test (S4) |
 
+## Network (S8, NET-SPEC section 11)
+
+| # | Invariant | How checked |
+|---|---|---|
+| NET1 | Every pool slot is in exactly one ownership state at all times; no slot is in two rings or lost | `netring/tests/ring_model.rs` (every operation of both sides against a reference that tracks each slot, 300 seeds); QEMU `net_driver_attaches_and_exchanges_a_frame` |
+| NET2 | The stack never learns a physical address and never maps a pool writable that it should not | `netsup` gives `netd` duplicates without the DMA right and the receive pool read-only; the loopback test checks both (a writable map is ACCESS_DENIED, `vmo_phys_addr` is refused) |
+| NET3 | The driver never maps a packet pool | by construction (`netdrv` is handed pool handles only for their physical addresses and maps its queue page, the ring VMO and the registers); the loopback test plays the stack |
+| NET4 | No value read from a shared ring, the control header or a packet is trusted without validation | `netring::validate` and the `Pool` transitions; `malformed_entries_are_rejected`; the bad-slot negative control (`net_faults_are_survived`) |
+| NET5 | Every queue and table is bounded and its full behaviour is the stated drop or error | `netcore` scripted tests (ARP cache, pending queues, rate limits), the flood test with the dropped count |
+| NET6 | An endpoint exists exactly as long as its channel; closing or dying frees the port, the identifier and the account charge | `net_clients_are_confined` (port reuse, account arithmetic exact), `proto/tests/net_accounts.rs` |
+| NET7 | Everything an endpoint holds is charged to its account; one account cannot exhaust another's | `net_clients_are_confined` (31 endpoints, then Quota; a second client unaffected) |
+| NET8 | `netd` and `netdrv` never block on a client or on each other, only on their own port with a deadline | the flood test (a stalled endpoint, the stack keeps answering pings), the no-doorbell negative control (the safety poll covers it) |
+| NET9 | No allocation is proportional to a packet-claimed value | `netwire` is `no_std` without `alloc`; `netcore` copies at most one MTU |
+| NET10 | No panic on any input from the wire, a ring or a client | `netwire`'s 200,000-case totality test, `proto::net`'s mutation fuzz, `netring::msg` and the DHCP property tests |
+
 ## Process rules
 
 - No `unsafe` outside the hardware-facing kernel binary; each block has a

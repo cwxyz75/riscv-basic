@@ -199,10 +199,7 @@ impl Drv {
                         if self.fault_bad_slot {
                             // negative control: a slot number the stack must refuse
                             self.fault_bad_slot = false;
-                            let _ = self.ring(RingId::RxUsed).push(Entry {
-                                slot: 200,
-                                len: 60,
-                            });
+                            let _ = self.ring(RingId::RxUsed).push(Entry { slot: 200, len: 60 });
                         }
                         self.rx
                             .mv(id, Slot::DriverHas, Slot::InRing(RingId::RxUsed))

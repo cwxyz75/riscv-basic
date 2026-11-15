@@ -29,14 +29,34 @@ struct Net {
     jobs: [u32; 2],
 }
 
-fn spawn_prog(bi: u32, name: &[u8], args: &[&[u8]], roles: Vec<(Role, u32)>, handles: &[u32], job: u32) -> Result<u32, Detail> {
+fn spawn_prog(
+    bi: u32,
+    name: &[u8],
+    args: &[&[u8]],
+    roles: Vec<(Role, u32)>,
+    handles: &[u32],
+    job: u32,
+) -> Result<u32, Detail> {
     spawn_prog_env(bi, name, args, roles, Vec::new(), handles, job)
 }
 
-fn spawn_prog_env(bi: u32, name: &[u8], args: &[&[u8]], roles: Vec<(Role, u32)>, env: Vec<Vec<u8>>, handles: &[u32], job: u32) -> Result<u32, Detail> {
+fn spawn_prog_env(
+    bi: u32,
+    name: &[u8],
+    args: &[&[u8]],
+    roles: Vec<(Role, u32)>,
+    env: Vec<Vec<u8>>,
+    handles: &[u32],
+    job: u32,
+) -> Result<u32, Detail> {
     let (off, len) = image_entry(bi, name)?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
-    let s = Startup { args: args.iter().map(|a| a.to_vec()).collect(), roles, env, ..Startup::default() };
+    let s = Startup {
+        args: args.iter().map(|a| a.to_vec()).collect(),
+        roles,
+        env,
+        ..Startup::default()
+    };
     let bytes = s.encode().map_err(|_| msg_at(line!()))?;
     rt::spawn::spawn_in(&image, &bytes, handles, job).map_err(|e| {
         let mut d = Detail::new();
@@ -509,7 +529,9 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     let publish_conn = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
     let (ctl, ctl_theirs) = channel()?;
     let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
-    let fault_env: Vec<Vec<u8>> = fault.map(|f| vec![[&b"FAULT="[..], f].concat()]).unwrap_or_default();
+    let fault_env: Vec<Vec<u8>> = fault
+        .map(|f| vec![[&b"FAULT="[..], f].concat()])
+        .unwrap_or_default();
     let sup = spawn_prog_env(
         bi,
         b"bin/netsup",
@@ -1198,13 +1220,18 @@ pub fn net_faults_are_survived() -> Outcome {
         ensure!(again, "pings flow again after the violation");
         let stats = cfg.stats(t(3000)).map_err(|_| msg_at(line!()))?;
         let violations = stats.last().map(|_| stats[stats.len() - 4].1).unwrap_or(0);
-        ensure!(violations >= 1, "the stack counted the ring violation ({violations})");
+        ensure!(
+            violations >= 1,
+            "the stack counted the ring violation ({violations})"
+        );
         Ok(())
     })();
     f.close();
     r?;
     // Q17: the stack never signals the driver: traffic still flows, within the safety poll
-    let Some(mut f) = start_full_opts(false, Some(b"no-doorbell"))? else { return Ok(()) };
+    let Some(mut f) = start_full_opts(false, Some(b"no-doorbell"))? else {
+        return Ok(());
+    };
     let r = (|| -> Outcome {
         let t = |n: u64| sys::clock_get() + n;
         let mut cfg = f.connect(b"net-config")?;
@@ -1224,15 +1251,21 @@ pub fn net_faults_are_survived() -> Outcome {
     r?;
     // Q14: a stack that dies on a marked datagram, fed the marker until the supervisor gives up: the network is marked down, and
     // nothing keeps restarting
-    let Some(mut f) = start_full_opts(false, Some(b"crash-on-magic"))? else { return Ok(()) };
+    let Some(mut f) = start_full_opts(false, Some(b"crash-on-magic"))? else {
+        return Ok(());
+    };
     let r = (|| -> Outcome {
         let t = |n: u64| sys::clock_get() + n;
         let mut cfg = f.connect(b"net-config")?;
         configure_static(&mut cfg)?;
         drop(cfg);
         for round in 0..6 {
-            let Ok(mut net) = f.connect(b"net") else { break };
-            let Ok(mut udp) = net.open_udp(0, 0, t(3000)) else { break };
+            let Ok(mut net) = f.connect(b"net") else {
+                break;
+            };
+            let Ok(mut udp) = net.open_udp(0, 0, t(3000)) else {
+                break;
+            };
             let _ = udp.send_to([10, 0, 2, 2], 9, b"##crash please");
             nap(600)?;
             let (_, down, _) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
@@ -1242,8 +1275,57 @@ pub fn net_faults_are_survived() -> Outcome {
             ensure!(round < 5, "the supervisor never gave up");
         }
         let (kids, down, _) = sup_status(&f).ok_or_else(|| msg_at(line!()))?;
-        ensure!(down, "the supervisor marked the network down after repeated crashes");
-        ensure!(kids[1].1 <= 4, "a bounded number of restarts ({})", kids[1].1);
+        ensure!(
+            down,
+            "the supervisor marked the network down after repeated crashes"
+        );
+        ensure!(
+            kids[1].1 <= 4,
+            "a bounded number of restarts ({})",
+            kids[1].1
+        );
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// The network benchmark (NET-SPEC 12.3, tier 2 data): the round trip of a ping to the gateway, median and 99th percentile of 200
+/// (`##BENCH` lines; measurements, not verdicts). The first numbers are the load the scheduler tasks 11 and 12 will be judged on.
+pub fn net_ping_round_trip_is_measured() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s8: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut net = f.connect(b"net")?;
+        let mut echo = net.open_echo(t(3000)).map_err(|_| msg_at(line!()))?;
+        // warm up (ARP, link)
+        for seq in 0..5u16 {
+            let _ = echo.ping([10, 0, 2, 2], seq, b"w", t(1500));
+        }
+        let mut rtts: Vec<u64> = Vec::new();
+        for seq in 0..200u16 {
+            let c0 = sys::debug_stat(6);
+            if echo
+                .ping([10, 0, 2, 2], 100 + seq, &[7u8; 32], t(1500))
+                .is_ok()
+            {
+                rtts.push((sys::debug_stat(6) - c0) * 100);
+            }
+        }
+        ensure!(
+            rtts.len() >= 150,
+            "most pings were answered ({} of 200)",
+            rtts.len()
+        );
+        rtts.sort_unstable();
+        let (p50, p99) = (rtts[rtts.len() / 2], rtts[rtts.len() * 99 / 100]);
+        println!("##BENCH net_ping_rtt_p50 {p50} ns");
+        println!("##BENCH net_ping_rtt_p99 {p99} ns");
         Ok(())
     })();
     f.close();

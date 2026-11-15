@@ -608,11 +608,11 @@ Architecture proposal: `NET-DESIGN.md`; draft specification with the acceptance 
 
 Design rule decided ahead of the spec (OD74, direction): a network endpoint is a native control channel plus, for streams, a data socket the client creates and passes in, so the client pays for its buffers; datagrams are control-channel messages; BSD sockets are a shim over that. The message formats, flow control and the driver/stack split are still to be specified. Depends on slices W and V.
 
-Progress (NET-SPEC steps; boxes tick only when verified in QEMU at `-smp 2` and `-smp 4`): step 1 (`netwire`, `netsim`) and step 2 (`netcore`, `supervise`) are built and host-tested (goldens from the real slirp capture, scripted packet tests, a seeded simulation, mutation checks; H5 smoltcp interop is not done: TIDY-UP T86); the pure `dhcp` client (step 5's core) is built; steps 3, 4, 5's programs and 6 are not.
+Progress (NET-SPEC steps; boxes tick only when verified in QEMU at `-smp 2` and `-smp 4`): steps 1 and 2 (`netwire`, `netsim`, `netcore`, `supervise`) and the pure `dhcp` client are merged (host-tested; H5 smoltcp interop not done: TIDY-UP T86); steps 3 to 5 are built on one branch: `netring` (loom-checked doorbell handshake), `devmgr`'s `ClaimNet`, `netdrv`, `netsup`, `netd`, `proto::net`, `rt::net`, `dhcpc`, `ping`, `udpecho`, `netinfo`, and the QEMU tests (loopback against slirp, ping the gateway with static configuration and with DHCP, UDP echo through `hostfwd` with the host's own UDP stack as the client and a clean packet capture, accounts and authority, killing each child, the negative controls, the flood); run at one and four harts on the AIA machine and at two harts on plain `virt`. Step 6's remainder is in TIDY-UP T87.
 
-- [ ] virtio-net driver
-- [ ] ARP, IPv4, ICMP, UDP
-- [ ] DHCP client
+- [x] virtio-net driver (verified in QEMU: smp1 and smp4 on AIA, smp2 on plain virt)
+- [x] ARP, IPv4, ICMP, UDP (as above; the guest pings its gateway, the host's UDP stack gets its datagrams echoed)
+- [x] DHCP client (as above: QEMU's own server configures the interface)
 
 ### S9: TCP and HTTP
 
