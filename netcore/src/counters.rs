@@ -58,4 +58,14 @@ counters!(
     icmp_error_tcp,
     icmp_error_other_protocol,
     icmp_error_malformed,
+    // S9 step 4a: TCP in the core
+    tcp_checksum,
+    tcp_bad_header,
+    tcp_no_connection,
+    tcp_rst_sent,
+    tcp_rst_rate_limited,
+    tcp_listen_overflow,
+    tcp_orphan_reset,
+    tcp_loopback_dropped,
+    tcp_tx_no_route,
 );
