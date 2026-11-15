@@ -40,6 +40,26 @@ fn the_run_queue_class_may_be_taken_twice_in_ascending_instance_order() {
 }
 
 #[test]
+fn two_run_queues_means_two() {
+    let mut h = Held::new();
+    h.check(Class::Rq, 0).unwrap();
+    h.push(Class::Rq, 0);
+    h.check(Class::Rq, 1).unwrap();
+    h.push(Class::Rq, 1);
+    assert!(
+        h.check(Class::Rq, 2).is_err(),
+        "a third run-queue lock is refused"
+    );
+}
+
+#[test]
+#[should_panic(expected = "does not hold")]
+fn releasing_a_lock_that_is_not_held_is_a_bug() {
+    let mut h = Held::new();
+    h.pop(Class::Vmo, 0);
+}
+
+#[test]
 fn a_chain_is_checked_against_everything_held() {
     // the nestings of 3.3: LEGACY, OBJ, JOBS, RQ, HEAP, UART
     let mut h = Held::new();

@@ -32,19 +32,27 @@ impl Machine for M {
     fn released(_: Class, _: u32) {}
 }
 
-fn model_rounds(rounds: u32) {
+/// Two harts each add `rounds` with a read-modify-write that loses updates unless something excludes. `locked`: under
+/// the real `Spin`; not: the negative control, on a counter nothing protects (the checkers must see it lose).
+fn model_rounds_with(rounds: u32, locked: bool) {
     NEXT.store(0, std::sync::atomic::Ordering::Relaxed);
     let lock: Arc<Spin<AtomicU32, M>> = Arc::new(Spin::new(Class::Jobs, 0, AtomicU32::new(0)));
+    let plain = Arc::new(AtomicU32::new(0));
     let hs: Vec<_> = (0..2)
         .map(|_| {
-            let l = lock.clone();
+            let (l, p) = (lock.clone(), plain.clone());
             thread::spawn(move || {
                 for _ in 0..rounds {
-                    let g = l.lock();
-                    // a read-modify-write that loses updates unless the lock excludes
-                    let v = g.load(Ordering::Relaxed);
-                    thread::yield_now();
-                    g.store(v + 1, Ordering::Relaxed);
+                    if locked {
+                        let g = l.lock();
+                        let v = g.load(Ordering::Relaxed);
+                        thread::yield_now();
+                        g.store(v + 1, Ordering::Relaxed);
+                    } else {
+                        let v = p.load(Ordering::Relaxed);
+                        thread::yield_now();
+                        p.store(v + 1, Ordering::Relaxed);
+                    }
                 }
             })
         })
@@ -52,17 +60,28 @@ fn model_rounds(rounds: u32) {
     for h in hs {
         h.join().unwrap();
     }
-    assert_eq!(lock.lock().load(Ordering::Relaxed), 2 * rounds);
+    let total = if locked {
+        lock.lock().load(Ordering::Relaxed)
+    } else {
+        plain.load(Ordering::Relaxed)
+    };
+    assert_eq!(total, 2 * rounds, "updates were lost");
 }
 
-#[cfg(loom)]
-#[test]
-fn the_lock_excludes_under_loom() {
-    loom::model(|| model_rounds(1));
+fn explore(rounds: u32, locked: bool) {
+    #[cfg(loom)]
+    loom::model(move || model_rounds_with(rounds, locked));
+    #[cfg(shuttle)]
+    shuttle::check_random(move || model_rounds_with(rounds, locked), 2000);
 }
 
-#[cfg(shuttle)]
 #[test]
-fn the_lock_excludes_under_shuttle() {
-    shuttle::check_random(|| model_rounds(3), 2000);
+fn the_lock_excludes() {
+    explore(if cfg!(loom) { 1 } else { 3 }, true);
+}
+
+#[test]
+fn without_the_lock_the_model_loses_updates() {
+    // the negative control: the same model on an unprotected counter must be caught
+    assert!(std::panic::catch_unwind(|| explore(1, false)).is_err());
 }

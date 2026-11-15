@@ -134,7 +134,14 @@ impl Held {
             // classes are the same class (the console re-taken by itself)
             return if top <= class { Ok(()) } else { Err(bad) };
         }
-        if class > top || (class == top && class.allows_two() && instance > top_instance) {
+        // ("two" means two: a third lock of the class is refused)
+        let same = self.stack[..self.len]
+            .iter()
+            .filter(|&&(c, _)| c == class)
+            .count();
+        if class > top
+            || (class == top && class.allows_two() && instance > top_instance && same < 2)
+        {
             Ok(())
         } else {
             Err(bad)
@@ -162,7 +169,9 @@ impl Held {
             self.stack.copy_within(i + 1..self.len, i);
             self.len -= 1;
         } else {
-            debug_assert!(
+            // (a reentrant class is released only at its outermost take, so it is held then too; only the legacy lock
+            // and the console are lenient, as the kernel's hand-overs of the big lock make an exact count hard to prove)
+            assert!(
                 class.reentrant(),
                 "released a {class:?} lock the hart does not hold"
             );
@@ -239,6 +248,7 @@ impl<T, M: Machine> Spin<T, M> {
             lock: self,
             depth,
             was,
+            _not_send: PhantomData,
         }
     }
 
@@ -258,6 +268,7 @@ impl<T, M: Machine> Spin<T, M> {
             lock: self,
             depth,
             was,
+            _not_send: PhantomData,
         })
     }
 
@@ -272,7 +283,12 @@ pub struct Guard<'a, T, M: Machine> {
     lock: &'a Spin<T, M>,
     depth: Depth,
     was: bool,
+    /// A guard belongs to the hart (and `Held` stack) that took it: not `Send`.
+    _not_send: PhantomData<*mut ()>,
 }
+
+// SAFETY: `&Guard` gives `&T` only, so sharing a guard shares `&T`: sound exactly when `T: Sync`.
+unsafe impl<T: Sync, M: Machine> Sync for Guard<'_, T, M> {}
 
 impl<T, M: Machine> Deref for Guard<'_, T, M> {
     type Target = T;

@@ -163,7 +163,7 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | X7 | A wake never switches threads; the switch happens only in `schedule()`, entered with no lock held | code structure; the T62 scenario test |
 | G1 | State not yet peeled is touched only with the legacy lock held; each peel names the state it moves (replaces K1) | the asserts in the accessors; `LEGACY_SYSCALLS` checked against SYSCALLS.md |
 | PK1 | A wake that follows a waiter's registration is never lost (replaces the token rule of C3; built in task 10, running under the big lock) | `kcore/tests/park_concurrency.rs`: loom and shuttle park models with three negative controls (prepare after registering, `park` read outside the run-queue lock, the waker skipping the run-queue lock) |
-| PK2 | A thread runs on at most one hart and is never queued while running (C4 across harts) | the same models; `Sched::audit` |
+| PK2 | A thread runs on at most one hart and is never queued while running (C4 across harts) | `Sched::audit` and the multi-hart random model (`sched_smp_model.rs`); the park model has no second hart, so it does not check this |
 | W1' | The dirty log is empty whenever the object lock is released (replaces W1) | by construction in the guard; loom model; `wait-audit` |
 | ID1 | No runnable thread stays queued while a hart it may run on idles with no IPI pending | shuttle idle model with three negative controls; the starvation watchdog |
 | GP1 | At quiescence no hart runs a thread while a higher-priority thread that may run there is queued (throttled RT excepted) | `Sched::audit` after every model step, against an independent reference |

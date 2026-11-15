@@ -20,10 +20,6 @@
 //! and does not block; of one that is neither (idle park word), it does nothing: **a wake is never remembered**.
 //! ([`Sched::block_current`] and [`Sched::sleep_until`] prepare for a caller that has not: under one lock the two
 //! are the same step.)
-//!
-//! ---- the remainder of the old text, about the token, no longer applies: ----
-//! The one exception is [`Sched::sleep_until`], which used to discard a token left from
-//! before the call: a sleep is for *time*, and a stale wake must not cut it short.
 
 use crate::park::Park;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -533,6 +529,9 @@ impl<C: SchedClass> Sched<C> {
     pub fn sleep_until_on(&mut self, hart: usize, deadline: u64) -> Result<bool, SchedError> {
         let c = self.cur[hart].ok_or(SchedError::NoCurrent)?;
         let park = &self.threads.get(&c).expect("current exists").park;
+        if park.take_notified() {
+            return Ok(false); // a wake already arrived after `prepare_block`: the wait is over before it began
+        }
         park.prepare();
         if deadline <= self.now {
             park.cancel();
@@ -549,6 +548,12 @@ impl<C: SchedClass> Sched<C> {
     }
 
     pub fn wake_on(&mut self, caller: usize, tid: Tid) -> Result<(), SchedError> {
+        self.wake_counted_on(caller, tid).map(|_| ())
+    }
+
+    /// `wake_on`, saying whether the wake **counted**: the thread was blocked (now runnable) or prepared (now
+    /// notified). False: it was neither, and nothing was done (a wake is never remembered).
+    pub fn wake_counted_on(&mut self, caller: usize, tid: Tid) -> Result<bool, SchedError> {
         let t = self.threads.get_mut(&tid).ok_or(SchedError::NoSuchThread)?;
         match t.state {
             State::Blocked => {
@@ -560,14 +565,12 @@ impl<C: SchedClass> Sched<C> {
                 let prio = t.prio;
                 self.class.enqueue_tail(tid, prio);
                 self.resched_all(caller);
+                Ok(true)
             }
             // counts only if the thread is prepared; otherwise nothing is left behind
-            State::Running | State::Runnable => {
-                let _ = t.park.notify();
-            }
-            State::Exited => {}
+            State::Running | State::Runnable => Ok(t.park.notify()),
+            State::Exited => Ok(false),
         }
-        Ok(())
     }
 
     /// The current thread gives up the rest of its slice.
@@ -772,6 +775,13 @@ impl<C: SchedClass> Sched<C> {
                     "thread {tid}: timer record disagrees with the timer set"
                 ));
             }
+            // PK: a blocked thread is prepared; a notification belongs to a thread that is running or runnable
+            if t.state == State::Blocked && t.park.state() != crate::park::ParkState::Prepared {
+                return Err(alloc::format!("blocked thread {tid} is not prepared"));
+            }
+            if t.state == State::Blocked && t.park.state() == crate::park::ParkState::Notified {
+                return Err(alloc::format!("blocked thread {tid} was notified"));
+            }
             if t.state == State::Exited && t.park.state() != crate::park::ParkState::Idle {
                 return Err(alloc::format!("exited thread {tid} has a park word set"));
             }
@@ -814,5 +824,97 @@ impl<C: SchedClass> Sched<C> {
             }
         }
         Ok(())
+    }
+}
+
+/// A FIFO of threads waiting for something, on the park protocol: a thread prepares, queues itself and blocks; a
+/// waker takes the longest-waiting thread whose wake **counts** (it is blocked, or prepared and not yet blocked). Not
+/// the token-era `WaitQueue`: nothing is remembered for a thread that is not waiting. Used for kernel-thread waits
+/// (join, the reaper, the self-tests); the user-visible waits register in the wait table instead.
+#[derive(Default)]
+pub struct Waiters {
+    waiters: VecDeque<Tid>,
+}
+
+impl Waiters {
+    pub fn new() -> Waiters {
+        Waiters::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiters.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    /// Test hook: queue `tid` without blocking it (the half-way state of a waiter that has prepared and queued but not
+    /// yet blocked).
+    #[doc(hidden)]
+    pub fn test_enqueue(&mut self, tid: Tid) {
+        self.waiters.push_back(tid);
+    }
+
+    /// Queue the thread running on `hart` and block it. False if a wake that arrived first let it through (it is
+    /// then no longer queued).
+    pub fn wait_on<C: SchedClass>(
+        &mut self,
+        sched: &mut Sched<C>,
+        hart: usize,
+    ) -> Result<bool, SchedError> {
+        let me = sched.current_on(hart).ok_or(SchedError::NoCurrent)?;
+        sched.prepare_block_on(hart)?;
+        // a thread is queued at most once: a stale entry (it was woken some other way) must not swallow a later wake
+        self.waiters.retain(|&t| t != me);
+        self.waiters.push_back(me);
+        let blocked = sched.block_current_on(hart)?;
+        if !blocked {
+            self.waiters.retain(|&t| t != me);
+        }
+        Ok(blocked)
+    }
+
+    /// `wait_on` with a deadline (absolute ticks). After waking, the caller tells a wake from the deadline by
+    /// re-checking its condition and the clock; a deadline wake leaves a stale entry, which the next wake skips and
+    /// the thread's next wait replaces.
+    pub fn wait_until_on<C: SchedClass>(
+        &mut self,
+        sched: &mut Sched<C>,
+        hart: usize,
+        deadline: u64,
+    ) -> Result<bool, SchedError> {
+        let me = sched.current_on(hart).ok_or(SchedError::NoCurrent)?;
+        sched.prepare_block_on(hart)?;
+        self.waiters.retain(|&t| t != me);
+        self.waiters.push_back(me);
+        let blocked = sched.sleep_until_on(hart, deadline)?;
+        if !blocked {
+            self.waiters.retain(|&t| t != me);
+        }
+        Ok(blocked)
+    }
+
+    /// Wake the longest-waiting thread whose wake counts; stale entries (gone, or neither blocked nor prepared) are
+    /// dropped. A prepared thread that has not blocked yet is notified, so it will not block: that is a wake.
+    pub fn wake_one_on<C: SchedClass>(
+        &mut self,
+        sched: &mut Sched<C>,
+        caller: usize,
+    ) -> Option<Tid> {
+        while let Some(tid) = self.waiters.pop_front() {
+            if sched.wake_counted_on(caller, tid) == Ok(true) {
+                return Some(tid);
+            }
+        }
+        None
+    }
+
+    pub fn wake_all_on<C: SchedClass>(&mut self, sched: &mut Sched<C>, caller: usize) -> usize {
+        let mut n = 0;
+        while self.wake_one_on(sched, caller).is_some() {
+            n += 1;
+        }
+        n
     }
 }

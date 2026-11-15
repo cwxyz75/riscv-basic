@@ -651,6 +651,10 @@ impl<N: Class> HartRq<N> {
             .filter(|&c| Some(c) != self.idle)
             .ok_or(Error::NoCurrent)?;
         let t = self.threads.get_mut(&c).expect("current exists");
+        if t.park == crate::park::ParkState::Notified {
+            t.park = crate::park::ParkState::Idle;
+            return Ok(false); // a wake already arrived after `prepare_block`
+        }
         t.park = crate::park::ParkState::Prepared;
         if deadline <= self.now {
             t.park = crate::park::ParkState::Idle;

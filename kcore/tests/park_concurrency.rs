@@ -135,8 +135,20 @@ fn explore(v: Variant) {
     shuttle::check_random(move || model(v), 5000);
 }
 
+/// The variant is caught **for the reason claimed**: the panic is the PK1 assertion, not some accident.
 fn is_caught(v: Variant) -> bool {
-    std::panic::catch_unwind(move || explore(v)).is_err()
+    match std::panic::catch_unwind(move || explore(v)) {
+        Ok(()) => false,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            // (loom and shuttle re-raise the model's panic, sometimes wrapped: look for the assertion's own words)
+            msg.contains("PK1") || msg.contains("lost")
+        }
+    }
 }
 
 #[test]

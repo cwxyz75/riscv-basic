@@ -23,6 +23,8 @@ enum M {
 struct MT {
     prio: Prio,
     state: M,
+    /// 0 idle, 1 prepared, 2 notified (the park word)
+    park: u8,
     deadline: Option<u64>,
     /// slice ticks it will have when it next runs (a preempted thread keeps its rest)
     slice: u32,
@@ -94,6 +96,7 @@ impl Model {
             MT {
                 prio,
                 state: M::Ready,
+                park: 0,
                 deadline: None,
                 slice: TIMESLICE_TICKS,
             },
@@ -110,6 +113,7 @@ impl Model {
             MT {
                 prio,
                 state: M::Running,
+                park: 0,
                 deadline: None,
                 slice: TIMESLICE_TICKS,
             },
@@ -120,6 +124,11 @@ impl Model {
     fn block(&mut self) -> bool {
         let c = self.current.unwrap();
         let t = self.threads.get_mut(&c).unwrap();
+        if t.park == 2 {
+            t.park = 0;
+            return false;
+        }
+        t.park = 1;
         t.state = M::Blocked;
         self.current = None;
         self.dispatch();
@@ -127,10 +136,17 @@ impl Model {
     }
     fn sleep_until(&mut self, deadline: u64) -> bool {
         let c = self.current.unwrap();
-        if deadline <= self.now {
+        let t = self.threads.get_mut(&c).unwrap();
+        if t.park == 2 {
+            t.park = 0;
             return false;
         }
-        self.threads.get_mut(&c).unwrap().deadline = Some(deadline);
+        t.park = 1;
+        if deadline <= self.now {
+            t.park = 0;
+            return false;
+        }
+        t.deadline = Some(deadline);
         self.block()
     }
     fn wake(&mut self, tid: Tid) {
@@ -138,13 +154,27 @@ impl Model {
         match t.state {
             M::Blocked => {
                 t.deadline = None;
+                t.park = 0;
                 t.state = M::Ready;
                 self.ready.push(tid);
                 self.resched();
             }
-            // a wake that finds nobody waiting is not remembered (the park protocol, SCHED-SMP-SPEC 3.7)
-            M::Running | M::Ready | M::Exited => {}
+            // counts only for a prepared thread; nothing is remembered otherwise (SCHED-SMP-SPEC 3.7)
+            M::Running | M::Ready => {
+                if t.park == 1 {
+                    t.park = 2;
+                }
+            }
+            M::Exited => {}
         }
+    }
+    fn prepare(&mut self) {
+        let c = self.current.unwrap();
+        self.threads.get_mut(&c).unwrap().park = 1;
+    }
+    fn cancel(&mut self) {
+        let c = self.current.unwrap();
+        self.threads.get_mut(&c).unwrap().park = 0;
     }
     fn yield_now(&mut self) {
         let c = self.current.unwrap();
@@ -155,7 +185,9 @@ impl Model {
     }
     fn exit(&mut self) {
         let c = self.current.unwrap();
-        self.threads.get_mut(&c).unwrap().state = M::Exited;
+        let t = self.threads.get_mut(&c).unwrap();
+        t.state = M::Exited;
+        t.park = 0;
         self.current = None;
         self.dispatch();
     }
@@ -183,6 +215,7 @@ impl Model {
         for (_, id) in due {
             let t = self.threads.get_mut(&id).unwrap();
             t.deadline = None;
+            t.park = 0;
             t.state = M::Ready;
             self.ready.push(id);
         }
@@ -220,6 +253,12 @@ fn agree<C: SchedClass>(s: &Sched<C>, m: &Model, ctx: &str) {
             M::Exited => State::Exited,
         };
         assert_eq!(s.state(tid), Some(want), "{ctx}: state of thread {tid}");
+        let park = match s.park_state(tid) {
+            Some(ParkState::Idle) => 0,
+            Some(ParkState::Prepared) => 1,
+            _ => 2,
+        };
+        assert_eq!(park, t.park, "{ctx}: park word of thread {tid}");
         assert_eq!(
             s.priority(tid),
             Some(t.prio),
@@ -250,7 +289,7 @@ fn run<C: SchedClass>(make: impl Fn() -> C, by_priority: bool) {
             let cur = s.current().unwrap();
             let can_block = cur != idle;
             let all: Vec<Tid> = m.threads.keys().copied().collect();
-            match rng.below(15) {
+            match rng.below(17) {
                 0..=2 => {
                     let p = rng.below(PRIO_MAX as u64 + 1) as Prio;
                     let p = if p == PRIO_IDLE { 1 } else { p };
@@ -276,6 +315,14 @@ fn run<C: SchedClass>(make: impl Fn() -> C, by_priority: bool) {
                 10 => {
                     s.yield_current().unwrap();
                     m.yield_now();
+                }
+                15 if can_block => {
+                    s.prepare_block_on(0).unwrap();
+                    m.prepare();
+                }
+                16 if can_block => {
+                    s.cancel_block_on(0).unwrap();
+                    m.cancel();
                 }
                 11 if can_block && rng.chance(30) => {
                     s.exit_current().unwrap();
@@ -628,4 +675,80 @@ fn a_wait_with_a_deadline_ends_at_the_deadline_or_at_a_wake_whichever_is_first()
         "and leaves nothing prepared"
     );
     assert_eq!(s.audit(), Ok(()));
+}
+
+#[test]
+fn a_timed_block_keeps_a_notification_that_arrived_after_prepare() {
+    // (review of task 10, finding 1) prepare, wake, then a timed wait: the wait must not begin
+    let mut s = Sched::new(FixedPriority::new());
+    s.adopt_current(PRIO_IDLE).unwrap();
+    let t = s.spawn(7).unwrap();
+    s.prepare_block_on(0).unwrap();
+    s.wake(t).unwrap();
+    assert_eq!(
+        s.sleep_until(1000),
+        Ok(false),
+        "the notification ends the wait before it begins"
+    );
+    assert_eq!(s.park_state(t), Some(ParkState::Idle));
+    assert_eq!(s.sleep_until(1000), Ok(true), "and it is consumed once");
+    s.audit().unwrap();
+}
+
+#[test]
+fn waiters_wake_in_order_and_stale_entries_are_skipped() {
+    let mut s = Sched::new(FixedPriority::new());
+    s.adopt_current(PRIO_IDLE).unwrap();
+    let mut q = Waiters::new();
+    let (a, b) = (s.spawn(5).unwrap(), s.spawn(5).unwrap());
+    assert_eq!(s.current(), Some(a));
+    assert_eq!(q.wait_on(&mut s, 0), Ok(true)); // a waits; b runs
+    assert_eq!(q.wait_on(&mut s, 0), Ok(true)); // b waits; idle runs
+    s.wake(a).unwrap(); // a is woken some other way: its entry is stale
+    assert_eq!(s.current(), Some(a));
+    assert_eq!(
+        q.wake_one_on(&mut s, 0),
+        Some(b),
+        "the stale entry for a is skipped"
+    );
+    assert_eq!(q.wait_on(&mut s, 0), Ok(true)); // a waits again: queued once
+    assert_eq!(q.len(), 1);
+    assert_eq!(q.wake_all_on(&mut s, 0), 1);
+    assert_eq!(q.wake_one_on(&mut s, 0), None);
+    s.audit().unwrap();
+}
+
+#[test]
+fn a_prepared_thread_that_has_not_blocked_yet_is_woken_by_the_queue() {
+    // (review of task 10, finding 4) the waker finds the thread queued and prepared but still running on another
+    // hart: the wake counts, the thread will not block
+    let mut s = Sched::with_harts(FixedPriority::new(), 2);
+    s.adopt_current_on(0, PRIO_IDLE, Some(0)).unwrap();
+    s.adopt_current_on(1, PRIO_IDLE, Some(1)).unwrap();
+    let t = s.spawn_on(1, 6, Some(1)).unwrap();
+    let mut q = Waiters::new();
+    s.prepare_block_on(1).unwrap();
+    // (the thread queues itself, as `wait_on` does, but has not blocked yet)
+    q.test_enqueue(t);
+    assert_eq!(q.wake_one_on(&mut s, 0), Some(t), "the wake counts");
+    assert_eq!(s.block_current_on(1), Ok(false), "so it does not block");
+}
+
+#[test]
+fn a_wait_with_a_deadline_through_the_queue() {
+    let mut s = Sched::new(FixedPriority::new());
+    s.adopt_current(PRIO_IDLE).unwrap();
+    let mut q = Waiters::new();
+    let a = s.spawn(5).unwrap();
+    assert_eq!(q.wait_until_on(&mut s, 0, 5), Ok(true));
+    for _ in 0..5 {
+        s.tick();
+    }
+    assert_eq!(s.current(), Some(a), "the deadline woke it");
+    assert_eq!(
+        q.wait_until_on(&mut s, 0, 3),
+        Ok(false),
+        "a passed deadline does not block"
+    );
+    assert!(q.is_empty());
 }
