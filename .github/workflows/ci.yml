@@ -62,7 +62,7 @@ jobs:
         run: python3 home/scripts/verify_demo_images.py
 
   # Tier 1: one boot of the whole suite on the default (AIA) machine at four harts, and the release smoke.
-  # Budget: 10 minutes. (If the harness itself changed, the fail-demo check that proves it can see a failure runs too.)
+  # Budget: 10 minutes. (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
   kernel:
     name: kernel (smoke)
     needs: changes
@@ -88,12 +88,43 @@ jobs:
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
           dpkg -l opensbi | tail -1
       - run: make os-boot-test-smoke os-release-smoke
-      - name: "The harness changed, so prove it still sees a failure (fail-demo)"
-        if: ${{ github.event_name == 'pull_request' }}
+
+  # If the harness itself changed (scripts/os_boot_test.py or the Makefile), prove it still sees a failure: a kernel built with a
+  # deliberate fault must fail the boot test. Its own job, so its minutes do not come out of the smoke job's budget.
+  harness-fail-demo:
+    name: harness (fail-demo)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Did the harness change?
+        id: h
         run: |
           if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -qE '^(scripts/os_boot_test.py|Makefile)$'; then
-            make os-boot-test-fail-demo
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.h.outputs.changed == 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        if: steps.h.outputs.changed == 'true'
+        with:
+          key: smoke
+      - name: Install QEMU and OpenSBI
+        if: steps.h.outputs.changed == 'true'
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+      - name: fail-demo
+        if: steps.h.outputs.changed == 'true'
+        run: |
+          make os-boot-test-fail-demo
 
   # The home computer is its own job: it only needs to run when home/ or something shared changed.
   home-kernel:
