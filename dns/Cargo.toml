@@ -1,0 +1,7 @@
+[package]
+name = "dns"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S9 step 7: a pure DNS stub-resolver core (message builder and parser, answer validation, the query state machine, a small cache), sans-IO and total over any input (S9-SPEC 11)"
+
+[dependencies]

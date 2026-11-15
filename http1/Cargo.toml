@@ -1,0 +1,7 @@
+[package]
+name = "http1"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S9 step 7: a pure, total HTTP/1 request parser, target sanitiser, response head builder and response-head parser (S9-SPEC 10), for the demo server and the fetch tool"
+
+[dependencies]
