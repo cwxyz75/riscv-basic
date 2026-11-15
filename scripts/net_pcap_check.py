@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent checksum check of a pcap (NET-SPEC H1 and Q5), Python standard library only.
 
-Verifies, for every Ethernet/IPv4 frame: the IPv4 header checksum, the ICMP checksum, and the UDP checksum (a zero UDP
-checksum is allowed). Fragments are skipped for the transport checks (they cannot be checked alone). Prints one line per
+Verifies, for every Ethernet/IPv4 frame: the IPv4 header checksum, the ICMP checksum, the UDP checksum (a zero UDP
+checksum is allowed) and the TCP checksum (pseudo-header and the segment length from the IP length; never zero). Fragments are skipped for the transport checks (they cannot be checked alone). Prints one line per
 problem and exits 1 if there is any; `--self-test` proves the checker can fail: it corrupts one byte of each kind in a
 copy of the capture and requires all three to be reported (the negative control of the check itself).
 
@@ -28,7 +28,7 @@ def frames(data):
         i += 16 + cl; n += 1
 
 def check(data):
-    problems, counts = [], {"ip": 0, "icmp": 0, "udp": 0}
+    problems, counts = [], {"ip": 0, "icmp": 0, "udp": 0, "tcp": 0}
     for n, _, f in frames(data):
         if len(f) < 34 or f[12:14] != b"\x08\x00": continue
         ihl = (f[14] & 15) * 4
@@ -48,13 +48,27 @@ def check(data):
             if body[6:8] != b"\0\0":
                 pseudo = f[26:34] + struct.pack("!BBH", 0, 17, len(body))
                 if csum(pseudo + body) != 0: problems.append((n, "bad UDP checksum"))
+        elif proto == 6 and len(body) >= 20:
+            counts["tcp"] += 1
+            pseudo = f[26:34] + struct.pack("!BBH", 0, 6, len(body))
+            if csum(pseudo + body) != 0: problems.append((n, "bad TCP checksum"))
     return problems, counts
 
 def self_test(data):
     ok = True
-    for kind, find, off in (("IPv4 header checksum", lambda f: f[12:14] == b"\x08\x00", 14 + 8),
+    _, have = check(data)
+    tests = [("IPv4 header checksum", lambda f: f[12:14] == b"\x08\x00", 14 + 8),
                             ("ICMP checksum", lambda f: f[12:14] == b"\x08\x00" and f[23] == 1 and (f[20] & 0x3f) == 0 and f[21] == 0, 34 + 6),
-                            ("UDP checksum", lambda f: f[12:14] == b"\x08\x00" and f[23] == 17 and f[36:38] == b"\x1e\x61" and (f[20] & 0x3f) == 0 and f[21] == 0, 42)):
+                            ("UDP checksum", lambda f: f[12:14] == b"\x08\x00" and f[23] == 17 and f[36:38] == b"\x1e\x61" and (f[20] & 0x3f) == 0 and f[21] == 0, 42)]
+    if have["tcp"]:
+        # a TCP segment with data, corrupted in its last payload byte (so only the checksum can catch it), and one
+        # corrupted in the checksum field itself
+        tests.append(("TCP checksum (payload)", lambda f: f[12:14] == b"\x08\x00" and f[23] == 6 and len(f) > 80 and (f[20] & 0x3f) == 0 and f[21] == 0, 70))
+        tests.append(("TCP checksum (field)", lambda f: f[12:14] == b"\x08\x00" and f[23] == 6 and (f[20] & 0x3f) == 0 and f[21] == 0, 34 + 16))
+    for kind, find, off in tests:
+        proto = kind.split()[0].lower()
+        if proto in have and not have[proto]:
+            continue                                    # this capture has no such frames: not what it is for
         d = bytearray(data)
         for n, pos, f in frames(data):
             if find(f):
