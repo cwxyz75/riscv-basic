@@ -4206,8 +4206,8 @@ fn runtime_heap_stops_at_its_cap() -> Outcome {
     wait_ended(p, 30_000)?;
     let blocks = sys::process_info(p).a1 as i64;
     ensure!(
-        (122..=128).contains(&blocks),
-        "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use)"
+        (112..=128).contains(&blocks),
+        "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use: the boot image and the programs take memory from the machine's 256 MiB)"
     );
     let _ = in_w;
     Ok(())

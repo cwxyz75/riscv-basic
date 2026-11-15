@@ -457,11 +457,15 @@ pub fn app_main() -> i32 {
             return 4;
         }
     }
-    let (rx_pa, tx_pa, q_pa) = (
-        sys::vmo_phys_addr(rx_dma).a1 as u64,
-        sys::vmo_phys_addr(tx_dma).a1 as u64,
-        sys::vmo_phys_addr(q_dma).a1 as u64,
+    let (rx_r, tx_r, q_r) = (
+        sys::vmo_phys_addr(rx_dma),
+        sys::vmo_phys_addr(tx_dma),
+        sys::vmo_phys_addr(q_dma),
     );
+    if rx_r.status != 0 || tx_r.status != 0 || q_r.status != 0 {
+        return 4;
+    }
+    let (rx_pa, tx_pa, q_pa) = (rx_r.a1 as u64, tx_r.a1 as u64, q_r.a1 as u64);
     let shm = Shm {
         base: RING_VA as usize,
     };
@@ -494,7 +498,12 @@ pub fn app_main() -> i32 {
     for id in RingId::ALL {
         Ring::new(&shm, id).reset();
     }
-    let generation = shm.load64(ctl::GENERATION) + 1;
+    // the generation is the supervisor's to give (a stack that is dying could write anything into the shared header)
+    let generation = env
+        .var(b"GEN")
+        .and_then(|g| core::str::from_utf8(g).ok())
+        .and_then(|g| g.parse::<u64>().ok())
+        .unwrap_or(1);
     shm.store64(ctl::GENERATION, generation);
     shm.write_bytes(ctl::MAC, &mac);
     netring::Mem::store(&shm, ctl::LINK_UP, 1);

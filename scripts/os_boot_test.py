@@ -407,6 +407,8 @@ def run_streaming(cmd):
 def net_problems(text):
     """The host's view of the network tests (NET-SPEC Q4, Q5): the echo client's verdict and the capture's checksums."""
     found = []
+    if os.environ.get("OS_NET") != "0" and "s8: udpecho ready" not in text and "net tests skipped" not in text:
+        found.append("the network tests did not run (no marker from the UDP echo test)")
     if "s8: udpecho ready" in text:
         for l in HOST_NET:
             print(l.replace("##HOSTNET", "host net:", 1))

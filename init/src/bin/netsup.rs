@@ -58,6 +58,8 @@ struct Held {
     to_driver: u32,
     /// The configuration blob (one page): netd's interface half and dhcpc's lease half.
     blob: u32,
+    /// The next driver generation (the supervisor gives it; the driver never takes one from shared memory).
+    next_gen: core::cell::Cell<u64>,
     /// A deliberate fault for the negative-control tests (`FAULT=name` in our own environment), passed to the children.
     fault: Option<Vec<u8>>,
     #[allow(dead_code)] // (read by the status and flight-recorder code of the full supervisor)
@@ -121,8 +123,16 @@ fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u32, u32), i32> {
         }
     };
     let ok = add(Role::NetMmio, dup(h.mmio, Rights::SAME), &mut handles)
-        & add(Role::NetRxDma, dup(h.rx, Rights::SAME), &mut handles)
-        & add(Role::NetTxDma, dup(h.tx, Rights::SAME), &mut handles)
+        & add(
+            Role::NetRxDma,
+            dup(h.rx, Rights::DMA.union(Rights::TRANSFER)),
+            &mut handles,
+        )
+        & add(
+            Role::NetTxDma,
+            dup(h.tx, Rights::DMA.union(Rights::TRANSFER)),
+            &mut handles,
+        )
         & add(Role::NetQueueDma, dup(h.q, Rights::SAME), &mut handles)
         & add(Role::NetRing, dup(h.ring, Rights::SAME), &mut handles)
         & add(
@@ -142,7 +152,13 @@ fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u32, u32), i32> {
     let s = Startup {
         args: alloc::vec![b"netdrv".to_vec()],
         roles,
-        env: fault_env(h),
+        env: {
+            let mut e = fault_env(h);
+            let g = h.next_gen.get();
+            h.next_gen.set(g + 1);
+            e.push(alloc::format!("GEN={g}").into_bytes());
+            e
+        },
         ..Startup::default()
     };
     let Ok(bytes) = s.encode() else {
@@ -247,6 +263,7 @@ pub fn app_main() -> i32 {
         return 28;
     }
     let held = Held {
+        next_gen: core::cell::Cell::new(1),
         fault: env.var(b"FAULT").map(|v| v.to_vec()),
         blob: blob.a1 as u32,
         mmio: hs[0],
@@ -311,7 +328,7 @@ pub fn app_main() -> i32 {
     if pair.status != 0 {
         return 27;
     }
-    let (sup_end, netd_sup_end) = (pair.a1 as u32, pair.a2 as u32);
+    let (mut sup_end, netd_sup_end) = (pair.a1 as u32, pair.a2 as u32);
     let mut dhcpc = Child {
         proc: None,
         seq: 0,
@@ -381,7 +398,34 @@ pub fn app_main() -> i32 {
             }
         });
         for c in due {
-            if c == 2 {
+            if c == 1 && !down {
+                // the stack restarted: a fresh driver goes with it (generation + 1) and the new stack gets its control channel
+                if let Some(dp) = drv.proc.take() {
+                    sys::process_kill(dp, -1);
+                    let _ = sys::object_wait(dp, signals::TERMINATED, sys::clock_get() + 2000);
+                    sys::handle_close(dp);
+                }
+                pending.retain(|&(_, c)| c != 0);
+                match restart_both(
+                    &held,
+                    &drv_image,
+                    &netd_image,
+                    &mut drv,
+                    &mut netd,
+                    registry,
+                    &bind,
+                ) {
+                    Some(new_sup) => {
+                        sys::handle_close(sup_end);
+                        sup_end = new_sup;
+                    }
+                    None => {
+                        down = true;
+                        rt::println!("##NETSUP down reason=restart");
+                    }
+                }
+            }
+            if c == 2 && !down {
                 if let Some(img) = &dhcp_image {
                     match spawn_dhcpc(&held, img, registry) {
                         Ok(p) => {
@@ -392,7 +436,7 @@ pub fn app_main() -> i32 {
                     }
                 }
             }
-            if c == 0 {
+            if c == 0 && !down && netd.proc.is_some() {
                 match spawn_driver(&held, &drv_image) {
                     Ok((p, ctl_end)) => {
                         drv.proc = Some(p);
@@ -448,41 +492,34 @@ pub fn app_main() -> i32 {
                 if down {
                     continue;
                 }
+                // exits that are only the consequence of the stack's death (the driver sees its control channel close, the DHCP
+                // client its connections) are restarted at once and do not count against the intensity limit
+                let consequence = (idx == 0 && code == 31) || (idx == 2 && code == 8);
+                if consequence {
+                    pending.push((now2, idx as usize));
+                    continue;
+                }
                 let restartable = !(20..=24).contains(&code);
-                match sup.on_exit(idx as usize, now2, restartable) {
+                match sup.on_exit(idx as usize, now2 * supervise::MS, restartable) {
                     Action::Restart { delay } => {
-                        if idx == 0 || idx == 2 {
-                            pending.push((now2 + delay / 1_000_000, idx as usize));
-                        } else {
-                            // the stack restarted: a fresh driver goes with it (it re-attaches as generation + 1), and the new
-                            // stack gets its control channel in its startup message
-                            if let Some(dp) = drv.proc.take() {
-                                sys::process_kill(dp, -1);
-                                let _ = sys::object_wait(
-                                    dp,
-                                    signals::TERMINATED,
-                                    sys::clock_get() + 2000,
-                                );
-                                sys::handle_close(dp);
-                            }
-                            pending.retain(|&(_, c)| c != 0);
-                            if !restart_both(
-                                &held,
-                                &drv_image,
-                                &netd_image,
-                                &mut drv,
-                                &mut netd,
-                                registry,
-                                &bind,
-                            ) {
-                                down = true;
-                                rt::println!("##NETSUP down reason=restart");
-                            }
-                        }
+                        pending.push((now2 + delay / supervise::MS, idx as usize))
                     }
                     Action::Down => {
                         down = true;
                         rt::println!("##NETSUP down reason={:?}", sup.down_reason());
+                    }
+                }
+                if down {
+                    // the network is marked down: nothing keeps restarting, and the stack's listeners close (the registry
+                    // answers UNAVAILABLE from now on)
+                    pending.clear();
+                    for c in [&mut drv, &mut netd, &mut dhcpc] {
+                        if let Some(p) = c.proc.take() {
+                            sys::process_kill(p, -1);
+                            let _ =
+                                sys::object_wait(p, signals::TERMINATED, sys::clock_get() + 2000);
+                            sys::handle_close(p);
+                        }
                     }
                 }
             }
@@ -499,6 +536,9 @@ pub fn app_main() -> i32 {
                     );
                     if rd.status != 0 {
                         break;
+                    }
+                    if rd.a1 < 8 {
+                        continue;
                     }
                     let Some(txid) = b
                         .get(..4)
@@ -521,7 +561,7 @@ pub fn app_main() -> i32 {
                                 .extend_from_slice(&held.shm.load64(ctl::GENERATION).to_le_bytes());
                         }
                         2 => {
-                            let which = b[8];
+                            let which = if rd.a1 >= 9 { b[8] } else { 255 };
                             let target = match which {
                                 0 => drv.proc,
                                 1 => netd.proc,
@@ -652,7 +692,7 @@ fn spawn_dhcpc(h: &Held, image: &[u8], registry: u32) -> Result<u32, i32> {
 }
 
 /// After the stack died: start a new driver and a new stack together (a new control channel, generation + 1). `false`:
-/// something could not be started.
+/// something could not be started; else our end of the new supervisor channel.
 fn restart_both(
     held: &Held,
     drv_image: &[u8],
@@ -661,25 +701,24 @@ fn restart_both(
     netd: &mut Child,
     registry: u32,
     bind: &dyn Fn(u32, &mut Child, u64),
-) -> bool {
+) -> Option<u32> {
     let Ok((dp, ctl_end)) = spawn_driver(held, drv_image) else {
-        return false;
+        return None;
     };
     drv.proc = Some(dp);
     bind(dp, drv, 0);
     let pair = sys::channel_create();
     if pair.status != 0 {
-        return false;
+        return None;
     }
     // (a fresh supervisor channel for the new stack; the old one died with it)
     match spawn_netd(held, netd_image, ctl_end, registry, pair.a2 as u32) {
         Ok(p) => {
             netd.proc = Some(p);
             bind(p, netd, 1);
-            // our end of the new supervisor channel must outlive this call: it is leaked on purpose (one per restart)
-            let _ = pair.a1;
-            true
+            // our end of the new supervisor channel: the caller keeps it (the next driver restart sends the new control channel there)
+            Some(pair.a1 as u32)
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }

@@ -195,11 +195,13 @@ impl<'a, M: Mem> Ring<'a, M> {
 }
 
 /// The producer's half of the doorbell (5.5), **after** `Ring::push`: must the consumer be signalled? Only if the ring
-/// was empty before the publish and the consumer's waiting flag (at `waiting_off`) is set. The fence orders the publish
+/// consumer's waiting flag (at `waiting_off`) is set (whatever the ring held before). The fence orders the publish
 /// before the flag read; with the consumer's fence in [`announce_waiting`] one of the two sees the other.
-pub fn must_signal<M: Mem>(mem: &M, waiting_off: usize, was_empty: bool) -> bool {
+pub fn must_signal<M: Mem>(mem: &M, waiting_off: usize, _was_empty: bool) -> bool {
+    // (an earlier draft also required the ring to have been empty before the publish; the shuttle model of the review of S8
+    // showed that rule loses a wakeup when the ring already holds an entry the consumer has not seen)
     mem.fence();
-    was_empty && mem.load(waiting_off) == 1
+    mem.load(waiting_off) == 1
 }
 
 /// The consumer's half (5.5), after draining: set the waiting flag, fence, and re-check the ring. True: the ring is

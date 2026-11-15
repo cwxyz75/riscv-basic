@@ -191,9 +191,8 @@ impl Netd {
                         },
                     )) => {
                         if generation <= self.last_generation || self.link != Link::Detached {
-                            // a generation that is not newer, or a second READY: a violation by the driver
-                            self.shm.count(stat::RING_VIOLATIONS);
-                            self.detach();
+                            // a generation that is not newer, or a second READY: a violation by the driver (it is told to go)
+                            self.violation();
                             continue;
                         }
                         // forget every outstanding slot, rebuild the free list, treat it as a link flap
@@ -212,10 +211,7 @@ impl Netd {
                         let ev = self.net.link(link);
                         self.apply(ev);
                     }
-                    _ => {
-                        self.shm.count(stat::RING_VIOLATIONS);
-                        self.detach();
-                    }
+                    _ => self.violation(),
                 },
                 Some(Sys::ShouldWait) => return,
                 _ => {
@@ -265,6 +261,10 @@ impl Netd {
                 // the driver restarted underneath us (state NONE, or a newer generation)
                 self.detach();
             }
+            // nothing to move: sleep until an event or the next timer (not a busy loop while there is no driver)
+            let ev = self.net.poll(now_ns());
+            self.apply(ev);
+            self.more = false;
             return;
         }
         netring::Mem::store(&self.shm, ctl::NET_WAITING, 0);

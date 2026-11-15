@@ -1170,6 +1170,20 @@ pub fn net_children_restart() -> Outcome {
             }
         }
         ensure!(ok, "pings work again after the stack's restart");
+        // review of S8 (finding 1): after the stack restarted, a later driver restart must still reach the new stack
+        sup_restart(&f, 0);
+        let t3 = sys::clock_get();
+        let mut ok = false;
+        while sys::clock_get() < t3 + 8000 {
+            if echo2.ping([10, 0, 2, 2], 8, b"e", t(700)).is_ok() {
+                ok = true;
+                break;
+            }
+        }
+        ensure!(
+            ok,
+            "pings work after a driver restart that follows a stack restart"
+        );
         ensure!(
             sup_status(&f).is_some_and(|s| !s.1),
             "the supervisor is not down after three single restarts"
