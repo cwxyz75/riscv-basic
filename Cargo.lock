@@ -300,6 +300,14 @@ name = "netsim"
 version = "0.1.0"
 
 [[package]]
+name = "nettcp"
+version = "0.1.0"
+dependencies = [
+ "netsim",
+ "netwire",
+]
+
+[[package]]
 name = "netwire"
 version = "0.1.0"
 

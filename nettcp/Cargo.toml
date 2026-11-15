@@ -1,0 +1,11 @@
+[package]
+name = "nettcp"
+version = "0.1.0"
+edition = "2021"
+description = "OS track S9: the pure TCP state machine (RFC 9293 core, retransmission, delayed ACK, persist, reassembly), sans-IO, behind netwire segments (S9-SPEC 5)"
+
+[dependencies]
+netwire = { path = "../netwire" }
+
+[dev-dependencies]
+netsim = { path = "../netsim" }
