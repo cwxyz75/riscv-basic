@@ -23,6 +23,12 @@ pub const NET_FLAG_IRQ: u32 = 1;
 /// The handles of a successful claim, in order: the MMIO VMO (read-write), the receive-pool DMA VMO, the
 /// transmit-pool DMA VMO, the virtqueue DMA VMO (each with the DMA right) and, if `NET_FLAG_IRQ`, the interrupt.
 pub const NET_CLAIM_HANDLES: usize = 4;
+/// Claim virtio entropy device number `index` (S9 step 5): same request layout. The reply is a [`RngClaim`] and carries the
+/// handles in [`RNG_CLAIM_HANDLES`] order (the MMIO VMO, then the DMA VMO). Released when the claimant's connection closes.
+pub const OP_CLAIM_RNG: u16 = 4;
+/// A `ClaimRng` reply: `txid u32 | status i32 | flags u32 | dma_pages u32`.
+pub const RNG_CLAIM_REPLY_LEN: usize = 16;
+pub const RNG_CLAIM_HANDLES: usize = 2;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -106,6 +112,58 @@ pub fn decode_request(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
 }
 
 /// Ask for network device number `index` (lowest slot address first).
+pub fn encode_claim_rng(txid: u32, index: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_CLAIM_RNG.to_le_bytes());
+    b.extend_from_slice(&index.to_le_bytes());
+    b
+}
+
+pub fn decode_claim_rng(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_CLAIM_RNG) {
+        return Err(txid);
+    }
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(i)) => Ok((t, i)),
+        _ => Err(None),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RngClaim {
+    pub flags: u32,
+    pub dma_pages: u32,
+}
+
+pub fn encode_claim_rng_reply(txid: u32, status: Status, c: &RngClaim) -> Vec<u8> {
+    let mut b = Vec::with_capacity(RNG_CLAIM_REPLY_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&(status as i32).to_le_bytes());
+    b.extend_from_slice(&c.flags.to_le_bytes());
+    b.extend_from_slice(&c.dma_pages.to_le_bytes());
+    b
+}
+
+pub fn decode_claim_rng_reply(b: &[u8]) -> Option<(u32, Status, Option<RngClaim>)> {
+    if b.len() == REPLY_LEN {
+        let (t, s) = decode_reply(b)?;
+        return Some((t, s, None));
+    }
+    if b.len() != RNG_CLAIM_REPLY_LEN {
+        return None;
+    }
+    Some((
+        rd_u32(b, 0)?,
+        Status::from_i32(rd_u32(b, 4)? as i32)?,
+        Some(RngClaim {
+            flags: rd_u32(b, 8)?,
+            dma_pages: rd_u32(b, 12)?,
+        }),
+    ))
+}
+
 pub fn encode_claim_net(txid: u32, index: u16) -> Vec<u8> {
     let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
@@ -195,6 +253,27 @@ mod tests {
             decode_reply(&encode_reply(9, Status::NoDevice)),
             Some((9, Status::NoDevice))
         );
+    }
+
+    #[test]
+    fn claim_rng_golden_and_round_trip() {
+        assert_eq!(encode_claim_rng(7, 1), [7, 0, 0, 0, 4, 0, 1, 0]);
+        assert_eq!(decode_claim_rng(&encode_claim_rng(7, 1)), Ok((7, 1)));
+        assert_eq!(decode_claim_rng(&encode_claim_net(7, 1)), Err(Some(7)));
+        assert_eq!(decode_claim_net(&encode_claim_rng(7, 1)), Err(Some(7)));
+        assert_eq!(decode_claim_rng(&[1, 2]), Err(None));
+        let c = RngClaim {
+            flags: 0,
+            dma_pages: 2,
+        };
+        let r = encode_claim_rng_reply(9, Status::Ok, &c);
+        assert_eq!(r.len(), RNG_CLAIM_REPLY_LEN);
+        assert_eq!(decode_claim_rng_reply(&r), Some((9, Status::Ok, Some(c))));
+        assert_eq!(
+            decode_claim_rng_reply(&encode_reply(9, Status::NoDevice)),
+            Some((9, Status::NoDevice, None))
+        );
+        assert_eq!(decode_claim_rng_reply(&r[..15]), None);
     }
 
     #[test]

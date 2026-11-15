@@ -26,7 +26,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -36,7 +36,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings

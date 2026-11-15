@@ -4723,6 +4723,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ping".to_vec(),
             b"probe".to_vec(),
             b"registryd".to_vec(),
+            b"rngd".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
             b"udpecho".to_vec()
@@ -10268,6 +10269,10 @@ pub fn app_main() -> i32 {
         (
             "stream_budgets_with_the_launcher_defaults",
             stream_proto::stream_budgets_with_the_launcher_defaults,
+        ),
+        (
+            "random_service_gives_seeded_distinct_bytes",
+            net_tests::random_service_gives_seeded_distinct_bytes,
         ),
         (
             "net_streams_over_loopback",

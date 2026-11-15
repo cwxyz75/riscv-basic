@@ -441,6 +441,8 @@ Where the 16 bytes come from is Q11 (entropy), which is open, and design review 
 
 Tests always inject a fixed secret, so nothing in section 14 depends on which is chosen.
 
+**As built (step 5):** option (a), generalised: `rngd` is a **system random service** (`/svc/random`, `proto::random`), not private to the stack: it claims the entropy device through `devmgr` (`OP_CLAIM_RNG`), runs `rngcore::Drbg` (ChaCha20 with fast key erasure, reseeded from the device), and answers `NOT_SEEDED` rather than inventing bytes. `netsup` draws 32 bytes, derives the stack's key with HKDF-SHA256 and passes it to `netd` in its environment (TIDY-UP T99). The libc's `getrandom` and Lua's seeding will use the same service.
+
 ### 5.11 The stack restarts: connections die with `netd` (the contract)
 
 TCP state is not persisted or replicated (NET-DESIGN section 9). When `netd` dies:
