@@ -430,7 +430,10 @@ pub fn decode_ep_event(b: &[u8]) -> Option<EpEvent<'_>> {
 }
 
 /// `GetArp`: a count then `ip u32, mac[6], pad u16, age_ms u32` entries (16 bytes each).
-pub fn encode_arp(entries: &[([u8; 4], [u8; 6], u32)]) -> Vec<u8> {
+/// One ARP table row: address, hardware address, age in milliseconds.
+pub type ArpRow = ([u8; 4], [u8; 6], u32);
+
+pub fn encode_arp(entries: &[ArpRow]) -> Vec<u8> {
     let n = entries.len().min(limits::ARP_MAX);
     let mut b = Vec::with_capacity(4 + 16 * n);
     b.extend_from_slice(&(n as u32).to_le_bytes());
@@ -443,7 +446,7 @@ pub fn encode_arp(entries: &[([u8; 4], [u8; 6], u32)]) -> Vec<u8> {
     b
 }
 
-pub fn decode_arp(b: &[u8]) -> Option<Vec<([u8; 4], [u8; 6], u32)>> {
+pub fn decode_arp(b: &[u8]) -> Option<Vec<ArpRow>> {
     let n = rd_u32(b, 0)? as usize;
     if n > limits::ARP_MAX || b.len() != 4 + 16 * n {
         return None;

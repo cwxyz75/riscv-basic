@@ -75,7 +75,7 @@ fn random_charges_and_refunds_match_a_recount() {
         let mut held = vec![0u32; ids.len()];
         for step in 0..3000 {
             let i = (rng.next() % ids.len() as u64) as usize;
-            if rng.next() % 3 != 0 {
+            if !rng.next().is_multiple_of(3) {
                 let total: u32 = held.iter().sum();
                 let want_ok = held[i] < limits::CONNS_PER_ACCOUNT && total < limits::POOL_CONNS;
                 let got = a.charge_conn(ids[i]);

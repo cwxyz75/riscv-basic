@@ -175,7 +175,7 @@ impl Net {
         self.ok(&Request::ClearConfig, None, deadline).map(|_| ())
     }
 
-    pub fn arp(&mut self, deadline: u64) -> Result<Vec<([u8; 4], [u8; 6], u32)>, NetError> {
+    pub fn arp(&mut self, deadline: u64) -> Result<Vec<pn::ArpRow>, NetError> {
         let b = self.ok(&Request::GetArp, None, deadline)?;
         pn::decode_arp(&b).ok_or(NetError::Garbled)
     }

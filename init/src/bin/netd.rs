@@ -494,9 +494,7 @@ impl Netd {
                 }
                 let addr = (local_addr != [0; 4]).then_some(local_addr);
                 let made = if kind == pn::kind::UDP {
-                    self.net
-                        .open_udp(local_port, addr, oflags != 0)
-                        .map(|(e, p)| (e, p))
+                    self.net.open_udp(local_port, addr, oflags != 0)
                 } else {
                     self.net.open_echo(false).map(|(e, _)| (e, 0))
                 };
@@ -660,7 +658,7 @@ impl Netd {
             }
         }
         // the registry connection itself stays open (we keep it: publishing is a standing authority of netsup's)
-        core::mem::forget(fs);
+        let _ = fs;
         true
     }
 }
@@ -838,8 +836,7 @@ pub fn app_main() -> i32 {
     }
     rt::println!("netd: up");
     // the runtime loop, with the supervisor channel and the control channel polled each pass
-    let code = loop_with_sup(&mut d, sup);
-    code
+    loop_with_sup(&mut d, sup)
 }
 
 /// `service::run` does not know the supervisor channel: wrap it by polling `sup` from `tick` via a thin adapter.
