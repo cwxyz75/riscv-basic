@@ -978,7 +978,7 @@ so it is scheduled (task 26) rather than left reserved, but after S8: nothing be
 * Private futexes stay as they are (key: address space and address), with bucket locks.
 * **Shared futexes are reserved, not built**: a flag bit in `futex_wait`/`futex_wake` (NOT_SUPPORTED when set) for a
   key of (VMO, offset), found by translating the address under `AS`. Nothing needs them until a shared-memory ring
-  wants to sleep without a channel; the network design uses channels as doorbells.
+  wants to sleep without a channel; the network design uses events as doorbells (`NET-DESIGN.md` 5.3), so it does not need them.
 * PI futexes are private only.
 
 ### 5.8 The message-loop library and the culture risk
