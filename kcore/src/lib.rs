@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod aspace;
+pub mod donate;
 pub mod elf;
 pub mod fdt;
 pub mod fp;

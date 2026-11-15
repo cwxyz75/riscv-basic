@@ -620,6 +620,32 @@ impl<N: Class> HartRq<N> {
         Ok(())
     }
 
+    /// Set a thread's *effective* priority (what donation, `kcore::donate`, computes) without touching its base: a
+    /// queued thread moves to where it now belongs (possibly into the other band's class), the running one may now
+    /// be preempted, and the base is what it falls back to. Returns whether the thread is known.
+    pub fn set_effective(&mut self, tid: Tid, eff: Prio) -> bool {
+        let Some(t) = self.threads.get(&tid) else {
+            return false;
+        };
+        if eff > PRIO_MAX || t.eff == eff {
+            return t.eff == eff;
+        }
+        let state = t.state;
+        if state == State::Runnable {
+            self.class_dequeue(tid, Deq::AttrChange);
+        }
+        self.threads.get_mut(&tid).expect("exists").eff = eff;
+        match state {
+            State::Runnable => {
+                self.class_enqueue(tid, Enq::AttrChanged);
+                self.reschedule();
+            }
+            State::Running => self.reschedule(),
+            _ => {}
+        }
+        true
+    }
+
     /// Advance the clock by `dt`: fire the timers that are due, account the running thread's slice (rotating it
     /// when its slice is over and an equal or better peer waits), then make the designation right.
     pub fn advance(&mut self, dt: Time) {

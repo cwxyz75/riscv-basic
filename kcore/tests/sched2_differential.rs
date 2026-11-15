@@ -194,3 +194,30 @@ fn bands_and_queues_are_what_the_spec_says() {
     assert_eq!(q.pop_best(), Some(1));
     assert!(q.is_empty() && q.top().is_none());
 }
+
+/// Donation's hook: an effective priority above the base moves a queued thread (across bands too) and lets the
+/// running thread be preempted; lowering it back restores the order.
+#[test]
+fn an_effective_priority_moves_queued_and_running_threads() {
+    let mut rq = HartRq::new(FixedPrio::new());
+    rq.adopt_idle();
+    let low = rq.spawn(attr(5)).unwrap();
+    let mid = rq.spawn(attr(10)).unwrap();
+    assert_eq!(rq.current(), Some(mid));
+    // the queued low thread is boosted into the real-time band: it preempts a normal thread of priority 10
+    assert!(rq.set_effective(low, 40));
+    assert_eq!(rq.current(), Some(low), "a boost across bands preempts");
+    assert_eq!(
+        rq.record(low).unwrap().base.prio,
+        5,
+        "the base is untouched"
+    );
+    // the boost ends: back to its base, so the thread that was preempted runs again
+    assert!(rq.set_effective(low, 5));
+    assert_eq!(rq.current(), Some(mid));
+    // lowering the running thread's effective priority below a queued one's lets the queued one run
+    assert!(rq.set_effective(mid, 3));
+    assert_eq!(rq.current(), Some(low));
+    assert!(!rq.set_effective(999, 7), "an unknown thread");
+    rq.audit().unwrap();
+}
