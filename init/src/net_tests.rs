@@ -705,16 +705,11 @@ pub fn net_udp_echo_through_hostfwd() -> Outcome {
                     // drain what was queued, then take the host's tail datagram: the count of what was dropped rides on the
                     // next datagram delivered (7.2), which the host sends once the flood is over
                     let (mut n, mut dropped) = (0u32, 0u64);
-                    loop {
-                        match udp.recv(t(8000)) {
-                            Ok(d) => {
-                                n += 1;
-                                dropped += u64::from(d.dropped);
-                                if d.payload == b"##tail" {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok(d) = udp.recv(t(8000)) {
+                        n += 1;
+                        dropped += u64::from(d.dropped);
+                        if d.payload == b"##tail" {
+                            break;
                         }
                     }
                     ensure!(n > 0 && n < 3000, "some of the flood was delivered and not all ({n} delivered, dropped {dropped})");
@@ -838,7 +833,10 @@ pub fn net_dhcp_configures_the_interface() -> Outcome {
 
 /// `netsup`'s control channel: `Status` as `(running, restarts, last_exit)` for the driver, the stack and the DHCP client, then whether
 /// the network is marked down and the driver generation.
-fn sup_status(f: &Full) -> Option<([(bool, u32, i32); 3], bool, u64)> {
+/// What `Status` says: per child (running, restarts, last exit code), then down and the generation.
+type SupStatus = ([(bool, u32, i32); 3], bool, u64);
+
+fn sup_status(f: &Full) -> Option<SupStatus> {
     let req = [1, 0, 0, 0, 1, 0, 0, 0];
     sys::channel_write(f.ctl, req.as_ptr(), req.len(), core::ptr::null(), 0);
     if sys::object_wait(f.ctl, sig::READABLE, sys::clock_get() + 3000).status != 0 {
