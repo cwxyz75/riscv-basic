@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod blk;
 pub mod bootimg;
+pub mod clock;
 pub mod console;
 pub mod devmgr;
 pub mod file;

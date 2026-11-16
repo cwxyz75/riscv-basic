@@ -379,7 +379,7 @@ it on deliberately. A process without it cannot reach device memory.
 
 A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
 non-empty, a whole number of pages and inside one *device window* (`abi::layout::DEVICE_WINDOWS`:
-the eight QEMU `virt` virtio-mmio slots, `0x1000_1000..0x1000_9000`); anything else, RAM
+the eight QEMU `virt` virtio-mmio slots, `0x1000_1000..0x1000_9000`, and the one-page goldfish RTC, `0x10_1000..0x10_2000`); anything else, RAM
 included, is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
 DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
 and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device

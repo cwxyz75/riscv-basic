@@ -14,6 +14,8 @@ pub use abi;
 #[cfg(feature = "heap")]
 pub mod blk;
 #[cfg(feature = "heap")]
+pub mod clock;
+#[cfg(feature = "heap")]
 pub mod fs;
 #[cfg(feature = "heap")]
 pub mod heap;
