@@ -16,6 +16,26 @@ const REPLY_TIMEOUT: u64 = 30_000;
 pub struct Stat {
     pub is_dir: bool,
     pub size: u64,
+    /// Everything `STAT` said: the kind (including a symlink), time and the advisory POSIX attributes.
+    pub info: file::StatInfo,
+}
+
+impl Stat {
+    /// A `Stat` with no times or attributes (for a caller that has only a kind and a size).
+    pub fn basic(is_dir: bool, size: u64) -> Stat {
+        Stat {
+            is_dir,
+            size,
+            info: file::StatInfo {
+                kind: if is_dir { 2 } else { 1 },
+                size,
+                mtime: 0,
+                mode: file::ABSENT,
+                uid: file::ABSENT,
+                gid: file::ABSENT,
+            },
+        }
+    }
 }
 
 /// A reply with its payload and (for `GetVmo`) a handle.
@@ -371,12 +391,11 @@ impl Fs {
     }
 
     fn parse_stat(a: &Answer) -> Result<Stat, i32> {
-        if a.payload.len() != 9 {
-            return Err(-4);
-        }
+        let info = file::StatInfo::decode(a.a, &a.payload).map_err(|_| -4)?;
         Ok(Stat {
-            is_dir: a.payload[0] == 2,
-            size: a.a,
+            is_dir: info.kind == 2,
+            size: info.size,
+            info,
         })
     }
 
@@ -405,6 +424,24 @@ impl Fs {
     pub fn fstat(&mut self) -> Result<Stat, i32> {
         let a = self.simple(file::op::FSTAT, 0, 0, &[])?;
         Self::parse_stat(&a)
+    }
+
+    /// The target text of the symlink `path` (relative to this directory; the link itself is the last component).
+    pub fn readlink(&mut self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        self.simple(file::op::READLINK, 0, 0, path)
+            .map(|a| a.payload)
+    }
+
+    /// Make a symlink `path` (relative to this directory) pointing at `target` (needs `CREATE`; the server refuses an absolute
+    /// target or one that climbs above this connection's root).
+    pub fn symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), i32> {
+        let (a, payload) = file::encode_symlink(path, target);
+        let r = self.call(file::op::SYMLINK, 0, 0, a, 0, &payload, None)?;
+        if r.status == 0 {
+            Ok(())
+        } else {
+            Err(r.status)
+        }
     }
 
     /// Make everything written so far durable (`fsync`): the reply comes when the server has committed.

@@ -201,6 +201,7 @@ impl Service for Registry {
                     .take(128)
                     .map(|name| file::DirEntry {
                         is_dir: false,
+                        is_link: false,
                         name,
                     })
                     .collect();

@@ -61,6 +61,20 @@ pub fn run_main() -> i32 {
         .filter(|p| p.first() == Some(&b'/'))
         .map(pathres::parse_abs);
     crate::fd::set_table(table);
+    if let Some(u) = env
+        .var(b"UID")
+        .and_then(|v| core::str::from_utf8(v).ok())
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        crate::fd::DEFAULT_UID.store(u, Ordering::Relaxed);
+    }
+    if let Some(g) = env
+        .var(b"GID")
+        .and_then(|v| core::str::from_utf8(v).ok())
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        crate::fd::DEFAULT_GID.store(g, Ordering::Relaxed);
+    }
     crate::fd::TTY_IN.store(
         u32::from(env.var(b"STDIN") == Some(&b"tty"[..])),
         Ordering::Relaxed,

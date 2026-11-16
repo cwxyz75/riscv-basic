@@ -176,10 +176,17 @@ def main():
           b"ok: open a directory by path", b"ok: openat with .. from a path-annotated directory descriptor",
           b"ok: `..` above the root stays at the root", b"ok: the empty path names nothing",
           b"ok: write to /dev/null", b"ok: read zeros from /dev/zero", b"ok: write a file in the private /tmp",
+          b"ok: a new file has the default mode 0644", b"ok: one link, its size and a modification time", b"ok: chmod, then stat shows the mode", b"ok: access sees the execute bit", b"ok: and sees it cleared", b"ok: chown sets the advisory owner and group", b"ok: fchmod and fstat on a descriptor", b"ok: mkdir applies the umask", b"ok: make a symlink", b"ok: lstat describes the link itself", b"ok: stat follows it", b"ok: readlink gives the target text", b"ok: an absolute link target is refused", b"ok: hard links are refused",
           b"ok: leave a file for the next session",
           b"mount: 0 failures"],
          "a C program makes, reads, renames and removes files in the granted volume")
     step(b"ls /mnt/store\n", [b"$ ls /mnt/store", b"kept"], "what it left behind")
+    step(b"ls -l /mnt/store\n", [b"$ ls -l /mnt/store", b"-rw-r--r-- 21 kept"], "ls -l shows the advisory mode and the size")
+    step(b"ls -l /home\n", [b"$ ls -l /home", b"-rw-r--r-- 13 hello.txt", b"-rw-r--r-- 14 lines.txt", b"drwxr-xr-x 1 sub/"],
+         "ls -l on the boot image: files 0644, directories 0755")
+    step(b"ls -l /usr\n", [b"$ ls -l /usr", b"lrwxrwxrwx 6 bin -> ../bin", b"lrwxrwxrwx 10 include -> ../include",
+                           b"lrwxrwxrwx 6 lib -> ../lib", b"lrwxrwxrwx 8 share -> ../share"],
+         "ls -l shows links and their targets")
     step(b"ls /tmp\n", [b"$ ls /tmp"], "the program's private /tmp is gone with it")
     step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "cat reads inside the volume")
     step(b"echo hi | cat /mnt/store/kept\n", [b"$ echo hi | cat /mnt/store/kept", b"kept across sessions"],

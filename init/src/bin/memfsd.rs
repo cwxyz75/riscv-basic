@@ -82,10 +82,10 @@ fn err_status(e: Error, name_len: usize) -> i32 {
 }
 
 fn kind_byte(k: Kind) -> u8 {
-    if k == Kind::Dir {
-        2
-    } else {
-        1
+    match k {
+        Kind::Dir => 2,
+        Kind::Symlink => 3,
+        _ => 1,
     }
 }
 
@@ -339,6 +339,7 @@ impl Server {
                             .into_iter()
                             .map(|(name, k)| file::DirEntry {
                                 is_dir: k == Kind::Dir,
+                                is_link: k == Kind::Symlink,
                                 name,
                             })
                             .collect();
@@ -475,6 +476,26 @@ impl Server {
                     Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
                 }
             }
+            op::READLINK => {
+                if !need(pr::READ) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let Ok(comps) = file::split_path(req.payload) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                // (the link is the last component: only links in the middle stop the walk)
+                if self.link_on_path(node, &comps, false) {
+                    return self.send_status(key, txid, status::SYMLINK);
+                }
+                match self
+                    .fs
+                    .walk(node, &comps)
+                    .and_then(|id| self.fs.read_link(id))
+                {
+                    Ok(t) => self.send(key, txid, 0, t.len() as u64, &t, None),
+                    Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
+                }
+            }
             op::GETVMO => {
                 if !need(pr::READ) {
                     return self.send(key, txid, denied, 0, &[], None);
@@ -501,14 +522,32 @@ impl Server {
         }
     }
 
+    /// What `STAT` says about `id`: the kind, size, time and the advisory POSIX attributes (USER-VIEW-SPEC section 6). The
+    /// programs of the boot image (`/bin/*`, read-only image files that cannot carry attributes) are executable by default.
+    fn stat_info(&self, id: NodeId) -> Result<file::StatInfo, Error> {
+        let kind = self.fs.kind(id)?;
+        let attr = |name: &[u8]| self.fs.attr_get(id, name).ok().map(|(_, v)| v);
+        let mut mode = file::attr_u32(attr(file::ATTR_POSIX_MODE).as_deref());
+        if mode == file::ABSENT && kind == Kind::Image {
+            let in_bin = self
+                .fs
+                .lookup(ROOT, b"bin")
+                .is_ok_and(|bin| self.fs.parent(id) == Ok(bin));
+            mode = if in_bin { 0o755 } else { 0o644 };
+        }
+        Ok(file::StatInfo {
+            kind: kind_byte(kind),
+            size: self.fs.size(id)?,
+            mtime: self.fs.mtime(id)?,
+            mode,
+            uid: file::attr_u32(attr(file::ATTR_POSIX_UID).as_deref()),
+            gid: file::attr_u32(attr(file::ATTR_POSIX_GID).as_deref()),
+        })
+    }
+
     fn stat_reply(&mut self, key: u64, txid: u32, target: Result<NodeId, Error>) {
-        let r = target.and_then(|id| Ok((self.fs.kind(id)?, self.fs.size(id)?)));
-        match r {
-            Ok((k, size)) => {
-                let mut p = alloc::vec![kind_byte(k)];
-                p.extend_from_slice(&size.to_le_bytes());
-                self.send(key, txid, 0, size, &p, None);
-            }
+        match target.and_then(|id| self.stat_info(id)) {
+            Ok(s) => self.send(key, txid, 0, s.size, &s.encode_payload(), None),
             Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
         }
     }

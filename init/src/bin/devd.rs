@@ -195,6 +195,7 @@ impl Service for Devd {
                     .into_iter()
                     .map(|(n, _)| file::DirEntry {
                         is_dir: false,
+                        is_link: false,
                         name: n.to_vec(),
                     })
                     .collect();
@@ -216,9 +217,15 @@ impl Service for Devd {
                 let Some(t) = target else {
                     return self.send(key, txid, status::NOT_FOUND, 0, &[]);
                 };
-                let mut p = alloc::vec![if t == Node::Root { 2u8 } else { 1u8 }];
-                p.extend_from_slice(&0u64.to_le_bytes());
-                self.send(key, txid, 0, 0, &p);
+                let info = file::StatInfo {
+                    kind: if t == Node::Root { 2 } else { 1 },
+                    size: 0,
+                    mtime: 0,
+                    mode: if t == Node::Root { 0o755 } else { 0o666 },
+                    uid: file::ABSENT,
+                    gid: file::ABSENT,
+                };
+                self.send(key, txid, 0, 0, &info.encode_payload());
             }
             op::GETSIZE => self.send(key, txid, 0, 0, &[]),
             op::SETSIZE => {

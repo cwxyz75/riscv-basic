@@ -122,10 +122,10 @@ fn fstat(e: FsError, name_len: usize) -> i32 {
 }
 
 fn kind_byte(k: Kind) -> u8 {
-    if k == Kind::Dir {
-        2
-    } else {
-        1
+    match k {
+        Kind::Dir => 2,
+        Kind::Symlink => 3,
+        _ => 1,
     }
 }
 
@@ -483,6 +483,7 @@ impl Server {
                             .into_iter()
                             .map(|(name, k)| file::DirEntry {
                                 is_dir: k == Kind::Dir,
+                                is_link: k == Kind::Symlink,
                                 name,
                             })
                             .collect();
@@ -783,14 +784,28 @@ impl Server {
         }
     }
 
+    /// What `STAT` says about `id`: the kind, size, time and the advisory POSIX attributes (USER-VIEW-SPEC section 6).
+    fn stat_info(&mut self, id: NodeId) -> Result<file::StatInfo, FsError> {
+        let kind = self.fs.kind(id)?;
+        let size = self.fs.size(id)?;
+        let mtime = self.fs.mtime(id)?;
+        let mut get = |name: &[u8]| self.fs.attr_get(id, name).ok().map(|(_, v)| v);
+        let mode = file::attr_u32(get(file::ATTR_POSIX_MODE).as_deref());
+        let uid = file::attr_u32(get(file::ATTR_POSIX_UID).as_deref());
+        let gid = file::attr_u32(get(file::ATTR_POSIX_GID).as_deref());
+        Ok(file::StatInfo {
+            kind: kind_byte(kind),
+            size,
+            mtime,
+            mode,
+            uid,
+            gid,
+        })
+    }
+
     fn stat_reply(&mut self, key: u64, txid: u32, target: Result<NodeId, FsError>) {
-        let r = target.and_then(|id| Ok((self.fs.kind(id)?, self.fs.size(id)?)));
-        match r {
-            Ok((k, size)) => {
-                let mut p = alloc::vec![kind_byte(k)];
-                p.extend_from_slice(&size.to_le_bytes());
-                self.send(key, txid, 0, size, &p, None);
-            }
+        match target.and_then(|id| self.stat_info(id)) {
+            Ok(s) => self.send(key, txid, 0, s.size, &s.encode_payload(), None),
             Err(e) => self.send(key, txid, fstat(e, 0), 0, &[], None),
         }
     }

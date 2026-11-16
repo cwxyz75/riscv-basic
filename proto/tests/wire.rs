@@ -305,22 +305,32 @@ fn directory_entries_pack_and_unpack() {
     let es = vec![
         DirEntry {
             is_dir: true,
+            is_link: false,
             name: b"sub".to_vec(),
         },
         DirEntry {
             is_dir: false,
+            is_link: false,
             name: b"a.txt".to_vec(),
+        },
+        DirEntry {
+            is_dir: false,
+            is_link: true,
+            name: b"l".to_vec(),
         },
     ];
     let (bytes, n) = file::encode_entries(&es, 1000);
-    assert_eq!(n, 2);
-    assert_eq!(bytes, hex("02 03 00 73 75 62  01 05 00 61 2e 74 78 74"));
+    assert_eq!(n, 3);
+    assert_eq!(
+        bytes,
+        hex("02 03 00 73 75 62  01 05 00 61 2e 74 78 74  03 01 00 6c")
+    );
     assert_eq!(file::decode_entries(&bytes).unwrap(), es);
-    let (b2, n2) = file::encode_entries(&es, 8);
+    let (b2, n2) = file::encode_entries(&es[..2], 8);
     assert_eq!(n2, 1, "only what fits");
     assert_eq!(b2.len(), 6);
     assert!(
-        file::decode_entries(&hex("03 01 00 61")).is_err(),
+        file::decode_entries(&hex("04 01 00 61")).is_err(),
         "unknown kind"
     );
     assert!(
@@ -966,4 +976,44 @@ fn queries_and_hits_survive_a_round_trip() {
         let (bytes, n) = file::encode_hits(&hits, 4096);
         assert_eq!(file::decode_hits(&bytes).unwrap(), hits[..n].to_vec());
     }
+}
+
+#[test]
+fn stat_payload_goldens_and_the_advisory_attribute_helper() {
+    use file::{StatInfo, ABSENT};
+    let s = StatInfo {
+        kind: 1,
+        size: 27,
+        mtime: 0x0102_0304_0506_0708,
+        mode: 0o644,
+        uid: 1000,
+        gid: ABSENT,
+    };
+    let p = s.encode_payload();
+    assert_eq!(
+        p,
+        hex("01  08 07 06 05 04 03 02 01  a4 01 00 00  e8 03 00 00  ff ff ff ff")
+    );
+    assert_eq!(StatInfo::decode(27, &p), Ok(s));
+    // a wrong length or an unknown kind is an error, never a misread
+    assert!(StatInfo::decode(0, &p[..20]).is_err());
+    assert!(StatInfo::decode(
+        0,
+        &hex("09  00 00 00 00 00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00")
+    )
+    .is_err());
+    for n in 0..p.len() {
+        assert!(StatInfo::decode(0, &p[..n]).is_err());
+    }
+    // the attribute helper: little-endian u64, absent when missing, malformed or too big for 32 bits
+    assert_eq!(file::attr_u32(Some(&0o755u64.to_le_bytes())), 0o755);
+    assert_eq!(file::attr_u32(None), ABSENT);
+    assert_eq!(file::attr_u32(Some(&[1, 2, 3])), ABSENT);
+    assert_eq!(file::attr_u32(Some(&(1u64 << 40).to_le_bytes())), ABSENT);
+    assert_eq!(
+        file::attr_u32(Some(&(u32::MAX as u64).to_le_bytes())),
+        ABSENT,
+        "the sentinel itself is not a value"
+    );
+    assert_eq!(file::ATTR_POSIX_MODE, b"posix.mode");
 }

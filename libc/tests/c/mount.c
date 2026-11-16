@@ -69,6 +69,36 @@ int mount_test(const char *mnt) {
     if (zer >= 0) close(zer);
     FILE *tf = fopen("/tmp/scratch", "w");
     CHECK(tf != NULL && fputs("private", tf) >= 0 && fclose(tf) == 0, "write a file in the private /tmp");
+    /* UV3: POSIX attributes are advisory data on the node; the defaults are synthesized */
+    char lp[256], hp[256], dp[256];
+    snprintf(path, sizeof path, "%s/posix-file", mnt);
+    snprintf(lp, sizeof lp, "%s/posix-link", mnt);
+    snprintf(hp, sizeof hp, "%s/posix-hard", mnt);
+    snprintf(dp, sizeof dp, "%s/posix-dir", mnt);
+    unlink(path); unlink(lp); rmdir(dp);
+    f = fopen(path, "w");
+    if (f) { fputs("abc", f); fclose(f); }
+    CHECK(stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0644, "a new file has the default mode 0644");
+    CHECK(st.st_nlink == 1 && st.st_size == 3 && st.st_mtime > 0, "one link, its size and a modification time");
+    CHECK(chmod(path, 0755) == 0 && stat(path, &st) == 0 && (st.st_mode & 07777) == 0755, "chmod, then stat shows the mode");
+    CHECK(access(path, X_OK) == 0, "access sees the execute bit");
+    CHECK(chmod(path, 0600) == 0 && access(path, X_OK) != 0, "and sees it cleared");
+    CHECK(chown(path, 42, 43) == 0 && stat(path, &st) == 0 && st.st_uid == 42 && st.st_gid == 43, "chown sets the advisory owner and group");
+    int ffd = open(path, O_RDWR);
+    CHECK(ffd >= 0 && fchmod(ffd, 0640) == 0 && fstat(ffd, &st) == 0 && (st.st_mode & 0777) == 0640, "fchmod and fstat on a descriptor");
+    if (ffd >= 0) close(ffd);
+    umask(077);
+    CHECK(mkdir(dp, 0777) == 0 && stat(dp, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 0777) == 0700, "mkdir applies the umask");
+    umask(022);
+    CHECK(symlink("posix-file", lp) == 0, "make a symlink");
+    CHECK(lstat(lp, &st) == 0 && S_ISLNK(st.st_mode), "lstat describes the link itself");
+    CHECK(stat(lp, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 3, "stat follows it");
+    char tb[64];
+    long tn = readlink(lp, tb, sizeof tb);
+    CHECK(tn == 10 && memcmp(tb, "posix-file", 10) == 0, "readlink gives the target text");
+    CHECK(symlink("/etc/passwd", hp) != 0 && errno == EINVAL, "an absolute link target is refused");
+    CHECK(link(path, hp) != 0 && errno == EPERM, "hard links are refused");
+    unlink(lp); unlink(path); rmdir(dp);
     /* leave one file behind: the shell test reads it from a later session (the volume is durable) */
     char kept[256];
     snprintf(kept, sizeof kept, "%s/kept", mnt);
