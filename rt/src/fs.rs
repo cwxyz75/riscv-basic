@@ -342,6 +342,66 @@ impl Fs {
         self.simple(file::op::SYNC, 0, 0, &[]).map(|_| ())
     }
 
+    /// Set attribute `name` of this connection's node (`ty`: 0 bytes, 1 text, 2 u64, 3 i64; the value as on the wire).
+    pub fn attr_set(&mut self, ty: u8, name: &[u8], value: &[u8]) -> Result<(), i32> {
+        self.simple(
+            file::op::ATTR_SET,
+            0,
+            0,
+            &file::encode_attr_set(ty, name, value),
+        )
+        .map(|_| ())
+    }
+
+    /// The type and value of an attribute.
+    pub fn attr_get(&mut self, name: &[u8]) -> Result<(u8, Vec<u8>), i32> {
+        let a = self.simple(file::op::ATTR_GET, 0, 0, name)?;
+        Ok((a.a as u8, a.payload))
+    }
+
+    pub fn attr_remove(&mut self, name: &[u8]) -> Result<(), i32> {
+        self.simple(file::op::ATTR_REMOVE, 0, 0, name).map(|_| ())
+    }
+
+    /// The names of all attributes (follows the paging cookie).
+    pub fn attr_list(&mut self) -> Result<Vec<Vec<u8>>, i32> {
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let cookie = all.last().cloned().unwrap_or_default();
+            let a = self.simple(file::op::ATTR_LIST, 0, 0, &cookie)?;
+            let names = file::decode_names(&a.payload)
+                .map_err(|_| abi::status::Status::InvalidArgs.code())?;
+            let empty = names.is_empty();
+            all.extend(names);
+            if a.a == 0 || empty {
+                return Ok(all);
+            }
+        }
+    }
+
+    /// Create an index on a user attribute (this connection is a directory).
+    pub fn make_index(&mut self, ty: u8, name: &[u8]) -> Result<(), i32> {
+        self.simple(
+            file::op::MAKE_INDEX,
+            0,
+            0,
+            &file::encode_make_index(ty, name),
+        )
+        .map(|_| ())
+    }
+
+    /// One page of a query below this directory: the hits and whether there are more.
+    pub fn query(&mut self, q: &file::Query<'_>) -> Result<(Vec<file::QueryHit>, bool), i32> {
+        let (flags, payload) = q.encode();
+        let a = self.call(file::op::QUERY, 0, 0, q.max, flags, &payload, None)?;
+        if a.status != 0 {
+            return Err(a.status);
+        }
+        let hits =
+            file::decode_hits(&a.payload).map_err(|_| abi::status::Status::InvalidArgs.code())?;
+        Ok((hits, a.a != 0))
+    }
+
     pub fn mkdir(&mut self, name: &[u8]) -> Result<(), i32> {
         self.simple(file::op::MKDIR, 0, 0, name).map(|_| ())
     }

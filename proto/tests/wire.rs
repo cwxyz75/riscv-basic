@@ -734,7 +734,7 @@ fn query_goldens_and_rejections() {
     assert_eq!(flags, 10);
     assert_eq!(
         payload,
-        hex("04 00 79 65 61 72  08 00 05 00 00 00 00 00 00 00  08 00 00 00 00 00 00 00 07 cf  05 00 00 00")
+        hex("04 00 79 65 61 72  08 00 05 00 00 00 00 00 00 00  08 00 00 00 00 00 00 00 07 cf  05 00 00 00 00 00 00 00")
     );
     assert_eq!(file::decode_query(1000, flags, &payload), Ok(q));
     // both bounds, no position: flags LO | HI = 6
@@ -796,12 +796,12 @@ fn query_hit_goldens() {
     assert_eq!(n, 1);
     assert_eq!(
         bytes,
-        hex("08 00 00 00 00 00 00 00 07 cf 03 00 00 00 03 00 64 2f 61")
+        hex("08 00 00 00 00 00 00 00 07 cf 03 00 00 00 00 00 00 00 03 00 64 2f 61")
     );
     assert_eq!(file::decode_hits(&bytes), Ok(vec![h.clone()]));
     let two = [h.clone(), h.clone()];
-    let (bytes, n) = file::encode_hits(&two, 20);
-    assert_eq!((n, bytes.len()), (1, 19), "the second hit does not fit");
+    let (bytes, n) = file::encode_hits(&two, 30);
+    assert_eq!((n, bytes.len()), (1, 23), "the second hit does not fit");
     assert_eq!(
         file::decode_hits(&hex("08 00 00")),
         Err(FrameError::BadLength)
@@ -947,7 +947,7 @@ fn queries_and_hits_survive_a_round_trip() {
                 hi: Some(&hi),
             },
         };
-        let after = (r.below(2) == 0).then_some((key.as_slice(), r.below(1 << 20) as u32));
+        let after = (r.below(2) == 0).then_some((key.as_slice(), r.below(1 << 20) * 0x1_0000_0001));
         let q = file::Query {
             index: &index,
             term,
@@ -959,7 +959,7 @@ fn queries_and_hits_survive_a_round_trip() {
         let hits: Vec<file::QueryHit> = (0..r.below(6))
             .map(|_| file::QueryHit {
                 key: rnd(&mut r),
-                id: r.below(1 << 30) as u32,
+                id: r.below(1 << 30) * 0x1_0000_0001,
                 path: rnd(&mut r),
             })
             .collect();

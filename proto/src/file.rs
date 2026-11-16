@@ -471,12 +471,13 @@ pub enum QueryTerm<'a> {
 /// `QUERY`: the request's `a` is `max`, its `b` the flags below, its payload the fields in order. Flags: bit 0 `Eq` (else a
 /// range), bit 1 has `lo` (or the `Eq` value is always present), bit 2 has `hi`, bit 3 has `after`. Fields: `index` (`len:u16,
 /// bytes`), then the `Eq` value, or `lo` if present and `hi` if present (each `len:u16, bytes`), then `after` if present (`key`
-/// as `len:u16, bytes`, then the node id as `u32`).
+/// as `len:u16, bytes`, then the node id as `u64`). The reply's `a` is 1 if there were more matches than were returned (the
+/// `max` was reached or the hits did not fit the message), and its payload is the hits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query<'a> {
     pub index: &'a [u8],
     pub term: QueryTerm<'a>,
-    pub after: Option<(&'a [u8], u32)>,
+    pub after: Option<(&'a [u8], u64)>,
     pub max: u64,
 }
 
@@ -544,8 +545,8 @@ pub fn decode_query(max: u64, flags: u64, b: &[u8]) -> Result<Query<'_>, FrameEr
     };
     let after = if flags & query_flags::AFTER != 0 {
         let k = get16(b, &mut at)?;
-        let id = rd_u32(b, at).ok_or(FrameError::TooShort)?;
-        at += 4;
+        let id = rd_u64(b, at).ok_or(FrameError::TooShort)?;
+        at += 8;
         Some((k, id))
     } else {
         None
@@ -561,11 +562,11 @@ pub fn decode_query(max: u64, flags: u64, b: &[u8]) -> Result<Query<'_>, FrameEr
     })
 }
 
-/// One `QUERY` result: `key_len:u16, key, id:u32, path_len:u16, path`.
+/// One `QUERY` result: `key_len:u16, key, id:u64, path_len:u16, path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryHit {
     pub key: Vec<u8>,
-    pub id: u32,
+    pub id: u64,
     pub path: Vec<u8>,
 }
 
@@ -574,7 +575,7 @@ pub fn encode_hits(hits: &[QueryHit], max: usize) -> (Vec<u8>, usize) {
     let mut out = Vec::new();
     let mut n = 0;
     for h in hits {
-        if out.len() + 8 + h.key.len() + h.path.len() > max {
+        if out.len() + 12 + h.key.len() + h.path.len() > max {
             break;
         }
         put16(&mut out, &h.key);
@@ -590,8 +591,8 @@ pub fn decode_hits(b: &[u8]) -> Result<Vec<QueryHit>, FrameError> {
     let mut out = Vec::new();
     while at < b.len() {
         let key = get16(b, &mut at)?.to_vec();
-        let id = rd_u32(b, at).ok_or(FrameError::TooShort)?;
-        at += 4;
+        let id = rd_u64(b, at).ok_or(FrameError::TooShort)?;
+        at += 8;
         let path = get16(b, &mut at)?.to_vec();
         out.push(QueryHit { key, id, path });
     }

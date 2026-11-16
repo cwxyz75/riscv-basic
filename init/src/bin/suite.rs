@@ -8070,8 +8070,46 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
         Some(pst::EXISTS),
         "an error from the disk filesystem"
     );
+    // attributes, an index and a query (FS-SPEC 9.1) on the disk
+    ensure_eq!(
+        a.attr_set(1, b"tag", b"alpha"),
+        Ok(()),
+        "a text attribute on a file"
+    );
+    ensure_eq!(
+        docs.attr_set(1, b"tag", b"dirtag"),
+        Ok(()),
+        "and on a directory"
+    );
+    ensure_eq!(root.make_index(1, b"tag"), Ok(()), "an index on it");
+    ensure_eq!(code(root.make_index(1, b"tag")), Some(pst::EXISTS), "twice");
+    let all_tags = proto::file::Query {
+        index: b"tag",
+        term: proto::file::QueryTerm::Range { lo: None, hi: None },
+        after: None,
+        max: 100,
+    };
+    let (hits, more) = root.query(&all_tags).map_err(|e| msg_e(e, line!()))?;
+    let found: Vec<(Vec<u8>, Vec<u8>)> = hits
+        .iter()
+        .map(|h| (h.key.clone(), h.path.clone()))
+        .collect();
+    ensure_eq!(
+        found,
+        vec![
+            (b"alpha".to_vec(), b"docs/b.txt".to_vec()),
+            (b"dirtag".to_vec(), b"docs".to_vec())
+        ],
+        "the query finds both, ordered by key"
+    );
+    ensure!(!more, "nothing more");
     ensure_eq!(root.sync(), Ok(()), "sync");
     // after the sync: more changes, then the server dies before it commits them
+    ensure_eq!(
+        a.attr_set(1, b"tag", b"late"),
+        Ok(()),
+        "an unsynced attribute change"
+    );
     let mut late = root
         .open(b"late", pfl::CREATE, prt::READ | prt::WRITE)
         .map_err(|e| msg_e(e, line!()))?;

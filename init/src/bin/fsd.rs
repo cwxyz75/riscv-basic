@@ -9,7 +9,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use doofs::{Fs, FsError, Limits, NodeId, ROOT};
+use doofs::{AttrType, Fs, FsError, Limits, NodeId, Term, ROOT};
 use memfs::{Error, Kind};
 use proto::file::{self, flags, op, rights as pr, status};
 use proto::startup::Role;
@@ -245,6 +245,10 @@ impl Server {
         if req.op != op::CLONE
             && req.op != op::ACCOUNT
             && req.op != op::SYNC
+            && !matches!(
+                req.op,
+                op::ATTR_SET | op::ATTR_GET | op::ATTR_REMOVE | op::ATTR_LIST
+            )
             && op::is_directory_op(req.op) != is_dir
         {
             close_ep(endpoint);
@@ -469,6 +473,111 @@ impl Server {
                 }
                 match self.fs.write(node, req.a, req.payload) {
                     Ok(n) => self.send(key, txid, 0, n as u64, &[], None),
+                    Err(e) => self.send(key, txid, fstat(e, 0), 0, &[], None),
+                }
+            }
+            op::ATTR_SET => {
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let Ok((ty, name, value)) = file::decode_attr_set(req.payload) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let Some(ty) = AttrType::from_code(ty) else {
+                    return self.send(key, txid, status::BAD_VALUE, 0, &[], None);
+                };
+                self.changed();
+                let st = self
+                    .fs
+                    .attr_set(node, name, ty, value)
+                    .map_or_else(|e| fstat(e, name.len()), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
+            }
+            op::ATTR_GET => {
+                if !need(pr::READ) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                match self.fs.attr_get(node, req.payload) {
+                    Ok((ty, v)) => self.send(key, txid, 0, ty as u64, &v, None),
+                    Err(e) => self.send(key, txid, fstat(e, req.payload.len()), 0, &[], None),
+                }
+            }
+            op::ATTR_REMOVE => {
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                self.changed();
+                let st = self
+                    .fs
+                    .attr_remove(node, req.payload)
+                    .map_or_else(|e| fstat(e, req.payload.len()), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
+            }
+            op::ATTR_LIST => {
+                if !need(pr::READ) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                match self.fs.attr_list(node) {
+                    Ok(names) => {
+                        // the names after the cookie (`payload`), as many as fit one reply; `a` says whether more remain
+                        let rest: Vec<Vec<u8>> = names
+                            .into_iter()
+                            .filter(|n| req.payload.is_empty() || n.as_slice() > req.payload)
+                            .collect();
+                        let (bytes, n) = file::encode_names(&rest, file::MAX_IO);
+                        self.send(key, txid, 0, u64::from(n < rest.len()), &bytes, None);
+                    }
+                    Err(e) => self.send(key, txid, fstat(e, 0), 0, &[], None),
+                }
+            }
+            op::MAKE_INDEX => {
+                // (the INDEX right is not defined yet, T109(3): writing is what the server asks for)
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let Ok((ty, name)) = file::decode_make_index(req.payload) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let Some(ty) = AttrType::from_code(ty) else {
+                    return self.send(key, txid, status::BAD_VALUE, 0, &[], None);
+                };
+                self.changed();
+                let st = self
+                    .fs
+                    .make_index(name, ty)
+                    .map_or_else(|e| fstat(e, name.len()), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
+            }
+            op::QUERY => {
+                if !need(pr::ENUMERATE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let Ok(q) = file::decode_query(req.a, req.b, req.payload) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let term = match q.term {
+                    file::QueryTerm::Eq(v) => Term::Eq(v.to_vec()),
+                    file::QueryTerm::Range { lo, hi } => Term::Range {
+                        lo: lo.map(<[u8]>::to_vec),
+                        hi: hi.map(<[u8]>::to_vec),
+                    },
+                };
+                let max = usize::try_from(q.max).unwrap_or(usize::MAX);
+                match self.fs.query(node, q.index, &term, q.after, max) {
+                    Ok(r) => {
+                        let hits: Vec<file::QueryHit> = r
+                            .hits
+                            .iter()
+                            .map(|h| file::QueryHit {
+                                key: h.key.clone(),
+                                id: h.id,
+                                path: h.path.clone(),
+                            })
+                            .collect();
+                        let (bytes, n) = file::encode_hits(&hits, file::MAX_IO);
+                        let more = r.more || n < hits.len();
+                        self.send(key, txid, 0, u64::from(more), &bytes, None);
+                    }
                     Err(e) => self.send(key, txid, fstat(e, 0), 0, &[], None),
                 }
             }

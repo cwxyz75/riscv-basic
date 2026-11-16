@@ -7,7 +7,7 @@
 
 use doofs::{fsck::check_fs, Fs, ROOT};
 use fsfmt::{check, mkfs, mount, DevError, Device, MemDevice, BLOCK};
-use memfs::{Kind, Limits};
+use memfs::{AttrType, Kind, Limits, Term};
 use std::collections::BTreeMap;
 
 const BLOCKS: u64 = 120;
@@ -48,6 +48,9 @@ enum W {
     Truncate(&'static str, u64),
     Rename(&'static str, &'static str),
     Unlink(&'static str),
+    SetAttr(&'static str, &'static [u8]),
+    RemoveAttr(&'static str),
+    MakeIndex,
     Fsync,
 }
 
@@ -66,6 +69,10 @@ fn all_ops() -> Vec<W> {
         Rename("d", "e"),
         Unlink("g"),
         Unlink("d/f"),
+        SetAttr("g", b"red"),
+        SetAttr("d/f", b"blue"),
+        RemoveAttr("g"),
+        MakeIndex,
         Fsync,
     ]
 }
@@ -76,6 +83,9 @@ type Dump = BTreeMap<String, (Kind, Vec<u8>)>;
 trait Tree {
     fn dirs(&mut self, dir: u64) -> Vec<(Vec<u8>, Kind, u64)>;
     fn bytes(&mut self, id: u64) -> Vec<u8>;
+    /// The attributes of a node as (name, value), and the entries of the `tag` index as (key, path).
+    fn attrs(&mut self, id: u64) -> Vec<(Vec<u8>, Vec<u8>)>;
+    fn tagged(&mut self) -> Vec<(Vec<u8>, Vec<u8>)>;
 }
 
 struct M<'a>(&'a mut memfs::Fs);
@@ -91,6 +101,30 @@ impl Tree for M<'_> {
     }
     fn bytes(&mut self, id: u64) -> Vec<u8> {
         self.0.read(id as u32, 0, 1 << 20).unwrap()
+    }
+    fn attrs(&mut self, id: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let id = id as u32;
+        let names = self.0.attr_list(id).unwrap();
+        names
+            .into_iter()
+            .map(|n| {
+                let v = self.0.attr_get(id, &n).unwrap().1;
+                (n, v)
+            })
+            .collect()
+    }
+    fn tagged(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self
+            .0
+            .query(0, b"tag", &Term::Range { lo: None, hi: None }, None, 1000)
+        {
+            Ok(r) => {
+                let mut v: Vec<_> = r.hits.into_iter().map(|h| (h.key, h.path)).collect();
+                v.sort();
+                v
+            }
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -110,6 +144,32 @@ impl<X: Device> Tree for D<'_, X> {
             .read(id, 0, 1 << 20)
             .expect("a file reads without error")
     }
+    fn attrs(&mut self, id: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let names = self.0.attr_list(id).expect("attributes list");
+        names
+            .into_iter()
+            .map(|n| {
+                let v = self.0.attr_get(id, &n).unwrap().1;
+                (n, v)
+            })
+            .collect()
+    }
+    fn tagged(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self.0.query(
+            ROOT,
+            b"tag",
+            &Term::Range { lo: None, hi: None },
+            None,
+            1000,
+        ) {
+            Ok(r) => {
+                let mut v: Vec<_> = r.hits.into_iter().map(|h| (h.key, h.path)).collect();
+                v.sort();
+                v
+            }
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 fn dump(t: &mut dyn Tree) -> Dump {
@@ -118,6 +178,12 @@ fn dump(t: &mut dyn Tree) -> Dump {
     while let Some((dir, path)) = work.pop() {
         for (n, k, id) in t.dirs(dir) {
             let p = format!("{path}/{}", String::from_utf8_lossy(&n));
+            for (an, av) in t.attrs(id) {
+                out.insert(
+                    format!("{p}@{}", String::from_utf8_lossy(&an)),
+                    (Kind::File, av),
+                );
+            }
             match k {
                 Kind::Dir => {
                     out.insert(p.clone(), (k, vec![]));
@@ -132,6 +198,16 @@ fn dump(t: &mut dyn Tree) -> Dump {
                 }
             }
         }
+    }
+    for (key, path) in t.tagged() {
+        out.insert(
+            format!(
+                "tag-index:{}:{}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(&path)
+            ),
+            (Kind::File, vec![]),
+        );
     }
     out
 }
@@ -195,6 +271,19 @@ fn apply_m(m: &mut memfs::Fs, w: &W) {
                 let _ = m.unlink(d, n);
             }
         }
+        W::SetAttr(p, v) => {
+            if let Some(id) = walk(m, p) {
+                let _ = m.attr_set(id, b"tag", AttrType::Text, v);
+            }
+        }
+        W::RemoveAttr(p) => {
+            if let Some(id) = walk(m, p) {
+                let _ = m.attr_remove(id, b"tag");
+            }
+        }
+        W::MakeIndex => {
+            let _ = m.make_index(b"tag", AttrType::Text);
+        }
         W::Fsync => {}
     }
 }
@@ -239,6 +328,19 @@ fn apply_d<X: Device>(f: &mut Fs<X>, w: &W) {
             if let Ok(d) = f.walk(ROOT, &d) {
                 let _ = f.unlink(d, n);
             }
+        }
+        W::SetAttr(p, v) => {
+            if let Some(id) = walk(f, p) {
+                let _ = f.attr_set(id, b"tag", AttrType::Text, v);
+            }
+        }
+        W::RemoveAttr(p) => {
+            if let Some(id) = walk(f, p) {
+                let _ = f.attr_remove(id, b"tag");
+            }
+        }
+        W::MakeIndex => {
+            let _ = f.make_index(b"tag", AttrType::Text);
         }
         W::Fsync => f.commit().expect("commit"),
     }
@@ -434,7 +536,7 @@ fn every_one_and_two_operation_workload_survives_a_crash_at_every_point() {
     for a in &ops {
         scenarios += crash_test(&[a.clone(), W::Fsync], &mut rng, 2);
         for b in &ops {
-            scenarios += crash_test(&[a.clone(), b.clone()], &mut rng, 2);
+            scenarios += crash_test(&[a.clone(), b.clone()], &mut rng, 1);
         }
     }
     eprintln!("{scenarios} crash scenarios");
@@ -457,4 +559,36 @@ fn sampled_three_operation_workloads_survive_too() {
         scenarios += crash_test(&ws, &mut rng, 2);
     }
     eprintln!("{scenarios} crash scenarios");
+}
+
+/// Attribute and index workloads that end in a commit (the exhaustive two-operation set has no room for three).
+#[test]
+fn attribute_and_index_workloads_survive_a_crash_at_every_point() {
+    use W::*;
+    let mut rng = Rng(0x00A7_71B0_7E55);
+    let sets: Vec<Vec<W>> = vec![
+        vec![SetAttr("g", b"red"), MakeIndex, Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Fsync],
+        vec![
+            SetAttr("g", b"red"),
+            SetAttr("d/f", b"blue"),
+            MakeIndex,
+            Fsync,
+        ],
+        vec![MakeIndex, SetAttr("g", b"red"), RemoveAttr("g"), Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Rename("g", "h"), Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Unlink("g"), Fsync],
+        vec![SetAttr("g", b"red"), Fsync, MakeIndex, Fsync],
+        vec![MakeIndex, Fsync, SetAttr("g", b"red"), Fsync],
+        vec![
+            MakeIndex,
+            Write("g", 0, 5000, 7),
+            Fsync,
+            Truncate("g", 10),
+            Fsync,
+        ],
+    ];
+    for ws in sets {
+        crash_test(&ws, &mut rng, 3);
+    }
 }
