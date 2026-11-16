@@ -649,3 +649,314 @@ mod streams {
         assert_eq!(pn::limits::POSTED_ACCEPTS_MAX, 16);
     }
 }
+
+// --- attributes, queries and symlinks (FS-SPEC 9.1): goldens worked out by hand from the field lists in `proto::file` ---
+
+#[test]
+fn attribute_and_index_payload_goldens() {
+    // ty 2 (U64), name "age" (len 3), value 7 as 8 little-endian bytes
+    let p = file::encode_attr_set(2, b"age", &7u64.to_le_bytes());
+    assert_eq!(p, hex("02 03 00 61 67 65 07 00 00 00 00 00 00 00"));
+    assert_eq!(
+        file::decode_attr_set(&p),
+        Ok((2, &b"age"[..], &7u64.to_le_bytes()[..]))
+    );
+    // an empty value is allowed; the name length may not run past the end
+    assert_eq!(
+        file::decode_attr_set(&hex("00 01 00 6b")),
+        Ok((0, &b"k"[..], &b""[..]))
+    );
+    assert_eq!(
+        file::decode_attr_set(&hex("00 05 00 6b")),
+        Err(FrameError::BadLength)
+    );
+    assert_eq!(
+        file::decode_attr_set(&hex("00 05")),
+        Err(FrameError::TooShort)
+    );
+    assert_eq!(file::decode_attr_set(&[]), Err(FrameError::TooShort));
+    // MAKE_INDEX: ty 2, name "year"
+    let p = file::encode_make_index(2, b"year");
+    assert_eq!(p, hex("02 79 65 61 72"));
+    assert_eq!(file::decode_make_index(&p), Ok((2, &b"year"[..])));
+    assert_eq!(file::decode_make_index(&[]), Err(FrameError::TooShort));
+    // ATTR_LIST's reply
+    let (bytes, n) = file::encode_names(&[b"a".to_vec(), b"bc".to_vec(), b"def".to_vec()], 100);
+    assert_eq!(
+        (bytes.clone(), n),
+        (hex("01 00 61 02 00 62 63 03 00 64 65 66"), 3)
+    );
+    assert_eq!(
+        file::decode_names(&bytes),
+        Ok(vec![b"a".to_vec(), b"bc".to_vec(), b"def".to_vec()])
+    );
+    let (bytes, n) = file::encode_names(&[b"a".to_vec(), b"bc".to_vec(), b"def".to_vec()], 7);
+    assert_eq!(
+        (bytes, n),
+        (hex("01 00 61 02 00 62 63"), 2),
+        "stops before the limit"
+    );
+    assert_eq!(
+        file::decode_names(&hex("03 00 61 62")),
+        Err(FrameError::BadLength)
+    );
+}
+
+#[test]
+fn query_goldens_and_rejections() {
+    // Eq on index "year": flags 1; payload: index (len 4) "year", value (len 8) 1999 little-endian
+    let q = file::Query {
+        index: b"year",
+        term: file::QueryTerm::Eq(&1999u64.to_le_bytes()),
+        after: None,
+        max: 50,
+    };
+    let (flags, payload) = q.encode();
+    assert_eq!(flags, 1);
+    assert_eq!(
+        payload,
+        hex("04 00 79 65 61 72 08 00 cf 07 00 00 00 00 00 00")
+    );
+    assert_eq!(file::decode_query(50, flags, &payload), Ok(q));
+    // a range with a lower bound and a position to continue after: flags LO | AFTER = 2 | 8 = 10
+    let lo = 5u64.to_le_bytes();
+    let key = [0, 0, 0, 0, 0, 0, 7, 0xcf];
+    let q = file::Query {
+        index: b"year",
+        term: file::QueryTerm::Range {
+            lo: Some(&lo),
+            hi: None,
+        },
+        after: Some((&key, 5)),
+        max: 1000,
+    };
+    let (flags, payload) = q.encode();
+    assert_eq!(flags, 10);
+    assert_eq!(
+        payload,
+        hex("04 00 79 65 61 72  08 00 05 00 00 00 00 00 00 00  08 00 00 00 00 00 00 00 07 cf  05 00 00 00")
+    );
+    assert_eq!(file::decode_query(1000, flags, &payload), Ok(q));
+    // both bounds, no position: flags LO | HI = 6
+    let hi = 9u64.to_le_bytes();
+    let q = file::Query {
+        index: b"n",
+        term: file::QueryTerm::Range {
+            lo: Some(&lo),
+            hi: Some(&hi),
+        },
+        after: None,
+        max: 3,
+    };
+    let (flags, payload) = q.encode();
+    assert_eq!(flags, 6);
+    assert_eq!(file::decode_query(3, flags, &payload), Ok(q));
+    // an open range: flags 0, only the index
+    assert_eq!(
+        file::decode_query(7, 0, &hex("01 00 6e")),
+        Ok(file::Query {
+            index: b"n",
+            term: file::QueryTerm::Range { lo: None, hi: None },
+            after: None,
+            max: 7
+        })
+    );
+    // rejections: an undefined flag, Eq together with a bound, a missing field, bytes left over
+    assert_eq!(
+        file::decode_query(1, 16, &hex("01 00 6e")),
+        Err(FrameError::BadBits)
+    );
+    assert_eq!(
+        file::decode_query(1, 1 | 2, &hex("01 00 6e 00 00")),
+        Err(FrameError::BadBits)
+    );
+    assert_eq!(
+        file::decode_query(1, 1, &hex("01 00 6e")),
+        Err(FrameError::TooShort)
+    );
+    assert_eq!(
+        file::decode_query(1, 0, &hex("01 00 6e 00")),
+        Err(FrameError::BadLength)
+    );
+    assert_eq!(
+        file::decode_query(1, 8, &hex("01 00 6e 01 00 6b 05 00")),
+        Err(FrameError::TooShort)
+    );
+}
+
+#[test]
+fn query_hit_goldens() {
+    // key 1999 big-endian, node 3, path "d/a"
+    let h = file::QueryHit {
+        key: vec![0, 0, 0, 0, 0, 0, 7, 0xcf],
+        id: 3,
+        path: b"d/a".to_vec(),
+    };
+    let (bytes, n) = file::encode_hits(std::slice::from_ref(&h), 100);
+    assert_eq!(n, 1);
+    assert_eq!(
+        bytes,
+        hex("08 00 00 00 00 00 00 00 07 cf 03 00 00 00 03 00 64 2f 61")
+    );
+    assert_eq!(file::decode_hits(&bytes), Ok(vec![h.clone()]));
+    let two = [h.clone(), h.clone()];
+    let (bytes, n) = file::encode_hits(&two, 20);
+    assert_eq!((n, bytes.len()), (1, 19), "the second hit does not fit");
+    assert_eq!(
+        file::decode_hits(&hex("08 00 00")),
+        Err(FrameError::BadLength)
+    );
+    assert_eq!(
+        file::decode_hits(&hex("00 00 01 00")),
+        Err(FrameError::TooShort)
+    );
+}
+
+#[test]
+fn symlink_payload_and_target_rule() {
+    let (a, payload) = file::encode_symlink(b"d/l", b"../x");
+    assert_eq!((a, payload.clone()), (3, b"d/l../x".to_vec()));
+    assert_eq!(
+        file::decode_symlink(a, &payload),
+        Ok((&b"d/l"[..], &b"../x"[..]))
+    );
+    assert_eq!(
+        file::decode_symlink(99, &payload),
+        Err(FrameError::BadLength)
+    );
+    // the target rule, with the depth of the link's directory below the connection root
+    for (target, depth, ok) in [
+        (&b"x"[..], 0, true),
+        (b"../x", 0, false),
+        (b"../x", 1, true),
+        (b"../../x", 1, false),
+        (b"a/../../x", 1, true),
+        (b"a/../../../x", 1, false),
+        (b"./x", 0, true),
+        (b"/x", 5, false),
+        (b"", 0, false),
+        (b"x/", 0, false),
+        (b"x//y", 0, false),
+        (b"x\0", 0, false),
+    ] {
+        assert_eq!(
+            file::check_link_target(target, depth).is_ok(),
+            ok,
+            "{:?} at depth {depth}",
+            String::from_utf8_lossy(target)
+        );
+    }
+    assert!(
+        file::check_link_target(&vec![b'x'; 1024], 0).is_err(),
+        "one 1024-byte component is too long as a name"
+    );
+    assert!(
+        file::check_link_target(&[b"x/".repeat(520), b"x".to_vec()].concat(), 0).is_err(),
+        "over 1024 bytes"
+    );
+}
+
+#[test]
+fn the_new_operations_have_numbers_handle_counts_and_kinds() {
+    use file::op;
+    for (o, n) in [
+        (op::ATTR_SET, 20),
+        (op::ATTR_GET, 21),
+        (op::ATTR_REMOVE, 22),
+        (op::ATTR_LIST, 23),
+        (op::MAKE_INDEX, 24),
+        (op::QUERY, 25),
+        (op::SYMLINK, 26),
+        (op::READLINK, 27),
+    ] {
+        assert_eq!(o, n);
+        assert_eq!(op::handles(o), Some(0));
+    }
+    for o in [op::MAKE_INDEX, op::QUERY, op::SYMLINK, op::READLINK] {
+        assert!(op::is_directory_op(o));
+    }
+    for o in [op::ATTR_SET, op::ATTR_GET, op::ATTR_REMOVE, op::ATTR_LIST] {
+        assert!(
+            !op::is_directory_op(o),
+            "attribute operations act on any connection's node"
+        );
+    }
+    assert_eq!(op::handles(28), None, "28 is not defined");
+    assert_eq!(
+        [
+            file::status::NO_ATTR,
+            file::status::NO_INDEX,
+            file::status::BAD_VALUE,
+            file::status::BAD_TARGET
+        ],
+        [-110, -111, -112, -113]
+    );
+}
+
+#[test]
+fn the_new_decoders_never_panic_on_any_bytes() {
+    let mut r = Rng(0x5eed);
+    for _ in 0..20_000 {
+        let n = r.below(40) as usize;
+        let b: Vec<u8> = (0..n)
+            .map(|_| {
+                if r.below(3) == 0 {
+                    0
+                } else {
+                    r.below(256) as u8
+                }
+            })
+            .collect();
+        let _ = file::decode_attr_set(&b);
+        let _ = file::decode_make_index(&b);
+        let _ = file::decode_names(&b);
+        let _ = file::decode_hits(&b);
+        let _ = file::decode_symlink(r.below(50), &b);
+        let _ = file::decode_query(r.below(10), r.below(32), &b);
+        let _ = file::check_link_target(&b, r.below(4) as usize);
+    }
+}
+
+#[test]
+fn queries_and_hits_survive_a_round_trip() {
+    let mut r = Rng(77);
+    for _ in 0..2_000 {
+        let rnd =
+            |r: &mut Rng| -> Vec<u8> { (0..r.below(12)).map(|_| r.below(256) as u8).collect() };
+        let index = rnd(&mut r);
+        let (lo, hi, eq, key) = (rnd(&mut r), rnd(&mut r), rnd(&mut r), rnd(&mut r));
+        let term = match r.below(4) {
+            0 => file::QueryTerm::Eq(&eq),
+            1 => file::QueryTerm::Range {
+                lo: Some(&lo),
+                hi: None,
+            },
+            2 => file::QueryTerm::Range {
+                lo: None,
+                hi: Some(&hi),
+            },
+            _ => file::QueryTerm::Range {
+                lo: Some(&lo),
+                hi: Some(&hi),
+            },
+        };
+        let after = (r.below(2) == 0).then_some((key.as_slice(), r.below(1 << 20) as u32));
+        let q = file::Query {
+            index: &index,
+            term,
+            after,
+            max: r.below(2000),
+        };
+        let (flags, payload) = q.encode();
+        assert_eq!(file::decode_query(q.max, flags, &payload).as_ref(), Ok(&q));
+        let hits: Vec<file::QueryHit> = (0..r.below(6))
+            .map(|_| file::QueryHit {
+                key: rnd(&mut r),
+                id: r.below(1 << 30) as u32,
+                path: rnd(&mut r),
+            })
+            .collect();
+        let (bytes, n) = file::encode_hits(&hits, 4096);
+        assert_eq!(file::decode_hits(&bytes).unwrap(), hits[..n].to_vec());
+    }
+}

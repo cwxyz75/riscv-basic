@@ -3,6 +3,10 @@
 //! quota accounting, read-only subtrees, and reference counts so a node that is unlinked while
 //! a connection has it open lives on until the last connection lets go. `no_std`,
 //! `forbid(unsafe_code)`, host-tested against an independent path-keyed model.
+//!
+//! Step 0 of the disk filesystem (FS-SPEC section 9.1) adds, as the reference every other implementation must match:
+//! a parent link and a modification time on every node, typed **attributes**, volume-wide **indexes** with back-fill,
+//! **queries** filtered to a subtree, and **symlinks** that are never followed here.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -33,6 +37,93 @@ pub struct Limits {
 /// What a node costs against `max_meta` beyond its name.
 const NODE_OVERHEAD: usize = 96;
 
+/// Longest attribute name and value (FS-SPEC 9.1), longest indexable value, most indexes, most results of one query and
+/// longest symlink target.
+pub const MAX_ATTR_NAME: usize = 255;
+pub const MAX_ATTR_VALUE: usize = 1024;
+pub const MAX_INDEX_VALUE: usize = 255;
+pub const MAX_INDEXES: usize = 16;
+pub const MAX_QUERY: usize = 1000;
+pub const MAX_LINK_TARGET: usize = 1024;
+/// What an attribute costs against `max_meta` beyond its name and value, and an index beyond its name.
+const ATTR_OVERHEAD: usize = 32;
+const INDEX_OVERHEAD: usize = 64;
+/// The built-in indexes: always present, no `MakeIndex`; their names are not available to attributes.
+pub const BUILTIN_NAME: &[u8] = b"name";
+pub const BUILTIN_SIZE: &[u8] = b"size";
+pub const BUILTIN_MTIME: &[u8] = b"mtime";
+
+/// The type of an attribute value (and of an index over it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttrType {
+    Bytes = 0,
+    /// Valid UTF-8.
+    Text = 1,
+    /// Exactly 8 bytes, little-endian.
+    U64 = 2,
+    /// Exactly 8 bytes, little-endian, two's complement.
+    I64 = 3,
+}
+
+impl AttrType {
+    pub fn from_code(c: u8) -> Option<AttrType> {
+        Some(match c {
+            0 => AttrType::Bytes,
+            1 => AttrType::Text,
+            2 => AttrType::U64,
+            3 => AttrType::I64,
+            _ => return None,
+        })
+    }
+
+    /// Check `value` against the type and return its **index key**: `U64` big-endian, `I64` big-endian with the sign bit
+    /// flipped (so signed order is bytewise order), `Bytes` and `Text` as they are.
+    pub fn key(self, value: &[u8]) -> Result<Vec<u8>, Error> {
+        match self {
+            AttrType::Bytes => Ok(value.to_vec()),
+            AttrType::Text => core::str::from_utf8(value)
+                .map(|_| value.to_vec())
+                .map_err(|_| Error::BadValue),
+            AttrType::U64 => {
+                let b: [u8; 8] = value.try_into().map_err(|_| Error::BadValue)?;
+                Ok(u64::from_le_bytes(b).to_be_bytes().to_vec())
+            }
+            AttrType::I64 => {
+                let b: [u8; 8] = value.try_into().map_err(|_| Error::BadValue)?;
+                Ok((i64::from_le_bytes(b) as u64 ^ (1 << 63))
+                    .to_be_bytes()
+                    .to_vec())
+            }
+        }
+    }
+}
+
+/// A query's term on an index key (FS-SPEC 9.1): equality, or a range with the lower bound inclusive and the upper
+/// bound exclusive, either optional. The values are given as raw attribute values of the index's type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Term {
+    Eq(Vec<u8>),
+    Range {
+        lo: Option<Vec<u8>>,
+        hi: Option<Vec<u8>>,
+    },
+}
+
+/// One query result: the node, its key, and its path relative to the directory queried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub id: NodeId,
+    pub key: Vec<u8>,
+    pub path: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryResult {
+    pub hits: Vec<Hit>,
+    /// There were more matches than `max`.
+    pub more: bool,
+}
+
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
@@ -50,6 +141,8 @@ pub enum Kind {
     Dir,
     /// A read-only file whose bytes are an extent of the boot image.
     Image,
+    /// A symbolic link: a relative target that nothing here ever follows.
+    Symlink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +162,16 @@ pub enum Error {
     BadName,
     /// An offset or length that overflows.
     BadRange,
-    /// A directory cannot be moved into itself or below itself.
+    /// A directory cannot be moved into itself or below itself; `read` or `write` of a symlink.
     Invalid,
+    /// No attribute of that name.
+    NoAttr,
+    /// No index of that name.
+    NoIndex,
+    /// An attribute value or query term that does not fit its type, or is too long.
+    BadValue,
+    /// A symlink target that is malformed, absolute, or could climb above the connection root.
+    BadTarget,
 }
 
 /// File contents: fixed-size chunks, so a file holds (about) the bytes it counts. One growing
@@ -161,6 +262,7 @@ enum Data {
     File(Blob),
     Dir(BTreeMap<Vec<u8>, NodeId>),
     Image { offset: u64, len: u64 },
+    Symlink(Vec<u8>),
 }
 
 struct Node {
@@ -172,6 +274,14 @@ struct Node {
     /// Open connections holding this node.
     refs: u32,
     readonly: bool,
+    /// The directory that holds the entry that names this node (the root's is itself): one entry per node, no hard links.
+    parent: NodeId,
+    /// Wall-clock time of the last content change (FS-SPEC 9.1).
+    mtime: u64,
+    /// Attributes: name to (type, value).
+    attrs: BTreeMap<Vec<u8>, (AttrType, Vec<u8>)>,
+    /// Bytes of attributes charged to `max_meta`.
+    attr_cost: usize,
 }
 
 pub struct Fs {
@@ -181,6 +291,10 @@ pub struct Fs {
     live: usize,
     bytes: usize,
     meta: usize,
+    /// The wall clock the server last gave (`set_time`).
+    now: u64,
+    /// User indexes: attribute name to type.
+    indexes: BTreeMap<Vec<u8>, AttrType>,
 }
 
 fn check_name(n: &[u8]) -> Result<(), Error> {
@@ -195,6 +309,10 @@ impl Fs {
             refs: 0,
             readonly: false,
             cost: 0,
+            parent: ROOT,
+            mtime: 0,
+            attrs: BTreeMap::new(),
+            attr_cost: 0,
         };
         Fs {
             limits,
@@ -203,6 +321,8 @@ impl Fs {
             live: 1,
             bytes: 0,
             meta: 0,
+            now: 0,
+            indexes: BTreeMap::new(),
         }
     }
 
@@ -257,6 +377,7 @@ impl Fs {
             Data::File(_) => Kind::File,
             Data::Dir(_) => Kind::Dir,
             Data::Image { .. } => Kind::Image,
+            Data::Symlink(_) => Kind::Symlink,
         })
     }
 
@@ -266,6 +387,7 @@ impl Fs {
             Data::File(b) => b.len as u64,
             Data::Dir(m) => m.len() as u64,
             Data::Image { len, .. } => *len,
+            Data::Symlink(t) => t.len() as u64,
         })
     }
 
@@ -330,6 +452,10 @@ impl Fs {
             links: 1,
             refs: 0,
             readonly: false,
+            parent: dir,
+            mtime: self.now,
+            attrs: BTreeMap::new(),
+            attr_cost: 0,
         };
         let id = if let Some(id) = self.free.pop() {
             self.nodes[id as usize] = Some(node);
@@ -341,7 +467,10 @@ impl Fs {
         };
         self.live += 1;
         self.meta += cost;
-        if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
+        let now = self.now;
+        let d = self.node_mut(dir)?;
+        d.mtime = now;
+        if let Data::Dir(m) = &mut d.data {
             m.insert(name.to_vec(), id);
         }
         Ok(id)
@@ -372,7 +501,7 @@ impl Fs {
         match self.node(id)?.data {
             Data::Image { offset, len } => Ok((offset, len)),
             Data::Dir(_) => Err(Error::IsDirectory),
-            Data::File(_) => Err(Error::NotFound),
+            Data::File(_) | Data::Symlink(_) => Err(Error::NotFound),
         }
     }
 
@@ -395,7 +524,10 @@ impl Fs {
                 return Err(Error::NotEmpty);
             }
         }
-        if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
+        let now = self.now;
+        let d = self.node_mut(dir)?;
+        d.mtime = now;
+        if let Data::Dir(m) = &mut d.data {
             m.remove(name);
         }
         self.node_mut(target)?.links = 0;
@@ -471,14 +603,21 @@ impl Fs {
             self.node_mut(d)?.links = 0;
             self.collect(d);
         }
-        if let Data::Dir(m) = &mut self.node_mut(from_dir)?.data {
+        let now = self.now;
+        let f = self.node_mut(from_dir)?;
+        f.mtime = now;
+        if let Data::Dir(m) = &mut f.data {
             m.remove(from_name);
         }
-        if let Data::Dir(m) = &mut self.node_mut(to_dir)?.data {
+        let t = self.node_mut(to_dir)?;
+        t.mtime = now;
+        if let Data::Dir(m) = &mut t.data {
             m.insert(to_name.to_vec(), src);
         }
         self.meta = self.meta - old_cost + new_cost;
-        self.node_mut(src)?.cost = new_cost;
+        let moved = self.node_mut(src)?;
+        moved.cost = new_cost;
+        moved.parent = to_dir;
         Ok(())
     }
 
@@ -519,7 +658,7 @@ impl Fs {
                 continue;
             }
             if let Some(Some(n)) = self.nodes.get_mut(id as usize).map(|s| s.take()) {
-                self.meta -= n.cost;
+                self.meta -= n.cost + n.attr_cost;
                 match &n.data {
                     Data::File(b) => self.bytes -= b.len,
                     // Defence in depth: whatever a dying directory still names dies with it.
@@ -531,7 +670,7 @@ impl Fs {
                             work.push(child);
                         }
                     }
-                    Data::Image { .. } => {}
+                    Data::Image { .. } | Data::Symlink(_) => {}
                 }
             }
             self.free.push(id);
@@ -547,6 +686,7 @@ impl Fs {
                 .ok_or(Error::Quota),
             Data::Dir(_) => Err(Error::IsDirectory),
             Data::Image { .. } => Err(Error::ReadOnly),
+            Data::Symlink(_) => Err(Error::Invalid),
         }
     }
 
@@ -560,6 +700,7 @@ impl Fs {
         match &n.data {
             Data::Dir(_) => return Err(Error::IsDirectory),
             Data::Image { .. } => return Err(Error::ReadOnly),
+            Data::Symlink(_) => return Err(Error::Invalid),
             Data::File(_) => {}
         }
         if n.readonly {
@@ -571,7 +712,10 @@ impl Fs {
         let end = usize::try_from(end).map_err(|_| Error::TooBig)?;
         self.resize_for(id, end)?;
         let offset = offset as usize;
-        if let Data::File(b) = &mut self.node_mut(id)?.data {
+        let now = self.now;
+        let node = self.node_mut(id)?;
+        node.mtime = now;
+        if let Data::File(b) = &mut node.data {
             b.write_at(offset, data);
         }
         Ok(data.len())
@@ -583,6 +727,7 @@ impl Fs {
         match &n.data {
             Data::Dir(_) => return Err(Error::IsDirectory),
             Data::Image { .. } => return Err(Error::ReadOnly),
+            Data::Symlink(_) => return Err(Error::Invalid),
             Data::File(_) => {}
         }
         if n.readonly {
@@ -596,15 +741,17 @@ impl Fs {
             Data::File(b) => b.len,
             _ => 0,
         };
+        let now = self.now;
         if size > cur {
-            self.resize_for(id, size)
+            self.resize_for(id, size)?;
         } else {
             if let Data::File(b) = &mut self.node_mut(id)?.data {
                 let _ = b.resize(size); // shrinking frees; it cannot fail
             }
             self.bytes -= cur - size;
-            Ok(())
         }
+        self.node_mut(id)?.mtime = now;
+        Ok(())
     }
 
     /// Grow the file to at least `new_len` bytes, checking limits before changing anything.
@@ -628,6 +775,301 @@ impl Fs {
         }
         self.bytes += grow;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------------------------------ step 0 (FS-SPEC 9.1)
+
+    /// The wall clock the server gives (nanoseconds); later changes are stamped with it.
+    pub fn set_time(&mut self, now: u64) {
+        self.now = now;
+    }
+
+    /// The directory holding the entry that names `id` (the root's is itself).
+    pub fn parent(&self, id: NodeId) -> Result<NodeId, Error> {
+        Ok(self.node(id)?.parent)
+    }
+
+    /// The time of the last content change of `id`.
+    pub fn mtime(&self, id: NodeId) -> Result<u64, Error> {
+        Ok(self.node(id)?.mtime)
+    }
+
+    /// The name of `id` in its parent (none for the root).
+    fn name_of(&self, id: NodeId) -> Option<Vec<u8>> {
+        if id == ROOT {
+            return None;
+        }
+        let p = self.node(id).ok()?.parent;
+        match &self.node(p).ok()?.data {
+            Data::Dir(m) => m.iter().find(|(_, &c)| c == id).map(|(n, _)| n.clone()),
+            _ => None,
+        }
+    }
+
+    /// The path of `id` relative to `below` (components joined by `/`), if `id` is strictly below it and linked.
+    fn path_below(&self, id: NodeId, below: NodeId) -> Option<Vec<u8>> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut at = id;
+        while at != below {
+            let n = self.node(at).ok()?;
+            if n.links == 0 || at == ROOT {
+                return None;
+            }
+            parts.push(self.name_of(at)?);
+            at = n.parent;
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        parts.reverse();
+        Some(parts.join(&b'/'))
+    }
+
+    /// How many directories below `root` `dir` is (0 for `root` itself); `Invalid` if `dir` is not at or below it.
+    pub fn depth_below(&self, dir: NodeId, root: NodeId) -> Result<usize, Error> {
+        let mut at = dir;
+        let mut depth = 0;
+        while at != root {
+            if at == ROOT {
+                return Err(Error::Invalid);
+            }
+            at = self.node(at)?.parent;
+            depth += 1;
+        }
+        Ok(depth)
+    }
+
+    fn check_attr_name(name: &[u8]) -> Result<(), Error> {
+        if name.is_empty()
+            || name.len() > MAX_ATTR_NAME
+            || name.contains(&0)
+            || name.contains(&b'/')
+            || name == BUILTIN_NAME
+            || name == BUILTIN_SIZE
+            || name == BUILTIN_MTIME
+        {
+            return Err(Error::BadName);
+        }
+        Ok(())
+    }
+
+    /// Set (replace) attribute `name` of `id`.
+    pub fn attr_set(
+        &mut self,
+        id: NodeId,
+        name: &[u8],
+        ty: AttrType,
+        value: &[u8],
+    ) -> Result<(), Error> {
+        Self::check_attr_name(name)?;
+        if value.len() > MAX_ATTR_VALUE {
+            return Err(Error::TooBig);
+        }
+        ty.key(value)?; // type and length
+        let n = self.node(id)?;
+        if n.readonly || matches!(n.data, Data::Image { .. }) {
+            return Err(Error::ReadOnly);
+        }
+        if let Some(&it) = self.indexes.get(name) {
+            if it == ty && value.len() > MAX_INDEX_VALUE {
+                return Err(Error::TooBig);
+            }
+        }
+        let new_cost = name.len() + value.len() + ATTR_OVERHEAD;
+        let old_cost = n
+            .attrs
+            .get(name)
+            .map_or(0, |(_, v)| name.len() + v.len() + ATTR_OVERHEAD);
+        if new_cost > old_cost && self.meta + (new_cost - old_cost) > self.limits.max_meta {
+            return Err(Error::Quota);
+        }
+        let node = self.node_mut(id)?;
+        node.attrs.insert(name.to_vec(), (ty, value.to_vec()));
+        node.attr_cost = node.attr_cost - old_cost + new_cost;
+        self.meta = self.meta - old_cost + new_cost;
+        Ok(())
+    }
+
+    pub fn attr_get(&self, id: NodeId, name: &[u8]) -> Result<(AttrType, Vec<u8>), Error> {
+        Self::check_attr_name(name)?;
+        self.node(id)?.attrs.get(name).cloned().ok_or(Error::NoAttr)
+    }
+
+    pub fn attr_remove(&mut self, id: NodeId, name: &[u8]) -> Result<(), Error> {
+        Self::check_attr_name(name)?;
+        let n = self.node(id)?;
+        if n.readonly || matches!(n.data, Data::Image { .. }) {
+            return Err(Error::ReadOnly);
+        }
+        let node = self.node_mut(id)?;
+        let (_, v) = node.attrs.remove(name).ok_or(Error::NoAttr)?;
+        let cost = name.len() + v.len() + ATTR_OVERHEAD;
+        node.attr_cost -= cost;
+        self.meta -= cost;
+        Ok(())
+    }
+
+    /// The attribute names of `id` in bytewise order.
+    pub fn attr_list(&self, id: NodeId) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self.node(id)?.attrs.keys().cloned().collect())
+    }
+
+    /// Create an index on attribute `name` of type `ty` and back-fill it. Nothing changes on error.
+    pub fn make_index(&mut self, name: &[u8], ty: AttrType) -> Result<(), Error> {
+        Self::check_attr_name(name)?;
+        if self.indexes.contains_key(name) {
+            return Err(Error::Exists);
+        }
+        if self.indexes.len() >= MAX_INDEXES {
+            return Err(Error::Quota);
+        }
+        // the back-fill: every value of that type must be indexable
+        for n in self.nodes.iter().flatten() {
+            if let Some((t, v)) = n.attrs.get(name) {
+                if *t == ty && v.len() > MAX_INDEX_VALUE {
+                    return Err(Error::TooBig);
+                }
+            }
+        }
+        let cost = name.len() + INDEX_OVERHEAD;
+        if self.meta + cost > self.limits.max_meta {
+            return Err(Error::Quota);
+        }
+        self.meta += cost;
+        self.indexes.insert(name.to_vec(), ty);
+        Ok(())
+    }
+
+    /// The user indexes (name, type) in bytewise order. The built-in ones are not listed.
+    pub fn indexes(&self) -> Vec<(Vec<u8>, AttrType)> {
+        self.indexes.iter().map(|(n, t)| (n.clone(), *t)).collect()
+    }
+
+    /// The index key of `id` for index `index`, if it has one.
+    fn key_of(&self, id: NodeId, index: &[u8], ty: AttrType) -> Option<Vec<u8>> {
+        let n = self.node(id).ok()?;
+        if index == BUILTIN_NAME {
+            return self.name_of(id);
+        }
+        if index == BUILTIN_SIZE {
+            return Some(self.size(id).ok()?.to_be_bytes().to_vec());
+        }
+        if index == BUILTIN_MTIME {
+            return Some(n.mtime.to_be_bytes().to_vec());
+        }
+        let (t, v) = n.attrs.get(index)?;
+        if *t != ty {
+            return None;
+        }
+        ty.key(v).ok()
+    }
+
+    /// The live, linked nodes strictly below `dir` whose key in `index` matches `term`, ordered by `(key, id)`, strictly
+    /// after `after` when given, at most `min(max, MAX_QUERY)` of them (FS-SPEC 9.1).
+    pub fn query(
+        &self,
+        dir: NodeId,
+        index: &[u8],
+        term: &Term,
+        after: Option<(&[u8], NodeId)>,
+        max: usize,
+    ) -> Result<QueryResult, Error> {
+        if !matches!(self.node(dir)?.data, Data::Dir(_)) {
+            return Err(Error::NotDirectory);
+        }
+        let ty = if index == BUILTIN_NAME {
+            AttrType::Bytes
+        } else if index == BUILTIN_SIZE || index == BUILTIN_MTIME {
+            AttrType::U64
+        } else {
+            *self.indexes.get(index).ok_or(Error::NoIndex)?
+        };
+        // the term's values, as keys (the built-ins take their 8-byte values big-endian from a little-endian wire value)
+        let enc = |v: &[u8]| -> Result<Vec<u8>, Error> { ty.key(v) };
+        let (lo, hi, eq) = match term {
+            Term::Eq(v) => (None, None, Some(enc(v)?)),
+            Term::Range { lo, hi } => (
+                lo.as_deref().map(enc).transpose()?,
+                hi.as_deref().map(enc).transpose()?,
+                None,
+            ),
+        };
+        let mut found: Vec<(Vec<u8>, NodeId)> = Vec::new();
+        for (i, slot) in self.nodes.iter().enumerate() {
+            let id = i as NodeId;
+            if slot.is_none() || id == ROOT || id == dir {
+                continue;
+            }
+            let Some(key) = self.key_of(id, index, ty) else {
+                continue;
+            };
+            let hit = match (&eq, &lo, &hi) {
+                (Some(e), _, _) => &key == e,
+                (None, l, h) => {
+                    l.as_ref().is_none_or(|l| key >= *l) && h.as_ref().is_none_or(|h| key < *h)
+                }
+            };
+            if !hit || self.path_below(id, dir).is_none() {
+                continue;
+            }
+            if let Some((ak, aid)) = after {
+                if (key.as_slice(), id) <= (ak, aid) {
+                    continue;
+                }
+            }
+            found.push((key, id));
+        }
+        found.sort();
+        let max = max.min(MAX_QUERY);
+        let more = found.len() > max;
+        found.truncate(max);
+        let hits = found
+            .into_iter()
+            .map(|(key, id)| Hit {
+                id,
+                key,
+                path: self.path_below(id, dir).unwrap_or_default(),
+            })
+            .collect();
+        Ok(QueryResult { hits, more })
+    }
+
+    /// Create the symlink `name` in `dir` with `target`. `root` is the connection root the link is created through
+    /// (`dir` must be at or below it): the target may never climb above it (FS-SPEC 9.1).
+    pub fn symlink(
+        &mut self,
+        dir: NodeId,
+        name: &[u8],
+        target: &[u8],
+        root: NodeId,
+    ) -> Result<NodeId, Error> {
+        let depth = self.depth_below(dir, root)?;
+        proto::file::check_link_target(target, depth).map_err(|_| Error::BadTarget)?;
+        // (the target's bytes are charged like a name)
+        let id = self.insert(dir, name, Data::Symlink(target.to_vec()))?;
+        let extra = target.len();
+        if self.meta + extra > self.limits.max_meta {
+            // roll back: the link is created or it is not
+            self.node_mut(dir)?;
+            if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
+                m.remove(name);
+            }
+            self.node_mut(id)?.links = 0;
+            self.collect(id);
+            return Err(Error::Quota);
+        }
+        self.node_mut(id)?.cost += extra;
+        self.meta += extra;
+        Ok(id)
+    }
+
+    /// The target of a symlink.
+    pub fn read_link(&self, id: NodeId) -> Result<Vec<u8>, Error> {
+        match &self.node(id)?.data {
+            Data::Symlink(t) => Ok(t.clone()),
+            Data::Dir(_) => Err(Error::IsDirectory),
+            _ => Err(Error::Invalid),
+        }
     }
 
     /// Entries of `dir` in bytewise name order, strictly after `after` (the last name the caller
