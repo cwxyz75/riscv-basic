@@ -1,0 +1,8 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: credential verifiers for authd (USER-VIEW-SPEC section 10.1, step UV5a): scrypt password records, constant-time verification and the credential store format. Pure, no_std + alloc, host-tested."
+
+[dependencies]
+scrypt = { version = "0.11", default-features = false }
