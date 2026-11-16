@@ -78,6 +78,11 @@ const NAMES: &[&str] = &[
     "confine",
 ];
 
+/// The builtin names, for completion.
+pub fn names() -> &'static [&'static str] {
+    NAMES
+}
+
 pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }

@@ -28,6 +28,8 @@ pub enum FailKind {
     Error,
     /// The reader of our output is gone.
     Pipe,
+    /// The user pressed Ctrl-C: ends whatever the shell was running, and is never caught.
+    Interrupt,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,9 @@ pub struct Shell<H: Host> {
     pub help: String,
     /// Set when `exit` (or `halt`) ended the shell with a status.
     exit_requested: Option<i32>,
+    /// Counts statements and loop iterations, so the host is asked about interrupts every 4096th (a system call each time
+    /// would starve everything else on the machine).
+    poll_tick: u32,
 }
 
 /// Process-level result of running a script or a line.
@@ -149,6 +154,7 @@ impl<H: Host> Shell<H> {
             legacy: false,
             help: String::new(),
             exit_requested: None,
+            poll_tick: 0,
         }
     }
 
@@ -159,6 +165,26 @@ impl<H: Host> Shell<H> {
 
     pub fn set_var(&mut self, name: &str, v: Val) {
         self.frames[0].vars.insert(String::from(name), v);
+    }
+
+    /// The names of the variables visible now (for completion).
+    pub fn var_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.frames[0].vars.keys().cloned().collect();
+        if let Some(top) = self.frames.last() {
+            v.extend(top.vars.keys().cloned());
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The names of the shell functions (for completion).
+    pub fn fn_names(&self) -> Vec<String> {
+        self.fns
+            .keys()
+            .filter(|k| !k.contains("::"))
+            .cloned()
+            .collect()
     }
 
     pub fn var(&self, name: &str) -> Option<Val> {
@@ -346,7 +372,9 @@ impl<H: Host> Shell<H> {
                 1
             }
             Err(Flow::Fail(f)) => {
-                if f.kind != FailKind::Pipe {
+                if f.kind == FailKind::Interrupt {
+                    let _ = self.out(b"^C\n");
+                } else if f.kind != FailKind::Pipe {
                     let text = match &f.value {
                         Val::Str(s) => String::from(&**s),
                         Val::Map(m) if matches!(m.get("kind"), Some(Val::Str(k)) if &**k == "exit") =>
@@ -375,10 +403,26 @@ impl<H: Host> Shell<H> {
 
     // ---- statements ----
 
+    fn check_interrupt(&mut self) -> Res<()> {
+        self.poll_tick = self.poll_tick.wrapping_add(1);
+        if self.poll_tick & 4095 != 1 {
+            return Ok(());
+        }
+        if self.host.interrupted() {
+            return Err(Flow::Fail(Fail {
+                value: Val::str("interrupted"),
+                code: 130,
+                kind: FailKind::Interrupt,
+            }));
+        }
+        Ok(())
+    }
+
     pub fn exec_block(&mut self, stmts: &[Stmt], mode: Mode) -> Res<Val> {
         let n = stmts.len();
         let mut last = Val::Null;
         for (i, s) in stmts.iter().enumerate() {
+            self.check_interrupt()?;
             let m = if i + 1 == n { mode } else { Mode::Stmt };
             last = self.exec(s, m)?;
         }
@@ -438,6 +482,7 @@ impl<H: Host> Shell<H> {
             } => {
                 self.pos = *pos;
                 loop {
+                    self.check_interrupt()?;
                     let c = self.eval_word(cond)?;
                     let Val::Bool(b) = c else {
                         return Err(error(&format!("`while` needs a boolean, got {}", c.kind())));
@@ -472,6 +517,7 @@ impl<H: Host> Shell<H> {
                     }
                 }
                 for item in list {
+                    self.check_interrupt()?;
                     self.assign(var, item);
                     match self.exec_block(body, Mode::Stmt) {
                         Ok(_) | Err(Flow::Continue) => {}
@@ -490,7 +536,9 @@ impl<H: Host> Shell<H> {
             } => {
                 self.pos = *pos;
                 match self.exec_block(body, mode) {
-                    Err(Flow::Fail(f)) if f.kind != FailKind::Pipe => {
+                    Err(Flow::Fail(f))
+                        if !matches!(f.kind, FailKind::Pipe | FailKind::Interrupt) =>
+                    {
                         self.assign(name, f.value.clone());
                         if let Some(c) = code_name {
                             self.assign(c, Val::int(i64::from(f.code)));

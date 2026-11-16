@@ -20,6 +20,7 @@ import s4a_serial_test as base  # noqa: E402
 def fail(session, msg):
     print(f"s4e shell test FAILED: {msg}")
     print(f"last lines: {[l[:80] for l in session.seen[-8:]]}")
+    print(f"partial line: {getattr(session, 'partial', None)!r}")
     session.p.kill()
     sys.exit(1)
 
@@ -58,7 +59,7 @@ class Session(base.Session):
 
     def prompt(self):
         deadline = time.time() + base.TIMEOUT
-        while self.partial != b"$ ":
+        while self.partial not in (b"$ ", b"> "):
             if time.time() > deadline:
                 fail(self, "timed out waiting for the prompt")
             time.sleep(0.002)
@@ -212,6 +213,27 @@ def main():
          [b'$ confine { "/nope": "r" } do ls end', b"sh: confine: not found"], "confine: a grant that does not exist")
     step(b"ls /\n", [b"$ ls /", b"bin/", b"dev/", b"etc/", b"home/", b"include/", b"lib/", b"mnt/", b"share/", b"svc/", b"tmp/", b"usr/"],
          "the confinement ended with the block")
+    # SH5: the line editor. The shell puts the terminal in raw mode and edits the line itself, so what it writes is derived
+    # by hand from the editor's rules (ish/src/line.rs): a typed character is echoed, Backspace is BS SP BS, a character
+    # typed in the middle reprints the rest and moves back with ESC [ 1 D, Enter moves to the end of the line first.
+    step(b"echo hel\x7flo\r", [b"$ echo hel\x08 \x08lo", b"helo"], "editing: backspace")
+    step(b"echo ac\x1b[Db\r", [b"$ echo ac\x1b[1Dbc\x1b[1D\x1b[1C", b"abc"], "editing: Left, then a character in the middle")
+    step(b"echo hist\r", [b"$ echo hist", b"hist"], "history: a command is run")
+    step(b"\x1b[A\r", [b"$ echo hist", b"hist"], "history: Up brings it back")
+    step(b"cat hel\t\r", [b"$ cat hello.txt ", b"hello, world"], "completion: a file name from the shell's table")
+    step(b"ls su\t\x03", [b"$ ls sub/^C"], "completion: a directory gets a slash and no space")
+    step(b"ech\t hi\r", [b"$ echo  hi", b"hi"], "completion: a program name from /bin")
+    step(b"if true do\r", [b"$ if true do"], "a block that is not finished")
+    step(b"echo ml\r", [b"> echo ml"], "the continuation prompt")
+    step(b"end\r", [b"> end", b"ml"], "the block runs when it is complete")
+    step(b"echo abc\x03", [b"$ echo abc^C"], "Ctrl-C abandons the line being typed")
+    step(b"echo ok\r", [b"$ echo ok", b"ok"], "the shell after an abandoned line")
+    step(b"while true do end\r", [b"$ while true do end"], "a loop written in shell code")
+    time.sleep(1)
+    s.wait_for_prompt = False  # the shell is busy: there is no prompt to wait for
+    step(b"\x03", [b"^C"], "Ctrl-C stops the loop")
+    s.wait_for_prompt = True
+    step(b"echo alive\r", [b"$ echo alive", b"alive"], "the shell after an interrupted loop")
     # the session ends and a fresh one starts: the volume is durable
     step(b"exit\n", [b"$ exit", BANNER], "a new session")
     time.sleep(4)

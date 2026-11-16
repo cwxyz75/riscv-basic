@@ -11,6 +11,12 @@
 //! --- script
 //! source
 //! --- lines               (instead of `script`: each line is run as an interactive line)
+//! --- term               (instead of `script`: interactive; one line per chunk of terminal input, with the escapes
+//!                         \e \b \r \t \n \a \\ \xNN; a line `@interrupt` is the console's interrupt event)
+//! --- tty                (the expected terminal output of an interactive run, control bytes escaped the same way;
+//!                         a real newline follows each `\n`; one trailing newline of the section is not part of the output)
+//! --- batch              (the script is read from `stdin` by the non-interactive mode)
+//! --- interrupt-after N  (the user presses Ctrl-C at the Nth poll)
 //! --- stdout
 //! --- stderr
 //! --- status
@@ -34,6 +40,11 @@ struct Case {
     stdout: String,
     stderr: String,
     status: i32,
+    term: Option<String>,
+    tty: Option<String>,
+    batch: bool,
+    legacy: bool,
+    interrupt_after: u32,
 }
 
 fn parse(text: &str) -> Case {
@@ -47,6 +58,11 @@ fn parse(text: &str) -> Case {
         stdout: String::new(),
         stderr: String::new(),
         status: 0,
+        term: None,
+        tty: None,
+        batch: false,
+        legacy: false,
+        interrupt_after: 0,
     };
     let mut section: Option<String> = None;
     let mut body = String::new();
@@ -66,6 +82,11 @@ fn parse(text: &str) -> Case {
                     c.script = b;
                     c.interactive = true;
                 }
+                ("term", _) => c.term = Some(b),
+                ("tty", _) => c.tty = Some(b),
+                ("batch", _) => c.batch = true,
+                ("legacy", _) => c.legacy = true,
+                ("interrupt-after", n) => c.interrupt_after = n.trim().parse().expect("count"),
                 ("stdout", _) => c.stdout = b,
                 ("stderr", _) => c.stderr = b,
                 ("status", _) => c.status = b.trim().parse().expect("status"),
@@ -85,6 +106,55 @@ fn parse(text: &str) -> Case {
     c
 }
 
+fn unescape(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            i += 1;
+            match b[i] {
+                b'e' => out.push(0x1b),
+                b'b' => out.push(0x08),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'a' => out.push(0x07),
+                b'\\' => out.push(b'\\'),
+                b'x' => {
+                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).expect("hex"));
+                    i += 2;
+                }
+                c => panic!("unknown escape \\{}", c as char),
+            }
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn escape(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for ch in String::from_utf8_lossy(bytes).chars() {
+        match ch {
+            '\x1b' => out.push_str("\\e"),
+            '\x08' => out.push_str("\\b"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x07' => out.push_str("\\a"),
+            '\n' => out.push_str("\\n\n"),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn run(c: &Case) -> (String, String, i32, usize) {
     let mut host = FakeHost::new();
     for (p, content) in &c.files {
@@ -97,7 +167,25 @@ fn run(c: &Case) -> (String, String, i32, usize) {
         sh.host.setenv(k, v);
     }
     sh.set_args(c.args.clone());
-    let status = if c.interactive {
+    if c.legacy {
+        sh.name = "sh".into();
+        sh.legacy = true;
+    }
+    sh.host.interrupt_after_polls = c.interrupt_after;
+    let status = if let Some(term) = &c.term {
+        for l in term.lines() {
+            if l == "@interrupt" {
+                sh.host.term_in.push_back(ish::host::TermIn::Interrupt);
+            } else {
+                sh.host
+                    .term_in
+                    .push_back(ish::host::TermIn::Bytes(unescape(l)));
+            }
+        }
+        ish::repl::run_interactive(&mut sh)
+    } else if c.batch {
+        ish::repl::run_batch(&mut sh)
+    } else if c.interactive {
         let mut last = 0;
         for l in c.script.lines() {
             last = sh.run_line(l);
@@ -126,8 +214,13 @@ fn golden_transcripts() {
         let text = fs::read_to_string(path).unwrap();
         let c = parse(&text);
         let (out, err, st, leaked) = run(&c);
+        let out = if c.term.is_some() {
+            escape(out.as_bytes())
+        } else {
+            out
+        };
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        if bless {
+        if bless && c.term.is_none() {
             let head: String = text
                 .split("--- stdout")
                 .next()
@@ -147,10 +240,18 @@ fn golden_transcripts() {
             fs::write(path, new).unwrap();
             continue;
         }
-        if out != c.stdout {
+        let (want_out, got_out) = if c.term.is_some() {
+            let w = c.tty.clone().unwrap_or_default();
+            let w = w.strip_suffix('\n').unwrap_or(&w).to_string();
+            let g = out.strip_suffix('\n').unwrap_or(&out).to_string();
+            (w, g)
+        } else {
+            (c.stdout.clone(), out.clone())
+        };
+        if want_out != got_out {
             failures.push(format!(
-                "{name}: stdout\n  expected: {:?}\n  actual:   {:?}",
-                c.stdout, out
+                "{name}: output\n  expected: {:?}\n  actual:   {:?}",
+                want_out, got_out
             ));
         }
         if err != c.stderr {
