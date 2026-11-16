@@ -685,3 +685,69 @@ fn a_hart_that_joins_late_starts_its_clock_at_the_join_not_at_zero() {
         "after the slice, the equal peer gets its turn"
     );
 }
+
+#[test]
+fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
+    // all harts busy, one with a long queue of equal-priority threads: equals are not pulled by priority, so the tick moves
+    // them by queue length, one per tick per hart, until the queues are within one of each other
+    let mut s = Sched2::new(2, FixedPrio::new);
+    let _boot = s
+        .adopt_current_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            None,
+        )
+        .unwrap();
+    let b = s
+        .spawn_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            None,
+        )
+        .unwrap();
+    s.reschedule_on(1);
+    assert_eq!(s.current_on(1), b);
+    for _ in 0..8 {
+        // both harts run 10: each new equal queues on its creator's hart
+        s.spawn_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!((s.queued_on(0), s.queued_on(1)), (8, 0));
+    let mut now = 0;
+    for _ in 0..20 {
+        now += MS;
+        s.tick_on(0, now);
+        s.tick_on(1, now);
+        for h in 0..2 {
+            if s.resched_pending(h) {
+                s.reschedule_on(h);
+            }
+        }
+    }
+    let (a, c) = (s.queued_on(0), s.queued_on(1));
+    assert!(
+        a.abs_diff(c) <= 1,
+        "queues of {a} and {c}: within one of each other"
+    );
+    let pulls = s.pulls;
+    for _ in 0..20 {
+        now += MS;
+        s.tick_on(0, now);
+        s.tick_on(1, now);
+    }
+    assert_eq!(s.pulls, pulls, "balanced queues do not churn");
+    s.audit(true).unwrap();
+}

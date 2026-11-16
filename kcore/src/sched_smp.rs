@@ -38,6 +38,9 @@ pub struct Sched2<N: Class> {
     pokes: u32,
     /// How many threads were pulled from another hart (a counter for tests and the kernel's statistics).
     pub pulls: u64,
+    /// Statistics: calls to `settle`, marks turned on, and records migrated by a wake.
+    pub settles: u64,
+    pub marks: u64,
 }
 
 fn allowed(rec: &ThreadSched, hart: usize) -> bool {
@@ -57,6 +60,8 @@ impl<N: Class> Sched2<N> {
             online: alloc::vec![true; harts],
             pokes: 0,
             pulls: 0,
+            settles: 0,
+            marks: 0,
         };
         for h in 0..harts {
             let tid = s.alloc_tid();
@@ -172,6 +177,7 @@ impl<N: Class> Sched2<N> {
     fn mark(&mut self, x: usize) {
         // (a hart that is not in the scheduler is never marked: it looks at its queues when it joins, 3.9)
         if self.online[x] && !self.pending[x] {
+            self.marks += 1;
             self.pending[x] = true;
             self.pokes |= 1 << x;
         }
@@ -249,6 +255,7 @@ impl<N: Class> Sched2<N> {
 
     /// Hart `h` makes its own designation right: pull what outranks it, preempt for what waits, and push what it leaves.
     fn settle(&mut self, h: usize) {
+        self.settles += 1;
         self.pending[h] = false;
         loop {
             let pulled = self.pull(h);
@@ -464,6 +471,35 @@ impl<N: Class> Sched2<N> {
     pub fn tick_on(&mut self, hart: usize, now: Time) {
         self.harts[hart].tick_to(now);
         self.settle(hart);
+        self.balance(hart);
+    }
+
+    /// Equal-priority work does not move by priority (no pull of an equal, 4.4), so queues of equals would stay as lopsided as
+    /// they were made: a thread on a long queue waits a whole rotation of it. At a tick, a hart whose queue is at least two
+    /// shorter than another's takes one thread from it that it may run and that is not worse than what it runs. One per
+    /// tick; with queues within one of each other nothing moves, so equals do not churn between harts.
+    fn balance(&mut self, h: usize) {
+        let mine = self.harts[h].queued_len();
+        let busiest = (0..self.harts.len())
+            .filter(|&g| g != h && self.online[g])
+            .max_by_key(|&g| (self.harts[g].queued_len(), core::cmp::Reverse(g)));
+        let Some(g) = busiest else { return };
+        if self.harts[g].queued_len() < mine + 2 {
+            return;
+        }
+        let cur = self.view_cur(h);
+        let found = {
+            let src = &self.harts[g];
+            src.queued_top_where(&|t| src.record(t).is_some_and(|r| allowed(r, h)))
+        };
+        let Some((tid, p)) = found else { return };
+        if p < cur {
+            return;
+        }
+        let rec = self.harts[g].detach_queued(tid).expect("it was queued");
+        self.harts[h].attach(rec, Enq::Migrated, h as u8);
+        self.loc.insert(tid, h);
+        self.pulls += 1;
     }
 
     pub fn bad_picks(&self) -> u32 {

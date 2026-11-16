@@ -794,6 +794,8 @@ pub fn wake_stat(which: u64) -> u64 {
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
         // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
+        // 10 to 12: scheduler statistics (pulls, settles, marks)
+        10..=12 => sched_stat(which),
         _ => 0,
     }
 }
@@ -928,5 +930,17 @@ pub fn debug_state(tid: Tid) -> alloc::string::String {
                 .map(|h| k.sched.resched_pending(h))
                 .collect::<Vec<_>>()
         )
+    })
+}
+
+/// Scheduler statistics for the benchmarks: 10 pulls, 11 calls that make a hart's designation right, 12 marks.
+fn sched_stat(which: u64) -> u64 {
+    irq::without(|| {
+        let k = kernel();
+        match which {
+            10 => k.sched.pulls,
+            11 => k.sched.settles,
+            _ => k.sched.marks,
+        }
     })
 }
