@@ -41,6 +41,14 @@ pub enum OpenMode {
     Append,
 }
 
+/// How a bounded wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Done(i32),
+    Timeout,
+    Interrupted,
+}
+
 /// The three standard streams of a started program.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcIo {
@@ -68,9 +76,21 @@ pub trait Host {
 
     /// Start the program `argv[0]` with the given streams (the host keeps its own copies; the caller still owns its
     /// handles and closes them). `Err(NotFound)` when there is no such program.
-    fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError>;
+    /// `env` is the environment the program starts with (the value of the shell's `$env` at that moment, A2).
+    fn spawn(
+        &mut self,
+        argv: &[String],
+        env: &[(String, String)],
+        io: ProcIo,
+    ) -> Result<Pid, HostError>;
     /// Wait for the program to end; its exit status.
     fn wait(&mut self, pid: Pid) -> i32;
+    /// The status of a program that has ended (and forget it), `None` while it runs.
+    fn try_wait(&mut self, pid: Pid) -> Option<i32>;
+    /// Wait for the first of the programs to end: its index in `pids` and its status (which is forgotten).
+    fn wait_any(&mut self, pids: &[Pid]) -> (usize, i32);
+    /// Wait at most `ms` milliseconds; an interrupt ends the wait early.
+    fn wait_timeout(&mut self, pid: Pid, ms: u64) -> WaitOutcome;
 
     /// A pipe: (read end, write end).
     fn pipe(&mut self) -> Result<(Stream, Stream), HostError>;
@@ -135,9 +155,7 @@ pub trait Host {
         false
     }
 
-    fn getenv(&self, name: &str) -> Option<String>;
-    fn setenv(&mut self, name: &str, value: &str);
-    /// All environment variables, in name order.
+    /// The environment the shell starts with: it becomes the binding `$env` (A2).
     fn environ(&self) -> Vec<(String, String)>;
     fn cwd(&self) -> String;
     fn chdir(&mut self, path: &str) -> Result<(), HostError>;

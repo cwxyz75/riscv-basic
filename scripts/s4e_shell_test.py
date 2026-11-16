@@ -370,6 +370,30 @@ def main():
     s.wait_for_prompt = True
     step(b"echo again\n", [b"$ echo again", b"again"], "the shell after a pipeline kill")
 
+    # jobs (SHELL-SPEC J1-J9, SH4b): spawn returns at once, poll sees it running, a bounded wait times out and leaves it
+    # running, kill ends it, and Ctrl-C during a wait is an `interrupted` failure that try can catch and defer survives
+    step(b'k = spawn { "out": "discard" } spin\n', [b'$ k = spawn { "out": "discard" } spin'], "a background job starts at once")
+    step(b"print (poll $k)\n", [b"$ print (poll $k)", b"null"], "the job is still running")
+    step(b'try do wait { "timeout": 300 } $k end catch e do print $e.kind end\n',
+         [b'$ try do wait { "timeout": 300 } $k end catch e do print $e.kind end', b"timeout"], "a bounded wait times out")
+    step(b"print (poll $k)\n", [b"$ print (poll $k)", b"null"], "the job survived the timeout")
+    step(b"fn w do defer do print cleanup end; wait $k end\n", [b"$ fn w do defer do print cleanup end; wait $k end"], "a function that waits")
+    step(b"try do w end catch e do print caught $e end\n", [b"$ try do w end catch e do print caught $e end"], "waiting for the job")
+    time.sleep(1)
+    s.wait_for_prompt = False
+    step(b"\x03", [b"cleanup", b"caught interrupted"], "Ctrl-C ends the wait: defer runs, try catches")
+    s.wait_for_prompt = True
+    step(b"print (poll $k)\n", [b"$ print (poll $k)", b"null"], "the job is still running after the interrupt")
+    step(b"w\n", [b"$ w"], "an uncaught interrupt in a wait")
+    time.sleep(1)
+    s.wait_for_prompt = False
+    step(b"\x03", [b"cleanup", b"^C"], "Ctrl-C ends the wait: defer runs, the shell reports it")
+    s.wait_for_prompt = True
+    step(b"kill $k\n", [b"$ kill $k"], "kill ends the job")
+    step(b"r = wait $k\n", [b"$ r = wait $k"], "the killed job's result")
+    step(b"print $r.status\n", [b"$ print $r.status", b"-1"], "the killed job's status")
+    step(b"echo done\n", [b"$ echo done", b"done"], "the shell after the jobs")
+
     # end of input and exit: the shell ends and a fresh session starts
     step(b"\x04", [b"$ " + BANNER], "Ctrl-D ends the shell; init starts a new one")
     step(b"pwd\n", [b"$ pwd", b"/home"], "a fresh session starts in /home")

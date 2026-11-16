@@ -1,18 +1,23 @@
-# export, $env, the host environment
+# $env is an ordinary binding: children get its value at start (A2), with-env adds for one command (A3)
 --- env HOME=/home/ann
 --- script
 print $env.HOME
-export EDITOR kilo
-print $env.EDITOR
-print (get-or $env ["NOPE"] none)
-cd /d
-print (pwd)
---- file /d/x
-1
+set env.EDITOR = 'kilo'
+printenv EDITOR
+with-env { "EDITOR": "vi", "N": "1" } printenv EDITOR N
+printenv EDITOR
+print ($env.NOPE ?? 'none')
+set env.BAD = [1]
+printenv EDITOR
+print not-reached
 --- stdout
 /home/ann
-kilo
+EDITOR=kilo
+EDITOR=vi
+N=1
+EDITOR=kilo
 none
-/d
+--- stderr
+ish: $env.BAD is a list, not text: a program's environment holds only text
 --- status
-0
+1

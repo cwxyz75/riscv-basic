@@ -16,6 +16,10 @@ pub struct ProgCtx<'a> {
     pub cwd: &'a str,
     /// What the program may reach: `(path, rights)`.
     pub table: &'a [(String, String)],
+    /// The environment the program was started with.
+    pub env: &'a [(String, String)],
+    /// How long the program runs on the fake clock, in milliseconds (`u64::MAX`: until killed).
+    pub run_ms: u64,
 }
 
 pub type Prog = fn(&mut ProgCtx) -> i32;
@@ -49,7 +53,12 @@ pub struct FakeHost {
     pipes: BTreeMap<u32, Pipe>,
     next: u32,
     progs: BTreeMap<String, Prog>,
-    statuses: BTreeMap<u32, i32>,
+    /// pid -> (exit status, the fake time in milliseconds at which the program ends)
+    statuses: BTreeMap<u32, (i32, u64)>,
+    /// The fake clock, advanced only by waiting.
+    pub now_ms: u64,
+    /// A wait with a timeout reports an interrupt (to test J9).
+    pub interrupt_in_wait: bool,
     /// Every program started, in order, with its arguments.
     pub log: Vec<Vec<String>>,
     confined: Vec<Vec<(String, String)>>,
@@ -92,6 +101,8 @@ impl FakeHost {
             next: 10,
             progs: BTreeMap::new(),
             statuses: BTreeMap::new(),
+            now_ms: 0,
+            interrupt_in_wait: false,
             log: Vec::new(),
             confined: Vec::new(),
             term_in: VecDeque::new(),
@@ -114,6 +125,10 @@ impl FakeHost {
         self.files
             .insert(norm("/", path), content.as_bytes().to_vec());
         self
+    }
+
+    pub fn set_env(&mut self, name: &str, value: &str) {
+        self.env.insert(String::from(name), String::from(value));
     }
 
     pub fn set_stdin(&mut self, bytes: &[u8]) {
@@ -236,7 +251,12 @@ impl Host for FakeHost {
         Stream(2)
     }
 
-    fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError> {
+    fn spawn(
+        &mut self,
+        argv: &[String],
+        env: &[(String, String)],
+        io: ProcIo,
+    ) -> Result<Pid, HostError> {
         let name = argv[0].rsplit('/').next().unwrap_or("");
         let Some(prog) = self.progs.get(name).copied() else {
             return Err(HostError::NotFound);
@@ -248,6 +268,8 @@ impl Host for FakeHost {
         let table = self.table();
         let mut ctx = ProgCtx {
             table: &table,
+            env,
+            run_ms: 0,
             args: argv,
             input,
             out: Vec::new(),
@@ -261,12 +283,65 @@ impl Host for FakeHost {
         self.write_obj(io.stderr.0, &err).ok();
         let pid = self.next;
         self.next += 1;
-        self.statuses.insert(pid, status);
+        let ends = if ctx.run_ms == u64::MAX {
+            u64::MAX
+        } else {
+            self.now_ms + ctx.run_ms
+        };
+        self.statuses.insert(pid, (status, ends));
         Ok(Pid(pid))
     }
 
     fn wait(&mut self, pid: Pid) -> i32 {
-        self.statuses.remove(&pid.0).unwrap_or(-1)
+        match self.statuses.remove(&pid.0) {
+            Some((st, ends)) => {
+                if ends != u64::MAX {
+                    self.now_ms = self.now_ms.max(ends);
+                }
+                st
+            }
+            None => -1,
+        }
+    }
+
+    fn try_wait(&mut self, pid: Pid) -> Option<i32> {
+        match self.statuses.get(&pid.0) {
+            Some(&(st, ends)) if ends <= self.now_ms => {
+                self.statuses.remove(&pid.0);
+                Some(st)
+            }
+            Some(_) => None,
+            None => Some(-1),
+        }
+    }
+
+    fn wait_any(&mut self, pids: &[Pid]) -> (usize, i32) {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, p) in pids.iter().enumerate() {
+            let ends = self.statuses.get(&p.0).map_or(0, |&(_, e)| e);
+            if best.is_none_or(|(_, b)| ends < b) {
+                best = Some((i, ends));
+            }
+        }
+        let (i, _) = best.unwrap_or((0, 0));
+        let st = self.wait(pids[i]);
+        (i, st)
+    }
+
+    fn wait_timeout(&mut self, pid: Pid, ms: u64) -> WaitOutcome {
+        if self.interrupt_in_wait {
+            return WaitOutcome::Interrupted;
+        }
+        match self.statuses.get(&pid.0) {
+            None => WaitOutcome::Done(-1),
+            Some(&(_, ends)) if ends != u64::MAX && ends <= self.now_ms + ms => {
+                WaitOutcome::Done(self.wait(pid))
+            }
+            Some(_) => {
+                self.now_ms += ms;
+                WaitOutcome::Timeout
+            }
+        }
     }
 
     fn pipe(&mut self) -> Result<(Stream, Stream), HostError> {
@@ -427,6 +502,12 @@ impl Host for FakeHost {
         self.confined.pop();
     }
 
+    fn kill(&mut self, pid: Pid) {
+        if let Some(e) = self.statuses.get_mut(&pid.0) {
+            *e = (137, self.now_ms);
+        }
+    }
+
     fn term_read(&mut self) -> TermIn {
         self.term_in.pop_front().unwrap_or(TermIn::Gone)
     }
@@ -457,14 +538,6 @@ impl Host for FakeHost {
             return self.interrupt_after_polls == 0;
         }
         false
-    }
-
-    fn getenv(&self, name: &str) -> Option<String> {
-        self.env.get(name).cloned()
-    }
-
-    fn setenv(&mut self, name: &str, value: &str) {
-        self.env.insert(String::from(name), String::from(value));
     }
 
     fn environ(&self) -> Vec<(String, String)> {
@@ -657,7 +730,26 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
         0
     }
     fn printenv(c: &mut ProgCtx) -> i32 {
-        c.out.extend_from_slice(b"(no env in the fake)\n");
+        let mut all: Vec<&(String, String)> = c.env.iter().collect();
+        all.sort();
+        for (k, v) in all {
+            if c.args.len() == 1 || c.args[1..].contains(k) {
+                c.out
+                    .extend_from_slice(alloc::format!("{k}={v}\n").as_bytes());
+            }
+        }
+        0
+    }
+    fn slow(c: &mut ProgCtx) -> i32 {
+        // slow MS [STATUS]: ends after MS milliseconds of the fake clock
+        c.run_ms = c.args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        c.out
+            .extend_from_slice(alloc::format!("slow {} done\n", c.run_ms).as_bytes());
+        c.args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+    fn hang(c: &mut ProgCtx) -> i32 {
+        c.run_ms = u64::MAX;
+        c.out.extend_from_slice(b"hanging\n");
         0
     }
     vec_of(&[
@@ -678,6 +770,8 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
         ("many-then-fail", many_then_fail),
         ("printenv", printenv),
         ("show-table", show_table),
+        ("slow", slow),
+        ("hang", hang),
     ])
 }
 

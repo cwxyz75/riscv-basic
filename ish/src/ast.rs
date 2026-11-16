@@ -1,4 +1,4 @@
-//! The syntax tree of `ish` (grammar: SHELL-SPEC section 5.1).
+//! The syntax tree of `ish` (grammar v2: SHELL-SPEC section 5.2).
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -35,26 +35,48 @@ pub struct Word {
 
 #[derive(Debug, Clone)]
 pub enum Part {
-    /// Bareword text. As the only part of a word in value position it may read as a number, `true`, `false` or `null`.
+    /// Bareword text. As the only part of a word it may read as a number, `true`, `false` or `null`.
     Lit(String),
     /// Quoted text: always a string.
     Str(String),
-    /// A number, `true`, `false` or `null` written in a literal or an island.
+    /// A number, `true`, `false` or `null` written in a literal or an expression.
     Num(Number),
     Bool(bool),
     Null,
     Var(VarRef),
     /// `$#name`
     Count(String),
-    /// `( statements )` evaluated in value position.
-    Sub(Vec<Stmt>),
-    /// `(calc ...)` or `(is ...)`.
-    Island(IslKind, Box<Isl>),
-    List(Vec<Word>),
-    Map(Vec<(Word, Word)>),
+    /// `( expression )`, with an optional path after it (`(split ' ' $l).1`).
+    Paren(Box<Expr>, Vec<Seg>),
+    List(Vec<Expr>),
+    Map(Vec<(Expr, Expr)>),
     Closure(Rc<ClosureDef>),
     /// A bareword with `*` or `?`: expanded by the host.
     Glob(String),
+    /// A backtick template.
+    Template(Vec<TplPart>),
+}
+
+#[derive(Debug, Clone)]
+pub enum TplPart {
+    Text(String),
+    /// `$name` or `${expression}`.
+    Hole(Expr),
+}
+
+/// An expression (SHELL-SPEC M2 to M4): a call, a formula, or one operand.
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// One operand: a word (a single piece in a formula).
+    Word(Word),
+    /// A call: a command line evaluated for its value.
+    Call(Box<AndOr>),
+    Un(UnOp, Box<Expr>),
+    Bin(BinOp, Box<Expr>, Box<Expr>),
+    /// `path ?? default`.
+    Coalesce(Box<Expr>, Box<Expr>),
+    /// `if ... end` or `try ... end catch ... end` used as a value.
+    Block(Box<Stmt>),
 }
 
 #[derive(Debug)]
@@ -97,7 +119,24 @@ pub struct Command {
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     pub negate: bool,
+    /// `succeeds`, `run`, `spawn` or `with-env`: it takes the rest of the pipeline as its command.
+    pub prefix: Option<Prefix>,
     pub stages: Vec<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixKind {
+    Succeeds,
+    Run,
+    Spawn,
+    WithEnv,
+}
+
+#[derive(Debug, Clone)]
+pub struct Prefix {
+    pub kind: PrefixKind,
+    /// The options map of `run` and `spawn`, or the environment map of `with-env`.
+    pub arg: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,21 +152,18 @@ pub struct AndOr {
 }
 
 #[derive(Debug, Clone)]
-pub enum Rhs {
-    /// One word: a value (a lone bareword is a string).
-    Atom(Word),
-    /// A call, or a pipeline, captured.
-    Call(AndOr),
-    /// `try ... end catch ...` or `if ... end` used as a value.
-    Stmt(Box<Stmt>),
-}
-
-#[derive(Debug, Clone)]
 pub enum Stmt {
+    /// `x = expression`: creates a binding.
     Assign {
         name: String,
+        expr: Expr,
+        pos: Pos,
+    },
+    /// `set x.a.b = expression`: changes an existing binding.
+    Set {
+        name: String,
         path: Vec<Seg>,
-        rhs: Rhs,
+        expr: Expr,
         pos: Pos,
     },
     Fn {
@@ -135,7 +171,7 @@ pub enum Stmt {
         def: Rc<ClosureDef>,
     },
     If {
-        cond: Word,
+        cond: Expr,
         then: Vec<Stmt>,
         els: Option<Vec<Stmt>>,
         pos: Pos,
@@ -147,7 +183,7 @@ pub enum Stmt {
         pos: Pos,
     },
     While {
-        cond: Word,
+        cond: Expr,
         body: Vec<Stmt>,
         until: bool,
         pos: Pos,
@@ -160,9 +196,10 @@ pub enum Stmt {
         pos: Pos,
     },
     Defer(Rc<ClosureDef>),
+    /// A call written as a statement: it streams and has no value.
     Cmd(AndOr),
-    /// A statement that is a single non-bareword word: `$x`, `(calc ...)`, `5`, a literal.
-    Value(Word),
+    /// An expression that is not a call: `$x`, `1 + 2`, `(date)`.
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,19 +227,4 @@ pub enum BinOp {
     Div,
     IDiv,
     Rem,
-}
-
-/// An infix expression island: `(calc ...)` yields a number, `(is ...)` a boolean.
-#[derive(Debug, Clone)]
-pub enum Isl {
-    Operand(Word),
-    Un(UnOp, Box<Isl>),
-    Bin(BinOp, Box<Isl>, Box<Isl>),
-}
-
-/// Which marker opened an island.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IslKind {
-    Calc,
-    Is,
 }

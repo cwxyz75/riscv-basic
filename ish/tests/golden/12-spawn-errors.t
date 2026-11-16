@@ -1,6 +1,6 @@
 # a command that cannot be started is an error, never a status
 --- script
-r = try do
+try do
     nosuch arg
 end catch e do
     print $e.kind $e.command $e.message

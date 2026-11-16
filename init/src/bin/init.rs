@@ -661,11 +661,11 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
 const SESSION_SCRIPTS: &[(&str, &str)] = &[
     (
         "alice",
-        "print $env.USER $env.UID $env.HOME $env.EDITOR\nprint (pwd)\ncat secret.txt\ncat /home/secret.txt\nr = run (cat /homes/bob/notes.txt)\nprint $r.status $r.out\nr = run (cat /etc/profiles/bob.json)\nprint $r.status $r.out\nr = run (cat /home/notes.txt)\nprint $r.status\nls /\n",
+        "print $env.USER $env.UID $env.HOME $env.EDITOR\nprint (pwd)\ncat secret.txt\ncat /home/secret.txt\nr = run { \"out\": \"capture\" } cat /homes/bob/notes.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /etc/profiles/bob.json\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/notes.txt\nprint $r.status\nls /\n",
     ),
     (
         "bob",
-        "print $env.USER $env.UID\ncat notes.txt\nr = run (cat /homes/alice/secret.txt)\nprint $r.status $r.out\nr = run (cat /home/secret.txt)\nprint $r.status\n",
+        "print $env.USER $env.UID\ncat notes.txt\nr = run { \"out\": \"capture\" } cat /homes/alice/secret.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/secret.txt\nprint $r.status\n",
     ),
 ];
 

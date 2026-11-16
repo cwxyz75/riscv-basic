@@ -1,32 +1,20 @@
-# SHELL-CORPUS script 10 (adapted): arguments, an imported library, a usage failure that becomes the exit status
+# the same tool with good arguments
 --- file /lib/text.ish
 fn slugify s do ok (lower (replace $s ' ' '-')) end
 --- args -u Hello World again
 --- script
 text = import /lib/text.ish
-fn usage do
-    eprint 'usage: slug [-u] NAME...'
-    fail null 2
-end
-flags = {}
-names = []
-for a in $args do
-    if (is $a == '-u') do
-        flags = set-in $flags ["upper"] true
-    else if (starts-with $a '-') do
-        usage
-    else
-        names = append $names $a
-    end
-end
-if (is (len $names) == 0) do usage end
-for n in $names do
+opts = parse-args { "usage": "slug [-u] NAME...", "flags": { "-u": "upper" }, "rest": "names", "min": 1 } $args
+for n in $opts.names do
     s = text.slugify $n
-    print (if (get-or $flags ["upper"] false) do upper $s else $s end)
+    print (if $opts.upper do (upper $s) else $s end)
 end
+eprint `slugged ${len $opts.names} names`
 --- stdout
 HELLO
 WORLD
 AGAIN
+--- stderr
+slugged 3 names
 --- status
 0

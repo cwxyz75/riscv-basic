@@ -1,6 +1,6 @@
-# assignment, $x, concatenation, counts
+# `=` creates a binding, `$x` reads it, `$#x` counts, `^` and adjacency join
 --- script
-x = hello
+x = 'hello'
 y = 5
 echo $x $y
 echo $x^'-'^$y
@@ -19,5 +19,6 @@ a b
 3 1 2 3
 [1,2,3]
 5
+--- stderr
 --- status
 0

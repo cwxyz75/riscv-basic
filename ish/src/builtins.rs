@@ -4,6 +4,7 @@
 use crate::eval::*;
 use crate::host::*;
 use crate::value::{VMap, Val};
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -59,10 +60,8 @@ const NAMES: &[&str] = &[
     "to-tsv",
     "to-number",
     "str",
-    "format",
     "read-file",
     "write-file",
-    "export",
     "cd",
     "pwd",
     "import",
@@ -70,8 +69,12 @@ const NAMES: &[&str] = &[
     "lines",
     "~",
     "range",
-    "succeeds",
-    "run",
+    "wait",
+    "wait-any",
+    "poll",
+    "kill",
+    "parse-args",
+    "lossy-lines",
     "help",
     "halt",
     "ns",
@@ -150,7 +153,7 @@ fn missing(what: &str) -> Flow {
             ("message", Val::string(format!("no such key: {what}"))),
         ]),
         code: 1,
-        kind: FailKind::Error,
+        kind: FailKind::MissingKey,
     })
 }
 
@@ -509,9 +512,7 @@ impl<H: Host> Shell<H> {
                 arity(name, a, 3, 3)?;
                 match get_path(&a[0], &keys_of(&a[1])?) {
                     Ok(v) => Ok(v),
-                    Err(Flow::Fail(f)) if matches!(&f.value, Val::Map(m) if m.get("kind").and_then(Val::as_str) == Some("missing-key")) => {
-                        Ok(a[2].clone())
-                    }
+                    Err(Flow::Fail(f)) if f.kind == FailKind::MissingKey => Ok(a[2].clone()),
                     Err(e) => Err(e),
                 }
             }
@@ -776,36 +777,6 @@ impl<H: Host> Shell<H> {
                     None => Ok(Val::string(json_text(&a[0]))),
                 }
             }
-            "format" => {
-                if a.is_empty() {
-                    return Err(error("format needs a template"));
-                }
-                let t = string(name, &a[0])?;
-                let mut out = String::new();
-                let mut next = 1;
-                let mut it = t.chars().peekable();
-                while let Some(c) = it.next() {
-                    if c == '%' {
-                        match it.next() {
-                            Some('s') => {
-                                let v = a
-                                    .get(next)
-                                    .ok_or_else(|| error("format: not enough arguments"))?;
-                                out.push_str(&echo_line(v));
-                                next += 1;
-                            }
-                            Some('%') => out.push('%'),
-                            _ => return Err(error("format: only %s and %% are known")),
-                        }
-                    } else {
-                        out.push(c);
-                    }
-                }
-                if next != a.len() {
-                    return Err(error("format: too many arguments"));
-                }
-                Ok(Val::string(out))
-            }
             "read-file" => {
                 arity(name, a, 1, 1)?;
                 let p = string(name, &a[0])?;
@@ -827,15 +798,6 @@ impl<H: Host> Shell<H> {
                 self.host
                     .write_file(p, text.as_bytes())
                     .map_err(|e| error(&format!("{p}: {}", e.message())))?;
-                Ok(Val::Null)
-            }
-            "export" => {
-                arity(name, a, 2, 2)?;
-                let k = string(name, &a[0])?;
-                match a[1].word() {
-                    Some(v) => self.host.setenv(k, &v),
-                    None => return Err(error("export needs a text value")),
-                }
                 Ok(Val::Null)
             }
             "cd" => {
@@ -925,9 +887,60 @@ impl<H: Host> Shell<H> {
                 let path = string(name, &a[0])?;
                 self.import(path)
             }
-            "succeeds" | "run" => Err(error(&format!(
-                "{name} takes a command in parentheses: {name} (cmd)"
-            ))),
+            "wait" => {
+                arity(name, a, 1, 2)?;
+                let (timeout, job) = if a.len() == 2 {
+                    let t = match &a[0] {
+                        Val::Map(m) => match m.get("timeout") {
+                            Some(Val::Num(Number::Int(i))) if *i >= 0 => Some(*i as u64),
+                            None => None,
+                            _ => return Err(error("wait: `timeout` must be a number of milliseconds")),
+                        },
+                        v => return Err(error(&format!("wait's options must be a map, got a {}", v.kind()))),
+                    };
+                    (t, &a[1])
+                } else {
+                    (None, &a[0])
+                };
+                match job {
+                    Val::Job(j) => self.wait_job(j, timeout),
+                    v => Err(error(&format!("wait needs a job, got a {}", v.kind()))),
+                }
+            }
+            "poll" => {
+                arity(name, a, 1, 1)?;
+                match &a[0] {
+                    Val::Job(j) => self.poll_job(j),
+                    v => Err(error(&format!("poll needs a job, got a {}", v.kind()))),
+                }
+            }
+            "kill" => {
+                arity(name, a, 1, 1)?;
+                match &a[0] {
+                    Val::Job(j) => {
+                        self.kill_job(j);
+                        Ok(Val::Null)
+                    }
+                    v => Err(error(&format!("kill needs a job, got a {}", v.kind()))),
+                }
+            }
+            "wait-any" => {
+                arity(name, a, 1, 1)?;
+                let l = list(name, &a[0])?;
+                let mut jobs = Vec::new();
+                for x in l.iter() {
+                    match x {
+                        Val::Job(j) => jobs.push(j.clone()),
+                        v => return Err(error(&format!("wait-any needs a list of jobs, got a {} in it", v.kind()))),
+                    }
+                }
+                self.wait_any_jobs(&jobs)
+            }
+            "parse-args" => {
+                arity(name, a, 2, 2)?;
+                self.parse_args(&a[0], &a[1])
+            }
+            "lossy-lines" => Err(error("lossy-lines is a stage: put it after a pipe, before the first stage that reads lines")),
             _ => Err(error(&format!("{name}: not implemented"))),
         }
     }
@@ -1017,6 +1030,116 @@ impl<H: Host> Shell<H> {
         }
     }
 
+    /// `parse-args spec $args` (A1): flags not given are false, `--help` prints the usage, a bad flag prints it to stderr and
+    /// fails with code 2.
+    fn parse_args(&mut self, spec: &Val, args: &Val) -> Res<Val> {
+        let Val::Map(spec) = spec else {
+            return Err(error("parse-args needs a spec map"));
+        };
+        let Val::List(args) = args else {
+            return Err(error("parse-args needs the argument list"));
+        };
+        let usage = spec
+            .get("usage")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        let rest_name = spec
+            .get("rest")
+            .and_then(Val::as_str)
+            .unwrap_or("rest")
+            .to_string();
+        let min = match spec.get("min") {
+            Some(Val::Num(Number::Int(i))) if *i >= 0 => *i as usize,
+            _ => 0,
+        };
+        // flag -> (name, takes a value)
+        let mut flags: Vec<(String, String, bool)> = Vec::new();
+        if let Some(Val::Map(fm)) = spec.get("flags") {
+            for (k, v) in fm.iter() {
+                match v {
+                    Val::Str(n) => flags.push((String::from(k), String::from(&**n), false)),
+                    Val::Map(m) => {
+                        let n = m.get("name").and_then(Val::as_str).unwrap_or(k).to_string();
+                        flags.push((
+                            String::from(k),
+                            n,
+                            matches!(m.get("value"), Some(Val::Bool(true))),
+                        ));
+                    }
+                    _ => {
+                        return Err(error(
+                            "parse-args: a flag is a name or { \"name\": ..., \"value\": true }",
+                        ))
+                    }
+                }
+            }
+        }
+        let mut result = VMap::new();
+        for (_, n, _) in &flags {
+            result.set(n, Val::Bool(false));
+        }
+        let mut rest: Vec<Val> = Vec::new();
+        let mut i = 0;
+        let mut only_rest = false;
+        let bad = |sh: &mut Self, why: &str| -> Flow {
+            let msg = format!("{why}\nusage: {usage}\n");
+            let _ = sh.err_out(msg.as_bytes());
+            Flow::Fail(Fail {
+                value: Val::str(""),
+                code: 2,
+                kind: FailKind::User,
+            })
+        };
+        while i < args.len() {
+            let Some(arg) = args[i].word() else {
+                return Err(error("parse-args: arguments are text"));
+            };
+            i += 1;
+            if only_rest || arg == "-" || !arg.starts_with('-') {
+                rest.push(Val::string(arg));
+                continue;
+            }
+            if arg == "--" {
+                only_rest = true;
+                continue;
+            }
+            if arg == "--help" {
+                self.out(format!("usage: {usage}\n").as_bytes())?;
+                return Err(Flow::Exit(0));
+            }
+            let (flag, inline) = match arg.split_once('=') {
+                Some((f, v)) if f.starts_with("--") => (String::from(f), Some(String::from(v))),
+                _ => (arg.clone(), None),
+            };
+            let Some((_, name, takes)) = flags.iter().find(|(f, _, _)| *f == flag).cloned() else {
+                return Err(bad(self, &format!("unknown flag {arg}")));
+            };
+            if takes {
+                let v = match inline {
+                    Some(v) => v,
+                    None => {
+                        let Some(next) = args.get(i).and_then(Val::word) else {
+                            return Err(bad(self, &format!("{flag} needs a value")));
+                        };
+                        i += 1;
+                        next
+                    }
+                };
+                result.set(&name, Val::string(v));
+            } else if inline.is_some() {
+                return Err(bad(self, &format!("{flag} takes no value")));
+            } else {
+                result.set(&name, Val::Bool(true));
+            }
+        }
+        if rest.len() < min {
+            return Err(bad(self, "missing arguments"));
+        }
+        result.set(&rest_name, Val::list(rest));
+        Ok(Val::map(result))
+    }
+
     fn import(&mut self, path: &str) -> Res<Val> {
         if let Some(v) = self.imports.get(path) {
             return Ok(v.clone());
@@ -1035,16 +1158,24 @@ impl<H: Host> Shell<H> {
         self.importing.push(String::from(path));
         let prefix: Rc<str> = Rc::from(path);
         let saved_module = self.module.replace(prefix.clone());
-        let r = self.exec_block(&stmts, Mode::Stmt);
+        let r = self.run_module(&stmts);
         self.module = saved_module;
         self.importing.pop();
-        r?;
-        let mut m = VMap::new();
+        let bindings = r?;
         let pre = format!("{prefix}::");
+        // the module's top-level names, functions and bindings alike, in name order
+        let mut all: BTreeMap<String, Val> = BTreeMap::new();
+        for (k, v) in bindings.iter() {
+            all.insert(String::from(k), v.clone());
+        }
         for (k, c) in self.fns.iter() {
             if let Some(n) = k.strip_prefix(&pre) {
-                m.set(n, Val::Closure(c.clone()));
+                all.insert(String::from(n), Val::Closure(c.clone()));
             }
+        }
+        let mut m = VMap::new();
+        for (k, v) in all {
+            m.set(&k, v);
         }
         let v = Val::map(m);
         self.imports.insert(String::from(path), v.clone());

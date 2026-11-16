@@ -2,23 +2,23 @@
 --- script
 for e in (ns) do print $e.path $e.rights end
 confine { "/home": "r", "/dev": "rw" } do show-table end
-r = confine { "/home": "r" } do
+n = confine { "/home": "r" } do
     ok (len (ns))
 end
-print $r
+print $n
 confine { "/home": "rw" } do
     show-table
     confine { "/home/sub": "r" } do show-table end
-    r = try do
+    r1 = try do
         confine { "/etc": "r" } do show-table end
     end catch e do $e.message end
-    print $r
-    r = try do
+    print $r1
+    r2 = try do
         confine { "/home": "r" } do
             confine { "/home": "rw" } do show-table end
         end
     end catch e do $e.message end
-    print $r
+    print $r2
 end
 print (len (ns))
 --- stdout
@@ -42,5 +42,6 @@ print (len (ns))
 confine: permission denied
 confine: permission denied
 4
+--- stderr
 --- status
 0

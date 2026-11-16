@@ -22,7 +22,13 @@ enum Emit {
 }
 
 enum LineSrc {
-    Stream { s: Stream, buf: Vec<u8>, eof: bool },
+    Stream {
+        s: Stream,
+        buf: Vec<u8>,
+        eof: bool,
+        /// `lossy-lines`: invalid UTF-8 becomes U+FFFD instead of an error (A4).
+        lossy: bool,
+    },
     Lines(VecDeque<String>),
 }
 
@@ -122,7 +128,7 @@ impl<H: Host> Shell<H> {
 
     // ---- redirections ----
 
-    fn open_redir(&mut self, path: &str, kind: RedirKind) -> Res<Stream> {
+    pub(super) fn open_redir(&mut self, path: &str, kind: RedirKind) -> Res<Stream> {
         let m = match kind {
             RedirKind::Read => OpenMode::Read,
             RedirKind::Append => OpenMode::Append,
@@ -134,7 +140,7 @@ impl<H: Host> Shell<H> {
     }
 
     /// Run an in-process stage (a builtin or a shell function) with its redirections.
-    fn call_proc(&mut self, st: Stage, mode: Mode, stdin: Option<Stream>) -> Res<Val> {
+    pub(super) fn call_proc(&mut self, st: Stage, mode: Mode, stdin: Option<Stream>) -> Res<Val> {
         let StageKind::Proc {
             name,
             args,
@@ -201,7 +207,7 @@ impl<H: Host> Shell<H> {
         r
     }
 
-    fn close_all(&mut self, streams: &[Stream]) {
+    pub(super) fn close_all(&mut self, streams: &[Stream]) {
         for s in streams {
             self.host.close(*s);
         }
@@ -210,13 +216,14 @@ impl<H: Host> Shell<H> {
     // ---- external stages ----
 
     /// Start the external stages with the given ends. Pipes between stages are made and closed here.
-    fn start_ext(
+    pub(super) fn start_ext(
         &mut self,
         ext: &[Stage],
         first_in: Stream,
         last_out: Stream,
         err: Stream,
     ) -> Res<Vec<(Pid, String)>> {
+        let env = self.child_env()?;
         let mut pids: Vec<(Pid, String)> = Vec::new();
         let mut prev_read: Option<Stream> = None;
         let n = ext.len();
@@ -290,6 +297,7 @@ impl<H: Host> Shell<H> {
             }
             let res = self.host.spawn(
                 argv,
+                &env,
                 ProcIo {
                     stdin: inp,
                     stdout: outp,
@@ -340,7 +348,7 @@ impl<H: Host> Shell<H> {
     }
 
     /// Wait for every stage; the first non-zero status is a failure (pipefail), unless `ignore` (we stopped reading early).
-    fn wait_all(&mut self, pids: &[(Pid, String)], ignore: bool) -> Res<()> {
+    pub(super) fn wait_all(&mut self, pids: &[(Pid, String)], ignore: bool) -> Res<()> {
         let mut first: Option<(i32, String)> = None;
         let mut all = Vec::new();
         for (pid, name) in pids {
@@ -366,7 +374,7 @@ impl<H: Host> Shell<H> {
     }
 
     /// The pipeline's stages are running: make them the foreground job. On failure they are killed.
-    fn begin_job(&mut self, pids: &[(Pid, String)]) -> Res<()> {
+    pub(super) fn begin_job(&mut self, pids: &[(Pid, String)]) -> Res<()> {
         let ps: Vec<Pid> = pids.iter().map(|(p, _)| *p).collect();
         if self.host.started(&ps) {
             return Ok(());
@@ -383,7 +391,7 @@ impl<H: Host> Shell<H> {
 
     /// Read every listed stream to its end into its buffer (None discards), without deadlock between them.
     /// Returns true if a buffer hit the capture cap (that stream was closed).
-    fn drain_all(&mut self, mut reads: Drains) -> bool {
+    pub(super) fn drain_all(&mut self, mut reads: Drains) -> bool {
         let mut capped = false;
         let mut chunk = [0u8; 4096];
         while !reads.is_empty() {
@@ -417,7 +425,7 @@ impl<H: Host> Shell<H> {
 
     /// The streams that stderr and (when not capturing) stdout of the last external stage go to: either the shell's own, or
     /// pipes that are drained into memory.
-    fn sink_stream(
+    pub(super) fn sink_stream(
         &mut self,
         sink: &Sink,
         drains: &mut Drains,
@@ -447,7 +455,7 @@ impl<H: Host> Shell<H> {
     }
 
     /// Feed bytes to a new pipe and return its read end (the write end is closed: the reader sees them and then the end).
-    fn feed_stream(&mut self, bytes: &[u8]) -> Res<Stream> {
+    pub(super) fn feed_stream(&mut self, bytes: &[u8]) -> Res<Stream> {
         let (r, w) = self
             .host
             .pipe()
@@ -498,7 +506,7 @@ impl<H: Host> Shell<H> {
             return Err(Flow::Fail(Fail {
                 value: err_val("capture-limit", "output too large to capture"),
                 code: 1,
-                kind: FailKind::Error,
+                kind: FailKind::CaptureLimit,
             }));
         }
         waited?;
@@ -549,6 +557,7 @@ impl<H: Host> Shell<H> {
             s: rd,
             buf: Vec::new(),
             eof: false,
+            lossy: false,
         };
         let (res, stopped_early) = self.run_consumers_inner(src, consumers, mode);
         self.host.close(rd);
@@ -574,9 +583,22 @@ impl<H: Host> Shell<H> {
         consumers: Vec<Stage>,
         mode: Mode,
     ) -> (Res<Val>, bool) {
+        // `lossy-lines` first in the consumers makes the line reading forgiving about invalid UTF-8 (A4)
+        let mut consumers = consumers;
+        let mut lossy_first = false;
+        if matches!(consumers.first(), Some(Stage { kind: StageKind::Proc { name, args, closure: None }, redirs }) if name == "lossy-lines" && args.is_empty() && redirs.is_empty())
+        {
+            consumers.remove(0);
+            lossy_first = true;
+            if let LineSrc::Stream { lossy, .. } = &mut src {
+                *lossy = true;
+            }
+        }
         let chain: Option<Vec<SStage>> = consumers.iter().map(stream_stage).collect();
         match chain {
-            Some(stages) if !stages.is_empty() => self.run_chain(&mut src, stages, mode),
+            Some(stages) if !stages.is_empty() || lossy_first => {
+                self.run_chain(&mut src, stages, mode)
+            }
             _ => {
                 // a single arbitrary shell function reading standard input
                 if consumers.len() != 1 {
@@ -611,21 +633,24 @@ impl<H: Host> Shell<H> {
     fn next_line(&mut self, src: &mut LineSrc) -> Res<Option<String>> {
         match src {
             LineSrc::Lines(l) => Ok(l.pop_front()),
-            LineSrc::Stream { s, buf, eof } => loop {
+            LineSrc::Stream { s, buf, eof, lossy } => loop {
+                let decode = |line: Vec<u8>| -> Res<Option<String>> {
+                    if *lossy {
+                        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+                    } else {
+                        String::from_utf8(line).map(Some).map_err(|_| error("input is not valid UTF-8 (put `lossy-lines` before the first stage to replace bad bytes)"))
+                    }
+                };
                 if let Some(i) = buf.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = buf.drain(..=i).take(i).collect();
-                    return String::from_utf8(line)
-                        .map(Some)
-                        .map_err(|_| error("input is not valid UTF-8"));
+                    return decode(line);
                 }
                 if *eof {
                     if buf.is_empty() {
                         return Ok(None);
                     }
                     let line = core::mem::take(buf);
-                    return String::from_utf8(line)
-                        .map(Some)
-                        .map_err(|_| error("input is not valid UTF-8"));
+                    return decode(line);
                 }
                 let mut chunk = [0u8; 4096];
                 match self.host.read(*s, &mut chunk) {

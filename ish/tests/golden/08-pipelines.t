@@ -1,11 +1,11 @@
-# external pipelines, in-process stages, redirection
+# external pipelines, stream stages, redirection
 --- script
 seq 3 | upper-stdin
 seq 5 | each @ l do print got $l end
 seq 5 | take 2
-x = (seq 4 | map @ l do ok (calc (to-number $l) * 10) end)
+x = seq 4 | map @ l do ok ((to-number $l) * 10) end
 print $x
-print (seq 4 | fold 0 @ a l do ok (calc $a + (to-number $l)) end)
+print (seq 4 | fold 0 @ a l do ok ($a + (to-number $l)) end)
 print a b c | count-lines
 echo hi > /out.txt
 echo there >> /out.txt
@@ -31,5 +31,6 @@ hi
 there
 2
 oops
+--- stderr
 --- status
 0
