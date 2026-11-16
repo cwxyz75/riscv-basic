@@ -741,11 +741,38 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
                     Some(pid) if va < abi::user::TOP => {
                         let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
-                        p.aspace
-                            .handle_fault(&mut k.mm, &mut k.vmos, va, access)
-                            .is_ok()
+                        let r = p.aspace.handle_fault(&mut k.mm, &mut k.vmos, va, access);
+                        if cfg!(feature = "fault-log") {
+                            if let Err(e) = &r {
+                                let _ = core::fmt::Write::write_fmt(
+                                    &mut crate::console::Console,
+                                    format_args!("kernel: handle_fault failed: {e:?} (pid {pid}, va {va:#x})\n"),
+                                );
+                            }
+                        }
+                        r.is_ok()
                     }
-                    _ => false,
+                    Some(pid) => {
+                        if cfg!(feature = "fault-log") {
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut crate::console::Console,
+                                format_args!("kernel: fault above TOP (pid {pid}, va {va:#x})\n"),
+                            );
+                        }
+                        false
+                    }
+                    None => {
+                        if cfg!(feature = "fault-log") {
+                            let _ = core::fmt::Write::write_fmt(
+                                &mut crate::console::Console,
+                                format_args!(
+                                    "kernel: fault in thread {} with no process\n",
+                                    thread::current()
+                                ),
+                            );
+                        }
+                        false
+                    }
                 }
             };
             if resolved {

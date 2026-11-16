@@ -96,10 +96,12 @@ pub enum Deq {
     Gone,
 }
 
-/// One deque per level and a 64-bit occupancy mask (best level in one instruction).
+/// One deque per level and a 64-bit occupancy mask (best level in one instruction), and an index from thread to level so
+/// that `contains` is a lookup and `remove` touches one level.
 pub struct PrioQueues {
     levels: Vec<VecDeque<Tid>>,
     mask: u64,
+    at: BTreeMap<Tid, Prio>,
 }
 
 impl Default for PrioQueues {
@@ -113,15 +115,18 @@ impl PrioQueues {
         PrioQueues {
             levels: (0..=PRIO_MAX as usize).map(|_| VecDeque::new()).collect(),
             mask: 0,
+            at: BTreeMap::new(),
         }
     }
     pub fn push_back(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_back(t);
         self.mask |= 1 << p;
+        self.at.insert(t, p);
     }
     pub fn push_front(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_front(t);
         self.mask |= 1 << p;
+        self.at.insert(t, p);
     }
     /// The best queued level.
     pub fn top(&self) -> Option<Prio> {
@@ -133,19 +138,23 @@ impl PrioQueues {
         if self.levels[p as usize].is_empty() {
             self.mask &= !(1 << p);
         }
+        if let Some(t) = t {
+            self.at.remove(&t);
+        }
         t
     }
     pub fn remove(&mut self, t: Tid) -> bool {
-        for p in 0..=PRIO_MAX as usize {
-            if let Some(i) = self.levels[p].iter().position(|&x| x == t) {
-                self.levels[p].remove(i);
-                if self.levels[p].is_empty() {
-                    self.mask &= !(1 << p);
-                }
-                return true;
-            }
+        let Some(p) = self.at.remove(&t) else {
+            return false;
+        };
+        let level = &mut self.levels[p as usize];
+        if let Some(i) = level.iter().position(|&x| x == t) {
+            level.remove(i);
         }
-        false
+        if level.is_empty() {
+            self.mask &= !(1 << p);
+        }
+        true
     }
     pub fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
         (0..=PRIO_MAX).rev().find_map(|p| {
@@ -156,10 +165,10 @@ impl PrioQueues {
         })
     }
     pub fn contains(&self, t: Tid) -> bool {
-        self.levels.iter().any(|l| l.contains(&t))
+        self.at.contains_key(&t)
     }
     pub fn len(&self) -> usize {
-        self.levels.iter().map(VecDeque::len).sum()
+        self.at.len()
     }
     pub fn is_empty(&self) -> bool {
         self.mask == 0
@@ -179,6 +188,12 @@ pub trait Class {
     fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)>;
     /// Should a queued thread of this class replace `cur` right now?
     fn preempts(&self, cur: &ThreadSched, now: Time) -> bool;
+    /// Would a thread of priority `cand`, queued here, displace a running thread of effective priority `cur_eff`?
+    /// (Placement, push and pull ask this: moving a thread to a hart where it would only wait is churn.) Fixed priority:
+    /// a higher number wins. A class that never preempts says no.
+    fn displaces(&self, cand: Prio, cur_eff: Prio) -> bool {
+        cand > cur_eff
+    }
     /// Charge `ran` to the running thread; true: its slice is over and an equal or better peer waits.
     fn account(&mut self, cur: &mut ThreadSched, ran: Time, now: Time) -> bool;
     /// When this class next needs the hart's timer while `cur` runs (slice end), if at all.
@@ -196,8 +211,9 @@ fn enqueue_common(q: &mut PrioQueues, t: &mut ThreadSched, how: Enq, slice: Time
             t.slice_left = t.slice_left.max(1);
             q.push_front(t.eff, t.tid);
         }
-        // a priority change keeps the slice the thread had (it moves to the back of its new level, not a new turn)
-        Enq::AttrChanged => {
+        // a priority change keeps the slice the thread had (it moves to the back of its new level, not a new turn); so does a
+        // migration: moving harts is not a new turn either
+        Enq::AttrChanged | Enq::Migrated => {
             t.slice_left = t.slice_left.max(1);
             q.push_back(t.eff, t.tid);
         }
@@ -267,6 +283,93 @@ impl Class for FixedPrio {
     }
     fn contains(&self, tid: Tid) -> bool {
         self.q.contains(tid)
+    }
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+}
+
+/// The normal band as plain round robin: the queue is one FIFO whatever the priorities (a second policy, to show classes
+/// are pluggable and the conformance suite is about every one of them). It still reports the best queued priority, so
+/// placement and pull can see what waits; it never preempts and it rotates when a slice ends and anything waits.
+pub struct RoundRobin {
+    q: alloc::collections::VecDeque<(Tid, Prio)>,
+}
+
+impl RoundRobin {
+    pub fn new() -> RoundRobin {
+        RoundRobin {
+            q: alloc::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Class for RoundRobin {
+    fn name(&self) -> &'static str {
+        "round-robin"
+    }
+    fn enqueue(&mut self, t: &mut ThreadSched, how: Enq, _now: Time) {
+        match how {
+            Enq::Preempted => {
+                t.slice_left = t.slice_left.max(1);
+                self.q.push_front((t.tid, t.eff));
+            }
+            Enq::AttrChanged | Enq::Migrated => {
+                t.slice_left = t.slice_left.max(1);
+                self.q.push_back((t.tid, t.eff));
+            }
+            _ => {
+                t.slice_left = TIMESLICE;
+                self.q.push_back((t.tid, t.eff));
+            }
+        }
+    }
+    fn dequeue(&mut self, t: &mut ThreadSched, _why: Deq, _now: Time) {
+        self.q.retain(|&(x, _)| x != t.tid);
+    }
+    fn pick(&mut self, _now: Time) -> Option<Tid> {
+        self.q.pop_front().map(|(t, _)| t)
+    }
+    fn top(&self) -> Option<Prio> {
+        self.q.iter().map(|&(_, p)| p).max()
+    }
+    fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
+        self.q
+            .iter()
+            .filter(|&&(t, _)| ok(t))
+            .max_by_key(|&&(_, p)| p)
+            .map(|&(t, p)| (t, p))
+    }
+    fn preempts(&self, _cur: &ThreadSched, _now: Time) -> bool {
+        false
+    }
+    fn displaces(&self, _cand: Prio, _cur_eff: Prio) -> bool {
+        false // round robin never preempts: a waiting thread gets its turn at a slice end
+    }
+    fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
+        cur.cpu += ran;
+        cur.slice_left = cur.slice_left.saturating_sub(ran);
+        if cur.slice_left > 0 {
+            return false;
+        }
+        if self.q.is_empty() {
+            cur.slice_left = TIMESLICE;
+            false
+        } else {
+            true
+        }
+    }
+    fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
+        Some(now + cur.slice_left)
+    }
+    fn contains(&self, tid: Tid) -> bool {
+        self.q.iter().any(|&(t, _)| t == tid)
     }
     fn len(&self) -> usize {
         self.q.len()
@@ -872,6 +975,21 @@ impl<N: Class> HartRq<N> {
             _ => 0,
         }
     }
+    /// Would a thread of priority `cand` queued on this hart run instead of what runs now? An idle hart takes anything;
+    /// otherwise the thread must outrank the current one and its band's class must be willing to preempt.
+    pub(crate) fn would_run(&self, cand: Prio) -> bool {
+        if self.cur == self.idle {
+            return cand > 0;
+        }
+        let cur = self.cur_eff();
+        if cand <= cur {
+            return false;
+        }
+        match band(cand) {
+            Band::Rt => self.rt.displaces(cand, cur),
+            _ => self.normal.displaces(cand, cur),
+        }
+    }
     /// The best queued effective priority, if anything is queued here.
     pub(crate) fn queued_top(&self) -> Option<Prio> {
         self.rt.top().or_else(|| self.normal.top())
@@ -879,6 +997,10 @@ impl<N: Class> HartRq<N> {
     /// The best queued thread that satisfies `ok`.
     pub(crate) fn queued_top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
         self.rt.top_where(ok).or_else(|| self.normal.top_where(ok))
+    }
+    /// Set the clock without running timers (a hart joining the scheduler).
+    pub(crate) fn set_now(&mut self, now: Time) {
+        self.now = now;
     }
     pub(crate) fn is_queued(&self, tid: Tid) -> bool {
         self.rt.contains(tid) || self.normal.contains(tid)
