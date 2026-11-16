@@ -337,6 +337,11 @@ impl Fs {
         Self::parse_stat(&a)
     }
 
+    /// Make everything written so far durable (`fsync`): the reply comes when the server has committed.
+    pub fn sync(&mut self) -> Result<(), i32> {
+        self.simple(file::op::SYNC, 0, 0, &[]).map(|_| ())
+    }
+
     pub fn mkdir(&mut self, name: &[u8]) -> Result<(), i32> {
         self.simple(file::op::MKDIR, 0, 0, name).map(|_| ())
     }

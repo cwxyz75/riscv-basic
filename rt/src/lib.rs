@@ -12,6 +12,8 @@ use core::fmt::{self, Write};
 pub use abi;
 
 #[cfg(feature = "heap")]
+pub mod blk;
+#[cfg(feature = "heap")]
 pub mod fs;
 #[cfg(feature = "heap")]
 pub mod heap;

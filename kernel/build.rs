@@ -54,6 +54,7 @@ fn main() {
         "rngd",
         "fetch",
         "httpd",
+        "fsd",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

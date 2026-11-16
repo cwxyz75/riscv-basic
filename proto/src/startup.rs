@@ -69,6 +69,8 @@ pub enum Role {
     NetTxPool = 29,
     /// The one-page configuration blob `netsup` holds across restarts (NET-SPEC 8.4).
     NetConfigBlob = 30,
+    /// The block channel a filesystem server stores its volume on (FS-SPEC section 5): the protocol of `proto::blk`.
+    BlockDevice = 31,
 }
 
 impl Role {
@@ -104,6 +106,7 @@ impl Role {
             28 => Role::NetRxPool,
             29 => Role::NetTxPool,
             30 => Role::NetConfigBlob,
+            31 => Role::BlockDevice,
             _ => return None,
         })
     }
