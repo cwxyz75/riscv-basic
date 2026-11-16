@@ -1,7 +1,7 @@
 # each, map, filter, fold and take as pipeline stages; early stop ignores the producer's exit status
 --- script
-seq 6 | filter @ l do ok (is (to-number $l) % 2 == 0) end
-print (seq 6 | filter @ l do ok (is (to-number $l) % 2 == 0) end)
+seq 6 | filter @ l do ok ((to-number $l) % 2 == 0) end
+print (seq 6 | filter @ l do ok ((to-number $l) % 2 == 0) end)
 print (many-then-fail 2 | take 2)
 print (seq 5 | map @ l do ok (to-number $l) end | take 3)
 print (seq 3 | each @ l do print seen $l end)
@@ -20,5 +20,6 @@ seen 3
 null
 A B
 ["1"]
+--- stderr
 --- status
 0

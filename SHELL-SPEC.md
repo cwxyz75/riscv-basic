@@ -151,7 +151,7 @@ transcripts) before the evaluator, in step SH0.
 
 ## 5.1 Grammar v1 (as built; superseded by grammar v2, section 5.2)
 
-This section records what `ish/` implements today, until step SH2b replaces it. Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
+This section records what `ish/` implemented before step SH2b replaced it (the goldens now pin grammar v2). Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
 shape open, the choice made is marked **(chosen)**; changing one is a small edit in the parser and the goldens.
 
 **Lexical.** Scripts are UTF-8. `#` starts a comment at the start of a word; a backslash before a newline continues the line.
@@ -201,7 +201,7 @@ pipeline fails if any stage fails, naming the first.
 never caught by `succeeds`, `&&`, `||`, `!` or `run`), `user` (`fail`), `error` (the language). `try ... catch` catches all of them.
 An uncaught failure prints its value to stderr as `ish: ...` and ends the script with its code.
 
-## 5.2 Grammar v2 (**Decided** 2026-11-16; not yet implemented: step SH2b)
+## 5.2 Grammar v2 (**Decided** 2026-11-16; implemented in steps SH2b and SH4b, leftovers in TIDY-UP T129)
 
 One sentence per rule. **(new)** marks a change from grammar v1 (section 5.1), **(changed)** a revision of something v1
 has; unmarked rules are as built. The value model (section 4) is unchanged.

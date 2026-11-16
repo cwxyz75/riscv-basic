@@ -1,12 +1,12 @@
 //! The evaluator: statements, words, calls and pipelines over a [`Host`] (SHELL-SPEC sections 5 and 9).
 //!
 //! Position decides how a command runs: as a statement it streams to the current stdout and its value is dropped; in value
-//! position (an assignment's right side, an argument in parentheses) its output is captured as a list of lines; in the last
-//! position of a function a shell callee returns its value and an external program streams (`Mode::Tail`).
+//! position (the right side of `=`, an argument in parentheses) its output is captured as a list of lines. A function's result
+//! is the value of its last statement; a call written as a statement has no value (N2, N3).
 
 use crate::ast::*;
 use crate::host::*;
-use crate::value::{Closure, VMap, Val};
+use crate::value::{Closure, NoValue, VMap, Val};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
@@ -26,6 +26,12 @@ pub enum FailKind {
     User,
     /// A language error: a wrong type, an undefined name, a limit.
     Error,
+    /// A key or index that is not there (`$m.key`, `require`).
+    MissingKey,
+    /// A capture past its cap.
+    CaptureLimit,
+    /// A bounded wait or `run` that ran out of time.
+    Timeout,
     /// The reader of our output is gone.
     Pipe,
     /// The user pressed Ctrl-C: ends whatever the shell was running, and is never caught.
@@ -53,9 +59,10 @@ pub type Res<T> = Result<T, Flow>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
+    /// Streams to the current standard output.
     Stmt,
+    /// Captured: a program's output is its list of lines.
     Value,
-    Tail,
 }
 
 #[derive(Clone)]
@@ -72,9 +79,25 @@ pub struct Io {
     pub stderr: Sink,
 }
 
+/// One function's bindings: scopes from the captured values (if any) outwards in, and the `defer`s to run at its exit.
 struct Frame {
-    vars: BTreeMap<String, Val>,
+    scopes: Vec<BTreeMap<String, Val>>,
     defers: Vec<Rc<Closure>>,
+    /// How many leading scopes are captured values (not bindings of this function, B1).
+    captured: usize,
+    /// A module's frame does not see the importer's top-level names.
+    isolated: bool,
+}
+
+impl Frame {
+    fn new(scopes: Vec<BTreeMap<String, Val>>, captured: usize, isolated: bool) -> Frame {
+        Frame {
+            scopes,
+            defers: Vec::new(),
+            captured,
+            isolated,
+        }
+    }
 }
 
 pub const MAX_CALL_DEPTH: usize = 48;
@@ -103,6 +126,12 @@ pub struct Shell<H: Host> {
     /// Counts statements and loop iterations, so the host is asked about interrupts every 4096th (a system call each time
     /// would starve everything else on the machine).
     poll_tick: u32,
+    /// Background jobs of this run (killed at the end unless detached, J8).
+    pub(crate) jobs: Vec<Rc<RefCell<crate::job::JobState>>>,
+    /// `with-env` additions for the command being run.
+    pub(crate) env_extra: Vec<(String, String)>,
+    /// An interrupt is being handled: a second one ends the script at once (J9).
+    interrupting: bool,
 }
 
 /// Process-level result of running a script or a line.
@@ -127,6 +156,12 @@ impl<H: Host> Shell<H> {
     pub fn new(host: H) -> Shell<H> {
         let mut sh = Shell::bare(host);
         sh.set_args(Vec::new());
+        // `$env` is an ordinary binding (A2): the environment the shell started with
+        let mut m = VMap::new();
+        for (k, v) in sh.host.environ() {
+            m.set(&k, Val::string(v));
+        }
+        sh.set_var("env", Val::map(m));
         sh
     }
 
@@ -138,10 +173,7 @@ impl<H: Host> Shell<H> {
         };
         Shell {
             host,
-            frames: vec![Frame {
-                vars: BTreeMap::new(),
-                defers: Vec::new(),
-            }],
+            frames: vec![Frame::new(vec![BTreeMap::new()], 0, false)],
             fns: BTreeMap::new(),
             io,
             cap: DEFAULT_CAP,
@@ -155,23 +187,30 @@ impl<H: Host> Shell<H> {
             help: String::new(),
             exit_requested: None,
             poll_tick: 0,
+            jobs: Vec::new(),
+            env_extra: Vec::new(),
+            interrupting: false,
         }
     }
 
     pub fn set_args(&mut self, args: Vec<String>) {
         let l = Val::list(args.iter().map(|a| Val::str(a)).collect());
-        self.frames[0].vars.insert(String::from("args"), l);
+        self.frames[0].scopes[0].insert(String::from("args"), l);
     }
 
     pub fn set_var(&mut self, name: &str, v: Val) {
-        self.frames[0].vars.insert(String::from(name), v);
+        self.frames[0].scopes[0].insert(String::from(name), v);
     }
 
     /// The names of the variables visible now (for completion).
     pub fn var_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.frames[0].vars.keys().cloned().collect();
+        let mut v: Vec<String> = self.frames[0]
+            .scopes
+            .iter()
+            .flat_map(|s| s.keys().cloned())
+            .collect();
         if let Some(top) = self.frames.last() {
-            v.extend(top.vars.keys().cloned());
+            v.extend(top.scopes.iter().flat_map(|s| s.keys().cloned()));
         }
         v.sort();
         v.dedup();
@@ -210,7 +249,7 @@ impl<H: Host> Shell<H> {
                     return Err(Flow::Fail(Fail {
                         value: err_val("capture-limit", "output too large to capture"),
                         code: 1,
-                        kind: FailKind::Error,
+                        kind: FailKind::CaptureLimit,
                     }));
                 }
                 b.extend_from_slice(bytes);
@@ -230,45 +269,104 @@ impl<H: Host> Shell<H> {
         self.write_sink(&s, bytes)
     }
 
-    // ---- variables ----
+    // ---- variables and scopes (B1 to B4) ----
 
     fn lookup(&self, name: &str) -> Option<Val> {
-        if name == "env" {
-            let mut m = VMap::new();
-            for (k, v) in self.host.environ() {
-                m.set(&k, Val::string(v));
-            }
-            return Some(Val::map(m));
-        }
         let top = self.frames.last()?;
-        top.vars
-            .get(name)
-            .or_else(|| self.frames[0].vars.get(name))
-            .cloned()
+        for sc in top.scopes.iter().rev() {
+            if let Some(v) = sc.get(name) {
+                return Some(v.clone());
+            }
+        }
+        if !top.isolated {
+            for sc in self.frames[0].scopes.iter().rev() {
+                if let Some(v) = sc.get(name) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        None
     }
 
-    fn assign(&mut self, name: &str, v: Val) {
+    fn bound_here(&self, name: &str) -> bool {
+        self.frames
+            .last()
+            .is_some_and(|f| f.scopes[f.captured..].iter().any(|s| s.contains_key(name)))
+    }
+
+    /// `x = v` (B1): a new binding, an error if the function already has one.
+    fn bind_new(&mut self, name: &str, v: Val) -> Res<()> {
+        if self.bound_here(name) {
+            return Err(error(&format!(
+                "`{name}` is already bound here; to change it write `set {name} = ...`"
+            )));
+        }
+        self.bind_loop(name, v);
+        Ok(())
+    }
+
+    /// A binding that needs no check: a loop variable, a catch name, a parameter.
+    fn bind_loop(&mut self, name: &str, v: Val) {
         let top = self.frames.len() - 1;
-        if self.frames[top].vars.contains_key(name) || !self.frames[0].vars.contains_key(name) {
-            self.frames[top].vars.insert(String::from(name), v);
-        } else {
-            self.frames[0].vars.insert(String::from(name), v);
+        if let Some(sc) = self.frames[top].scopes.last_mut() {
+            sc.insert(String::from(name), v);
         }
     }
 
-    fn take_var(&mut self, name: &str) -> Option<Val> {
+    fn push_scope(&mut self) {
         let top = self.frames.len() - 1;
-        if self.frames[top].vars.contains_key(name) {
-            return self.frames[top].vars.get_mut(name).map(take_val);
-        }
-        self.frames[0].vars.get_mut(name).map(take_val)
+        self.frames[top].scopes.push(BTreeMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        let top = self.frames.len() - 1;
+        self.frames[top].scopes.pop();
+    }
+
+    /// The binding `set` changes: this function's (including captured values), never another function's.
+    fn binding_mut(&mut self, name: &str) -> Option<&mut Val> {
+        let top = self.frames.len() - 1;
+        self.frames[top]
+            .scopes
+            .iter_mut()
+            .rev()
+            .find_map(|s| s.get_mut(name))
     }
 
     fn snapshot(&self) -> BTreeMap<String, Val> {
-        self.frames
-            .last()
-            .map(|f| f.vars.clone())
-            .unwrap_or_default()
+        let mut m = BTreeMap::new();
+        if let Some(f) = self.frames.last() {
+            for sc in &f.scopes {
+                for (k, v) in sc {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        m
+    }
+
+    /// The environment a program starts with: the value of `$env`, plus `with-env` additions (A2, A3). A value that is not
+    /// text is an error naming the key.
+    pub(crate) fn child_env(&self) -> Res<Vec<(String, String)>> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        if let Some(Val::Map(m)) = self.lookup("env") {
+            for (k, v) in m.iter() {
+                match v.word() {
+                    Some(t) => out.push((String::from(k), t)),
+                    None => {
+                        return Err(error(&format!(
+                            "$env.{k} is a {}, not text: a program's environment holds only text",
+                            v.kind()
+                        )))
+                    }
+                }
+            }
+        }
+        for (k, v) in &self.env_extra {
+            out.retain(|(n, _)| n != k);
+            out.push((k.clone(), v.clone()));
+        }
+        Ok(out)
     }
 
     // ---- running scripts and lines ----
@@ -281,15 +379,17 @@ impl<H: Host> Shell<H> {
                 2
             }
             Ok(stmts) => {
-                let r = self.exec_block(&stmts, Mode::Stmt);
+                let r = self.exec_block(&stmts, false);
                 let r = self.run_defers_top(r);
+                self.kill_jobs();
                 self.finish(r.map(|_| ()))
             }
         }
     }
 
-    /// Run one interactive line: errors are shown and the shell goes on. A non-null value is echoed (a list of strings as
-    /// lines, anything else as JSON). Returns the status of the line.
+    /// Run one interactive line: errors are shown and the shell goes on. At the prompt, and only there, a top-level call to
+    /// a builtin or shell function that gives a value shows it (I1), a list of strings as lines and anything else as JSON.
+    /// Returns the status of the line.
     pub fn run_line(&mut self, src: &str) -> i32 {
         match crate::parser::parse(src) {
             Err(e) => {
@@ -302,9 +402,9 @@ impl<H: Host> Shell<H> {
                 2
             }
             Ok(stmts) => {
-                let r = self.exec_block(&stmts, Mode::Tail);
+                let r = self.exec_line(&stmts);
                 match r {
-                    Ok(Val::Null) => 0,
+                    Ok(Val::Null | Val::Void(_)) => 0,
                     Ok(v) => {
                         let text = crate::builtins::echo_text(&v);
                         let _ = self.out(text.as_bytes());
@@ -338,10 +438,54 @@ impl<H: Host> Shell<H> {
         }
     }
 
+    /// The statements of one prompt line. The last one, if it is a call to a builtin or a shell function, is run for its
+    /// value (I1); an expression statement gives its value too.
+    fn exec_line(&mut self, stmts: &[Stmt]) -> Res<Val> {
+        let Some((last, init)) = stmts.split_last() else {
+            return Ok(Val::Null);
+        };
+        self.exec_block(init, false)?;
+        self.check_interrupt()?;
+        match last {
+            Stmt::Cmd(ao) if self.is_shell_call(ao) => {
+                self.pos = ao.first.stages[0].pos;
+                self.exec_and_or(ao, Mode::Value)
+            }
+            Stmt::Expr(e) => self.eval_expr(e),
+            s => {
+                self.exec(s, false)?;
+                Ok(Val::Null)
+            }
+        }
+    }
+
+    /// A lone call to a builtin or a shell function (no pipe, no list, no prefix, no redirection).
+    fn is_shell_call(&self, ao: &AndOr) -> bool {
+        if !ao.rest.is_empty()
+            || ao.first.negate
+            || ao.first.prefix.is_some()
+            || ao.first.stages.len() != 1
+        {
+            return false;
+        }
+        let c = &ao.first.stages[0];
+        if !c.redirs.is_empty() {
+            return false;
+        }
+        match c.words.first().map(|w| w.parts.as_slice()) {
+            Some([Part::Lit(t)]) => self.is_callable(t),
+            _ => false,
+        }
+    }
+
     fn run_defers_top(&mut self, r: Res<Val>) -> Res<Val> {
         let ds: Vec<Rc<Closure>> = core::mem::take(&mut self.frames[0].defers);
         let mut r = r;
         for d in ds.into_iter().rev() {
+            // a second interrupt while cleaning up ends the script at once, skipping the rest (J9)
+            if self.interrupting && self.host.interrupted() {
+                return Err(Flow::Exit(130));
+            }
             if let Err(e) = self.call_closure(&d, vec![]) {
                 if r.is_ok() {
                     r = Err(e);
@@ -374,7 +518,9 @@ impl<H: Host> Shell<H> {
             Err(Flow::Fail(f)) => {
                 if f.kind == FailKind::Interrupt {
                     let _ = self.out(b"^C\n");
-                } else if f.kind != FailKind::Pipe {
+                } else if f.kind != FailKind::Pipe
+                    && !matches!(&f.value, Val::Str(s) if s.is_empty())
+                {
                     let text = match &f.value {
                         Val::Str(s) => String::from(&**s),
                         Val::Map(m) if matches!(m.get("kind"), Some(Val::Str(k)) if &**k == "exit") =>
@@ -408,7 +554,14 @@ impl<H: Host> Shell<H> {
         if self.poll_tick & 4095 != 1 {
             return Ok(());
         }
+        self.poll_interrupt()
+    }
+
+    /// Ask the host now (a statement boundary, a loop turn, the inside of a wait): an interrupt is a failure of kind
+    /// `interrupt` that `defer` runs for and `try` can catch (J9).
+    pub(crate) fn poll_interrupt(&mut self) -> Res<()> {
         if self.host.interrupted() {
+            self.interrupting = true;
             return Err(Flow::Fail(Fail {
                 value: Val::str("interrupted"),
                 code: 130,
@@ -418,28 +571,62 @@ impl<H: Host> Shell<H> {
         Ok(())
     }
 
-    pub fn exec_block(&mut self, stmts: &[Stmt], mode: Mode) -> Res<Val> {
-        let n = stmts.len();
+    /// Run statements in the current scope; with `value` the last one's value is the result (a call statement gives none).
+    pub fn exec_block(&mut self, stmts: &[Stmt], value: bool) -> Res<Val> {
         let mut last = Val::Null;
-        for (i, s) in stmts.iter().enumerate() {
+        for s in stmts {
             self.check_interrupt()?;
-            let m = if i + 1 == n { mode } else { Mode::Stmt };
-            last = self.exec(s, m)?;
+            last = self.exec(s, value)?;
         }
         Ok(last)
     }
 
-    fn exec(&mut self, s: &Stmt, mode: Mode) -> Res<Val> {
+    /// A block with its own scope: what it binds ends at its `end` (B3).
+    fn exec_scoped(&mut self, stmts: &[Stmt], value: bool) -> Res<Val> {
+        self.push_scope();
+        let r = self.exec_block(stmts, value);
+        self.pop_scope();
+        r
+    }
+
+    /// The name a call statement is shown by in the no-value error.
+    fn call_name(ao: &AndOr) -> Rc<str> {
+        let first = ao.first.stages.first().and_then(|c| c.words.first());
+        match first.map(|w| w.parts.as_slice()) {
+            Some([Part::Lit(t)]) => Rc::from(t.as_str()),
+            _ => Rc::from("call"),
+        }
+    }
+
+    /// A value that is no value (N3).
+    pub(crate) fn need_value(&self, v: Val) -> Res<Val> {
+        if let Val::Void(nv) = &v {
+            let func = nv.func.as_deref().unwrap_or("that block");
+            return Err(error(&format!(
+                "{func} ended with a call statement, so it has no value; write ({} ...) or ok ({} ...)",
+                nv.call, nv.call
+            )));
+        }
+        Ok(v)
+    }
+
+    fn exec(&mut self, s: &Stmt, value: bool) -> Res<Val> {
         match s {
-            Stmt::Assign {
+            Stmt::Assign { name, expr, pos } => {
+                self.pos = *pos;
+                let v = self.eval_expr(expr)?;
+                self.bind_new(name, v)?;
+                Ok(Val::Null)
+            }
+            Stmt::Set {
                 name,
                 path,
-                rhs,
+                expr,
                 pos,
             } => {
                 self.pos = *pos;
-                let v = self.eval_rhs(rhs)?;
-                self.assign_path(name, path, v)?;
+                let v = self.eval_expr(expr)?;
+                self.set_binding(name, path, v)?;
                 Ok(Val::Null)
             }
             Stmt::Fn { name, def } => {
@@ -462,14 +649,14 @@ impl<H: Host> Shell<H> {
                 pos,
             } => {
                 self.pos = *pos;
-                let c = self.eval_word(cond)?;
+                let c = self.eval_expr(cond)?;
                 let Val::Bool(b) = c else {
                     return Err(error(&format!("`if` needs a boolean, got {}", c.kind())));
                 };
                 if b {
-                    self.exec_block(then, mode)
+                    self.exec_scoped(then, value)
                 } else if let Some(e) = els {
-                    self.exec_block(e, mode)
+                    self.exec_scoped(e, value)
                 } else {
                     Ok(Val::Null)
                 }
@@ -483,14 +670,14 @@ impl<H: Host> Shell<H> {
                 self.pos = *pos;
                 loop {
                     self.check_interrupt()?;
-                    let c = self.eval_word(cond)?;
+                    let c = self.eval_expr(cond)?;
                     let Val::Bool(b) = c else {
                         return Err(error(&format!("`while` needs a boolean, got {}", c.kind())));
                     };
                     if b == *until {
                         break;
                     }
-                    match self.exec_block(body, Mode::Stmt) {
+                    match self.exec_scoped(body, false) {
                         Ok(_) | Err(Flow::Continue) => {}
                         Err(Flow::Break) => break,
                         Err(e) => return Err(e),
@@ -507,19 +694,17 @@ impl<H: Host> Shell<H> {
                 self.pos = *pos;
                 let mut list = Vec::new();
                 for w in items {
-                    match self.eval_word(w)? {
-                        Val::List(l) => list.extend(l.iter().cloned()),
-                        Val::Null => return Err(error("cannot loop over null")),
-                        v @ (Val::Map(_) | Val::Closure(_)) => {
-                            return Err(error(&format!("cannot loop over a {}", v.kind())))
-                        }
-                        v => list.push(v),
-                    }
+                    let mut texts: Vec<Val> = Vec::new();
+                    self.eval_word_for(w, &mut texts)?;
+                    list.extend(texts);
                 }
                 for item in list {
                     self.check_interrupt()?;
-                    self.assign(var, item);
-                    match self.exec_block(body, Mode::Stmt) {
+                    self.push_scope();
+                    self.bind_loop(var, item);
+                    let r = self.exec_block(body, false);
+                    self.pop_scope();
+                    match r {
                         Ok(_) | Err(Flow::Continue) => {}
                         Err(Flow::Break) => break,
                         Err(e) => return Err(e),
@@ -535,15 +720,16 @@ impl<H: Host> Shell<H> {
                 pos,
             } => {
                 self.pos = *pos;
-                match self.exec_block(body, mode) {
-                    Err(Flow::Fail(f))
-                        if !matches!(f.kind, FailKind::Pipe | FailKind::Interrupt) =>
-                    {
-                        self.assign(name, f.value.clone());
+                match self.exec_scoped(body, value) {
+                    Err(Flow::Fail(f)) if !matches!(f.kind, FailKind::Pipe) => {
+                        self.push_scope();
+                        self.bind_loop(name, f.value.clone());
                         if let Some(c) = code_name {
-                            self.assign(c, Val::int(i64::from(f.code)));
+                            self.bind_loop(c, Val::int(i64::from(f.code)));
                         }
-                        self.exec_block(handler, mode)
+                        let r = self.exec_block(handler, value);
+                        self.pop_scope();
+                        r
                     }
                     r => r,
                 }
@@ -558,41 +744,25 @@ impl<H: Host> Shell<H> {
                 self.frames[top].defers.push(c);
                 Ok(Val::Null)
             }
-            Stmt::Value(w) => {
-                self.pos = w.pos;
-                self.eval_word(w)
-            }
-            Stmt::Cmd(ao) => self.exec_and_or(ao, mode),
-        }
-    }
-
-    fn eval_rhs(&mut self, rhs: &Rhs) -> Res<Val> {
-        match rhs {
-            Rhs::Atom(w) => {
-                self.pos = w.pos;
-                if let [Part::Lit(t)] = w.parts.as_slice() {
-                    // a lone bareword is text, unless it reads as a number, true, false or null; a name that is also a
-                    // callable is ambiguous and refused
-                    let v = literal_value(t);
-                    if matches!(v, Val::Str(_)) && self.is_callable(t) {
-                        return Err(error(&format!(
-                            "`{t}` is a command here: write ({t}) to call it or '{t}' for the text"
-                        )));
-                    }
-                    return Ok(v);
+            Stmt::Expr(e) => {
+                if let Expr::Word(w) = e {
+                    self.pos = w.pos;
                 }
-                self.eval_word(w)
+                self.eval_expr(e)
             }
-            Rhs::Call(ao) => self.exec_and_or(ao, Mode::Value),
-            Rhs::Stmt(s) => self.exec(s, Mode::Value),
+            Stmt::Cmd(ao) => {
+                self.exec_and_or(ao, Mode::Stmt)?;
+                // a call written as a statement has no value (N2)
+                Ok(Val::Void(Rc::new(NoValue {
+                    func: None,
+                    call: Self::call_name(ao),
+                })))
+            }
         }
     }
 
-    fn assign_path(&mut self, name: &str, path: &[Seg], v: Val) -> Res<()> {
-        if path.is_empty() {
-            self.assign(name, v);
-            return Ok(());
-        }
+    /// `set x.a.b = v` (B2): change a binding of this function.
+    fn set_binding(&mut self, name: &str, path: &[Seg], v: Val) -> Res<()> {
         let keys: Vec<Val> = path
             .iter()
             .map(|s| match s {
@@ -600,16 +770,27 @@ impl<H: Host> Shell<H> {
                 Seg::Dyn(w) => self.eval_word(w),
             })
             .collect::<Res<_>>()?;
-        let Some(cur) = self.take_var(name) else {
-            return Err(error(&format!("`{name}` is not set")));
+        let Some(slot) = self.binding_mut(name) else {
+            return Err(error(&format!(
+                "there is no binding `{name}` to change here (`set` changes only bindings of the current function; write `{name} = ...` to make one)"
+            )));
         };
+        if keys.is_empty() {
+            *slot = v;
+            return Ok(());
+        }
+        let cur = take_val(slot);
         match crate::builtins::set_path(cur.clone(), &keys, v) {
             Ok(nv) => {
-                self.assign(name, nv);
+                if let Some(slot) = self.binding_mut(name) {
+                    *slot = nv;
+                }
                 Ok(())
             }
             Err(e) => {
-                self.assign(name, cur);
+                if let Some(slot) = self.binding_mut(name) {
+                    *slot = cur;
+                }
                 Err(e)
             }
         }
@@ -630,15 +811,15 @@ impl<H: Host> Shell<H> {
         self.find_fn(name).is_some() || crate::builtins::is_builtin(name)
     }
 
-    /// Call a closure with values. The function's value is its last expression, an `ok value`, or null.
+    /// Call a closure with values. The function's value is its last statement's (a call statement gives none), or an `ok`.
     pub fn call_closure(&mut self, c: &Rc<Closure>, args: Vec<Val>) -> Res<Val> {
         if self.depth >= MAX_CALL_DEPTH {
             return Err(error("calls nested too deeply"));
         }
         let def = c.def.clone();
-        let mut vars = c.env.clone();
+        let mut params = BTreeMap::new();
         if def.params.is_empty() {
-            vars.insert(String::from("args"), Val::list(args));
+            params.insert(String::from("args"), Val::list(args));
         } else {
             if args.len() != def.params.len() {
                 let who = def.name.as_deref().unwrap_or("function");
@@ -649,16 +830,14 @@ impl<H: Host> Shell<H> {
                 )));
             }
             for (p, a) in def.params.iter().zip(args) {
-                vars.insert(p.clone(), a);
+                params.insert(p.clone(), a);
             }
         }
-        self.frames.push(Frame {
-            vars,
-            defers: Vec::new(),
-        });
+        self.frames
+            .push(Frame::new(vec![c.env.clone(), params], 1, false));
         self.depth += 1;
         let saved_module = core::mem::replace(&mut self.module, c.module.clone());
-        let r = self.exec_block(&def.body, Mode::Tail);
+        let r = self.exec_block(&def.body, true);
         let frame_defers = self
             .frames
             .last_mut()
@@ -666,9 +845,17 @@ impl<H: Host> Shell<H> {
             .unwrap_or_default();
         let mut r = match r {
             Err(Flow::Ok(v)) => Ok(v),
+            Ok(Val::Void(nv)) => Ok(Val::Void(Rc::new(NoValue {
+                func: Some(Rc::from(def.name.as_deref().unwrap_or("that function"))),
+                call: nv.call.clone(),
+            }))),
             r => r,
         };
         for d in frame_defers.into_iter().rev() {
+            if self.interrupting && self.host.interrupted() {
+                r = Err(Flow::Exit(130));
+                break;
+            }
             if let Err(e) = self.call_closure(&d, vec![]) {
                 if r.is_ok() {
                     r = Err(e);
@@ -684,7 +871,89 @@ impl<H: Host> Shell<H> {
         }
     }
 
-    // ---- words ----
+    /// Run an imported script in a frame of its own; its top-level names (bindings and functions) are the result (N5).
+    pub(crate) fn run_module(&mut self, stmts: &[Stmt]) -> Res<VMap> {
+        let mut base = BTreeMap::new();
+        if let Some(e) = self.lookup("env") {
+            base.insert(String::from("env"), e);
+        }
+        base.insert(String::from("args"), Val::list(Vec::new()));
+        self.frames.push(Frame::new(vec![base], 0, true));
+        let r = self.exec_block(stmts, false);
+        let frame = self.frames.pop();
+        r?;
+        let mut m = VMap::new();
+        if let Some(f) = frame {
+            // in name order, so the result does not depend on how the module was written
+            for (k, v) in &f.scopes[0] {
+                if k != "env" && k != "args" {
+                    m.set(k, v.clone());
+                }
+            }
+        }
+        Ok(m)
+    }
+
+    // ---- expressions and words ----
+
+    /// An expression's value (M2 to M4, E1 to E5).
+    pub fn eval_expr(&mut self, e: &Expr) -> Res<Val> {
+        match e {
+            Expr::Word(w) => self.eval_word(w),
+            Expr::Call(ao) => {
+                let v = self.exec_and_or(ao, Mode::Value)?;
+                self.need_value(v)
+            }
+            Expr::Block(st) => {
+                let v = self.exec(st, true)?;
+                self.need_value(v)
+            }
+            Expr::Un(op, x) => {
+                let v = self.eval_expr(x)?;
+                match (op, v) {
+                    (UnOp::Neg, Val::Num(n)) => n.neg().map(Val::Num).map_err(arith_err),
+                    (UnOp::Neg, v) => Err(error(&format!(
+                        "unary - needs a number, got a {}",
+                        v.kind()
+                    ))),
+                    (UnOp::Not, Val::Bool(b)) => Ok(Val::Bool(!b)),
+                    (UnOp::Not, v) => {
+                        Err(error(&format!("`not` needs a boolean, got a {}", v.kind())))
+                    }
+                }
+            }
+            Expr::Coalesce(p, d) => match self.eval_expr(p) {
+                Err(Flow::Fail(f)) if f.kind == FailKind::MissingKey => self.eval_expr(d),
+                r => r,
+            },
+            Expr::Bin(op, a, b) => {
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let name = if *op == BinOp::And { "and" } else { "or" };
+                    let l = self.eval_expr(a)?;
+                    let Val::Bool(lb) = l else {
+                        return Err(error(&format!(
+                            "`{name}` needs booleans, got a {}",
+                            l.kind()
+                        )));
+                    };
+                    if (*op == BinOp::And && !lb) || (*op == BinOp::Or && lb) {
+                        return Ok(Val::Bool(lb));
+                    }
+                    let r = self.eval_expr(b)?;
+                    return match r {
+                        Val::Bool(rb) => Ok(Val::Bool(rb)),
+                        r => Err(error(&format!(
+                            "`{name}` needs booleans, got a {}",
+                            r.kind()
+                        ))),
+                    };
+                }
+                let l = self.eval_expr(a)?;
+                let r = self.eval_expr(b)?;
+                binary(*op, &l, &r)
+            }
+        }
+    }
 
     /// A word in value position: one value.
     pub fn eval_word(&mut self, w: &Word) -> Res<Val> {
@@ -700,6 +969,19 @@ impl<H: Host> Shell<H> {
             }
         }
         Ok(Val::string(s))
+    }
+
+    /// The items a `for` loop goes over: words as a command takes them (lists splice, patterns expand).
+    fn eval_word_for(&mut self, w: &Word, out: &mut Vec<Val>) -> Res<()> {
+        match self.eval_word(w)? {
+            Val::List(l) => out.extend(l.iter().cloned()),
+            Val::Null => return Err(error("cannot loop over null")),
+            v @ (Val::Map(_) | Val::Closure(_) | Val::Job(_)) => {
+                return Err(error(&format!("cannot loop over a {}", v.kind())))
+            }
+            v => out.push(v),
+        }
+        Ok(())
     }
 
     /// A word as text for an external program: a list splices (one level), a glob expands.
@@ -750,41 +1032,30 @@ impl<H: Host> Shell<H> {
                     None => return Err(error(&format!("cannot count a {}", v.kind()))),
                 }
             }
-            Part::Sub(stmts) => {
+            Part::Paren(e, path) => {
                 let saved_pos = self.pos;
-                let v = self.exec_block(stmts, Mode::Value);
+                let mut v = self.eval_expr(e)?;
                 self.pos = saved_pos;
-                v?
-            }
-            Part::Island(kind, e) => {
-                let v = self.eval_isl(e)?;
-                match (kind, &v) {
-                    (IslKind::Calc, Val::Num(_)) | (IslKind::Is, Val::Bool(_)) => v,
-                    (IslKind::Calc, _) => {
-                        return Err(error(&format!(
-                            "`calc` makes a number, got a {} (use `is` for conditions)",
-                            v.kind()
-                        )))
-                    }
-                    (IslKind::Is, _) => {
-                        return Err(error(&format!(
-                            "`is` makes a boolean, got a {} (use `calc` for arithmetic)",
-                            v.kind()
-                        )))
-                    }
+                for seg in path {
+                    let key = match seg {
+                        Seg::Name(n) => Val::str(n),
+                        Seg::Dyn(w) => self.eval_word(w)?,
+                    };
+                    v = crate::builtins::index(&v, &key)?;
                 }
+                v
             }
             Part::List(items) => {
                 let mut v = Vec::new();
                 for it in items {
-                    v.push(self.eval_word(it)?);
+                    v.push(self.eval_expr(it)?);
                 }
                 Val::list(v)
             }
             Part::Map(items) => {
                 let mut m = VMap::new();
                 for (k, v) in items {
-                    let key = match self.eval_word(k)? {
+                    let key = match self.eval_expr(k)? {
                         Val::Str(s) => s,
                         other => {
                             return Err(error(&format!(
@@ -796,10 +1067,35 @@ impl<H: Host> Shell<H> {
                     if m.get(&key).is_some() {
                         return Err(error(&format!("duplicate key `{key}`")));
                     }
-                    let value = self.eval_word(v)?;
+                    let value = self.eval_expr(v)?;
                     m.set(&key, value);
                 }
                 Val::map(m)
+            }
+            Part::Template(parts) => {
+                // a hole inserts text as it is and a number, boolean or null as its JSON text (T2)
+                let mut s = String::new();
+                for tp in parts {
+                    match tp {
+                        TplPart::Text(t) => s.push_str(t),
+                        TplPart::Hole(e) => {
+                            let v = self.eval_expr(e)?;
+                            match v {
+                                Val::Str(t) => s.push_str(&t),
+                                Val::Num(_) | Val::Bool(_) | Val::Null => {
+                                    s.push_str(&crate::builtins::echo_line(&v))
+                                }
+                                v => {
+                                    return Err(error(&format!(
+                                    "a {} cannot go in a template hole (join a list explicitly)",
+                                    v.kind()
+                                )))
+                                }
+                            }
+                        }
+                    }
+                }
+                Val::string(s)
             }
             Part::Closure(def) => Val::Closure(Rc::new(Closure {
                 def: def.clone(),
@@ -835,64 +1131,15 @@ impl<H: Host> Shell<H> {
         Ok(v)
     }
 
-    // ---- infix islands ----
-
-    fn eval_isl(&mut self, e: &Isl) -> Res<Val> {
-        match e {
-            Isl::Operand(w) => self.eval_word(w),
-            Isl::Un(op, x) => {
-                let v = self.eval_isl(x)?;
-                match (op, v) {
-                    (UnOp::Neg, Val::Num(n)) => n.neg().map(Val::Num).map_err(arith_err),
-                    (UnOp::Neg, v) => Err(error(&format!(
-                        "unary - needs a number, got a {}",
-                        v.kind()
-                    ))),
-                    (UnOp::Not, Val::Bool(b)) => Ok(Val::Bool(!b)),
-                    (UnOp::Not, v) => {
-                        Err(error(&format!("`not` needs a boolean, got a {}", v.kind())))
-                    }
-                }
-            }
-            Isl::Bin(op, a, b) => {
-                if matches!(op, BinOp::And | BinOp::Or) {
-                    let l = self.eval_isl(a)?;
-                    let Val::Bool(lb) = l else {
-                        return Err(error(&format!(
-                            "`{}` needs booleans, got a {}",
-                            if *op == BinOp::And { "and" } else { "or" },
-                            l.kind()
-                        )));
-                    };
-                    if (*op == BinOp::And && !lb) || (*op == BinOp::Or && lb) {
-                        return Ok(Val::Bool(lb));
-                    }
-                    let r = self.eval_isl(b)?;
-                    return match r {
-                        Val::Bool(rb) => Ok(Val::Bool(rb)),
-                        r => Err(error(&format!(
-                            "`{}` needs booleans, got a {}",
-                            if *op == BinOp::And { "and" } else { "or" },
-                            r.kind()
-                        ))),
-                    };
-                }
-                let l = self.eval_isl(a)?;
-                let r = self.eval_isl(b)?;
-                binary(*op, &l, &r)
-            }
-        }
-    }
-
     // ---- and/or lists and pipelines ----
 
     fn exec_and_or(&mut self, ao: &AndOr, mode: Mode) -> Res<Val> {
         if ao.rest.is_empty() {
-            return self.exec_pipeline(&ao.first, mode, false);
+            return self.exec_pipeline(&ao.first, mode);
         }
         // a list: every operand but the last is a test, so a failing operand is a false, not a raise
         let n = ao.rest.len();
-        let mut cur = self.exec_pipeline(&ao.first, Mode::Stmt, true);
+        let mut cur = self.exec_pipeline(&ao.first, Mode::Stmt);
         let mut ran_last = false;
         for (i, (conn, pl)) in ao.rest.iter().enumerate() {
             let ok = cur.is_ok();
@@ -907,7 +1154,7 @@ impl<H: Host> Shell<H> {
             };
             if run {
                 let last = i + 1 == n;
-                cur = self.exec_pipeline(pl, if last { mode } else { Mode::Stmt }, !last);
+                cur = self.exec_pipeline(pl, if last { mode } else { Mode::Stmt });
                 ran_last = last;
             } else {
                 ran_last = false; // short-circuited: `cur` still stands
@@ -920,10 +1167,9 @@ impl<H: Host> Shell<H> {
         }
     }
 
-    /// Run a pipeline. `testing`: the caller treats an exit failure as false (it still returns the failure, tagged).
-    fn exec_pipeline(&mut self, pl: &Pipeline, mode: Mode, _testing: bool) -> Res<Val> {
+    fn exec_pipeline(&mut self, pl: &Pipeline, mode: Mode) -> Res<Val> {
         if pl.negate {
-            let r = self.exec_stages(&pl.stages, Mode::Stmt);
+            let r = self.exec_pipeline_inner(pl, Mode::Stmt);
             return match r {
                 Ok(_) => Err(Flow::Fail(Fail {
                     value: Val::record(vec![
@@ -938,12 +1184,20 @@ impl<H: Host> Shell<H> {
                 Err(e) => Err(e),
             };
         }
-        self.exec_stages(&pl.stages, mode)
+        self.exec_pipeline_inner(pl, mode)
+    }
+
+    fn exec_pipeline_inner(&mut self, pl: &Pipeline, mode: Mode) -> Res<Val> {
+        match &pl.prefix {
+            None => self.exec_stages(&pl.stages, mode),
+            Some(p) => self.exec_prefixed(p, &pl.stages, mode),
+        }
     }
 }
 
 fn is_test_failure(f: &Fail) -> bool {
-    matches!(f.kind, FailKind::Exit | FailKind::User)
+    // `succeeds`, `run`, `&&`, `||` and `!` absorb exit failures and never spawn failures (X2)
+    f.kind == FailKind::Exit
 }
 
 pub(crate) fn arith_err(e: ArithError) -> Flow {
@@ -1176,100 +1430,11 @@ impl<H: Host> Shell<H> {
     }
 
     pub(crate) fn exec_stages(&mut self, cmds: &[Command], mode: Mode) -> Res<Val> {
-        // `succeeds (...)` and `run (...)` take their command unevaluated
-        if cmds.len() == 1 {
-            if let Some(r) = self.special_form(&cmds[0], mode) {
-                return r;
-            }
-        }
         let mut stages = Vec::new();
         for c in cmds {
             stages.push(self.resolve_stage(c)?);
         }
         self.run_stages(stages, mode)
-    }
-
-    fn special_form(&mut self, c: &Command, _mode: Mode) -> Option<Res<Val>> {
-        let [Part::Lit(name)] = c.words.first()?.parts.as_slice() else {
-            return None;
-        };
-        if name != "succeeds" && name != "run" {
-            return None;
-        }
-        let arg = c.words.get(1)?;
-        let [Part::Sub(stmts)] = arg.parts.as_slice() else {
-            return None;
-        };
-        if self.find_fn(name).is_some() {
-            return None;
-        }
-        let stmts: &Vec<Stmt> = stmts;
-        if name == "succeeds" {
-            if c.words.len() != 2 {
-                return Some(Err(error("succeeds takes one command in parentheses")));
-            }
-            return Some(match self.exec_block(stmts, Mode::Stmt) {
-                Ok(_) => Ok(Val::Bool(true)),
-                Err(Flow::Fail(f)) if is_test_failure(&f) => Ok(Val::Bool(false)),
-                Err(e) => Err(e),
-            });
-        }
-        // run: capture stdout and stderr, never raise for a non-zero exit
-        let mut opts = VMap::new();
-        if let Some(o) = c.words.get(2) {
-            match self.eval_word(o) {
-                Ok(Val::Map(m)) => opts = (*m).clone(),
-                Ok(v) => {
-                    return Some(Err(error(&format!(
-                        "run's options must be a map, got a {}",
-                        v.kind()
-                    ))))
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-        Some(self.run_capture(stmts, &opts))
-    }
-
-    fn run_capture(&mut self, stmts: &[Stmt], opts: &VMap) -> Res<Val> {
-        let out = Rc::new(RefCell::new(Vec::new()));
-        let err = Rc::new(RefCell::new(Vec::new()));
-        let saved_cap = self.cap;
-        if let Some(Val::Num(Number::Int(i))) = opts.get("max") {
-            if *i > 0 {
-                self.cap = *i as usize;
-            }
-        }
-        let new = Io {
-            stdin: self.io.stdin,
-            stdout: Sink::Mem(out.clone()),
-            stderr: Sink::Mem(err.clone()),
-        };
-        let saved = core::mem::replace(&mut self.io, new);
-        let r = self.exec_block(stmts, Mode::Tail);
-        self.io = saved;
-        self.cap = saved_cap;
-        let text = |b: &Rc<RefCell<Vec<u8>>>| String::from_utf8_lossy(&b.borrow()).into_owned();
-        let (status, value, failed) = match r {
-            Ok(v) => (0, v, None),
-            Err(Flow::Fail(f)) if is_test_failure(&f) => (f.code, Val::Null, Some(f)),
-            Err(e) => return Err(e),
-        };
-        let mut rec = vec![("status", Val::int(i64::from(status)))];
-        let out_text = text(&out);
-        if out_text.is_empty() && !matches!(value, Val::Null) {
-            // a shell callee's value stands in for output
-            rec.push(("value", value));
-        } else {
-            rec.push(("out", split_lines_val(&out_text)));
-        }
-        rec.push(("err", Val::string(text(&err))));
-        if let Some(f) = failed {
-            if f.kind == FailKind::User {
-                rec.push(("value", f.value));
-            }
-        }
-        Ok(Val::record(rec))
     }
 }
 
@@ -1286,4 +1451,5 @@ pub(crate) fn split_lines(t: &str) -> Vec<String> {
     t.split('\n').map(String::from).collect()
 }
 
+mod jobs;
 mod pipeline;

@@ -11,6 +11,7 @@ pub mod complete;
 pub mod eval;
 pub mod fake;
 pub mod host;
+pub mod job;
 pub mod line;
 pub mod parser;
 pub mod repl;

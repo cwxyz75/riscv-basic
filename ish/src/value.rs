@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use data::{Number, Value as Data};
 
 /// A function value: code plus the variables it saw when it was made (captured by value; values are immutable, so this is safe).
@@ -26,6 +27,17 @@ pub enum Val {
     List(Rc<Vec<Val>>),
     Map(Rc<VMap>),
     Closure(Rc<Closure>),
+    /// A background job (a handle, Q3): it can be stored and captured but not serialized.
+    Job(Rc<RefCell<crate::job::JobState>>),
+    /// What a call statement gives: no value. Using it as a value is an error that names the fix (N3).
+    Void(Rc<NoValue>),
+}
+
+/// The absence of a value: which function ended with which call statement.
+#[derive(Debug)]
+pub struct NoValue {
+    pub func: Option<Rc<str>>,
+    pub call: Rc<str>,
 }
 
 /// An ordered map (insertion order, string keys) that is cheap to clone and update when uniquely held.
@@ -112,6 +124,8 @@ impl Val {
             Val::List(_) => "list",
             Val::Map(_) => "map",
             Val::Closure(_) => "closure",
+            Val::Job(_) => "job",
+            Val::Void(_) => "nothing",
         }
     }
 
@@ -155,6 +169,7 @@ impl Val {
                 a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.equals(w)))
             }
             (Val::Closure(a), Val::Closure(b)) => Rc::ptr_eq(a, b),
+            (Val::Job(a), Val::Job(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -175,6 +190,8 @@ impl Val {
                 Data::Map(out)
             }
             Val::Closure(_) => return Err("closure"),
+            Val::Job(_) => return Err("job"),
+            Val::Void(_) => return Err("nothing"),
         })
     }
 

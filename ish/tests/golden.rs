@@ -161,11 +161,10 @@ fn run(c: &Case) -> (String, String, i32, usize) {
         host = host.with_file(p, content);
     }
     host.set_stdin(c.stdin.as_bytes());
-    let mut sh = Shell::new(host);
     for (k, v) in &c.env {
-        use ish::Host;
-        sh.host.setenv(k, v);
+        host.set_env(k, v);
     }
+    let mut sh = Shell::new(host);
     sh.set_args(c.args.clone());
     if c.legacy {
         sh.name = "sh".into();

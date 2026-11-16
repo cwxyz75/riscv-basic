@@ -3,7 +3,7 @@
 fn f do
     defer do print cleanup end
     print working
-    fail oops 9
+    fail 'oops' 9
 end
 try do f end catch e do print caught $e end
 fn g do
@@ -11,7 +11,7 @@ fn g do
     print g-body
 end
 g
-lines = (lines-of do echo a; echo b end)
+lines = lines-of do echo a; echo b end
 print $lines
 print (lines-of do print x; print y end)
 defer do print script-end end
@@ -26,5 +26,6 @@ g-done
 ["x","y"]
 last
 script-end
+--- stderr
 --- status
 0

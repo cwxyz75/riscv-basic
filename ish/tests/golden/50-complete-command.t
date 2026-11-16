@@ -12,6 +12,6 @@ l\t\t\x03
 $ echo \n
 \n
 $ l\n
-len  lines  lines-of  list  lower  ls\n
+len  lines  lines-of  list  lossy-lines  lower  ls\n
 $ l^C\n
 $ 

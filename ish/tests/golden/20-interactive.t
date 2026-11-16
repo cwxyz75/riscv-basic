@@ -1,9 +1,9 @@
-# the prompt echoes a non-null value; lists of strings as lines; errors do not end the session
+# at the prompt a top-level call to a builtin or shell function that gives a value shows it (I1); lists of strings as lines
 --- lines
 len [1, 2, 3]
 x = 4
-(calc $x * 2)
-[ "a", "b" ]
+$x * 2
+["a", "b"]
 { "k": 1 }
 echo hi
 nosuch

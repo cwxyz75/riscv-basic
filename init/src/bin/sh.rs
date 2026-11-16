@@ -18,7 +18,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream, TermIn};
+use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream, TermIn, WaitOutcome};
 use proto::console::{self as ctl, Control};
 use proto::file::{flags, rights};
 use proto::startup::{Role, Startup};
@@ -67,15 +67,16 @@ struct Os {
     tmp: Option<Fs>,
     dev: Option<Fs>,
     jobs: u32,
-    /// The private directories made for the foreground job, removed when it ends.
-    tmps: Vec<Vec<u8>>,
+    /// The private directory just made for the program being started (taken by `spawn`).
+    new_tmp: Option<Vec<u8>>,
+    /// Each running program's private directory, removed when it is reaped.
+    tmp_of: BTreeMap<u32, Vec<u8>>,
     txid: u32,
     inbuf: Vec<u8>,
     objs: BTreeMap<u32, Obj>,
     next_stream: u32,
     procs: BTreeMap<u32, u32>,
     next_pid: u32,
-    env: BTreeMap<String, String>,
     killed: bool,
     /// The session's profile (UV5): its program grants replace `/etc/trusted`, and its identity is in every program's environment.
     session_env: Vec<(String, String)>,
@@ -356,14 +357,28 @@ impl Os {
         }
     }
 
-    /// Remove the private `/tmp` directories of the job that just ended.
-    fn cleanup_tmps(&mut self) {
-        let names: Vec<Vec<u8>> = core::mem::take(&mut self.tmps);
-        if let Some(t) = self.tmp.as_mut() {
-            for n in names {
+    /// Remove the private `/tmp` directory of a program that has been reaped.
+    fn cleanup_tmp(&mut self, pid: u32) {
+        if let Some(n) = self.tmp_of.remove(&pid) {
+            if let Some(t) = self.tmp.as_mut() {
                 remove_tree(t, &n, 0);
             }
         }
+    }
+
+    /// A program has ended: its exit code, its handle closed and its `/tmp` removed.
+    fn reap(&mut self, pid: u32, h: u32) -> i32 {
+        let code = if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
+            sys::process_info(h).a1 as i64 as i32
+        } else {
+            -1
+        };
+        if code == KILLED {
+            self.killed = true;
+        }
+        sys::handle_close(h);
+        self.cleanup_tmp(pid);
+        code
     }
 
     fn add_obj(&mut self, o: Obj) -> Stream {
@@ -403,7 +418,12 @@ impl Os {
         abs[1..].to_vec()
     }
 
-    fn start(&mut self, argv: &[String], io: ProcIo) -> Result<u32, HostError> {
+    fn start(
+        &mut self,
+        argv: &[String],
+        env: &[(String, String)],
+        io: ProcIo,
+    ) -> Result<u32, HostError> {
         let name = argv[0].as_bytes();
         if !shell_core::valid_command_name(name) {
             return Err(HostError::Other(String::from("bad command name")));
@@ -451,12 +471,9 @@ impl Os {
             roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
         };
-        // the environment the shell has been given (`export`), then the working directory as a path: the libc's `getcwd`,
-        // and `..` that climbs, start from it
-        for (k, v) in &self.session_env {
-            startup.env.push(format!("{k}={v}").into_bytes());
-        }
-        for (k, v) in &self.env {
+        // the environment the shell passes (its `$env` binding, A2), then the working directory as a path: the libc's
+        // `getcwd`, and `..` that climbs, start from it
+        for (k, v) in env {
             startup.env.push(format!("{k}={v}").into_bytes());
         }
         startup.env.push([&b"PWD="[..], &self.cwd_path].concat());
@@ -540,7 +557,7 @@ impl Os {
                     .namespace
                     .push((b"/tmp".to_vec(), forward.len() as u32));
                 forward.push(c.ch);
-                self.tmps.push(name);
+                self.new_tmp = Some(name);
             }
         }
         // the volumes this program is granted, opened now from the registry (retrying while the volume manager brings a
@@ -616,13 +633,32 @@ impl Host for Os {
         Stream(2)
     }
 
-    fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError> {
+    fn spawn(
+        &mut self,
+        argv: &[String],
+        env: &[(String, String)],
+        io: ProcIo,
+    ) -> Result<Pid, HostError> {
         // programs read the terminal through the console server's line editor
         self.go_cooked();
-        let h = self.start(argv, io)?;
+        self.new_tmp = None;
+        let started = self.start(argv, env, io);
+        let tmp = self.new_tmp.take();
         let id = self.next_pid;
+        let h = match started {
+            Ok(h) => h,
+            Err(e) => {
+                if let (Some(n), Some(t)) = (tmp, self.tmp.as_mut()) {
+                    remove_tree(t, &n, 0);
+                }
+                return Err(e);
+            }
+        };
         self.next_pid += 1;
         self.procs.insert(id, h);
+        if let Some(n) = tmp {
+            self.tmp_of.insert(id, n);
+        }
         Ok(Pid(id))
     }
 
@@ -630,17 +666,54 @@ impl Host for Os {
         let Some(h) = self.procs.remove(&pid.0) else {
             return -1;
         };
-        let w = sys::object_wait(h, signals::TERMINATED, u64::MAX);
-        let code = if w.status == 0 {
-            sys::process_info(h).a1 as i64 as i32
-        } else {
-            -1
-        };
-        if code == KILLED {
-            self.killed = true;
+        sys::object_wait(h, signals::TERMINATED, u64::MAX);
+        self.reap(pid.0, h)
+    }
+
+    fn try_wait(&mut self, pid: Pid) -> Option<i32> {
+        let h = *self.procs.get(&pid.0)?;
+        if sys::object_wait(h, signals::TERMINATED, 0).status != 0 {
+            return None;
         }
-        sys::handle_close(h);
-        code
+        self.procs.remove(&pid.0);
+        Some(self.reap(pid.0, h))
+    }
+
+    fn wait_any(&mut self, pids: &[Pid]) -> (usize, i32) {
+        // there is no wait-for-many call yet (TIDY-UP): look at each, then sleep a little
+        loop {
+            for (i, p) in pids.iter().enumerate() {
+                if !self.procs.contains_key(&p.0) {
+                    return (i, -1);
+                }
+                if let Some(st) = self.try_wait(*p) {
+                    return (i, st);
+                }
+            }
+            io::nap(2);
+        }
+    }
+
+    fn wait_timeout(&mut self, pid: Pid, ms: u64) -> WaitOutcome {
+        let Some(&h) = self.procs.get(&pid.0) else {
+            return WaitOutcome::Done(-1);
+        };
+        let deadline = sys::clock_get() + ms;
+        loop {
+            self.poll_ctl();
+            if core::mem::take(&mut self.interrupt) {
+                return WaitOutcome::Interrupted;
+            }
+            let now = sys::clock_get();
+            let slice = deadline.min(now + 20);
+            if sys::object_wait(h, signals::TERMINATED, slice).status == 0 {
+                self.procs.remove(&pid.0);
+                return WaitOutcome::Done(self.reap(pid.0, h));
+            }
+            if sys::clock_get() >= deadline {
+                return WaitOutcome::Timeout;
+            }
+        }
     }
 
     fn pipe(&mut self) -> Result<(Stream, Stream), HostError> {
@@ -904,7 +977,6 @@ impl Host for Os {
         if self.interactive {
             self.control(Control::ClearForeground, &[]);
         }
-        self.cleanup_tmps();
         if self.killed {
             self.killed = false;
             self.swallow_interrupt();
@@ -985,26 +1057,9 @@ impl Host for Os {
         self.confined.pop();
     }
 
-    fn getenv(&self, name: &str) -> Option<String> {
-        self.env.get(name).cloned().or_else(|| {
-            self.session_env
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-        })
-    }
-
-    fn setenv(&mut self, name: &str, value: &str) {
-        self.env.insert(String::from(name), String::from(value));
-    }
-
     fn environ(&self) -> Vec<(String, String)> {
-        // the identity the session gives, then what was exported
+        // the identity the session gives
         let mut v: Vec<(String, String)> = self.session_env.clone();
-        for (k, x) in &self.env {
-            v.retain(|(n, _)| n != k);
-            v.push((k.clone(), x.clone()));
-        }
         v.sort();
         v
     }
@@ -1133,14 +1188,14 @@ pub fn app_main() -> i32 {
         tmp: env.handle(Role::TmpDir).map(Fs::new),
         dev: env.handle(Role::DevDir).map(Fs::new),
         jobs: 0,
-        tmps: Vec::new(),
+        new_tmp: None,
+        tmp_of: BTreeMap::new(),
         txid: 0,
         inbuf: Vec::new(),
         objs: BTreeMap::new(),
         next_stream: 3,
         procs: BTreeMap::new(),
         next_pid: 1,
-        env: BTreeMap::new(),
         killed: false,
         session_env: Vec::new(),
         confined: Vec::new(),
@@ -1148,15 +1203,17 @@ pub fn app_main() -> i32 {
         interrupt: false,
         interactive: ctl_ch.is_some(),
     };
-    let mut sh = ish::Shell::new(os);
-    sh.name = String::from("sh");
+    let mut os = os;
     let profile_loaded = env
         .var(b"PROFILE")
         .and_then(|b| core::str::from_utf8(b).ok())
-        .is_some_and(|t| sh.host.load_profile(t));
+        .is_some_and(|t| os.load_profile(t));
     if !profile_loaded {
-        sh.host.load_trusted();
+        os.load_trusted();
     }
+    // (after the profile: the shell's `$env` starts from the identity it gives)
+    let mut sh = ish::Shell::new(os);
+    sh.name = String::from("sh");
     if !sh.host.interactive {
         // not on a terminal: the standard messages, no prompt, no echo
         return ish::repl::run_batch(&mut sh);
