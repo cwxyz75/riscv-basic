@@ -157,7 +157,7 @@ A convention, not a fixed tree: every process gets only the entries its launcher
   `tar -h` walk `/usr/usr/...` to the loop limit). `/usr/local` is not provided until the install-layout question is
   settled.
 * `/lib` is the real directory and `/usr/lib` the link.
-* **Install layout is Open Q4**: a flat merged layout as above, or `/pkg/<name>/<version>/{bin,lib,share}` with
+* **Install layout is the flat merged layout above (Q4, resolved 2026-11-17).** The alternative, kept as a later option: `/pkg/<name>/<version>/{bin,lib,share}` with
   `/bin` and `/lib` built as unions from manifests (a fit for per-process views; more machinery; `--prefix` covers most
   build systems). System `/bin` read-only, user tools in `/home/<user>/bin` unioned in, would make "trusted programs"
   a visible layer instead of a config file.
@@ -323,7 +323,7 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 2. **Q2: dynamic linking.** A deliberate later project (a `.so` loader, `dlopen`), or avoid it by keeping rustc
    proc macros out of scope at first?
 3. **Q3: handles as shell values** (`SHELL-SPEC.md` Q3).
-4. **Q4: install layout**: flat merged, or `/pkg/<name>/<version>` with unions.
+4. **Q4 (resolved 2026-11-17): install layout** is the flat merged one of section 7 (`/bin`, `/lib`, `/include`, `/share`). `/pkg/<name>/<version>` with unions needs the union server (S10) and stays a later option; flat does not prevent it.
 5. **Q5: PIDs**: local to a job, or global numbers from the process server.
 6. **Q6: `/run` and `AF_UNIX`**: build with the registry now, or wait for a port that needs it.
 7. **Q7: system configuration format**: TOML, or shell data literals (`SHELL-SPEC.md` Q2).
@@ -331,8 +331,7 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 9. **Q9: queries in the tree** (`/query/<expr>`) or only a command.
 10. **Q10 (the registry's, open already): passing a service connection to another program, and revocation.**
 11. **Q11: the self-hosting bring-up path**: cross-build and run natively (Proposal), or bootstrap from tcc.
-12. **Q12: default namespace for a program the shell launches**: the current directory's subtree plus stdio and a few
-    `/dev` entries, or something broader. (Still the confined-by-default question, OD20.)
+12. **Q12 (resolved 2026-11-17): default namespace for a program the shell launches** is the confined one: the current directory's subtree, standard input, output and error, and a few `/dev` entries (`null`, `zero`, `urandom`, `tty`). Anything wider (the skeleton root, volumes, `/svc` views) is an explicit grant: `/etc/trusted` lines until the session manager's profiles (UV5) and the manifest (S10) replace them. (OD20 stands.)
 
 ## 16. Invariants to add when built
 
@@ -347,7 +346,7 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 
 ## 17. Shortcuts to record in `TIDY-UP.md` when built
 
-Lexical `..` deviation and stale cwd after a parent rename; advisory metadata that enforces nothing; no hard links;
+`/etc/passwd` and `/etc/group` are static one-entry files from the boot image until the session manager (UV5) synthesizes them; authentication and the profile format are decided at UV5 (owner, 2026-11-17); lexical `..` deviation and stale cwd after a parent rename; advisory metadata that enforces nothing; no hard links;
 `/proc` kept minimal and scoped; a C locale only; no `/usr/local`; the `shell-core::resolve` error above the root until
 UV1; a one-user, single-owner session model with guest and service profiles only.
 
