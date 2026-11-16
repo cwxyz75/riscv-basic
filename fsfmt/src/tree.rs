@@ -72,17 +72,20 @@ fn route(kids: &[(Vec<u8>, Ptr)], key: &[u8]) -> usize {
     kids[1..].partition_point(|(b, _)| b.as_slice() <= key)
 }
 
-/// Where to cut `sizes` so both halves are non-empty and about equal in bytes.
+/// Where to cut `sizes` so both halves are non-empty and the larger is as small as it can be (so that both fit a block).
 fn cut(sizes: &[usize]) -> usize {
     let total: usize = sizes.iter().sum();
     let mut acc = 0;
-    for (i, s) in sizes.iter().enumerate() {
+    let (mut best, mut best_max) = (1, usize::MAX);
+    for (i, s) in sizes.iter().enumerate().take(sizes.len() - 1) {
         acc += s;
-        if acc * 2 >= total {
-            return (i + 1).clamp(1, sizes.len() - 1);
+        let m = acc.max(total - acc);
+        if m < best_max {
+            best_max = m;
+            best = i + 1;
         }
     }
-    sizes.len() - 1
+    best
 }
 
 impl Default for Tree {
@@ -466,6 +469,10 @@ impl Tree {
             }
             _ => return Err(TreeError::Structure("siblings of different kinds")),
         };
+        // (an internal merge can grow by the parent's separator replacing a shorter first bound: check what is built)
+        if merged.size() > CAP {
+            return Ok(());
+        }
         let p = pool.write_node(&merged)?;
         let (ra, rb) = (kids[a].1, kids[b].1);
         pool.retire(&ra);

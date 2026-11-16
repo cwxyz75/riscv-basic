@@ -148,7 +148,11 @@ impl Server {
                 self.dirty_since = None;
                 0
             }
-            Err(e) => fstat(e, 0),
+            Err(e) => {
+                // try again after the interval, not in a busy loop (review finding 3)
+                self.dirty_since = Some(sys::clock_get());
+                fstat(e, 0)
+            }
         }
     }
 
@@ -215,6 +219,8 @@ impl Server {
     }
 
     fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u32>) {
+        // file times are the time of the change, not of the last open (review finding 9)
+        self.fs.set_time(sys::clock_get().saturating_mul(1_000_000));
         let close_ep = |ep: Option<u32>| {
             if let Some(h) = ep {
                 sys::handle_close(h);
@@ -629,7 +635,10 @@ impl Server {
                     Err(e) => self.send(key, txid, fstat(e, 0), 0, &[], None),
                 }
             }
-            _ => self.send(key, txid, status::BAD_REQUEST, 0, &[], None),
+            _ => {
+                close_ep(endpoint);
+                self.send(key, txid, status::BAD_REQUEST, 0, &[], None)
+            }
         }
     }
 

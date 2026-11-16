@@ -42,6 +42,9 @@ const NODE_OVERHEAD: usize = 96;
 /// Blocks kept back from ordinary writes so that unlink, shrink and release still work on a full volume.
 pub const RESERVE: u64 = 64;
 
+/// The deepest a directory tree is walked: longer parent chains are a cycle on a damaged volume.
+pub(crate) const MAX_DEPTH: usize = 4096;
+
 const K_INODE: u8 = 1;
 const K_DIRENT: u8 = 2;
 const K_SYMLINK: u8 = 4;
@@ -203,6 +206,11 @@ fn k_id(tag: u8, id: NodeId) -> [u8; 9] {
     let mut k = [tag; 9];
     k[1..].copy_from_slice(&id.to_be_bytes());
     k
+}
+
+/// `a - b` for values read from disk: a result below zero means the volume is damaged, not that the code is wrong.
+fn sub(a: u64, b: u64) -> R<u64> {
+    a.checked_sub(b).ok_or(FsError::Corrupt)
 }
 
 fn u64_of(v: &[u8]) -> R<u64> {
@@ -481,6 +489,9 @@ impl<D: Device> Fs<D> {
             }
             at = self.inode(at)?.parent;
             depth += 1;
+            if depth > MAX_DEPTH {
+                return Err(FsError::Corrupt); // a parent cycle on a damaged volume
+            }
         }
         Ok(depth)
     }
@@ -503,7 +514,7 @@ impl<D: Device> Fs<D> {
             }
             None => k_dirent(dir, b""),
         };
-        let hi = k_dirent(dir + 1, b"");
+        let hi = k_dirent(dir.saturating_add(1), b"");
         let root = self.vol.tree.root();
         let ents = Tree::range_limited(&mut self.vol.pool, root, Some(&lo), Some(&hi), max)?;
         let mut out = Vec::new();
@@ -526,11 +537,15 @@ impl<D: Device> Fs<D> {
 
     fn next_id(&mut self) -> R<NodeId> {
         let id = u64_of(&self.get(&[K_NEXTID])?.ok_or(FsError::Corrupt)?)?;
-        self.put(&[K_NEXTID], &(id + 1).to_be_bytes())?;
+        self.put(
+            &[K_NEXTID],
+            &id.checked_add(1).ok_or(FsError::Corrupt)?.to_be_bytes(),
+        )?;
         Ok(id)
     }
 
-    fn insert(&mut self, dir: NodeId, name: &[u8], kind: Kind, extra_cost: usize) -> R<NodeId> {
+    fn insert(&mut self, dir: NodeId, name: &[u8], kind: Kind, target: Option<&[u8]>) -> R<NodeId> {
+        let extra_cost = target.map_or(0, <[u8]>::len);
         check_name(name)?;
         let d = self.inode(dir)?;
         if d.kind != Kind::Dir {
@@ -562,12 +577,15 @@ impl<D: Device> Fs<D> {
                     links: 1,
                     parent: dir,
                     mtime: fs.now,
-                    size: 0,
+                    size: extra_cost as u64,
                     cost: (cost + extra_cost) as u32,
                     attr_cost: 0,
                 },
             )?;
             fs.set_name(id, name)?;
+            if let Some(t) = target {
+                fs.put(&k_id(K_SYMLINK, id), t)?;
+            }
             fs.put(&k_dirent(dir, name), &id.to_be_bytes())?;
             let mut d = d;
             d.mtime = fs.now;
@@ -580,31 +598,19 @@ impl<D: Device> Fs<D> {
     }
 
     pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> R<NodeId> {
-        self.insert(dir, name, Kind::File, 0)
+        self.insert(dir, name, Kind::File, None)
     }
 
     pub fn mkdir(&mut self, dir: NodeId, name: &[u8]) -> R<NodeId> {
-        self.insert(dir, name, Kind::Dir, 0)
+        self.insert(dir, name, Kind::Dir, None)
     }
 
     /// Create the symlink `name` in `dir`; the target may never climb above the connection root `root` (FS-SPEC 9.1).
     pub fn symlink(&mut self, dir: NodeId, name: &[u8], target: &[u8], root: NodeId) -> R<NodeId> {
         let depth = self.depth_below(dir, root)?;
         proto::file::check_link_target(target, depth).map_err(|_| Error::BadTarget)?;
-        let id = self.insert(dir, name, Kind::Symlink, target.len())?;
-        // (insert's transaction is complete; the target is a second one, which cannot fail on quota: it was charged above)
-        let made = self.txn(|fs| {
-            fs.put(&k_id(K_SYMLINK, id), target)?;
-            let mut n = fs.inode(id)?;
-            n.size = target.len() as u64;
-            fs.put_inode(id, &n)
-        });
-        if let Err(e) = made {
-            // the link is made whole or not at all
-            let _ = self.unlink(dir, name);
-            return Err(e);
-        }
-        Ok(id)
+        // one transaction: the node, its entry and its target are made together or not at all (review finding 4)
+        self.insert(dir, name, Kind::Symlink, Some(target))
     }
 
     // ------------------------------------------------------------------------------------------------------ removal
@@ -615,7 +621,7 @@ impl<D: Device> Fs<D> {
         match n.kind {
             Kind::File => {
                 self.truncate_blocks(id, 0)?;
-                self.counters.bytes -= n.size;
+                self.counters.bytes = sub(self.counters.bytes, n.size)?;
             }
             Kind::Symlink => self.del(&k_id(K_SYMLINK, id))?,
             _ => {}
@@ -624,8 +630,8 @@ impl<D: Device> Fs<D> {
         self.del(&k_inode(id))?;
         self.del(&k_id(K_ORPHAN, id))?;
         self.del(&k_id(K_NAMEOF, id))?;
-        self.counters.nodes -= 1;
-        self.counters.meta -= n.cost as u64 + n.attr_cost as u64;
+        self.counters.nodes = sub(self.counters.nodes, 1)?;
+        self.counters.meta = sub(self.counters.meta, n.cost as u64 + n.attr_cost as u64)?;
         Ok(())
     }
 
@@ -661,7 +667,7 @@ impl<D: Device> Fs<D> {
             fs.del(&k_dirent(dir, name))?;
             let mut d = d;
             d.mtime = fs.now;
-            d.size -= 1;
+            d.size = sub(d.size, 1)?;
             fs.put_inode(dir, &d)?;
             fs.drop_link(target)
         })
@@ -735,14 +741,14 @@ impl<D: Device> Fs<D> {
             if let Some(d) = dst {
                 fs.del(&k_dirent(to_dir, to_name))?;
                 let mut t = fs.inode(to_dir)?;
-                t.size -= 1;
+                t.size = sub(t.size, 1)?;
                 fs.put_inode(to_dir, &t)?;
                 fs.drop_link(d)?;
             }
             fs.del(&k_dirent(from_dir, from_name))?;
             let mut f = fs.inode(from_dir)?;
             f.mtime = fs.now;
-            f.size -= 1;
+            f.size = sub(f.size, 1)?;
             fs.put_inode(from_dir, &f)?;
             fs.put(&k_dirent(to_dir, to_name), &src.to_be_bytes())?;
             let mut t = fs.inode(to_dir)?;
@@ -761,7 +767,7 @@ impl<D: Device> Fs<D> {
     /// Is `target` the directory `root` itself or somewhere below it?
     fn is_within(&mut self, root: NodeId, target: NodeId) -> R<bool> {
         let mut at = target;
-        loop {
+        for _ in 0..=MAX_DEPTH {
             if at == root {
                 return Ok(true);
             }
@@ -770,6 +776,7 @@ impl<D: Device> Fs<D> {
             }
             at = self.inode(at)?.parent;
         }
+        Err(FsError::Corrupt)
     }
 
     /// A connection starts holding `id`.
@@ -900,7 +907,7 @@ impl<D: Device> Fs<D> {
     /// Drop every block of `id` from block number `from` on.
     fn truncate_blocks(&mut self, id: NodeId, from: u64) -> R<()> {
         let root = self.vol.tree.root();
-        let (lo, hi) = (k_extent(id, from), k_extent(id + 1, 0));
+        let (lo, hi) = (k_extent(id, from), k_extent(id.saturating_add(1), 0));
         let ents = Tree::range_at(&mut self.vol.pool, root, Some(&lo), Some(&hi))?;
         for (k, v) in ents {
             if v.len() != 32 {
@@ -934,7 +941,7 @@ impl<D: Device> Fs<D> {
                         fs.write_block(id, b, o, &zeros[o..])?;
                     }
                 }
-                fs.counters.bytes -= n.size - size;
+                fs.counters.bytes = sub(fs.counters.bytes, n.size - size)?;
             } else {
                 fs.counters.bytes += size - n.size;
             }
