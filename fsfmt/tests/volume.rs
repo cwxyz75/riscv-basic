@@ -298,3 +298,48 @@ fn the_reserve_is_kept_back_from_ordinary_writes_but_open_to_the_deleting_paths(
     assert!(v.tree.delete(&mut v.pool, &0u32.to_be_bytes()).is_ok());
     v.pool.allow_reserve(false);
 }
+
+#[test]
+fn probe_recognises_a_volume_and_refuses_everything_else() {
+    use fsfmt::probe;
+    let mut d = fresh(200);
+    let s = probe(&mut d).unwrap();
+    assert_eq!((s.uuid, s.label_str()), (UUID, "scratch"));
+    // blank, random bytes, too small, and a volume on a device of another size
+    assert!(probe(&mut MemDevice::new(200)).is_none());
+    let mut junk = MemDevice::new(200);
+    for a in 0..200 {
+        junk.write(a, &[0x5a; BLOCK]).unwrap();
+    }
+    assert!(probe(&mut junk).is_none());
+    assert!(probe(&mut MemDevice::new(5)).is_none());
+    let mut other = MemDevice::new(300);
+    for i in 0..SLOTS {
+        let mut b = [0u8; BLOCK];
+        fresh(200).read(slot_addr(i, 200), &mut b).unwrap();
+        other.write(i.min(3), &b).unwrap();
+    }
+    assert!(
+        probe(&mut other).is_none(),
+        "a geometry larger than the device"
+    );
+    // a label with control bytes
+    let mut bad = fresh(200);
+    let mut sb = probe(&mut bad).unwrap();
+    sb.label[0] = 7;
+    for i in 0..SLOTS {
+        bad.write(slot_addr(i, 200), &sb.encode()).unwrap();
+    }
+    assert!(probe(&mut bad).is_none());
+    // bit flips in a good image never panic and never invent a different identity
+    let good = fresh(200);
+    for a in [0u64, 1, 196, 197] {
+        for bit in (0..BLOCK * 8).step_by(37) {
+            let mut d = good.clone();
+            d.raw_mut(a).unwrap()[bit / 8] ^= 1 << (bit % 8);
+            if let Some(s) = probe(&mut d) {
+                assert_eq!(s.uuid, UUID);
+            }
+        }
+    }
+}

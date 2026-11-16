@@ -56,6 +56,7 @@ fn main() {
         "httpd",
         "fsd",
         "clockd",
+        "volmgr",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

@@ -138,6 +138,33 @@ fn owner(uuid: &[u8; 16]) -> u64 {
     sb::owner_of(uuid)
 }
 
+/// Is this device a doofs volume? The newest superblock slot that decodes, with a plausible geometry and a printable label, and
+/// no walk of the tree (a hostile device costs eight block reads). Used by `volmgr`; mount does the real checking.
+pub fn probe<D: Device>(dev: &mut D) -> Option<Superblock> {
+    let blocks = dev.blocks();
+    if blocks < MIN_BLOCKS {
+        return None;
+    }
+    let mut best: Option<Superblock> = None;
+    for i in 0..SLOTS {
+        let mut b = [0u8; BLOCK];
+        if dev.read(sb::slot_addr(i, blocks), &mut b).is_err() {
+            continue;
+        }
+        let Ok(s) = Superblock::decode(&b) else {
+            continue;
+        };
+        let n = s.label.iter().position(|&c| c == 0).unwrap_or(LABEL_MAX);
+        if s.blocks != blocks || !s.label[..n].iter().all(|&c| (0x20..0x7f).contains(&c)) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|x| s.generation > x.generation) {
+            best = Some(s);
+        }
+    }
+    best
+}
+
 /// Read all slots, and walk each readable slot's tree. Changes nothing.
 pub fn check<D: Device>(dev: &mut D) -> Report {
     let blocks = dev.blocks();

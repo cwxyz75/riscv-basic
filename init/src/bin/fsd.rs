@@ -53,6 +53,8 @@ struct Conn {
     node: NodeId,
     rights: u32,
     is_dir: bool,
+    /// A listener channel the registry forwards opens of the published volume to (not a client connection).
+    listener: bool,
 }
 
 struct Server {
@@ -60,7 +62,18 @@ struct Server {
     core: Core<Conn>,
     /// The tick of the first change not yet committed (`None`: nothing to commit).
     dirty_since: Option<u64>,
+    /// What a forwarded open is connected to, and the most rights it may have (`ro` and `sub=` of the mount table).
+    base: NodeId,
+    allowed: u32,
+    /// The wall clock (`/svc/clock`), if the volume manager gave a view of it: file times are the service's time, kept as an
+    /// offset to the monotonic clock and re-read every `WALL_RESYNC` ticks. Without it they are nanoseconds since boot.
+    clock: Option<rt::clock::Clock>,
+    wall_offset: u64,
+    next_wall_sync: u64,
 }
+
+/// Re-read the wall clock this often (ticks).
+const WALL_RESYNC: u64 = 30_000;
 
 /// Commit this long (ticks) after the first uncommitted change.
 const COMMIT_INTERVAL: u64 = 2_000;
@@ -111,6 +124,9 @@ impl Service for Server {
     }
 
     fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+        if self.core.conn(key).is_some_and(|c| c.listener) {
+            return self.forwarded_open(msg, handles);
+        }
         // (the runtime reads at most one handle: more is a protocol violation it has already ended)
         self.handle_request(key, msg, handles.first().copied());
     }
@@ -134,6 +150,57 @@ impl Service for Server {
 }
 
 impl Server {
+    /// An open the registry forwarded to a listener: the client's endpoint becomes a connection to the volume's base
+    /// directory in an account of its own, with the rights it asked for (never more than the mount allows).
+    fn forwarded_open(&mut self, msg: &[u8], hs: &[u32]) {
+        let ok = file::decode_request(msg)
+            .ok()
+            .filter(|r| r.op == op::OPEN && r.payload.is_empty() && hs.len() == 1);
+        let Some(req) = ok else {
+            for &h in hs {
+                sys::handle_close(h);
+            }
+            return;
+        };
+        let limits = Limits2 {
+            conns: 64,
+            held_bytes: 256 * 1024,
+            inflight: 16,
+            stream_bytes: 0,
+        };
+        let Ok(account) = self.core.accounts().open(svc::ROOT, limits) else {
+            sys::handle_close(hs[0]);
+            return;
+        };
+        let rights = req.rights & self.allowed;
+        if self
+            .add_conn(account, hs[0], self.base, rights, true)
+            .is_none()
+        {
+            sys::handle_close(hs[0]);
+            let _ = self.core.accounts().close(account);
+        }
+    }
+
+    /// File times: wall time if the clock service gave it, else nanoseconds since boot.
+    fn stamp(&mut self) {
+        let now = sys::clock_get();
+        if now >= self.next_wall_sync {
+            self.next_wall_sync = now + WALL_RESYNC;
+            if let Some(c) = self.clock.as_mut() {
+                if let Ok(n) = c.now(now + 300) {
+                    if n.quality != proto::clock::quality::UNSET {
+                        self.wall_offset = n.nanos.saturating_sub(now.saturating_mul(1_000_000));
+                    }
+                }
+            }
+        }
+        self.fs.set_time(
+            now.saturating_mul(1_000_000)
+                .saturating_add(self.wall_offset),
+        );
+    }
+
     /// Something may have changed on disk: remember when, so the next commit is due.
     fn changed(&mut self) {
         if self.dirty_since.is_none() {
@@ -174,10 +241,11 @@ impl Server {
                 node,
                 rights,
                 is_dir,
+                listener: false,
             },
         )?;
         let _ = self.fs.retain(node);
-        self.fs.set_time(sys::clock_get().saturating_mul(1_000_000));
+        self.stamp();
         Some(key)
     }
 
@@ -220,7 +288,7 @@ impl Server {
 
     fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u32>) {
         // file times are the time of the change, not of the last open (review finding 9)
-        self.fs.set_time(sys::clock_get().saturating_mul(1_000_000));
+        self.stamp();
         let close_ep = |ep: Option<u32>| {
             if let Some(h) = ep {
                 sys::handle_close(h);
@@ -414,7 +482,17 @@ impl Server {
                     .fs
                     .walk(node, old_parents)
                     .and_then(|from| Ok((from, self.fs.walk(node, new_parents)?)))
-                    .and_then(|(from, to)| self.fs.rename(from, old_last, to, new_last));
+                    .and_then(|(from, to)| {
+                        // a symlink must not end up where its target would climb above this connection's root (T117 8)
+                        let moved = self.fs.lookup(from, old_last)?;
+                        if self.fs.kind(moved)? == Kind::Symlink {
+                            let target = self.fs.read_link(moved)?;
+                            let depth = self.fs.depth_below(to, node)?;
+                            file::check_link_target(&target, depth)
+                                .map_err(|_| FsError::Fs(Error::BadTarget))?;
+                        }
+                        self.fs.rename(from, old_last, to, new_last)
+                    });
                 let st = r.map_or_else(|e| fstat(e, new_last.len().max(old_last.len())), |_| 0);
                 self.send(key, txid, st, 0, &[], None);
             }
@@ -581,6 +659,10 @@ impl Server {
                             })
                             .collect();
                         let (bytes, n) = file::encode_hits(&hits, file::MAX_IO);
+                        if n == 0 && !hits.is_empty() {
+                            // one hit (a very long path) does not fit a reply: say so instead of `more` forever (T117 11)
+                            return self.send(key, txid, Status::TooBig.code(), 0, &[], None);
+                        }
                         let more = r.more || n < hits.len();
                         self.send(key, txid, 0, u64::from(more), &bytes, None);
                     }
@@ -768,11 +850,31 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
-    let (Some(root_ch), Some(blk_ch)) =
-        (env.handle(Role::ServiceFs), env.handle(Role::BlockDevice))
-    else {
+    let Some(blk_ch) = env.handle(Role::BlockDevice) else {
         return 3;
     };
+    let root_ch = env.handle(Role::ServiceFs);
+    // a view of the registry that allows `clock` (the volume manager gives one): the wall clock for file times
+    let clock = env.handle(Role::ServiceRegistry).and_then(|h| {
+        let mut v = rt::fs::Fs::new(h);
+        rt::clock::Clock::connect(&mut v, sys::clock_get() + 400).ok()
+    });
+    let listeners = [
+        env.handle(Role::ServiceListener),
+        env.handle(Role::ServiceListenerAlt),
+    ];
+    if root_ch.is_none() && listeners.iter().all(Option::is_none) {
+        return 3;
+    }
+    // the mount table's options, as arguments: `ro` and `sub=<dir>`
+    let (mut readonly, mut sub): (bool, Option<alloc::vec::Vec<u8>>) = (false, None);
+    for a in env.startup.args.iter().skip(1) {
+        if a.as_slice() == b"ro" {
+            readonly = true;
+        } else if let Some(p) = a.strip_prefix(b"sub=") {
+            sub = Some(p.to_vec());
+        }
+    }
     let Some(dev) = BlkDevice::open(blk_ch) else {
         return 4;
     };
@@ -792,13 +894,49 @@ pub fn app_main() -> i32 {
         fs,
         core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         dirty_since: None,
+        clock,
+        wall_offset: 0,
+        next_wall_sync: 0,
+        base: ROOT,
+        allowed: if readonly {
+            pr::READ | pr::ENUMERATE
+        } else {
+            pr::ALL
+        },
     };
-    // The service channel is the root directory connection with every right.
-    if server
-        .add_conn(svc::ROOT, root_ch, ROOT, pr::ALL, true)
-        .is_none()
-    {
-        return 9;
+    if let Some(path) = sub {
+        let Ok(comps) = file::split_path(&path) else {
+            return 10;
+        };
+        match server.fs.walk(ROOT, &comps) {
+            Ok(id) if server.fs.kind(id) == Ok(Kind::Dir) => server.base = id,
+            _ => return 10,
+        }
+    }
+    // The service channel (if any) is a connection to the base directory with every right the mount allows.
+    if let Some(ch) = root_ch {
+        let (base, allowed) = (server.base, server.allowed);
+        if server
+            .add_conn(svc::ROOT, ch, base, allowed, true)
+            .is_none()
+        {
+            return 9;
+        }
+    }
+    for l in listeners.into_iter().flatten() {
+        match server.core.add_conn(
+            l,
+            svc::ROOT,
+            Conn {
+                node: ROOT,
+                rights: 0,
+                is_dir: true,
+                listener: true,
+            },
+        ) {
+            Some(_) => {}
+            None => return 9,
+        }
     }
     let code = service::run(&mut server);
     // the last client has gone: leave the volume committed

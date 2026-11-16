@@ -154,6 +154,27 @@ impl Fs {
         Ok(r)
     }
 
+    /// `open`, retrying while the service behind a registry name is `UNAVAILABLE` (its server is down and about to be
+    /// restarted), with growing naps, until `give_up` (an absolute tick). Any other error is returned at once.
+    pub fn open_retry(
+        &mut self,
+        path: &[u8],
+        flags: u16,
+        rights: u32,
+        give_up: u64,
+    ) -> Result<Fs, i32> {
+        let mut wait = 50;
+        loop {
+            match self.open(path, flags, rights) {
+                Err(e) if e == file::status::UNAVAILABLE && sys::clock_get() + wait < give_up => {
+                    crate::io::nap(wait);
+                    wait = (wait * 2).min(500);
+                }
+                r => return r,
+            }
+        }
+    }
+
     /// Open `path` (relative to this directory) with `flags` and `rights`: a new connection.
     pub fn open(&mut self, path: &[u8], flags: u16, rights: u32) -> Result<Fs, i32> {
         let c = sys::channel_create();
