@@ -10732,18 +10732,6 @@ pub fn app_main() -> i32 {
             devmgr_starts_blkd_for_the_disk,
         ),
         (
-            "fsd_keeps_files_across_a_restart",
-            fsd_keeps_files_across_a_restart,
-        ),
-        (
-            "clock_service_reports_the_rtc",
-            clock_service_reports_the_rtc,
-        ),
-        (
-            "volmgr_serves_volumes_by_the_table",
-            volmgr_serves_volumes_by_the_table,
-        ),
-        (
             "a_child_has_no_device_authority",
             a_child_has_no_device_authority,
         ),
@@ -11098,6 +11086,18 @@ pub fn app_main() -> i32 {
         (
             "job_create_sees_the_credit_of_a_job_closed_just_before",
             job_create_sees_the_credit_of_a_job_closed_just_before,
+        ),
+        (
+            "fsd_keeps_files_across_a_restart",
+            fsd_keeps_files_across_a_restart,
+        ),
+        (
+            "clock_service_reports_the_rtc",
+            clock_service_reports_the_rtc,
+        ),
+        (
+            "volmgr_serves_volumes_by_the_table",
+            volmgr_serves_volumes_by_the_table,
         ),
         (
             "threads_left_behind_when_init_exits",
