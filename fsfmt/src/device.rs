@@ -37,6 +37,7 @@ impl<D: Device + ?Sized> Device for &mut D {
 }
 
 /// A device in memory. A block never written reads as zeros.
+#[derive(Clone)]
 pub struct MemDevice {
     blocks: Vec<Option<alloc::boxed::Box<[u8; BLOCK]>>>,
     /// Counts, for tests.
