@@ -239,7 +239,8 @@ mode, no window size, no terminal types, and no notion of a session.
   about users. A user's home is private because only that user's sessions hold a handle to it.
 * A **session manager** service builds sessions. **Authentication is only what permits it to build one.** Autologin on
   the console is the development default; a remote login is a terminal backend that authenticates, asks for a session
-  and connects a pty-like terminal.
+  and connects a pty-like terminal. How a party is authenticated, how the first profile comes to exist and how access
+  returns after a lost credential are in section 10.1.
 * Daemons run in sessions with no terminal (`supervise` is the starter). A registry of live sessions (`/svc/session`,
   seen through `/proc`) answers `who`, `w` and `last`.
 * **Re-authentication for more authority** (the `su` and `sudo` equivalent): ask the manager for a child session with a
@@ -249,6 +250,68 @@ mode, no window size, no terminal types, and no notion of a session.
   in its table.
 * **Multi-user identity is not built** (Decided): no ACLs, no groups, no identity in servers. Revisit only if a real
   sharing need shows up; the session manager is where it could be added without touching servers.
+
+### 10.1 Authentication, enrolment and recovery (**Decided** in the 2026-11-16 discussion unless marked)
+
+Authentication answers one question: **may this party obtain this capability?** It is a gate in front of the session
+manager, never a name that another server checks (P4, UVI6). Surveyed for this (from memory, not fresh research):
+Unix and PAM (a uid checked everywhere: the ambient model P4 rejects), Windows NT (a token minted by the LSA, plus the
+secure attention sequence as a trusted path), Plan 9 (`factotum`, a per-user agent that holds secrets and runs the auth
+protocols so programs never see them), Fuchsia (no uid; a userspace account manager authenticates and starts a session),
+EROS, KeyKOS and Genode (authentication is a small trusted component outside the kernel), and Android, systemd-homed and
+macOS (the credential releases the key that decrypts the user's storage). The shape below is Plan 9 and Fuchsia, with the
+trusted path from Windows and the key release from the last group.
+
+1. **`authd` is a service of its own, separate from the session manager** (Decided). It holds the credential verifiers
+   (a password hash to begin with; SSH public keys next; WebAuthn later) and nothing else. Its output is **the right to
+   ask the session manager for a session from profile X**, as an attenuated handle; it is never a uid or a name. The
+   session manager therefore holds no secrets and does not check passwords, and `authd` builds no sessions.
+2. **Secrets stay in the agent** (Decided; the factotum and ssh-agent pattern). A program that must authenticate to
+   something (an `ssh` or HTTPS client, a `git` remote) asks `authd` or its per-session agent to run the exchange and
+   never holds the secret. The agent's protocol is the authority-UX topic's (section 12) first concrete piece.
+3. **The trusted path mostly comes free** (Decided as a property to keep). Only a process holding the console handle can
+   draw on it, so no other program can fake the console login. The weak spot is a **fake re-authentication prompt
+   inside a session** (the `sudo` case); `authd` must prompt through a channel the session's programs do not hold, as
+   the Windows secure desktop does. The design of that channel belongs with the authority-UX topic.
+4. **A remote login is a terminal backend** (Decided): sshd (or a login service) authenticates through `authd`, then asks
+   the session manager for a session and connects a pty-like terminal. No other path changes.
+5. **A password-hash gate is enough until storage encryption exists** (Decided). The hash is a memory-hard one (argon2
+   or scrypt: a small utility crate needing its own decision-log entry), stored by `authd` on its own volume.
+6. **Later (Proposal, not scheduled): derive the home volume's key from the credential** (the homed and Android
+   pattern), so a wrong password yields no data instead of a refusal that a bypass could skip. It needs storage
+   encryption in `fsd` first and is the point where a lost credential stops being resettable (see recovery below).
+7. **Program identity is separate from user identity** (Decided as a direction): what a program may do comes from its
+   manifest (S10), as with Fuchsia component URLs, never from the user who ran it.
+
+**Enrolment**: how the first profile and its credential come to exist. Three ways, each tied to a scenario, and all
+three are the same act (giving the session manager its first "may build profile X" grant), so they add no mechanism:
+
+* **Owner claim at first boot** (the real-use default). With no profile on the volume, the console starts a **setup
+  session**: an unauthenticated profile that can do exactly one thing, create the first profile and set its credential.
+  When that is done the setup profile ceases to exist. The physical console is the root of trust, as on a phone or a
+  new Mac.
+* **A seed credential in the image or manifest** (tests and headless boots). The build, or the S10 manifest, supplies
+  a public key or a hash. The credential sits in the image, which is acceptable for QEMU tests and development and for
+  nothing else.
+* **Autologin** (the development default, and what the system does today). A named profile (`autologin`) that the
+  manifest enables; it is **off in every non-development manifest**, and its use is logged.
+
+**Recovery**: how access returns after a lost credential. Authority has to come from somewhere other than the lost
+credential, and **how much to promise is a per-system policy, not one built-in answer** (owner, 2026-11-16: physical
+access is fine for most uses, something more elaborate for a handful). The policy is `authd` configuration read at boot
+(its format is Q13). The mechanisms, from weakest to strongest:
+
+* **Physical console** (the default and the first one built): booting with a recovery flag, or from install media,
+  gives the console session the right to reset credentials. Physical access equals full authority, which is right for a
+  single-owner machine whose disk is not encrypted.
+* **A second enrolled credential** (a spare SSH key or hardware key) authenticates a reset. No console is needed.
+* **A recovery key**, generated at enrolment and kept by the owner elsewhere, accepted in place of the credential. It is
+  **mandatory once the home volume's key derives from the credential** (item 6): then a reset cannot recover the data,
+  so without the recovery key a lost credential means lost data, and the policy must say so out loud.
+* **No recovery** (a policy a system may choose): console access does not reset anything.
+
+Which mechanisms a system enables, and whether any needs a second party or a delay, is configuration; the mechanisms
+themselves are built one at a time, in the order above.
 
 ## 11. The shell
 
@@ -289,6 +352,13 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
   hangup distinguishable; the existing cooked behaviour is unchanged.
 * **UV5: the session manager, profiles and autologin.** *Acceptance:* boot goes to a session built from a profile; a
   second profile cannot open the first's home; closing a session ends its job; `/proc/self/ns` matches the table.
+* **UV5a: `authd`, enrolment and the physical-console recovery** (after UV5; section 10.1). *Acceptance:* a boot with an
+  empty volume starts only the setup session, which can create one profile and then no longer exists; a wrong password
+  yields no session and a right one yields a session for that profile only; `authd` and the session manager are separate
+  processes and the manager's table holds no verifier; a seed-credential boot (the test manifest) logs in headlessly; the
+  recovery flag resets a credential and an ordinary boot refuses it; autologin is refused by a manifest that does not
+  enable it. A negative control per property (a mutation that lets the wrong password through, or the setup session
+  survive, must fail a test).
 * **UV6: `/proc`.** The adapter, driven by the corpus (`ps`, `free`, `nproc`, `top`). *Acceptance:* each file
   has a test from the program that reads it; a process cannot see processes it holds no handle to.
 * **UV7: detach and reattach.** *Acceptance:* a long job keeps running when the backend closes; a new backend
@@ -315,6 +385,15 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
   profile; servers never see identities (restates H5); sharing is by handle.
 * **OD-UV9.** The Rust `std` for the target is a Unix-family target over the C libc; native programs stay on `rt`
   (refines OD19).
+* **OD-UV10.** Authentication is a capability-granting gate: an `authd` service, separate from the session manager,
+  holds the credential verifiers and yields only the right to ask for a session from a profile, never a name. Secrets
+  stay in `authd` or a per-session agent; a re-authentication prompt uses a channel the session's programs do not hold. A
+  salted memory-hard password hash is enough until storage encryption exists.
+* **OD-UV11.** Enrolment is the first "may build profile X" grant, by one of three scenario-tied routes: an owner claim
+  through a one-shot setup session (real use), a seed credential in the image or manifest (tests, headless), or the
+  logged `autologin` profile (development only, off in other manifests). Recovery is a per-system policy configured
+  in `authd`, with physical-console reset as the default and a second credential, a recovery key (mandatory once the
+  home key derives from the credential) and no recovery as stronger options.
 
 ## 15. Open questions (stop and ask)
 
@@ -333,6 +412,15 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 11. **Q11: the self-hosting bring-up path**: cross-build and run natively (Proposal), or bootstrap from tcc.
 12. **Q12 (resolved 2026-11-17): default namespace for a program the shell launches** is the confined one: the current directory's subtree, standard input, output and error, and a few `/dev` entries (`null`, `zero`, `urandom`, `tty`). Anything wider (the skeleton root, volumes, `/svc` views) is an explicit grant: `/etc/trusted` lines until the session manager's profiles (UV5) and the manifest (S10) replace them. (OD20 stands.)
 
+13. **Q13: the recovery policy's format and menu** (section 10.1): the configuration keys, whether a mechanism can
+    require a second party or a delay, and whether the policy is changeable only by an authenticated session or also
+    from the console. The first built mechanism is the physical console only.
+14. **Q14: deriving the home volume's key from the credential** (section 10.1, item 6): when, with which key
+    hierarchy, and what `fsd` encryption it needs. Not scheduled; it turns recovery from a reset into a recovery-key
+    question and so must be decided before it is built, not after.
+15. **Q15: the multi-factor and hardware-key story** (WebAuthn, a TOTP, a smartcard): which `authd` verifier kinds, and
+    in what order. Later; the verifier interface should not assume a password.
+
 ## 16. Invariants to add when built
 
 * **UVI1** `..` is resolved only by the libc against the process's own table; a server never sees one; no path a
@@ -343,12 +431,18 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 * **UVI4** A terminal's foreground job is a handle the shell gave it, and an event reaches only that job.
 * **UVI5** Closing the last backend of a detachable session never kills its job; hangup does.
 * **UVI6** No server stores or checks an identity; uid, gid and mode are data.
+* **UVI7** `authd`'s output is a handle to ask for a session from one profile, never a name; the session manager holds
+  no credential verifier, and no program other than `authd` and its agent ever holds a secret.
+* **UVI8** The setup session exists only while no profile does, and can only create one; `autologin` exists only where
+  the manifest enables it.
 
 ## 17. Shortcuts to record in `TIDY-UP.md` when built
 
 `/etc/passwd` and `/etc/group` are static one-entry files from the boot image until the session manager (UV5) synthesizes them; authentication and the profile format are decided at UV5 (owner, 2026-11-17); lexical `..` deviation and stale cwd after a parent rename; advisory metadata that enforces nothing; no hard links;
 `/proc` kept minimal and scoped; a C locale only; no `/usr/local`; the `shell-core::resolve` error above the root until
-UV1; a one-user, single-owner session model with guest and service profiles only.
+UV1; a one-user, single-owner session model with guest and service profiles only; **recovery is physical-console reset
+only** (a system that needs a second credential, a recovery key or no recovery waits for the configurable policy, Q13), and
+**home volumes are not encrypted** (Q14), so a password gate is the whole defence.
 
 ## 18. Risks
 

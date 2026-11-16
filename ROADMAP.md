@@ -701,9 +701,8 @@ later the S10 manifest).
 The command-line side of the system: the canonical layout of a session's namespace, POSIX as a porting surface judged by a
 named corpus, advisory POSIX metadata, the terminal, sessions and profiles, `/proc`, and the es-style native shell. The specs
 are `USER-VIEW-SPEC.md` (the track and its steps UV0 to UV10), `SHELL-SPEC.md` (the shell language), `SHELL-CORPUS.md` (ten
-scripts and the findings that shaped the syntax) and `UV0-GAP-SURVEY.md` (the libc and `rt` against the target programs). Q4 (flat merged install layout) and Q12 (the confined default namespace) were resolved on 2026-11-17; authentication and the
-profile format are decided at UV5. Other open
-questions are in `USER-VIEW-SPEC.md` section 15 (Q2 dynamic linking, Q5 PIDs, and others). Decisions to log on acceptance are in its section 14 (OD-UV1 to OD-UV10, provisional).
+scripts and the findings that shaped the syntax) and `UV0-GAP-SURVEY.md` (the libc and `rt` against the target programs). Q4 (flat merged install layout) and Q12 (the confined default namespace) were resolved on 2026-11-17; authentication, enrolment and recovery were designed on 2026-11-16 (`USER-VIEW-SPEC.md` section 10.1: an `authd` service separate from the session manager, three scenario-tied enrolment routes, and a recovery policy that is configurable per system, physical-console reset being the default); the profile format is decided at UV5. Other open
+questions are in `USER-VIEW-SPEC.md` section 15 (Q2 dynamic linking, Q5 PIDs, Q13 to Q15 recovery policy, home-key derivation and multi-factor, and others). Decisions to log on acceptance are in its section 14 (OD-UV1 to OD-UV11, provisional).
 
 Already built that the track builds on: per-program namespaces and the registry (SD), the `/etc/trusted` grants of volumes at
 `/mnt/<name>` (filesystem step 5e), the doofs attributes and indexes (step 6; UV3's storage), the libc over the file protocol.
@@ -714,6 +713,7 @@ Already built that the track builds on: per-program namespaces and the registry 
 - [ ] UV3: advisory POSIX attributes (`posix.mode/uid/gid` on doofs and `memfs`, `stat` populated, hard links refused)
 - [ ] UV4: the terminal's raw mode, events and window size
 - [ ] UV5: the session manager, profiles and autologin (replaces the `/etc/trusted` list as the way a program gets its table)
+- [ ] UV5a: `authd`, enrolment (owner-claim setup session, seed credential, dev autologin) and physical-console recovery (`USER-VIEW-SPEC.md` 10.1); later, **configurable recovery** (a second credential, a recovery key, no recovery) for the few systems that need more than physical access, and home-key derivation from the credential (Q13, Q14)
 - [ ] UV6: `/proc` (the adapter, driven by `ps`, `free`, `nproc`, `top`)
 - [ ] UV7: detach and reattach
 - [ ] UV8: BusyBox NOMMU as the first real userland
