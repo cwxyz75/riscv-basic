@@ -651,11 +651,38 @@ impl Server {
     }
 }
 
-fn build_tree(fs: &mut Fs, entries: &[proto::bootimg::Entry]) -> Option<()> {
+/// The image names a session's root is built from, and where each appears: `home_src` (a directory of the image, `home` by
+/// default) is `/home`; the image's `homes/` (every user's own directory) and `etc/profiles/` (the profiles) are never part of
+/// a session's root, so no session can reach another's home or read the profiles (USER-VIEW-SPEC section 10, step UV5).
+fn session_name(name: &[u8], home_src: &[u8]) -> Option<Vec<u8>> {
+    let under =
+        |dir: &[u8]| name.len() > dir.len() && name.starts_with(dir) && name[dir.len()] == b'/';
+    // the session's own home first (it may be a directory below `homes/`)
+    if home_src != b"home" && under(home_src) {
+        return Some([&b"home"[..], &name[home_src.len()..]].concat());
+    }
+    if under(b"homes") || under(b"etc/profiles") {
+        return None;
+    }
+    if home_src != b"home" && under(b"home") {
+        return None;
+    }
+    Some(name.to_vec())
+}
+
+fn build_tree(fs: &mut Fs, entries: &[proto::bootimg::Entry], home_src: &[u8]) -> Option<()> {
     let tmp = fs.mkdir(ROOT, b"tmp").ok()?;
     let _ = tmp;
+    // `/home` exists even when the profile's home has nothing in it
+    match fs.mkdir(ROOT, b"home") {
+        Ok(_) | Err(Error::Exists) => {}
+        Err(_) => return None,
+    }
     for e in entries {
-        let comps = file::split_path(&e.name).ok()?;
+        let Some(name) = session_name(&e.name, home_src) else {
+            continue;
+        };
+        let comps = file::split_path(&name).ok()?;
         // `tmp` is the one writable directory and is made above: an image name may not use it
         if comps[0] == b"tmp" {
             return None;
@@ -734,7 +761,9 @@ pub fn app_main() -> i32 {
     };
     drop(prefix);
     let mut fs = Fs::new(Limits::default());
-    if build_tree(&mut fs, &entries).is_none() {
+    // the profile's home: a directory of the image that is `/home` in this session (default `home`)
+    let home_src = env.var(b"HOME_SRC").unwrap_or(b"home").to_vec();
+    if build_tree(&mut fs, &entries, &home_src).is_none() {
         return 6;
     }
     let p = sys::port_create();

@@ -1,0 +1,8 @@
+[package]
+name = "profile"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: session profiles (USER-VIEW-SPEC sections 10 and 13, step UV5): a JSON document naming a user's table template, home, shell, identity values, program grants and quotas. Pure, no_std + alloc, host-tested."
+
+[dependencies]
+data = { path = "../data" }

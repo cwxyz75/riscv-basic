@@ -1,0 +1,2 @@
+{ "name": "bob", "uid": 1002, "home": "homes/bob",
+  "programs": { "cat": { "root": true }, "ls": { "root": true } } }

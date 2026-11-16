@@ -112,6 +112,8 @@ pub fn app_main() -> i32 {
             !e.name.starts_with(b"etc/basic/")
                 && !e.name.starts_with(b"etc/lua/")
                 && !e.name.starts_with(b"etc/lua-tests/")
+                && !e.name.starts_with(b"etc/profiles/")
+                && !e.name.starts_with(b"homes/")
         })
     {
         banner.push(' ');
@@ -135,6 +137,10 @@ pub fn app_main() -> i32 {
                     // test aid for S4d: hand the serial line to the console server and act as
                     // the shell's stand-in on its terminal socket
                     return console_session(serial, &img, &entries);
+                }
+                if line.as_slice() == b"sessions" {
+                    // test aid for UV5: sessions of two profiles side by side, each on a terminal socket
+                    return sessions_test(serial, image_vmo, &img, &entries);
                 }
                 if line.as_slice() == b"quit" {
                     let _ = io::write_all(serial, b"bye\r\n");
@@ -651,6 +657,131 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
     }
 }
 
+/// The scripts the UV5 test runs in each session (a shell with no console server reads its script from the terminal socket).
+const SESSION_SCRIPTS: &[(&str, &str)] = &[
+    (
+        "alice",
+        "print $env.USER $env.UID $env.HOME $env.EDITOR\nprint (pwd)\ncat secret.txt\ncat /home/secret.txt\nr = run (cat /homes/bob/notes.txt)\nprint $r.status $r.out\nr = run (cat /etc/profiles/bob.json)\nprint $r.status $r.out\nr = run (cat /home/notes.txt)\nprint $r.status\nls /\n",
+    ),
+    (
+        "bob",
+        "print $env.USER $env.UID\ncat notes.txt\nr = run (cat /homes/alice/secret.txt)\nprint $r.status $r.out\nr = run (cat /home/secret.txt)\nprint $r.status\n",
+    ),
+];
+
+/// Read what the shell of a session writes, line by line (the callback returns false to stop), until it ends.
+fn read_session_lines(sock: u32, mut each: impl FnMut(&str) -> bool) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=i).collect();
+            if !each(String::from_utf8_lossy(&line[..line.len() - 1]).as_ref()) {
+                return;
+            }
+        }
+        match io::read(sock, &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if !buf.is_empty() {
+        each(String::from_utf8_lossy(&buf).as_ref());
+    }
+}
+
+/// UV5 test aid: run a script in a session of each profile, each on a terminal socket the aid holds (so the shell is in its
+/// non-interactive mode), and print what came back, line by line, to the serial line. Then a session whose shell runs a
+/// program forever, ended by closing the session: its job must be empty afterwards.
+fn sessions_test(
+    serial: u32,
+    image_vmo: u32,
+    img: &[u8],
+    entries: &[proto::bootimg::Entry],
+) -> i32 {
+    use rt::sys;
+    let say = |s: &str| {
+        let _ = io::write_all(serial, s.as_bytes());
+    };
+    let profiles = load_profiles(img, entries);
+    say("sessions ready\r\n");
+    let open = |who: &Loaded| -> Option<(Stack, u32)> {
+        let s = sys::socket_create();
+        if s.status != 0 {
+            return None;
+        }
+        let (mine, theirs) = (s.a1 as u32, s.a2 as u32);
+        let stack = start_stack(Term::Socket(theirs), image_vmo, img, entries, who).ok()?;
+        Some((stack, mine))
+    };
+    for (name, script) in SESSION_SCRIPTS {
+        let Some(who) = profiles.iter().find(|l| l.profile.name == *name) else {
+            say("no such profile\r\n");
+            return 20;
+        };
+        let Some((stack, mine)) = open(who) else {
+            say("the session could not start\r\n");
+            return 21;
+        };
+        let _ = io::write_all(mine, script.as_bytes());
+        sys::socket_shutdown(mine);
+        read_session_lines(mine, |l| {
+            say(&alloc::format!("{name}| {l}\r\n"));
+            true
+        });
+        let w = sys::object_wait(
+            stack.sh,
+            rt::abi::signals::TERMINATED,
+            sys::clock_get() + 5000,
+        );
+        let code = if w.status == 0 {
+            sys::process_info(stack.sh).a1 as i64
+        } else {
+            -999
+        };
+        say(&alloc::format!("{name} status {code}\r\n"));
+        sys::handle_close(mine);
+        stop_stack(stack);
+    }
+    // closing a session ends its job
+    let Some(who) = profiles.iter().find(|l| l.profile.name == "alice") else {
+        return 22;
+    };
+    let Some((stack, mine)) = open(who) else {
+        return 23;
+    };
+    let _ = io::write_all(mine, b"print started\nspin\n");
+    sys::socket_shutdown(mine);
+    read_session_lines(mine, |l| {
+        say(&alloc::format!("alice2| {l}\r\n"));
+        l != "spinning"
+    });
+    let job = sys::handle_duplicate(stack.session, rt::abi::rights::Rights::SAME.0);
+    let running = sys::job_info(job.a1 as u32, 0).a1;
+    say(&alloc::format!(
+        "job processes while open: {}\r\n",
+        if running >= 5 {
+            "5 or more"
+        } else {
+            "fewer than 5"
+        }
+    ));
+    stop_stack(stack);
+    // (processes are reaped a moment after the kill)
+    let mut left = sys::job_info(job.a1 as u32, 0).a1;
+    for _ in 0..100 {
+        if left == 0 {
+            break;
+        }
+        io::nap(20);
+        left = sys::job_info(job.a1 as u32, 0).a1;
+    }
+    say(&alloc::format!("job processes after close: {left}\r\n"));
+    sys::handle_close(mine);
+    sys::handle_close(job.a1 as u32);
+    0
+}
+
 /// One control call to `consoled`: the reply's value (0 for a plain reply), `None` when it failed. Events that arrive
 /// meanwhile are dropped (the caller is not looking for them).
 fn ctl_call(ctl: u32, txid: &mut u32, c: proto::console::Control) -> Option<u32> {
@@ -747,6 +878,44 @@ fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, firs
     let _ = io::write_all(tty, msg.as_bytes());
 }
 
+/// A profile as read from the image, with its text (the shell is given it to read its own grants).
+struct Loaded {
+    profile: profile::Profile,
+    text: String,
+}
+
+/// Every profile in the boot image's `etc/profiles/` (a profile that does not parse is skipped, and said so).
+fn load_profiles(img: &[u8], entries: &[proto::bootimg::Entry]) -> Vec<Loaded> {
+    let mut out = Vec::new();
+    for e in entries
+        .iter()
+        .filter(|e| e.name.starts_with(b"etc/profiles/") && e.name.ends_with(b".json"))
+    {
+        let Some(bytes) = image_entry(img, entries, &e.name) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        match profile::Profile::parse(&text) {
+            Ok(p) => out.push(Loaded { profile: p, text }),
+            Err(err) => {
+                rt::sys::debug_write(
+                    alloc::format!("init: {}: {err}\n", String::from_utf8_lossy(&e.name))
+                        .as_bytes(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Where a session's terminal comes from: the serial line (through a console server), or a socket the caller holds (no
+/// console server: the shell runs a script from it, and the session has no volumes).
+#[derive(Clone, Copy)]
+enum Term {
+    Serial(u32),
+    Socket(u32),
+}
+
 /// The services of one interactive session, in start order.
 struct Stack {
     /// The job every process of the session lives in (handle with every right): `stop_stack` ends
@@ -754,10 +923,10 @@ struct Stack {
     session: u32,
     memfsd: u32,
     launcher: u32,
-    consoled: u32,
+    consoled: Option<u32>,
     sh: u32,
     /// `sh` writes here when the user says `halt`.
-    halt: u32,
+    halt: Option<u32>,
     /// A connection to the service registry, to ask the volumes to commit before the session ends.
     registry: Option<rt::fs::Fs>,
 }
@@ -768,10 +937,11 @@ fn kill_close(h: u32) {
 }
 
 fn start_stack(
-    serial: u32,
+    term: Term,
     image_vmo: u32,
     img: &[u8],
     entries: &[proto::bootimg::Entry],
+    who: &Loaded,
 ) -> Result<Stack, i32> {
     use proto::startup::Startup;
     use rt::abi::rights::Rights;
@@ -798,13 +968,22 @@ fn start_stack(
         return Err(38);
     }
     let session = session.a1 as u32;
-    let apps = sys::job_create(session, &[16, 32, 40960, 20, 1000, 768 * 1024]);
+    // (a profile's quota can only lower what programs may have)
+    let (app_procs, app_pages) = match &who.profile.quota {
+        Some(q) => (q.processes.min(16), (q.memory_mib * 256).min(40960)),
+        None => (16, 40960),
+    };
+    let apps = sys::job_create(session, &[app_procs, 32, app_pages, 20, 1000, 768 * 1024]);
     if apps.status != 0 {
         sys::handle_close(session);
         return Err(38);
     }
     let apps = apps.a1 as u32;
-    let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u32]| -> Result<u32, i32> {
+    let start_env = |name: &[u8],
+                     roles: Vec<(Role, u32)>,
+                     handles: &[u32],
+                     extra: Vec<Vec<u8>>|
+     -> Result<u32, i32> {
         let path: Vec<u8> = [&b"bin/"[..], name].concat();
         let Some(image) = image_entry(img, entries, &path) else {
             for &h in handles {
@@ -816,7 +995,7 @@ fn start_stack(
             args: alloc::vec![name.to_vec()],
             roles,
             // (the services that log their start-up to the serial line stay quiet in a user's session)
-            env: alloc::vec![b"QUIET=1".to_vec()],
+            env: [alloc::vec![b"QUIET=1".to_vec()], extra].concat(),
             ..Startup::default()
         };
         let Ok(bytes) = st.encode() else {
@@ -832,6 +1011,9 @@ fn start_stack(
             );
             33
         })
+    };
+    let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u32]| -> Result<u32, i32> {
+        start_env(name, roles, handles, Vec::new())
     };
     // the launcher: its only client is the shell
     let (launch_sh, launch_theirs) = chan()?;
@@ -852,10 +1034,12 @@ fn start_stack(
     if image_dup.status != 0 {
         return Err(34);
     }
-    let memfsd = start(
+    let memfsd = start_env(
         b"memfsd",
         alloc::vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
         &[fs_theirs, image_dup.a1 as u32],
+        // the profile's home is `/home` in this session
+        alloc::vec![[&b"HOME_SRC="[..], who.profile.home.as_bytes()].concat()],
     )?;
     let mut root = rt::fs::Fs::new(fs_mine);
     let sh_fs = match root.clone_conn(proto::file::rights::READ | proto::file::rights::ENUMERATE) {
@@ -890,25 +1074,36 @@ fn start_stack(
         d.close();
         c
     })();
-    // the console server: the serial line, the terminal socket, the control channel
-    let tty = sys::socket_create();
-    if tty.status != 0 {
-        return Err(36);
-    }
-    let (tty_console, tty_sh) = (tty.a1 as u32, tty.a2 as u32);
-    let (ctl_console, ctl_sh) = chan()?;
-    let serial_dup = sys::handle_duplicate(serial, Rights::SAME.0);
-    if serial_dup.status != 0 {
-        return Err(37);
-    }
-    let consoled = start(
-        b"consoled",
-        alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
-        &[serial_dup.a1 as u32, tty_console, ctl_console],
-    )?;
+    // the console server: the serial line, the terminal socket, the control channel (a session with a terminal socket of its
+    // own has none: its shell reads a script from the socket)
+    let (consoled, tty_sh, ctl_sh) = match term {
+        Term::Serial(serial) => {
+            let tty = sys::socket_create();
+            if tty.status != 0 {
+                return Err(36);
+            }
+            let (tty_console, tty_sh) = (tty.a1 as u32, tty.a2 as u32);
+            let (ctl_console, ctl_sh) = chan()?;
+            let serial_dup = sys::handle_duplicate(serial, Rights::SAME.0);
+            if serial_dup.status != 0 {
+                return Err(37);
+            }
+            let consoled = start(
+                b"consoled",
+                alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
+                &[serial_dup.a1 as u32, tty_console, ctl_console],
+            )?;
+            (Some(consoled), tty_sh, Some(ctl_sh))
+        }
+        Term::Socket(h) => (None, h, None),
+    };
     // the volumes (FS-SPEC 5d, 5e): the device manager, the registry, the clock and the volume manager, best effort: a machine
     // with no disk, or a service that does not start, leaves the session without volumes and nothing else changed
+    let with_volumes = matches!(term, Term::Serial(_));
     let volumes = (|| -> Option<(rt::fs::Fs, rt::fs::Fs)> {
+        if !with_volumes {
+            return None;
+        }
         let res = sys::resource_root();
         if res.status != 0 {
             return None;
@@ -979,15 +1174,21 @@ fn start_stack(
         Some((r, s)) => (Some(r), Some(s)),
         None => (None, None),
     };
-    let (halt_init, halt_sh) = chan()?;
     let mut sh_roles = alloc::vec![
         (Role::Tty, 0),
         (Role::ServiceFs, 1),
-        (Role::ServiceLaunch, 2),
-        (Role::ServiceConsole, 3),
-        (Role::ServiceInit, 4)
+        (Role::ServiceLaunch, 2)
     ];
-    let mut sh_handles = alloc::vec![tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh];
+    let mut sh_handles = alloc::vec![tty_sh, sh_fs.ch, launch_sh];
+    let mut halt_init = None;
+    if let Some(ctl_sh) = ctl_sh {
+        let (hi, halt_sh) = chan()?;
+        halt_init = Some(hi);
+        sh_roles.push((Role::ServiceConsole, 3));
+        sh_roles.push((Role::ServiceInit, 4));
+        sh_handles.push(ctl_sh);
+        sh_handles.push(halt_sh);
+    }
     if let Some(r) = sh_registry {
         sh_roles.push((Role::ServiceRegistry, sh_handles.len() as u32));
         sh_handles.push(r.ch);
@@ -1000,7 +1201,12 @@ fn start_stack(
         sh_roles.push((Role::DevDir, sh_handles.len() as u32));
         sh_handles.push(d.ch);
     }
-    let sh = start(b"sh", sh_roles, &sh_handles)?;
+    let sh = start_env(
+        who.profile.shell.as_bytes(),
+        sh_roles,
+        &sh_handles,
+        alloc::vec![[&b"PROFILE="[..], who.text.as_bytes()].concat()],
+    )?;
     Ok(Stack {
         session,
         memfsd,
@@ -1035,26 +1241,44 @@ fn stop_stack(mut s: Stack) {
         r.close();
     }
     sys::process_kill(s.sh, -1);
-    let w = sys::object_wait(
-        s.consoled,
-        rt::abi::signals::TERMINATED,
-        sys::clock_get() + 2000,
-    );
-    let _ = w;
-    for h in [s.sh, s.consoled, s.launcher, s.memfsd] {
+    if let Some(c) = s.consoled {
+        let w = sys::object_wait(c, rt::abi::signals::TERMINATED, sys::clock_get() + 2000);
+        let _ = w;
+    }
+    for h in [Some(s.sh), s.consoled, Some(s.launcher), Some(s.memfsd)]
+        .into_iter()
+        .flatten()
+    {
         kill_close(h);
     }
     // Whatever else the session started (programs the shell left behind) goes too, and nothing
     // can start in it any more.
     sys::job_kill(s.session, -1);
     sys::handle_close(s.session);
-    sys::handle_close(s.halt);
+    if let Some(h) = s.halt {
+        sys::handle_close(h);
+    }
 }
 
 /// The supervisor (S4-SPEC section 10): start `memfsd`, `launcher`, `consoled` and `sh`; when the
 /// shell exits (or any service dies) end the session and start a fresh one; on `halt` end it and
 /// return 0, which lets the kernel run its leak checks and power off.
 fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+    let profiles = load_profiles(img, entries);
+    let profs: Vec<profile::Profile> = profiles.iter().map(|l| l.profile.clone()).collect();
+    if profile::check_homes_distinct(&profs).is_err() {
+        rt::sys::debug_write(b"init: two profiles share a home\n");
+        return 43;
+    }
+    // who is logged in at boot: the one profile marked `autologin` (UV5; the development default)
+    let who = match profile::pick_autologin(&profs) {
+        Ok(Some(p)) => profiles.iter().find(|l| l.profile.name == p.name),
+        _ => None,
+    };
+    let Some(who) = who else {
+        rt::sys::debug_write(b"init: no profile is marked autologin\n");
+        return 44;
+    };
     use rt::abi::signals;
     use rt::sys;
     // Consecutive sessions that ended because a service died (a shell that exits is normal and
@@ -1065,7 +1289,7 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
             sys::debug_write(b"init: giving up after repeated service failures\n");
             return 40;
         }
-        let stack = match start_stack(serial, image_vmo, img, entries) {
+        let stack = match start_stack(Term::Serial(serial), image_vmo, img, entries, who) {
             Ok(s) => s,
             Err(code) => {
                 sys::debug_write(b"init: the session could not start\n");
@@ -1077,11 +1301,20 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
             return 41;
         }
         let port = port.a1 as u32;
-        let watched = [stack.sh, stack.consoled, stack.launcher, stack.memfsd];
-        for (i, &h) in watched.iter().enumerate() {
-            sys::port_bind(port, h, signals::TERMINATED, i as u64);
+        let watched = [
+            Some(stack.sh),
+            stack.consoled,
+            Some(stack.launcher),
+            Some(stack.memfsd),
+        ];
+        for (i, h) in watched.iter().enumerate() {
+            if let Some(h) = h {
+                sys::port_bind(port, *h, signals::TERMINATED, i as u64);
+            }
         }
-        sys::port_bind(port, stack.halt, signals::READABLE, 9);
+        if let Some(h) = stack.halt {
+            sys::port_bind(port, h, signals::READABLE, 9);
+        }
         let r = sys::port_wait(port, u64::MAX);
         sys::handle_close(port);
         if r.status != 0 {
@@ -1093,7 +1326,7 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
                 // `halt`: leave only if the message really was a halt
                 let mut b = [0u8; 8];
                 let m = sys::channel_read(
-                    stack.halt,
+                    stack.halt.unwrap_or(0),
                     b.as_mut_ptr(),
                     b.len(),
                     core::ptr::null_mut(),
