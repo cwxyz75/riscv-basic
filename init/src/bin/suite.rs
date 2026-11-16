@@ -3316,6 +3316,33 @@ fn socket_syscalls() -> Outcome {
     );
     let n = sys::socket_read(b, buf.as_mut_ptr(), 8);
     ensure_eq!((n.status, n.a1), (0, 8), "the data is still there");
+    // the zero-length cases of SYSCALLS.md (T91): a probe is OK on a live socket, BAD_STATE after our own shutdown, PEER_CLOSED
+    // when the peer is gone, and the shutdown check comes before the peer check
+    let (c, d) = socket()?;
+    ensure_eq!(
+        st(sys::socket_write(c, big.as_ptr(), 0)),
+        Some(S::Ok),
+        "a zero-length write on a live socket"
+    );
+    sys::socket_shutdown(c);
+    ensure_eq!(
+        st(sys::socket_write(c, big.as_ptr(), 0)),
+        Some(S::BadState),
+        "a zero-length write after our own shutdown"
+    );
+    sys::handle_close(d);
+    ensure_eq!(
+        st(sys::socket_write(c, big.as_ptr(), 0)),
+        Some(S::BadState),
+        "BAD_STATE comes before PEER_CLOSED"
+    );
+    let (e2, f2) = socket()?;
+    sys::handle_close(f2);
+    ensure_eq!(
+        st(sys::socket_write(e2, big.as_ptr(), 0)),
+        Some(S::PeerClosed),
+        "a zero-length write to a dead peer"
+    );
     Ok(())
 }
 

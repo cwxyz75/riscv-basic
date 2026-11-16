@@ -62,7 +62,9 @@ jobs:
         run: python3 home/scripts/verify_demo_images.py
 
   # Tier 1: one boot of the whole suite on the default (AIA) machine at four harts, and the release smoke.
-  # Budget: 10 minutes. (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
+  # Budget: 10 minutes (the docs check enforces it). Measured 2026-11-16: about 7.3 minutes, the boot being 5.5 of them; shard the
+  # suite (TESTING.md "When the smoke boot outgrows its budget") before a run passes 9. (The fail-demo check, when the harness changed,
+  # is the separate job `harness (fail-demo)`.)
   kernel:
     name: kernel (smoke)
     needs: changes
