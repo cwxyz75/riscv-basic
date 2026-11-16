@@ -33,13 +33,17 @@ Rules:
 6. **Negative controls and mutation checks** guard a specific mechanism; they run in the soak tier (`os-boot-test-smp-neg`,
    `os-boot-test-aia`) and a mutation check is run once per new test, by hand, not on every push.
 7. **Independent oracles** (the upstream Lua suite, the C transcript against the host build, the BASIC golden corpus, real
-   clients) stay in the suite: while the whole suite fits the budget (35 s at four harts) they run in smoke. They are what
+   clients) stay in the suite: while the whole suite fits the budget (about 100 s of guest time at four harts, see below) they run in smoke. They are what
    the roadmap means by an oracle that the writing context did not produce.
 
 ## When the smoke boot outgrows its budget
 
-The smoke boot is the whole suite at four harts, 35 seconds in the profile below, against a 10-minute job (of which the
-cold build is most). If it grows past the budget, in this order: (1) shard the suite across parallel QEMU instances; (2)
+The smoke boot is the whole suite at four harts. Measured 2026-11-16 (after S9): 217 tests, about 101 seconds of guest time on the
+development machine, more than half of it in the network tests (mostly deliberate waits: timeouts, drains, restarts), and about
+5.5 minutes of boot on a CI runner, which is about 3.3 times slower; the whole job took 7.3 minutes against a 10-minute budget, so
+there are about 2.5 minutes of room (the budget is enforced by `check_docs.py`). The harness prints `suite guest time` and the six slowest tests after every passing boot, so
+the growth is visible in every log. Shard before a run passes 9 minutes. The order: (1) shard the suite across parallel QEMU instances
+(the `net=lossy` boot argument and the harness's `required` list are the model for a per-shard filter); (2)
 tag tests soak-only and add a filter (a `SOAK` list in the suite's registry and a flag the init program reads), starting
 with the slowest in the profile (`profile_check.py` prints them); (3) move the logic of QEMU tests to the host (below).
 The profile is the guide: do not guess.

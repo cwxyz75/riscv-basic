@@ -656,9 +656,15 @@ NO_MEMORY if the handle table has no room for two handles or the object cap is r
 
 Append up to `length` bytes to the peer's buffer; a write that does not fit completely writes
 what fits (a short write) and reports it. Rights: WRITE. `length` at most `SOCKET_BUFFER`.
-Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG; INVALID_ARGS (the source is
-not readable user memory); PEER_CLOSED (the peer is gone; nothing written); SHOULD_WAIT (the
-peer's buffer is full and `length` > 0; nothing written). `length` 0 is OK with `written` 0.
+Errors, in the order the code checks them: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG;
+INVALID_ARGS (the source is not readable user memory); BAD_STATE (this endpoint has shut down
+its write side, `socket_shutdown`); PEER_CLOSED (the peer is gone; nothing written; this holds for
+`length` 0 too, so a zero-length write is a cheap probe for a dead peer); then, for `length` 0
+on a live socket, OK with `written` 0; SHOULD_WAIT (the peer's buffer is full and `length` > 0;
+nothing written); NO_MEMORY (the system-wide queued-data budget is spent, or the quota of the
+job that owns the *receiving* endpoint is: its creator pays for what is queued, and no reader
+of another socket will make room, so this is not SHOULD_WAIT; also if the buffer cannot grow).
+A write that is not refused writes at least one byte.
 
 ### socket_read(socket, buffer, max) -> status, read
 

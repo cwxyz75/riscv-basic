@@ -1143,6 +1143,17 @@ def main() -> int:
             print("--- serial output ---", text, sep="\n", file=sys.stderr)
         else:
             print(f"os boot test passed: {label} ({len(parse(lines)[1])} tests, exit status {status})")
+            # where the time goes (guest milliseconds per test, from the suite's `tt:` lines): the smoke budget is watched from here
+            tts = []
+            for l in text.split("\n"):
+                if l.startswith("tt: "):
+                    parts = l.split()
+                    if len(parts) == 3 and parts[2].isdigit():
+                        tts.append((int(parts[2]), parts[1]))
+            if tts:
+                tts.sort(reverse=True)
+                print(f"suite guest time: {sum(t for t, _ in tts) / 1000:.0f} s over {len(tts)} tests; slowest: "
+                      + ", ".join(f"{n} {t / 1000:.1f} s" for t, n in tts[:6]))
     return failed
 
 
