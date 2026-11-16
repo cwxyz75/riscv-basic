@@ -560,3 +560,35 @@ fn sampled_three_operation_workloads_survive_too() {
     }
     eprintln!("{scenarios} crash scenarios");
 }
+
+/// Attribute and index workloads that end in a commit (the exhaustive two-operation set has no room for three).
+#[test]
+fn attribute_and_index_workloads_survive_a_crash_at_every_point() {
+    use W::*;
+    let mut rng = Rng(0xA77_1B07_E5);
+    let sets: Vec<Vec<W>> = vec![
+        vec![SetAttr("g", b"red"), MakeIndex, Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Fsync],
+        vec![
+            SetAttr("g", b"red"),
+            SetAttr("d/f", b"blue"),
+            MakeIndex,
+            Fsync,
+        ],
+        vec![MakeIndex, SetAttr("g", b"red"), RemoveAttr("g"), Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Rename("g", "h"), Fsync],
+        vec![MakeIndex, SetAttr("g", b"red"), Unlink("g"), Fsync],
+        vec![SetAttr("g", b"red"), Fsync, MakeIndex, Fsync],
+        vec![MakeIndex, Fsync, SetAttr("g", b"red"), Fsync],
+        vec![
+            MakeIndex,
+            Write("g", 0, 5000, 7),
+            Fsync,
+            Truncate("g", 10),
+            Fsync,
+        ],
+    ];
+    for ws in sets {
+        crash_test(&ws, &mut rng, 3);
+    }
+}
