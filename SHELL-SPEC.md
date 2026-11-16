@@ -178,7 +178,7 @@ lines) or last-in-function. `ok v` leaves the nearest function (at script level 
 `succeeds (cmd)` and `run (cmd) [options]` need the command in parentheses.
 
 **Islands.** Inside `(calc ...)` or `(is ...)`: numbers (decimal, `0x`, `0b`), `'text'`, `"text"`, `$x`, literals, `true false
-null`, and `( )` which is a **call** (write `(calc ...)` or `(is ...)` to nest an island **(chosen)**). Operators, low to high:
+null`, and `( )`, which **groups** when what follows is an island expression ending at the `)` (`(calc ($a + 1) * 2)`), and is otherwise a **call** (`(len $x)`, `($f 1 2)`, `(calc ...)`); a lone `($x)` groups **(chosen, revised 2026-11-17 after review)**. Operators, low to high:
 `or`, `and`, `not`, `== != < <= > >= in matches`, `^`, `+ -`, `* / // %`, unary `-`. `calc` must yield a number and `is` a boolean.
 
 **Redirections.** `> f`, `>> f`, `< f`, `>[2=1]`, `>[2] f`; on shell callees too.

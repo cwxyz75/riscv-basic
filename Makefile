@@ -26,7 +26,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -36,7 +36,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
@@ -277,9 +277,11 @@ os-serial-test: os-interactive
 	python3 scripts/s4a_serial_test.py $(OS_REPL_ELF)
 	python3 scripts/s4d_console_test.py $(OS_REPL_ELF)
 	python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
+	python3 scripts/uv5_sessions_test.py $(OS_REPL_ELF)
 	@# the harness must be able to fail: a wrong expectation has to be reported
 	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4d_console_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the console test passed a broken expectation"; exit 1; fi
+	@if S4_TIMEOUT=15 python3 scripts/uv5_sessions_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the sessions test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
 # The reference CPU of the OS track (OD47).

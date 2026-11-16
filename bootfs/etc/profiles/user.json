@@ -1,0 +1,6 @@
+{ "name": "user", "uid": 1000, "home": "home", "autologin": true,
+  "programs": {
+    "ls":    { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] },
+    "cat":   { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] },
+    "ctest": { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] }
+  } }

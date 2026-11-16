@@ -12,6 +12,9 @@ print (is ('a' ^ 'b') == 'ab')
 x = 4
 print (calc $x * $x - 1)
 print (is $x >= 4 or false)
+print (calc (1 + 2) * 3) (calc (calc 1 + 2) * 3) (calc (len [1, 2]) + 1) (is (1 < 2) and (2 < 3)) (calc ((1 + 2) * (3 - 1)) + 1)
+x = 4
+print (calc ($x + 1) * 2) (is not ($x == 4))
 --- stdout
 7
 9
@@ -24,5 +27,7 @@ ab1
 true
 15
 true
+9 9 3 true 7
+10 false
 --- status
 0

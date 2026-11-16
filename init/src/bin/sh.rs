@@ -77,6 +77,8 @@ struct Os {
     next_pid: u32,
     env: BTreeMap<String, String>,
     killed: bool,
+    /// The session's profile (UV5): its program grants replace `/etc/trusted`, and its identity is in every program's environment.
+    session_env: Vec<(String, String)>,
     /// `confine` grants, innermost last: while set, programs get exactly these (and `.`, `/dev`, `/tmp`).
     confined: Vec<Vec<(String, String)>>,
     /// The terminal is in raw mode (the shell is editing a line); programs run with it cooked.
@@ -100,6 +102,8 @@ struct Grant {
 struct Trust {
     name: Vec<u8>,
     grants: Vec<Grant>,
+    /// The program gets a read-only root (`/etc/trusted` always gives one; a profile may not).
+    root: bool,
 }
 
 fn parse_trust(line: &[u8]) -> Option<Trust> {
@@ -133,7 +137,11 @@ fn parse_trust(line: &[u8]) -> Option<Trust> {
             readonly,
         });
     }
-    Some(Trust { name, grants })
+    Some(Trust {
+        name,
+        grants,
+        root: true,
+    })
 }
 
 /// Remove the directory `name` of `parent` and everything below it (a dead program's scratch space).
@@ -309,6 +317,32 @@ impl Os {
         }
     }
 
+    /// The session's profile: the program grants and the identity it gives every program.
+    fn load_profile(&mut self, text: &str) -> bool {
+        let Ok(p) = profile::Profile::parse(text) else {
+            return false;
+        };
+        self.trusted = p
+            .programs
+            .iter()
+            .map(|(name, g)| Trust {
+                name: name.as_bytes().to_vec(),
+                root: g.root,
+                grants: g
+                    .mounts
+                    .iter()
+                    .map(|m| Grant {
+                        mount: m.path.as_bytes().to_vec(),
+                        vol: m.volume.as_bytes().to_vec(),
+                        readonly: m.rights == profile::Rights::Read,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.session_env = p.session_env();
+        true
+    }
+
     fn load_trusted(&mut self) {
         if let Ok(mut f) = self.root.open(b"etc/trusted", 0, rights::READ) {
             if let Ok(data) = f.read_all() {
@@ -384,7 +418,7 @@ impl Os {
         let (vmo, offset, len) = image.map_err(|_| HostError::NotFound)?;
         let want = rights::READ | rights::ENUMERATE;
         let trust = self.trusted.iter().position(|t| t.name == name);
-        let trusted = trust.is_some();
+        let trusted = trust.is_some_and(|t| self.trusted[t].root);
         let Some(stdin) = self.forward_stream(io.stdin, true) else {
             sys::handle_close(vmo);
             return Err(HostError::Other(String::from(
@@ -419,6 +453,9 @@ impl Os {
         };
         // the environment the shell has been given (`export`), then the working directory as a path: the libc's `getcwd`,
         // and `..` that climbs, start from it
+        for (k, v) in &self.session_env {
+            startup.env.push(format!("{k}={v}").into_bytes());
+        }
         for (k, v) in &self.env {
             startup.env.push(format!("{k}={v}").into_bytes());
         }
@@ -822,6 +859,9 @@ impl Host for Os {
     }
 
     fn started(&mut self, pids: &[Pid]) -> bool {
+        if !self.interactive {
+            return true; // no console server: nothing to register with
+        }
         // register the job (duplicates with only KILL|WAIT|TRANSFER)
         let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
         let hs: Vec<u32> = pids
@@ -861,7 +901,9 @@ impl Host for Os {
     }
 
     fn finished(&mut self) {
-        self.control(Control::ClearForeground, &[]);
+        if self.interactive {
+            self.control(Control::ClearForeground, &[]);
+        }
         self.cleanup_tmps();
         if self.killed {
             self.killed = false;
@@ -944,7 +986,12 @@ impl Host for Os {
     }
 
     fn getenv(&self, name: &str) -> Option<String> {
-        self.env.get(name).cloned()
+        self.env.get(name).cloned().or_else(|| {
+            self.session_env
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
     }
 
     fn setenv(&mut self, name: &str, value: &str) {
@@ -952,10 +999,14 @@ impl Host for Os {
     }
 
     fn environ(&self) -> Vec<(String, String)> {
-        self.env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        // the identity the session gives, then what was exported
+        let mut v: Vec<(String, String)> = self.session_env.clone();
+        for (k, x) in &self.env {
+            v.retain(|(n, _)| n != k);
+            v.push((k.clone(), x.clone()));
+        }
+        v.sort();
+        v
     }
 
     fn cwd(&self) -> String {
@@ -1091,6 +1142,7 @@ pub fn app_main() -> i32 {
         next_pid: 1,
         env: BTreeMap::new(),
         killed: false,
+        session_env: Vec::new(),
         confined: Vec::new(),
         raw: false,
         interrupt: false,
@@ -1098,13 +1150,19 @@ pub fn app_main() -> i32 {
     };
     let mut sh = ish::Shell::new(os);
     sh.name = String::from("sh");
+    let profile_loaded = env
+        .var(b"PROFILE")
+        .and_then(|b| core::str::from_utf8(b).ok())
+        .is_some_and(|t| sh.host.load_profile(t));
+    if !profile_loaded {
+        sh.host.load_trusted();
+    }
     if !sh.host.interactive {
         // not on a terminal: the standard messages, no prompt, no echo
         return ish::repl::run_batch(&mut sh);
     }
     sh.legacy = true;
     sh.help = String::from(HELP);
-    sh.host.load_trusted();
     sh.host.say(BANNER);
     ish::repl::run_interactive(&mut sh)
 }

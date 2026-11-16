@@ -1,0 +1,4 @@
+{ "name": "alice", "uid": 1001, "home": "homes/alice",
+  "env": { "EDITOR": "kilo" },
+  "programs": { "cat": { "root": true }, "ls": { "root": true } },
+  "quota": { "memory_mib": 32, "processes": 16 } }

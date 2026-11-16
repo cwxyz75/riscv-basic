@@ -1048,6 +1048,11 @@ impl Parser {
             self.i += 1;
             let e = self.isl(8)?;
             Isl::Un(UnOp::Neg, Box::new(e))
+        } else if self.peek() == Some('(') {
+            match self.isl_group() {
+                Some(e) => e,
+                None => Isl::Operand(self.isl_operand()?),
+            }
         } else {
             Isl::Operand(self.isl_operand()?)
         };
@@ -1093,6 +1098,26 @@ impl Parser {
                 }
             }
         })
+    }
+
+    /// A `(` inside an island groups when what follows is an island expression that ends at the `)`; otherwise it is a call
+    /// (`(len $x)`, `($f 1 2)`, `(calc ...)`). The cursor is left after the `)` on success and where it was on failure.
+    fn isl_group(&mut self) -> Option<Isl> {
+        let (save_i, save_depth) = (self.i, self.depth);
+        self.i += 1;
+        self.depth += 1;
+        let ok = self.depth <= MAX_NEST;
+        let r = if ok { self.isl(0).ok() } else { None };
+        self.wsn();
+        if let Some(e) = r {
+            if self.eat(')') {
+                self.depth = save_depth;
+                return Some(e);
+            }
+        }
+        self.i = save_i;
+        self.depth = save_depth;
+        None
     }
 
     fn isl_operand(&mut self) -> R<Word> {
