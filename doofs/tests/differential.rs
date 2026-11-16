@@ -4,7 +4,7 @@
 
 use doofs::{Fs, FsError};
 use fsfmt::{check, mkfs, mount, verify_all, MemDevice};
-use memfs::{Error, Limits};
+use memfs::{AttrType, Error, Limits, Term};
 use std::collections::BTreeMap;
 
 thread_local! {
@@ -177,6 +177,120 @@ impl Pair {
         assert_eq!(c.meta as usize, self.m.meta_used(), "meta");
         for id in self.ids.clone() {
             self.compare_node(id);
+            let did = self.did(id);
+            let (m, d) = (self.m.attr_list(id), self.d.attr_list(did));
+            if let Some(names) = same("attr list", m, d) {
+                for n in names {
+                    same(
+                        "attr value",
+                        self.m.attr_get(id, &n),
+                        self.d.attr_get(did, &n),
+                    );
+                }
+            }
+        }
+        assert_eq!(self.m.indexes(), self.d.indexes().unwrap(), "the indexes");
+    }
+
+    /// A random query through both, compared as sets ordered by (key, path): the tie-break by node id differs between the
+    /// two (memfs reuses ids), so what is compared in order is the key, and the paths of equal keys as sets.
+    fn query(&mut self, r: &mut Rng, what: &str) {
+        let dir = if r.below(3) == 0 { self.pick(r) } else { 0 };
+        let index: &[u8] = [
+            &b"name"[..],
+            b"size",
+            b"mtime",
+            b"color",
+            b"rank",
+            b"tag",
+            b"missing",
+        ][r.below(7)];
+        let enc = |r: &mut Rng, ty_hint: usize| -> Vec<u8> {
+            match (index, ty_hint) {
+                (b"name", _) => NAMES[r.below(NAMES.len())].to_vec(),
+                (b"size" | b"mtime", _) => (r.below(3000) as u64).to_le_bytes().to_vec(),
+                (_, 0) => (r.below(5) as i64 - 2).to_le_bytes().to_vec(),
+                (_, 1) => vec![b'a' + r.below(3) as u8],
+                _ => vec![1, 2],
+            }
+        };
+        let hint = r.below(3);
+        let term = match r.below(3) {
+            0 => Term::Eq(enc(r, hint)),
+            1 => Term::Range {
+                lo: Some(enc(r, hint)),
+                hi: None,
+            },
+            _ => Term::Range {
+                lo: if r.below(2) == 0 {
+                    None
+                } else {
+                    Some(enc(r, hint))
+                },
+                hi: Some(enc(r, hint)),
+            },
+        };
+        let m = self.m.query(dir, index, &term, None, 1000);
+        let d = self.d.query(self.did(dir), index, &term, None, 1000);
+        match (m, d) {
+            (Ok(a), Ok(b)) => {
+                let key = |h: &(Vec<u8>, Vec<u8>)| h.clone();
+                let mut x: Vec<_> = a
+                    .hits
+                    .iter()
+                    .map(|h| (h.key.clone(), h.path.clone()))
+                    .collect();
+                let mut y: Vec<_> = b
+                    .hits
+                    .iter()
+                    .map(|h| (h.key.clone(), h.path.clone()))
+                    .collect();
+                // doofs's own order is (key, id): check it, then compare as sets
+                assert!(
+                    b.hits
+                        .windows(2)
+                        .all(|w| (&w[0].key, w[0].id) < (&w[1].key, w[1].id)),
+                    "{what}: order"
+                );
+                x.sort_by_key(key);
+                y.sort_by_key(key);
+                assert_eq!(x, y, "{what}: query hits");
+                assert_eq!(a.more, b.more, "{what}: more");
+                seen("query ok".into());
+                if !b.hits.is_empty() {
+                    seen("query hit".into());
+                }
+                // paging in doofs: pages of 2 by (key, id) rebuild the full list, and `more` is right
+                let mut got = Vec::new();
+                let mut after: Option<(Vec<u8>, u64)> = None;
+                loop {
+                    let page = self
+                        .d
+                        .query(
+                            self.did(dir),
+                            index,
+                            &term,
+                            after.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+                            2,
+                        )
+                        .unwrap();
+                    got.extend(page.hits.iter().cloned());
+                    if !page.more {
+                        break;
+                    }
+                    let last = page.hits.last().unwrap();
+                    after = Some((last.key.clone(), last.id));
+                }
+                assert_eq!(got, b.hits, "{what}: pages rebuild the list");
+                let capped = self.d.query(self.did(dir), index, &term, None, 2).unwrap();
+                assert_eq!(capped.more, b.hits.len() > 2, "{what}: more at a cap of 2");
+                assert_eq!(capped.hits.len(), b.hits.len().min(2));
+            }
+            (Err(a), Err(FsError::Fs(b))) => {
+                assert_eq!(a, b, "{what}: query error");
+                seen(format!("query {a:?}"));
+            }
+            (a, b) => panic!("{what}: memfs {a:?} but doofs {b:?}"),
         }
     }
 
@@ -213,6 +327,33 @@ const NAMES: &[&[u8]] = &[
     b"x/y",
     b"long-name-0123456789012345678901234567890123456789",
 ];
+const ATTR_NAMES: &[&[u8]] = &[
+    b"color", b"rank", b"tag", b"x", b"y", b"name", b"size", b"mtime", b"", b"a/b",
+];
+
+/// A random attribute value, mostly well formed, sometimes not (the wrong length, bad UTF-8, too long to store or to index).
+fn attr_value(r: &mut Rng) -> (AttrType, Vec<u8>) {
+    let ty = [
+        AttrType::Bytes,
+        AttrType::Text,
+        AttrType::U64,
+        AttrType::I64,
+    ][r.below(4)];
+    let v = match (ty, r.below(12)) {
+        (AttrType::Bytes | AttrType::Text, 0) => vec![b'z'; 300],
+        (AttrType::Bytes | AttrType::Text, 1) => vec![b'q'; 1100],
+        (AttrType::Text, 2) => vec![0xff, 0xfe],
+        (AttrType::Bytes, 3) => vec![0, 1, 0, 255],
+        (AttrType::Bytes | AttrType::Text, _) => {
+            let n = r.below(6);
+            (0..n).map(|_| b"abc"[r.below(3)]).collect()
+        }
+        (_, 0) => vec![1, 2, 3],
+        (_, _) => (r.below(5) as i64 - 2).to_le_bytes().to_vec(),
+    };
+    (ty, v)
+}
+
 const TARGETS: &[&[u8]] = &[
     b"a",
     b"../a",
@@ -242,7 +383,7 @@ fn run(seed: u64, steps: usize) {
     for step in 0..steps {
         let what = format!("seed {seed} step {step}");
         let name = NAMES[r.below(NAMES.len())];
-        match r.below(24) {
+        match r.below(34) {
             0..=2 => {
                 let dir = p.pick(&mut r);
                 let (m, d) = (
@@ -349,6 +490,45 @@ fn run(seed: u64, steps: usize) {
                 p.m.set_time(p.now);
                 p.d.set_time(p.now);
             }
+            24..=26 => {
+                let id = p.pick(&mut r);
+                let name = ATTR_NAMES[r.below(ATTR_NAMES.len())];
+                let (ty, value) = attr_value(&mut r);
+                same(
+                    &what,
+                    p.m.attr_set(id, name, ty, &value),
+                    p.d.attr_set(p.did(id), name, ty, &value),
+                );
+            }
+            27 => {
+                let id = p.pick(&mut r);
+                let name = ATTR_NAMES[r.below(ATTR_NAMES.len())];
+                same(&what, p.m.attr_get(id, name), p.d.attr_get(p.did(id), name));
+            }
+            28 => {
+                let id = p.pick(&mut r);
+                let name = ATTR_NAMES[r.below(ATTR_NAMES.len())];
+                same(
+                    &what,
+                    p.m.attr_remove(id, name),
+                    p.d.attr_remove(p.did(id), name),
+                );
+            }
+            29 => {
+                let id = p.pick(&mut r);
+                same(&what, p.m.attr_list(id), p.d.attr_list(p.did(id)));
+            }
+            30 => {
+                let name = ATTR_NAMES[r.below(ATTR_NAMES.len())];
+                let ty = [
+                    AttrType::Bytes,
+                    AttrType::Text,
+                    AttrType::U64,
+                    AttrType::I64,
+                ][r.below(4)];
+                same(&what, p.m.make_index(name, ty), p.d.make_index(name, ty));
+            }
+            31..=32 => p.query(&mut r, &what),
             _ => {
                 if r.below(8) == 0 {
                     p.remount();

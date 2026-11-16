@@ -22,6 +22,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+pub use attrs::{AttrType, Hit, QueryResult, Term};
 use fsfmt::node::Ptr;
 use fsfmt::pool::PoolError;
 use fsfmt::tree::TreeError;
@@ -29,6 +30,7 @@ use fsfmt::volume::{VolError, Volume};
 use fsfmt::{Device, Tree, BLOCK, KEY_EXTENT};
 pub use memfs::{Error, Kind, Limits};
 
+pub mod attrs;
 pub mod fsck;
 
 pub type NodeId = u64;
@@ -46,6 +48,14 @@ const K_SYMLINK: u8 = 4;
 const K_ORPHAN: u8 = 5;
 const K_COUNTERS: u8 = 6;
 const K_NEXTID: u8 = 7;
+/// `08 id name`: an attribute (type byte, value).
+const K_ATTR: u8 = 8;
+/// `09 name`: an index definition (type byte, index number).
+const K_IDXDEF: u8 = 9;
+/// `0a index escaped-key id`: an index entry (empty value).
+const K_INDEX: u8 = 10;
+/// `0b id`: the node's name in its directory (empty for the root).
+const K_NAMEOF: u8 = 11;
 
 /// An error of the operation (`Fs`, the same as `memfs`'s), or of the disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +127,8 @@ struct Inode {
     /// File: bytes. Directory: entries. Symlink: target length.
     size: u64,
     cost: u32,
+    /// Bytes of attributes charged to the metadata quota (names, values and a fixed overhead each).
+    attr_cost: u32,
 }
 
 fn kind_code(k: Kind) -> u8 {
@@ -138,6 +150,7 @@ impl Inode {
         b[16..24].copy_from_slice(&self.mtime.to_be_bytes());
         b[24..32].copy_from_slice(&self.size.to_be_bytes());
         b[32..36].copy_from_slice(&self.cost.to_be_bytes());
+        b[36..40].copy_from_slice(&self.attr_cost.to_be_bytes());
         b
     }
 
@@ -160,6 +173,7 @@ impl Inode {
             mtime: u(16..24),
             size: u(24..32),
             cost: u32::from_be_bytes(b[32..36].try_into().expect("4 bytes")),
+            attr_cost: u32::from_be_bytes(b[36..40].try_into().expect("4 bytes")),
         })
     }
 }
@@ -244,6 +258,7 @@ impl<D: Device> Fs<D> {
                             mtime: 0,
                             size: 0,
                             cost: 0,
+                            attr_cost: 0,
                         },
                     )?;
                     fs.counters.nodes = 1;
@@ -315,8 +330,45 @@ impl<D: Device> Fs<D> {
         }
     }
 
+    /// Store `n`; the built-in size and mtime index entries follow it (a node is in them while it is linked).
     fn put_inode(&mut self, id: NodeId, n: &Inode) -> R<()> {
-        self.put(&k_inode(id), &n.encode())
+        let old = match self.get(&k_inode(id))? {
+            Some(v) => Some(Inode::decode(&v)?),
+            None => None,
+        };
+        self.put(&k_inode(id), &n.encode())?;
+        if id != ROOT {
+            let want = attrs::builtin_keys(n);
+            let had = old.as_ref().map(attrs::builtin_keys).unwrap_or_default();
+            for (idx, key) in &had {
+                if !want.contains(&(*idx, key.clone())) {
+                    self.del(&attrs::k_index(*idx, key, id))?;
+                }
+            }
+            for (idx, key) in &want {
+                if !had.contains(&(*idx, key.clone())) {
+                    self.put(&attrs::k_index(*idx, key, id), b"")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record `id`'s name (and, while it is linked, its entry in the built-in name index).
+    fn set_name(&mut self, id: NodeId, name: &[u8]) -> R<()> {
+        if let Some(old) = self.get(&k_id(K_NAMEOF, id))? {
+            self.del(&attrs::k_index(attrs::IDX_NAME, &old, id))?;
+        }
+        self.put(&k_id(K_NAMEOF, id), name)?;
+        self.put(&attrs::k_index(attrs::IDX_NAME, name, id), b"")
+    }
+
+    /// The node is no longer named: its name leaves the index (the record goes when the node does).
+    fn unname(&mut self, id: NodeId) -> R<()> {
+        if let Some(old) = self.get(&k_id(K_NAMEOF, id))? {
+            self.del(&attrs::k_index(attrs::IDX_NAME, &old, id))?;
+        }
+        Ok(())
     }
 
     fn save_counters(&mut self) -> R<()> {
@@ -512,8 +564,10 @@ impl<D: Device> Fs<D> {
                     mtime: fs.now,
                     size: 0,
                     cost: (cost + extra_cost) as u32,
+                    attr_cost: 0,
                 },
             )?;
+            fs.set_name(id, name)?;
             fs.put(&k_dirent(dir, name), &id.to_be_bytes())?;
             let mut d = d;
             d.mtime = fs.now;
@@ -566,10 +620,12 @@ impl<D: Device> Fs<D> {
             Kind::Symlink => self.del(&k_id(K_SYMLINK, id))?,
             _ => {}
         }
+        self.drop_attrs(id)?;
         self.del(&k_inode(id))?;
         self.del(&k_id(K_ORPHAN, id))?;
+        self.del(&k_id(K_NAMEOF, id))?;
         self.counters.nodes -= 1;
-        self.counters.meta -= n.cost as u64;
+        self.counters.meta -= n.cost as u64 + n.attr_cost as u64;
         Ok(())
     }
 
@@ -577,6 +633,7 @@ impl<D: Device> Fs<D> {
     fn drop_link(&mut self, id: NodeId) -> R<()> {
         let mut n = self.inode(id)?;
         n.links = 0;
+        self.unname(id)?;
         if self.refs.get(&id).copied().unwrap_or(0) > 0 {
             self.put_inode(id, &n)?;
             self.put(&k_id(K_ORPHAN, id), b"")
@@ -696,7 +753,8 @@ impl<D: Device> Fs<D> {
             let mut m = fs.inode(src)?;
             m.cost = new_cost as u32;
             m.parent = to_dir;
-            fs.put_inode(src, &m)
+            fs.put_inode(src, &m)?;
+            fs.set_name(src, to_name)
         })
     }
 

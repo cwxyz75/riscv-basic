@@ -3,8 +3,10 @@
 //! extents belong to files and lie inside them, symlink targets exist, orphans are unlinked, and the quota counters are what
 //! the nodes add up to. Read-only.
 
+use crate::attrs::{builtin_keys, k_index, parse_entry, ATTR_OVERHEAD, IDX_NAME, INDEX_OVERHEAD};
 use crate::{
-    Counters, Fs, Inode, K_COUNTERS, K_DIRENT, K_INODE, K_ORPHAN, K_SYMLINK, NODE_OVERHEAD,
+    Counters, Fs, Inode, K_ATTR, K_COUNTERS, K_DIRENT, K_IDXDEF, K_INDEX, K_INODE, K_NAMEOF,
+    K_ORPHAN, K_SYMLINK, NODE_OVERHEAD,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -31,6 +33,10 @@ pub fn check_fs<D: Device>(fs: &mut Fs<D>) -> Vec<String> {
     let mut symlinks: BTreeMap<u64, usize> = BTreeMap::new();
     let mut orphans: Vec<u64> = Vec::new();
     let mut stored: Option<Counters> = None;
+    let mut attrs: Vec<(u64, Vec<u8>, u8, usize)> = Vec::new();
+    let mut defs: BTreeMap<Vec<u8>, (u8, u8)> = BTreeMap::new();
+    let mut entries: Vec<(u8, Vec<u8>, u64)> = Vec::new();
+    let mut names: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for (k, v) in &all {
         match k[0] {
             K_INODE if k.len() == 9 => match Inode::decode(v) {
@@ -55,6 +61,19 @@ pub fn check_fs<D: Device>(fs: &mut Fs<D>) -> Vec<String> {
                 });
             }
             crate::K_NEXTID if k.len() == 1 => {}
+            K_ATTR if k.len() > 9 && !v.is_empty() => {
+                attrs.push((u64_at(&k[1..9]), k[9..].to_vec(), v[0], v.len() - 1));
+            }
+            K_IDXDEF if k.len() > 1 && v.len() == 2 => {
+                defs.insert(k[1..].to_vec(), (v[0], v[1]));
+            }
+            K_INDEX if k.len() > 2 => match parse_entry(k) {
+                Some((key, id)) => entries.push((k[1], key, id)),
+                None => bad.push("a malformed index entry".into()),
+            },
+            K_NAMEOF if k.len() == 9 => {
+                names.insert(u64_at(&k[1..9]), v.clone());
+            }
             _ => bad.push(format!("an unknown or malformed record, key type {}", k[0])),
         }
     }
@@ -92,7 +111,7 @@ pub fn check_fs<D: Device>(fs: &mut Fs<D>) -> Vec<String> {
     let (mut nodes, mut bytes, mut meta) = (0u64, 0u64, 0u64);
     for (id, n) in &inodes {
         nodes += 1;
-        meta += n.cost as u64;
+        meta += n.cost as u64 + n.attr_cost as u64;
         if n.kind == Kind::File {
             bytes += n.size;
         }
@@ -145,6 +164,77 @@ pub fn check_fs<D: Device>(fs: &mut Fs<D>) -> Vec<String> {
             _ => bad.push(format!("an extent of {id}, which is not a file")),
         }
     }
+    // attributes: each belongs to a node, and a node's attribute cost is what they add up to
+    let mut attr_cost: BTreeMap<u64, u64> = BTreeMap::new();
+    for (id, name, _, len) in &attrs {
+        if !inodes.contains_key(id) {
+            bad.push(format!("an attribute of the missing node {id}"));
+        }
+        *attr_cost.entry(*id).or_insert(0) += (name.len() + len + ATTR_OVERHEAD) as u64;
+    }
+    for (id, n) in &inodes {
+        if n.attr_cost as u64 != attr_cost.get(id).copied().unwrap_or(0) {
+            bad.push(format!(
+                "node {id} says {} bytes of attributes, has {}",
+                n.attr_cost,
+                attr_cost.get(id).copied().unwrap_or(0)
+            ));
+        }
+    }
+    for name in defs.keys() {
+        meta += (name.len() + INDEX_OVERHEAD) as u64;
+    }
+    // names: every node but the root has one record
+    for id in inodes.keys() {
+        if *id != 0 && !names.contains_key(id) {
+            bad.push(format!("node {id} has no name record"));
+        }
+    }
+    for id in names.keys() {
+        if !inodes.contains_key(id) {
+            bad.push(format!("a name record for the missing node {id}"));
+        }
+    }
+    // index entries: exactly the ones the nodes and attributes call for
+    let mut want: Vec<(u8, Vec<u8>, u64)> = Vec::new();
+    for (id, n) in &inodes {
+        if *id == 0 {
+            continue;
+        }
+        for (idx, key) in builtin_keys(n) {
+            want.push((idx, key, *id));
+        }
+        if n.links == 1 {
+            if let Some(name) = names.get(id) {
+                want.push((IDX_NAME, name.clone(), *id));
+            }
+        }
+    }
+    for (id, name, ty, len) in &attrs {
+        if let Some((dty, idx)) = defs.get(name) {
+            if dty == ty {
+                let value = all
+                    .iter()
+                    .find(|(k, _)| k.as_slice() == crate::attrs::k_attr(*id, name).as_slice())
+                    .map(|(_, v)| v[1..].to_vec())
+                    .unwrap_or_default();
+                let _ = len;
+                if let Some(t) = memfs::AttrType::from_code(*ty) {
+                    if let Ok(key) = t.key(&value) {
+                        want.push((*idx, key, *id));
+                    }
+                }
+            }
+        }
+    }
+    want.sort();
+    entries.sort();
+    if want != entries {
+        let missing = want.iter().filter(|w| !entries.contains(w)).count();
+        let extra = entries.iter().filter(|e| !want.contains(e)).count();
+        bad.push(format!("the index entries differ from what the nodes and attributes call for ({missing} missing, {extra} extra)"));
+    }
+    let _ = k_index;
     let have = Counters { nodes, bytes, meta };
     if stored != Some(have) || have != fs.counters() {
         bad.push(format!(
