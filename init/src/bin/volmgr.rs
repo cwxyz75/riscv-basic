@@ -85,9 +85,23 @@ fn image_file(bi: u32, name: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Start the volume server for `v` on block channel `blk`, and publish its names.
-fn start(v: &mut Volume, blk: u32, image: &[u8], reg: &mut rt::fs::Fs) -> bool {
+fn start(
+    v: &mut Volume,
+    blk: u32,
+    image: &[u8],
+    reg: &mut rt::fs::Fs,
+    clock_view: &mut Option<rt::fs::Fs>,
+) -> bool {
     let mut handles = alloc::vec![blk];
     let mut roles = alloc::vec![(Role::BlockDevice, 0u32)];
+    // a connection to a registry view that allows `clock`, for file times (none: the server uses time since boot)
+    if let Some(c) = clock_view
+        .as_mut()
+        .and_then(|c| c.clone_conn(proto::file::rights::READ).ok())
+    {
+        handles.push(c.ch);
+        roles.push((Role::ServiceRegistry, handles.len() as u32 - 1));
+    }
     let mut names: Vec<String> = alloc::vec![format!("vol-uuid-{}", v.uuid_hex)];
     if let Some(n) = &v.name {
         names.push(format!("vol-{n}"));
@@ -172,6 +186,7 @@ pub fn app_main() -> i32 {
         },
     };
     let mut reg = rt::fs::Fs::new(registry);
+    let mut clock_view = reg.view(&[&b"clock"[..]], proto::file::rights::READ).ok();
     // ---- discovery
     let mut txid = 0u32;
     let mut found: Vec<Found> = Vec::new();
@@ -235,7 +250,7 @@ pub fn app_main() -> i32 {
                     proc: None,
                     restarts: 0,
                 };
-                if start(&mut v, ch, &fsd_image, &mut reg) {
+                if start(&mut v, ch, &fsd_image, &mut reg, &mut clock_view) {
                     rt::println!("volmgr: serving {} as {:?}", v.uuid_hex, v.name);
                     volumes.push(v);
                 }
@@ -281,7 +296,7 @@ pub fn app_main() -> i32 {
         let Some((devmgr::Status::Ok, Some(ch))) = open_block_retry(dm, &mut txid, v.device) else {
             continue;
         };
-        if start(v, ch, &fsd_image, &mut reg) {
+        if start(v, ch, &fsd_image, &mut reg, &mut clock_view) {
             if let Some(pr) = v.proc {
                 sys::port_bind(port, pr, signals::TERMINATED, i as u64);
             }

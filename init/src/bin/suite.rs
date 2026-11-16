@@ -8406,6 +8406,46 @@ fn start_volmgr_rig(res: u32, bi: u32) -> Result<(Fs, u32), Detail> {
     .map_err(|_| msg_at(line!()))?;
     let mut root = Fs::new(reg_mine);
     let publish = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    // the clock service, as a second client of the device manager, so that the volume server can stamp files with wall time
+    let (cd_dm, cd_theirs) = channel()?;
+    let req = proto::devmgr::encode_connect(1);
+    ensure_eq!(
+        st(sys::channel_write(
+            dm_mine,
+            req.as_ptr(),
+            req.len(),
+            &cd_theirs,
+            1
+        )),
+        Some(S::Ok),
+        "connect the clock service to the device manager"
+    );
+    ensure_eq!(
+        st(sys::object_wait(
+            dm_mine,
+            sig::READABLE,
+            sys::clock_get() + 5000
+        )),
+        Some(S::Ok),
+        "the manager answers"
+    );
+    let mut rb = [0u8; 16];
+    sys::channel_read(dm_mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    let clock_pub = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let (off, len) = image_entry(bi, b"bin/clockd")?;
+    let cimage = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let s = Startup {
+        args: vec![b"clockd".to_vec()],
+        roles: vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+        ..Startup::default()
+    };
+    rt::spawn::spawn_in(
+        &cimage,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[cd_dm, clock_pub.ch],
+        mj,
+    )
+    .map_err(|_| msg_at(line!()))?;
     let bi_dup2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
     let (off, len) = image_entry(bi, b"bin/volmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -8435,7 +8475,7 @@ fn open_volume(root: &mut Fs, name: &[u8], rights: u32) -> Result<Fs, Detail> {
         .map_err(|e| msg_e(e, line!()))?;
     let until = sys::clock_get() + 15_000;
     loop {
-        match view.open(name, pfl::DIRECTORY, rights) {
+        match view.open_retry(name, pfl::DIRECTORY, rights, until) {
             Ok(f) => return Ok(f),
             Err(e) if sys::clock_get() < until => {
                 let _ = e;
@@ -8493,6 +8533,38 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     );
     ensure_eq!(data.sync(), Ok(()), "sync");
     f.close();
+    // file times are the wall clock's (the rig runs the clock service): everything changed since the RTC's base time
+    let base = RTC_BASE_NS.to_le_bytes();
+    let since = proto::file::Query {
+        index: b"mtime",
+        term: proto::file::QueryTerm::Range {
+            lo: Some(&base),
+            hi: None,
+        },
+        after: None,
+        max: 100,
+    };
+    let (hits, _) = data.query(&since).map_err(|e| msg_e(e, line!()))?;
+    let paths: Vec<Vec<u8>> = hits.iter().map(|h| h.path.clone()).collect();
+    ensure!(
+        paths.contains(&b"kept/note".to_vec()) && paths.contains(&b"kept".to_vec()),
+        "the new file and directory carry wall-clock times: {paths:?}"
+    );
+    let before = proto::file::Query {
+        index: b"mtime",
+        term: proto::file::QueryTerm::Range {
+            lo: None,
+            hi: Some(&base),
+        },
+        after: None,
+        max: 100,
+    };
+    let (old, _) = data.query(&before).map_err(|e| msg_e(e, line!()))?;
+    ensure!(
+        old.is_empty(),
+        "nothing is older than the clock's base: {} hits",
+        old.len()
+    );
     data.close();
     // the same volume under its uuid
     let mut again = open_volume(&mut reg, hex, RO_DIR)?;

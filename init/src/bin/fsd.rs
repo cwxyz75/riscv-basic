@@ -65,7 +65,15 @@ struct Server {
     /// What a forwarded open is connected to, and the most rights it may have (`ro` and `sub=` of the mount table).
     base: NodeId,
     allowed: u32,
+    /// The wall clock (`/svc/clock`), if the volume manager gave a view of it: file times are the service's time, kept as an
+    /// offset to the monotonic clock and re-read every `WALL_RESYNC` ticks. Without it they are nanoseconds since boot.
+    clock: Option<rt::clock::Clock>,
+    wall_offset: u64,
+    next_wall_sync: u64,
 }
+
+/// Re-read the wall clock this often (ticks).
+const WALL_RESYNC: u64 = 30_000;
 
 /// Commit this long (ticks) after the first uncommitted change.
 const COMMIT_INTERVAL: u64 = 2_000;
@@ -174,6 +182,25 @@ impl Server {
         }
     }
 
+    /// File times: wall time if the clock service gave it, else nanoseconds since boot.
+    fn stamp(&mut self) {
+        let now = sys::clock_get();
+        if now >= self.next_wall_sync {
+            self.next_wall_sync = now + WALL_RESYNC;
+            if let Some(c) = self.clock.as_mut() {
+                if let Ok(n) = c.now(now + 300) {
+                    if n.quality != proto::clock::quality::UNSET {
+                        self.wall_offset = n.nanos.saturating_sub(now.saturating_mul(1_000_000));
+                    }
+                }
+            }
+        }
+        self.fs.set_time(
+            now.saturating_mul(1_000_000)
+                .saturating_add(self.wall_offset),
+        );
+    }
+
     /// Something may have changed on disk: remember when, so the next commit is due.
     fn changed(&mut self) {
         if self.dirty_since.is_none() {
@@ -218,7 +245,7 @@ impl Server {
             },
         )?;
         let _ = self.fs.retain(node);
-        self.fs.set_time(sys::clock_get().saturating_mul(1_000_000));
+        self.stamp();
         Some(key)
     }
 
@@ -261,7 +288,7 @@ impl Server {
 
     fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u32>) {
         // file times are the time of the change, not of the last open (review finding 9)
-        self.fs.set_time(sys::clock_get().saturating_mul(1_000_000));
+        self.stamp();
         let close_ep = |ep: Option<u32>| {
             if let Some(h) = ep {
                 sys::handle_close(h);
@@ -827,6 +854,11 @@ pub fn app_main() -> i32 {
         return 3;
     };
     let root_ch = env.handle(Role::ServiceFs);
+    // a view of the registry that allows `clock` (the volume manager gives one): the wall clock for file times
+    let clock = env.handle(Role::ServiceRegistry).and_then(|h| {
+        let mut v = rt::fs::Fs::new(h);
+        rt::clock::Clock::connect(&mut v, sys::clock_get() + 400).ok()
+    });
     let listeners = [
         env.handle(Role::ServiceListener),
         env.handle(Role::ServiceListenerAlt),
@@ -862,6 +894,9 @@ pub fn app_main() -> i32 {
         fs,
         core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         dirty_since: None,
+        clock,
+        wall_offset: 0,
+        next_wall_sync: 0,
         base: ROOT,
         allowed: if readonly {
             pr::READ | pr::ENUMERATE
