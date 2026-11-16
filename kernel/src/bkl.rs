@@ -246,6 +246,8 @@ impl klock::Machine for Machine {
         percpu::this()
             .last_class
             .store(class as u32, Ordering::Relaxed);
+        // (a new wait: the detector counts one wait, not everything since boot)
+        percpu::this().spins.store(0, Ordering::Relaxed);
         note_acquire(class);
     }
     fn released(class: Class, _instance: u32) {

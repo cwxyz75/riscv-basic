@@ -440,6 +440,12 @@ fn reschedule() {
             finish_switch();
             return;
         }
+        // (a double dispatch would panic here instead of running one thread on two harts)
+        debug_assert!(
+            (0..crate::smp::started())
+                .all(|y| y == h || crate::percpu::hart(y).running.load(Ordering::Relaxed) != next),
+            "thread {next} is already running on another hart"
+        );
         let outgoing = k.threads.get_mut(&running).expect("running thread exists");
         if let Some(stack) = &outgoing.stack {
             assert!(
@@ -520,7 +526,11 @@ pub fn reschedule_fast() -> bool {
     let (pokes, switch) = {
         let mut sc = sched();
         sc.reschedule_on(h);
-        (sc.take_pokes(), sc.current_on(h) != running_here())
+        let switch = sc.current_on(h) != running_here();
+        if !switch {
+            sc.switched(h); // no switch after all: nothing is in transit
+        }
+        (sc.take_pokes(), switch)
     };
     send_pokes(pokes, h);
     switch
@@ -542,7 +552,11 @@ pub fn timer_tick_fast() -> bool {
     let (pokes, switch) = {
         let mut sc = sched();
         sc.tick_on(h, ticks_to_ns(now));
-        (sc.take_pokes(), sc.current_on(h) != running_here())
+        let switch = sc.current_on(h) != running_here();
+        if !switch {
+            sc.switched(h); // the designation came back to the running thread: nothing is in transit
+        }
+        (sc.take_pokes(), switch)
     };
     send_pokes(pokes, h);
     switch

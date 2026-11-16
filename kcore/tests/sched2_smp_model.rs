@@ -467,7 +467,9 @@ fn equal_priority_threads_are_not_pulled_back_and_forth() {
     );
     for _ in 0..10 {
         s.yield_on(1).unwrap();
+        s.switched(1); // (each hart finishes its switch before it does anything else)
         s.yield_on(0).unwrap();
+        s.switched(0);
     }
     assert_eq!(s.pulls, 0, "equals never migrate");
     s.audit(true).unwrap();

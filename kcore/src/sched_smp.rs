@@ -200,7 +200,11 @@ impl<N: Class> Sched2<N> {
     /// After an operation on hart `h` that may have changed what it runs: if its previous thread is now queued (it is
     /// still executing, as the caller has not switched yet), record that it is in transit.
     fn note_transit(&mut self, h: usize, before: Tid) {
-        if Some(before) != self.harts[h].current()
+        // The first thread displaced is the one still executing; a later change of designation (a pull after a tick's
+        // rotation, say) displaces only a thread that was never run, so the first one stays protected until `switched`
+        // (review of task 12: overwriting it left the executing thread free to be pulled and run on two harts).
+        if self.transit[h].is_none()
+            && Some(before) != self.harts[h].current()
             && self.harts[h].state(before) == Some(State::Runnable)
         {
             self.transit[h] = Some(before);
