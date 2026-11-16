@@ -1,0 +1,7 @@
+[package]
+name = "clockmodel"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the pure wall-clock model of clockd (FS-SPEC section 7): an RTC reading plus the monotonic clock gives UTC nanoseconds that never go backwards for a client, slewing a backward correction away. No I/O."
+
+[dependencies]

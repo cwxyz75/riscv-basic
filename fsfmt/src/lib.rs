@@ -16,11 +16,15 @@ pub mod crc;
 pub mod device;
 pub mod node;
 pub mod pool;
+pub mod superblock;
 pub mod tree;
+pub mod volume;
 
 pub use device::{DevError, Device, MemDevice, BLOCK};
 pub use pool::Pool;
+pub use superblock::Superblock;
 pub use tree::{Snapshot, Tree, TreeError, Verified};
+pub use volume::{check, mkfs, mount, Report, VolError, Volume};
 
 /// Longest key and longest value the tree stores (FS-SPEC section 12: names up to 255 bytes, inline values up to 1 KiB).
 pub const MAX_KEY: usize = 300;

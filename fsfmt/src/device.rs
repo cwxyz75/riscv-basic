@@ -17,6 +17,23 @@ pub trait Device {
     fn blocks(&self) -> u64;
     fn read(&mut self, addr: u64, buf: &mut [u8; BLOCK]) -> Result<(), DevError>;
     fn write(&mut self, addr: u64, data: &[u8; BLOCK]) -> Result<(), DevError>;
+    /// Everything written so far is durable before this returns (a write barrier).
+    fn flush(&mut self) -> Result<(), DevError>;
+}
+
+impl<D: Device + ?Sized> Device for &mut D {
+    fn blocks(&self) -> u64 {
+        (**self).blocks()
+    }
+    fn read(&mut self, addr: u64, buf: &mut [u8; BLOCK]) -> Result<(), DevError> {
+        (**self).read(addr, buf)
+    }
+    fn write(&mut self, addr: u64, data: &[u8; BLOCK]) -> Result<(), DevError> {
+        (**self).write(addr, data)
+    }
+    fn flush(&mut self) -> Result<(), DevError> {
+        (**self).flush()
+    }
 }
 
 /// A device in memory. A block never written reads as zeros.
@@ -25,6 +42,7 @@ pub struct MemDevice {
     /// Counts, for tests.
     pub reads: u64,
     pub writes: u64,
+    pub flushes: u64,
 }
 
 impl MemDevice {
@@ -33,6 +51,7 @@ impl MemDevice {
             blocks: (0..blocks).map(|_| None).collect(),
             reads: 0,
             writes: 0,
+            flushes: 0,
         }
     }
 
@@ -62,6 +81,11 @@ impl Device for MemDevice {
             Some(b) => buf.copy_from_slice(&**b),
             None => buf.fill(0),
         }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), DevError> {
+        self.flushes += 1;
         Ok(())
     }
 
