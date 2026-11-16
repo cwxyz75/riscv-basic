@@ -728,6 +728,6 @@ V, T, R, SD, DM, I, L) are the concrete versions; the items below are the origin
   supervisor. The kernel side of the idea is "share nothing, send messages between harts".
 
 Longer-term backlog (see `OS-ARCHITECTURE.md` section 16): a real on-disk
-filesystem with crash-injection tests, a 9P bridge, graphics and input, scheduler
+filesystem with crash-injection tests, graphics and input, scheduler
 alternatives against the conformance suite, capability revocation, quotas,
 self-hosting; **IPv6** (distant future, added at the owner's request 2026-11-15: NET-SPEC and S9 are IPv4 only on purpose, and `netwire`, `netcore` and `nettcp` should keep addresses behind small types so it stays possible).
