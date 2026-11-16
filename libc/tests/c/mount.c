@@ -59,6 +59,16 @@ int mount_test(const char *mnt) {
     if (dfd >= 0) close(dfd);
     CHECK(chdir("/../../..") == 0 && getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/") == 0, "`..` above the root stays at the root");
     CHECK(open("", O_RDONLY) < 0 && errno == ENOENT, "the empty path names nothing");
+    /* /dev and the private /tmp every program is given */
+    int nul = open("/dev/null", O_WRONLY);
+    CHECK(nul >= 0 && write(nul, "x", 1) == 1, "write to /dev/null");
+    if (nul >= 0) close(nul);
+    int zer = open("/dev/zero", O_RDONLY);
+    char zb[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    CHECK(zer >= 0 && read(zer, zb, 8) == 8 && zb[0] == 0 && zb[7] == 0, "read zeros from /dev/zero");
+    if (zer >= 0) close(zer);
+    FILE *tf = fopen("/tmp/scratch", "w");
+    CHECK(tf != NULL && fputs("private", tf) >= 0 && fclose(tf) == 0, "write a file in the private /tmp");
     /* leave one file behind: the shell test reads it from a later session (the volume is durable) */
     char kept[256];
     snprintf(kept, sizeof kept, "%s/kept", mnt);

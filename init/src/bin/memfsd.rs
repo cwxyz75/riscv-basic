@@ -633,6 +633,25 @@ fn build_tree(fs: &mut Fs, entries: &[proto::bootimg::Entry]) -> Option<()> {
         fs.add_image_file(at, last, u64::from(e.offset), u64::from(e.size))
             .ok()?;
     }
+    // The skeleton (USER-VIEW-SPEC section 7, UV2): the directories a session's namespace hangs things on, empty here (`/dev`,
+    // `/mnt` and `/svc` are mount points other servers are bound over in a program's table; `/lib`, `/include` and `/share`
+    // wait for what is installed), and `/usr`, a real directory of compatibility links to the real ones (ported software
+    // hardcodes `/usr/bin/env`, `/usr/lib`, ...; nothing is installed under it).
+    for name in [&b"dev"[..], b"mnt", b"svc", b"lib", b"include", b"share"] {
+        match fs.mkdir(ROOT, name) {
+            Ok(_) | Err(Error::Exists) => {}
+            Err(_) => return None,
+        }
+    }
+    let usr = fs.mkdir(ROOT, b"usr").ok()?;
+    for (name, target) in [
+        (&b"bin"[..], &b"../bin"[..]),
+        (b"lib", b"../lib"),
+        (b"include", b"../include"),
+        (b"share", b"../share"),
+    ] {
+        fs.symlink(usr, name, target, ROOT).ok()?;
+    }
     // Everything that came from the boot image is read-only; so is the root (no new top-level
     // names); `/tmp` stays writable.
     fn lock(fs: &mut Fs, dir: NodeId) {

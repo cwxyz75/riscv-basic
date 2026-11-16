@@ -69,7 +69,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -111,7 +111,7 @@ def main():
     # programs on the fixtures
     step(b"ls\n", [b"$ ls", b"hello.txt", b"lines.txt", b"sub/"], "ls of the working directory")
     step(b"ls sub\n", [b"$ ls sub", b"inner.txt"], "ls of a subdirectory")
-    step(b"ls /\n", [b"$ ls /", b"bin/", b"etc/", b"home/", b"tmp/"], "ls of the root (trusted)")
+    step(b"ls /\n", [b"$ ls /", b"bin/", b"dev/", b"etc/", b"home/", b"include/", b"lib/", b"mnt/", b"share/", b"svc/", b"tmp/", b"usr/"], "ls of the root (trusted)")
     step(b"ls /bin\n", [b"$ ls /bin"] + BIN, "ls of /bin: sorted bytewise")
     step(b"cat hello.txt\n", [b"$ cat hello.txt", b"hello, world"], "cat")
     step(b"cat lines.txt sub/inner.txt\n",
@@ -175,16 +175,18 @@ def main():
           b"ok: chdir with .. climbs out of the volume to the root's /home", b"ok: and getcwd says so",
           b"ok: open a directory by path", b"ok: openat with .. from a path-annotated directory descriptor",
           b"ok: `..` above the root stays at the root", b"ok: the empty path names nothing",
+          b"ok: write to /dev/null", b"ok: read zeros from /dev/zero", b"ok: write a file in the private /tmp",
           b"ok: leave a file for the next session",
           b"mount: 0 failures"],
          "a C program makes, reads, renames and removes files in the granted volume")
     step(b"ls /mnt/store\n", [b"$ ls /mnt/store", b"kept"], "what it left behind")
+    step(b"ls /tmp\n", [b"$ ls /tmp"], "the program's private /tmp is gone with it")
     step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "cat reads inside the volume")
     step(b"echo hi | cat /mnt/store/kept\n", [b"$ echo hi | cat /mnt/store/kept", b"kept across sessions"],
          "a pipeline with a volume path")
     # a program that is not named in /etc/trusted gets no volume, and nothing named by the table leaks to it
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108", b"write ./f: -3",
-                      b"clone: ok", b"clone all: -3", b"root: absent", b"spawn: -5"],
+                      b"clone: ok", b"clone all: -3", b"root: absent", b"dev null: 0", b"dev zero: 0", b"tmp: 0", b"spawn: -5"],
          "probe has no volume")
     # the session ends and a fresh one starts: the volume is durable
     step(b"exit\n", [b"$ exit", BANNER], "a new session")
@@ -244,7 +246,7 @@ def main():
     # confinement: `probe` has only a read-only working directory
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108",
                       b"write ./f: -3", b"clone: ok", b"clone all: -3", b"root: absent",
-                      b"spawn: -5"],
+                      b"dev null: 0", b"dev zero: 0", b"tmp: 0", b"spawn: -5"],
          "probe: nothing outside the working directory")
 
     # limits (S4.5): a program is the only process of its job, runs at most four threads, and

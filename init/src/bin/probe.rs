@@ -65,6 +65,30 @@ pub fn app_main() -> i32 {
         "absent"
     };
     lines.push(format!("root: {root}\n"));
+    // what every program is given besides its working directory: `/dev` (null and zero) and a private `/tmp`
+    for (what, mount, path, want, flags) in [
+        (
+            "dev null",
+            &b"/dev"[..],
+            &b"null"[..],
+            rights::READ | rights::WRITE,
+            0,
+        ),
+        ("dev zero", b"/dev", b"zero", rights::READ, 0),
+        (
+            "tmp",
+            b"/tmp",
+            b"scratch",
+            rights::READ | rights::WRITE,
+            flags::CREATE,
+        ),
+    ] {
+        let r = match p.env.namespace(mount) {
+            Some(h) => code(Fs::new(h).open(path, flags, want).map(Fs::close)),
+            None => -1,
+        };
+        lines.push(format!("{what}: {r}\n"));
+    }
     // it may not start another process: its job allows only itself (NO_MEMORY, -5)
     let w = sys::process_create();
     lines.push(format!("spawn: {}\n", w.status));
