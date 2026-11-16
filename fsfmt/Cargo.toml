@@ -1,0 +1,7 @@
+[package]
+name = "fsfmt"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the pure format of the doofs disk filesystem (FS-SPEC section 3): blocks, pointers with check fields, the copy-on-write B+tree over a block-device trait. No I/O of its own."
+
+[dependencies]
