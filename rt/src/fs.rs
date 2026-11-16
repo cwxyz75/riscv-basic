@@ -33,6 +33,30 @@ struct Tagged {
     answer: Answer,
 }
 
+/// Why a path operation did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// The walk met a symlink after consuming `consumed` components of the path (the link included); `target` is its text.
+    Link {
+        consumed: usize,
+        target: Vec<u8>,
+    },
+    Status(i32),
+}
+
+impl Stopped {
+    fn of(a: Answer) -> Stopped {
+        if a.status == file::status::SYMLINK {
+            Stopped::Link {
+                consumed: a.a as usize,
+                target: a.payload,
+            }
+        } else {
+            Stopped::Status(a.status)
+        }
+    }
+}
+
 pub struct Fs {
     pub ch: u32,
     txid: u32,
@@ -177,9 +201,18 @@ impl Fs {
 
     /// Open `path` (relative to this directory) with `flags` and `rights`: a new connection.
     pub fn open(&mut self, path: &[u8], flags: u16, rights: u32) -> Result<Fs, i32> {
+        self.open_stop(path, flags, rights).map_err(|s| match s {
+            Stopped::Link { .. } => file::status::SYMLINK,
+            Stopped::Status(e) => e,
+        })
+    }
+
+    /// `open`, but a symlink in the way is reported with what the server said about it (how many components it consumed, and the
+    /// target text) instead of as a bare status: the caller follows it (`pathres`).
+    pub fn open_stop(&mut self, path: &[u8], flags: u16, rights: u32) -> Result<Fs, Stopped> {
         let c = sys::channel_create();
         if c.status != 0 {
-            return Err(c.status);
+            return Err(Stopped::Status(c.status));
         }
         let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
         // the endpoint travels with the request; the server closes it if it refuses
@@ -188,11 +221,11 @@ impl Fs {
             Ok(a) if a.status == 0 => Ok(Fs::new(mine)),
             Ok(a) => {
                 sys::handle_close(mine);
-                Err(a.status)
+                Err(Stopped::of(a))
             }
             Err(e) => {
                 sys::handle_close(mine);
-                Err(e)
+                Err(Stopped::Status(e))
             }
         }
     }
@@ -349,8 +382,24 @@ impl Fs {
 
     /// Stat `path` relative to this directory (empty: the directory itself).
     pub fn stat(&mut self, path: &[u8]) -> Result<Stat, i32> {
-        let a = self.simple(file::op::STAT, 0, 0, path)?;
-        Self::parse_stat(&a)
+        self.stat_stop(path, 0).map_err(|s| match s {
+            Stopped::Link { .. } => file::status::SYMLINK,
+            Stopped::Status(e) => e,
+        })
+    }
+
+    /// `stat` with `flags` (`NOFOLLOW` to describe a link itself), reporting a symlink in the way as [`Stopped::Link`].
+    pub fn stat_stop(&mut self, path: &[u8], flags: u16) -> Result<Stat, Stopped> {
+        let r = self
+            .call(file::op::STAT, flags, 0, 0, 0, path, None)
+            .map_err(Stopped::Status)?;
+        if r.status != 0 {
+            if let Some(h) = r.handle {
+                sys::handle_close(h);
+            }
+            return Err(Stopped::of(r));
+        }
+        Self::parse_stat(&r).map_err(Stopped::Status)
     }
 
     pub fn fstat(&mut self) -> Result<Stat, i32> {

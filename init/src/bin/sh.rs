@@ -252,10 +252,7 @@ impl Shell {
         }
         let arg = &args[0];
         let show = String::from_utf8_lossy(arg).into_owned();
-        let Some(path) = shell_core::resolve(&self.cwd_path, arg) else {
-            self.say(format!("cd: {show}: not found\n").as_bytes());
-            return;
-        };
+        let path = shell_core::resolve(&self.cwd_path, arg);
         let rel: &[u8] = &path[1..]; // without the leading slash
         let want = rights::READ | rights::ENUMERATE;
         let opened = if rel.is_empty() {
@@ -328,6 +325,8 @@ impl Shell {
             roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
         };
+        // the working directory as a path: the libc's `getcwd`, and `..` that climbs, start from it
+        startup.env.push([&b"PWD="[..], &self.cwd_path].concat());
         // which of the standard streams are the terminal (a program tells a tty from a pipe by this)
         if tty.0 {
             startup.env.push(b"STDIN=tty".to_vec());

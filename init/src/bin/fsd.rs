@@ -68,6 +68,8 @@ struct Server {
     /// The wall clock (`/svc/clock`), if the volume manager gave a view of it: file times are the service's time, kept as an
     /// offset to the monotonic clock and re-read every `WALL_RESYNC` ticks. Without it they are nanoseconds since boot.
     clock: Option<rt::clock::Clock>,
+    /// A walk met a symlink: (components consumed, target text) for the reply (`status::SYMLINK`).
+    link_stop: Option<(usize, Vec<u8>)>,
     wall_offset: u64,
     next_wall_sync: u64,
 }
@@ -180,6 +182,40 @@ impl Server {
             sys::handle_close(hs[0]);
             let _ = self.core.accounts().close(account);
         }
+    }
+
+    /// Does walking `comps` from `node` meet a symlink? A link in the middle always stops the walk; the last component only if
+    /// `follow_last`. If so the stop is remembered for `send_status` and `true` is returned (USER-VIEW-SPEC section 5: a
+    /// server never follows a link, the client does).
+    fn link_on_path(&mut self, node: NodeId, comps: &[&[u8]], follow_last: bool) -> bool {
+        let mut at = node;
+        for (i, c) in comps.iter().enumerate() {
+            let Ok(id) = self.fs.lookup(at, c) else {
+                return false; // missing: the ordinary error follows
+            };
+            match self.fs.kind(id) {
+                Ok(Kind::Symlink) if i + 1 < comps.len() || follow_last => {
+                    if let Ok(t) = self.fs.read_link(id) {
+                        self.link_stop = Some((i + 1, t));
+                        return true;
+                    }
+                    return false;
+                }
+                Ok(Kind::Dir) => at = id,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// A reply that carries only a status, except that `SYMLINK` carries the stop `link_on_path` remembered.
+    fn send_status(&mut self, key: u64, txid: u32, st: i32) {
+        if st == status::SYMLINK {
+            if let Some((consumed, target)) = self.link_stop.take() {
+                return self.send(key, txid, st, consumed as u64, &target, None);
+            }
+        }
+        self.send(key, txid, st, 0, &[], None);
     }
 
     /// File times: wall time if the clock service gave it, else nanoseconds since boot.
@@ -361,7 +397,7 @@ impl Server {
                     Ok(kind) => self.send(key, txid, 0, u64::from(kind), &[], None),
                     Err(s) => {
                         close_ep(endpoint);
-                        self.send(key, txid, s, 0, &[], None);
+                        self.send_status(key, txid, s);
                     }
                 }
             }
@@ -415,7 +451,7 @@ impl Server {
                     Err(s) => {
                         let _ = self.core.accounts().close(account);
                         close_ep(endpoint);
-                        self.send(key, txid, s, 0, &[], None);
+                        self.send_status(key, txid, s);
                     }
                 }
             }
@@ -504,7 +540,12 @@ impl Server {
                     Ok(node)
                 } else {
                     match file::split_path(req.payload) {
-                        Ok(comps) => self.fs.walk(node, &comps),
+                        Ok(comps) => {
+                            if self.link_on_path(node, &comps, req.flags & flags::NOFOLLOW == 0) {
+                                return self.send_status(key, txid, status::SYMLINK);
+                            }
+                            self.fs.walk(node, &comps)
+                        }
                         Err(_) => return self.send(key, txid, status::BAD_REQUEST, 0, &[], None),
                     }
                 };
@@ -693,6 +734,9 @@ impl Server {
                     return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
                 };
                 let (last, parents) = comps.split_last().expect("a split path is never empty");
+                if self.link_on_path(node, parents, true) {
+                    return self.send_status(key, txid, status::SYMLINK);
+                }
                 let r = self
                     .fs
                     .walk(node, parents)
@@ -708,6 +752,10 @@ impl Server {
                 let Ok(comps) = file::split_path(req.payload) else {
                     return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
                 };
+                // (the link itself is the last component: only links in the middle stop the walk)
+                if self.link_on_path(node, &comps, false) {
+                    return self.send_status(key, txid, status::SYMLINK);
+                }
                 match self
                     .fs
                     .walk(node, &comps)
@@ -763,6 +811,10 @@ impl Server {
         } else {
             let comps = file::split_path(path).map_err(|_| status::BAD_REQUEST)?;
             let (last, parents) = comps.split_last().expect("a split path is never empty");
+            let follow = fl & flags::NOFOLLOW == 0 && fl & flags::EXCLUSIVE == 0;
+            if self.link_on_path(dir, &comps, follow) {
+                return Err(status::SYMLINK);
+            }
             let parent = self.fs.walk(dir, parents).map_err(|e| fstat(e, 0))?;
             match self.fs.lookup(parent, last) {
                 Ok(id) => {
@@ -895,6 +947,7 @@ pub fn app_main() -> i32 {
         core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         dirty_since: None,
         clock,
+        link_stop: None,
         wall_offset: 0,
         next_wall_sync: 0,
         base: ROOT,

@@ -31,7 +31,10 @@ pub mod flags {
     pub const EXCLUSIVE: u16 = 2;
     pub const TRUNCATE: u16 = 4;
     pub const DIRECTORY: u16 = 8;
-    pub const ALL: u16 = 15;
+    /// Do not follow a symlink that is the last component of the path (`OPEN`, `STAT`): act on the link itself (`lstat`,
+    /// `O_NOFOLLOW`). Symlinks in the middle of a path are never followed by a server (see `status::SYMLINK`).
+    pub const NOFOLLOW: u16 = 16;
+    pub const ALL: u16 = 31;
 }
 
 /// Operations.
@@ -143,6 +146,11 @@ pub mod status {
     pub const BAD_TARGET: i32 = -113;
     /// The storage under the server failed or a block did not verify (a damaged volume): never retried by the server.
     pub const IO_ERROR: i32 = -114;
+    /// A walk met a symlink: the reply's `a` is how many components of the path were consumed (the link included) and its
+    /// payload is the link's target text. The client resolves the target lexically from the link's own directory and tries
+    /// again (`pathres`, USER-VIEW-SPEC section 5): a server never follows a link. Given for `OPEN`, `STAT`, `SYMLINK` and
+    /// `READLINK` paths; the final component is reported only by `OPEN` and `STAT` without `NOFOLLOW`.
+    pub const SYMLINK: i32 = -115;
 }
 
 /// A request, borrowing its payload.

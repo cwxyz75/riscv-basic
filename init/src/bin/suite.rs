@@ -8621,6 +8621,158 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     Ok(())
 }
 
+/// Symlinks are followed by the client, never by a server (USER-VIEW-SPEC section 5, step UV1): `fsd` stops a walk at a link and
+/// says how much of the path it consumed and what the target is; `pathres` resolves the target lexically and tries again.
+fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
+    use rt::fs::Stopped;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let have_disk = match find_blk(res)? {
+        Some(_) => {
+            let me = sys::process_self().a1 as u32;
+            sys::process_unmap(me, MMIO_VA);
+            sys::handle_close(me);
+            true
+        }
+        None => false,
+    };
+    if !have_disk {
+        return Ok(());
+    }
+    let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+    let blk = open_disk(mgr_ch, 1, 1)?;
+    {
+        let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
+        fsfmt::mkfs(&mut dev, FSD_UUID, "links").map_err(|_| msg_at(line!()))?;
+    }
+    let (p, mut root) = spawn_fsd(blk)?;
+    let link = |root: &mut Fs, path: &[u8], target: &[u8]| -> Result<(), Detail> {
+        let (a, payload) = proto::file::encode_symlink(path, target);
+        let r = root
+            .call(pop::SYMLINK, 0, 0, a, 0, &payload, None)
+            .map_err(|e| msg_e(e, line!()))?;
+        ensure_eq!(r.status, 0, "make a link");
+        Ok(())
+    };
+    ensure_eq!(root.mkdir(b"d"), Ok(()), "mkdir");
+    let mut f = root
+        .open(b"d/f", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(f.write(0, b"payload"), Ok(7), "write the target");
+    f.close();
+    link(&mut root, b"d/rel", b"f")?;
+    link(&mut root, b"d/up", b"../d/f")?;
+    link(&mut root, b"dirl", b"d")?;
+    link(&mut root, b"loop1", b"loop2")?;
+    link(&mut root, b"loop2", b"loop1")?;
+    // the server refuses a target that climbs above the connection root, or is absolute (FS-SPEC 9.1)
+    let (a, payload) = proto::file::encode_symlink(b"d/esc", b"../../d/f");
+    let r = root
+        .call(pop::SYMLINK, 0, 0, a, 0, &payload, None)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        r.status,
+        pst::BAD_TARGET,
+        "a link that climbs above the root is refused"
+    );
+    // what a server says when a walk meets a link
+    ensure_eq!(
+        root.open_stop(b"d/rel", 0, prt::READ).err(),
+        Some(Stopped::Link {
+            consumed: 2,
+            target: b"f".to_vec()
+        }),
+        "a final link is reported with the components consumed and its target"
+    );
+    ensure_eq!(
+        root.open_stop(b"dirl/f", 0, prt::READ).err(),
+        Some(Stopped::Link {
+            consumed: 1,
+            target: b"d".to_vec()
+        }),
+        "a link in the middle stops the walk"
+    );
+    ensure!(
+        root.open_stop(b"d/rel", pfl::NOFOLLOW, prt::READ).is_ok(),
+        "NOFOLLOW opens the link itself"
+    );
+    ensure_eq!(
+        root.stat_stop(b"d/rel", pfl::NOFOLLOW)
+            .map(|s| (s.is_dir, s.size)),
+        Ok((false, 1)),
+        "and describes it: a link whose size is its target's length"
+    );
+    ensure_eq!(
+        code(root.open(b"d/../d/f", 0, prt::READ)),
+        Some(pst::BAD_REQUEST),
+        "the server still refuses a raw `..`"
+    );
+    // the client follows
+    let table = pathres::Table {
+        mounts: vec![(vec![], root.ch)],
+        cwd: Some(vec![b"d".to_vec()]),
+        cwd_handle: None,
+    };
+    let read_via = |path: &[u8]| -> Result<Vec<u8>, Detail> {
+        let mut view = Fs::new(root.ch);
+        let (mut file, _) = pathres::open_following(&table, path, |_, rel| {
+            view.open_stop(rel, 0, prt::READ).map_err(|e| match e {
+                Stopped::Link { consumed, target } => pathres::Stop::Symlink { consumed, target },
+                Stopped::Status(s) => pathres::Stop::Status(s),
+            })
+        })
+        .map_err(|e| {
+            let mut d = Detail::new();
+            let _ = core::fmt::Write::write_fmt(&mut d, format_args!("follow {path:?}: {e:?}"));
+            d
+        })?;
+        let data = file.read_all().map_err(|e| msg_e(e, line!()))?;
+        file.close();
+        Ok(data)
+    };
+    ensure_eq!(
+        read_via(b"/d/rel")?,
+        b"payload".to_vec(),
+        "a link in the same directory"
+    );
+    ensure_eq!(
+        read_via(b"/d/up")?,
+        b"payload".to_vec(),
+        "a link with `..` resolves from the link's own directory"
+    );
+    ensure_eq!(
+        read_via(b"/dirl/f")?,
+        b"payload".to_vec(),
+        "a link to a directory in the middle of a path"
+    );
+    ensure_eq!(
+        read_via(b"rel")?,
+        b"payload".to_vec(),
+        "relative to the cwd"
+    );
+    ensure_eq!(
+        read_via(b"../dirl/rel")?,
+        b"payload".to_vec(),
+        "`..` from the cwd, then two links"
+    );
+    ensure_eq!(
+        read_via(b"/../../d/f")?,
+        b"payload".to_vec(),
+        "`..` above the root stays at the root"
+    );
+    ensure!(read_via(b"/loop1").is_err(), "a loop of links ends");
+    root.close();
+    wait_ended(p, 5000).ok();
+    sys::handle_close(p);
+    sys::debug_write(b"fs: symlinks are followed by the client\n");
+    sys::handle_close(mgr_ch);
+    wait_ended(mgr, 3000)?;
+    sys::handle_close(mgr);
+    job_use_settles(mj, 0, 0, 3000)?;
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -11102,6 +11254,10 @@ pub fn app_main() -> i32 {
         (
             "volmgr_serves_volumes_by_the_table",
             volmgr_serves_volumes_by_the_table,
+        ),
+        (
+            "symlinks_are_followed_by_the_client_not_the_server",
+            symlinks_are_followed_by_the_client_not_the_server,
         ),
         (
             "threads_left_behind_when_init_exits",

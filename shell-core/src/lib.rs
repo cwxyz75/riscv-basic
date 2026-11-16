@@ -114,9 +114,10 @@ pub fn parse(line: &[u8]) -> Result<Vec<Stage>, ParseError> {
 }
 
 /// Resolve `arg` against the lexical working directory `cwd` (an absolute path without a
-/// trailing slash, `/` for the root). Returns the new absolute path, or `None` when `..` would
-/// climb above `/`. `.` and empty components are ignored; the result has no trailing slash.
-pub fn resolve(cwd: &[u8], arg: &[u8]) -> Option<Vec<u8>> {
+/// trailing slash, `/` for the root). Returns the new absolute path; `..` is resolved lexically and **clamped at the root**
+/// (`/..` is `/`: the chroot rule, USER-VIEW-SPEC section 5). `.` and empty components are ignored; the result has no
+/// trailing slash.
+pub fn resolve(cwd: &[u8], arg: &[u8]) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = Vec::new();
     if arg.first() != Some(&b'/') {
         for c in cwd.split(|&b| b == b'/') {
@@ -129,20 +130,20 @@ pub fn resolve(cwd: &[u8], arg: &[u8]) -> Option<Vec<u8>> {
         match c {
             b"" | b"." => {}
             b".." => {
-                parts.pop()?;
+                parts.pop(); // (at the root: stays there)
             }
             _ => parts.push(c),
         }
     }
     if parts.is_empty() {
-        return Some(alloc::vec![b'/']);
+        return alloc::vec![b'/'];
     }
     let mut out = Vec::new();
     for p in parts {
         out.push(b'/');
         out.extend_from_slice(p);
     }
-    Some(out)
+    out
 }
 
 /// A command name the shell will look up in `/bin`: non-empty, no `/`.
@@ -263,7 +264,7 @@ mod tests {
     }
 
     fn r(cwd: &str, arg: &str) -> Option<String> {
-        resolve(cwd.as_bytes(), arg.as_bytes()).map(|v| String::from_utf8(v).unwrap())
+        Some(String::from_utf8(resolve(cwd.as_bytes(), arg.as_bytes())).unwrap())
     }
 
     #[test]
@@ -278,10 +279,12 @@ mod tests {
         assert_eq!(r("/home", "/"), Some("/".into()));
         assert_eq!(r("/home", "//a//b"), Some("/a/b".into()));
         assert_eq!(r("/home", ""), Some("/home".into()));
-        assert_eq!(r("/", ".."), None);
-        assert_eq!(r("/home", "../.."), None);
-        assert_eq!(r("/home", "/.."), None);
-        assert_eq!(r("/", "a/../.."), None);
+        // `..` above the root stays at the root (the chroot rule)
+        assert_eq!(r("/", ".."), Some("/".into()));
+        assert_eq!(r("/home", "../.."), Some("/".into()));
+        assert_eq!(r("/home", "/.."), Some("/".into()));
+        assert_eq!(r("/", "a/../.."), Some("/".into()));
+        assert_eq!(r("/home", "../../x"), Some("/x".into()));
     }
 
     #[test]

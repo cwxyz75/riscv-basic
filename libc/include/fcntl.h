@@ -6,6 +6,8 @@
 #define O_CREAT 0x40
 #define O_EXCL 0x80
 #define O_TRUNC 0x200
+#define O_DIRECTORY 0x10000
+#define AT_FDCWD (-100)
 #define O_APPEND 0x400
 #define O_NONBLOCK 04000
 #define O_CLOEXEC 02000000
@@ -16,4 +18,5 @@
 #define FD_CLOEXEC 1
 int fcntl(int fd, int cmd, ...);
 int open(const char *path, int flags, ...);
+int openat(int dirfd, const char *path, int flags, ...);
 #endif
