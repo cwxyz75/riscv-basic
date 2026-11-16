@@ -742,7 +742,31 @@ fn start_stack(
             return Err(35);
         }
     };
+    // `/tmp`: a writable connection for the shell, which makes each program a private directory in it (UV2)
+    let tmp_conn = root.open(
+        b"tmp",
+        proto::file::flags::DIRECTORY,
+        proto::file::rights::READ
+            | proto::file::rights::WRITE
+            | proto::file::rights::CREATE
+            | proto::file::rights::ENUMERATE,
+    );
     root.close();
+    // `/dev`: the device directory server, one connection for the shell (best effort)
+    let dev_conn = (|| -> Option<rt::fs::Fs> {
+        let (dev_mine, dev_theirs) = chan().ok()?;
+        start(b"devd", alloc::vec![(Role::ServiceFs, 0)], &[dev_theirs]).ok()?;
+        let mut d = rt::fs::Fs::new(dev_mine);
+        let c = d
+            .clone_conn(
+                proto::file::rights::READ
+                    | proto::file::rights::WRITE
+                    | proto::file::rights::ENUMERATE,
+            )
+            .ok();
+        d.close();
+        c
+    })();
     // the console server: the serial line, the terminal socket, the control channel
     let tty = sys::socket_create();
     if tty.status != 0 {
@@ -842,8 +866,16 @@ fn start_stack(
     ];
     let mut sh_handles = alloc::vec![tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh];
     if let Some(r) = sh_registry {
-        sh_roles.push((Role::ServiceRegistry, 5));
+        sh_roles.push((Role::ServiceRegistry, sh_handles.len() as u32));
         sh_handles.push(r.ch);
+    }
+    if let Ok(t) = tmp_conn {
+        sh_roles.push((Role::TmpDir, sh_handles.len() as u32));
+        sh_handles.push(t.ch);
+    }
+    if let Some(d) = dev_conn {
+        sh_roles.push((Role::DevDir, sh_handles.len() as u32));
+        sh_handles.push(d.ch);
     }
     let sh = start(b"sh", sh_roles, &sh_handles)?;
     Ok(Stack {

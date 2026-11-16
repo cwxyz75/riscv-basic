@@ -76,6 +76,10 @@ pub enum Role {
     ServiceListener = 32,
     /// A second listener (the same volume under another name).
     ServiceListenerAlt = 33,
+    /// A writable connection to the directory the shell makes each program's private `/tmp` in (UV2).
+    TmpDir = 34,
+    /// A connection to the `/dev` server's root (UV2).
+    DevDir = 35,
 }
 
 impl Role {
@@ -114,6 +118,8 @@ impl Role {
             31 => Role::BlockDevice,
             32 => Role::ServiceListener,
             33 => Role::ServiceListenerAlt,
+            34 => Role::TmpDir,
+            35 => Role::DevDir,
             _ => return None,
         })
     }

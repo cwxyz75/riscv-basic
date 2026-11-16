@@ -4714,13 +4714,64 @@ fn memfsd_serves_the_boot_image() -> Outcome {
         names(&top),
         vec![
             b"bin".to_vec(),
+            b"dev".to_vec(),
             b"etc".to_vec(),
             b"home".to_vec(),
-            b"tmp".to_vec()
+            b"include".to_vec(),
+            b"lib".to_vec(),
+            b"mnt".to_vec(),
+            b"share".to_vec(),
+            b"svc".to_vec(),
+            b"tmp".to_vec(),
+            b"usr".to_vec()
         ],
-        "the top level"
+        "the top level: the skeleton"
     );
-    ensure!(top[0].is_dir && top[3].is_dir, "they are directories");
+    ensure!(top.iter().all(|e| e.is_dir), "they are directories");
+    // `/usr` is a real directory of compatibility links to the real ones, which a client follows (UV1)
+    let mut usr = root
+        .open(b"usr", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&usr.read_dir().map_err(|e| msg_e(e, line!()))?),
+        vec![
+            b"bin".to_vec(),
+            b"include".to_vec(),
+            b"lib".to_vec(),
+            b"share".to_vec()
+        ],
+        "what /usr holds"
+    );
+    usr.close();
+    ensure_eq!(
+        root.open_stop(b"usr/bin/hello", 0, prt::READ).err(),
+        Some(rt::fs::Stopped::Link {
+            consumed: 2,
+            target: b"../bin".to_vec()
+        }),
+        "/usr/bin is a link to ../bin"
+    );
+    let table = pathres::Table {
+        mounts: vec![(vec![], root.ch)],
+        cwd: None,
+        cwd_handle: None,
+    };
+    let mut view = Fs::new(root.ch);
+    let (mut prog, _) = pathres::open_following(&table, b"/usr/bin/hello", |_, rel| {
+        view.open_stop(rel, 0, prt::READ).map_err(|e| match e {
+            rt::fs::Stopped::Link { consumed, target } => {
+                pathres::Stop::Symlink { consumed, target }
+            }
+            rt::fs::Stopped::Status(s) => pathres::Stop::Status(s),
+        })
+    })
+    .map_err(|_| msg_at(line!()))?;
+    ensure_eq!(
+        prog.read(0, 4),
+        Ok(b"\x7fELF".to_vec()),
+        "a program read through /usr/bin"
+    );
+    prog.close();
     let mut bin = root
         .open(b"bin", pfl::DIRECTORY, RO_DIR)
         .map_err(|e| msg_e(e, line!()))?;
@@ -4736,6 +4787,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"consoled".to_vec(),
             b"crash".to_vec(),
             b"ctest".to_vec(),
+            b"devd".to_vec(),
             b"devmgr".to_vec(),
             b"dhcpc".to_vec(),
             b"echo".to_vec(),
@@ -8773,6 +8825,69 @@ fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
     Ok(())
 }
 
+/// `/dev` (USER-VIEW-SPEC section 8, UV2): `null` and `zero` are files that behave like their Unix namesakes, and nothing can
+/// be created in the directory.
+fn devd_serves_null_and_zero() -> Outcome {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/devd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"devd".to_vec()],
+        roles: vec![(Role::ServiceFs, 0)],
+        ..Startup::default()
+    };
+    let p = rt::spawn::spawn(&image, &s.encode().map_err(|_| msg_at(line!()))?, &[theirs])
+        .map_err(|_| msg_at(line!()))?;
+    let mut root = Fs::new(mine);
+    let list = root.read_dir().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&list),
+        vec![b"null".to_vec(), b"zero".to_vec()],
+        "the directory (no random service: no urandom)"
+    );
+    let mut null = root
+        .open(b"null", 0, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(null.write(0, b"gone"), Ok(4), "a write to null is accepted");
+    ensure_eq!(
+        null.read(0, 100),
+        Ok(vec![]),
+        "a read of null is the end at once"
+    );
+    ensure_eq!(null.size(), Ok(0), "its size is zero");
+    null.close();
+    let mut zero = root
+        .open(b"zero", 0, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        zero.read(0, 5000),
+        Ok(vec![0u8; 5000]),
+        "a read of zero is zeros"
+    );
+    ensure_eq!(zero.write(0, b"x"), Ok(1), "and a write is accepted");
+    zero.close();
+    ensure_eq!(
+        code(root.open(b"new", pfl::CREATE, prt::READ | prt::WRITE)),
+        Some(DENIED),
+        "nothing can be created in /dev"
+    );
+    ensure_eq!(
+        code(root.open(b"nope", 0, prt::READ)),
+        Some(pst::NOT_FOUND),
+        "an unknown device"
+    );
+    ensure_eq!(
+        code(root.mkdir(b"d")),
+        Some(pst::BAD_REQUEST),
+        "no directories"
+    );
+    root.close();
+    wait_ended(p, 3000)?;
+    sys::handle_close(p);
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -11255,6 +11370,7 @@ pub fn app_main() -> i32 {
             "volmgr_serves_volumes_by_the_table",
             volmgr_serves_volumes_by_the_table,
         ),
+        ("devd_serves_null_and_zero", devd_serves_null_and_zero),
         (
             "symlinks_are_followed_by_the_client_not_the_server",
             symlinks_are_followed_by_the_client_not_the_server,

@@ -50,6 +50,13 @@ struct Shell {
     trusted: Vec<Trust>,
     /// A read connection to the service registry (volumes are opened as `vol-<name>`), if the session has one.
     registry: Option<Fs>,
+    /// A writable connection to `/tmp`, where each program gets a private directory for the length of its run, and a
+    /// connection to the `/dev` server (UV2).
+    tmp: Option<Fs>,
+    dev: Option<Fs>,
+    jobs: u32,
+    /// The private directories made for the foreground job, removed when it ends.
+    tmps: Vec<Vec<u8>>,
     txid: u32,
     inbuf: Vec<u8>,
 }
@@ -101,6 +108,26 @@ fn parse_trust(line: &[u8]) -> Option<Trust> {
         });
     }
     Some(Trust { name, grants })
+}
+
+/// Remove the directory `name` of `parent` and everything below it (a dead program's scratch space).
+fn remove_tree(parent: &mut Fs, name: &[u8], depth: u32) {
+    if depth < 16 {
+        let want = rights::READ | rights::WRITE | rights::CREATE | rights::ENUMERATE;
+        if let Ok(mut d) = parent.open(name, flags::DIRECTORY, want) {
+            if let Ok(list) = d.read_dir() {
+                for e in list {
+                    if e.is_dir {
+                        remove_tree(&mut d, &e.name, depth + 1);
+                    } else {
+                        let _ = d.unlink(&e.name);
+                    }
+                }
+            }
+            d.close();
+        }
+    }
+    let _ = parent.unlink(name);
 }
 
 fn say(tty: u32, bytes: &[u8]) {
@@ -364,6 +391,39 @@ impl Shell {
             }
             None => {}
         }
+        // `/dev` for everyone, and a private `/tmp` for the length of this run (USER-VIEW-SPEC section 7): a fresh directory
+        // only this program holds a connection to, removed when the job ends
+        if let Some(d) = self.dev.as_mut() {
+            if let Ok(c) = d.clone_conn(rights::READ | rights::WRITE | rights::ENUMERATE) {
+                startup
+                    .namespace
+                    .push((b"/dev".to_vec(), forward.len() as u32));
+                forward.push(c.ch);
+            }
+        }
+        if self.tmp.is_some() {
+            self.jobs += 1;
+            let name = format!("j{}", self.jobs).into_bytes();
+            let opened = self.tmp.as_mut().and_then(|t| {
+                t.mkdir(&name).ok()?;
+                let c = t.open(
+                    &name,
+                    flags::DIRECTORY,
+                    rights::READ | rights::WRITE | rights::CREATE | rights::ENUMERATE,
+                );
+                if c.is_err() {
+                    let _ = t.unlink(&name);
+                }
+                c.ok()
+            });
+            if let Some(c) = opened {
+                startup
+                    .namespace
+                    .push((b"/tmp".to_vec(), forward.len() as u32));
+                forward.push(c.ch);
+                self.tmps.push(name);
+            }
+        }
         // the volumes this program is granted, opened now from the registry (retrying while the volume manager brings a
         // restarted volume server back)
         if let Some(t) = trust {
@@ -400,6 +460,16 @@ impl Shell {
             Err(e) => {
                 close_all(&forward);
                 Err(format!("sh: {shown}: could not start ({e})\n"))
+            }
+        }
+    }
+
+    /// Remove the private `/tmp` directories of the job that just ended.
+    fn cleanup_tmps(&mut self) {
+        let names: Vec<Vec<u8>> = core::mem::take(&mut self.tmps);
+        if let Some(t) = self.tmp.as_mut() {
+            for n in names {
+                remove_tree(t, &n, 0);
             }
         }
     }
@@ -617,6 +687,7 @@ impl Shell {
         }
         // (a stage that names no program is reported by `spawn_stage`; stages are checked there)
         self.run_pipeline(&stages);
+        self.cleanup_tmps();
         None
     }
 }
@@ -651,6 +722,10 @@ pub fn app_main() -> i32 {
         init_ch,
         trusted: Vec::new(),
         registry: env.handle(Role::ServiceRegistry).map(Fs::new),
+        tmp: env.handle(Role::TmpDir).map(Fs::new),
+        dev: env.handle(Role::DevDir).map(Fs::new),
+        jobs: 0,
+        tmps: Vec::new(),
         txid: 0,
         inbuf: Vec::new(),
     };
