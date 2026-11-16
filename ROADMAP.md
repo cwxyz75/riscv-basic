@@ -678,12 +678,19 @@ own small PR, and the lock-peel tasks also get a soak run (`make soak`), at `-sm
 
 ### F: doofs, the disk filesystem (draft spec in `FS-SPEC.md`; not started; after S9)
 
-Acceptance: the eight checks in `FS-SPEC.md` section 9 (tree model, exhaustive crash testing, `memfs` differential, corruption,
-independent `fsck`, full volume, QEMU restart, confinement). Steps 0 to 6 are listed there; step 0 (attributes, indexes and
-queries in `memfs`) is S10's first bullet moved ahead.
+Acceptance: the thirteen checks in `FS-SPEC.md` section 11 (tree model, exhaustive crash testing, `memfs` differential, corruption,
+independent `fsck`, full volume, QEMU restart, confinement, symlinks, discovery with nothing compiled in, restart, hostile
+superblock, clock). Steps are in `FS-SPEC.md` section 8: step 0 (attributes, indexes and `query` in `memfs`, S10's first bullet
+moved ahead), C1 (the wall clock, slice C), 1 to 4 (host only: tree, format, semantics, crash harness), 5a to 5f (the QEMU side:
+`proto::blk` discard and device info, SD step 4 narrowed, `fsd`, `volmgr`, the mount table, the boot test) and 6 (attributes on
+disk, independent Fable review). The mount table is data, not a kernel object: a volume is published as `/svc/vol/<label>`
+and granted to a program at a prefix by `/etc/mounts`.
 
 - [ ] Step 0: attributes, indexes and `query` in `memfs` and `proto::file`
-- [ ] Steps 1 to 6 as in `FS-SPEC.md` section 6
+- [ ] Step C1: wall clock service `clockd` (`/svc/clock`), RTC through `devmgr`, `clockmodel`
+- [ ] Steps 1 to 4: `fsfmt`, `mkfs`/`fsck`/`dump.doofs`, differential, crash harness
+- [ ] Steps 5a to 5f: discard and device info, SD step 4 (narrowed), `fsd`, `volmgr`, `/etc/mounts`, QEMU boot test
+- [ ] Step 6: attributes and queries on disk; review
 
 ### S10: Namespaces and attributes
 

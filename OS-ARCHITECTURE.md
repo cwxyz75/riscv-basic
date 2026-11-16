@@ -819,7 +819,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
   trusted programs listed in a config file get broader namespaces.
 - **Q9: Quotas and resource accounting:** how far to take job limits.
 - **Q10: Capability revocation:** accept proxy-based revocation, or design more.
-- **Q11: Entropy and time:** virtio-rng and a wall clock source.
+- **Q11: Entropy and time:** entropy is resolved (virtio-rng, `rngd`, OD108). The wall clock is proposed in `FS-SPEC.md` section 7: a `clockd` service over a real-time clock claimed through `devmgr`, kernel time stays monotonic (OD91); not decided until the owner accepts the spec.
 - **Q12: A name** for the OS.
 
 ---
