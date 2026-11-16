@@ -35,6 +35,11 @@ pub struct Sched2<N: Class> {
     /// Harts that are part of the scheduler: only they are chosen to run or hold threads (a hart that has not joined
     /// yet is skipped by placement and by push). Every hart starts online; the kernel clears the others until they join.
     online: Vec<bool>,
+    /// `transit[h]`: the thread hart `h` has just been told to stop running and has queued (preempted, rotated, yielded) but
+    /// whose context the kernel has not finished saving. It is not available to any other hart (no pull, no balance, no
+    /// push) until `switched(h)`: the spec's "the switch completes under the lock" (3.7), for kernels whose lock is not held
+    /// across the switch.
+    transit: Vec<Option<Tid>>,
     pokes: u32,
     /// How many threads were pulled from another hart (a counter for tests and the kernel's statistics).
     pub pulls: u64,
@@ -58,6 +63,7 @@ impl<N: Class> Sched2<N> {
             next_tid: 1,
             pending: alloc::vec![false; harts],
             online: alloc::vec![true; harts],
+            transit: alloc::vec![None; harts],
             pokes: 0,
             pulls: 0,
             settles: 0,
@@ -173,6 +179,34 @@ impl<N: Class> Sched2<N> {
         }
     }
 
+    fn is_in_transit(&self, t: Tid) -> bool {
+        self.transit.contains(&Some(t))
+    }
+
+    /// The thread hart `h` has switched away from but whose context is not yet saved, if any.
+    pub fn in_transit(&self, hart: usize) -> Option<Tid> {
+        self.transit[hart]
+    }
+
+    /// Hart `h`'s context switch is complete (called by the thread that resumes on `h`, or by a new thread starting there,
+    /// or by `h` when it decided not to switch after all): the thread it left is now available to every hart. Marks owed
+    /// for it (it may belong on a lower hart) are set; the caller sends the pokes.
+    pub fn switched(&mut self, h: usize) {
+        if let Some(t) = self.transit[h].take() {
+            self.push_marks(t, h);
+        }
+    }
+
+    /// After an operation on hart `h` that may have changed what it runs: if its previous thread is now queued (it is
+    /// still executing, as the caller has not switched yet), record that it is in transit.
+    fn note_transit(&mut self, h: usize, before: Tid) {
+        if Some(before) != self.harts[h].current()
+            && self.harts[h].state(before) == Some(State::Runnable)
+        {
+            self.transit[h] = Some(before);
+        }
+    }
+
     /// Mark `x` for a reschedule (one poke owed to whoever turns the mark on).
     fn mark(&mut self, x: usize) {
         // (a hart that is not in the scheduler is never marked: it looks at its queues when it joins, 3.9)
@@ -196,7 +230,7 @@ impl<N: Class> Sched2<N> {
         let Some(rec) = self.harts[g].record(tid) else {
             return false;
         };
-        if rec.state != State::Runnable {
+        if rec.state != State::Runnable || self.is_in_transit(tid) {
             return false;
         }
         let eff = rec.eff;
@@ -235,7 +269,9 @@ impl<N: Class> Sched2<N> {
                 .max(self.harts[h].queued_top().unwrap_or(0));
             let found = {
                 let src = &self.harts[g];
-                src.queued_top_where(&|t| src.record(t).is_some_and(|r| allowed(r, h)))
+                src.queued_top_where(&|t| {
+                    src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+                })
             };
             let Some((tid, p)) = found else { continue };
             if p <= mine || !self.harts[h].would_run(p) {
@@ -257,6 +293,7 @@ impl<N: Class> Sched2<N> {
     fn settle(&mut self, h: usize) {
         self.settles += 1;
         self.pending[h] = false;
+        let entry_cur = self.harts[h].current();
         loop {
             let pulled = self.pull(h);
             if !self.harts[h].wants_resched() {
@@ -275,6 +312,9 @@ impl<N: Class> Sched2<N> {
                 }
             }
         }
+        if let Some(b) = entry_cur {
+            self.note_transit(h, b);
+        }
         // whatever is still queued here may belong on a hart running something lower: for each other hart, the best queued
         // thread here that may run there (O(harts), not O(threads))
         self.push_queue(h);
@@ -286,9 +326,12 @@ impl<N: Class> Sched2<N> {
         let (top, free) = {
             let src = &self.harts[g];
             (
-                src.queued_top_where(&|_| true).map(|(t, _)| t),
-                src.queued_top_where(&|t| src.record(t).is_some_and(|r| r.affinity.is_none()))
+                src.queued_top_where(&|t| !self.is_in_transit(t))
                     .map(|(t, _)| t),
+                src.queued_top_where(&|t| {
+                    !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.affinity.is_none())
+                })
+                .map(|(t, _)| t),
             )
         };
         for t in [top, free].into_iter().flatten() {
@@ -429,7 +472,7 @@ impl<N: Class> Sched2<N> {
         let cur = self.harts[hart].current();
         self.harts[hart].yield_now()?;
         if let Some(c) = cur {
-            self.push_marks(c, hart);
+            self.note_transit(hart, c);
         }
         self.settle(hart);
         Ok(())
@@ -469,7 +512,11 @@ impl<N: Class> Sched2<N> {
 
     /// Hart `hart`'s tick: the clock moves to `now`, its due timers fire, the running thread is accounted.
     pub fn tick_on(&mut self, hart: usize, now: Time) {
+        let before = self.harts[hart].current();
         self.harts[hart].tick_to(now);
+        if let Some(b) = before {
+            self.note_transit(hart, b);
+        }
         self.settle(hart);
         self.balance(hart);
     }
@@ -490,7 +537,9 @@ impl<N: Class> Sched2<N> {
         let cur = self.view_cur(h);
         let found = {
             let src = &self.harts[g];
-            src.queued_top_where(&|t| src.record(t).is_some_and(|r| allowed(r, h)))
+            src.queued_top_where(&|t| {
+                src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+            })
         };
         let Some((tid, p)) = found else { return };
         if p < cur {
@@ -539,6 +588,15 @@ impl<N: Class> Sched2<N> {
         if seen != self.loc.len() {
             return Err(alloc::format!("{seen} records, {} located", self.loc.len()));
         }
+        for (h, t) in self.transit.iter().enumerate() {
+            if let Some(t) = *t {
+                if self.loc.get(&t) != Some(&h) || self.harts[h].state(t) != Some(State::Runnable) {
+                    return Err(alloc::format!(
+                        "thread {t} in transit on hart {h} is not queued there"
+                    ));
+                }
+            }
+        }
         if !quiescent {
             return Ok(());
         }
@@ -561,6 +619,10 @@ impl<N: Class> Sched2<N> {
                 continue;
             }
             for &(g, t, eff, aff) in &queued {
+                // (a thread in transit is deliberately unavailable until its hart's switch completes)
+                if self.is_in_transit(t) {
+                    continue;
+                }
                 if aff.is_none_or(|a| a as usize == x) && self.harts[x].would_run(eff) {
                     return Err(alloc::format!(
                         "GP1: hart {x} runs priority {} while thread {t} (priority {eff}) waits on hart {g}",

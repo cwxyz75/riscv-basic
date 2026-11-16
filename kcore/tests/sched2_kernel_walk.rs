@@ -50,12 +50,37 @@ struct World<N: Class> {
     harts: usize,
     joined: Vec<bool>,
     rr: bool,
+    /// Marks set by `finish` since the last poke check (it checked them itself; the operation's check must not count them
+    /// as its own).
+    carry: Vec<bool>,
 }
 
 impl<N: Class> World<N> {
     fn cur(&self, h: usize) -> Option<Tid> {
         let c = self.s.current_on(h);
         (c != self.s.idle(h)).then_some(c)
+    }
+
+    /// Hart `h` finishes the context switch it was in the middle of: what every kernel path does before the hart does
+    /// anything else. The thread it left becomes available to the other harts, and the marks owed for it are poked.
+    fn finish(&mut self, h: usize) {
+        if self.s.in_transit(h).is_some() {
+            let before = self.pending();
+            let _ = self.s.take_pokes();
+            self.s.switched(h);
+            let pokes = self.s.take_pokes();
+            for x in 0..self.harts {
+                let new_mark = self.s.resched_pending(x) && !before[x];
+                if new_mark {
+                    self.carry[x] = true;
+                }
+                assert_eq!(
+                    pokes & (1 << x) != 0,
+                    new_mark,
+                    "finishing hart {h}'s switch: marks and pokes disagree for hart {x}"
+                );
+            }
+        }
     }
 
     fn pending(&self) -> Vec<bool> {
@@ -68,17 +93,24 @@ impl<N: Class> World<N> {
         for h in 0..self.harts {
             let marked = self.s.resched_pending(h);
             let bit = pokes & (1 << h) != 0;
-            if marked && !before[h] && !bit {
+            if marked && !before[h] && !self.carry[h] && !bit {
                 panic!(
                     "seed {seed} step {step} after {what}: hart {h} was marked with no poke owed"
                 );
             }
             if bit && !marked {
-                panic!("seed {seed} step {step} after {what}: a poke owed to hart {h}, which is not marked");
+                panic!(
+                    "seed {seed} step {step} after {what}: a poke owed to hart {h}, which is not marked"
+                );
             }
             if (marked || bit) && !self.joined[h] {
-                panic!("seed {seed} step {step} after {what}: hart {h} is marked or poked while offline");
+                panic!(
+                    "seed {seed} step {step} after {what}: hart {h} is marked or poked while offline"
+                );
             }
+        }
+        for h in 0..self.harts {
+            self.carry[h] = false;
         }
     }
 
@@ -96,6 +128,7 @@ impl<N: Class> World<N> {
                 panic!("seed {seed} step {step} after {what}: marks did not die out in {bound} rounds ({marked:?})");
             }
             let h = marked[r.below(marked.len() as u64) as usize];
+            self.finish(h);
             let before = self.pending();
             self.s.reschedule_on(h);
             self.check_pokes(&before, what, seed, step);
@@ -150,6 +183,9 @@ impl<N: Class> World<N> {
                             self.s.state(tid)
                         ));
                     }
+                    if (0..self.harts).any(|h| self.s.in_transit(h) == Some(tid)) {
+                        continue; // mid-switch: not available to the other harts yet
+                    }
                     for h in 0..self.harts {
                         if !self.joined[h] || r.pin.is_some_and(|p| p != h) {
                             continue;
@@ -183,6 +219,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
         harts,
         joined: (0..harts).map(|h| h == 0).collect(),
         rr,
+        carry: vec![false; harts],
     };
     for h in 1..harts {
         w.s.set_online(h, false);
@@ -214,6 +251,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                 break c;
             }
         };
+        w.finish(caller);
         let before = w.pending();
         let what;
         match r.below(100) {
@@ -224,6 +262,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                     clock[h] = now;
                     w.s.set_online(h, true);
                     w.joined[h] = true;
+                    w.finish(h);
                     w.s.reschedule_on(h);
                 }
                 what = "join";
@@ -252,6 +291,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // block (untimed) the thread on some hart
             25..=38 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     w.s.prepare_block_on(h).unwrap();
                     assert!(w.s.block_on(h).unwrap());
@@ -262,6 +302,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // prepare, then a wake before the block: the notified path: it must not block
             39..=44 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     w.s.prepare_block_on(h).unwrap();
                     assert!(
@@ -297,6 +338,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // yield
             63..=70 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if w.cur(h).is_some() {
                     w.s.yield_on(h).unwrap();
                 }
@@ -305,6 +347,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // exit
             71..=75 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     let runnable = w.t.values().filter(|x| x.state == R::Runnable).count();
                     if runnable > harts + 2 {
@@ -342,6 +385,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                         let lag = if h == 0 { 0 } else { r.below(2) * MS };
                         let t = now.saturating_sub(lag).max(clock[h]);
                         clock[h] = t;
+                        w.finish(h);
                         let before = w.pending();
                         w.s.tick_on(h, t);
                         w.check_pokes(&before, "tick", seed, step);
@@ -749,5 +793,49 @@ fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
         s.tick_on(1, now);
     }
     assert_eq!(s.pulls, pulls, "balanced queues do not churn");
+    s.audit(true).unwrap();
+}
+
+#[test]
+fn a_thread_switched_away_is_not_available_to_other_harts_until_its_switch_completes() {
+    // the race a kernel without a lock across the switch would have: hart 0's tick rotates A out (queued, still executing); an
+    // idle hart 1 must not take A and run it while hart 0 is still saving its context
+    let mut s = Sched2::new(2, FixedPrio::new);
+    let a = s
+        .adopt_current_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            None,
+        )
+        .unwrap();
+    s.set_online(1, false); // (keep hart 1 out of it while the situation is set up)
+    let b = s
+        .spawn_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            Some(0),
+        )
+        .unwrap();
+    s.tick_on(0, 11 * MS); // the slice is over and an equal waits: A is rotated out
+    assert_eq!(s.current_on(0), b);
+    assert_eq!(
+        s.in_transit(0),
+        Some(a),
+        "A is still executing on hart 0, queued but in transit"
+    );
+    s.set_online(1, true);
+    s.reschedule_on(1);
+    assert_eq!(s.current_on(1), s.idle(1), "hart 1 cannot take A yet");
+    assert_eq!(s.home(a), Some(0));
+    s.switched(0);
+    assert_eq!(s.in_transit(0), None);
+    s.reschedule_on(1);
+    assert_eq!(s.current_on(1), a, "now it can");
     s.audit(true).unwrap();
 }

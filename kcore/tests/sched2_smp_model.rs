@@ -62,12 +62,21 @@ impl World {
         (c != self.s.idle(h)).then_some(c)
     }
 
+    /// Hart `h` finishes the context switch it was in the middle of (every kernel path does this before the hart does anything
+    /// else); the thread it left becomes available to the other harts.
+    fn finish(&mut self, h: usize) {
+        if self.s.in_transit(h).is_some() {
+            self.s.switched(h);
+        }
+    }
+
     /// The marked harts look at their queues until nobody is marked (the IPIs of a real kernel).
     fn drain(&mut self) {
         for _ in 0..1000 {
             let mut any = false;
             for h in 0..self.harts {
                 if self.s.resched_pending(h) {
+                    self.finish(h);
                     self.s.reschedule_on(h);
                     any = true;
                 }
@@ -130,6 +139,9 @@ impl World {
                         if st != Some(State::Runnable) {
                             ctx(format!("thread {tid} should wait in a queue, is {st:?}"));
                         }
+                        if (0..self.harts).any(|h| self.s.in_transit(h) == Some(tid)) {
+                            continue; // mid-switch: not available to the other harts yet
+                        }
                         // GP1, recomputed from the reference: every hart that may run it runs at least this priority
                         for h in 0..self.harts {
                             if r.pin.is_none_or(|p| p == h) {
@@ -183,6 +195,7 @@ fn walk(harts: usize, seed: u64, steps: usize) {
     w.check("adopt", seed, 0);
     for step in 1..=steps {
         let caller = r.below(harts as u64) as usize;
+        w.finish(caller);
         let what;
         match r.below(100) {
             // spawn
@@ -216,6 +229,7 @@ fn walk(harts: usize, seed: u64, steps: usize) {
             // block or sleep: the thread running on some hart
             20..=39 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     let timed = r.below(2) == 0;
                     w.s.prepare_block_on(h).unwrap();
@@ -249,6 +263,7 @@ fn walk(harts: usize, seed: u64, steps: usize) {
             // yield
             60..=67 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if w.cur(h).is_some() {
                     w.s.yield_on(h).unwrap();
                 }
@@ -257,6 +272,7 @@ fn walk(harts: usize, seed: u64, steps: usize) {
             // exit (keep a supply of threads: only when several are runnable)
             68..=73 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     if w.live_runnable().len() > harts + 2 {
                         w.s.exit_on(h).unwrap();
@@ -290,6 +306,7 @@ fn walk(harts: usize, seed: u64, steps: usize) {
             _ => {
                 w.now += r.below(25) * MS + MS;
                 for h in 0..harts {
+                    w.finish(h);
                     w.s.tick_on(h, w.now);
                 }
                 let now = w.now;

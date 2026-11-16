@@ -329,7 +329,31 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && !ready);
-    if light {
+    if cause == (1 << 63) | 5 && ready {
+        // The scheduler's tick (SCHED-SMP-SPEC task 12). Its work is done under the scheduler's own lock. A tick that
+        // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
+        // switch threads. A tick that interrupted **user mode** still takes it, as every user-mode trap does: the return
+        // to user mode is where a killed process dies (`activate_current`), which needs the lock until the kill flag is
+        // per thread (TIDY-UP T107).
+        crate::percpu::this()
+            .timer_ticks
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        if from_user {
+            crate::bkl::lock();
+            crate::fp::trap_entry(frame);
+            let _ = crate::thread::timer_tick_fast();
+            crate::thread::switch_if_designated();
+            crate::user::commit_wake();
+            crate::user::activate_current();
+            crate::heap::service();
+            crate::bkl::unlock();
+        } else if crate::thread::timer_tick_fast() {
+            crate::bkl::lock();
+            crate::thread::switch_if_designated();
+            crate::heap::service();
+            crate::bkl::unlock();
+        }
+    } else if light {
         trap_body(frame);
     } else {
         crate::bkl::lock();
@@ -358,13 +382,19 @@ fn trap_body(frame: &mut TrapFrame) {
         // Supervisor software interrupt: an IPI.
         let reasons = crate::smp::ipi_interrupt();
         if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
-            crate::bkl::lock();
-            crate::fp::trap_entry(frame);
-            crate::thread::reschedule_this_hart();
             if frame.sstatus & (1 << 8) == 0 {
+                // interrupted user mode: the full path (the return to user mode is where a killed process dies)
+                crate::bkl::lock();
+                crate::fp::trap_entry(frame);
+                crate::thread::reschedule_this_hart();
                 crate::user::activate_current();
+                crate::bkl::unlock();
+            } else if crate::thread::reschedule_fast() {
+                // interrupted kernel code and the hart must switch: only now the big kernel lock
+                crate::bkl::lock();
+                crate::thread::switch_if_designated();
+                crate::bkl::unlock();
             }
-            crate::bkl::unlock();
         }
         return;
     }
@@ -386,19 +416,6 @@ fn trap_body(frame: &mut TrapFrame) {
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         crate::timer::next_tick();
-        return;
-    }
-    if cause == (1 << 63) | 5 {
-        // Supervisor timer interrupt: the scheduler's tick (and preemption).
-        crate::percpu::this()
-            .timer_ticks
-            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        crate::thread::timer_interrupt();
-        if frame.sstatus & (1 << 8) == 0 {
-            // Interrupted user code: other threads may have run (under their own address
-            // space) before we got the CPU back.
-            crate::user::activate_current();
-        }
         return;
     }
     if frame.sstatus & (1 << 8) == 0 {

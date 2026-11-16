@@ -140,10 +140,20 @@ pub fn lock() {
     if !LOCK.held_by(me) {
         note_acquire(Class::Legacy);
     }
+    let outermost = !LOCK.held_by(me);
     #[cfg(feature = "latency-trace")]
-    let (outermost_take, asked) = (!LOCK.held_by(me), crate::timer::now());
-    LOCK.lock(me, &percpu::this().bkl_depth, core::hint::spin_loop);
+    let (outermost_take, asked) = (outermost, crate::timer::now());
+    let spins = core::cell::Cell::new(0u64);
+    LOCK.lock(me, &percpu::this().bkl_depth, || {
+        core::hint::spin_loop();
+        let mut n = spins.get();
+        spin_watchdog(&mut n, "the big kernel lock");
+        spins.set(n);
+    });
     OWNER.store(me as usize + 1, Ordering::Relaxed);
+    if outermost {
+        percpu::this().bkl_takes.fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(feature = "latency-trace")]
     if outermost_take {
         crate::latency::bkl_acquired(crate::timer::now().saturating_sub(asked));
@@ -191,6 +201,23 @@ pub fn swap_depth(incoming: u32) -> u32 {
     LOCK.swap_depth(me, &percpu::this().bkl_depth, incoming)
 }
 
+/// A debug-build deadlock detector: a hart that has spun this long for one lock is stuck, not waiting (a lock is held for
+/// microseconds). It panics with who owns the big lock, so a hang becomes a diagnosable failure.
+fn spin_watchdog(spins: &mut u64, what: &str) {
+    if cfg!(debug_assertions) {
+        *spins += 1;
+        if *spins == 30_000_000 {
+            *spins = 0;
+            panic!(
+                "hart {} has spun for {what} (last class asked for: {}) for 30 million iterations; the big kernel lock is owned by hart+1 = {}",
+                who(),
+                percpu::this().last_class.load(Ordering::Relaxed),
+                OWNER.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
 /// Is the BKL free (nobody holds it)? For tests, from any hart.
 pub fn is_free() -> bool {
     LOCK.is_free()
@@ -211,8 +238,14 @@ impl klock::Machine for Machine {
     }
     fn relax() {
         core::hint::spin_loop();
+        let mut n = percpu::this().spins.load(Ordering::Relaxed);
+        spin_watchdog(&mut n, "a spin lock");
+        percpu::this().spins.store(n, Ordering::Relaxed);
     }
     fn acquired(class: Class, _instance: u32) {
+        percpu::this()
+            .last_class
+            .store(class as u32, Ordering::Relaxed);
         note_acquire(class);
     }
     fn released(class: Class, _instance: u32) {

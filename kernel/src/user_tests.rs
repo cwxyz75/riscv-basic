@@ -120,6 +120,38 @@ fn bkl_is_released() -> Outcome {
     probe("idle")
 }
 
+/// SCHED-SMP-SPEC task 12, acceptance: a hart whose only events are its timer ticks does not take the big kernel lock for
+/// them. Hart 1 is idle while this thread sleeps on hart 0 (the sleep takes the lock, on hart 0); hart 1's count of
+/// big-lock takes must hardly move over 80 ticks (it took one per tick when every trap took the lock).
+fn idle_harts_take_no_big_lock_for_their_ticks() -> Outcome {
+    use crate::smp;
+    if smp::started() < 2 {
+        return Ok(());
+    }
+    thread::sleep_ticks(20); // let the previous test's work on hart 1 drain
+    let before = thread::wake_stat(17);
+    let ticks0 = crate::percpu::hart(1)
+        .timer_ticks
+        .load(core::sync::atomic::Ordering::Relaxed);
+    thread::sleep_ticks(80);
+    let takes = thread::wake_stat(17) - before;
+    let ticks = crate::percpu::hart(1)
+        .timer_ticks
+        .load(core::sync::atomic::Ordering::Relaxed)
+        - ticks0;
+    if ticks < 50 {
+        return Err(format!(
+            "hart 1 took only {ticks} timer ticks in the window"
+        ));
+    }
+    if takes > 4 {
+        return Err(format!(
+            "hart 1 took the big kernel lock {takes} times for {ticks} ticks of nothing"
+        ));
+    }
+    Ok(())
+}
+
 pub struct Report {
     /// (name, outcome) of each kernel-side test.
     pub tests: alloc::vec::Vec<(String, Outcome)>,
@@ -143,6 +175,10 @@ pub fn run_all() -> Report {
     );
 
     push("bkl_is_released_on_user_entry_and_idle", bkl_is_released());
+    push(
+        "idle_harts_take_no_big_lock_for_their_ticks",
+        idle_harts_take_no_big_lock_for_their_ticks(),
+    );
 
     // The user-level suite, as a process.
     let frames = free_frames();
