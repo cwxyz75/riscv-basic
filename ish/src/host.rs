@@ -1,0 +1,92 @@
+//! The machine the shell runs on (SHELL-SPEC section 9): processes, byte streams and files, behind one trait, so the
+//! evaluator is pure. The OS implementation (SH4) starts programs through the launcher with an explicit table; the tests
+//! use [`crate::fake::FakeHost`].
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// A byte stream the host owns: a pipe end, a file, or one of the shell's own standard streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Stream(pub u32);
+
+/// A started program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pid(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostError {
+    NotFound,
+    Denied,
+    /// The other end of a pipe is gone.
+    Closed,
+    Other(String),
+}
+
+impl HostError {
+    pub fn message(&self) -> String {
+        match self {
+            HostError::NotFound => String::from("not found"),
+            HostError::Denied => String::from("permission denied"),
+            HostError::Closed => String::from("broken pipe"),
+            HostError::Other(m) => m.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Read,
+    /// Create or truncate.
+    Write,
+    Append,
+}
+
+/// The three standard streams of a started program.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcIo {
+    pub stdin: Stream,
+    pub stdout: Stream,
+    pub stderr: Stream,
+}
+
+pub trait Host {
+    /// The shell's own standard streams.
+    fn stdin(&self) -> Stream;
+    fn stdout(&self) -> Stream;
+    fn stderr(&self) -> Stream;
+
+    /// Start the program `argv[0]` with the given streams (the host keeps its own copies; the caller still owns its
+    /// handles and closes them). `Err(NotFound)` when there is no such program.
+    fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError>;
+    /// Wait for the program to end; its exit status.
+    fn wait(&mut self, pid: Pid) -> i32;
+
+    /// A pipe: (read end, write end).
+    fn pipe(&mut self) -> Result<(Stream, Stream), HostError>;
+    /// Read up to `buf.len()` bytes; `Ok(0)` is end of input.
+    fn read(&mut self, s: Stream, buf: &mut [u8]) -> Result<usize, HostError>;
+    /// Write all of `bytes`; `Err(Closed)` when the reader is gone.
+    fn write(&mut self, s: Stream, bytes: &[u8]) -> Result<(), HostError>;
+    /// Block until one of `streams` has data (or is at end), read it into `buf`: `(index into streams, bytes)`, where 0
+    /// bytes means that stream is at end. This lets the shell drain a program's stdout and stderr without deadlock.
+    fn poll_read(
+        &mut self,
+        streams: &[Stream],
+        buf: &mut [u8],
+    ) -> Result<(usize, usize), HostError>;
+    fn close(&mut self, s: Stream);
+    fn open(&mut self, path: &str, mode: OpenMode) -> Result<Stream, HostError>;
+
+    /// Whole-file helpers.
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, HostError>;
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), HostError>;
+    /// Expand a pattern with `*` and `?` (per path component) into sorted matches.
+    fn glob(&mut self, pattern: &str) -> Vec<String>;
+
+    fn getenv(&self, name: &str) -> Option<String>;
+    fn setenv(&mut self, name: &str, value: &str);
+    /// All environment variables, in name order.
+    fn environ(&self) -> Vec<(String, String)>;
+    fn cwd(&self) -> String;
+    fn chdir(&mut self, path: &str) -> Result<(), HostError>;
+}

@@ -732,3 +732,134 @@ fn a_prefix_of_a_document_is_never_the_whole_value() {
         }
     }
 }
+
+// ---- arithmetic (SHELL-SPEC section 7, Q4) ----
+
+fn n(s: &str) -> Number {
+    Number::parse(s.as_bytes()).unwrap()
+}
+
+#[test]
+fn arithmetic_table() {
+    use data::ArithError::*;
+    let ok = |a: &str, op: &str, b: &str| -> Result<String, data::ArithError> {
+        let (a, b) = (n(a), n(b));
+        match op {
+            "+" => a.add(&b),
+            "-" => a.sub(&b),
+            "*" => a.mul(&b),
+            "/" => a.div(&b),
+            "//" => a.idiv(&b),
+            "%" => a.rem(&b),
+            _ => unreachable!(),
+        }
+        .map(|x| x.format())
+    };
+    for (a, op, b, want) in [
+        ("1", "+", "2", "3"),
+        ("0.1", "+", "0.2", "0.3"), // exact: no 0.30000000000000004
+        ("1.5", "+", "-1.5", "0"),
+        ("9223372036854775807", "+", "1", "9223372036854775808"), // past i64: still exact
+        ("-9223372036854775808", "-", "1", "-9223372036854775809"),
+        ("0.01", "*", "0.01", "0.0001"),
+        ("123456789", "*", "987654321", "121932631112635269"),
+        ("2.50", "*", "4", "10"),
+        ("7", "/", "2", "3.5"),
+        ("1", "/", "3", "0.333333333333333333"),
+        ("2", "/", "3", "0.666666666666666667"), // half-even at 18 digits: ...6667
+        ("-1", "/", "3", "-0.333333333333333333"),
+        ("-2", "/", "3", "-0.666666666666666667"),
+        ("1", "/", "8", "0.125"),
+        ("10", "/", "4", "2.5"),
+        ("6", "/", "3", "2"),
+        ("1", "/", "0.5", "2"),
+        ("0.0000000000000000005", "*", "1", "0.0000000000000000005"),
+        ("7", "//", "2", "3"),
+        ("-7", "//", "2", "-4"), // floor
+        ("7", "//", "-2", "-4"),
+        ("-7", "//", "-2", "3"),
+        ("7.5", "//", "2", "3"),
+        ("7", "%", "3", "1"),
+        ("-7", "%", "3", "2"), // the sign of the divisor
+        ("7", "%", "-3", "-2"),
+        ("7.5", "%", "2", "1.5"),
+        ("-7.5", "%", "2", "0.5"),
+        ("5", "%", "5", "0"),
+    ] {
+        assert_eq!(ok(a, op, b), Ok(want.to_string()), "{a} {op} {b}");
+    }
+    for (a, op, b) in [
+        ("1", "/", "0"),
+        ("1", "//", "0"),
+        ("1", "%", "0"),
+        ("1", "/", "0.0"),
+    ] {
+        assert_eq!(ok(a, op, b), Err(DivideByZero), "{a} {op} {b}");
+    }
+    // overflow is an error, never wraparound
+    let big = "9".repeat(38);
+    assert_eq!(ok(&big, "+", "1"), Err(Overflow));
+    assert_eq!(ok(&big, "*", "2"), Err(Overflow));
+    assert_eq!(ok(&format!("-{big}"), "-", "1"), Err(Overflow));
+    assert_eq!(ok(&big, "/", "7"), Err(Overflow));
+    assert_eq!(n("0.5").neg().unwrap().format(), "-0.5");
+    assert_eq!(n("0").neg().unwrap(), Number::Int(0));
+}
+
+#[test]
+fn comparison_is_by_value() {
+    use core::cmp::Ordering::*;
+    for (a, b, want) in [
+        ("1", "2", Less),
+        ("2", "1", Greater),
+        ("1.0", "1", Equal),
+        ("0.5", "0.25", Greater),
+        ("-0.5", "0.25", Less),
+        ("9223372036854775808", "9223372036854775807", Greater),
+        ("10", "9", Greater), // numeric, never string order
+    ] {
+        assert_eq!(n(a).compare(&n(b)), Ok(want), "{a} {b}");
+    }
+}
+
+#[test]
+fn arithmetic_agrees_with_integer_arithmetic_on_random_integers() {
+    // the independent oracle for the integer subset: i128 arithmetic on the same operands
+    let mut r = Rng(4242);
+    for _ in 0..5000 {
+        let (a, b) = (
+            r.next() as i64 as i128 / 1000,
+            (r.next() as i64 as i128 / 1000),
+        );
+        let (na, nb) = (
+            Number::from_parts(a, 0).unwrap(),
+            Number::from_parts(b, 0).unwrap(),
+        );
+        assert_eq!(na.add(&nb).unwrap().parts().0, a + b);
+        assert_eq!(na.sub(&nb).unwrap().parts().0, a - b);
+        assert_eq!(na.mul(&nb).unwrap().parts().0, a * b);
+        if b != 0 {
+            assert_eq!(
+                na.idiv(&nb).unwrap().parts().0,
+                a.div_euclid(b) - if b < 0 && a.rem_euclid(b) != 0 { 1 } else { 0 }
+            );
+            let rem = na.rem(&nb).unwrap().parts().0;
+            let q = na.idiv(&nb).unwrap().parts().0;
+            assert_eq!(q * b + rem, a, "{a} {b}");
+            assert!(rem == 0 || (rem < 0) == (b < 0));
+            // a/b times b is a up to the rounding at 18 digits
+            let d = na.div(&nb).unwrap();
+            let back = d.mul(&nb).unwrap();
+            let err = back.sub(&na).unwrap();
+            let bound = n("0.000000000000000001")
+                .mul(&Number::from_parts(b.abs(), 0).unwrap())
+                .unwrap();
+            let abs = if err.compare(&Number::Int(0)).unwrap().is_lt() {
+                err.neg().unwrap()
+            } else {
+                err
+            };
+            assert!(abs.compare(&bound).unwrap().is_le(), "{a} / {b}");
+        }
+    }
+}

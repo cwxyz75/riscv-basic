@@ -140,6 +140,58 @@ transcripts) before the evaluator, in step SH0.
   Literal values pass to builtins, closures and the `data` primitives; at the **exec boundary** (an external program's
   argument) a map or list is still an error (rule 2). **Accessor sugar** (`$m.key`, `$l(2)`) is **Decided** (Q1b); `get-or`, `set-in`, `del-in`, `keys`, `len` remain the function forms.
 
+## 5.1 Grammar v1 (written while building SH2; the owner reviews it with the first interactive demo)
+
+Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
+shape open, the choice made is marked **(chosen)**; changing one is a small edit in the parser and the goldens.
+
+**Lexical.** Scripts are UTF-8. `#` starts a comment at the start of a word; a backslash before a newline continues the line.
+Newlines and `;` end statements; newlines are ignored inside `( )`, `[ ]`, `{ }` and after `|`, `&&`, `||`. `do`, `end`, `else`
+and `catch` are reserved wherever they appear unquoted **(chosen: so `if c do ls end` works on one line)**; quote them to
+use them as text. A **bareword** runs to whitespace or one of `( ) [ ] { } ; | & > < $ ' " ^`; one containing `*` or `?` is a
+pattern the host expands (no match is an error). `'text'` is literal (`''` is a quote, newlines allowed); `"text"` is a JSON
+string with escapes **everywhere** **(chosen: no interpolation, so a pasted JSON document means what it says; build text with
+`^` or `format`)**. Adjacent pieces form one word; `^` joins words explicitly, with or without blanks.
+
+**Variables.** `$name` (letters, digits, `_`), `$#name` (count), and a path: `$m.key`, `$l.0`, `$m.'a.b'`, `$m.($k)`, `$m.$k`.
+Assignment targets are `name = value` and `name.key.key = value` (an update that rebinds `name`); the `=` must stand alone,
+so `x=5` is a word.
+
+**Statements.** `fn name params do ... end`, `if COND do ... [else if COND do ...] [else ...] end` (one `end` closes the whole
+chain), `for x in WORDS do ... end` (lists splice one level), `while COND do ... end`, `until COND do ... end`,
+`try do ... end catch e [code] do ... end`, `defer do ... end` (at function or script exit, last in first out), `break`,
+`continue`; COND is one word and must be a boolean. Anything else is a **command**: `head word... redirection...`, joined into
+pipelines (`|`), lists (`&&`, `||`) and negation (`! cmd`). A statement that is a single non-bareword word (`$x`, `(calc ..)`,
+`'text'`, a literal) is an **expression statement**.
+
+**Values in words.** `( ... )` evaluates statements in value position; `[ ... ]` and `{ ... }` are JSON-mode literals (strings
+in `"`, numbers, `true false null`, `$x`, `( )`, nesting, commas; **a bareword is an error there**); `do ... end` is a closure
+and `@ a b do ... end` a function; `(calc ...)` is a number and `(is ...)` a boolean. A lone bareword is text, except that in
+value position it reads as a number, `true`, `false` or `null`; **assigning a lone bareword that names a function or builtin is
+an error that says to write `(name)` or `'name'` (chosen)**. An assignment with more than one word on the right is a call:
+`names = ls /bin` is the lines of `ls`.
+
+**Calls.** The head names a shell function, a builtin or a program, in that order, or is a closure value (`$f x`) or
+`module.function`. A shell callee gets its arguments as **values** (a list stays one list); a program gets **words** (a list
+splices, a pattern expands, a map or closure is an error). Position decides the rest (section 5): statement, value (captured as
+lines) or last-in-function. `ok v` leaves the nearest function (at script level it ends the script); `fail v [code]` raises.
+`succeeds (cmd)` and `run (cmd) [options]` need the command in parentheses.
+
+**Islands.** Inside `(calc ...)` or `(is ...)`: numbers (decimal, `0x`, `0b`), `'text'`, `"text"`, `$x`, literals, `true false
+null`, and `( )` which is a **call** (write `(calc ...)` or `(is ...)` to nest an island **(chosen)**). Operators, low to high:
+`or`, `and`, `not`, `== != < <= > >= in matches`, `^`, `+ -`, `* / // %`, unary `-`. `calc` must yield a number and `is` a boolean.
+
+**Redirections.** `> f`, `>> f`, `< f`, `>[2=1]`, `>[2] f`; on shell callees too.
+
+**Pipelines.** Programs are joined by host pipes. A shell callee may start a pipeline (its output is buffered, up to the capture
+cap, then fed in) and `each`, `map`, `filter`, `fold`, `take` (or one shell function) may end it, reading lines as they arrive;
+`take` closes the pipe and the producer's exit status is then ignored. A shell callee in the middle is an error **(chosen)**. A
+pipeline fails if any stage fails, naming the first.
+
+**Failures.** A failure has a value and a code and a kind: `exit` (a program exited non-zero), `spawn` (it could not be started:
+never caught by `succeeds`, `&&`, `||`, `!` or `run`), `user` (`fail`), `error` (the language). `try ... catch` catches all of them.
+An uncaught failure prints its value to stderr as `ish: ...` and ends the script with its code.
+
 ## 6. Data primitives (**Decided** scope; **Proposal** shape)
 
 A pure crate **`data`** (`no_std` + `alloc`, `#![forbid(unsafe_code)]`, host-tested) holds the value type (without

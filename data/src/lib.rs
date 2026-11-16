@@ -21,7 +21,7 @@ pub use access::{del_in, get, get_or, has, keys, len, require, set_in, values, K
 pub use csv::{from_csv, from_tsv, to_csv, to_tsv, TableError, TableErrorKind, TableOptions};
 pub use json::{from_json, to_json, to_json_pretty, Error, ErrorKind};
 pub use map::{DuplicateKey, Map};
-pub use number::Number;
+pub use number::{ArithError, Number};
 
 use alloc::string::String;
 use alloc::vec::Vec;

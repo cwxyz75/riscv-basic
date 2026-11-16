@@ -195,6 +195,119 @@ impl Number {
     }
 }
 
+/// Why an arithmetic operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithError {
+    /// The result (or an intermediate) does not fit 38 digits.
+    Overflow,
+    DivideByZero,
+}
+
+/// Digits kept after the point by `/` when the quotient does not terminate sooner (rounded half to even).
+pub const DIV_SCALE: u32 = 18;
+
+fn pow10(n: u32) -> Option<i128> {
+    10i128.checked_pow(n)
+}
+
+/// Both operands as mantissas of one common scale.
+fn align(a: &Number, b: &Number) -> Result<(i128, i128, u32), ArithError> {
+    let ((ma, sa), (mb, sb)) = (a.parts(), b.parts());
+    let s = sa.max(sb);
+    let ma = ma
+        .checked_mul(pow10(s - sa).ok_or(ArithError::Overflow)?)
+        .ok_or(ArithError::Overflow)?;
+    let mb = mb
+        .checked_mul(pow10(s - sb).ok_or(ArithError::Overflow)?)
+        .ok_or(ArithError::Overflow)?;
+    Ok((ma, mb, s))
+}
+
+fn make(m: i128, s: u32) -> Result<Number, ArithError> {
+    Number::from_parts(m, s).map_err(|_| ArithError::Overflow)
+}
+
+impl Number {
+    pub fn neg(&self) -> Result<Number, ArithError> {
+        let (m, s) = self.parts();
+        make(m.checked_neg().ok_or(ArithError::Overflow)?, s)
+    }
+
+    pub fn add(&self, o: &Number) -> Result<Number, ArithError> {
+        let (a, b, s) = align(self, o)?;
+        make(a.checked_add(b).ok_or(ArithError::Overflow)?, s)
+    }
+
+    pub fn sub(&self, o: &Number) -> Result<Number, ArithError> {
+        let (a, b, s) = align(self, o)?;
+        make(a.checked_sub(b).ok_or(ArithError::Overflow)?, s)
+    }
+
+    pub fn mul(&self, o: &Number) -> Result<Number, ArithError> {
+        let ((a, sa), (b, sb)) = (self.parts(), o.parts());
+        make(a.checked_mul(b).ok_or(ArithError::Overflow)?, sa + sb)
+    }
+
+    /// Exact decimal division: a quotient that does not terminate within [`DIV_SCALE`] digits is rounded half to even.
+    pub fn div(&self, o: &Number) -> Result<Number, ArithError> {
+        let ((ma, sa), (mb, sb)) = (self.parts(), o.parts());
+        if mb == 0 {
+            return Err(ArithError::DivideByZero);
+        }
+        // a/b = (ma / mb) * 10^(sb - sa); work with DIV_SCALE extra digits
+        let num = ma
+            .checked_mul(pow10(DIV_SCALE + sb).ok_or(ArithError::Overflow)?)
+            .ok_or(ArithError::Overflow)?;
+        let den = mb
+            .checked_mul(pow10(sa).ok_or(ArithError::Overflow)?)
+            .ok_or(ArithError::Overflow)?;
+        let (mut q, r) = (num / den, num % den);
+        if r != 0 {
+            let twice = r
+                .unsigned_abs()
+                .checked_mul(2)
+                .ok_or(ArithError::Overflow)?;
+            let half = den.unsigned_abs();
+            let away = twice > half || (twice == half && q % 2 != 0);
+            if away {
+                q += if (num < 0) != (den < 0) { -1 } else { 1 };
+            }
+        }
+        make(q, DIV_SCALE)
+    }
+
+    /// Floor division: the greatest integer not above the exact quotient.
+    pub fn idiv(&self, o: &Number) -> Result<Number, ArithError> {
+        let (a, b, _) = align(self, o)?;
+        if b == 0 {
+            return Err(ArithError::DivideByZero);
+        }
+        let mut q = a / b;
+        if a % b != 0 && ((a < 0) != (b < 0)) {
+            q -= 1;
+        }
+        make(q, 0)
+    }
+
+    /// The remainder that goes with floor division: `a - b * (a // b)`, with the sign of `b`.
+    pub fn rem(&self, o: &Number) -> Result<Number, ArithError> {
+        let (a, b, s) = align(self, o)?;
+        if b == 0 {
+            return Err(ArithError::DivideByZero);
+        }
+        let mut r = a % b;
+        if r != 0 && ((r < 0) != (b < 0)) {
+            r += b;
+        }
+        make(r, s)
+    }
+
+    pub fn compare(&self, o: &Number) -> Result<core::cmp::Ordering, ArithError> {
+        let (a, b, _) = align(self, o)?;
+        Ok(a.cmp(&b))
+    }
+}
+
 impl core::fmt::Display for Number {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.format())

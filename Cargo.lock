@@ -208,6 +208,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ish"
+version = "0.1.0"
+dependencies = [
+ "data",
+]
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,8 @@
+[package]
+name = "ish"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the native shell `ish` (SHELL-SPEC, steps SH2 and SH3): parser and evaluator over a `Host` trait. Pure, no_std + alloc, no unsafe, host-tested against golden transcripts."
+
+[dependencies]
+data = { path = "../data" }
