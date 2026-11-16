@@ -683,8 +683,9 @@ independent `fsck`, full volume, QEMU restart, confinement, symlinks, discovery 
 superblock, clock). Steps are in `FS-SPEC.md` section 8: step 0 (attributes, indexes and `query` in `memfs`, S10's first bullet
 moved ahead), C1 (the wall clock, slice C), 1 to 4 (host only: tree, format, semantics, crash harness), 5a to 5f (the QEMU side:
 `proto::blk` discard and device info, SD step 4 narrowed, `fsd`, `volmgr`, the mount table, the boot test) and 6 (attributes on
-disk, independent Fable review). The mount table is data, not a kernel object: a volume is published as `/svc/vol/<label>`
-and granted to a program at a prefix by `/etc/mounts`.
+disk, independent Fable review). The mount table is data, not a kernel object: a volume is identified by its uuid, named by
+`/etc/mounts` (a mapping, uuid to local name) as `/svc/vol/<name>`, and granted to programs by a separate list (`/etc/trusted`,
+later the S10 manifest).
 
 - [ ] Step 0: attributes, indexes and `query` in `memfs` and `proto::file`
 - [ ] Step C1: wall clock service `clockd` (`/svc/clock`), RTC through `devmgr`, `clockmodel`
