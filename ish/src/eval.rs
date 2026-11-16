@@ -10,7 +10,7 @@ use crate::value::{Closure, VMap, Val};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -90,6 +90,14 @@ pub struct Shell<H: Host> {
     depth: usize,
     /// The module being run (import), for finding sibling functions.
     pub(crate) module: Option<Rc<str>>,
+    /// The name messages start with (`ish: ...`).
+    pub name: String,
+    /// The S4e compatibility profile of the OS shell: `sh:` messages, `[exit N]` reports, `cd` printing its own errors.
+    pub legacy: bool,
+    /// What `help` prints.
+    pub help: String,
+    /// Set when `exit` (or `halt`) ended the shell with a status.
+    exit_requested: Option<i32>,
 }
 
 /// Process-level result of running a script or a line.
@@ -137,6 +145,10 @@ impl<H: Host> Shell<H> {
             importing: Vec::new(),
             depth: 0,
             module: None,
+            name: String::from("ish"),
+            legacy: false,
+            help: String::new(),
+            exit_requested: None,
         }
     }
 
@@ -239,7 +251,7 @@ impl<H: Host> Shell<H> {
     pub fn run_script(&mut self, src: &str) -> i32 {
         match crate::parser::parse(src) {
             Err(e) => {
-                let _ = self.err_out(format!("ish: {e}\n").as_bytes());
+                let _ = self.err_out(format!("{}: {e}\n", self.name).as_bytes());
                 2
             }
             Ok(stmts) => {
@@ -255,7 +267,12 @@ impl<H: Host> Shell<H> {
     pub fn run_line(&mut self, src: &str) -> i32 {
         match crate::parser::parse(src) {
             Err(e) => {
-                let _ = self.err_out(format!("ish: {e}\n").as_bytes());
+                let text = if self.legacy {
+                    e.msg.clone()
+                } else {
+                    e.to_string()
+                };
+                let _ = self.err_out(format!("{}: {text}\n", self.name).as_bytes());
                 2
             }
             Ok(stmts) => {
@@ -266,6 +283,28 @@ impl<H: Host> Shell<H> {
                         let text = crate::builtins::echo_text(&v);
                         let _ = self.out(text.as_bytes());
                         0
+                    }
+                    Err(Flow::Fail(f)) if self.legacy && f.kind == FailKind::Exit => {
+                        // S4e style: one `[exit N]` per stage that did not end with 0 (a closed pipe is not reported)
+                        let list: Vec<i64> = match &f.value {
+                            Val::Map(m) => match m.get("statuses") {
+                                Some(Val::List(l)) => l
+                                    .iter()
+                                    .filter_map(|v| match v {
+                                        Val::Num(Number::Int(i)) => Some(*i),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            },
+                            _ => Vec::new(),
+                        };
+                        let mut text = String::new();
+                        for st in list.into_iter().filter(|&s| s != 0 && s != 141) {
+                            text.push_str(&format!("[exit {st}]\n"));
+                        }
+                        let _ = self.out(text.as_bytes());
+                        f.code
                     }
                     Err(f) => self.finish(Err(f)),
                 }
@@ -286,14 +325,24 @@ impl<H: Host> Shell<H> {
         r
     }
 
+    /// The status `exit` asked for, if the last thing run ended the shell.
+    pub fn take_exit(&mut self) -> Option<i32> {
+        self.exit_requested.take()
+    }
+
     /// Report an uncaught flow; the status.
     fn finish(&mut self, r: Res<()>) -> i32 {
         match r {
             Ok(()) => 0,
             Err(Flow::Ok(_)) => 0,
-            Err(Flow::Exit(n)) => n,
+            Err(Flow::Exit(n)) => {
+                self.exit_requested = Some(n);
+                n
+            }
             Err(Flow::Break | Flow::Continue) => {
-                let _ = self.err_out(b"ish: break or continue outside a loop\n");
+                let _ = self.err_out(
+                    format!("{}: break or continue outside a loop\n", self.name).as_bytes(),
+                );
                 1
             }
             Err(Flow::Fail(f)) => {
@@ -317,7 +366,7 @@ impl<H: Host> Shell<H> {
                         }
                         v => crate::builtins::json_text(v),
                     };
-                    let _ = self.err_out(format!("ish: {text}\n").as_bytes());
+                    let _ = self.err_out(format!("{}: {text}\n", self.name).as_bytes());
                 }
                 f.code
             }

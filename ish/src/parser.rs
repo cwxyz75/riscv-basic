@@ -580,6 +580,13 @@ impl Parser {
             }
         }
         if words.is_empty() && redirs.is_empty() {
+            let before = self.s[..self.i]
+                .iter()
+                .rev()
+                .find(|c| !matches!(c, ' ' | '\t' | '\n'));
+            if before == Some(&'|') || self.peek() == Some('|') {
+                return self.err("empty command in pipeline");
+            }
             return self.err("expected a command");
         }
         Ok(Command { words, redirs, pos })

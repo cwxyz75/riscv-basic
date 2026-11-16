@@ -83,6 +83,33 @@ pub trait Host {
     /// Expand a pattern with `*` and `?` (per path component) into sorted matches.
     fn glob(&mut self, pattern: &str) -> Vec<String>;
 
+    /// All stages of a pipeline are running: make them the foreground job (so an interrupt reaches them). `false` if that
+    /// could not be done (the shell then kills them and reports it).
+    fn started(&mut self, _pids: &[Pid]) -> bool {
+        true
+    }
+    /// The pipeline is over (every stage waited for): release the foreground job and what was made for it.
+    fn finished(&mut self) {}
+    /// End a started program that is no longer wanted.
+    fn kill(&mut self, _pid: Pid) {}
+    /// The `halt` builtin: ask the system to end the session.
+    fn halt(&mut self) {}
+
+    /// The namespace table the shell holds: `(path, rights)` with rights written `r`, `rw`.
+    fn table(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Narrow what programs started from now on may reach to exactly these grants (`confine`): each is a path in the shell's
+    /// table and a rights string. Nested confinement can only narrow (SHELL-SPEC SHI2): a grant the current confinement
+    /// does not cover is `Err(Denied)`.
+    fn confine(&mut self, _grants: &[(String, String)]) -> Result<(), HostError> {
+        Err(HostError::Other(String::from(
+            "confine is not supported here",
+        )))
+    }
+    /// End the innermost `confine`.
+    fn unconfine(&mut self) {}
+
     fn getenv(&self, name: &str) -> Option<String>;
     fn setenv(&mut self, name: &str, value: &str);
     /// All environment variables, in name order.

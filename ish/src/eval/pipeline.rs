@@ -62,6 +62,18 @@ impl<H: Host> Shell<H> {
                 StageKind::Ext(_) => self.run_ext_pipeline(vec![st], None, mode),
             };
         }
+        for st in &stages {
+            if let StageKind::Proc {
+                name,
+                closure: None,
+                ..
+            } = &st.kind
+            {
+                if matches!(name.as_str(), "cd" | "pwd" | "exit" | "help" | "halt") {
+                    return Err(error(&format!("{name}: a builtin cannot be piped")));
+                }
+            }
+        }
         // shape: [producer proc] ext* [consumer proc]*
         let mut it = stages.into_iter().peekable();
         let mut producer = None;
@@ -317,6 +329,9 @@ impl<H: Host> Shell<H> {
                 self.host.close(r);
             }
             for (pid, _) in &pids {
+                self.host.kill(*pid);
+            }
+            for (pid, _) in &pids {
                 self.host.wait(*pid);
             }
             return Err(f);
@@ -327,8 +342,10 @@ impl<H: Host> Shell<H> {
     /// Wait for every stage; the first non-zero status is a failure (pipefail), unless `ignore` (we stopped reading early).
     fn wait_all(&mut self, pids: &[(Pid, String)], ignore: bool) -> Res<()> {
         let mut first: Option<(i32, String)> = None;
+        let mut all = Vec::new();
         for (pid, name) in pids {
             let st = self.host.wait(*pid);
+            all.push(Val::int(i64::from(st)));
             if st != 0 && first.is_none() {
                 first = Some((st, name.clone()));
             }
@@ -339,12 +356,29 @@ impl<H: Host> Shell<H> {
                     ("kind", Val::str("exit")),
                     ("status", Val::int(i64::from(st))),
                     ("command", Val::string(name)),
+                    ("statuses", Val::list(all)),
                 ]),
                 code: st,
                 kind: FailKind::Exit,
             })),
             _ => Ok(()),
         }
+    }
+
+    /// The pipeline's stages are running: make them the foreground job. On failure they are killed.
+    fn begin_job(&mut self, pids: &[(Pid, String)]) -> Res<()> {
+        let ps: Vec<Pid> = pids.iter().map(|(p, _)| *p).collect();
+        if self.host.started(&ps) {
+            return Ok(());
+        }
+        for p in &ps {
+            self.host.kill(*p);
+        }
+        for p in &ps {
+            self.host.wait(*p);
+        }
+        self.host.finished();
+        Err(error("could not register the job"))
     }
 
     /// Read every listed stream to its end into its buffer (None discards), without deadlock between them.
@@ -452,8 +486,14 @@ impl<H: Host> Shell<H> {
                 self.host.close(s);
             }
         })?;
+        if let Err(e) = self.begin_job(&pids) {
+            let rs: Vec<Stream> = drains.iter().map(|(s, _)| *s).collect();
+            self.close_all(&rs);
+            return Err(e);
+        }
         let capped = self.drain_all(drains);
         let waited = self.wait_all(&pids, capped);
+        self.host.finished();
         if capped {
             return Err(Flow::Fail(Fail {
                 value: err_val("capture-limit", "output too large to capture"),
@@ -514,6 +554,7 @@ impl<H: Host> Shell<H> {
         self.host.close(rd);
         self.drain_all(drains);
         let waited = self.wait_all(&pids, stopped_early);
+        self.host.finished();
         let v = res?;
         waited?;
         Ok(v)

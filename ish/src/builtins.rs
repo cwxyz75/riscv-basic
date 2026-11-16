@@ -72,6 +72,10 @@ const NAMES: &[&str] = &[
     "range",
     "succeeds",
     "run",
+    "help",
+    "halt",
+    "ns",
+    "confine",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -830,12 +834,70 @@ impl<H: Host> Shell<H> {
                 Ok(Val::Null)
             }
             "cd" => {
+                if self.legacy && a.len() != 1 {
+                    self.out(b"cd: usage: cd <dir>\n")?;
+                    return Ok(Val::Null);
+                }
                 arity(name, a, 1, 1)?;
                 let p = string(name, &a[0])?;
+                match self.host.chdir(p) {
+                    Ok(()) => Ok(Val::Null),
+                    Err(e) if self.legacy => {
+                        // the S4e shell said it and went on
+                        self.out(format!("cd: {p}: {}\n", e.message()).as_bytes())?;
+                        Ok(Val::Null)
+                    }
+                    Err(e) => Err(error(&format!("cd: {p}: {}", e.message()))),
+                }
+            }
+            "ns" => {
+                arity(name, a, 0, 0)?;
+                let rows: Vec<Val> = self
+                    .host
+                    .table()
+                    .into_iter()
+                    .map(|(p, r)| {
+                        Val::record(vec![("path", Val::string(p)), ("rights", Val::string(r))])
+                    })
+                    .collect();
+                Ok(Val::list(rows))
+            }
+            "confine" => {
+                arity(name, a, 2, 2)?;
+                let Val::Map(m) = &a[0] else {
+                    return Err(error(&format!(
+                        "confine needs a map of grants, got a {}",
+                        a[0].kind()
+                    )));
+                };
+                let mut grants = Vec::new();
+                for (path, r) in m.iter() {
+                    match r {
+                        Val::Str(r) if matches!(&**r, "r" | "rw") => {
+                            grants.push((String::from(path), String::from(&**r)))
+                        }
+                        _ => {
+                            return Err(error(&format!(
+                                "confine: the rights of {path} must be \"r\" or \"rw\""
+                            )))
+                        }
+                    }
+                }
                 self.host
-                    .chdir(p)
-                    .map_err(|e| error(&format!("cd: {p}: {}", e.message())))?;
+                    .confine(&grants)
+                    .map_err(|e| error(&format!("confine: {}", e.message())))?;
+                let r = self.call_fn(&a[1], vec![]);
+                self.host.unconfine();
+                r
+            }
+            "help" => {
+                let t = self.help.clone();
+                self.out(t.as_bytes())?;
                 Ok(Val::Null)
+            }
+            "halt" => {
+                self.host.halt();
+                Err(Flow::Exit(1))
             }
             "pwd" => Ok(Val::string(self.host.cwd())),
             "lines" => {

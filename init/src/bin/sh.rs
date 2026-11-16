@@ -1,19 +1,24 @@
-//! The shell (S4e, S4-SPEC section 8). Reads lines from the console server's terminal socket,
-//! parses them with `shell-core`, and starts each stage of a pipeline through the launcher with
-//! only what it needs: STDIN/STDOUT (the terminal or pipe ends, narrowed), a read-only working
-//! directory, and, for the programs named in `/etc/trusted`, a read-only root. It registers the
-//! stages as the foreground job with the console server, so Ctrl-C reaches them.
+//! The shell (S4e, S4-SPEC section 8; step SH4): `ish`, the native shell (`SHELL-SPEC.md`), running on this machine. It reads
+//! lines from the console server's terminal socket and runs each with the `ish` evaluator over [`Os`], the host: starting a
+//! program means the launcher with only what it needs (STDIN/STDOUT/STDERR, a read-only working directory, `/dev`, a private
+//! `/tmp`, and for the programs named in `/etc/trusted` a read-only root and their volumes), and the stages of a pipeline
+//! are registered with the console server as the foreground job so Ctrl-C reaches them.
 //!
-//! Known gap (TIDY-UP T31): a Ctrl-C between a stage starting and the registration being
-//! acknowledged is lost; the specified start gate is not built.
+//! The S4e behaviour the suite checks is kept by the evaluator's compatibility profile (`legacy`: `sh:` messages, one
+//! `[exit N]` per failed stage, `cd` printing its own errors); TIDY-UP records what it papers over.
+//!
+//! Known gap (TIDY-UP T31): a Ctrl-C between a stage starting and the registration being acknowledged is handled by reading
+//! ahead after the registration, not by the specified start gate.
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream};
 use proto::console::{self as ctl, Control};
 use proto::file::{flags, rights};
 use proto::startup::{Role, Startup};
@@ -27,10 +32,9 @@ use rt::sys;
 
 const PROMPT: &[u8] = b"$ ";
 const BANNER: &[u8] = b"riscv-os S4 ready\n";
-const HELP: &[u8] =
-    b"builtins: cd pwd exit help halt\nprograms: ls cat echo probe spin hog bomb ipchog\n";
-const KILLED: i64 = -130;
-const PIPE_EXIT: i64 = 141;
+const HELP: &str =
+    "builtins: cd pwd exit help halt\nprograms: ls cat echo probe spin hog bomb ipchog\n";
+const KILLED: i32 = -130;
 
 enum Event {
     Line(Vec<u8>),
@@ -39,7 +43,23 @@ enum Event {
     Gone,
 }
 
-struct Shell {
+/// What a `Stream` the shell hands to `ish` stands for (0, 1 and 2 are the terminal).
+enum Obj {
+    PipeR(u32),
+    PipeW(u32),
+    FileR {
+        data: Vec<u8>,
+        pos: usize,
+    },
+    FileW {
+        path: String,
+        buf: Vec<u8>,
+        append: bool,
+    },
+}
+
+/// The machine, as `ish` sees it.
+struct Os {
     tty: u32,
     root: Fs,
     cwd: Fs,
@@ -59,6 +79,14 @@ struct Shell {
     tmps: Vec<Vec<u8>>,
     txid: u32,
     inbuf: Vec<u8>,
+    objs: BTreeMap<u32, Obj>,
+    next_stream: u32,
+    procs: BTreeMap<u32, u32>,
+    next_pid: u32,
+    env: BTreeMap<String, String>,
+    killed: bool,
+    /// `confine` grants, innermost last: while set, programs get exactly these (and `.`, `/dev`, `/tmp`).
+    confined: Vec<Vec<(String, String)>>,
 }
 
 /// A volume granted to a trusted program (`/etc/trusted`, FS-SPEC section 6): the volume's name in the mount table, the
@@ -146,7 +174,15 @@ fn close_all(hs: &[u32]) {
     }
 }
 
-impl Shell {
+fn host_err(e: i32) -> HostError {
+    if e == proto::file::status::NOT_FOUND {
+        HostError::NotFound
+    } else {
+        HostError::Other(format!("error {e}"))
+    }
+}
+
+impl Os {
     fn say(&self, bytes: &[u8]) {
         say(self.tty, bytes);
     }
@@ -272,93 +308,112 @@ impl Shell {
         }
     }
 
-    fn cd(&mut self, args: &[Vec<u8>]) {
-        if args.len() != 1 {
-            self.say(b"cd: usage: cd <dir>\n");
-            return;
-        }
-        let arg = &args[0];
-        let show = String::from_utf8_lossy(arg).into_owned();
-        let path = shell_core::resolve(&self.cwd_path, arg);
-        let rel: &[u8] = &path[1..]; // without the leading slash
-        let want = rights::READ | rights::ENUMERATE;
-        let opened = if rel.is_empty() {
-            self.root.clone_conn(want)
-        } else {
-            self.root.open(rel, flags::DIRECTORY, want)
-        };
-        match opened {
-            Ok(d) => {
-                let old = core::mem::replace(&mut self.cwd, d);
-                old.close();
-                self.cwd_path = path;
-            }
-            Err(e) => {
-                let why = if e == proto::file::status::NOT_DIRECTORY {
-                    "not a directory"
-                } else {
-                    "not found"
-                };
-                self.say(format!("cd: {show}: {why}\n").as_bytes());
+    /// Remove the private `/tmp` directories of the job that just ended.
+    fn cleanup_tmps(&mut self) {
+        let names: Vec<Vec<u8>> = core::mem::take(&mut self.tmps);
+        if let Some(t) = self.tmp.as_mut() {
+            for n in names {
+                remove_tree(t, &n, 0);
             }
         }
     }
 
-    /// Start one stage; returns the process handle, or the message to print.
-    fn spawn_stage(
-        &mut self,
-        words: &[Vec<u8>],
-        stdin: u32,
-        stdout: u32,
-        tty: (bool, bool),
-    ) -> Result<u32, String> {
-        let name = &words[0];
-        let shown = String::from_utf8_lossy(name).into_owned();
-        let path: Vec<u8> = [&b"bin/"[..], name].concat();
-        let mut file = match self.root.open(&path, 0, rights::READ) {
-            Ok(f) => f,
-            Err(_) => {
-                close_all(&[stdin, stdout]);
-                return Err(format!("sh: {shown}: not found\n"));
-            }
+    fn add_obj(&mut self, o: Obj) -> Stream {
+        let id = self.next_stream;
+        self.next_stream += 1;
+        self.objs.insert(id, o);
+        Stream(id)
+    }
+
+    /// The handle to forward to a program for one of its standard streams.
+    fn forward_stream(&self, s: Stream, input: bool) -> Option<u32> {
+        let (h, want) = match s.0 {
+            0 if input => (
+                self.tty,
+                Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+            ),
+            1 | 2 if !input => (
+                self.tty,
+                Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+            ),
+            _ => match self.objs.get(&s.0)? {
+                Obj::PipeR(h) if input => {
+                    (*h, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0)
+                }
+                Obj::PipeW(h) if !input => {
+                    (*h, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0)
+                }
+                _ => return None,
+            },
         };
+        dup(h, want)
+    }
+
+    /// The path as a root-relative path (no leading slash), resolved lexically against the working directory.
+    fn rel_path(&self, path: &str) -> Vec<u8> {
+        let abs = shell_core::resolve(&self.cwd_path, path.as_bytes());
+        abs[1..].to_vec()
+    }
+
+    fn start(&mut self, argv: &[String], io: ProcIo) -> Result<u32, HostError> {
+        let name = argv[0].as_bytes();
+        if !shell_core::valid_command_name(name) {
+            return Err(HostError::Other(String::from("bad command name")));
+        }
+        let path: Vec<u8> = [&b"bin/"[..], name].concat();
+        let mut file = self
+            .root
+            .open(&path, 0, rights::READ)
+            .map_err(|_| HostError::NotFound)?;
         let image = file.get_vmo();
         file.close();
-        let Ok((vmo, offset, len)) = image else {
-            close_all(&[stdin, stdout]);
-            return Err(format!("sh: {shown}: not found\n"));
-        };
+        let (vmo, offset, len) = image.map_err(|_| HostError::NotFound)?;
         let want = rights::READ | rights::ENUMERATE;
-        let trust = self.trusted.iter().position(|t| &t.name == name);
+        let trust = self.trusted.iter().position(|t| t.name == name);
         let trusted = trust.is_some();
+        let Some(stdin) = self.forward_stream(io.stdin, true) else {
+            sys::handle_close(vmo);
+            return Err(HostError::Other(String::from(
+                "this input cannot be given to a program",
+            )));
+        };
+        let Some(stdout) = self.forward_stream(io.stdout, false) else {
+            sys::handle_close(vmo);
+            sys::handle_close(stdin);
+            return Err(HostError::Other(String::from(
+                "this output cannot be given to a program",
+            )));
+        };
+        let Some(stderr) = self.forward_stream(io.stderr, false) else {
+            sys::handle_close(vmo);
+            close_all(&[stdin, stdout]);
+            return Err(HostError::Other(String::from(
+                "this output cannot be given to a program",
+            )));
+        };
         let cwd = self.cwd.clone_conn(want);
         let root = if trusted {
             Some(self.root.clone_conn(want))
         } else {
             None
         };
-        // standard error is a duplicate of the same stream as standard output
-        let Some(stderr) = dup(
-            stdout,
-            Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
-        ) else {
-            sys::handle_close(vmo);
-            close_all(&[stdin, stdout]);
-            return Err(String::from("sh: could not duplicate standard output\n"));
-        };
         let mut forward: Vec<u32> = alloc::vec![stdin, stdout, stderr];
         let mut startup = Startup {
-            args: words.to_vec(),
+            args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
             roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
         };
-        // the working directory as a path: the libc's `getcwd`, and `..` that climbs, start from it
+        // the environment the shell has been given (`export`), then the working directory as a path: the libc's `getcwd`,
+        // and `..` that climbs, start from it
+        for (k, v) in &self.env {
+            startup.env.push(format!("{k}={v}").into_bytes());
+        }
         startup.env.push([&b"PWD="[..], &self.cwd_path].concat());
         // which of the standard streams are the terminal (a program tells a tty from a pipe by this)
-        if tty.0 {
+        if io.stdin == Stream(0) {
             startup.env.push(b"STDIN=tty".to_vec());
         }
-        if tty.1 {
+        if io.stdout == Stream(1) {
             startup.env.push(b"STDOUT=tty".to_vec());
         }
         match cwd {
@@ -374,9 +429,20 @@ impl Shell {
                 if let Some(Ok(r)) = root {
                     r.close();
                 }
-                return Err(String::from("sh: could not open the working directory\n"));
+                return Err(HostError::Other(String::from(
+                    "could not open the working directory",
+                )));
             }
         }
+        let confined = self.confined.last().cloned();
+        let root = if confined.is_some() {
+            if let Some(Ok(r)) = root {
+                r.close();
+            }
+            None
+        } else {
+            root
+        };
         match root {
             Some(Ok(r)) => {
                 startup
@@ -387,7 +453,9 @@ impl Shell {
             Some(Err(_)) => {
                 sys::handle_close(vmo);
                 close_all(&forward);
-                return Err(String::from("sh: could not open the root directory\n"));
+                return Err(HostError::Other(String::from(
+                    "could not open the root directory",
+                )));
             }
             None => {}
         }
@@ -426,7 +494,28 @@ impl Shell {
         }
         // the volumes this program is granted, opened now from the registry (retrying while the volume manager brings a
         // restarted volume server back)
-        if let Some(t) = trust {
+        if let Some(grants) = &confined {
+            // `confine`: exactly the grants, opened now, each as narrow as asked
+            for (path, rw) in grants {
+                match self.open_grant(path, rw) {
+                    Ok(f) => {
+                        startup
+                            .namespace
+                            .push((path.as_bytes().to_vec(), forward.len() as u32));
+                        forward.push(f.ch);
+                    }
+                    Err(e) => {
+                        sys::handle_close(vmo);
+                        close_all(&forward);
+                        return Err(HostError::Other(format!(
+                            "confine: {path}: {}",
+                            e.message()
+                        )));
+                    }
+                }
+            }
+        }
+        if let (Some(t), None) = (trust, &confined) {
             for g in 0..self.trusted[t].grants.len() {
                 let (mount, vol, ro) = {
                     let g = &self.trusted[t].grants[g];
@@ -459,236 +548,406 @@ impl Shell {
             Ok(p) => Ok(p),
             Err(e) => {
                 close_all(&forward);
-                Err(format!("sh: {shown}: could not start ({e})\n"))
+                Err(HostError::Other(format!("could not start ({e})")))
             }
         }
     }
+}
 
-    /// Remove the private `/tmp` directories of the job that just ended.
-    fn cleanup_tmps(&mut self) {
-        let names: Vec<Vec<u8>> = core::mem::take(&mut self.tmps);
-        if let Some(t) = self.tmp.as_mut() {
-            for n in names {
-                remove_tree(t, &n, 0);
+impl Host for Os {
+    fn stdin(&self) -> Stream {
+        Stream(0)
+    }
+    fn stdout(&self) -> Stream {
+        Stream(1)
+    }
+    fn stderr(&self) -> Stream {
+        Stream(2)
+    }
+
+    fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError> {
+        let h = self.start(argv, io)?;
+        let id = self.next_pid;
+        self.next_pid += 1;
+        self.procs.insert(id, h);
+        Ok(Pid(id))
+    }
+
+    fn wait(&mut self, pid: Pid) -> i32 {
+        let Some(h) = self.procs.remove(&pid.0) else {
+            return -1;
+        };
+        let w = sys::object_wait(h, signals::TERMINATED, u64::MAX);
+        let code = if w.status == 0 {
+            sys::process_info(h).a1 as i64 as i32
+        } else {
+            -1
+        };
+        if code == KILLED {
+            self.killed = true;
+        }
+        sys::handle_close(h);
+        code
+    }
+
+    fn pipe(&mut self) -> Result<(Stream, Stream), HostError> {
+        let s = sys::socket_create();
+        if s.status != 0 {
+            return Err(HostError::Other(String::from("could not make a pipe")));
+        }
+        let (a, b) = (s.a1 as u32, s.a2 as u32);
+        let w = dup(
+            a,
+            Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+        );
+        let r = dup(
+            b,
+            Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+        );
+        close_all(&[a, b]);
+        let (Some(w), Some(r)) = (w, r) else {
+            for h in [w, r].into_iter().flatten() {
+                sys::handle_close(h);
             }
+            return Err(HostError::Other(String::from("could not make a pipe")));
+        };
+        Ok((self.add_obj(Obj::PipeR(r)), self.add_obj(Obj::PipeW(w))))
+    }
+
+    fn read(&mut self, s: Stream, buf: &mut [u8]) -> Result<usize, HostError> {
+        let h = match s.0 {
+            0 => self.tty,
+            _ => match self.objs.get_mut(&s.0) {
+                Some(Obj::PipeR(h)) => *h,
+                Some(Obj::FileR { data, pos }) => {
+                    let n = buf.len().min(data.len() - *pos);
+                    buf[..n].copy_from_slice(&data[*pos..*pos + n]);
+                    *pos += n;
+                    return Ok(n);
+                }
+                _ => return Err(HostError::Other(String::from("not readable"))),
+            },
+        };
+        io::read(h, buf).map_err(|_| HostError::Other(String::from("read failed")))
+    }
+
+    fn poll_read(
+        &mut self,
+        streams: &[Stream],
+        buf: &mut [u8],
+    ) -> Result<(usize, usize), HostError> {
+        let handles: Vec<Option<u32>> = streams
+            .iter()
+            .map(|s| match self.objs.get(&s.0) {
+                Some(Obj::PipeR(h)) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        loop {
+            for (i, h) in handles.iter().enumerate() {
+                let Some(h) = h else { return Ok((i, 0)) };
+                let r = sys::socket_read(*h, buf.as_mut_ptr(), buf.len());
+                match r.status() {
+                    Some(Status::Ok) => return Ok((i, r.a1)),
+                    Some(Status::ShouldWait) => {}
+                    _ => return Ok((i, 0)), // PEER_CLOSED: the end of that stream
+                }
+            }
+            let p = sys::port_create();
+            if p.status != 0 {
+                return Err(HostError::Other(String::from("no port")));
+            }
+            let port = p.a1 as u32;
+            for (i, h) in handles.iter().enumerate() {
+                if let Some(h) = h {
+                    sys::port_bind(port, *h, signals::READABLE | signals::PEER_CLOSED, i as u64);
+                }
+            }
+            sys::port_wait(port, u64::MAX);
+            sys::handle_close(port);
         }
     }
 
-    fn run_pipeline(&mut self, stages: &[shell_core::Stage]) {
-        let n = stages.len();
-        // the pipes between stages: pipe i joins stage i's STDOUT to stage i+1's STDIN
-        let mut ends: Vec<(u32, u32)> = Vec::new(); // (write end for stage i, read end for i+1)
-        for _ in 1..n {
-            let s = sys::socket_create();
-            if s.status != 0 {
-                for &(w, r) in &ends {
-                    close_all(&[w, r]);
+    fn write(&mut self, s: Stream, bytes: &[u8]) -> Result<(), HostError> {
+        let h = match s.0 {
+            1 | 2 => self.tty,
+            _ => match self.objs.get_mut(&s.0) {
+                Some(Obj::PipeW(h)) => *h,
+                Some(Obj::FileW { buf, .. }) => {
+                    buf.extend_from_slice(bytes);
+                    return Ok(());
                 }
-                self.say(b"sh: could not make a pipe\n");
-                return;
-            }
-            let (a, b) = (s.a1 as u32, s.a2 as u32);
-            let w = dup(
-                a,
-                Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
-            );
-            let r = dup(b, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
-            close_all(&[a, b]);
-            let (Some(w), Some(r)) = (w, r) else {
-                for h in [w, r].into_iter().flatten() {
-                    sys::handle_close(h);
-                }
-                for &(w, r) in &ends {
-                    close_all(&[w, r]);
-                }
-                self.say(b"sh: could not make a pipe\n");
-                return;
-            };
-            ends.push((w, r));
-        }
-        let tty_in = Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
-        // (DUPLICATE: the shell makes standard error from a duplicate of standard output)
-        let tty_out = Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0;
-        let mut procs: Vec<u32> = Vec::new();
-        let mut failure: Option<String> = None;
-        // which pipe ends were handed to a stage (a stage consumes its handles even when it
-        // fails to start); the rest are closed below
-        let mut taken_w = alloc::vec![false; ends.len()];
-        let mut taken_r = alloc::vec![false; ends.len()];
-        for (i, words) in stages.iter().enumerate() {
-            let tty_dup_in = if i == 0 { dup(self.tty, tty_in) } else { None };
-            let tty_dup_out = if i + 1 == n {
-                dup(self.tty, tty_out)
-            } else {
-                None
-            };
-            if (i == 0 && tty_dup_in.is_none()) || (i + 1 == n && tty_dup_out.is_none()) {
-                for h in [tty_dup_in, tty_dup_out].into_iter().flatten() {
-                    sys::handle_close(h);
-                }
-                failure = Some(String::from("sh: could not duplicate the terminal\n"));
-                break;
-            }
-            let stdin = match tty_dup_in {
-                Some(h) => h,
-                None => {
-                    taken_r[i - 1] = true;
-                    ends[i - 1].1
-                }
-            };
-            let stdout = match tty_dup_out {
-                Some(h) => h,
-                None => {
-                    taken_w[i] = true;
-                    ends[i].0
-                }
-            };
-            match self.spawn_stage(words, stdin, stdout, (i == 0, i + 1 == n)) {
-                Ok(p) => procs.push(p),
-                Err(msg) => {
-                    failure = Some(msg);
-                    break;
-                }
-            }
-        }
-        for (i, &(w, r)) in ends.iter().enumerate() {
-            if !taken_w[i] {
-                sys::handle_close(w);
-            }
-            if !taken_r[i] {
-                sys::handle_close(r);
-            }
-        }
-        if let Some(msg) = failure {
-            for &p in &procs {
-                sys::process_kill(p, -1);
-                sys::handle_close(p);
-            }
-            self.say(msg.as_bytes());
+                _ => return Err(HostError::Other(String::from("not writable"))),
+            },
+        };
+        io::write_all(h, bytes).map_err(|e| match e {
+            io::IoError::PeerClosed => HostError::Closed,
+            _ => HostError::Other(String::from("write failed")),
+        })
+    }
+
+    fn close(&mut self, s: Stream) {
+        if s.0 < 3 {
             return;
         }
-        // register the job (duplicates with only KILL|WAIT|TRANSFER), then wait for every stage
+        match self.objs.remove(&s.0) {
+            Some(Obj::PipeR(h) | Obj::PipeW(h)) => {
+                sys::handle_close(h);
+            }
+            Some(Obj::FileW { path, buf, append }) => {
+                let _ = self.store(&path, &buf, append);
+            }
+            _ => {}
+        }
+    }
+
+    fn open(&mut self, path: &str, mode: OpenMode) -> Result<Stream, HostError> {
+        match mode {
+            OpenMode::Read => {
+                let data = self.read_file(path)?;
+                Ok(self.add_obj(Obj::FileR { data, pos: 0 }))
+            }
+            OpenMode::Write => Ok(self.add_obj(Obj::FileW {
+                path: String::from(path),
+                buf: Vec::new(),
+                append: false,
+            })),
+            OpenMode::Append => Ok(self.add_obj(Obj::FileW {
+                path: String::from(path),
+                buf: Vec::new(),
+                append: true,
+            })),
+        }
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, HostError> {
+        let rel = self.rel_path(path);
+        let mut f = self.root.open(&rel, 0, rights::READ).map_err(host_err)?;
+        let r = f.read_all();
+        f.close();
+        r.map_err(host_err)
+    }
+
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        self.store(path, bytes, false)
+    }
+
+    fn glob(&mut self, _pattern: &str) -> Vec<String> {
+        Vec::new() // (T126: patterns are not expanded in the OS yet)
+    }
+
+    fn started(&mut self, pids: &[Pid]) -> bool {
+        // register the job (duplicates with only KILL|WAIT|TRANSFER)
         let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
-        let dups: Vec<u32> = procs.iter().filter_map(|&p| dup(p, job_rights)).collect();
-        let registered = if dups.len() == procs.len() {
+        let hs: Vec<u32> = pids
+            .iter()
+            .filter_map(|p| self.procs.get(&p.0).copied())
+            .collect();
+        let dups: Vec<u32> = hs.iter().filter_map(|&p| dup(p, job_rights)).collect();
+        let registered = if dups.len() == hs.len() && !hs.is_empty() {
             self.control(Control::SetForeground, &dups)
         } else {
             close_all(&dups);
             false
         };
         if !registered {
-            // Without a registration Ctrl-C could not reach the job and the wait below would
-            // never end: do not run it.
-            for &p in &procs {
-                sys::process_kill(p, -1);
-            }
-            close_all(&procs);
-            self.say(b"sh: could not register the job\n");
-            return;
+            // Without a registration Ctrl-C could not reach the job and the wait would never end: do not run it.
+            return false;
         }
-        // A Ctrl-C typed before the registration was acknowledged reached the console server
-        // while it had no job to kill, but its 0x03 byte is already waiting on the terminal:
-        // honour it now (this closes the start-gate race, T31).
+        // A Ctrl-C typed before the registration was acknowledged reached the console server while it had no job to kill,
+        // but its 0x03 byte is already waiting on the terminal: honour it now (this closes the start-gate race, T31).
         self.read_ahead();
         if let Some(i) = self.inbuf.iter().position(|&b| b == 0x03) {
             self.inbuf.remove(i);
-            for &p in &procs {
-                sys::process_kill(p, KILLED as i32);
+            for &p in &hs {
+                sys::process_kill(p, KILLED);
             }
         }
-        let port = sys::port_create();
-        let mut left = procs.len();
-        if port.status == 0 {
-            let port = port.a1 as u32;
-            for (i, &p) in procs.iter().enumerate() {
-                sys::port_bind(port, p, signals::TERMINATED, i as u64);
-            }
-            // a stage that is already gone is reported at once (level-triggered)
-            let mut done = alloc::vec![false; procs.len()];
-            while left > 0 {
-                let r = sys::port_wait(port, u64::MAX);
-                if r.status != 0 {
-                    break;
-                }
-                let k = r.a1;
-                if !done[k] {
-                    done[k] = true;
-                    left -= 1;
-                    sys::port_unbind(port, k as u64);
-                }
-            }
-            sys::handle_close(port);
-        }
-        let mut killed = false;
-        let mut report = String::new();
-        for &p in &procs {
-            let code = sys::process_info(p).a1 as i64;
-            if code == KILLED {
-                killed = true;
-            }
-            if code != 0 && code != PIPE_EXIT {
-                report.push_str(&format!("[exit {code}]\n"));
-            }
-        }
+        true
+    }
+
+    fn finished(&mut self) {
         self.control(Control::ClearForeground, &[]);
-        close_all(&procs);
-        self.say(report.as_bytes());
-        if killed {
+        self.cleanup_tmps();
+        if self.killed {
+            self.killed = false;
             self.swallow_interrupt();
         }
     }
 
-    fn run_line(&mut self, line: &[u8]) -> Option<i32> {
-        let stages = match shell_core::parse(line) {
-            Ok(s) => s,
-            Err(e) => {
-                self.say(format!("sh: {}\n", e.message()).as_bytes());
-                return None;
+    fn kill(&mut self, pid: Pid) {
+        if let Some(&h) = self.procs.get(&pid.0) {
+            sys::process_kill(h, -1);
+        }
+    }
+
+    fn halt(&mut self) {
+        // ask init to end the session, then wait to be stopped
+        sys::channel_write(self.init_ch, b"halt".as_ptr(), 4, core::ptr::null(), 0);
+        io::nap(5000);
+    }
+
+    fn table(&self) -> Vec<(String, String)> {
+        let always = |v: &mut Vec<(String, String)>| {
+            v.push((String::from("."), String::from("r")));
+            if self.dev.is_some() {
+                v.push((String::from("/dev"), String::from("rw")));
+            }
+            if self.tmp.is_some() {
+                v.push((String::from("/tmp"), String::from("rw")));
             }
         };
-        if stages.is_empty() {
-            return None;
-        }
-        for st in &stages {
-            let name = &st[0];
-            if !shell_core::valid_command_name(name) {
-                let shown = String::from_utf8_lossy(name).into_owned();
-                self.say(format!("sh: {shown}: bad command name\n").as_bytes());
-                return None;
+        match self.confined.last() {
+            Some(g) => {
+                let mut v = g.clone();
+                always(&mut v);
+                v
             }
-        }
-        let is_builtin = |n: &[u8]| matches!(n, b"cd" | b"pwd" | b"exit" | b"help" | b"halt");
-        if stages.len() > 1 {
-            if let Some(st) = stages.iter().find(|st| is_builtin(&st[0])) {
-                let shown = String::from_utf8_lossy(&st[0]).into_owned();
-                self.say(format!("sh: {shown}: a builtin cannot be piped\n").as_bytes());
-                return None;
-            }
-        }
-        let name = stages[0][0].clone();
-        if is_builtin(&name) {
-            match name.as_slice() {
-                b"cd" => self.cd(&stages[0][1..]),
-                b"pwd" => {
-                    let mut out = self.cwd_path.clone();
-                    out.push(b'\n');
-                    self.say(&out);
+            None => {
+                let mut v = alloc::vec![(String::from("/"), String::from("r"))];
+                always(&mut v);
+                if self.registry.is_some() {
+                    v.push((String::from("/svc"), String::from("r")));
                 }
-                b"help" => self.say(HELP),
-                b"exit" => return Some(0),
-                _ => {
-                    // halt: ask init to end the session, then wait to be stopped
-                    sys::channel_write(self.init_ch, b"halt".as_ptr(), 4, core::ptr::null(), 0);
-                    io::nap(5000);
-                    return Some(1);
-                }
+                v
             }
-            return None;
         }
-        // (a stage that names no program is reported by `spawn_stage`; stages are checked there)
-        self.run_pipeline(&stages);
-        self.cleanup_tmps();
-        None
+    }
+
+    fn confine(&mut self, grants: &[(String, String)]) -> Result<(), HostError> {
+        let now = self.table();
+        for (path, rw) in grants {
+            let abs =
+                String::from_utf8_lossy(&shell_core::resolve(b"/", path.as_bytes())).into_owned();
+            // a grant must lie inside the table the shell has now, with no more rights (SHELL-SPEC SHI2); volumes come
+            // from the registry connection
+            let is_volume = abs.starts_with("/mnt/") && self.registry.is_some();
+            let covered = is_volume
+                || now.iter().any(|(e, r)| {
+                    (e == "/"
+                        || abs == *e
+                        || abs
+                            .strip_prefix(e.as_str())
+                            .is_some_and(|x| x.starts_with('/')))
+                        && (r == "rw" || rw == "r")
+                });
+            if !covered {
+                return Err(HostError::Denied);
+            }
+            // and it must exist, now: an error at `confine`, not later in a program
+            let f = self.open_grant(path, rw)?;
+            f.close();
+        }
+        self.confined
+            .push(grants.iter().map(|(p, r)| (p.clone(), r.clone())).collect());
+        Ok(())
+    }
+
+    fn unconfine(&mut self) {
+        self.confined.pop();
+    }
+
+    fn getenv(&self, name: &str) -> Option<String> {
+        self.env.get(name).cloned()
+    }
+
+    fn setenv(&mut self, name: &str, value: &str) {
+        self.env.insert(String::from(name), String::from(value));
+    }
+
+    fn environ(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn cwd(&self) -> String {
+        String::from_utf8_lossy(&self.cwd_path).into_owned()
+    }
+
+    fn chdir(&mut self, path: &str) -> Result<(), HostError> {
+        let abs = shell_core::resolve(&self.cwd_path, path.as_bytes());
+        let rel: &[u8] = &abs[1..]; // without the leading slash
+        let want = rights::READ | rights::ENUMERATE;
+        let opened = if rel.is_empty() {
+            self.root.clone_conn(want)
+        } else {
+            self.root.open(rel, flags::DIRECTORY, want)
+        };
+        match opened {
+            Ok(d) => {
+                let old = core::mem::replace(&mut self.cwd, d);
+                old.close();
+                self.cwd_path = abs;
+                Ok(())
+            }
+            Err(e) if e == proto::file::status::NOT_DIRECTORY => {
+                Err(HostError::Other(String::from("not a directory")))
+            }
+            Err(_) => Err(HostError::NotFound),
+        }
+    }
+}
+
+impl Os {
+    /// A connection for a `confine` grant: a path under `/mnt/<volume>` is that volume (from the registry), anything else a
+    /// directory of the shell's own root, with the rights asked for (a read-only root cannot give write access).
+    fn open_grant(&mut self, path: &str, rw: &str) -> Result<Fs, HostError> {
+        let want = if rw == "rw" {
+            rights::ALL & !rights::PUBLISH
+        } else {
+            rights::READ | rights::ENUMERATE
+        };
+        let abs = shell_core::resolve(b"/", path.as_bytes());
+        let rel: &[u8] = &abs[1..];
+        let map = |e: i32| match e {
+            e if e == proto::file::status::NOT_FOUND => HostError::NotFound,
+            e if e == Status::AccessDenied.code() => HostError::Denied,
+            e => HostError::Other(format!("error {e}")),
+        };
+        if let Some(rest) = rel.strip_prefix(b"mnt/") {
+            let (vol, sub) = match rest.iter().position(|&b| b == b'/') {
+                Some(i) => (&rest[..i], &rest[i + 1..]),
+                None => (rest, &b""[..]),
+            };
+            let name = [&b"vol-"[..], vol].concat();
+            let Some(reg) = self.registry.as_mut() else {
+                return Err(HostError::NotFound);
+            };
+            let mut v = reg
+                .open_retry(&name, flags::DIRECTORY, want, sys::clock_get() + 2000)
+                .map_err(map)?;
+            if sub.is_empty() {
+                return Ok(v);
+            }
+            let r = v.open(sub, flags::DIRECTORY, want).map_err(map);
+            v.close();
+            return r;
+        }
+        if rel.is_empty() {
+            self.root.clone_conn(want).map_err(map)
+        } else {
+            self.root.open(rel, flags::DIRECTORY, want).map_err(map)
+        }
+    }
+
+    /// Write a file (create or truncate; or append).
+    fn store(&mut self, path: &str, bytes: &[u8], append: bool) -> Result<(), HostError> {
+        let rel = self.rel_path(path);
+        let fl = if append {
+            flags::CREATE
+        } else {
+            flags::CREATE | flags::TRUNCATE
+        };
+        let mut f = self
+            .root
+            .open(&rel, fl, rights::READ | rights::WRITE)
+            .map_err(host_err)?;
+        let off = if append { f.size().unwrap_or(0) } else { 0 };
+        let r = f.write_all(off, bytes);
+        f.close();
+        r.map_err(host_err)
     }
 }
 
@@ -712,7 +971,7 @@ pub fn app_main() -> i32 {
     let Ok(cwd) = root.open(b"home", flags::DIRECTORY, rights::READ | rights::ENUMERATE) else {
         return 4;
     };
-    let mut sh = Shell {
+    let os = Os {
         tty,
         root,
         cwd,
@@ -728,14 +987,31 @@ pub fn app_main() -> i32 {
         tmps: Vec::new(),
         txid: 0,
         inbuf: Vec::new(),
+        objs: BTreeMap::new(),
+        next_stream: 3,
+        procs: BTreeMap::new(),
+        next_pid: 1,
+        env: BTreeMap::new(),
+        killed: false,
+        confined: Vec::new(),
     };
-    sh.load_trusted();
-    sh.say(BANNER);
+    let mut sh = ish::Shell::new(os);
+    sh.name = String::from("sh");
+    sh.legacy = true;
+    sh.help = String::from(HELP);
+    sh.host.load_trusted();
+    sh.host.say(BANNER);
     loop {
-        sh.say(PROMPT);
-        match sh.next_event() {
+        sh.host.say(PROMPT);
+        match sh.host.next_event() {
             Event::Line(line) => {
-                if let Some(code) = sh.run_line(&line) {
+                match String::from_utf8(line) {
+                    Ok(text) => {
+                        sh.run_line(&text);
+                    }
+                    Err(_) => sh.host.say(b"sh: input is not valid UTF-8\n"),
+                }
+                if let Some(code) = sh.take_exit() {
                     return code;
                 }
             }
