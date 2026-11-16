@@ -107,7 +107,9 @@ dependencies = [
 name = "doofs-tools"
 version = "0.1.0"
 dependencies = [
+ "doofs",
  "fsfmt",
+ "memfs",
 ]
 
 [[package]]
@@ -187,6 +189,7 @@ dependencies = [
  "http1",
  "kcore",
  "memfs",
+ "mounts",
  "netcore",
  "netring",
  "netwire",

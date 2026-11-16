@@ -71,6 +71,11 @@ pub enum Role {
     NetConfigBlob = 30,
     /// The block channel a filesystem server stores its volume on (FS-SPEC section 5): the protocol of `proto::blk`.
     BlockDevice = 31,
+    /// A listener channel a volume server (`fsd`) serves: the registry forwards each open of a published volume name to it,
+    /// and each forwarded endpoint becomes a connection to the volume's root.
+    ServiceListener = 32,
+    /// A second listener (the same volume under another name).
+    ServiceListenerAlt = 33,
 }
 
 impl Role {
@@ -107,6 +112,8 @@ impl Role {
             29 => Role::NetTxPool,
             30 => Role::NetConfigBlob,
             31 => Role::BlockDevice,
+            32 => Role::ServiceListener,
+            33 => Role::ServiceListenerAlt,
             _ => return None,
         })
     }

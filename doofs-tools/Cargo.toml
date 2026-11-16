@@ -6,6 +6,8 @@ description = "Host tools for doofs volume images (FS-SPEC section 8, step 2): m
 
 [dependencies]
 fsfmt = { path = "../fsfmt" }
+doofs = { path = "../doofs" }
+memfs = { path = "../memfs" }
 
 [[bin]]
 name = "mkfs-doofs"

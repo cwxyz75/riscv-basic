@@ -1,0 +1,3 @@
+# uuid  name  [options]: which local name a volume is published under (FS-SPEC section 6)
+# (the QEMU suite formats its test volume with this uuid)
+6673642d73756974652d766f6c756d65  data

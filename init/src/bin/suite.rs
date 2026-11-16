@@ -4760,7 +4760,8 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"rngd".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
-            b"udpecho".to_vec()
+            b"udpecho".to_vec(),
+            b"volmgr".to_vec()
         ],
         "the programs"
     );
@@ -8356,6 +8357,194 @@ fn clock_service_reports_the_rtc() -> Outcome {
     Ok(())
 }
 
+// --- The volume manager (FS-SPEC steps 5d and 5e) ---------------------------------------------
+
+/// The device manager, a registry and the volume manager in one job: (a connection to the registry, the job).
+fn start_volmgr_rig(res: u32, bi: u32) -> Result<(Fs, u32), Detail> {
+    let root_j = root_job()?;
+    let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root_j);
+    let (dm_mine, dm_theirs) = channel()?;
+    let res_dup = ok(
+        sys::handle_duplicate(res, Rights::SAME.0),
+        "dup the resource",
+    )?
+    .a1 as u32;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let (off, len) = image_entry(bi, b"bin/devmgr")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let s = Startup {
+        args: vec![b"devmgr".to_vec()],
+        roles: vec![
+            (Role::Resource, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceDevmgr, 2),
+        ],
+        ..Startup::default()
+    };
+    rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[res_dup, bi_dup, dm_theirs],
+        mj,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let (off, len) = image_entry(bi, b"bin/registryd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (reg_mine, reg_theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"registryd".to_vec()],
+        roles: vec![(Role::ServiceRegistry, 0)],
+        ..Startup::default()
+    };
+    rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[reg_theirs],
+        mj,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let mut root = Fs::new(reg_mine);
+    let publish = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let bi_dup2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let (off, len) = image_entry(bi, b"bin/volmgr")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let s = Startup {
+        args: vec![b"volmgr".to_vec()],
+        roles: vec![
+            (Role::ServiceDevmgr, 0),
+            (Role::ServiceRegistry, 1),
+            (Role::BootImage, 2),
+        ],
+        ..Startup::default()
+    };
+    rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[dm_mine, publish.ch, bi_dup2],
+        mj,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    Ok((root, mj))
+}
+
+/// Open the published volume `name` (retrying while the volume manager has not published it yet).
+fn open_volume(root: &mut Fs, name: &[u8], rights: u32) -> Result<Fs, Detail> {
+    let mut view = root
+        .view(&[name], prt::ALL)
+        .map_err(|e| msg_e(e, line!()))?;
+    let until = sys::clock_get() + 15_000;
+    loop {
+        match view.open(name, pfl::DIRECTORY, rights) {
+            Ok(f) => return Ok(f),
+            Err(e) if sys::clock_get() < until => {
+                let _ = e;
+                nap_ticks(100);
+            }
+            Err(e) => return Err(msg_e(e, line!())),
+        }
+    }
+}
+
+fn volmgr_serves_volumes_by_the_table() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let have_disk = match find_blk(res)? {
+        Some(_) => {
+            let me = sys::process_self().a1 as u32;
+            sys::process_unmap(me, MMIO_VA);
+            sys::handle_close(me);
+            true
+        }
+        None => false,
+    };
+    if !have_disk {
+        return Ok(());
+    }
+    // setup: format the second disk (device 1) the way a host tool would
+    {
+        let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+        let blk = open_disk(mgr_ch, 1, 1)?;
+        let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
+        fsfmt::mkfs(&mut dev, FSD_UUID, "volmgrtest").map_err(|_| msg_at(line!()))?;
+        sys::handle_close(blk);
+        sys::handle_close(mgr_ch);
+        wait_ended(mgr, 3000)?;
+        sys::handle_close(mgr);
+        job_use_settles(mj, 0, 0, 3000)?;
+        sys::handle_close(mj);
+    }
+    let bi = boot_image_vmo()?;
+    let hex = b"vol-uuid-6673642d73756974652d766f6c756d65";
+    // ---- the first run: device 0 is not a volume (ignored), device 1 is, named `data` by the table
+    let (mut reg, mj) = start_volmgr_rig(res, bi)?;
+    let mut data = open_volume(&mut reg, b"vol-data", RW_DIR)?;
+    ensure_eq!(
+        data.mkdir(b"kept"),
+        Ok(()),
+        "make a directory on the volume"
+    );
+    let mut f = data
+        .open(b"kept/note", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        f.write(0, b"through the volume manager"),
+        Ok(26),
+        "write a file"
+    );
+    ensure_eq!(data.sync(), Ok(()), "sync");
+    f.close();
+    data.close();
+    // the same volume under its uuid
+    let mut again = open_volume(&mut reg, hex, RO_DIR)?;
+    let mut kept = again
+        .open(b"kept", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&kept.read_dir().map_err(|e| msg_e(e, line!()))?),
+        vec![b"note".to_vec()],
+        "by uuid"
+    );
+    // a read-only grant cannot write
+    ensure!(
+        again.mkdir(b"x").is_err(),
+        "no write through a read-only connection"
+    );
+    kept.close();
+    again.close();
+    // a name the table does not map does not exist
+    let mut view = reg.view(&[&b"vol-other"[..]], prt::ALL);
+    if let Ok(v) = view.as_mut() {
+        ensure!(
+            v.open(b"vol-other", pfl::DIRECTORY, RO_DIR).is_err(),
+            "an unmapped name gives nothing"
+        );
+    }
+    // ---- the machine's services all die and start again: the volume comes back from the disk
+    reg.close();
+    ok(sys::job_kill(mj, -1), "kill the first rig")?;
+    job_use_settles(mj, 0, 0, 5000)?;
+    sys::handle_close(mj);
+    let (mut reg, mj) = start_volmgr_rig(res, bi)?;
+    let mut data = open_volume(&mut reg, b"vol-data", RO_DIR)?;
+    let mut f = data
+        .open(b"kept/note", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        f.read_all(),
+        Ok(b"through the volume manager".to_vec()),
+        "the file after the restart"
+    );
+    f.close();
+    data.close();
+    reg.close();
+    ok(sys::job_kill(mj, -1), "kill the second rig")?;
+    job_use_settles(mj, 0, 0, 5000)?;
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    sys::debug_write(b"fs: volmgr served the volume by the table and after a restart\n");
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -10477,6 +10666,10 @@ pub fn app_main() -> i32 {
         (
             "clock_service_reports_the_rtc",
             clock_service_reports_the_rtc,
+        ),
+        (
+            "volmgr_serves_volumes_by_the_table",
+            volmgr_serves_volumes_by_the_table,
         ),
         (
             "a_child_has_no_device_authority",
