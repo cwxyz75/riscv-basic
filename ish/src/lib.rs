@@ -7,10 +7,13 @@ extern crate alloc;
 
 pub mod ast;
 pub mod builtins;
+pub mod complete;
 pub mod eval;
 pub mod fake;
 pub mod host;
+pub mod line;
 pub mod parser;
+pub mod repl;
 pub mod value;
 
 pub use parser::{parse, ParseError};

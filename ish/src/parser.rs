@@ -14,6 +14,8 @@ use data::Number;
 pub struct ParseError {
     pub pos: Pos,
     pub msg: String,
+    /// The input ended inside a construct (an unclosed block, bracket or pipe): more lines would complete it.
+    pub incomplete: bool,
 }
 
 impl core::fmt::Display for ParseError {
@@ -90,10 +92,7 @@ impl Parser {
     }
 
     fn err<T>(&self, msg: &str) -> R<T> {
-        Err(ParseError {
-            pos: self.pos(),
-            msg: String::from(msg),
-        })
+        Err(self.e(msg))
     }
 
     fn peek(&self) -> Option<char> {
@@ -659,6 +658,7 @@ impl Parser {
         ParseError {
             pos: self.pos(),
             msg: String::from(msg),
+            incomplete: self.i >= self.s.len() && !msg.starts_with("unterminated"),
         }
     }
 
@@ -953,6 +953,7 @@ impl Parser {
                     Ok(n) => Part::Num(n),
                     Err(_) => {
                         return Err(ParseError {
+                            incomplete: false,
                             pos,
                             msg: format!("bad number `{t}`"),
                         })
@@ -968,6 +969,7 @@ impl Parser {
                     "null" => Part::Null,
                     _ => {
                         return Err(ParseError {
+                            incomplete: false,
                             pos,
                             msg: format!("`{t}` is not a value here: quote it (barewords are not values in a literal)"),
                         })

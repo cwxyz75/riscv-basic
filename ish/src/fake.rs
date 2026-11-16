@@ -53,6 +53,10 @@ pub struct FakeHost {
     /// Every program started, in order, with its arguments.
     pub log: Vec<Vec<String>>,
     confined: Vec<Vec<(String, String)>>,
+    /// What the terminal will give, in order (then it is gone).
+    pub term_in: VecDeque<TermIn>,
+    /// `interrupted()` answers true on this many polls from now (0 = never).
+    pub interrupt_after_polls: u32,
 }
 
 fn norm(cwd: &str, p: &str) -> String {
@@ -90,6 +94,8 @@ impl FakeHost {
             statuses: BTreeMap::new(),
             log: Vec::new(),
             confined: Vec::new(),
+            term_in: VecDeque::new(),
+            interrupt_after_polls: 0,
         };
         h.objs.insert(0, Obj::Stdin);
         h.objs.insert(1, Obj::Stdout);
@@ -419,6 +425,38 @@ impl Host for FakeHost {
 
     fn unconfine(&mut self) {
         self.confined.pop();
+    }
+
+    fn term_read(&mut self) -> TermIn {
+        self.term_in.pop_front().unwrap_or(TermIn::Gone)
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<Vec<(String, bool)>, HostError> {
+        let dir = norm(&self.cwd, path);
+        let prefix = alloc::format!("{}/", dir.trim_end_matches('/'));
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for k in self.files.keys() {
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                let first = rest.split('/').next().unwrap_or("");
+                let is_dir = rest.contains('/');
+                if !out.iter().any(|(n, _)| n == first) {
+                    out.push((String::from(first), is_dir));
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(HostError::NotFound);
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn interrupted(&mut self) -> bool {
+        if self.interrupt_after_polls > 0 {
+            self.interrupt_after_polls -= 1;
+            return self.interrupt_after_polls == 0;
+        }
+        false
     }
 
     fn getenv(&self, name: &str) -> Option<String> {

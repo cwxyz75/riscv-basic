@@ -18,7 +18,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream};
+use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream, TermIn};
 use proto::console::{self as ctl, Control};
 use proto::file::{flags, rights};
 use proto::startup::{Role, Startup};
@@ -30,18 +30,10 @@ use rt::io;
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
-const PROMPT: &[u8] = b"$ ";
 const BANNER: &[u8] = b"riscv-os S4 ready\n";
 const HELP: &str =
     "builtins: cd pwd exit help halt\nprograms: ls cat echo probe spin hog bomb ipchog\n";
 const KILLED: i32 = -130;
-
-enum Event {
-    Line(Vec<u8>),
-    Interrupt,
-    Eof,
-    Gone,
-}
 
 /// What a `Stream` the shell hands to `ish` stands for (0, 1 and 2 are the terminal).
 enum Obj {
@@ -87,6 +79,12 @@ struct Os {
     killed: bool,
     /// `confine` grants, innermost last: while set, programs get exactly these (and `.`, `/dev`, `/tmp`).
     confined: Vec<Vec<(String, String)>>,
+    /// The terminal is in raw mode (the shell is editing a line); programs run with it cooked.
+    raw: bool,
+    /// Ctrl-C was reported while the shell was not looking (an event on the control channel).
+    interrupt: bool,
+    /// There is a console server: interactive mode.
+    interactive: bool,
 }
 
 /// A volume granted to a trusted program (`/etc/trusted`, FS-SPEC section 6): the volume's name in the mount table, the
@@ -187,31 +185,41 @@ impl Os {
         say(self.tty, bytes);
     }
 
-    /// The next thing the user did: a line, Ctrl-C (a lone 0x03) or Ctrl-D (a lone 0x04).
-    fn next_event(&mut self) -> Event {
+    /// Put the terminal in raw mode, where the shell edits the line itself and Ctrl-C is an event (no echo, no line
+    /// editing in the console server).
+    fn go_raw(&mut self) {
+        if self.interactive && !self.raw {
+            self.raw = self.control(Control::SetMode(ctl::mode::ISIG), &[]);
+        }
+    }
+
+    /// Give the terminal back to the console server's line discipline, for the programs the shell starts.
+    fn go_cooked(&mut self) {
+        if self.interactive && self.raw {
+            self.control(Control::SetMode(ctl::mode::COOKED), &[]);
+            self.raw = false;
+        }
+    }
+
+    /// Look at the control channel without waiting: an interrupt event sets the flag.
+    fn poll_ctl(&mut self) {
+        if !self.interactive {
+            return;
+        }
         loop {
-            if let Some(&b) = self.inbuf.first() {
-                match b {
-                    0x03 => {
-                        self.inbuf.remove(0);
-                        return Event::Interrupt;
-                    }
-                    0x04 => {
-                        self.inbuf.remove(0);
-                        return Event::Eof;
-                    }
-                    _ => {}
-                }
+            let mut rb = [0u8; 16];
+            let r = sys::channel_read(
+                self.ctl,
+                rb.as_mut_ptr(),
+                rb.len(),
+                core::ptr::null_mut(),
+                0,
+            );
+            if r.status != 0 {
+                return;
             }
-            if let Some(i) = self.inbuf.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = self.inbuf.drain(..=i).collect();
-                line.pop();
-                return Event::Line(line);
-            }
-            let mut buf = [0u8; 256];
-            match io::read(self.tty, &mut buf) {
-                Ok(0) | Err(_) => return Event::Gone,
-                Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
+            if let Some(ctl::Event::Interrupt) = ctl::decode_event(&rb[..r.a1]) {
+                self.interrupt = true;
             }
         }
     }
@@ -282,7 +290,13 @@ impl Os {
             if r.status == 0 {
                 match ctl::decode_reply(&rb[..r.a1]) {
                     Some((t, st)) if t == self.txid => return st == 0,
-                    _ => continue, // a late reply to an earlier call: skip it
+                    Some(_) => continue, // a late reply to an earlier call: skip it
+                    None => {
+                        if let Some(ctl::Event::Interrupt) = ctl::decode_event(&rb[..r.a1]) {
+                            self.interrupt = true;
+                        }
+                        continue;
+                    }
                 }
             }
             if r.status() != Some(Status::ShouldWait) {
@@ -566,6 +580,8 @@ impl Host for Os {
     }
 
     fn spawn(&mut self, argv: &[String], io: ProcIo) -> Result<Pid, HostError> {
+        // programs read the terminal through the console server's line editor
+        self.go_cooked();
         let h = self.start(argv, io)?;
         let id = self.next_pid;
         self.next_pid += 1;
@@ -736,6 +752,77 @@ impl Host for Os {
         Vec::new() // (T126: patterns are not expanded in the OS yet)
     }
 
+    fn term_read(&mut self) -> TermIn {
+        self.go_raw();
+        if !self.inbuf.is_empty() {
+            return TermIn::Bytes(core::mem::take(&mut self.inbuf));
+        }
+        loop {
+            let p = sys::port_create();
+            if p.status != 0 {
+                return TermIn::Gone;
+            }
+            let port = p.a1 as u32;
+            sys::port_bind(port, self.tty, signals::READABLE | signals::PEER_CLOSED, 1);
+            sys::port_bind(port, self.ctl, signals::READABLE | signals::PEER_CLOSED, 2);
+            let w = sys::port_wait(port, u64::MAX);
+            sys::handle_close(port);
+            if w.status != 0 {
+                return TermIn::Gone;
+            }
+            // the control channel first: an interrupt event is not typed text
+            let mut rb = [0u8; 16];
+            let c = sys::channel_read(
+                self.ctl,
+                rb.as_mut_ptr(),
+                rb.len(),
+                core::ptr::null_mut(),
+                0,
+            );
+            if c.status == 0 {
+                match ctl::decode_event(&rb[..c.a1]) {
+                    Some(ctl::Event::Interrupt) => return TermIn::Interrupt,
+                    Some(ctl::Event::Hangup) => return TermIn::Gone,
+                    _ => {}
+                }
+            } else if c.status() != Some(Status::ShouldWait) {
+                return TermIn::Gone; // the console server closed the channel
+            }
+            let mut buf = [0u8; 256];
+            let r = sys::socket_read(self.tty, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(Status::Ok) if r.a1 > 0 => return TermIn::Bytes(buf[..r.a1].to_vec()),
+                Some(Status::Ok) | Some(Status::ShouldWait) => {}
+                _ => return TermIn::Gone,
+            }
+        }
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<Vec<(String, bool)>, HostError> {
+        let rel = self.rel_path(path);
+        let want = rights::READ | rights::ENUMERATE;
+        let mut d = if rel.is_empty() {
+            self.root.clone_conn(want)
+        } else {
+            self.root.open(&rel, flags::DIRECTORY, want)
+        }
+        .map_err(host_err)?;
+        let list = d.read_dir();
+        d.close();
+        let list = list.map_err(host_err)?;
+        Ok(list
+            .into_iter()
+            .map(|e| (String::from_utf8_lossy(&e.name).into_owned(), e.is_dir))
+            .collect())
+    }
+
+    fn interrupted(&mut self) -> bool {
+        // a loop of shell code must not hog the machine: give the console server (and everything else) the processor
+        io::nap(1);
+        self.poll_ctl();
+        core::mem::take(&mut self.interrupt)
+    }
+
     fn started(&mut self, pids: &[Pid]) -> bool {
         // register the job (duplicates with only KILL|WAIT|TRANSFER)
         let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
@@ -757,8 +844,17 @@ impl Host for Os {
         // A Ctrl-C typed before the registration was acknowledged reached the console server while it had no job to kill,
         // but its 0x03 byte is already waiting on the terminal: honour it now (this closes the start-gate race, T31).
         self.read_ahead();
-        if let Some(i) = self.inbuf.iter().position(|&b| b == 0x03) {
+        self.poll_ctl();
+        let early = self.inbuf.iter().position(|&b| b == 0x03);
+        if let Some(i) = early {
             self.inbuf.remove(i);
+        }
+        if early.is_some() || self.interrupt {
+            // (in raw mode the console server reports the interrupt as an event and does not echo it)
+            if self.interrupt {
+                self.say(b"^C\r\n");
+            }
+            self.interrupt = false;
             for &p in &hs {
                 sys::process_kill(p, KILLED);
             }
@@ -773,6 +869,8 @@ impl Host for Os {
             self.killed = false;
             self.swallow_interrupt();
         }
+        self.interrupt = false;
+        self.go_raw();
     }
 
     fn kill(&mut self, pid: Pid) {
@@ -958,15 +1056,17 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
-    let (Some(tty), Some(root_ch), Some(launch), Some(ctl_ch), Some(init_ch)) = (
+    // without a console server the shell is not on a terminal: it reads a script from standard input (the Tty role's
+    // stream) and prints no prompt
+    let (Some(tty), Some(root_ch), Some(launch)) = (
         env.handle(Role::Tty),
         env.handle(Role::ServiceFs),
         env.handle(Role::ServiceLaunch),
-        env.handle(Role::ServiceConsole),
-        env.handle(Role::ServiceInit),
     ) else {
         return 3;
     };
+    let ctl_ch = env.handle(Role::ServiceConsole);
+    let init_ch = env.handle(Role::ServiceInit);
     let mut root = Fs::new(root_ch);
     let Ok(cwd) = root.open(b"home", flags::DIRECTORY, rights::READ | rights::ENUMERATE) else {
         return 4;
@@ -977,8 +1077,8 @@ pub fn app_main() -> i32 {
         cwd,
         cwd_path: b"/home".to_vec(),
         launch,
-        ctl: ctl_ch,
-        init_ch,
+        ctl: ctl_ch.unwrap_or(u32::MAX),
+        init_ch: init_ch.unwrap_or(u32::MAX),
         trusted: Vec::new(),
         registry: env.handle(Role::ServiceRegistry).map(Fs::new),
         tmp: env.handle(Role::TmpDir).map(Fs::new),
@@ -994,30 +1094,19 @@ pub fn app_main() -> i32 {
         env: BTreeMap::new(),
         killed: false,
         confined: Vec::new(),
+        raw: false,
+        interrupt: false,
+        interactive: ctl_ch.is_some(),
     };
     let mut sh = ish::Shell::new(os);
     sh.name = String::from("sh");
+    if !sh.host.interactive {
+        // not on a terminal: the standard messages, no prompt, no echo
+        return ish::repl::run_batch(&mut sh);
+    }
     sh.legacy = true;
     sh.help = String::from(HELP);
     sh.host.load_trusted();
     sh.host.say(BANNER);
-    loop {
-        sh.host.say(PROMPT);
-        match sh.host.next_event() {
-            Event::Line(line) => {
-                match String::from_utf8(line) {
-                    Ok(text) => {
-                        sh.run_line(&text);
-                    }
-                    Err(_) => sh.host.say(b"sh: input is not valid UTF-8\n"),
-                }
-                if let Some(code) = sh.take_exit() {
-                    return code;
-                }
-            }
-            Event::Interrupt => {} // the console server already echoed ^C: just prompt again
-            Event::Eof => return 0,
-            Event::Gone => return 0,
-        }
-    }
+    ish::repl::run_interactive(&mut sh)
 }

@@ -49,6 +49,17 @@ pub struct ProcIo {
     pub stderr: Stream,
 }
 
+/// What the terminal gave the shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermIn {
+    /// Bytes typed (the terminal is in raw mode while the shell edits a line).
+    Bytes(Vec<u8>),
+    /// The terminal reported an interrupt (Ctrl-C) while no job was running.
+    Interrupt,
+    /// The terminal is gone.
+    Gone,
+}
+
 pub trait Host {
     /// The shell's own standard streams.
     fn stdin(&self) -> Stream;
@@ -109,6 +120,20 @@ pub trait Host {
     }
     /// End the innermost `confine`.
     fn unconfine(&mut self) {}
+
+    /// Wait for the terminal (interactive hosts only).
+    fn term_read(&mut self) -> TermIn {
+        TermIn::Gone
+    }
+    /// The entries of a directory, `(name, is_directory)`, for completion.
+    fn list_dir(&mut self, _path: &str) -> Result<Vec<(String, bool)>, HostError> {
+        Err(HostError::NotFound)
+    }
+    /// Has the user interrupted (Ctrl-C) since the last call? Polled between statements and loop iterations, so a loop
+    /// made of shell code can be stopped.
+    fn interrupted(&mut self) -> bool {
+        false
+    }
 
     fn getenv(&self, name: &str) -> Option<String>;
     fn setenv(&mut self, name: &str, value: &str);
