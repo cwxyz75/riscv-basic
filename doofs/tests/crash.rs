@@ -199,6 +199,16 @@ fn dump(t: &mut dyn Tree) -> Dump {
             }
         }
     }
+    for (key, path) in t.tagged() {
+        out.insert(
+            format!(
+                "tag-index:{}:{}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(&path)
+            ),
+            (Kind::File, vec![]),
+        );
+    }
     out
 }
 
