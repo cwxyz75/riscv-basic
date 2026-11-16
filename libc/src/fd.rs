@@ -632,7 +632,7 @@ unsafe fn fill_stat(out: *mut Stat, info: &proto::file::StatInfo, dev: u64, abs:
         st_rdev: 0,
         st_size: info.size as i64,
         st_blksize: 4096,
-        st_blocks: ((info.size + 511) / 512) as i64,
+        st_blocks: info.size.div_ceil(512) as i64,
         st_atim: t,
         st_mtim: t,
         st_ctim: t,
