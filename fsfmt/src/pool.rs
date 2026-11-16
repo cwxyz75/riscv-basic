@@ -8,7 +8,7 @@
 
 use crate::device::{DevError, Device, BLOCK};
 use crate::node::{Node, NodeError, Ptr};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,12 @@ pub struct Pool<D: Device> {
     limit: u64,
     free: Vec<u64>,
     retired: Vec<Retired>,
+    /// Inside a transaction: the blocks taken since `begin`, and how many retirements there were.
+    txn: Option<(BTreeSet<u64>, usize)>,
+    /// Blocks kept back from ordinary writes so that deleting still works on a full volume.
+    reserve: u64,
+    /// Inside the deleting paths: the reserve may be used.
+    use_reserve: bool,
     /// Retained snapshots: generation to how many hold it.
     live: BTreeMap<u64, u32>,
 }
@@ -65,6 +71,9 @@ impl<D: Device> Pool<D> {
             limit,
             free: Vec::new(),
             retired: Vec::new(),
+            txn: None,
+            reserve: 0,
+            use_reserve: false,
             live: BTreeMap::new(),
         }
     }
@@ -82,6 +91,9 @@ impl<D: Device> Pool<D> {
             limit,
             free,
             retired: Vec::new(),
+            txn: None,
+            reserve: 0,
+            use_reserve: false,
             live: BTreeMap::new(),
         }
     }
@@ -124,15 +136,96 @@ impl<D: Device> Pool<D> {
         }
     }
 
+    /// Keep `blocks` back from ordinary writes (see `allow_reserve`).
+    pub fn set_reserve(&mut self, blocks: u64) {
+        self.reserve = blocks;
+    }
+
+    /// Let the writes of the deleting paths (unlink, shrink, reap) use the reserve.
+    pub fn allow_reserve(&mut self, on: bool) {
+        self.use_reserve = on;
+    }
+
     fn take(&mut self) -> Result<u64, PoolError> {
-        if let Some(a) = self.free.pop() {
-            return Ok(a);
-        }
-        if self.next >= self.limit {
+        let available = self.free.len() as u64 + (self.limit - self.next.min(self.limit));
+        if !self.use_reserve && available <= self.reserve {
             return Err(PoolError::NoSpace);
         }
-        self.next += 1;
-        Ok(self.next - 1)
+        let a = if let Some(a) = self.free.pop() {
+            a
+        } else if self.next >= self.limit {
+            return Err(PoolError::NoSpace);
+        } else {
+            self.next += 1;
+            self.next - 1
+        };
+        if let Some((log, _)) = &mut self.txn {
+            log.insert(a);
+        }
+        Ok(a)
+    }
+
+    /// Return a block `take` gave out that was never used.
+    fn give_back(&mut self, addr: u64) {
+        if let Some((log, _)) = &mut self.txn {
+            log.remove(&addr);
+        }
+        self.free.push(addr);
+    }
+
+    /// Start a transaction: until `end` or `rollback`, the blocks taken and the blocks retired are remembered.
+    pub fn begin(&mut self) {
+        self.txn = Some((BTreeSet::new(), self.retired.len()));
+    }
+
+    /// Keep what the transaction did.
+    pub fn end(&mut self) {
+        if let Some((_, from)) = self.txn.take() {
+            // what was born in the open generation and retired in it is reachable from no snapshot: free it now
+            let open = self.open_gen;
+            let mut i = from;
+            while i < self.retired.len() {
+                if self.retired[i].birth == open {
+                    self.free.push(self.retired.swap_remove(i).addr);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Undo the transaction's effect on the pool: the blocks it took are free again and what it retired is live again.
+    /// (The caller puts the tree root back; nothing on the device needs undoing, since nothing points at those blocks.)
+    pub fn rollback(&mut self) {
+        if let Some((log, retired)) = self.txn.take() {
+            self.retired.truncate(retired);
+            self.free.extend(log);
+        }
+        self.use_reserve = false;
+    }
+
+    /// Write one block of file data to a fresh block born in the open generation. Its check field is the block's CRC.
+    pub fn write_data(&mut self, data: &[u8; BLOCK]) -> Result<Ptr, PoolError> {
+        let addr = self.take()?;
+        if let Err(e) = self.dev.write(addr, data) {
+            self.give_back(addr);
+            return Err(e.into());
+        }
+        Ok(Ptr {
+            addr,
+            gen: self.open_gen,
+            check: Ptr::check_of(data),
+        })
+    }
+
+    /// Read a block of file data and verify it against the pointer's check field.
+    pub fn read_data(&mut self, ptr: &Ptr) -> Result<[u8; BLOCK], PoolError> {
+        let mut b = [0u8; BLOCK];
+        self.dev.read(ptr.addr, &mut b)?;
+        if Ptr::check_of(&b) != ptr.check {
+            return Err(NodeError::Check.into());
+        }
+        Ok(b)
     }
 
     /// Write `node` to a fresh block born in the open generation; returns its pointer.
@@ -140,7 +233,7 @@ impl<D: Device> Pool<D> {
         let addr = self.take()?;
         let block = node.encode(addr, self.open_gen, self.owner);
         if let Err(e) = self.dev.write(addr, &block) {
-            self.free.push(addr);
+            self.give_back(addr);
             return Err(e.into());
         }
         Ok(Ptr {
@@ -159,6 +252,13 @@ impl<D: Device> Pool<D> {
 
     /// The tree has stopped using `ptr`'s block as of the open generation.
     pub fn retire(&mut self, ptr: &Ptr) {
+        // a block this transaction wrote is reachable from nothing else, not even the root a rollback would restore
+        if let Some((log, _)) = &mut self.txn {
+            if log.remove(&ptr.addr) {
+                self.free.push(ptr.addr);
+                return;
+            }
+        }
         self.retired.push(Retired {
             addr: ptr.addr,
             birth: ptr.gen,

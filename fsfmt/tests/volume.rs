@@ -274,3 +274,27 @@ fn overwriting_forever_does_not_run_out_of_space() {
     let rep = check(&mut v.into_device());
     assert!(rep.problems.is_empty());
 }
+
+#[test]
+fn the_reserve_is_kept_back_from_ordinary_writes_but_open_to_the_deleting_paths() {
+    let mut v = mount(fresh(60)).unwrap();
+    v.pool.set_reserve(10);
+    let mut n = 0u32;
+    // ordinary writes stop with the reserve untouched
+    while v
+        .tree
+        .insert(&mut v.pool, &n.to_be_bytes(), &[7; 900])
+        .is_ok()
+    {
+        n += 1;
+    }
+    assert!(
+        v.pool.free_blocks() >= 9,
+        "the reserve is untouched: {}",
+        v.pool.free_blocks()
+    );
+    // the reserve's users can still write
+    v.pool.allow_reserve(true);
+    assert!(v.tree.delete(&mut v.pool, &0u32.to_be_bytes()).is_ok());
+    v.pool.allow_reserve(false);
+}

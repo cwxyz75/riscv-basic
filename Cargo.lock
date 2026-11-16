@@ -95,6 +95,15 @@ name = "dns"
 version = "0.1.0"
 
 [[package]]
+name = "doofs"
+version = "0.1.0"
+dependencies = [
+ "fsfmt",
+ "memfs",
+ "proto",
+]
+
+[[package]]
 name = "doofs-tools"
 version = "0.1.0"
 dependencies = [
