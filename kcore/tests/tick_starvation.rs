@@ -25,13 +25,13 @@ fn a_periodic_high_priority_waker_does_not_starve_equal_peers() {
             rq.sleep_until(now + MS).unwrap();
         }
         let who = rq.current().expect("something runs");
-        *ran.entry(who as u32).or_default() += 1;
+        *ran.entry(who).or_default() += 1;
         now += MS;
         rq.advance(MS);
     }
     let (ra, rb) = (
-        ran.get(&(a as u32)).copied().unwrap_or(0),
-        ran.get(&(b as u32)).copied().unwrap_or(0),
+        ran.get(&a).copied().unwrap_or(0),
+        ran.get(&b).copied().unwrap_or(0),
     );
     assert!(
         ra >= 60 && rb >= 60,
