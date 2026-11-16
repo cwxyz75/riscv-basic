@@ -84,6 +84,10 @@ name = "console"
 version = "0.1.0"
 
 [[package]]
+name = "data"
+version = "0.1.0"
+
+[[package]]
 name = "dhcp"
 version = "0.1.0"
 dependencies = [
@@ -201,6 +205,13 @@ dependencies = [
  "shell-core",
  "supervise",
  "svc",
+]
+
+[[package]]
+name = "ish"
+version = "0.1.0"
+dependencies = [
+ "data",
 ]
 
 [[package]]

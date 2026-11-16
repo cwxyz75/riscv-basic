@@ -1,0 +1,7 @@
+[package]
+name = "data"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the value type and the JSON, CSV and TSV parsers and emitters of the native shell ish (SHELL-SPEC sections 4 and 6, step SH1). Pure, no_std + alloc, no unsafe, host-tested."
+
+[dependencies]
