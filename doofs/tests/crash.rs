@@ -565,7 +565,7 @@ fn sampled_three_operation_workloads_survive_too() {
 #[test]
 fn attribute_and_index_workloads_survive_a_crash_at_every_point() {
     use W::*;
-    let mut rng = Rng(0xA77_1B07_E5);
+    let mut rng = Rng(0x00A7_71B0_7E55);
     let sets: Vec<Vec<W>> = vec![
         vec![SetAttr("g", b"red"), MakeIndex, Fsync],
         vec![MakeIndex, SetAttr("g", b"red"), Fsync],
