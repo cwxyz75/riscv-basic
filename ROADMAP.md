@@ -701,9 +701,9 @@ later the S10 manifest).
 The command-line side of the system: the canonical layout of a session's namespace, POSIX as a porting surface judged by a
 named corpus, advisory POSIX metadata, the terminal, sessions and profiles, `/proc`, and the es-style native shell. The specs
 are `USER-VIEW-SPEC.md` (the track and its steps UV0 to UV10), `SHELL-SPEC.md` (the shell language), `SHELL-CORPUS.md` (ten
-scripts and the findings that shaped the syntax) and `UV0-GAP-SURVEY.md` (the libc and `rt` against the target programs). Open
-questions are in `USER-VIEW-SPEC.md` section 15 (Q2 dynamic linking, Q4 install layout, Q5 PIDs, Q12 the default namespace of a
-program the shell starts, and others). Decisions to log on acceptance are in its section 14 (OD-UV1 to OD-UV10, provisional).
+scripts and the findings that shaped the syntax) and `UV0-GAP-SURVEY.md` (the libc and `rt` against the target programs). Q4 (flat merged install layout) and Q12 (the confined default namespace) were resolved on 2026-11-17; authentication and the
+profile format are decided at UV5. Other open
+questions are in `USER-VIEW-SPEC.md` section 15 (Q2 dynamic linking, Q5 PIDs, and others). Decisions to log on acceptance are in its section 14 (OD-UV1 to OD-UV10, provisional).
 
 Already built that the track builds on: per-program namespaces and the registry (SD), the `/etc/trusted` grants of volumes at
 `/mnt/<name>` (filesystem step 5e), the doofs attributes and indexes (step 6; UV3's storage), the libc over the file protocol.
