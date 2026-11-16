@@ -671,8 +671,41 @@ impl<C: SchedClass> Sched<C> {
     /// One timer tick on hart 0 of a one-hart scheduler: advance the clock by one, fire timers,
     /// account the time slice.
     pub fn tick(&mut self) {
+        // the tick is charged to the thread that ran it, even if a timer wake below preempts it (T127: charging whoever
+        // is current afterwards let a thread woken at every tick make the one it preempted immortal)
+        let ran = self.cur[0];
         self.advance_to(self.now + 1, 0);
-        self.tick_slice(0);
+        match ran {
+            Some(c) if self.cur[0] != Some(c) => {
+                self.charge_preempted(c, 0);
+                self.reschedule_on(0);
+            }
+            _ => self.tick_slice(0),
+        }
+    }
+
+    /// A thread that was preempted during this very tick used up one tick of its slice: with the slice gone and an equal or
+    /// better thread waiting it goes to the back of its level.
+    fn charge_preempted(&mut self, c: Tid, hart: usize) {
+        let prio = self.threads[&c].prio;
+        if self.threads[&c].state != State::Runnable {
+            return;
+        }
+        let left = self.threads[&c].slice.saturating_sub(1);
+        if left > 0 {
+            self.threads.get_mut(&c).expect("exists").slice = left;
+            return;
+        }
+        let rotate = {
+            let this: &Sched<C> = self;
+            this.class
+                .would_rotate_where(prio, &|t| this.allowed_ro(t, hart))
+        };
+        self.threads.get_mut(&c).expect("exists").slice = TIMESLICE_TICKS;
+        if rotate {
+            self.class.remove(c);
+            self.class.enqueue_tail(c, prio);
+        }
     }
 
     /// Advance the clock to `now` (never backwards) and fire the timers that are due; `caller`

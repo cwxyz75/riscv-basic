@@ -817,8 +817,6 @@ impl Host for Os {
     }
 
     fn interrupted(&mut self) -> bool {
-        // a loop of shell code must not hog the machine: give the console server (and everything else) the processor
-        io::nap(1);
         self.poll_ctl();
         core::mem::take(&mut self.interrupt)
     }

@@ -857,6 +857,11 @@ impl<N: Class> HartRq<N> {
     /// Advance the clock by `dt`: fire the timers that are due, account the running thread's slice (rotating it
     /// when its slice is over and an equal or better peer waits), then make the designation right.
     pub fn advance(&mut self, dt: Time) {
+        // The thread that ran during this tick: it is the one whose slice the tick uses up, even when a timer wake below
+        // preempts it. (Charging whoever is current *after* the wakes made a thread that is woken at every tick, such as
+        // the interactive boot's serial bridge, pay for every tick, so the thread it preempted never used up its slice and
+        // its equal-priority peers never ran: T127.)
+        let ran = self.cur.filter(|&c| Some(c) != self.idle);
         self.now += dt;
         let due: Vec<(Time, Tid)> = self.timers.range(..(self.now + 1, 0)).copied().collect();
         for (d, tid) in due {
@@ -871,22 +876,31 @@ impl<N: Class> HartRq<N> {
                 }
             }
         }
-        // (v1 fires the timers, makes the designation right for them, then accounts the slice; the order matters
-        // for which thread owns the tick that ends a slice)
+        // (v1 fires the timers and makes the designation right for them; the slice is accounted to the thread that ran)
         self.reschedule();
-        if let Some(c) = self.cur.filter(|&c| Some(c) != self.idle) {
+        if let Some(c) = ran {
             let now = self.now;
-            let mut t = self.threads.remove(&c).expect("current exists");
+            let mut t = self.threads.remove(&c).expect("the thread that ran exists");
             let rotate = match band(t.eff) {
                 Band::Rt => self.rt.account(&mut t, dt, now),
                 _ => self.normal.account(&mut t, dt, now),
             };
             self.threads.insert(c, t);
             if rotate {
-                self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
-                self.cur = None;
-                self.class_enqueue(c, Enq::SliceEnd);
-                self.pick();
+                if self.cur == Some(c) {
+                    self.threads.get_mut(&c).expect("current exists").state = State::Runnable;
+                    self.cur = None;
+                    self.class_enqueue(c, Enq::SliceEnd);
+                    self.pick();
+                } else if self
+                    .threads
+                    .get(&c)
+                    .is_some_and(|t| t.state == State::Runnable)
+                {
+                    // preempted this very tick with its slice used up: it goes to the back of its level
+                    self.class_dequeue(c, Deq::AttrChange);
+                    self.class_enqueue(c, Enq::SliceEnd);
+                }
             }
         }
         self.reschedule();
