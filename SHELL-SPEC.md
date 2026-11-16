@@ -52,6 +52,13 @@ A script runs with the authority of the shell that started it, so a ported `sh` 
 10. **The two exits are `ok` and `fail`; `if` is strict-boolean with `succeeds` (and `try`/`catch`); scripts are
     loaded with `import` only** (Decided 2026-11-15; section 5).
 11. **The shell is named `ish`** ("improved shell"), scripts `.ish` (Decided 2026-11-15; Q6).
+12. **Grammar v2** (Decided 2026-11-16, in a syntax review with the owner; section 5.2). It keeps the data model and
+    replaces the surface. A command takes words and an expression computes values, with one rule to tell them apart; `calc`
+    and `is` go; bindings are created with `=` and changed only with `set`; backtick templates; `??` for a missing key;
+    command prefixes (`succeeds`, `run`, `spawn`, `with-env`); jobs; `parse-args`; `lossy-lines`. The design test was:
+    **every rule can be said in one sentence, without "except" and without examples**, and least surprise wins over
+    ruthless consistency where they conflict (the one exception kept is rule I1). Where sections 5, 5.1 and 7 disagree
+    with section 5.2, **5.2 wins**.
 
 ## 3. Non-goals
 
@@ -84,7 +91,9 @@ or a network is untrusted.
 
 ## 5. The language (**Proposal**, except where marked)
 
-The semantics follow `es`; this section fixes only what we change or add. The full grammar is written (with golden
+The semantics follow `es`; this section fixes only what we change or add. **Grammar v2 (section 5.2) supersedes the
+surface syntax written here** (`succeeds (cmd)`, `run (cmd)`, the `calc`/`is` markers, "a command in the last position
+runs and prints" for any callee); the semantics stand. The full grammar is written (with golden
 transcripts) before the evaluator, in step SH0.
 
 * **Commands and pipelines:** `cmd a b c`, `a | b`, `a ; b`, newlines, `&&`, `||`, `!`; redirection as in es
@@ -140,9 +149,9 @@ transcripts) before the evaluator, in step SH0.
   Literal values pass to builtins, closures and the `data` primitives; at the **exec boundary** (an external program's
   argument) a map or list is still an error (rule 2). **Accessor sugar** (`$m.key`, `$l(2)`) is **Decided** (Q1b); `get-or`, `set-in`, `del-in`, `keys`, `len` remain the function forms.
 
-## 5.1 Grammar v1 (written while building SH2; the owner reviews it with the first interactive demo)
+## 5.1 Grammar v1 (as built; superseded by grammar v2, section 5.2)
 
-Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
+This section records what `ish/` implements today, until step SH2b replaces it. Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
 shape open, the choice made is marked **(chosen)**; changing one is a small edit in the parser and the goldens.
 
 **Lexical.** Scripts are UTF-8. `#` starts a comment at the start of a word; a backslash before a newline continues the line.
@@ -192,6 +201,175 @@ pipeline fails if any stage fails, naming the first.
 never caught by `succeeds`, `&&`, `||`, `!` or `run`), `user` (`fail`), `error` (the language). `try ... catch` catches all of them.
 An uncaught failure prints its value to stderr as `ish: ...` and ends the script with its code.
 
+## 5.2 Grammar v2 (**Decided** 2026-11-16; not yet implemented: step SH2b)
+
+One sentence per rule. **(new)** marks a change from grammar v1 (section 5.1), **(changed)** a revision of something v1
+has; unmarked rules are as built. The value model (section 4) is unchanged.
+
+**Values.**
+* **V1.** A value is text, a number, a boolean, `null`, a list, a map, a closure or a handle, and every value is immutable.
+* **V2.** A number is a 64-bit integer or an exact decimal kept in canonical form (`1.10` is `1.1`); arithmetic never
+  converts a non-number, and overflow is an error.
+* **V3.** `==` is structural equality: values of different kinds are never equal (`'1' == 1` is false), and maps compare
+  without regard to key order; `in` uses the same equality. (A typed `==` that raised on a kind mismatch was considered
+  and withdrawn: its rules for nested values and `in` could not be said in one sentence.)
+* **V4.** A list, map, closure or handle cannot be a program's argument, and closures and handles cannot be serialized.
+
+**Lexical.**
+* **L1.** Scripts are UTF-8; `#` at the start of a word begins a comment; a backslash before a newline continues the line.
+* **L2.** A newline or `;` ends a statement, except inside `( )`, `[ ]` and `{ }` and after `|`, `&&` and `||`.
+* **L3. (changed)** Text is quoted in one of three ways: `'…'` takes every character as written (`''` writes a quote,
+  newlines allowed); `"…"` is a JSON string with JSON escapes and no interpolation; `` `…` `` is a template (T1).
+  `'…'` is the default in documentation and examples.
+* **L4.** Pieces written next to each other form one word, and `^` joins words explicitly.
+* **L5.** `do`, `end`, `else`, `catch` and `set` are reserved wherever they appear unquoted.
+
+**Templates.**
+* **T1. (new)** A backtick string is a template: `$name` inserts a variable and stops at the name (so `.` after it is
+  text: `` `$base.txt` ``), `${expr}` inserts an expression (`` `${$args.0}` ``, `` `${len $xs}` ``), backslash escapes are
+  JSON's plus `\$` and `` \` ``, and a template that starts with a newline drops that newline and the common indentation.
+* **T2. (new)** A hole inserts text as it is and a number, boolean or `null` as its JSON text; a list, map, closure or
+  handle in a hole is an error (join a list explicitly). `format` is dropped.
+
+**The two modes.**
+* **M1.** A statement that starts with a bareword, or with `$f` followed by an argument, is a **command**, and its words
+  are text.
+* **M2. (new)** These places are **expressions**: the right side of `=` and `set`, a condition up to `do`, the inside of
+  `( )`, a slot of a `[ ]` or `{ }` literal, and a template hole.
+* **M3. (new)** In an expression, a leading bareword, or a second token that is not an operator, makes it a **call**;
+  anything else is a **formula**. (This replaces the v1 rule that a parenthesis in an island "groups when it can"; it also
+  settles `>`, which is a comparison in a formula and a redirection in a call.)
+* **M4. (new)** A call inside a formula is the whole expression or sits in parentheses (`if (len $xs) > 0 do`,
+  `if has $m 'k' do`).
+* **M5. (changed)** A bareword that reads as a JSON number, `true`, `false` or `null` is that value; any other bareword is
+  text in a command and a call in an expression. A program receives a number word exactly as written (`echo 1.10`
+  prints `1.10`).
+* **M6. (new)** Parentheses and conditions run a lone bareword (`(date)`); the right side of `=` and `set` and a literal
+  slot reject it, with an error that names both fixes (`'date'` for text, `(date)` to run it). Paths are not exempt: an
+  exemption would make `./notes` and `notes` mean different things.
+
+**Bindings.**
+* **B1. (new)** `x = v` creates a binding, and it is an error if `x` is already bound in this function (the script's top
+  level counts as one function; a parameter may reuse a top-level name).
+* **B2. (new)** `set x = v` changes an existing binding, and it is an error if there is none; `set x.a.b = v` rebinds
+  `x` to an updated copy.
+* **B3. (new)** A binding made inside a block ends at its `end`, so a value chosen in a branch is written
+  `x = if c do 1 else 2 end`.
+* **B4.** Closures capture by value.
+
+**Variables and paths.**
+* **P1.** `$name` is a variable's value and `$#name` its length.
+* **P2. (changed)** A path (`.key`, `.0`, `.'a.b'`, `.($k)`, `.$k`) can follow a variable or a parenthesized value
+  (`(split ' ' $line).1`); a missing key raises `missing-key`, `.` on text is an error, and there are no negative indices.
+
+**Commands.**
+* **C1.** The head names a shell function, a builtin or a program, looked up in that order, or is a closure (`$f`) or a
+  module member (`text.slugify`).
+* **C2.** A shell callee receives values (a list stays one value); a program receives words (lists splice one level, a
+  glob expands and no match is an error, a map, closure or handle is an error).
+* **C3.** A command as a statement streams its output and has no value; in value position a program's output is its
+  list of lines and a shell callee gives its result.
+* **C4. (new)** `succeeds`, `run [options]`, `spawn [options]` and `with-env map` are prefixes that take the rest of the
+  pipeline as their command (`found = succeeds grep -q root /etc/passwd`).
+* **C5.** The `=` of an assignment stands alone, so `x=5` is a word.
+
+**Expressions.**
+* **E1. (changed)** Operators from loosest to tightest: `or`; `and`; `not`; `== != < <= > >= in matches`; `^`; `+ -`;
+  `* / // %`; unary `-`; `??`.
+* **E2.** Arithmetic and ordering take only numbers, and `and`, `or` and `not` take only booleans and short-circuit.
+* **E3.** `/` is exact division (half-even at 18 places), `//` floor division and `%` its matching remainder.
+* **E4.** `in` tests membership in a list (structurally) or a key in a map; `matches` tests text against a glob pattern.
+* **E5. (new)** `p ?? d` gives `d` when the key or index in the path `p` is missing, and only then (a key holding `null`
+  gives `null`); it is sugar for `get-or`.
+
+**Control flow.**
+* **F1.** `if C do … else if C do … else … end` is closed by one `end`; `while`, `until`, `break` and `continue` as usual.
+* **F2. (changed)** A condition is an expression up to `do` and must be a boolean (`if $n > 3 and not $done do`).
+* **F3.** `for x in WORDS do … end` takes command-mode words.
+* **F4.** `try do … end catch e [code] do … end` gives the value of the block that ran.
+* **F5.** `defer do … end` runs when the function or script exits, last in first out.
+
+**Functions.**
+* **N1.** `fn name params do … end` defines a function, `@ params do … end` is a closure, and `$args` holds the arguments.
+* **N2. (stated)** A function's result is the value of its last statement; a call written as a statement has no value.
+  (Unlike v1, this does not depend on what kind of callee the call names.)
+* **N3. (new)** Using a function that has no value for its value is an error that names the fix
+  (`total ended with a call statement, so it has no value; write (fold …) or ok (fold …)`).
+* **N4.** `ok v` returns early, `fail v [code]` raises, `exit n` ends the process; there is no `return`.
+* **N5.** `import path` returns a map of the script's top-level names; no search path, cached per run, a cycle is an error.
+
+**Failures.**
+* **X1. (changed)** A failure has a value, a code and a kind: `exit`, `spawn`, `user`, `error`, `missing-key`,
+  `capture-limit`, `timeout` or `interrupt`.
+* **X2.** `succeeds`, `run`, `&&`, `||` and `!` absorb `exit` failures and never `spawn` failures.
+* **X3.** An uncaught failure stops a script and prints `ish: …` with its code; interactive use shows it and continues.
+* **X4. (new)** `!`, `&&` and `||` join commands and `not`, `and` and `or` join booleans; using one where the other
+  belongs is an error that names the right one.
+
+**Jobs.**
+* **J1. (new)** `job = spawn [options] cmd …` starts the rest of the pipeline (a program or a shell callee) in the
+  background and returns a job handle at once.
+* **J2. (new)** `spawn` takes `run`'s options map (`out`, `err`, `max`); output is passed through by default.
+* **J3. (new)** `wait $job` returns the same map as `run` (`status`, `out`, `err`) and never raises for a non-zero exit, so
+  `spawn` then `wait` is `run` in the background.
+* **J4. (new)** `wait-any $jobs` waits for the first of a list of jobs and returns `{ "job": …, "result": … }`.
+* **J5. (new)** `poll $job` returns `null` while the job runs and its result map once it has ended, without blocking.
+* **J6. (new)** `kill $job` ends the job (the `KILL` right on its handle; no signals in v1).
+* **J7. (new)** `wait { "timeout": ms } $job` raises `timeout` and leaves the job running; `run { "timeout": ms } cmd`
+  kills the command, then raises `timeout`.
+* **J8. (new)** When a script ends, for any reason, its unfinished jobs are killed, unless started with
+  `spawn { "detach": true }`.
+* **J9. (new)** An interrupt is an `interrupt` failure raised at the next statement boundary or inside a wait, so `defer`
+  runs and `try` can catch it; a second interrupt ends the script at once, skipping the remaining `defer` blocks.
+* **J10. (new)** A job is a handle (Q3): it can be stored and captured but not serialized, and a job started inside
+  `confine` keeps the narrowed table.
+
+**Arguments, environment and bytes.**
+* **A1. (new)** `parse-args spec $args` returns a map: flags not given are `false`, `--help` prints the usage, and a bad
+  flag prints the usage to stderr and fails with code 2.
+  `parse-args { "usage": "slug [-u] [--out FILE] NAME...", "flags": { "-u": "upper", "--out": { "name": "out", "value": true } }, "rest": "names", "min": 1 } $args`
+* **A2. (new)** `$env` is an ordinary binding: every child gets the value of `$env` when it starts, `set env.EDITOR =
+  'kilo'` changes it for later children, and a value in it that is not text is an error naming the key; there is no
+  `export`.
+* **A3. (new)** `with-env map cmd` runs one command with those variables added to `$env`.
+* **A4. (new)** `lossy-lines` is a stream stage that turns invalid UTF-8 into U+FFFD; plain lines stay strict, so
+  corruption is never silent unless the script asks for it (`zcat big.log.gz | lossy-lines | fold …`).
+
+**Pipelines and redirection.**
+* **R1.** `>`, `>>`, `<`, `>[2=1]` and `>[2] f` work on any command, shell callees included.
+* **R2.** A shell callee may start a pipeline and the stream stages (`each`, `filter`, `map`, `fold`, `take`,
+  `lossy-lines`) may end one; any other shell callee in the middle is an error.
+* **R3.** A pipeline fails if any stage fails, naming the first; when `take` closes the pipe the producer's status is ignored.
+* **R4.** A capture is capped at 1 MiB unless `run`'s `max` option says otherwise.
+
+**Interactive.**
+* **I1. (new)** At the prompt, and only there, a top-level call to a builtin or shell function that returns a non-null
+  value shows that value (`len $names` prints `42`); scripts are unaffected. This is the one exception to N2, kept
+  because the prompt is where people look at values.
+* **I2.** When stdin is not a terminal there is no prompt and no colour.
+
+**Examples** (SHELL-CORPUS scripts 4 and 10 in grammar v2):
+
+```
+counts = zcat /var/log/big.log.gz | lossy-lines | fold {} @ acc line do
+    if not $line matches 'ERROR*' do ok $acc end
+    hour = slice (split ' ' $line).1 0 2
+    set acc.($hour) = ($acc.($hour) ?? 0) + 1
+    $acc
+end
+print (to-json $counts)
+```
+
+```
+text = import lib/text.ish
+opts = parse-args { "usage": "slug [-u] NAME...", "flags": { "-u": "upper" }, "rest": "names", "min": 1 } $args
+for n in $opts.names do
+    s = text.slugify $n
+    print (if $opts.upper do (upper $s) else $s end)
+end
+eprint `slugged ${len $opts.names} names`
+```
+
 ## 6. Data primitives (**Decided** scope; **Proposal** shape)
 
 A pure crate **`data`** (`no_std` + `alloc`, `#![forbid(unsafe_code)]`, host-tested) holds the value type (without
@@ -226,7 +404,7 @@ JSON-mode literal. Operands are variables, literals, nested calls in parentheses
 arithmetic `+ - * / %` and unary `-`; ordering `< <= > >=` (numeric only, no coercion: a non-number is
 an error); logic `and or not` on strict booleans, short-circuiting; `==` and `!=` are a **total structural equality** of any two values (Decided 2026-11-15; `eq` and `ne` are dropped)
 (numbers compare by value, a string never equals a number, `null` is an ordinary operand, lists and maps compare structurally, and map equality ignores key order); `in` for membership; `matches` for patterns; `^` for string concatenation. `&&`, `||`
-and `!` stay the success-based flow between commands. The markers are `calc` (yields a number, arithmetic only) and `is` (yields a boolean, arithmetic operands allowed), accepted in principle; the remaining details are settled in Q12.
+and `!` stay the success-based flow between commands. The markers are `calc` (yields a number, arithmetic only) and `is` (yields a boolean, arithmetic operands allowed), accepted in principle; the remaining details are settled in Q12. **Superseded by grammar v2 (2026-11-16):** there are no markers; a formula is any expression that does not start with a call (section 5.2, M2 and M3).
 
 ## 8. Capability verbs (OD20 continues; **Proposal**)
 
@@ -262,9 +440,20 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
   accepted, every must-reject rejected, implementation-defined cases documented); CSV and TSV pass vectors and a
   round-trip property test; depth, size and duplicate-key limits are tested; one mutation check per new test.
 * **SH2: the evaluator on the host.** Lexer, parser, evaluator over a `Host` trait: lists, closures, exceptions,
-  return values, hooks. *Acceptance:* golden transcripts pass; on the common subset the output equals upstream `es`
-  where it is installed on the host (a differential check, skipped with a message when absent); hook redefinition
-  cannot change what a fake `Host` allows.
+  return values, hooks. *Acceptance:* golden transcripts pass; hook redefinition cannot change what a fake `Host`
+  allows. (The differential check against upstream `es` is dropped as of 2026-11-16: grammar v2 shares too little with
+  `es` for it to mean anything.)
+* **SH2b: grammar v2 on the host** (section 5.2). *Acceptance, written before the code:* the goldens are rewritten in v2
+  first (and fail on the v1 parser), one golden or more per rule marked new or changed, including every error message
+  that names a fix (M6, B1, B2, N3, X4, T2); the ten SHELL-CORPUS scripts rewritten in v2, plus five new ones (a service
+  supervisor with restarts, a tool using `parse-args`, a configuration file rendered from a template, cleanup on
+  interrupt, a log scan over invalid UTF-8 with `lossy-lines`); **independent oracles**: the `data` crate against
+  Python's `json` and `csv`, decimal arithmetic against Python's `decimal`, pipeline exit statuses against
+  `bash -o pipefail` on commands both can run, and a parser fuzz run for SHI4. Jobs (J1 to J10) are tested on the fake
+  `Host` here and in QEMU with SH4b.
+* **SH4b: grammar v2 in the OS.** Jobs, `kill`, timeouts, interrupts and `$env` over the launcher. *Acceptance:* the
+  shell test in QEMU (`-smp 2` and `-smp 4`, said plainly) plus steps for spawn, wait, kill, a timeout and an interrupted
+  script whose `defer` runs.
 * **SH3: numbers.** *Acceptance:* a table of arithmetic cases including overflow and decimal round-trips; operators
   never coerce a non-number.
 * **SH4: in the OS, replacing `sh.rs`.** Launcher integration, pipelines, `confine`, `ns`, `/etc/trusted`, and every
@@ -328,7 +517,13 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
     boolean and may use arithmetic operands (`(is $n + 1 > 3)`), so it needs no nested `calc`; `(is not $done)`,
     `(is $x in $list)` and `(is $line matches 'ERROR*')` read as English. `==` is a total structural equality with no
     coercion, which retires `eq`/`ne`. No operator-as-function names (`add`, `lt`) in v1, since `@ a b calc $a + $b`
-    covers `map` and `fold`; no compound assignment (`+=`) in v1.
+    covers `map` and `fold`; no compound assignment (`+=`) in v1. **Amended 2026-11-16 by grammar v2:** the `calc` and
+    `is` markers are dropped (section 5.2, M2 to M4: `if $n + 1 > 3 do`, `x = $a + $b`); `==` stays a total structural
+    equality.
+13. **Q13 (resolved 2026-11-16): grammar v2.** The owner's syntax review; the result is section 5.2 and decision 12 in
+    section 2. Also settled there: bindings are created with `=` and changed with `set` (the scoping rule finding 6 of
+    SHELL-CORPUS asked for), templates (finding 11), `??` (finding 10), the no-value error (finding 3), jobs (finding 7),
+    `parse-args`, `with-env` and `lossy-lines`.
 
 ## 13. Shortcuts to record in `TIDY-UP.md` when built
 

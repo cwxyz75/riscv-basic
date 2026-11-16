@@ -6,6 +6,9 @@ find out where the model is awkward *before* the grammar is chosen. Everything i
 provisional; the findings at the end are the point. When the grammar exists (step SH0), these scripts become its first
 golden transcripts.
 
+**2026-11-16:** the scripts below are in the placeholder syntax of 2026-11-15. Grammar v2 (`SHELL-SPEC.md` section 5.2)
+answers most of the findings; rewriting these scripts in v2, plus five new system scripts, is part of step SH2b.
+
 The shell is called `ish` (SHELL-SPEC Q6, resolved: "improved shell", and "POSIX-ish"). Scripts are `.ish`.
 
 ## 0. The placeholder syntax (what the examples assume)
