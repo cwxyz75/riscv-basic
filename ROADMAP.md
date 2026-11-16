@@ -351,7 +351,7 @@ the whole suite at four harts takes 35 s, so smoke runs all of it and needs no p
 
 Estimated size (not measured): steps 0 to 2 a day of work in two or three PRs; step 3 spread over the following slices.
 
-### Queue before S8 (proposed order; set 2026-11-14 after the design review)
+### Queue before S8 (history: the order set 2026-11-14 after the design review; S8 and S9 have since been built, and the state of each slice is in its own section below)
 
 The design review (`reviews/2026-11-14-design-review.md`) found a handful of structural things worth
 settling before the network stack is built on them. This is the proposed order; the owner can reorder.
@@ -377,7 +377,7 @@ first tasks come before S8 and the measured lock peels after S9, as set out in t
 10. S8; then tasks 11 and 12 (per-hart queues, the scheduler out of the big kernel lock) after its first milestone, with the
     network stack as the load; then S9; then the measured lock peels (tasks 15 to 20).
 
-### W: Targeted wake and ports as registrations (planned, before S8; not started)
+### W: Targeted wake and ports as registrations (built except step 4's remainder, which is L task 21)
 
 Why: the design review (finding D1) found that the kernel wakes every blocked thread after almost
 every syscall (one global wait queue, OD43), and that signals and ports leave nowhere to attach a
@@ -412,7 +412,7 @@ before poll); a `fault-skip-touch` negative-control kernel; every existing test 
 Estimated size (not measured): 6 to 7 PRs, comparable to S5c or S7b. The kernel review of this slice is a
 Fable review.
 
-### V: VMO commit and the shared-memory rule (planned, before S8; not started)
+### V: VMO commit and the shared-memory rule (done)
 
 Why: the design review (finding D3) found that a page fault on a VMO whose creator's job is over its
 limit ends the process that touched it, whoever owns the VMO, and that there is no way to commit pages
@@ -451,7 +451,7 @@ checks; a negative-control kernel that skips the commit charge.
 
 Estimated size (not measured): 3 to 4 PRs. Kernel and security sensitive: a Fable review.
 
-### A: The RVA23 user ABI (planned; not started)
+### A: The RVA23 user ABI (done; the scalar bit-manipulation and vector extensions are deliberately not used)
 
 Decision (2026-11-14, owner, OD76): user code follows RVA23. Today user programs and all C are soft-float
 `rv64imac`/`lp64`, the kernel keeps FP and vector state off (OD40, OD50), and the Rust user target is
@@ -479,7 +479,7 @@ and after; a negative control that skips the FP save.
 
 Estimated size (not measured): 3 to 5 PRs; a Fable review (kernel context switching).
 
-### R: The service runtime (specified, OD84; step 1 partly built)
+### R: The service runtime (built; step 3 mostly done, step 4's documents not written)
 
 Decision (2026-11-14, owner, OD77): one service loop in `rt`, and accounted connections. Fixes design review
 D7 (nobody uses `channel_call`), D8 (backpressure solved five ways), D11 (servers cannot tell clients apart)
@@ -505,7 +505,7 @@ exact; the benchmark for a request/reply round trip.
 
 Estimated size (not measured): 4 to 6 PRs; a Fable review.
 
-### DM: The device manager overhaul (planned; not started)
+### DM: The device manager overhaul (built: table-driven, several devices and clients; T41 and some documents open)
 
 Design review D6: `devmgr` handles one device type, one client and one driver at a time. It becomes
 table-driven (devices from the device tree, a driver per matching device, started and supervised), serves
@@ -519,7 +519,7 @@ Builds on slices R (the service loop) and I (interrupts); the existing block-dri
 
 Estimated size (not measured): 2 to 3 PRs.
 
-### I: AIA interrupts (done; Fable review pending)
+### I: AIA interrupts (done; the Fable review is still owed)
 
 Decision (2026-11-14, owner, OD75): AIA is the target, full stop. Today interrupt objects are PLIC-only, AIA
 machines fall back to polling, and delivery goes to the boot hart only (design review D5, T43). Plan: interrupt
@@ -540,7 +540,7 @@ Done as one PR rather than three (it was small). The Fable review is still to do
 
 Measured: one PR.
 
-### T: Kernel memory and threads (specified in T-SPEC.md; steps 1 to 6 not started)
+### T: Kernel memory and threads (built: steps 1 to 5 of the list below; kernel-object memory is still not charged to jobs, T1 and T13)
 
 Decision (2026-11-14, owner, OD79): design review D9. The fixed 8 MiB kernel heap, chosen in S1 for simplicity
 (OD29), is half the problem: every kernel cap (OD50) is hand-tuned to fit it (T13), and 32 KiB kernel stacks
@@ -576,7 +576,7 @@ the thread and `channel_call` benchmark before and after; the whole suite at one
 
 Estimated size (not measured): 5 to 6 PRs; a Fable review.
 
-### SD: Service directory and namespaces (specified, OD97; step 1 partly built)
+### SD: Service directory and namespaces (built through step 3; step 4, moving the old servers and clients onto it, is open and no longer waiting: S8 and S9 are the first services on it)
 
 Decision (2026-11-14, owner, OD78): design review D10. A **registry service** (not `init`) holds the directory.
 A service publishes a name by handing the registry a listener channel; a client opens `/svc/<name>` with the file
@@ -628,7 +628,7 @@ Progress (2026-11-15): step 0 (slirp TCP probe and capture) and step 1 (the data
 - [x] Simulated lossy/reordering link suite (the host-side suite, and the QEMU lossy relay at `-smp 2` and `-smp 4`; see T102 for what the relay run does not cover)
 - [x] HTTP server demo; DNS resolver (step 7)
 
-### L: Scheduler, SMP and threads (specified in SCHED-SMP-SPEC.md, OD85 to OD96; not started)
+### L: Scheduler, SMP and threads (specified in SCHED-SMP-SPEC.md, OD85 to OD96; tasks 1 to 4 and 6 to 10 done, 11 to 28 not started)
 
 Supersedes the earlier plan for this slice (the design review's D2 carve-outs, kept as history in the review). The whole
 design is `SCHED-SMP-SPEC.md`: domain spinlocks in one checked order with the big kernel lock shrinking to the object lock
@@ -638,7 +638,7 @@ design is `SCHED-SMP-SPEC.md`: domain spinlocks in one checked order with the bi
 crate (OD95) and measurement (OD96). Slices named in the list: **B** benchmark, **SC** two-band scheduler, **TH** threads,
 **TM** timers, **RT** real-time, **L** lock peels, **W** the remainder of targeted wake.
 
-**Gate (owner, 2026-11-14):** tasks 1 to 10 before S8; tasks 11 and 12 after S8's first milestone; tasks 13, 14 and 21 to 28
+**Gate (owner, 2026-11-14; status 2026-11-15: S8 and S9 are done, so tasks 11 and 12 are overdue and 15 to 20 are unlocked):** tasks 1 to 10 before S8; tasks 11 and 12 after S8's first milestone; tasks 13, 14 and 21 to 28
 may follow S8; tasks 15 to 20 after S9, in the order the contention profile gives (the order given is a prediction). Stopping
 after task 12 leaves a coherent system; stopping after task 20 leaves the final execution model. **Deferred:** the EEVDF-style
 hierarchical fair class (only its stubs and preconditions are built), splitting the object lock, shared futexes, suspend and
@@ -648,7 +648,7 @@ resume. The object lock stays one lock (owner defers to the spec; revisit on its
 - [x] Task 2 (slice B, Built; done: the `latency-trace` feature, `make os-latency`, the test, the first numbers in `TESTING.md`; the RT histogram waits for the real-time probe of task 8): `latency-trace`: interrupts-off maximum with site, BKL wait and hold per syscall, the RT histogram (kernel-thread probe). *Acceptance, written first:* `the_latency_trace_can_see_a_long_section` (a test section of known length is reported within 20%); restate 3.12's budget with measured values. *Needs:* 1. *Review:* default.
 - [~] Task 3 (slice B, Built; **done: `wake_many` (T62) and the per-thread cleanup guard (T63)**; **not done: the clock (T40), see TIDY-UP T40 for why it is deferred**): Debts the peels would inherit: `wake_many` (T62), the cleanup guard (T63), the scheduler clock from `time` (T40). *Acceptance, written first:* the T62 scenario (one low waker, two high waiters, a hog, one hart) as a failing test first; `ticks_do_not_stretch_under_lock_contention`. *Needs:* nothing. *Review:* Fable (small).
 - [x] Task 4 (slice B, Built; done: the model, the T65 fix and the wfi test, in `kcore/tests/idle_concurrency.rs`, `kernel/src/thread.rs` and `kernel/src/smp_tests.rs`): The T38 shuttle model of today's idle/wake/IPI protocol; fix T65; `wfi_returns_with_interrupts_masked`. *Acceptance, written first:* the model fails on each of its three negative controls and passes on the code. *Needs:* nothing. *Review:* default.
-- [ ] Task 5 (slice paper, ): Accept this document: the ODs, the planned lock table in INVARIANTS, reserved syscall numbers, ROADMAP, TIDY-UP (section 8). *Acceptance, written first:* `check_docs.py` passes; no code. *Needs:* nothing. *Review:* owner.
+- [x] Task 5 (slice paper, done: the ODs, `INVARIANTS.md` (the lock table, TLB2), the reserved syscall numbers, TIDY-UP; accepted by use): Accept this document: the ODs, the planned lock table in INVARIANTS, reserved syscall numbers, ROADMAP, TIDY-UP (section 8). *Acceptance, written first:* `check_docs.py` passes; no code. *Needs:* nothing. *Review:* owner.
 - [x] Task 6 (slice SC, Stub (structure; behaviour as today); **stage one done: `kcore::sched2`** (bands and `SchedAttr`, the per-thread record, `PrioQueues` with an occupancy mask, the class interface with `Enq`/`Deq`, `FixedPrio` and `RtClass`, `HartRq` with strict precedence in `pick`, a nanosecond clock; tested by `kcore/tests/sched2_differential.rs`: 400 seeds of random operations give the same `current` and thread states as the old `sched::Sched` after every step, mutation-checked, plus the RT band's own rules). **stage two done (6b): the kernel runs the bands** — `sched2::TwoBand`, the two bands as one `SchedClass` under the existing multi-hart core (shared-queue mode: one set of queues, a current thread per hart): real-time (32 to 63) above normal with strict precedence, the normal band rotating as before, real-time FIFO within a level (no slice rotation; the round-robin flag waits for per-hart classes), a preempted thread at the front of its level; tested by `kcore/tests/two_band.rs` (differential against the old fixed-priority class at 1, 2 and 4 harts, the real-time rules, the default constructor) and the multi-hart random model, mutation-checked, the whole suite booted at one and four harts. Per-hart `HartRq` queues, push and pull and the conformance suite per class belong to task 11 **: `kcore::sched` v2: `SchedAttr`, `ThreadSched`, the new `SchedClass`, `HartRq` hosting RT + normal + idle, `PrioQueues`, nanosecond clock and accounting hooks. The kernel still runs it in **shared-queue mode** (one set of class queues for all harts, per-hart `cur`, as today) under the BKL. *Acceptance, written first:* differential test against `sched_v1`; conformance suite per class; AC1; the whole suite unchanged. *Needs:* 3. *Review:* default.
 - [x] Task 7 (slice SC, Stub (graph built, unused); **done**: `kcore::donate` (add, set_base, donate, revoke, retarget, remove, audit; a bounded change list; cycles, depth beyond 8 and double donation refused) tested against a reference that recomputes every effective priority from the edges (mutation-checked), and `HartRq::set_effective`, the hook that applies a change, tested across bands): `kcore::donate`, wired to `HartRq::set_effective`; no producer of edges yet. *Acceptance, written first:* DN1 to DN3 against the recompute reference, mutation-checked. *Needs:* 6. *Review:* default.
 - [~] Task 8 (slice SC, Built (API, bounds); Stub (budget enforcement); **done**: job `max_prio`, `rt_budget` and `cpu_weight` in `kcore::job` (PR1 and PR2 model-tested), `job_set_sched` (96), `thread_set_sched` (65), `thread_get_sched` (66), `job_info` selector 6, inheritance and clamping at thread creation and when a job's maximum is lowered, `thread_priority_is_bounded_by_the_job` (mutation-checked); **not done**: RT budget accounting and `job_info` selectors 7 and 8, `bin/rtdemo` and its negative control, the launcher and `devmgr` policy of 4.9 (programs still run at 10 and every job has the root's 63): Authority and the priority API: job `max_prio`, `rt_budget`, `cpu_weight`; `job_set_sched`; `thread_set_sched`, `thread_get_sched`; inheritance and clamping; RT accounting without enforcement; `bin/rtdemo`. *Acceptance, written first:* PR1, PR2 in the job model; `a_confined_program_cannot_raise_its_priority`; the user-level RT latency demo with its negative control. *Needs:* 6. *Review:* Fable.
