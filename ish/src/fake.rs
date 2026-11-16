@@ -14,6 +14,8 @@ pub struct ProgCtx<'a> {
     pub err: Vec<u8>,
     pub files: &'a BTreeMap<String, Vec<u8>>,
     pub cwd: &'a str,
+    /// What the program may reach: `(path, rights)`.
+    pub table: &'a [(String, String)],
 }
 
 pub type Prog = fn(&mut ProgCtx) -> i32;
@@ -50,6 +52,7 @@ pub struct FakeHost {
     statuses: BTreeMap<u32, i32>,
     /// Every program started, in order, with its arguments.
     pub log: Vec<Vec<String>>,
+    confined: Vec<Vec<(String, String)>>,
 }
 
 fn norm(cwd: &str, p: &str) -> String {
@@ -86,6 +89,7 @@ impl FakeHost {
             progs: BTreeMap::new(),
             statuses: BTreeMap::new(),
             log: Vec::new(),
+            confined: Vec::new(),
         };
         h.objs.insert(0, Obj::Stdin);
         h.objs.insert(1, Obj::Stdout);
@@ -235,7 +239,9 @@ impl Host for FakeHost {
         let input = self.read_all(io.stdin.0);
         let files = self.files.clone();
         let cwd = self.cwd.clone();
+        let table = self.table();
         let mut ctx = ProgCtx {
+            table: &table,
             args: argv,
             input,
             out: Vec::new(),
@@ -370,6 +376,49 @@ impl Host for FakeHost {
         }
         out.sort();
         out
+    }
+
+    fn table(&self) -> Vec<(String, String)> {
+        match self.confined.last() {
+            Some(t) => t.clone(),
+            None => [("/", "rw"), (".", "r"), ("/dev", "rw"), ("/tmp", "rw")]
+                .iter()
+                .map(|(p, r)| (String::from(*p), String::from(*r)))
+                .collect(),
+        }
+    }
+
+    fn confine(&mut self, grants: &[(String, String)]) -> Result<(), HostError> {
+        let now = self.table();
+        for (path, rights) in grants {
+            let within = |entry: &str| {
+                entry == "/"
+                    || path == entry
+                    || path.strip_prefix(entry).is_some_and(|r| r.starts_with('/'))
+            };
+            let covered = now
+                .iter()
+                .any(|(e, r)| within(e) && (r == "rw" || rights == "r"));
+            if !covered {
+                return Err(HostError::Denied);
+            }
+        }
+        // the new view: the grants, and the always-present entries that are already in the view
+        let mut view: Vec<(String, String)> = grants.to_vec();
+        for keep in [".", "/dev", "/tmp"] {
+            if view.iter().any(|(p, _)| p == keep) {
+                continue;
+            }
+            if let Some(e) = now.iter().find(|(p, _)| p == keep) {
+                view.push(e.clone());
+            }
+        }
+        self.confined.push(view);
+        Ok(())
+    }
+
+    fn unconfine(&mut self) {
+        self.confined.pop();
     }
 
     fn getenv(&self, name: &str) -> Option<String> {
@@ -562,6 +611,13 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
         }
         141
     }
+    fn show_table(c: &mut ProgCtx) -> i32 {
+        for (p, r) in c.table {
+            c.out
+                .extend_from_slice(alloc::format!("{p} {r}\n").as_bytes());
+        }
+        0
+    }
     fn printenv(c: &mut ProgCtx) -> i32 {
         c.out.extend_from_slice(b"(no env in the fake)\n");
         0
@@ -583,6 +639,7 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
         ("loud", loud),
         ("many-then-fail", many_then_fail),
         ("printenv", printenv),
+        ("show-table", show_table),
     ])
 }
 

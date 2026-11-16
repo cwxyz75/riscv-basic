@@ -195,6 +195,23 @@ def main():
     step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108", b"write ./f: -3",
                       b"clone: ok", b"clone all: -3", b"root: absent", b"dev null: 0", b"dev zero: 0", b"tmp: 0", b"spawn: -5"],
          "probe has no volume")
+    # SH4: `ns` lists the table the shell holds; `confine` narrows what programs started inside can reach, and only narrows
+    step(b"ns\n", [b"$ ns", b'[{"path":"/","rights":"r"},{"path":".","rights":"r"},{"path":"/dev","rights":"rw"},{"path":"/tmp","rights":"rw"},{"path":"/svc","rights":"r"}]'],
+         "ns lists the shell's table")
+    step(b'confine { "/home": "r" } do cat /home/hello.txt end\n',
+         [b'$ confine { "/home": "r" } do cat /home/hello.txt end', b"hello, world"], "confine: a granted path is readable")
+    step(b'confine { "/home": "r" } do cat /etc/trusted end\n',
+         [b'$ confine { "/home": "r" } do cat /etc/trusted end', b"cat: /etc/trusted: not found", b"[exit 1]"],
+         "confine: a path that was not granted is not there, even for a trusted program")
+    step(b'confine { "/home": "rw" } do cat /home/hello.txt end\n',
+         [b'$ confine { "/home": "rw" } do cat /home/hello.txt end', b"sh: confine: permission denied"],
+         "confine cannot widen: the shell's root is read-only")
+    step(b'confine { "/mnt/store": "r" } do ls /mnt/store end\n',
+         [b'$ confine { "/mnt/store": "r" } do ls /mnt/store end', b"kept"], "confine: a volume from the registry")
+    step(b'confine { "/nope": "r" } do ls end\n',
+         [b'$ confine { "/nope": "r" } do ls end', b"sh: confine: not found"], "confine: a grant that does not exist")
+    step(b"ls /\n", [b"$ ls /", b"bin/", b"dev/", b"etc/", b"home/", b"include/", b"lib/", b"mnt/", b"share/", b"svc/", b"tmp/", b"usr/"],
+         "the confinement ended with the block")
     # the session ends and a fresh one starts: the volume is durable
     step(b"exit\n", [b"$ exit", BANNER], "a new session")
     time.sleep(4)
