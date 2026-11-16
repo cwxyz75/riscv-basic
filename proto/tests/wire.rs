@@ -82,10 +82,10 @@ fn startup_rejects_every_kind_of_malformation() {
     let mut c = good.clone();
     c[8] = 9;
     assert!(d(&c, 3).is_err());
-    // unknown role (31) and duplicate role (both Stdin)
+    // unknown role (32) and duplicate role (both Stdin)
     let mut r = good.clone();
     let n = r.len();
-    r[n - 8] = 31;
+    r[n - 8] = 32;
     assert_eq!(d(&r, 3), Err(StartupError::UnknownRole));
     let mut r = good.clone();
     r[n - 8] = 1;
@@ -881,7 +881,14 @@ fn the_new_operations_have_numbers_handle_counts_and_kinds() {
             "attribute operations act on any connection's node"
         );
     }
-    assert_eq!(op::handles(28), None, "28 is not defined");
+    assert_eq!(op::SYNC, 28);
+    assert_eq!(op::handles(op::SYNC), Some(0));
+    assert!(
+        !op::is_directory_op(op::SYNC),
+        "sync is valid on either kind of connection"
+    );
+    assert_eq!(file::status::IO_ERROR, -114);
+    assert_eq!(op::handles(29), None, "29 is not defined");
     assert_eq!(
         [
             file::status::NO_ATTR,

@@ -4739,6 +4739,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"dhcpc".to_vec(),
             b"echo".to_vec(),
             b"fetch".to_vec(),
+            b"fsd".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
             b"httpd".to_vec(),
@@ -7933,6 +7934,237 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
     Ok(())
 }
 
+// --- The disk filesystem server (FS-SPEC step 5c) ---------------------------------------------
+
+/// A volume identity for the test (the harness formats nothing: the test does it, as setup).
+const FSD_UUID: [u8; 16] = *b"fsd-suite-volume";
+
+/// `devmgr` in a job of its own: (our channel to it, its process, its job).
+fn start_devmgr_in_job(res: u32) -> Result<(u32, u32, u32), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/devmgr")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let res_dup = ok(
+        sys::handle_duplicate(res, Rights::SAME.0),
+        "dup the resource",
+    )?
+    .a1 as u32;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let s = Startup {
+        args: vec![b"devmgr".to_vec()],
+        roles: vec![
+            (Role::Resource, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceDevmgr, 2),
+        ],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let root = root_job()?;
+    let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root);
+    let mgr = rt::spawn::spawn_in(&image, &bytes, &[res_dup, bi_dup, theirs], mj).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn devmgr: {e:?}"));
+        d
+    })?;
+    Ok((mine, mgr, mj))
+}
+
+/// The block channel of device `index`, retrying while the previous driver for it winds down.
+fn open_disk(mgr_ch: u32, mut txid: u32, index: u16) -> Result<u32, Detail> {
+    use proto::devmgr::Status as D;
+    let until = sys::clock_get() + 5000;
+    loop {
+        let (status, h) = devmgr_open_at(mgr_ch, txid, index)?;
+        if status == D::Ok {
+            return h.ok_or_else(|| msg_at(line!()));
+        }
+        ensure_eq!(status, D::Busy, "only Busy while the old driver winds down");
+        ensure!(sys::clock_get() < until, "the old driver never ended");
+        txid += 1;
+        let _ = sys::object_wait(mgr_ch, 1 << 24, sys::clock_get() + 5);
+    }
+}
+
+/// Start `fsd` on the block channel (it takes the channel): (its process, a root connection).
+fn spawn_fsd(blk_ch: u32) -> Result<(u32, Fs), Detail> {
+    let bi = boot_image_vmo()?;
+    let (off, len) = image_entry(bi, b"bin/fsd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (mine, theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"fsd".to_vec()],
+        roles: vec![(Role::ServiceFs, 0), (Role::BlockDevice, 1)],
+        ..Startup::default()
+    };
+    let bytes = s.encode().map_err(|_| msg_at(line!()))?;
+    let p = rt::spawn::spawn(&image, &bytes, &[theirs, blk_ch]).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("spawn fsd: {e:?}"));
+        d
+    })?;
+    Ok((p, Fs::new(mine)))
+}
+
+fn fsd_pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 13 + i / 251) as u8).collect()
+}
+
+fn fsd_keeps_files_across_a_restart() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let have_disk = match find_blk(res)? {
+        Some(_) => {
+            let me = sys::process_self().a1 as u32;
+            sys::process_unmap(me, MMIO_VA);
+            sys::handle_close(me);
+            true
+        }
+        None => false,
+    };
+    if !have_disk {
+        return Ok(()); // OS_DISK=0
+    }
+    let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+    // device 1 is the small second disk (the first belongs to the block-driver tests)
+    let blk = open_disk(mgr_ch, 1, 1)?;
+    {
+        // setup, the way a host tool would do it (the OS has no formatter, FS-SPEC section 6)
+        let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
+        ensure_eq!(fsfmt::Device::blocks(&dev), 256, "a 1 MiB disk");
+        fsfmt::mkfs(&mut dev, FSD_UUID, "fsdtest").map_err(|_| msg_at(line!()))?;
+    }
+    // the first run: make some files, sync, then more that is never synced, then die
+    let (p1, mut root) = spawn_fsd(blk)?;
+    ensure_eq!(root.mkdir(b"docs"), Ok(()), "mkdir");
+    let mut docs = root
+        .open(b"docs", pfl::DIRECTORY, RW_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let mut a = docs
+        .open(b"a.txt", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(a.write(0, b"hello, disk"), Ok(11), "write a small file");
+    let mut big = docs
+        .open(b"big", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        big.write_all(0, &fsd_pattern(20_000)),
+        Ok(()),
+        "write a file of five blocks"
+    );
+    ensure_eq!(big.set_size(18_000), Ok(()), "truncate it");
+    ensure_eq!(docs.rename(b"a.txt", b"b.txt"), Ok(()), "rename");
+    let mut tmp = docs
+        .open(b"tmp", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(tmp.write(0, &[7; 5000]), Ok(5000), "a file to remove");
+    tmp.close();
+    ensure_eq!(docs.unlink(b"tmp"), Ok(()), "unlink");
+    ensure_eq!(
+        code(root.open(
+            b"docs",
+            pfl::DIRECTORY | pfl::CREATE | pfl::EXCLUSIVE,
+            RW_DIR
+        )),
+        Some(pst::EXISTS),
+        "an error from the disk filesystem"
+    );
+    ensure_eq!(root.sync(), Ok(()), "sync");
+    // after the sync: more changes, then the server dies before it commits them
+    let mut late = root
+        .open(b"late", pfl::CREATE, prt::READ | prt::WRITE)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        late.write(0, b"never committed"),
+        Ok(15),
+        "an unsynced write"
+    );
+    ensure_eq!(
+        st(sys::process_kill(p1, -9)),
+        Some(S::Ok),
+        "kill the server"
+    );
+    wait_ended(p1, 3000)?;
+    sys::handle_close(p1);
+    for f in [late, big, a, docs, root] {
+        f.close();
+    }
+    // the second run: a fresh server on the same disk sees the synced state and none of the rest
+    let blk = open_disk(mgr_ch, 10, 1)?;
+    let (p2, mut root) = spawn_fsd(blk)?;
+    let top = root.read_dir().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&top),
+        vec![b"docs".to_vec()],
+        "the unsynced file is gone"
+    );
+    let mut docs = root
+        .open(b"docs", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    let inside = docs.read_dir().map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&inside),
+        vec![b"b.txt".to_vec(), b"big".to_vec()],
+        "the synced names"
+    );
+    let mut b = docs
+        .open(b"b.txt", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(b.read_all(), Ok(b"hello, disk".to_vec()), "the small file");
+    let mut g = docs
+        .open(b"big", 0, prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        g.read_all(),
+        Ok(fsd_pattern(18_000)),
+        "the five-block file, truncated"
+    );
+    // a change made now is committed when the last client leaves
+    {
+        let mut w = root
+            .open(b"docs", pfl::DIRECTORY, RW_DIR)
+            .map_err(|e| msg_e(e, line!()))?;
+        ensure_eq!(w.mkdir(b"made-later"), Ok(()), "mkdir in the second run");
+        w.close();
+    }
+    for f in [g, b, docs, root] {
+        f.close();
+    }
+    wait_ended(p2, 5000)?;
+    ensure_eq!(
+        sys::process_info(p2).a1 as i64,
+        0,
+        "the server exits 0 once its last client is gone"
+    );
+    sys::handle_close(p2);
+    // the third run: the orderly exit committed it
+    let blk = open_disk(mgr_ch, 20, 1)?;
+    let (p3, mut root) = spawn_fsd(blk)?;
+    let mut docs = root
+        .open(b"docs", pfl::DIRECTORY, RO_DIR)
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        names(&docs.read_dir().map_err(|e| msg_e(e, line!()))?),
+        vec![b"b.txt".to_vec(), b"big".to_vec(), b"made-later".to_vec()],
+        "the change made just before the last client left"
+    );
+    docs.close();
+    root.close();
+    wait_ended(p3, 5000)?;
+    sys::handle_close(p3);
+    sys::debug_write(b"fs: fsd kept its files across a restart\n");
+    sys::handle_close(mgr_ch);
+    wait_ended(mgr, 3000)?;
+    sys::handle_close(mgr);
+    job_use_settles(mj, 0, 0, 3000)?;
+    job_use_settles(mj, 1, 0, 3000)?;
+    job_use_settles(mj, 2, 0, 3000)?;
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -10046,6 +10278,10 @@ pub fn app_main() -> i32 {
         (
             "devmgr_starts_blkd_for_the_disk",
             devmgr_starts_blkd_for_the_disk,
+        ),
+        (
+            "fsd_keeps_files_across_a_restart",
+            fsd_keeps_files_across_a_restart,
         ),
         (
             "a_child_has_no_device_authority",

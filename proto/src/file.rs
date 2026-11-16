@@ -83,6 +83,9 @@ pub mod op {
     pub const SYMLINK: u16 = 26;
     /// `payload` is a path; the reply payload is the link's target.
     pub const READLINK: u16 = 27;
+    /// Make everything written so far durable (`fsync`/`sync`): the reply comes when the volume has committed. Valid on a
+    /// connection of either kind; a server with nothing to flush answers Ok.
+    pub const SYNC: u16 = 28;
 
     /// How many handles a request with this op carries (`None`: unknown op).
     pub fn handles(op: u16) -> Option<usize> {
@@ -90,12 +93,12 @@ pub mod op {
             OPEN | CLONE | ACCOUNT | PUBLISH | VIEW => Some(1),
             READDIR | MKDIR | UNLINK | RENAME | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT
             | GETVMO | UNPUBLISH | ATTR_SET | ATTR_GET | ATTR_REMOVE | ATTR_LIST | MAKE_INDEX
-            | QUERY | SYMLINK | READLINK => Some(0),
+            | QUERY | SYMLINK | READLINK | SYNC => Some(0),
             _ => None,
         }
     }
 
-    /// Does this op belong to a directory connection only? (`CLONE` and `ACCOUNT` are valid on both kinds; every
+    /// Does this op belong to a directory connection only? (`CLONE`, `ACCOUNT` and `SYNC` are valid on both kinds; every
     /// other op that is not listed here belongs to file connections.)
     pub fn is_directory_op(op: u16) -> bool {
         matches!(
@@ -138,6 +141,8 @@ pub mod status {
     pub const BAD_VALUE: i32 = -112;
     /// A symlink target that is malformed, absolute, or could climb above the connection root.
     pub const BAD_TARGET: i32 = -113;
+    /// The storage under the server failed or a block did not verify (a damaged volume): never retried by the server.
+    pub const IO_ERROR: i32 = -114;
 }
 
 /// A request, borrowing its payload.

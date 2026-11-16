@@ -12,6 +12,8 @@ oslibc = { path = "../libc" }
 basic = { path = "../home/basic" }
 basic-script = { path = "../home/basic-script" }
 memfs = { path = "../memfs" }
+doofs = { path = "../doofs" }
+fsfmt = { path = "../fsfmt" }
 rt = { path = "../rt", features = ["heap"] }
 shell-core = { path = "../shell-core" }
 netring = { path = "../netring" }

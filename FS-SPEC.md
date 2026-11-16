@@ -161,6 +161,8 @@ C1. **Wall clock** (slice C): `clockmodel`, the RTC claim in `devmgr`, `clockd`,
 Attribute `Get`, `Set`, `Remove`, `List` (typed values: a type code plus bytes), `MakeIndex`, `Query`. A server that does not
 support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are normative in `proto`'s goldens, as for S4 (T27).
 
+`Sync` (op 28, valid on any connection) makes everything written so far durable and answers when the volume has committed (`fsync`, `sync`). `IO_ERROR` (-114) is the status for a failed or damaged disk. A server also commits on its own a couple of seconds after the first change, and when its last client has gone.
+
 ### 9.1 The semantics step 0 fixes (normative for `memfs` and for `fsfmt`; the tests of step 0 are their written form)
 
 * **Attributes.** A node has named attributes: a name (1 to 255 bytes, no NUL, no `/`; `name`, `size` and `mtime` are reserved
