@@ -614,13 +614,18 @@ static void streams(void) {
 #ifdef __riscv
 int sockets_test(void);
 #define RUN_SOCKETS(argc, argv) ((argc) > 1 && strcmp((argv)[1], "sockets") == 0)
+int mount_test(const char *mnt);
+#define RUN_MOUNT(argc, argv) ((argc) > 2 && strcmp((argv)[1], "mount") == 0)
 #else
 static int sockets_test(void) { return 0; }
 #define RUN_SOCKETS(argc, argv) 0
+static int mount_test(const char *mnt) { (void)mnt; return 0; }
+#define RUN_MOUNT(argc, argv) 0
 #endif
 
 int main(int argc, char **argv) {
     if (RUN_SOCKETS(argc, argv)) return sockets_test();
+    if (RUN_MOUNT(argc, argv)) return mount_test(argv[2]);
     atexit(tail);
     printf("argc %d\n", argc);
     formats();

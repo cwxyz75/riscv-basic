@@ -47,9 +47,60 @@ struct Shell {
     launch: u32,
     ctl: u32,
     init_ch: u32,
-    trusted: Vec<Vec<u8>>,
+    trusted: Vec<Trust>,
+    /// A read connection to the service registry (volumes are opened as `vol-<name>`), if the session has one.
+    registry: Option<Fs>,
     txid: u32,
     inbuf: Vec<u8>,
+}
+
+/// A volume granted to a trusted program (`/etc/trusted`, FS-SPEC section 6): the volume's name in the mount table, the
+/// path it appears at in the program's namespace (`/mnt/<name>` unless the entry says otherwise) and whether it is read-only.
+struct Grant {
+    mount: Vec<u8>,
+    vol: Vec<u8>,
+    readonly: bool,
+}
+
+/// One line of `/etc/trusted`: `program [volume[:ro] | /path=volume[:ro]]...`. The program gets a read-only root; each volume
+/// is opened from the registry as `vol-<volume>` and granted at its mount point.
+struct Trust {
+    name: Vec<u8>,
+    grants: Vec<Grant>,
+}
+
+fn parse_trust(line: &[u8]) -> Option<Trust> {
+    let mut words = line
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|w| !w.is_empty());
+    let name = words.next()?.to_vec();
+    let mut grants = Vec::new();
+    for w in words {
+        let (path, vol) = match w.iter().position(|&b| b == b'=') {
+            Some(i) => (Some(&w[..i]), &w[i + 1..]),
+            None => (None, w),
+        };
+        let (vol, readonly) = match vol.strip_suffix(b":ro") {
+            Some(v) => (v, true),
+            None => (vol, false),
+        };
+        if vol.is_empty() {
+            return None;
+        }
+        let mount = match path {
+            Some(p) => p.to_vec(),
+            None => [&b"/mnt/"[..], vol].concat(),
+        };
+        if !proto::startup::valid_prefix(&mount) || mount == b"/" || mount == b"." {
+            return None;
+        }
+        grants.push(Grant {
+            mount,
+            vol: vol.to_vec(),
+            readonly,
+        });
+    }
+    Some(Trust { name, grants })
 }
 
 fn say(tty: u32, bytes: &[u8]) {
@@ -187,7 +238,7 @@ impl Shell {
                 self.trusted = data
                     .split(|&b| b == b'\n')
                     .filter(|l| !l.is_empty() && l[0] != b'#')
-                    .map(|l| l.to_vec())
+                    .filter_map(parse_trust)
                     .collect();
             }
             f.close();
@@ -254,7 +305,8 @@ impl Shell {
             return Err(format!("sh: {shown}: not found\n"));
         };
         let want = rights::READ | rights::ENUMERATE;
-        let trusted = self.trusted.iter().any(|t| t == name);
+        let trust = self.trusted.iter().position(|t| &t.name == name);
+        let trusted = trust.is_some();
         let cwd = self.cwd.clone_conn(want);
         let root = if trusted {
             Some(self.root.clone_conn(want))
@@ -312,6 +364,34 @@ impl Shell {
                 return Err(String::from("sh: could not open the root directory\n"));
             }
             None => {}
+        }
+        // the volumes this program is granted, opened now from the registry (retrying while the volume manager brings a
+        // restarted volume server back)
+        if let Some(t) = trust {
+            for g in 0..self.trusted[t].grants.len() {
+                let (mount, vol, ro) = {
+                    let g = &self.trusted[t].grants[g];
+                    (g.mount.clone(), g.vol.clone(), g.readonly)
+                };
+                let want = if ro {
+                    rights::READ | rights::ENUMERATE
+                } else {
+                    rights::ALL & !rights::PUBLISH
+                };
+                let name = [&b"vol-"[..], &vol].concat();
+                let opened = match self.registry.as_mut() {
+                    Some(r) => r
+                        .open_retry(&name, flags::DIRECTORY, want, sys::clock_get() + 4000)
+                        .ok(),
+                    None => None,
+                };
+                // a volume that is not there (no disk, or its server is down for good) is not a reason to refuse to run `ls`:
+                // the program starts without that mount point and its own errors say what is missing
+                if let Some(f) = opened {
+                    startup.namespace.push((mount, forward.len() as u32));
+                    forward.push(f.ch);
+                }
+            }
         }
         self.txid = self.txid.wrapping_add(1);
         let r = rt::launch::spawn_via(self.launch, vmo, offset, len, &startup, &forward, self.txid);
@@ -571,6 +651,7 @@ pub fn app_main() -> i32 {
         ctl: ctl_ch,
         init_ch,
         trusted: Vec::new(),
+        registry: env.handle(Role::ServiceRegistry).map(Fs::new),
         txid: 0,
         inbuf: Vec::new(),
     };

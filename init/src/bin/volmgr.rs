@@ -12,6 +12,16 @@
 #![no_std]
 #![no_main]
 
+/// Log to the serial line unless the parent asked for quiet (`QUIET=1`: a user's session).
+static QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+macro_rules! say {
+    ($($a:tt)*) => {
+        if !QUIET.load(core::sync::atomic::Ordering::Relaxed) {
+            rt::println!($($a)*);
+        }
+    };
+}
+
 extern crate alloc;
 
 use alloc::format;
@@ -161,6 +171,10 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
+    QUIET.store(
+        env.var(b"QUIET") == Some(&b"1"[..]),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let (Some(dm), Some(registry), Some(bi)) = (
         env.handle(Role::ServiceDevmgr),
         env.handle(Role::ServiceRegistry),
@@ -176,7 +190,7 @@ pub fn app_main() -> i32 {
         Some(t) => match mounts::parse(&t) {
             Ok(t) => t,
             Err(e) => {
-                rt::println!(
+                say!(
                     "volmgr: etc/mounts is not usable ({:?} at line {}): no names",
                     e.kind,
                     e.line
@@ -199,13 +213,13 @@ pub fn app_main() -> i32 {
             break;
         }
         let (devmgr::Status::Ok, Some(ch)) = (st, h) else {
-            rt::println!("volmgr: device {index}: {st:?}");
+            say!("volmgr: device {index}: {st:?}");
             continue;
         };
         let probed = BlkDevice::open(ch).and_then(|mut d| fsfmt::probe(&mut d));
         match probed {
             Some(sb) => {
-                rt::println!(
+                say!(
                     "volmgr: device {index}: doofs volume {} {:?}",
                     mounts::uuid_hex(&sb.uuid),
                     sb.label_str()
@@ -218,7 +232,7 @@ pub fn app_main() -> i32 {
                 chans.push(ch);
             }
             None => {
-                rt::println!("volmgr: device {index}: not a doofs volume, ignored");
+                say!("volmgr: device {index}: not a doofs volume, ignored");
                 sys::handle_close(ch);
             }
         }
@@ -228,7 +242,7 @@ pub fn app_main() -> i32 {
     for ((f, d), ch) in mounts::plan(&table, &found).into_iter().zip(chans) {
         match d {
             Decision::RefuseDuplicate => {
-                rt::println!(
+                say!(
                     "volmgr: device {}: a second volume with uuid {}: refused",
                     f.device,
                     mounts::uuid_hex(&f.uuid)
@@ -251,13 +265,13 @@ pub fn app_main() -> i32 {
                     restarts: 0,
                 };
                 if start(&mut v, ch, &fsd_image, &mut reg, &mut clock_view) {
-                    rt::println!("volmgr: serving {} as {:?}", v.uuid_hex, v.name);
+                    say!("volmgr: serving {} as {:?}", v.uuid_hex, v.name);
                     volumes.push(v);
                 }
             }
         }
     }
-    rt::println!("volmgr: up, {} volume(s)", volumes.len());
+    say!("volmgr: up, {} volume(s)", volumes.len());
     // ---- supervision
     let p = sys::port_create();
     if p.status != 0 {
@@ -282,13 +296,13 @@ pub fn app_main() -> i32 {
             sys::handle_close(old);
         }
         if v.restarts >= MAX_RESTARTS {
-            rt::println!("volmgr: volume {} keeps failing: left down", v.uuid_hex);
+            say!("volmgr: volume {} keeps failing: left down", v.uuid_hex);
             continue;
         }
         v.restarts += 1;
         // let the registry notice the old listeners closed, so that the names are stale and can be published again
         let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 200);
-        rt::println!(
+        say!(
             "volmgr: volume {} ended: restart {}",
             v.uuid_hex,
             v.restarts

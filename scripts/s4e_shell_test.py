@@ -72,7 +72,31 @@ BANNER = b"riscv-os S4 ready"
 BIN = [b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
+UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
+
+
+def make_volume():
+    """A doofs volume made by the host tool, attached as a virtio disk: the volume manager finds it, the table names it
+    `store`, and /etc/trusted grants it to ls, cat and ctest at /mnt/store (FS-SPEC 5e)."""
+    import subprocess
+    import tempfile
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if subprocess.run(["cargo", "build", "-q", "-p", "doofs-tools"], cwd=here).returncode != 0:
+        print("s4e shell test FAILED: could not build the host tools")
+        sys.exit(1)
+    img = tempfile.NamedTemporaryFile(prefix="s4e-vol-", suffix=".img", delete=False).name
+    r = subprocess.run([os.path.join(here, "target", "debug", "mkfs-doofs"), "--uuid", UUID, "--label", "shelltest",
+                        "--size-mib", "4", img], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"s4e shell test FAILED: mkfs-doofs: {r.stderr}")
+        sys.exit(1)
+    return here, img
+
+
 def main():
+    here, img = make_volume()
+    Session.EXTRA_ARGS = ["-global", "virtio-mmio.force-legacy=false", "-drive", f"file={img},if=none,format=raw,id=hd0",
+                          "-device", "virtio-blk-device,drive=hd0"]
     s = Session(sys.argv[1])
     s.skip_to(BANNER, "the banner")
     step = s.step
@@ -92,7 +116,7 @@ def main():
     step(b"cat hello.txt\n", [b"$ cat hello.txt", b"hello, world"], "cat")
     step(b"cat lines.txt sub/inner.txt\n",
          [b"$ cat lines.txt sub/inner.txt", b"one", b"two", b"three", b"inner"], "cat of two files")
-    step(b"cat /etc/trusted\n", [b"$ cat /etc/trusted", b"ls", b"cat"], "the trust list")
+    step(b"cat /etc/trusted\n", [b"$ cat /etc/trusted", b"ls store", b"cat store", b"ctest store"], "the trust list")
     step(b"echo a   'b  c' \"d\"\n", [b"$ echo a   'b  c' \"d\"", b"a b  c d"], "echo and quoting")
     step(b"echo\n", [b"$ echo", b""], "echo with no arguments")
 
@@ -135,6 +159,31 @@ def main():
     step(b"ls | cd sub\n", [b"$ ls | cd sub", b"sh: cd: a builtin cannot be piped"], "a piped builtin")
     step(b"echo ok | frob\n", [b"$ echo ok | frob", b"sh: frob: not found"], "an unknown stage")
     step(b"echo still alive\n", [b"$ echo still alive", b"still alive"], "the shell after errors")
+
+    # volumes (FS-SPEC 5e): the volume manager serves the host-made disk, the mount table names it `store`, and /etc/trusted
+    # grants it to ls, cat and ctest at /mnt/store. The volume comes up a moment after the prompt.
+    time.sleep(4)
+    step(b"ls /mnt/store\n", [b"$ ls /mnt/store"], "the new volume is empty")
+    step(b"ctest mount /mnt/store\n",
+         [b"$ ctest mount /mnt/store",
+          b"ok: create a file in the volume", b"ok: write it", b"ok: close it", b"ok: open it again",
+          b"ok: read the same bytes", b"ok: stat reports its size", b"ok: rename inside the volume",
+          b"ok: the old name is gone", b"ok: unlink it", b"ok: make a directory", b"ok: remove it",
+          b"ok: a path with .. does not leave the volume", b"ok: leave a file for the next session",
+          b"mount: 0 failures"],
+         "a C program makes, reads, renames and removes files in the granted volume")
+    step(b"ls /mnt/store\n", [b"$ ls /mnt/store", b"kept"], "what it left behind")
+    step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "cat reads inside the volume")
+    step(b"echo hi | cat /mnt/store/kept\n", [b"$ echo hi | cat /mnt/store/kept", b"kept across sessions"],
+         "a pipeline with a volume path")
+    # a program that is not named in /etc/trusted gets no volume, and nothing named by the table leaks to it
+    step(b"probe\n", [b"$ probe", b"open /etc/trusted: -108", b"open ../x: -108", b"write ./f: -3",
+                      b"clone: ok", b"clone all: -3", b"root: absent", b"spawn: -5"],
+         "probe has no volume")
+    # the session ends and a fresh one starts: the volume is durable
+    step(b"exit\n", [b"$ exit", BANNER], "a new session")
+    time.sleep(4)
+    step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "the file in the next session")
 
     # BASIC (S7a): the home computer's interpreter as an ordinary program on the terminal
     step(b"basic\n", [b"$ basic", b"READY."], "basic starts and prompts")
@@ -294,6 +343,11 @@ def main():
         fail(s, "QEMU did not exit")
     if rc != 0:
         fail(s, f"QEMU exit status {rc}")
+    import subprocess
+    r = subprocess.run([os.path.join(here, "target", "debug", "fsck-doofs"), img], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(s, f"the host fsck rejects the volume: {r.stdout}{r.stderr}")
+    os.unlink(img)
     print("s4e shell test passed")
 
 

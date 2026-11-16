@@ -1,2 +1,3 @@
-ls
-cat
+ls store
+cat store
+ctest store

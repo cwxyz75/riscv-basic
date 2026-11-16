@@ -4788,7 +4788,11 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     let mut t = root
         .open(b"etc/trusted", 0, prt::READ)
         .map_err(|e| msg_e(e, line!()))?;
-    ensure_eq!(t.read_all(), Ok(b"ls\ncat\n".to_vec()), "the trust list");
+    ensure_eq!(
+        t.read_all(),
+        Ok(include_bytes!("../../../bootfs/etc/trusted").to_vec()),
+        "the trust list"
+    );
     let mut prog = root
         .open(b"bin/hello", 0, prt::READ)
         .map_err(|e| msg_e(e, line!()))?;
@@ -8517,7 +8521,7 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     let hex = b"vol-uuid-6673642d73756974652d766f6c756d65";
     // ---- the first run: device 0 is not a volume (ignored), device 1 is, named `data` by the table
     let (mut reg, mj) = start_volmgr_rig(res, bi)?;
-    let mut data = open_volume(&mut reg, b"vol-data", RW_DIR)?;
+    let mut data = open_volume(&mut reg, b"vol-store", RW_DIR)?;
     ensure_eq!(
         data.mkdir(b"kept"),
         Ok(()),
@@ -8597,7 +8601,7 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     job_use_settles(mj, 0, 0, 5000)?;
     sys::handle_close(mj);
     let (mut reg, mj) = start_volmgr_rig(res, bi)?;
-    let mut data = open_volume(&mut reg, b"vol-data", RO_DIR)?;
+    let mut data = open_volume(&mut reg, b"vol-store", RO_DIR)?;
     let mut f = data
         .open(b"kept/note", 0, prt::READ)
         .map_err(|e| msg_e(e, line!()))?;
