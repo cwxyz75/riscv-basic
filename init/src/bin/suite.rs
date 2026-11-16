@@ -4728,6 +4728,46 @@ fn memfsd_serves_the_boot_image() -> Outcome {
         "the top level: the skeleton"
     );
     ensure!(top.iter().all(|e| e.is_dir), "they are directories");
+    // STAT carries the advisory attributes (UV3): the image's programs are executable, its other files are not
+    let prog = root.stat(b"bin/hello").map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        (prog.info.kind, prog.info.mode),
+        (1, 0o755),
+        "a program is 0755"
+    );
+    let text = root
+        .stat(b"home/hello.txt")
+        .map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        (text.info.kind, text.info.mode),
+        (1, 0o644),
+        "a fixture is 0644"
+    );
+    ensure_eq!(
+        text.info.uid,
+        proto::file::ABSENT,
+        "no owner is recorded: the libc supplies the session's"
+    );
+    let link = root
+        .stat_stop(b"usr/bin", pfl::NOFOLLOW)
+        .map_err(|_| msg_at(line!()))?;
+    ensure_eq!(
+        (link.info.kind, link.size),
+        (3, 6),
+        "a link is described itself: kind 3, the length of its target"
+    );
+    let usr_list = {
+        let mut u = root
+            .open(b"usr", pfl::DIRECTORY, RO_DIR)
+            .map_err(|e| msg_e(e, line!()))?;
+        let l = u.read_dir().map_err(|e| msg_e(e, line!()))?;
+        u.close();
+        l
+    };
+    ensure!(
+        usr_list.iter().all(|e| e.is_link && !e.is_dir),
+        "a directory listing says which entries are links"
+    );
     // `/usr` is a real directory of compatibility links to the real ones, which a client follows (UV1)
     let mut usr = root
         .open(b"usr", pfl::DIRECTORY, RO_DIR)
@@ -4855,19 +4895,13 @@ fn memfsd_serves_the_boot_image() -> Outcome {
         "a program reads as its ELF bytes"
     );
     ensure_eq!(
-        root.stat(b"home/lines.txt"),
-        Ok(rt::fs::Stat {
-            is_dir: false,
-            size: 14
-        }),
+        root.stat(b"home/lines.txt").map(|s| (s.is_dir, s.size)),
+        Ok((false, 14)),
         "stat by path"
     );
     ensure_eq!(
-        root.stat(b"home/sub"),
-        Ok(rt::fs::Stat {
-            is_dir: true,
-            size: 1
-        }),
+        root.stat(b"home/sub").map(|s| (s.is_dir, s.size)),
+        Ok((true, 1)),
         "stat a directory"
     );
     ensure_eq!(

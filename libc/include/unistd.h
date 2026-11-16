@@ -13,5 +13,15 @@ int usleep(unsigned usec);
 int unlink(const char *path);
 char *getcwd(char *buf, size_t size);
 int chdir(const char *path);
+int access(const char *path, int mode);
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+long readlink(const char *path, char *buf, size_t size);
+int symlink(const char *target, const char *linkpath);
+int link(const char *oldpath, const char *newpath);
+int chown(const char *path, int uid, int gid);
+int fchown(int fd, int uid, int gid);
 int rmdir(const char *path);
 #endif

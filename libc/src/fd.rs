@@ -111,6 +111,7 @@ fn errno_of(status: i32) -> c_int {
         ps::QUOTA => 28,          // ENOSPC
         ps::BAD_REQUEST => 22,    // EINVAL
         ps::SYMLINK | LOOP => 40, // ELOOP
+        ps::BAD_TARGET => 22,     // EINVAL: a link target the server refuses
         -3 => 13,                 // EACCES
         -5 => 12,                 // ENOMEM
         _ => 5,                   // EIO
@@ -521,39 +522,353 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn mkdir(path: *const c_char, _mode: c_int) -> c_int {
     let _guard = FDS.lock();
-    match with_parent(path_bytes(path), rights::READ | rights::WRITE, |d, name| {
+    let r = with_parent(path_bytes(path), rights::READ | rights::WRITE, |d, name| {
         d.mkdir(name)
-    }) {
+    });
+    match r {
+        Ok(()) => {
+            // the mode (less the mask) is an advisory attribute; the default needs no record
+            let want = _mode as u32 & !UMASK.load(Ordering::Relaxed) & 0o7777;
+            if want != 0o755 {
+                let _ = set_posix(
+                    path_bytes(path),
+                    proto::file::ATTR_POSIX_MODE,
+                    u64::from(want),
+                );
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// `struct stat` (USER-VIEW-SPEC section 6): the mode, owner and group are the node's advisory `posix.*` attributes or defaults
+/// (directories `0755`, files `0644`, links `0777`; the owner and group of the session); `st_nlink` is 1 (hard links are refused);
+/// `st_dev` and `st_ino` are opaque tokens (the mount the node was found through, and a hash of its path), never ids a server
+/// or a disk format uses.
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atim: Timespec,
+    pub st_mtim: Timespec,
+    pub st_ctim: Timespec,
+}
+
+pub const S_IFDIR: u32 = 0o040_000;
+pub const S_IFREG: u32 = 0o100_000;
+pub const S_IFLNK: u32 = 0o120_000;
+pub const S_IFCHR: u32 = 0o020_000;
+pub const S_IFIFO: u32 = 0o010_000;
+pub const S_IFSOCK: u32 = 0o140_000;
+
+/// The owner and group programs see when a node has no `posix.uid` or `posix.gid` (the session's: `UID` and `GID` in the
+/// environment, else 1000).
+pub static DEFAULT_UID: AtomicU32 = AtomicU32::new(1000);
+pub static DEFAULT_GID: AtomicU32 = AtomicU32::new(1000);
+/// The file-creation mask (`umask`).
+static UMASK: AtomicU32 = AtomicU32::new(0o022);
+
+fn fnv(parts: &[Vec<u8>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in parts {
+        for &b in p.iter().chain(b"/") {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Fill a `struct stat` from what `STAT` said, found through mount `dev` at absolute path `abs`.
+unsafe fn fill_stat(out: *mut Stat, info: &proto::file::StatInfo, dev: u64, abs: &[Vec<u8>]) {
+    use proto::file::ABSENT;
+    let (kind_bits, default_perm) = match info.kind {
+        2 => (S_IFDIR, 0o755),
+        3 => (S_IFLNK, 0o777),
+        _ => (S_IFREG, 0o644),
+    };
+    let perm = if info.mode == ABSENT {
+        default_perm
+    } else {
+        info.mode & 0o7777
+    };
+    let secs = (info.mtime / 1_000_000_000) as i64;
+    let nanos = (info.mtime % 1_000_000_000) as i64;
+    let t = Timespec {
+        tv_sec: secs,
+        tv_nsec: nanos,
+    };
+    *out = Stat {
+        st_dev: dev,
+        st_ino: fnv(abs),
+        st_mode: kind_bits | perm,
+        st_nlink: 1,
+        st_uid: if info.uid == ABSENT {
+            DEFAULT_UID.load(Ordering::Relaxed)
+        } else {
+            info.uid
+        },
+        st_gid: if info.gid == ABSENT {
+            DEFAULT_GID.load(Ordering::Relaxed)
+        } else {
+            info.gid
+        },
+        st_rdev: 0,
+        st_size: info.size as i64,
+        st_blksize: 4096,
+        st_blocks: ((info.size + 511) / 512) as i64,
+        st_atim: t,
+        st_mtim: t,
+        st_ctim: t,
+    };
+}
+
+/// `stat` and `lstat`: one round trip to the server (`STAT` carries the attributes). `nofollow` describes a final symlink itself.
+unsafe fn stat_path(path: *const c_char, out: *mut Stat, nofollow: bool) -> c_int {
+    let _guard = FDS.lock();
+    let table = TABLE.lock().clone();
+    let fl = if nofollow { pf::NOFOLLOW } else { 0 };
+    let r = pathres::open_following(&table, path_bytes(path), |h, rel| {
+        dir_view(h)
+            .stat_stop(rel, fl)
+            .map(|s| (s, h))
+            .map_err(stop_of)
+    })
+    .map_err(status_of);
+    match r {
+        Ok(((s, h), abs)) => {
+            fill_stat(out, &s.info, u64::from(h), &abs);
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stat(path: *const c_char, out: *mut Stat) -> c_int {
+    stat_path(path, out, false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lstat(path: *const c_char, out: *mut Stat) -> c_int {
+    stat_path(path, out, true)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
+    let mut t = FDS.lock();
+    match t.fds.get_mut(fd as usize).and_then(Option::as_mut) {
+        Some(Entry::File(f)) => match f.fs.fstat() {
+            Ok(s) => {
+                let abs = f.path.clone().unwrap_or_default();
+                fill_stat(out, &s.info, 0, &abs);
+                0
+            }
+            Err(e) => fail(e),
+        },
+        Some(Entry::Stream(_)) => {
+            let info = proto::file::StatInfo {
+                kind: 1,
+                size: 0,
+                mtime: 0,
+                mode: 0o620,
+                uid: proto::file::ABSENT,
+                gid: proto::file::ABSENT,
+            };
+            fill_stat(out, &info, 0, &[]);
+            let tty = TTY_OUT.load(Ordering::Relaxed) != 0;
+            (*out).st_mode = if tty {
+                S_IFCHR | 0o620
+            } else {
+                S_IFIFO | 0o600
+            };
+            0
+        }
+        Some(Entry::Socket(_)) => {
+            let info = proto::file::StatInfo {
+                kind: 1,
+                size: 0,
+                mtime: 0,
+                mode: 0o777,
+                uid: proto::file::ABSENT,
+                gid: proto::file::ABSENT,
+            };
+            fill_stat(out, &info, 0, &[]);
+            (*out).st_mode = S_IFSOCK | 0o777;
+            0
+        }
+        None => {
+            errno::set(9); // EBADF
+            -1
+        }
+    }
+}
+
+/// Open a node (file, directory or link target) with `rights`, following links: a file first, then as a directory if that is
+/// what it is (`chmod` and `chown` do not know which).
+fn open_node(path: &[u8], rights_wanted: u32) -> Result<Fs, i32> {
+    match open_path(path, 0, rights_wanted) {
+        Err(ps::IS_DIRECTORY) => open_path(path, pf::DIRECTORY, rights_wanted).map(|(f, _)| f),
+        Ok((f, _)) => Ok(f),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set advisory attribute `name` of the node at `path` to `value` (a `U64`).
+fn set_posix(path: &[u8], name: &[u8], value: u64) -> Result<(), i32> {
+    let mut f = open_node(path, rights::READ | rights::WRITE)?;
+    let r = f.attr_set(2, name, &value.to_le_bytes());
+    f.close();
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn chmod(path: *const c_char, mode: u32) -> c_int {
+    let _guard = FDS.lock();
+    match set_posix(
+        path_bytes(path),
+        proto::file::ATTR_POSIX_MODE,
+        u64::from(mode & 0o7777),
+    ) {
         Ok(()) => 0,
         Err(e) => fail(e),
     }
 }
 
-/// `struct stat` here is not Linux's: the size and the kind are all the file protocol knows.
-#[repr(C)]
-pub struct Stat {
-    pub st_size: i64,
-    pub st_mode: u32,
+#[no_mangle]
+pub unsafe extern "C" fn chown(path: *const c_char, uid: c_int, gid: c_int) -> c_int {
+    let _guard = FDS.lock();
+    let p = path_bytes(path);
+    for (v, name) in [
+        (uid, proto::file::ATTR_POSIX_UID),
+        (gid, proto::file::ATTR_POSIX_GID),
+    ] {
+        if v != -1 {
+            if let Err(e) = set_posix(p, name, v as u32 as u64) {
+                return fail(e);
+            }
+        }
+    }
+    0
+}
+
+/// `fchmod`: the descriptor's own connection is used, so it needs write access (a read-only descriptor gets `EACCES`).
+#[no_mangle]
+pub extern "C" fn fchmod(fd: c_int, mode: u32) -> c_int {
+    let mut t = FDS.lock();
+    match t.fds.get_mut(fd as usize).and_then(Option::as_mut) {
+        Some(Entry::File(f)) => match f.fs.attr_set(
+            2,
+            proto::file::ATTR_POSIX_MODE,
+            &u64::from(mode & 0o7777).to_le_bytes(),
+        ) {
+            Ok(()) => 0,
+            Err(e) => fail(e),
+        },
+        _ => {
+            errno::set(9);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn stat(path: *const c_char, out: *mut Stat) -> c_int {
-    let _guard = FDS.lock();
-    // the server's STAT takes a whole path: no parent to open (and READ is all it needs)
-    let table = TABLE.lock().clone();
-    let r = pathres::open_following(&table, path_bytes(path), |h, rel| {
-        dir_view(h).stat_stop(rel, 0).map_err(stop_of)
-    })
-    .map(|(s, _)| s)
-    .map_err(status_of);
-    match r {
-        Ok(s) => {
-            (*out).st_size = s.size as i64;
-            (*out).st_mode = if s.is_dir { 0o040_755 } else { 0o100_644 };
+pub extern "C" fn fchown(fd: c_int, uid: c_int, gid: c_int) -> c_int {
+    let mut t = FDS.lock();
+    match t.fds.get_mut(fd as usize).and_then(Option::as_mut) {
+        Some(Entry::File(f)) => {
+            for (v, name) in [
+                (uid, proto::file::ATTR_POSIX_UID),
+                (gid, proto::file::ATTR_POSIX_GID),
+            ] {
+                if v != -1 {
+                    if let Err(e) = f.fs.attr_set(2, name, &(v as u32 as u64).to_le_bytes()) {
+                        return fail(e);
+                    }
+                }
+            }
             0
         }
+        _ => {
+            errno::set(9);
+            -1
+        }
+    }
+}
+
+/// Set the file-creation mask; returns the old one.
+#[no_mangle]
+pub extern "C" fn umask(mask: u32) -> u32 {
+    UMASK.swap(mask & 0o777, Ordering::Relaxed)
+}
+
+pub const X_OK: c_int = 1;
+
+/// `access`: the node must exist; read and write are decided by the rights of the handles (so they are not refused here); the
+/// execute bit is advisory data, read as such (`PATH` lookup, `test -x`).
+#[no_mangle]
+pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
+    let mut st: Stat = core::mem::zeroed();
+    if stat(path, &mut st) != 0 {
+        return -1;
+    }
+    if mode & X_OK != 0 && st.st_mode & 0o111 == 0 {
+        errno::set(13); // EACCES
+        return -1;
+    }
+    0
+}
+
+/// `readlink`: the target text of a symlink, not NUL-terminated, truncated to `size`.
+#[no_mangle]
+pub unsafe extern "C" fn readlink(path: *const c_char, buf: *mut c_char, size: usize) -> isize {
+    let _guard = FDS.lock();
+    match with_parent(path_bytes(path), rights::READ, |d, name| d.readlink(name)) {
+        Ok(t) => {
+            let n = t.len().min(size);
+            core::ptr::copy_nonoverlapping(t.as_ptr(), buf as *mut u8, n);
+            n as isize
+        }
+        Err(e) => fail(e) as isize,
+    }
+}
+
+/// `symlink`: the server refuses a target that is absolute or climbs above the connection root (`EINVAL`).
+#[no_mangle]
+pub unsafe extern "C" fn symlink(target: *const c_char, linkpath: *const c_char) -> c_int {
+    let _guard = FDS.lock();
+    let t = path_bytes(target);
+    match with_parent(
+        path_bytes(linkpath),
+        rights::READ | rights::WRITE | rights::CREATE,
+        |d, name| d.symlink(name, t),
+    ) {
+        Ok(()) => 0,
         Err(e) => fail(e),
     }
+}
+
+/// Hard links are refused (`EPERM`): one entry names one node, so `st_nlink` is always 1 and `tar` falls back to a copy.
+#[no_mangle]
+pub extern "C" fn link(_old: *const c_char, _new: *const c_char) -> c_int {
+    errno::set(1); // EPERM
+    -1
 }
 
 #[no_mangle]

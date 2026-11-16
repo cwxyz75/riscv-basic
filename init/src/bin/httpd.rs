@@ -67,10 +67,7 @@ fn respond(www: &mut Fs, method: Method, target: &[u8]) -> (Vec<u8>, Option<(Fs,
     }
     // a directory (or the root) serves its index.html
     let st = if rel.is_empty() {
-        Some(rt::fs::Stat {
-            is_dir: true,
-            size: 0,
-        })
+        Some(rt::fs::Stat::basic(true, 0))
     } else {
         www.stat(&rel).ok()
     };

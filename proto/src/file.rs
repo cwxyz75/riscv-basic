@@ -358,10 +358,12 @@ pub fn split_path(p: &[u8]) -> Result<Vec<&[u8]>, PathError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
     pub is_dir: bool,
+    /// A symbolic link (kind byte 3). Never also `is_dir`.
+    pub is_link: bool,
     pub name: Vec<u8>,
 }
 
-/// Pack entries as `kind:u8 (1 file, 2 directory), name_len:u16, name`, stopping before `max`
+/// Pack entries as `kind:u8 (1 file, 2 directory, 3 symlink), name_len:u16, name`, stopping before `max`
 /// bytes; returns the bytes and how many entries fit.
 pub fn encode_entries(entries: &[DirEntry], max: usize) -> (Vec<u8>, usize) {
     let mut out = Vec::new();
@@ -370,7 +372,13 @@ pub fn encode_entries(entries: &[DirEntry], max: usize) -> (Vec<u8>, usize) {
         if out.len() + 3 + e.name.len() > max {
             break;
         }
-        out.push(if e.is_dir { 2 } else { 1 });
+        out.push(if e.is_dir {
+            2
+        } else if e.is_link {
+            3
+        } else {
+            1
+        });
         out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
         out.extend_from_slice(&e.name);
         n += 1;
@@ -388,16 +396,83 @@ pub fn decode_entries(b: &[u8]) -> Result<Vec<DirEntry>, FrameError> {
             .get(at + 3..at + 3 + n)
             .ok_or(FrameError::BadLength)?
             .to_vec();
-        if !(kind == 1 || kind == 2) || valid_name(&name).is_err() {
+        if !(1..=3).contains(&kind) || valid_name(&name).is_err() {
             return Err(FrameError::BadLength);
         }
         out.push(DirEntry {
             is_dir: kind == 2,
+            is_link: kind == 3,
             name,
         });
         at += 3 + n;
     }
     Ok(out)
+}
+
+// -------------------------------------------------------------------------------- stat (USER-VIEW-SPEC section 6)
+
+/// The advisory POSIX attributes (USER-VIEW-SPEC section 6, Q8 resolved 2026-11-17): `U64` attributes holding the mode (the
+/// permission and set-id bits, `0o7777`), the owner and the group. A server reports them in `STAT` when present; the libc
+/// supplies defaults when absent. Nothing enforces them: rights on handles do.
+pub const ATTR_POSIX_MODE: &[u8] = b"posix.mode";
+pub const ATTR_POSIX_UID: &[u8] = b"posix.uid";
+pub const ATTR_POSIX_GID: &[u8] = b"posix.gid";
+
+/// What `STAT` and `FSTAT` return: the reply's `a` is `size` and the payload is
+/// `kind:u8 (1 file, 2 directory, 3 symlink), mtime:u64 (ns), mode:u32, uid:u32, gid:u32`; a mode, uid or gid the node has no
+/// attribute for is [`ABSENT`]. A directory's size is its entry count, a symlink's its target's length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatInfo {
+    pub kind: u8,
+    pub size: u64,
+    pub mtime: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The value of a `StatInfo` field the node has no attribute for.
+pub const ABSENT: u32 = u32::MAX;
+pub const STAT_PAYLOAD: usize = 21;
+
+impl StatInfo {
+    pub fn encode_payload(&self) -> Vec<u8> {
+        let mut p = Vec::with_capacity(STAT_PAYLOAD);
+        p.push(self.kind);
+        p.extend_from_slice(&self.mtime.to_le_bytes());
+        p.extend_from_slice(&self.mode.to_le_bytes());
+        p.extend_from_slice(&self.uid.to_le_bytes());
+        p.extend_from_slice(&self.gid.to_le_bytes());
+        p
+    }
+
+    /// `a` is the reply's `a`.
+    pub fn decode(a: u64, payload: &[u8]) -> Result<StatInfo, FrameError> {
+        if payload.len() != STAT_PAYLOAD || !(1..=3).contains(&payload[0]) {
+            return Err(FrameError::BadLength);
+        }
+        Ok(StatInfo {
+            kind: payload[0],
+            size: a,
+            mtime: rd_u64(payload, 1).ok_or(FrameError::TooShort)?,
+            mode: rd_u32(payload, 9).ok_or(FrameError::TooShort)?,
+            uid: rd_u32(payload, 13).ok_or(FrameError::TooShort)?,
+            gid: rd_u32(payload, 17).ok_or(FrameError::TooShort)?,
+        })
+    }
+}
+
+/// The value of an advisory attribute (8 bytes, little endian) as a `StatInfo` field: [`ABSENT`] if it is missing, malformed or
+/// does not fit 32 bits.
+pub fn attr_u32(value: Option<&[u8]>) -> u32 {
+    match value.and_then(|v| <[u8; 8]>::try_from(v).ok()) {
+        // (a value too big for 32 bits, or equal to the sentinel itself, reads as absent)
+        Some(b) => match u32::try_from(u64::from_le_bytes(b)) {
+            Ok(v) if v != ABSENT => v,
+            _ => ABSENT,
+        },
+        None => ABSENT,
+    }
 }
 
 // -------------------------------------------------------------------------------- attributes, queries (FS-SPEC 9.1)

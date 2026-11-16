@@ -119,7 +119,7 @@ built in memfs first):
   never doofs ids, so the on-disk format stays hidden behind `proto::file`. Stable within a mount, unique enough for the
   loop detection that `find`, `tar` and `cp` do.
 * Times are nanosecond; `mtime` is what `make` sees. Names are UTF-8 and case-sensitive; limits are per volume.
-* Open Q8: the exact attribute names and whether `posix.*` may be indexed for `find`-style queries.
+* Q8 is resolved: the names above, and `posix.*` may be indexed. `STAT` carries them (`proto::file::StatInfo`), so a `stat` is one round trip.
 
 ## 7. The canonical layout (**Proposal**; this is the default table an interactive session builds)
 
@@ -406,7 +406,7 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 5. **Q5: PIDs**: local to a job, or global numbers from the process server.
 6. **Q6: `/run` and `AF_UNIX`**: build with the registry now, or wait for a port that needs it.
 7. **Q7: system configuration format**: TOML, or shell data literals (`SHELL-SPEC.md` Q2).
-8. **Q8: advisory attribute names** and whether they may be indexed.
+8. **Q8 (resolved 2026-11-17): advisory attribute names** are `posix.mode`, `posix.uid` and `posix.gid` (`U64`, the mode being the permission and set-id bits), and they may be indexed like any attribute.
 9. **Q9: queries in the tree** (`/query/<expr>`) or only a command.
 10. **Q10 (the registry's, open already): passing a service connection to another program, and revocation.**
 11. **Q11: the self-hosting bring-up path**: cross-build and run natively (Proposal), or bootstrap from tcc.
