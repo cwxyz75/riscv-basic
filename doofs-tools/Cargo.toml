@@ -1,0 +1,20 @@
+[package]
+name = "doofs-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Host tools for doofs volume images (FS-SPEC section 8, step 2): mkfs-doofs, fsck-doofs, dump-doofs over a file or block device, built on the pure fsfmt crate."
+
+[dependencies]
+fsfmt = { path = "../fsfmt" }
+
+[[bin]]
+name = "mkfs-doofs"
+path = "src/bin/mkfs.rs"
+
+[[bin]]
+name = "fsck-doofs"
+path = "src/bin/fsck.rs"
+
+[[bin]]
+name = "dump-doofs"
+path = "src/bin/dump.rs"
