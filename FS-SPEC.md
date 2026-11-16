@@ -100,6 +100,11 @@ section 6, SD-SPEC), so "mounting" is **granting a connection at a prefix** in a
   for example `3f2a9c1e-...  data`; an option can name a subdirectory to publish instead of the root, or a read-only cap. It is
   **a mapping from identity to a local name, nothing more**; it says nothing about who may use the volume. The parser is a pure
   `no_std` crate (`mounts`) with host golden tests and a no-panic sweep.
+* **The grant point is `/mnt/<name>`** (decided with the owner, 2026-11-17): a granted volume appears in the program's namespace
+  at `/mnt/<volume name>` (an entry may name another path). `/svc/vol/...` lists what exists; `/mnt/...` is what *this program* was
+  given: the two never share a prefix. Built (step 5e): the `/etc/trusted` line is `program [volume[:ro] | /path=volume[:ro]]...`;
+  the shell opens `vol-<volume>` from the registry and passes it as a namespace entry; the C library and the `ls`/`cat`
+  programs resolve absolute paths inside such an entry. A volume that is not there does not stop the program from starting.
 * **The grant: the manifest (a list).** Who gets which named volume, at which prefix and with which rights is the per-program
   grant list: `/etc/trusted` entries today (a trusted program may be given `/data` from `/svc/vol/data`, rights only shrink),
   the S10 manifest later. The shell and launcher read it when they build a program's startup namespace; a confined program

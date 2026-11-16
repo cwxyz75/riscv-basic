@@ -70,6 +70,28 @@ impl Prog {
     /// there (an absolute path loses its leading slashes). `None`: nothing to resolve against.
     pub fn base_for<'a>(&self, path: &'a [u8]) -> Option<(u32, &'a [u8])> {
         if path.first() == Some(&b'/') {
+            // a path inside a granted volume (`/mnt/store/x`) is relative to that volume's connection
+            let mut best: Option<(usize, u32)> = None;
+            for (prefix, i) in &self.env.startup.namespace {
+                let pre = prefix.as_slice();
+                if pre == b"/" || pre == b"." || pre == b"/svc" {
+                    continue;
+                }
+                let inside =
+                    path.starts_with(pre) && (path.len() == pre.len() || path[pre.len()] == b'/');
+                if inside && best.is_none_or(|(l, _)| pre.len() > l) {
+                    if let Some(&h) = self.env.handles.get(*i as usize) {
+                        best = Some((pre.len(), h));
+                    }
+                }
+            }
+            if let Some((len, h)) = best {
+                let mut p = &path[len..];
+                while p.first() == Some(&b'/') {
+                    p = &p[1..];
+                }
+                return Some((h, p));
+            }
             let h = self.env.namespace(b"/")?;
             let mut p = path;
             while p.first() == Some(&b'/') {

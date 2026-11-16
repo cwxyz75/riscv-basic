@@ -28,6 +28,9 @@ BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/lau
 
 
 class Session:
+    # more QEMU arguments (the shell test attaches a disk)
+    EXTRA_ARGS = []
+
     def __init__(self, kernel):
         cmd = ["qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt,aia=aplic-imsic"),
                "-bios", "default", "-m", "256M", "-display", "none", "-serial", "stdio",
@@ -36,6 +39,7 @@ class Session:
             cmd[1:1] = ["-cpu", os.environ["OS_CPU"]]
         if os.environ.get("OS_SMP"):
             cmd[1:1] = ["-smp", os.environ["OS_SMP"]]
+        cmd += self.EXTRA_ARGS
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT)
         self.lines = queue.Queue()
@@ -129,7 +133,7 @@ def main():
     s.step(b"ls home\n", [b"hello.txt", b"lines.txt", b"sub/"], "the home directory")
     s.step(b"cat home/hello.txt\n", [b"hello, world"], "a fixture")
     s.step(b"cat home/sub/inner.txt\n", [b"inner"], "a nested fixture")
-    s.step(b"cat etc/trusted\n", [b"ls", b"cat"], "the trust list")
+    s.step(b"cat etc/trusted\n", [b"ls store", b"cat store", b"ctest store"], "the trust list")
     s.step(b"write tmp/note some text here\n", [b"ok"], "a write to /tmp")
     s.step(b"cat tmp/note\n", [b"some text here"], "reading it back")
     s.step(b"write bin/x hi\n", [b"write: bin/x: access denied"], "writing into /bin")

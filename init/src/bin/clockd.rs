@@ -7,6 +7,16 @@
 #![no_std]
 #![no_main]
 
+/// Log to the serial line unless the parent asked for quiet (`QUIET=1`: a user's session).
+static QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+macro_rules! say {
+    ($($a:tt)*) => {
+        if !QUIET.load(core::sync::atomic::Ordering::Relaxed) {
+            rt::println!($($a)*);
+        }
+    };
+}
+
 extern crate alloc;
 
 use clockmodel::{ClockModel, Quality};
@@ -150,6 +160,10 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
+    QUIET.store(
+        env.var(b"QUIET") == Some(&b"1"[..]),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let (Some(devmgr_ch), Some(registry)) = (
         env.handle(Role::ServiceDevmgr),
         env.handle(Role::ServiceRegistry),
@@ -219,6 +233,6 @@ pub fn app_main() -> i32 {
     if d.core.add_conn(mine, svc::ROOT, Conn::Listener).is_none() {
         return 8;
     }
-    rt::println!("clockd: up, rtc={}", u8::from(rtc));
+    say!("clockd: up, rtc={}", u8::from(rtc));
     service::run(&mut d)
 }

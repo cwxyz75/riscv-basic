@@ -50,6 +50,18 @@ static FDS: Mutex<Table> = Mutex::new(Table {
 /// The directory connections of the namespace (`/` and `.`), 0 if absent; owned by the startup message.
 pub static ROOT: AtomicU32 = AtomicU32::new(0);
 pub static CWD: AtomicU32 = AtomicU32::new(0);
+/// Volumes the program was granted: namespace entries other than `/`, `.` and `/svc` (`/mnt/<name>`), as (prefix, handle).
+type Mount = Option<(Vec<u8>, u32)>;
+static MOUNTS: Mutex<[Mount; 8]> = Mutex::new([const { None }; 8]);
+
+/// Remember a granted volume (up to eight).
+pub fn add_mount(prefix: &[u8], handle: u32) {
+    let mut m = MOUNTS.lock();
+    if let Some(slot) = m.iter_mut().find(|s| s.is_none()) {
+        *slot = Some((prefix.to_vec(), handle));
+    }
+}
+
 /// Which standard streams are the terminal (`STDIN=tty`, `STDOUT=tty` in the environment).
 pub static TTY_IN: AtomicU32 = AtomicU32::new(0);
 pub static TTY_OUT: AtomicU32 = AtomicU32::new(0);
@@ -114,16 +126,32 @@ fn dir_view(h: u32) -> Fs {
 /// (`a//b`, a trailing slash) and `.` are dropped; `..` is left for the server to refuse. `None` for
 /// an empty path or a namespace without that directory.
 fn resolve(path: &[u8]) -> Option<(u32, Vec<u8>)> {
-    let h = if path.first() == Some(&b'/') {
+    let mut h = if path.first() == Some(&b'/') {
         ROOT.load(Ordering::Relaxed)
     } else {
         CWD.load(Ordering::Relaxed)
     };
-    let mut out: Vec<u8> = Vec::new();
-    for comp in path
+    let mut comps: Vec<&[u8]> = path
         .split(|&c| c == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
-    {
+        .collect();
+    // an absolute path inside a granted volume (`/mnt/store/x`) is relative to that volume's connection
+    if path.first() == Some(&b'/') {
+        let m = MOUNTS.lock();
+        for (prefix, mh) in m.iter().flatten() {
+            let pc: Vec<&[u8]> = prefix
+                .split(|&c| c == b'/')
+                .filter(|c| !c.is_empty())
+                .collect();
+            if comps.len() > pc.len() && comps[..pc.len()] == pc[..] {
+                h = *mh;
+                comps.drain(..pc.len());
+                break;
+            }
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    for comp in comps {
         if !out.is_empty() {
             out.push(b'/');
         }

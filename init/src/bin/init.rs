@@ -635,6 +635,8 @@ struct Stack {
     sh: u32,
     /// `sh` writes here when the user says `halt`.
     halt: u32,
+    /// A connection to the service registry, to ask the volumes to commit before the session ends.
+    registry: Option<rt::fs::Fs>,
 }
 
 fn kill_close(h: u32) {
@@ -690,6 +692,8 @@ fn start_stack(
         let st = Startup {
             args: alloc::vec![name.to_vec()],
             roles,
+            // (the services that log their start-up to the serial line stay quiet in a user's session)
+            env: alloc::vec![b"QUIET=1".to_vec()],
             ..Startup::default()
         };
         let Ok(bytes) = st.encode() else {
@@ -755,18 +759,93 @@ fn start_stack(
         alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
         &[serial_dup.a1 as u32, tty_console, ctl_console],
     )?;
+    // the volumes (FS-SPEC 5d, 5e): the device manager, the registry, the clock and the volume manager, best effort: a machine
+    // with no disk, or a service that does not start, leaves the session without volumes and nothing else changed
+    let volumes = (|| -> Option<(rt::fs::Fs, rt::fs::Fs)> {
+        let res = sys::resource_root();
+        if res.status != 0 {
+            return None;
+        }
+        let res = res.a1 as u32;
+        let dup = |h: u32| {
+            let d = sys::handle_duplicate(h, Rights::SAME.0);
+            (d.status == 0).then_some(d.a1 as u32)
+        };
+        let (dm_mine, dm_theirs) = chan().ok()?;
+        start(
+            b"devmgr",
+            alloc::vec![
+                (Role::Resource, 0),
+                (Role::BootImage, 1),
+                (Role::ServiceDevmgr, 2)
+            ],
+            &[dup(res)?, dup(image_vmo)?, dm_theirs],
+        )
+        .ok()?;
+        sys::handle_close(res);
+        let (reg_mine, reg_theirs) = chan().ok()?;
+        start(
+            b"registryd",
+            alloc::vec![(Role::ServiceRegistry, 0)],
+            &[reg_theirs],
+        )
+        .ok()?;
+        let mut reg = rt::fs::Fs::new(reg_mine);
+        // the clock service is a second client of the device manager
+        let (cd_mine, cd_theirs) = chan().ok()?;
+        let req = proto::devmgr::encode_connect(1);
+        if sys::channel_write(dm_mine, req.as_ptr(), req.len(), &cd_theirs, 1).status != 0 {
+            return None;
+        }
+        if sys::object_wait(dm_mine, rt::abi::signals::READABLE, sys::clock_get() + 3000).status
+            != 0
+        {
+            return None;
+        }
+        let mut rb = [0u8; 16];
+        sys::channel_read(dm_mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+        let clock_pub = reg.clone_conn(proto::file::rights::ALL).ok()?;
+        start(
+            b"clockd",
+            alloc::vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+            &[cd_mine, clock_pub.ch],
+        )
+        .ok()?;
+        let vol_pub = reg.clone_conn(proto::file::rights::ALL).ok()?;
+        start(
+            b"volmgr",
+            alloc::vec![
+                (Role::ServiceDevmgr, 0),
+                (Role::ServiceRegistry, 1),
+                (Role::BootImage, 2)
+            ],
+            &[dm_mine, vol_pub.ch, dup(image_vmo)?],
+        )
+        .ok()?;
+        // the shell may open volumes and may not publish
+        let sh_reg = reg
+            .clone_conn(proto::file::rights::ALL & !proto::file::rights::PUBLISH)
+            .ok()?;
+        Some((reg, sh_reg))
+    })();
+    let (registry, sh_registry) = match volumes {
+        Some((r, s)) => (Some(r), Some(s)),
+        None => (None, None),
+    };
     let (halt_init, halt_sh) = chan()?;
-    let sh = start(
-        b"sh",
-        alloc::vec![
-            (Role::Tty, 0),
-            (Role::ServiceFs, 1),
-            (Role::ServiceLaunch, 2),
-            (Role::ServiceConsole, 3),
-            (Role::ServiceInit, 4)
-        ],
-        &[tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh],
-    )?;
+    let mut sh_roles = alloc::vec![
+        (Role::Tty, 0),
+        (Role::ServiceFs, 1),
+        (Role::ServiceLaunch, 2),
+        (Role::ServiceConsole, 3),
+        (Role::ServiceInit, 4)
+    ];
+    let mut sh_handles = alloc::vec![tty_sh, sh_fs.ch, launch_sh, ctl_sh, halt_sh];
+    if let Some(r) = sh_registry {
+        sh_roles.push((Role::ServiceRegistry, 5));
+        sh_handles.push(r.ch);
+    }
+    let sh = start(b"sh", sh_roles, &sh_handles)?;
     Ok(Stack {
         session,
         memfsd,
@@ -774,13 +853,32 @@ fn start_stack(
         consoled,
         sh,
         halt: halt_init,
+        registry,
     })
 }
 
 /// End a session: stop the shell first (which closes the terminal and so ends the console server
 /// once it has flushed the serial line), then the rest.
-fn stop_stack(s: Stack) {
+fn stop_stack(mut s: Stack) {
     use rt::sys;
+    // make every volume durable before the session's processes are killed (a volume server commits a couple of seconds
+    // after a change; ending the session would lose that)
+    if let Some(mut r) = s.registry.take() {
+        if let Ok(names) = r.read_dir() {
+            for e in names.iter().filter(|e| e.name.starts_with(b"vol-uuid-")) {
+                if let Ok(mut v) = r.open_retry(
+                    &e.name,
+                    proto::file::flags::DIRECTORY,
+                    proto::file::rights::READ | proto::file::rights::WRITE,
+                    sys::clock_get() + 1000,
+                ) {
+                    let _ = v.sync();
+                    v.close();
+                }
+            }
+        }
+        r.close();
+    }
     sys::process_kill(s.sh, -1);
     let w = sys::object_wait(
         s.consoled,
