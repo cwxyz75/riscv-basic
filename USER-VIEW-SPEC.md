@@ -141,12 +141,18 @@ A convention, not a fixed tree: every process gets only the entries its launcher
 ├── run            a WRITABLE registry area: bind() and connect() for AF_UNIX (section 8)
 ├── tmp            memfs, private per job (quota domain), gone with the job
 ├── home           the user's volume (doofs); /home/<user> is $HOME
-├── vol            other volumes by label: /vol/data, /vol/usb
+├── mnt            volumes granted to this program, one directory each: /mnt/<name> (names from etc/mounts, see below)
 ├── boot           the boot image, read-only (what bootfs is today)
 ├── net            optional: a file-shaped adapter over /svc/net, only if the program holds that view
 └── usr            compatibility only: bin, lib, include, share are symlinks to ../bin, ../lib, ...
 ```
 
+* **Volumes are granted at `/mnt/<name>`** (decided with the owner, 2026-11-17; amends the earlier `/vol/<label>` draft). The
+  name is the one the mount table (`/etc/mounts`, `FS-SPEC.md` section 6) gives the volume's uuid, never the disk's own label.
+  `/svc/vol/...` lists the volumes that exist (a view the program may not have); `/mnt/...` is what this program was given:
+  the two never share a prefix. Built in the filesystem slice (step 5e): `/etc/trusted` lines name the volumes a program gets;
+  the session manager's profiles (UV5) and the manifest (S10) replace that list. `/home` is the user's own volume, granted the
+  same way.
 * **`/usr` is a real directory of four or five symlinks**, not a self-link (`/usr -> /` would make `find -L` and
   `tar -h` walk `/usr/usr/...` to the loop limit). `/usr/local` is not provided until the install-layout question is
   settled.

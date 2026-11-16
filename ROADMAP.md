@@ -696,13 +696,37 @@ later the S10 manifest).
 - [~] Steps 5a to 5f. **Done (2026-11-16/17):** 5c `fsd` (see below), 5d `volmgr` (`init/src/bin/volmgr.rs`: asks `devmgr` for every block device, probes each with `fsfmt::probe` (eight block reads, geometry and label checked), reads `etc/mounts` through the pure `mounts` crate, decides with `mounts::plan` (names only from the table, a cloned disk refused), starts one `fsd` per volume with listener channels and publishes `vol-uuid-<hex>` and `vol-<name>`; restarts a dead server), 5e the table (`bootfs/etc/mounts`; options `ro` and `sub=`), 5f in part: the QEMU test `volmgr_serves_volumes_by_the_table` (junk disk ignored, the table names the volume, a read-only grant cannot write, everything is killed and started again and the file is still there) and the host `fsck-doofs` (now also the filesystem layer) run on the second disk after every strict boot. **Grants (5e/5b, 2026-11-17):** the interactive session now starts `devmgr`, `registryd`, `clockd` and `volmgr` (best effort: no disk, no volumes); `sh` opens `vol-<name>` for the volumes a trusted program's `/etc/trusted` line names and passes them at `/mnt/<name>` (`ls store`, `cat store`, `ctest store` in the shipped file); libc and `ls`/`cat` resolve paths inside such an entry; `rt::fs::open_retry` retries `UNAVAILABLE`; the session's end asks every volume to commit first. Shell test (`scripts/s4e_shell_test.py`): a host-made doofs disk, a C program makes/reads/renames/removes files at `/mnt/store`, a file survives `exit` and the new session, an untrusted program has no volume, and the host `fsck-doofs` accepts the disk afterwards. **Not done:** 5a (discard), the supervision restart is not exercised in QEMU (T118), images built by the host tools and attached in either order with a duplicate and blank disk (needs a third and fourth disk, which shifts device numbers the older tests rely on, T118), the independent checker (T113)
 - [x] Step 6, the implementation (2026-11-16): attributes, user and built-in indexes and queries on disk (`doofs::attrs`: attribute records, index definitions, entries `(index, escaped key, id)` kept by `put_inode`/`set_name`/`attr_*`, back-fill at `make_index`, a range scan filtered to the subtree with `(key, id)` paging), served by `fsd` (`ATTR_*`, `MAKE_INDEX`, `QUERY`; the wire's query ids are now 64-bit) and exercised in QEMU (`fsd_keeps_files_across_a_restart`: set, index, query, sync, an unsynced change, kill, remount, query again). The differential test against `memfs` covers attributes, indexes and queries (30 seeds clean; eight hand mutations caught), `fsck` checks the index entries, the crash harness includes attribute and index operations (about 46,000 scenarios). **Not done: the independent review of the whole slice (Fable, its own PR), which this unattended run does not start**
 
+### UV: The user's view of the system, and the native shell (specified, **nothing built beyond the survey**; drafted 2026-11-15)
+
+The command-line side of the system: the canonical layout of a session's namespace, POSIX as a porting surface judged by a
+named corpus, advisory POSIX metadata, the terminal, sessions and profiles, `/proc`, and the es-style native shell. The specs
+are `USER-VIEW-SPEC.md` (the track and its steps UV0 to UV10), `SHELL-SPEC.md` (the shell language), `SHELL-CORPUS.md` (ten
+scripts and the findings that shaped the syntax) and `UV0-GAP-SURVEY.md` (the libc and `rt` against the target programs). Open
+questions are in `USER-VIEW-SPEC.md` section 15 (Q2 dynamic linking, Q4 install layout, Q5 PIDs, Q12 the default namespace of a
+program the shell starts, and others). Decisions to log on acceptance are in its section 14 (OD-UV1 to OD-UV10, provisional).
+
+Already built that the track builds on: per-program namespaces and the registry (SD), the `/etc/trusted` grants of volumes at
+`/mnt/<name>` (filesystem step 5e), the doofs attributes and indexes (step 6; UV3's storage), the libc over the file protocol.
+
+- [x] UV0: the gap survey (`UV0-GAP-SURVEY.md`, #157). Table only; no code
+- [ ] UV1: `..`, the cwd string and path-annotated fds (libc changes, the `shell-core::resolve` clamp; the server keeps refusing a raw `..`)
+- [ ] UV2: the skeleton root and the canonical layout (launcher-built root, `/usr` links, `/dev` servers, private `/tmp` per job, `/mnt`)
+- [ ] UV3: advisory POSIX attributes (`posix.mode/uid/gid` on doofs and `memfs`, `stat` populated, hard links refused)
+- [ ] UV4: the terminal's raw mode, events and window size
+- [ ] UV5: the session manager, profiles and autologin (replaces the `/etc/trusted` list as the way a program gets its table)
+- [ ] UV6: `/proc` (the adapter, driven by `ps`, `free`, `nproc`, `top`)
+- [ ] UV7: detach and reattach
+- [ ] UV8: BusyBox NOMMU as the first real userland
+- [ ] UV9: `/run` and `AF_UNIX` (when a port needs it); UV10: the Rust `std` on our libc and uutils (with S11)
+- [ ] The native shell (`SHELL-SPEC.md`): not yet cut into steps; it lands alongside UV4 to UV5
+
 ### S10: Namespaces and attributes
 
 Acceptance: scripted attribute queries pass; a union-backed `/bin` demo works.
 
-- [ ] Indexed attributes and `query` in the memory filesystem
+- [x] Indexed attributes and `query` in the memory filesystem (done as filesystem step 0, 2026-11-16, and on disk in step 6; see slice F)
 - [ ] Union server
-- [ ] Manifest-driven, confined-by-default shell
+- [ ] Manifest-driven, confined-by-default shell (the design is in slice UV above: `USER-VIEW-SPEC.md`, `SHELL-SPEC.md`; the manifest replaces `/etc/trusted`)
 
 ### S11: Compatibility
 
