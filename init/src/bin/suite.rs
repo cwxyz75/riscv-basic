@@ -4732,6 +4732,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"blkd".to_vec(),
             b"bomb".to_vec(),
             b"cat".to_vec(),
+            b"clockd".to_vec(),
             b"consoled".to_vec(),
             b"crash".to_vec(),
             b"ctest".to_vec(),
@@ -8203,6 +8204,158 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
     Ok(())
 }
 
+// --- The wall clock (FS-SPEC step C1) ---------------------------------------------------------
+
+/// The harness starts QEMU with `-rtc base=2030-06-15T12:00:00,clock=vm`: the real-time clock starts there and follows the
+/// virtual clock, so the clock service must say a time a little after this many nanoseconds since the epoch.
+const RTC_BASE_NS: u64 = 1_907_755_200 * 1_000_000_000;
+
+/// A registry, a connection that can publish, and a clock service on `devmgr_ch`: (the view of `clock`, the processes).
+fn start_clockd(bi: u32, job_h: u32, devmgr_ch: u32) -> Result<(Fs, Vec<u32>), Detail> {
+    let (off, len) = image_entry(bi, b"bin/registryd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let (reg_mine, reg_theirs) = channel()?;
+    let s = Startup {
+        args: vec![b"registryd".to_vec()],
+        roles: vec![(Role::ServiceRegistry, 0)],
+        ..Startup::default()
+    };
+    let reg = rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[reg_theirs],
+        job_h,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let mut root = Fs::new(reg_mine);
+    let publish = root.clone_conn(prt::ALL).map_err(|e| msg_e(e, line!()))?;
+    let (off, len) = image_entry(bi, b"bin/clockd")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let s = Startup {
+        args: vec![b"clockd".to_vec()],
+        roles: vec![(Role::ServiceDevmgr, 0), (Role::ServiceRegistry, 1)],
+        ..Startup::default()
+    };
+    let clockd = rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[devmgr_ch, publish.ch],
+        job_h,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let view = root
+        .view(&[b"clock"], prt::READ)
+        .map_err(|e| msg_e(e, line!()))?;
+    root.close();
+    Ok((view, vec![reg, clockd]))
+}
+
+fn clock_service_reports_the_rtc() -> Outcome {
+    use proto::clock::quality;
+    use rt::clock::Clock;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let bi = boot_image_vmo()?;
+    let root_j = root_job()?;
+    let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
+    sys::handle_close(root_j);
+    let t = |n: u64| sys::clock_get() + n;
+    // ---- with the device manager (whose one client is the clock service): the RTC's time, quality FromRtc
+    let (dm_mine, dm_theirs) = channel()?;
+    let res_dup = ok(
+        sys::handle_duplicate(res, Rights::SAME.0),
+        "dup the resource",
+    )?
+    .a1 as u32;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let (off, len) = image_entry(bi, b"bin/devmgr")?;
+    let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
+    let s = Startup {
+        args: vec![b"devmgr".to_vec()],
+        roles: vec![
+            (Role::Resource, 0),
+            (Role::BootImage, 1),
+            (Role::ServiceDevmgr, 2),
+        ],
+        ..Startup::default()
+    };
+    let mgr = rt::spawn::spawn_in(
+        &image,
+        &s.encode().map_err(|_| msg_at(line!()))?,
+        &[res_dup, bi_dup, dm_theirs],
+        mj,
+    )
+    .map_err(|_| msg_at(line!()))?;
+    let (mut view, mut procs) = start_clockd(bi, mj, dm_mine)?;
+    procs.push(mgr);
+    let mut c = Clock::connect(&mut view, t(8000)).map_err(|_| msg_at(line!()))?;
+    let a = c.now(t(3000)).map_err(|_| msg_at(line!()))?;
+    ensure_eq!(a.quality, quality::FROM_RTC, "the time comes from the RTC");
+    ensure!(
+        a.nanos >= RTC_BASE_NS && a.nanos < RTC_BASE_NS + 600 * 1_000_000_000,
+        "within ten minutes after the base the harness set: {} ns",
+        a.nanos
+    );
+    nap_ticks(60);
+    let b = c.now(t(3000)).map_err(|_| msg_at(line!()))?;
+    ensure!(b.nanos >= a.nanos, "never backwards");
+    ensure!(
+        b.nanos - a.nanos >= 50_000_000 && b.nanos - a.nanos < 5_000_000_000,
+        "it advanced by about the time we slept: {} ns",
+        b.nanos - a.nanos
+    );
+    // a malformed request is answered BAD_REQUEST with its txid, the service lives on
+    let bad = [9u8, 0, 0, 0, 7, 0, 0, 0];
+    ensure_eq!(
+        st(sys::channel_write(
+            c.channel(),
+            bad.as_ptr(),
+            bad.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send a bad request"
+    );
+    let w = sys::object_wait(c.channel(), sig::READABLE, t(3000));
+    ensure_eq!(st(w), Some(S::Ok), "answered");
+    let mut rb = [0u8; 32];
+    let r = sys::channel_read(c.channel(), rb.as_mut_ptr(), 32, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        proto::clock::decode_reply(&rb[..r.a1]).map(|(t, s, _, _)| (t, s)),
+        Some((9, proto::clock::status::BAD_REQUEST)),
+        "BAD_REQUEST with its txid"
+    );
+    ensure!(c.now(t(3000)).is_ok(), "and it still answers");
+    drop(c);
+    view.close();
+    for p in procs.drain(..) {
+        sys::process_kill(p, -1);
+        sys::handle_close(p);
+    }
+    // ---- with no device manager to claim from: quality Unset, counting from the epoch at boot
+    let (dead, _gone) = channel()?; // the other end is closed at once: the claim finds nobody
+    sys::handle_close(_gone);
+    let (mut view, procs) = start_clockd(bi, mj, dead)?;
+    let mut c = Clock::connect(&mut view, t(8000)).map_err(|_| msg_at(line!()))?;
+    let u = c.now(t(3000)).map_err(|_| msg_at(line!()))?;
+    ensure_eq!(u.quality, quality::UNSET, "no RTC: Unset");
+    ensure!(
+        u.nanos < 3_600 * 1_000_000_000,
+        "counted from the epoch at boot: {} ns",
+        u.nanos
+    );
+    drop(c);
+    view.close();
+    for p in procs {
+        sys::process_kill(p, -1);
+        sys::handle_close(p);
+    }
+    sys::debug_write(b"clock: the clock service reported the RTC and the Unset case\n");
+    sys::handle_close(mj);
+    sys::handle_close(res);
+    Ok(())
+}
+
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
@@ -10320,6 +10473,10 @@ pub fn app_main() -> i32 {
         (
             "fsd_keeps_files_across_a_restart",
             fsd_keeps_files_across_a_restart,
+        ),
+        (
+            "clock_service_reports_the_rtc",
+            clock_service_reports_the_rtc,
         ),
         (
             "a_child_has_no_device_authority",

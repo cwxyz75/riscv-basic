@@ -363,8 +363,9 @@ pub mod layout {
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
     /// Physical RAM on QEMU's `virt` board starts here.
     pub const RAM_BASE: u64 = 0x8000_0000;
-    /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots.
-    pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x1000_1000, 0x1000_9000)];
+    /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots, and the goldfish real-time clock
+    /// (one page, `0x101000`: the wall clock, FS-SPEC section 7; the device manager hands clients a read-only VMO of it).
+    pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
     /// Is `[pa, pa + bytes)` page aligned, non-empty and inside one device window?
     pub fn in_device_window(pa: u64, bytes: u64) -> bool {
         let Some(end) = pa.checked_add(bytes) else {

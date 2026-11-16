@@ -43,7 +43,7 @@ It is a capability, not ambient authority: a process without the handle cannot r
 at all.
 
 **Physical VMOs.** `vmo_create_physical(resource, pa, size) -> vmo`. The range must lie inside one of
-the *device windows* the kernel allows (QEMU `virt`: virtio-mmio `0x1000_1000..0x1000_9000`; the
+the *device windows* the kernel allows (QEMU `virt`: virtio-mmio `0x1000_1000..0x1000_9000`, and since step C1 the goldfish RTC page `0x10_1000`; the
 list is a constant in `abi::layout`) and be page aligned; RAM is never allowed (that is what DMA
 VMOs are for). The VMO has fixed frames that are not in the frame database, are never freed, are
 never zero-filled, never charged to a job's page limit (the *object* is charged as one object),

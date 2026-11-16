@@ -29,6 +29,10 @@ pub const OP_CLAIM_RNG: u16 = 4;
 /// A `ClaimRng` reply: `txid u32 | status i32 | flags u32 | dma_pages u32`.
 pub const RNG_CLAIM_REPLY_LEN: usize = 16;
 pub const RNG_CLAIM_HANDLES: usize = 2;
+/// Claim the real-time clock device number `index` (the wall clock, FS-SPEC section 7; a `google,goldfish-rtc` on QEMU `virt`):
+/// same request layout. The reply is a plain [`Status`] reply and, for `Ok`, carries one handle: a **read-only** VMO of the
+/// device's register page. Any number of clients may hold one (reading the time changes nothing).
+pub const OP_CLAIM_RTC: u16 = 5;
 pub const REQUEST_LEN: usize = 8;
 pub const REPLY_LEN: usize = 8;
 
@@ -164,6 +168,25 @@ pub fn decode_claim_rng_reply(b: &[u8]) -> Option<(u32, Status, Option<RngClaim>
     ))
 }
 
+pub fn encode_claim_rtc(txid: u32, index: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(REQUEST_LEN);
+    b.extend_from_slice(&txid.to_le_bytes());
+    b.extend_from_slice(&OP_CLAIM_RTC.to_le_bytes());
+    b.extend_from_slice(&index.to_le_bytes());
+    b
+}
+
+pub fn decode_claim_rtc(b: &[u8]) -> Result<(u32, u16), Option<u32>> {
+    let txid = rd_u32(b, 0);
+    if b.len() != REQUEST_LEN || rd_u16(b, 4) != Some(OP_CLAIM_RTC) {
+        return Err(txid);
+    }
+    match (txid, rd_u16(b, 6)) {
+        (Some(t), Some(i)) => Ok((t, i)),
+        _ => Err(None),
+    }
+}
+
 pub fn encode_claim_net(txid: u32, index: u16) -> Vec<u8> {
     let mut b = Vec::with_capacity(REQUEST_LEN);
     b.extend_from_slice(&txid.to_le_bytes());
@@ -253,6 +276,16 @@ mod tests {
             decode_reply(&encode_reply(9, Status::NoDevice)),
             Some((9, Status::NoDevice))
         );
+    }
+
+    #[test]
+    fn claim_rtc_golden_and_round_trip() {
+        assert_eq!(encode_claim_rtc(7, 1), [7, 0, 0, 0, 5, 0, 1, 0]);
+        assert_eq!(decode_claim_rtc(&encode_claim_rtc(7, 1)), Ok((7, 1)));
+        assert_eq!(decode_claim_rtc(&encode_claim_rng(7, 1)), Err(Some(7)));
+        assert_eq!(decode_claim_rng(&encode_claim_rtc(7, 1)), Err(Some(7)));
+        assert_eq!(decode_claim_rtc(&[1, 2]), Err(None));
+        assert_eq!(decode_claim_rtc(&[1, 0, 0, 0, 5, 0]), Err(Some(1)));
     }
 
     #[test]

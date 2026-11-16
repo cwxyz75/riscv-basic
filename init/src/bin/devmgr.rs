@@ -246,6 +246,8 @@ struct DevMgr {
     blocks: Vec<Block>,
     nets: Vec<Net>,
     rngs: Vec<Rng>,
+    /// The real-time clocks: one VMO of each register page (claimed read-only, by any number of clients).
+    rtcs: Vec<u32>,
     image: Option<Vec<u8>>,
 }
 
@@ -304,6 +306,26 @@ impl Service for DevMgr {
         }
         if !hs.is_empty() {
             return self.reply(key, txid_of(msg), Status::BadRequest, None);
+        }
+        if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_RTC) {
+            return match devmgr::decode_claim_rtc(msg) {
+                Ok((txid, index)) => {
+                    let Some(&vmo) = self.rtcs.get(usize::from(index)) else {
+                        return self.reply(key, txid, Status::NoDevice, None);
+                    };
+                    // read-only: the claimant can map and read the time, nothing else
+                    let d = sys::handle_duplicate(
+                        vmo,
+                        Rights::READ.0 | Rights::MAP.0 | Rights::TRANSFER.0,
+                    );
+                    if d.status != 0 {
+                        return self.reply(key, txid, Status::Failed, None);
+                    }
+                    self.reply(key, txid, Status::Ok, Some(d.a1 as u32))
+                }
+                Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
+                Err(None) => {}
+            };
         }
         if devmgr::op_of(msg) == Some(devmgr::OP_CLAIM_RNG) {
             return match devmgr::decode_claim_rng(msg) {
@@ -523,6 +545,21 @@ pub fn app_main() -> i32 {
             });
         }
     }
+    // the real-time clocks (a goldfish RTC on QEMU `virt`): a VMO of each one's register page, kept for claims
+    let mut rtcs: Vec<u32> = Vec::new();
+    for n in nodes
+        .iter()
+        .filter(|n| n.is_compatible("google,goldfish-rtc"))
+    {
+        if let Some((base, size)) = n.reg() {
+            if size >= 4096 && base % 4096 == 0 {
+                let v = sys::vmo_create_physical(res, base, 4096);
+                if v.status == 0 {
+                    rtcs.push(v.a1 as u32);
+                }
+            }
+        }
+    }
     let image = blkd_image(bi);
     let p = sys::port_create();
     if p.status != 0 {
@@ -540,6 +577,7 @@ pub fn app_main() -> i32 {
         blocks,
         nets,
         rngs,
+        rtcs,
         image,
     };
     match mgr.core.add_conn(chan, svc::ROOT, 0) {
