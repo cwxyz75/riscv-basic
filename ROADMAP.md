@@ -742,3 +742,131 @@ Longer-term backlog (see `OS-ARCHITECTURE.md` section 16): a real on-disk
 filesystem with crash-injection tests, graphics and input, scheduler
 alternatives against the conformance suite, capability revocation, quotas,
 self-hosting; **IPv6** (distant future, added at the owner's request 2026-11-15: NET-SPEC and S9 are IPv4 only on purpose, and `netwire`, `netcore` and `nettcp` should keep addresses behind small types so it stays possible).
+
+### Future topics (noted 2026-11-15; not specified, not scheduled, not committed)
+
+**Topics only.** These came out of a design conversation; each needs a spec, an acceptance check and an
+OD entry before it becomes a slice. Nothing here has been checked against the code beyond a keyword
+search, so some of it may already be partly covered by a slice above. Rough grouping, not an order.
+
+*Portability and hardware*
+
+- **A second architecture (AArch64).** Approach if ever wanted: an in-tree `arch` layer, not kernel forks.
+  Refactor on RISC-V first (arch code behind one module: boot, trap frame, context switch, per-CPU
+  register, timer, IPI, TLB and cache maintenance, FP state; the page-table code in `kcore` made generic
+  over a PTE format; an interrupt-controller trait; a barrier abstraction), then bring Arm up under
+  `qemu-system-aarch64 -M virt` and run the same suite as the oracle. First step would be a read-only audit
+  of RISC-V assumptions leaking into `kcore` and `user.rs`. Needs its own profile-floor decision beside OD47.
+- **A real driver model that is not QEMU `virt`.** Drivers are already userspace programs holding
+  capabilities, and `devmgr` reads the DTB (slice DM). What is still QEMU-shaped: `DEVICE_WINDOWS` and
+  `MAX_IRQ` in `abi` are constants, not derived from the DTB; `devmgr` matches only virtio-mmio block, with no
+  `compatible`-to-driver table; the kernel UART bridge (T14); trust-based DMA with no IOMMU or cache
+  maintenance (T42); no shared virtio-queue crate. Also: fault-injecting fake devices as an independent
+  oracle for drivers, more QEMU machine types (PL011, SDHCI), and one real board as a periodic (not merge)
+  hardware gate.
+- **Drivers informed by Linux and the BSDs.** Not a line-by-line translation: Linux is GPL-2.0, so a
+  translation is a derivative work, and its drivers are tied to kernel frameworks. Preferred shape: extract
+  a prose hardware spec (datasheet plus Linux and BSD behaviour and quirks), write the driver from that
+  spec over a typed MMIO layer, and review it against the sources in a fresh context. BSD-licensed drivers
+  are the easier source. Needs the target board chosen first, and a licence decision.
+
+*Foundations*
+
+- **Logging.** A preallocated kernel ring buffer (structured records, never blocks, usable in the panic
+  path) with serial as one consumer, plus a userspace `logd` for persistent and queryable logs (shared-memory
+  rings, capability-carried source identity, per-source rate limits, file and network sinks, a shell `log`
+  command). Verdict lines stay on their own path. The lock-order placement against the BKL, heap and UART
+  is the design question. Would let T14's bridge go.
+- **Wall-clock time.** RTC driver, a time service, timezones, optional time sync (Q11). Needed by file
+  timestamps, TLS certificate validation and log records.
+- **Terminals.** A tty/pty layer with a line discipline, job control and window size, or an explicit
+  decision to refuse ptys (see the layered-API direction above).
+- **Process model completeness.** The process server, PIDs and `wait`, and real signal semantics
+  (Ctrl-C is a kill today); overlaps S11.
+- **Memory maturity.** Pager-backed VMOs, a page or buffer cache, an out-of-memory policy, a per-process
+  memory quota (Q9), and dynamic linking and shared libraries (to be confirmed: only static linking was
+  seen).
+
+*Operations*
+
+- **Power management.** Layers, cheap to hard: tickless idle on a hardware-counter monotonic clock
+  (the 1 ms tick today); clean shutdown and reboot (SBI SRST, PSCI on Arm) with a service-notification
+  protocol and a deadline; hart park and unpark; a userspace `powerd` holding a power-control capability and
+  owning policy; device power states through `devmgr`; DVFS and thermal (needs real hardware); suspend
+  (probably never). Interrupt objects need a wake-source attribute. Park/unpark against IPIs and TLB
+  shootdowns belongs under loom/shuttle first.
+- **Service supervision and boot configuration.** Dependency order, restart policy, health checks and a
+  place for system configuration; the shutdown protocol is the same mechanism seen from the other side
+  (builds on slice R and the OTP direction above).
+- **Crash handling and debugging.** Core dumps or a crash-report record, and a debug capability (the
+  `ptrace` equivalent).
+- **Filesystem safety.** Crash consistency, an fsck equivalent, snapshots or backup. Decide before the
+  doofs on-disk format is fixed (slice F).
+- **Observability beyond logs.** Counters, tracing and profiling hooks, generalising the latency trace.
+
+*Security*
+
+- **An authority and login model.** There are no uids by design; still open is how a session's
+  capabilities are built, how a program asks for more, and what "login" means.
+- **Crypto and TLS.** A hash, signature and TLS stack and a certificate store (HTTPS, ssh, signed updates);
+  the "write it here" rule for the kernel and network stack probably should not apply to cryptography.
+- **Authentication and hardening.** A credential store; ASLR, stack protection, W^X across userland;
+  syscall fuzzing as a standing check if soak does not already cover it.
+
+*Lifecycle*
+
+- **Packaging and updates.** How software is installed; a signed system image with A/B or rollback.
+- **Internationalisation.** UTF-8 throughout, locale and timezone data.
+
+*More components (a second, broader pass, same date)*
+
+- **Boot chain.** What loads the kernel on real hardware (OpenSBI plus U-Boot or UEFI), partition and
+  boot-menu handling, a boot-config format, A/B slots, a recovery or rescue mode. QEMU `-kernel` hides it.
+- **Bus enumeration.** PCIe (config space, BARs, MSI/MSI-X, hotplug) and USB (host controller, hubs, class
+  drivers for storage, keyboard, serial, network). The decision on whether the OS can leave QEMU.
+- **Storage stack below the filesystem.** Partition tables, volume management, disk encryption, SMART and
+  error reporting, TRIM, an I/O scheduler.
+- **Input and display.** Keyboard, mouse, framebuffer or GPU, a compositor, fonts and text rendering, a
+  clipboard, and isolation of screen and input between programs. Extends the "graphics and input" backlog item.
+- **Audio, wireless, Bluetooth.** Each a driver plus a policy service; optional.
+- **Network management and services beyond S8/S9.** Packet filter or firewall, NAT, a DHCP server, IPv6,
+  VPN, a time-sync client, mDNS, and a network configuration manager (interfaces, routes).
+- **Scheduled work.** A cron or timer service.
+- **Common libraries and formats.** Compression and archives (tar, zip), a media-type registry, a
+  standard serialisation for the native protocols.
+
+*More cross-cutting properties*
+
+- **ABI and protocol stability.** A versioning and deprecation policy for syscalls and `proto::*` (how a
+  new kernel runs old binaries, how a field is added). Cheap now, expensive after more servers exist; the
+  one to raise earliest.
+- **Fault containment and recovery.** Hardware and software watchdogs, hung-versus-crashed policy, memory
+  error handling, and a "what survives which failure" matrix. Ties together slice R, supervision and shutdown.
+- **Audit and accountability.** Tamper-resistant records of security-relevant events (capability grants,
+  process starts, authentication, policy changes), distinct from diagnostic logging.
+- **Sandboxing untrusted code.** A helper that runs a program with a deliberately narrowed capability set,
+  and limits on resource exhaustion and covert channels beyond quotas.
+- **Hardware-rooted security.** Measured or secure boot, a TPM or similar, firmware update, architecture
+  memory protections (PMP/Smepmp; pointer authentication and BTI on Arm).
+- **Real-time guarantees.** Worst-case analysis behind the real-time band: bounded lock hold times,
+  priority inheritance, an interrupt-latency budget, which paths may allocate.
+- **Resource management as policy.** End-to-end limits beyond quotas and jobs: I/O bandwidth, network
+  shaping, per-service CPU shares, and what happens when limits conflict.
+- **Determinism and reproducibility.** Reproducible builds and a record of which sources and tests produced
+  which image.
+- **Formal or model-based assurance for the core.** A formal model or machine-checked proofs of handle
+  unforgeability and rights monotonicity (optional; the capability design suits it).
+
+*Ecosystem and human factors*
+
+- **Developer experience.** A debugger, profiler, symbolised crash traces, and a self-hosting toolchain.
+- **Documentation.** Manual pages or equivalent, a programming guide for the native API, references
+  generated from the specs; the audience is not yet defined.
+- **Interoperability.** FAT/exFAT for removable media at minimum, network file protocols beyond 9P.
+- **Accessibility and input.** Keyboard layouts, input methods, screen-reader hooks; painful to retrofit
+  once a display layer exists.
+- **Licence and provenance tracking.** Which parts are original, which are ported (Lua, libc pieces), and
+  under what terms; becomes real as soon as anything comes from Linux or the BSDs.
+- **Review and assurance record for the AI-written process.** Which review caught what, which invariants
+  have independent oracles and which do not, a periodic fresh-context audit (TIDY-UP and `reviews/` do much
+  of this already).
