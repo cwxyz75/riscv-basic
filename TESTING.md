@@ -169,3 +169,15 @@ First measurements (2026-11-14, QEMU, debug build, four harts, the whole suite; 
 
 These are the numbers the lock peels (tasks 14 to 20) are judged against; the budget stated in SCHED-SMP-SPEC 3.12 is to be
 restated from them once a release build and, ideally, hardware numbers exist (T75).
+
+## Network TCP checks by tier (S9 step 8, S9-SPEC 14.7)
+
+| Check | Tier | Where |
+|---|---|---|
+| `nettcp`, `netcore` TCP, `netwire::tcp`, `netsim` lossy-link suite (reduced seeds), `dns`, `http1`, `sockshim`, `rngcore` | 0 | `make os-test` |
+| The streams, sockets, random, fetch and `httpd` tests in the boot suite, `net_tcp_churn` (short form: 100 in sequence, 3 rounds of 32) | 1 | the smoke boot |
+| Three bulk TCP tests behind the lossy relay (`make os-boot-test-lossy`, `LOSSY_SEEDS="1 .. 20"` for the full run), `net_tcp_churn` at full length (`bench=full`: 2,000 in sequence, 40 rounds of 32), the `##BENCH tcp_*` lines | 2 | `make os-boot-test-lossy`, `make os-bench`; the soak workflow's "lossy relay" job |
+
+Benchmarks added: `tcp_loopback_1mib` and `tcp_echo_rt_4k` (from `net_streams_over_loopback`), next to `net_ping_rtt_*`. Not yet
+measured: the transfers from and to the host and `net_bkl_profile_tcp` (TIDY-UP T102). The lossy mode runs only three tests, so the
+harness's checks for the others are off in it; the lossy tests' post-close waits are longer in it (`drain_ms`).

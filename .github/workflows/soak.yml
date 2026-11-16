@@ -33,6 +33,8 @@ jobs:
             targets: os-boot-test-smp os-boot-test-overflow os-bench os-latency
           - name: negative controls and serial at four harts
             targets: os-boot-test-smp-neg
+          - name: lossy relay
+            targets: os-boot-test-lossy
           - name: AIA, RVA23, polling, no disk, serial
             targets: os-boot-test-aia os-boot-test-polling os-boot-test-nodisk os-boot-test-rva23 os-serial-test os-release-smoke
     steps:

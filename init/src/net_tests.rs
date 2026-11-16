@@ -1508,6 +1508,7 @@ pub fn net_streams_over_loopback() -> Outcome {
         ensure_eq!(s.local(), Some(([10, 0, 2, 15], 7000)), "the server's view");
         let mut block = [0u8; 4096];
         let mut back = [0u8; 4096];
+        let echo0 = sys::debug_stat(6);
         for i in 0..64usize {
             for (k, b) in block.iter_mut().enumerate() {
                 *b = pattern(i as u32, k);
@@ -1519,12 +1520,18 @@ pub fn net_streams_over_loopback() -> Outcome {
             read_exact(&mut c, &mut back, t(5000)).map_err(|_| msg_at(line!()))?;
             ensure!(back == block, "block {i} came back intact");
         }
+        // (14.3: the lockstep round trip of 4 KiB through the stack and back, per round trip)
+        println!(
+            "##BENCH tcp_echo_rt_4k {} ns",
+            (sys::debug_stat(6) - echo0) * 100 / 64
+        );
         // ---- a megabyte one way, both ends pumped from here with immediate deadlines
         let total = 1024 * 1024usize;
         let (mut sent, mut got) = (0usize, 0usize);
         let mut chunk = [0u8; 8192];
         let mut rbuf = [0u8; 8192];
         let until = sys::clock_get() + 60_000;
+        let mb0 = sys::debug_stat(6);
         while got < total {
             ensure!(
                 sys::clock_get() < until,
@@ -1551,6 +1558,11 @@ pub fn net_streams_over_loopback() -> Outcome {
                 nap(1)?;
             }
         }
+        // (14.3: the whole megabyte through loopback, the stack and the IPC with no device)
+        println!(
+            "##BENCH tcp_loopback_1mib {} ns",
+            (sys::debug_stat(6) - mb0) * 100
+        );
         // ---- half-close both ways: end-of-file is clean only because PeerFin came first
         c.shutdown_write();
         let mut one = [0u8; 8];
@@ -1916,11 +1928,21 @@ pub fn net_tcp_echo_for_the_host() -> Outcome {
         }
         s.shutdown_write();
         ensure_eq!(total, 200_000, "the host's 200,000 bytes were echoed");
-        nap(300)?;
+        nap(drain_ms(300))?;
         Ok(())
     })();
     f.close();
     r
+}
+
+/// How long a test lets the last bytes and the close drain after its final write before it stops the stack: a short time on the
+/// clean link, long enough for a few retransmission timeouts when the harness runs the guest behind the lossy relay (Q30).
+fn drain_ms(clean: u64) -> u64 {
+    if sys::debug_stat(9) != 0 {
+        12_000
+    } else {
+        clean
+    }
 }
 
 /// The other direction: the guest connects to a TCP server on the host (10.0.2.2 through slirp), reads a greeting and 300,000
@@ -1975,8 +1997,169 @@ pub fn net_tcp_to_the_host_server() -> Outcome {
             return Err(d);
         }
         s.shutdown_write();
-        nap(500)?;
+        nap(drain_ms(500))?;
         sys::debug_write(b"s9: host-tcp-server done\n");
+        Ok(())
+    })();
+    f.close();
+    r
+}
+
+/// A connect that waits out Quota: a connection the client just closed keeps its reservation until its orphan has drained (up to
+/// 20 s, N22), so a churning client sees Quota for a moment. Anything else is an error.
+fn connect_patiently(net: &mut rt::net::Net, port: u16) -> Result<rt::net::Stream, Detail> {
+    for _ in 0..400 {
+        match net.connect_stream([10, 0, 2, 15], port, 0, 4096, 4096, sys::clock_get() + 8000) {
+            Ok(s) => return Ok(s),
+            Err(Stack(6)) => nap(50)?,
+            Err(e) => {
+                let mut d = Detail::new();
+                let _ = core::fmt::Write::write_fmt(&mut d, format_args!("connect: {e:?}"));
+                return Err(d);
+            }
+        }
+    }
+    Err(msg_at(line!()))
+}
+
+/// Churn (Q32, tier 1 in a short form, the full 2,000 connections with `bench=full`): connections opened and closed in every way,
+/// in sequence over one listener and then 32 at a time over two, with nothing left behind. The leak check is by capacity: after the
+/// churn the client account takes exactly its full complement of streams again (the account arithmetic is exact, so a leaked
+/// reservation anywhere shows as a Quota too early), and a closed connection's port can be listened on afresh.
+pub fn net_tcp_churn() -> Outcome {
+    let Some(mut f) = start_full()? else {
+        sys::debug_write(b"s9: no network device on this machine: net tests skipped\n");
+        return Ok(());
+    };
+    let r = (|| -> Outcome {
+        let t = |n: u64| sys::clock_get() + n;
+        let full = sys::debug_stat(7) != 0;
+        let mut cfg = f.connect(b"net-config")?;
+        configure_static(&mut cfg)?;
+        let mut sa = f.connect(b"net")?;
+        let mut sb = f.connect(b"net")?;
+        let mut sc = f.connect(b"net")?;
+        let mut sd = f.connect(b"net")?;
+        let mut client = f.connect(b"net")?;
+        // (an account holds at most 32 connections, its service connection among them: 32 streams at once need two clients)
+        let mut client2 = f.connect(b"net")?;
+        let t0 = sys::clock_get();
+        // ---- in sequence: one listener, N connections, four ways to end
+        let n_seq = if full { 2000 } else { 100 };
+        let mut l = sa
+            .listen_stream(7200, 4, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        for i in 0..n_seq {
+            let mut c = connect_patiently(&mut client, 7200)?;
+            let mut s = l.accept(t(8000)).map_err(|_| msg_at(line!()))?;
+            let msg = [pattern(11, i), pattern(12, i), 7, 8];
+            c.write_all(&msg, t(5000)).map_err(|_| msg_at(line!()))?;
+            let mut got = [0u8; 4];
+            read_exact(&mut s, &mut got, t(5000)).map_err(|_| msg_at(line!()))?;
+            ensure_eq!(got, msg, "connection {i}: the bytes arrived");
+            match i % 4 {
+                0 => drop((c, s)),
+                1 => {
+                    drop(s);
+                    drop(c);
+                }
+                2 => {
+                    c.abort();
+                    drop((c, s));
+                }
+                _ => {
+                    s.write_all(&got, t(5000)).map_err(|_| msg_at(line!()))?;
+                    drop(s);
+                    let mut back = [0u8; 4];
+                    read_exact(&mut c, &mut back, t(5000)).map_err(|_| msg_at(line!()))?;
+                    drop(c);
+                }
+            }
+        }
+        drop(l);
+        // ---- 32 at a time over four listeners (eight posted accepts each), rounds of connect, exchange and a mixed close
+        let rounds = if full { 40 } else { 3 };
+        // (four server accounts with eight posted accepts each: an accepted stream holds 32 KiB, so a account with sixteen of
+        // them has no room for the next round's SYNs until its streams have drained)
+        let mut ls = Vec::new();
+        for (i, srv) in [&mut sa, &mut sb, &mut sc, &mut sd].into_iter().enumerate() {
+            ls.push(
+                srv.listen_stream(7201 + i as u16, 8, 0, t(3000))
+                    .map_err(|_| msg_at(line!()))?,
+            );
+        }
+        for round in 0..rounds {
+            let mut clients = Vec::new();
+            for k in 0..32usize {
+                let port = 7201 + (k % 4) as u16;
+                let who = if k < 16 { &mut client } else { &mut client2 };
+                let c = connect_patiently(who, port)?;
+                clients.push(c);
+            }
+            let mut servers = Vec::new();
+            for k in 0..32usize {
+                servers.push(ls[k % 4].accept(t(8000)).map_err(|_| msg_at(line!()))?);
+            }
+            // (accepts come in arrival order per listener, which is the order of the connects)
+            for (k, c) in clients.iter_mut().enumerate() {
+                c.write_all(&[k as u8; 100], t(5000))
+                    .map_err(|_| msg_at(line!()))?;
+            }
+            let mut buf = [0u8; 100];
+            for (k, s) in servers.iter_mut().enumerate() {
+                read_exact(s, &mut buf, t(5000)).map_err(|_| msg_at(line!()))?;
+                ensure!(
+                    buf.iter().all(|&b| b == k as u8),
+                    "round {round} stream {k}: the right bytes on the right connection"
+                );
+            }
+            for (k, (c, s)) in clients.into_iter().zip(servers).enumerate() {
+                match k % 4 {
+                    0 => drop(c),
+                    1 => drop(s),
+                    2 => {
+                        let mut c = c;
+                        c.abort();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop(ls);
+        // ---- nothing left behind: the account takes streams again (eight, the listener's backlog), once the
+        // orphans and the closing connections have gone (a bounded time: 20 s for an orphan, TIME-WAIT is not charged)
+        let mut l = sa
+            .listen_stream(7210, 8, 0, t(3000))
+            .map_err(|_| msg_at(line!()))?;
+        let mut settled = false;
+        for _ in 0..60 {
+            let mut held = Vec::new();
+            let mut ok = true;
+            for _ in 0..8 {
+                match client.connect_stream([10, 0, 2, 15], 7210, 0, 4096, 4096, t(5000)) {
+                    Ok(s) => held.push(s),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            drop(held);
+            for _ in 0..8 {
+                let _ = l.accept(t(200));
+            }
+            if ok {
+                settled = true;
+                break;
+            }
+            nap(500)?;
+        }
+        ensure!(settled, "the account's streams came back after the churn");
+        let secs = (sys::clock_get() - t0) / 1000;
+        let msg = alloc::format!(
+            "s9: churn done ({n_seq} in sequence, {rounds} rounds of 32) in {secs} s\n"
+        );
+        sys::debug_write(msg.as_bytes());
         Ok(())
     })();
     f.close();

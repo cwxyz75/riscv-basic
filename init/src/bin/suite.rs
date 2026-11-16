@@ -10301,6 +10301,7 @@ pub fn app_main() -> i32 {
             "net_tcp_to_the_host_server",
             net_tests::net_tcp_to_the_host_server,
         ),
+        ("net_tcp_churn", net_tests::net_tcp_churn),
         (
             "net_streams_survive_a_stack_restart",
             net_tests::net_streams_survive_a_stack_restart,
@@ -10387,7 +10388,17 @@ pub fn app_main() -> i32 {
         println!("tt: {name} {ticks}");
         ok
     };
+    // Behind the lossy relay (`net=lossy`, S9-SPEC Q30) only the tests that move bulk TCP data in a way slirp copes with run: the others assume a clean link
+    let lossy = sys::debug_stat(9) != 0;
+    const LOSSY_TESTS: [&str; 3] = [
+        "net_fetch_from_a_host_server",
+        "net_httpd_for_the_host",
+        "net_tcp_echo_for_the_host",
+    ];
     for (name, test) in tests {
+        if lossy && !LOSSY_TESTS.contains(name) {
+            continue;
+        }
         if !timed(name, *test) {
             failed += 1;
         }
