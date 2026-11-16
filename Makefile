@@ -26,7 +26,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p fsfmt -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p fsfmt -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -36,7 +36,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p cfmt -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p fsfmt -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p fsfmt -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
@@ -307,7 +307,7 @@ docs-check:
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-tcp-probe.pcap --self-test
 
 quick: fmt-check docs-check
-	cargo test -p abi -p kcore -p proto -p svc -p memfs -p cfmt -p basic-script
+	cargo test -p abi -p kcore -p proto -p svc -p memfs -p cfmt -p clockmodel -p basic-script
 	$(MAKE) os-release-smoke
 
 # Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
