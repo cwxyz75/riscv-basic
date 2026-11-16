@@ -27,3 +27,37 @@ I could not finish or verify are marked **OPEN**.
    scheduler lock round trip per switch.
 6. **Round-robin kernel build** keeps a strict real-time band (the boot thread at 40, the reaper at 50), so it proves less than OD32
    says (review finding 11, T107).
+
+## Filesystem work (after the kernel tasks)
+
+Merged: step 0 (attributes, indexes, queries in `memfs` and `proto::file`, #165-era), step 1 `fsfmt` (CoW B+tree, #170), step 2
+(the format: superblock rings, mkfs/mount/commit/check, host tools `mkfs-doofs`/`fsck-doofs`/`dump-doofs`) with the pure
+`clockmodel` crate (#171), step 3 `doofs` (files, directories, symlinks, rename, quotas, orphans, fsck, differential against
+`memfs`, #172). Step 4 (crash harness, corruption test, invariants FI1 to FI7) is #173.
+
+**Not done, and why:** C1's device side (the RTC claim in `devmgr`, `clockd`, the boot test), steps 5a to 5f (`proto::blk`
+discard and info, the `/svc` view, `fsd`, `volmgr`, mounts, the QEMU test) and step 6 (attributes on disk). These touch `init`,
+the shell and the QEMU harness: each is a PR of its own with a boot test.
+
+### DECISIONS
+
+7. **I did not `git pull` your main checkout.** It has local edits (Makefile, .gitignore, ROADMAP.md, untracked `notes/`) that a
+   pull would have tangled with; all work was done in fresh worktrees from `origin/main` (`../riscv-basic-fs`, `../riscv-basic-clk`).
+   Your checkout is behind `origin/main`; `git stash; git pull; git stash pop` there when you wake.
+8. **Tool names:** `mkfs-doofs`, `fsck-doofs`, `dump-doofs` (hyphens). Cargo crate names cannot contain a dot. The spec's
+   `mkfs.doofs` names can be symlinks or wrappers later.
+9. **No inline data and one tree entry per 4 KiB block** (T112): simpler; every non-empty file costs a block. Performance work
+   is a later slice.
+10. **Ids are never reused** on disk (64-bit counter), unlike `memfs`: the differential maps ids.
+11. **Two `memfs` bugs found by the differential and fixed in step 3:** a symlink's target bytes were dropped from its cost on
+    rename; a refused symlink had already touched its directory's mtime (the quota check is now in the same place as the rest).
+12. **A 64-block reserve** (`doofs::RESERVE`) for the deleting paths, and an automatic commit-and-retry when a write hits
+    `NoSpace` (space freed by earlier operations returns only at a commit). 64 blocks is 256 KiB: 20% of a 1 MiB volume, which
+    is a lot for tiny images (the QEMU test images should be at least a few MiB).
+13. **Opt-level 2 for `fsfmt` and `doofs` under `cargo test`** (workspace `Cargo.toml`): the crash harness is 35 s in debug and 11 s
+    optimised; the rest of the host tests are unaffected.
+
+### OPEN
+
+* The independent checker of FS-SPEC check 5 (T113): a separate-context `fsck`. Recommended as a Fable review slice before 5f.
+* A hand-checked sample of the crash harness's three-operation workloads is random (60 by default); `DOOFS_CRASH3=500` for more.
