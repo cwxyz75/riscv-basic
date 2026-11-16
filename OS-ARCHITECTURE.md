@@ -670,7 +670,7 @@ M and L series. Each milestone ends in a demo and has a runnable acceptance chec
   software that needs `fork` runs.
 
 **Longer-term backlog:** a real on-disk filesystem (ext2-compatible, crash-injection
-tested), the 9P bridge, graphics and input, DNS, scheduler alternatives against the
+tested), graphics and input, DNS, scheduler alternatives against the
 conformance suite, capability revocation, quotas, live-image niceties, self-hosting.
 
 If you give up early, each rung is still a finished artifact: rung 4 is a working
@@ -694,7 +694,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD10 | One bootstrap handle plus a startup message; manifest-built namespaces | Proposed |
 | OD11 | Namespaces are Plan 9-like but live in the libc; authority is handles; `..` forbidden | Proposed (discussed and accepted in principle) |
 | OD12 | Union directories wanted, implemented later as a union server; protocol must not preclude it | Decided |
-| OD13 | 9P as an adapter/bridge, not the native file protocol | Proposed |
+| OD13 | 9P as an adapter/bridge, not the native file protocol | Proposed; the bridge was dropped from the backlog by the owner 2026-11-15 (the native protocol stays as it is) |
 | OD14 | Userspace drivers over interrupt objects and device-memory VMOs; virtio-mmio first; DMA is trusted-driver | Proposed |
 | OD15 | Storage first step: a memory-backed filesystem; a real filesystem is longer-term | Decided |
 | OD16 | BeOS-style indexed attributes with a `query` tool | Decided |
