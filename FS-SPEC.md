@@ -23,7 +23,7 @@ persisted free map, an intent log, live queries, multithreaded `fsd`, writable s
 |---|---|---|
 | F1 | **Own format**: one copy-on-write B+tree committed by flipping a checksummed root; no journal, no replay | 2026-11-15 |
 | F2 | **Queries** use volume-wide indexes; results are filtered to the subtree of the directory connection the caller holds (needs `ENUMERATE`) | 2026-11-15 |
-| F3 | **No hard links** in v1; every node has exactly one directory entry (symlinks stay, never followed by the server) | 2026-11-15 |
+| F3 | **No hard links** in v1; every node has exactly one directory entry (symlinks stay: relative-only, never followed by the server, resolved by the client against the connection they were found through; OD17 as amended, `OS-ARCHITECTURE.md` section 12) | 2026-11-15 |
 | F4 | **Durability**: `fsync`/`sync` is a full commit; data is always written copy-on-write; rename-over is atomic. A btrfs-style tree log may come later | 2026-11-15 |
 | F5 | **Who pays**: persistent quota domains on directory subtrees for disk space; the block cache is charged to `fsd`'s own job with a cap until pager-backed VMOs (Q4) allow per-client charging | 2026-11-15 |
 
@@ -97,6 +97,7 @@ support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are n
 * **FI5** Rights on a connection only shrink; a query returns only nodes under its directory; space is charged to exactly one
   quota domain and counters equal the sum of their nodes (checked by `fsck`).
 * **FI6** Delete and commit succeed on a full volume (the reserve).
+* **FI7** A symlink target is relative and stays inside the connection it is read through; the server refuses to create any other.
 
 ## 9. Acceptance checks (written before the code)
 
@@ -117,6 +118,10 @@ support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are n
    whole machine on the same disk image, read everything back; the host checks the image after exit with the independent `fsck`.
 8. **Confinement:** a program holding a read-only connection to `/data/a` cannot read, query or enumerate `/data/b`; a query
    from `/data/a` never returns paths outside it.
+9. **Symlinks:** creating a link with an absolute target, or one whose `..` would climb above its connection's root, is refused;
+   a hostile writer in a shared directory plants `link -> ../secret` and `link -> /home/secret`, and a reader holding only that
+   directory cannot reach the target by following either (the libc walk fails closed); a legal relative link resolves through
+   the same connection, and one that loops is cut off with a bounded depth.
 
 ## 10. Limits (proposal; expressed per volume, not as bare constants, T79)
 
