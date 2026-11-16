@@ -523,9 +523,15 @@ Plan 9-like per-process namespaces, but capability-based.
   plus indexes that support database-style queries, a `query` command, and
   attribute-aware tools. Built in the memory filesystem first and format-independent;
   a later disk format must persist them.
-- **Symlinks (decided):** stored as the format allows, but the server **never
-  follows them itself**. It returns the target text and the libc resolves it against
-  the process's own namespace, preserving the sandbox property.
+- **Symlinks (decided; amended 2026-11-15):** stored as the format allows, but the server
+  **never follows them itself**. It returns the target text and the libc resolves it. The
+  target is **relative only**, with no `..` that climbs above the root of the directory
+  connection the link was reached through, and it is resolved **against that same
+  connection**, so following a link can reach nothing the reader could not already reach by
+  that route (no new authority, no confused deputy: a writer cannot make a more privileged
+  reader open something the writer could not). Absolute targets are refused at creation.
+  Crossing subtrees is done by the namespace (bind, union), not by links. There are no hard
+  links (F3): aliasing is the namespace's job.
 - **Longer-term: a real on-disk filesystem.** Candidate ladder: an ext2-compatible
   format first (oracles: `mke2fs -d` to build images, `e2fsck` to verify, Linux can
   mount the image; weaker as a journal, strong on semantics), and possibly a
@@ -698,7 +704,7 @@ shell on a preemptive kernel; rung 9 is a machine that serves a web page.
 | OD14 | Userspace drivers over interrupt objects and device-memory VMOs; virtio-mmio first; DMA is trusted-driver | Proposed |
 | OD15 | Storage first step: a memory-backed filesystem; a real filesystem is longer-term | Decided |
 | OD16 | BeOS-style indexed attributes with a `query` tool | Decided |
-| OD17 | Symlinks stored on disk but resolved by the client library against its own namespace; servers never follow them | Decided |
+| OD17 | Symlinks stored on disk but resolved by the client library; servers never follow them. Amended 2026-11-15: relative targets only, resolved against the connection the link was found through (not the reader's whole namespace), no `..` above that connection's root, absolute targets refused (section 12) | Decided |
 | OD18 | Our own network stack; references and test tools welcome; no third-party stack code | Decided |
 | OD19 | Two userland runtimes: native Rust runtime and a C libc; Rust `std` port deferred | Proposed |
 | OD20 | Shell is a POSIX-ish powerbox, **confined by default** with a trusted-program config | Decided |
