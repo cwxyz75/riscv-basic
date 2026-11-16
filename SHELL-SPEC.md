@@ -61,7 +61,7 @@ language (use Lua); typed pipelines between programs (pipes carry bytes); floati
 
 ## 4. The value model (Decided, rules 1 to 8)
 
-A **value** is one of: string, number, bool, null, list, map, **closure**, and (Open Q3) possibly an opaque **handle**.
+A **value** is one of: string, number, bool, null, list, map, **closure**, and an opaque **handle** (Q3, resolved).
 
 1. A one-element list is **not** the same as a string; `"a"` and `["a"]` differ. A command's arguments **splice**
    lists, one level, as rc does (`cmd $xs` passes each element as a word).
@@ -111,7 +111,7 @@ transcripts) before the evaluator, in step SH0.
   `{ "value" or "out", "err", "status" }` and never raises for a non-zero exit. A command that **cannot be started**
   (not found, no permission) is always an error and never a status.
 * **Failure in scripts:** an uncaught failure stops a script, prints its value to stderr and exits with its code;
-  interactive use shows it and continues. (**Proposal**; Open Q5.)
+  interactive use shows it and continues. (**Decided** 2026-11-17, Q5.)
 * **Native scripts (Decided):** called as a **command**, a script follows command rules (output collected as lines,
   exit code as the status); loaded **in-process** with `import` (Decided; there is no `source`-style include) the local rules
   apply and it yields values.
@@ -121,7 +121,7 @@ transcripts) before the evaluator, in step SH0.
   stdout and nothing is collected, because only the exit status is wanted (write `> /dev/null` to silence it). The
   `try`/`catch` block form is the equivalent, and `catch` can tell the two
   cases apart by the failure's `kind` (`exit` or `spawn`). `&&`, `||` and `!` keep their success-based shell meaning.
-* **Large output (Proposal; Open Q11).** Collecting happens only in value position, so a statement never collects.
+* **Large output (Decided 2026-11-17, Q11).** Collecting happens only in value position, so a statement never collects.
   For gigantic output: (1) **redirect** (`> file`, `> /dev/null`) or **pipe** it; a pipeline's value is its last
   stage's value and its intermediates are never collected; (2) **stream through an in-process stage**: `cmd | each
   (line) (...)`, `cmd | fold init (acc line) (...)`, `cmd | take n` are builtins that read lines from stdin as they
@@ -138,8 +138,7 @@ transcripts) before the evaluator, in step SH0.
   to a JSON mode inside a literal; `$x` (and `$#x`) may appear where a JSON value may, so `{ "name": $n }` builds a
   map from a variable; barewords are **not** allowed as values, so a mistyped word is an error, never a string.
   Literal values pass to builtins, closures and the `data` primitives; at the **exec boundary** (an external program's
-  argument) a map or list is still an error (rule 2). **Accessor sugar** (`$m.key`, `$l(2)`) remains **Open Q1b**;
-  until decided, `get-or`, `set-in`, `del-in`, `keys`, `len` are the access path, which is enough for golden tests.
+  argument) a map or list is still an error (rule 2). **Accessor sugar** (`$m.key`, `$l(2)`) is **Decided** (Q1b); `get-or`, `set-in`, `del-in`, `keys`, `len` remain the function forms.
 
 ## 6. Data primitives (**Decided** scope; **Proposal** shape)
 
@@ -166,8 +165,8 @@ OD27 applies if a third-party parser is considered: a decision-log entry per cra
 Separate numeric operators from string and pattern matching, so `10 < 9` is never a string comparison by accident
 (`==`, `<`, `+`, ... are numeric; `~` stays the pattern match; string equality has its own spelling). Integers are
 checked i64. Decimals are exact (parse, format and round-trip), with a defined scale and rounding. Hex and binary
-literals; optional size suffixes (`4k`, `2M`) are **Open Q4**. Floating point waits for FP context saving
-(INVARIANTS C7); soft-float is possible but not planned. Division semantics (integer or decimal) is **Open Q4**.
+literals; size suffixes are not in v1 (Q4). Floating point waits for FP context saving
+(INVARIANTS C7); soft-float is possible but not planned. Division: `/` is exact decimal, `//` floor integer division (Q4).
 
 **Infix expressions (wanted: Decided 2026-11-15; shape: Proposal).** An expression island evaluates numbers and
 booleans with infix operators and ordinary precedence, in any value position, as a condition, and as a value inside a
@@ -175,7 +174,7 @@ JSON-mode literal. Operands are variables, literals, nested calls in parentheses
 arithmetic `+ - * / %` and unary `-`; ordering `< <= > >=` (numeric only, no coercion: a non-number is
 an error); logic `and or not` on strict booleans, short-circuiting; `==` and `!=` are a **total structural equality** of any two values (Decided 2026-11-15; `eq` and `ne` are dropped)
 (numbers compare by value, a string never equals a number, `null` is an ordinary operand, lists and maps compare structurally, and map equality ignores key order); `in` for membership; `matches` for patterns; `^` for string concatenation. `&&`, `||`
-and `!` stay the success-based flow between commands. The markers are `calc` (yields a number, arithmetic only) and `is` (yields a boolean, arithmetic operands allowed), accepted in principle; the remaining details are **Open Q12**.
+and `!` stay the success-based flow between commands. The markers are `calc` (yields a number, arithmetic only) and `is` (yields a boolean, arithmetic operands allowed), accepted in principle; the remaining details are settled in Q12.
 
 ## 8. Capability verbs (OD20 continues; **Proposal**)
 
@@ -235,43 +234,49 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
 
 ## 12. Open points (stop and ask)
 
-1. **Q1 (resolved 2026-11-15): blocks are `do ... end`.** **Q1b (direction agreed 2026-11-15: `.` is a general accessor):** `$m.key`, `$l.0`, module members (`text.slugify`;
-   an `import` yields a map of functions), `$env.PATH`, and assignment through a path (`cfg.a.b = 5` is a functional
-   update that rebinds `cfg`). Lean, not yet decided: no reserved key names (keys are arbitrary data, and JSON from
-   outside will contain `status`, `len` and everything else); `.` selects data only and builtin operations stay
-   functions, so nothing shadows anything; odd keys by quoting (`$m.'a.b'`), computed keys by `$m.($k)`; `$name.txt`
-   is always an accessor, so concatenation is `^`, and applying `.` to a string is an error that names the fix;
-   `$r.status` raises a `missing-key` failure when absent, and defaults stay `get-or`.
-2. **Q2: system configuration format**: TOML or shell data literals (the owner passed; decide before SH6).
-3. **Q3: handle values.** May a variable hold an opaque handle (a directory, a service connection), non-serializable
-   like a closure? It makes the powerbox far more expressive, and it needs a rule for what a closure captures.
-4. **Q4: number details**: division (integer or decimal), decimal scale and rounding, size suffixes.
-5. **Q5: failure default** for scripts (stop on any uncaught failure, or only inside an explicit block).
+1. **Q1 (resolved 2026-11-15): blocks are `do ... end`.** **Q1b (resolved 2026-11-17): `.` is a general data accessor.**
+   `$m.key`, `$l.0`, module members (`text.slugify`; an `import` yields a map of functions), `$env.PATH`, and assignment
+   through a path (`cfg.a.b = 5` is a functional update that rebinds `cfg`). `.` selects data only and builtin
+   operations stay functions, so nothing shadows anything; there are no reserved key names; odd keys are quoted
+   (`$m.'a.b'`), computed keys are `$m.($k)`; `$name.txt` is always an accessor, so concatenation is `^`, and applying `.`
+   to a string is an error that names the fix; a missing key or an out-of-range index raises a `missing-key` failure,
+   and defaults stay `get-or`. No negative indices in v1.
+2. **Q2: system configuration format**: TOML or shell data literals. **Deferred** (2026-11-17): decided before SH6.
+3. **Q3 (resolved 2026-11-17): handles are values.** A variable may hold an opaque handle (a directory, a service
+   connection). It cannot be serialized and is an error as a word, like a closure. Handles come only from named builtins
+   (the directory and service openers, added in SH4), never from parsed text. A closure captures its variables by value,
+   handles included; since a closure cannot be serialized it cannot carry authority out of the shell (SHI1 holds).
+4. **Q4 (resolved 2026-11-17): number details.** `/` is exact decimal division; a result that does not terminate rounds
+   half-even at 18 fractional digits. `//` is floor integer division and `%` the matching floor remainder. `+`, `-` and
+   `*` are exact; exceeding the digit cap is an error. No size suffixes in v1 (`k` is ambiguous between 1000 and 1024;
+   they are cheap to add later).
+5. **Q5 (resolved 2026-11-17): failure default.** A script stops on an uncaught failure, prints its value to stderr and
+   exits with its code; interactive use shows the failure and continues. Failures inside `succeeds`, `try`, `&&`, `||`
+   and `!` do not stop a script. A pipeline fails if any stage fails (pipefail is the default), and the failure value
+   names the stage.
 6. **Q6 (resolved 2026-11-15): the shell is named `ish`**: "improved shell", and an honest "POSIX-ish" (it is only
    *ish* about POSIX). The script extension is `.ish`; `sh` stays free for the compat shell. Three characters. No command
    of that name exists on the machine checked; the known cost is search noise from the iSH iOS app (about 20,000 stars).
    Considered and set aside: `dunsh` (a pun on *dunce*, to go with *doofs*; the most distinctive), `mush`, `usher`, and
    `trash` (ruled out: `/usr/bin/trash` is a real command).
-7. **Q7: shell-level job control** shape, once the terminal's foreground-job protocol exists.
+7. **Q7: shell-level job control** shape, once the terminal's foreground-job protocol exists. **Deferred** (2026-11-17): decided with SH5.
 8. **Q8 (resolved 2026-11-15): `ok` and `fail`.** There is no bare `return` (a POSIX `return 1` is a status; here it
    would return the value 1, a muscle-memory trap), and the diagnostic for it says to use `ok` or `fail`. `fail value
    [code]` takes a value, then an optional code.
 9. **Q9 (resolved 2026-11-15): a strict-boolean `if`** with `succeeds (cmd)`, and `try`/`catch` as the block form.
-10. **Q10 (resolved in part, 2026-11-15): `import` only**, no `source`-style include. Still open: the namespacing rules
-    for `import`, and what a script run as a command does with a final non-command value (the lean: nothing is
-    printed unless it prints; an interactive prompt echoes non-null values).
-11. **Q11: large output.** The default capture cap (size and whether it is per call or per shell); the exact shape of
-    `run`'s options map; the names and set of the stream-stage builtins (`each`, `fold`, `take`, others); whether
-    early termination (`take`) closes the pipe so the producer sees a broken pipe.
-12. **Q12: the infix marker and details** (2026-11-15: `calc` is accepted conceptually; the owner suggests a separate
-    `is` for comparisons and booleans, for example `if (is $n != 0)`. Lean: `calc` yields a number and takes only
-    arithmetic; `is` yields a boolean and may use arithmetic operands, so `(is $n + 1 > 3)` needs no nested `calc`;
-    `(is not $done)`, `(is $x in $list)` and `(is $line matches 'ERROR*')` read as English; equality is a total
-    structural `==` with no coercion, which would retire `eq`/`ne`. `calc` and `is` accepted in principle; structural `==` and the removal of `eq`/`ne` decided 2026-11-15.) `(= ...)` (terse, but reads oddly after an assignment: `n = (= $n + 1)`),
-    or `(calc ...)` (readable, greppable); or no marker in conditions and assignments, found by a reserved-operator
-    scan, which I think is too clever. Also: `/` (exact decimal, or integer on integers, with `//` for integer
-    division), whether the operators exist as prefix functions for `map` and `fold` (`add`, `lt`, ...), and compound
-    assignment (`+=`).
+10. **Q10 (resolved 2026-11-17): `import` only**, no `source`-style include. `import path` returns a map of the script's
+    top-level functions and values and is never bound implicitly. The path resolves against the importing script's
+    directory, or is an absolute path in the shell's table; there is no search path in v1. Modules are cached per shell
+    run; a cycle is an error. A script run as a command prints nothing for a final non-command value; the interactive
+    prompt echoes non-null values.
+11. **Q11 (resolved 2026-11-17): large output.** The default capture cap is 1 MiB per call, overridden by `run`'s `max`
+    option. The stream-stage builtins in v1 are `each`, `filter`, `fold` and `take`. `take` closes the pipe, so the producer
+    sees a broken pipe and its status 141 is not reported as a failure. The options map is as written in section 5.
+12. **Q12 (resolved 2026-11-17): `calc` and `is`.** `calc` yields a number and takes only arithmetic; `is` yields a
+    boolean and may use arithmetic operands (`(is $n + 1 > 3)`), so it needs no nested `calc`; `(is not $done)`,
+    `(is $x in $list)` and `(is $line matches 'ERROR*')` read as English. `==` is a total structural equality with no
+    coercion, which retires `eq`/`ne`. No operator-as-function names (`add`, `lt`) in v1, since `@ a b calc $a + $b`
+    covers `map` and `fold`; no compound assignment (`+=`) in v1.
 
 ## 13. Shortcuts to record in `TIDY-UP.md` when built
 
