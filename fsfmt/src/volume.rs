@@ -6,9 +6,38 @@
 //! next one is on disk, so a torn slot always leaves the previous root intact (FI2).
 
 use crate::device::{DevError, Device, BLOCK};
+use crate::node::Ptr;
 use crate::pool::{Pool, PoolError};
 use crate::superblock::{self as sb, SbError, Superblock, LABEL_MAX, MIN_BLOCKS, SLOTS};
-use crate::tree::{Snapshot, Tree, TreeError};
+use crate::tree::{Snapshot, Tree, TreeError, Verified};
+
+/// Key type byte of an extent entry: its value is the 32-byte pointer of a data block (the layer above owns the rest of the
+/// key). The volume must know it: the free map is what the tree and the extents do not reach.
+pub const KEY_EXTENT: u8 = 3;
+
+/// `Tree::verify_at`, plus the data blocks the extent entries point at (in `reachable`, sorted, each once).
+pub fn verify_all<D: Device>(
+    pool: &mut Pool<D>,
+    root: Option<Ptr>,
+    gen: u64,
+) -> Result<Verified, TreeError> {
+    let mut v = Tree::verify_at(pool, root, gen)?;
+    for (_, val) in Tree::range_at(pool, root, Some(&[KEY_EXTENT]), Some(&[KEY_EXTENT + 1]))? {
+        if val.len() != 32 {
+            return Err(TreeError::Structure("an extent value is not a pointer"));
+        }
+        let p = Ptr::decode(&val);
+        if p.gen > gen {
+            return Err(TreeError::Structure("a data block born after the snapshot"));
+        }
+        v.reachable.push(p.addr);
+    }
+    v.reachable.sort_unstable();
+    if v.reachable.windows(2).any(|w| w[0] == w[1]) {
+        return Err(TreeError::Structure("a block is reached twice"));
+    }
+    Ok(v)
+}
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +174,7 @@ pub fn check<D: Device>(dev: &mut D) -> Report {
             }
             let mut pool =
                 Pool::mounted(&mut *dev, owner(&s.uuid), s.generation + 1, hi, Vec::new());
-            let v = Tree::verify_at(&mut pool, s.root, s.generation);
+            let v = verify_all(&mut pool, s.root, s.generation);
             tree = Some(match &v {
                 Ok(v) => Ok((v.entries, v.nodes)),
                 Err(e) => Err(*e),
@@ -205,7 +234,7 @@ pub fn mount<D: Device>(mut dev: D) -> Result<Volume<D>, VolError> {
         .filter(|s| s.uuid == newest.uuid && s.blocks == blocks)
     {
         let mut pool = Pool::mounted(dev, owner(&s.uuid), s.generation + 1, hi, Vec::new());
-        let walked = Tree::verify_at(&mut pool, s.root, s.generation);
+        let walked = verify_all(&mut pool, s.root, s.generation);
         match walked {
             Ok(v) if v.reachable.iter().all(|&a| a >= lo && a < hi) => {
                 // reachable is sorted: the free map is the gaps

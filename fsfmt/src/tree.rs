@@ -101,6 +101,11 @@ impl Tree {
         Tree { root: s.root }
     }
 
+    /// A tree rooted at `root` (a pointer remembered earlier, to put a tree back).
+    pub fn from_root(root: Option<Ptr>) -> Tree {
+        Tree { root }
+    }
+
     pub fn root(&self) -> Option<Ptr> {
         self.root
     }
@@ -169,9 +174,20 @@ impl Tree {
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
     ) -> Result<Entries, TreeError> {
+        Self::range_limited(pool, root, lo, hi, usize::MAX)
+    }
+
+    /// As `range_at`, stopping after `limit` entries.
+    pub fn range_limited<D: Device>(
+        pool: &mut Pool<D>,
+        root: Option<Ptr>,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Entries, TreeError> {
         let mut out = Vec::new();
         if let Some(p) = root {
-            Self::range_node(pool, &p, lo, hi, &mut out)?;
+            Self::range_node(pool, &p, lo, hi, limit, &mut out)?;
         }
         Ok(out)
     }
@@ -190,11 +206,15 @@ impl Tree {
         p: &Ptr,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        limit: usize,
+        out: &mut Entries,
     ) -> Result<(), TreeError> {
         match pool.read_node(p)? {
             Node::Leaf(e) => {
                 for (k, v) in e {
+                    if out.len() >= limit {
+                        break;
+                    }
                     if lo.is_none_or(|l| k.as_slice() >= l) && hi.is_none_or(|h| k.as_slice() < h) {
                         out.push((k, v));
                     }
@@ -202,6 +222,9 @@ impl Tree {
             }
             Node::Internal { kids, .. } => {
                 for i in 0..kids.len() {
+                    if out.len() >= limit {
+                        break;
+                    }
                     // keys of child i are below the next bound: skip it when they all fall below `lo`
                     if let (Some(l), Some((nb, _))) = (lo, kids.get(i + 1)) {
                         if nb.as_slice() <= l {
@@ -212,7 +235,7 @@ impl Tree {
                     if i > 0 && hi.is_some_and(|h| kids[i].0.as_slice() >= h) {
                         break;
                     }
-                    Self::range_node(pool, &kids[i].1, lo, hi, out)?;
+                    Self::range_node(pool, &kids[i].1, lo, hi, limit, out)?;
                 }
             }
         }

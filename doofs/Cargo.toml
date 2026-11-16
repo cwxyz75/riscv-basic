@@ -1,0 +1,10 @@
+[package]
+name = "doofs"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the doofs filesystem logic (FS-SPEC section 8, step 3): files, directories, symlinks, rename, quotas and orphans over an fsfmt volume. Pure and host-tested; the operations and their errors are those of memfs, which is its differential oracle."
+
+[dependencies]
+fsfmt = { path = "../fsfmt" }
+memfs = { path = "../memfs" }
+proto = { path = "../proto" }

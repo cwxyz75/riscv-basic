@@ -421,7 +421,13 @@ impl Fs {
         Ok(at)
     }
 
-    fn insert(&mut self, dir: NodeId, name: &[u8], data: Data) -> Result<NodeId, Error> {
+    fn insert(
+        &mut self,
+        dir: NodeId,
+        name: &[u8],
+        data: Data,
+        extra: usize,
+    ) -> Result<NodeId, Error> {
         check_name(name)?;
         {
             let d = self.node(dir)?;
@@ -442,7 +448,7 @@ impl Fs {
                 return Err(Error::NotFound);
             }
         }
-        let cost = name.len() + NODE_OVERHEAD;
+        let cost = name.len() + NODE_OVERHEAD + extra;
         if self.live >= self.limits.max_nodes || self.meta + cost > self.limits.max_meta {
             return Err(Error::Quota);
         }
@@ -477,11 +483,11 @@ impl Fs {
     }
 
     pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
-        self.insert(dir, name, Data::File(Blob::new()))
+        self.insert(dir, name, Data::File(Blob::new()), 0)
     }
 
     pub fn mkdir(&mut self, dir: NodeId, name: &[u8]) -> Result<NodeId, Error> {
-        self.insert(dir, name, Data::Dir(BTreeMap::new()))
+        self.insert(dir, name, Data::Dir(BTreeMap::new()), 0)
     }
 
     /// A read-only file whose contents are `len` bytes at `offset` of the boot image.
@@ -493,7 +499,7 @@ impl Fs {
         len: u64,
     ) -> Result<NodeId, Error> {
         offset.checked_add(len).ok_or(Error::BadRange)?;
-        self.insert(dir, name, Data::Image { offset, len })
+        self.insert(dir, name, Data::Image { offset, len }, 0)
     }
 
     /// The `(offset, length)` of an image file.
@@ -585,7 +591,12 @@ impl Fs {
             freed = self.node(d)?.cost;
         }
         let old_cost = self.node(src)?.cost;
-        let new_cost = to_name.len() + NODE_OVERHEAD;
+        // a symlink's cost includes its target, which a rename does not change
+        let target_len = match &self.node(src)?.data {
+            Data::Symlink(t) => t.len(),
+            _ => 0,
+        };
+        let new_cost = to_name.len() + NODE_OVERHEAD + target_len;
         // the replaced target's cost comes back once nothing holds it (not before: a connection
         // may keep it alive), so count it only if it is freed at once
         let credit = match dst {
@@ -1045,22 +1056,8 @@ impl Fs {
     ) -> Result<NodeId, Error> {
         let depth = self.depth_below(dir, root)?;
         proto::file::check_link_target(target, depth).map_err(|_| Error::BadTarget)?;
-        // (the target's bytes are charged like a name)
-        let id = self.insert(dir, name, Data::Symlink(target.to_vec()))?;
-        let extra = target.len();
-        if self.meta + extra > self.limits.max_meta {
-            // roll back: the link is created or it is not
-            self.node_mut(dir)?;
-            if let Data::Dir(m) = &mut self.node_mut(dir)?.data {
-                m.remove(name);
-            }
-            self.node_mut(id)?.links = 0;
-            self.collect(id);
-            return Err(Error::Quota);
-        }
-        self.node_mut(id)?.cost += extra;
-        self.meta += extra;
-        Ok(id)
+        // (the target's bytes are charged like a name, in the same check as the rest of the cost: nothing changes on error)
+        self.insert(dir, name, Data::Symlink(target.to_vec()), target.len())
     }
 
     /// The target of a symlink.
