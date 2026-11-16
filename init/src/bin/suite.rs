@@ -4234,9 +4234,9 @@ fn runtime_heap_stops_at_its_cap() -> Outcome {
     let blocks = sys::process_info(p).a1 as i64;
     // (the lower bound is what the machine has left for one program: 256 MiB less the kernel, which grows its heap in 2 MiB
     // steps and never gives it back (T81), the boot image and the other programs; it was 112 and a run that had grown the
-    // kernel heap once more got 111. The test is about the cap stopping the heap, not about the exact figure.)
+    // kernel heap once more got 111, and the boot image has grown with every program since (the volume services alone are 2 MiB of debug code), CI saw 99. The test is about the cap stopping the heap, not about the exact figure.)
     ensure!(
-        (100..=128).contains(&blocks),
+        (90..=128).contains(&blocks),
         "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use: the boot image and the programs take memory from the machine's 256 MiB)"
     );
     let _ = in_w;
