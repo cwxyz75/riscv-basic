@@ -689,7 +689,8 @@ later the S10 manifest).
 
 - [x] Step 0 (2026-11-16): attributes, indexes and `query` in `memfs` and `proto::file`, plus symlinks (never followed, relative targets that cannot climb above the connection root) and modification times; the semantics are FS-SPEC 9.1; hand-derived scenarios, a random walk against an independent path-keyed model (60 seeds, 500 steps, queries compared with a brute-force evaluation), eight of ten hand mutations caught (the other two are equivalent), wire goldens and a no-panic sweep in `proto`. `memfsd` does not serve the new operations yet (TIDY-UP T109)
 - [ ] Step C1: wall clock service `clockd` (`/svc/clock`), RTC through `devmgr`, `clockmodel`
-- [ ] Steps 1 to 4: `fsfmt`, `mkfs`/`fsck`/`dump.doofs`, differential, crash harness
+- [x] Step 1 (2026-11-16): `fsfmt` crate: CRC-32C, the block device trait, the 32-byte pointer with its check field, node encode/decode with strict validation, the block pool (generation-tagged retire/reclaim, snapshot pins) and the copy-on-write B+tree (`get`, `insert`, `delete`, `range`, `commit`, `verify`); a random walk against a `BTreeMap` with retained snapshots (FI2: no block reachable from a snapshot is on the free list; no leak after a drain), a flipped-bit test; four hand mutations caught (stale child pointer, missed empty-node removal, split bound off by one, missing retire)
+- [ ] Steps 2 to 4: `mkfs`/`fsck`/`dump.doofs` and the format (superblock ring, commit, mount, free map), files and directories, differential against `memfs`, crash harness
 - [ ] Steps 5a to 5f: discard and device info, SD step 4 (narrowed), `fsd`, `volmgr`, `/etc/mounts`, QEMU boot test
 - [ ] Step 6: attributes and queries on disk; review
 
