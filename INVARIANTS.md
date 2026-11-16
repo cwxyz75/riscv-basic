@@ -214,6 +214,18 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | NET24 | **Sequence numbers do not repeat or leak.** For one four-tuple the ISN only moves forward within a boot, across `netd` restarts too; the secret is known only to `netsup` and `netd` and never printed (N24) | `nettcp/tests/isn.rs` (SipHash vectors, monotonic ISNs), `random_service_gives_seeded_distinct_bytes`; **caveat: the secret travels in `netd`'s startup environment, not a read-only VMO (T99)** |
 
 
+## Filesystem (doofs, FS-SPEC section 10)
+
+| # | Invariant | How it is enforced |
+|---|---|---|
+| FI1 | The newest valid superblock slot names a tree in which every block verifies, or mount takes the next older slot, or fails closed | `fsfmt::volume::mount` walks the tree (`verify_all`) before it accepts a slot; `a_torn_newest_slot_falls_back_to_the_previous_commit`, `a_block_from_another_volume_is_caught`, the corruption test (`doofs/tests/corruption.rs`: every 61st bit of every used block) |
+| FI2 | A block reachable from the last committed root or the live tree is never overwritten or reused before the commit that supersedes it is durable | `Pool` retire/reclaim with the last commit pinned (`Volume::commit`); the free-list checks in `fsfmt/tests/tree.rs`, `volume.rs` and the differential's FI2 check; the crash harness (`doofs/tests/crash.rs`) drops and tears unflushed writes at every point |
+| FI3 | After a crash at any point the remounted state is the model state at the last durable commit or at one in flight | `doofs/tests/crash.rs` (every one- and two-operation workload at every crash point, sampled three-operation ones), against `memfs` as the model; mutation-checked (no flush before the slot, no flush after it, free-everything, oldest-slot mount) |
+| FI4 | Everything made durable by a returned `commit` (`fsync`) is present after any later crash | the same harness: a commit's end index makes its model the minimum allowed state |
+| FI5 | Space is charged to exactly one quota domain and the counters equal the sum of their nodes | `doofs::fsck::check_fs` (counters, link counts, entry counts, orphans), run after every sample of the differential and after every crash; **the rights half (rights only shrink, a query stays below its directory) belongs to `fsd`, step 5c** |
+| FI6 | Delete and commit succeed on a full volume | the 64-block reserve for the deleting paths (`Pool::set_reserve`, `allow_reserve`) and the retry-after-commit in `Fs::txn_with`; `a_full_volume_refuses_cleanly_keeps_its_data_and_frees_on_delete`, the pool-level reserve test |
+| FI7 | A symlink target is relative and stays inside the connection it is read through | `proto::file::check_link_target` in `memfs` and `doofs` (the differential compares the refusals); **the client-side resolution belongs to the libc, T104** |
+
 ## Process rules
 
 - No `unsafe` outside the hardware-facing kernel binary; each block has a

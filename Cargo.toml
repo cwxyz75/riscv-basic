@@ -23,6 +23,11 @@ opt-level = 2
 [profile.dev.package.memfs]
 debug = 0
 opt-level = 2
+[profile.dev.package.fsfmt]
+debug = 0
+opt-level = 2
+[profile.dev.package.doofs]
+opt-level = 2
 [profile.dev.package.proto]
 debug = 0
 opt-level = 2
