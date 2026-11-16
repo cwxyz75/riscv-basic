@@ -11,5 +11,7 @@ int isatty(int fd);
 unsigned sleep(unsigned seconds);
 int usleep(unsigned usec);
 int unlink(const char *path);
+char *getcwd(char *buf, size_t size);
+int chdir(const char *path);
 int rmdir(const char *path);
 #endif

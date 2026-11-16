@@ -45,16 +45,22 @@ pub fn run_main() -> i32 {
         // no separate standard error: it shares standard output
         env.handle(Role::Stderr).unwrap_or(out),
     );
-    crate::fd::ROOT.store(env.namespace(b"/").unwrap_or(0), Ordering::Relaxed);
-    crate::fd::CWD.store(env.namespace(b".").unwrap_or(0), Ordering::Relaxed);
     crate::socket::SVC.store(env.namespace(b"/svc").unwrap_or(0), Ordering::Relaxed);
+    // the namespace table: every absolute prefix with its handle, and the cwd as a path (the `PWD` the parent set) plus handle
+    let mut table = pathres::Table::default();
     for (prefix, i) in &env.startup.namespace {
-        if prefix.as_slice() != b"/" && prefix.as_slice() != b"." && prefix.as_slice() != b"/svc" {
-            if let Some(&h) = env.handles.get(*i as usize) {
-                crate::fd::add_mount(prefix, h);
+        if let Some(&h) = env.handles.get(*i as usize) {
+            if prefix.first() == Some(&b'/') {
+                table.mounts.push((pathres::parse_abs(prefix), h));
             }
         }
     }
+    table.cwd_handle = env.namespace(b".");
+    table.cwd = env
+        .var(b"PWD")
+        .filter(|p| p.first() == Some(&b'/'))
+        .map(pathres::parse_abs);
+    crate::fd::set_table(table);
     crate::fd::TTY_IN.store(
         u32::from(env.var(b"STDIN") == Some(&b"tty"[..])),
         Ordering::Relaxed,

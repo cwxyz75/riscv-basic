@@ -1,0 +1,7 @@
+[package]
+name = "pathres"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: path resolution in the libc and the shell (USER-VIEW-SPEC section 5, step UV1): lexical `..` against the process's namespace table with a clamp at the root, the cwd as a path string, and symlink following driven by what a server reports. Pure, no_std, host-tested."
+
+[dependencies]

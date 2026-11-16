@@ -44,6 +44,21 @@ int mount_test(const char *mnt) {
     char up[256];
     snprintf(up, sizeof up, "%s/../escape", mnt);
     CHECK(open(up, O_RDONLY) < 0, "a path with .. does not leave the volume");
+    /* the cwd is a path string, `..` is lexical and crosses mount boundaries, openat resolves from a path-annotated descriptor */
+    char cwd[256];
+    CHECK(getcwd(cwd, sizeof cwd) != NULL && cwd[0] == '/', "getcwd returns an absolute path");
+    CHECK(chdir(mnt) == 0, "chdir into the volume");
+    CHECK(getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, mnt) == 0, "getcwd names it");
+    CHECK(chdir("../../home") == 0, "chdir with .. climbs out of the volume to the root's /home");
+    CHECK(getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/home") == 0, "and getcwd says so");
+    int dfd = open("/home/sub", O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0, "open a directory by path");
+    int upfd = dfd >= 0 ? openat(dfd, "../hello.txt", O_RDONLY) : -1;
+    CHECK(upfd >= 0, "openat with .. from a path-annotated directory descriptor");
+    if (upfd >= 0) close(upfd);
+    if (dfd >= 0) close(dfd);
+    CHECK(chdir("/../../..") == 0 && getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/") == 0, "`..` above the root stays at the root");
+    CHECK(open("", O_RDONLY) < 0 && errno == ENOENT, "the empty path names nothing");
     /* leave one file behind: the shell test reads it from a later session (the volume is durable) */
     char kept[256];
     snprintf(kept, sizeof kept, "%s/kept", mnt);

@@ -142,7 +142,8 @@ def main():
     step(b"cat inner.txt\n", [b"$ cat inner.txt", b"inner"], "cat in the new directory")
     step(b"cd ../..\n", [b"$ cd ../.."], "cd to the root")
     step(b"pwd\n", [b"$ pwd", b"/"], "pwd at the root")
-    step(b"cd ..\n", [b"$ cd ..", b"cd: ..: not found"], "cd above the root")
+    step(b"cd ..\n", [b"$ cd .."], "cd above the root stays at the root (the chroot rule)")
+    step(b"pwd\n", [b"$ pwd", b"/"], "pwd is still /")
     step(b"cd nope\n", [b"$ cd nope", b"cd: nope: not found"], "cd to a missing directory")
     step(b"cd home/hello.txt\n", [b"$ cd home/hello.txt", b"cd: home/hello.txt: not a directory"],
          "cd to a file")
@@ -169,7 +170,12 @@ def main():
           b"ok: create a file in the volume", b"ok: write it", b"ok: close it", b"ok: open it again",
           b"ok: read the same bytes", b"ok: stat reports its size", b"ok: rename inside the volume",
           b"ok: the old name is gone", b"ok: unlink it", b"ok: make a directory", b"ok: remove it",
-          b"ok: a path with .. does not leave the volume", b"ok: leave a file for the next session",
+          b"ok: a path with .. does not leave the volume",
+          b"ok: getcwd returns an absolute path", b"ok: chdir into the volume", b"ok: getcwd names it",
+          b"ok: chdir with .. climbs out of the volume to the root's /home", b"ok: and getcwd says so",
+          b"ok: open a directory by path", b"ok: openat with .. from a path-annotated directory descriptor",
+          b"ok: `..` above the root stays at the root", b"ok: the empty path names nothing",
+          b"ok: leave a file for the next session",
           b"mount: 0 failures"],
          "a C program makes, reads, renames and removes files in the granted volume")
     step(b"ls /mnt/store\n", [b"$ ls /mnt/store", b"kept"], "what it left behind")

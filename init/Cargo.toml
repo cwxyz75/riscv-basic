@@ -16,6 +16,7 @@ doofs = { path = "../doofs" }
 fsfmt = { path = "../fsfmt" }
 clockmodel = { path = "../clockmodel" }
 mounts = { path = "../mounts" }
+pathres = { path = "../pathres" }
 rt = { path = "../rt", features = ["heap"] }
 shell-core = { path = "../shell-core" }
 netring = { path = "../netring" }

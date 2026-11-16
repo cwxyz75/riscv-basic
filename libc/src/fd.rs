@@ -25,6 +25,9 @@ const CHUNK: usize = 16 * 1024;
 
 pub struct OpenFile {
     fs: Fs,
+    /// The absolute components of the path this was opened by: `openat` resolves relative to it, `..` included (a descriptor
+    /// with no path cannot be the base of a path that climbs).
+    path: Option<pathres::Comps>,
     off: u64,
     append: bool,
     readable: bool,
@@ -47,20 +50,23 @@ static FDS: Mutex<Table> = Mutex::new(Table {
     fds: [const { None }; MAX_FDS],
 });
 
-/// The directory connections of the namespace (`/` and `.`), 0 if absent; owned by the startup message.
-pub static ROOT: AtomicU32 = AtomicU32::new(0);
-pub static CWD: AtomicU32 = AtomicU32::new(0);
-/// Volumes the program was granted: namespace entries other than `/`, `.` and `/svc` (`/mnt/<name>`), as (prefix, handle).
-type Mount = Option<(Vec<u8>, u32)>;
-static MOUNTS: Mutex<[Mount; 8]> = Mutex::new([const { None }; 8]);
+/// The process's namespace table (`pathres`): absolute prefixes to handles (the startup message owns them), and the cwd as a
+/// path string plus its handle (USER-VIEW-SPEC section 5).
+static TABLE: Mutex<pathres::Table> = Mutex::new(pathres::Table {
+    mounts: Vec::new(),
+    cwd: None,
+    cwd_handle: None,
+});
+/// A cwd handle `chdir` opened (closed when the next `chdir` replaces it); 0 if the cwd is still the startup message's.
+static OWN_CWD: AtomicU32 = AtomicU32::new(0);
 
-/// Remember a granted volume (up to eight).
-pub fn add_mount(prefix: &[u8], handle: u32) {
-    let mut m = MOUNTS.lock();
-    if let Some(slot) = m.iter_mut().find(|s| s.is_none()) {
-        *slot = Some((prefix.to_vec(), handle));
-    }
+/// Install the namespace table (start-up).
+pub fn set_table(t: pathres::Table) {
+    *TABLE.lock() = t;
 }
+
+/// `ELOOP`, as a status of this layer (too many symlinks).
+const LOOP: i32 = -999;
 
 /// Which standard streams are the terminal (`STDIN=tty`, `STDOUT=tty` in the environment).
 pub static TTY_IN: AtomicU32 = AtomicU32::new(0);
@@ -96,17 +102,18 @@ pub fn socket_of(fd: c_int) -> Result<Option<crate::socket::SockRef>, ()> {
 
 fn errno_of(status: i32) -> c_int {
     match status {
-        ps::NOT_FOUND => 2,      // ENOENT
-        ps::EXISTS => 17,        // EEXIST
-        ps::NOT_EMPTY => 39,     // ENOTEMPTY
-        ps::IS_DIRECTORY => 21,  // EISDIR
-        ps::NOT_DIRECTORY => 20, // ENOTDIR
-        ps::NAME_TOO_LONG => 36, // ENAMETOOLONG
-        ps::QUOTA => 28,         // ENOSPC
-        ps::BAD_REQUEST => 22,   // EINVAL
-        -3 => 13,                // EACCES
-        -5 => 12,                // ENOMEM
-        _ => 5,                  // EIO
+        ps::NOT_FOUND => 2,       // ENOENT
+        ps::EXISTS => 17,         // EEXIST
+        ps::NOT_EMPTY => 39,      // ENOTEMPTY
+        ps::IS_DIRECTORY => 21,   // EISDIR
+        ps::NOT_DIRECTORY => 20,  // ENOTDIR
+        ps::NAME_TOO_LONG => 36,  // ENAMETOOLONG
+        ps::QUOTA => 28,          // ENOSPC
+        ps::BAD_REQUEST => 22,    // EINVAL
+        ps::SYMLINK | LOOP => 40, // ELOOP
+        -3 => 13,                 // EACCES
+        -5 => 12,                 // ENOMEM
+        _ => 5,                   // EIO
     }
 }
 
@@ -122,54 +129,44 @@ fn dir_view(h: u32) -> Fs {
     Fs::new_at(h, TXIDS.fetch_add(1 << 12, Ordering::Relaxed))
 }
 
-/// The directory a path is relative to and the path to use there, cleaned up: empty components
-/// (`a//b`, a trailing slash) and `.` are dropped; `..` is left for the server to refuse. `None` for
-/// an empty path or a namespace without that directory.
-fn resolve(path: &[u8]) -> Option<(u32, Vec<u8>)> {
-    let mut h = if path.first() == Some(&b'/') {
-        ROOT.load(Ordering::Relaxed)
-    } else {
-        CWD.load(Ordering::Relaxed)
-    };
-    let mut comps: Vec<&[u8]> = path
-        .split(|&c| c == b'/')
-        .filter(|c| !c.is_empty() && *c != b".")
-        .collect();
-    // an absolute path inside a granted volume (`/mnt/store/x`) is relative to that volume's connection
-    if path.first() == Some(&b'/') {
-        let m = MOUNTS.lock();
-        for (prefix, mh) in m.iter().flatten() {
-            let pc: Vec<&[u8]> = prefix
-                .split(|&c| c == b'/')
-                .filter(|c| !c.is_empty())
-                .collect();
-            if comps.len() > pc.len() && comps[..pc.len()] == pc[..] {
-                h = *mh;
-                comps.drain(..pc.len());
-                break;
-            }
-        }
+fn stop_of(s: rt::fs::Stopped) -> pathres::Stop {
+    match s {
+        rt::fs::Stopped::Link { consumed, target } => pathres::Stop::Symlink { consumed, target },
+        rt::fs::Stopped::Status(e) => pathres::Stop::Status(e),
     }
-    let mut out: Vec<u8> = Vec::new();
-    for comp in comps {
-        if !out.is_empty() {
-            out.push(b'/');
-        }
-        out.extend_from_slice(comp);
+}
+
+fn status_of(f: pathres::Fail) -> i32 {
+    match f {
+        pathres::Fail::Status(s) => s,
+        pathres::Fail::NoMount => ps::NOT_FOUND,
+        pathres::Fail::Loop => LOOP,
     }
-    (h != 0 && !out.is_empty()).then_some((h, out))
+}
+
+/// Open `path` with `flags` and `rights`: `..` is resolved lexically against the table and symlinks are followed here (the
+/// server only reports them). Returns the connection and the absolute components of what was opened.
+fn open_path(path: &[u8], flags: u16, rights: u32) -> Result<(Fs, pathres::Comps), i32> {
+    let table = TABLE.lock().clone();
+    pathres::open_following(&table, path, |h, rel| {
+        dir_view(h).open_stop(rel, flags, rights).map_err(stop_of)
+    })
+    .map_err(status_of)
 }
 
 unsafe fn path_bytes<'a>(p: *const c_char) -> &'a [u8] {
     core::ffi::CStr::from_ptr(p).to_bytes()
 }
 
+pub const O_DIRECTORY: c_int = 0x10000;
+pub const AT_FDCWD: c_int = -100;
+
 #[no_mangle]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: c_int) -> c_int {
-    let Some((dir, rel)) = resolve(path_bytes(path)) else {
-        errno::set(2);
-        return -1;
-    };
+    open_bytes(path_bytes(path), flags)
+}
+
+fn open_bytes(path: &[u8], flags: c_int) -> c_int {
     let access = flags & 3;
     let mut r = 0;
     if access == O_RDONLY || access == O_RDWR {
@@ -191,14 +188,17 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: c_int) -
     if flags & O_TRUNC != 0 {
         f |= pf::TRUNCATE;
     }
+    if flags & O_DIRECTORY != 0 {
+        f |= pf::DIRECTORY;
+        r |= rights::ENUMERATE;
+    }
     let mut t = FDS.lock();
     let Some(slot) = (3..MAX_FDS).find(|&i| t.fds[i].is_none()) else {
         errno::set(24); // EMFILE
         return -1;
     };
-    let mut d = dir_view(dir); // a view of a connection the startup message owns: never closed here
-    match d.open(&rel, f, r) {
-        Ok(mut fs) => {
+    match open_path(path, f, r) {
+        Ok((mut fs, abs)) => {
             // an append stream starts at the end (so `ftell` is right before the first write)
             let off = if flags & O_APPEND != 0 {
                 fs.size().unwrap_or(0)
@@ -207,6 +207,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: c_int) -
             };
             t.fds[slot] = Some(Entry::File(OpenFile {
                 fs,
+                path: Some(abs),
                 off,
                 append: flags & O_APPEND != 0,
                 readable: access != O_WRONLY,
@@ -216,6 +217,78 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: c_int) -
         }
         Err(e) => fail(e),
     }
+}
+
+/// `openat`: `path` relative to the directory `dirfd` (or the cwd for `AT_FDCWD`). A relative path that climbs (`..`) works only
+/// from a descriptor that remembers the path it was opened by; a descriptor without one refuses it.
+#[no_mangle]
+pub unsafe extern "C" fn openat(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    _mode: c_int,
+) -> c_int {
+    let p = path_bytes(path);
+    if p.first() == Some(&b'/') || dirfd == AT_FDCWD {
+        return open_bytes(p, flags);
+    }
+    let base = {
+        let t = FDS.lock();
+        match t.fds.get(dirfd as usize).and_then(Option::as_ref) {
+            Some(Entry::File(f)) => f.path.clone(),
+            _ => {
+                errno::set(9); // EBADF
+                return -1;
+            }
+        }
+    };
+    let Some(base) = base else {
+        errno::set(13); // EACCES: no path to resolve from
+        return -1;
+    };
+    let full = pathres::join_abs(&pathres::clamp(&base, p));
+    open_bytes(&full, flags)
+}
+
+/// `chdir`: open the directory (following links), make it the cwd and remember its path.
+#[no_mangle]
+pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
+    match open_path(
+        path_bytes(path),
+        pf::DIRECTORY,
+        rights::READ | rights::ENUMERATE,
+    ) {
+        Ok((fs, abs)) => {
+            let old = OWN_CWD.swap(fs.ch, Ordering::Relaxed);
+            let mut t = TABLE.lock();
+            t.cwd = Some(abs);
+            t.cwd_handle = Some(fs.ch);
+            drop(t);
+            if old != 0 {
+                rt::sys::handle_close(old);
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// `getcwd`: the cwd as an absolute path string; `ENOENT` if the program was not told its cwd.
+#[no_mangle]
+pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
+    let cwd = TABLE.lock().cwd.clone();
+    let Some(cwd) = cwd else {
+        errno::set(2);
+        return core::ptr::null_mut();
+    };
+    let p = pathres::join_abs(&cwd);
+    if size < p.len() + 1 {
+        errno::set(34); // ERANGE
+        return core::ptr::null_mut();
+    }
+    core::ptr::copy_nonoverlapping(p.as_ptr(), buf as *mut u8, p.len());
+    *buf.add(p.len()) = 0;
+    buf
 }
 
 #[no_mangle]
@@ -404,25 +477,29 @@ pub extern "C" fn isatty(fd: c_int) -> c_int {
 }
 
 /// Run `f` on the directory holding the last component of `path`, with that component. The parent
-/// is opened with `parent_rights` only (reading and writing, not all four).
+/// is opened (links followed, `..` lexical) with `parent_rights` only (reading and writing, not all four).
 fn with_parent<R>(
     path: &[u8],
     parent_rights: u32,
     f: impl FnOnce(&mut Fs, &[u8]) -> Result<R, i32>,
 ) -> Result<R, i32> {
-    let Some((dir, rel)) = resolve(path) else {
-        return Err(ps::NOT_FOUND);
-    };
-    let mut d = dir_view(dir);
-    match rel.iter().rposition(|&c| c == b'/') {
-        None => f(&mut d, &rel),
-        Some(i) => {
-            let mut parent = d.open(&rel[..i], pf::DIRECTORY, parent_rights)?;
-            let r = f(&mut parent, &rel[i + 1..]);
-            parent.close();
-            r
-        }
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
     }
+    let path = &path[..end];
+    let (parent, name): (&[u8], &[u8]) = match path.iter().rposition(|&c| c == b'/') {
+        None => (b".", path),
+        Some(0) => (b"/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(ps::BAD_REQUEST);
+    }
+    let (mut dir, _) = open_path(parent, pf::DIRECTORY, parent_rights)?;
+    let r = f(&mut dir, name);
+    dir.close();
+    r
 }
 
 #[no_mangle]
@@ -463,10 +540,12 @@ pub struct Stat {
 pub unsafe extern "C" fn stat(path: *const c_char, out: *mut Stat) -> c_int {
     let _guard = FDS.lock();
     // the server's STAT takes a whole path: no parent to open (and READ is all it needs)
-    let r = match resolve(path_bytes(path)) {
-        Some((dir, rel)) => dir_view(dir).stat(&rel),
-        None => Err(ps::NOT_FOUND),
-    };
+    let table = TABLE.lock().clone();
+    let r = pathres::open_following(&table, path_bytes(path), |h, rel| {
+        dir_view(h).stat_stop(rel, 0).map_err(stop_of)
+    })
+    .map(|(s, _)| s)
+    .map_err(status_of);
     match r {
         Ok(s) => {
             (*out).st_size = s.size as i64;
@@ -480,7 +559,13 @@ pub unsafe extern "C" fn stat(path: *const c_char, out: *mut Stat) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
     let _guard = FDS.lock();
-    let (Some((d1, old)), Some((d2, new))) = (resolve(path_bytes(from)), resolve(path_bytes(to)))
+    let table = TABLE.lock().clone();
+    let place = |p: &[u8]| {
+        table
+            .place(p)
+            .map(|pl| (pl.handle, pathres::join_rel(&pl.rel)))
+    };
+    let (Some((d1, old)), Some((d2, new))) = (place(path_bytes(from)), place(path_bytes(to)))
     else {
         errno::set(2); // ENOENT
         return -1;

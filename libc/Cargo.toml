@@ -14,3 +14,4 @@ proto = { path = "../proto" }
 rt = { path = "../rt", features = ["heap"] }
 libm = "0.2"
 sockshim = { path = "../sockshim" }
+pathres = { path = "../pathres" }

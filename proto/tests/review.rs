@@ -166,7 +166,7 @@ fn file_framing_is_strict() {
     assert!(bytes.len() <= file::MAX_MESSAGE);
     assert!(file::decode_request(&bytes).is_ok());
     let bad_flags = Request {
-        flags: 0x10,
+        flags: 0x20, // (0x10 is NOFOLLOW since UV1)
         payload: b"",
         ..req.clone()
     }
