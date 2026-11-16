@@ -709,6 +709,8 @@ differential property test drives both with the same random operation sequences 
 `current` after every step (task 6). On several harts the per-hart design is *not* step-identical to the global
 queue; there the requirement is GP1 and GP2 plus the existing scenario tests.
 
+**A correction (T127, 2026-11-17).** The tick's cost is charged to the thread that *ran* it, not to whichever thread is current after the tick's timer wakes have been served: a thread that sleeps one tick in a loop (the interactive boot's serial bridge) preempts the running thread at every tick, and charging the waker left the preempted thread's slice untouched forever, so its equal-priority peers starved on one hart. A thread preempted by the very tick that used up its slice goes to the back of its level. `sched::Sched::tick`, the v1 oracle of the differential tests, has the same rule.
+
 ### 4.7 The normal class later: hierarchical fair scheduling (sketch only; deferred)
 
 Enough to be sure the interfaces above do not preclude it:
