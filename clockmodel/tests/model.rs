@@ -76,7 +76,7 @@ fn random_readings_keep_the_properties() {
         let mut bound_until: Option<(u64, u64)> = None; // (mono when the surplus is gone, truth_off)
         for _ in 0..400 {
             mono += r.next() % 5_000_000;
-            if r.next() % 8 == 0 {
+            if r.next().is_multiple_of(8) {
                 let shown_before = c.now(mono);
                 truth_off = (truth_off as i64 + (r.next() % 2_000_000) as i64 - 1_000_000) as u64;
                 c.sync(mono + truth_off, mono, Quality::Synced);
