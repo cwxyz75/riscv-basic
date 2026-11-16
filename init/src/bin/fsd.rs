@@ -6,6 +6,17 @@
 #![no_std]
 #![no_main]
 
+/// Say why the server is ending (unless the parent asked for quiet): a volume server that exits is otherwise silent.
+static QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+macro_rules! why {
+    ($code:expr, $what:expr) => {{
+        if !QUIET.load(core::sync::atomic::Ordering::Relaxed) {
+            rt::println!("fsd: exit {}: {}", $code, $what);
+        }
+        return $code;
+    }};
+}
+
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -902,8 +913,12 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
+    QUIET.store(
+        env.var(b"QUIET") == Some(&b"1"[..]),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let Some(blk_ch) = env.handle(Role::BlockDevice) else {
-        return 3;
+        why!(3, "no block channel");
     };
     let root_ch = env.handle(Role::ServiceFs);
     // a view of the registry that allows `clock` (the volume manager gives one): the wall clock for file times
@@ -916,7 +931,7 @@ pub fn app_main() -> i32 {
         env.handle(Role::ServiceListenerAlt),
     ];
     if root_ch.is_none() && listeners.iter().all(Option::is_none) {
-        return 3;
+        why!(3, "nothing to serve on");
     }
     // the mount table's options, as arguments: `ro` and `sub=<dir>`
     let (mut readonly, mut sub): (bool, Option<alloc::vec::Vec<u8>>) = (false, None);
@@ -928,15 +943,17 @@ pub fn app_main() -> i32 {
         }
     }
     let Some(dev) = BlkDevice::open(blk_ch) else {
-        return 4;
+        why!(4, "the block device did not answer Info");
     };
     let limits = limits_for(fsfmt::Device::blocks(&dev));
-    let Ok(vol) = fsfmt::mount(dev) else {
+    let vol = match fsfmt::mount(dev) {
+        Ok(v) => v,
         // not a doofs volume (or damaged beyond the older slots): fail closed
-        return 5;
+        Err(e) => why!(5, alloc::format!("mount: {e:?}")),
     };
-    let Ok(fs) = Fs::open(vol, limits) else {
-        return 6;
+    let fs = match Fs::open(vol, limits) {
+        Ok(f) => f,
+        Err(e) => why!(6, alloc::format!("open: {e:?}")),
     };
     let p = sys::port_create();
     if p.status != 0 {
@@ -990,6 +1007,10 @@ pub fn app_main() -> i32 {
             Some(_) => {}
             None => return 9,
         }
+    }
+    // mounted and listening: tell the parent (it publishes the volume's names only now)
+    if let Some(r) = env.handle(Role::Ready) {
+        let _ = sys::channel_write(r, b"r".as_ptr(), 1, core::ptr::null(), 0);
     }
     let code = service::run(&mut server);
     // the last client has gone: leave the volume committed
