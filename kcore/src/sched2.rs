@@ -789,6 +789,206 @@ impl<N: Class> HartRq<N> {
         self.reschedule();
     }
 
+    // ---- what `kcore::sched_smp` (task 11) needs to run several of these as one machine: record migration, a quiet
+    // priority change, queue views for placement and pull, and the same operations without the immediate reschedule
+    // (a remote hart's current thread is changed only by that hart).
+
+    /// A fresh thread record with a caller-chosen id (the multi-hart scheduler owns the id space).
+    pub(crate) fn fresh_as(
+        &mut self,
+        tid: Tid,
+        attr: SchedAttr,
+        state: State,
+        affinity: Option<u8>,
+        last_hart: u8,
+    ) -> Result<(), Error> {
+        if attr.prio > PRIO_MAX {
+            return Err(Error::BadPriority);
+        }
+        self.threads.insert(
+            tid,
+            ThreadSched {
+                tid,
+                base: attr,
+                eff: attr.prio,
+                demoted_window: 0,
+                state,
+                affinity,
+                last_hart,
+                slice_left: TIMESLICE,
+                deadline: None,
+                runnable_since: self.now,
+                started: self.now,
+                cpu: 0,
+                group: 0,
+                job: 0,
+                class_words: [0; 4],
+                park: crate::park::ParkState::Idle,
+            },
+        );
+        Ok(())
+    }
+
+    /// This hart's idle thread, with a caller-chosen id.
+    pub(crate) fn adopt_idle_as(&mut self, tid: Tid, hart: u8) {
+        self.fresh_as(
+            tid,
+            SchedAttr { prio: 0, rr: false },
+            State::Running,
+            Some(hart),
+            hart,
+        )
+        .expect("priority 0 is valid");
+        self.idle = Some(tid);
+        self.cur = Some(tid);
+    }
+
+    /// Adopt the code already running on this hart (the boot thread) as a normal thread.
+    pub(crate) fn adopt_current_as(
+        &mut self,
+        tid: Tid,
+        attr: SchedAttr,
+        affinity: Option<u8>,
+        hart: u8,
+    ) -> Result<(), Error> {
+        if self.cur.is_some_and(|c| Some(c) != self.idle) {
+            return Err(Error::NoCurrent);
+        }
+        self.fresh_as(tid, attr, State::Running, affinity, hart)?;
+        self.cur = Some(tid);
+        Ok(())
+    }
+
+    pub(crate) fn idle_tid(&self) -> Option<Tid> {
+        self.idle
+    }
+    pub(crate) fn tids(&self) -> impl Iterator<Item = Tid> + '_ {
+        self.threads.keys().copied()
+    }
+    /// The effective priority of what runs here (0 for the idle thread).
+    pub(crate) fn cur_eff(&self) -> Prio {
+        match self.cur {
+            Some(c) if Some(c) != self.idle => self.threads[&c].eff,
+            _ => 0,
+        }
+    }
+    /// The best queued effective priority, if anything is queued here.
+    pub(crate) fn queued_top(&self) -> Option<Prio> {
+        self.rt.top().or_else(|| self.normal.top())
+    }
+    /// The best queued thread that satisfies `ok`.
+    pub(crate) fn queued_top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
+        self.rt.top_where(ok).or_else(|| self.normal.top_where(ok))
+    }
+    pub(crate) fn is_queued(&self, tid: Tid) -> bool {
+        self.rt.contains(tid) || self.normal.contains(tid)
+    }
+    pub(crate) fn queued_len(&self) -> usize {
+        self.rt.len() + self.normal.len()
+    }
+    pub(crate) fn wants_resched(&self) -> bool {
+        self.better_waits()
+    }
+    /// Make the designation right (dispatch, or preempt for something better that waits). Only this hart calls it.
+    pub(crate) fn resched(&mut self) {
+        self.reschedule();
+    }
+
+    /// Queue a thread whose record is already here and that is `Runnable`.
+    pub(crate) fn enqueue_runnable(&mut self, tid: Tid, how: Enq) {
+        self.class_enqueue(tid, how);
+    }
+
+    /// Take a queued thread (Runnable) off this hart's queues, record and all, to move it to another hart.
+    pub(crate) fn detach_queued(&mut self, tid: Tid) -> Option<ThreadSched> {
+        if !self.is_queued(tid) {
+            return None;
+        }
+        self.class_dequeue(tid, Deq::Migrate);
+        self.threads.remove(&tid)
+    }
+
+    /// Take a blocked thread's record (cancelling its timer), made `Runnable`, to place it on another hart. It is not
+    /// queued anywhere; the caller attaches it. Returns the record and how long it slept.
+    pub(crate) fn detach_woken(&mut self, tid: Tid) -> Result<(ThreadSched, Time), Error> {
+        let t = self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?;
+        if t.state != State::Blocked {
+            return Err(Error::NoCurrent);
+        }
+        if let Some(d) = t.deadline.take() {
+            self.timers.remove(&(d, tid));
+        }
+        let slept = self.now.saturating_sub(t.started);
+        t.park = crate::park::ParkState::Idle;
+        t.state = State::Runnable;
+        t.runnable_since = self.now;
+        Ok((self.threads.remove(&tid).expect("exists"), slept))
+    }
+
+    /// Put a record here and queue it.
+    pub(crate) fn attach(&mut self, mut rec: ThreadSched, how: Enq, hart: u8) {
+        rec.last_hart = hart;
+        let tid = rec.tid;
+        self.threads.insert(tid, rec);
+        self.class_enqueue(tid, how);
+    }
+
+    /// `wake` without the reschedule, for a thread whose record is here (the caller does the designation or marks the
+    /// hart). Returns whether it was made runnable (it was blocked); a prepared one is notified.
+    pub(crate) fn wake_quiet(&mut self, tid: Tid) -> Result<bool, Error> {
+        let t = self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?;
+        match t.state {
+            State::Blocked => {
+                if let Some(d) = t.deadline.take() {
+                    self.timers.remove(&(d, tid));
+                }
+                let slept = self.now.saturating_sub(t.started);
+                t.park = crate::park::ParkState::Idle;
+                t.state = State::Runnable;
+                t.runnable_since = self.now;
+                self.class_enqueue(tid, Enq::Wake { slept });
+                Ok(true)
+            }
+            State::Running | State::Runnable => {
+                if t.park == crate::park::ParkState::Prepared {
+                    t.park = crate::park::ParkState::Notified;
+                }
+                Ok(false)
+            }
+            State::Exited => Ok(false),
+        }
+    }
+
+    /// `set_priority` without the reschedule: returns whether this hart's designation may now be wrong.
+    pub(crate) fn set_priority_quiet(&mut self, tid: Tid, prio: Prio) -> Result<bool, Error> {
+        if prio > PRIO_MAX {
+            return Err(Error::BadPriority);
+        }
+        let t = self.threads.get(&tid).ok_or(Error::NoSuchThread)?;
+        let (state, old) = (t.state, t.eff);
+        if state == State::Runnable && old != prio {
+            self.class_dequeue(tid, Deq::AttrChange);
+        }
+        let t = self.threads.get_mut(&tid).expect("exists");
+        t.base.prio = prio;
+        t.eff = prio;
+        Ok(match state {
+            State::Runnable if old != prio => {
+                self.class_enqueue(tid, Enq::AttrChanged);
+                true
+            }
+            State::Running => true,
+            _ => false,
+        })
+    }
+
+    /// The timers and the slice accounting of `advance`, up to `now`, without the final designation by a remote caller
+    /// (this is the hart's own tick). Same as `advance`; the name says whose call it is.
+    pub(crate) fn tick_to(&mut self, now: Time) {
+        let dt = now.saturating_sub(self.now);
+        self.advance(dt);
+    }
+
     /// The per-hart rules (the single-hart form of GP2): every thread is in exactly one place.
     pub fn audit(&self) -> Result<(), String> {
         let mut running = 0;
