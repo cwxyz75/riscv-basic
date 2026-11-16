@@ -9,14 +9,14 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--uuid" => uuid = args.next().and_then(|s| parse_uuid(&s)).or_else(|| usage()),
-            "--label" => label = args.next().unwrap_or_else(|| usage()),
-            "--size-mib" => size = args.next().and_then(|s| s.parse().ok()).or_else(|| usage()),
+            "--uuid" => uuid = args.next().and_then(|s| parse_uuid(&s)).or_else(usage),
+            "--label" => label = args.next().unwrap_or_else(usage),
+            "--size-mib" => size = args.next().and_then(|s| s.parse().ok()).or_else(usage),
             _ if path.is_none() => path = Some(a),
             _ => usage(),
         }
     }
-    let path = path.unwrap_or_else(|| usage());
+    let path = path.unwrap_or_else(usage);
     let uuid = uuid.unwrap_or_else(random_uuid);
     let mut dev = match size {
         Some(m) => FileDevice::create(&path, m * 256),
