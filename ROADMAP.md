@@ -718,7 +718,12 @@ Already built that the track builds on: per-program namespaces and the registry 
 - [ ] UV7: detach and reattach
 - [ ] UV8: BusyBox NOMMU as the first real userland
 - [ ] UV9: `/run` and `AF_UNIX` (when a port needs it); UV10: the Rust `std` on our libc and uutils (with S11)
-- [ ] The native shell (`SHELL-SPEC.md`): not yet cut into steps; it lands alongside UV4 to UV5
+- [ ] **The native shell, `ish`** (`SHELL-SPEC.md` section 10, steps SH0 to SH7; named in its Q6). Order against the UV steps:
+  - **SH0** (spec and corpus, done as a draft) then settle the open points that block the evaluator (Q1b, Q3, Q4, Q5, Q11, Q12 in `SHELL-SPEC.md` section 12): stop and ask the owner.
+  - **SH1** (`data` crate: JSON, CSV, TSV; JSONTestSuite as the oracle), **SH2** (evaluator over a fake `Host`; differential against `es` where installed) and **SH3** (numbers): pure host work with no OS dependency. Start any time after the open points; they can run beside UV5.
+  - **SH4** (replace `sh.rs`: launcher, pipelines, `confine`, `ns`, `/etc/trusted`; every existing shell test passes unchanged) goes **before UV5**, because the session manager and profiles launch the shell and replace `/etc/trusted` with a table built from a profile: UV5 should target `ish`, not a shell about to be replaced.
+  - **SH5** (interactive layer on the raw mode, events and size) is **unblocked by UV4**; it follows SH4. Per-program termios (UV4b, T124) is not needed for it, since the shell is the terminal's owner.
+  - **SH6** (TOML, YAML subset) after Q2; **SH7** (compat `/bin/sh`) with UV8 and `posix_spawn`.
 
 ### S10: Namespaces and attributes
 
