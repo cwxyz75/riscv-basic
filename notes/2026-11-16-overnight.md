@@ -61,3 +61,23 @@ the shell and the QEMU harness: each is a PR of its own with a boot test.
 
 * The independent checker of FS-SPEC check 5 (T113): a separate-context `fsck`. Recommended as a Fable review slice before 5f.
 * A hand-checked sample of the crash harness's three-operation workloads is random (60 by default); `DOOFS_CRASH3=500` for more.
+
+## Later in the night (after step 4)
+
+Merged since: `fsd` and its QEMU restart test (#174), step 6 attributes/indexes/queries on disk (#175), C1 `clockd` with the RTC
+device window (#176). A Fable review of the whole doofs slice (`reviews/2026-11-16-doofs-slice.md`) found 17 items; 1 to 7, 9 and
+12 are fixed in #177 (a B+tree merge that could write an oversized node, a mount that rolled back on a read error, failed commits
+wearing through the slots, a non-atomic symlink, overflow panics on hostile images, parent cycles); the rest are T117.
+
+### More DECISIONS
+14. **The RTC page became a kernel device window** (`abi::layout::DEVICE_WINDOWS`, SYSCALLS.md): it is the smallest way to give
+    `clockd` the clock; `devmgr` hands clients a read-only VMO. Review this boundary change (D1 still holds: never RAM).
+15. **The harness boots QEMU with `-rtc base=2030-06-15T12:00:00,clock=vm`** so the clock test can tell a real reading from a made-up one.
+16. **Query node ids on the wire are 64-bit now** (`proto::file`), because disk ids are 64-bit.
+17. **`MAX_KEY` is 600** in `fsfmt` so an escaped 255-byte index value fits a key.
+
+### Not done (and why I stopped)
+5a (discard), 5b (`/svc` view for services and reconnect on `UNAVAILABLE`), 5d `volmgr`, 5e the grants (the pure `mounts` crate and
+its naming plan are in #177), 5f (harness-built images, host `fsck` after exit, the independent checker T113), wiring `fsd` to
+`clockd` (T116). They are plumbing through `init`, the shell, the registry and the harness with boot tests each; I judged them
+better done awake. `fsd` itself is complete and tested; today the QEMU test hands it a block channel directly.

@@ -110,6 +110,7 @@ impl Superblock {
         };
         let n = label.iter().position(|&c| c == 0).unwrap_or(LABEL_MAX);
         if generation == 0
+            || generation > u64::MAX / 2
             || core::str::from_utf8(&label[..n]).is_err()
             || label[n..].iter().any(|&c| c != 0)
             || b[81..88].iter().any(|&c| c != 0)

@@ -151,10 +151,27 @@ pub fn check_fs<D: Device>(fs: &mut Fs<D>) -> Vec<String> {
             bad.push(format!("a symlink record for {id}, which is not a symlink"));
         }
     }
+    // every parent chain ends at the root (a cycle detached from it would loop a walk forever)
+    for id in inodes.keys() {
+        let mut at = *id;
+        let mut steps = 0usize;
+        while at != 0 {
+            steps += 1;
+            match inodes.get(&at) {
+                Some(n) if steps <= inodes.len() => at = n.parent,
+                _ => {
+                    bad.push(format!(
+                        "node {id} has a parent chain that does not end at the root"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
     for (id, block) in &extents {
         match inodes.get(id) {
             Some(n) if n.kind == Kind::File => {
-                if block * BLOCK as u64 >= n.size {
+                if block.saturating_mul(BLOCK as u64) >= n.size {
                     bad.push(format!(
                         "file {id} has an extent at block {block} past its size {}",
                         n.size

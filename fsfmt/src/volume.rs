@@ -261,6 +261,8 @@ pub fn mount<D: Device>(mut dev: D) -> Result<Volume<D>, VolError> {
                     last,
                 });
             }
+            // a device that cannot be read is not a damaged volume: do not fall back to an older commit (finding 2)
+            Err(TreeError::Pool(PoolError::Dev(e))) => return Err(VolError::Dev(e)),
             _ => dev = pool.dev,
         }
     }
@@ -306,6 +308,9 @@ impl<D: Device> Volume<D> {
             .and_then(|()| self.pool.dev.flush());
         if let Err(e) = written {
             Tree::release(&mut self.pool, &snap);
+            // the generation was not made durable: the retry takes the same number and the same slot, so repeated failures
+            // never wear through the older slots (review finding 3)
+            self.pool.open_gen = snap.gen;
             return Err(e.into());
         }
         Tree::release(&mut self.pool, &self.last);

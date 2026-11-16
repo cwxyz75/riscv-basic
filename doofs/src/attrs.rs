@@ -254,9 +254,12 @@ impl<D: Device> Fs<D> {
                 }
             }
             let mut n = fs.inode(id)?;
-            n.attr_cost -= cost as u32;
+            n.attr_cost = n
+                .attr_cost
+                .checked_sub(cost as u32)
+                .ok_or(FsError::Corrupt)?;
             fs.put_inode(id, &n)?;
-            fs.counters.meta -= cost as u64;
+            fs.counters.meta = crate::sub(fs.counters.meta, cost as u64)?;
             Ok(())
         })
     }
@@ -264,7 +267,7 @@ impl<D: Device> Fs<D> {
     /// The attribute names of `id` in bytewise order.
     pub fn attr_list(&mut self, id: u64) -> R<Vec<Vec<u8>>> {
         self.inode(id)?;
-        let (lo, hi) = (k_attr(id, b""), k_attr(id + 1, b""));
+        let (lo, hi) = (k_attr(id, b""), k_attr(id.saturating_add(1), b""));
         let root = self.vol.tree.root();
         let ents = Tree::range_at(&mut self.vol.pool, root, Some(&lo), Some(&hi))?;
         Ok(ents.into_iter().map(|(k, _)| k[9..].to_vec()).collect())
@@ -272,7 +275,7 @@ impl<D: Device> Fs<D> {
 
     /// Remove every attribute of a node that is going away, and its entries.
     pub(crate) fn drop_attrs(&mut self, id: u64) -> R<()> {
-        let (lo, hi) = (k_attr(id, b""), k_attr(id + 1, b""));
+        let (lo, hi) = (k_attr(id, b""), k_attr(id.saturating_add(1), b""));
         let root = self.vol.tree.root();
         let ents = Tree::range_at(&mut self.vol.pool, root, Some(&lo), Some(&hi))?;
         for (k, v) in ents {
@@ -337,7 +340,12 @@ impl<D: Device> Fs<D> {
     fn path_below(&mut self, id: u64, below: u64) -> R<Option<Vec<u8>>> {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         let mut at = id;
+        let mut steps = 0;
         while at != below {
+            steps += 1;
+            if steps > crate::MAX_DEPTH {
+                return Err(FsError::Corrupt);
+            }
             let n = self.inode(at)?;
             if n.links == 0 || at == ROOT {
                 return Ok(None);
