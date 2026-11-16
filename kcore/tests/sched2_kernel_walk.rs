@@ -50,12 +50,57 @@ struct World<N: Class> {
     harts: usize,
     joined: Vec<bool>,
     rr: bool,
+    /// Marks set by `finish` since the last poke check (it checked them itself; the operation's check must not count them
+    /// as its own).
+    carry: Vec<bool>,
+    /// The thread whose context is live on each hart: what the hart last switched to (`finish`), not what the scheduler has
+    /// designated since. No thread may be designated on one hart while it is executing on another.
+    executing: Vec<Option<Tid>>,
+    /// Harts whose open switch came from a tick or a served mark (no big lock held yet). Every other switch is made under
+    /// the big kernel lock, which the hart keeps until the switch is done, so no other hart's big-lock operation can run
+    /// while it is open (`bkl_barrier`).
+    fast: Vec<bool>,
 }
 
 impl<N: Class> World<N> {
     fn cur(&self, h: usize) -> Option<Tid> {
         let c = self.s.current_on(h);
         (c != self.s.idle(h)).then_some(c)
+    }
+
+    /// Hart `h` finishes the context switch it was in the middle of: what every kernel path does before the hart does
+    /// anything else. The thread it left becomes available to the other harts, and the marks owed for it are poked.
+    fn finish(&mut self, h: usize) {
+        self.fast[h] = false;
+        // the hart's switch is complete (or there was none): its context is the one it is designated to run
+        self.executing[h] = self.cur(h);
+        if self.s.in_transit(h).is_some() {
+            let before = self.pending();
+            let _ = self.s.take_pokes();
+            self.s.switched(h);
+            let pokes = self.s.take_pokes();
+            for x in 0..self.harts {
+                let new_mark = self.s.resched_pending(x) && !before[x];
+                if new_mark {
+                    self.carry[x] = true;
+                }
+                assert_eq!(
+                    pokes & (1 << x) != 0,
+                    new_mark,
+                    "finishing hart {h}'s switch: marks and pokes disagree for hart {x}"
+                );
+            }
+        }
+    }
+
+    /// An operation that takes the big kernel lock starts: every switch made under that lock has finished (its hart held the
+    /// lock until then); only switches begun by a tick or a served mark, which take it later, may still be open.
+    fn bkl_barrier(&mut self) {
+        for h in 0..self.harts {
+            if !self.fast[h] {
+                self.finish(h);
+            }
+        }
     }
 
     fn pending(&self) -> Vec<bool> {
@@ -68,17 +113,24 @@ impl<N: Class> World<N> {
         for h in 0..self.harts {
             let marked = self.s.resched_pending(h);
             let bit = pokes & (1 << h) != 0;
-            if marked && !before[h] && !bit {
+            if marked && !before[h] && !self.carry[h] && !bit {
                 panic!(
                     "seed {seed} step {step} after {what}: hart {h} was marked with no poke owed"
                 );
             }
             if bit && !marked {
-                panic!("seed {seed} step {step} after {what}: a poke owed to hart {h}, which is not marked");
+                panic!(
+                    "seed {seed} step {step} after {what}: a poke owed to hart {h}, which is not marked"
+                );
             }
             if (marked || bit) && !self.joined[h] {
-                panic!("seed {seed} step {step} after {what}: hart {h} is marked or poked while offline");
+                panic!(
+                    "seed {seed} step {step} after {what}: hart {h} is marked or poked while offline"
+                );
             }
+        }
+        for h in 0..self.harts {
+            self.carry[h] = false;
         }
     }
 
@@ -96,8 +148,10 @@ impl<N: Class> World<N> {
                 panic!("seed {seed} step {step} after {what}: marks did not die out in {bound} rounds ({marked:?})");
             }
             let h = marked[r.below(marked.len() as u64) as usize];
+            self.finish(h);
             let before = self.pending();
             self.s.reschedule_on(h);
+            self.fast[h] = self.s.in_transit(h).is_some();
             self.check_pokes(&before, what, seed, step);
         }
     }
@@ -131,6 +185,15 @@ impl<N: Class> World<N> {
                 }
             }
         }
+        for x in 0..self.harts {
+            if let Some(c) = self.cur(x) {
+                for y in 0..self.harts {
+                    if y != x && self.executing[y] == Some(c) {
+                        ctx(format!("double dispatch: thread {c} is designated on hart {x} while it executes on hart {y}"));
+                    }
+                }
+            }
+        }
         for (&tid, r) in &self.t {
             match r.state {
                 R::Blocked => assert_eq!(
@@ -149,6 +212,9 @@ impl<N: Class> World<N> {
                             "thread {tid} should wait, is {:?}",
                             self.s.state(tid)
                         ));
+                    }
+                    if (0..self.harts).any(|h| self.s.in_transit(h) == Some(tid)) {
+                        continue; // mid-switch: not available to the other harts yet
                     }
                     for h in 0..self.harts {
                         if !self.joined[h] || r.pin.is_some_and(|p| p != h) {
@@ -183,6 +249,9 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
         harts,
         joined: (0..harts).map(|h| h == 0).collect(),
         rr,
+        carry: vec![false; harts],
+        executing: vec![None; harts],
+        fast: vec![false; harts],
     };
     for h in 1..harts {
         w.s.set_online(h, false);
@@ -214,9 +283,14 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                 break c;
             }
         };
+        w.finish(caller);
         let before = w.pending();
         let what;
-        match r.below(100) {
+        let op = r.below(100);
+        if !(86..=99).contains(&op) {
+            w.bkl_barrier();
+        }
+        match op {
             // a hart joins
             0..=4 => {
                 if let Some(h) = (1..harts).find(|&h| !w.joined[h]) {
@@ -224,6 +298,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                     clock[h] = now;
                     w.s.set_online(h, true);
                     w.joined[h] = true;
+                    w.finish(h);
                     w.s.reschedule_on(h);
                 }
                 what = "join";
@@ -252,6 +327,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // block (untimed) the thread on some hart
             25..=38 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     w.s.prepare_block_on(h).unwrap();
                     assert!(w.s.block_on(h).unwrap());
@@ -262,6 +338,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // prepare, then a wake before the block: the notified path: it must not block
             39..=44 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     w.s.prepare_block_on(h).unwrap();
                     assert!(
@@ -297,6 +374,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // yield
             63..=70 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if w.cur(h).is_some() {
                     w.s.yield_on(h).unwrap();
                 }
@@ -305,6 +383,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             // exit
             71..=75 => {
                 let h = r.below(harts as u64) as usize;
+                w.finish(h);
                 if let Some(c) = w.cur(h) {
                     let runnable = w.t.values().filter(|x| x.state == R::Runnable).count();
                     if runnable > harts + 2 {
@@ -342,8 +421,10 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                         let lag = if h == 0 { 0 } else { r.below(2) * MS };
                         let t = now.saturating_sub(lag).max(clock[h]);
                         clock[h] = t;
+                        w.finish(h);
                         let before = w.pending();
                         w.s.tick_on(h, t);
+                        w.fast[h] = w.s.in_transit(h).is_some();
                         w.check_pokes(&before, "tick", seed, step);
                         w.serve(&mut r, "tick", seed, step);
                     }
@@ -750,4 +831,80 @@ fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
     }
     assert_eq!(s.pulls, pulls, "balanced queues do not churn");
     s.audit(true).unwrap();
+}
+
+#[test]
+fn a_thread_switched_away_is_not_available_to_other_harts_until_its_switch_completes() {
+    // the race a kernel without a lock across the switch would have: hart 0's tick rotates A out (queued, still executing); an
+    // idle hart 1 must not take A and run it while hart 0 is still saving its context
+    let mut s = Sched2::new(2, FixedPrio::new);
+    let a = s
+        .adopt_current_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            None,
+        )
+        .unwrap();
+    s.set_online(1, false); // (keep hart 1 out of it while the situation is set up)
+    let b = s
+        .spawn_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            Some(0),
+        )
+        .unwrap();
+    s.tick_on(0, 11 * MS); // the slice is over and an equal waits: A is rotated out
+    assert_eq!(s.current_on(0), b);
+    assert_eq!(
+        s.in_transit(0),
+        Some(a),
+        "A is still executing on hart 0, queued but in transit"
+    );
+    s.set_online(1, true);
+    s.reschedule_on(1);
+    assert_eq!(s.current_on(1), s.idle(1), "hart 1 cannot take A yet");
+    assert_eq!(s.home(a), Some(0));
+    s.switched(0);
+    assert_eq!(s.in_transit(0), None);
+    s.reschedule_on(1);
+    assert_eq!(s.current_on(1), a, "now it can");
+    s.audit(true).unwrap();
+}
+
+#[test]
+fn a_tick_that_rotates_and_then_pulls_still_protects_the_thread_that_is_executing() {
+    // the review of task 12 (its reproduction): hart 0's tick rotates A out, and the same settle pulls C from hart 1 over B;
+    // the transit marker must stay on A, which is still executing, so that hart 2 cannot take it
+    let at = |prio: u8| SchedAttr { prio, rr: false };
+    let mut s = Sched2::new(3, FixedPrio::new);
+    s.set_online(2, false);
+    let a = s.adopt_current_on(0, at(10), None).unwrap(); // A runs on hart 0, free
+    let c = s.adopt_current_on(1, at(20), None).unwrap(); // C runs on hart 1, free
+    let _b = s.spawn_on(0, at(10), Some(0)).unwrap(); // B: A's equal peer, pinned to hart 0, queued
+    assert_eq!(s.current_on(0), a);
+    let x = s.spawn_on(1, at(30), Some(1)).unwrap(); // X (30, pinned to 1) preempts C
+    assert_eq!(s.current_on(1), x);
+    assert_eq!(s.in_transit(1), Some(c));
+    s.switched(1); // hart 1 finished: C is available, hart 0 is marked for it
+    s.tick_on(0, 11 * MS); // the slice is over: A rotates out, and the settle pulls C over B
+    assert_eq!(
+        s.in_transit(0),
+        Some(a),
+        "A is the thread still executing on hart 0"
+    );
+    s.set_online(2, true);
+    s.reschedule_on(2);
+    assert_ne!(
+        s.current_on(2),
+        a,
+        "hart 2 took A while hart 0 has not completed its switch"
+    );
+    s.audit(false).unwrap();
+    s.switched(0);
 }

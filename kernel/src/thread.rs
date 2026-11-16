@@ -122,10 +122,7 @@ struct KThread {
 }
 
 struct Kernel {
-    sched: KSched,
     threads: BTreeMap<Tid, KThread>,
-    /// The thread running on each hart (by dense hart index).
-    running: Vec<Tid>,
     exits: Waiters2,
     queues: Vec<Waiters2>,
     /// Exited detached threads waiting for the reaper.
@@ -134,6 +131,40 @@ struct Kernel {
 }
 
 static mut KERNEL: Option<Kernel> = None;
+
+/// The scheduler core, behind its own lock (class `RQ`, SCHED-SMP-SPEC task 12): taken for one operation at a time, with
+/// interrupts off, by code that holds the big kernel lock (which comes first in the order) and by the timer and reschedule
+/// interrupts that do not. Nothing here is held across a context switch: `cur[h]` is only ever changed by hart `h`, and the
+/// switch itself (`reschedule`) is done under the big lock, which is handed from thread to thread as before.
+static SCHED: klock::Spin<Option<KSched>, crate::bkl::Machine> =
+    klock::Spin::new(klock::Class::Rq, 0, None);
+
+struct SchedGuard(klock::Guard<'static, Option<KSched>, crate::bkl::Machine>);
+
+impl core::ops::Deref for SchedGuard {
+    type Target = KSched;
+    fn deref(&self) -> &KSched {
+        self.0.as_ref().expect("thread::init was not called")
+    }
+}
+impl core::ops::DerefMut for SchedGuard {
+    fn deref_mut(&mut self) -> &mut KSched {
+        self.0.as_mut().expect("thread::init was not called")
+    }
+}
+
+/// Take the scheduler lock (one operation at a time: do not call this while holding the guard).
+fn sched() -> SchedGuard {
+    SchedGuard(SCHED.lock())
+}
+
+/// The thread this hart is running (its own record: only this hart writes it).
+fn running_here() -> Tid {
+    crate::percpu::this().running.load(Ordering::Relaxed)
+}
+fn set_running(tid: Tid) {
+    crate::percpu::this().running.store(tid, Ordering::Relaxed);
+}
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Counts iterations of the idle loop (so a test can see that idle ran).
 pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
@@ -196,15 +227,15 @@ pub fn init(boot_prio: Prio) {
     // SAFETY: called once, interrupts off, before any other use of KERNEL.
     unsafe {
         *addr_of_mut!(KERNEL) = Some(Kernel {
-            sched,
             threads,
-            running: alloc::vec![boot; harts],
             exits: Waiters2::new(),
             queues: Vec::new(),
             zombies: Vec::new(),
             reaper_queue: 0,
         });
     }
+    *SCHED.lock() = Some(sched);
+    set_running(boot);
     // hart 0's idle thread (the other harts use their own boot context when they join): the scheduler made its id, this
     // gives it a stack and a first instruction
     let idle_thread = new_kthread("idle", idle_main, 0, false);
@@ -249,10 +280,9 @@ pub fn join_scheduler() -> ! {
         let h = hart();
         let k = kernel();
         // the hart's boot context becomes its idle thread (the scheduler made the id when it was built)
-        let tid = k.sched.idle(h);
-        k.sched
-            .set_clock(h, ticks_to_ns(TICKS.load(Ordering::SeqCst)));
-        k.sched.set_online(h, true);
+        let tid = sched().idle(h);
+        sched().set_clock(h, ticks_to_ns(TICKS.load(Ordering::SeqCst)));
+        sched().set_online(h, true);
         k.threads.insert(
             tid,
             KThread {
@@ -263,7 +293,7 @@ pub fn join_scheduler() -> ! {
                 bkl_depth: 0,
             },
         );
-        k.running[h] = tid;
+        set_running(tid);
         crate::percpu::this()
             .in_sched
             .store(true, Ordering::Release);
@@ -280,9 +310,11 @@ pub fn join_scheduler() -> ! {
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
-        irq::without(crate::heap::service); // an idle hart is a safe point too
-                                            // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
-                                            // here (thread_bootstrap enabled them).
+        if crate::heap::needs_service() {
+            irq::without(crate::heap::service); // an idle hart is a safe point too
+        }
+        // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
+        // here (thread_bootstrap enabled them).
         unsafe { core::arch::asm!("wfi") };
     }
 }
@@ -293,6 +325,7 @@ extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
     // A new thread starts inside a context switch, with interrupts off and the big kernel lock
     // handed over at depth 1: it leaves that region now and runs outside the lock (K4).
     crate::latency::switch_in();
+    finish_switch();
     crate::bkl::unlock();
     irq::enable();
     // SAFETY: `entry` is the `fn(usize)` that `spawn` stored, round-tripped through
@@ -348,8 +381,7 @@ fn spawn_with_affinity(
     let thread = new_kthread(name, entry, arg, detached);
     irq::without(|| {
         let k = kernel();
-        let tid = k
-            .sched
+        let tid = sched()
             .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
             .expect("valid priority");
         k.threads.insert(tid, thread);
@@ -378,6 +410,18 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
     }
 }
 
+/// This hart's context switch is complete (the thread it left has been saved), or it decided not to switch: the thread it
+/// left, if any, is now available to the other harts (`Sched2::switched`). Interrupts are off.
+fn finish_switch() {
+    let h = hart();
+    let pokes = {
+        let mut sc = sched();
+        sc.switched(h);
+        sc.take_pokes()
+    };
+    send_pokes(pokes, h);
+}
+
 /// Switch to whichever thread the core says should run, if it is not this one.
 /// Interrupts must be off.
 fn reschedule() {
@@ -386,13 +430,22 @@ fn reschedule() {
     let (old, new) = {
         let k = kernel();
         let h = hart();
-        let pokes = k.sched.take_pokes();
+        let (pokes, next) = {
+            let mut sc = sched();
+            (sc.take_pokes(), sc.current_on(h))
+        };
         send_pokes(pokes, h);
-        let next = k.sched.current_on(h);
-        let running = k.running[h];
+        let running = running_here();
         if next == running {
+            finish_switch();
             return;
         }
+        // (a double dispatch would panic here instead of running one thread on two harts)
+        debug_assert!(
+            (0..crate::smp::started())
+                .all(|y| y == h || crate::percpu::hart(y).running.load(Ordering::Relaxed) != next),
+            "thread {next} is already running on another hart"
+        );
         let outgoing = k.threads.get_mut(&running).expect("running thread exists");
         if let Some(stack) = &outgoing.stack {
             assert!(
@@ -402,7 +455,7 @@ fn reschedule() {
             );
         }
         let old: *mut Context = &mut *outgoing.ctx;
-        k.running[h] = next;
+        set_running(next);
         let incoming = k.threads.get(&next).expect("next thread exists");
         if let Some(stack) = &incoming.stack {
             assert!(
@@ -434,7 +487,14 @@ fn reschedule() {
     // reference to KERNEL is live.
     crate::latency::switch_out();
     unsafe { context_switch(old, new) };
+    // (resumed: on whichever hart now runs this thread, the switch that brought it here has finished saving the one before)
+    finish_switch();
     crate::latency::switch_in();
+}
+
+/// Switch threads if the scheduler core has designated another one for this hart (the caller holds the big kernel lock).
+pub fn switch_if_designated() {
+    reschedule();
 }
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
@@ -453,16 +513,35 @@ fn send_pokes(mut pokes: u32, me: usize) {
 /// The reschedule IPI (or any other reason to look again): this hart makes its own designation
 /// right, then switches if needed. Called with the big kernel lock held.
 pub fn reschedule_this_hart() {
-    let k = kernel();
     let h = hart();
-    k.sched.reschedule_on(h);
+    sched().reschedule_on(h);
     reschedule();
 }
 
-/// The timer interrupt: advance time, and preempt if the core says so.
-pub fn timer_interrupt() {
+/// The reschedule IPI's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12): the hart makes its own
+/// designation right under the scheduler lock and sends the pokes that owes. Returns whether it must now switch threads
+/// (the caller then takes the big lock and calls `reschedule`); most of the time it need not.
+pub fn reschedule_fast() -> bool {
     let h = hart();
-    let k = kernel();
+    let (pokes, switch) = {
+        let mut sc = sched();
+        sc.reschedule_on(h);
+        let switch = sc.current_on(h) != running_here();
+        if !switch {
+            sc.switched(h); // no switch after all: nothing is in transit
+        }
+        (sc.take_pokes(), switch)
+    };
+    send_pokes(pokes, h);
+    switch
+}
+
+/// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12): advance this hart's clock,
+/// fire its due timers, account the running thread's slice. Returns whether the hart must now switch threads (a rotation, a
+/// timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls `reschedule`.
+/// A tick that changes nothing needs no lock but the scheduler's own.
+pub fn timer_tick_fast() -> bool {
+    let h = hart();
     crate::timer::next_tick();
     // Hart 0 keeps the clock (sleepers' deadlines are in its ticks); every hart runs its own timers and slice from it.
     let now = if h == 0 {
@@ -470,8 +549,17 @@ pub fn timer_interrupt() {
     } else {
         TICKS.load(Ordering::SeqCst)
     };
-    k.sched.tick_on(h, ticks_to_ns(now));
-    reschedule();
+    let (pokes, switch) = {
+        let mut sc = sched();
+        sc.tick_on(h, ticks_to_ns(now));
+        let switch = sc.current_on(h) != running_here();
+        if !switch {
+            sc.switched(h); // the designation came back to the running thread: nothing is in transit
+        }
+        (sc.take_pokes(), switch)
+    };
+    send_pokes(pokes, h);
+    switch
 }
 
 /// Ticks (1 ms) to the scheduler's nanoseconds; "never" (`u64::MAX`) stays never.
@@ -485,13 +573,17 @@ pub fn ticks() -> u64 {
 }
 
 pub fn current() -> Tid {
-    irq::without(|| kernel().running[hart()])
+    // (interrupts off so the thread cannot be moved to another hart between reading `tp` and the record; no lock)
+    let was = irq::save_and_disable();
+    let t = running_here();
+    irq::restore(was);
+    t
 }
 
 /// Give up the rest of the time slice.
 pub fn yield_now() {
     irq::without(|| {
-        kernel().sched.yield_on(hart()).expect("running thread");
+        sched().yield_on(hart()).expect("running thread");
         reschedule();
     });
 }
@@ -500,22 +592,19 @@ pub fn yield_now() {
 /// wait with `block` (which returns at once if a wake arrived meanwhile).
 pub fn prepare_block() {
     irq::without(|| {
-        kernel()
-            .sched
-            .prepare_block_on(hart())
-            .expect("running thread");
+        sched().prepare_block_on(hart()).expect("running thread");
     });
 }
 
 /// The park word of a thread (a test hook).
 pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
-    irq::without(|| kernel().sched.park_state(tid))
+    irq::without(|| sched().park_state(tid))
 }
 
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
 pub fn block() {
     irq::without(|| {
-        if kernel().sched.block_on(hart()).expect("running thread") {
+        if sched().block_on(hart()).expect("running thread") {
             reschedule();
         }
     });
@@ -525,7 +614,7 @@ pub fn block() {
 /// (a wake is never remembered).
 pub fn wake(tid: Tid) {
     irq::without(|| {
-        let _ = kernel().sched.wake_on(hart(), tid);
+        let _ = sched().wake_on(hart(), tid);
         reschedule();
     });
 }
@@ -537,11 +626,10 @@ pub fn sleep_ticks(n: u64) {
     // end before its deadline.
     loop {
         let done = irq::without(|| {
-            let k = kernel();
             if ticks() >= deadline {
                 return true;
             }
-            if k.sched
+            if sched()
                 .sleep_until_on(hart(), ticks_to_ns(deadline))
                 .expect("running thread")
             {
@@ -557,7 +645,7 @@ pub fn sleep_ticks(n: u64) {
 
 /// A thread's current priority (its base: nothing donates yet).
 pub fn priority_of(tid: Tid) -> Option<Prio> {
-    irq::without(|| kernel().sched.priority(tid))
+    irq::without(|| sched().priority(tid))
 }
 
 /// Set several threads' priorities in one critical section and reschedule once (a clamp must reach every thread
@@ -565,7 +653,7 @@ pub fn priority_of(tid: Tid) -> Option<Prio> {
 pub fn set_priorities(changes: &[(Tid, Prio)]) {
     irq::without(|| {
         for &(tid, prio) in changes {
-            let _ = kernel().sched.set_priority_on(hart(), tid, prio);
+            let _ = sched().set_priority_on(hart(), tid, prio);
         }
         reschedule();
     });
@@ -573,7 +661,7 @@ pub fn set_priorities(changes: &[(Tid, Prio)]) {
 
 pub fn set_priority(tid: Tid, prio: Prio) {
     irq::without(|| {
-        let _ = kernel().sched.set_priority_on(hart(), tid, prio);
+        let _ = sched().set_priority_on(hart(), tid, prio);
         reschedule();
     });
 }
@@ -583,23 +671,25 @@ pub fn exit() -> ! {
     irq::without(|| {
         let k = kernel();
         let h = hart();
-        k.sched.exit_on(h).expect("running thread");
-        let me = k.running[h];
+        let me = running_here();
         let detached = k.threads.get(&me).is_some_and(|t| t.detached);
         let Kernel {
-            sched,
             exits,
             queues,
             zombies,
             reaper_queue,
             ..
         } = k;
-        exits.wake_all_on(sched, h);
-        if detached {
-            // Nobody will join it: hand it to the reaper (which runs once we have switched
-            // away, so its stack is no longer in use when it is freed).
-            zombies.push(me);
-            queues[*reaper_queue].wake_all_on(sched, h);
+        {
+            let mut sc = sched();
+            sc.exit_on(h).expect("running thread");
+            exits.wake_all_on(&mut sc, h);
+            if detached {
+                // Nobody will join it: hand it to the reaper (which runs once we have switched
+                // away, so its stack is no longer in use when it is freed).
+                zombies.push(me);
+                queues[*reaper_queue].wake_all_on(&mut sc, h);
+            }
         }
         reschedule();
     });
@@ -613,21 +703,26 @@ pub fn join(tid: Tid) -> bool {
     loop {
         let result = irq::without(|| {
             let k = kernel();
-            if tid == k.running[hart()] {
+            if tid == running_here() {
                 return Some(false);
             }
-            match k.sched.state(tid) {
+            // (the state is read first: a guard in the scrutinee would live through every arm)
+            let state = sched().state(tid);
+            match state {
                 None => Some(false),
                 Some(State::Exited) => {
-                    k.sched.reap(tid).expect("exited thread");
+                    sched().reap(tid).expect("exited thread");
                     if let Some(t) = k.threads.remove(&tid) {
                         note_stack_use(&t);
                     }
                     Some(true)
                 }
                 Some(_) => {
-                    let Kernel { sched, exits, .. } = k;
-                    if exits.wait_on(sched, hart()).expect("running thread") {
+                    let blocked = {
+                        let mut sc = sched();
+                        k.exits.wait_on(&mut sc, hart()).expect("running thread")
+                    };
+                    if blocked {
                         reschedule();
                     }
                     None
@@ -671,16 +766,15 @@ pub fn wait_deadline_registered(
             if ready() {
                 return Some(true);
             }
-            let k = kernel();
             if ticks() >= deadline {
                 return Some(false);
             }
             // (prepared before registering: the order of 3.7 — under the big lock nothing can interleave, but the
             // protocol is the one the later locks need)
-            let _ = k.sched.prepare_block_on(hart());
+            let _ = sched().prepare_block_on(hart());
             register();
             count_sleep(&mut slept);
-            if k.sched
+            if sched()
                 .sleep_until_on(hart(), ticks_to_ns(deadline))
                 .expect("running thread")
             {
@@ -701,12 +795,11 @@ pub fn wait_deadline_registered(
 /// re-check).
 pub fn wake_many(tids: &[Tid]) {
     irq::without(|| {
-        let k = kernel();
         for &tid in tids {
-            if k.sched.state(tid) == Some(State::Blocked) {
+            if sched().state(tid) == Some(State::Blocked) {
                 WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            let _ = k.sched.wake_on(hart(), tid);
+            let _ = sched().wake_on(hart(), tid);
         }
         reschedule();
     });
@@ -714,7 +807,7 @@ pub fn wake_many(tids: &[Tid]) {
 
 /// Is `tid` blocked right now (a test hook)?
 pub fn is_blocked(tid: Tid) -> bool {
-    irq::without(|| kernel().sched.state(tid) == Some(State::Blocked))
+    irq::without(|| sched().state(tid) == Some(State::Blocked))
 }
 
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts
@@ -727,10 +820,15 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
             if ready() {
                 return true;
             }
-            let k = kernel();
             count_sleep(&mut slept);
-            let Kernel { sched, queues, .. } = k;
-            if queues[q].wait_on(sched, hart()).expect("running thread") {
+            let k = kernel();
+            let blocked = {
+                let mut sc = sched();
+                k.queues[q]
+                    .wait_on(&mut sc, hart())
+                    .expect("running thread")
+            };
+            if blocked {
                 reschedule();
             }
             false
@@ -744,8 +842,10 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
 pub fn wake_one(q: usize) -> bool {
     irq::without(|| {
         let k = kernel();
-        let Kernel { sched, queues, .. } = k;
-        let woke = queues[q].wake_one_on(sched, hart()).is_some();
+        let woke = {
+            let mut sc = sched();
+            k.queues[q].wake_one_on(&mut sc, hart()).is_some()
+        };
         reschedule();
         woke
     })
@@ -754,8 +854,10 @@ pub fn wake_one(q: usize) -> bool {
 pub fn wake_all(q: usize) {
     irq::without(|| {
         let k = kernel();
-        let Kernel { sched, queues, .. } = k;
-        let n = queues[q].wake_all_on(sched, hart());
+        let n = {
+            let mut sc = sched();
+            k.queues[q].wake_all_on(&mut sc, hart())
+        };
         WAKES.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
         reschedule();
     });
@@ -796,6 +898,10 @@ pub fn wake_stat(which: u64) -> u64 {
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
+        // 16 + h: how often hart h took the big kernel lock from free
+        16..=23 => crate::percpu::hart((which - 16) as usize)
+            .bkl_takes
+            .load(Relaxed),
         _ => 0,
     }
 }
@@ -828,7 +934,7 @@ pub fn thread_count() -> usize {
 
 /// How many threads the scheduler core tracks (must equal `thread_count`).
 pub fn sched_thread_count() -> usize {
-    irq::without(|| kernel().sched.thread_count())
+    irq::without(|| sched().thread_count())
 }
 
 /// Test hook: damage (or repair) a thread's stack guard, to show the overflow
@@ -861,7 +967,7 @@ pub fn current_stack_top() -> u64 {
         let k = kernel();
         let t = k
             .threads
-            .get(&k.running[hart()])
+            .get(&running_here())
             .expect("running thread exists");
         let stack = t
             .stack
@@ -883,7 +989,7 @@ fn reaper_main(_: usize) {
             let k = kernel();
             let dead: Vec<Tid> = core::mem::take(&mut k.zombies);
             for tid in dead {
-                if k.sched.reap(tid).is_ok() {
+                if sched().reap(tid).is_ok() {
                     if let Some(t) = k.threads.remove(&tid) {
                         note_stack_use(&t);
                     }
@@ -917,17 +1023,17 @@ pub fn stack_high_water() -> usize {
 /// The scheduler's view of a thread (diagnostics for the SMP tests).
 pub fn debug_state(tid: Tid) -> alloc::string::String {
     irq::without(|| {
-        let k = kernel();
+        let sc = sched();
         alloc::format!(
             "{:?} prio {:?} aff {:?} cur {:?} pending {:?}",
-            k.sched.state(tid),
-            k.sched.priority(tid),
-            k.sched.affinity(tid),
-            (0..k.sched.harts())
-                .map(|h| Some(k.sched.current_on(h)))
+            sc.state(tid),
+            sc.priority(tid),
+            sc.affinity(tid),
+            (0..sc.harts())
+                .map(|h| Some(sc.current_on(h)))
                 .collect::<Vec<_>>(),
-            (0..k.sched.harts())
-                .map(|h| k.sched.resched_pending(h))
+            (0..sc.harts())
+                .map(|h| sc.resched_pending(h))
                 .collect::<Vec<_>>()
         )
     })
@@ -935,12 +1041,10 @@ pub fn debug_state(tid: Tid) -> alloc::string::String {
 
 /// Scheduler statistics for the benchmarks: 10 pulls, 11 calls that make a hart's designation right, 12 marks.
 fn sched_stat(which: u64) -> u64 {
-    irq::without(|| {
-        let k = kernel();
-        match which {
-            10 => k.sched.pulls,
-            11 => k.sched.settles,
-            _ => k.sched.marks,
-        }
-    })
+    let sc = sched();
+    match which {
+        10 => sc.pulls,
+        11 => sc.settles,
+        _ => sc.marks,
+    }
 }

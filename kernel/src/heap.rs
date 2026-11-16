@@ -187,6 +187,12 @@ pub fn grow(bytes: usize) -> usize {
     added
 }
 
+/// Does the heap want a safe point (is it below its low-water mark)? A lock-free check, so an idle hart can look without
+/// taking the big kernel lock for nothing.
+pub fn needs_service() -> bool {
+    LOW.load(Ordering::Relaxed)
+}
+
 /// The safe point: with the big kernel lock held, make sure the heap has headroom (see the module comment).
 pub fn service() {
     // (until the heap is back above the low-water mark, or nothing more can be added)

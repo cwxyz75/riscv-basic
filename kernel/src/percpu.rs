@@ -72,6 +72,14 @@ pub struct PerHart {
     pub work_done: AtomicBool,
     /// The `satp` last written for user mode on this hart (so a switch is made only when needed).
     pub active_satp: AtomicU64,
+    /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
+    pub bkl_takes: AtomicU64,
+    /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
+    pub running: AtomicU32,
+    /// Spin iterations in the current wait for a lock (the deadlock detector's counter).
+    pub spins: AtomicU64,
+    /// The lock class this hart last asked for (diagnostics for the deadlock detector).
+    pub last_class: AtomicU32,
 }
 
 impl PerHart {
@@ -98,6 +106,10 @@ impl PerHart {
             work_result: AtomicU64::new(0),
             work_done: AtomicBool::new(false),
             active_satp: AtomicU64::new(0),
+            bkl_takes: AtomicU64::new(0),
+            running: AtomicU32::new(0),
+            spins: AtomicU64::new(0),
+            last_class: AtomicU32::new(0),
         }
     }
 }
