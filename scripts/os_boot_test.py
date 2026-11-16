@@ -84,7 +84,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_is_reserved", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_tcp_churn", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -597,8 +597,8 @@ class HostTcpServer:
             try:
                 c.settimeout(30)
                 c.sendall(b"HELLO-FROM-HOST\n" + tcp_pattern(3, 300_000))
-                c.shutdown(socket.SHUT_WR)
                 got = bytearray()
+                c.shutdown(socket.SHUT_WR)
                 while True:
                     d = c.recv(65536)
                     if not d:
@@ -734,15 +734,18 @@ def run_streaming(cmd):
 def net_problems(text):
     """The host's view of the network tests (NET-SPEC Q4, Q5): the echo client's verdict and the capture's checksums."""
     found = []
-    if os.environ.get("OS_NET") != "0" and "s8: udpecho ready" not in text and "net tests skipped" not in text:
+    lossy = bool(os.environ.get("OS_NET_LOSSY"))
+    if os.environ.get("OS_NET") != "0" and not lossy and "s8: udpecho ready" not in text and "net tests skipped" not in text:
         found.append("the network tests did not run (no marker from the UDP echo test)")
-    if os.environ.get("OS_NET") != "0" and "s8: udpecho ready" in text and "netd: tcp secret from rngd" not in text:
+    if os.environ.get("OS_NET") != "0" and ("s8: udpecho ready" in text or lossy) and "netd: tcp secret from rngd" not in text:
         found.append("the stack did not take its TCP secret from the random service (no 'netd: tcp secret from rngd')")
-    if "s8: udpecho ready" in text:
+    if "s8: udpecho ready" in text or lossy:
         for l in HOST_NET:
             print(l.replace("##HOSTNET", "host net:", 1))
         res = [l for l in HOST_NET if l.startswith("##HOSTNET udp_echo")]
-        if not res:
+        if lossy:
+            pass  # (the UDP test does not run in lossy mode)
+        elif not res:
             found.append("the host UDP client reported nothing")
         elif not res[0].endswith("PASS"):
             found.append(res[0])
@@ -805,6 +808,72 @@ def free_tcp_port():
 NET_PCAP = os.environ.get("OS_NET_PCAP")
 
 
+LOSSY_PROCS = []
+
+# the tests that run in lossy mode (the guest's suite runs only these when the kernel line says `net=lossy`)
+LOSSY_REQUIRED = ["net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_tcp_echo_for_the_host"]
+
+
+def lossy_start(udp_port, tcp_port):
+    """S9-SPEC 3.1: slirp lives in a second QEMU with no machine; the lossy relay sits between it and the guest's QEMU.
+    OS_NET_LOSSY is the seed; OS_NET_LOSS, OS_NET_DUP, OS_NET_REORDER (fractions) and OS_NET_DELAY (ms) shape the link.
+    Returns the guest's -netdev value."""
+    import time
+    slirp_port, relay_port = free_tcp_port(), free_tcp_port()
+    qemu = ["qemu-system-riscv64", "-machine", "none", "-nographic", "-nodefaults", "-monitor", "none", "-serial", "none",
+            "-netdev", f"user,id=u0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:{udp_port}-:7777,hostfwd=tcp:127.0.0.1:{tcp_port}-:7778",
+            "-netdev", "hubport,id=h0,hubid=0,netdev=u0",
+            "-netdev", f"socket,id=s0,listen=127.0.0.1:{slirp_port}",
+            "-netdev", "hubport,id=h1,hubid=0,netdev=s0"]
+    LOSSY_PROCS.append(subprocess.Popen(qemu, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    for _ in range(100):  # wait for slirp's QEMU to listen
+        try:
+            socket_probe(slirp_port)
+            break
+        except OSError:
+            time.sleep(0.1)
+    env = os.environ
+    relay = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_lossy_relay.py"),
+             "--listen", str(relay_port), "--slirp", str(slirp_port), "--seed", env["OS_NET_LOSSY"],
+             "--loss", env.get("OS_NET_LOSS", "0.02"), "--dup", env.get("OS_NET_DUP", "0.01"),
+             "--reorder", env.get("OS_NET_REORDER", "0.05"), "--delay", env.get("OS_NET_DELAY", "5")]
+    LOSSY_PROCS.append(subprocess.Popen(relay, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE))
+    for _ in range(100):
+        try:
+            socket_probe(relay_port)
+            break
+        except OSError:
+            time.sleep(0.1)
+    return f"socket,id=n0,connect=127.0.0.1:{relay_port}"
+
+
+def socket_probe(port):
+    import socket
+    # (the slirp QEMU and the relay each accept one connection, so probing by connecting would use it up: probe by binding)
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return  # taken: someone is listening
+        raise OSError("not listening yet")
+
+
+def lossy_stop():
+    stats = ""
+    for p in LOSSY_PROCS:
+        p.terminate()
+        try:
+            _, err = p.communicate(timeout=5)
+            if err and b"lossy relay" in err:
+                stats = err.decode().strip()
+        except Exception:
+            p.kill()
+    LOSSY_PROCS.clear()
+    if stats:
+        print(stats)
+
+
 def net_args():
     port = int(os.environ.get("OS_NET_HOSTPORT") or free_udp_port())
     pcap = os.environ.get("OS_NET_PCAP") or os.path.join(tempfile.gettempdir(), f"os-net-{os.getpid()}-{port}.pcap")
@@ -813,9 +882,14 @@ def net_args():
     os.environ["OS_NET_LAST_HOSTPORT"] = str(port)
     os.environ["OS_NET_LAST_TCP_HOSTPORT"] = str(tcp_port)
     os.environ["OS_NET_PCAP_USED"] = pcap
+    user = f"user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:{port}-:7777,hostfwd=tcp:127.0.0.1:{tcp_port}-:7778"
+    if os.environ.get("OS_NET_LOSSY"):
+        netdev = lossy_start(port, tcp_port)
+    else:
+        netdev = user
     return [
         "-global", "virtio-mmio.force-legacy=false",
-        "-netdev", f"user,id=n0,net=10.0.2.0/24,host=10.0.2.2,dhcpstart=10.0.2.15,hostfwd=udp:127.0.0.1:{port}-:7777,hostfwd=tcp:127.0.0.1:{tcp_port}-:7778",
+        "-netdev", netdev,
         "-device", "virtio-net-device,netdev=n0,mac=52:54:00:12:34:56",
         # the entropy device the random service seeds from (S9 step 5)
         "-object", "rng-random,filename=/dev/urandom,id=rng0",
@@ -846,7 +920,9 @@ def run(kernel: str, extra=()):
             "-device", "virtio-blk-device,drive=hd1",
             "-drive", f"file={scratch_disk()},if=none,format=raw,id=hd0",
             "-device", "virtio-blk-device,drive=hd0"]),
-        *(["-append", "bench=full"] if os.environ.get("OS_BENCH_FULL") == "1" else []),
+        *(["-append", " ".join(a for a in ("bench=full" if os.environ.get("OS_BENCH_FULL") == "1" else "",
+                                           "net=lossy" if os.environ.get("OS_NET_LOSSY") else "") if a)]
+          if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") else []),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;
@@ -857,7 +933,10 @@ def run(kernel: str, extra=()):
     if os.environ.get("OS_PROFILE"):
         out, status, timed_out = run_profiled(cmd, kernel)
     else:
-        out, status, timed_out = run_streaming(cmd)
+        try:
+            out, status, timed_out = run_streaming(cmd)
+        finally:
+            lossy_stop()
     text = out.decode("utf-8", errors="replace").replace("\r\n", "\n")
     return [l for l in text.split("\n") if l.startswith("##")], status, timed_out, text
 
@@ -988,7 +1067,7 @@ def main() -> int:
         if len(sys.argv) not in (2, 3, 4):
             print(__doc__, file=sys.stderr)
             return 2
-        runs = [(sys.argv[1], False, None, "kernel")]
+        runs = [(sys.argv[1], False, LOSSY_REQUIRED if os.environ.get("OS_NET_LOSSY") else None, "kernel")]
         if len(sys.argv) >= 3:
             runs.append((sys.argv[2], True, None, "fail-demo kernel (must be detected as failing)"))
         if len(sys.argv) == 4:
@@ -1009,25 +1088,27 @@ def main() -> int:
         want_harts = int(os.environ.get("OS_SMP", "1"))
         if want_harts > 1 and f"harts online: {want_harts}" not in text.split("\n"):
             found.append(f"the kernel did not report 'harts online: {want_harts}'")
+        # (the lossy mode runs only the bulk TCP tests: the checks for the other tests would fail by design)
+        strict = not expect_fail and not os.environ.get("OS_NET_LOSSY")
         # The interrupt controller the kernel found must be the one the machine has (S6a-2): a PLIC on
         # the default board, the AIA (APLIC + IMSIC, OD75) on the aia machine. Otherwise the interrupt-object test
         # could pass by skipping.
         aia = "aia" in os.environ.get("OS_MACHINE", DEFAULT_MACHINE)
         want_ic = "interrupt controller: AIA" if aia else "interrupt controller: none"
-        if not expect_fail and want_ic not in text.split("\n"):
+        if strict and want_ic not in text.split("\n"):
             found.append(f"the kernel did not report '{want_ic}'")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (not expect_fail and os.environ.get("OS_DISK") != "0" and aia
+        if (strict and os.environ.get("OS_DISK") != "0" and aia
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
         # The block-driver tests must have found the disk and run (with interrupts on both machines, OD75).
-        if (not expect_fail and os.environ.get("OS_DISK") != "0"
+        if (strict and os.environ.get("OS_DISK") != "0"
                 and f"s6: blkd exercised ({'interrupts' if aia else 'polling'})" not in text):
             found.append("the block-driver tests did not run in the expected mode "
                          f"({'interrupts' if aia else 'polling'})")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if not expect_fail and aia and os.environ.get("OS_DISK") != "0":
+        if strict and aia and os.environ.get("OS_DISK") != "0":
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")
@@ -1038,11 +1119,11 @@ def main() -> int:
                                  f"misrouted {mis} (harts {want_harts})")
         # The disk, looked at from the host once the guest is gone (only when the guest ran the
         # block-driver tests to the end; a timed-out or failing run leaves it half written).
-        if (not expect_fail and not found and os.environ.get("OS_DISK") != "0"
+        if (strict and not found and os.environ.get("OS_DISK") != "0"
                 and LAST_DISK[0]):
             found += check_disk(LAST_DISK[0])
         # The device manager found the disk (or, with OS_DISK=0, found none and started nothing).
-        if not expect_fail:
+        if strict:
             want_dm = ("s6: devmgr: no block device" if os.environ.get("OS_DISK") == "0"
                        else "s6: devmgr found the disk")
             if want_dm not in text:
@@ -1053,6 +1134,7 @@ def main() -> int:
         # The C library (S7c): the guest's transcript must equal the same C program run on the host.
         if not expect_fail:
             found += net_problems(text)
+        if strict:
             found += c_transcript_problems(text)
             found += lua_transcript_problems(text)
         if found:

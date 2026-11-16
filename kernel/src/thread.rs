@@ -775,6 +775,8 @@ pub fn wake_stat(which: u64) -> u64 {
         // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
         8 => crate::latency::irq_off_max().0,
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
+        // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
+        9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
         _ => 0,
     }
 }

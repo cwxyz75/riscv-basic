@@ -215,6 +215,17 @@ os-bench: kernel-main
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
 
+# S9 Q30 (soak tier): the bulk TCP tests (fetch, httpd, echo) with the guest's network behind the lossy relay
+# (scripts/net_lossy_relay.py: loss 2%, duplication 1%, reordering 5%, delay 5 ms on TCP frames) for each seed, at two and four
+# harts. LOSSY_SEEDS is a list ("1 2 3 ... 20" for the full run). The capture is checked as ever.
+LOSSY_SEEDS ?= 1 2 3
+os-boot-test-lossy: kernel-main
+	python3 scripts/net_lossy_relay.py --selftest
+	for smp in 2 4; do for seed in $(LOSSY_SEEDS); do \
+	  echo "lossy relay: seed $$seed at -smp $$smp"; \
+	  OS_SMP=$$smp OS_NET_LOSSY=$$seed python3 scripts/os_boot_test.py $(OS_ELF) || exit 1; \
+	done; done
+
 # The latency trace (slice B task 2; soak tier): a kernel built with `latency-trace` runs the suite at four harts and
 # prints the longest interrupts-off span (with its site) and the big-lock holds and waits per syscall; the test
 # `the_latency_trace_can_see_a_long_section` proves the instrumentation sees a 5 ms section within 20%.
@@ -297,7 +308,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required; run it on demand,
 # on a label, nightly (CI), and before a release. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
