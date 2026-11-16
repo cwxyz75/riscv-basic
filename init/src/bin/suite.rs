@@ -8542,6 +8542,18 @@ fn open_volume(root: &mut Fs, name: &[u8], rights: u32) -> Result<Fs, Detail> {
     }
 }
 
+/// Kills a job when it goes out of scope, so a test that fails part way does not leave services running on the disk for the
+/// next test (a failure then cascades).
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let _ = sys::job_kill(self.0, -1);
+        }
+    }
+}
+
 fn volmgr_serves_volumes_by_the_table() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
     let have_disk = match find_blk(res)? {
@@ -8573,6 +8585,7 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     let hex = b"vol-uuid-6673642d73756974652d766f6c756d65";
     // ---- the first run: device 0 is not a volume (ignored), device 1 is, named `data` by the table
     let (mut reg, mj) = start_volmgr_rig(res, bi)?;
+    let mut guard1 = KillOnDrop(mj);
     let mut data = open_volume(&mut reg, b"vol-store", RW_DIR)?;
     ensure_eq!(
         data.mkdir(b"kept"),
@@ -8651,8 +8664,10 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     reg.close();
     ok(sys::job_kill(mj, -1), "kill the first rig")?;
     job_use_settles(mj, 0, 0, 5000)?;
+    guard1.0 = 0;
     sys::handle_close(mj);
     let (mut reg, mj) = start_volmgr_rig(res, bi)?;
+    let mut guard2 = KillOnDrop(mj);
     let mut data = open_volume(&mut reg, b"vol-store", RO_DIR)?;
     let mut f = data
         .open(b"kept/note", 0, prt::READ)
@@ -8667,6 +8682,7 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
     reg.close();
     ok(sys::job_kill(mj, -1), "kill the second rig")?;
     job_use_settles(mj, 0, 0, 5000)?;
+    guard2.0 = 0;
     sys::handle_close(mj);
     sys::handle_close(res);
     sys::debug_write(b"fs: volmgr served the volume by the table and after a restart\n");
@@ -8691,6 +8707,7 @@ fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
         return Ok(());
     }
     let (mgr_ch, mgr, mj) = start_devmgr_in_job(res)?;
+    let mut guard = KillOnDrop(mj);
     let blk = open_disk(mgr_ch, 1, 1)?;
     {
         let mut dev = rt::blk::BlkDevice::open(blk).ok_or_else(|| msg_at(line!()))?;
@@ -8820,6 +8837,7 @@ fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
     wait_ended(mgr, 3000)?;
     sys::handle_close(mgr);
     job_use_settles(mj, 0, 0, 3000)?;
+    guard.0 = 0;
     sys::handle_close(mj);
     sys::handle_close(res);
     Ok(())

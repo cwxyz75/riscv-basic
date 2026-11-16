@@ -134,6 +134,14 @@ fn start(
         ));
         published.push((name.clone(), theirs));
     }
+    // the server writes a byte here once it has mounted the volume; its exit first closes it
+    let rc = sys::channel_create();
+    if rc.status != 0 {
+        return false;
+    }
+    let (ready_mine, ready_theirs) = (rc.a1 as u32, rc.a2 as u32);
+    handles.push(ready_theirs);
+    roles.push((Role::Ready, handles.len() as u32 - 1));
     let mut args: Vec<Vec<u8>> = alloc::vec![b"fsd".to_vec()];
     if v.readonly {
         args.push(b"ro".to_vec());
@@ -153,6 +161,27 @@ fn start(
         return false;
     };
     v.proc = Some(p);
+    // wait until the server is ready (or gone): a name published before that would hand clients a connection to a server that
+    // may then exit (a mount that fails)
+    let w = sys::object_wait(
+        ready_mine,
+        signals::READABLE | signals::PEER_CLOSED,
+        sys::clock_get() + 15_000,
+    );
+    let mut b = [0u8; 1];
+    let got = w.status == 0
+        && sys::channel_read(ready_mine, b.as_mut_ptr(), 1, core::ptr::null_mut(), 0).status == 0;
+    sys::handle_close(ready_mine);
+    if !got {
+        say!(
+            "volmgr: the volume server for {} did not come up",
+            v.uuid_hex
+        );
+        sys::process_kill(p, -1);
+        sys::handle_close(p);
+        v.proc = None;
+        return false;
+    }
     // (after a restart the old listeners closed with the old server and the registry has marked the names stale, which the
     // caller waited for: a publish replaces a stale name; a publish that fails closes the listener, so the server is useless)
     for (name, theirs) in published {
@@ -295,24 +324,29 @@ pub fn app_main() -> i32 {
         if let Some(old) = v.proc.take() {
             sys::handle_close(old);
         }
-        if v.restarts >= MAX_RESTARTS {
-            say!("volmgr: volume {} keeps failing: left down", v.uuid_hex);
-            continue;
-        }
-        v.restarts += 1;
-        // let the registry notice the old listeners closed, so that the names are stale and can be published again
-        let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 200);
-        say!(
-            "volmgr: volume {} ended: restart {}",
-            v.uuid_hex,
-            v.restarts
-        );
-        let Some((devmgr::Status::Ok, Some(ch))) = open_block_retry(dm, &mut txid, v.device) else {
-            continue;
-        };
-        if start(v, ch, &fsd_image, &mut reg, &mut clock_view) {
-            if let Some(pr) = v.proc {
-                sys::port_bind(port, pr, signals::TERMINATED, i as u64);
+        // restart it, retrying (a start can fail: the old driver still winding down, a mount that did not work yet)
+        loop {
+            if v.restarts >= MAX_RESTARTS {
+                say!("volmgr: volume {} keeps failing: left down", v.uuid_hex);
+                break;
+            }
+            v.restarts += 1;
+            say!(
+                "volmgr: volume {} ended: restart {}",
+                v.uuid_hex,
+                v.restarts
+            );
+            // let the registry notice the old listeners closed, so that the names are stale and can be published again
+            let _ = sys::object_wait(dm, 1 << 24, sys::clock_get() + 200);
+            let Some((devmgr::Status::Ok, Some(ch))) = open_block_retry(dm, &mut txid, v.device)
+            else {
+                continue;
+            };
+            if start(v, ch, &fsd_image, &mut reg, &mut clock_view) {
+                if let Some(pr) = v.proc {
+                    sys::port_bind(port, pr, signals::TERMINATED, i as u64);
+                }
+                break;
             }
         }
     }

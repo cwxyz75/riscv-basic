@@ -80,6 +80,9 @@ pub enum Role {
     TmpDir = 34,
     /// A connection to the `/dev` server's root (UV2).
     DevDir = 35,
+    /// A channel a volume server writes one byte to once it has mounted its volume and is ready to serve (`volmgr` publishes
+    /// the volume's names only then; a server that exits first closes it).
+    Ready = 36,
 }
 
 impl Role {
@@ -120,6 +123,7 @@ impl Role {
             33 => Role::ServiceListenerAlt,
             34 => Role::TmpDir,
             35 => Role::DevDir,
+            36 => Role::Ready,
             _ => return None,
         })
     }
