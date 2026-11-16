@@ -96,10 +96,12 @@ pub enum Deq {
     Gone,
 }
 
-/// One deque per level and a 64-bit occupancy mask (best level in one instruction).
+/// One deque per level and a 64-bit occupancy mask (best level in one instruction), and an index from thread to level so
+/// that `contains` is a lookup and `remove` touches one level.
 pub struct PrioQueues {
     levels: Vec<VecDeque<Tid>>,
     mask: u64,
+    at: BTreeMap<Tid, Prio>,
 }
 
 impl Default for PrioQueues {
@@ -113,15 +115,18 @@ impl PrioQueues {
         PrioQueues {
             levels: (0..=PRIO_MAX as usize).map(|_| VecDeque::new()).collect(),
             mask: 0,
+            at: BTreeMap::new(),
         }
     }
     pub fn push_back(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_back(t);
         self.mask |= 1 << p;
+        self.at.insert(t, p);
     }
     pub fn push_front(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_front(t);
         self.mask |= 1 << p;
+        self.at.insert(t, p);
     }
     /// The best queued level.
     pub fn top(&self) -> Option<Prio> {
@@ -133,19 +138,23 @@ impl PrioQueues {
         if self.levels[p as usize].is_empty() {
             self.mask &= !(1 << p);
         }
+        if let Some(t) = t {
+            self.at.remove(&t);
+        }
         t
     }
     pub fn remove(&mut self, t: Tid) -> bool {
-        for p in 0..=PRIO_MAX as usize {
-            if let Some(i) = self.levels[p].iter().position(|&x| x == t) {
-                self.levels[p].remove(i);
-                if self.levels[p].is_empty() {
-                    self.mask &= !(1 << p);
-                }
-                return true;
-            }
+        let Some(p) = self.at.remove(&t) else {
+            return false;
+        };
+        let level = &mut self.levels[p as usize];
+        if let Some(i) = level.iter().position(|&x| x == t) {
+            level.remove(i);
         }
-        false
+        if level.is_empty() {
+            self.mask &= !(1 << p);
+        }
+        true
     }
     pub fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
         (0..=PRIO_MAX).rev().find_map(|p| {
@@ -156,10 +165,10 @@ impl PrioQueues {
         })
     }
     pub fn contains(&self, t: Tid) -> bool {
-        self.levels.iter().any(|l| l.contains(&t))
+        self.at.contains_key(&t)
     }
     pub fn len(&self) -> usize {
-        self.levels.iter().map(VecDeque::len).sum()
+        self.at.len()
     }
     pub fn is_empty(&self) -> bool {
         self.mask == 0
