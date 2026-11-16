@@ -71,6 +71,11 @@ fn err_status(e: Error, name_len: usize) -> i32 {
         Error::ReadOnly => Status::AccessDenied.code(),
         Error::BadName if name_len > file::MAX_COMPONENT => status::NAME_TOO_LONG,
         Error::BadName | Error::BadRange | Error::Invalid => status::BAD_REQUEST,
+        // (attributes, indexes, queries and symlinks arrive with the server step; the statuses are defined, nothing sends them yet)
+        Error::NoAttr => status::NO_ATTR,
+        Error::NoIndex => status::NO_INDEX,
+        Error::BadValue => status::BAD_VALUE,
+        Error::BadTarget => status::BAD_TARGET,
     }
 }
 

@@ -65,13 +65,32 @@ pub mod op {
     pub const SETSIZE: u16 = 13;
     pub const FSTAT: u16 = 14;
     pub const GETVMO: u16 = 15;
+    // Attributes, indexes, queries and symlinks (FS-SPEC 9.1). A server that does not support them answers NOT_SUPPORTED.
+    /// Set (replace) an attribute of the connection's node: `payload` is `ty:u8, name_len:u16, name, value`.
+    pub const ATTR_SET: u16 = 20;
+    /// `payload` is the name; the reply's `a` is the type and its payload the value.
+    pub const ATTR_GET: u16 = 21;
+    /// `payload` is the name.
+    pub const ATTR_REMOVE: u16 = 22;
+    /// `payload` is the name to continue after (empty: from the start); the reply is names as `len:u16, name`, and `a` is 1
+    /// if there are more.
+    pub const ATTR_LIST: u16 = 23;
+    /// Create and back-fill an index (right `INDEX` is not yet defined; the server decides): `payload` is `ty:u8, name`.
+    pub const MAKE_INDEX: u16 = 24;
+    /// Query below the directory connection (needs `ENUMERATE`): see [`super::Query`].
+    pub const QUERY: u16 = 25;
+    /// Create a symlink (needs `CREATE`): `a` is the length of the path, the payload is the path then the target.
+    pub const SYMLINK: u16 = 26;
+    /// `payload` is a path; the reply payload is the link's target.
+    pub const READLINK: u16 = 27;
 
     /// How many handles a request with this op carries (`None`: unknown op).
     pub fn handles(op: u16) -> Option<usize> {
         match op {
             OPEN | CLONE | ACCOUNT | PUBLISH | VIEW => Some(1),
             READDIR | MKDIR | UNLINK | RENAME | STAT | READ | WRITE | GETSIZE | SETSIZE | FSTAT
-            | GETVMO | UNPUBLISH => Some(0),
+            | GETVMO | UNPUBLISH | ATTR_SET | ATTR_GET | ATTR_REMOVE | ATTR_LIST | MAKE_INDEX
+            | QUERY | SYMLINK | READLINK => Some(0),
             _ => None,
         }
     }
@@ -81,7 +100,18 @@ pub mod op {
     pub fn is_directory_op(op: u16) -> bool {
         matches!(
             op,
-            OPEN | READDIR | MKDIR | UNLINK | RENAME | STAT | PUBLISH | UNPUBLISH | VIEW
+            OPEN | READDIR
+                | MKDIR
+                | UNLINK
+                | RENAME
+                | STAT
+                | PUBLISH
+                | UNPUBLISH
+                | VIEW
+                | MAKE_INDEX
+                | QUERY
+                | SYMLINK
+                | READLINK
         )
     }
 }
@@ -100,6 +130,14 @@ pub mod status {
     /// The service behind a published name is gone (its listener closed): try again later. Never says that a
     /// name exists to a connection whose view hides it.
     pub const UNAVAILABLE: i32 = -109;
+    /// No attribute of that name (FS-SPEC 9.1).
+    pub const NO_ATTR: i32 = -110;
+    /// No index of that name.
+    pub const NO_INDEX: i32 = -111;
+    /// An attribute value or query term that does not fit its type, or is too long.
+    pub const BAD_VALUE: i32 = -112;
+    /// A symlink target that is malformed, absolute, or could climb above the connection root.
+    pub const BAD_TARGET: i32 = -113;
 }
 
 /// A request, borrowing its payload.
@@ -248,6 +286,39 @@ pub fn valid_name(n: &[u8]) -> Result<(), PathError> {
     Ok(())
 }
 
+/// Longest symlink target.
+pub const MAX_LINK_TARGET: usize = 1024;
+
+/// Check a symlink target (FS-SPEC 9.1): 1 to 1024 bytes, no NUL, not absolute, components separated by single `/` with none
+/// empty, each a valid name, `.` or `..`; and, counting a name as one level down and `..` as one up from the link's directory
+/// (`depth` levels below the connection root it is created through), never above the root. The same rule is the client's
+/// guard when it resolves a link it finds: a target that fails it is not followed.
+pub fn check_link_target(target: &[u8], depth: usize) -> Result<(), PathError> {
+    if target.is_empty() || target.len() > MAX_LINK_TARGET || target.contains(&0) {
+        return Err(PathError::Malformed);
+    }
+    if target[0] == b'/' {
+        return Err(PathError::Malformed);
+    }
+    let mut level = depth as i64;
+    for c in target.split(|&b| b == b'/') {
+        match c {
+            b"." => {}
+            b".." => {
+                level -= 1;
+                if level < 0 {
+                    return Err(PathError::Dots);
+                }
+            }
+            _ => {
+                valid_name(c)?;
+                level += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Split a relative path into validated components. `..` can never appear, so a directory
 /// connection is a sandbox boundary. An *empty* path is `Malformed` here: the server treats an
 /// empty `Open` path as `Clone` (S4-SPEC section 7) before calling this.
@@ -314,4 +385,225 @@ pub fn decode_entries(b: &[u8]) -> Result<Vec<DirEntry>, FrameError> {
         at += 3 + n;
     }
     Ok(out)
+}
+
+// -------------------------------------------------------------------------------- attributes, queries (FS-SPEC 9.1)
+
+fn put16(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+fn get16<'a>(b: &'a [u8], at: &mut usize) -> Result<&'a [u8], FrameError> {
+    let n = rd_u16(b, *at).ok_or(FrameError::TooShort)? as usize;
+    let v = b.get(*at + 2..*at + 2 + n).ok_or(FrameError::BadLength)?;
+    *at += 2 + n;
+    Ok(v)
+}
+
+/// `ATTR_SET`'s payload: `ty:u8, name_len:u16, name, value`.
+pub fn encode_attr_set(ty: u8, name: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + name.len() + value.len());
+    out.push(ty);
+    put16(&mut out, name);
+    out.extend_from_slice(value);
+    out
+}
+
+pub fn decode_attr_set(b: &[u8]) -> Result<(u8, &[u8], &[u8]), FrameError> {
+    let ty = *b.first().ok_or(FrameError::TooShort)?;
+    let mut at = 1;
+    let name = get16(b, &mut at)?;
+    Ok((ty, name, &b[at..]))
+}
+
+/// `MAKE_INDEX`'s payload: `ty:u8, name`.
+pub fn encode_make_index(ty: u8, name: &[u8]) -> Vec<u8> {
+    let mut out = alloc::vec![ty];
+    out.extend_from_slice(name);
+    out
+}
+
+pub fn decode_make_index(b: &[u8]) -> Result<(u8, &[u8]), FrameError> {
+    let ty = *b.first().ok_or(FrameError::TooShort)?;
+    Ok((ty, &b[1..]))
+}
+
+/// Pack names as `len:u16, name`, stopping before `max` bytes; returns the bytes and how many fit (`ATTR_LIST`'s reply).
+pub fn encode_names(names: &[Vec<u8>], max: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut n = 0;
+    for name in names {
+        if out.len() + 2 + name.len() > max {
+            break;
+        }
+        put16(&mut out, name);
+        n += 1;
+    }
+    (out, n)
+}
+
+pub fn decode_names(b: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at < b.len() {
+        out.push(get16(b, &mut at)?.to_vec());
+    }
+    Ok(out)
+}
+
+/// A query's term on an index key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm<'a> {
+    Eq(&'a [u8]),
+    /// Lower bound inclusive, upper bound exclusive, either optional.
+    Range {
+        lo: Option<&'a [u8]>,
+        hi: Option<&'a [u8]>,
+    },
+}
+
+/// `QUERY`: the request's `a` is `max`, its `b` the flags below, its payload the fields in order. Flags: bit 0 `Eq` (else a
+/// range), bit 1 has `lo` (or the `Eq` value is always present), bit 2 has `hi`, bit 3 has `after`. Fields: `index` (`len:u16,
+/// bytes`), then the `Eq` value, or `lo` if present and `hi` if present (each `len:u16, bytes`), then `after` if present (`key`
+/// as `len:u16, bytes`, then the node id as `u32`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query<'a> {
+    pub index: &'a [u8],
+    pub term: QueryTerm<'a>,
+    pub after: Option<(&'a [u8], u32)>,
+    pub max: u64,
+}
+
+pub mod query_flags {
+    pub const EQ: u64 = 1;
+    pub const LO: u64 = 2;
+    pub const HI: u64 = 4;
+    pub const AFTER: u64 = 8;
+    pub const ALL: u64 = 15;
+}
+
+impl Query<'_> {
+    /// `(b, payload)` of the request (`a` is `max`).
+    pub fn encode(&self) -> (u64, Vec<u8>) {
+        let mut flags = 0;
+        let mut out = Vec::new();
+        put16(&mut out, self.index);
+        match &self.term {
+            QueryTerm::Eq(v) => {
+                flags |= query_flags::EQ;
+                put16(&mut out, v);
+            }
+            QueryTerm::Range { lo, hi } => {
+                if let Some(l) = lo {
+                    flags |= query_flags::LO;
+                    put16(&mut out, l);
+                }
+                if let Some(h) = hi {
+                    flags |= query_flags::HI;
+                    put16(&mut out, h);
+                }
+            }
+        }
+        if let Some((k, id)) = self.after {
+            flags |= query_flags::AFTER;
+            put16(&mut out, k);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        (flags, out)
+    }
+}
+
+pub fn decode_query(max: u64, flags: u64, b: &[u8]) -> Result<Query<'_>, FrameError> {
+    if flags & !query_flags::ALL != 0
+        || (flags & query_flags::EQ != 0 && flags & (query_flags::LO | query_flags::HI) != 0)
+    {
+        return Err(FrameError::BadBits);
+    }
+    let mut at = 0;
+    let index = get16(b, &mut at)?;
+    let term = if flags & query_flags::EQ != 0 {
+        QueryTerm::Eq(get16(b, &mut at)?)
+    } else {
+        let lo = if flags & query_flags::LO != 0 {
+            Some(get16(b, &mut at)?)
+        } else {
+            None
+        };
+        let hi = if flags & query_flags::HI != 0 {
+            Some(get16(b, &mut at)?)
+        } else {
+            None
+        };
+        QueryTerm::Range { lo, hi }
+    };
+    let after = if flags & query_flags::AFTER != 0 {
+        let k = get16(b, &mut at)?;
+        let id = rd_u32(b, at).ok_or(FrameError::TooShort)?;
+        at += 4;
+        Some((k, id))
+    } else {
+        None
+    };
+    if at != b.len() {
+        return Err(FrameError::BadLength);
+    }
+    Ok(Query {
+        index,
+        term,
+        after,
+        max,
+    })
+}
+
+/// One `QUERY` result: `key_len:u16, key, id:u32, path_len:u16, path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryHit {
+    pub key: Vec<u8>,
+    pub id: u32,
+    pub path: Vec<u8>,
+}
+
+/// Pack hits, stopping before `max` bytes; returns the bytes and how many fit.
+pub fn encode_hits(hits: &[QueryHit], max: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut n = 0;
+    for h in hits {
+        if out.len() + 8 + h.key.len() + h.path.len() > max {
+            break;
+        }
+        put16(&mut out, &h.key);
+        out.extend_from_slice(&h.id.to_le_bytes());
+        put16(&mut out, &h.path);
+        n += 1;
+    }
+    (out, n)
+}
+
+pub fn decode_hits(b: &[u8]) -> Result<Vec<QueryHit>, FrameError> {
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at < b.len() {
+        let key = get16(b, &mut at)?.to_vec();
+        let id = rd_u32(b, at).ok_or(FrameError::TooShort)?;
+        at += 4;
+        let path = get16(b, &mut at)?.to_vec();
+        out.push(QueryHit { key, id, path });
+    }
+    Ok(out)
+}
+
+/// `SYMLINK`'s payload: the path then the target (the request's `a` is the path's length).
+pub fn encode_symlink(path: &[u8], target: &[u8]) -> (u64, Vec<u8>) {
+    let mut out = path.to_vec();
+    out.extend_from_slice(target);
+    (path.len() as u64, out)
+}
+
+pub fn decode_symlink(a: u64, b: &[u8]) -> Result<(&[u8], &[u8]), FrameError> {
+    let n = usize::try_from(a).map_err(|_| FrameError::BadLength)?;
+    if n > b.len() {
+        return Err(FrameError::BadLength);
+    }
+    Ok((&b[..n], &b[n..]))
 }

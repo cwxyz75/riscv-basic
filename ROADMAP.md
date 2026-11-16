@@ -687,7 +687,7 @@ disk, independent Fable review). The mount table is data, not a kernel object: a
 `/etc/mounts` (a mapping, uuid to local name) as `/svc/vol/<name>`, and granted to programs by a separate list (`/etc/trusted`,
 later the S10 manifest).
 
-- [ ] Step 0: attributes, indexes and `query` in `memfs` and `proto::file`
+- [x] Step 0 (2026-11-16): attributes, indexes and `query` in `memfs` and `proto::file`, plus symlinks (never followed, relative targets that cannot climb above the connection root) and modification times; the semantics are FS-SPEC 9.1; hand-derived scenarios, a random walk against an independent path-keyed model (60 seeds, 500 steps, queries compared with a brute-force evaluation), eight of ten hand mutations caught (the other two are equivalent), wire goldens and a no-panic sweep in `proto`. `memfsd` does not serve the new operations yet (TIDY-UP T109)
 - [ ] Step C1: wall clock service `clockd` (`/svc/clock`), RTC through `devmgr`, `clockmodel`
 - [ ] Steps 1 to 4: `fsfmt`, `mkfs`/`fsck`/`dump.doofs`, differential, crash harness
 - [ ] Steps 5a to 5f: discard and device info, SD step 4 (narrowed), `fsd`, `volmgr`, `/etc/mounts`, QEMU boot test

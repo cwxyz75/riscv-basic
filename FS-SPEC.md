@@ -161,6 +161,37 @@ C1. **Wall clock** (slice C): `clockmodel`, the RTC claim in `devmgr`, `clockd`,
 Attribute `Get`, `Set`, `Remove`, `List` (typed values: a type code plus bytes), `MakeIndex`, `Query`. A server that does not
 support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are normative in `proto`'s goldens, as for S4 (T27).
 
+### 9.1 The semantics step 0 fixes (normative for `memfs` and for `fsfmt`; the tests of step 0 are their written form)
+
+* **Attributes.** A node has named attributes: a name (1 to 255 bytes, no NUL, no `/`; `name`, `size` and `mtime` are reserved
+  for the built-in indexes) and a typed value of at most **1024 bytes**. Types: `0 Bytes`, `1 Text` (must be valid UTF-8),
+  `2 U64` (exactly 8 bytes, little-endian on the wire), `3 I64` (exactly 8 bytes). `Set` replaces; `Get` returns type and value;
+  `Remove`; `List` returns names in bytewise order. A read-only node refuses `Set` and `Remove` (`ReadOnly`); a missing
+  attribute is `NoAttr`; a bad type, length or UTF-8 is `BadValue`. Attribute bytes (name, value and a fixed overhead) are charged to
+  the metadata quota (`Quota`). Attributes do not change `mtime`.
+* **Time.** The server supplies a wall-clock nanosecond count (`set_time`); a node's `mtime` is the time of its last content
+  change: a file's `write` or `set_size`, a directory's entry created, removed or renamed in it; creation counts.
+* **Indexes.** `MakeIndex(name, type)` creates a volume-wide index on a user attribute and **back-fills** it; at most 16;
+  an existing index is `Exists`; the reserved names need none (always present: `name` Bytes, `size` U64, `mtime` U64). Values longer
+  than 255 bytes cannot be indexed: `MakeIndex` fails (`TooBig`, nothing changed) if one exists, and a later `Set` of such a value
+  on an indexed name fails the same way. A node whose attribute has a different type from the index is not in it.
+* **Key order.** `U64` big-endian; `I64` big-endian with the sign bit flipped (so signed order is bytewise); `Bytes` and `Text`
+  bytewise. The built-ins' sizes: a file's length, a directory's entry count, a symlink's target length.
+* **Query.** `Query(dir, index, term, after, max)` where `term` is `Eq(v)` or `Range{lo, hi}` (`lo` inclusive, `hi` exclusive,
+  either optional), on the encoded key. It returns the **live, linked nodes strictly below `dir`** (the directory itself and
+  nodes unlinked while open are never returned) whose key matches, ordered by `(key, node id)`, each with its path relative
+  to `dir` (components joined by `/`); strictly after the pair `after` when given; at most `min(max, 1000)`, with `more` true if
+  there were further matches. Querying an index that does not exist is `NoIndex`; a term that does not fit the index type is
+  `BadValue`. (On a server the caller needs `ENUMERATE` on the directory connection.)
+* **Symlinks.** A symlink node holds a target of 1 to 1024 bytes: no NUL, not starting with `/`, components separated by single
+  `/` with none empty, each a valid name, `.` or `..`. Creating one is refused (`BadTarget`) if its target could climb above
+  **the connection root it is created through**: walking the components from the link's directory, counting a name as one level
+  down and `..` as one up, the level may never go below that of the root (`depth` = how far below the root the link's
+  directory is). Neither the server nor `memfs` follows a link: `lookup` and `walk` return the link node; reading it gives the
+  target (`read_link`). `read` and `write` on a link are `Invalid`. A link is unlinked like a file and has no hard links.
+* **Wire.** Operations `ATTR_SET`, `ATTR_GET`, `ATTR_REMOVE`, `ATTR_LIST` (file or directory connections), `MAKE_INDEX`, `QUERY`,
+  `SYMLINK`, `READLINK` carry the encodings of `proto::file` (goldens in `proto/tests/wire.rs`).
+
 ## 10. Invariants (to add to INVARIANTS.md when built)
 
 * **FI1** The newest valid superblock slot always names a tree in which every block verifies, or mount fails closed.
