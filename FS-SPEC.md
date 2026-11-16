@@ -89,27 +89,32 @@ section 6, SD-SPEC), so "mounting" is **granting a connection at a prefix** in a
   superblock (doofs magic, version, checksum; other formats could be added later). It holds only block channels, no hardware
   authority: `devmgr` stays the one holder of the root resource. Probing treats the device as hostile: a bad magic, bad
   checksum or absurd geometry is logged and ignored, never fatal.
-* **Naming.** A doofs superblock carries a 16-byte **uuid** and a label (1 to 32 printable bytes, set by `mkfs.doofs`). For each
-  recognised volume `volmgr` starts one `fsd` holding only that device's block channel, a `clockd` connection and account
-  limits, supervised and restarted (a restart remounts from the newest valid superblock, which FI1 makes safe), and publishes
-  it in the registry as `/svc/vol/<label>`; a duplicate label is refused and logged (the uuid name `/svc/vol/by-uuid/<hex>`
-  is always published). `volls` lists them. While `fsd` is down, clients see `UNAVAILABLE` and retry (SD semantics).
-* **The table: `/etc/mounts`** (in the boot image, later also on a volume), one line per grant, read by the shell and launcher
-  when they build a program's startup namespace (and later the S10 manifest-driven shell, whose manifest it is a first version
-  of): `name-or-uuid  prefix  rights  [program or class]`, for example `data /data rw trusted`. Confined programs get nothing
-  unless a line names them; the rights are the connection's rights (they only shrink), and a subdirectory may be granted
-  instead of the volume root. The parser is a pure `no_std` crate (`mounts`) with host golden tests and a no-panic sweep.
+* **Naming: names come from the table, never from the disk.** A doofs superblock carries a 16-byte **uuid** and a label
+  (1 to 32 printable bytes, set by `mkfs.doofs`); the label is display text only (`volls`). For each recognised volume
+  `volmgr` starts one `fsd` holding only that device's block channel, a `clockd` connection and account limits, supervised
+  and restarted (a restart remounts from the newest valid superblock, which FI1 makes safe). It publishes the volume as
+  `/svc/vol/by-uuid/<hex>` always, and as `/svc/vol/<name>` **only if `/etc/mounts` maps that uuid to a name**; a volume the
+  table does not know has no name, so a disk cannot claim a name by calling itself `data`. A duplicate uuid (a cloned disk) is
+  refused and logged. While `fsd` is down, clients see `UNAVAILABLE` and retry (SD semantics).
+* **The mapping: `/etc/mounts`** (in the boot image, later also on a volume): one line per known volume, `uuid  name  [options]`,
+  for example `3f2a9c1e-...  data`; an option can name a subdirectory to publish instead of the root, or a read-only cap. It is
+  **a mapping from identity to a local name, nothing more**; it says nothing about who may use the volume. The parser is a pure
+  `no_std` crate (`mounts`) with host golden tests and a no-panic sweep.
+* **The grant: the manifest (a list).** Who gets which named volume, at which prefix and with which rights is the per-program
+  grant list: `/etc/trusted` entries today (a trusted program may be given `/data` from `/svc/vol/data`, rights only shrink),
+  the S10 manifest later. The shell and launcher read it when they build a program's startup namespace; a confined program
+  with no entry gets nothing. The two files differ in kind (a mapping and a list) and stay two; the manifest's format is S10's
+  design.
 * **What changes in SD:** SD step 4 stops being deferred: `volmgr` and `clockd` are the first non-network services that need
   the registry, the shell granting a `/svc` view, and `rt::fs` reconnecting on `UNAVAILABLE`. Narrow step 4 to what they need;
   moving `memfsd`, `launcher` and the older servers stays out.
 * **Boot order:** `init` starts `devmgr`, `registryd`, `clockd`, then `volmgr`; volumes appear as they are found. A test
-  attaches images with any labels in any order and expects them to appear.
+  attaches images in any order and expects each to appear under its uuid, and under its name where the table has one.
 * **Not in v1:** hot removal (a vanished device ends its `fsd` and the entry goes stale), partition tables or a volume manager
   proper (a doofs volume is a whole device from sector 0), formatting from inside the OS (the host tool does it), root on a
   volume (`/` stays the boot image), multi-volume filesystems.
-* **Open (owner):** whether a table line matches by label or pins the uuid (a swapped disk labelled `data` would be granted to
-  programs that expect the old one; recommend: match by label by default, pin the uuid with `uuid=` where it matters); whether
-  `/etc/mounts` and the S10 manifest are one file (recommend yes, extend one format).
+* **Decided (owner, 2026-11-15):** volumes are identified by uuid; the table maps uuid to a local name; grants are a separate
+  list. Label matching is not a mechanism, and a convenience rule like "any disk labelled X" would be an explicit line in the table.
 
 ## 7. Wall clock (proposal; the other half of Q11, entropy is done as OD108)
 
@@ -144,10 +149,10 @@ C1. **Wall clock** (slice C): `clockmodel`, the RTC claim in `devmgr`, `clockd`,
 5b. **SD step 4, narrowed:** the shell grants a `/svc` view, `rt::fs` reconnects on `UNAVAILABLE`, `volmgr` and `clockd` can
     publish. Its own PR (it touches `init`, the shell and the runtime).
 5c. **`fsd`** on the service runtime over one block channel, with the mount-time free-map rebuild and the clock connection.
-5d. **`volmgr`**: probing, one supervised `fsd` per recognised volume, `/svc/vol/<label>` and `by-uuid`, `volls`.
-5e. **The mount table**: the `mounts` crate, `/etc/mounts`, the shell and launcher grant volumes by it (a writable `/data`
+5d. **`volmgr`**: probing, one supervised `fsd` per recognised volume, `/svc/vol/by-uuid/<hex>` and `/svc/vol/<name>` from the table, `volls`.
+5e. **The mapping and the grants**: the `mounts` crate and `/etc/mounts` (uuid to name); the shell and launcher grant named volumes through `/etc/trusted` entries (a writable `/data`
     powerbox entry for trusted programs).
-5f. **QEMU**: the harness builds images with `mkfs.doofs` (labels chosen by the test, attached in any order), restarts `fsd`
+5f. **QEMU**: the harness builds images with `mkfs.doofs` (uuids and labels chosen by the test, attached in any order, with a table line per uuid), restarts `fsd`
     and the machine, and runs `fsck.doofs` on the images afterwards; `-smp 2` and `-smp 4`.
 6. Attributes, indexes and queries on disk; then the independent review of the whole slice (Fable, own PR).
 
@@ -190,14 +195,16 @@ support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are n
    a hostile writer in a shared directory plants `link -> ../secret` and `link -> /home/secret`, and a reader holding only that
    directory cannot reach the target by following either (the libc walk fails closed); a legal relative link resolves through
    the same connection, and one that loops is cut off with a bounded depth.
-10. **Discovery, nothing compiled in:** the harness attaches two doofs images with different labels, in either order, plus a
-    blank disk and an image of random bytes; both volumes appear as `/svc/vol/<label>` and under `by-uuid`, the junk is logged
-    and ignored, and `volmgr` survives; a program gets a volume only through a line in `/etc/mounts`, and with no line it gets
+10. **Discovery, nothing compiled in:** the harness attaches two doofs images (fresh uuids) in either order, plus a blank disk
+    and an image of random bytes; both appear under `/svc/vol/by-uuid/`, the one the table maps also appears as its name, the
+    junk is logged and ignored, and `volmgr` survives; a program gets a volume only through a grant entry, and with none it gets
     nothing.
+10b. **No name theft:** an image whose label is `data` but whose uuid the table does not map gets no `/svc/vol/data`; a second
+    image with the same uuid as a mapped one is refused and the first keeps its name.
 11. **Restart:** killing a volume's `fsd` makes its clients see `UNAVAILABLE`, then succeed after the supervised restart; the
     data is the last committed state; the other volume is unaffected.
 12. **Hostile superblock:** valid magic with a bad checksum, a geometry larger than the device, a label with control bytes and
-    a duplicate label are each refused without a panic, a hang or a leak (leak checks exact).
+    a duplicate uuid are each refused without a panic, a hang or a leak (leak checks exact).
 13. **Clock:** with a fixed QEMU base, `Now` is within a stated tolerance of it and never goes backwards for one client across a
     re-read; with no RTC attached the quality is `Unset`; files written through `fsd` carry the clock's time.
 
@@ -220,4 +227,4 @@ amplification under an `fsync` loop; full-volume behaviour; a shared misreading 
 ## 15. Open points
 
 Whether the commit interval is time or dirty-size driven first; whether `proto::blk` FUA is worth having if flush is trusted
-anyway; the exact `INDEX` right name and where it is granted; whether step 0 should be its own PR (recommended: yes); the two open questions in section 6 (label versus pinned uuid; one file for `/etc/mounts` and the S10 manifest); the goldfish RTC facts (section 7) are from memory.
+anyway; the exact `INDEX` right name and where it is granted; whether step 0 should be its own PR (recommended: yes); the manifest's format (S10); the goldfish RTC facts (section 7) are from memory.
