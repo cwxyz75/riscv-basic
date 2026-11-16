@@ -1,6 +1,9 @@
 //! The console server (S4d, S4-SPEC section 8): owns the serial socket, runs the line
 //! discipline (`proto::tty`, over `console::LineEditor`) and serves one terminal session.
 //!
+//! Terminal modes, the window size and events (USER-VIEW-SPEC section 9, step UV4): the owner on the control channel
+//! sets the mode and size and gets `Interrupt`, `Hangup` and `Resize` events pushed to it (`proto::console`).
+//!
 //! Handles: `Serial` (the serial socket), `Tty` (the session's socket: the client's bytes go
 //! to the serial line, lines come back), `ServiceConsole` (the control channel on which the
 //! shell registers the foreground job). Authority beyond the three: `KILL|WAIT|TRANSFER`
@@ -30,6 +33,9 @@ const KILLED: i32 = -130;
 const OUT_CAP: usize = 16 * 1024;
 const DELIVER_CAP: usize = 4 * 1024;
 
+/// How long a size query waits for the host terminal's report.
+const QUERY_MS: u64 = 2000;
+
 const K_SERIAL: u64 = 1;
 const K_SERIAL_W: u64 = 2;
 const K_TTY: u64 = 3;
@@ -52,6 +58,8 @@ struct Console {
     tty_w_bound: bool,
     /// A write failed for lack of kernel memory: retry on a timer, not on a signal.
     retry: bool,
+    /// When the pending size query gives up.
+    query_deadline: Option<u64>,
 }
 
 impl Console {
@@ -163,9 +171,7 @@ impl Console {
         match r.status() {
             Some(Status::Ok) => {
                 let input = self.tty.serial_in(&buf[..r.a1]);
-                if input.kill {
-                    self.kill_jobs();
-                }
+                self.after_input(&input);
                 if self.deliver.len() + input.deliver.len() <= DELIVER_CAP {
                     self.deliver.extend_from_slice(&input.deliver);
                 } else {
@@ -174,7 +180,45 @@ impl Console {
                 true
             }
             Some(Status::ShouldWait) => true,
-            _ => false, // the serial line is gone (PEER_CLOSED) or broken
+            _ => {
+                // the serial line is gone (PEER_CLOSED) or broken: the owner is told before the session ends
+                self.event(ctl::Event::Hangup);
+                false
+            }
+        }
+    }
+
+    /// What a chunk of input asks of the jobs and the owner.
+    fn after_input(&mut self, input: &proto::tty::Input) {
+        if input.kill {
+            self.kill_jobs();
+        }
+        if input.interrupt {
+            self.event(ctl::Event::Interrupt);
+        }
+        if let Some((cols, rows)) = input.resized {
+            self.query_deadline = None;
+            self.event(ctl::Event::Resize { cols, rows });
+        }
+    }
+
+    /// Push an event to the owner (best effort: a full or dead channel loses it).
+    fn event(&self, e: ctl::Event) {
+        if let Some(ch) = self.ctl_ch {
+            let bytes = ctl::encode_event(e);
+            sys::channel_write(ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
+        }
+    }
+
+    /// The size query got no answer: what was held is ordinary input after all.
+    fn query_timed_out(&mut self) {
+        self.query_deadline = None;
+        let input = self.tty.cancel_query();
+        self.after_input(&input);
+        if self.deliver.len() + input.deliver.len() <= DELIVER_CAP {
+            self.deliver.extend_from_slice(&input.deliver);
+        } else {
+            self.lost_input += input.deliver.len() as u64;
         }
     }
 
@@ -194,6 +238,11 @@ impl Console {
     fn reply(&self, ch: u32, txid: u32, status: i32) {
         let bytes = ctl::encode_reply(txid, status);
         // (a full or dead channel loses the reply; the client's call then fails: its problem)
+        sys::channel_write(ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
+    }
+
+    fn reply_value(&self, ch: u32, txid: u32, value: u32) {
+        let bytes = ctl::encode_reply_value(txid, 0, value);
         sys::channel_write(ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
     }
 
@@ -229,6 +278,24 @@ impl Console {
                 self.clear_jobs();
                 self.reply(ch, txid, 0);
             }
+            Ok((txid, Control::SetMode(m))) => {
+                self.tty.set_mode(m);
+                self.reply(ch, txid, 0);
+            }
+            Ok((txid, Control::GetMode)) => self.reply_value(ch, txid, u32::from(self.tty.mode())),
+            Ok((txid, Control::SetSize { cols, rows })) => {
+                self.tty.set_size(cols, rows);
+                self.reply(ch, txid, 0);
+            }
+            Ok((txid, Control::GetSize)) => {
+                let (cols, rows) = self.tty.size();
+                self.reply_value(ch, txid, u32::from(cols) | u32::from(rows) << 16);
+            }
+            Ok((txid, Control::QuerySize)) => {
+                self.tty.query_size();
+                self.query_deadline = Some(sys::clock_get() + QUERY_MS);
+                self.reply(ch, txid, 0);
+            }
             Err(_) => {
                 for &h in hs {
                     sys::handle_close(h);
@@ -245,6 +312,8 @@ impl Console {
             sys::handle_close(ch);
         }
         self.clear_jobs();
+        // nobody owns the terminal any more: back to the plain line discipline
+        self.tty.set_mode(proto::console::mode::COOKED);
     }
 
     /// Best effort at the end of the session: let the serial line take what is queued.
@@ -293,16 +362,20 @@ pub fn app_main() -> i32 {
         serial_w_bound: false,
         tty_w_bound: false,
         retry: false,
+        query_deadline: None,
     };
     c.bind(K_SERIAL, serial, signals::READABLE | signals::PEER_CLOSED);
     c.bind(K_TTY, tty_sock, signals::READABLE | signals::PEER_CLOSED);
     c.bind(K_CTL, ctl_ch, signals::READABLE | signals::PEER_CLOSED);
     loop {
-        let deadline = if c.retry {
+        let mut deadline = if c.retry {
             sys::clock_get() + 10
         } else {
             u64::MAX
         };
+        if let Some(q) = c.query_deadline {
+            deadline = deadline.min(q);
+        }
         let r = sys::port_wait(c.port, deadline);
         let alive = match r.status() {
             Some(Status::Ok) => {
@@ -322,7 +395,12 @@ pub fn app_main() -> i32 {
                     _ => observed & signals::PEER_CLOSED == 0,
                 }
             }
-            Some(Status::TimedOut) => true,
+            Some(Status::TimedOut) => {
+                if c.query_deadline.is_some_and(|q| sys::clock_get() >= q) {
+                    c.query_timed_out();
+                }
+                true
+            }
             _ => return 5,
         };
         if !alive {

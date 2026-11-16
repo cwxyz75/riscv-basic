@@ -91,6 +91,29 @@ def main():
     # the client wrote 500000 'f' and one '\n' (-> CR LF); every byte is shown or dropped
     if len(rest) + dropped != 500000 + 2:
         fail(s, f"accounting: shown {len(rest)} + dropped {dropped} != 500002")
+    # UV4: terminal modes, size and events. Expectations are derived from the spec (USER-VIEW-SPEC section 9):
+    # raw delivers every byte as it arrives with no echo (so editing keys and escape sequences are data, Ctrl-C too)
+    s.step(b"raw\n", [b"raw", b"mode: raw"], "entering raw mode")
+    s.step(b"a\x7f\x1b[A\x04\x03\x15", [b"raw: 61", b"raw: 7f", b"raw: 1b", b"raw: 5b", b"raw: 41",
+                                          b"raw: 04", b"raw: 03", b"raw: 15"], "raw bytes, unechoed")
+    s.step(b"q", [b"size: 80x24", b"mode: 0", b"mode: cooked"], "leaving raw mode, default size")
+    s.step(b"back\n", [b"back", b"got: back"], "cooked behaviour is back")
+    # cbreak echoes; Ctrl-C is an event (no byte), not a delivered 0x03
+    s.step(b"cbreak\n", [b"cbreak", b"mode: cbreak"], "entering cbreak mode")
+    s.step(b"\x03", [b"^C", b"event: interrupt"], "an interrupt event")
+    s.step(b"a\r", [b"a", b"raw: 61", b"size: 80x24", b"mode: 6", b"mode: cooked"], "cbreak echo and bytes")
+    # the window size: set it, read it back
+    s.step(b"resize\n", [b"resize", b"size: 100x30"], "setting the window size")
+    # the host terminal is asked (the probe is on the wire), and its report is an event, never input
+    probe = b"\x1b7\x1b[999;999H\x1b[6n\x1b8"
+    s.step(b"size\n", [b"size", probe + b"size: asked"], "the size query")
+    s.step(b"\x1b[40;132R", [b"event: resize 132x40"], "the size report")
+    s.step(b"q", [b"size: 132x40", b"mode: 0", b"mode: cooked"], "the size is kept")
+    # a report that never completes is given back as input after the query times out
+    s.step(b"size\n", [b"size", probe + b"size: asked"], "a second size query")
+    s.step(b"\x1b[", [b"raw: 1b", b"raw: 5b"], "a partial report is input after the timeout")
+    s.step(b"q", [b"size: 132x40", b"mode: 0", b"mode: cooked"], "the size is unchanged")
+    s.step(b"end\n", [b"end", b"got: end"], "cooked again")
     # end of input
     # (Ctrl-D after "x" is ignored; erasing the x leaves an empty line, where Ctrl-D ends input)
     s.step(b"x\x04\x7f\x04", [b"x\x08 \x08eof"], "Ctrl-D on an empty line is end of input")

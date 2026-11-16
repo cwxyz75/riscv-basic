@@ -441,6 +441,8 @@ fn image_entry<'a>(
 /// `spin` starts the `spin` program and registers it as the foreground job; `flood` writes
 /// 500000 bytes in one go; `quit` and Ctrl-D (a lone 0x04) end the session; a lone 0x03
 /// (Ctrl-C) reports `interrupt` and what became of the job; anything else answers `got: <line>`.
+/// UV4: `raw`, `cbreak` and `size` switch the terminal's mode (see `terminal_demo`), `resize` sets the window size
+/// and reads it back.
 fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
     use rt::abi::rights::Rights;
     use rt::sys;
@@ -581,6 +583,31 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                             None => String::from("spin: could not start\n"),
                         };
                         let _ = io::write_all(tty_mine, msg.as_bytes());
+                    } else if cmd.as_slice() == b"raw" || cmd.as_slice() == b"cbreak" {
+                        let m = if cmd.as_slice() == b"raw" {
+                            proto::console::mode::RAW
+                        } else {
+                            proto::console::mode::CBREAK
+                        };
+                        let name = if m == 0 { "raw" } else { "cbreak" };
+                        let msg = alloc::format!("mode: {name}\n");
+                        terminal_demo(tty_mine, ctl_mine, &mut txid, m, false, &msg);
+                    } else if cmd.as_slice() == b"size" {
+                        let m = proto::console::mode::RAW;
+                        terminal_demo(tty_mine, ctl_mine, &mut txid, m, true, "size: asked\n");
+                    } else if cmd.as_slice() == b"resize" {
+                        use proto::console::Control;
+                        let _ = ctl_call(
+                            ctl_mine,
+                            &mut txid,
+                            Control::SetSize {
+                                cols: 100,
+                                rows: 30,
+                            },
+                        );
+                        let v = ctl_call(ctl_mine, &mut txid, Control::GetSize).unwrap_or(0);
+                        let msg = alloc::format!("size: {}x{}\n", v & 0xffff, v >> 16);
+                        let _ = io::write_all(tty_mine, msg.as_bytes());
                     } else if cmd.as_slice() == b"flood" {
                         let data = alloc::vec![b'f'; 500_000];
                         let _ = io::write_all(tty_mine, &data);
@@ -622,6 +649,102 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
     } else {
         25
     }
+}
+
+/// One control call to `consoled`: the reply's value (0 for a plain reply), `None` when it failed. Events that arrive
+/// meanwhile are dropped (the caller is not looking for them).
+fn ctl_call(ctl: u32, txid: &mut u32, c: proto::console::Control) -> Option<u32> {
+    use rt::sys;
+    *txid += 1;
+    let msg = proto::console::encode(*txid, c);
+    if sys::channel_write(ctl, msg.as_ptr(), msg.len(), core::ptr::null(), 0).status != 0 {
+        return None;
+    }
+    let mut rb = [0u8; 16];
+    for _ in 0..400 {
+        let r = sys::channel_read(ctl, rb.as_mut_ptr(), rb.len(), core::ptr::null_mut(), 0);
+        if r.status == 0 {
+            let b = &rb[..r.a1];
+            if let Some((t, st, v)) = proto::console::decode_reply_value(b) {
+                return (t == *txid && st == 0).then_some(v);
+            }
+            if let Some((t, st)) = proto::console::decode_reply(b) {
+                return (t == *txid && st == 0).then_some(0);
+            }
+            continue; // an event
+        }
+        io::nap(5);
+    }
+    None
+}
+
+/// UV4 test aid: the stand-in shell takes the terminal in `mode` (asking the host for its size first if `query`),
+/// says `first`, then reports what happens, one line each: `raw: <hex>` for every byte the terminal delivers and
+/// `event: resize CxR`, `event: interrupt` or `event: hangup` for the events. The byte `q` (the carriage return when
+/// echo is on) ends it: the stand-in prints the window size and mode it reads back, restores cooked mode and prints
+/// `mode: cooked`.
+fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, first: &str) {
+    use proto::console::{Control, Event};
+    use rt::abi::status::Status;
+    use rt::sys;
+    let quit = if mode & proto::console::mode::ECHO != 0 {
+        b'\r'
+    } else {
+        b'q'
+    };
+    if ctl_call(ctl, txid, Control::SetMode(mode)).is_none() {
+        let _ = io::write_all(tty, b"mode: set failed\n");
+        return;
+    }
+    if query && ctl_call(ctl, txid, Control::QuerySize).is_none() {
+        let _ = io::write_all(tty, b"size: query failed\n");
+        return;
+    }
+    let _ = io::write_all(tty, first.as_bytes());
+    let mut buf = [0u8; 64];
+    'demo: loop {
+        let mut idle = true;
+        let r = sys::socket_read(tty, buf.as_mut_ptr(), buf.len());
+        match r.status() {
+            Some(Status::Ok) => {
+                idle = false;
+                for &b in &buf[..r.a1] {
+                    if b == quit {
+                        break 'demo;
+                    }
+                    let _ = io::write_all(tty, alloc::format!("raw: {b:02x}\n").as_bytes());
+                }
+            }
+            Some(Status::ShouldWait) => {}
+            _ => return,
+        }
+        let mut rb = [0u8; 16];
+        let r = sys::channel_read(ctl, rb.as_mut_ptr(), rb.len(), core::ptr::null_mut(), 0);
+        if r.status == 0 {
+            idle = false;
+            let line = match proto::console::decode_event(&rb[..r.a1]) {
+                Some(Event::Resize { cols, rows }) => {
+                    alloc::format!("event: resize {cols}x{rows}\n")
+                }
+                Some(Event::Interrupt) => String::from("event: interrupt\n"),
+                Some(Event::Hangup) => String::from("event: hangup\n"),
+                None => String::from("event: ?\n"),
+            };
+            let _ = io::write_all(tty, line.as_bytes());
+        }
+        if idle {
+            io::nap(5);
+        }
+    }
+    let size = ctl_call(ctl, txid, Control::GetSize).unwrap_or(0);
+    let m = ctl_call(ctl, txid, Control::GetMode).unwrap_or(99);
+    let _ = ctl_call(ctl, txid, Control::SetMode(proto::console::mode::COOKED));
+    let msg = alloc::format!(
+        "size: {}x{}\nmode: {m}\nmode: cooked\n",
+        size & 0xffff,
+        size >> 16
+    );
+    let _ = io::write_all(tty, msg.as_bytes());
 }
 
 /// The services of one interactive session, in start order.
