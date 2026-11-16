@@ -1,5 +1,5 @@
 //! The wake / IPI / idle protocol of the kernel (TIDY-UP T38, T65; SCHED-SMP-SPEC section 3.9, task 4): a model
-//! of two harts and a waker over the real `kcore::sched::Sched`, explored by random schedules (shuttle). The
+//! of two harts and a waker over the real `kcore::sched_smp::Sched2` (the scheduler the kernel runs since task 11), explored by random schedules (shuttle). The
 //! kernel's glue (`send_pokes`, the IPI handler, `join_scheduler`, the idle `wfi`) cannot run on the host, so
 //! it is written out here once, with the protocol the spec requires and, as **negative controls**, the three
 //! ways it can go wrong; each wrong variant must be caught (a runnable thread stranded while its hart idles with
@@ -8,15 +8,16 @@
 //! Run by `make os-test` with `RUSTFLAGS="--cfg shuttle"`; without the cfg this file is empty.
 #![cfg(shuttle)]
 
-use kcore::sched::{FixedPriority, Sched, PRIO_IDLE};
+use kcore::sched2::{FixedPrio, SchedAttr};
+use kcore::sched_smp::Sched2;
 use shuttle::sync::atomic::{AtomicBool, Ordering};
 use shuttle::sync::{Arc, Mutex};
 use shuttle::thread;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Variant {
-    /// The protocol as specified: a hart that joins late reschedules itself, pokes to harts that are not up
-    /// are forgotten (the mark cleared), the IPI handler makes its hart's designation right.
+    /// The protocol as specified: a hart that joins late reschedules itself, a hart that is not in the scheduler is never
+    /// marked (nothing is owed to it), the IPI handler makes its hart's designation right.
     Right,
     /// Negative control 1: `join_scheduler` does not end with a reschedule (the T65 bug): an IPI that arrived
     /// before the hart was ready is lost.
@@ -28,7 +29,7 @@ enum Variant {
 }
 
 struct World {
-    sched: Mutex<Sched<FixedPriority>>,
+    sched: Mutex<Sched2<FixedPrio>>,
     ipi: [AtomicBool; 2],
     online: [AtomicBool; 2],
     in_sched: [AtomicBool; 2],
@@ -37,8 +38,8 @@ struct World {
     v: Variant,
 }
 
-/// What `send_pokes` does in the kernel: IPIs to started harts, others forgotten (and the mark cleared).
-fn send_pokes(w: &World, s: &mut Sched<FixedPriority>, mut pokes: u32, me: usize) {
+/// What `send_pokes` does in the kernel: an IPI to every poked hart that is up.
+fn send_pokes(w: &World, mut pokes: u32, me: usize) {
     pokes &= !(1 << me);
     while pokes != 0 {
         let i = pokes.trailing_zeros() as usize;
@@ -48,8 +49,6 @@ fn send_pokes(w: &World, s: &mut Sched<FixedPriority>, mut pokes: u32, me: usize
         }
         if w.online[i].load(Ordering::Acquire) {
             w.ipi[i].store(true, Ordering::SeqCst);
-        } else {
-            s.clear_resched_pending(i);
         }
     }
 }
@@ -59,14 +58,15 @@ fn look(w: &World, h: usize, idle: u32) {
     let mut s = w.sched.lock().unwrap();
     s.reschedule_on(h);
     let pokes = s.take_pokes();
-    send_pokes(w, &mut s, pokes, h);
-    while let Some(c) = s.current_on(h) {
+    send_pokes(w, pokes, h);
+    loop {
+        let c = s.current_on(h);
         if c == idle {
             break;
         }
         // the thread runs to completion at once (what matters is that it was picked)
         w.ran.store(true, Ordering::SeqCst);
-        s.exit_current_on(h).unwrap();
+        s.exit_on(h).unwrap();
         s.reschedule_on(h);
     }
 }
@@ -76,11 +76,13 @@ fn hart_main(w: Arc<World>, h: usize) {
     let idle;
     {
         let mut s = w.sched.lock().unwrap();
-        idle = s.adopt_current_on(h, PRIO_IDLE, Some(h)).unwrap();
-        // "online" (it may receive IPIs) comes before "in the scheduler" (its handler acts on them)
+        idle = s.idle(h);
+        // "online" (it may receive IPIs) comes before "in the scheduler" (its handler acts on them, and the scheduler
+        // marks it)
         w.online[h].store(true, Ordering::Release);
         thread::yield_now();
         w.in_sched[h].store(true, Ordering::Release);
+        s.set_online(h, true);
         if w.v != Variant::NoJoinReschedule {
             drop(s);
             look(&w, h, idle); // the fix: end the join with a reschedule
@@ -104,7 +106,12 @@ fn hart_main(w: Arc<World>, h: usize) {
 
 fn model(v: Variant) {
     let w = Arc::new(World {
-        sched: Mutex::new(Sched::with_harts(FixedPriority::new(), 2)),
+        sched: Mutex::new({
+            // the boot hart is part of the scheduler from the start; the second joins in `hart_main`
+            let mut s = Sched2::new(2, FixedPrio::new);
+            s.set_online(1, false);
+            s
+        }),
         ipi: [AtomicBool::new(false), AtomicBool::new(false)],
         online: [AtomicBool::new(false), AtomicBool::new(false)],
         in_sched: [AtomicBool::new(false), AtomicBool::new(false)],
@@ -126,14 +133,17 @@ fn model(v: Variant) {
     thread::yield_now();
     {
         let mut s = w.sched.lock().unwrap();
-        if s.current_on(0).is_none() {
-            drop(s);
-            thread::yield_now(); // hart 0 has not adopted its idle thread yet: let it
-            s = w.sched.lock().unwrap();
-        }
-        s.spawn_on(0, 10, Some(1)).unwrap();
+        s.spawn_on(
+            0,
+            SchedAttr {
+                prio: 10,
+                rr: false,
+            },
+            Some(1),
+        )
+        .unwrap();
         let pokes = s.take_pokes();
-        send_pokes(&w, &mut s, pokes, 0);
+        send_pokes(&w, pokes, 0);
     }
     // let the harts settle: ID1 says the thread runs without any further event (no tick is modelled)
     for _ in 0..200 {

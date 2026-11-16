@@ -561,8 +561,8 @@ the parent's); INVALID_ARGS (`max_prio` above 63, `cpu_weight` outside 1 to 6553
 
 ### thread_set_sched(thread, priority, flags) -> status
 
-Set a thread's base priority (1 to 63) and flags (bit 0: round robin within its level; today every level rotates, so the flag
-is stored and reported only). `thread` 0 names the caller (no right needed and still bounded). Otherwise MANAGE on the thread
+Set a thread's base priority (1 to 63) and flags (bit 0: round robin within its level; the flag is stored and reported but not yet
+passed to the scheduler, so a real-time thread (32 to 63) never rotates whatever the flag says, TIDY-UP T104; the normal band always rotates). `thread` 0 names the caller (no right needed and still bounded). Otherwise MANAGE on the thread
 handle. ACCESS_DENIED if `priority` exceeds the thread's job's `max_prio`. A new user thread inherits its creator's base
 priority clamped to its job's maximum; the first thread of a process starts at 10, clamped. Errors: BAD_HANDLE; WRONG_TYPE;
 ACCESS_DENIED; INVALID_ARGS (priority 0 or above 63, a reserved flag bit); BAD_STATE (the thread has ended or has not started).

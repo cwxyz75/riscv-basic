@@ -1,5 +1,6 @@
 //! Kernel threads: per-thread kernel stacks, the context switch, and the glue between
-//! the pure scheduler core (`kcore::sched`) and the machine (OS-ARCHITECTURE.md, 8).
+//! the pure scheduler core (`kcore::sched_smp::Sched2`: one run queue per hart, SCHED-SMP-SPEC 4.4) and the machine
+//! (OS-ARCHITECTURE.md, 8).
 //!
 //! All scheduler state lives in one `Kernel` value that is only touched with
 //! interrupts disabled and the big kernel lock held (`irq::without`). The core decides
@@ -19,12 +20,17 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kcore::sched::{Prio, Sched, State, Tid, Waiters, PRIO_IDLE};
+use kcore::sched::{Prio, State, Tid};
+use kcore::sched2::{SchedAttr, MS};
+use kcore::sched_smp::{Sched2, Waiters2};
 
 #[cfg(not(feature = "sched-round-robin"))]
-pub type Class = kcore::sched2::TwoBand;
+pub type Class = kcore::sched2::FixedPrio;
 #[cfg(feature = "sched-round-robin")]
-pub type Class = kcore::sched::RoundRobin;
+pub type Class = kcore::sched2::RoundRobin;
+
+/// The scheduler: one run queue per hart, placement, push and pull (`kcore::sched_smp`, SCHED-SMP-SPEC 4.4).
+type KSched = Sched2<Class>;
 
 fn new_class() -> Class {
     Class::default()
@@ -116,12 +122,12 @@ struct KThread {
 }
 
 struct Kernel {
-    sched: Sched<Class>,
+    sched: KSched,
     threads: BTreeMap<Tid, KThread>,
     /// The thread running on each hart (by dense hart index).
     running: Vec<Tid>,
-    exits: Waiters,
-    queues: Vec<Waiters>,
+    exits: Waiters2,
+    queues: Vec<Waiters2>,
     /// Exited detached threads waiting for the reaper.
     zombies: Vec<Tid>,
     reaper_queue: usize,
@@ -149,7 +155,7 @@ fn kernel() -> &'static mut Kernel {
     }
 }
 
-/// Turn the code that is running (the boot thread) into thread 1 and start the idle
+/// Turn the code that is running (the boot thread) into a thread (its id follows the harts' idle ids) and start the idle
 /// thread. Needs the heap. Interrupts must still be off.
 pub fn init(boot_prio: Prio) {
     // The kernel does no floating point and thread switches do not save FP state:
@@ -160,10 +166,22 @@ pub fn init(boot_prio: Prio) {
     // SAFETY: clears sstatus.FS and sstatus.VS only.
     unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     let harts = crate::smp::started();
-    let mut sched = Sched::with_harts(new_class(), harts);
+    let mut sched = KSched::new(harts, new_class);
+    // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
+    for h in 1..harts {
+        sched.set_online(h, false);
+    }
     let boot = sched
-        .adopt_current_on(0, boot_prio, Some(0))
+        .adopt_current_on(
+            0,
+            SchedAttr {
+                prio: boot_prio,
+                rr: false,
+            },
+            Some(0),
+        )
         .expect("boot thread");
+    let idle0 = sched.idle(0);
     let mut threads = BTreeMap::new();
     threads.insert(
         boot,
@@ -181,14 +199,16 @@ pub fn init(boot_prio: Prio) {
             sched,
             threads,
             running: alloc::vec![boot; harts],
-            exits: Waiters::new(),
+            exits: Waiters2::new(),
             queues: Vec::new(),
             zombies: Vec::new(),
             reaper_queue: 0,
         });
     }
-    // hart 0's idle thread (the other harts adopt their own boot context when they join)
-    spawn_with_affinity("idle", PRIO_IDLE, idle_main, 0, false, Some(0));
+    // hart 0's idle thread (the other harts use their own boot context when they join): the scheduler made its id, this
+    // gives it a stack and a first instruction
+    let idle_thread = new_kthread("idle", idle_main, 0, false);
+    kernel().threads.insert(idle0, idle_thread);
     let q = new_queue();
     kernel().reaper_queue = q;
     spawn("reaper", REAPER_PRIO, reaper_main, 0);
@@ -228,10 +248,11 @@ pub fn join_scheduler() -> ! {
     irq::without(|| {
         let h = hart();
         let k = kernel();
-        let tid = k
-            .sched
-            .adopt_current_on(h, PRIO_IDLE, Some(h))
-            .expect("a secondary hart joins once");
+        // the hart's boot context becomes its idle thread (the scheduler made the id when it was built)
+        let tid = k.sched.idle(h);
+        k.sched
+            .set_clock(h, ticks_to_ns(TICKS.load(Ordering::SeqCst)));
+        k.sched.set_online(h, true);
         k.threads.insert(
             tid,
             KThread {
@@ -324,7 +345,22 @@ fn spawn_with_affinity(
     detached: bool,
     affinity: Option<usize>,
 ) -> Tid {
-    // The stack comes from frames, not the heap, and has a guard page below it (`kstack.rs`).
+    let thread = new_kthread(name, entry, arg, detached);
+    irq::without(|| {
+        let k = kernel();
+        let tid = k
+            .sched
+            .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
+            .expect("valid priority");
+        k.threads.insert(tid, thread);
+        reschedule();
+        tid
+    })
+}
+
+/// A kernel thread's stack and first context. The stack comes from frames, not the heap, and has a guard page below it
+/// (`kstack.rs`).
+fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool) -> KThread {
     let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.top();
@@ -333,25 +369,13 @@ fn spawn_with_affinity(
     ctx.sp = (top & !15) as u64;
     ctx.s[0] = entry as usize as u64;
     ctx.s[1] = arg as u64;
-    irq::without(|| {
-        let k = kernel();
-        let tid = k
-            .sched
-            .spawn_on(hart(), prio, affinity)
-            .expect("valid priority");
-        k.threads.insert(
-            tid,
-            KThread {
-                ctx,
-                stack: Some(stack),
-                name,
-                detached,
-                bkl_depth: 1,
-            },
-        );
-        reschedule();
-        tid
-    })
+    KThread {
+        ctx,
+        stack: Some(stack),
+        name,
+        detached,
+        bkl_depth: 1,
+    }
 }
 
 /// Switch to whichever thread the core says should run, if it is not this one.
@@ -363,11 +387,8 @@ fn reschedule() {
         let k = kernel();
         let h = hart();
         let pokes = k.sched.take_pokes();
-        send_pokes(&mut k.sched, pokes, h);
-        let next = k
-            .sched
-            .current_on(h)
-            .expect("the idle thread always exists");
+        send_pokes(pokes, h);
+        let next = k.sched.current_on(h);
         let running = k.running[h];
         if next == running {
             return;
@@ -417,17 +438,14 @@ fn reschedule() {
 }
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
-fn send_pokes(sched: &mut Sched<Class>, mut pokes: u32, me: usize) {
+fn send_pokes(mut pokes: u32, me: usize) {
     pokes &= !(1 << me);
     while pokes != 0 {
         let i = pokes.trailing_zeros() as usize;
         pokes &= pokes - 1;
+        // (the scheduler marks only harts that have joined it, so every poke is for a hart that is up)
         if i < crate::smp::started() && crate::percpu::hart(i).online.load(Ordering::Acquire) {
             crate::smp::send_ipi(i, crate::percpu::IPI_RESCHED);
-        } else {
-            // a hart that is not up: forget the mark, or it would suppress every later poke until the hart
-            // reschedules itself (T65); it makes its designation right when it joins (`join_scheduler`)
-            sched.clear_resched_pending(i);
         }
     }
 }
@@ -446,13 +464,19 @@ pub fn timer_interrupt() {
     let h = hart();
     let k = kernel();
     crate::timer::next_tick();
-    if h == 0 {
-        // Hart 0 keeps the clock: sleepers' deadlines are in its ticks.
-        let now = TICKS.fetch_add(1, Ordering::SeqCst) + 1;
-        k.sched.advance_to(now, 0);
-    }
-    k.sched.tick_slice(h);
+    // Hart 0 keeps the clock (sleepers' deadlines are in its ticks); every hart runs its own timers and slice from it.
+    let now = if h == 0 {
+        TICKS.fetch_add(1, Ordering::SeqCst) + 1
+    } else {
+        TICKS.load(Ordering::SeqCst)
+    };
+    k.sched.tick_on(h, ticks_to_ns(now));
     reschedule();
+}
+
+/// Ticks (1 ms) to the scheduler's nanoseconds; "never" (`u64::MAX`) stays never.
+fn ticks_to_ns(t: u64) -> u64 {
+    t.saturating_mul(MS)
 }
 
 /// Ticks since the timer started (1 ms each).
@@ -467,10 +491,7 @@ pub fn current() -> Tid {
 /// Give up the rest of the time slice.
 pub fn yield_now() {
     irq::without(|| {
-        kernel()
-            .sched
-            .yield_current_on(hart())
-            .expect("running thread");
+        kernel().sched.yield_on(hart()).expect("running thread");
         reschedule();
     });
 }
@@ -494,11 +515,7 @@ pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
 pub fn block() {
     irq::without(|| {
-        if kernel()
-            .sched
-            .block_current_on(hart())
-            .expect("running thread")
-        {
+        if kernel().sched.block_on(hart()).expect("running thread") {
             reschedule();
         }
     });
@@ -515,17 +532,17 @@ pub fn wake(tid: Tid) {
 
 /// Sleep for `n` ticks (or until woken).
 pub fn sleep_ticks(n: u64) {
-    let deadline = irq::without(|| kernel().sched.now() + n);
+    let deadline = ticks() + n;
     // A loop: a stale entry on a wait queue can wake a sleeper early, and the sleep must not
     // end before its deadline.
     loop {
         let done = irq::without(|| {
             let k = kernel();
-            if k.sched.now() >= deadline {
+            if ticks() >= deadline {
                 return true;
             }
             if k.sched
-                .sleep_until_on(hart(), deadline)
+                .sleep_until_on(hart(), ticks_to_ns(deadline))
                 .expect("running thread")
             {
                 reschedule();
@@ -566,7 +583,7 @@ pub fn exit() -> ! {
     irq::without(|| {
         let k = kernel();
         let h = hart();
-        k.sched.exit_current_on(h).expect("running thread");
+        k.sched.exit_on(h).expect("running thread");
         let me = k.running[h];
         let detached = k.threads.get(&me).is_some_and(|t| t.detached);
         let Kernel {
@@ -627,7 +644,7 @@ pub fn join(tid: Tid) -> bool {
 pub fn new_queue() -> usize {
     irq::without(|| {
         let k = kernel();
-        k.queues.push(Waiters::new());
+        k.queues.push(Waiters2::new());
         k.queues.len() - 1
     })
 }
@@ -655,7 +672,7 @@ pub fn wait_deadline_registered(
                 return Some(true);
             }
             let k = kernel();
-            if k.sched.now() >= deadline {
+            if ticks() >= deadline {
                 return Some(false);
             }
             // (prepared before registering: the order of 3.7 — under the big lock nothing can interleave, but the
@@ -664,7 +681,7 @@ pub fn wait_deadline_registered(
             register();
             count_sleep(&mut slept);
             if k.sched
-                .sleep_until_on(hart(), deadline)
+                .sleep_until_on(hart(), ticks_to_ns(deadline))
                 .expect("running thread")
             {
                 reschedule();
@@ -828,7 +845,12 @@ pub fn debug_set_guard(tid: Tid, intact: bool) {
 
 /// The scheduling class in use.
 pub fn class_name() -> &'static str {
-    kcore::sched::SchedClass::name(&new_class())
+    // (the names the tests and the boot banner know; the classes' own names are `fixed-prio` and `round-robin`)
+    if cfg!(feature = "sched-round-robin") {
+        "round-robin"
+    } else {
+        "fixed-priority"
+    }
 }
 
 /// The top of the calling thread's kernel stack (where a trap from user mode starts).
@@ -900,7 +922,7 @@ pub fn debug_state(tid: Tid) -> alloc::string::String {
             k.sched.priority(tid),
             k.sched.affinity(tid),
             (0..k.sched.harts())
-                .map(|h| k.sched.current_on(h))
+                .map(|h| Some(k.sched.current_on(h)))
                 .collect::<Vec<_>>(),
             (0..k.sched.harts())
                 .map(|h| k.sched.resched_pending(h))
