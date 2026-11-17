@@ -91,6 +91,36 @@ jobs:
           dpkg -l opensbi | tail -1
       - run: make os-boot-test-smoke os-release-smoke
 
+  # The shell test (BusyBox applets, programs that start programs, signals) needs the BusyBox sources, which are fetched (and cached:
+  # the archive is pinned by its sha256 in third_party/fetch-manifest.txt), not committed. Without them `busybox` is a stub.
+  shell-test:
+    name: kernel (shell test)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shell-test
+      - name: Install QEMU and OpenSBI
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+      - uses: actions/cache@v4
+        with:
+          path: third_party/fetched
+          key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
+      - name: Fetch BusyBox (pinned by sha256)
+        run: FETCH_ONLY=busybox make fetch-third-party
+      - name: Build the interactive image and run the shell test
+        run: |
+          make os-interactive
+          python3 scripts/s4e_shell_test.py target/os-interactive/riscv64gc-unknown-none-elf/debug/kernel
+
   # If the harness itself changed (scripts/os_boot_test.py or the Makefile), prove it still sees a failure: a kernel built with a
   # deliberate fault must fail the boot test. Its own job, so its minutes do not come out of the smoke job's budget.
   harness-fail-demo:
