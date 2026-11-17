@@ -225,12 +225,15 @@ impl Console {
         match r.status() {
             Some(Status::Ok) => {
                 let input = self.tty.serial_in(&buf[..r.a1]);
-                self.after_input(&input);
                 if self.deliver.len() + input.deliver.len() <= DELIVER_CAP {
                     self.deliver.extend_from_slice(&input.deliver);
                 } else {
                     self.lost_input += input.deliver.len() as u64;
                 }
+                // the bytes typed before a Ctrl-C reach the client before the event does (the shell, in raw mode, echoes what it
+                // reads: an event that overtook the byte before it printed `^C` ahead of that byte)
+                self.pump_tty();
+                self.after_input(&input);
                 true
             }
             Some(Status::ShouldWait) => true,
@@ -273,12 +276,13 @@ impl Console {
     fn query_timed_out(&mut self) {
         self.query_deadline = None;
         let input = self.tty.cancel_query();
-        self.after_input(&input);
         if self.deliver.len() + input.deliver.len() <= DELIVER_CAP {
             self.deliver.extend_from_slice(&input.deliver);
         } else {
             self.lost_input += input.deliver.len() as u64;
         }
+        self.pump_tty();
+        self.after_input(&input);
     }
 
     fn on_tty(&mut self) -> bool {

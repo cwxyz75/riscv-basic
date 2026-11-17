@@ -208,7 +208,9 @@ fn main() {
     println!("cargo:rustc-link-arg=--no-relax");
     // The programs are embedded in the boot image: leave out the debug info of the standard
     // library that would otherwise make each one over a megabyte.
-    println!("cargo:rustc-link-arg=--strip-debug");
+    // (no symbol tables either: the image is held in several copies, so each program's 1 MiB of symbols cost several; on CI's machine
+    // the tables were twice the size and the hog test found 26 MiB of heap left instead of 120)
+    println!("cargo:rustc-link-arg=--strip-all");
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CC_RISCV");

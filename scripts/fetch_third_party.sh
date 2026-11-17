@@ -4,7 +4,8 @@
 # Reads third_party/fetch-manifest.txt: one source per line, "name url file sha256" (a sha256 of "-" means
 # "not recorded yet": the script prints the computed one so it can be pinned). Downloads are never committed.
 # Each archive is verified against the manifest, then extracted into <name>/src (archives are only
-# unpacked here; nothing from them is built or run by this script).
+# unpacked here; nothing from them is built or run by this script). FETCH_ONLY="busybox lua" limits it to those names (CI
+# fetches only what its tests build).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,6 +17,7 @@ mkdir -p "$dest"
 
 while read -r name url file sha; do
   case "$name" in ''|'#'*) continue ;; esac
+  if [ -n "${FETCH_ONLY:-}" ] && ! printf ' %s ' "$FETCH_ONLY" | grep -q " $name "; then continue; fi
   dir="$dest/$name"
   mkdir -p "$dir"
   f="$dir/$file"

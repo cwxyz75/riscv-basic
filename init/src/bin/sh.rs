@@ -109,6 +109,8 @@ struct Os {
     raw: bool,
     /// Ctrl-C was reported while the shell was not looking (an event on the control channel).
     interrupt: bool,
+    /// An interrupt event arrived with typed bytes still in the terminal socket: the bytes are read first, then the interrupt.
+    late_interrupt: bool,
     /// There is a console server: interactive mode.
     interactive: bool,
     /// Programs may start programs (OD118): the default; each program's channel is below.
@@ -639,6 +641,25 @@ impl Os {
         }
     }
 
+    /// Watch what the shell serves on `port`: every program's spawn channel, every program a program started, every output pump.
+    /// (A port's keys are unique: each binding gets its own, from 1000 up; a repeated key is refused, and the object is not
+    /// watched.)
+    fn bind_served(&self, port: u32) {
+        let mut key = 1000;
+        for b in &self.brokers {
+            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, key);
+            key += 1;
+        }
+        for d in self.desc.values() {
+            sys::port_bind(port, d.h, signals::TERMINATED, key);
+            key += 1;
+        }
+        for q in &self.pumps_out {
+            sys::port_bind(port, q.rd, signals::READABLE | signals::PEER_CLOSED, key);
+            key += 1;
+        }
+    }
+
     /// Wait on `h` for `mask` (or a few milliseconds) while serving; the shell never sits in a blocking read or write while a
     /// program of its own is waiting for it.
     fn serve_wait(&mut self, h: u32, mask: u32) {
@@ -649,15 +670,7 @@ impl Os {
         }
         let port = p.a1 as u32;
         sys::port_bind(port, h, mask, 0);
-        for b in &self.brokers {
-            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1);
-        }
-        for d in self.desc.values() {
-            sys::port_bind(port, d.h, signals::TERMINATED, 2);
-        }
-        for q in &self.pumps_out {
-            sys::port_bind(port, q.rd, signals::READABLE | signals::PEER_CLOSED, 3);
-        }
+        self.bind_served(port);
         sys::port_wait(port, sys::clock_get() + 20);
         sys::handle_close(port);
         self.serve();
@@ -827,15 +840,10 @@ impl Os {
             return;
         }
         let port = p.a1 as u32;
-        for &h in extra {
-            sys::port_bind(port, h, signals::TERMINATED, 0);
+        for (i, &h) in extra.iter().enumerate() {
+            sys::port_bind(port, h, signals::TERMINATED, i as u64);
         }
-        for b in &self.brokers {
-            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1);
-        }
-        for d in self.desc.values() {
-            sys::port_bind(port, d.h, signals::TERMINATED, 2);
-        }
+        self.bind_served(port);
         sys::port_wait(port, until);
         sys::handle_close(port);
     }
@@ -1557,12 +1565,7 @@ impl Host for Os {
                     sys::port_bind(port, *h, signals::READABLE | signals::PEER_CLOSED, i as u64);
                 }
             }
-            for b in &self.brokers {
-                sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1000);
-            }
-            for d in self.desc.values() {
-                sys::port_bind(port, d.h, signals::TERMINATED, 1001);
-            }
+            self.bind_served(port);
             sys::port_wait(port, sys::clock_get() + 20);
             sys::handle_close(port);
             self.serve();
@@ -1715,6 +1718,11 @@ impl Host for Os {
         if !self.inbuf.is_empty() {
             return TermIn::Bytes(core::mem::take(&mut self.inbuf));
         }
+        // an interrupt that came with typed bytes: if the command those bytes made did not take it (`interrupted`, a wait), it is
+        // for the line being edited
+        if core::mem::take(&mut self.late_interrupt) && core::mem::take(&mut self.interrupt) {
+            return TermIn::Interrupt;
+        }
         loop {
             let p = sys::port_create();
             if p.status != 0 {
@@ -1724,15 +1732,7 @@ impl Host for Os {
             sys::port_bind(port, self.tty, signals::READABLE | signals::PEER_CLOSED, 1);
             sys::port_bind(port, self.ctl, signals::READABLE | signals::PEER_CLOSED, 2);
             // a background job may ask for a program, or write a redirected file, while the shell waits for a key
-            for b in &self.brokers {
-                sys::port_bind(port, b.ch, signals::READABLE, 3);
-            }
-            for d in self.desc.values() {
-                sys::port_bind(port, d.h, signals::TERMINATED, 4);
-            }
-            for p in &self.pumps_out {
-                sys::port_bind(port, p.rd, signals::READABLE | signals::PEER_CLOSED, 5);
-            }
+            self.bind_served(port);
             let w = sys::port_wait(
                 port,
                 if self.has_pumps() {
@@ -1757,7 +1757,18 @@ impl Host for Os {
             );
             if c.status == 0 {
                 match ctl::decode_event(&rb[..c.a1]) {
-                    Some(ctl::Event::Interrupt) => return TermIn::Interrupt,
+                    Some(ctl::Event::Interrupt) => {
+                        // what was typed before the Ctrl-C comes first (the event travels on its own channel and can be
+                        // read before bytes the console server wrote to the terminal socket ahead of it)
+                        self.read_ahead();
+                        if self.inbuf.is_empty() {
+                            return TermIn::Interrupt;
+                        }
+                        // (`interrupt` is what a command that runs now sees, so a Ctrl-C typed with the command still ends it)
+                        self.interrupt = true;
+                        self.late_interrupt = true;
+                        return TermIn::Bytes(core::mem::take(&mut self.inbuf));
+                    }
                     Some(ctl::Event::Hangup) => return TermIn::Gone,
                     _ => {}
                 }
@@ -2089,6 +2100,7 @@ pub fn app_main() -> i32 {
         confined: Vec::new(),
         raw: false,
         interrupt: false,
+        late_interrupt: false,
         interactive: ctl_ch.is_some(),
         spawn_grant: true,
         brokers: Vec::new(),

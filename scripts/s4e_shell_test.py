@@ -228,7 +228,9 @@ def main():
     step(b"if true do\r", [b"$ if true do"], "a block that is not finished")
     step(b"echo ml\r", [b"> echo ml"], "the continuation prompt")
     step(b"end\r", [b"> end", b"ml"], "the block runs when it is complete")
-    step(b"echo abc\x03", [b"$ echo abc^C"], "Ctrl-C abandons the line being typed")
+    # (repeated: on a slow machine the event once overtook the byte typed just before it, `echo ab^C` and then `c`)
+    for _ in range(25):
+        step(b"echo abc\x03", [b"$ echo abc^C"], "Ctrl-C abandons the line being typed")
     step(b"echo ok\r", [b"$ echo ok", b"ok"], "the shell after an abandoned line")
     step(b"while true do end\r", [b"$ while true do end"], "a loop written in shell code")
     time.sleep(1)
@@ -301,6 +303,12 @@ def main():
     # has a bounded amount of memory, whatever it tries
     step(b"bomb\n", [b"$ bomb", b"bomb: process_create: -5", b"bomb: threads: 31 then -5"],
          "a process and thread bomb is refused")
+    # (the memory the machine has just before the hog: CI's machine gave the hog 26 MiB where this one gives 120 or more)
+    s.prompt()
+    s.p.stdin.write(b"free\n")
+    s.p.stdin.flush()
+    free_lines = [s.next_line("free") for _ in range(3)]
+    print("memory before the hog:", free_lines[1:], flush=True)
     counts = []
     for attempt in (1, 2):
         step(b"hog\n", [b"$ hog"], f"a memory hog, run {attempt}")
@@ -318,7 +326,7 @@ def main():
         counts.append(mib)
     # the heap stops at 128 MiB (some of it is the program's own); the 136 MiB job never has to refuse
     if not 120 <= counts[0] <= 128:
-        fail(s, f"the hog got {counts[0]} MiB of a 128 MiB heap")
+        fail(s, f"the hog got {counts[0]} MiB of a 128 MiB heap (memory before it: {free_lines[1:]})")
     if counts[0] != counts[1]:
         fail(s, f"the second hog got {counts[1]} MiB, the first {counts[0]}: memory was not given back")
     step(b"echo survived\n", [b"$ echo survived", b"survived"], "the shell after the hog")
@@ -482,6 +490,16 @@ def main():
     step(b"print $cap.status\n", [b"$ print $cap.status", b"0"], "... ends well")
     step(b"print $cap.out\n", [b"$ print $cap.out", b'["found ./hello.txt"]'], "... and its child's output is captured")
     step_re(b"busybox time busybox echo timed\n", [b"$ busybox time busybox echo timed", b"timed", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")], "time runs a program")
+    # the spawn rate: 100 programs started one after another by xargs (a `vfork`, a request to the shell, a launch, a wait each)
+    got = step_re(b"busybox seq 100 | busybox time busybox xargs -n 1 busybox true\n",
+                  [b"$ busybox seq 100 | busybox time busybox xargs -n 1 busybox true", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")],
+                  "100 spawns")
+    m = re.fullmatch(rb"real\t(\d+)m ([\d.]+)s", got[1])
+    secs = int(m.group(1)) * 60 + float(m.group(2))
+    print(f"spawn rate: 100 programs in {secs:.2f} s of guest time ({100 / max(secs, 0.01):.0f} per second)", flush=True)
+    # (12.9 s when the shell watched only the first program's spawn channel: a request from any other waited for a 100 ms timeout)
+    if secs > 8:
+        fail(s, f"100 spawns took {secs:.1f} s")
     # the chain has a depth limit: the fifth program down holds no spawn grant
     step(b"busybox env busybox env busybox env busybox env busybox env busybox echo deep\n",
          [b"$ busybox env busybox env busybox env busybox env busybox env busybox echo deep", b"env: can't execute 'busybox': Function not implemented", b"[exit 126]"],

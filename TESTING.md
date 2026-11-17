@@ -16,7 +16,8 @@ which is what happened after the previous adjustment.
 Rules:
 
 1. **The gate is tiers 0 and 1 and nothing else.** `make check` is exactly `smoke`. `ci.yml` runs only smoke targets (plus the
-   fail-demo harness check when the harness itself changed), has no build matrix, and every job's `timeout-minutes` is at most
+   fail-demo harness check when the harness itself changed, and `kernel (shell test)`: the interactive shell test, the one job that
+   builds BusyBox, from sources fetched by sha256 and cached), has no build matrix, and every job's `timeout-minutes` is at most
    the budget. A job that outgrows its budget fails loudly: raise the budget on purpose here, or cut work, do not let it grow.
 2. **Locally, run tier 0 and the one targeted test** while iterating (`make quick`, or `cargo test -p kcore --test X`). Run
    `make smoke` (about three minutes warm) before a push if you want the whole gate; CI runs it anyway. Do not run the soak
