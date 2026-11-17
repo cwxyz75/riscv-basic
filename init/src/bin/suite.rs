@@ -4860,6 +4860,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"sessiond".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
+            b"sqlite3".to_vec(),
             b"udpecho".to_vec(),
             b"volmgr".to_vec(),
         ],

@@ -61,6 +61,7 @@ fn main() {
         "authd",
         "busybox",
         "kilo",
+        "sqlite3",
         "sessiond",
         "procd",
         "ps",

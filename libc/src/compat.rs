@@ -1021,9 +1021,17 @@ unsupported! {
     statvfs(a: *const c_char, b: *mut c_void) -> c_int = -1;
     fstatvfs(a: c_int, b: *mut c_void) -> c_int = -1;
     utimes(a: *const c_char, b: *const c_void) -> c_int = -1;
+    utime(a: *const c_char, b: *const c_void) -> c_int = -1;
     setsid() -> c_int = -1;
     getsid(a: c_int) -> c_int = -1;
     fork() -> c_int = -1;
+}
+
+/// `getrusage`: nothing is accounted per process (the clock times are `times`' business): all zeros.
+#[no_mangle]
+pub unsafe extern "C" fn getrusage(_who: c_int, ru: *mut u8) -> c_int {
+    core::ptr::write_bytes(ru, 0, 144);
+    0
 }
 
 // ---- the user database: the session's own identity (USER, UID, GID, HOME in the environment) ----

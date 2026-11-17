@@ -389,6 +389,8 @@ impl Server {
                     r.map_or_else(|e| err_status(e, new_last.len().max(old_last.len())), |_| 0);
                 self.send(key, txid, st, 0, &[], None);
             }
+            // memory has nothing to commit: a sync succeeds (SQLite syncs its journal)
+            op::SYNC => self.send(key, txid, 0, 0, &[], None),
             op::STAT => {
                 if !need(pr::READ) {
                     return self.send(key, txid, denied, 0, &[], None);

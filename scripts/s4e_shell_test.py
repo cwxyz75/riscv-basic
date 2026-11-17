@@ -72,7 +72,7 @@ class Session(base.Session):
 BANNER = b"riscv-os S4 ready"
 LINES_TXT_LINES = 3  # bootfs/home/lines.txt: one, two, three
 LINES_HEAD2 = [b"one", b"two"]
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"kilo", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"kilo", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"sqlite3", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -119,7 +119,7 @@ def main():
     step(b"cat hello.txt\n", [b"$ cat hello.txt", b"hello, world"], "cat")
     step(b"cat lines.txt sub/inner.txt\n",
          [b"$ cat lines.txt sub/inner.txt", b"one", b"two", b"three", b"inner"], "cat of two files")
-    step(b"cat /etc/trusted\n", [b"$ cat /etc/trusted", b"ls store", b"cat store", b"ctest store"], "the trust list")
+    step(b"cat /etc/trusted\n", [b"$ cat /etc/trusted", b"ls store", b"cat store", b"ctest store", b"sqlite3 store"], "the trust list")
     step(b"echo a   'b  c' \"d\"\n", [b"$ echo a   'b  c' \"d\"", b"a b  c d"], "echo and quoting")
     step(b"echo\n", [b"$ echo", b""], "echo with no arguments")
 
@@ -390,6 +390,31 @@ def main():
         pass  # (cat's output follows kilo's last screen on the same line: the cursor is shown again, then the file)
     s.wait_for_prompt = True
     step(b"echo after kilo\n", [b"$ echo after kilo", b"after kilo"], "the terminal is cooked again after the editor")
+    # SQLite, unmodified: the same SQL through ours and the host's sqlite3 (the oracle); then a database file that two processes use
+    # (a journal, fsync, truncate, rename on the memory file system) and one on the disk volume (the file system under test)
+    import subprocess as sp
+    sql_scripts = [
+        "create table t(a integer primary key, b text); insert into t(b) values (char(120)),(char(121)),(char(122)); select a, b from t order by a desc;",
+        "create table t(a); insert into t values (1),(2),(3),(4); select sum(a), avg(a), min(a), max(a), count(*) from t;",
+        "select upper(char(104,105)), length(char(104,105,106)), hex(char(97)), abs(-5), round(3.14159, 2), 7/2, 7.0/2, 7%3;",
+        "create table u(v); begin; insert into u values (1),(2); rollback; select count(*) from u; begin; insert into u values (3); commit; select * from u;",
+        "create table t(a, b); insert into t values (1, 10),(2, 20),(3, 30); create table s(a, c); insert into s values (2, 200),(3, 300); select t.a, b, c from t join s on t.a = s.a order by t.a;",
+        "select json_extract(json_array(1,2,3), char(36,91,49,93)), json_object(char(107), 1);",
+        "with recursive n(i) as (select 1 union all select i+1 from n where i<5) select group_concat(i, char(44)) from n;",
+    ]
+    for sql in sql_scripts:
+        want = sp.run(["sqlite3", ":memory:", sql], capture_output=True, text=True).stdout.splitlines()
+        send = "sqlite3 :memory: '" + sql + "'\n"
+        step(send.encode(), [b"$ " + send.strip().encode()] + [w.encode() for w in want], "sqlite: " + sql[:50])
+    # two processes, one database file (in the shared /tmp of a script)
+    db_sql = ["create table t(a, b)", "insert into t values (1, char(120)), (2, char(121))", "update t set b = char(122) where a = 2", "delete from t where a = 1", "select * from t"]
+    want = sp.run(["sqlite3", ":memory:", "; ".join(db_sql) + ";"], capture_output=True, text=True).stdout.splitlines()
+    cmd = "busybox hush -c '" + "; ".join(f'sqlite3 /tmp/d.db "{q}"' for q in db_sql) + "'\n"
+    step(cmd.encode(), [b"$ " + cmd.strip().encode()] + [w.encode() for w in want], "sqlite: a database file across processes")
+    # the same on the disk volume (doofs): journal file, fsync, truncate, rename
+    vol = "sqlite3 /mnt/store/s.db 'create table if not exists t(a); delete from t; insert into t values (1),(2),(3); select count(*) from t'\n"
+    step(vol.encode(), [b"$ " + vol.strip().encode(), b"3"], "sqlite: a database on the disk volume")
+    step(b"sqlite3 /mnt/store/s.db 'select sum(a) from t; pragma integrity_check'\n", [b"$ sqlite3 /mnt/store/s.db 'select sum(a) from t; pragma integrity_check'", b"6", b"ok"], "sqlite: it is still there, and intact")
     # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
     step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
     s.wait_for_prompt = False
