@@ -58,6 +58,7 @@ fn main() {
         "clockd",
         "volmgr",
         "devd",
+        "authd",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());
@@ -103,6 +104,23 @@ fn main() {
     }
     let mut files = Vec::new();
     walk(&fixtures, "", &mut files);
+    // A test overlay (UV5a): `OS_BOOTFS_OVERLAY` names a directory whose files replace or add image files, and a file named
+    // `<path>.rm` removes `<path>`; this is how the tests build images with no profile, or with a seed credential.
+    println!("cargo:rerun-if-env-changed=OS_BOOTFS_OVERLAY");
+    if let Ok(overlay) = std::env::var("OS_BOOTFS_OVERLAY") {
+        let overlay = PathBuf::from(overlay);
+        println!("cargo:rerun-if-changed={}", overlay.display());
+        let mut extra = Vec::new();
+        walk(&overlay, "", &mut extra);
+        for (name, bytes) in extra {
+            if let Some(gone) = name.strip_suffix(b".rm") {
+                files.retain(|(n, _)| n != gone);
+            } else {
+                files.retain(|(n, _)| n != &name);
+                files.push((name, bytes));
+            }
+        }
+    }
     // The BASIC golden corpus and the demo programs it loads, for `basic --golden` (S7a): the
     // scripts and their expected outputs under /etc/basic/golden, the examples under /etc/basic/examples.
     for (src, prefix) in [

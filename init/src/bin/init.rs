@@ -47,7 +47,8 @@ pub fn app_main() -> i32 {
         return 5;
     };
     if env.startup.args.get(1).map(|a| a.as_slice()) != Some(b"repl") {
-        return supervise(serial, image_vmo, &img, &entries);
+        let recovery = env.startup.args.get(1).map(|a| a.as_slice()) == Some(b"recovery");
+        return supervise(serial, image_vmo, &img, &entries, recovery);
     }
     // Start the launcher with `rt::spawn` (the first services cannot use one).
     let Some(launcher_entry) = entries.iter().find(|e| e.name == b"bin/launcher") else {
@@ -879,6 +880,7 @@ fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, firs
 }
 
 /// A profile as read from the image, with its text (the shell is given it to read its own grants).
+#[derive(Clone)]
 struct Loaded {
     profile: profile::Profile,
     text: String,
@@ -1263,21 +1265,32 @@ fn stop_stack(mut s: Stack) {
 /// The supervisor (S4-SPEC section 10): start `memfsd`, `launcher`, `consoled` and `sh`; when the
 /// shell exits (or any service dies) end the session and start a fresh one; on `halt` end it and
 /// return 0, which lets the kernel run its leak checks and power off.
-fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
-    let profiles = load_profiles(img, entries);
+fn supervise(
+    serial: u32,
+    image_vmo: u32,
+    img: &[u8],
+    entries: &[proto::bootimg::Entry],
+    recovery: bool,
+) -> i32 {
+    let mut profiles = load_profiles(img, entries);
     let profs: Vec<profile::Profile> = profiles.iter().map(|l| l.profile.clone()).collect();
     if profile::check_homes_distinct(&profs).is_err() {
         rt::sys::debug_write(b"init: two profiles share a home\n");
         return 43;
     }
-    // who is logged in at boot: the one profile marked `autologin` (UV5; the development default)
-    let who = match profile::pick_autologin(&profs) {
-        Ok(Some(p)) => profiles.iter().find(|l| l.profile.name == p.name),
-        _ => None,
+    // the manifest: whether this image enables autologin (development images only)
+    let manifest = image_entry(img, entries, b"etc/boot")
+        .and_then(|b| core::str::from_utf8(b).ok())
+        .unwrap_or("");
+    let autologin_enabled = manifest.lines().any(|l| l.trim() == "autologin=on");
+    // `authd`: the only process that holds credential verifiers; this manager asks it and never sees one
+    let Some(authd) = start_authd(image_vmo, img, entries, recovery) else {
+        rt::sys::debug_write(b"init: authd could not start\n");
+        return 46;
     };
-    let Some(who) = who else {
-        rt::sys::debug_write(b"init: no profile is marked autologin\n");
-        return 44;
+    let mut console = Login {
+        serial,
+        pending: Vec::new(),
     };
     use rt::abi::signals;
     use rt::sys;
@@ -1289,7 +1302,17 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
             sys::debug_write(b"init: giving up after repeated service failures\n");
             return 40;
         }
-        let stack = match start_stack(Term::Serial(serial), image_vmo, img, entries, who) {
+        let who = match choose_profile(
+            &mut console,
+            &authd,
+            &mut profiles,
+            autologin_enabled,
+            recovery,
+        ) {
+            Ok(w) => w,
+            Err(code) => return code,
+        };
+        let stack = match start_stack(Term::Serial(serial), image_vmo, img, entries, &who) {
             Ok(s) => s,
             Err(code) => {
                 sys::debug_write(b"init: the session could not start\n");
@@ -1351,5 +1374,236 @@ fn supervise(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg:
         }
         // (a short pause, longer the more often a service has failed in a row)
         io::nap(50 * (1 + failures));
+    }
+}
+
+/// The channel to `authd` and the process behind it.
+struct Authd {
+    ch: u32,
+}
+
+fn start_authd(
+    image_vmo: u32,
+    img: &[u8],
+    entries: &[proto::bootimg::Entry],
+    recovery: bool,
+) -> Option<Authd> {
+    use rt::abi::rights::Rights;
+    let e = entries.iter().find(|e| e.name == b"bin/authd")?;
+    let bin = img.get(e.offset as usize..(e.offset + e.size) as usize)?;
+    let c = rt::sys::channel_create();
+    if c.status != 0 {
+        return None;
+    }
+    let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+    let image = rt::sys::handle_duplicate(image_vmo, Rights::SAME.0);
+    if image.status != 0 {
+        return None;
+    }
+    let startup = proto::startup::Startup {
+        args: alloc::vec![b"authd".to_vec()],
+        env: if recovery {
+            alloc::vec![b"RECOVERY=1".to_vec()]
+        } else {
+            Vec::new()
+        },
+        roles: alloc::vec![(Role::ServiceAuth, 0), (Role::BootImage, 1)],
+        ..proto::startup::Startup::default()
+    };
+    let bytes = startup.encode().ok()?;
+    rt::spawn::spawn(bin, &bytes, &[theirs, image.a1 as u32]).ok()?;
+    Some(Authd { ch: mine })
+}
+
+impl Authd {
+    /// One request, one reply (a lost `authd` answers `gone`).
+    fn ask(&self, req: &str) -> String {
+        use rt::abi::signals;
+        use rt::sys;
+        sys::channel_write(self.ch, req.as_ptr(), req.len(), core::ptr::null(), 0);
+        let w = sys::object_wait(self.ch, signals::READABLE | signals::PEER_CLOSED, u64::MAX);
+        if w.status != 0 {
+            return String::from("gone");
+        }
+        let mut buf = [0u8; 128];
+        let r = sys::channel_read(
+            self.ch,
+            buf.as_mut_ptr(),
+            buf.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        if r.status != 0 {
+            return String::from("gone");
+        }
+        String::from_utf8_lossy(&buf[..r.a1]).into_owned()
+    }
+
+    fn count(&self) -> usize {
+        self.ask("count").parse().unwrap_or(0)
+    }
+}
+
+/// The login prompts, on the serial line (before the console server of a session exists, and after it is gone).
+struct Login {
+    serial: u32,
+    pending: Vec<u8>,
+}
+
+impl Login {
+    fn say(&self, text: &str) {
+        let _ = io::write_all(self.serial, text.as_bytes());
+    }
+
+    /// Show `prompt`, read one line (echoed unless `secret`); `None` when the terminal is gone.
+    fn line(&mut self, prompt: &str, secret: bool) -> Option<String> {
+        self.say(prompt);
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            if self.pending.is_empty() {
+                let mut buf = [0u8; 64];
+                match io::read(self.serial, &mut buf) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => self.pending.extend_from_slice(&buf[..n]),
+                }
+            }
+            let b = self.pending.remove(0);
+            match b {
+                b'\r' | b'\n' => {
+                    // (a \n straight after \r belongs to the same Enter)
+                    if b == b'\r' && self.pending.first() == Some(&b'\n') {
+                        self.pending.remove(0);
+                    }
+                    self.say("\r\n");
+                    return Some(String::from_utf8_lossy(&line).into_owned());
+                }
+                0x7f | 0x08 => {
+                    if line.pop().is_some() && !secret {
+                        self.say("\x08 \x08");
+                    }
+                }
+                b if b >= 0x20 && line.len() < 200 => {
+                    line.push(b);
+                    if !secret {
+                        self.say(core::str::from_utf8(&[b]).unwrap_or("?"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A profile for the first user, made by the setup session: the image's shared home, no extra program grants.
+fn setup_profile(name: &str) -> Option<Loaded> {
+    let text = alloc::format!("{{ \"name\": \"{name}\", \"uid\": 1000, \"home\": \"home\" }}");
+    let p = profile::Profile::parse(&text).ok()?;
+    Some(Loaded { profile: p, text })
+}
+
+/// Decide who gets a session now (the boot policy of `auth::boot`), prompting as the plan says. `Err` is an exit code.
+fn choose_profile(
+    console: &mut Login,
+    authd: &Authd,
+    profiles: &mut Vec<Loaded>,
+    autologin_enabled: bool,
+    recovery: bool,
+) -> Result<Loaded, i32> {
+    loop {
+        let names: Vec<&str> = profiles.iter().map(|l| l.profile.name.as_str()).collect();
+        let profs: Vec<profile::Profile> = profiles.iter().map(|l| l.profile.clone()).collect();
+        let auto = match profile::pick_autologin(&profs) {
+            Ok(p) => p.map(|p| p.name.as_str()),
+            Err(_) => None,
+        };
+        let facts = auth::boot::Facts {
+            profiles: &names,
+            autologin_profile: auto,
+            autologin_enabled,
+            credentials: authd.count(),
+            recovery_requested: recovery,
+        };
+        match auth::boot::decide(&facts) {
+            auth::boot::Plan::Autologin(n) => {
+                rt::sys::debug_write(alloc::format!("init: autologin: {n}\n").as_bytes());
+                if let Some(l) = profiles.iter().find(|l| l.profile.name == n) {
+                    return Ok(l.clone());
+                }
+            }
+            auth::boot::Plan::Locked => {
+                rt::sys::debug_write(b"init: profiles exist but nobody can log in\n");
+                return Err(45);
+            }
+            auth::boot::Plan::Setup => {
+                // the setup session: it can create the first profile and its credential, and nothing else
+                let mut setup = auth::boot::Setup::new();
+                console.say("setup: this system has no users yet\r\n");
+                loop {
+                    let Some(name) = console.line("new user name: ", false) else {
+                        return Err(47);
+                    };
+                    let Ok(name) = setup.create(&name) else {
+                        console
+                            .say("that name will not do (lower case letters, digits, - and _)\r\n");
+                        continue;
+                    };
+                    let Some(pw) = console.line("password: ", true) else {
+                        return Err(47);
+                    };
+                    if authd.ask(&alloc::format!("set {name} {pw}")) != "ok" {
+                        console.say("the credential could not be set\r\n");
+                        return Err(48);
+                    }
+                    let Some(l) = setup_profile(&name) else {
+                        return Err(49);
+                    };
+                    profiles.push(l.clone());
+                    console.say("setup: done\r\n");
+                    // the setup session has done its one thing and is gone; the new user's session starts
+                    return Ok(l);
+                }
+            }
+            auth::boot::Plan::Login | auth::boot::Plan::LoginWithRecovery => {
+                let Some(name) = console.line("login: ", false) else {
+                    return Err(47);
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                if name == "!reset" {
+                    if authd.ask("reset-allowed") != "ok" {
+                        console.say(
+                            "recovery refused: it needs the console's recovery request at boot\r\n",
+                        );
+                        continue;
+                    }
+                    let Some(who) = console.line("reset which user: ", false) else {
+                        return Err(47);
+                    };
+                    let Some(pw) = console.line("new password: ", true) else {
+                        return Err(47);
+                    };
+                    let ok = profiles.iter().any(|l| l.profile.name == who)
+                        && authd.ask(&alloc::format!("set {who} {pw}")) == "ok";
+                    console.say(if ok {
+                        "credential reset\r\n"
+                    } else {
+                        "reset failed\r\n"
+                    });
+                    continue;
+                }
+                let Some(pw) = console.line("password: ", true) else {
+                    return Err(47);
+                };
+                let known = profiles.iter().find(|l| l.profile.name == name);
+                if authd.ask(&alloc::format!("check {name} {pw}")) == "ok" {
+                    if let Some(l) = known {
+                        rt::sys::debug_write(alloc::format!("init: login: {name}\n").as_bytes());
+                        return Ok(l.clone());
+                    }
+                }
+                console.say("login incorrect\r\n");
+            }
+        }
     }
 }

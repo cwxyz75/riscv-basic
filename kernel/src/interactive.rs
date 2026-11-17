@@ -93,6 +93,9 @@ pub fn run() -> crate::user_tests::Report {
         let msg = Startup {
             args: if cfg!(feature = "repl") {
                 alloc::vec![b"init".to_vec(), b"repl".to_vec()]
+            } else if crate::dtb::boot_arg_present("recovery") {
+                // the physical console asked for credential recovery at this boot (UV5a)
+                alloc::vec![b"init".to_vec(), b"recovery".to_vec()]
             } else {
                 alloc::vec![b"init".to_vec()]
             },

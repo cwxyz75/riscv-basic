@@ -83,6 +83,8 @@ pub enum Role {
     /// A channel a volume server writes one byte to once it has mounted its volume and is ready to serve (`volmgr` publishes
     /// the volume's names only then; a server that exits first closes it).
     Ready = 36,
+    /// The channel `authd` serves (UV5a): one request, one reply, in text.
+    ServiceAuth = 37,
 }
 
 impl Role {
@@ -124,6 +126,7 @@ impl Role {
             34 => Role::TmpDir,
             35 => Role::DevDir,
             36 => Role::Ready,
+            37 => Role::ServiceAuth,
             _ => return None,
         })
     }
