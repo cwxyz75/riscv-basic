@@ -228,7 +228,9 @@ def main():
     step(b"if true do\r", [b"$ if true do"], "a block that is not finished")
     step(b"echo ml\r", [b"> echo ml"], "the continuation prompt")
     step(b"end\r", [b"> end", b"ml"], "the block runs when it is complete")
-    step(b"echo abc\x03", [b"$ echo abc^C"], "Ctrl-C abandons the line being typed")
+    # (repeated: on a slow machine the event once overtook the byte typed just before it, `echo ab^C` and then `c`)
+    for _ in range(25):
+        step(b"echo abc\x03", [b"$ echo abc^C"], "Ctrl-C abandons the line being typed")
     step(b"echo ok\r", [b"$ echo ok", b"ok"], "the shell after an abandoned line")
     step(b"while true do end\r", [b"$ while true do end"], "a loop written in shell code")
     time.sleep(1)
@@ -482,6 +484,16 @@ def main():
     step(b"print $cap.status\n", [b"$ print $cap.status", b"0"], "... ends well")
     step(b"print $cap.out\n", [b"$ print $cap.out", b'["found ./hello.txt"]'], "... and its child's output is captured")
     step_re(b"busybox time busybox echo timed\n", [b"$ busybox time busybox echo timed", b"timed", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")], "time runs a program")
+    # the spawn rate: 100 programs started one after another by xargs (a `vfork`, a request to the shell, a launch, a wait each)
+    got = step_re(b"busybox seq 100 | busybox time busybox xargs -n 1 busybox true\n",
+                  [b"$ busybox seq 100 | busybox time busybox xargs -n 1 busybox true", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")],
+                  "100 spawns")
+    m = re.fullmatch(rb"real\t(\d+)m ([\d.]+)s", got[1])
+    secs = int(m.group(1)) * 60 + float(m.group(2))
+    print(f"spawn rate: 100 programs in {secs:.2f} s of guest time ({100 / max(secs, 0.01):.0f} per second)", flush=True)
+    # (12.9 s when the shell watched only the first program's spawn channel: a request from any other waited for a 100 ms timeout)
+    if secs > 8:
+        fail(s, f"100 spawns took {secs:.1f} s")
     # the chain has a depth limit: the fifth program down holds no spawn grant
     step(b"busybox env busybox env busybox env busybox env busybox env busybox echo deep\n",
          [b"$ busybox env busybox env busybox env busybox env busybox env busybox echo deep", b"env: can't execute 'busybox': Function not implemented", b"[exit 126]"],
