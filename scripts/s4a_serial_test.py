@@ -79,6 +79,8 @@ class Session:
             line = self.next_line(what)
             if line == text:
                 return
+            if b"frames free" in line:
+                print("boot:", line.decode(errors="replace"), flush=True)  # (how much memory the machine has: CI differs from a laptop)
             if line.startswith(b"##PANIC"):
                 fail(self, f"kernel panic while waiting for {what}: {line!r}")
 
