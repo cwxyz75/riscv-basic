@@ -163,6 +163,15 @@ static int child_tests(const char *self) {
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
     printf("SIGKILL: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    /* a child's end is a SIGCHLD: it wakes pause() */
+    got = 0;
+    signal(SIGCHLD, on_sig);
+    char *argv4[] = {(char *)self, "signals", "child-quick", NULL};
+    if (posix_spawn(&pid, self, NULL, NULL, argv4, environ) != 0) { printf("spawn failed\n"); return 1; }
+    int pr = pause();
+    waitpid(pid, &status, 0);
+    printf("a child's end: pause %d errno EINTR %d handler SIGCHLD %d\n", pr, errno == EINTR, got == SIGCHLD);
+    signal(SIGCHLD, SIG_DFL);
     /* a signal to nobody */
     printf("kill of a pid that is not ours: %d errno ESRCH %d\n", kill(99999, SIGTERM), errno == ESRCH);
     return 0;
@@ -187,6 +196,9 @@ int signals_test(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[2], "child-handled") == 0) {
         signal(SIGTERM, on_term_exit7);
         for (;;) sleep(10);
+    }
+    if (argc > 2 && strcmp(argv[2], "child-quick") == 0) {
+        return 0;
     }
     if (argc > 2 && strcmp(argv[2], "child-default") == 0) {
         for (;;) sleep(10);

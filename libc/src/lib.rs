@@ -24,6 +24,7 @@ mod ctype;
 mod errno;
 mod fd;
 mod file;
+mod glob;
 mod math;
 mod misc;
 mod netdb;

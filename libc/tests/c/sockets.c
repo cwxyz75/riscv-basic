@@ -61,7 +61,7 @@ static void refusals(void) {
     CHECK(socket(AF_INET, 3, 0) < 0 && errno == EPROTONOSUPPORT, "SOCK_RAW is EPROTONOSUPPORT");
     CHECK(socket(AF_INET, SOCK_STREAM, 17) < 0 && errno == EPROTONOSUPPORT, "TCP with protocol 17 is EPROTONOSUPPORT");
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(s >= 3, "a stream socket gets a descriptor");
+    CHECK(s >= 0, "a stream socket gets a descriptor (the lowest free one: 0 to 2 may be closed)");
     int one = 1;
     CHECK(setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one) < 0 && errno == ENOPROTOOPT, "SO_KEEPALIVE is ENOPROTOOPT");
     CHECK(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "SO_REUSEADDR is accepted");

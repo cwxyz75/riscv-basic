@@ -32,6 +32,8 @@ pub fn init(ch: u32) {
 }
 
 struct Child {
+    /// SIGCHLD has been posted for this child's end.
+    notified: bool,
     pid: c_int,
     /// The process handle, or 0 for a child that ended before it began (a `vfork` child whose `exec` failed).
     h: u32,
@@ -46,8 +48,38 @@ fn register(pid: c_int, h: u32, done: Option<i32>) -> c_int {
     } else {
         NEXT_PSEUDO.fetch_add(1, Ordering::Relaxed) as c_int
     };
-    CHILDREN.lock().push(Child { pid, h, done });
+    CHILDREN.lock().push(Child {
+        notified: false,
+        pid,
+        h,
+        done,
+    });
     pid
+}
+
+/// Have children ended since the last look? (Each end is reported once; the library posts SIGCHLD for it.)
+pub fn newly_exited() -> bool {
+    let mut any = false;
+    for c in CHILDREN.lock().iter_mut() {
+        if !c.notified
+            && (c.done.is_some()
+                || (c.h != 0 && sys::object_wait(c.h, signals::TERMINATED, 0).status == 0))
+        {
+            c.notified = true;
+            any = true;
+        }
+    }
+    any
+}
+
+/// The process handles of the children that have not ended yet, for a wait that a child's end should wake.
+pub fn live_child_handles() -> Vec<u32> {
+    CHILDREN
+        .lock()
+        .iter()
+        .filter(|c| !c.notified && c.h != 0)
+        .map(|c| c.h)
+        .collect()
 }
 
 /// Is a `vfork` child running (in this process)?
@@ -300,6 +332,7 @@ vfork:
 #[no_mangle]
 extern "C" fn vfork_prepare() {
     crate::sig::vfork_save();
+    crate::fd::vfork_enter();
     VFORK_ACTIVE.store(1, Ordering::Relaxed);
 }
 
@@ -311,6 +344,7 @@ extern "C" {
 fn vfork_return(spid: c_int, h: u32, done: Option<i32>) -> ! {
     VFORK_ACTIVE.store(0, Ordering::Relaxed);
     crate::sig::vfork_restore();
+    crate::fd::vfork_leave();
     let pid = register(spid, h, done);
     // SAFETY: `VFORK_BUF` was filled by `vfork` and the frame it describes is still live: the child may not return from it.
     unsafe { longjmp(core::ptr::addr_of_mut!(VFORK_BUF) as *mut u64, pid) }

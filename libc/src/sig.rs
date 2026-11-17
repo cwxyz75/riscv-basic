@@ -155,6 +155,9 @@ pub fn deliver() -> Delivered {
     loop {
         drain();
         check_alarm();
+        if crate::spawn::newly_exited() {
+            post(17); // SIGCHLD (its default is to do nothing; hush's `wait` and `sigsuspend` callers wait for it)
+        }
         // a process waiting for the program it `exec`'d passes its signals on to it
         let fwd = crate::spawn::FORWARD_TO.load(Ordering::Relaxed);
         if fwd != 0 {
@@ -211,6 +214,9 @@ pub fn deliver() -> Delivered {
     }
 }
 
+/// Port keys from here up are children's ends (`wait_any`'s own objects count up from 0).
+const CHILD_KEY: u64 = 1 << 32;
+
 /// How a wait ended.
 #[allow(dead_code)]
 pub enum Wait {
@@ -259,9 +265,19 @@ pub fn wait_any(items: &[(u32, u32)], deadline: u64, restart: bool) -> Wait {
         if ch != 0 {
             sys::port_bind_flags(port, ch, sg::READABLE, u64::MAX, port_flags::ONESHOT);
         }
+        // a child's end wakes the wait too (SIGCHLD is posted at the top of the loop)
+        for (k, h) in crate::spawn::live_child_handles().into_iter().enumerate() {
+            sys::port_bind_flags(
+                port,
+                h,
+                sg::TERMINATED,
+                CHILD_KEY + k as u64,
+                port_flags::ONESHOT,
+            );
+        }
         let r = sys::port_wait(port, until);
         sys::handle_close(port);
-        if r.status == 0 && r.a1 != u64::MAX as usize {
+        if r.status == 0 && r.a1 != u64::MAX as usize && (r.a1 as u64) < CHILD_KEY {
             return Wait::Ready(r.a1);
         }
     }
