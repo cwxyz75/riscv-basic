@@ -111,6 +111,13 @@ struct Os {
     interrupt: bool,
     /// There is a console server: interactive mode.
     interactive: bool,
+    /// Programs may start programs (OD118): the default; each program's channel is below.
+    spawn_grant: bool,
+    brokers: Vec<Broker>,
+    /// The broker made for the program being started (attached to its pid by the caller).
+    pending_broker: Option<Broker>,
+    /// Programs started by programs, by pid.
+    desc: BTreeMap<u32, Desc>,
 }
 
 /// A volume granted to a trusted program (`/etc/trusted`, FS-SPEC section 6): the volume's name in the mount table, the
@@ -128,6 +135,77 @@ struct Trust {
     grants: Vec<Grant>,
     /// The program gets a read-only root (`/etc/trusted` always gives one; a profile may not).
     root: bool,
+}
+
+/// How a program's standard streams are given: shell streams (a command line), or handles a program passed in a spawn request
+/// (which move to the new program).
+#[derive(Clone, Copy)]
+enum Stdio {
+    Streams(ProcIo),
+    Handles([u32; 3]),
+}
+
+/// A spawn request's handles go away with a start that fails before it uses them.
+fn drop_stdio(stdio: Stdio) {
+    if let Stdio::Handles(h) = stdio {
+        close_all(&h);
+    }
+}
+
+/// How deep programs may start programs (below the shell's own), and how many a started program may have alive at once.
+const SPAWN_DEPTH: u8 = 4;
+const SPAWN_LIVE: usize = 32;
+
+/// The shell's end of the spawn channel of one running program (OD118): what the program holds (so a child never holds more),
+/// where it was started from, and how deep in the chain it is.
+struct Broker {
+    /// The program this channel belongs to (a shell pid, or a descendant's).
+    pid: u32,
+    /// The program the shell's command line started, the root of this chain.
+    root: u32,
+    ch: u32,
+    depth: u8,
+    cwd: Fs,
+    cwd_path: Vec<u8>,
+    /// Each mount in the program's namespace and whether it is writable.
+    mounts: Vec<(Vec<u8>, bool)>,
+    /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
+    confined: Option<Vec<(String, String)>>,
+}
+
+/// A program a program started (the shell holds its process handle too: it reaps it and ends it with its chain's root).
+struct Desc {
+    h: u32,
+    root: u32,
+}
+
+/// May a program that holds `allow` pass on `name` at these rights? (No `allow` means the shell is starting it.)
+fn allowed(allow: Option<&[(Vec<u8>, bool)]>, name: &[u8], writable: bool) -> bool {
+    match allow {
+        None => true,
+        Some(a) => a.iter().any(|(n, w)| n == name && (*w || !writable)),
+    }
+}
+
+/// Add a namespace entry unless the asking program does not hold it; record it for the new program's own spawn grant.
+fn ns_push(
+    startup: &mut Startup,
+    forward: &mut Vec<u32>,
+    mounts: &mut Vec<(Vec<u8>, bool)>,
+    allow: Option<&[(Vec<u8>, bool)]>,
+    name: &[u8],
+    ch: u32,
+    writable: bool,
+) {
+    if !allowed(allow, name, writable) {
+        sys::handle_close(ch);
+        return;
+    }
+    startup
+        .namespace
+        .push((name.to_vec(), forward.len() as u32));
+    forward.push(ch);
+    mounts.push((name.to_vec(), writable));
 }
 
 fn parse_trust(line: &[u8]) -> Option<Trust> {
@@ -433,9 +511,288 @@ impl Os {
             self.killed = true;
         }
         sys::handle_close(h);
+        self.end_chain(pid);
+        self.drop_broker(pid);
         self.cleanup_tmp(pid);
         self.proc_forget(pid);
         code
+    }
+
+    /// Give the broker made for a program just started its pid.
+    fn attach_broker(&mut self, pid: u32, root: u32) {
+        if let Some(mut b) = self.pending_broker.take() {
+            b.pid = pid;
+            b.root = root;
+            self.brokers.push(b);
+        }
+    }
+
+    /// A program is gone: its spawn channel closes.
+    fn drop_broker(&mut self, pid: u32) {
+        if let Some(i) = self.brokers.iter().position(|b| b.pid == pid) {
+            let b = self.brokers.remove(i);
+            sys::handle_close(b.ch);
+            b.cwd.close();
+        }
+    }
+
+    /// A program a program started is gone (or ended): forget it everywhere.
+    fn forget_desc(&mut self, id: u32) {
+        if let Some(d) = self.desc.remove(&id) {
+            sys::handle_close(d.h);
+        }
+        self.cleanup_tmp(id);
+        self.proc_forget(id);
+        self.drop_broker(id);
+    }
+
+    /// The programs that ended on their own.
+    fn reap_desc(&mut self) {
+        let done: Vec<u32> = self
+            .desc
+            .iter()
+            .filter(|(_, d)| sys::object_wait(d.h, signals::TERMINATED, 0).status == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in done {
+            self.forget_desc(id);
+        }
+    }
+
+    /// A started program has ended: whatever it started and left running ends with it (there are no orphans).
+    fn end_chain(&mut self, root: u32) {
+        let ids: Vec<u32> = self
+            .desc
+            .iter()
+            .filter(|(_, d)| d.root == root)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            if let Some(d) = self.desc.get(&id) {
+                sys::process_kill(d.h, -1);
+            }
+            self.forget_desc(id);
+        }
+    }
+
+    /// Answer the spawn requests programs have sent (never blocks; at most a few per program per call, so a program that floods
+    /// its channel cannot keep the shell from looking at anything else). A program that closes its channel, or speaks the
+    /// protocol wrongly, loses it.
+    fn service_brokers(&mut self) {
+        if self.brokers.is_empty() {
+            return;
+        }
+        let mut buf = alloc::vec![0u8; proto::spawn::MAX_BYTES];
+        let mut i = 0;
+        while i < self.brokers.len() {
+            let mut served = 0;
+            let mut keep = true;
+            while served < 4 {
+                let mut hs = [0u32; proto::spawn::HANDLES + 1];
+                let ch = self.brokers[i].ch;
+                let r =
+                    sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
+                match r.status() {
+                    Some(Status::Ok) => {}
+                    Some(Status::ShouldWait) => break,
+                    _ => {
+                        // the program closed it, or sent what does not fit: no more requests from it
+                        keep = false;
+                        break;
+                    }
+                }
+                served += 1;
+                if !self.answer_spawn(i, &buf[..r.a1], &hs[..r.a2]) {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                i += 1;
+            } else {
+                let b = self.brokers.remove(i);
+                sys::handle_close(b.ch);
+                b.cwd.close();
+            }
+        }
+    }
+
+    /// Serve everything the shell serves while it waits: output pumps, spawn requests, ended programs, and the chains of
+    /// programs that have ended (what a program started does not outlive it, whether or not the shell has waited for it yet).
+    fn serve(&mut self) {
+        self.service_pumps();
+        self.service_brokers();
+        self.reap_desc();
+        let dead: Vec<u32> = self
+            .procs
+            .iter()
+            .filter(|(id, h)| {
+                self.desc.values().any(|d| d.root == **id)
+                    && sys::object_wait(**h, signals::TERMINATED, 0).status == 0
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            self.end_chain(id);
+        }
+    }
+
+    /// Wait on `h` for `mask` (or a few milliseconds) while serving; the shell never sits in a blocking read or write while a
+    /// program of its own is waiting for it.
+    fn serve_wait(&mut self, h: u32, mask: u32) {
+        let p = sys::port_create();
+        if p.status != 0 {
+            io::nap(2);
+            return;
+        }
+        let port = p.a1 as u32;
+        sys::port_bind(port, h, mask, 0);
+        for b in &self.brokers {
+            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1);
+        }
+        for d in self.desc.values() {
+            sys::port_bind(port, d.h, signals::TERMINATED, 2);
+        }
+        for q in &self.pumps_out {
+            sys::port_bind(port, q.rd, signals::READABLE | signals::PEER_CLOSED, 3);
+        }
+        sys::port_wait(port, sys::clock_get() + 20);
+        sys::handle_close(port);
+        self.serve();
+    }
+
+    fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u32]) -> bool {
+        let ch = self.brokers[i].ch;
+        let txid = proto::file::peek_txid(msg).unwrap_or(0);
+        let reply = |status: i32, h: Option<u32>| {
+            let m = proto::spawn::encode_reply(txid, status);
+            let hv: &[u32] = match &h {
+                Some(x) => core::slice::from_ref(x),
+                None => &[],
+            };
+            if sys::channel_write(ch, m.as_ptr(), m.len(), hv.as_ptr(), hv.len()).status != 0 {
+                if let Some(x) = h {
+                    sys::handle_close(x);
+                }
+            }
+        };
+        let Ok(req) = proto::spawn::decode(msg) else {
+            close_all(hs);
+            reply(proto::file::status::BAD_REQUEST, None);
+            return false;
+        };
+        if hs.len() != proto::spawn::HANDLES {
+            close_all(hs);
+            reply(proto::file::status::BAD_REQUEST, None);
+            return false;
+        }
+        let root = self.brokers[i].root;
+        if self.desc.values().filter(|d| d.root == root).count() >= SPAWN_LIVE {
+            close_all(hs);
+            reply(proto::file::status::QUOTA, None);
+            return true;
+        }
+        let prog = String::from_utf8_lossy(req.prog).into_owned();
+        let argv: Vec<String> = req
+            .args
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let env: Vec<(String, String)> = req
+            .env
+            .iter()
+            .filter_map(|e| {
+                let at = e.iter().position(|&b| b == b'=')?;
+                Some((
+                    String::from_utf8_lossy(&e[..at]).into_owned(),
+                    String::from_utf8_lossy(&e[at + 1..]).into_owned(),
+                ))
+            })
+            .collect();
+        if !shell_core::valid_command_name(prog.as_bytes()) {
+            close_all(hs);
+            reply(proto::file::status::NOT_FOUND, None);
+            return true;
+        }
+        let mut b = self.brokers.remove(i);
+        self.new_tmp = None;
+        let started = self.start_with(
+            &prog,
+            &argv,
+            &env,
+            Stdio::Handles([hs[0], hs[1], hs[2]]),
+            Some(&mut b),
+        );
+        self.brokers.insert(i, b);
+        let tmp = self.new_tmp.take();
+        match started {
+            Err(e) => {
+                if let Some(t) = tmp {
+                    if let Some(tf) = self.tmp.as_mut() {
+                        remove_tree(tf, &t, 0);
+                    }
+                }
+                let st = match e {
+                    HostError::NotFound => proto::file::status::NOT_FOUND,
+                    _ => proto::file::status::UNAVAILABLE,
+                };
+                reply(st, None);
+            }
+            Ok(ph) => {
+                let id = self.next_pid;
+                self.next_pid += 1;
+                self.proc_announce(
+                    id,
+                    ph,
+                    if argv.is_empty() {
+                        core::slice::from_ref(&prog)
+                    } else {
+                        &argv
+                    },
+                );
+                self.desc.insert(id, Desc { h: ph, root });
+                self.attach_broker(id, root);
+                if let Some(t) = tmp {
+                    self.tmp_of.insert(id, t);
+                }
+                let give = dup(
+                    ph,
+                    Rights::WAIT.0 | Rights::INSPECT.0 | Rights::KILL.0 | Rights::TRANSFER.0,
+                );
+                match give {
+                    Some(g) => reply(0, Some(g)),
+                    None => {
+                        sys::process_kill(ph, -1);
+                        self.forget_desc(id);
+                        reply(proto::file::status::UNAVAILABLE, None)
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Sleep until something the shell serves happens: a program ends (`extra`, and the ones programs started), a program
+    /// sends a spawn request, or `deadline` (capped, so the output pumps are looked at too).
+    fn idle(&mut self, extra: &[u32], deadline: u64) {
+        let until = deadline.min(sys::clock_get() + if self.has_pumps() { 10 } else { 100 });
+        let p = sys::port_create();
+        if p.status != 0 {
+            io::nap(2);
+            return;
+        }
+        let port = p.a1 as u32;
+        for &h in extra {
+            sys::port_bind(port, h, signals::TERMINATED, 0);
+        }
+        for b in &self.brokers {
+            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1);
+        }
+        for d in self.desc.values() {
+            sys::port_bind(port, d.h, signals::TERMINATED, 2);
+        }
+        sys::port_wait(port, until);
+        sys::handle_close(port);
     }
 
     fn add_obj(&mut self, o: Obj) -> Stream {
@@ -450,19 +807,21 @@ impl Os {
         let (h, want) = match s.0 {
             0 if input => (
                 self.tty,
-                Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+                Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
             ),
             1 | 2 if !input => (
                 self.tty,
-                Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
+                Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
             ),
             _ => match self.objs.get(&s.0)? {
-                Obj::PipeR(h) if input => {
-                    (*h, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0)
-                }
-                Obj::PipeW(h) if !input => {
-                    (*h, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0)
-                }
+                Obj::PipeR(h) if input => (
+                    *h,
+                    Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+                ),
+                Obj::PipeW(h) if !input => (
+                    *h,
+                    Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+                ),
                 Obj::FileW { .. } if !input => return self.pump_out(s.0),
                 Obj::FileR { .. } if input => return self.pump_in(s.0),
                 _ => return None,
@@ -478,7 +837,10 @@ impl Os {
             return None;
         }
         let (rd, wr) = (s.a1 as u32, s.a2 as u32);
-        let fwd = dup(wr, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
+        let fwd = dup(
+            wr,
+            Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+        );
         let mine = dup(rd, Rights::READ.0 | Rights::WAIT.0);
         close_all(&[rd, wr]);
         let (fwd, mine) = (fwd?, mine?);
@@ -509,7 +871,10 @@ impl Os {
             return None;
         }
         let (rd, wr) = (s.a1 as u32, s.a2 as u32);
-        let fwd = dup(rd, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
+        let fwd = dup(
+            rd,
+            Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
+        );
         let mine = dup(wr, Rights::WRITE.0 | Rights::WAIT.0);
         close_all(&[rd, wr]);
         let (fwd, mine) = (fwd?, mine?);
@@ -602,42 +967,70 @@ impl Os {
         env: &[(String, String)],
         io: ProcIo,
     ) -> Result<u32, HostError> {
-        let name = argv[0].as_bytes();
+        self.start_with(&argv[0], argv, env, Stdio::Streams(io), None)
+    }
+
+    /// Start a program. `parent` is the broker of the program that asked (a spawn request, OD118): the new program gets
+    /// only what that program also holds, at no wider rights, and its working directory.
+    fn start_with(
+        &mut self,
+        prog: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        stdio: Stdio,
+        mut parent: Option<&mut Broker>,
+    ) -> Result<u32, HostError> {
+        let allow: Option<Vec<(Vec<u8>, bool)>> = parent.as_ref().map(|p| p.mounts.clone());
+        let mut mounts: Vec<(Vec<u8>, bool)> = Vec::new();
+        let name = prog.as_bytes();
         if !shell_core::valid_command_name(name) {
+            drop_stdio(stdio);
             return Err(HostError::Other(String::from("bad command name")));
         }
         let path: Vec<u8> = [&b"bin/"[..], name].concat();
-        let mut file = self
-            .root
-            .open(&path, 0, rights::READ)
-            .map_err(|_| HostError::NotFound)?;
+        let mut file = self.root.open(&path, 0, rights::READ).map_err(|_| {
+            drop_stdio(stdio);
+            HostError::NotFound
+        })?;
         let image = file.get_vmo();
         file.close();
-        let (vmo, offset, len) = image.map_err(|_| HostError::NotFound)?;
+        let (vmo, offset, len) = image.map_err(|_| {
+            drop_stdio(stdio);
+            HostError::NotFound
+        })?;
         let want = rights::READ | rights::ENUMERATE;
         let trust = self.trusted.iter().position(|t| t.name == name);
         let trusted = trust.is_some_and(|t| self.trusted[t].root);
-        let Some(stdin) = self.forward_stream(io.stdin, true) else {
-            sys::handle_close(vmo);
-            return Err(HostError::Other(String::from(
-                "this input cannot be given to a program",
-            )));
+        let (stdin, stdout, stderr) = match stdio {
+            Stdio::Handles([a, b, c]) => (a, b, c),
+            Stdio::Streams(io) => {
+                let Some(stdin) = self.forward_stream(io.stdin, true) else {
+                    sys::handle_close(vmo);
+                    return Err(HostError::Other(String::from(
+                        "this input cannot be given to a program",
+                    )));
+                };
+                let Some(stdout) = self.forward_stream(io.stdout, false) else {
+                    sys::handle_close(vmo);
+                    sys::handle_close(stdin);
+                    return Err(HostError::Other(String::from(
+                        "this output cannot be given to a program",
+                    )));
+                };
+                let Some(stderr) = self.forward_stream(io.stderr, false) else {
+                    sys::handle_close(vmo);
+                    close_all(&[stdin, stdout]);
+                    return Err(HostError::Other(String::from(
+                        "this output cannot be given to a program",
+                    )));
+                };
+                (stdin, stdout, stderr)
+            }
         };
-        let Some(stdout) = self.forward_stream(io.stdout, false) else {
-            sys::handle_close(vmo);
-            sys::handle_close(stdin);
-            return Err(HostError::Other(String::from(
-                "this output cannot be given to a program",
-            )));
+        let (cwd, cwd_path) = match parent.as_deref_mut() {
+            Some(p) => (p.cwd.clone_conn(want), p.cwd_path.clone()),
+            None => (self.cwd.clone_conn(want), self.cwd_path.clone()),
         };
-        let Some(stderr) = self.forward_stream(io.stderr, false) else {
-            sys::handle_close(vmo);
-            close_all(&[stdin, stdout]);
-            return Err(HostError::Other(String::from(
-                "this output cannot be given to a program",
-            )));
-        };
-        let cwd = self.cwd.clone_conn(want);
         let root = if trusted {
             Some(self.root.clone_conn(want))
         } else {
@@ -645,7 +1038,11 @@ impl Os {
         };
         let mut forward: Vec<u32> = alloc::vec![stdin, stdout, stderr];
         let mut startup = Startup {
-            args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            args: if argv.is_empty() {
+                alloc::vec![prog.as_bytes().to_vec()]
+            } else {
+                argv.iter().map(|a| a.as_bytes().to_vec()).collect()
+            },
             roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
         };
@@ -654,20 +1051,27 @@ impl Os {
         for (k, v) in env {
             startup.env.push(format!("{k}={v}").into_bytes());
         }
-        startup.env.push([&b"PWD="[..], &self.cwd_path].concat());
+        startup.env.push([&b"PWD="[..], &cwd_path].concat());
         // which of the standard streams are the terminal (a program tells a tty from a pipe by this)
-        if io.stdin == Stream(0) {
-            startup.env.push(b"STDIN=tty".to_vec());
-        }
-        if io.stdout == Stream(1) {
-            startup.env.push(b"STDOUT=tty".to_vec());
+        if let Stdio::Streams(io) = stdio {
+            if io.stdin == Stream(0) {
+                startup.env.push(b"STDIN=tty".to_vec());
+            }
+            if io.stdout == Stream(1) {
+                startup.env.push(b"STDOUT=tty".to_vec());
+            }
         }
         match cwd {
             Ok(c) => {
-                startup
-                    .namespace
-                    .push((b".".to_vec(), forward.len() as u32));
-                forward.push(c.ch);
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    None,
+                    b".",
+                    c.ch,
+                    false,
+                );
             }
             Err(_) => {
                 sys::handle_close(vmo);
@@ -680,7 +1084,10 @@ impl Os {
                 )));
             }
         }
-        let confined = self.confined.last().cloned();
+        let confined = match parent.as_ref() {
+            Some(p) => p.confined.clone(),
+            None => self.confined.last().cloned(),
+        };
         let root = if confined.is_some() {
             if let Some(Ok(r)) = root {
                 r.close();
@@ -691,10 +1098,15 @@ impl Os {
         };
         match root {
             Some(Ok(r)) => {
-                startup
-                    .namespace
-                    .push((b"/".to_vec(), forward.len() as u32));
-                forward.push(r.ch);
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    allow.as_deref(),
+                    b"/",
+                    r.ch,
+                    false,
+                );
             }
             Some(Err(_)) => {
                 sys::handle_close(vmo);
@@ -709,21 +1121,31 @@ impl Os {
         // only this program holds a connection to, removed when the job ends
         if let Some(d) = self.dev.as_mut() {
             if let Ok(c) = d.clone_conn(rights::READ | rights::WRITE | rights::ENUMERATE) {
-                startup
-                    .namespace
-                    .push((b"/dev".to_vec(), forward.len() as u32));
-                forward.push(c.ch);
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    allow.as_deref(),
+                    b"/dev",
+                    c.ch,
+                    true,
+                );
             }
         }
         if let Some(d) = self.proc_root.as_mut() {
             if let Ok(c) = d.clone_conn(rights::READ | rights::ENUMERATE) {
-                startup
-                    .namespace
-                    .push((b"/proc".to_vec(), forward.len() as u32));
-                forward.push(c.ch);
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    allow.as_deref(),
+                    b"/proc",
+                    c.ch,
+                    false,
+                );
             }
         }
-        if self.tmp.is_some() {
+        if self.tmp.is_some() && allowed(allow.as_deref(), b"/tmp", true) {
             self.jobs += 1;
             let name = format!("j{}", self.jobs).into_bytes();
             let opened = self.tmp.as_mut().and_then(|t| {
@@ -739,10 +1161,15 @@ impl Os {
                 c.ok()
             });
             if let Some(c) = opened {
-                startup
-                    .namespace
-                    .push((b"/tmp".to_vec(), forward.len() as u32));
-                forward.push(c.ch);
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    allow.as_deref(),
+                    b"/tmp",
+                    c.ch,
+                    true,
+                );
                 self.new_tmp = Some(name);
             }
         }
@@ -751,12 +1178,25 @@ impl Os {
         if let Some(grants) = &confined {
             // `confine`: exactly the grants, opened now, each as narrow as asked
             for (path, rw) in grants {
+                let writable = rw.contains('w');
+                // (`.` and `/tmp` are the program's own, never a grant by name)
+                if parent.is_some() && (path == "." || path == "/tmp") {
+                    continue;
+                }
+                if !allowed(allow.as_deref(), path.as_bytes(), writable) {
+                    continue;
+                }
                 match self.open_grant(path, rw) {
                     Ok(f) => {
-                        startup
-                            .namespace
-                            .push((path.as_bytes().to_vec(), forward.len() as u32));
-                        forward.push(f.ch);
+                        ns_push(
+                            &mut startup,
+                            &mut forward,
+                            &mut mounts,
+                            allow.as_deref(),
+                            path.as_bytes(),
+                            f.ch,
+                            writable,
+                        );
                     }
                     Err(e) => {
                         sys::handle_close(vmo);
@@ -775,6 +1215,9 @@ impl Os {
                     let g = &self.trusted[t].grants[g];
                     (g.mount.clone(), g.vol.clone(), g.readonly)
                 };
+                if !allowed(allow.as_deref(), &mount, !ro) {
+                    continue;
+                }
                 let want = if ro {
                     rights::READ | rights::ENUMERATE
                 } else {
@@ -790,8 +1233,48 @@ impl Os {
                 // a volume that is not there (no disk, or its server is down for good) is not a reason to refuse to run `ls`:
                 // the program starts without that mount point and its own errors say what is missing
                 if let Some(f) = opened {
-                    startup.namespace.push((mount, forward.len() as u32));
-                    forward.push(f.ch);
+                    ns_push(
+                        &mut startup,
+                        &mut forward,
+                        &mut mounts,
+                        allow.as_deref(),
+                        &mount,
+                        f.ch,
+                        !ro,
+                    );
+                }
+            }
+        }
+        // the program's own spawn grant (OD118): a channel to this shell, kept with what the program holds so that what it
+        // starts holds no more; absent below the depth limit or when the session turned the grant off
+        self.pending_broker = None;
+        let depth = parent.as_ref().map_or(1, |p| p.depth + 1);
+        if self.spawn_grant && depth <= SPAWN_DEPTH {
+            let c = sys::channel_create();
+            if c.status == 0 {
+                let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+                let cw = match parent {
+                    Some(p) => p.cwd.clone_conn(rights::READ | rights::ENUMERATE),
+                    None => self.cwd.clone_conn(rights::READ | rights::ENUMERATE),
+                };
+                match cw {
+                    Ok(cw) => {
+                        startup
+                            .roles
+                            .push((Role::ServiceSpawn, forward.len() as u32));
+                        forward.push(theirs);
+                        self.pending_broker = Some(Broker {
+                            pid: 0,
+                            root: 0,
+                            ch: mine,
+                            depth,
+                            cwd: cw,
+                            cwd_path: cwd_path.clone(),
+                            mounts: mounts.clone(),
+                            confined: confined.clone(),
+                        });
+                    }
+                    Err(_) => close_all(&[mine, theirs]),
                 }
             }
         }
@@ -801,6 +1284,10 @@ impl Os {
         match r {
             Ok(p) => Ok(p),
             Err(e) => {
+                if let Some(b) = self.pending_broker.take() {
+                    sys::handle_close(b.ch);
+                    b.cwd.close();
+                }
                 close_all(&forward);
                 Err(HostError::Other(format!("could not start ({e})")))
             }
@@ -842,6 +1329,7 @@ impl Host for Os {
         };
         self.next_pid += 1;
         self.procs.insert(id, h);
+        self.attach_broker(id, id);
         self.proc_announce(id, h, argv);
         if let Some(n) = tmp {
             self.tmp_of.insert(id, n);
@@ -853,22 +1341,19 @@ impl Host for Os {
         let Some(h) = self.procs.remove(&pid.0) else {
             return -1;
         };
-        if self.has_pumps() {
-            loop {
-                self.service_pumps();
-                if sys::object_wait(h, signals::TERMINATED, sys::clock_get() + 10).status == 0 {
-                    break;
-                }
+        loop {
+            self.serve();
+            if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
+                break;
             }
-            self.service_pumps();
-        } else {
-            sys::object_wait(h, signals::TERMINATED, u64::MAX);
+            self.idle(&[h], u64::MAX);
         }
+        self.service_pumps();
         self.reap(pid.0, h)
     }
 
     fn try_wait(&mut self, pid: Pid) -> Option<i32> {
-        self.service_pumps();
+        self.serve();
         let h = *self.procs.get(&pid.0)?;
         if sys::object_wait(h, signals::TERMINATED, 0).status != 0 {
             return None;
@@ -898,7 +1383,7 @@ impl Host for Os {
         };
         let deadline = sys::clock_get() + ms;
         loop {
-            self.service_pumps();
+            self.serve();
             self.poll_ctl();
             if core::mem::take(&mut self.interrupt) {
                 return WaitOutcome::Interrupted;
@@ -953,7 +1438,20 @@ impl Host for Os {
                 _ => return Err(HostError::Other(String::from("not readable"))),
             },
         };
-        io::read(h, buf).map_err(|_| HostError::Other(String::from("read failed")))
+        if s.0 == 0 {
+            return io::read(h, buf).map_err(|_| HostError::Other(String::from("read failed")));
+        }
+        // a pipe: the shell keeps serving the programs that feed it while it waits for them
+        loop {
+            let r = sys::socket_read(h, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(Status::Ok) => return Ok(r.a1),
+                Some(Status::ShouldWait) => {
+                    self.serve_wait(h, signals::READABLE | signals::PEER_CLOSED)
+                }
+                _ => return Ok(0), // the end of the stream
+            }
+        }
     }
 
     fn poll_read(
@@ -988,8 +1486,15 @@ impl Host for Os {
                     sys::port_bind(port, *h, signals::READABLE | signals::PEER_CLOSED, i as u64);
                 }
             }
-            sys::port_wait(port, u64::MAX);
+            for b in &self.brokers {
+                sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1000);
+            }
+            for d in self.desc.values() {
+                sys::port_bind(port, d.h, signals::TERMINATED, 1001);
+            }
+            sys::port_wait(port, sys::clock_get() + 20);
             sys::handle_close(port);
+            self.serve();
         }
     }
 
@@ -1005,10 +1510,25 @@ impl Host for Os {
                 _ => return Err(HostError::Other(String::from("not writable"))),
             },
         };
-        io::write_all(h, bytes).map_err(|e| match e {
-            io::IoError::PeerClosed => HostError::Closed,
-            _ => HostError::Other(String::from("write failed")),
-        })
+        if s.0 == 1 || s.0 == 2 {
+            return io::write_all(h, bytes).map_err(|e| match e {
+                io::IoError::PeerClosed => HostError::Closed,
+                _ => HostError::Other(String::from("write failed")),
+            });
+        }
+        let mut at = 0;
+        while at < bytes.len() {
+            let r = sys::socket_write(h, bytes[at..].as_ptr(), bytes.len() - at);
+            match r.status() {
+                Some(Status::Ok) => at += r.a1,
+                Some(Status::ShouldWait) => {
+                    self.serve_wait(h, signals::WRITABLE | signals::PEER_CLOSED)
+                }
+                Some(Status::PeerClosed) => return Err(HostError::Closed),
+                _ => return Err(HostError::Other(String::from("write failed"))),
+            }
+        }
+        Ok(())
     }
 
     fn close(&mut self, s: Stream) {
@@ -1132,9 +1652,27 @@ impl Host for Os {
             let port = p.a1 as u32;
             sys::port_bind(port, self.tty, signals::READABLE | signals::PEER_CLOSED, 1);
             sys::port_bind(port, self.ctl, signals::READABLE | signals::PEER_CLOSED, 2);
-            let w = sys::port_wait(port, u64::MAX);
+            // a background job may ask for a program, or write a redirected file, while the shell waits for a key
+            for b in &self.brokers {
+                sys::port_bind(port, b.ch, signals::READABLE, 3);
+            }
+            for d in self.desc.values() {
+                sys::port_bind(port, d.h, signals::TERMINATED, 4);
+            }
+            for p in &self.pumps_out {
+                sys::port_bind(port, p.rd, signals::READABLE | signals::PEER_CLOSED, 5);
+            }
+            let w = sys::port_wait(
+                port,
+                if self.has_pumps() {
+                    sys::clock_get() + 20
+                } else {
+                    u64::MAX
+                },
+            );
             sys::handle_close(port);
-            if w.status != 0 {
+            self.serve();
+            if w.status != 0 && w.status != Status::TimedOut.code() {
                 return TermIn::Gone;
             }
             // the control channel first: an interrupt event is not typed text
@@ -1481,6 +2019,10 @@ pub fn app_main() -> i32 {
         raw: false,
         interrupt: false,
         interactive: ctl_ch.is_some(),
+        spawn_grant: true,
+        brokers: Vec::new(),
+        pending_broker: None,
+        desc: BTreeMap::new(),
     };
     let mut os = os;
     let profile_loaded = env

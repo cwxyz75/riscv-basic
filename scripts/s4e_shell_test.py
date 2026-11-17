@@ -451,9 +451,6 @@ def main():
     step(b"busybox sha1sum hello.txt\n", [b"$ busybox sha1sum hello.txt", hashlib.sha1(hello).hexdigest().encode() + b"  hello.txt"], "an applet: sha1sum")
     step(b"busybox nosuchapplet\n", [b"$ busybox nosuchapplet", b"nosuchapplet: applet not found", b"[exit 127]"], "an unknown applet")
 
-    # /proc (UV6): each file read by a real program (`ps`, `free`, `nproc`, `cat`); only this session's programs are listed
-    cpus = os.environ.get("OS_SMP", "1").encode()
-
     def step_re(send, want, what):
         """Like `step`, but an expected line may be a compiled regex (matched in full)."""
         s.prompt()
@@ -467,6 +464,49 @@ def main():
                 fail(s, f"{what}: expected {getattr(w, 'pattern', w)!r}, got {got!r}")
             out.append(got)
         return out
+
+    # programs that start programs (UV8, OD118): the shell is the broker, each program holds only what its starter held
+    step(b"busybox env -i A=1 B=2\n", [b"$ busybox env -i A=1 B=2", b"A=1", b"B=2"], "env prints the environment it was given")
+    step(b"busybox env FOO=bar busybox echo exec-works\n", [b"$ busybox env FOO=bar busybox echo exec-works", b"exec-works"], "env starts a program (exec)")
+    step(b"busybox env FOO=bar busybox env | busybox grep FOO\n", [b"$ busybox env FOO=bar busybox env | busybox grep FOO", b"FOO=bar"], "the child gets the environment and the pipe")
+    step(b"busybox env busybox false\n", [b"$ busybox env busybox false", b"[exit 1]"], "the child's exit status is the parent's")
+    step(b"busybox env nosuchapplet\n", [b"$ busybox env nosuchapplet", b"env: can't execute 'nosuchapplet': No such file or directory", b"[exit 127]"], "starting what does not exist")
+    step(b"busybox seq 3 | busybox xargs busybox echo got\n", [b"$ busybox seq 3 | busybox xargs busybox echo got", b"got 1 2 3"], "xargs runs a program on its input")
+    step(b"busybox seq 3 | busybox xargs -n 1 busybox echo item\n", [b"$ busybox seq 3 | busybox xargs -n 1 busybox echo item", b"item 1", b"item 2", b"item 3"], "xargs runs it once per item (vfork and wait)")
+    step(b"busybox seq 3 | busybox xargs -n 1 echo bare\n", [b"$ busybox seq 3 | busybox xargs -n 1 echo bare", b"bare 1", b"bare 2", b"bare 3"], "xargs runs a separate program (`echo`) by name")
+    step(b"busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort\n", [b"$ busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort", b"found ./hello.txt", b"found ./lines.txt", b"found ./sub/inner.txt"], "find -exec")
+    # the shell serves a program's requests while it reads that program's captured output (it used to wait for the library's timeout)
+    step(b"cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'\n", [b"$ cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'"], "a captured program that starts a program")
+    step(b"print $cap.status\n", [b"$ print $cap.status", b"0"], "... ends well")
+    step(b"print $cap.out\n", [b"$ print $cap.out", b'["found ./hello.txt"]'], "... and its child's output is captured")
+    step_re(b"busybox time busybox echo timed\n", [b"$ busybox time busybox echo timed", b"timed", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")], "time runs a program")
+    # the chain has a depth limit: the fifth program down holds no spawn grant
+    step(b"busybox env busybox env busybox env busybox env busybox env busybox echo deep\n",
+         [b"$ busybox env busybox env busybox env busybox env busybox env busybox echo deep", b"env: can't execute 'busybox': Function not implemented", b"[exit 126]"],
+         "programs may start programs only four deep")
+    step(b"busybox env busybox env busybox env busybox env busybox echo four\n", [b"$ busybox env busybox env busybox env busybox env busybox echo four", b"four"], "four deep works")
+    # a child holds no more than the program that started it: `ls` is trusted (a root and the volume) when the shell starts it,
+    # but not when `busybox`, which holds neither, starts it
+    step(b"busybox env /bin/ls /\n", [b"$ busybox env /bin/ls /", b"/bin/ls: /: not found", b"[exit 1]"], "a trusted program started by an untrusted one gets no root")
+    step(b"busybox env /bin/ls /mnt/store\n", [b"$ busybox env /bin/ls /mnt/store", b"/bin/ls: /mnt/store: not found", b"[exit 1]"], "... and no volume")
+    step(b"busybox env /bin/probe\n", [b"$ busybox env /bin/probe", b"open /etc/trusted: -108", b"open ../x: -108", b"write ./f: -3",
+                      b"clone: ok", b"clone all: -3", b"root: absent", b"dev null: 0", b"dev zero: 0", b"tmp: 0", b"spawn: -5"],
+         "a child started by a program sees what a program started by the shell sees")
+    # Ctrl-C ends the whole chain, not only the program the shell started
+    step(b"busybox env busybox sleep 100\n", [b"$ busybox env busybox sleep 100"], "a program that has started a program")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x03", [b"^C", b"[exit -130]"], "Ctrl-C ends it")
+    s.wait_for_prompt = True
+    step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R ps")], "nothing it started is left running")
+    # a background job asks for a program while the shell sits at its prompt: it is served, and the job ends
+    step(b'bg = spawn { "out": "discard" } busybox env busybox echo hi\n', [b'$ bg = spawn { "out": "discard" } busybox env busybox echo hi'], "a background job that starts a program")
+    time.sleep(1.0)
+    step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ Z busybox env busybox echo hi"), re.compile(rb"\d+ R ps")], "it was served while the shell was idle")
+    step(b"set r = wait $bg\n", [b"$ set r = wait $bg"], "wait for it")
+
+    # /proc (UV6): each file read by a real program (`ps`, `free`, `nproc`, `cat`); only this session's programs are listed
+    cpus = os.environ.get("OS_SMP", "1").encode()
 
     step(b"nproc\n", [b"$ nproc", cpus], "nproc counts /proc/cpuinfo")
     step_re(b"cat /proc/cpuinfo\n", [b"$ cat /proc/cpuinfo"] + [x for i in range(int(cpus)) for x in (f"processor\t: {i}".encode(), b"")], "cpuinfo has a stanza per hart")

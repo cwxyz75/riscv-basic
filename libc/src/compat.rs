@@ -687,6 +687,7 @@ pub extern "C" fn dup(fd: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn _exit(code: c_int) -> ! {
+    crate::spawn::vfork_child_exit(code);
     rt::sys::exit(code)
 }
 
@@ -1207,15 +1208,8 @@ unsupported! {
     utimes(a: *const c_char, b: *const c_void) -> c_int = -1;
     popen(a: *const c_char, b: *const c_char) -> *mut c_void = core::ptr::null_mut();
     pclose(a: *mut c_void) -> c_int = -1;
-    kill(a: c_int, b: c_int) -> c_int = -1;
     setsid() -> c_int = -1;
-    vfork() -> c_int = -1;
     fork() -> c_int = -1;
-    execv(a: *const c_char, b: *const *const c_char) -> c_int = -1;
-    execvp(a: *const c_char, b: *const *const c_char) -> c_int = -1;
-    execve(a: *const c_char, b: *const *const c_char, c: *const *const c_char) -> c_int = -1;
-    wait(a: *mut c_int) -> c_int = -1;
-    waitpid(a: c_int, b: *mut c_int, c: c_int) -> c_int = -1;
     getppid() -> c_int = 1;
 }
 

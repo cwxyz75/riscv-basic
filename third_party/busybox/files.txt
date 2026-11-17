@@ -11,6 +11,7 @@ coreutils/df.c
 coreutils/dirname.c
 coreutils/du.c
 coreutils/echo.c
+coreutils/env.c
 coreutils/expand.c
 coreutils/expr.c
 coreutils/factor.c
@@ -31,6 +32,7 @@ coreutils/mkfifo.c
 coreutils/mktemp.c
 coreutils/mv.c
 coreutils/nl.c
+coreutils/nohup.c
 coreutils/nproc.c
 coreutils/od.c
 coreutils/paste.c
@@ -72,6 +74,7 @@ editors/diff.c
 editors/sed.c
 findutils/find.c
 findutils/grep.c
+findutils/xargs.c
 libbb/appletlib.c
 libbb/ask_confirmation.c
 libbb/auto_string.c
@@ -194,6 +197,7 @@ libbb/xreadlink.c
 libbb/xrealloc_vector.c
 libbb/xregcomp.c
 libpwdgrp/uidgid_get.c
+miscutils/time.c
 util-linux/hexdump.c
 util-linux/hexdump_xxd.c
 util-linux/rev.c
