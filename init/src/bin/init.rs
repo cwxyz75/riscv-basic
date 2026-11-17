@@ -571,9 +571,14 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                                             0,
                                         );
                                         if r.status == 0 {
-                                            ok = proto::console::decode_reply(&rb[..r.a1])
-                                                == Some((txid, 0));
-                                            break;
+                                            // (an event from an earlier Ctrl-C may come first: it is not the reply)
+                                            if let Some(rep) =
+                                                proto::console::decode_reply(&rb[..r.a1])
+                                            {
+                                                ok = rep == (txid, 0);
+                                                break;
+                                            }
+                                            continue;
                                         }
                                         io::nap(5);
                                     }
@@ -874,6 +879,7 @@ fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, firs
                 }
                 Some(Event::Interrupt) => String::from("event: interrupt\n"),
                 Some(Event::Hangup) => String::from("event: hangup\n"),
+                Some(Event::JobInterrupt) => String::from("event: job-interrupt\n"),
                 None => String::from("event: ?\n"),
             };
             let _ = io::write_all(tty, line.as_bytes());

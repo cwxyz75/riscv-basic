@@ -196,7 +196,27 @@ static int child_tests(const char *self) {
     return 0;
 }
 
+static void on_int_report(int s) {
+    (void)s;
+    got = SIGINT;
+    write(1, "got SIGINT\n", 11);
+}
+
 int signals_test(int argc, char **argv) {
+    /* Ctrl-C reaches a program that handles SIGINT as the signal, and the program decides (the shell test types it) */
+    if (argc > 2 && strcmp(argv[2], "int-handler") == 0) {
+        signal(SIGINT, on_int_report);
+        write(1, "ready\n", 6);
+        while (!got) pause();
+        return 5;
+    }
+    if (argc > 2 && strcmp(argv[2], "int-ignore") == 0) {
+        signal(SIGINT, SIG_IGN);
+        write(1, "ready\n", 6);
+        sleep(2);
+        write(1, "survived\n", 9);
+        return 0;
+    }
     /* a program kills the program that started it (SIGKILL goes through the shell: the parent is not the caller's child) */
     if (argc > 2 && strcmp(argv[2], "killparent") == 0) {
         char *a[] = {argv[0], "signals", "killparent-child", NULL};

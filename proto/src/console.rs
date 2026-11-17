@@ -12,6 +12,9 @@ pub const OP_GET_MODE: u16 = 4;
 pub const OP_SET_SIZE: u16 = 5;
 pub const OP_GET_SIZE: u16 = 6;
 pub const OP_QUERY_SIZE: u16 = 7;
+/// A foreground job runs and none of its programs is on the kill list (they handle Ctrl-C themselves): the server reports the
+/// Ctrl-C as `Event::JobInterrupt`, which it does only while a foreground job is declared (S11).
+pub const OP_HOLD_FOREGROUND: u16 = 8;
 /// At most this many job handles in one `SetForeground`.
 pub const MAX_JOBS: usize = 16;
 
@@ -34,6 +37,7 @@ pub enum Control {
     /// The handles of the message (1..=MAX_JOBS) are the foreground set.
     SetForeground,
     ClearForeground,
+    HoldForeground,
     /// Set the terminal mode (`mode` flags).
     SetMode(u8),
     /// Reply value: the mode flags.
@@ -64,6 +68,7 @@ pub fn encode(txid: u32, c: Control) -> Vec<u8> {
     let (op, arg) = match c {
         Control::SetForeground => (OP_SET_FOREGROUND, 0),
         Control::ClearForeground => (OP_CLEAR_FOREGROUND, 0),
+        Control::HoldForeground => (OP_HOLD_FOREGROUND, 0),
         Control::SetMode(m) => (OP_SET_MODE, u16::from(m)),
         Control::GetMode => (OP_GET_MODE, 0),
         Control::SetSize { .. } => (OP_SET_SIZE, 0),
@@ -96,6 +101,8 @@ pub fn decode(b: &[u8], nhandles: usize) -> Result<(u32, Control), ControlError>
         return Err(ControlError::BadOp);
     }
     let c = match op {
+        OP_HOLD_FOREGROUND if nhandles == 0 => Control::HoldForeground,
+        OP_HOLD_FOREGROUND => return Err(ControlError::BadHandles),
         OP_SET_FOREGROUND | OP_CLEAR_FOREGROUND => {
             let ok = if op == OP_SET_FOREGROUND {
                 (1..=MAX_JOBS).contains(&nhandles)
@@ -174,9 +181,15 @@ pub const EVENT_TXID: u32 = 0xFFFF_FFFF;
 /// **resize** (the window size changed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Interrupt,
     Hangup,
+    /// Ctrl-C while a foreground job runs (canonical mode): the console server has ended the jobs it was given; the shell
+    /// passes SIGINT on to the programs it kept back because they handle it (S11).
+    JobInterrupt,
 }
 
 pub fn encode_event(e: Event) -> Vec<u8> {
@@ -184,6 +197,7 @@ pub fn encode_event(e: Event) -> Vec<u8> {
         Event::Resize { cols, rows } => (1u16, cols, rows),
         Event::Interrupt => (2, 0, 0),
         Event::Hangup => (3, 0, 0),
+        Event::JobInterrupt => (4, 0, 0),
     };
     let mut out = Vec::new();
     out.extend_from_slice(&EVENT_TXID.to_le_bytes());
@@ -203,6 +217,7 @@ pub fn decode_event(b: &[u8]) -> Option<Event> {
         (1, cols, rows) if cols != 0 && rows != 0 => Some(Event::Resize { cols, rows }),
         (2, 0, 0) => Some(Event::Interrupt),
         (3, 0, 0) => Some(Event::Hangup),
+        (4, 0, 0) => Some(Event::JobInterrupt),
         _ => None,
     }
 }
@@ -218,6 +233,9 @@ mod tests {
         assert_eq!(decode(&m, MAX_JOBS), Ok((7, Control::SetForeground)));
         assert_eq!(decode(&m, 0), Err(ControlError::BadHandles));
         assert_eq!(decode(&m, MAX_JOBS + 1), Err(ControlError::BadHandles));
+        let hold = encode(11, Control::HoldForeground);
+        assert_eq!(decode(&hold, 0), Ok((11, Control::HoldForeground)));
+        assert_eq!(decode(&hold, 1), Err(ControlError::BadHandles));
         let c = encode(9, Control::ClearForeground);
         assert_eq!(decode(&c, 0), Ok((9, Control::ClearForeground)));
         assert_eq!(decode(&c, 1), Err(ControlError::BadHandles));
@@ -366,6 +384,8 @@ mod tests {
         let (i, h) = (encode_event(Event::Interrupt), encode_event(Event::Hangup));
         assert_eq!(i, [0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 0, 0]);
         assert_eq!(h, [0xff, 0xff, 0xff, 0xff, 3, 0, 0, 0, 0, 0]);
+        let j = encode_event(Event::JobInterrupt);
+        assert_eq!(j, [0xff, 0xff, 0xff, 0xff, 4, 0, 0, 0, 0, 0]);
         assert_ne!(i, h);
         for (b, e) in [
             (
@@ -377,6 +397,7 @@ mod tests {
             ),
             (&i, Event::Interrupt),
             (&h, Event::Hangup),
+            (&j, Event::JobInterrupt),
         ] {
             assert_eq!(decode_event(b), Some(e));
             for n in 0..b.len() {

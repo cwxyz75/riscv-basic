@@ -10,7 +10,7 @@
 
 use crate::errno;
 use core::ffi::{c_int, c_long};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use rt::abi::port_flags;
 use rt::abi::signals as sg;
 use rt::abi::status::Status;
@@ -75,7 +75,30 @@ pub fn vfork_restore() {
         let pending = t.pending;
         *t = saved;
         t.pending |= pending;
+        let handled = t.handler[2] != SIG_DFL;
+        drop(t);
+        notify_int(handled);
     }
+}
+
+/// Whether the shell has been told that this program handles SIGINT (so that Ctrl-C is passed to it as a signal, not an end).
+static INT_HANDLED: AtomicU8 = AtomicU8::new(0);
+
+/// Tell the shell when SIGINT's disposition changes between the default and something else (a handler, or ignoring it): the
+/// console server ends the foreground programs on Ctrl-C, and the shell keeps off its list the ones that handle the signal and
+/// sends them SIGINT instead (T47).
+fn notify_int(handled: bool) {
+    let ch = channel();
+    if ch == 0 || INT_HANDLED.swap(u8::from(handled), Ordering::Relaxed) == u8::from(handled) {
+        return;
+    }
+    sys::channel_write(
+        ch,
+        [b'H', 2, u8::from(handled)].as_ptr(),
+        3,
+        core::ptr::null(),
+        0,
+    );
 }
 
 fn bit(sig: c_int) -> u64 {
@@ -379,6 +402,11 @@ pub unsafe extern "C" fn sigaction(
         t.mask[sig as usize] = (*act).mask;
         t.flags[sig as usize] = (*act).flags;
     }
+    let int_handled = t.handler[2] != SIG_DFL;
+    drop(t);
+    if sig == 2 {
+        notify_int(int_handled);
+    }
     0
 }
 
@@ -393,6 +421,10 @@ pub extern "C" fn signal(sig: c_int, h: Handler) -> Handler {
     t.handler[sig as usize] = h;
     t.mask[sig as usize] = 0;
     t.flags[sig as usize] = SA_RESTART;
+    drop(t);
+    if sig == 2 {
+        notify_int(h != SIG_DFL);
+    }
     old
 }
 
