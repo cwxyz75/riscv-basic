@@ -71,8 +71,8 @@ fn bracket(p: &[u8], c: u8, fold: bool) -> Option<(bool, usize)> {
 
 fn fnm(p: &[u8], s: &[u8], flags: i32, at_start: bool) -> bool {
     let (noescape, pathname, period, fold) = (
-        flags & 1 != 0,
         flags & 2 != 0,
+        flags & 1 != 0,
         flags & 4 != 0,
         flags & 0x10 != 0,
     );
@@ -123,7 +123,7 @@ fn fnm(p: &[u8], s: &[u8], flags: i32, at_start: bool) -> bool {
     }
 }
 
-/// `fnmatch`: does `string` match `pattern` under the `FNM_*` flags (Linux values: `NOESCAPE` 1, `PATHNAME` 2, `PERIOD` 4,
+/// `fnmatch`: does `string` match `pattern` under the `FNM_*` flags (the Linux values: `PATHNAME` 1, `NOESCAPE` 2, `PERIOD` 4,
 /// `CASEFOLD` 0x10)?
 pub fn fnmatch(pattern: &[u8], string: &[u8], flags: i32) -> bool {
     fnm(pattern, string, flags, true)

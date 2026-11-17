@@ -40,10 +40,19 @@ impl Rng {
     }
 }
 
-const FNM_NOESCAPE: i32 = 1;
-const FNM_PATHNAME: i32 = 2;
+// (ours are the Linux values; Apple's libc swaps the first two, `host_flags` translates)
+const FNM_PATHNAME: i32 = 1;
+const FNM_NOESCAPE: i32 = 2;
 const FNM_PERIOD: i32 = 4;
 const FNM_CASEFOLD: i32 = 0x10;
+
+fn host_flags(f: i32) -> i32 {
+    if cfg!(target_os = "macos") {
+        (f & !3) | ((f & 1) << 1) | ((f & 2) >> 1)
+    } else {
+        f
+    }
+}
 
 #[test]
 fn fnmatch_agrees_with_the_host() {
@@ -93,12 +102,6 @@ fn fnmatch_agrees_with_the_host() {
         let pat: String = (0..1 + rng.below(6)).map(|_| rng.pick(&tokens)).collect();
         let s: String = (0..rng.below(7)).map(|_| rng.pick(&chars)).collect();
         let flags = flag_sets[rng.below(flag_sets.len())];
-        // glibc lets `*` before a bracket run across a `/` under FNM_PATHNAME (`fnmatch("*[[:alpha:]][!a]", "///ab", PATHNAME)` is a match
-        // there); Apple's libc and the standard say no
-        if flags & FNM_PATHNAME != 0 && pat.contains("*[") && s.contains('/') {
-            skipped += 1;
-            continue;
-        }
         // a trailing lone backslash is undefined in the standard and the two libcs differ; so is a case class under CASEFOLD
         if (pat.ends_with('\\') && !pat.ends_with("\\\\"))
             || (flags & FNM_CASEFOLD != 0 && pat.contains("[[:upper:]]"))
@@ -111,7 +114,8 @@ fn fnmatch_agrees_with_the_host() {
             CString::new(s.clone()).unwrap(),
         );
         // SAFETY: NUL-terminated strings the host function only reads.
-        let theirs = unsafe { host::fnmatch(cp.as_ptr(), cs.as_ptr(), flags as c_int) } == 0;
+        let theirs =
+            unsafe { host::fnmatch(cp.as_ptr(), cs.as_ptr(), host_flags(flags) as c_int) } == 0;
         let ours = fnmatch(pat.as_bytes(), s.as_bytes(), flags);
         assert_eq!(
             ours, theirs,
