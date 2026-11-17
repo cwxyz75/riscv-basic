@@ -25,7 +25,7 @@ static const char bbconfig_config[] ALIGN1 =
 "# CONFIG_FEATURE_WTMP is not set\n"
 "# CONFIG_FEATURE_PIDFILE is not set\n"
 "CONFIG_PID_FILE_PATH=\"\"\n"
-"# CONFIG_BUSYBOX is not set\n"
+"CONFIG_BUSYBOX=y\n"
 "# CONFIG_FEATURE_SHOW_SCRIPT is not set\n"
 "# CONFIG_FEATURE_INSTALLER is not set\n"
 "# CONFIG_INSTALL_NO_USR is not set\n"

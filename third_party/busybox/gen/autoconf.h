@@ -2,7 +2,7 @@
  * Automatically generated C config: don't edit
  * Busybox version: 1.36.1
  */
-#define AUTOCONF_TIMESTAMP "2026-11-17 08:14:17 EST"
+#define AUTOCONF_TIMESTAMP "2026-11-17 09:19:32 EST"
 
 #define CONFIG_HAVE_DOT_CONFIG 1
 #define ENABLE_HAVE_DOT_CONFIG 1
@@ -84,10 +84,14 @@
 # define IF_PID_FILE_PATH(...) __VA_ARGS__
 #endif
 #define IF_NOT_PID_FILE_PATH(...)
-#undef CONFIG_BUSYBOX
-#define ENABLE_BUSYBOX 0
-#define IF_BUSYBOX(...)
-#define IF_NOT_BUSYBOX(...) __VA_ARGS__
+#define CONFIG_BUSYBOX 1
+#define ENABLE_BUSYBOX 1
+#ifdef MAKE_SUID
+# define IF_BUSYBOX(...) __VA_ARGS__ "CONFIG_BUSYBOX"
+#else
+# define IF_BUSYBOX(...) __VA_ARGS__
+#endif
+#define IF_NOT_BUSYBOX(...)
 #undef CONFIG_FEATURE_SHOW_SCRIPT
 #define ENABLE_FEATURE_SHOW_SCRIPT 0
 #define IF_FEATURE_SHOW_SCRIPT(...)

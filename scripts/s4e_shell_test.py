@@ -465,6 +465,8 @@ def main():
             out.append(got)
         return out
 
+    step(b"busybox --list | busybox grep -x xargs\n", [b"$ busybox --list | busybox grep -x xargs", b"xargs"], "busybox --list names the applets")
+    step_re(b"busybox --list | busybox wc -l\n", [b"$ busybox --list | busybox wc -l", re.compile(rb"8[0-9]|9[0-9]|1[0-9][0-9]")], "... the configured applets (the count follows scripts/busybox_configure.sh)")
     # programs that start programs (UV8, OD118): the shell is the broker, each program holds only what its starter held
     step(b"busybox env -i A=1 B=2\n", [b"$ busybox env -i A=1 B=2", b"A=1", b"B=2"], "env prints the environment it was given")
     step(b"busybox env FOO=bar busybox echo exec-works\n", [b"$ busybox env FOO=bar busybox echo exec-works", b"exec-works"], "env starts a program (exec)")
