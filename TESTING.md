@@ -185,3 +185,5 @@ restated from them once a release build and, ideally, hardware numbers exist (T7
 Benchmarks added: `tcp_loopback_1mib` and `tcp_echo_rt_4k` (from `net_streams_over_loopback`), next to `net_ping_rtt_*`. Not yet
 measured: the transfers from and to the host and `net_bkl_profile_tcp` (TIDY-UP T102). The lossy mode runs only three tests, so the
 harness's checks for the others are off in it; the lossy tests' post-close waits are longer in it (`drain_ms`).
+
+**Soak parallelism (2026-11-17).** `make soak` runs three boots at once (`SOAK_JOBS=3`). On a ten-core laptop that is also running anything else, the network tests and the benchmark comparison fail from load (a `net_tcp_to_the_host_server` timeout, a `thread_create_join` ratio over 3, QEMU's "Guest moved used index"), and the same targets pass when run alone. Use `SOAK_JOBS=1` for a trustworthy run, and rerun a failing target alone before calling it a failure.

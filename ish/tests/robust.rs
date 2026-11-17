@@ -1,5 +1,5 @@
 //! The parser and evaluator never panic or hang on hostile input: random token soup, deep nesting, runaway recursion and
-//! loops, and a differential check against upstream `es` on the common subset (skipped with a message when `es` is absent).
+//! loops. (The `es` differential of grammar v1 is gone, SHELL-SPEC SH2b: the independent oracles are in `oracles.rs`.)
 
 use ish::fake::FakeHost;
 use ish::Shell;
@@ -18,11 +18,96 @@ impl Rng {
 }
 
 const TOKENS: &[&str] = &[
-    "echo", "print", "x", "=", "$x", "$#x", "$x.y", "(", ")", "[", "]", "{", "}", "do", "end",
-    "else", "if", "for", "in", "fn", "try", "catch", "|", "||", "&&", "!", ";", "\n", ">", ">>",
-    "<", ">[2=1]", "'a b'", "\"q\\n\"", "1", "2.5", "-", "calc", "is", "+", "*", "/", "==", "<",
-    "and", "not", "@", "^", ",", ":", "true", "null", "*.t", "?", "ok", "fail", "exit", "break",
-    "defer", "\\\n", "#c\n", "map", "each", "take", "fold", "seq", "3",
+    "echo",
+    "print",
+    "x",
+    "=",
+    "$x",
+    "$#x",
+    "$x.y",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    "do",
+    "end",
+    "else",
+    "if",
+    "for",
+    "in",
+    "fn",
+    "try",
+    "catch",
+    "|",
+    "||",
+    "&&",
+    "!",
+    ";",
+    "\n",
+    ">",
+    ">>",
+    "<",
+    ">[2=1]",
+    "'a b'",
+    "\"q\\n\"",
+    "1",
+    "2.5",
+    "-",
+    "set",
+    "`t ${x}`",
+    "+",
+    "*",
+    "/",
+    "==",
+    "<",
+    "and",
+    "not",
+    "@",
+    "^",
+    ",",
+    ":",
+    "true",
+    "null",
+    "*.t",
+    "?",
+    "??",
+    "ok",
+    "fail",
+    "exit",
+    "break",
+    "defer",
+    "\\\n",
+    "#c\n",
+    "map",
+    "each",
+    "take",
+    "fold",
+    "seq",
+    "3",
+    "spawn",
+    "run",
+    "succeeds",
+    "with-env",
+    "wait",
+    "wait-any",
+    "poll",
+    "kill",
+    "parse-args",
+    "lossy-lines",
+    "slow",
+    "hang",
+    "exit-with",
+    "{}",
+    "[]",
+    "$env",
+    "$env.PATH",
+    "$job",
+    "$job.status",
+    "{ \"timeout\": 5 }",
+    "!&&",
+    "||",
 ];
 
 fn soup(r: &mut Rng) -> String {
@@ -66,7 +151,7 @@ fn arbitrary_characters_do_not_panic_the_parser() {
 
 #[test]
 fn deep_nesting_is_an_error_not_a_stack_overflow() {
-    for open in ["(", "[", "{", "(echo ", "if true do ", "(calc "] {
+    for open in ["(", "[", "{", "(echo ", "if true do ", "(slow "] {
         let src = open.repeat(100_000);
         assert!(ish::parse(&src).is_err(), "{open:?}");
     }
@@ -97,44 +182,4 @@ fn a_hostile_data_expression_is_bounded() {
     let st = sh.run_script("x = (range 5000000)\n");
     assert_ne!(st, 0, "an enormous range must be refused");
     assert_eq!(sh.run_script("print (len (range 100000))"), 0);
-}
-
-fn es_available() -> bool {
-    std::process::Command::new("es")
-        .arg("-c")
-        .arg("exit 0")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[test]
-fn common_subset_agrees_with_upstream_es() {
-    if !es_available() {
-        eprintln!("skipped: upstream `es` is not installed (the differential check needs it)");
-        return;
-    }
-    // scripts in the common subset: plain commands, quoting, `;`, `&&`, `||`, redirection of echo
-    let scripts = [
-        "echo hello world",
-        "echo one; echo two",
-        "echo 'a b' c",
-        "echo a && echo b",
-        "false || echo fallback",
-        "echo ''",
-    ];
-    for s in scripts {
-        let es = std::process::Command::new("es")
-            .arg("-c")
-            .arg(s)
-            .output()
-            .unwrap();
-        let mut sh = Shell::new(FakeHost::new());
-        sh.run_script(s);
-        assert_eq!(
-            sh.host.stdout_text(),
-            String::from_utf8_lossy(&es.stdout),
-            "{s}"
-        );
-    }
 }

@@ -127,6 +127,12 @@ impl FakeHost {
         self
     }
 
+    /// A file with arbitrary bytes (a log that is not valid UTF-8).
+    pub fn with_file_bytes(mut self, path: &str, content: &[u8]) -> FakeHost {
+        self.files.insert(norm("/", path), content.to_vec());
+        self
+    }
+
     pub fn set_env(&mut self, name: &str, value: &str) {
         self.env.insert(String::from(name), String::from(value));
     }
