@@ -303,6 +303,12 @@ def main():
     # has a bounded amount of memory, whatever it tries
     step(b"bomb\n", [b"$ bomb", b"bomb: process_create: -5", b"bomb: threads: 31 then -5"],
          "a process and thread bomb is refused")
+    # (the memory the machine has just before the hog: CI's machine gave the hog 26 MiB where this one gives 120 or more)
+    s.prompt()
+    s.p.stdin.write(b"free\n")
+    s.p.stdin.flush()
+    free_lines = [s.next_line("free") for _ in range(3)]
+    print("memory before the hog:", free_lines[1:], flush=True)
     counts = []
     for attempt in (1, 2):
         step(b"hog\n", [b"$ hog"], f"a memory hog, run {attempt}")
@@ -320,7 +326,7 @@ def main():
         counts.append(mib)
     # the heap stops at 128 MiB (some of it is the program's own); the 136 MiB job never has to refuse
     if not 120 <= counts[0] <= 128:
-        fail(s, f"the hog got {counts[0]} MiB of a 128 MiB heap")
+        fail(s, f"the hog got {counts[0]} MiB of a 128 MiB heap (memory before it: {free_lines[1:]})")
     if counts[0] != counts[1]:
         fail(s, f"the second hog got {counts[1]} MiB, the first {counts[0]}: memory was not given back")
     step(b"echo survived\n", [b"$ echo survived", b"survived"], "the shell after the hog")
