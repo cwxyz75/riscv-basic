@@ -1718,7 +1718,9 @@ impl Host for Os {
         if !self.inbuf.is_empty() {
             return TermIn::Bytes(core::mem::take(&mut self.inbuf));
         }
-        if core::mem::take(&mut self.late_interrupt) {
+        // an interrupt that came with typed bytes: if the command those bytes made did not take it (`interrupted`, a wait), it is
+        // for the line being edited
+        if core::mem::take(&mut self.late_interrupt) && core::mem::take(&mut self.interrupt) {
             return TermIn::Interrupt;
         }
         loop {
@@ -1762,6 +1764,8 @@ impl Host for Os {
                         if self.inbuf.is_empty() {
                             return TermIn::Interrupt;
                         }
+                        // (`interrupt` is what a command that runs now sees, so a Ctrl-C typed with the command still ends it)
+                        self.interrupt = true;
                         self.late_interrupt = true;
                         return TermIn::Bytes(core::mem::take(&mut self.inbuf));
                     }
