@@ -43,7 +43,7 @@ pub fn load_profiles(img: &[u8], entries: &[proto::bootimg::Entry]) -> Vec<Loade
             Ok(p) => out.push(Loaded { profile: p, text }),
             Err(err) => {
                 rt::sys::debug_write(
-                    alloc::format!("init: {}: {err}\n", String::from_utf8_lossy(&e.name))
+                    alloc::format!("sessiond: {}: {err}\n", String::from_utf8_lossy(&e.name))
                         .as_bytes(),
                 );
             }
@@ -161,7 +161,7 @@ pub fn start_stack(
         rt::spawn::spawn_in(image, &bytes, handles, session).map_err(|e| {
             sys::debug_write(
                 alloc::format!(
-                    "init: could not start {}: {e:?}\n",
+                    "sessiond: could not start {}: {e:?}\n",
                     String::from_utf8_lossy(name)
                 )
                 .as_bytes(),
@@ -202,7 +202,9 @@ pub fn start_stack(
     let sh_fs = match root.clone_conn(proto::file::rights::READ | proto::file::rights::ENUMERATE) {
         Ok(f) => f,
         Err(e) => {
-            sys::debug_write(alloc::format!("init: clone of the root failed: {e}\n").as_bytes());
+            sys::debug_write(
+                alloc::format!("sessiond: clone of the root failed: {e}\n").as_bytes(),
+            );
             return Err(35);
         }
     };
@@ -468,7 +470,7 @@ pub fn supervise(
     let mut profiles = load_profiles(img, entries);
     let profs: Vec<profile::Profile> = profiles.iter().map(|l| l.profile.clone()).collect();
     if profile::check_homes_distinct(&profs).is_err() {
-        rt::sys::debug_write(b"init: two profiles share a home\n");
+        rt::sys::debug_write(b"sessiond: two profiles share a home\n");
         return 43;
     }
     // the manifest: whether this image enables autologin (development images only)
@@ -478,7 +480,7 @@ pub fn supervise(
     let autologin_enabled = manifest.lines().any(|l| l.trim() == "autologin=on");
     // `authd`: the only process that holds credential verifiers; this manager asks it and never sees one
     let Some(authd) = start_authd(image_vmo, img, entries, recovery) else {
-        rt::sys::debug_write(b"init: authd could not start\n");
+        rt::sys::debug_write(b"sessiond: authd could not start\n");
         return 46;
     };
     let mut console = Login {
@@ -492,7 +494,7 @@ pub fn supervise(
     let mut failures = 0;
     loop {
         if failures > 20 {
-            sys::debug_write(b"init: giving up after repeated service failures\n");
+            sys::debug_write(b"sessiond: giving up after repeated service failures\n");
             return 40;
         }
         let who = match choose_profile(
@@ -508,7 +510,7 @@ pub fn supervise(
         let stack = match start_stack(powers, Term::Serial(serial), image_vmo, img, entries, &who) {
             Ok(s) => s,
             Err(code) => {
-                sys::debug_write(b"init: the session could not start\n");
+                sys::debug_write(b"sessiond: the session could not start\n");
                 return code;
             }
         };
@@ -552,7 +554,7 @@ pub fn supervise(
                 if m.status == 0 && &b[..m.a1] == b"halt" {
                     return 0;
                 }
-                sys::debug_write(b"init: a bad halt message\n");
+                sys::debug_write(b"sessiond: a bad halt message\n");
             }
             0 => {
                 // the shell ended (exit, Ctrl-D, crash): a fresh session
@@ -560,7 +562,7 @@ pub fn supervise(
                 stop_stack(stack);
             }
             _ => {
-                sys::debug_write(b"init: a service died, restarting the session\n");
+                sys::debug_write(b"sessiond: a service died, restarting the session\n");
                 failures += 1;
                 stop_stack(stack);
             }
@@ -718,13 +720,13 @@ pub fn choose_profile(
         };
         match auth::boot::decide(&facts) {
             auth::boot::Plan::Autologin(n) => {
-                rt::sys::debug_write(alloc::format!("init: autologin: {n}\n").as_bytes());
+                rt::sys::debug_write(alloc::format!("sessiond: autologin: {n}\n").as_bytes());
                 if let Some(l) = profiles.iter().find(|l| l.profile.name == n) {
                     return Ok(l.clone());
                 }
             }
             auth::boot::Plan::Locked => {
-                rt::sys::debug_write(b"init: profiles exist but nobody can log in\n");
+                rt::sys::debug_write(b"sessiond: profiles exist but nobody can log in\n");
                 return Err(45);
             }
             auth::boot::Plan::Setup => {
@@ -791,7 +793,9 @@ pub fn choose_profile(
                 let known = profiles.iter().find(|l| l.profile.name == name);
                 if authd.ask(&alloc::format!("check {name} {pw}")) == "ok" {
                     if let Some(l) = known {
-                        rt::sys::debug_write(alloc::format!("init: login: {name}\n").as_bytes());
+                        rt::sys::debug_write(
+                            alloc::format!("sessiond: login: {name}\n").as_bytes(),
+                        );
                         return Ok(l.clone());
                     }
                 }

@@ -904,8 +904,53 @@ impl Host for Os {
         self.store(path, bytes, false)
     }
 
-    fn glob(&mut self, _pattern: &str) -> Vec<String> {
-        Vec::new() // (T126: patterns are not expanded in the OS yet)
+    fn glob(&mut self, pattern: &str) -> Vec<String> {
+        // Expand component by component: a component with `*`, `?` or `[` lists the directory reached so far and keeps the
+        // entries that match (a name starting with `.` only when the pattern does); a plain component is appended as it is.
+        let absolute = pattern.starts_with('/');
+        let comps: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+        let mut paths: Vec<String> = alloc::vec![if absolute {
+            String::from("/")
+        } else {
+            String::new()
+        }];
+        for (i, comp) in comps.iter().enumerate() {
+            let last = i + 1 == comps.len();
+            let mut next: Vec<String> = Vec::new();
+            for base in &paths {
+                if !comp.contains(['*', '?', '[']) {
+                    next.push(format!("{base}{comp}{}", if last { "" } else { "/" }));
+                    continue;
+                }
+                let dir = if base.is_empty() {
+                    String::from(".")
+                } else {
+                    base.clone()
+                };
+                let Ok(entries) = self.list_dir(&dir) else {
+                    continue;
+                };
+                for (name, is_dir) in entries {
+                    if name.starts_with('.') && !comp.starts_with('.') {
+                        continue;
+                    }
+                    if !last && !is_dir {
+                        continue;
+                    }
+                    if ish::builtins::glob_match(comp, &name) {
+                        next.push(format!("{base}{name}{}", if last { "" } else { "/" }));
+                    }
+                }
+            }
+            paths = next;
+        }
+        // a pattern with no wildcard names itself: it matches only if it exists
+        if !pattern.contains(['*', '?', '[']) {
+            return Vec::new();
+        }
+        paths.retain(|p| !p.is_empty());
+        paths.sort();
+        paths
     }
 
     fn term_read(&mut self) -> TermIn {
