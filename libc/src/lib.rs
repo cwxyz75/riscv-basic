@@ -37,6 +37,7 @@ mod start;
 mod stdio;
 mod stdlib;
 mod string;
+mod term;
 mod thread;
 mod time;
 
