@@ -93,6 +93,12 @@ fn fnmatch_agrees_with_the_host() {
         let pat: String = (0..1 + rng.below(6)).map(|_| rng.pick(&tokens)).collect();
         let s: String = (0..rng.below(7)).map(|_| rng.pick(&chars)).collect();
         let flags = flag_sets[rng.below(flag_sets.len())];
+        // glibc lets `*` before a bracket run across a `/` under FNM_PATHNAME (`fnmatch("*[[:alpha:]][!a]", "///ab", PATHNAME)` is a match
+        // there); Apple's libc and the standard say no
+        if flags & FNM_PATHNAME != 0 && pat.contains("*[") && s.contains('/') {
+            skipped += 1;
+            continue;
+        }
         // a trailing lone backslash is undefined in the standard and the two libcs differ; so is a case class under CASEFOLD
         if (pat.ends_with('\\') && !pat.ends_with("\\\\"))
             || (flags & FNM_CASEFOLD != 0 && pat.contains("[[:upper:]]"))
