@@ -47,11 +47,31 @@ enum Obj {
         path: String,
         buf: Vec<u8>,
         append: bool,
+        /// A program writes it through a socket the shell drains (`pumps_out`): the file is stored when that ends.
+        piped: bool,
     },
+}
+
+/// A program's standard output redirected to a file: the shell holds the read end of a socket the program writes to and stores
+/// what arrives when the program (every writer) is gone (UV8 follow-up, T126 item 2).
+struct PumpOut {
+    rd: u32,
+    path: String,
+    append: bool,
+    buf: Vec<u8>,
+}
+
+/// A program's standard input from a file: the shell feeds the write end of a socket and closes it at the end of the data.
+struct PumpIn {
+    wr: u32,
+    data: Vec<u8>,
+    pos: usize,
 }
 
 /// The machine, as `ish` sees it.
 struct Os {
+    pumps_out: Vec<PumpOut>,
+    pumps_in: Vec<PumpIn>,
     tty: u32,
     root: Fs,
     cwd: Fs,
@@ -426,7 +446,7 @@ impl Os {
     }
 
     /// The handle to forward to a program for one of its standard streams.
-    fn forward_stream(&self, s: Stream, input: bool) -> Option<u32> {
+    fn forward_stream(&mut self, s: Stream, input: bool) -> Option<u32> {
         let (h, want) = match s.0 {
             0 if input => (
                 self.tty,
@@ -443,10 +463,131 @@ impl Os {
                 Obj::PipeW(h) if !input => {
                     (*h, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0)
                 }
+                Obj::FileW { .. } if !input => return self.pump_out(s.0),
+                Obj::FileR { .. } if input => return self.pump_in(s.0),
                 _ => return None,
             },
         };
         dup(h, want)
+    }
+
+    /// A redirected output file for a program: a socket pair, the write end for the program, the read end drained by the shell.
+    fn pump_out(&mut self, id: u32) -> Option<u32> {
+        let s = sys::socket_create();
+        if s.status != 0 {
+            return None;
+        }
+        let (rd, wr) = (s.a1 as u32, s.a2 as u32);
+        let fwd = dup(wr, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
+        let mine = dup(rd, Rights::READ.0 | Rights::WAIT.0);
+        close_all(&[rd, wr]);
+        let (fwd, mine) = (fwd?, mine?);
+        let Some(Obj::FileW {
+            path,
+            append,
+            piped,
+            ..
+        }) = self.objs.get_mut(&id)
+        else {
+            close_all(&[fwd, mine]);
+            return None;
+        };
+        *piped = true;
+        self.pumps_out.push(PumpOut {
+            rd: mine,
+            path: path.clone(),
+            append: *append,
+            buf: Vec::new(),
+        });
+        Some(fwd)
+    }
+
+    /// A redirected input file for a program: a socket pair, the read end for the program, the write end fed by the shell.
+    fn pump_in(&mut self, id: u32) -> Option<u32> {
+        let s = sys::socket_create();
+        if s.status != 0 {
+            return None;
+        }
+        let (rd, wr) = (s.a1 as u32, s.a2 as u32);
+        let fwd = dup(rd, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0);
+        let mine = dup(wr, Rights::WRITE.0 | Rights::WAIT.0);
+        close_all(&[rd, wr]);
+        let (fwd, mine) = (fwd?, mine?);
+        let Some(Obj::FileR { data, pos }) = self.objs.get_mut(&id) else {
+            close_all(&[fwd, mine]);
+            return None;
+        };
+        let rest = data[(*pos).min(data.len())..].to_vec();
+        *pos = data.len();
+        self.pumps_in.push(PumpIn {
+            wr: mine,
+            data: rest,
+            pos: 0,
+        });
+        Some(fwd)
+    }
+
+    /// Move what the programs have written to their redirected files, store a file whose writers are all gone, and feed the
+    /// programs that read a file. Never blocks.
+    fn service_pumps(&mut self) {
+        let mut i = 0;
+        while i < self.pumps_out.len() {
+            let mut ended = false;
+            loop {
+                let mut buf = [0u8; 4096];
+                let r = sys::socket_read(self.pumps_out[i].rd, buf.as_mut_ptr(), buf.len());
+                match r.status() {
+                    Some(Status::Ok) if r.a1 > 0 => {
+                        self.pumps_out[i].buf.extend_from_slice(&buf[..r.a1])
+                    }
+                    Some(Status::ShouldWait) => break,
+                    _ => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+            if ended {
+                let p = self.pumps_out.remove(i);
+                sys::handle_close(p.rd);
+                self.store_reporting(&p.path, &p.buf, p.append);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.pumps_in.len() {
+            let p = &mut self.pumps_in[i];
+            let mut done = false;
+            while p.pos < p.data.len() {
+                let r = sys::socket_write(p.wr, p.data[p.pos..].as_ptr(), p.data.len() - p.pos);
+                match r.status() {
+                    Some(Status::Ok) if r.a1 > 0 => p.pos += r.a1,
+                    Some(Status::ShouldWait) => break,
+                    _ => {
+                        done = true; // the program stopped reading
+                        break;
+                    }
+                }
+            }
+            if done || p.pos >= p.data.len() {
+                let p = self.pumps_in.remove(i);
+                sys::handle_close(p.wr);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Store a redirected file; a failure is said on the terminal (the command has already run).
+    fn store_reporting(&mut self, path: &str, bytes: &[u8], append: bool) {
+        if let Err(e) = self.store(path, bytes, append) {
+            self.say(format!("sh: {path}: {}\r\n", e.message()).as_bytes());
+        }
+    }
+
+    fn has_pumps(&self) -> bool {
+        !self.pumps_out.is_empty() || !self.pumps_in.is_empty()
     }
 
     /// The path as a root-relative path (no leading slash), resolved lexically against the working directory.
@@ -712,11 +853,22 @@ impl Host for Os {
         let Some(h) = self.procs.remove(&pid.0) else {
             return -1;
         };
-        sys::object_wait(h, signals::TERMINATED, u64::MAX);
+        if self.has_pumps() {
+            loop {
+                self.service_pumps();
+                if sys::object_wait(h, signals::TERMINATED, sys::clock_get() + 10).status == 0 {
+                    break;
+                }
+            }
+            self.service_pumps();
+        } else {
+            sys::object_wait(h, signals::TERMINATED, u64::MAX);
+        }
         self.reap(pid.0, h)
     }
 
     fn try_wait(&mut self, pid: Pid) -> Option<i32> {
+        self.service_pumps();
         let h = *self.procs.get(&pid.0)?;
         if sys::object_wait(h, signals::TERMINATED, 0).status != 0 {
             return None;
@@ -746,6 +898,7 @@ impl Host for Os {
         };
         let deadline = sys::clock_get() + ms;
         loop {
+            self.service_pumps();
             self.poll_ctl();
             if core::mem::take(&mut self.interrupt) {
                 return WaitOutcome::Interrupted;
@@ -866,9 +1019,13 @@ impl Host for Os {
             Some(Obj::PipeR(h) | Obj::PipeW(h)) => {
                 sys::handle_close(h);
             }
-            Some(Obj::FileW { path, buf, append }) => {
-                let _ = self.store(&path, &buf, append);
-            }
+            // (a file a program writes is stored when its pump ends, not here)
+            Some(Obj::FileW {
+                path,
+                buf,
+                append,
+                piped: false,
+            }) => self.store_reporting(&path, &buf, append),
             _ => {}
         }
     }
@@ -883,18 +1040,27 @@ impl Host for Os {
                 path: String::from(path),
                 buf: Vec::new(),
                 append: false,
+                piped: false,
             })),
             OpenMode::Append => Ok(self.add_obj(Obj::FileW {
                 path: String::from(path),
                 buf: Vec::new(),
                 append: true,
+                piped: false,
             })),
         }
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, HostError> {
         let rel = self.rel_path(path);
-        let mut f = self.root.open(&rel, 0, rights::READ).map_err(host_err)?;
+        // `/tmp/...` is the shell's own scratch directory (the parent of the programs' private ones), not part of the image
+        let mut f = match rel.strip_prefix(b"tmp/") {
+            Some(under) => match self.tmp.as_mut() {
+                Some(t) => t.open(under, 0, rights::READ).map_err(host_err)?,
+                None => return Err(HostError::NotFound),
+            },
+            None => self.root.open(&rel, 0, rights::READ).map_err(host_err)?,
+        };
         let r = f.read_all();
         f.close();
         r.map_err(host_err)
@@ -1065,6 +1231,14 @@ impl Host for Os {
     }
 
     fn finished(&mut self) {
+        // a program's redirected output arrives a moment after it ends: let the files be stored before the next command
+        let until = sys::clock_get() + 2000;
+        while self.has_pumps() && sys::clock_get() < until {
+            self.service_pumps();
+            if self.has_pumps() {
+                io::nap(2);
+            }
+        }
         if self.interactive {
             self.control(Control::ClearForeground, &[]);
         }
@@ -1236,9 +1410,16 @@ impl Os {
         } else {
             flags::CREATE | flags::TRUNCATE
         };
-        let mut f = self
-            .root
-            .open(&rel, fl, rights::READ | rights::WRITE)
+        // only `/tmp/...` can be written: the image is read-only and the volumes belong to the programs the profile grants them to
+        let target = match rel.strip_prefix(b"tmp/") {
+            Some(under) => self.tmp.as_mut().map(|t| (t, under.to_vec())),
+            None => None,
+        };
+        let Some((tmp, under)) = target else {
+            return Err(HostError::Denied);
+        };
+        let mut f = tmp
+            .open(&under, fl, rights::READ | rights::WRITE)
             .map_err(host_err)?;
         let off = if append { f.size().unwrap_or(0) } else { 0 };
         let r = f.write_all(off, bytes);
@@ -1270,6 +1451,8 @@ pub fn app_main() -> i32 {
         return 4;
     };
     let os = Os {
+        pumps_out: Vec::new(),
+        pumps_in: Vec::new(),
         tty,
         root,
         cwd,

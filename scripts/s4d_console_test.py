@@ -108,7 +108,8 @@ def main():
     got = []
     while not got or got[-1] != b"mode: cooked":
         got.append(s.next_line("cbreak echo and bytes"))
-    joined = b"\n".join(got).replace(b"araw: 61", b"a\nraw: 61")
+    # (the echo of the Enter, `\r\n`, can also land between the two reports and leave an empty line)
+    joined = b"\n".join(l for l in got if l).replace(b"araw: 61", b"a\nraw: 61")
     want = b"\n".join([b"a", b"raw: 61", b"size: 80x24", b"mode: 6", b"mode: cooked"])
     if joined != want:
         fail(s, f"cbreak echo and bytes: expected {want!r}, got {joined!r}")
