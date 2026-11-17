@@ -62,7 +62,7 @@ fn wait_status(code: i32) -> c_int {
     match code {
         -130 => 2,
         -1 => 9,
-        c if c <= crate::sig::SIGNALED_BASE && c > crate::sig::SIGNALED_BASE - 65 => {
+        c if c < crate::sig::SIGNALED_BASE && c > crate::sig::SIGNALED_BASE - 65 => {
             crate::sig::SIGNALED_BASE - c
         }
         c if (-1100..=-1000).contains(&c) => match -1000 - c {
@@ -226,8 +226,21 @@ pub fn kill_pid(pid: c_int, sig: c_int) -> c_int {
             return 0;
         }
     }
+    // a child this process holds exists until it is waited for, whatever the shell says (it has no grant of its own below the
+    // depth limit, so the shell may not know it as a program of the chain)
+    let held = CHILDREN.lock().iter().find(|c| c.pid == pid).map(|c| c.h);
+    if sig == 0 && held.is_some() {
+        return 0;
+    }
     match signal_via_shell(pid, sig) {
         Ok(()) => 0,
+        Err(3) if held.is_some_and(|h| h != 0) => {
+            // the shell has no channel to it: a signal that would end it ends it (the others have nowhere to go)
+            if !matches!(sig, 17..=23 | 28) {
+                sys::process_kill(held.unwrap_or(0), -1);
+            }
+            0
+        }
         Err(e) => {
             errno::set(e);
             -1
@@ -338,14 +351,13 @@ unsafe fn exec_with(
             }
             // not a `vfork` child: this process becomes the program (it runs, and this one ends with its status); what is
             // sent to this process meanwhile is the program's, so it is passed on
-            register(pid, h, None);
             FORWARD_TO.store(pid as u32, Ordering::Relaxed);
-            let mut status = 0;
-            waitpid(pid, &mut status, 0);
-            let code = match status & 0x7f {
-                0 => (status >> 8) & 0xff,
-                sig => crate::sig::SIGNALED_BASE - sig,
-            };
+            while !matches!(
+                crate::sig::wait_any(&[(h, signals::TERMINATED)], u64::MAX, true),
+                crate::sig::Wait::Ready(_)
+            ) {}
+            let code = sys::process_info(h).a1 as i64 as i32;
+            sys::handle_close(h);
             crate::compat::_exit(code)
         }
     }

@@ -1407,7 +1407,8 @@ impl Host for Os {
     }
 
     fn wait(&mut self, pid: Pid) -> i32 {
-        let Some(h) = self.procs.remove(&pid.0) else {
+        // (the pid stays in `procs` until the program is reaped: a program of its chain may still ask the shell to end it)
+        let Some(&h) = self.procs.get(&pid.0) else {
             return -1;
         };
         loop {
@@ -1418,6 +1419,7 @@ impl Host for Os {
             self.idle(&[h], u64::MAX);
         }
         self.service_pumps();
+        self.procs.remove(&pid.0);
         self.reap(pid.0, h)
     }
 
@@ -2081,7 +2083,7 @@ pub fn app_main() -> i32 {
         objs: BTreeMap::new(),
         next_stream: 3,
         procs: BTreeMap::new(),
-        next_pid: 1,
+        next_pid: 2,
         killed: false,
         session_env: Vec::new(),
         confined: Vec::new(),

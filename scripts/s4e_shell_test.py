@@ -488,6 +488,7 @@ def main():
     # signals (S11, OD119): the same C program the host runs; its output (the host's) is the expected transcript
     expected = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "libc", "tests", "c", "signals.expected"), "rb").read().splitlines()
     step(b"ctest signals\n", [b"$ ctest signals"] + expected, "signals: the C library's subset, interrupted waits, signals between programs")
+    step(b"ctest signals killparent\n", [b"$ ctest signals killparent", b"[exit -1]"], "a program ends the one that started it (SIGKILL through the shell, while the shell waits for it)")
     # a child holds no more than the program that started it: `ls` is trusted (a root and the volume) when the shell starts it,
     # but not when `busybox`, which holds neither, starts it
     step(b"busybox env /bin/ls /\n", [b"$ busybox env /bin/ls /", b"/bin/ls: /: not found", b"[exit 1]"], "a trusted program started by an untrusted one gets no root")

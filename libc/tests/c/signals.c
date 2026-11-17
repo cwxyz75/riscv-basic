@@ -145,6 +145,21 @@ static int child_tests(const char *self) {
 }
 
 int signals_test(int argc, char **argv) {
+    /* a program kills the program that started it (SIGKILL goes through the shell: the parent is not the caller's child) */
+    if (argc > 2 && strcmp(argv[2], "killparent") == 0) {
+        char *a[] = {argv[0], "signals", "killparent-child", NULL};
+        pid_t pid;
+        if (posix_spawn(&pid, argv[0], NULL, NULL, a, environ) != 0) return 1;
+        int status;
+        waitpid(pid, &status, 0);
+        sleep(30);
+        printf("the parent survived\n");
+        return 0;
+    }
+    if (argc > 2 && strcmp(argv[2], "killparent-child") == 0) {
+        kill(getppid(), SIGKILL);
+        return 0;
+    }
     if (argc > 2 && strcmp(argv[2], "child-handled") == 0) {
         signal(SIGTERM, on_term_exit7);
         for (;;) sleep(10);
