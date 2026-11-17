@@ -3,6 +3,3 @@
 # soft-float user target of OD40), as static executables.
 [build]
 target = "riscv64gc-unknown-none-elf"
-# The programs go into the boot image, which every service holds copies of: no symbol tables in them (they were 2x larger on CI's
-# machine and the hog test had 26 MiB of heap left instead of 120; a panic names its message and place, not the symbol).
-rustflags = ["-C", "strip=symbols"]
