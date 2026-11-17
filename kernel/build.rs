@@ -59,6 +59,10 @@ fn main() {
         "volmgr",
         "devd",
         "authd",
+        "procd",
+        "ps",
+        "free",
+        "nproc",
     ] {
         let src = built.join(name);
         println!("cargo:rerun-if-changed={}", src.display());

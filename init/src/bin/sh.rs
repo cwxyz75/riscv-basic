@@ -66,6 +66,9 @@ struct Os {
     /// connection to the `/dev` server (UV2).
     tmp: Option<Fs>,
     dev: Option<Fs>,
+    /// `/proc` (UV6): a connection to `procd`'s root, and the channel the shell tells it about its programs on.
+    proc_root: Option<Fs>,
+    proc_ctl: Option<u32>,
     jobs: u32,
     /// The private directory just made for the program being started (taken by `spawn`).
     new_tmp: Option<Vec<u8>>,
@@ -357,6 +360,39 @@ impl Os {
         }
     }
 
+    /// Tell `procd` about a program (it gets an INSPECT-only duplicate of the process handle).
+    fn proc_announce(&mut self, pid: u32, h: u32, argv: &[String]) {
+        let Some(ctl) = self.proc_ctl else {
+            return;
+        };
+        let Some(dup_h) = dup(h, Rights::INSPECT.0 | Rights::TRANSFER.0) else {
+            return;
+        };
+        let mut msg = alloc::vec![b'A'];
+        msg.extend_from_slice(&pid.to_le_bytes());
+        for (i, a) in argv.iter().enumerate() {
+            if i > 0 {
+                msg.push(0);
+            }
+            msg.extend_from_slice(a.as_bytes());
+        }
+        msg.truncate(500);
+        let hs = [dup_h];
+        if sys::channel_write(ctl, msg.as_ptr(), msg.len(), hs.as_ptr(), 1).status != 0 {
+            sys::handle_close(dup_h);
+        }
+    }
+
+    /// The program has been waited for: `procd` forgets it.
+    fn proc_forget(&mut self, pid: u32) {
+        let Some(ctl) = self.proc_ctl else {
+            return;
+        };
+        let mut msg = alloc::vec![b'D'];
+        msg.extend_from_slice(&pid.to_le_bytes());
+        sys::channel_write(ctl, msg.as_ptr(), msg.len(), core::ptr::null(), 0);
+    }
+
     /// Remove the private `/tmp` directory of a program that has been reaped.
     fn cleanup_tmp(&mut self, pid: u32) {
         if let Some(n) = self.tmp_of.remove(&pid) {
@@ -378,6 +414,7 @@ impl Os {
         }
         sys::handle_close(h);
         self.cleanup_tmp(pid);
+        self.proc_forget(pid);
         code
     }
 
@@ -537,6 +574,14 @@ impl Os {
                 forward.push(c.ch);
             }
         }
+        if let Some(d) = self.proc_root.as_mut() {
+            if let Ok(c) = d.clone_conn(rights::READ | rights::ENUMERATE) {
+                startup
+                    .namespace
+                    .push((b"/proc".to_vec(), forward.len() as u32));
+                forward.push(c.ch);
+            }
+        }
         if self.tmp.is_some() {
             self.jobs += 1;
             let name = format!("j{}", self.jobs).into_bytes();
@@ -656,6 +701,7 @@ impl Host for Os {
         };
         self.next_pid += 1;
         self.procs.insert(id, h);
+        self.proc_announce(id, h, argv);
         if let Some(n) = tmp {
             self.tmp_of.insert(id, n);
         }
@@ -1006,6 +1052,9 @@ impl Host for Os {
             if self.tmp.is_some() {
                 v.push((String::from("/tmp"), String::from("rw")));
             }
+            if self.proc_root.is_some() {
+                v.push((String::from("/proc"), String::from("r")));
+            }
         };
         match self.confined.last() {
             Some(g) => {
@@ -1187,6 +1236,8 @@ pub fn app_main() -> i32 {
         registry: env.handle(Role::ServiceRegistry).map(Fs::new),
         tmp: env.handle(Role::TmpDir).map(Fs::new),
         dev: env.handle(Role::DevDir).map(Fs::new),
+        proc_root: env.handle(Role::ProcDir).map(Fs::new),
+        proc_ctl: env.handle(Role::ServiceProc),
         jobs: 0,
         new_tmp: None,
         tmp_of: BTreeMap::new(),

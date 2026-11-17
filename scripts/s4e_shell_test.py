@@ -70,7 +70,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -197,7 +197,7 @@ def main():
                       b"clone: ok", b"clone all: -3", b"root: absent", b"dev null: 0", b"dev zero: 0", b"tmp: 0", b"spawn: -5"],
          "probe has no volume")
     # SH4: `ns` lists the table the shell holds; `confine` narrows what programs started inside can reach, and only narrows
-    step(b"ns\n", [b"$ ns", b'[{"path":"/","rights":"r"},{"path":".","rights":"r"},{"path":"/dev","rights":"rw"},{"path":"/tmp","rights":"rw"},{"path":"/svc","rights":"r"}]'],
+    step(b"ns\n", [b"$ ns", b'[{"path":"/","rights":"r"},{"path":".","rights":"r"},{"path":"/dev","rights":"rw"},{"path":"/tmp","rights":"rw"},{"path":"/proc","rights":"r"},{"path":"/svc","rights":"r"}]'],
          "ns lists the shell's table")
     step(b'confine { "/home": "r" } do cat /home/hello.txt end\n',
          [b'$ confine { "/home": "r" } do cat /home/hello.txt end', b"hello, world"], "confine: a granted path is readable")
@@ -393,6 +393,56 @@ def main():
     step(b"r = wait $k\n", [b"$ r = wait $k"], "the killed job's result")
     step(b"print $r.status\n", [b"$ print $r.status", b"-1"], "the killed job's status")
     step(b"echo done\n", [b"$ echo done", b"done"], "the shell after the jobs")
+
+    # /proc (UV6): each file read by a real program (`ps`, `free`, `nproc`, `cat`); only this session's programs are listed
+    cpus = os.environ.get("OS_SMP", "1").encode()
+
+    def step_re(send, want, what):
+        """Like `step`, but an expected line may be a compiled regex (matched in full)."""
+        s.prompt()
+        s.p.stdin.write(send)
+        s.p.stdin.flush()
+        out = []
+        for w in want:
+            got = s.next_line(what)
+            ok = w.fullmatch(got) if hasattr(w, "fullmatch") else got == w
+            if not ok:
+                fail(s, f"{what}: expected {getattr(w, 'pattern', w)!r}, got {got!r}")
+            out.append(got)
+        return out
+
+    step(b"nproc\n", [b"$ nproc", cpus], "nproc counts /proc/cpuinfo")
+    step_re(b"cat /proc/cpuinfo\n", [b"$ cat /proc/cpuinfo"] + [x for i in range(int(cpus)) for x in (f"processor\t: {i}".encode(), b"")], "cpuinfo has a stanza per hart")
+    got = step_re(b"free\n", [b"$ free", b"total used free", re.compile(rb"196608 \d+ \d+")], "free reads /proc/meminfo")
+    total, used, free = (int(x) for x in got[2].split())
+    if used + free != total or used == 0:
+        fail(s, f"free: {got[2]!r} does not add up")
+    step_re(b"cat /proc/meminfo\n", [b"$ cat /proc/meminfo", re.compile(rb"MemTotal: +196608 kB"), re.compile(rb"MemFree: +\d+ kB"), re.compile(rb"MemAvailable: +\d+ kB")], "meminfo")
+    step_re(b"cat /proc/uptime\n", [b"$ cat /proc/uptime", re.compile(rb"\d+\.\d\d 0\.00")], "uptime")
+    step_re(b"cat /proc/loadavg\n", [b"$ cat /proc/loadavg", re.compile(rb"0\.00 0\.00 0\.00 1/\d+ \d+")], "loadavg: only cat is running")
+    # a program sees itself and nothing else: not the services, not other sessions
+    step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R ps")], "ps lists itself and nothing outside the session")
+    step(b'j = spawn { "out": "discard" } spin\n', [b'$ j = spawn { "out": "discard" } spin'], "a background program")
+    time.sleep(0.5)
+    rows = step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R spin"), re.compile(rb"\d+ R ps")], "ps lists a background job, in pid order")
+    pid = rows[2].split()[0]
+    if int(pid) >= int(rows[3].split()[0]):
+        fail(s, "ps rows are not in pid order")
+    step(b"cat /proc/" + pid + b"/status\n", [b"$ cat /proc/" + pid + b"/status", b"Name:\tspin", b"State:\tR", b"Pid:\t" + pid], "a program's status")
+    step(b"cat /proc/" + pid + b"/stat\n", [b"$ cat /proc/" + pid + b"/stat", pid + b" (spin) R"], "a program's stat")
+    step(b"ls /proc/" + pid + b"\n", [b"$ ls /proc/" + pid, b"cmdline", b"stat", b"status"], "a program's directory")
+    step(b"kill $j\n", [b"$ kill $j"], "end the background program")
+    step(b"set r = wait $j\n", [b"$ set r = wait $j"], "wait for it")
+    step(b"cat /proc/" + pid + b"/status\n", [b"$ cat /proc/" + pid + b"/status", b"cat: /proc/" + pid + b"/status: not found", b"[exit 1]"], "a waited-for program is gone from /proc")
+    step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R ps")], "ps after the job is gone")
+    # an ended program that has not been waited for is shown as Z, with its exit code, until it is
+    step(b'e = spawn { "out": "discard" } echo hi\n', [b'$ e = spawn { "out": "discard" } echo hi'], "a program that ends at once")
+    time.sleep(0.5)
+    rows = step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ Z echo hi"), re.compile(rb"\d+ R ps")], "ps shows an ended program as Z")
+    zpid = rows[2].split()[0]
+    step(b"cat /proc/" + zpid + b"/status\n", [b"$ cat /proc/" + zpid + b"/status", b"Name:\techo", b"State:\tZ", b"Pid:\t" + zpid, b"ExitCode:\t0"], "a Z program's status")
+    step(b"set r = wait $e\n", [b"$ set r = wait $e"], "wait for it")
+    step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R ps")], "ps once it is waited for")
 
     # end of input and exit: the shell ends and a fresh session starts
     step(b"\x04", [b"$ init: autologin: user", BANNER], "Ctrl-D ends the shell; init starts a new one")

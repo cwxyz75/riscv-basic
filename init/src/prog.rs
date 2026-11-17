@@ -65,6 +65,31 @@ impl Prog {
         self.out(&line)
     }
 
+    /// The whole contents of a file (`Err` is a file-protocol status or `-1` when the path is in no namespace entry).
+    pub fn read_file(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
+        let (base, rel) = self.base_for(path).ok_or(-1)?;
+        let mut dir = rt::fs::Fs::new(base); // borrowed: the program's own connection stays open
+        let mut f = dir.open(rel, 0, proto::file::rights::READ)?;
+        let data = f.read_all();
+        f.close();
+        data
+    }
+
+    /// The entries of a directory.
+    pub fn read_dir(&self, path: &[u8]) -> Result<Vec<proto::file::DirEntry>, i32> {
+        let (base, rel) = self.base_for(path).ok_or(-1)?;
+        let mut dir = rt::fs::Fs::new(base);
+        let want = proto::file::rights::READ | proto::file::rights::ENUMERATE;
+        let mut d = if rel.is_empty() {
+            dir.clone_conn(want)?
+        } else {
+            dir.open(rel, proto::file::flags::DIRECTORY, want)?
+        };
+        let list = d.read_dir();
+        d.close();
+        list
+    }
+
     /// The connection a path is relative to: `/` for absolute paths when the program was given a
     /// root, else the working directory `.`. Returns the connection handle and the path to open
     /// there (an absolute path loses its leading slashes). `None`: nothing to resolve against.

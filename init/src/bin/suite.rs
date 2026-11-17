@@ -4833,6 +4833,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"dhcpc".to_vec(),
             b"echo".to_vec(),
             b"fetch".to_vec(),
+            b"free".to_vec(),
             b"fsd".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
@@ -4847,14 +4848,17 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"netdrv".to_vec(),
             b"netinfo".to_vec(),
             b"netsup".to_vec(),
+            b"nproc".to_vec(),
             b"ping".to_vec(),
             b"probe".to_vec(),
+            b"procd".to_vec(),
+            b"ps".to_vec(),
             b"registryd".to_vec(),
             b"rngd".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
             b"udpecho".to_vec(),
-            b"volmgr".to_vec()
+            b"volmgr".to_vec(),
         ],
         "the programs"
     );
@@ -9567,6 +9571,25 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         st(sys::job_info(root, 9)),
         Some(S::InvalidArgs),
         "an unknown resource"
+    );
+    // 7 is the processors (UV6): at least one, the same number twice, and the same for every job
+    let (cpus, cpus_limit) = job_use(root, 7)?;
+    ensure!(
+        cpus >= 1 && cpus == cpus_limit,
+        "job_info 7 gives the online harts twice"
+    );
+    ensure!(cpus <= 8, "a plausible number of harts");
+    let child = job(root, 1, 1, 1)?;
+    ensure_eq!(
+        job_use(child, 7)?,
+        (cpus, cpus),
+        "every job sees the same processors"
+    );
+    sys::handle_close(child);
+    ensure_eq!(
+        st(sys::job_info(root, 8)),
+        Some(S::InvalidArgs),
+        "the resource after the last"
     );
     // each operation needs its own right
     let only = |r: Rights| -> Result<u32, Detail> {

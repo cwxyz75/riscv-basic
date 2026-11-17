@@ -85,6 +85,10 @@ pub enum Role {
     Ready = 36,
     /// The channel `authd` serves (UV5a): one request, one reply, in text.
     ServiceAuth = 37,
+    /// The channel the shell tells `procd` about its programs on (UV6): both ends hold this role.
+    ServiceProc = 38,
+    /// A connection to `procd`'s root, the shell's `/proc` (UV6).
+    ProcDir = 39,
 }
 
 impl Role {
@@ -127,6 +131,8 @@ impl Role {
             35 => Role::DevDir,
             36 => Role::Ready,
             37 => Role::ServiceAuth,
+            38 => Role::ServiceProc,
+            39 => Role::ProcDir,
             _ => return None,
         })
     }
