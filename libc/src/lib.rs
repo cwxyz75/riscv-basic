@@ -29,6 +29,7 @@ mod misc;
 mod netdb;
 mod random;
 mod setjmp;
+mod sig;
 mod socket;
 mod spawn;
 mod start;

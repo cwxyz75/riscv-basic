@@ -485,6 +485,9 @@ def main():
          [b"$ busybox env busybox env busybox env busybox env busybox env busybox echo deep", b"env: can't execute 'busybox': Function not implemented", b"[exit 126]"],
          "programs may start programs only four deep")
     step(b"busybox env busybox env busybox env busybox env busybox echo four\n", [b"$ busybox env busybox env busybox env busybox env busybox echo four", b"four"], "four deep works")
+    # signals (S11, OD119): the same C program the host runs; its output (the host's) is the expected transcript
+    expected = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "libc", "tests", "c", "signals.expected"), "rb").read().splitlines()
+    step(b"ctest signals\n", [b"$ ctest signals"] + expected, "signals: the C library's subset, interrupted waits, signals between programs")
     # a child holds no more than the program that started it: `ls` is trusted (a root and the volume) when the shell starts it,
     # but not when `busybox`, which holds neither, starts it
     step(b"busybox env /bin/ls /\n", [b"$ busybox env /bin/ls /", b"/bin/ls: /: not found", b"[exit 1]"], "a trusted program started by an untrusted one gets no root")
@@ -504,6 +507,14 @@ def main():
     time.sleep(1.0)
     step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ Z busybox env busybox echo hi"), re.compile(rb"\d+ R ps")], "it was served while the shell was idle")
     step(b"set r = wait $bg\n", [b"$ set r = wait $bg"], "wait for it")
+    # a program may signal only the programs of its own chain: a job the shell started on its own is out of reach
+    step(b'j2 = spawn { "out": "discard" } spin\n', [b'$ j2 = spawn { "out": "discard" } spin'], "another background job")
+    time.sleep(0.5)
+    rows = step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R spin"), re.compile(rb"\d+ R ps")], "its pid")
+    spid = rows[2].split()[0]
+    step_re(b"busybox kill -TERM " + spid + b"\n", [b"$ busybox kill -TERM " + spid, re.compile(rb"kill: can't kill pid \d+: No such process"), b"[exit 1]"], "a program cannot signal one outside its chain")
+    step(b"kill $j2\n", [b"$ kill $j2"], "end it")
+    step(b"set r = wait $j2\n", [b"$ set r = wait $j2"], "wait for it")
 
     # /proc (UV6): each file read by a real program (`ps`, `free`, `nproc`, `cat`); only this session's programs are listed
     cpus = os.environ.get("OS_SMP", "1").encode()

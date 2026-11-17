@@ -169,6 +169,8 @@ struct Broker {
     cwd_path: Vec<u8>,
     /// Each mount in the program's namespace and whether it is writable.
     mounts: Vec<(Vec<u8>, bool)>,
+    /// The shell's end of the channel the program receives signals on (S11, OD119).
+    sig: u32,
     /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
     confined: Option<Vec<(String, String)>>,
 }
@@ -531,7 +533,7 @@ impl Os {
     fn drop_broker(&mut self, pid: u32) {
         if let Some(i) = self.brokers.iter().position(|b| b.pid == pid) {
             let b = self.brokers.remove(i);
-            sys::handle_close(b.ch);
+            close_all(&[b.ch, b.sig]);
             b.cwd.close();
         }
     }
@@ -611,7 +613,7 @@ impl Os {
                 i += 1;
             } else {
                 let b = self.brokers.remove(i);
-                sys::handle_close(b.ch);
+                close_all(&[b.ch, b.sig]);
                 b.cwd.close();
             }
         }
@@ -664,8 +666,8 @@ impl Os {
     fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u32]) -> bool {
         let ch = self.brokers[i].ch;
         let txid = proto::file::peek_txid(msg).unwrap_or(0);
-        let reply = |status: i32, h: Option<u32>| {
-            let m = proto::spawn::encode_reply(txid, status);
+        let reply = |status: i32, pid: u32, h: Option<u32>| {
+            let m = proto::spawn::encode_reply(txid, status, pid);
             let hv: &[u32] = match &h {
                 Some(x) => core::slice::from_ref(x),
                 None => &[],
@@ -676,20 +678,62 @@ impl Os {
                 }
             }
         };
-        let Ok(req) = proto::spawn::decode(msg) else {
-            close_all(hs);
-            reply(proto::file::status::BAD_REQUEST, None);
-            return false;
+        let req = match proto::spawn::decode_message(msg) {
+            Ok(proto::spawn::Message::Spawn(r)) => r,
+            Ok(proto::spawn::Message::Signal { pid, sig, .. }) => {
+                close_all(hs);
+                // a signal goes to a program of the asker's own chain (itself, what it started, what started it): the
+                // shell writes the number to the program's signal channel; it is delivered where that program waits
+                let root = self.brokers[i].root;
+                let target = self
+                    .brokers
+                    .iter()
+                    .find(|b| b.pid == pid && b.root == root)
+                    .map(|b| b.sig);
+                let st = match target {
+                    Some(_) if sig == 9 => {
+                        // SIGKILL is not a message: the shell ends the process (it holds the handle of everything in
+                        // its chains)
+                        match self
+                            .procs
+                            .get(&pid)
+                            .copied()
+                            .or_else(|| self.desc.get(&pid).map(|d| d.h))
+                        {
+                            Some(h) => {
+                                sys::process_kill(h, -1);
+                                0
+                            }
+                            None => proto::file::status::NOT_FOUND,
+                        }
+                    }
+                    Some(_) if sig == 0 => 0,
+                    Some(t) if (1..=64).contains(&sig) => {
+                        // (a full queue drops it: a signal that is already waiting coalesces with this one)
+                        sys::channel_write(t, [sig as u8].as_ptr(), 1, core::ptr::null(), 0);
+                        0
+                    }
+                    Some(_) => proto::file::status::BAD_REQUEST,
+                    None => proto::file::status::NOT_FOUND,
+                };
+                reply(st, 0, None);
+                return true;
+            }
+            Err(_) => {
+                close_all(hs);
+                reply(proto::file::status::BAD_REQUEST, 0, None);
+                return false;
+            }
         };
         if hs.len() != proto::spawn::HANDLES {
             close_all(hs);
-            reply(proto::file::status::BAD_REQUEST, None);
+            reply(proto::file::status::BAD_REQUEST, 0, None);
             return false;
         }
         let root = self.brokers[i].root;
         if self.desc.values().filter(|d| d.root == root).count() >= SPAWN_LIVE {
             close_all(hs);
-            reply(proto::file::status::QUOTA, None);
+            reply(proto::file::status::QUOTA, 0, None);
             return true;
         }
         let prog = String::from_utf8_lossy(req.prog).into_owned();
@@ -711,12 +755,15 @@ impl Os {
             .collect();
         if !shell_core::valid_command_name(prog.as_bytes()) {
             close_all(hs);
-            reply(proto::file::status::NOT_FOUND, None);
+            reply(proto::file::status::NOT_FOUND, 0, None);
             return true;
         }
         let mut b = self.brokers.remove(i);
         self.new_tmp = None;
+        let id = self.next_pid;
+        self.next_pid += 1;
         let started = self.start_with(
+            id,
             &prog,
             &argv,
             &env,
@@ -736,11 +783,9 @@ impl Os {
                     HostError::NotFound => proto::file::status::NOT_FOUND,
                     _ => proto::file::status::UNAVAILABLE,
                 };
-                reply(st, None);
+                reply(st, 0, None);
             }
             Ok(ph) => {
-                let id = self.next_pid;
-                self.next_pid += 1;
                 self.proc_announce(
                     id,
                     ph,
@@ -760,11 +805,11 @@ impl Os {
                     Rights::WAIT.0 | Rights::INSPECT.0 | Rights::KILL.0 | Rights::TRANSFER.0,
                 );
                 match give {
-                    Some(g) => reply(0, Some(g)),
+                    Some(g) => reply(0, id, Some(g)),
                     None => {
                         sys::process_kill(ph, -1);
                         self.forget_desc(id);
-                        reply(proto::file::status::UNAVAILABLE, None)
+                        reply(proto::file::status::UNAVAILABLE, 0, None)
                     }
                 }
             }
@@ -963,17 +1008,19 @@ impl Os {
 
     fn start(
         &mut self,
+        pid: u32,
         argv: &[String],
         env: &[(String, String)],
         io: ProcIo,
     ) -> Result<u32, HostError> {
-        self.start_with(&argv[0], argv, env, Stdio::Streams(io), None)
+        self.start_with(pid, &argv[0], argv, env, Stdio::Streams(io), None)
     }
 
     /// Start a program. `parent` is the broker of the program that asked (a spawn request, OD118): the new program gets
     /// only what that program also holds, at no wider rights, and its working directory.
     fn start_with(
         &mut self,
+        pid: u32,
         prog: &str,
         argv: &[String],
         env: &[(String, String)],
@@ -1049,8 +1096,15 @@ impl Os {
         // the environment the shell passes (its `$env` binding, A2), then the working directory as a path: the libc's
         // `getcwd`, and `..` that climbs, start from it
         for (k, v) in env {
-            startup.env.push(format!("{k}={v}").into_bytes());
+            // (the program's pid and its parent's are the shell's to say)
+            if k != "PID" && k != "PPID" {
+                startup.env.push(format!("{k}={v}").into_bytes());
+            }
         }
+        startup.env.push(format!("PID={pid}").into_bytes());
+        startup
+            .env
+            .push(format!("PPID={}", parent.as_ref().map_or(0, |p| p.pid)).into_bytes());
         startup.env.push([&b"PWD="[..], &cwd_path].concat());
         // which of the standard streams are the terminal (a program tells a tty from a pipe by this)
         if let Stdio::Streams(io) = stdio {
@@ -1257,13 +1311,19 @@ impl Os {
                     Some(p) => p.cwd.clone_conn(rights::READ | rights::ENUMERATE),
                     None => self.cwd.clone_conn(rights::READ | rights::ENUMERATE),
                 };
+                let sg = sys::channel_create();
                 match cw {
-                    Ok(cw) => {
+                    Ok(cw) if sg.status == 0 => {
                         startup
                             .roles
                             .push((Role::ServiceSpawn, forward.len() as u32));
                         forward.push(theirs);
+                        startup
+                            .roles
+                            .push((Role::SignalChannel, forward.len() as u32));
+                        forward.push(sg.a2 as u32);
                         self.pending_broker = Some(Broker {
+                            sig: sg.a1 as u32,
                             pid: 0,
                             root: 0,
                             ch: mine,
@@ -1274,7 +1334,16 @@ impl Os {
                             confined: confined.clone(),
                         });
                     }
-                    Err(_) => close_all(&[mine, theirs]),
+                    Ok(cw) => {
+                        cw.close();
+                        close_all(&[mine, theirs]);
+                    }
+                    Err(_) => {
+                        close_all(&[mine, theirs]);
+                        if sg.status == 0 {
+                            close_all(&[sg.a1 as u32, sg.a2 as u32]);
+                        }
+                    }
                 }
             }
         }
@@ -1285,7 +1354,7 @@ impl Os {
             Ok(p) => Ok(p),
             Err(e) => {
                 if let Some(b) = self.pending_broker.take() {
-                    sys::handle_close(b.ch);
+                    close_all(&[b.ch, b.sig]);
                     b.cwd.close();
                 }
                 close_all(&forward);
@@ -1315,9 +1384,10 @@ impl Host for Os {
         // programs read the terminal through the console server's line editor
         self.go_cooked();
         self.new_tmp = None;
-        let started = self.start(argv, env, io);
-        let tmp = self.new_tmp.take();
         let id = self.next_pid;
+        self.next_pid += 1;
+        let started = self.start(id, argv, env, io);
+        let tmp = self.new_tmp.take();
         let h = match started {
             Ok(h) => h,
             Err(e) => {
@@ -1327,7 +1397,6 @@ impl Host for Os {
                 return Err(e);
             }
         };
-        self.next_pid += 1;
         self.procs.insert(id, h);
         self.attach_broker(id, id);
         self.proc_announce(id, h, argv);
