@@ -533,6 +533,33 @@ pub extern "C" fn ftruncate(fd: c_int, len: c_long) -> c_int {
     }
 }
 
+/// `fsync` and `fdatasync`: the server's `SYNC` (the file system commits what the connection wrote: FS-SPEC F4); a standard stream or
+/// a socket has nothing to commit.
+#[no_mangle]
+pub extern "C" fn fsync(fd: c_int) -> c_int {
+    let mut t = FDS.lock();
+    match t
+        .fds
+        .get_mut(usize::try_from(fd).unwrap_or(usize::MAX))
+        .and_then(Option::as_mut)
+    {
+        Some(Entry::File(f)) => match f.fs.sync() {
+            Ok(()) => 0,
+            Err(e) => fail(e),
+        },
+        Some(_) => 0,
+        None => {
+            errno::set(9);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fdatasync(fd: c_int) -> c_int {
+    fsync(fd)
+}
+
 /// The entries of a directory, read whole when it is opened: `(name, is_dir, is_link)`. `Err` is an errno.
 pub fn dir_entries(path: &[u8]) -> Result<Vec<(Vec<u8>, bool, bool)>, c_int> {
     let _guard = FDS.lock();
@@ -727,12 +754,21 @@ pub fn vfork_leave() {
 /// `fcntl`: `F_DUPFD` on a stream; the descriptor flags a socket supports (`O_NONBLOCK`); other descriptors answer the harmless
 /// defaults.
 #[no_mangle]
-pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
+    // F_GETLK, F_SETLK, F_SETLKW: every lock is granted and nothing is held (advisory, and one writer at a time is the caller's
+    // business: TIDY-UP T142); F_GETLK says the region is unlocked. `arg` is the pointer to the `struct flock`.
+    if (5..=7).contains(&cmd) {
+        if cmd == 5 && arg != 0 {
+            // SAFETY: the caller passes a `struct flock` for F_GETLK; `l_type` is its first field (a `short`)
+            unsafe { *(arg as *mut i16) = 2 }; // F_UNLCK
+        }
+        return 0;
+    }
     if cmd == 0 || cmd == 1030 {
         // F_DUPFD, F_DUPFD_CLOEXEC: the lowest free descriptor from `arg`
         let slot = {
             let t = FDS.lock();
-            (arg.max(0) as usize..MAX_FDS).find(|&i| t.fds[i].is_none())
+            ((arg as c_int).max(0) as usize..MAX_FDS).find(|&i| t.fds[i].is_none())
         };
         return match slot {
             Some(s) => dup_stream(fd, s as c_int),
@@ -740,7 +776,7 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
         };
     }
     match socket_of(fd) {
-        Ok(Some(s)) => crate::socket::sock_fcntl(&s, cmd, arg),
+        Ok(Some(s)) => crate::socket::sock_fcntl(&s, cmd, arg as c_int),
         Ok(None) => match cmd {
             1..=4 => 0,
             _ => fail(-4),

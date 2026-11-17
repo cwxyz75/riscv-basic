@@ -144,6 +144,38 @@ fn build_lua(dir: &str) -> Option<PathBuf> {
     )
 }
 
+/// SQLite 3.45.1: the amalgamation and the shell, one thread, no loadable extensions, no write-ahead log (it needs shared memory),
+/// no memory mapping.
+fn build_sqlite(dir: &str) -> Option<PathBuf> {
+    let src = Path::new(dir).join("../third_party/fetched/sqlite/src/sqlite-amalgamation-3450100");
+    println!("cargo:rerun-if-changed={}", src.join("sqlite3.c").display());
+    if !src.join("sqlite3.c").exists() {
+        return None;
+    }
+    let mut flags: Vec<String> = [
+        "-w",
+        "-O2",
+        "-DSQLITE_THREADSAFE=0",
+        "-DSQLITE_OMIT_LOAD_EXTENSION",
+        "-DSQLITE_OMIT_WAL",
+        "-DSQLITE_OMIT_SHARED_CACHE",
+        "-DSQLITE_DEFAULT_MEMSTATUS=0",
+        "-DSQLITE_MAX_MMAP_SIZE=0",
+        "-DSQLITE_OS_UNIX=1",
+        "-DHAVE_READLINE=0",
+        "-DSQLITE_TEMP_STORE=3",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    flags.push(format!("-I{}", src.display()));
+    build_c_archive(
+        "sqlite",
+        &[src.join("sqlite3.c"), src.join("shell.c")],
+        &flags,
+    )
+}
+
 /// kilo (a 1300-line editor): the single file fetched by `make fetch-third-party`; without it `kilo` is a stub.
 fn build_kilo(dir: &str) -> Option<PathBuf> {
     let src = Path::new(dir).join("../third_party/fetched/kilo/src/kilo.c");
@@ -229,12 +261,18 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_lua)");
     println!("cargo:rustc-check-cfg=cfg(have_busybox)");
     println!("cargo:rustc-check-cfg=cfg(have_kilo)");
+    println!("cargo:rustc-check-cfg=cfg(have_sqlite)");
     if let Some(archive) = build_c_tests(&dir) {
         println!("cargo:rustc-cfg=have_c");
         println!("cargo:rustc-link-arg-bin=ctest={}", archive.display());
         if let Some(lua) = build_lua(&dir) {
             println!("cargo:rustc-cfg=have_lua");
             println!("cargo:rustc-link-arg-bin=lua={}", lua.display());
+        }
+        if let Some(q) = build_sqlite(&dir) {
+            println!("cargo:rustc-cfg=have_sqlite");
+            println!("cargo:rustc-link-arg-bin=sqlite3={}", q.display());
+            println!("cargo:rustc-link-arg-bin=sqlite3=--error-limit=0");
         }
         if let Some(k) = build_kilo(&dir) {
             println!("cargo:rustc-cfg=have_kilo");

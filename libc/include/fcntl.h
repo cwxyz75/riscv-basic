@@ -19,6 +19,14 @@
 int fcntl(int fd, int cmd, ...);
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);
+/* advisory record locks (SQLite): the library answers every request as granted, nothing is enforced between processes (TIDY-UP T142) */
+#define F_GETLK 5
+#define F_SETLK 6
+#define F_SETLKW 7
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+struct flock { short l_type; short l_whence; long l_start; long l_len; int l_pid; };
 #define F_DUPFD 0
 #define F_DUPFD_CLOEXEC 1030
 #define O_NOCTTY 0400

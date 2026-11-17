@@ -9,6 +9,7 @@ int *__errno_location(void);
 #define ESPIPE 29
 #define EPIPE 32
 #define EDEADLK 35
+#define ENOLCK 37
 #define ENAMETOOLONG 36
 #define ENOTEMPTY 39
 #define EOVERFLOW 75

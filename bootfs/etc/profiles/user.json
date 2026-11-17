@@ -2,5 +2,6 @@
   "programs": {
     "ls":    { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] },
     "cat":   { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] },
-    "ctest": { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] }
+    "ctest": { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] },
+    "sqlite3": { "root": true, "mounts": [ { "volume": "store", "rights": "rw" } ] }
   } }

@@ -1,3 +1,4 @@
 ls store
 cat store
 ctest store
+sqlite3 store

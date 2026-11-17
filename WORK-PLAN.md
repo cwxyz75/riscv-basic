@@ -25,7 +25,7 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 7. [ ] **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
    needed**; its own PR; soak at `-smp 2` and `-smp 4`; Fable review.
 
-Then: a first real port from `third_party/fetched` (**`kilo` done**: PR kilo; next `gzip`, `gnutar`, `sqlite`), and the design-review slice queue before S8 (`ROADMAP.md`,
+Then: a first real port from `third_party/fetched` (**`kilo` and `sqlite3` done**; next `gzip`, `gnutar`), and the design-review slice queue before S8 (`ROADMAP.md`,
 `reviews/`).
 
 Working rules that apply throughout (CLAUDE.md, the owner's earlier instructions): a runnable acceptance check first; one mutation
