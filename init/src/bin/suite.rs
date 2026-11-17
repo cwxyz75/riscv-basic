@@ -4841,6 +4841,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"httpd".to_vec(),
             b"init".to_vec(),
             b"ipchog".to_vec(),
+            b"kilo".to_vec(),
             b"launcher".to_vec(),
             b"ls".to_vec(),
             b"lua".to_vec(),

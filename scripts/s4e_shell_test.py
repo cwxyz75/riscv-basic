@@ -72,7 +72,7 @@ class Session(base.Session):
 BANNER = b"riscv-os S4 ready"
 LINES_TXT_LINES = 3  # bootfs/home/lines.txt: one, two, three
 LINES_HEAD2 = [b"one", b"two"]
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"kilo", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -366,6 +366,30 @@ def main():
     step(b'bgt = spawn { "out": "discard" } ctest signals tty\n', [b'$ bgt = spawn { "out": "discard" } ctest signals tty'], "a background program that asks for the terminal")
     step(b"rbg = wait $bgt\n", [b"$ rbg = wait $bgt"], "wait for it")
     step(b"print $rbg.status\n", [b"$ print $rbg.status", b"1"], "it was refused (tcgetattr failed)")
+    # kilo, an unmodified text editor (raw mode, the window size, a read that times out): type two letters, save, quit, and the file has them
+    def until(pat, what):
+        while True:
+            line = s.next_line(what)
+            if pat in line:
+                return line
+
+    s.prompt()
+    s.p.stdin.write(b"busybox hush -c 'kilo /tmp/k.txt; busybox cat /tmp/k.txt'\n")
+    s.p.stdin.flush()
+    s.wait_for_prompt = False
+    until(b"~", "kilo draws its screen")
+    s.p.stdin.write(b"hi")
+    s.p.stdin.flush()
+    until(b"1 lines", "kilo shows what was typed (a one-line file)")
+    s.p.stdin.write(b"\x13")  # Ctrl-S
+    s.p.stdin.flush()
+    time.sleep(0.5)  # (its "bytes written" message is a partial line: no newline follows it)
+    s.p.stdin.write(b"\x11")  # Ctrl-Q
+    s.p.stdin.flush()
+    while not s.next_line("kilo quits and cat shows the file").endswith(b"hi"):
+        pass  # (cat's output follows kilo's last screen on the same line: the cursor is shown again, then the file)
+    s.wait_for_prompt = True
+    step(b"echo after kilo\n", [b"$ echo after kilo", b"after kilo"], "the terminal is cooked again after the editor")
     # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
     step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
     s.wait_for_prompt = False

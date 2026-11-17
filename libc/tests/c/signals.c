@@ -87,6 +87,7 @@ static int self_tests(void) {
     got = 0;
     alarm(1);
     unsigned left = sleep(10);
+    if (left < 1 || left > 9) printf("DEBUG sleep left %u, handler %d\n", left, got == SIGALRM);
     printf("alarm interrupted sleep: handler %d, time left %s\n", got == SIGALRM, left >= 1 && left <= 9 ? "about 9" : "wrong");
     printf("alarm(0) with nothing set returns %u\n", alarm(0));
 

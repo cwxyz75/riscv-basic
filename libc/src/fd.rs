@@ -37,7 +37,7 @@ pub struct OpenFile {
 enum Entry {
     /// A stream: the handle of a socket, and whether this table owns it (a `pipe` end or a `dup`: closed with the descriptor;
     /// the startup message's own streams are not).
-    Stream(u32, bool),
+    Stream(u32, bool, bool),
     File(OpenFile),
     /// A socket (S9 step 6): shared, so a blocking call does not hold the descriptor table.
     Socket(crate::socket::SockRef),
@@ -69,16 +69,15 @@ pub fn set_table(t: pathres::Table) {
 /// `ELOOP`, as a status of this layer (too many symlinks).
 const LOOP: i32 = -999;
 
-/// Which standard streams are the terminal (`STDIN=tty`, `STDOUT=tty` in the environment).
-pub static TTY_IN: AtomicU32 = AtomicU32::new(0);
-pub static TTY_OUT: AtomicU32 = AtomicU32::new(0);
-
 /// Install the three standard streams (handles 0 = absent).
-pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
+pub fn init_std(stdin: u32, stdout: u32, stderr: u32, tty_in: bool, tty_out: bool) {
     let mut t = FDS.lock();
     for (i, h) in [stdin, stdout, stderr].into_iter().enumerate() {
         if h != 0 {
-            t.fds[i] = Some(Entry::Stream(h, false));
+            // (the terminal: input on descriptor 0 when the shell said `STDIN=tty`, output on 1 and 2 for `STDOUT=tty`; the flag goes with
+            // a duplicate)
+            let tty = if i == 0 { tty_in } else { tty_out };
+            t.fds[i] = Some(Entry::Stream(h, false, tty));
         }
     }
 }
@@ -86,7 +85,7 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
 /// The handle of a standard stream (descriptors 0-2 and what `dup` made of them), if `fd` is one.
 pub fn stream_handle(fd: c_int) -> Option<u32> {
     match FDS.lock().fds.get(usize::try_from(fd).ok()?)?.as_ref()? {
-        Entry::Stream(h, _) => Some(*h),
+        Entry::Stream(h, _, _) => Some(*h),
         _ => None,
     }
 }
@@ -129,8 +128,8 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
         drop(t);
         return dup_file(from, to);
     }
-    let h = match t.fds.get(from as usize).and_then(Option::as_ref) {
-        Some(Entry::Stream(h, _)) => *h,
+    let (h, tty) = match t.fds.get(from as usize).and_then(Option::as_ref) {
+        Some(Entry::Stream(h, _, tty)) => (*h, *tty),
         Some(_) => {
             errno::set(38);
             return -1;
@@ -145,10 +144,10 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
         errno::set(24);
         return -1;
     }
-    if let Some(Entry::Stream(old, true)) = t.fds[to as usize].take() {
+    if let Some(Entry::Stream(old, true, _)) = t.fds[to as usize].take() {
         rt::sys::handle_close(old);
     }
-    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32, true));
+    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32, true, tty));
     to
 }
 
@@ -362,7 +361,7 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             f.fs.close();
             0
         }
-        Some(Entry::Stream(h, owned)) => {
+        Some(Entry::Stream(h, owned, _)) => {
             if owned {
                 rt::sys::handle_close(h); // (a pipe end, or a duplicate; the startup message's own streams stay open)
             }
@@ -391,7 +390,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
         return 0;
     }
     match entry {
-        Entry::Stream(h, _) => {
+        Entry::Stream(h, _, _) => {
             let h = *h;
             drop(t); // a blocking read must not hold the table
             read_stream(fd, h, buf as *mut u8, n)
@@ -432,7 +431,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, n: usize) -> isize
         return -1;
     };
     match entry {
-        Entry::Stream(h, _) => {
+        Entry::Stream(h, _, _) => {
             let h = *h;
             drop(t);
             match crate::sig::stream_write(h, data) {
@@ -561,17 +560,11 @@ pub fn stdio_for_child(fd: c_int) -> Option<(u32, Option<alloc::string::String>)
     let mut t = FDS.lock();
     let entry = t.fds.get_mut(usize::try_from(fd).ok()?)?.as_mut()?;
     match entry {
-        Entry::Stream(h, owned) => {
+        Entry::Stream(h, _, tty) => {
             let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
             if d.status != 0 {
                 return None;
             }
-            let tty = !*owned
-                && match fd {
-                    0 => TTY_IN.load(Ordering::Relaxed) != 0,
-                    1 | 2 => TTY_OUT.load(Ordering::Relaxed) != 0,
-                    _ => false,
-                };
             Some((d.a1 as u32, tty.then(|| alloc::string::String::from("tty"))))
         }
         Entry::File(f) => {
@@ -635,7 +628,7 @@ fn dup_file(from: c_int, to: c_int) -> c_int {
         }
     };
     match t.fds[to as usize].take() {
-        Some(Entry::Stream(old, true)) => {
+        Some(Entry::Stream(old, true, _)) => {
             rt::sys::handle_close(old);
         }
         Some(Entry::File(old)) => old.fs.close(),
@@ -664,8 +657,8 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
         errno::set(24);
         return -1;
     };
-    t.fds[r] = Some(Entry::Stream(a, true));
-    t.fds[w] = Some(Entry::Stream(b, true));
+    t.fds[r] = Some(Entry::Stream(a, true, false));
+    t.fds[w] = Some(Entry::Stream(b, true, false));
     *fds = r as c_int;
     *fds.add(1) = w as c_int;
     0
@@ -683,10 +676,10 @@ pub fn vfork_enter() {
     let mut t = FDS.lock();
     for i in 0..MAX_FDS {
         match &mut t.fds[i] {
-            Some(Entry::Stream(h, _)) => {
+            Some(Entry::Stream(h, _, tty)) => {
                 let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
                 if d.status == 0 {
-                    child.fds[i] = Some(Entry::Stream(d.a1 as u32, true));
+                    child.fds[i] = Some(Entry::Stream(d.a1 as u32, true, *tty));
                 }
             }
             // an open file: a connection of its own (the child redirects, and starts programs with it as a standard stream)
@@ -722,7 +715,7 @@ pub fn vfork_leave() {
     let child = core::mem::replace(&mut *FDS.lock(), *parent);
     for e in child.fds.into_iter().flatten() {
         match e {
-            Entry::Stream(h, true) => {
+            Entry::Stream(h, true, _) => {
                 rt::sys::handle_close(h);
             }
             Entry::File(f) => f.fs.close(),
@@ -759,34 +752,24 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
     }
 }
 
-/// Is `fd` the terminal this program was started on (its own startup stream)?
+/// Is `fd` a terminal (the one this program was started on, or a duplicate of it)?
 pub fn is_tty(fd: c_int) -> bool {
-    let owned = matches!(
+    matches!(
         FDS.lock()
             .fds
             .get(usize::try_from(fd).unwrap_or(usize::MAX))
             .and_then(Option::as_ref),
-        Some(Entry::Stream(_, false))
-    );
-    owned
-        && match fd {
-            0 => TTY_IN.load(Ordering::Relaxed) != 0,
-            1 | 2 => TTY_OUT.load(Ordering::Relaxed) != 0,
-            _ => false,
-        }
+        Some(Entry::Stream(_, _, true))
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn isatty(fd: c_int) -> c_int {
-    let tty = match fd {
-        0 => TTY_IN.load(Ordering::Relaxed),
-        1 | 2 => TTY_OUT.load(Ordering::Relaxed),
-        _ => 0,
-    };
-    if tty == 0 {
+    let tty = is_tty(fd);
+    if !tty {
         errno::set(25); // ENOTTY
     }
-    c_int::from(tty != 0)
+    c_int::from(tty)
 }
 
 /// Run `f` on the directory holding the last component of `path`, with that component. The parent
@@ -994,7 +977,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
             }
             Err(e) => fail(e),
         },
-        Some(Entry::Stream(_, _)) => {
+        Some(Entry::Stream(_, _, _)) => {
             let info = proto::file::StatInfo {
                 kind: 1,
                 size: 0,
@@ -1004,7 +987,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
                 gid: proto::file::ABSENT,
             };
             fill_stat(out, &info, 0, &[]);
-            let tty = TTY_OUT.load(Ordering::Relaxed) != 0;
+            let tty = is_tty(fd);
             (*out).st_mode = if tty {
                 S_IFCHR | 0o620
             } else {
@@ -1223,7 +1206,7 @@ static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// stream like any other: the bytes before it come out first, then a read returns 0 (end of input),
 /// and what follows is kept for the read after that.
 unsafe fn read_stream(fd: c_int, h: u32, buf: *mut u8, n: usize) -> isize {
-    let tty = fd == 0 && TTY_IN.load(Ordering::Relaxed) != 0;
+    let tty = fd == 0 && is_tty(0);
     let mut data: Vec<u8> = if tty {
         core::mem::take(&mut *PENDING.lock())
     } else {

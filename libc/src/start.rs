@@ -44,6 +44,8 @@ pub fn run_main() -> i32 {
         out,
         // no separate standard error: it shares standard output
         env.handle(Role::Stderr).unwrap_or(out),
+        env.var(b"STDIN") == Some(&b"tty"[..]),
+        env.var(b"STDOUT") == Some(&b"tty"[..]),
     );
     crate::spawn::init(env.handle(Role::ServiceSpawn).unwrap_or(0));
     let num = |name: &[u8]| {
@@ -87,14 +89,6 @@ pub fn run_main() -> i32 {
     {
         crate::fd::DEFAULT_GID.store(g, Ordering::Relaxed);
     }
-    crate::fd::TTY_IN.store(
-        u32::from(env.var(b"STDIN") == Some(&b"tty"[..])),
-        Ordering::Relaxed,
-    );
-    crate::fd::TTY_OUT.store(
-        u32::from(env.var(b"STDOUT") == Some(&b"tty"[..])),
-        Ordering::Relaxed,
-    );
     // a standard stream that is a file (a redirection the starting program made): `STDIN=file:<mode>:<offset>`, and so on
     for (i, name) in [&b"STDIN"[..], b"STDOUT", b"STDERR"]
         .into_iter()

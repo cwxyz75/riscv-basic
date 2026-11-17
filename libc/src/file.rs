@@ -6,7 +6,6 @@
 use crate::errno;
 use crate::fd;
 use core::ffi::{c_char, c_int, c_long, c_void};
-use core::sync::atomic::Ordering;
 use rt::sync::Mutex;
 
 pub const BUFSIZ: usize = 4096;
@@ -224,11 +223,7 @@ pub fn init_std_buffering() {
     // SAFETY: start-up, single thread.
     unsafe {
         let out = &mut *std_stream(1);
-        out.set_mode(if fd::TTY_OUT.load(Ordering::Relaxed) != 0 {
-            1
-        } else {
-            0
-        });
+        out.set_mode(if fd::is_tty(1) { 1 } else { 0 });
         (*std_stream(2)).set_mode(2);
     }
 }

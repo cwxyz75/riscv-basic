@@ -53,7 +53,7 @@ jobs:
           path: third_party/fetched
           key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
       - name: Fetch BusyBox (pinned by sha256; the serial tests run its applets)
-        run: FETCH_ONLY=busybox make fetch-third-party
+        run: FETCH_ONLY="busybox kilo" make fetch-third-party
       - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
         run: |
           qemu-system-riscv64 --version | head -1
