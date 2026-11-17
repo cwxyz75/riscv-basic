@@ -1,0 +1,22 @@
+signal returned SIG_DFL: 1
+raise ran the handler: 1
+old SIGUSR2 action was default: 1
+an ignored signal does nothing: 1
+sigaction reads the action: 1
+blocked: handler has not run: 1
+pending: USR1 1 USR2 1 ALRM 0
+unblocked: ran 2 handlers, one for each signal: 1
+nothing pending now: 1
+mask set and read: 1 0
+alarm interrupted sleep: handler 1, time left about 9
+alarm(0) with nothing set returns 0
+pause: -1 errno EINTR 1 handler 1
+sigsuspend: -1 errno EINTR 1 handler 1
+alarm returns the time left: about 5
+kill 0 finds the child: 0
+handled SIGTERM: exited 1 status 7
+default SIGTERM: signaled 1 signal 15
+ignored SIGTERM: still there: 0
+SIGKILL: signaled 1 signal 9
+kill of a pid that is not ours: -1 errno ESRCH 1
+signals: done

@@ -1,8 +1,8 @@
 #ifndef _OS_SIGNAL_H
 #define _OS_SIGNAL_H
 #include <sys/types.h>
-/* Signal numbers follow Linux (riscv64) so ported software finds what it expects. There is no asynchronous delivery yet
- * (S11): `sigaction` and `signal` record the disposition and `raise` runs a handler directly; nothing interrupts a program. */
+/* Signal numbers follow Linux (riscv64) so ported software finds what it expects. Signals are delivered where a program waits
+ * or calls the library, not asynchronously into a loop (S11, OD119, sig.rs): a blocking call a handler interrupted returns EINTR. */
 typedef int sig_atomic_t;
 typedef void (*sighandler_t)(int);
 typedef unsigned long sigset_t;
@@ -60,4 +60,6 @@ int sigdelset(sigset_t *set, int sig);
 int sigismember(const sigset_t *set, int sig);
 unsigned alarm(unsigned seconds);
 int sigisemptyset(const sigset_t *set);
+int sigpending(sigset_t *set);
+int pause(void);
 #endif

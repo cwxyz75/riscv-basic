@@ -21,7 +21,10 @@ use rt::sys;
 static SPAWN_CH: AtomicU32 = AtomicU32::new(0);
 /// Requests and replies on the spawn channel are one exchange at a time.
 static EXCHANGE: Mutex<()> = Mutex::new(());
-static NEXT_PID: AtomicU32 = AtomicU32::new(1000);
+/// Transaction numbers for requests, and pids for the children that ended before they began (a failed `exec` in a `vfork`
+/// child); a started program's pid is the shell's.
+static NEXT_TX: AtomicU32 = AtomicU32::new(1);
+static NEXT_PSEUDO: AtomicU32 = AtomicU32::new(1_000_000);
 
 /// Install the spawn channel (start-up); 0 means the program holds no grant.
 pub fn init(ch: u32) {
@@ -37,17 +40,36 @@ struct Child {
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
-fn register(h: u32, done: Option<i32>) -> c_int {
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as c_int;
+fn register(pid: c_int, h: u32, done: Option<i32>) -> c_int {
+    let pid = if pid != 0 {
+        pid
+    } else {
+        NEXT_PSEUDO.fetch_add(1, Ordering::Relaxed) as c_int
+    };
     CHILDREN.lock().push(Child { pid, h, done });
     pid
 }
 
-/// The wait status of a child: exited with `code`, or killed (the shell's Ctrl-C is -130, a kill is -1).
+/// Is a `vfork` child running (in this process)?
+pub fn in_vfork_child() -> bool {
+    VFORK_ACTIVE.load(Ordering::Relaxed) != 0
+}
+
+/// The wait status of a child: exited with `code`, or killed. Killed is the shell's Ctrl-C (-130: SIGINT), a kill (-1:
+/// SIGKILL), a default signal action (`-2000 - signal`, `sig.rs`) or a fault the kernel ended the program for (`-1000 -
+/// scause`: SIGILL, SIGBUS or SIGSEGV).
 fn wait_status(code: i32) -> c_int {
     match code {
         -130 => 2,
         -1 => 9,
+        c if c < crate::sig::SIGNALED_BASE && c > crate::sig::SIGNALED_BASE - 65 => {
+            crate::sig::SIGNALED_BASE - c
+        }
+        c if (-1100..=-1000).contains(&c) => match -1000 - c {
+            2 => 4,
+            0 | 4 | 6 => 7,
+            _ => 11,
+        },
         c => (c & 0xff) << 8,
     }
 }
@@ -80,7 +102,12 @@ fn status_errno(st: i32) -> c_int {
 }
 
 /// Ask the shell to start `argv` with `env` and the three standard streams from `fds`; the process handle, or an `errno`.
-fn start(prog: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>], fds: [c_int; 3]) -> Result<u32, c_int> {
+fn start(
+    prog: &[u8],
+    argv: &[Vec<u8>],
+    env: &[Vec<u8>],
+    fds: [c_int; 3],
+) -> Result<(u32, c_int), c_int> {
     let ch = SPAWN_CH.load(Ordering::Relaxed);
     if ch == 0 {
         return Err(38);
@@ -88,7 +115,7 @@ fn start(prog: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>], fds: [c_int; 3]) -> Res
     let a: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
     let e: Vec<&[u8]> = env.iter().map(|v| v.as_slice()).collect();
     let _x = EXCHANGE.lock();
-    let txid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let txid = NEXT_TX.fetch_add(1, Ordering::Relaxed);
     let req = proto::spawn::encode(txid, prog, &a, &e).map_err(|_| 7)?; // E2BIG
     let mut hs = [0u32; 3];
     for (i, fd) in fds.iter().enumerate() {
@@ -122,8 +149,8 @@ fn start(prog: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>], fds: [c_int; 3]) -> Res
             return Err(5);
         }
         match proto::spawn::decode_reply(&buf[..r.a1]) {
-            Some((id, 0)) if id == txid && r.a2 == 1 => return Ok(h[0]),
-            Some((id, st)) if id == txid => {
+            Some((id, 0, pid)) if id == txid && r.a2 == 1 => return Ok((h[0], pid as c_int)),
+            Some((id, st, _)) if id == txid => {
                 for &x in &h[..r.a2] {
                     sys::handle_close(x);
                 }
@@ -134,6 +161,89 @@ fn start(prog: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>], fds: [c_int; 3]) -> Res
                     sys::handle_close(x);
                 }
             }
+        }
+    }
+}
+
+/// Ask the shell to deliver `sig` to the program with pid `pid` in this chain (itself, what it started, what started it); an
+/// `errno` (`ESRCH` for no such program).
+fn signal_via_shell(pid: c_int, sig: c_int) -> Result<(), c_int> {
+    let ch = SPAWN_CH.load(Ordering::Relaxed);
+    if ch == 0 {
+        return Err(3);
+    }
+    let _x = EXCHANGE.lock();
+    let txid = NEXT_TX.fetch_add(1, Ordering::Relaxed);
+    let req = proto::spawn::encode_signal(txid, pid as u32, sig as u32);
+    if sys::channel_write(ch, req.as_ptr(), req.len(), core::ptr::null(), 0).status != 0 {
+        return Err(3);
+    }
+    let deadline = sys::clock_get() + 30_000;
+    loop {
+        if sys::object_wait(ch, signals::READABLE | signals::PEER_CLOSED, deadline).status != 0 {
+            return Err(110);
+        }
+        let mut buf = [0u8; 16];
+        let mut h = [0u32; 1];
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
+        if r.status != 0 {
+            return Err(5);
+        }
+        for &x in &h[..r.a2] {
+            sys::handle_close(x);
+        }
+        match proto::spawn::decode_reply(&buf[..r.a1]) {
+            Some((id, 0, _)) if id == txid => return Ok(()),
+            Some((id, st, _)) if id == txid => {
+                return Err(if st == ps::NOT_FOUND { 3 } else { 22 });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// While this process is an `exec`'d program's wait (`exec_with`): the pid its signals are passed on to.
+pub static FORWARD_TO: AtomicU32 = AtomicU32::new(0);
+
+/// `kill`: a signal to this process runs through `raise`; one to a program in the chain goes through the shell, and SIGKILL
+/// to a child this process holds ends it at once.
+pub fn kill_pid(pid: c_int, sig: c_int) -> c_int {
+    if !(0..=64).contains(&sig) {
+        errno::set(22);
+        return -1;
+    }
+    if pid <= 0 {
+        errno::set(3); // process groups are not emulated
+        return -1;
+    }
+    if crate::sig::own_pid() != 0 && pid as u32 == crate::sig::own_pid() {
+        return crate::sig::raise(sig);
+    }
+    if sig == 9 {
+        let g = CHILDREN.lock();
+        if let Some(c) = g.iter().find(|c| c.pid == pid && c.h != 0) {
+            sys::process_kill(c.h, -1);
+            return 0;
+        }
+    }
+    // a child this process holds exists until it is waited for, whatever the shell says (it has no grant of its own below the
+    // depth limit, so the shell may not know it as a program of the chain)
+    let held = CHILDREN.lock().iter().find(|c| c.pid == pid).map(|c| c.h);
+    if sig == 0 && held.is_some() {
+        return 0;
+    }
+    match signal_via_shell(pid, sig) {
+        Ok(()) => 0,
+        Err(3) if held.is_some_and(|h| h != 0) => {
+            // the shell has no channel to it: a signal that would end it ends it (the others have nowhere to go)
+            if !matches!(sig, 17..=23 | 28) {
+                sys::process_kill(held.unwrap_or(0), -1);
+            }
+            0
+        }
+        Err(e) => {
+            errno::set(e);
+            -1
         }
     }
 }
@@ -188,9 +298,9 @@ extern "C" {
 }
 
 /// The `vfork` child is done (it started a program or ended): back to the caller of `vfork`, with the child's pid.
-fn vfork_return(h: u32, done: Option<i32>) -> ! {
+fn vfork_return(spid: c_int, h: u32, done: Option<i32>) -> ! {
     VFORK_ACTIVE.store(0, Ordering::Relaxed);
-    let pid = register(h, done);
+    let pid = register(spid, h, done);
     // SAFETY: `VFORK_BUF` was filled by `vfork` and the frame it describes is still live: the child may not return from it.
     unsafe { longjmp(core::ptr::addr_of_mut!(VFORK_BUF) as *mut u64, pid) }
 }
@@ -198,7 +308,7 @@ fn vfork_return(h: u32, done: Option<i32>) -> ! {
 /// `_exit` in a `vfork` child: the child ended with `code`; the caller of `vfork` resumes.
 pub fn vfork_child_exit(code: c_int) {
     if VFORK_ACTIVE.load(Ordering::Relaxed) != 0 {
-        vfork_return(0, Some(code));
+        vfork_return(0, 0, Some(code));
     }
 }
 
@@ -209,7 +319,7 @@ unsafe fn exec_start(
     file: *const c_char,
     argv: *const *const c_char,
     envp: Option<*const *const c_char>,
-) -> Result<u32, c_int> {
+) -> Result<(u32, c_int), c_int> {
     if file.is_null() || argv.is_null() {
         return Err(14);
     }
@@ -235,12 +345,17 @@ unsafe fn exec_with(
             errno::set(e);
             -1
         }
-        Ok(h) => {
+        Ok((h, pid)) => {
             if VFORK_ACTIVE.load(Ordering::Relaxed) != 0 {
-                vfork_return(h, None)
+                vfork_return(pid, h, None)
             }
-            // not a `vfork` child: this process becomes the program (it runs, and this one ends with its status)
-            sys::object_wait(h, signals::TERMINATED, u64::MAX);
+            // not a `vfork` child: this process becomes the program (it runs, and this one ends with its status); what is
+            // sent to this process meanwhile is the program's, so it is passed on
+            FORWARD_TO.store(pid as u32, Ordering::Relaxed);
+            while !matches!(
+                crate::sig::wait_any(&[(h, signals::TERMINATED)], u64::MAX, true),
+                crate::sig::Wait::Ready(_)
+            ) {}
             let code = sys::process_info(h).a1 as i64 as i32;
             sys::handle_close(h);
             crate::compat::_exit(code)
@@ -356,8 +471,8 @@ unsafe fn spawn_impl(
         }
     }
     match start(name, &args, &string_array(envp), map) {
-        Ok(h) => {
-            let p = register(h, None);
+        Ok((h, spid)) => {
+            let p = register(spid, h, None);
             if !pid.is_null() {
                 *pid = p;
             }
@@ -444,16 +559,11 @@ pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int)
                 .map(|c| c.h)
                 .collect()
         };
-        let p = sys::port_create();
-        if p.status != 0 {
-            sys::object_wait(handles[0], signals::TERMINATED, sys::clock_get() + 5);
-            continue;
+        let items: Vec<(u32, u32)> = handles.iter().map(|&h| (h, signals::TERMINATED)).collect();
+        if let crate::sig::Wait::Interrupted = crate::sig::wait_any(&items, u64::MAX, true) {
+            errno::set(4); // EINTR
+            return -1;
         }
-        for &h in &handles {
-            sys::port_bind(p.a1 as u32, h, signals::TERMINATED, 0);
-        }
-        sys::port_wait(p.a1 as u32, u64::MAX);
-        sys::handle_close(p.a1 as u32);
     }
 }
 
@@ -484,20 +594,7 @@ pub unsafe extern "C" fn wait(status: *mut c_int) -> c_int {
     waitpid(-1, status, 0)
 }
 
-/// Signals are not delivered (T134): a signal sent to a child ends it. Signal 0 asks whether the child exists.
 #[no_mangle]
 pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
-    let g = CHILDREN.lock();
-    match g.iter().find(|c| c.pid == pid) {
-        Some(c) => {
-            if sig != 0 && c.h != 0 {
-                sys::process_kill(c.h, -1);
-            }
-            0
-        }
-        None => {
-            errno::set(3); // ESRCH
-            -1
-        }
-    }
+    kill_pid(pid, sig)
 }

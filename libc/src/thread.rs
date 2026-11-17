@@ -619,30 +619,46 @@ pub unsafe extern "C" fn clock_gettime(_clock: c_int, ts: *mut Timespec) -> c_in
     0
 }
 
+/// Sleep until `deadline` (ms): the milliseconds left if a signal's handler ran first, else 0.
+fn sleep_until(deadline: u64) -> u64 {
+    match crate::sig::wait_any(&[], deadline, false) {
+        crate::sig::Wait::Interrupted => deadline.saturating_sub(rt::sys::clock_get()),
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int {
     let ms = (*req)
         .tv_sec
         .saturating_mul(1000)
         .saturating_add(((*req).tv_nsec + 999_999) / 1_000_000);
-    if ms > 0 {
-        rt::io::nap(ms as u64);
-    }
+    let left = if ms > 0 {
+        sleep_until(rt::sys::clock_get() + ms as u64)
+    } else {
+        0
+    };
     if !rem.is_null() {
-        (*rem).tv_sec = 0;
-        (*rem).tv_nsec = 0;
+        (*rem).tv_sec = (left / 1000) as i64;
+        (*rem).tv_nsec = ((left % 1000) * 1_000_000) as c_long;
+    }
+    if left > 0 {
+        crate::errno::set(4); // EINTR
+        return -1;
     }
     0
 }
 
 #[no_mangle]
 pub extern "C" fn sleep(s: u32) -> u32 {
-    rt::io::nap(u64::from(s) * 1000);
-    0
+    sleep_until(rt::sys::clock_get() + u64::from(s) * 1000).div_ceil(1000) as u32
 }
 
 #[no_mangle]
 pub extern "C" fn usleep(us: u32) -> c_int {
-    rt::io::nap(u64::from(us).div_ceil(1000));
+    if sleep_until(rt::sys::clock_get() + u64::from(us).div_ceil(1000)) > 0 {
+        crate::errno::set(4);
+        return -1;
+    }
     0
 }

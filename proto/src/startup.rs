@@ -94,6 +94,9 @@ pub enum Role {
     /// The channel a program asks the shell on to start another program (UV8, OD118): `proto::spawn`. Present only when the
     /// starter granted it; a child's own grant is never wider than its parent's.
     ServiceSpawn = 41,
+    /// The channel a program receives signals on (S11, OD119): the shell writes one message per signal, the program's libc
+    /// reads it where the program waits. Present whenever the program has a spawn grant.
+    SignalChannel = 42,
 }
 
 impl Role {
@@ -140,6 +143,7 @@ impl Role {
             39 => Role::ProcDir,
             40 => Role::ServiceTerm,
             41 => Role::ServiceSpawn,
+            42 => Role::SignalChannel,
             _ => return None,
         })
     }

@@ -747,7 +747,7 @@ Acceptance: ported software that needs `fork` runs.
 
 - [ ] `fork` shim over copy-on-write snapshot VMOs
 - [ ] `mmap` private and shared; pager-backed VMOs
-- [ ] `posix_spawn`, a signals subset, the process server
+- [~] `posix_spawn` (done, OD118), a signals subset (first part done 2026-11-17, OD119: handlers, masks, `EINTR`, `alarm`, `kill` within a chain; delivery only at waits; the host is the oracle), the process server
 
 ### Directions under discussion (not committed)
 

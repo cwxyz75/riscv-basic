@@ -1209,8 +1209,8 @@ unsupported! {
     popen(a: *const c_char, b: *const c_char) -> *mut c_void = core::ptr::null_mut();
     pclose(a: *mut c_void) -> c_int = -1;
     setsid() -> c_int = -1;
+    getsid(a: c_int) -> c_int = -1;
     fork() -> c_int = -1;
-    getppid() -> c_int = 1;
 }
 
 // ---- the user database: the session's own identity (USER, UID, GID, HOME in the environment) ----

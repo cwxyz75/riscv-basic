@@ -422,11 +422,12 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, n: usize) -> isize
         Entry::Stream(h) => {
             let h = *h;
             drop(t);
-            if rt::io::write_all(h, data).is_ok() {
-                n as isize
-            } else {
-                errno::set(32); // EPIPE
-                -1
+            match crate::sig::stream_write(h, data) {
+                Ok(w) => w as isize,
+                Err(e) => {
+                    errno::set(e); // EPIPE, or EINTR when a signal's handler ran
+                    -1
+                }
             }
         }
         Entry::Socket(s) => {
@@ -1010,7 +1011,11 @@ unsafe fn read_stream(fd: c_int, h: u32, buf: *mut u8, n: usize) -> isize {
     };
     if data.is_empty() {
         let mut tmp = alloc::vec![0u8; n.min(CHUNK)];
-        match rt::io::read(h, &mut tmp) {
+        match crate::sig::stream_read(h, &mut tmp) {
+            Err(e) if e == 4 => {
+                errno::set(e); // EINTR
+                return -1;
+            }
             Ok(0) | Err(_) => return 0,
             Ok(got) => {
                 tmp.truncate(got);

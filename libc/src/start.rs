@@ -46,6 +46,17 @@ pub fn run_main() -> i32 {
         env.handle(Role::Stderr).unwrap_or(out),
     );
     crate::spawn::init(env.handle(Role::ServiceSpawn).unwrap_or(0));
+    let num = |name: &[u8]| {
+        env.var(name)
+            .and_then(|v| core::str::from_utf8(v).ok())
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    crate::sig::init(
+        env.handle(Role::SignalChannel).unwrap_or(0),
+        num(b"PID"),
+        num(b"PPID"),
+    );
     crate::socket::SVC.store(env.namespace(b"/svc").unwrap_or(0), Ordering::Relaxed);
     // the namespace table: every absolute prefix with its handle, and the cwd as a path (the `PWD` the parent set) plus handle
     let mut table = pathres::Table::default();

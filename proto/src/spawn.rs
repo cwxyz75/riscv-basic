@@ -13,6 +13,9 @@ use crate::{rd_u16, rd_u32};
 use alloc::vec::Vec;
 
 pub const OP_SPAWN: u16 = 1;
+/// Send a signal to a program in the asker's chain: `txid:u32, op:u16 (2), reserved:u16 (0), pid:u32, sig:u32`.
+pub const OP_SIGNAL: u16 = 2;
+pub const SIGNAL_BYTES: usize = 16;
 pub const HEADER: usize = 12;
 /// The handles a request carries: stdin, stdout, stderr.
 pub const HANDLES: usize = 3;
@@ -120,12 +123,52 @@ pub fn decode(b: &[u8]) -> Result<Request<'_>, SpawnError> {
     })
 }
 
-pub fn encode_reply(txid: u32, status: i32) -> Vec<u8> {
-    crate::launch::encode_reply(txid, status)
+/// The reply to a spawn: `txid:u32, status:i32, pid:u32` (the new program's pid, 0 on failure), and on success its process
+/// handle. The reply to a signal request is the same shape with pid 0.
+pub fn encode_reply(txid: u32, status: i32, pid: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&txid.to_le_bytes());
+    out.extend_from_slice(&status.to_le_bytes());
+    out.extend_from_slice(&pid.to_le_bytes());
+    out
 }
 
-pub fn decode_reply(b: &[u8]) -> Option<(u32, i32)> {
-    crate::launch::decode_reply(b)
+pub fn decode_reply(b: &[u8]) -> Option<(u32, i32, u32)> {
+    if b.len() != 12 {
+        return None;
+    }
+    Some((rd_u32(b, 0)?, rd_u32(b, 4)? as i32, rd_u32(b, 8)?))
+}
+
+pub fn encode_signal(txid: u32, pid: u32, sig: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&txid.to_le_bytes());
+    out.extend_from_slice(&OP_SIGNAL.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&pid.to_le_bytes());
+    out.extend_from_slice(&sig.to_le_bytes());
+    out
+}
+
+/// A request a program sends the shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message<'a> {
+    Spawn(Request<'a>),
+    Signal { txid: u32, pid: u32, sig: u32 },
+}
+
+pub fn decode_message(b: &[u8]) -> Result<Message<'_>, SpawnError> {
+    if rd_u16(b, 4) == Some(OP_SIGNAL) {
+        if b.len() != SIGNAL_BYTES || rd_u16(b, 6) != Some(0) {
+            return Err(SpawnError::BadLength);
+        }
+        return Ok(Message::Signal {
+            txid: rd_u32(b, 0).ok_or(SpawnError::TooShort)?,
+            pid: rd_u32(b, 8).ok_or(SpawnError::TooShort)?,
+            sig: rd_u32(b, 12).ok_or(SpawnError::TooShort)?,
+        });
+    }
+    decode(b).map(Message::Spawn)
 }
 
 #[cfg(test)]
@@ -184,7 +227,25 @@ mod tests {
     }
 
     #[test]
-    fn reply_shape_is_the_launchers() {
-        assert_eq!(decode_reply(&encode_reply(5, -3)), Some((5, -3)));
+    fn replies_and_signals_round_trip() {
+        assert_eq!(decode_reply(&encode_reply(5, -3, 9)), Some((5, -3, 9)));
+        assert_eq!(decode_reply(&[0; 8]), None);
+        let m = encode_signal(4, 77, 15);
+        assert_eq!(
+            decode_message(&m),
+            Ok(Message::Signal {
+                txid: 4,
+                pid: 77,
+                sig: 15
+            })
+        );
+        for cut in 0..m.len() {
+            assert!(decode_message(&m[..cut]).is_err(), "cut {cut}");
+        }
+        let mut longer = m.clone();
+        longer.push(0);
+        assert!(decode_message(&longer).is_err());
+        let sp = encode(1, b"x", &[b"x"], &[]).unwrap();
+        assert!(matches!(decode_message(&sp), Ok(Message::Spawn(_))));
     }
 }
