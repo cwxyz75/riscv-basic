@@ -60,6 +60,7 @@ fn main() {
         "devd",
         "authd",
         "busybox",
+        "kilo",
         "sessiond",
         "procd",
         "ps",

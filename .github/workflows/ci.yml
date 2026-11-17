@@ -115,7 +115,7 @@ jobs:
           path: third_party/fetched
           key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
       - name: Fetch BusyBox (pinned by sha256)
-        run: FETCH_ONLY=busybox make fetch-third-party
+        run: FETCH_ONLY="busybox kilo" make fetch-third-party
       - name: Build the interactive image and run the shell test
         run: |
           make os-interactive

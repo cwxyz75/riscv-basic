@@ -144,6 +144,16 @@ fn build_lua(dir: &str) -> Option<PathBuf> {
     )
 }
 
+/// kilo (a 1300-line editor): the single file fetched by `make fetch-third-party`; without it `kilo` is a stub.
+fn build_kilo(dir: &str) -> Option<PathBuf> {
+    let src = Path::new(dir).join("../third_party/fetched/kilo/src/kilo.c");
+    println!("cargo:rerun-if-changed={}", src.display());
+    if !src.exists() {
+        return None;
+    }
+    build_c_archive("kilo", &[src], &["-w".to_string(), "-O2".to_string()])
+}
+
 /// BusyBox 1.36.1 (UV8): the sources fetched by `make fetch-third-party` (not committed), built for the configuration in
 /// `third_party/busybox/config` from the file list and generated headers committed next to it (`scripts/busybox_configure.sh`
 /// makes them). Without the fetched sources, or without a RISC-V C compiler, `busybox` is a stub that exits 99.
@@ -218,12 +228,17 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_c)");
     println!("cargo:rustc-check-cfg=cfg(have_lua)");
     println!("cargo:rustc-check-cfg=cfg(have_busybox)");
+    println!("cargo:rustc-check-cfg=cfg(have_kilo)");
     if let Some(archive) = build_c_tests(&dir) {
         println!("cargo:rustc-cfg=have_c");
         println!("cargo:rustc-link-arg-bin=ctest={}", archive.display());
         if let Some(lua) = build_lua(&dir) {
             println!("cargo:rustc-cfg=have_lua");
             println!("cargo:rustc-link-arg-bin=lua={}", lua.display());
+        }
+        if let Some(k) = build_kilo(&dir) {
+            println!("cargo:rustc-cfg=have_kilo");
+            println!("cargo:rustc-link-arg-bin=kilo={}", k.display());
         }
         if let Some(bb) = build_busybox(&dir) {
             println!("cargo:rustc-cfg=have_busybox");
