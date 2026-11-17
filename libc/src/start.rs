@@ -95,6 +95,32 @@ pub fn run_main() -> i32 {
         u32::from(env.var(b"STDOUT") == Some(&b"tty"[..])),
         Ordering::Relaxed,
     );
+    // a standard stream that is a file (a redirection the starting program made): `STDIN=file:<mode>:<offset>`, and so on
+    for (i, name) in [&b"STDIN"[..], b"STDOUT", b"STDERR"]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(v) = env.var(name).and_then(|v| v.strip_prefix(b"file:")) else {
+            continue;
+        };
+        let mut parts = v.split(|&b| b == b':');
+        let mode = parts
+            .next()
+            .and_then(|p| core::str::from_utf8(p).ok())
+            .and_then(|p| p.parse::<u8>().ok());
+        let off = parts
+            .next()
+            .and_then(|p| core::str::from_utf8(p).ok())
+            .and_then(|p| p.parse::<u64>().ok());
+        let h = [
+            env.handle(Role::Stdin),
+            env.handle(Role::Stdout),
+            env.handle(Role::Stderr),
+        ][i];
+        if let (Some(mode), Some(off), Some(h)) = (mode, off, h) {
+            crate::fd::init_file_std(i as c_int, h, mode, off);
+        }
+    }
     crate::file::init_std_buffering();
     let argv = leak_array(&env.startup.args);
     // SAFETY: single-threaded start-up; the array is leaked and NULL-terminated.

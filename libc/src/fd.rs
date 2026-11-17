@@ -122,6 +122,13 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
         return -1;
     }
     let mut t = FDS.lock();
+    if matches!(
+        t.fds.get(from as usize).and_then(Option::as_ref),
+        Some(Entry::File(_))
+    ) {
+        drop(t);
+        return dup_file(from, to);
+    }
     let h = match t.fds.get(from as usize).and_then(Option::as_ref) {
         Some(Entry::Stream(h, _)) => *h,
         Some(_) => {
@@ -546,6 +553,98 @@ pub fn dir_entries(path: &[u8]) -> Result<Vec<(Vec<u8>, bool, bool)>, c_int> {
     }
 }
 
+/// What a started program gets for its standard stream `fd` (spawn, `spawn.rs`): a handle, and the marker to put in its environment
+/// (`STDIN`, `STDOUT` or `STDERR`): `tty` for the terminal the program was started on, `file:<mode>:<offset>` for a file (the
+/// program gets a connection of its own to it: mode bit 1 readable, 2 writable, 3 append), nothing for a socket. A file that is
+/// shared this way is written at its end from then on, by both sides: a writer's position is not shared, and an append is.
+pub fn stdio_for_child(fd: c_int) -> Option<(u32, Option<alloc::string::String>)> {
+    let mut t = FDS.lock();
+    let entry = t.fds.get_mut(usize::try_from(fd).ok()?)?.as_mut()?;
+    match entry {
+        Entry::Stream(h, owned) => {
+            let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
+            if d.status != 0 {
+                return None;
+            }
+            let tty = !*owned
+                && match fd {
+                    0 => TTY_IN.load(Ordering::Relaxed) != 0,
+                    1 | 2 => TTY_OUT.load(Ordering::Relaxed) != 0,
+                    _ => false,
+                };
+            Some((d.a1 as u32, tty.then(|| alloc::string::String::from("tty"))))
+        }
+        Entry::File(f) => {
+            let want = (if f.readable { rights::READ } else { 0 })
+                | (if f.writable { rights::WRITE } else { 0 });
+            let c = f.fs.clone_conn(want).ok()?;
+            let mode =
+                u8::from(f.readable) << 1 | u8::from(f.writable) << 2 | u8::from(f.writable) << 3;
+            if f.writable {
+                f.append = true;
+            }
+            let h = c.ch;
+            Some((h, Some(alloc::format!("file:{mode}:{}", f.off))))
+        }
+        _ => None,
+    }
+}
+
+/// A started program's standard stream that is a file: replace the socket entry `init_std` made.
+pub fn init_file_std(fd: c_int, handle: u32, mode: u8, off: u64) {
+    let Some(slot) = usize::try_from(fd).ok().filter(|&i| i < 3) else {
+        return;
+    };
+    FDS.lock().fds[slot] = Some(Entry::File(OpenFile {
+        fs: Fs::new(handle),
+        path: None,
+        off,
+        append: mode & 8 != 0,
+        readable: mode & 2 != 0,
+        writable: mode & 4 != 0,
+    }));
+}
+
+/// `dup2` of an open file: the new descriptor has a connection of its own to the same node and the same flags; both are appended
+/// to from then on (the position is not shared).
+fn dup_file(from: c_int, to: c_int) -> c_int {
+    let mut t = FDS.lock();
+    let copy = match t.fds.get_mut(from as usize).and_then(Option::as_mut) {
+        Some(Entry::File(f)) => {
+            let want = (if f.readable { rights::READ } else { 0 })
+                | (if f.writable { rights::WRITE } else { 0 });
+            let Ok(c) = f.fs.clone_conn(want) else {
+                errno::set(24);
+                return -1;
+            };
+            if f.writable {
+                f.append = true;
+            }
+            OpenFile {
+                fs: c,
+                path: f.path.clone(),
+                off: f.off,
+                append: f.append,
+                readable: f.readable,
+                writable: f.writable,
+            }
+        }
+        _ => {
+            errno::set(9);
+            return -1;
+        }
+    };
+    match t.fds[to as usize].take() {
+        Some(Entry::Stream(old, true)) => {
+            rt::sys::handle_close(old);
+        }
+        Some(Entry::File(old)) => old.fs.close(),
+        _ => {}
+    }
+    t.fds[to as usize] = Some(Entry::File(copy));
+    to
+}
+
 /// `pipe`: a connected pair of stream sockets; `fds[0]` is the end to read and `fds[1]` the end to write (the kernel's sockets are
 /// two-way, so a pipe is one used one way).
 #[no_mangle]
@@ -573,8 +672,8 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
 }
 
 /// While a `vfork` child runs (`spawn.rs`), it has a descriptor table of its own: duplicates of the streams, so what it closes or
-/// redirects (`dup2` of a pipe onto 1, the usual step before `exec`) does not touch its parent's. Open files and sockets are not
-/// in it (the program it starts gets descriptors 0 to 2 only).
+/// redirects (`dup2` of a pipe onto 1, the usual step before `exec`) does not touch its parent's: duplicates of the streams and
+/// connections of its own to the open files. Sockets are not in it.
 static VFORK_PARENT: Mutex<Option<alloc::boxed::Box<Table>>> = Mutex::new(None);
 
 pub fn vfork_enter() {
@@ -583,11 +682,32 @@ pub fn vfork_enter() {
     });
     let mut t = FDS.lock();
     for i in 0..MAX_FDS {
-        if let Some(Entry::Stream(h, _)) = &t.fds[i] {
-            let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
-            if d.status == 0 {
-                child.fds[i] = Some(Entry::Stream(d.a1 as u32, true));
+        match &mut t.fds[i] {
+            Some(Entry::Stream(h, _)) => {
+                let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
+                if d.status == 0 {
+                    child.fds[i] = Some(Entry::Stream(d.a1 as u32, true));
+                }
             }
+            // an open file: a connection of its own (the child redirects, and starts programs with it as a standard stream)
+            Some(Entry::File(f)) => {
+                let want = (if f.readable { rights::READ } else { 0 })
+                    | (if f.writable { rights::WRITE } else { 0 });
+                if let Ok(c) = f.fs.clone_conn(want) {
+                    if f.writable {
+                        f.append = true;
+                    }
+                    child.fds[i] = Some(Entry::File(OpenFile {
+                        fs: c,
+                        path: f.path.clone(),
+                        off: f.off,
+                        append: f.append,
+                        readable: f.readable,
+                        writable: f.writable,
+                    }));
+                }
+            }
+            _ => {}
         }
     }
     let parent = core::mem::replace(&mut *t, *child);
@@ -601,8 +721,12 @@ pub fn vfork_leave() {
     };
     let child = core::mem::replace(&mut *FDS.lock(), *parent);
     for e in child.fds.into_iter().flatten() {
-        if let Entry::Stream(h, true) = e {
-            rt::sys::handle_close(h);
+        match e {
+            Entry::Stream(h, true) => {
+                rt::sys::handle_close(h);
+            }
+            Entry::File(f) => f.fs.close(),
+            _ => {}
         }
     }
 }
