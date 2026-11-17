@@ -13,7 +13,7 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 2. [x] **Spawn-rate measurement** (UV8's open criterion): done in PR (branch spawn-rate): the shell test times 100 `xargs` spawns;
    found and fixed a duplicate-port-key bug in the shell's wait loops (12.9 s to 2.3 s for 100 spawns, about 44 per second in the
    debug build under QEMU). Recorded in TIDY-UP T136(9).
-3. [ ] **Host tests for the libc core** (TIDY-UP T134(3)): a host build of the pure parts (`getopt`, `fnmatch`, `sscanf`, `realpath`,
+3. [~] **Host tests for the libc core** (done for `fnmatch`, `getopt`, `strverscmp`: `cfmt/tests/portable.rs`, a bug found; `sscanf` and the signal table are left) (TIDY-UP T134(3)): a host build of the pure parts (`getopt`, `fnmatch`, `sscanf`, `realpath`,
    the signal table) with their own tests.
 4. [ ] **Small signal and spawn leftovers** (T136/T137): `poll`/`select` interruptible; save and restore the signal table around
    `vfork`; bytes (not lossy UTF-8) through the shell's start path; a profile field to turn the spawn grant off.

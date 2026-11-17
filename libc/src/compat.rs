@@ -181,46 +181,10 @@ pub unsafe extern "C" fn strsep(sp: *mut *mut c_char, delim: *const c_char) -> *
 /// `strverscmp`: compare with runs of digits as numbers (`file9` before `file10`).
 #[no_mangle]
 pub unsafe extern "C" fn strverscmp(a: *const c_char, b: *const c_char) -> c_int {
-    let (mut i, mut j) = (0usize, 0usize);
-    loop {
-        let (x, y) = (*a.add(i) as u8, *b.add(j) as u8);
-        if x.is_ascii_digit() && y.is_ascii_digit() {
-            let (si, sj) = (i, j);
-            while (*a.add(i) as u8).is_ascii_digit() {
-                i += 1;
-            }
-            while (*b.add(j) as u8).is_ascii_digit() {
-                j += 1;
-            }
-            // skip leading zeros, then a longer run is the larger number, equal lengths compare as text
-            let (mut ai, mut bj) = (si, sj);
-            while ai + 1 < i && *a.add(ai) as u8 == b'0' {
-                ai += 1;
-            }
-            while bj + 1 < j && *b.add(bj) as u8 == b'0' {
-                bj += 1;
-            }
-            let (la, lb) = (i - ai, j - bj);
-            if la != lb {
-                return if la < lb { -1 } else { 1 };
-            }
-            for k in 0..la {
-                let (p, q) = (*a.add(ai + k) as u8, *b.add(bj + k) as u8);
-                if p != q {
-                    return p as c_int - q as c_int;
-                }
-            }
-            continue;
-        }
-        if x != y {
-            return x as c_int - y as c_int;
-        }
-        if x == 0 {
-            return 0;
-        }
-        i += 1;
-        j += 1;
-    }
+    cfmt::glob::strverscmp(
+        core::ffi::CStr::from_ptr(a).to_bytes(),
+        core::ffi::CStr::from_ptr(b).to_bytes(),
+    )
 }
 
 // ---- libgen ----
@@ -259,11 +223,11 @@ pub static mut optind: c_int = 1;
 pub static mut opterr: c_int = 1;
 #[no_mangle]
 pub static mut optopt: c_int = 0;
-/// Where in the current argument the next option character is (0: start a new argument).
-static mut NEXTCHAR: usize = 0;
+static GETOPT: rt::sync::Mutex<cfmt::getopt::GetOpt> =
+    rt::sync::Mutex::new(cfmt::getopt::GetOpt::new());
 
-/// POSIX `getopt`: options end at the first argument that does not start with `-` (no permutation), `--` ends them, and a
-/// leading `:` in `optstring` makes a missing argument return `:` instead of `?`.
+/// POSIX `getopt` (the core is `cfmt::getopt`): options end at the first argument that does not start with `-` (no permutation),
+/// `--` ends them, and a leading `:` in `optstring` makes a missing argument return `:` instead of `?`.
 #[no_mangle]
 pub unsafe extern "C" fn getopt(
     argc: c_int,
@@ -271,81 +235,50 @@ pub unsafe extern "C" fn getopt(
     optstring: *const c_char,
 ) -> c_int {
     optarg = core::ptr::null_mut();
+    let mut st = GETOPT.lock();
     if optind == 0 {
         // the C library's way to ask for a fresh start
         optind = 1;
-        NEXTCHAR = 0;
+        st.reset();
     }
-    if optind >= argc {
-        return -1;
-    }
-    let arg = *argv.add(optind as usize);
-    if NEXTCHAR == 0 {
-        if arg.is_null() || *arg != b'-' as c_char || *arg.add(1) == 0 {
-            return -1;
-        }
-        if *arg.add(1) == b'-' as c_char && *arg.add(2) == 0 {
-            optind += 1;
-            return -1;
-        }
-        NEXTCHAR = 1;
-    }
-    let c = *arg.add(NEXTCHAR);
-    NEXTCHAR += 1;
-    let quiet = *optstring == b':' as c_char;
-    // find the character in optstring
-    let mut p = optstring;
-    if quiet {
-        p = p.add(1);
-    }
-    let mut found: *const c_char = core::ptr::null();
-    while *p != 0 {
-        if *p == c && c != b':' as c_char {
-            found = p;
-            break;
-        }
-        p = p.add(1);
-    }
-    let at_end = *arg.add(NEXTCHAR) == 0;
-    if found.is_null() {
-        optopt = c as u8 as c_int;
-        if at_end {
-            optind += 1;
-            NEXTCHAR = 0;
-        }
-        if opterr != 0 && !quiet {
-            let msg = alloc::format!("getopt: invalid option -- '{}'\n", c as u8 as char);
-            write(2, msg.as_ptr() as *const c_void, msg.len());
-        }
-        return b'?' as c_int;
-    }
-    if *found.add(1) == b':' as c_char {
-        // takes an argument: the rest of this word, or the next word
-        if !at_end {
-            optarg = arg.add(NEXTCHAR);
-            optind += 1;
-        } else if optind + 1 < argc {
-            optarg = *argv.add(optind as usize + 1);
-            optind += 2;
-        } else {
-            optopt = c as u8 as c_int;
-            optind += 1;
-            NEXTCHAR = 0;
-            if opterr != 0 && !quiet {
-                let msg = alloc::format!(
-                    "getopt: option requires an argument -- '{}'\n",
-                    c as u8 as char
-                );
-                write(2, msg.as_ptr() as *const c_void, msg.len());
+    // (a caller may set `optind` itself, as BusyBox does to skip arguments)
+    st.optind = optind.max(0) as usize;
+    let args: alloc::vec::Vec<&[u8]> = (0..argc.max(0) as usize)
+        .map(|i| {
+            let p = *argv.add(i);
+            if p.is_null() {
+                &[][..]
+            } else {
+                core::ffi::CStr::from_ptr(p).to_bytes()
             }
-            return if quiet { b':' as c_int } else { b'?' as c_int };
-        }
-        NEXTCHAR = 0;
-    } else if at_end {
-        optind += 1;
-        NEXTCHAR = 0;
+        })
+        .collect();
+    let step = st.next(&args, core::ffi::CStr::from_ptr(optstring).to_bytes());
+    optind = st.optind as c_int;
+    if let Some((i, off)) = step.optarg {
+        optarg = (*argv.add(i)).add(off);
     }
-    c as u8 as c_int
+    if let Some(c) = step.optopt {
+        optopt = c as c_int;
+    }
+    let quiet = *optstring == b':' as c_char;
+    if opterr != 0 && !quiet {
+        let msg = match step.fault {
+            Some(cfmt::getopt::Fault::Invalid(c)) => Some(alloc::format!(
+                "getopt: invalid option -- '{}'\n",
+                c as char
+            )),
+            Some(cfmt::getopt::Fault::MissingArgument(c)) => Some(alloc::format!(
+                "getopt: option requires an argument -- '{}'\n",
+                c as char
+            )),
+            None => None,
+        };
+        if let Some(m) = msg {
+            write(2, m.as_ptr() as *const c_void, m.len());
+        }
+    }
+    step.ret
 }
 
 // ---- identity ----
@@ -533,125 +466,6 @@ pub unsafe extern "C" fn rewinddir(d: *mut Dir) {
 
 // ---- fnmatch ----
 
-fn class_match(name: &[u8], c: u8) -> bool {
-    match name {
-        b"alpha" => c.is_ascii_alphabetic(),
-        b"digit" => c.is_ascii_digit(),
-        b"alnum" => c.is_ascii_alphanumeric(),
-        b"upper" => c.is_ascii_uppercase(),
-        b"lower" => c.is_ascii_lowercase(),
-        b"space" => c.is_ascii_whitespace() || c == 0x0b,
-        b"blank" => c == b' ' || c == b'\t',
-        b"punct" => c.is_ascii_punctuation(),
-        b"print" => (0x20..0x7f).contains(&c),
-        b"graph" => (0x21..0x7f).contains(&c),
-        b"cntrl" => c < 0x20 || c == 0x7f,
-        b"xdigit" => c.is_ascii_hexdigit(),
-        _ => false,
-    }
-}
-
-/// Match one `[...]` set at the start of `p` against `c`; `(matched, bytes of the set)`, or `None` if the set is not closed.
-fn bracket(p: &[u8], c: u8, fold: bool) -> Option<(bool, usize)> {
-    let mut i = 1;
-    let negate = matches!(p.get(i), Some(b'!') | Some(b'^'));
-    if negate {
-        i += 1;
-    }
-    let mut hit = false;
-    let mut first = true;
-    loop {
-        let ch = *p.get(i)?;
-        if ch == b']' && !first {
-            return Some((hit != negate, i + 1));
-        }
-        first = false;
-        if ch == b'[' && p.get(i + 1) == Some(&b':') {
-            if let Some(end) = p[i + 2..].windows(2).position(|w| w == b":]") {
-                let name = &p[i + 2..i + 2 + end];
-                if class_match(name, c) {
-                    hit = true;
-                }
-                i += 2 + end + 2;
-                continue;
-            }
-        }
-        let lo = ch;
-        if p.get(i + 1) == Some(&b'-') && p.get(i + 2).is_some_and(|&x| x != b']') {
-            let hi = p[i + 2];
-            let (c2, lo2, hi2) = if fold {
-                (
-                    c.to_ascii_lowercase(),
-                    lo.to_ascii_lowercase(),
-                    hi.to_ascii_lowercase(),
-                )
-            } else {
-                (c, lo, hi)
-            };
-            if lo2 <= c2 && c2 <= hi2 {
-                hit = true;
-            }
-            i += 3;
-        } else {
-            if lo == c || (fold && lo.eq_ignore_ascii_case(&c)) {
-                hit = true;
-            }
-            i += 1;
-        }
-    }
-}
-
-fn fnm(p: &[u8], s: &[u8], flags: c_int, at_start: bool) -> bool {
-    let (noescape, pathname, period, fold) = (
-        flags & 1 != 0,
-        flags & 2 != 0,
-        flags & 4 != 0,
-        flags & 0x10 != 0,
-    );
-    let Some(&pc) = p.first() else {
-        return s.is_empty();
-    };
-    let leading_dot = period && at_start && s.first() == Some(&b'.');
-    match pc {
-        b'?' => {
-            !s.is_empty()
-                && !(pathname && s[0] == b'/')
-                && !leading_dot
-                && fnm(&p[1..], &s[1..], flags, false)
-        }
-        b'*' => {
-            if leading_dot {
-                return false;
-            }
-            let rest = &p[1..];
-            for k in 0..=s.len() {
-                if fnm(rest, &s[k..], flags, false) {
-                    return true;
-                }
-                if k < s.len() && pathname && s[k] == b'/' {
-                    break;
-                }
-            }
-            false
-        }
-        b'[' => match (s.first(), bracket(p, *s.first().unwrap_or(&0), fold)) {
-            (Some(&c), Some((true, n))) if !(pathname && c == b'/') && !leading_dot => {
-                fnm(&p[n..], &s[1..], flags, false)
-            }
-            (Some(&c), None) => c == b'[' && fnm(&p[1..], &s[1..], flags, false),
-            _ => false,
-        },
-        b'\\' if !noescape && p.len() > 1 => {
-            s.first() == Some(&p[1]) && fnm(&p[2..], &s[1..], flags, false)
-        }
-        c => {
-            let eq = |x: u8| x == c || (fold && x.eq_ignore_ascii_case(&c));
-            s.first().is_some_and(|&x| eq(x))
-                && fnm(&p[1..], &s[1..], flags, pathname && c == b'/' && period)
-        }
-    }
-}
-
 /// `fnmatch`: shell patterns (`*`, `?`, `[...]` with classes and ranges, `\` escapes) with `FNM_*` flags.
 #[no_mangle]
 pub unsafe extern "C" fn fnmatch(
@@ -661,7 +475,8 @@ pub unsafe extern "C" fn fnmatch(
 ) -> c_int {
     let p = core::ffi::CStr::from_ptr(pattern).to_bytes();
     let s = core::ffi::CStr::from_ptr(string).to_bytes();
-    if fnm(p, s, flags, true) {
+    // (the core is `cfmt::glob`; 0 is a match)
+    if cfmt::glob::fnmatch(p, s, flags) {
         0
     } else {
         1
