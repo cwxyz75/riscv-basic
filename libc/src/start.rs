@@ -45,6 +45,7 @@ pub fn run_main() -> i32 {
         // no separate standard error: it shares standard output
         env.handle(Role::Stderr).unwrap_or(out),
     );
+    crate::spawn::init(env.handle(Role::ServiceSpawn).unwrap_or(0));
     crate::socket::SVC.store(env.namespace(b"/svc").unwrap_or(0), Ordering::Relaxed);
     // the namespace table: every absolute prefix with its handle, and the cwd as a path (the `PWD` the parent set) plus handle
     let mut table = pathres::Table::default();

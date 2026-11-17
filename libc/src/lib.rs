@@ -30,6 +30,7 @@ mod netdb;
 mod random;
 mod setjmp;
 mod socket;
+mod spawn;
 mod start;
 mod stdio;
 mod stdlib;

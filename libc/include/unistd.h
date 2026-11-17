@@ -56,6 +56,7 @@ pid_t vfork(void);
 int execv(const char *path, char *const argv[]);
 int execve(const char *path, char *const argv[], char *const envp[]);
 int execvp(const char *file, char *const argv[]);
+int execvpe(const char *file, char *const argv[], char *const envp[]);
 int getlogin_r(char *buf, size_t n);
 int ttyname_r(int fd, char *buf, size_t n);
 int getpagesize(void);

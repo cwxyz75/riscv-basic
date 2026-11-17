@@ -91,6 +91,9 @@ pub enum Role {
     ProcDir = 39,
     /// The channel a terminal backend provider uses to attach, detach and hang up (UV7): `proto::console::term`.
     ServiceTerm = 40,
+    /// The channel a program asks the shell on to start another program (UV8, OD118): `proto::spawn`. Present only when the
+    /// starter granted it; a child's own grant is never wider than its parent's.
+    ServiceSpawn = 41,
 }
 
 impl Role {
@@ -136,6 +139,7 @@ impl Role {
             38 => Role::ServiceProc,
             39 => Role::ProcDir,
             40 => Role::ServiceTerm,
+            41 => Role::ServiceSpawn,
             _ => return None,
         })
     }

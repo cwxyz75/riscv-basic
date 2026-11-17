@@ -57,12 +57,12 @@ fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<
     std::fs::create_dir_all(&out).ok()?;
     let mut objs = Vec::new();
     for src in sources {
-        let obj = out.join(format!(
-            "{}.o",
-            src.file_stem()
-                .expect("a source file name")
-                .to_string_lossy()
-        ));
+        // (named by the whole path: BusyBox has a `time.c` in two directories)
+        let stem = src
+            .with_extension("")
+            .to_string_lossy()
+            .replace(['/', '\\', ':'], "_");
+        let obj = out.join(format!("{stem}.o"));
         let ok = Command::new(&clang)
             .args([
                 "--target=riscv64-unknown-elf",

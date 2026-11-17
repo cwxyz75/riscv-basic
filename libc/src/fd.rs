@@ -82,6 +82,14 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
     }
 }
 
+/// The handle of a standard stream (descriptors 0-2 and what `dup` made of them), if `fd` is one.
+pub fn stream_handle(fd: c_int) -> Option<u32> {
+    match FDS.lock().fds.get(usize::try_from(fd).ok()?)?.as_ref()? {
+        Entry::Stream(h) => Some(*h),
+        _ => None,
+    }
+}
+
 /// Put a socket in the lowest free descriptor slot (3 and up).
 pub fn install_socket(s: crate::socket::SockRef) -> Option<c_int> {
     let mut t = FDS.lock();

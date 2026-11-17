@@ -1,0 +1,488 @@
+//! Starting programs from C (UV8, OD118). A program the shell started with a spawn grant holds a channel to the shell
+//! (`Role::ServiceSpawn`, `proto::spawn`); with it `posix_spawn`, `execve` and `vfork` work, and `waitpid` and `kill` act on the
+//! children it started. Without the grant they fail with `ENOSYS`, as before.
+//!
+//! There is no `fork` and no address-space replacement here. `execve` is "start the program, wait for it, exit with its status",
+//! except in the child of a `vfork`: the child runs in the caller until its first `execve` (or `_exit`), and that call returns
+//! to the caller of `vfork` with the new program's pid (a `longjmp` to where `vfork` was called), which is what the caller of a
+//! real `vfork` sees. The child must not return from the function that called `vfork`, change locals other than the pid, or
+//! call anything but `exec*` and `_exit` (the same rules as POSIX). One `vfork` at a time per process.
+
+use crate::errno;
+use alloc::vec::Vec;
+use core::ffi::{c_char, c_int, c_void, CStr};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use proto::file::status as ps;
+use rt::abi::rights::Rights;
+use rt::abi::signals;
+use rt::sync::Mutex;
+use rt::sys;
+
+static SPAWN_CH: AtomicU32 = AtomicU32::new(0);
+/// Requests and replies on the spawn channel are one exchange at a time.
+static EXCHANGE: Mutex<()> = Mutex::new(());
+static NEXT_PID: AtomicU32 = AtomicU32::new(1000);
+
+/// Install the spawn channel (start-up); 0 means the program holds no grant.
+pub fn init(ch: u32) {
+    SPAWN_CH.store(ch, Ordering::Relaxed);
+}
+
+struct Child {
+    pid: c_int,
+    /// The process handle, or 0 for a child that ended before it began (a `vfork` child whose `exec` failed).
+    h: u32,
+    done: Option<i32>,
+}
+
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+fn register(h: u32, done: Option<i32>) -> c_int {
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed) as c_int;
+    CHILDREN.lock().push(Child { pid, h, done });
+    pid
+}
+
+/// The wait status of a child: exited with `code`, or killed (the shell's Ctrl-C is -130, a kill is -1).
+fn wait_status(code: i32) -> c_int {
+    match code {
+        -130 => 2,
+        -1 => 9,
+        c => (c & 0xff) << 8,
+    }
+}
+
+/// A handle for a child's standard stream from our descriptor `fd`: a duplicate, or a stand-in when `fd` is closed (an input
+/// at its end, an output nobody reads).
+fn std_handle(fd: c_int, input: bool) -> Option<u32> {
+    if let Some(h) = crate::fd::stream_handle(fd) {
+        let d = sys::handle_duplicate(h, Rights::SAME.0);
+        return (d.status == 0).then_some(d.a1 as u32);
+    }
+    let s = sys::socket_create();
+    if s.status != 0 {
+        return None;
+    }
+    let (a, b) = (s.a1 as u32, s.a2 as u32);
+    // the end the child holds; ours is closed, so the child sees the end of input or a closed output
+    let (keep, drop_) = if input { (a, b) } else { (b, a) };
+    sys::handle_close(drop_);
+    Some(keep)
+}
+
+fn status_errno(st: i32) -> c_int {
+    match st {
+        s if s == ps::NOT_FOUND => 2,
+        s if s == ps::QUOTA => 11,
+        s if s == ps::BAD_REQUEST => 22,
+        _ => 5,
+    }
+}
+
+/// Ask the shell to start `argv` with `env` and the three standard streams from `fds`; the process handle, or an `errno`.
+fn start(prog: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>], fds: [c_int; 3]) -> Result<u32, c_int> {
+    let ch = SPAWN_CH.load(Ordering::Relaxed);
+    if ch == 0 {
+        return Err(38);
+    }
+    let a: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
+    let e: Vec<&[u8]> = env.iter().map(|v| v.as_slice()).collect();
+    let _x = EXCHANGE.lock();
+    let txid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let req = proto::spawn::encode(txid, prog, &a, &e).map_err(|_| 7)?; // E2BIG
+    let mut hs = [0u32; 3];
+    for (i, fd) in fds.iter().enumerate() {
+        match std_handle(*fd, i == 0) {
+            Some(h) => hs[i] = h,
+            None => {
+                for &h in &hs[..i] {
+                    sys::handle_close(h);
+                }
+                return Err(24);
+            }
+        }
+    }
+    let w = sys::channel_write(ch, req.as_ptr(), req.len(), hs.as_ptr(), hs.len());
+    if w.status != 0 {
+        for &h in &hs {
+            sys::handle_close(h);
+        }
+        return Err(5);
+    }
+    let deadline = sys::clock_get() + 120_000;
+    loop {
+        let wt = sys::object_wait(ch, signals::READABLE | signals::PEER_CLOSED, deadline);
+        if wt.status != 0 {
+            return Err(110); // ETIMEDOUT
+        }
+        let mut buf = [0u8; 16];
+        let mut h = [0u32; 1];
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
+        if r.status != 0 {
+            return Err(5);
+        }
+        match proto::spawn::decode_reply(&buf[..r.a1]) {
+            Some((id, 0)) if id == txid && r.a2 == 1 => return Ok(h[0]),
+            Some((id, st)) if id == txid => {
+                for &x in &h[..r.a2] {
+                    sys::handle_close(x);
+                }
+                return Err(status_errno(st));
+            }
+            _ => {
+                for &x in &h[..r.a2] {
+                    sys::handle_close(x);
+                }
+            }
+        }
+    }
+}
+
+/// `argv[0]` as the shell knows commands: a bare name, or `/bin/name`.
+fn command_name(file: &[u8]) -> Option<&[u8]> {
+    let n = file.strip_prefix(b"/bin/").unwrap_or(file);
+    (!n.is_empty() && !n.contains(&b'/')).then_some(n)
+}
+
+// SAFETY (callers): `p` is a NULL-terminated array of NUL-terminated strings.
+unsafe fn string_array(p: *const *const c_char) -> Vec<Vec<u8>> {
+    let mut v = Vec::new();
+    if p.is_null() {
+        return v;
+    }
+    let mut i = 0;
+    while !(*p.add(i)).is_null() {
+        v.push(CStr::from_ptr(*p.add(i)).to_bytes().to_vec());
+        i += 1;
+    }
+    v
+}
+
+unsafe fn current_env() -> Vec<Vec<u8>> {
+    string_array(crate::stdlib::ENVIRON as *const *const c_char)
+}
+
+// ---- vfork ----
+
+/// Where `vfork` was called (the `setjmp` layout), and whether a `vfork` child is running.
+#[no_mangle]
+pub static mut VFORK_BUF: [u64; 26] = [0; 26];
+#[no_mangle]
+pub static VFORK_ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+core::arch::global_asm!(
+    r#"
+    .section .text.vfork,"ax",@progbits
+    .globl vfork
+vfork:
+    la t0, VFORK_ACTIVE
+    li t1, 1
+    sb t1, 0(t0)
+    la a0, VFORK_BUF
+    j setjmp
+"#
+);
+
+extern "C" {
+    fn longjmp(buf: *mut u64, val: c_int) -> !;
+}
+
+/// The `vfork` child is done (it started a program or ended): back to the caller of `vfork`, with the child's pid.
+fn vfork_return(h: u32, done: Option<i32>) -> ! {
+    VFORK_ACTIVE.store(0, Ordering::Relaxed);
+    let pid = register(h, done);
+    // SAFETY: `VFORK_BUF` was filled by `vfork` and the frame it describes is still live: the child may not return from it.
+    unsafe { longjmp(core::ptr::addr_of_mut!(VFORK_BUF) as *mut u64, pid) }
+}
+
+/// `_exit` in a `vfork` child: the child ended with `code`; the caller of `vfork` resumes.
+pub fn vfork_child_exit(code: c_int) {
+    if VFORK_ACTIVE.load(Ordering::Relaxed) != 0 {
+        vfork_return(0, Some(code));
+    }
+}
+
+// ---- exec ----
+
+unsafe fn exec_with(file: *const c_char, argv: *const *const c_char, envp: &[Vec<u8>]) -> c_int {
+    if file.is_null() || argv.is_null() {
+        errno::set(14);
+        return -1;
+    }
+    let args = string_array(argv);
+    let Some(name) = command_name(CStr::from_ptr(file).to_bytes()) else {
+        errno::set(2);
+        return -1;
+    };
+    // the program is named by the file; `argv[0]` is what the program sees (an applet name, usually)
+    match start(name, &args, envp, [0, 1, 2]) {
+        Err(e) => {
+            errno::set(e);
+            -1
+        }
+        Ok(h) => {
+            if VFORK_ACTIVE.load(Ordering::Relaxed) != 0 {
+                vfork_return(h, None)
+            }
+            // not a `vfork` child: this process becomes the program (it runs, and this one ends with its status)
+            sys::object_wait(h, signals::TERMINATED, u64::MAX);
+            let code = sys::process_info(h).a1 as i64 as i32;
+            sys::handle_close(h);
+            crate::compat::_exit(code)
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn execve(
+    file: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    exec_with(file, argv, &string_array(envp))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn execv(file: *const c_char, argv: *const *const c_char) -> c_int {
+    exec_with(file, argv, &current_env())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
+    exec_with(file, argv, &current_env())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn execvpe(
+    file: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    exec_with(file, argv, &string_array(envp))
+}
+
+// ---- posix_spawn ----
+
+/// `posix_spawn_file_actions_t` is `{ void *actions }`: a boxed list of (kind, fd, newfd).
+#[repr(C)]
+pub struct FileActions {
+    list: *mut Vec<(u8, c_int, c_int)>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_init(fa: *mut FileActions) -> c_int {
+    (*fa).list = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Vec::new()));
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_destroy(fa: *mut FileActions) -> c_int {
+    if !(*fa).list.is_null() {
+        drop(alloc::boxed::Box::from_raw((*fa).list));
+        (*fa).list = core::ptr::null_mut();
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_adddup2(
+    fa: *mut FileActions,
+    fd: c_int,
+    to: c_int,
+) -> c_int {
+    if (*fa).list.is_null() {
+        return 22;
+    }
+    (*(*fa).list).push((0, fd, to));
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_addclose(
+    fa: *mut FileActions,
+    fd: c_int,
+) -> c_int {
+    if (*fa).list.is_null() {
+        return 22;
+    }
+    (*(*fa).list).push((1, fd, 0));
+    0
+}
+
+unsafe fn spawn_impl(
+    pid: *mut c_int,
+    file: *const c_char,
+    fa: *const FileActions,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    let Some(name) = command_name(CStr::from_ptr(file).to_bytes()) else {
+        return 2;
+    };
+    let args = string_array(argv);
+    // the child's standard streams: ours, then what the file actions say (dup2 of one standard stream onto another, close)
+    let mut map = [0 as c_int, 1, 2];
+    let mut closed = [false; 3];
+    if !fa.is_null() && !(*fa).list.is_null() {
+        for &(kind, fd, to) in (*(*fa).list).iter() {
+            match kind {
+                0 if (0..3).contains(&to) && (0..3).contains(&fd) => {
+                    map[to as usize] = map[fd as usize];
+                    closed[to as usize] = closed[fd as usize];
+                }
+                1 if (0..3).contains(&fd) => closed[fd as usize] = true,
+                _ => return 38, // a file action on anything but the standard streams
+            }
+        }
+    }
+    for i in 0..3 {
+        if closed[i] {
+            map[i] = -1;
+        }
+    }
+    match start(name, &args, &string_array(envp), map) {
+        Ok(h) => {
+            let p = register(h, None);
+            if !pid.is_null() {
+                *pid = p;
+            }
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn(
+    pid: *mut c_int,
+    file: *const c_char,
+    fa: *const FileActions,
+    _attr: *const c_void,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    spawn_impl(pid, file, fa, argv, envp)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawnp(
+    pid: *mut c_int,
+    file: *const c_char,
+    fa: *const FileActions,
+    _attr: *const c_void,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    spawn_impl(pid, file, fa, argv, envp)
+}
+
+// ---- waiting and killing ----
+
+/// `WNOHANG`.
+const WNOHANG: c_int = 1;
+
+#[no_mangle]
+pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
+    loop {
+        let handles: Vec<u32> = {
+            let mut g = CHILDREN.lock();
+            let mut any = false;
+            let mut found = None;
+            for (i, c) in g.iter().enumerate() {
+                if pid > 0 && c.pid != pid {
+                    continue;
+                }
+                any = true;
+                let over = match c.done {
+                    Some(_) => true,
+                    None => sys::object_wait(c.h, signals::TERMINATED, 0).status == 0,
+                };
+                if over {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = found {
+                let c = g.remove(i);
+                let code = match c.done {
+                    Some(code) => code,
+                    None => {
+                        let code = sys::process_info(c.h).a1 as i64 as i32;
+                        sys::handle_close(c.h);
+                        code
+                    }
+                };
+                if !status.is_null() {
+                    *status = wait_status(code);
+                }
+                return c.pid;
+            }
+            if !any {
+                errno::set(10); // ECHILD
+                return -1;
+            }
+            if options & WNOHANG != 0 {
+                return 0;
+            }
+            g.iter()
+                .filter(|c| pid <= 0 || c.pid == pid)
+                .map(|c| c.h)
+                .collect()
+        };
+        let p = sys::port_create();
+        if p.status != 0 {
+            sys::object_wait(handles[0], signals::TERMINATED, sys::clock_get() + 5);
+            continue;
+        }
+        for &h in &handles {
+            sys::port_bind(p.a1 as u32, h, signals::TERMINATED, 0);
+        }
+        sys::port_wait(p.a1 as u32, u64::MAX);
+        sys::handle_close(p.a1 as u32);
+    }
+}
+
+/// `struct rusage` is 144 bytes (two `timeval`s and 14 `long`s); nothing is accounted, so it is all zero.
+const RUSAGE_BYTES: usize = 144;
+
+#[no_mangle]
+pub unsafe extern "C" fn wait4(
+    pid: c_int,
+    status: *mut c_int,
+    options: c_int,
+    ru: *mut c_void,
+) -> c_int {
+    let r = waitpid(pid, status, options);
+    if r > 0 && !ru.is_null() {
+        core::ptr::write_bytes(ru as *mut u8, 0, RUSAGE_BYTES);
+    }
+    r
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wait3(status: *mut c_int, options: c_int, ru: *mut c_void) -> c_int {
+    wait4(-1, status, options, ru)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wait(status: *mut c_int) -> c_int {
+    waitpid(-1, status, 0)
+}
+
+/// Signals are not delivered (T134): a signal sent to a child ends it. Signal 0 asks whether the child exists.
+#[no_mangle]
+pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
+    let g = CHILDREN.lock();
+    match g.iter().find(|c| c.pid == pid) {
+        Some(c) => {
+            if sig != 0 && c.h != 0 {
+                sys::process_kill(c.h, -1);
+            }
+            0
+        }
+        None => {
+            errno::set(3); // ESRCH
+            -1
+        }
+    }
+}

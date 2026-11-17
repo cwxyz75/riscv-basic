@@ -12,4 +12,7 @@
 #define WCOREDUMP(s) ((s) & 0x80)
 pid_t wait(int *status);
 pid_t waitpid(pid_t pid, int *status, int options);
+struct rusage;
+pid_t wait3(int *status, int options, struct rusage *ru);
+pid_t wait4(pid_t pid, int *status, int options, struct rusage *ru);
 #endif
