@@ -15,7 +15,7 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
    debug build under QEMU). Recorded in TIDY-UP T136(9).
 3. [~] **Host tests for the libc core** (done for `fnmatch`, `getopt`, `strverscmp`: `cfmt/tests/portable.rs`, a bug found; `sscanf` and the signal table are left) (TIDY-UP T134(3)): a host build of the pure parts (`getopt`, `fnmatch`, `sscanf`, `realpath`,
    the signal table) with their own tests.
-4. [ ] **Small signal and spawn leftovers** (T136/T137): `poll`/`select` interruptible; save and restore the signal table around
+4. [~] **Small signal and spawn leftovers** (done: `poll`/`select` interruptible, the signal table saved around `vfork`, bytes through the shell's start path; left: a profile field to turn the spawn grant off)  (T136/T137): `poll`/`select` interruptible; save and restore the signal table around
    `vfork`; bytes (not lossy UTF-8) through the shell's start path; a profile field to turn the spawn grant off.
 5. [ ] **`/bin/sh` is a port, not `ish` (SHELL-SPEC lines 23 and 465, SH7): a spike with BusyBox `ash` in its no-MMU mode** (not dash:
    dash needs a real `fork`). Needs `pipe()`, `dup2` and `fcntl` beyond fds 0 to 2, job control off. Acceptance (SH7): five real

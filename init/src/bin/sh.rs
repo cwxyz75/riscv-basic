@@ -463,7 +463,7 @@ impl Os {
     }
 
     /// Tell `procd` about a program (it gets an INSPECT-only duplicate of the process handle).
-    fn proc_announce(&mut self, pid: u32, h: u32, argv: &[String]) {
+    fn proc_announce(&mut self, pid: u32, h: u32, argv: &[Vec<u8>]) {
         let Some(ctl) = self.proc_ctl else {
             return;
         };
@@ -476,7 +476,7 @@ impl Os {
             if i > 0 {
                 msg.push(0);
             }
-            msg.extend_from_slice(a.as_bytes());
+            msg.extend_from_slice(a);
         }
         msg.truncate(500);
         let hs = [dup_h];
@@ -749,24 +749,18 @@ impl Os {
             reply(proto::file::status::QUOTA, 0, None);
             return true;
         }
-        let prog = String::from_utf8_lossy(req.prog).into_owned();
-        let argv: Vec<String> = req
-            .args
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        let env: Vec<(String, String)> = req
+        // (bytes, not text: a file name given to `xargs` or `find -exec` need not be UTF-8)
+        let prog: Vec<u8> = req.prog.to_vec();
+        let argv: Vec<Vec<u8>> = req.args.iter().map(|a| a.to_vec()).collect();
+        let env: Vec<(Vec<u8>, Vec<u8>)> = req
             .env
             .iter()
             .filter_map(|e| {
                 let at = e.iter().position(|&b| b == b'=')?;
-                Some((
-                    String::from_utf8_lossy(&e[..at]).into_owned(),
-                    String::from_utf8_lossy(&e[at + 1..]).into_owned(),
-                ))
+                Some((e[..at].to_vec(), e[at + 1..].to_vec()))
             })
             .collect();
-        if !shell_core::valid_command_name(prog.as_bytes()) {
+        if !shell_core::valid_command_name(&prog) {
             close_all(hs);
             reply(proto::file::status::NOT_FOUND, 0, None);
             return true;
@@ -1021,7 +1015,12 @@ impl Os {
         env: &[(String, String)],
         io: ProcIo,
     ) -> Result<u32, HostError> {
-        self.start_with(pid, &argv[0], argv, env, Stdio::Streams(io), None)
+        let bytes: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
+        let envb: Vec<(Vec<u8>, Vec<u8>)> = env
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect();
+        self.start_with(pid, &bytes[0], &bytes, &envb, Stdio::Streams(io), None)
     }
 
     /// Start a program. `parent` is the broker of the program that asked (a spawn request, OD118): the new program gets
@@ -1029,15 +1028,15 @@ impl Os {
     fn start_with(
         &mut self,
         pid: u32,
-        prog: &str,
-        argv: &[String],
-        env: &[(String, String)],
+        prog: &[u8],
+        argv: &[Vec<u8>],
+        env: &[(Vec<u8>, Vec<u8>)],
         stdio: Stdio,
         mut parent: Option<&mut Broker>,
     ) -> Result<u32, HostError> {
         let allow: Option<Vec<(Vec<u8>, bool)>> = parent.as_ref().map(|p| p.mounts.clone());
         let mut mounts: Vec<(Vec<u8>, bool)> = Vec::new();
-        let name = prog.as_bytes();
+        let name = prog;
         if !shell_core::valid_command_name(name) {
             drop_stdio(stdio);
             return Err(HostError::Other(String::from("bad command name")));
@@ -1094,9 +1093,9 @@ impl Os {
         let mut forward: Vec<u32> = alloc::vec![stdin, stdout, stderr];
         let mut startup = Startup {
             args: if argv.is_empty() {
-                alloc::vec![prog.as_bytes().to_vec()]
+                alloc::vec![prog.to_vec()]
             } else {
-                argv.iter().map(|a| a.as_bytes().to_vec()).collect()
+                argv.to_vec()
             },
             roles: alloc::vec![(Role::Stdin, 0), (Role::Stdout, 1), (Role::Stderr, 2)],
             ..Startup::default()
@@ -1105,8 +1104,8 @@ impl Os {
         // `getcwd`, and `..` that climbs, start from it
         for (k, v) in env {
             // (the program's pid and its parent's are the shell's to say)
-            if k != "PID" && k != "PPID" {
-                startup.env.push(format!("{k}={v}").into_bytes());
+            if k != b"PID" && k != b"PPID" {
+                startup.env.push([&k[..], b"=", &v[..]].concat());
             }
         }
         startup.env.push(format!("PID={pid}").into_bytes());
@@ -1407,7 +1406,8 @@ impl Host for Os {
         };
         self.procs.insert(id, h);
         self.attach_broker(id, id);
-        self.proc_announce(id, h, argv);
+        let announced: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
+        self.proc_announce(id, h, &announced);
         if let Some(n) = tmp {
             self.tmp_of.insert(id, n);
         }

@@ -844,7 +844,12 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
     if fds.is_null() && nfds > 0 {
         return fail(EINVAL);
     }
-    let list = core::slice::from_raw_parts_mut(fds, nfds as usize);
+    // (no descriptors is a plain timed wait, and a null pointer is not a slice)
+    let list: &mut [PollFd] = if nfds == 0 {
+        &mut []
+    } else {
+        core::slice::from_raw_parts_mut(fds, nfds as usize)
+    };
     let deadline = if timeout_ms < 0 {
         NEVER
     } else {
@@ -852,6 +857,13 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
     };
     let mut port = 0u32;
     loop {
+        // a signal's handler that ran ends the call (`EINTR`), before and while it waits
+        if crate::sig::deliver().ran {
+            if port != 0 {
+                rt::sys::handle_close(port);
+            }
+            return fail(4);
+        }
         let mut ready = 0;
         let mut watch: Vec<(u32, u32)> = Vec::new();
         for p in list.iter_mut() {
@@ -889,6 +901,16 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
         for (i, (h, mask)) in watch.iter().enumerate() {
             let _ =
                 rt::sys::port_bind_flags(port, *h, *mask, i as u64, rt::abi::port_flags::ONESHOT);
+        }
+        let sigch = crate::sig::channel();
+        if sigch != 0 {
+            let _ = rt::sys::port_bind_flags(
+                port,
+                sigch,
+                rt::abi::signals::READABLE,
+                u64::MAX,
+                rt::abi::port_flags::ONESHOT,
+            );
         }
         // (no bindable object, such as a descriptor in the New state only: just sleep out the time)
         let _ = rt::sys::port_wait(port, deadline.min(now() + 1000));
