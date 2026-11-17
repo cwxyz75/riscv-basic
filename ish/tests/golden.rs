@@ -5,6 +5,7 @@
 //! # comment lines before the first section are ignored
 //! --- file /path          (optional, repeatable: a file in the fake file system)
 //! content
+//! --- file-hex /path     (optional, repeatable: a file given as hexadecimal digits, blanks ignored: bytes that are not text)
 //! --- args a b c        (optional: the script's arguments, split on blanks)
 //! --- env NAME=value      (optional, repeatable)
 //! --- stdin               (optional)
@@ -32,6 +33,7 @@ use std::path::PathBuf;
 
 struct Case {
     files: Vec<(String, String)>,
+    hex_files: Vec<(String, Vec<u8>)>,
     env: Vec<(String, String)>,
     args: Vec<String>,
     stdin: String,
@@ -50,6 +52,7 @@ struct Case {
 fn parse(text: &str) -> Case {
     let mut c = Case {
         files: vec![],
+        hex_files: vec![],
         env: vec![],
         args: vec![],
         stdin: String::new(),
@@ -71,6 +74,16 @@ fn parse(text: &str) -> Case {
             let b = std::mem::take(body);
             match s.split_once(' ').unwrap_or((s.as_str(), "")) {
                 ("file", p) => c.files.push((p.to_string(), b)),
+                ("file-hex", p) => {
+                    let digits: Vec<u8> = b.bytes().filter(|x| !x.is_ascii_whitespace()).collect();
+                    let bytes = digits
+                        .chunks(2)
+                        .map(|d| {
+                            u8::from_str_radix(core::str::from_utf8(d).unwrap(), 16).expect("hex")
+                        })
+                        .collect();
+                    c.hex_files.push((p.to_string(), bytes));
+                }
                 ("env", kv) => {
                     let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
                     c.env.push((k.to_string(), v.to_string()));
@@ -159,6 +172,9 @@ fn run(c: &Case) -> (String, String, i32, usize) {
     let mut host = FakeHost::new();
     for (p, content) in &c.files {
         host = host.with_file(p, content);
+    }
+    for (p, bytes) in &c.hex_files {
+        host = host.with_file_bytes(p, bytes);
     }
     host.set_stdin(c.stdin.as_bytes());
     for (k, v) in &c.env {
