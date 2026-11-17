@@ -113,6 +113,8 @@ struct Os {
     late_interrupt: bool,
     /// There is a console server: interactive mode.
     interactive: bool,
+    /// The pids of the foreground job (the stages of the running pipeline), for Ctrl-C.
+    fg_pids: Vec<u32>,
     /// Programs may start programs (OD118): the default; each program's channel is below.
     spawn_grant: bool,
     brokers: Vec<Broker>,
@@ -178,6 +180,8 @@ struct Broker {
     /// The private `/tmp` directory of this chain (its root's: what a program starts, it shares it, so a script's files are
     /// visible to the programs it runs).
     tmp: Option<Vec<u8>>,
+    /// The program has said it handles SIGINT (a handler or ignoring it): Ctrl-C is passed on to it as a signal.
+    handles_int: bool,
 }
 
 /// A program a program started (the shell holds its process handle too: it reaps it and ends it with its chain's root).
@@ -335,9 +339,68 @@ impl Os {
             if r.status != 0 {
                 return;
             }
-            if let Some(ctl::Event::Interrupt) = ctl::decode_event(&rb[..r.a1]) {
-                self.interrupt = true;
+            match ctl::decode_event(&rb[..r.a1]) {
+                Some(ctl::Event::Interrupt) => self.interrupt = true,
+                Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                _ => {}
             }
+        }
+    }
+
+    /// Ctrl-C reached a running job: the console server has ended the programs on the list it was given; the ones that handle
+    /// SIGINT were kept off it, and get the signal here.
+    fn sigint_foreground(&mut self) {
+        // (the console server also leaves the byte 0x03 on the terminal to wake an idle shell: it is swallowed when the job ends)
+        self.killed = true;
+        for pid in self.fg_pids.clone() {
+            if let Some(b) = self.brokers.iter().find(|b| b.pid == pid && b.handles_int) {
+                sys::channel_write(b.sig, [2u8].as_ptr(), 1, core::ptr::null(), 0);
+            }
+        }
+    }
+
+    /// The programs of the foreground job that do not handle SIGINT: what the console server may end on Ctrl-C.
+    fn register_foreground(&mut self) -> bool {
+        let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
+        let hs: Vec<u32> = self
+            .fg_pids
+            .iter()
+            .filter(|&&pid| !self.brokers.iter().any(|b| b.pid == pid && b.handles_int))
+            .filter_map(|pid| self.procs.get(pid).copied())
+            .collect();
+        let dups: Vec<u32> = hs.iter().filter_map(|&p| dup(p, job_rights)).collect();
+        if dups.len() != hs.len() {
+            close_all(&dups);
+            return false;
+        }
+        if dups.is_empty() {
+            // (a job runs, and none of it is for the console server to end)
+            return self.control(Control::HoldForeground, &[]);
+        }
+        self.control(Control::SetForeground, &dups)
+    }
+
+    /// What the programs have said to the shell on their signal channels (never blocks): that they handle SIGINT, or no longer do.
+    fn service_signal_notes(&mut self) {
+        let mut changed = false;
+        for b in self.brokers.iter_mut() {
+            loop {
+                let mut m = [0u8; 8];
+                let r = sys::channel_read(b.sig, m.as_mut_ptr(), m.len(), core::ptr::null_mut(), 0);
+                if r.status != 0 {
+                    break;
+                }
+                if r.a1 == 3 && m[0] == b'H' && m[1] == 2 {
+                    let now = m[2] != 0;
+                    if now != b.handles_int {
+                        b.handles_int = now;
+                        changed |= self.fg_pids.contains(&b.pid);
+                    }
+                }
+            }
+        }
+        if changed && self.interactive {
+            self.register_foreground();
         }
     }
 
@@ -409,8 +472,10 @@ impl Os {
                     Some((t, st)) if t == self.txid => return st == 0,
                     Some(_) => continue, // a late reply to an earlier call: skip it
                     None => {
-                        if let Some(ctl::Event::Interrupt) = ctl::decode_event(&rb[..r.a1]) {
-                            self.interrupt = true;
+                        match ctl::decode_event(&rb[..r.a1]) {
+                            Some(ctl::Event::Interrupt) => self.interrupt = true,
+                            Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                            _ => {}
                         }
                         continue;
                     }
@@ -627,6 +692,7 @@ impl Os {
     /// Serve everything the shell serves while it waits: output pumps, spawn requests, ended programs, and the chains of
     /// programs that have ended (what a program started does not outlive it, whether or not the shell has waited for it yet).
     fn serve(&mut self) {
+        self.service_signal_notes();
         self.service_pumps();
         self.service_brokers();
         self.reap_desc();
@@ -651,6 +717,8 @@ impl Os {
         let mut key = 1000;
         for b in &self.brokers {
             sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, key);
+            key += 1;
+            sys::port_bind(port, b.sig, signals::READABLE, key);
             key += 1;
         }
         for d in self.desc.values() {
@@ -1368,6 +1436,7 @@ impl Os {
                             mounts: mounts.clone(),
                             confined: confined.clone(),
                             tmp: chain_tmp.clone(),
+                            handles_int: false,
                         });
                     }
                     Ok(cw) => {
@@ -1450,6 +1519,9 @@ impl Host for Os {
         };
         loop {
             self.serve();
+            // (what the console server says about Ctrl-C reaches the programs that handle it; not while the shell edits a line:
+            // there the terminal read takes its own events)
+            self.poll_ctl();
             if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
                 break;
             }
@@ -1462,6 +1534,7 @@ impl Host for Os {
 
     fn try_wait(&mut self, pid: Pid) -> Option<i32> {
         self.serve();
+        self.poll_ctl();
         let h = *self.procs.get(&pid.0)?;
         if sys::object_wait(h, signals::TERMINATED, 0).status != 0 {
             return None;
@@ -1841,17 +1914,15 @@ impl Host for Os {
         if !self.interactive {
             return true; // no console server: nothing to register with
         }
-        // register the job (duplicates with only KILL|WAIT|TRANSFER)
-        let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
+        // register the job (duplicates with only KILL|WAIT|TRANSFER; not the programs that handle SIGINT)
         let hs: Vec<u32> = pids
             .iter()
             .filter_map(|p| self.procs.get(&p.0).copied())
             .collect();
-        let dups: Vec<u32> = hs.iter().filter_map(|&p| dup(p, job_rights)).collect();
-        let registered = if dups.len() == hs.len() && !hs.is_empty() {
-            self.control(Control::SetForeground, &dups)
+        self.fg_pids = pids.iter().map(|p| p.0).collect();
+        let registered = if hs.len() == pids.len() && !hs.is_empty() {
+            self.register_foreground()
         } else {
-            close_all(&dups);
             false
         };
         if !registered {
@@ -1891,6 +1962,7 @@ impl Host for Os {
         if self.interactive {
             self.control(Control::ClearForeground, &[]);
         }
+        self.fg_pids.clear();
         if self.killed {
             self.killed = false;
             self.swallow_interrupt();
@@ -2131,6 +2203,7 @@ pub fn app_main() -> i32 {
         interrupt: false,
         late_interrupt: false,
         interactive: ctl_ch.is_some(),
+        fg_pids: Vec::new(),
         spawn_grant: true,
         brokers: Vec::new(),
         pending_broker: None,
