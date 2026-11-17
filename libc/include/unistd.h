@@ -52,7 +52,7 @@ int fchdir(int fd);
 int chroot(const char *path);
 int lchown(const char *path, uid_t uid, gid_t gid);
 pid_t fork(void);
-pid_t vfork(void);
+pid_t vfork(void) __attribute__((returns_twice));
 int execv(const char *path, char *const argv[]);
 int execve(const char *path, char *const argv[], char *const envp[]);
 int execvp(const char *file, char *const argv[]);

@@ -475,6 +475,10 @@ def main():
     step(b"busybox seq 3 | busybox xargs -n 1 busybox echo item\n", [b"$ busybox seq 3 | busybox xargs -n 1 busybox echo item", b"item 1", b"item 2", b"item 3"], "xargs runs it once per item (vfork and wait)")
     step(b"busybox seq 3 | busybox xargs -n 1 echo bare\n", [b"$ busybox seq 3 | busybox xargs -n 1 echo bare", b"bare 1", b"bare 2", b"bare 3"], "xargs runs a separate program (`echo`) by name")
     step(b"busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort\n", [b"$ busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort", b"found ./hello.txt", b"found ./lines.txt", b"found ./sub/inner.txt"], "find -exec")
+    # the shell serves a program's requests while it reads that program's captured output (it used to wait for the library's timeout)
+    step(b"cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'\n", [b"$ cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'"], "a captured program that starts a program")
+    step(b"print $cap.status\n", [b"$ print $cap.status", b"0"], "... ends well")
+    step(b"print $cap.out\n", [b"$ print $cap.out", b'["found ./hello.txt"]'], "... and its child's output is captured")
     step_re(b"busybox time busybox echo timed\n", [b"$ busybox time busybox echo timed", b"timed", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")], "time runs a program")
     # the chain has a depth limit: the fifth program down holds no spawn grant
     step(b"busybox env busybox env busybox env busybox env busybox env busybox echo deep\n",

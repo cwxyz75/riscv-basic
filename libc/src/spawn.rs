@@ -6,7 +6,7 @@
 //! except in the child of a `vfork`: the child runs in the caller until its first `execve` (or `_exit`), and that call returns
 //! to the caller of `vfork` with the new program's pid (a `longjmp` to where `vfork` was called), which is what the caller of a
 //! real `vfork` sees. The child must not return from the function that called `vfork`, change locals other than the pid, or
-//! call anything but `exec*` and `_exit` (the same rules as POSIX). One `vfork` at a time per process.
+//! call anything but `exec*` and `_exit` (the same rules as POSIX). One `vfork` at a time per process, and the child must be the only thread to call `exec*` or `_exit` meanwhile.
 
 use crate::errno;
 use alloc::vec::Vec;
@@ -179,7 +179,7 @@ vfork:
     li t1, 1
     sb t1, 0(t0)
     la a0, VFORK_BUF
-    j setjmp
+    tail setjmp
 "#
 );
 
@@ -204,18 +204,33 @@ pub fn vfork_child_exit(code: c_int) {
 
 // ---- exec ----
 
-unsafe fn exec_with(file: *const c_char, argv: *const *const c_char, envp: &[Vec<u8>]) -> c_int {
+/// Ask for the program. Everything that allocates ends here, before any `longjmp` out of `exec_with`.
+unsafe fn exec_start(
+    file: *const c_char,
+    argv: *const *const c_char,
+    envp: Option<*const *const c_char>,
+) -> Result<u32, c_int> {
     if file.is_null() || argv.is_null() {
-        errno::set(14);
-        return -1;
+        return Err(14);
     }
     let args = string_array(argv);
     let Some(name) = command_name(CStr::from_ptr(file).to_bytes()) else {
-        errno::set(2);
-        return -1;
+        return Err(2);
+    };
+    let env = match envp {
+        Some(e) => string_array(e),
+        None => current_env(),
     };
     // the program is named by the file; `argv[0]` is what the program sees (an applet name, usually)
-    match start(name, &args, envp, [0, 1, 2]) {
+    start(name, &args, &env, [0, 1, 2])
+}
+
+unsafe fn exec_with(
+    file: *const c_char,
+    argv: *const *const c_char,
+    envp: Option<*const *const c_char>,
+) -> c_int {
+    match exec_start(file, argv, envp) {
         Err(e) => {
             errno::set(e);
             -1
@@ -239,17 +254,17 @@ pub unsafe extern "C" fn execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    exec_with(file, argv, &string_array(envp))
+    exec_with(file, argv, Some(envp))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn execv(file: *const c_char, argv: *const *const c_char) -> c_int {
-    exec_with(file, argv, &current_env())
+    exec_with(file, argv, None)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
-    exec_with(file, argv, &current_env())
+    exec_with(file, argv, None)
 }
 
 #[no_mangle]
@@ -258,7 +273,7 @@ pub unsafe extern "C" fn execvpe(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    exec_with(file, argv, &string_array(envp))
+    exec_with(file, argv, Some(envp))
 }
 
 // ---- posix_spawn ----

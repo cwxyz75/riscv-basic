@@ -169,6 +169,8 @@ struct Broker {
     cwd_path: Vec<u8>,
     /// Each mount in the program's namespace and whether it is writable.
     mounts: Vec<(Vec<u8>, bool)>,
+    /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
+    confined: Option<Vec<(String, String)>>,
 }
 
 /// A program a program started (the shell holds its process handle too: it reaps it and ends it with its chain's root).
@@ -573,35 +575,93 @@ impl Os {
         }
     }
 
-    /// Answer the spawn requests programs have sent (never blocks).
+    /// Answer the spawn requests programs have sent (never blocks; at most a few per program per call, so a program that floods
+    /// its channel cannot keep the shell from looking at anything else). A program that closes its channel, or speaks the
+    /// protocol wrongly, loses it.
     fn service_brokers(&mut self) {
+        if self.brokers.is_empty() {
+            return;
+        }
+        let mut buf = alloc::vec![0u8; proto::spawn::MAX_BYTES];
         let mut i = 0;
         while i < self.brokers.len() {
-            let mut buf = alloc::vec![0u8; proto::spawn::MAX_BYTES];
-            let mut hs = [0u32; proto::spawn::HANDLES + 1];
-            let ch = self.brokers[i].ch;
-            let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
-            match r.status() {
-                Some(Status::Ok) => {}
-                Some(Status::ShouldWait) | Some(Status::PeerClosed) => {
-                    i += 1;
-                    continue;
+            let mut served = 0;
+            let mut keep = true;
+            while served < 4 {
+                let mut hs = [0u32; proto::spawn::HANDLES + 1];
+                let ch = self.brokers[i].ch;
+                let r =
+                    sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
+                match r.status() {
+                    Some(Status::Ok) => {}
+                    Some(Status::ShouldWait) => break,
+                    _ => {
+                        // the program closed it, or sent what does not fit: no more requests from it
+                        keep = false;
+                        break;
+                    }
                 }
-                _ => {
-                    // a message that does not fit: the program is not speaking the protocol; end its channel
-                    let b = self.brokers.remove(i);
-                    sys::handle_close(b.ch);
-                    b.cwd.close();
-                    continue;
+                served += 1;
+                if !self.answer_spawn(i, &buf[..r.a1], &hs[..r.a2]) {
+                    keep = false;
+                    break;
                 }
             }
-            let (n, nh) = (r.a1, r.a2);
-            self.answer_spawn(i, &buf[..n], &hs[..nh]);
-            // (the broker may have been removed while answering: look at the same index again)
+            if keep {
+                i += 1;
+            } else {
+                let b = self.brokers.remove(i);
+                sys::handle_close(b.ch);
+                b.cwd.close();
+            }
         }
     }
 
-    fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u32]) {
+    /// Serve everything the shell serves while it waits: output pumps, spawn requests, ended programs, and the chains of
+    /// programs that have ended (what a program started does not outlive it, whether or not the shell has waited for it yet).
+    fn serve(&mut self) {
+        self.service_pumps();
+        self.service_brokers();
+        self.reap_desc();
+        let dead: Vec<u32> = self
+            .procs
+            .iter()
+            .filter(|(id, h)| {
+                self.desc.values().any(|d| d.root == **id)
+                    && sys::object_wait(**h, signals::TERMINATED, 0).status == 0
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            self.end_chain(id);
+        }
+    }
+
+    /// Wait on `h` for `mask` (or a few milliseconds) while serving; the shell never sits in a blocking read or write while a
+    /// program of its own is waiting for it.
+    fn serve_wait(&mut self, h: u32, mask: u32) {
+        let p = sys::port_create();
+        if p.status != 0 {
+            io::nap(2);
+            return;
+        }
+        let port = p.a1 as u32;
+        sys::port_bind(port, h, mask, 0);
+        for b in &self.brokers {
+            sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1);
+        }
+        for d in self.desc.values() {
+            sys::port_bind(port, d.h, signals::TERMINATED, 2);
+        }
+        for q in &self.pumps_out {
+            sys::port_bind(port, q.rd, signals::READABLE | signals::PEER_CLOSED, 3);
+        }
+        sys::port_wait(port, sys::clock_get() + 20);
+        sys::handle_close(port);
+        self.serve();
+    }
+
+    fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u32]) -> bool {
         let ch = self.brokers[i].ch;
         let txid = proto::file::peek_txid(msg).unwrap_or(0);
         let reply = |status: i32, h: Option<u32>| {
@@ -618,16 +678,19 @@ impl Os {
         };
         let Ok(req) = proto::spawn::decode(msg) else {
             close_all(hs);
-            return reply(proto::file::status::BAD_REQUEST, None);
+            reply(proto::file::status::BAD_REQUEST, None);
+            return false;
         };
         if hs.len() != proto::spawn::HANDLES {
             close_all(hs);
-            return reply(proto::file::status::BAD_REQUEST, None);
+            reply(proto::file::status::BAD_REQUEST, None);
+            return false;
         }
         let root = self.brokers[i].root;
         if self.desc.values().filter(|d| d.root == root).count() >= SPAWN_LIVE {
             close_all(hs);
-            return reply(proto::file::status::QUOTA, None);
+            reply(proto::file::status::QUOTA, None);
+            return true;
         }
         let prog = String::from_utf8_lossy(req.prog).into_owned();
         let argv: Vec<String> = req
@@ -646,6 +709,11 @@ impl Os {
                 ))
             })
             .collect();
+        if !shell_core::valid_command_name(prog.as_bytes()) {
+            close_all(hs);
+            reply(proto::file::status::NOT_FOUND, None);
+            return true;
+        }
         let mut b = self.brokers.remove(i);
         self.new_tmp = None;
         let started = self.start_with(
@@ -668,7 +736,7 @@ impl Os {
                     HostError::NotFound => proto::file::status::NOT_FOUND,
                     _ => proto::file::status::UNAVAILABLE,
                 };
-                reply(st, None)
+                reply(st, None);
             }
             Ok(ph) => {
                 let id = self.next_pid;
@@ -701,6 +769,7 @@ impl Os {
                 }
             }
         }
+        true
     }
 
     /// Sleep until something the shell serves happens: a program ends (`extra`, and the ones programs started), a program
@@ -1015,7 +1084,10 @@ impl Os {
                 )));
             }
         }
-        let confined = self.confined.last().cloned();
+        let confined = match parent.as_ref() {
+            Some(p) => p.confined.clone(),
+            None => self.confined.last().cloned(),
+        };
         let root = if confined.is_some() {
             if let Some(Ok(r)) = root {
                 r.close();
@@ -1107,6 +1179,10 @@ impl Os {
             // `confine`: exactly the grants, opened now, each as narrow as asked
             for (path, rw) in grants {
                 let writable = rw.contains('w');
+                // (`.` and `/tmp` are the program's own, never a grant by name)
+                if parent.is_some() && (path == "." || path == "/tmp") {
+                    continue;
+                }
                 if !allowed(allow.as_deref(), path.as_bytes(), writable) {
                     continue;
                 }
@@ -1195,6 +1271,7 @@ impl Os {
                             cwd: cw,
                             cwd_path: cwd_path.clone(),
                             mounts: mounts.clone(),
+                            confined: confined.clone(),
                         });
                     }
                     Err(_) => close_all(&[mine, theirs]),
@@ -1265,9 +1342,7 @@ impl Host for Os {
             return -1;
         };
         loop {
-            self.service_pumps();
-            self.service_brokers();
-            self.reap_desc();
+            self.serve();
             if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
                 break;
             }
@@ -1278,9 +1353,7 @@ impl Host for Os {
     }
 
     fn try_wait(&mut self, pid: Pid) -> Option<i32> {
-        self.service_pumps();
-        self.service_brokers();
-        self.reap_desc();
+        self.serve();
         let h = *self.procs.get(&pid.0)?;
         if sys::object_wait(h, signals::TERMINATED, 0).status != 0 {
             return None;
@@ -1310,9 +1383,7 @@ impl Host for Os {
         };
         let deadline = sys::clock_get() + ms;
         loop {
-            self.service_pumps();
-            self.service_brokers();
-            self.reap_desc();
+            self.serve();
             self.poll_ctl();
             if core::mem::take(&mut self.interrupt) {
                 return WaitOutcome::Interrupted;
@@ -1367,7 +1438,20 @@ impl Host for Os {
                 _ => return Err(HostError::Other(String::from("not readable"))),
             },
         };
-        io::read(h, buf).map_err(|_| HostError::Other(String::from("read failed")))
+        if s.0 == 0 {
+            return io::read(h, buf).map_err(|_| HostError::Other(String::from("read failed")));
+        }
+        // a pipe: the shell keeps serving the programs that feed it while it waits for them
+        loop {
+            let r = sys::socket_read(h, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(Status::Ok) => return Ok(r.a1),
+                Some(Status::ShouldWait) => {
+                    self.serve_wait(h, signals::READABLE | signals::PEER_CLOSED)
+                }
+                _ => return Ok(0), // the end of the stream
+            }
+        }
     }
 
     fn poll_read(
@@ -1402,8 +1486,15 @@ impl Host for Os {
                     sys::port_bind(port, *h, signals::READABLE | signals::PEER_CLOSED, i as u64);
                 }
             }
-            sys::port_wait(port, u64::MAX);
+            for b in &self.brokers {
+                sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, 1000);
+            }
+            for d in self.desc.values() {
+                sys::port_bind(port, d.h, signals::TERMINATED, 1001);
+            }
+            sys::port_wait(port, sys::clock_get() + 20);
             sys::handle_close(port);
+            self.serve();
         }
     }
 
@@ -1419,10 +1510,25 @@ impl Host for Os {
                 _ => return Err(HostError::Other(String::from("not writable"))),
             },
         };
-        io::write_all(h, bytes).map_err(|e| match e {
-            io::IoError::PeerClosed => HostError::Closed,
-            _ => HostError::Other(String::from("write failed")),
-        })
+        if s.0 == 1 || s.0 == 2 {
+            return io::write_all(h, bytes).map_err(|e| match e {
+                io::IoError::PeerClosed => HostError::Closed,
+                _ => HostError::Other(String::from("write failed")),
+            });
+        }
+        let mut at = 0;
+        while at < bytes.len() {
+            let r = sys::socket_write(h, bytes[at..].as_ptr(), bytes.len() - at);
+            match r.status() {
+                Some(Status::Ok) => at += r.a1,
+                Some(Status::ShouldWait) => {
+                    self.serve_wait(h, signals::WRITABLE | signals::PEER_CLOSED)
+                }
+                Some(Status::PeerClosed) => return Err(HostError::Closed),
+                _ => return Err(HostError::Other(String::from("write failed"))),
+            }
+        }
+        Ok(())
     }
 
     fn close(&mut self, s: Stream) {
@@ -1565,9 +1671,7 @@ impl Host for Os {
                 },
             );
             sys::handle_close(port);
-            self.service_pumps();
-            self.service_brokers();
-            self.reap_desc();
+            self.serve();
             if w.status != 0 && w.status != Status::TimedOut.code() {
                 return TermIn::Gone;
             }
