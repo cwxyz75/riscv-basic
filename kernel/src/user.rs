@@ -3315,6 +3315,12 @@ fn job_info(a: [u64; 6]) -> Reply {
                     .ok_or((Status::BadState, None, None))?;
                 return Ok((Some(u64::from(s.max_prio)), Some(s.rt_budget)));
             }
+            // 7: the processors a job's threads may run on: every hart that is online (there is no affinity yet), the
+            // count in both `a1` and `a2` (UV6: what `/proc/cpuinfo` and `nproc` report)
+            7 => {
+                let n = crate::smp::online() as u64;
+                return Ok((Some(n), Some(n)));
+            }
             _ => return bad(Status::InvalidArgs),
         };
         let jobs = &kmem::get().vmos.jobs;

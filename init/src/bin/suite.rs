@@ -4234,9 +4234,9 @@ fn runtime_heap_stops_at_its_cap() -> Outcome {
     let blocks = sys::process_info(p).a1 as i64;
     // (the lower bound is what the machine has left for one program: 256 MiB less the kernel, which grows its heap in 2 MiB
     // steps and never gives it back (T81), the boot image and the other programs; it was 112 and a run that had grown the
-    // kernel heap once more got 111, and the boot image has grown with every program since (the volume services alone are 2 MiB of debug code), CI saw 99. The test is about the cap stopping the heap, not about the exact figure.)
+    // kernel heap once more got 111, and the boot image has grown with every program since (the volume services alone are 2 MiB of debug code), CI saw 99, and 83 once authd, procd and the login programs were in the image (the lower bound is now 64). The test is about the cap stopping the heap, not about the exact figure.)
     ensure!(
-        (90..=128).contains(&blocks),
+        (64..=128).contains(&blocks),
         "the heap gave {blocks} MiB before refusing (cap 128 MiB, some in use: the boot image and the programs take memory from the machine's 256 MiB)"
     );
     let _ = in_w;
@@ -4833,6 +4833,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"dhcpc".to_vec(),
             b"echo".to_vec(),
             b"fetch".to_vec(),
+            b"free".to_vec(),
             b"fsd".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
@@ -4847,14 +4848,17 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"netdrv".to_vec(),
             b"netinfo".to_vec(),
             b"netsup".to_vec(),
+            b"nproc".to_vec(),
             b"ping".to_vec(),
             b"probe".to_vec(),
+            b"procd".to_vec(),
+            b"ps".to_vec(),
             b"registryd".to_vec(),
             b"rngd".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
             b"udpecho".to_vec(),
-            b"volmgr".to_vec()
+            b"volmgr".to_vec(),
         ],
         "the programs"
     );
@@ -9567,6 +9571,25 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         st(sys::job_info(root, 9)),
         Some(S::InvalidArgs),
         "an unknown resource"
+    );
+    // 7 is the processors (UV6): at least one, the same number twice, and the same for every job
+    let (cpus, cpus_limit) = job_use(root, 7)?;
+    ensure!(
+        cpus >= 1 && cpus == cpus_limit,
+        "job_info 7 gives the online harts twice"
+    );
+    ensure!(cpus <= 8, "a plausible number of harts");
+    let child = job(root, 1, 1, 1)?;
+    ensure_eq!(
+        job_use(child, 7)?,
+        (cpus, cpus),
+        "every job sees the same processors"
+    );
+    sys::handle_close(child);
+    ensure_eq!(
+        st(sys::job_info(root, 8)),
+        Some(S::InvalidArgs),
+        "the resource after the last"
     );
     // each operation needs its own right
     let only = |r: Rights| -> Result<u32, Detail> {

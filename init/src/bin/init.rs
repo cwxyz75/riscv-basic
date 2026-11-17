@@ -662,11 +662,11 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
 const SESSION_SCRIPTS: &[(&str, &str)] = &[
     (
         "alice",
-        "print $env.USER $env.UID $env.HOME $env.EDITOR\nprint (pwd)\ncat secret.txt\ncat /home/secret.txt\nr = run { \"out\": \"capture\" } cat /homes/bob/notes.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /etc/profiles/bob.json\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/notes.txt\nprint $r.status\nls /\n",
+        "print $env.USER $env.UID $env.HOME $env.EDITOR\nprint (pwd)\ncat secret.txt\ncat /home/secret.txt\nr = run { \"out\": \"capture\" } cat /homes/bob/notes.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /etc/profiles/bob.json\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/notes.txt\nprint $r.status\nls /\nps\n",
     ),
     (
         "bob",
-        "print $env.USER $env.UID\ncat notes.txt\nr = run { \"out\": \"capture\" } cat /homes/alice/secret.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/secret.txt\nprint $r.status\n",
+        "print $env.USER $env.UID\ncat notes.txt\nr = run { \"out\": \"capture\" } cat /homes/alice/secret.txt\nprint $r.status $r.out\nset r = run { \"out\": \"capture\" } cat /home/secret.txt\nprint $r.status\nps\n",
     ),
 ];
 
@@ -1076,6 +1076,28 @@ fn start_stack(
         d.close();
         c
     })();
+    // `/proc`: the process directory server (UV6). It gets the session job (to inspect, nothing else) and a control channel on
+    // which the shell tells it about the programs it starts; the shell gets one connection to its root.
+    let proc_conn = (|| -> Option<(rt::fs::Fs, u32)> {
+        let (root_mine, root_theirs) = chan().ok()?;
+        let (ctl_mine, ctl_theirs) = chan().ok()?;
+        let job = sys::handle_duplicate(session, Rights::INSPECT.0 | Rights::TRANSFER.0);
+        if job.status != 0 {
+            return None;
+        }
+        start(
+            b"procd",
+            alloc::vec![(Role::ServiceFs, 0), (Role::Job, 1), (Role::ServiceProc, 2)],
+            &[root_theirs, job.a1 as u32, ctl_theirs],
+        )
+        .ok()?;
+        let mut d = rt::fs::Fs::new(root_mine);
+        let c = d
+            .clone_conn(proto::file::rights::READ | proto::file::rights::ENUMERATE)
+            .ok();
+        d.close();
+        Some((c?, ctl_mine))
+    })();
     // the console server: the serial line, the terminal socket, the control channel (a session with a terminal socket of its
     // own has none: its shell reads a script from the socket)
     let (consoled, tty_sh, ctl_sh) = match term {
@@ -1202,6 +1224,12 @@ fn start_stack(
     if let Some(d) = dev_conn {
         sh_roles.push((Role::DevDir, sh_handles.len() as u32));
         sh_handles.push(d.ch);
+    }
+    if let Some((c, ctl)) = proc_conn {
+        sh_roles.push((Role::ProcDir, sh_handles.len() as u32));
+        sh_handles.push(c.ch);
+        sh_roles.push((Role::ServiceProc, sh_handles.len() as u32));
+        sh_handles.push(ctl);
     }
     let sh = start_env(
         who.profile.shell.as_bytes(),

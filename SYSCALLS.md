@@ -186,7 +186,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 | 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
 | 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns) |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
 | 96 | job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 | |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
@@ -545,7 +545,7 @@ read). The rights are checked before the pointer is touched.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`); `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 ### job_set_sched(job, max_prio, rt_budget_ns, cpu_weight) -> status
