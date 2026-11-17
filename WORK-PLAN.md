@@ -20,7 +20,7 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 5. [x] (done as a spike: hush runs scripts, files redirect, `system()`/`popen()` work, 25 scripts checked against the host sh; left in T139: here-documents, a `/bin/sh` name, interactive mode, a `configure` corpus) **(corrected: BusyBox `hush`, not `ash`: ash refuses to build without `fork`) `/bin/sh` is a port, not `ish` (SHELL-SPEC lines 23 and 465, SH7): a spike with BusyBox `ash` in its no-MMU mode** (not dash:
    dash needs a real `fork`). Needs `pipe()`, `dup2` and `fcntl` beyond fds 0 to 2, job control off. Acceptance (SH7): five real
    `configure` scripts run; dash's results are the second oracle on a shared corpus. Do the spawn rate first.
-6. [ ] **Ctrl-C as SIGINT** (T47): the shell sends SIGINT to a program that has a handler for it and keeps the kill otherwise
+6. [~] **Ctrl-C as SIGINT** (T47; done: the signal reaches a program that handles or ignores SIGINT; left: `termios` for programs, T124): the shell sends SIGINT to a program that has a handler for it and keeps the kill otherwise
    (BASIC's BREAK key needs it); then **`termios` for programs** (T124: raw mode, for `kilo` and friends).
 7. [ ] **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
    needed**; its own PR; soak at `-smp 2` and `-smp 4`; Fable review.

@@ -62,6 +62,8 @@ struct Console {
     deliver: Vec<u8>,
     lost_input: u64,
     jobs: Vec<u32>,
+    /// A foreground job is declared (`SetForeground` or `HoldForeground`): Ctrl-C is reported to the owner as `JobInterrupt`.
+    fg_active: bool,
     serial_w_bound: bool,
     tty_w_bound: bool,
     /// A write failed for lack of kernel memory: retry on a timer, not on a signal.
@@ -254,6 +256,10 @@ impl Console {
     fn after_input(&mut self, input: &proto::tty::Input) {
         if input.kill {
             self.kill_jobs();
+            if !input.interrupt && self.fg_active {
+                // canonical mode, a job running: the shell passes SIGINT on to the programs it kept off the list (they handle it)
+                self.event(ctl::Event::JobInterrupt);
+            }
         }
         if input.interrupt {
             self.event(ctl::Event::Interrupt);
@@ -334,11 +340,18 @@ impl Console {
         match ctl::decode(&bytes[..nb], nh) {
             Ok((txid, Control::SetForeground)) => {
                 self.clear_jobs();
+                self.fg_active = true;
                 self.jobs.extend_from_slice(hs);
                 self.reply(ch, txid, 0);
             }
             Ok((txid, Control::ClearForeground)) => {
                 self.clear_jobs();
+                self.fg_active = false;
+                self.reply(ch, txid, 0);
+            }
+            Ok((txid, Control::HoldForeground)) => {
+                self.clear_jobs();
+                self.fg_active = true;
                 self.reply(ch, txid, 0);
             }
             Ok((txid, Control::SetMode(m))) => {
@@ -429,6 +442,7 @@ impl Console {
             sys::handle_close(ch);
         }
         self.clear_jobs();
+        self.fg_active = false;
         // nobody owns the terminal any more: back to the plain line discipline
         self.tty.set_mode(proto::console::mode::COOKED);
     }
@@ -482,6 +496,7 @@ pub fn app_main() -> i32 {
         deliver: Vec::new(),
         lost_input: 0,
         jobs: Vec::new(),
+        fg_active: false,
         serial_w_bound: false,
         tty_w_bound: false,
         retry: false,

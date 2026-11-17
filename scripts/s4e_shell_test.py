@@ -356,6 +356,17 @@ def main():
     step(b"echo after\n", [b"$ echo after", b"after"], "one prompt after the kill (no extra prompt)")
     step(b"\x03", [b"$ ^C"], "Ctrl-C at an idle prompt")
     step(b"echo idle\n", [b"$ echo idle", b"idle"], "the shell after an idle Ctrl-C")
+    # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
+    step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x03", [b"^C", b"got SIGINT", b"[exit 5]"], "Ctrl-C is delivered as the signal, and the program ends itself")
+    s.wait_for_prompt = True
+    step(b"ctest signals int-ignore\n", [b"$ ctest signals int-ignore", b"ready"], "a program that ignores SIGINT")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x03", [b"^C", b"survived"], "Ctrl-C does not end a program that ignores it")
+    s.wait_for_prompt = True
     # a Ctrl-C typed together with the command, before the job is even registered, still ends it
     # (the job may or may not have printed its first line yet)
     step(b"spin\n\x03", [b"$ spin"], "a command and Ctrl-C in one write")
