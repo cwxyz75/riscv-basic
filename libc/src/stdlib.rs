@@ -359,11 +359,6 @@ pub extern "C" fn abort() -> ! {
     rt::sys::exit(134) // 128 + SIGABRT, as a shell would show
 }
 
-#[no_mangle]
-pub extern "C" fn system(_cmd: *const c_char) -> c_int {
-    -1
-}
-
 /// The environment (`NAME=value` strings, NUL-terminated), set by `run_main`; C sees it as `environ`.
 #[export_name = "environ"]
 pub static mut ENVIRON: *mut *mut c_char = core::ptr::null_mut();

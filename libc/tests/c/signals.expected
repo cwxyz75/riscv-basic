@@ -21,5 +21,12 @@ default SIGTERM: signaled 1 signal 15
 ignored SIGTERM: still there: 0
 SIGKILL: signaled 1 signal 9
 a child's end: pause -1 errno EINTR 1 handler SIGCHLD 1
+from system
+system: 0
+system exit: 3
+popen read: popen output
+pclose: 0
+to cat
+pclose after writing: 0
 kill of a pid that is not ours: -1 errno ESRCH 1
 signals: done

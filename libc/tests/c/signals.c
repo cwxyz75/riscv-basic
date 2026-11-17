@@ -172,6 +172,25 @@ static int child_tests(const char *self) {
     waitpid(pid, &status, 0);
     printf("a child's end: pause %d errno EINTR %d handler SIGCHLD %d\n", pr, errno == EINTR, got == SIGCHLD);
     signal(SIGCHLD, SIG_DFL);
+    /* system() and popen() run the command with the shell */
+    fflush(stdout);
+    int rc = system("echo from system");
+    printf("system: %d\n", WEXITSTATUS(rc));
+    rc = system("exit 3");
+    printf("system exit: %d\n", WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
+    FILE *pf = popen("echo popen output", "r");
+    char pline[64] = "";
+    if (pf) fgets(pline, sizeof pline, pf);
+    printf("popen read: %s", pline);
+    int pst = pf ? pclose(pf) : -1;
+    printf("pclose: %d\n", WEXITSTATUS(pst));
+    fflush(stdout);
+    pf = popen("cat", "w");
+    if (pf) {
+        fputs("to cat\n", pf);
+        pst = pclose(pf);
+        printf("pclose after writing: %d\n", WEXITSTATUS(pst));
+    }
     /* a signal to nobody */
     printf("kill of a pid that is not ours: %d errno ESRCH %d\n", kill(99999, SIGTERM), errno == ESRCH);
     return 0;
