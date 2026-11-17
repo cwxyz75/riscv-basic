@@ -145,13 +145,35 @@ fn start(
         return Err(38);
     }
     let a: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
-    let e: Vec<&[u8]> = env.iter().map(|v| v.as_slice()).collect();
     let _x = EXCHANGE.lock();
     let txid = NEXT_TX.fetch_add(1, Ordering::Relaxed);
-    let req = proto::spawn::encode(txid, prog, &a, &e).map_err(|_| 7)?; // E2BIG
+    // the standard streams: the environment says which are the terminal and which are files (the shell passes it on), whatever the
+    // caller's own environment said about its own
+    let mut env2: Vec<Vec<u8>> = env
+        .iter()
+        .filter(|v| {
+            !(v.starts_with(b"STDIN=") || v.starts_with(b"STDOUT=") || v.starts_with(b"STDERR="))
+        })
+        .cloned()
+        .collect();
     let mut hs = [0u32; 3];
     for (i, fd) in fds.iter().enumerate() {
-        match std_handle(*fd, i == 0) {
+        let got = match crate::fd::stdio_for_child(*fd) {
+            Some((h, marker)) => {
+                if let Some(m) = marker {
+                    env2.push(
+                        [b"STDIN=" as &[u8], b"STDOUT=", b"STDERR="][i]
+                            .iter()
+                            .chain(m.as_bytes())
+                            .copied()
+                            .collect(),
+                    );
+                }
+                Some(h)
+            }
+            None => std_handle(*fd, i == 0),
+        };
+        match got {
             Some(h) => hs[i] = h,
             None => {
                 for &h in &hs[..i] {
@@ -161,6 +183,8 @@ fn start(
             }
         }
     }
+    let e: Vec<&[u8]> = env2.iter().map(|v| v.as_slice()).collect();
+    let req = proto::spawn::encode(txid, prog, &a, &e).map_err(|_| 7)?; // E2BIG
     let w = sys::channel_write(ch, req.as_ptr(), req.len(), hs.as_ptr(), hs.len());
     if w.status != 0 {
         for &h in &hs {

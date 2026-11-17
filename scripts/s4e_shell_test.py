@@ -521,12 +521,20 @@ def main():
         "sleep 1 & echo bg; wait; echo done",
         "echo ${HOME:-none} ${UNSET:-dflt}",
         "echo $((6*7)) $(echo nested $(echo deep))",
+        "echo hello > /tmp/o; cat /tmp/o",
+        "echo one > /tmp/o; echo two >> /tmp/o; cat /tmp/o",
+        "seq 3 > /tmp/n; while read x; do echo got $x; done < /tmp/n",
+        "{ echo a; echo b; } > /tmp/g; cat /tmp/g",
+        "echo to-stderr 2> /tmp/e >&2; cat /tmp/e",
+        "echo x > /tmp/h; { read l; echo got $l; } < /tmp/h",
     ]
     import subprocess as sp
     for script in hush_scripts:
         want = sp.run(["/bin/sh", "-c", script], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/home"}).stdout.splitlines()
         send = "busybox hush -c '" + script.replace("'", "") + "'\n"
         step_re(send.encode(), [b"$ " + send.strip().encode()] + [re.compile(re.escape(w.encode())) for w in want], "hush: " + script)
+    # a program a subshell starts inherits the subshell's redirected output (an open file in the vfork child's table)
+    step(b"busybox hush -c '{ busybox echo a; echo b; } > /tmp/g; busybox cat /tmp/g'\n", [b"$ busybox hush -c '{ busybox echo a; echo b; } > /tmp/g; busybox cat /tmp/g'", b"a", b"b"], "hush: a started program inherits a redirected file")
     # (globbing reads the working directory: the fixtures are hello.txt, lines.txt and sub/inner.txt)
     step(b"busybox hush -c 'echo *.txt; echo sub/*; echo nomatch*'\n", [b"$ busybox hush -c 'echo *.txt; echo sub/*; echo nomatch*'", b"hello.txt lines.txt", b"sub/inner.txt", b"nomatch*"], "hush: globs match what is there and stay as written when nothing is")
     # the chain has a depth limit: the fifth program down holds no spawn grant

@@ -175,6 +175,9 @@ struct Broker {
     sig: u32,
     /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
     confined: Option<Vec<(String, String)>>,
+    /// The private `/tmp` directory of this chain (its root's: what a program starts, it shares it, so a script's files are
+    /// visible to the programs it runs).
+    tmp: Option<Vec<u8>>,
 }
 
 /// A program a program started (the shell holds its process handle too: it reaps it and ends it with its chain's root).
@@ -1206,7 +1209,31 @@ impl Os {
                 );
             }
         }
-        if self.tmp.is_some() && allowed(allow.as_deref(), b"/tmp", true) {
+        let mut chain_tmp: Option<Vec<u8>> = parent.as_ref().and_then(|p| p.tmp.clone());
+        let shared = chain_tmp.is_some();
+        if shared && allowed(allow.as_deref(), b"/tmp", true) {
+            // a program started by a program shares its chain's directory (the root's)
+            let name = chain_tmp.clone().unwrap_or_default();
+            let opened = self.tmp.as_mut().and_then(|t| {
+                t.open(
+                    &name,
+                    flags::DIRECTORY,
+                    rights::READ | rights::WRITE | rights::CREATE | rights::ENUMERATE,
+                )
+                .ok()
+            });
+            if let Some(c) = opened {
+                ns_push(
+                    &mut startup,
+                    &mut forward,
+                    &mut mounts,
+                    allow.as_deref(),
+                    b"/tmp",
+                    c.ch,
+                    true,
+                );
+            }
+        } else if self.tmp.is_some() && allowed(allow.as_deref(), b"/tmp", true) {
             self.jobs += 1;
             let name = format!("j{}", self.jobs).into_bytes();
             let opened = self.tmp.as_mut().and_then(|t| {
@@ -1231,6 +1258,7 @@ impl Os {
                     c.ch,
                     true,
                 );
+                chain_tmp = Some(name.clone());
                 self.new_tmp = Some(name);
             }
         }
@@ -1339,6 +1367,7 @@ impl Os {
                             cwd_path: cwd_path.clone(),
                             mounts: mounts.clone(),
                             confined: confined.clone(),
+                            tmp: chain_tmp.clone(),
                         });
                     }
                     Ok(cw) => {
