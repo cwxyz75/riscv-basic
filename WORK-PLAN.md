@@ -7,8 +7,9 @@ conversation was compacted, read this file and `git log` / `gh pr list` to see w
 
 Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 
-1. [~] **CI runs the shell test with real BusyBox** (PR 211: a `kernel (shell test)` job and the soak workflow fetch BusyBox, cached by
-   the manifest hash). Merge when green; fix whatever Linux clang finds.
+1. [x] **CI runs the shell test with real BusyBox** (PR 211, merged: a `kernel (shell test)` job and the soak workflow fetch BusyBox,
+   cached by the manifest hash). Running it on CI found: the Ctrl-C ordering race, the spawn-channel key bug, and symbol tables
+   making the image 50 MB (now `--strip-all`, 5 MB; T138).
 2. [x] **Spawn-rate measurement** (UV8's open criterion): done in PR (branch spawn-rate): the shell test times 100 `xargs` spawns;
    found and fixed a duplicate-port-key bug in the shell's wait loops (12.9 s to 2.3 s for 100 spawns, about 44 per second in the
    debug build under QEMU). Recorded in TIDY-UP T136(9).
