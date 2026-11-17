@@ -399,3 +399,41 @@ mod tests {
         );
     }
 }
+
+/// The backend provider's channel (UV7, USER-VIEW-SPEC section 9 item 8): a terminal's backend (the UART, an ssh server, a
+/// test harness) attaches a new byte socket, lets go of the current one, or reports that its user hung up. A backend that
+/// merely closes its socket is a **detach**; only `HANGUP` ends the session.
+pub mod term {
+    use alloc::vec::Vec;
+
+    /// Attach the socket in the message's handle as the terminal's backend (the previous one, if any, is closed). The new
+    /// backend is first sent the terminal's recent output, the screen state it missed.
+    pub const OP_ATTACH: u16 = 1;
+    /// Let go of the current backend without ending anything.
+    pub const OP_DETACH: u16 = 2;
+    /// The user hung up: the owner gets a `Hangup` event, the foreground job is killed and the terminal ends.
+    pub const OP_HANGUP: u16 = 3;
+
+    pub fn encode(txid: u32, op: u16) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8);
+        v.extend_from_slice(&txid.to_le_bytes());
+        v.extend_from_slice(&op.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    /// `(txid, op)` of a request carrying `nhandles` handles (one for an attach, none otherwise).
+    pub fn decode(b: &[u8], nhandles: usize) -> Option<(u32, u16)> {
+        if b.len() != 8 || b[6..8] != [0, 0] {
+            return None;
+        }
+        let txid = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let op = u16::from_le_bytes([b[4], b[5]]);
+        let want = match op {
+            OP_ATTACH => 1,
+            OP_DETACH | OP_HANGUP => 0,
+            _ => return None,
+        };
+        (nhandles == want).then_some((txid, op))
+    }
+}

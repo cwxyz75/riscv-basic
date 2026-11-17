@@ -279,10 +279,12 @@ os-serial-test: os-interactive
 	python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 	python3 scripts/uv5_sessions_test.py $(OS_REPL_ELF)
 	$(MAKE) os-auth-test
+	python3 scripts/uv7_detach_test.py $(OS_REPL_ELF)
 	@# the harness must be able to fail: a wrong expectation has to be reported
 	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4d_console_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the console test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/uv5_sessions_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the sessions test passed a broken expectation"; exit 1; fi
+	@if python3 scripts/uv7_detach_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the detach test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
 # The reference CPU of the OS track (OD47).

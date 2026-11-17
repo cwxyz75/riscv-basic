@@ -89,6 +89,8 @@ pub enum Role {
     ServiceProc = 38,
     /// A connection to `procd`'s root, the shell's `/proc` (UV6).
     ProcDir = 39,
+    /// The channel a terminal backend provider uses to attach, detach and hang up (UV7): `proto::console::term`.
+    ServiceTerm = 40,
 }
 
 impl Role {
@@ -133,6 +135,7 @@ impl Role {
             37 => Role::ServiceAuth,
             38 => Role::ServiceProc,
             39 => Role::ProcDir,
+            40 => Role::ServiceTerm,
             _ => return None,
         })
     }
