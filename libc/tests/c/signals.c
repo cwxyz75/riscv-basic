@@ -2,6 +2,7 @@
  * output must equal what the OS prints: the host is the oracle for the semantics, the OS for delivery between processes.
  * Signals are delivered where a program waits or calls the library (not asynchronously into a running loop). */
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -93,6 +94,12 @@ static int self_tests(void) {
     int r = pause();
     printf("pause: %d errno EINTR %d handler %d\n", r, errno == EINTR, got == SIGALRM);
 
+    /* poll() is interrupted too */
+    got = 0;
+    alarm(1);
+    r = poll(NULL, 0, 5000);
+    printf("poll: %d errno EINTR %d handler %d\n", r, errno == EINTR, got == SIGALRM);
+
     /* sigsuspend: swap the mask, wait, restore */
     sigemptyset(&set);
     sigaddset(&set, SIGALRM);
@@ -103,6 +110,23 @@ static int self_tests(void) {
     r = sigsuspend(&pend);
     printf("sigsuspend: %d errno EINTR %d handler %d\n", r, errno == EINTR, got == SIGALRM);
     sigprocmask(SIG_SETMASK, &pend, NULL);
+
+    /* a vfork child's changes to dispositions and the mask are its own */
+    signal(SIGUSR1, on_sig);
+    sigemptyset(&set);
+    sigprocmask(SIG_SETMASK, &set, NULL);
+    pid_t vp = vfork();
+    if (vp == 0) {
+        signal(SIGUSR1, SIG_IGN);
+        sigemptyset(&pend);
+        sigaddset(&pend, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &pend, NULL);
+        _exit(0);
+    }
+    waitpid(vp, NULL, 0);
+    sigaction(SIGUSR1, NULL, &old);
+    sigprocmask(SIG_SETMASK, NULL, &was);
+    printf("vfork child's signal changes stay in the child: %d\n", old.sa_handler == on_sig && !sigismember(&was, SIGUSR2));
 
     /* alarm returns what was left of the previous one */
     alarm(5);

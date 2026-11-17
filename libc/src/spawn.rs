@@ -285,13 +285,23 @@ core::arch::global_asm!(
     .section .text.vfork,"ax",@progbits
     .globl vfork
 vfork:
-    la t0, VFORK_ACTIVE
-    li t1, 1
-    sb t1, 0(t0)
+    addi sp, sp, -16
+    sd ra, 8(sp)
+    call vfork_prepare
+    ld ra, 8(sp)
+    addi sp, sp, 16
     la a0, VFORK_BUF
     tail setjmp
 "#
 );
+
+/// Called by `vfork` before it records where to come back to: a child is about to run, and what it does to the signal
+/// dispositions and the mask is its own, not its parent's.
+#[no_mangle]
+extern "C" fn vfork_prepare() {
+    crate::sig::vfork_save();
+    VFORK_ACTIVE.store(1, Ordering::Relaxed);
+}
 
 extern "C" {
     fn longjmp(buf: *mut u64, val: c_int) -> !;
@@ -300,6 +310,7 @@ extern "C" {
 /// The `vfork` child is done (it started a program or ended): back to the caller of `vfork`, with the child's pid.
 fn vfork_return(spid: c_int, h: u32, done: Option<i32>) -> ! {
     VFORK_ACTIVE.store(0, Ordering::Relaxed);
+    crate::sig::vfork_restore();
     let pid = register(spid, h, done);
     // SAFETY: `VFORK_BUF` was filled by `vfork` and the frame it describes is still live: the child may not return from it.
     unsafe { longjmp(core::ptr::addr_of_mut!(VFORK_BUF) as *mut u64, pid) }

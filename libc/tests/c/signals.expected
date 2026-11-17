@@ -11,7 +11,9 @@ mask set and read: 1 0
 alarm interrupted sleep: handler 1, time left about 9
 alarm(0) with nothing set returns 0
 pause: -1 errno EINTR 1 handler 1
+poll: -1 errno EINTR 1 handler 1
 sigsuspend: -1 errno EINTR 1 handler 1
+vfork child's signal changes stay in the child: 1
 alarm returns the time left: about 5
 kill 0 finds the child: 0
 handled SIGTERM: exited 1 status 7

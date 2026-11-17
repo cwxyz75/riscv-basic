@@ -43,6 +43,7 @@ static PARENT_PID: AtomicU32 = AtomicU32::new(0);
 static ALARM_AT: AtomicU64 = AtomicU64::new(0);
 static ALARM_EVERY: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
 struct Table {
     handler: [Handler; 65],
     mask: [u64; 65],
@@ -58,6 +59,24 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     blocked: 0,
     pending: 0,
 });
+
+/// The signal state a `vfork` child must not change for its parent: saved when `vfork` is called, put back when the child ends
+/// (the signals that arrived meanwhile stay pending).
+static VFORK_SAVED: Mutex<Option<Table>> = Mutex::new(None);
+
+pub fn vfork_save() {
+    let now = *TABLE.lock();
+    *VFORK_SAVED.lock() = Some(now);
+}
+
+pub fn vfork_restore() {
+    if let Some(saved) = VFORK_SAVED.lock().take() {
+        let mut t = TABLE.lock();
+        let pending = t.pending;
+        *t = saved;
+        t.pending |= pending;
+    }
+}
 
 fn bit(sig: c_int) -> u64 {
     1u64 << (sig - 1)

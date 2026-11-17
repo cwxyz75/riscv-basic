@@ -484,6 +484,7 @@ def main():
     step(b"busybox seq 3 | busybox xargs busybox echo got\n", [b"$ busybox seq 3 | busybox xargs busybox echo got", b"got 1 2 3"], "xargs runs a program on its input")
     step(b"busybox seq 3 | busybox xargs -n 1 busybox echo item\n", [b"$ busybox seq 3 | busybox xargs -n 1 busybox echo item", b"item 1", b"item 2", b"item 3"], "xargs runs it once per item (vfork and wait)")
     step(b"busybox seq 3 | busybox xargs -n 1 echo bare\n", [b"$ busybox seq 3 | busybox xargs -n 1 echo bare", b"bare 1", b"bare 2", b"bare 3"], "xargs runs a separate program (`echo`) by name")
+    step_re(b"busybox printf '\\377\\n' | busybox xargs busybox echo | busybox od -b\n", [b"$ busybox printf '\\377\\n' | busybox xargs busybox echo | busybox od -b", re.compile(rb"0000000 +377 012 *"), b"0000002"], "an argument that is not UTF-8 reaches the program as it is")
     step(b"busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort\n", [b"$ busybox find . -name '*.txt' -exec busybox echo found '{}' ';' | busybox sort", b"found ./hello.txt", b"found ./lines.txt", b"found ./sub/inner.txt"], "find -exec")
     # the shell serves a program's requests while it reads that program's captured output (it used to wait for the library's timeout)
     step(b"cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'\n", [b"$ cap = run { \"out\": \"capture\" } busybox find . -name hello.txt -exec busybox echo found '{}' ';'"], "a captured program that starts a program")
