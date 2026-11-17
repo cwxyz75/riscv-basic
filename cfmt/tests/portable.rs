@@ -1,7 +1,7 @@
 //! `fnmatch`, `getopt` and `strverscmp` (the pure cores in `cfmt::glob` and `cfmt::getopt`) against the host's own libc: generated
 //! patterns, option strings and argument vectors. The host is Apple's libc locally and glibc in CI, so a case that the two disagree
 //! about is left out: equivalence classes and collating symbols in brackets (`[[=a=]]`, `[[.a.]]`), unclosed brackets, GNU option
-//! permutation (`POSIXLY_CORRECT` is set for glibc) and optional arguments (`::`), and, for `strverscmp` (glibc only), digit runs
+//! permutation (the host option string gets a leading `+` on glibc) and optional arguments (`::`), and, for `strverscmp` (glibc only), digit runs
 //! with leading zeros, which glibc orders by a fractional rule this library does not have, a case class under `FNM_CASEFOLD`,
 //! and where `optind` ends up after a missing argument at the end of the vector, and the value of `optarg` after a call that returned no argument (the host leaves the last one in it).
 use cfmt::getopt::GetOpt;
@@ -156,8 +156,8 @@ static GETOPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn getopt_agrees_with_the_host() {
     let _g = GETOPT_LOCK.lock().unwrap();
-    // glibc permutes the arguments unless this is set; POSIX getopt (ours, Apple's) stops at the first non-option
-    std::env::set_var("POSIXLY_CORRECT", "1");
+    // (glibc permutes the arguments unless the option string starts with `+`; POSIX getopt, ours and Apple's, stops at the first
+    // non-option. `POSIXLY_CORRECT` would do it too but it is process-wide and changes how glibc's fnmatch reads `[^...]`.)
     let optstrings = [
         "ab", "abc:", "a:b", ":abc:", ":a:b:", "abcd", "c:d:", ":ab", "xa:",
     ];
@@ -177,7 +177,8 @@ fn getopt_agrees_with_the_host() {
             .map(|a| CString::new(a.clone()).unwrap())
             .collect();
         let ptrs: Vec<*mut c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut c_char).collect();
-        let copt = CString::new(optstring).unwrap();
+        let host_optstring = if cfg!(target_os = "linux") { format!("+{optstring}") } else { optstring.to_string() };
+        let copt = CString::new(host_optstring).unwrap();
         // the host's whole run
         host_getopt_reset();
         let mut theirs = Vec::new();
