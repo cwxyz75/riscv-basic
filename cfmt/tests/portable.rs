@@ -177,7 +177,11 @@ fn getopt_agrees_with_the_host() {
             .map(|a| CString::new(a.clone()).unwrap())
             .collect();
         let ptrs: Vec<*mut c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut c_char).collect();
-        let host_optstring = if cfg!(target_os = "linux") { format!("+{optstring}") } else { optstring.to_string() };
+        let host_optstring = if cfg!(target_os = "linux") {
+            format!("+{optstring}")
+        } else {
+            optstring.to_string()
+        };
         let copt = CString::new(host_optstring).unwrap();
         // the host's whole run
         host_getopt_reset();
