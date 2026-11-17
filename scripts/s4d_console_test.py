@@ -101,7 +101,17 @@ def main():
     # cbreak echoes; Ctrl-C is an event (no byte), not a delivered 0x03
     s.step(b"cbreak\n", [b"cbreak", b"mode: cbreak"], "entering cbreak mode")
     s.step(b"\x03", [b"^C", b"event: interrupt"], "an interrupt event")
-    s.step(b"a\r", [b"a", b"raw: 61", b"size: 80x24", b"mode: 6", b"mode: cooked"], "cbreak echo and bytes")
+    # (the echo of `a` and the stand-in's `raw: 61` race for the line: the echo has no newline of its own, so the two can arrive
+    # as `a` then `raw: 61` or as `araw: 61`; both are the same bytes in the same order, so the lines are joined and compared)
+    s.p.stdin.write(b"a\r")
+    s.p.stdin.flush()
+    got = []
+    while not got or got[-1] != b"mode: cooked":
+        got.append(s.next_line("cbreak echo and bytes"))
+    joined = b"\n".join(got).replace(b"araw: 61", b"a\nraw: 61")
+    want = b"\n".join([b"a", b"raw: 61", b"size: 80x24", b"mode: 6", b"mode: cooked"])
+    if joined != want:
+        fail(s, f"cbreak echo and bytes: expected {want!r}, got {joined!r}")
     # the window size: set it, read it back
     s.step(b"resize\n", [b"resize", b"size: 100x30"], "setting the window size")
     # the host terminal is asked (the probe is on the wire), and its report is an event, never input

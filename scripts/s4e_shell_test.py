@@ -237,7 +237,7 @@ def main():
     s.wait_for_prompt = True
     step(b"echo alive\r", [b"$ echo alive", b"alive"], "the shell after an interrupted loop")
     # the session ends and a fresh one starts: the volume is durable
-    step(b"exit\n", [b"$ exit", b"init: autologin: user", BANNER], "a new session")
+    step(b"exit\n", [b"$ exit", b"sessiond: autologin: user", BANNER], "a new session")
     time.sleep(4)
     step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "the file in the next session")
 
@@ -405,6 +405,12 @@ def main():
     step(b"busybox wc -l lines.txt\n", [b"$ busybox wc -l lines.txt", b"%d lines.txt" % LINES_TXT_LINES], "an applet: wc")
     step(b"busybox head -n 2 lines.txt\n", [b"$ busybox head -n 2 lines.txt"] + LINES_HEAD2, "an applet: head")
     step(b"busybox cat hello.txt\n", [b"$ busybox cat hello.txt", b"hello, world"], "an applet: cat")
+    # patterns are expanded by the shell (T126 item 3)
+    step(b"echo *.txt\n", [b"$ echo *.txt", b"hello.txt lines.txt"], "a pattern in the working directory")
+    step(b"echo s*/in*.txt\n", [b"$ echo s*/in*.txt", b"sub/inner.txt"], "a pattern with a directory component")
+    step(b"busybox wc -l *.txt\n", [b"$ busybox wc -l *.txt", b"        1 hello.txt", b"        3 lines.txt", b"        4 total"], "a pattern given to an applet")
+    step(b"echo /ho*/he*\n", [b"$ echo /ho*/he*", b"/home/hello.txt"], "an absolute pattern")
+    step(b"echo *.nope\n", [b"$ echo *.nope", b"sh: no match for *.nope"], "a pattern that matches nothing")
     step(b"busybox sort -r lines.txt\n", [b"$ busybox sort -r lines.txt", b"two", b"three", b"one"], "an applet: sort")
     step(b"busybox tail -n 1 lines.txt\n", [b"$ busybox tail -n 1 lines.txt", b"three"], "an applet: tail")
     step(b"busybox cut -c1-2 lines.txt\n", [b"$ busybox cut -c1-2 lines.txt", b"on", b"tw", b"th"], "an applet: cut")
@@ -487,11 +493,11 @@ def main():
     step_re(b"ps\n", [b"$ ps", b"PID STATE COMMAND", re.compile(rb"\d+ R ps")], "ps once it is waited for")
 
     # end of input and exit: the shell ends and a fresh session starts
-    step(b"\x04", [b"$ init: autologin: user", BANNER], "Ctrl-D ends the shell; init starts a new one")
+    step(b"\x04", [b"$ sessiond: autologin: user", BANNER], "Ctrl-D ends the shell; init starts a new one")
     step(b"pwd\n", [b"$ pwd", b"/home"], "a fresh session starts in /home")
     step(b"exit\n", [b"$ exit"], "exit")
     line = s.next_line("the autologin log after exit")
-    if line != b"init: autologin: user":
+    if line != b"sessiond: autologin: user":
         fail(s, f"after exit: expected the autologin log line, got {line!r}")
     line = s.next_line("the banner after exit")
     if line != BANNER:  # (the echoed `exit` ended the prompt's line)
