@@ -304,6 +304,41 @@ pub fn kill_pid(pid: c_int, sig: c_int) -> c_int {
     }
 }
 
+/// Ask the shell about the terminal (it answers a program of the foreground job): the answer (`proto::spawn::TERM_*`), or an `errno`
+/// (`ENOTTY` when the program is not the foreground job or is not on a terminal).
+pub fn term_via_shell(what: u16, value: u32) -> Result<u32, c_int> {
+    let ch = SPAWN_CH.load(Ordering::Relaxed);
+    if ch == 0 {
+        return Err(25);
+    }
+    let _x = EXCHANGE.lock();
+    let txid = NEXT_TX.fetch_add(1, Ordering::Relaxed);
+    let req = proto::spawn::encode_term(txid, what, value);
+    if sys::channel_write(ch, req.as_ptr(), req.len(), core::ptr::null(), 0).status != 0 {
+        return Err(25);
+    }
+    let deadline = sys::clock_get() + 30_000;
+    loop {
+        if sys::object_wait(ch, signals::READABLE | signals::PEER_CLOSED, deadline).status != 0 {
+            return Err(110);
+        }
+        let mut buf = [0u8; 16];
+        let mut h = [0u32; 1];
+        let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
+        if r.status != 0 {
+            return Err(5);
+        }
+        for &x in &h[..r.a2] {
+            sys::handle_close(x);
+        }
+        match proto::spawn::decode_reply(&buf[..r.a1]) {
+            Some((id, 0, v)) if id == txid => return Ok(v),
+            Some((id, _, _)) if id == txid => return Err(25),
+            _ => {}
+        }
+    }
+}
+
 /// `argv[0]` as the shell knows commands: a bare name, or `/bin/name`.
 fn command_name(file: &[u8]) -> Option<&[u8]> {
     let n = file.strip_prefix(b"/bin/").unwrap_or(file);

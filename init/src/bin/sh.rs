@@ -443,6 +443,47 @@ impl Os {
     }
 
     /// Register (or clear, with no handles) the foreground job; true when acknowledged.
+    /// `GetMode` and `GetSize`: the console server's answer (its reply carries a value).
+    fn control_query(&mut self, what: Control) -> Option<u32> {
+        self.txid = self.txid.wrapping_add(1);
+        let msg = ctl::encode(self.txid, what);
+        if sys::channel_write(self.ctl, msg.as_ptr(), msg.len(), core::ptr::null(), 0).status != 0 {
+            return None;
+        }
+        let deadline = sys::clock_get() + 2000;
+        loop {
+            let mut rb = [0u8; 16];
+            let r = sys::channel_read(
+                self.ctl,
+                rb.as_mut_ptr(),
+                rb.len(),
+                core::ptr::null_mut(),
+                0,
+            );
+            if r.status == 0 {
+                if let Some((t, st, v)) = ctl::decode_reply_value(&rb[..r.a1]) {
+                    if t == self.txid {
+                        return (st == 0).then_some(v);
+                    }
+                    continue;
+                }
+                match ctl::decode_event(&rb[..r.a1]) {
+                    Some(ctl::Event::Interrupt) => self.interrupt = true,
+                    Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                    _ => {}
+                }
+                continue;
+            }
+            if r.status() != Some(Status::ShouldWait)
+                || sys::object_wait(self.ctl, signals::READABLE | signals::PEER_CLOSED, deadline)
+                    .status
+                    != 0
+            {
+                return None;
+            }
+        }
+    }
+
     fn control(&mut self, what: Control, handles: &[u32]) -> bool {
         self.txid = self.txid.wrapping_add(1);
         let msg = ctl::encode(self.txid, what);
@@ -764,6 +805,34 @@ impl Os {
         };
         let req = match proto::spawn::decode_message(msg) {
             Ok(proto::spawn::Message::Spawn(r)) => r,
+            Ok(proto::spawn::Message::Term { what, value, .. }) => {
+                close_all(hs);
+                // the terminal belongs to the foreground job: a program of its chains may read and set the mode and read the
+                // size; the shell puts the mode back when the job ends
+                let root = self.brokers[i].root;
+                let (st, v) = if !self.interactive || !self.fg_pids.contains(&root) {
+                    (proto::file::status::BAD_REQUEST, 0)
+                } else {
+                    match what {
+                        proto::spawn::TERM_GET_MODE => self
+                            .control_query(Control::GetMode)
+                            .map_or((proto::file::status::UNAVAILABLE, 0), |m| (0, m)),
+                        proto::spawn::TERM_GET_SIZE => self
+                            .control_query(Control::GetSize)
+                            .map_or((proto::file::status::UNAVAILABLE, 0), |m| (0, m)),
+                        proto::spawn::TERM_SET_MODE if value <= u32::from(ctl::mode::ALL) => {
+                            if self.control(Control::SetMode(value as u8), &[]) {
+                                (0, 0)
+                            } else {
+                                (proto::file::status::UNAVAILABLE, 0)
+                            }
+                        }
+                        _ => (proto::file::status::BAD_REQUEST, 0),
+                    }
+                };
+                reply(st, v, None);
+                return true;
+            }
             Ok(proto::spawn::Message::Signal { pid, sig, .. }) => {
                 close_all(hs);
                 // a signal goes to a program of the asker's own chain (itself, what it started, what started it): the

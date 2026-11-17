@@ -1026,19 +1026,6 @@ unsupported! {
     fork() -> c_int = -1;
 }
 
-/// Terminal attributes are not available to programs yet (TIDY-UP T124): a program asking is told it is not on a terminal.
-#[no_mangle]
-pub extern "C" fn tcgetattr(_fd: c_int, _t: *mut c_void) -> c_int {
-    crate::errno::set(25); // ENOTTY
-    -1
-}
-
-#[no_mangle]
-pub extern "C" fn tcsetattr(_fd: c_int, _actions: c_int, _t: *const c_void) -> c_int {
-    crate::errno::set(25);
-    -1
-}
-
 // ---- the user database: the session's own identity (USER, UID, GID, HOME in the environment) ----
 
 #[repr(C)]
@@ -1455,12 +1442,4 @@ pub unsafe extern "C" fn asctime(tm: *const [i32; 9]) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn ctime(t: *const i64) -> *mut c_char {
     asctime(localtime(t))
-}
-
-/// `ioctl`: the terminal calls (`TIOCGWINSZ`, `TCGETS`) are answered with `ENOTTY` for now: a program that asks for the window
-/// size falls back to 80 columns (the terminal's own size is read through `consoled`'s control channel by the shell, TIDY-UP T134).
-#[no_mangle]
-pub extern "C" fn ioctl(_fd: c_int, _request: u64, _arg: u64) -> c_int {
-    crate::errno::set(25);
-    -1
 }

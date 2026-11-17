@@ -16,6 +16,14 @@ pub const OP_SPAWN: u16 = 1;
 /// Send a signal to a program in the asker's chain: `txid:u32, op:u16 (2), reserved:u16 (0), pid:u32, sig:u32`.
 pub const OP_SIGNAL: u16 = 2;
 pub const SIGNAL_BYTES: usize = 16;
+/// The terminal, for a program that is the foreground job: `txid:u32, op:u16 (3), what:u16, value:u32, reserved:u32 (0)`. The reply
+/// is the spawn reply with the answer in its last field. `what`: `TERM_GET_MODE` (the answer is `proto::console::mode` bits),
+/// `TERM_GET_SIZE` (`cols | rows << 16`), `TERM_SET_MODE` (`value` is the mode bits). The shell puts the mode back when the job ends.
+pub const OP_TERM: u16 = 3;
+pub const TERM_BYTES: usize = 16;
+pub const TERM_GET_MODE: u16 = 1;
+pub const TERM_GET_SIZE: u16 = 2;
+pub const TERM_SET_MODE: u16 = 3;
 pub const HEADER: usize = 12;
 /// The handles a request carries: stdin, stdout, stderr.
 pub const HANDLES: usize = 3;
@@ -155,9 +163,30 @@ pub fn encode_signal(txid: u32, pid: u32, sig: u32) -> Vec<u8> {
 pub enum Message<'a> {
     Spawn(Request<'a>),
     Signal { txid: u32, pid: u32, sig: u32 },
+    Term { txid: u32, what: u16, value: u32 },
+}
+
+pub fn encode_term(txid: u32, what: u16, value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&txid.to_le_bytes());
+    out.extend_from_slice(&OP_TERM.to_le_bytes());
+    out.extend_from_slice(&what.to_le_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
 }
 
 pub fn decode_message(b: &[u8]) -> Result<Message<'_>, SpawnError> {
+    if rd_u16(b, 4) == Some(OP_TERM) {
+        if b.len() != TERM_BYTES || rd_u32(b, 12) != Some(0) {
+            return Err(SpawnError::BadLength);
+        }
+        return Ok(Message::Term {
+            txid: rd_u32(b, 0).ok_or(SpawnError::TooShort)?,
+            what: rd_u16(b, 6).ok_or(SpawnError::TooShort)?,
+            value: rd_u32(b, 8).ok_or(SpawnError::TooShort)?,
+        });
+    }
     if rd_u16(b, 4) == Some(OP_SIGNAL) {
         if b.len() != SIGNAL_BYTES || rd_u16(b, 6) != Some(0) {
             return Err(SpawnError::BadLength);
@@ -245,6 +274,21 @@ mod tests {
         let mut longer = m.clone();
         longer.push(0);
         assert!(decode_message(&longer).is_err());
+        let t = encode_term(6, TERM_SET_MODE, 5);
+        assert_eq!(
+            decode_message(&t),
+            Ok(Message::Term {
+                txid: 6,
+                what: TERM_SET_MODE,
+                value: 5
+            })
+        );
+        for cut in 0..t.len() {
+            assert!(decode_message(&t[..cut]).is_err(), "cut {cut}");
+        }
+        let mut dirty = t.clone();
+        dirty[12] = 1;
+        assert!(decode_message(&dirty).is_err());
         let sp = encode(1, b"x", &[b"x"], &[]).unwrap();
         assert!(matches!(decode_message(&sp), Ok(Message::Spawn(_))));
     }

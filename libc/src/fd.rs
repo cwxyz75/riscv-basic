@@ -759,6 +759,23 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
     }
 }
 
+/// Is `fd` the terminal this program was started on (its own startup stream)?
+pub fn is_tty(fd: c_int) -> bool {
+    let owned = matches!(
+        FDS.lock()
+            .fds
+            .get(usize::try_from(fd).unwrap_or(usize::MAX))
+            .and_then(Option::as_ref),
+        Some(Entry::Stream(_, false))
+    );
+    owned
+        && match fd {
+            0 => TTY_IN.load(Ordering::Relaxed) != 0,
+            1 | 2 => TTY_OUT.load(Ordering::Relaxed) != 0,
+            _ => false,
+        }
+}
+
 #[no_mangle]
 pub extern "C" fn isatty(fd: c_int) -> c_int {
     let tty = match fd {
@@ -1213,6 +1230,28 @@ unsafe fn read_stream(fd: c_int, h: u32, buf: *mut u8, n: usize) -> isize {
         Vec::new()
     };
     if data.is_empty() {
+        // a terminal in non-canonical mode with VMIN = 0: the read gives up after VTIME tenths of a second (at once for 0)
+        if tty
+            && crate::term::TERM_RAWISH.load(Ordering::Relaxed) != 0
+            && crate::term::TERM_VMIN.load(Ordering::Relaxed) == 0
+        {
+            let wait = u64::from(crate::term::TERM_VTIME.load(Ordering::Relaxed)) * 100;
+            match crate::sig::wait_any(
+                &[(
+                    h,
+                    rt::abi::signals::READABLE | rt::abi::signals::PEER_CLOSED,
+                )],
+                rt::sys::clock_get() + wait,
+                true,
+            ) {
+                crate::sig::Wait::Timeout => return 0,
+                crate::sig::Wait::Interrupted => {
+                    errno::set(4);
+                    return -1;
+                }
+                crate::sig::Wait::Ready(_) => {}
+            }
+        }
         let mut tmp = alloc::vec![0u8; n.min(CHUNK)];
         match crate::sig::stream_read(h, &mut tmp) {
             Err(e) if e == 4 => {

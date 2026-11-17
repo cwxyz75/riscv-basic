@@ -356,6 +356,16 @@ def main():
     step(b"echo after\n", [b"$ echo after", b"after"], "one prompt after the kill (no extra prompt)")
     step(b"\x03", [b"$ ^C"], "Ctrl-C at an idle prompt")
     step(b"echo idle\n", [b"$ echo idle", b"idle"], "the shell after an idle Ctrl-C")
+    # the terminal for a program (T124): modes, the size, and a read that returns on one key (the shell asks the console server)
+    step(b"ctest signals tty\n", [b"$ ctest signals tty", b"isatty 1", b"mode: canon=1 echo=1 isig=1", b"size 80x24", b"mode: raw, press a key".replace(b"mode: ", b"")], "tcgetattr, TIOCGWINSZ and tcsetattr from a program")
+    s.wait_for_prompt = False
+    step(b"x", [b"got x", b"mode now: canon=0 echo=0", b"timeout read 0"], "a key reaches the program without Enter or an echo; VMIN 0 and VTIME time out")
+    s.wait_for_prompt = True
+    step(b"echo cooked again\n", [b"$ echo cooked again", b"cooked again"], "the terminal is cooked again when the program ends")
+    # only the foreground job owns the terminal: a background program is refused (the program prints nothing and exits 1)
+    step(b'bgt = spawn { "out": "discard" } ctest signals tty\n', [b'$ bgt = spawn { "out": "discard" } ctest signals tty'], "a background program that asks for the terminal")
+    step(b"rbg = wait $bgt\n", [b"$ rbg = wait $bgt"], "wait for it")
+    step(b"print $rbg.status\n", [b"$ print $rbg.status", b"1"], "it was refused (tcgetattr failed)")
     # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
     step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
     s.wait_for_prompt = False
