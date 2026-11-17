@@ -309,6 +309,11 @@ def main():
     s.p.stdin.flush()
     free_lines = [s.next_line("free") for _ in range(3)]
     print("memory before the hog:", free_lines[1:], flush=True)
+    s.prompt()
+    s.p.stdin.write(b"cat /proc/meminfo\n")
+    s.p.stdin.flush()
+    mem_lines = [s.next_line("meminfo") for _ in range(4)]
+    print("meminfo before the hog:", mem_lines[1:], flush=True)
     counts = []
     for attempt in (1, 2):
         step(b"hog\n", [b"$ hog"], f"a memory hog, run {attempt}")
