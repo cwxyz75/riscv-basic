@@ -2,6 +2,7 @@
 #define _OS_STDIO_H
 #include <stddef.h>
 #include <stdarg.h>
+#include <sys/types.h>
 typedef struct FILE FILE;
 extern FILE *stdin, *stdout, *stderr;
 #define EOF (-1)
@@ -54,4 +55,21 @@ char *tmpnam(char *buf);
 int remove(const char *path);
 int rename(const char *from, const char *to);
 void perror(const char *msg);
+int getc_unlocked(FILE *f);
+int getchar_unlocked(void);
+int putc_unlocked(int c, FILE *f);
+int putchar_unlocked(int c);
+int fputs_unlocked(const char *s, FILE *f);
+int ferror_unlocked(FILE *f);
+int fileno_unlocked(FILE *f);
+int sscanf(const char *s, const char *fmt, ...);
+int vasprintf(char **out, const char *fmt, va_list ap);
+int dprintf(int fd, const char *fmt, ...);
+ssize_t getline(char **line, size_t *n, FILE *f);
+int fseeko(FILE *f, off_t off, int whence);
+FILE *fdopen(int fd, const char *mode);
+FILE *popen(const char *cmd, const char *mode);
+int pclose(FILE *f);
+char *fgets_unlocked(char *s, int n, FILE *f);
+int feof_unlocked(FILE *f);
 #endif

@@ -478,6 +478,7 @@ dependencies = [
  "cfmt",
  "libm",
  "pathres",
+ "pregex",
  "proto",
  "rt",
  "sockshim",
@@ -517,6 +518,10 @@ checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
 ]
+
+[[package]]
+name = "pregex"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

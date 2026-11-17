@@ -29,4 +29,13 @@ void abort(void) __attribute__((noreturn));
 int atexit(void (*f)(void));
 char *getenv(const char *name);
 int system(const char *cmd);
+#define alloca(n) __builtin_alloca(n)
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+int putenv(char *s);
+int mkstemp(char *tmpl);
+char *mkdtemp(char *tmpl);
+char *mktemp(char *tmpl);
+char *realpath(const char *path, char *resolved);
+int clearenv(void);
 #endif

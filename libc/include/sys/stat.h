@@ -1,5 +1,6 @@
 #ifndef _OS_SYS_STAT_H
 #define _OS_SYS_STAT_H
+#include <sys/types.h>
 #include <time.h>
 #include <stdint.h>
 /* The mode, owner and group are advisory attributes (or defaults); nothing enforces them. st_nlink is always 1; st_dev and
@@ -15,7 +16,7 @@ struct stat {
     long long st_size;
     long long st_blksize;
     long long st_blocks;
-    struct { long long tv_sec; long long tv_nsec; } st_atim, st_mtim, st_ctim;
+    struct timespec st_atim, st_mtim, st_ctim;
 };
 #define st_atime st_atim.tv_sec
 #define st_mtime st_mtim.tv_sec
@@ -23,6 +24,7 @@ struct stat {
 #define S_IFMT 0170000
 #define S_IFDIR 0040000
 #define S_IFCHR 0020000
+#define S_IFBLK 0060000
 #define S_IFIFO 0010000
 #define S_IFREG 0100000
 #define S_IFLNK 0120000
@@ -55,4 +57,9 @@ int mkdir(const char *path, unsigned mode);
 int chmod(const char *path, unsigned mode);
 int fchmod(int fd, unsigned mode);
 unsigned umask(unsigned mask);
+#define S_ISBLK(m) (((m) & S_IFMT) == S_IFBLK)
+int mkfifo(const char *path, mode_t mode);
+int mknod(const char *path, mode_t mode, dev_t dev);
+int futimens(int fd, const struct timespec times[2]);
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
 #endif

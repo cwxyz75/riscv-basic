@@ -23,4 +23,17 @@ size_t strcspn(const char *s, const char *reject);
 char *strpbrk(const char *s, const char *set);
 char *strdup(const char *s);
 char *strerror(int e);
+char *strchrnul(const char *s, int c);
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, size_t n);
+char *strcasestr(const char *h, const char *n);
+void *mempcpy(void *d, const void *s, size_t n);
+char *stpcpy(char *d, const char *s);
+char *stpncpy(char *d, const char *s, size_t n);
+char *strndup(const char *s, size_t n);
+char *strsep(char **s, const char *delim);
+char *strtok(char *s, const char *delim);
+char *strtok_r(char *s, const char *delim, char **save);
+char *strsignal(int sig);
+int strverscmp(const char *a, const char *b);
 #endif

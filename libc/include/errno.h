@@ -49,4 +49,15 @@ int *__errno_location(void);
 #define EINPROGRESS 115
 #define EWOULDBLOCK EAGAIN
 #define ENOSYS 38
+#define ECHILD 10
+#define ESRCH 3
+#define E2BIG 7
+#define ENOEXEC 8
+#define ENODEV 19
+#define ENXIO 6
+#define EFAULT 14
+#define EXDEV 18
+#define ELOOP 40
+#define ENOSYS 38
+#define ENOTSUP EOPNOTSUPP
 #endif

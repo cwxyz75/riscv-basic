@@ -1,0 +1,5 @@
+[package]
+name = "pregex"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: POSIX regular expressions (basic and extended, with the common GNU extensions) for the libc's regcomp and regexec (UV8). Pure, no_std + alloc, host-tested against the host's grep."

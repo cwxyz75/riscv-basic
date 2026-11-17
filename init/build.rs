@@ -143,6 +143,59 @@ fn build_lua(dir: &str) -> Option<PathBuf> {
     )
 }
 
+/// BusyBox 1.36.1 (UV8): the sources fetched by `make fetch-third-party` (not committed), built for the configuration in
+/// `third_party/busybox/config` from the file list and generated headers committed next to it (`scripts/busybox_configure.sh`
+/// makes them). Without the fetched sources, or without a RISC-V C compiler, `busybox` is a stub that exits 99.
+fn build_busybox(dir: &str) -> Option<PathBuf> {
+    let root = Path::new(dir).join("../third_party");
+    let src = root.join("fetched/busybox/src");
+    if !src.join("libbb/appletlib.c").exists() {
+        return None;
+    }
+    let list = std::fs::read_to_string(root.join("busybox/files.txt")).ok()?;
+    let files: Vec<PathBuf> = list
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| src.join(l))
+        .collect();
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("busybox/files.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("busybox/gen").display()
+    );
+    // objects of different directories can share a file name (`md5_sha1_sum`, `ls`): build_c_archive names objects by stem
+    let _ = &files;
+    build_c_archive(
+        "busybox",
+        &files,
+        &[
+            "-w".to_string(),
+            "-Os".to_string(),
+            "-std=gnu99".to_string(),
+            "-funsigned-char".to_string(),
+            "-ffunction-sections".to_string(),
+            "-fdata-sections".to_string(),
+            "-fno-builtin-strlen".to_string(),
+            "-D_GNU_SOURCE".to_string(),
+            "-DNDEBUG".to_string(),
+            // clang puts an uninitialised `const` object in .rodata (gcc in .bss); BusyBox writes `ptr_to_globals` once at start
+            "-DBB_GLOBAL_CONST=".to_string(),
+            "-DBB_VER=\"1.36.1\"".to_string(),
+            "-DBB_BT=\"os\"".to_string(),
+            "-DKBUILD_STR(s)=#s".to_string(),
+            "-DKBUILD_BASENAME=KBUILD_STR(bb)".to_string(),
+            "-DKBUILD_MODNAME=KBUILD_STR(bb)".to_string(),
+            format!("-I{}", root.join("busybox/gen").display()),
+            format!("-I{}", src.join("include").display()),
+            format!("-I{}", src.join("libbb").display()),
+            format!("-include{}", root.join("busybox/gen/autoconf.h").display()),
+        ],
+    )
+}
+
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     println!("cargo:rustc-link-arg=-T{dir}/link.ld");
@@ -156,12 +209,18 @@ fn main() {
     println!("cargo:rerun-if-changed=../libc/include");
     println!("cargo:rustc-check-cfg=cfg(have_c)");
     println!("cargo:rustc-check-cfg=cfg(have_lua)");
+    println!("cargo:rustc-check-cfg=cfg(have_busybox)");
     if let Some(archive) = build_c_tests(&dir) {
         println!("cargo:rustc-cfg=have_c");
         println!("cargo:rustc-link-arg-bin=ctest={}", archive.display());
         if let Some(lua) = build_lua(&dir) {
             println!("cargo:rustc-cfg=have_lua");
             println!("cargo:rustc-link-arg-bin=lua={}", lua.display());
+        }
+        if let Some(bb) = build_busybox(&dir) {
+            println!("cargo:rustc-cfg=have_busybox");
+            println!("cargo:rustc-link-arg-bin=busybox={}", bb.display());
+            println!("cargo:rustc-link-arg-bin=busybox=--error-limit=0");
         }
     } else {
         println!(

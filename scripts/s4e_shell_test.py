@@ -70,7 +70,9 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
+LINES_TXT_LINES = 3  # bootfs/home/lines.txt: one, two, three
+LINES_HEAD2 = [b"one", b"two"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -393,6 +395,46 @@ def main():
     step(b"r = wait $k\n", [b"$ r = wait $k"], "the killed job's result")
     step(b"print $r.status\n", [b"$ print $r.status", b"-1"], "the killed job's status")
     step(b"echo done\n", [b"$ echo done", b"done"], "the shell after the jobs")
+
+    # BusyBox applets (UV8): the real upstream programs, the subset in third_party/busybox/config
+    cpus = os.environ.get("OS_SMP", "1").encode()
+    step(b"busybox echo hello from busybox\n", [b"$ busybox echo hello from busybox", b"hello from busybox"], "an applet: echo")
+    step(b"busybox seq 3\n", [b"$ busybox seq 3", b"1", b"2", b"3"], "an applet: seq")
+    step(b"busybox basename /a/b/c.txt .txt\n", [b"$ busybox basename /a/b/c.txt .txt", b"c"], "an applet: basename")
+    step(b"busybox dirname /a/b/c.txt\n", [b"$ busybox dirname /a/b/c.txt", b"/a/b"], "an applet: dirname")
+    step(b"busybox wc -l lines.txt\n", [b"$ busybox wc -l lines.txt", b"%d lines.txt" % LINES_TXT_LINES], "an applet: wc")
+    step(b"busybox head -n 2 lines.txt\n", [b"$ busybox head -n 2 lines.txt"] + LINES_HEAD2, "an applet: head")
+    step(b"busybox cat hello.txt\n", [b"$ busybox cat hello.txt", b"hello, world"], "an applet: cat")
+    step(b"busybox sort -r lines.txt\n", [b"$ busybox sort -r lines.txt", b"two", b"three", b"one"], "an applet: sort")
+    step(b"busybox tail -n 1 lines.txt\n", [b"$ busybox tail -n 1 lines.txt", b"three"], "an applet: tail")
+    step(b"busybox cut -c1-2 lines.txt\n", [b"$ busybox cut -c1-2 lines.txt", b"on", b"tw", b"th"], "an applet: cut")
+    step(b"cat hello.txt | busybox tr a-z A-Z\n", [b"$ cat hello.txt | busybox tr a-z A-Z", b"HELLO, WORLD"], "an applet reading a pipe: tr")
+    step(b"cat lines.txt | busybox uniq | busybox wc -l\n", [b"$ cat lines.txt | busybox uniq | busybox wc -l", b"3"], "two applets in a pipeline: uniq, wc")
+    # (the digests are computed here, by Python, from the same file: an independent oracle)
+    import hashlib
+    hello = open(os.path.join(os.path.dirname(__file__), "..", "bootfs", "home", "hello.txt"), "rb").read()
+    step(b"busybox md5sum hello.txt\n", [b"$ busybox md5sum hello.txt", hashlib.md5(hello).hexdigest().encode() + b"  hello.txt"], "an applet: md5sum")
+    step(b"busybox sha256sum hello.txt\n", [b"$ busybox sha256sum hello.txt", hashlib.sha256(hello).hexdigest().encode() + b"  hello.txt"], "an applet: sha256sum")
+    # regular expressions (the pregex crate behind regcomp): grep, sed, awk, expr
+    step(b"busybox grep -n t lines.txt\n", [b"$ busybox grep -n t lines.txt", b"2:two", b"3:three"], "an applet: grep")
+    step(b"busybox grep -c o lines.txt\n", [b"$ busybox grep -c o lines.txt", b"2"], "grep -c")
+    step(b"busybox grep -E '^(one|three)$' lines.txt\n", [b"$ busybox grep -E '^(one|three)$' lines.txt", b"one", b"three"], "grep -E")
+    step(b"busybox sed s/o/0/ lines.txt\n", [b"$ busybox sed s/o/0/ lines.txt", b"0ne", b"tw0", b"three"], "an applet: sed")
+    step(b"busybox sed -n '/^t/p' lines.txt\n", [b"$ busybox sed -n '/^t/p' lines.txt", b"two", b"three"], "sed -n with an address")
+    step(b"busybox awk '{ print NR \": \" $1 }' lines.txt\n", [b"$ busybox awk '{ print NR \": \" $1 }' lines.txt", b"1: one", b"2: two", b"3: three"], "an applet: awk")
+    step(b"busybox expr 2 + 3\n", [b"$ busybox expr 2 + 3", b"5"], "an applet: expr")
+    step(b"busybox expr foo : 'f\\(o*\\)'\n", [b"$ busybox expr foo : 'f\\(o*\\)'", b"oo"], "expr with a regular expression")
+    step(b"busybox uname -s\n", [b"$ busybox uname -s", b"riscv-os"], "an applet: uname")
+    step(b"busybox find . -name '*.txt' | busybox sort\n", [b"$ busybox find . -name '*.txt' | busybox sort", b"./hello.txt", b"./lines.txt", b"./sub/inner.txt"], "an applet: find (fnmatch and directories)")
+    step(b"busybox ls -1\n", [b"$ busybox ls -1", b"hello.txt", b"lines.txt", b"sub"], "an applet: ls (sorted)")
+    step(b"busybox ls -r | busybox cat\n", [b"$ busybox ls -r | busybox cat", b"sub", b"lines.txt", b"hello.txt"], "ls -r")
+    step(b"busybox nproc\n", [b"$ busybox nproc", cpus], "an applet: nproc (reads /proc/cpuinfo)")
+    step(b"busybox test -f hello.txt\n", [b"$ busybox test -f hello.txt"], "test: a file")
+    step(b"busybox test -d hello.txt\n", [b"$ busybox test -d hello.txt", b"[exit 1]"], "test: not a directory")
+    import base64
+    step(b"busybox base64 hello.txt\n", [b"$ busybox base64 hello.txt", base64.b64encode(hello).strip()], "an applet: base64")
+    step(b"busybox sha1sum hello.txt\n", [b"$ busybox sha1sum hello.txt", hashlib.sha1(hello).hexdigest().encode() + b"  hello.txt"], "an applet: sha1sum")
+    step(b"busybox nosuchapplet\n", [b"$ busybox nosuchapplet", b"nosuchapplet: applet not found", b"[exit 127]"], "an unknown applet")
 
     # /proc (UV6): each file read by a real program (`ps`, `free`, `nproc`, `cat`); only this session's programs are listed
     cpus = os.environ.get("OS_SMP", "1").encode()

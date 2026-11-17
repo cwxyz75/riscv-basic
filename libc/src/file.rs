@@ -291,6 +291,16 @@ pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut
     adopt(n, fl)
 }
 
+/// `fdopen`: a stream on an open descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut File {
+    let Some((_, fl)) = parse_mode(mode) else {
+        errno::set(22);
+        return core::ptr::null_mut();
+    };
+    adopt(fd, fl)
+}
+
 /// Wrap an open fd in a new heap `FILE` (closing the fd if that fails).
 fn adopt(n: c_int, fl: u32) -> *mut File {
     let p = crate::stdlib::malloc(core::mem::size_of::<File>()) as *mut File;
