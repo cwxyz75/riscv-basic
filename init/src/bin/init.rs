@@ -143,6 +143,10 @@ pub fn app_main() -> i32 {
                     // test aid for UV5: sessions of two profiles side by side, each on a terminal socket
                     return sessions_test(serial, image_vmo, &img, &entries);
                 }
+                if line.as_slice() == b"detach" {
+                    // test aid for UV7: a terminal backend that closes and a new one that attaches
+                    return detach_test(serial, image_vmo, &img, &entries);
+                }
                 if line.as_slice() == b"quit" {
                     let _ = io::write_all(serial, b"bye\r\n");
                     return 0;
@@ -915,6 +919,9 @@ fn load_profiles(img: &[u8], entries: &[proto::bootimg::Entry]) -> Vec<Loaded> {
 #[derive(Clone, Copy)]
 enum Term {
     Serial(u32),
+    /// A byte socket a backend provider holds the other end of (UV7): the console server serves it, treats its closing as a
+    /// detach and takes a new one on the stack's `term` channel.
+    Backend(u32),
     Socket(u32),
 }
 
@@ -931,6 +938,8 @@ struct Stack {
     halt: Option<u32>,
     /// A connection to the service registry, to ask the volumes to commit before the session ends.
     registry: Option<rt::fs::Fs>,
+    /// Init's end of the console server's attach channel (a `Term::Backend` session): `proto::console::term`.
+    term: Option<u32>,
 }
 
 fn kill_close(h: u32) {
@@ -1100,8 +1109,9 @@ fn start_stack(
     })();
     // the console server: the serial line, the terminal socket, the control channel (a session with a terminal socket of its
     // own has none: its shell reads a script from the socket)
+    let mut term_init: Option<u32> = None;
     let (consoled, tty_sh, ctl_sh) = match term {
-        Term::Serial(serial) => {
+        Term::Serial(serial) | Term::Backend(serial) => {
             let tty = sys::socket_create();
             if tty.status != 0 {
                 return Err(36);
@@ -1112,18 +1122,25 @@ fn start_stack(
             if serial_dup.status != 0 {
                 return Err(37);
             }
-            let consoled = start(
-                b"consoled",
-                alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
-                &[serial_dup.a1 as u32, tty_console, ctl_console],
-            )?;
+            let mut roles =
+                alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)];
+            let mut hs = alloc::vec![serial_dup.a1 as u32, tty_console, ctl_console];
+            let mut env = Vec::new();
+            if matches!(term, Term::Backend(_)) {
+                let (mine, theirs) = chan()?;
+                term_init = Some(mine);
+                roles.push((Role::ServiceTerm, 3));
+                hs.push(theirs);
+                env.push(b"DETACHABLE=1".to_vec());
+            }
+            let consoled = start_env(b"consoled", roles, &hs, env)?;
             (Some(consoled), tty_sh, Some(ctl_sh))
         }
         Term::Socket(h) => (None, h, None),
     };
     // the volumes (FS-SPEC 5d, 5e): the device manager, the registry, the clock and the volume manager, best effort: a machine
     // with no disk, or a service that does not start, leaves the session without volumes and nothing else changed
-    let with_volumes = matches!(term, Term::Serial(_));
+    let with_volumes = matches!(term, Term::Serial(_) | Term::Backend(_));
     let volumes = (|| -> Option<(rt::fs::Fs, rt::fs::Fs)> {
         if !with_volumes {
             return None;
@@ -1245,6 +1262,7 @@ fn start_stack(
         sh,
         halt: halt_init,
         registry,
+        term: term_init,
     })
 }
 
@@ -1634,4 +1652,166 @@ fn choose_profile(
             }
         }
     }
+}
+
+/// Read from a socket until `needle` has arrived (everything read so far is returned), or `ms` have passed.
+fn read_until(sock: u32, needle: &[u8], ms: u64) -> Option<Vec<u8>> {
+    use rt::abi::signals;
+    use rt::sys;
+    let deadline = sys::clock_get() + ms;
+    let mut got: Vec<u8> = Vec::new();
+    loop {
+        if got.windows(needle.len()).any(|w| w == needle) {
+            return Some(got);
+        }
+        let mut buf = [0u8; 256];
+        let r = sys::socket_read(sock, buf.as_mut_ptr(), buf.len());
+        match r.status() {
+            Some(rt::abi::status::Status::Ok) if r.a1 > 0 => got.extend_from_slice(&buf[..r.a1]),
+            Some(rt::abi::status::Status::ShouldWait) => {
+                if sys::clock_get() >= deadline {
+                    return None;
+                }
+                sys::object_wait(sock, signals::READABLE | signals::PEER_CLOSED, deadline);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// UV7 acceptance, driven from `init` as a terminal backend provider: a session whose terminal is served by `consoled` over a
+/// byte socket we hold. A long job runs; the backend closes (a detach: the job and the session carry on); a new backend
+/// attaches and is shown what the terminal last displayed, and can use it (Ctrl-C reaches the job); then a hangup ends it.
+fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+    use rt::abi::rights::Rights;
+    use rt::abi::signals;
+    use rt::sys;
+    let say = |s: &str| {
+        let _ = io::write_all(serial, alloc::format!("detach| {s}\r\n").as_bytes());
+    };
+    let profiles = load_profiles(img, entries);
+    let Some(who) = profiles.iter().find(|l| l.profile.name == "alice") else {
+        return 20;
+    };
+    let pair = || -> Option<(u32, u32)> {
+        let s = sys::socket_create();
+        (s.status == 0).then_some((s.a1 as u32, s.a2 as u32))
+    };
+    let Some((mut mine, theirs)) = pair() else {
+        return 21;
+    };
+    let Ok(stack) = start_stack(Term::Backend(theirs), image_vmo, img, entries, who) else {
+        say("the session could not start");
+        return 22;
+    };
+    sys::handle_close(theirs);
+    let Some(term) = stack.term else {
+        return 23;
+    };
+    let job = sys::handle_duplicate(stack.session, Rights::SAME.0).a1 as u32;
+    let mut txid = 0u32;
+    let mut call = |op: u16, handle: Option<u32>| -> bool {
+        txid += 1;
+        let msg = proto::console::term::encode(txid, op);
+        let hs: &[u32] = match &handle {
+            Some(h) => core::slice::from_ref(h),
+            None => &[],
+        };
+        if sys::channel_write(term, msg.as_ptr(), msg.len(), hs.as_ptr(), hs.len()).status != 0 {
+            return false;
+        }
+        if sys::object_wait(term, signals::READABLE, sys::clock_get() + 3000).status != 0 {
+            return false;
+        }
+        let mut b = [0u8; 16];
+        let r = sys::channel_read(term, b.as_mut_ptr(), b.len(), core::ptr::null_mut(), 0);
+        r.status == 0 && proto::console::decode_reply(&b[..r.a1]) == Some((txid, 0))
+    };
+    let ended = |h: u32| sys::object_wait(h, signals::TERMINATED, 0).status == 0;
+
+    // 1. a backend is attached: the shell's prompt, then a long job that prints once
+    if read_until(mine, b"$ ", 8000).is_none() {
+        say("no prompt");
+        return 24;
+    }
+    let _ = io::write_all(mine, b"spin\r");
+    if read_until(mine, b"spinning", 8000).is_none() {
+        say("the job did not start");
+        return 25;
+    }
+    say("attached: a prompt, and a job running");
+    let before = sys::job_info(job, 0).a1;
+
+    // 2. the backend closes: a detach, not a hangup
+    sys::handle_close(mine);
+    io::nap(700);
+    say(&alloc::format!(
+        "backend closed: the shell {}, the console server {}, the job {}",
+        if ended(stack.sh) { "ended" } else { "runs" },
+        if stack.consoled.is_some_and(ended) {
+            "ended"
+        } else {
+            "runs"
+        },
+        if sys::job_info(job, 0).a1 >= before {
+            "runs"
+        } else {
+            "lost processes"
+        }
+    ));
+
+    // 3. a new backend attaches: it is shown what the terminal last displayed, and it works
+    let Some((m2, t2)) = pair() else {
+        return 26;
+    };
+    mine = m2;
+    if !call(proto::console::term::OP_ATTACH, Some(t2)) {
+        say("the attach was refused");
+        return 27;
+    }
+    if read_until(mine, b"spinning", 5000).is_some() {
+        say("reattached: the screen state is shown again");
+    } else {
+        say("reattached: nothing was shown");
+    }
+    let _ = io::write_all(mine, b"\x03");
+    if read_until(mine, b"[exit -130]", 8000).is_some() {
+        say("the new backend's Ctrl-C reached the job");
+    } else {
+        say("the new backend's Ctrl-C did not reach the job");
+    }
+    let _ = io::write_all(mine, b"echo alive\r");
+    if read_until(mine, b"alive\r\n", 5000).is_some() {
+        say("the shell answers the new backend");
+    } else {
+        say("the shell does not answer");
+    }
+
+    // 4. a hangup ends it, job and all
+    let _ = io::write_all(mine, b"spin\r");
+    let _ = read_until(mine, b"spinning", 5000);
+    let hung = call(proto::console::term::OP_HANGUP, None);
+    let w = sys::object_wait(stack.sh, signals::TERMINATED, sys::clock_get() + 5000);
+    say(&alloc::format!(
+        "hangup: {}, the shell {}",
+        if hung {
+            "acknowledged"
+        } else {
+            "not acknowledged"
+        },
+        if w.status == 0 { "ended" } else { "still runs" }
+    ));
+    sys::handle_close(mine);
+    stop_stack(stack);
+    let mut left = sys::job_info(job, 0).a1;
+    for _ in 0..100 {
+        if left == 0 {
+            break;
+        }
+        io::nap(20);
+        left = sys::job_info(job, 0).a1;
+    }
+    say(&alloc::format!("job processes after the hangup: {left}"));
+    sys::handle_close(job);
+    0
 }

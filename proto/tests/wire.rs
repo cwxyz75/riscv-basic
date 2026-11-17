@@ -82,10 +82,10 @@ fn startup_rejects_every_kind_of_malformation() {
     let mut c = good.clone();
     c[8] = 9;
     assert!(d(&c, 3).is_err());
-    // unknown role (40) and duplicate role (both Stdin)
+    // unknown role (41) and duplicate role (both Stdin)
     let mut r = good.clone();
     let n = r.len();
-    r[n - 8] = 40;
+    r[n - 8] = 41;
     assert_eq!(d(&r, 3), Err(StartupError::UnknownRole));
     let mut r = good.clone();
     r[n - 8] = 1;
@@ -1016,4 +1016,20 @@ fn stat_payload_goldens_and_the_advisory_attribute_helper() {
         "the sentinel itself is not a value"
     );
     assert_eq!(file::ATTR_POSIX_MODE, b"posix.mode");
+}
+
+#[test]
+fn terminal_provider_requests_round_trip_and_reject_junk() {
+    use proto::console::term::{decode, encode, OP_ATTACH, OP_DETACH, OP_HANGUP};
+    for (op, handles) in [(OP_ATTACH, 1), (OP_DETACH, 0), (OP_HANGUP, 0)] {
+        assert_eq!(decode(&encode(7, op), handles), Some((7, op)));
+        // the wrong number of handles is refused: an attach without a socket, a hangup that smuggles one in
+        assert_eq!(decode(&encode(7, op), 1 - handles), None);
+        assert_eq!(decode(&encode(7, op), 2), None);
+    }
+    assert_eq!(decode(&encode(7, 9), 0), None);
+    assert_eq!(decode(&[0; 7], 0), None);
+    let mut junk = encode(7, OP_DETACH);
+    junk[6] = 1;
+    assert_eq!(decode(&junk, 0), None);
 }

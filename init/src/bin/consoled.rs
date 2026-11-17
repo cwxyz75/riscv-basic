@@ -41,10 +41,18 @@ const K_SERIAL_W: u64 = 2;
 const K_TTY: u64 = 3;
 const K_TTY_W: u64 = 4;
 const K_CTL: u64 = 5;
+const K_TERM: u64 = 6;
+/// What the terminal remembers of its recent output, to show a backend that attaches later.
+const SCROLL_CAP: usize = 8 * 1024;
 
 struct Console {
     port: u32,
-    serial: u32,
+    /// The backend's socket: the serial line, or what a provider attached. `None` while detached.
+    serial: Option<u32>,
+    /// A backend that closes is a detach, not the end (UV7): the terminal keeps its job and its recent output.
+    detachable: bool,
+    term_ch: Option<u32>,
+    scroll: Vec<u8>,
     tty_sock: u32,
     ctl_ch: Option<u32>,
     tty: Tty,
@@ -84,27 +92,42 @@ impl Console {
         }
     }
 
-    /// Push queued output to the serial socket. Returns false when the serial line is gone.
+    /// Remember output for a backend that attaches later (the newest `SCROLL_CAP` bytes).
+    fn remember(&mut self, bytes: &[u8]) {
+        self.scroll.extend_from_slice(bytes);
+        if self.scroll.len() > SCROLL_CAP {
+            let cut = self.scroll.len() - SCROLL_CAP;
+            self.scroll.drain(..cut);
+        }
+    }
+
+    /// Push queued output to the backend. Returns false when the backend is gone and cannot be detached.
     fn pump_serial(&mut self) -> bool {
+        let Some(serial) = self.serial else {
+            // detached: the output is kept for whoever attaches next, and the job runs on
+            while self.tty.has_output() {
+                let out = self.tty.take_out(512);
+                self.remember(&out);
+            }
+            return true;
+        };
         loop {
             if self.serial_buf.is_empty() {
                 if !self.tty.has_output() {
                     break;
                 }
                 self.serial_buf = self.tty.take_out(512);
+                let copy = self.serial_buf.clone();
+                self.remember(&copy);
             }
-            let r = sys::socket_write(self.serial, self.serial_buf.as_ptr(), self.serial_buf.len());
+            let r = sys::socket_write(serial, self.serial_buf.as_ptr(), self.serial_buf.len());
             match r.status() {
                 Some(Status::Ok) => {
                     self.serial_buf.drain(..r.a1);
                 }
                 Some(Status::ShouldWait) => {
                     if !self.serial_w_bound {
-                        self.bind(
-                            K_SERIAL_W,
-                            self.serial,
-                            signals::WRITABLE | signals::PEER_CLOSED,
-                        );
+                        self.bind(K_SERIAL_W, serial, signals::WRITABLE | signals::PEER_CLOSED);
                         self.serial_w_bound = true;
                     }
                     return true;
@@ -118,7 +141,14 @@ impl Console {
                     }
                     return true;
                 }
-                _ => return false, // PEER_CLOSED or worse
+                _ => {
+                    // PEER_CLOSED or worse
+                    if self.detachable {
+                        self.detach();
+                        return true;
+                    }
+                    return false;
+                }
             }
         }
         if self.serial_w_bound {
@@ -126,6 +156,27 @@ impl Console {
             self.serial_w_bound = false;
         }
         true
+    }
+
+    /// Let go of the backend; the terminal, its job and its recent output stay.
+    fn detach(&mut self) {
+        if let Some(s) = self.serial.take() {
+            self.unbind(K_SERIAL);
+            if self.serial_w_bound {
+                self.unbind(K_SERIAL_W);
+                self.serial_w_bound = false;
+            }
+            sys::handle_close(s);
+        }
+        self.serial_buf.clear();
+    }
+
+    /// A new backend: the old one is closed, the new one is shown what the terminal last displayed.
+    fn attach(&mut self, socket: u32) {
+        self.detach();
+        self.serial = Some(socket);
+        self.bind(K_SERIAL, socket, signals::READABLE | signals::PEER_CLOSED);
+        self.serial_buf = self.scroll.clone();
     }
 
     /// Push waiting lines to the client. Returns false when the client is gone.
@@ -167,7 +218,10 @@ impl Console {
 
     fn on_serial(&mut self) -> bool {
         let mut buf = [0u8; 256];
-        let r = sys::socket_read(self.serial, buf.as_mut_ptr(), buf.len());
+        let Some(serial) = self.serial else {
+            return true;
+        };
+        let r = sys::socket_read(serial, buf.as_mut_ptr(), buf.len());
         match r.status() {
             Some(Status::Ok) => {
                 let input = self.tty.serial_in(&buf[..r.a1]);
@@ -180,6 +234,11 @@ impl Console {
                 true
             }
             Some(Status::ShouldWait) => true,
+            _ if self.detachable => {
+                // the backend closed: a detach, not a hangup (UV7)
+                self.detach();
+                true
+            }
             _ => {
                 // the serial line is gone (PEER_CLOSED) or broken: the owner is told before the session ends
                 self.event(ctl::Event::Hangup);
@@ -306,6 +365,60 @@ impl Console {
         }
     }
 
+    /// The backend provider's channel (UV7). Returns false when the terminal ends (a hangup).
+    fn on_term(&mut self) -> bool {
+        let Some(ch) = self.term_ch else {
+            return true;
+        };
+        let mut bytes = [0u8; 16];
+        let mut handles = [0u32; 2];
+        let r = sys::channel_read(
+            ch,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            handles.as_mut_ptr(),
+            handles.len(),
+        );
+        match r.status() {
+            Some(Status::Ok) => {}
+            Some(Status::ShouldWait) => return true,
+            _ => {
+                // the provider is gone: with no backend and no one to attach one the terminal carries on
+                self.unbind(K_TERM);
+                sys::handle_close(ch);
+                self.term_ch = None;
+                return true;
+            }
+        }
+        let (nb, nh) = (r.a1, r.a2);
+        match proto::console::term::decode(&bytes[..nb], nh) {
+            Some((txid, proto::console::term::OP_ATTACH)) => {
+                self.attach(handles[0]);
+                self.reply(ch, txid, 0);
+                true
+            }
+            Some((txid, proto::console::term::OP_DETACH)) => {
+                self.detach();
+                self.reply(ch, txid, 0);
+                true
+            }
+            Some((txid, _hangup)) => {
+                self.reply(ch, txid, 0);
+                self.event(ctl::Event::Hangup);
+                self.kill_jobs();
+                false
+            }
+            None => {
+                for &h in &handles[..nh] {
+                    sys::handle_close(h);
+                }
+                let txid = proto::file::peek_txid(&bytes[..nb]).unwrap_or(0);
+                self.reply(ch, txid, proto::file::status::BAD_REQUEST);
+                true
+            }
+        }
+    }
+
     fn drop_ctl(&mut self) {
         if let Some(ch) = self.ctl_ch.take() {
             self.unbind(K_CTL);
@@ -318,6 +431,9 @@ impl Console {
 
     /// Best effort at the end of the session: let the serial line take what is queued.
     fn flush_at_end(&mut self) {
+        let Some(serial) = self.serial else {
+            return;
+        };
         let deadline = sys::clock_get() + 1000;
         while sys::clock_get() < deadline {
             if !self.pump_serial() {
@@ -326,7 +442,7 @@ impl Console {
             if self.serial_buf.is_empty() && !self.tty.has_output() {
                 return;
             }
-            sys::object_wait(self.serial, signals::WRITABLE, sys::clock_get() + 20);
+            sys::object_wait(serial, signals::WRITABLE, sys::clock_get() + 20);
         }
     }
 }
@@ -351,7 +467,10 @@ pub fn app_main() -> i32 {
     }
     let mut c = Console {
         port: p.a1 as u32,
-        serial,
+        serial: Some(serial),
+        detachable: env.var(b"DETACHABLE") == Some(b"1"),
+        term_ch: env.handle(Role::ServiceTerm),
+        scroll: Vec::new(),
         tty_sock,
         ctl_ch: Some(ctl_ch),
         tty: Tty::new(OUT_CAP),
@@ -367,6 +486,9 @@ pub fn app_main() -> i32 {
     c.bind(K_SERIAL, serial, signals::READABLE | signals::PEER_CLOSED);
     c.bind(K_TTY, tty_sock, signals::READABLE | signals::PEER_CLOSED);
     c.bind(K_CTL, ctl_ch, signals::READABLE | signals::PEER_CLOSED);
+    if let Some(t) = c.term_ch {
+        c.bind(K_TERM, t, signals::READABLE | signals::PEER_CLOSED);
+    }
     loop {
         let mut deadline = if c.retry {
             sys::clock_get() + 10
@@ -383,11 +505,18 @@ pub fn app_main() -> i32 {
                 match key {
                     K_SERIAL => c.on_serial(),
                     K_TTY => c.on_tty(),
+                    K_TERM => c.on_term(),
                     K_CTL => {
                         if observed & signals::READABLE != 0 {
                             c.on_ctl();
                         } else {
                             c.drop_ctl();
+                        }
+                        true
+                    }
+                    K_SERIAL_W if c.detachable => {
+                        if observed & signals::PEER_CLOSED != 0 {
+                            c.detach();
                         }
                         true
                     }
