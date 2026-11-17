@@ -23,7 +23,7 @@ import threading
 import time
 
 TIMEOUT = float(os.environ.get("S4_TIMEOUT", "90"))
-BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/launcher bin/memfsd bin/consoled bin/spin bin/echo bin/cat bin/ls bin/probe bin/sh bin/hog bin/bomb bin/ipchog bin/blkd bin/devmgr bin/basic bin/ctest bin/lua bin/registryd bin/netsup bin/netdrv bin/netd bin/dhcpc bin/ping bin/udpecho bin/netinfo bin/rngd bin/fetch bin/httpd bin/fsd bin/clockd bin/volmgr bin/devd etc/mounts etc/trusted "
+BANNER = (b"riscv-os S4a init ready; image: bin/init bin/crash bin/hello bin/launcher bin/memfsd bin/consoled bin/spin bin/echo bin/cat bin/ls bin/probe bin/sh bin/hog bin/bomb bin/ipchog bin/blkd bin/devmgr bin/basic bin/ctest bin/lua bin/registryd bin/netsup bin/netdrv bin/netd bin/dhcpc bin/ping bin/udpecho bin/netinfo bin/rngd bin/fetch bin/httpd bin/fsd bin/clockd bin/volmgr bin/devd bin/authd etc/boot etc/mounts etc/trusted "
           b"home/hello.txt home/lines.txt home/sub/inner.txt")
 
 
@@ -129,7 +129,7 @@ def main():
     s.step(b"run hello after-errors\n", [b"args=hello after-errors", b"[exit 2]"], "the launcher still works")
     # S4c: the filesystem server, through init's `ls`, `cat` and `write` test commands
     s.step(b"ls .\n", [b"bin/", b"dev/", b"etc/", b"home/", b"include/", b"lib/", b"mnt/", b"share/", b"svc/", b"tmp/", b"usr/"], "the top level")
-    s.step(b"ls bin\n", [b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"], "the programs")
+    s.step(b"ls bin\n", [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"], "the programs")
     s.step(b"ls home\n", [b"hello.txt", b"lines.txt", b"sub/"], "the home directory")
     s.step(b"cat home/hello.txt\n", [b"hello, world"], "a fixture")
     s.step(b"cat home/sub/inner.txt\n", [b"inner"], "a nested fixture")

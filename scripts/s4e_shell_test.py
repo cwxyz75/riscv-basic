@@ -70,7 +70,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"ping", b"probe", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -235,7 +235,7 @@ def main():
     s.wait_for_prompt = True
     step(b"echo alive\r", [b"$ echo alive", b"alive"], "the shell after an interrupted loop")
     # the session ends and a fresh one starts: the volume is durable
-    step(b"exit\n", [b"$ exit", BANNER], "a new session")
+    step(b"exit\n", [b"$ exit", b"init: autologin: user", BANNER], "a new session")
     time.sleep(4)
     step(b"cat /mnt/store/kept\n", [b"$ cat /mnt/store/kept", b"kept across sessions"], "the file in the next session")
 
@@ -395,9 +395,12 @@ def main():
     step(b"echo done\n", [b"$ echo done", b"done"], "the shell after the jobs")
 
     # end of input and exit: the shell ends and a fresh session starts
-    step(b"\x04", [b"$ " + BANNER], "Ctrl-D ends the shell; init starts a new one")
+    step(b"\x04", [b"$ init: autologin: user", BANNER], "Ctrl-D ends the shell; init starts a new one")
     step(b"pwd\n", [b"$ pwd", b"/home"], "a fresh session starts in /home")
     step(b"exit\n", [b"$ exit"], "exit")
+    line = s.next_line("the autologin log after exit")
+    if line != b"init: autologin: user":
+        fail(s, f"after exit: expected the autologin log line, got {line!r}")
     line = s.next_line("the banner after exit")
     if line != BANNER:  # (the echoed `exit` ended the prompt's line)
         fail(s, f"after exit: expected a new banner, got {line!r}")

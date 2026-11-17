@@ -1,0 +1,2 @@
+# the boot manifest (UV5a): a development image enables autologin; a real one does not
+autologin=on

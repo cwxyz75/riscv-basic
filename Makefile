@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -278,6 +278,7 @@ os-serial-test: os-interactive
 	python3 scripts/s4d_console_test.py $(OS_REPL_ELF)
 	python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF)
 	python3 scripts/uv5_sessions_test.py $(OS_REPL_ELF)
+	$(MAKE) os-auth-test
 	@# the harness must be able to fail: a wrong expectation has to be reported
 	@if S4_TIMEOUT=15 python3 scripts/s4a_serial_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the serial test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4d_console_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the console test passed a broken expectation"; exit 1; fi
@@ -330,3 +331,13 @@ check: smoke
 
 # Everything: smoke, then soak.
 check-all: smoke soak
+
+# UV5a: `authd` and the login policy, on three boot images (tests/uv5a overlays): no profile at all, and seed credentials.
+OS_AUTH_EMPTY_ELF := target/os-auth-empty/$(KERNEL_TARGET)/debug/kernel
+OS_AUTH_SEED_ELF := target/os-auth-seed/$(KERNEL_TARGET)/debug/kernel
+
+os-auth-test: os-user
+	cd kernel && OS_BOOTFS_OVERLAY=$(CURDIR)/tests/uv5a/empty cargo build --features interactive --target-dir ../target/os-auth-empty
+	cd kernel && OS_BOOTFS_OVERLAY=$(CURDIR)/tests/uv5a/seed cargo build --features interactive --target-dir ../target/os-auth-seed
+	python3 scripts/uv5a_auth_test.py $(OS_AUTH_EMPTY_ELF) $(OS_AUTH_SEED_ELF)
+	@if S4_TIMEOUT=15 python3 scripts/uv5a_auth_test.py $(OS_AUTH_EMPTY_ELF) $(OS_AUTH_SEED_ELF) --break-expectation >/dev/null 2>&1; then echo "the auth test passed a broken expectation"; exit 1; fi

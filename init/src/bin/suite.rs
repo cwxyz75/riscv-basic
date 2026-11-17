@@ -4819,6 +4819,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
     ensure_eq!(
         progs,
         vec![
+            b"authd".to_vec(),
             b"basic".to_vec(),
             b"blkd".to_vec(),
             b"bomb".to_vec(),

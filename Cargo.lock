@@ -259,6 +259,7 @@ version = "0.1.0"
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "basic",
  "basic-script",
  "clockmodel",
