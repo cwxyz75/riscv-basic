@@ -149,6 +149,11 @@ fn build_lua(dir: &str) -> Option<PathBuf> {
 fn build_busybox(dir: &str) -> Option<PathBuf> {
     let root = Path::new(dir).join("../third_party");
     let src = root.join("fetched/busybox/src");
+    // (so that fetching the sources later turns the stub into the program)
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("libbb/appletlib.c").display()
+    );
     if !src.join("libbb/appletlib.c").exists() {
         return None;
     }

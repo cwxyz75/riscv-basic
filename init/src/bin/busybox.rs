@@ -13,5 +13,7 @@ pub fn app_main() -> i32 {
 #[cfg(not(have_busybox))]
 #[no_mangle]
 pub fn app_main() -> i32 {
+    // (a reference to `rt` keeps its runtime and panic handler linked into the stub)
+    let _ = rt::sys::clock_get();
     99
 }
