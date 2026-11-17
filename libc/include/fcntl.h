@@ -19,4 +19,17 @@
 int fcntl(int fd, int cmd, ...);
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);
+#define F_DUPFD 0
+#define F_DUPFD_CLOEXEC 1030
+#define O_NOCTTY 0400
+#define O_NOFOLLOW 0400000
+#define O_SYNC 04010000
+#define F_GETLK 5
+#define F_SETLK 6
+#define F_SETLKW 7
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR 0x200
+#define AT_SYMLINK_FOLLOW 0x400
+#define UTIME_NOW ((1l << 30) - 1l)
+#define UTIME_OMIT ((1l << 30) - 2l)
 #endif

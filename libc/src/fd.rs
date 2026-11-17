@@ -90,6 +90,52 @@ pub fn install_socket(s: crate::socket::SockRef) -> Option<c_int> {
     Some(slot as c_int)
 }
 
+/// `dup` for a standard stream: the lowest free descriptor (3 and up) becomes a duplicate.
+pub fn dup_lowest(from: c_int) -> c_int {
+    let slot = {
+        let t = FDS.lock();
+        (3..MAX_FDS).find(|&i| t.fds[i].is_none())
+    };
+    match slot {
+        Some(s) => dup_stream(from, s as c_int),
+        None => {
+            errno::set(24);
+            -1
+        }
+    }
+}
+
+/// `dup2` for a standard stream: `to` becomes a duplicate of the stream's handle (what was there is closed). `ENOSYS` for any
+/// other kind of descriptor, `EBADF` for one that is not open.
+pub fn dup_stream(from: c_int, to: c_int) -> c_int {
+    if to < 0 || to as usize >= MAX_FDS {
+        errno::set(9);
+        return -1;
+    }
+    let mut t = FDS.lock();
+    let h = match t.fds.get(from as usize).and_then(Option::as_ref) {
+        Some(Entry::Stream(h)) => *h,
+        Some(_) => {
+            errno::set(38);
+            return -1;
+        }
+        None => {
+            errno::set(9);
+            return -1;
+        }
+    };
+    let d = rt::sys::handle_duplicate(h, rt::abi::rights::Rights::SAME.0);
+    if d.status != 0 {
+        errno::set(24);
+        return -1;
+    }
+    if let Some(Entry::Stream(old)) = t.fds[to as usize].take() {
+        rt::sys::handle_close(old);
+    }
+    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32));
+    to
+}
+
 /// The socket behind `fd`: `Ok(None)` for a descriptor that is not a socket, `Err(())` for one that is not open.
 pub fn socket_of(fd: c_int) -> Result<Option<crate::socket::SockRef>, ()> {
     let t = FDS.lock();
@@ -445,6 +491,43 @@ pub extern "C" fn lseek(fd: c_int, off: c_long, whence: c_int) -> c_long {
             errno::set(22);
             -1
         }
+    }
+}
+
+/// `ftruncate`: set the size of an open file (the server grows with zeros or cuts).
+#[no_mangle]
+pub extern "C" fn ftruncate(fd: c_int, len: c_long) -> c_int {
+    let mut t = FDS.lock();
+    let Some(Entry::File(f)) = t.fds.get_mut(fd as usize).and_then(Option::as_mut) else {
+        errno::set(22);
+        return -1;
+    };
+    if !f.writable || len < 0 {
+        errno::set(22);
+        return -1;
+    }
+    match f.fs.set_size(len as u64) {
+        Ok(()) => 0,
+        Err(e) => fail(e),
+    }
+}
+
+/// The entries of a directory, read whole when it is opened: `(name, is_dir, is_link)`. `Err` is an errno.
+pub fn dir_entries(path: &[u8]) -> Result<Vec<(Vec<u8>, bool, bool)>, c_int> {
+    let _guard = FDS.lock();
+    match open_path(path, pf::DIRECTORY, rights::READ | rights::ENUMERATE) {
+        Ok((mut fs, _)) => {
+            let r = fs.read_dir();
+            fs.close();
+            match r {
+                Ok(v) => Ok(v
+                    .into_iter()
+                    .map(|e| (e.name, e.is_dir, e.is_link))
+                    .collect()),
+                Err(e) => Err(errno_of(e)),
+            }
+        }
+        Err(e) => Err(errno_of(e)),
     }
 }
 

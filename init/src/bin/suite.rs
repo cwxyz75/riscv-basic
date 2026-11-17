@@ -4823,6 +4823,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"basic".to_vec(),
             b"blkd".to_vec(),
             b"bomb".to_vec(),
+            b"busybox".to_vec(),
             b"cat".to_vec(),
             b"clockd".to_vec(),
             b"consoled".to_vec(),

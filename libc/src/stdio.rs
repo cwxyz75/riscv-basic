@@ -53,6 +53,8 @@ variadic!("printf", "vprintf", "1", "24");
 variadic!("fprintf", "vfprintf", "2", "32");
 variadic!("sprintf", "vsprintf", "2", "32");
 variadic!("snprintf", "vsnprintf", "3", "40");
+variadic!("dprintf", "vdprintf", "2", "32");
+variadic!("sscanf", "vsscanf", "2", "32");
 
 /// The arguments of a `va_list`: 8-byte slots.
 struct Va(*const u64);

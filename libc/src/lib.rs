@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+mod compat;
 mod ctype;
 mod errno;
 mod fd;
