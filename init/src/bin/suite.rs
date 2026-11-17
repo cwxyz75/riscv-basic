@@ -4855,6 +4855,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"ps".to_vec(),
             b"registryd".to_vec(),
             b"rngd".to_vec(),
+            b"sessiond".to_vec(),
             b"sh".to_vec(),
             b"spin".to_vec(),
             b"udpecho".to_vec(),
