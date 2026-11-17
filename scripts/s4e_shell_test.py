@@ -314,6 +314,17 @@ def main():
     s.p.stdin.flush()
     mem_lines = [s.next_line("meminfo") for _ in range(4)]
     print("meminfo before the hog:", mem_lines[1:], flush=True)
+    # (and what is in the image: CI's was bigger than this machine's, so the services held more)
+    s.prompt()
+    s.p.stdin.write(b"ls -l /bin | busybox sort -k2 -n -r | busybox head -n 6\n")
+    s.p.stdin.flush()
+    s.next_line("ls -l /bin")
+    print("image: largest programs:", [s.next_line("the largest") for _ in range(6)], flush=True)
+    s.prompt()
+    s.p.stdin.write(b"ls -l /bin | busybox awk '{ s += $2 } END { print s }'\n")
+    s.p.stdin.flush()
+    s.next_line("ls -l /bin")
+    print("image: bytes in /bin:", s.next_line("the total"), flush=True)
     counts = []
     for attempt in (1, 2):
         step(b"hog\n", [b"$ hog"], f"a memory hog, run {attempt}")
