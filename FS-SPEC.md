@@ -26,8 +26,9 @@ persisted free map, an intent log, live queries, multithreaded `fsd`, writable s
 | F3 | **No hard links** in v1; every node has exactly one directory entry (symlinks stay: relative-only, never followed by the server, resolved by the client against the connection they were found through; OD17 as amended, `OS-ARCHITECTURE.md` section 12) | 2026-11-15 |
 | F4 | **Durability**: `fsync`/`sync` is a full commit; data is always written copy-on-write; rename-over is atomic. A btrfs-style tree log may come later | 2026-11-15 |
 | F5 | **Who pays**: persistent quota domains on directory subtrees for disk space; the block cache is charged to `fsd`'s own job with a cap until pager-backed VMOs (Q4) allow per-client charging | 2026-11-15 |
+| F6 | **Names are UTF-8**: valid UTF-8, no NUL, no `/`, no control characters (C0, DEL, C1), not empty, not `.` or `..`, at most 255 bytes; compared byte for byte and case-sensitively, with no normalisation; the same rule for symlink targets and attribute names (attribute *values* stay typed). One validator in `proto::file`, shared by `memfs` and doofs | 2026-11-17 |
 
-F3, F4 and F5 are provisional: they are recorded in `TIDY-UP.md` as T94, T93 and T95 to be reconsidered, and before the
+F6 is firm for v1 but its gaps (normalisation, look-alikes, bidirectional controls) are T141. F3, F4 and F5 are provisional: they are recorded in `TIDY-UP.md` as T94, T93 and T95 to be reconsidered, and before the
 format is frozen we decide whether it reserves room for each (a log-root field, a link count behind the parent id).
 
 ## 3. Format (proposal)
@@ -42,6 +43,10 @@ format is frozen we decide whether it reserves room for each (a log-root field, 
   entry, attribute (name; typed value, inline up to about 1 KiB), extent (offset, length, per-block checksums; used by files and
   by large attributes), symlink text, index definition, index entry `(index id, value, object id)` with an empty payload, quota
   counter, orphan record (unlinked but open; reaped at mount).
+* **Names (F6):** a directory-entry name, a symlink target component and an attribute name are valid UTF-8 without NUL, `/` or
+  control characters, so a name is always printable text and safe in line-based output. The key compares the bytes as stored.
+  The server refuses a bad name with `BadName` on create, rename and attribute set; a name already on a volume that breaks the
+  rule is a finding for `fsck` (test images made before step 0b may contain such names and are regenerated).
 * **Data:** up to about 1 KiB inline, otherwise extents (capped near 1 MiB). Always written to fresh blocks.
 * **Allocation:** the free map is **in memory and rebuilt at mount** by walking the tree (reachability is the truth). Moving
   cursor; metadata and data from separate regions. A reserve guarantees that delete and commit succeed on a full volume.
@@ -143,6 +148,11 @@ The kernel clock is monotonic (OD91) and stays so: **wall time is a service, not
 
 0. **Model first:** attributes, indexes and queries in `memfs` and `proto::file`, with golden tests (this is S10's first
    bullet, moved ahead; it fixes the semantics both implementations must share; symlink and no-hard-link rules, T104, with it).
+0b. **Names (F6):** tighten `proto::file::valid_name` to the UTF-8 rule, with hand-derived goldens for the accepted and
+   refused names (overlongs, surrogates, a stray continuation byte, NUL, `/`, DEL, a C1 control, `.`, `..`, 255 versus 256
+   bytes, a name with a combining accent next to the precomposed one, which must be two different names), and fix the fallout in
+   `memfs`, `doofs`, `rt::fs`, the libc (`EILSEQ`) and the tests. Step 0, steps 1 to 4 and `fsd` are already built on the
+   old rule, so this is a behaviour change with its own small PR, before the independent review of the slice.
 C1. **Wall clock** (slice C): `clockmodel`, the RTC claim in `devmgr`, `clockd`, `/svc/clock`, the fixed-base boot test.
    Independent of the filesystem: can run alongside steps 1 to 4.
 1. The B+tree in `fsfmt` with a random walk against a `BTreeMap` model; mutation-checked; no filesystem yet.
@@ -245,6 +255,10 @@ support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are n
     a duplicate uuid are each refused without a panic, a hang or a leak (leak checks exact).
 13. **Clock:** with a fixed QEMU base, `Now` is within a stated tolerance of it and never goes backwards for one client across a
     re-read; with no RTC attached the quality is `Unset`; files written through `fsd` carry the clock's time.
+14. **Names:** every refused name of step 0b is refused identically by `memfs` and doofs (the differential, check 3, generates
+    bad names), by create, rename, symlink and attribute set; the precomposed and combining forms of one letter coexist as two
+    names and both list and look up; `fsck.doofs` reports a name with invalid UTF-8 or a control character put into an image
+    by hand; no name is ever echoed to the terminal or the serial log without passing the existing line escaping.
 
 ## 12. Limits (proposal; expressed per volume, not as bare constants, T79)
 
