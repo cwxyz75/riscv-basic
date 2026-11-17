@@ -70,7 +70,7 @@ class Session(base.Session):
         return super().step(send, want, what)
 
 BANNER = b"riscv-os S4 ready"
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sh", b"spin", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`

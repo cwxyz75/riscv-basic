@@ -59,6 +59,7 @@ fn main() {
         "volmgr",
         "devd",
         "authd",
+        "sessiond",
         "procd",
         "ps",
         "free",
