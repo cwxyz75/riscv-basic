@@ -17,7 +17,7 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
    the signal table) with their own tests.
 4. [~] **Small signal and spawn leftovers** (done: `poll`/`select` interruptible, the signal table saved around `vfork`, bytes through the shell's start path; left: a profile field to turn the spawn grant off)  (T136/T137): `poll`/`select` interruptible; save and restore the signal table around
    `vfork`; bytes (not lossy UTF-8) through the shell's start path; a profile field to turn the spawn grant off.
-5. [~] **(corrected: BusyBox `hush`, not `ash`: ash refuses to build without `fork`) `/bin/sh` is a port, not `ish` (SHELL-SPEC lines 23 and 465, SH7): a spike with BusyBox `ash` in its no-MMU mode** (not dash:
+5. [x] (done as a spike: hush runs scripts, files redirect, `system()`/`popen()` work, 25 scripts checked against the host sh; left in T139: here-documents, a `/bin/sh` name, interactive mode, a `configure` corpus) **(corrected: BusyBox `hush`, not `ash`: ash refuses to build without `fork`) `/bin/sh` is a port, not `ish` (SHELL-SPEC lines 23 and 465, SH7): a spike with BusyBox `ash` in its no-MMU mode** (not dash:
    dash needs a real `fork`). Needs `pipe()`, `dup2` and `fcntl` beyond fds 0 to 2, job control off. Acceptance (SH7): five real
    `configure` scripts run; dash's results are the second oracle on a shared corpus. Do the spawn rate first.
 6. [ ] **Ctrl-C as SIGINT** (T47): the shell sends SIGINT to a program that has a handler for it and keeps the kill otherwise

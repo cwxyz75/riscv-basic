@@ -1021,8 +1021,6 @@ unsupported! {
     statvfs(a: *const c_char, b: *mut c_void) -> c_int = -1;
     fstatvfs(a: c_int, b: *mut c_void) -> c_int = -1;
     utimes(a: *const c_char, b: *const c_void) -> c_int = -1;
-    popen(a: *const c_char, b: *const c_char) -> *mut c_void = core::ptr::null_mut();
-    pclose(a: *mut c_void) -> c_int = -1;
     setsid() -> c_int = -1;
     getsid(a: c_int) -> c_int = -1;
     fork() -> c_int = -1;

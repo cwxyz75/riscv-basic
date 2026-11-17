@@ -667,3 +667,101 @@ pub unsafe extern "C" fn wait(status: *mut c_int) -> c_int {
 pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     kill_pid(pid, sig)
 }
+
+// ---- system and popen: the command goes to the compat shell (BusyBox `hush`, TIDY-UP T139) ----
+
+/// Start `busybox hush -c cmd` with the standard streams from `fds`.
+unsafe fn start_shell(cmd: *const c_char, fds: [c_int; 3]) -> Result<(u32, c_int), c_int> {
+    let line = CStr::from_ptr(cmd).to_bytes().to_vec();
+    let argv: Vec<Vec<u8>> =
+        alloc::vec![b"busybox".to_vec(), b"hush".to_vec(), b"-c".to_vec(), line];
+    start(b"busybox", &argv, &current_env(), fds)
+}
+
+/// `system`: run the command with `hush` and wait; a null command asks whether there is a shell (there is, if this program may
+/// start programs).
+#[no_mangle]
+pub unsafe extern "C" fn system(cmd: *const c_char) -> c_int {
+    if cmd.is_null() {
+        return c_int::from(SPAWN_CH.load(Ordering::Relaxed) != 0);
+    }
+    match start_shell(cmd, [0, 1, 2]) {
+        Ok((h, pid)) => {
+            register(pid, h, None);
+            let mut status = 0;
+            if waitpid(pid, &mut status, 0) < 0 {
+                return -1;
+            }
+            status
+        }
+        Err(e) => {
+            errno::set(e);
+            -1
+        }
+    }
+}
+
+/// The pipes `popen` made: the stream and the shell's pid, for `pclose`.
+static POPEN: Mutex<Vec<(usize, c_int)>> = Mutex::new(Vec::new());
+
+#[no_mangle]
+pub unsafe extern "C" fn popen(cmd: *const c_char, mode: *const c_char) -> *mut c_void {
+    let read = match CStr::from_ptr(mode).to_bytes().first() {
+        Some(b'r') => true,
+        Some(b'w') => false,
+        _ => {
+            errno::set(22);
+            return core::ptr::null_mut();
+        }
+    };
+    let mut fds = [0 as c_int; 2];
+    if crate::fd::pipe(fds.as_mut_ptr()) != 0 {
+        return core::ptr::null_mut();
+    }
+    // reading: the shell writes into the pipe (its stdout); writing: it reads from it (its stdin)
+    let (mine, theirs) = if read {
+        (fds[0], fds[1])
+    } else {
+        (fds[1], fds[0])
+    };
+    let map = if read { [0, theirs, 2] } else { [theirs, 1, 2] };
+    let started = start_shell(cmd, map);
+    crate::fd::close(theirs);
+    match started {
+        Ok((h, pid)) => {
+            register(pid, h, None);
+            let f = crate::file::fdopen(mine, mode);
+            if f.is_null() {
+                crate::fd::close(mine);
+                return core::ptr::null_mut();
+            }
+            POPEN.lock().push((f as usize, pid));
+            f as *mut c_void
+        }
+        Err(e) => {
+            crate::fd::close(mine);
+            errno::set(e);
+            core::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pclose(f: *mut c_void) -> c_int {
+    let pid = {
+        let mut g = POPEN.lock();
+        match g.iter().position(|&(p, _)| p == f as usize) {
+            Some(i) => g.remove(i).1,
+            None => {
+                errno::set(22);
+                return -1;
+            }
+        }
+    };
+    crate::file::fclose(f as *mut crate::file::File);
+    let mut status = 0;
+    if waitpid(pid, &mut status, 0) < 0 {
+        return -1;
+    }
+    status
+}
