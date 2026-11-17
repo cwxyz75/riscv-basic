@@ -35,8 +35,9 @@ pub struct OpenFile {
 }
 
 enum Entry {
-    /// A standard stream: the handle of a socket.
-    Stream(u32),
+    /// A stream: the handle of a socket, and whether this table owns it (a `pipe` end or a `dup`: closed with the descriptor;
+    /// the startup message's own streams are not).
+    Stream(u32, bool),
     File(OpenFile),
     /// A socket (S9 step 6): shared, so a blocking call does not hold the descriptor table.
     Socket(crate::socket::SockRef),
@@ -77,7 +78,7 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
     let mut t = FDS.lock();
     for (i, h) in [stdin, stdout, stderr].into_iter().enumerate() {
         if h != 0 {
-            t.fds[i] = Some(Entry::Stream(h));
+            t.fds[i] = Some(Entry::Stream(h, false));
         }
     }
 }
@@ -85,7 +86,7 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32) {
 /// The handle of a standard stream (descriptors 0-2 and what `dup` made of them), if `fd` is one.
 pub fn stream_handle(fd: c_int) -> Option<u32> {
     match FDS.lock().fds.get(usize::try_from(fd).ok()?)?.as_ref()? {
-        Entry::Stream(h) => Some(*h),
+        Entry::Stream(h, _) => Some(*h),
         _ => None,
     }
 }
@@ -93,7 +94,7 @@ pub fn stream_handle(fd: c_int) -> Option<u32> {
 /// Put a socket in the lowest free descriptor slot (3 and up).
 pub fn install_socket(s: crate::socket::SockRef) -> Option<c_int> {
     let mut t = FDS.lock();
-    let slot = (3..MAX_FDS).find(|&i| t.fds[i].is_none())?;
+    let slot = (0..MAX_FDS).find(|&i| t.fds[i].is_none())?;
     t.fds[slot] = Some(Entry::Socket(s));
     Some(slot as c_int)
 }
@@ -102,7 +103,7 @@ pub fn install_socket(s: crate::socket::SockRef) -> Option<c_int> {
 pub fn dup_lowest(from: c_int) -> c_int {
     let slot = {
         let t = FDS.lock();
-        (3..MAX_FDS).find(|&i| t.fds[i].is_none())
+        (0..MAX_FDS).find(|&i| t.fds[i].is_none())
     };
     match slot {
         Some(s) => dup_stream(from, s as c_int),
@@ -122,7 +123,7 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
     }
     let mut t = FDS.lock();
     let h = match t.fds.get(from as usize).and_then(Option::as_ref) {
-        Some(Entry::Stream(h)) => *h,
+        Some(Entry::Stream(h, _)) => *h,
         Some(_) => {
             errno::set(38);
             return -1;
@@ -137,10 +138,10 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
         errno::set(24);
         return -1;
     }
-    if let Some(Entry::Stream(old)) = t.fds[to as usize].take() {
+    if let Some(Entry::Stream(old, true)) = t.fds[to as usize].take() {
         rt::sys::handle_close(old);
     }
-    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32));
+    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32, true));
     to
 }
 
@@ -248,7 +249,7 @@ fn open_bytes(path: &[u8], flags: c_int) -> c_int {
         r |= rights::ENUMERATE;
     }
     let mut t = FDS.lock();
-    let Some(slot) = (3..MAX_FDS).find(|&i| t.fds[i].is_none()) else {
+    let Some(slot) = (0..MAX_FDS).find(|&i| t.fds[i].is_none()) else {
         errno::set(24); // EMFILE
         return -1;
     };
@@ -354,7 +355,12 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             f.fs.close();
             0
         }
-        Some(Entry::Stream(_)) => 0, // the handle belongs to the startup message
+        Some(Entry::Stream(h, owned)) => {
+            if owned {
+                rt::sys::handle_close(h); // (a pipe end, or a duplicate; the startup message's own streams stay open)
+            }
+            0
+        }
         Some(Entry::Socket(s)) => {
             drop(t);
             crate::socket::sock_close(s);
@@ -378,7 +384,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
         return 0;
     }
     match entry {
-        Entry::Stream(h) => {
+        Entry::Stream(h, _) => {
             let h = *h;
             drop(t); // a blocking read must not hold the table
             read_stream(fd, h, buf as *mut u8, n)
@@ -419,7 +425,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, n: usize) -> isize
         return -1;
     };
     match entry {
-        Entry::Stream(h) => {
+        Entry::Stream(h, _) => {
             let h = *h;
             drop(t);
             match crate::sig::stream_write(h, data) {
@@ -540,9 +546,82 @@ pub fn dir_entries(path: &[u8]) -> Result<Vec<(Vec<u8>, bool, bool)>, c_int> {
     }
 }
 
-/// `fcntl`: the descriptor flags a socket supports (`O_NONBLOCK`); other descriptors answer the harmless defaults.
+/// `pipe`: a connected pair of stream sockets; `fds[0]` is the end to read and `fds[1]` the end to write (the kernel's sockets are
+/// two-way, so a pipe is one used one way).
+#[no_mangle]
+pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
+    let c = rt::sys::socket_create();
+    if c.status != 0 {
+        errno::set(24);
+        return -1;
+    }
+    let (a, b) = (c.a1 as u32, c.a2 as u32);
+    let mut t = FDS.lock();
+    let mut free = (0..MAX_FDS).filter(|&i| t.fds[i].is_none());
+    let (Some(r), Some(w)) = (free.next(), free.next()) else {
+        drop(t);
+        rt::sys::handle_close(a);
+        rt::sys::handle_close(b);
+        errno::set(24);
+        return -1;
+    };
+    t.fds[r] = Some(Entry::Stream(a, true));
+    t.fds[w] = Some(Entry::Stream(b, true));
+    *fds = r as c_int;
+    *fds.add(1) = w as c_int;
+    0
+}
+
+/// While a `vfork` child runs (`spawn.rs`), it has a descriptor table of its own: duplicates of the streams, so what it closes or
+/// redirects (`dup2` of a pipe onto 1, the usual step before `exec`) does not touch its parent's. Open files and sockets are not
+/// in it (the program it starts gets descriptors 0 to 2 only).
+static VFORK_PARENT: Mutex<Option<alloc::boxed::Box<Table>>> = Mutex::new(None);
+
+pub fn vfork_enter() {
+    let mut child = alloc::boxed::Box::new(Table {
+        fds: [const { None }; MAX_FDS],
+    });
+    let mut t = FDS.lock();
+    for i in 0..MAX_FDS {
+        if let Some(Entry::Stream(h, _)) = &t.fds[i] {
+            let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
+            if d.status == 0 {
+                child.fds[i] = Some(Entry::Stream(d.a1 as u32, true));
+            }
+        }
+    }
+    let parent = core::mem::replace(&mut *t, *child);
+    drop(t);
+    *VFORK_PARENT.lock() = Some(alloc::boxed::Box::new(parent));
+}
+
+pub fn vfork_leave() {
+    let Some(parent) = VFORK_PARENT.lock().take() else {
+        return;
+    };
+    let child = core::mem::replace(&mut *FDS.lock(), *parent);
+    for e in child.fds.into_iter().flatten() {
+        if let Entry::Stream(h, true) = e {
+            rt::sys::handle_close(h);
+        }
+    }
+}
+
+/// `fcntl`: `F_DUPFD` on a stream; the descriptor flags a socket supports (`O_NONBLOCK`); other descriptors answer the harmless
+/// defaults.
 #[no_mangle]
 pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+    if cmd == 0 || cmd == 1030 {
+        // F_DUPFD, F_DUPFD_CLOEXEC: the lowest free descriptor from `arg`
+        let slot = {
+            let t = FDS.lock();
+            (arg.max(0) as usize..MAX_FDS).find(|&i| t.fds[i].is_none())
+        };
+        return match slot {
+            Some(s) => dup_stream(fd, s as c_int),
+            None => fail(-5),
+        };
+    }
     match socket_of(fd) {
         Ok(Some(s)) => crate::socket::sock_fcntl(&s, cmd, arg),
         Ok(None) => match cmd {
@@ -774,7 +853,7 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
             }
             Err(e) => fail(e),
         },
-        Some(Entry::Stream(_)) => {
+        Some(Entry::Stream(_, _)) => {
             let info = proto::file::StatInfo {
                 kind: 1,
                 size: 0,

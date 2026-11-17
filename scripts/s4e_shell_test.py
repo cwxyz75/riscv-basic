@@ -501,6 +501,34 @@ def main():
     # (12.9 s when the shell watched only the first program's spawn channel: a request from any other waited for a 100 ms timeout)
     if secs > 8:
         fail(s, f"100 spawns took {secs:.1f} s")
+    # the compat shell (SH7): BusyBox hush, which has a mode for systems that cannot fork. Each script's expected output is what the
+    # host's own `sh` prints for it (an independent oracle).
+    hush_scripts = [
+        "echo a; echo b",
+        "echo a | tr a-z A-Z",
+        "x=$(echo sub); echo got $x",
+        "for i in 1 2 3; do echo n$i; done",
+        "f() { echo in f $1; }; f arg; f other",
+        "(echo in subshell; exit 3); echo status $?",
+        "case abc in a*) echo matched;; *) echo no;; esac",
+        "false || echo or; true && echo and; ! false && echo not",
+        "seq 5 | head -n 2 | tr 1 X",
+        "seq 3 | while read n; do echo r$n; done",
+        "i=0; while [ $i -lt 3 ]; do i=$((i+1)); done; echo $i",
+        "export V=1; env | grep ^V=",
+        "set -- a b c; echo $# $2 ${3}; shift; echo $@",
+        "trap \"echo trapped\" EXIT; echo body",
+        "sleep 1 & echo bg; wait; echo done",
+        "echo ${HOME:-none} ${UNSET:-dflt}",
+        "echo $((6*7)) $(echo nested $(echo deep))",
+    ]
+    import subprocess as sp
+    for script in hush_scripts:
+        want = sp.run(["/bin/sh", "-c", script], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/home"}).stdout.splitlines()
+        send = "busybox hush -c '" + script.replace("'", "") + "'\n"
+        step_re(send.encode(), [b"$ " + send.strip().encode()] + [re.compile(re.escape(w.encode())) for w in want], "hush: " + script)
+    # (globbing reads the working directory: the fixtures are hello.txt, lines.txt and sub/inner.txt)
+    step(b"busybox hush -c 'echo *.txt; echo sub/*; echo nomatch*'\n", [b"$ busybox hush -c 'echo *.txt; echo sub/*; echo nomatch*'", b"hello.txt lines.txt", b"sub/inner.txt", b"nomatch*"], "hush: globs match what is there and stay as written when nothing is")
     # the chain has a depth limit: the fifth program down holds no spawn grant
     step(b"busybox env busybox env busybox env busybox env busybox env busybox echo deep\n",
          [b"$ busybox env busybox env busybox env busybox env busybox env busybox echo deep", b"env: can't execute 'busybox': Function not implemented", b"[exit 126]"],

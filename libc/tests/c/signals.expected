@@ -20,5 +20,6 @@ handled SIGTERM: exited 1 status 7
 default SIGTERM: signaled 1 signal 15
 ignored SIGTERM: still there: 0
 SIGKILL: signaled 1 signal 9
+a child's end: pause -1 errno EINTR 1 handler SIGCHLD 1
 kill of a pid that is not ours: -1 errno ESRCH 1
 signals: done

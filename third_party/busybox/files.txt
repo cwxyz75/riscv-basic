@@ -199,6 +199,10 @@ libbb/xregcomp.c
 libpwdgrp/uidgid_get.c
 miscutils/time.c
 procps/kill.c
+shell/hush.c
+shell/match.c
+shell/math.c
+shell/shell_common.c
 util-linux/hexdump.c
 util-linux/hexdump_xxd.c
 util-linux/rev.c
