@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <spawn.h>
+extern char **environ;
 #include <locale.h>
 #include <fnmatch.h>
 #include <termios.h>
@@ -155,6 +157,26 @@ int posix2_test(void) {
     }
     int status = 0;
     CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, "execlp runs a program found by name");
+    /* a script runs through its `#!` line, and /bin/sh is the compat shell */
+    {
+        FILE *f = fopen("/tmp/script.sh", "w");
+        if (f) { fputs("#!/bin/sh\necho from-script $1\n", f); fclose(f); }
+        fflush(stdout);
+        int st = system("/tmp/script.sh arg");
+        CHECK(st == 0, "a script with a #! line runs");
+        pid_t sp;
+        char *sh_argv[] = {"sh", "-c", "echo spawned-sh; exit 3", NULL};
+        fflush(stdout);
+        int rc = posix_spawn(&sp, "/bin/sh", NULL, NULL, sh_argv, environ);
+        int wst = 0;
+        if (rc == 0) waitpid(sp, &wst, 0);
+        CHECK(rc == 0 && WIFEXITED(wst) && WEXITSTATUS(wst) == 3, "posix_spawn of /bin/sh runs the compat shell");
+        char *bad_argv[] = {"nothere", NULL};
+        CHECK(posix_spawn(&sp, "/tmp/nothere.sh", NULL, NULL, bad_argv, environ) == ENOENT, "a missing script is ENOENT");
+        FILE *g = fopen("/tmp/plain.txt", "w");
+        if (g) { fputs("not a script\n", g); fclose(g); }
+        CHECK(posix_spawn(&sp, "/tmp/plain.txt", NULL, NULL, bad_argv, environ) == ENOEXEC, "a file with no #! line is ENOEXEC");
+    }
     /* the rest of POSIX's error list, in Linux numbers, each with its own message (the library publishes Linux's numbering) */
     {
         struct { const char *name; int v, want; } e[] = {
