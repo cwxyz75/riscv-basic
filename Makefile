@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main os-boot-test-smoke quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-boot-test-smoke os-boot-test-smoke-core os-boot-test-smoke-net quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -138,8 +138,15 @@ os-miri:
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
 # kernel at four harts is also the fastest full run (35 s: waits overlap).
-os-boot-test-smoke: kernel-main
-	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+# The suite is two boots, `core` and `net` (OD121), so CI can run them as parallel jobs and each fits its budget with room;
+# locally `make os-boot-test-smoke` runs both, one after the other.
+os-boot-test-smoke: os-boot-test-smoke-core os-boot-test-smoke-net
+
+os-boot-test-smoke-core: kernel-main
+	OS_SHARD=core OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+
+os-boot-test-smoke-net: kernel-main
+	OS_SHARD=net OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)

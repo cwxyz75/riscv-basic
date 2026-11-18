@@ -32,11 +32,12 @@ STALE = [
 ]
 
 
-GATE_BUDGET_MINUTES = 10  # TESTING.md: every job of the merge gate (ci.yml) may take at most this long
+GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of the merge gate (ci.yml) may take at most this long
 # Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that the gate may run, conditionally (see ci.yml): the harness check.
-GATE_EXTRA = {"os-boot-test-main"}
+# (the smoke boot is two parallel jobs, one per shard of the suite, and the release smoke is a third: OD121)
+GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-core", "os-boot-test-smoke-net"}
 
 
 def make_var(makefile, name):

@@ -896,6 +896,17 @@ pub fn wake_stat(which: u64) -> u64 {
         7 => u64::from(crate::dtb::boot_arg_present("bench=full")),
         // 9: 1 if the kernel command line has `net=lossy` (the harness runs the guest behind the lossy relay, S9-SPEC Q30)
         9 => u64::from(crate::dtb::boot_arg_present("net=lossy")),
+        // 13: which part of the suite the kernel line asks for: 0 all of it, 1 `shard=core` (everything but the network tests), 2
+        // `shard=net` (only the network tests); CI runs the two as parallel jobs (TESTING.md, OD121)
+        13 => {
+            if crate::dtb::boot_arg_present("shard=core") {
+                1
+            } else if crate::dtb::boot_arg_present("shard=net") {
+                2
+            } else {
+                0
+            }
+        }
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
         // 16 + h: how often hart h took the big kernel lock from free

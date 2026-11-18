@@ -29,6 +29,7 @@ use rt::fs::Fs;
 use rt::io;
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
+use shell_core::{may_pass_on, Held};
 
 const BANNER: &[u8] = b"riscv-os S4 ready\n";
 const HELP: &str =
@@ -171,8 +172,8 @@ struct Broker {
     depth: u8,
     cwd: Fs,
     cwd_path: Vec<u8>,
-    /// Each mount in the program's namespace and whether it is writable.
-    mounts: Vec<(Vec<u8>, bool)>,
+    /// Each mount in the program's namespace, whether it is writable and what it is made from.
+    mounts: Vec<Held>,
     /// The shell's end of the channel the program receives signals on (S11, OD119).
     sig: u32,
     /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
@@ -190,25 +191,17 @@ struct Desc {
     root: u32,
 }
 
-/// May a program that holds `allow` pass on `name` at these rights? (No `allow` means the shell is starting it.)
-fn allowed(allow: Option<&[(Vec<u8>, bool)]>, name: &[u8], writable: bool) -> bool {
-    match allow {
-        None => true,
-        Some(a) => a.iter().any(|(n, w)| n == name && (*w || !writable)),
-    }
-}
-
 /// Add a namespace entry unless the asking program does not hold it; record it for the new program's own spawn grant.
 fn ns_push(
     startup: &mut Startup,
     forward: &mut Vec<u32>,
-    mounts: &mut Vec<(Vec<u8>, bool)>,
-    allow: Option<&[(Vec<u8>, bool)]>,
-    name: &[u8],
+    mounts: &mut Vec<Held>,
+    allow: Option<&[Held]>,
+    (name, source): (&[u8], &[u8]),
     ch: u32,
     writable: bool,
 ) {
-    if !allowed(allow, name, writable) {
+    if !may_pass_on(allow, name, source, writable) {
         sys::handle_close(ch);
         return;
     }
@@ -216,7 +209,11 @@ fn ns_push(
         .namespace
         .push((name.to_vec(), forward.len() as u32));
     forward.push(ch);
-    mounts.push((name.to_vec(), writable));
+    mounts.push(Held {
+        name: name.to_vec(),
+        writable,
+        source: source.to_vec(),
+    });
 }
 
 fn parse_trust(line: &[u8]) -> Option<Trust> {
@@ -241,7 +238,7 @@ fn parse_trust(line: &[u8]) -> Option<Trust> {
             Some(p) => p.to_vec(),
             None => [&b"/mnt/"[..], vol].concat(),
         };
-        if !proto::startup::valid_prefix(&mount) || mount == b"/" || mount == b"." {
+        if !proto::startup::valid_prefix(&mount) || shell_core::reserved_mount(&mount) {
             return None;
         }
         grants.push(Grant {
@@ -1182,8 +1179,8 @@ impl Os {
         stdio: Stdio,
         mut parent: Option<&mut Broker>,
     ) -> Result<u32, HostError> {
-        let allow: Option<Vec<(Vec<u8>, bool)>> = parent.as_ref().map(|p| p.mounts.clone());
-        let mut mounts: Vec<(Vec<u8>, bool)> = Vec::new();
+        let allow: Option<Vec<Held>> = parent.as_ref().map(|p| p.mounts.clone());
+        let mut mounts: Vec<Held> = Vec::new();
         let name = prog;
         if !shell_core::valid_command_name(name) {
             drop_stdio(stdio);
@@ -1277,7 +1274,7 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     None,
-                    b".",
+                    (b".", b""),
                     c.ch,
                     false,
                 );
@@ -1312,7 +1309,7 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     allow.as_deref(),
-                    b"/",
+                    (b"/", b""),
                     r.ch,
                     false,
                 );
@@ -1335,7 +1332,7 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     allow.as_deref(),
-                    b"/dev",
+                    (b"/dev", b""),
                     c.ch,
                     true,
                 );
@@ -1348,7 +1345,7 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     allow.as_deref(),
-                    b"/proc",
+                    (b"/proc", b""),
                     c.ch,
                     false,
                 );
@@ -1356,7 +1353,7 @@ impl Os {
         }
         let mut chain_tmp: Option<Vec<u8>> = parent.as_ref().and_then(|p| p.tmp.clone());
         let shared = chain_tmp.is_some();
-        if shared && allowed(allow.as_deref(), b"/tmp", true) {
+        if shared && may_pass_on(allow.as_deref(), b"/tmp", b"", true) {
             // a program started by a program shares its chain's directory (the root's)
             let name = chain_tmp.clone().unwrap_or_default();
             let opened = self.tmp.as_mut().and_then(|t| {
@@ -1373,12 +1370,12 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     allow.as_deref(),
-                    b"/tmp",
+                    (b"/tmp", b""),
                     c.ch,
                     true,
                 );
             }
-        } else if self.tmp.is_some() && allowed(allow.as_deref(), b"/tmp", true) {
+        } else if self.tmp.is_some() && may_pass_on(allow.as_deref(), b"/tmp", b"", true) {
             self.jobs += 1;
             let name = format!("j{}", self.jobs).into_bytes();
             let opened = self.tmp.as_mut().and_then(|t| {
@@ -1399,7 +1396,7 @@ impl Os {
                     &mut forward,
                     &mut mounts,
                     allow.as_deref(),
-                    b"/tmp",
+                    (b"/tmp", b""),
                     c.ch,
                     true,
                 );
@@ -1417,7 +1414,7 @@ impl Os {
                 if parent.is_some() && (path == "." || path == "/tmp") {
                     continue;
                 }
-                if !allowed(allow.as_deref(), path.as_bytes(), writable) {
+                if !may_pass_on(allow.as_deref(), path.as_bytes(), b"", writable) {
                     continue;
                 }
                 match self.open_grant(path, rw) {
@@ -1427,7 +1424,7 @@ impl Os {
                             &mut forward,
                             &mut mounts,
                             allow.as_deref(),
-                            path.as_bytes(),
+                            (path.as_bytes(), b""),
                             f.ch,
                             writable,
                         );
@@ -1449,7 +1446,8 @@ impl Os {
                     let g = &self.trusted[t].grants[g];
                     (g.mount.clone(), g.vol.clone(), g.readonly)
                 };
-                if !allowed(allow.as_deref(), &mount, !ro) {
+                let name = [&b"vol-"[..], &vol].concat();
+                if !may_pass_on(allow.as_deref(), &mount, &name, !ro) {
                     continue;
                 }
                 let want = if ro {
@@ -1457,7 +1455,6 @@ impl Os {
                 } else {
                     rights::ALL & !rights::PUBLISH
                 };
-                let name = [&b"vol-"[..], &vol].concat();
                 let opened = match self.registry.as_mut() {
                     Some(r) => r
                         .open_retry(&name, flags::DIRECTORY, want, sys::clock_get() + 4000)
@@ -1472,7 +1469,7 @@ impl Os {
                         &mut forward,
                         &mut mounts,
                         allow.as_deref(),
-                        &mount,
+                        (&mount, &name),
                         f.ch,
                         !ro,
                     );

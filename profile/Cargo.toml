@@ -6,3 +6,4 @@ description = "OS track: session profiles (USER-VIEW-SPEC sections 10 and 13, st
 
 [dependencies]
 data = { path = "../data" }
+shell-core = { path = "../shell-core" }

@@ -302,10 +302,13 @@ impl Profile {
                             Some(p) => String::from(str_of("path", p)?),
                             None => alloc::format!("/mnt/{volume}"),
                         };
-                        if !path.starts_with('/') || path == "/" || !valid_path_components(&path) {
+                        if !path.starts_with('/')
+                            || shell_core::reserved_mount(path.as_bytes())
+                            || !valid_path_components(&path)
+                        {
                             return Err(ProfileError::Bad(
                                 String::from("path"),
-                                "an absolute path below /",
+                                "an absolute path below /, not /tmp, /dev or /proc",
                             ));
                         }
                         let rights = match mm.get("rights") {

@@ -151,6 +151,37 @@ pub fn valid_command_name(name: &[u8]) -> bool {
     !name.is_empty() && !name.contains(&b'/')
 }
 
+/// A mount point a policy may not remap: the shell makes these itself (the root, the working directory, the private `/tmp`,
+/// the device and process directories), so a trust entry or a profile naming one, or anything below one, is refused.
+pub fn reserved_mount(path: &[u8]) -> bool {
+    path == b"."
+        || path == b"/"
+        || [&b"/tmp"[..], b"/dev", b"/proc"]
+            .iter()
+            .any(|r| path.starts_with(r) && (path.len() == r.len() || path[r.len()] == b'/'))
+}
+
+/// One mount in a program's namespace as the shell remembers it: where it appears, whether it is writable, and what it is
+/// made from. `source` is empty for the mounts the shell makes itself and the volume's registry name for one a policy
+/// granted, so two mounts at the same path over different volumes are different mounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub name: Vec<u8>,
+    pub writable: bool,
+    pub source: Vec<u8>,
+}
+
+/// May a program that holds `held` pass on the mount `name` made from `source` at these rights? (`None` means the shell is
+/// starting it, which may grant anything.) The same object, not the same name: a child starts from what its asker holds.
+pub fn may_pass_on(held: Option<&[Held]>, name: &[u8], source: &[u8], writable: bool) -> bool {
+    match held {
+        None => true,
+        Some(h) => h
+            .iter()
+            .any(|m| m.name == name && m.source == source && (m.writable || !writable)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -294,5 +325,62 @@ mod tests {
         assert!(!valid_command_name(b"bin/ls"));
         assert!(!valid_command_name(b"/ls"));
         assert!(!valid_command_name(b"../x"));
+    }
+
+    #[test]
+    fn reserved_mounts_cannot_be_remapped() {
+        for r in [
+            &b"/"[..],
+            b".",
+            b"/tmp",
+            b"/dev",
+            b"/proc",
+            b"/tmp/x",
+            b"/dev/y/z",
+            b"/proc/1",
+        ] {
+            assert!(reserved_mount(r), "{:?}", r);
+        }
+        for ok in [
+            &b"/mnt/store"[..],
+            b"/tmpx",
+            b"/devices",
+            b"/procs",
+            b"/data",
+            b"/mnt/tmp",
+        ] {
+            assert!(!reserved_mount(ok), "{:?}", ok);
+        }
+    }
+
+    fn held(name: &str, w: bool, src: &str) -> Held {
+        Held {
+            name: name.into(),
+            writable: w,
+            source: src.into(),
+        }
+    }
+
+    #[test]
+    fn a_child_gets_the_same_object_not_the_same_name() {
+        let a = [
+            held("/data", true, "vol-x"),
+            held("/", false, ""),
+            held("/mnt/ro", false, "vol-r"),
+        ];
+        // the shell starting a program may grant anything
+        assert!(may_pass_on(None, b"/data", b"vol-y", true));
+        // the same name over the same volume, at no more than the asker's rights
+        assert!(may_pass_on(Some(&a), b"/data", b"vol-x", true));
+        assert!(may_pass_on(Some(&a), b"/data", b"vol-x", false));
+        assert!(may_pass_on(Some(&a), b"/", b"", false));
+        // the same name over another volume is not what the asker holds
+        assert!(!may_pass_on(Some(&a), b"/data", b"vol-y", false));
+        // a shell-made mount is not a volume of the same name, and the other way round
+        assert!(!may_pass_on(Some(&a), b"/", b"vol-x", false));
+        assert!(!may_pass_on(Some(&a), b"/data", b"", false));
+        // never more rights than the asker has, and nothing the asker lacks
+        assert!(!may_pass_on(Some(&a), b"/mnt/ro", b"vol-r", true));
+        assert!(!may_pass_on(Some(&a), b"/mnt/other", b"vol-x", false));
     }
 }
