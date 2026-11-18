@@ -1,9 +1,55 @@
-# Work plan (agreed with the owner, 2026-11-17)
+# Work plan (second plan, agreed with the owner, 2026-11-17 night; the first plan is below as history)
 
 **Standing instruction from the owner: carry on with this plan autonomously until it is complete or the owner interrupts, whichever
 comes first. Do not stop to ask; decide, log (OS decision log, TIDY-UP) and go on. Merge green PRs. Do not vendor third-party
-sources (they are fetched, pinned by sha256, never committed). The kernel step (7) needs the owner's go-ahead first.** If the
+sources (they are fetched, pinned by sha256, never committed).** If the
 conversation was compacted, read this file and `git log` / `gh pr list` to see where things stand, and tick items here as they land.
+
+**Overnight instruction from the owner (2026-11-17): the owner is asleep. Keep working through plan 2 until one of these: you truly
+cannot continue, the plan is complete, or the owner interrupts (which means they have woken). Do not stop to ask. For any important
+decision, use your best judgement, write the decision down (the OS decision log and a line in the "Decisions to discuss in the
+morning" list at the end of this file, with what was chosen, the alternative and why) and carry on. `fork()` is out of scope tonight
+(owner: ignore it). Do not start kernel locking tasks, namespaces or anything else that needs the owner's choice. Merge green PRs.
+Say plainly what was and was not run.**
+
+## Plan 2 (written 2026-11-17, before bedtime; sizes are guesses)
+
+Rules for the night: the lighter local gate (`make fmt-check lint docs-check`, the one targeted test, `make check` when the image or a
+program list changes, `make os-serial-test` when console, sessions, auth, profiles or the trust list change, `-smp 4` only for kernel
+work; CI runs the rest); never force-push (merge main into the branch); batch small slices into one PR; a fresh-context review for
+kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS decision log.
+
+1. [ ] **Merge the docs PR** (this file, branch `workplan-update`).
+2. [ ] **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
+   grant off (T136); say in TIDY-UP what is still open in T139.
+3. [ ] **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
+   coreutils, gnutar, busybox, gzip, sqlite) and write the ranked gap list into a document (`UV0-GAP-SURVEY.md` or a new
+   `LIBC-GAPS.md`). Then, each with a C test (the host's libc as oracle where it can be) and a note in TIDY-UP: `getopt_long` moved
+   from `third_party/compat` into the libc (with `getopt_long_only`, permutation, and a host differential test); `error.h`
+   (`error`, `error_at_line`); `strings.h` (`bcmp`, `bcopy`, `index`, `rindex`); `alloca.h`; `creat`, `ftello`, `fscanf`;
+   `execlp`/`execvp` over the spawn grant; `sigwait`; the `*at` family (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `symlinkat`,
+   `readlinkat`, `fchmodat`, `linkat` as refused) on the existing path code; basic wide characters (`mbrtowc`/`wcrtomb` for UTF-8,
+   `uchar.h`, `wcwidth`). Re-run the GNU tar measurement afterwards and record the new numbers in T145.
+4. [ ] **F step 0b: names are UTF-8, through one `names` crate** (decided 2026-11-17: a small `no_std`, `forbid(unsafe_code)` crate owns the rule, `validate` first; `proto::file::valid_name` becomes a wrapper; invalid names are refused with `EILSEQ`, names are stored as given; normalised comparison is a later slice, T141, with no flags word). **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical; TIDY-UP T146 lists what has to follow): `proto::file::valid_name`,
+   goldens, `memfs`, `doofs`, `rt::fs`, the libc.
+5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
+   the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
+   finds; the slice I (AIA) review is also still owed.
+6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
+   needs executable memory, say so and stop at "compiles to a file".
+7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7 is the hush port, no shell to write: T139 lists what is left), or L-task work, which are the
+   owner's to choose: do not start the kernel locking tasks unasked).
+
+## Long-range list (not scheduled)
+
+- **A complete libc**: the C standard library as the gap survey can measure it, then POSIX base interfaces (locale and wide
+  characters, `regex`, `iconv`, `mmap` and `fork` shims, `dlopen` refused), with the host's libc as the oracle wherever the behaviour
+  is defined. Phase 1 is item 3 above; the measure is "every fetched program in `scripts/libc_gap_survey.py` reports no undeclared
+  names, and the portable test corpus passes".
+- GNU tar and GNU coreutils (both need gnulib on a libc with the interfaces above; T145), a real `/bin/sh` for interactive use, `tcc`.
+- The remaining `ish` steps (SH1 to SH5 are done: `sh` is `ish`; SH6 is left; SH7 is the hush port), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
+
+## Plan 1 (history)
 
 Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 
@@ -22,10 +68,10 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
    `configure` scripts run; dash's results are the second oracle on a shared corpus. Do the spawn rate first.
 6. [x] **Ctrl-C as SIGINT** (T47, done) **and `termios` for programs** (T124, done for the foreground job: modes, size, `VMIN`/`VTIME`): the shell sends SIGINT to a program that has a handler for it and keeps the kill otherwise
    (BASIC's BREAK key needs it); then **`termios` for programs** (T124: raw mode, for `kilo` and friends).
-7. [ ] **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
+7. [x] (done: PR 223; the library half, `pthread_cancel` and `alarm` in a CPU loop, is still open in T56) **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
    needed**; its own PR; soak at `-smp 2` and `-smp 4`; Fable review.
 
-Then: a first real port from `third_party/fetched` (**`kilo` and `sqlite3` done**; next `gzip`, `gnutar`), and the design-review slice queue before S8 (`ROADMAP.md`,
+Then: a first real port from `third_party/fetched` (**`kilo`, `sqlite3` and GNU `gzip` done** (PRs 220, 222, 224); `tar` is BusyBox's (PR 225) and GNU tar is deferred: T145), and the design-review slice queue before S8 (`ROADMAP.md`,
 `reviews/`).
 
 Working rules that apply throughout (CLAUDE.md, the owner's earlier instructions): a runnable acceptance check first; one mutation
@@ -33,3 +79,9 @@ check per new test; `make fmt-check lint docs-check` and `make check` before a p
 `-smp 4` when the shell, libc or protocols change; a fresh-context Fable review for authority and kernel slices (they have found real
 bugs twice: PR 208 and 209); shortcuts into TIDY-UP.md; tick ROADMAP boxes only when verified in QEMU; say plainly what was and was
 not run.
+
+## Decisions to discuss in the morning
+
+(Add one line per decision taken without the owner: what, the alternative, why, where it is recorded.)
+
+- (none yet)
