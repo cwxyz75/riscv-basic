@@ -59,6 +59,9 @@ struct Process {
     /// `process_kill` asked for it to end, with this exit code; its thread dies at its next
     /// return to user mode (or wakes from a wait to do so).
     killed: Option<i32>,
+    /// `process_suspend` stopped it: every thread parks at its next return to user mode (a thread blocked in a call
+    /// stays blocked, and parks when the call returns) until `process_resume` or a kill. SIG2, SYSCALLS.md.
+    stopped: bool,
     /// User threads that exist and have not ended (counted from `thread_create`, before the
     /// thread first runs). The process is torn down when this reaches 0.
     threads_alive: usize,
@@ -320,6 +323,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         state: ProcState::Running,
         detached: false,
         killed: None,
+        stopped: false,
         threads_alive: 1,
         thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
@@ -454,6 +458,9 @@ fn user_thread_main(token: usize) {
         irq::enable();
         leave(code, true);
     }
+    // A thread created in a stopped process waits here: it runs no user code before `process_resume` (or dies with the
+    // process).
+    park_while_stopped();
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();
@@ -699,6 +706,32 @@ fn killed_now() -> Option<i32> {
     s.procs.get(pid)?.killed
 }
 
+/// Where a stopped process stops and a killed one dies: the calling thread's return to user mode. A thread of a process
+/// that `process_suspend` stopped sleeps here (woken by id, like a futex sleeper) until `process_resume` or a kill; a
+/// killed process ends here too. Nothing is held across the sleep but the big lock, which follows the thread as it does
+/// in every blocking call.
+fn park_while_stopped() {
+    loop {
+        if let Some(code) = irq::without(killed_now) {
+            exit_process(code);
+        }
+        if !irq::without(stopped_now) {
+            return;
+        }
+        commit_wake(); // (wakes this trap made are committed before this thread sleeps, as at every blocking site)
+        thread::wait_deadline_private(|| killed_now().is_some() || !stopped_now(), u64::MAX);
+    }
+}
+
+/// Is the calling thread's process stopped (`process_suspend`)?
+fn stopped_now() -> bool {
+    let s = state();
+    s.thread_pid
+        .get(&thread::current())
+        .and_then(|pid| s.procs.get(pid))
+        .is_some_and(|p| p.stopped)
+}
+
 fn satp_of(p: &Process) -> u64 {
     (8u64 << 60) | (u64::from(p.asid) << 44) | p.aspace.table().root()
 }
@@ -710,9 +743,7 @@ fn satp_of(p: &Process) -> u64 {
 pub fn activate_current() {
     // A process that was killed while its thread was not running dies here, at the point
     // where it would otherwise return to user mode.
-    if let Some(code) = irq::without(killed_now) {
-        exit_process(code);
-    }
+    park_while_stopped();
     let satp = irq::without(|| {
         let s = state();
         s.thread_pid
@@ -881,6 +912,8 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_UNMAP
         | nr::PROCESS_START
         | nr::PROCESS_KILL
+        | nr::PROCESS_SUSPEND
+        | nr::PROCESS_RESUME
         | nr::PROCESS_INFO
         | nr::THREAD_CREATE
         | nr::THREAD_SPAWN
@@ -2401,6 +2434,9 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_START => process_start(a),
         nr::PROCESS_KILL | nr::PROCESS_INFO if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_KILL => process_kill(a),
+        nr::PROCESS_SUSPEND | nr::PROCESS_RESUME if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_SUSPEND => process_stop(a, true),
+        nr::PROCESS_RESUME => process_stop(a, false),
         nr::PROCESS_INFO => process_info(a),
         nr::THREAD_CREATE if wide(0) => bad(Status::BadHandle),
         nr::THREAD_CREATE => thread_create(a),
@@ -2496,6 +2532,7 @@ fn process_create(a: [u64; 6]) -> Reply {
                 state: ProcState::Created,
                 detached: true,
                 killed: None,
+                stopped: false,
                 threads_alive: 0,
                 thread_objs: BTreeMap::new(),
                 job,
@@ -2787,6 +2824,41 @@ fn process_kill(a: [u64; 6]) -> Reply {
         exit_process(code);
     }
     request_kill(tpid, code);
+    Ok((None, None))
+}
+
+/// `process_suspend(process)` and `process_resume(process)` (SIG2): stop or continue every thread of a process. Both need
+/// KILL on the handle (the right to end a process is the right to stop it), are idempotent, and refuse an ended process
+/// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
+fn process_stop(a: [u64; 6], stop: bool) -> Reply {
+    let ph = Handle(a[0] as u32);
+    let tpid = irq::without(|| -> Result<u32, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let (_, tpid, terminated, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::KILL)
+            .map_err(|e| (e, None, None))?;
+        let target = s
+            .procs
+            .get_mut(&tpid)
+            .ok_or((Status::BadState, None, None))?;
+        if terminated || target.exit_code.is_some() || target.killed.is_some() {
+            return Err((Status::BadState, None, None));
+        }
+        target.stopped = stop;
+        if let Some(obj) = target.obj {
+            ipc::process_set_stopped(&mut s.objs, obj, stop);
+        }
+        if stop {
+            // a thread running user code on another hart parks at its next trap: the flag is set first and the kick comes
+            // in the same locked region (as for a kill)
+            crate::smp::kick_others();
+        }
+        Ok(tpid)
+    })?;
+    if !stop {
+        wake_threads_of(tpid);
+    }
     Ok((None, None))
 }
 

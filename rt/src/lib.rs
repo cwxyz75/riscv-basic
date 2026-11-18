@@ -480,6 +480,13 @@ pub mod sys {
     pub fn process_kill(process: u32, code: i32) -> Ret {
         syscall(PROCESS_KILL, [process as usize, code as usize, 0, 0, 0, 0])
     }
+    /// Stop every thread of `process` until `process_resume` (needs KILL).
+    pub fn process_suspend(process: u32) -> Ret {
+        syscall(PROCESS_SUSPEND, [process as usize, 0, 0, 0, 0, 0])
+    }
+    pub fn process_resume(process: u32) -> Ret {
+        syscall(PROCESS_RESUME, [process as usize, 0, 0, 0, 0, 0])
+    }
     pub fn process_info(process: u32) -> Ret {
         syscall(PROCESS_INFO, [process as usize, 0, 0, 0, 0, 0])
     }

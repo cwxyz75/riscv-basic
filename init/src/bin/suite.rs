@@ -732,7 +732,7 @@ fn wait_arguments_are_checked() -> Outcome {
         "an empty mask"
     );
     ensure_eq!(
-        st(sys::object_wait(e, 1 << 6, 0)),
+        st(sys::object_wait(e, 1 << 7, 0)),
         Some(S::InvalidArgs),
         "a bit that is no signal"
     );
@@ -2091,6 +2091,239 @@ fn kill_a_spinning_child() -> Outcome {
         Some(S::BadState),
         "kill it again"
     );
+    Ok(())
+}
+
+// ---- process_suspend and process_resume (SIG2) ----
+
+/// Read and drop every message waiting on `ch`; how many there were.
+fn drain_reports(ch: u32) -> usize {
+    let mut n = 0;
+    let mut buf = [0u8; 64];
+    while sys::channel_read(ch, buf.as_mut_ptr(), 64, core::ptr::null_mut(), 0).status == 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Reports from a counting child (`crash` mode 71) arrive within `ticks`.
+fn reports_arrive(ch: u32, ticks: u64) -> bool {
+    sys::object_wait(ch, sig::READABLE, sys::clock_get() + ticks).status == 0
+}
+
+/// The child is silent: nothing arrives for `ticks`, after the reports in flight were dropped.
+fn child_is_silent(ch: u32, ticks: u64) -> Outcome {
+    nap(8)?; // time to park (a thread on another hart is kicked at once, a tick at the latest)
+    drain_reports(ch);
+    nap(ticks)?;
+    ensure_eq!(drain_reports(ch), 0, "a stopped process runs no user code");
+    Ok(())
+}
+
+fn process_suspend_stops_a_spinner_and_resume_restarts_it() -> Outcome {
+    let (p, mine) = launch(71)?;
+    ensure!(reports_arrive(mine, 500), "the child counts");
+    ensure_eq!(st(sys::process_suspend(p)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_signals(p).a1 as u32 & sig::STOPPED,
+        sig::STOPPED,
+        "STOPPED is raised"
+    );
+    child_is_silent(mine, 40)?;
+    ensure_eq!(
+        st(sys::process_suspend(p)),
+        Some(S::Ok),
+        "suspending again is fine"
+    );
+    child_is_silent(mine, 10)?;
+    ensure_eq!(
+        st(sys::process_info(p)),
+        Some(S::BadState),
+        "a stopped process has not ended"
+    );
+    ensure_eq!(st(sys::process_resume(p)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_signals(p).a1 as u32 & sig::STOPPED,
+        0,
+        "STOPPED is cleared"
+    );
+    ensure!(reports_arrive(mine, 500), "the child counts again");
+    ensure_eq!(
+        st(sys::process_resume(p)),
+        Some(S::Ok),
+        "resuming a running process is fine"
+    );
+    ensure_eq!(st(sys::process_kill(p, 5)), Some(S::Ok), "kill");
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        st(sys::process_suspend(p)),
+        Some(S::BadState),
+        "an ended process cannot be stopped"
+    );
+    ensure_eq!(st(sys::process_resume(p)), Some(S::BadState), "or resumed");
+    Ok(())
+}
+
+fn process_suspend_stops_every_thread_on_every_hart() -> Outcome {
+    let (p, mine) = launch(71)?;
+    // three more counting threads (they share the bootstrap channel), so with several harts some run elsewhere
+    let mut ts = [0u32; 3];
+    for (i, t) in ts.iter_mut().enumerate() {
+        *t = child_thread(p, i as u64, 71)?;
+    }
+    ensure!(reports_arrive(mine, 500), "the threads count");
+    ensure_eq!(st(sys::process_suspend(p)), Some(S::Ok), "suspend");
+    child_is_silent(mine, 40)?;
+    // a thread made in a stopped process runs nothing until the resume
+    let late = child_thread(p, 3, 71)?;
+    child_is_silent(mine, 40)?;
+    ensure_eq!(st(sys::process_resume(p)), Some(S::Ok), "resume");
+    ensure!(reports_arrive(mine, 500), "they count again");
+    ensure_eq!(st(sys::process_kill(p, -4)), Some(S::Ok), "kill");
+    wait_ended(p, 1000)?;
+    for t in ts.into_iter().chain([late]) {
+        thread_ended_with(t, -4)?;
+    }
+    Ok(())
+}
+
+fn a_stopped_process_whose_wait_ends_stays_parked_until_resumed() -> Outcome {
+    // `crash` mode 14 waits for one message, echoes it reversed and exits 3
+    let (p, mine) = launch(14)?;
+    nap(5)?;
+    ensure_eq!(
+        st(sys::process_suspend(p)),
+        Some(S::Ok),
+        "suspend the blocked child"
+    );
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            b"abc".as_ptr(),
+            3,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "send"
+    );
+    nap(40)?;
+    ensure_eq!(
+        sys::object_signals(mine).a1 as u32 & sig::READABLE,
+        0,
+        "its wait ended but it did not run"
+    );
+    ensure_eq!(
+        st(sys::process_info(p)),
+        Some(S::BadState),
+        "and it has not exited"
+    );
+    ensure_eq!(st(sys::process_resume(p)), Some(S::Ok), "resume");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 3, "it finished its work");
+    let mut buf = [0u8; 8];
+    let r = sys::channel_read(mine, buf.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+    ensure_eq!(
+        (r.status, &buf[..r.a1.min(8)]),
+        (0, &b"cba"[..]),
+        "the echo"
+    );
+    Ok(())
+}
+
+fn a_stopped_process_can_be_killed_and_suspend_needs_the_kill_right() -> Outcome {
+    let (p, _mine) = launch(16)?;
+    ensure_eq!(
+        st(sys::process_suspend(p)),
+        Some(S::Ok),
+        "suspend a blocked child"
+    );
+    nap(5)?;
+    ensure_eq!(
+        st(sys::process_kill(p, -7)),
+        Some(S::Ok),
+        "kill it while stopped"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -7, "the kill's code");
+    // rights, handle types
+    let (q, _m) = launch(15)?;
+    let no_kill = weaker(q, Rights::PROCESS.0 & !Rights::KILL.0)?;
+    ensure_eq!(
+        st(sys::process_suspend(no_kill)),
+        Some(S::AccessDenied),
+        "suspend needs KILL"
+    );
+    ensure_eq!(
+        st(sys::process_resume(no_kill)),
+        Some(S::AccessDenied),
+        "resume needs KILL"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::process_suspend(ev)),
+        Some(S::WrongType),
+        "a process handle"
+    );
+    ensure_eq!(
+        st(sys::process_resume(9999)),
+        Some(S::BadHandle),
+        "a handle that is not one"
+    );
+    let _ = sys::process_kill(q, 1);
+    Ok(())
+}
+
+fn a_stopped_process_with_parked_threads_is_killed_without_a_resume() -> Outcome {
+    let (p, mine) = launch(71)?;
+    let t = child_thread(p, 0, 71)?;
+    ensure!(reports_arrive(mine, 500), "the threads count");
+    ensure_eq!(st(sys::process_suspend(p)), Some(S::Ok), "suspend");
+    let late = child_thread(p, 1, 71)?; // parked before it ever ran user code
+    child_is_silent(mine, 20)?;
+    ensure_eq!(
+        st(sys::process_kill(p, -6)),
+        Some(S::Ok),
+        "kill it while its threads are parked"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -6, "the kill's code");
+    thread_ended_with(t, -6)?;
+    thread_ended_with(late, -6)
+}
+
+fn a_process_can_stop_itself() -> Outcome {
+    let (p, mine) = launch(72)?;
+    let me_with_kill = weaker(p, Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0)?;
+    ensure_eq!(
+        st(sys::channel_write(
+            mine,
+            b"k".as_ptr(),
+            1,
+            [me_with_kill].as_ptr(),
+            1
+        )),
+        Some(S::Ok),
+        "send the child a handle to itself"
+    );
+    nap(30)?;
+    ensure_eq!(
+        sys::object_signals(p).a1 as u32 & sig::STOPPED,
+        sig::STOPPED,
+        "it stopped itself"
+    );
+    ensure_eq!(
+        sys::object_signals(mine).a1 as u32 & sig::READABLE,
+        0,
+        "and ran nothing more"
+    );
+    ensure_eq!(
+        st(sys::process_resume(p)),
+        Some(S::Ok),
+        "resume it from outside"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, 4, "it went on to its end");
     Ok(())
 }
 
@@ -11224,6 +11457,27 @@ pub fn app_main() -> i32 {
         ("child_faults_are_contained", child_faults_are_contained),
         ("parent_and_child_talk", parent_and_child_talk),
         ("kill_a_spinning_child", kill_a_spinning_child),
+        (
+            "process_suspend_stops_a_spinner_and_resume_restarts_it",
+            process_suspend_stops_a_spinner_and_resume_restarts_it,
+        ),
+        (
+            "process_suspend_stops_every_thread_on_every_hart",
+            process_suspend_stops_every_thread_on_every_hart,
+        ),
+        (
+            "a_stopped_process_with_parked_threads_is_killed_without_a_resume",
+            a_stopped_process_with_parked_threads_is_killed_without_a_resume,
+        ),
+        ("a_process_can_stop_itself", a_process_can_stop_itself),
+        (
+            "a_stopped_process_whose_wait_ends_stays_parked_until_resumed",
+            a_stopped_process_whose_wait_ends_stays_parked_until_resumed,
+        ),
+        (
+            "a_stopped_process_can_be_killed_and_suspend_needs_the_kill_right",
+            a_stopped_process_can_be_killed_and_suspend_needs_the_kill_right,
+        ),
         ("kill_a_blocked_child", kill_a_blocked_child),
         (
             "closing_the_last_process_handle_kills_the_child",

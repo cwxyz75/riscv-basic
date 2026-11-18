@@ -199,11 +199,19 @@ pub mod signals {
     pub const WRITE_CLOSED: u32 = 1 << 4;
     /// An interrupt object's source fired and has not been acknowledged.
     pub const INTERRUPT: u32 = 1 << 5;
+    /// A process is stopped by `process_suspend` (level: cleared by `process_resume`; never set with TERMINATED).
+    pub const STOPPED: u32 = 1 << 6;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
     /// Every signal a wait or a port binding may name.
-    pub const WAITABLE: u32 =
-        READABLE | WRITABLE | PEER_CLOSED | TERMINATED | WRITE_CLOSED | INTERRUPT | USER_MASK;
+    pub const WAITABLE: u32 = READABLE
+        | WRITABLE
+        | PEER_CLOSED
+        | TERMINATED
+        | WRITE_CLOSED
+        | INTERRUPT
+        | STOPPED
+        | USER_MASK;
 }
 
 /// The handle value of the bootstrap channel every process starts with.
@@ -284,6 +292,9 @@ pub mod syscall {
     pub const PROCESS_START: usize = 54;
     pub const PROCESS_KILL: usize = 55;
     pub const PROCESS_INFO: usize = 56;
+    /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
+    pub const PROCESS_SUSPEND: usize = 57;
+    pub const PROCESS_RESUME: usize = 58;
     pub const THREAD_CREATE: usize = 60;
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
