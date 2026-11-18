@@ -3,7 +3,7 @@ id: LIBC2
 kind: slice
 title: A complete libc, phase 2
 area: libc
-horizon: long
+horizon: near
 ---
 
 - **A complete libc** (noted 2026-11-17, owner). The C standard library as `scripts/libc_gap_survey.py` can measure it, then the POSIX base interfaces (locale and wide characters, `regex`, `iconv`, `*at` calls, `mmap`/`fork` shims), with the host's libc as the oracle wherever behaviour is defined. Phase 1 is item 3 of `WORK-PLAN.md` (plan 2). Done when every fetched program in the survey reports nothing undeclared and the portable corpus passes. It unlocks GNU tar and coreutils (TIDY-UP T145).
