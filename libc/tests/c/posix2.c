@@ -15,6 +15,9 @@
 #include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <locale.h>
+#include <fnmatch.h>
+#include <termios.h>
 
 static int failures;
 
@@ -152,6 +155,26 @@ int posix2_test(void) {
     }
     int status = 0;
     CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, "execlp runs a program found by name");
+    /* the rest of POSIX's error list, in Linux numbers, each with its own message (the library publishes Linux's numbering) */
+    {
+        struct { const char *name; int v, want; } e[] = {
+            {"EBADMSG", EBADMSG, 74}, {"ECANCELED", ECANCELED, 125}, {"ECONNABORTED", ECONNABORTED, 103}, {"EDQUOT", EDQUOT, 122},
+            {"EFBIG", EFBIG, 27}, {"EIDRM", EIDRM, 43}, {"EMLINK", EMLINK, 31}, {"EMULTIHOP", EMULTIHOP, 72}, {"ENETRESET", ENETRESET, 102},
+            {"ENODATA", ENODATA, 61}, {"ENOLINK", ENOLINK, 67}, {"ENOMSG", ENOMSG, 42}, {"ENOSR", ENOSR, 63}, {"ENOSTR", ENOSTR, 60},
+            {"ENOTRECOVERABLE", ENOTRECOVERABLE, 131}, {"EOWNERDEAD", EOWNERDEAD, 130}, {"EPROTO", EPROTO, 71}, {"EPROTOTYPE", EPROTOTYPE, 91},
+            {"EROFS", EROFS, 30}, {"ESTALE", ESTALE, 116}, {"ETIME", ETIME, 62}, {"ETXTBSY", ETXTBSY, 26}, {"ENOTBLK", ENOTBLK, 15},
+        };
+        int bad = 0;
+        for (unsigned i = 0; i < sizeof e / sizeof e[0]; i++) {
+            if (e[i].v != e[i].want) { printf("FAIL: %s is %d, not %d\n", e[i].name, e[i].v, e[i].want); bad++; }
+            if (strcmp(strerror(e[i].want), "Unknown error") == 0) { printf("FAIL: %s has no message\n", e[i].name); bad++; }
+        }
+        CHECK(bad == 0, "the rest of POSIX's errno names have Linux's numbers and messages");
+        CHECK(strcmp(strerror(EROFS), "Read-only file system") == 0 && strcmp(strerror(EDQUOT), "Disk quota exceeded") == 0, "strerror texts");
+    }
+    /* constants gnulib and busybox ask for */
+    CHECK(MB_CUR_MAX == 4 && LC_MESSAGES == 5 && AT_EACCESS == 0x200 && FNM_FILE_NAME == FNM_PATHNAME && FNM_LEADING_DIR == 8, "MB_CUR_MAX, LC_MESSAGES, AT_EACCESS, FNM_FILE_NAME and FNM_LEADING_DIR");
+    CHECK(VEOL == 11 && VSTART == 8 && VSTOP == 9 && VSUSP == 10 && CS5 == 0 && CS6 == 0020 && CS7 == 0040 && FLUSHO == 0010000, "the remaining termios names");
     printf("posix2: %d failures\n", failures);
     return failures;
 }

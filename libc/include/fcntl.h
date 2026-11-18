@@ -37,6 +37,7 @@ struct flock { short l_type; short l_whence; long l_start; long l_len; int l_pid
 #define F_GETLK 5
 #define F_SETLK 6
 #define F_SETLKW 7
+#define AT_EACCESS 0x200
 #define AT_SYMLINK_NOFOLLOW 0x100
 #define AT_REMOVEDIR 0x200
 #define AT_SYMLINK_FOLLOW 0x400

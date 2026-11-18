@@ -12,6 +12,10 @@ struct termios { tcflag_t c_iflag, c_oflag, c_cflag, c_lflag; cc_t c_line; cc_t 
 #define VEOF 4
 #define VTIME 5
 #define VMIN 6
+#define VSTART 8
+#define VSTOP 9
+#define VSUSP 10
+#define VEOL 11
 #define ISIG 0000001
 #define ICANON 0000002
 #define ECHO 0000010
@@ -25,7 +29,11 @@ struct termios { tcflag_t c_iflag, c_oflag, c_cflag, c_lflag; cc_t c_line; cc_t 
 #define IGNCR 0000200
 #define OPOST 0000001
 #define ONLCR 0000004
+#define CS5 0000000
+#define CS6 0000020
+#define CS7 0000040
 #define CS8 0000060
+#define FLUSHO 0010000
 #define CSIZE 0000060
 #define B0 0
 #define B50 1
