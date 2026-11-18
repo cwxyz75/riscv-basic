@@ -326,9 +326,28 @@ const NAMES: &[&[u8]] = &[
     b"..",
     b"x/y",
     b"long-name-0123456789012345678901234567890123456789",
+    // names are UTF-8 without control characters (FS-SPEC F6, step 0b): good ones that look alike but differ, and refused ones
+    b"caf\xc3\xa9",
+    b"cafe\xcc\x81",
+    b"\xff\xfe",
+    b"tab\there",
+    b"nel\xc2\x85",
+    b"\xed\xa0\x80",
 ];
 const ATTR_NAMES: &[&[u8]] = &[
-    b"color", b"rank", b"tag", b"x", b"y", b"name", b"size", b"mtime", b"", b"a/b",
+    b"color",
+    b"rank",
+    b"tag",
+    b"x",
+    b"y",
+    b"name",
+    b"size",
+    b"mtime",
+    b"",
+    b"a/b",
+    b"caf\xc3\xa9",
+    b"\xffattr",
+    b"ctl\x01",
 ];
 
 /// A random attribute value, mostly well formed, sometimes not (the wrong length, bad UTF-8, too long to store or to index).
@@ -580,6 +599,7 @@ fn doofs_matches_memfs_over_random_operations() {
             "NotEmpty",
             "NotFound",
             "BadName",
+            "BadEncoding",
             "BadTarget",
             "ReadOnly",
             "Invalid",

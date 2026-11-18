@@ -288,6 +288,29 @@ fn path_validation() {
     assert_eq!(file::split_path(b"a/"), Err(Malformed), "a trailing slash");
     assert_eq!(file::split_path(b"a//b"), Err(Malformed));
     assert_eq!(file::split_path(b"a\0b"), Err(Malformed));
+    // names are UTF-8 without control characters (FS-SPEC F6)
+    assert_eq!(
+        file::split_path(b"caf\xc3\xa9/x"),
+        Ok(vec![&b"caf\xc3\xa9"[..], b"x"])
+    );
+    assert_eq!(file::split_path(b"a\xffb"), Err(BadEncoding), "not UTF-8");
+    assert_eq!(
+        file::split_path(b"ok/\xed\xa0\x80"),
+        Err(BadEncoding),
+        "a surrogate in the second component"
+    );
+    assert_eq!(
+        file::split_path(b"a\nb"),
+        Err(BadEncoding),
+        "a control character"
+    );
+    assert_eq!(
+        file::split_path(b"x\xc2\x85"),
+        Err(BadEncoding),
+        "a C1 control (NEL)"
+    );
+    assert_eq!(file::path_status(BadEncoding), file::status::BAD_NAME);
+    assert_eq!(file::path_status(Dots), file::status::BAD_REQUEST);
     assert_eq!(file::split_path(b".."), Err(Dots));
     assert_eq!(file::split_path(b"a/../b"), Err(Dots), "no parent, ever");
     assert_eq!(file::split_path(b"./a"), Err(Dots));

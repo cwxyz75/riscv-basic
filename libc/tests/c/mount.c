@@ -2,6 +2,7 @@
  * the grant. Run on the OS only: `ctest mount /mnt/<name>`. Every check prints `ok: <what>` or `FAIL: <what>`; the return
  * value is the number of failures. */
 #include <errno.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -102,6 +103,26 @@ int mount_test(const char *mnt) {
     CHECK(symlink("/etc/passwd", hp) != 0 && errno == EINVAL, "an absolute link target is refused");
     CHECK(link(path, hp) != 0 && errno == EPERM, "hard links are refused");
     unlink(lp); unlink(path); rmdir(dp);
+    /* names are UTF-8 without control characters (FS-SPEC F6): good ones work, others are refused with EILSEQ, never repaired */
+    char np[256];
+    snprintf(np, sizeof np, "%s/caf\xc3\xa9", mnt);
+    f = fopen(np, "w");
+    int utf_ok = f != NULL && fputs("x", f) >= 0 && fclose(f) == 0 && stat(np, &st) == 0;
+    DIR *nd = opendir(mnt);
+    int listed = 0;
+    for (struct dirent *de; nd && (de = readdir(nd));) if (strcmp(de->d_name, "caf\xc3\xa9") == 0) listed = 1;
+    if (nd) closedir(nd);
+    CHECK(utf_ok && listed && unlink(np) == 0, "a UTF-8 name works on the volume and is listed as it was written");
+    snprintf(np, sizeof np, "%s/bad\xff", mnt);
+    errno = 0;
+    CHECK(open(np, O_WRONLY | O_CREAT, 0644) < 0 && errno == EILSEQ, "a name that is not UTF-8 is refused with EILSEQ on the volume");
+    errno = 0;
+    CHECK(open("/tmp/bad\xc3", O_WRONLY | O_CREAT, 0644) < 0 && errno == EILSEQ, "and in /tmp");
+    snprintf(np, sizeof np, "%s/tab\there", mnt);
+    errno = 0;
+    CHECK(mkdir(np, 0755) != 0 && errno == EILSEQ, "a control character in a name is refused (mkdir)");
+    f = fopen("/tmp/caf\xc3\xa9", "w");
+    CHECK(f != NULL && fclose(f) == 0 && unlink("/tmp/caf\xc3\xa9") == 0, "a UTF-8 name works in /tmp");
     /* leave one file behind: the shell test reads it from a later session (the volume is durable) */
     char kept[256];
     snprintf(kept, sizeof kept, "%s/kept", mnt);
