@@ -23,8 +23,8 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
    `execlp`/`execvp` over the spawn grant; `sigwait`; the `*at` family (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `symlinkat`,
    `readlinkat`, `fchmodat`, `linkat` as refused) on the existing path code; basic wide characters (`mbrtowc`/`wcrtomb` for UTF-8,
    `uchar.h`, `wcwidth`). Re-run the GNU tar measurement afterwards and record the new numbers in T145.
-4. [ ] **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical): `proto::file::valid_name`, goldens, `memfs`,
-   `doofs`, `rt::fs`, the libc.
+4. [ ] **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical; TIDY-UP T146 lists what has to follow): `proto::file::valid_name`,
+   goldens, `memfs`, `doofs`, `rt::fs`, the libc.
 5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
    the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
    finds; the slice I (AIA) review is also still owed.
