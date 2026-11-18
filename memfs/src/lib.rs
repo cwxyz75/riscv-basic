@@ -160,6 +160,8 @@ pub enum Error {
     ReadOnly,
     /// A name that is empty, too long, `.`/`..`, or contains `/` or NUL.
     BadName,
+    /// A name that is not valid UTF-8 or has a control character (FS-SPEC F6): `EILSEQ`.
+    BadEncoding,
     /// An offset or length that overflows.
     BadRange,
     /// A directory cannot be moved into itself or below itself; `read` or `write` of a symlink.
@@ -297,8 +299,16 @@ pub struct Fs {
     indexes: BTreeMap<Vec<u8>, AttrType>,
 }
 
+/// The file-system error for a name the rule refuses.
+pub fn name_error(e: proto::file::PathError) -> Error {
+    match e {
+        proto::file::PathError::BadEncoding => Error::BadEncoding,
+        _ => Error::BadName,
+    }
+}
+
 fn check_name(n: &[u8]) -> Result<(), Error> {
-    proto::file::valid_name(n).map_err(|_| Error::BadName)
+    proto::file::valid_name(n).map_err(name_error)
 }
 
 impl Fs {
@@ -861,7 +871,7 @@ impl Fs {
         {
             return Err(Error::BadName);
         }
-        Ok(())
+        proto::file::valid_text(name).map_err(name_error)
     }
 
     /// Set (replace) attribute `name` of `id`.

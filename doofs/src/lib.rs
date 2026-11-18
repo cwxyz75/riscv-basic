@@ -229,7 +229,7 @@ pub struct Fs<D: Device> {
 }
 
 fn check_name(n: &[u8]) -> Result<(), Error> {
-    proto::file::valid_name(n).map_err(|_| Error::BadName)
+    proto::file::valid_name(n).map_err(memfs::name_error)
 }
 
 impl<D: Device> Fs<D> {

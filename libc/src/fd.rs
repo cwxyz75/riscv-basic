@@ -171,11 +171,12 @@ fn errno_of(status: i32) -> c_int {
         ps::NAME_TOO_LONG => 36,  // ENAMETOOLONG
         ps::QUOTA => 28,          // ENOSPC
         ps::BAD_REQUEST => 22,    // EINVAL
+        ps::BAD_NAME => 84, // EILSEQ: a name that is not UTF-8 or has a control character (FS-SPEC F6)
         ps::SYMLINK | LOOP => 40, // ELOOP
-        ps::BAD_TARGET => 22,     // EINVAL: a link target the server refuses
-        -3 => 13,                 // EACCES
-        -5 => 12,                 // ENOMEM
-        _ => 5,                   // EIO
+        ps::BAD_TARGET => 22, // EINVAL: a link target the server refuses
+        -3 => 13,           // EACCES
+        -5 => 12,           // ENOMEM
+        _ => 5,             // EIO
     }
 }
 
