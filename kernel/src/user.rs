@@ -123,6 +123,8 @@ struct UserState {
     /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
     /// hart skip the cleanup while one cleaner was preempted).
     cleaning: alloc::collections::BTreeSet<Tid>,
+    /// Threads with a pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
+    interrupts: alloc::collections::BTreeSet<Tid>,
     /// Thread starts waiting for their thread to run, by token.
     starts: BTreeMap<usize, ThreadStart>,
     next_token: usize,
@@ -183,6 +185,7 @@ fn state() -> &'static mut UserState {
             next_pid: 1,
             pending_vmos: Vec::new(),
             cleaning: alloc::collections::BTreeSet::new(),
+            interrupts: alloc::collections::BTreeSet::new(),
             starts: BTreeMap::new(),
             next_token: 1,
             ktable: HandleTable::new(256),
@@ -641,6 +644,7 @@ fn leave(code: i32, whole: bool) -> ! {
         let tid = thread::current();
         crate::fp::thread_gone(tid);
         s.sched_flags.remove(&tid);
+        s.interrupts.remove(&tid);
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
@@ -676,6 +680,16 @@ fn leave(code: i32, whole: bool) -> ! {
         _ => notify(),
     }
     thread::exit()
+}
+
+/// Whether the calling thread has a pending `thread_interrupt` (for wait conditions; interrupts are off or the lock is held).
+fn interrupted_now() -> bool {
+    state().interrupts.contains(&thread::current())
+}
+
+/// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
+fn take_interrupt() -> bool {
+    irq::without(|| state().interrupts.remove(&thread::current()))
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
@@ -1769,7 +1783,11 @@ fn object_wait(a: [u64; 6]) -> Reply {
         // while a change it should have seen is still in the log)
         commit_wake();
         thread::wait_deadline_registered(
-            || killed_now().is_some() || signals_now(h).map_or(true, |s| s & mask != 0),
+            || {
+                killed_now().is_some()
+                    || interrupted_now()
+                    || signals_now(h).map_or(true, |s| s & mask != 0)
+            },
             || register_wait(me, h, mask),
             deadline,
         );
@@ -1779,6 +1797,8 @@ fn object_wait(a: [u64; 6]) -> Reply {
     let seen = observed().map_err(|e| (e, None, None))?;
     if seen & mask != 0 {
         Ok((Some(u64::from(seen)), None))
+    } else if deadline != 0 && take_interrupt() {
+        Err((Status::Interrupted, Some(u64::from(seen)), None))
     } else {
         Err((Status::TimedOut, Some(u64::from(seen)), None))
     }
@@ -1821,12 +1841,14 @@ fn futex_wait(a: [u64; 6]) -> Reply {
     // sleep until woken (removed from the table), killed, or the deadline: not on the global queue,
     // only `futex_wake` and a kill wake this thread (by id)
     thread::wait_deadline_private(
-        || killed_now().is_some() || !state().futexes.contains(who),
+        || killed_now().is_some() || interrupted_now() || !state().futexes.contains(who),
         deadline,
     );
     // still in the table: the deadline (or a kill) ended the wait: leave it
     let timed_out = irq::without(|| state().futexes.forget(who));
-    if timed_out {
+    if timed_out && take_interrupt() {
+        fail(Status::Interrupted)
+    } else if timed_out {
         fail(Status::TimedOut)
     } else {
         Ok((None, None))
@@ -1871,6 +1893,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
         && deadline != 0
         && thread::ticks() < deadline
         && irq::without(killed_now).is_none()
+        && !irq::without(interrupted_now)
     {
         // (the poll above may have touched the port; tell the wait table before sleeping, so that no
         // thread goes to sleep, and the lock is released, with signal changes still in the log)
@@ -1882,6 +1905,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
         thread::wait_deadline_registered(
             || {
                 killed_now().is_some()
+                    || interrupted_now()
                     || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
             },
             || register_wait(me, h, abi::signals::READABLE),
@@ -1892,6 +1916,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
     }
     match got {
         Some((key, observed)) => Ok((Some(key), Some(u64::from(observed)))),
+        None if deadline != 0 && take_interrupt() => fail(Status::Interrupted),
         None => fail(Status::TimedOut),
     }
 }
@@ -1977,7 +2002,7 @@ fn channel_call(a: [u64; 6]) -> Reply {
         let Some(p) = s.procs.get(&pid) else {
             return true;
         };
-        if p.killed.is_some() {
+        if p.killed.is_some() || s.interrupts.contains(&thread::current()) {
             return true;
         }
         !matches!(
@@ -2040,7 +2065,11 @@ fn channel_call(a: [u64; 6]) -> Reply {
         }
     })
     .map_err(|e| (e, None, None))?;
-    out
+    // (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
+    match out {
+        Err((Status::TimedOut, ..)) if take_interrupt() => fail(Status::Interrupted),
+        other => other,
+    }
 }
 
 /// The creator's end of a process's bootstrap channel, held by the kernel (S3c-1). Kernel
@@ -3026,19 +3055,24 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
     Ok((Some(u64::from(handle)), Some(u64::from(tid))))
 }
 
-/// `thread_interrupt(thread)`: reserved (T56). The place exists so nothing built meanwhile assumes a wait cannot
-/// be interrupted; it checks the handle the way the real call will (a thread handle with MANAGE) and then
-/// says NOT_SUPPORTED.
+/// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
+/// wait that would sleep (object_wait, port_wait, futex_wait, channel_call, with a deadline other than 0) returns
+/// INTERRUPTED and takes the flag; one that is satisfied, or a poll, leaves it. It ends waits, not running code.
+/// Needs MANAGE on a thread handle; a thread that has ended is BAD_STATE.
 fn thread_interrupt(a: [u64; 6]) -> Reply {
-    let th = Handle(a[0] as u32);
-    irq::without(|| -> Reply {
+    if a[0] > u64::from(u32::MAX) {
+        return fail(Status::BadHandle);
+    }
+    let tid = irq::without(|| -> Result<Tid, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        ipc::thread_of(&s.objs, &caller.handles, th, Rights::MANAGE)
-            .map_err(|e| (e, None, None))?;
-        bad(Status::NotSupported)
-    })
+        let (tid, _) = thread_target(s, me, a[0], Rights::MANAGE)?;
+        s.interrupts.insert(tid);
+        Ok(tid)
+    })?;
+    // (after the lock is released: a wake can switch threads)
+    thread::wake(tid);
+    Ok((None, None))
 }
 
 fn thread_info(a: [u64; 6]) -> Reply {

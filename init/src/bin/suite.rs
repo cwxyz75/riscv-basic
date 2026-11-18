@@ -2444,8 +2444,234 @@ fn a_user_signal_wakes_a_blocked_thread() -> Outcome {
     Ok(())
 }
 
-/// The reserved cancellation call (T56): it checks its handle like the real one will, then says NOT_SUPPORTED.
-fn thread_interrupt_is_reserved() -> Outcome {
+// ---- thread_interrupt (T56, SCHED-SMP-SPEC task 26) ----
+// A worker blocks in one kind of wait; the test interrupts it and reads what the wait returned. The wait that is interrupted
+// returns INTERRUPTED (-14); the flag is set whether or not the thread is blocked, and is taken by the blocking call that sees
+// it (never by a poll, never by a call whose condition already holds).
+
+static INTR_H: AtomicU32 = AtomicU32::new(0);
+static INTR_H2: AtomicU32 = AtomicU32::new(0);
+static INTR_WORD: AtomicU32 = AtomicU32::new(0);
+static INTR_GO: AtomicU32 = AtomicU32::new(0);
+static INTR_STARTED: AtomicU32 = AtomicU32::new(0);
+static INTR_R1: AtomicU32 = AtomicU32::new(u32::MAX);
+static INTR_R2: AtomicU32 = AtomicU32::new(u32::MAX);
+static INTR_R3: AtomicU32 = AtomicU32::new(u32::MAX);
+const INTERRUPTED: u32 = -14i32 as u32;
+
+fn intr_reset() {
+    for a in [&INTR_GO, &INTR_STARTED, &INTR_WORD] {
+        a.store(0, Ordering::SeqCst);
+    }
+    for a in [&INTR_R1, &INTR_R2, &INTR_R3] {
+        a.store(u32::MAX, Ordering::SeqCst);
+    }
+}
+
+fn intr_wait_go() {
+    INTR_STARTED.store(1, Ordering::SeqCst);
+    while INTR_GO.load(Ordering::SeqCst) == 0 {
+        sys::thread_yield();
+    }
+}
+
+/// `arg` picks the wait: 0 an object, 1 a port, 2 a futex, 3 a channel call, 4 a poll then a wait, 5 a satisfied wait then a wait,
+/// 6 an interrupted wait then a timed one.
+extern "C" fn intr_worker(arg: usize) -> ! {
+    let (h, h2) = (
+        INTR_H.load(Ordering::SeqCst),
+        INTR_H2.load(Ordering::SeqCst),
+    );
+    intr_wait_go();
+    let (r1, r2, r3): (u32, u32, u32) = match arg {
+        0 => (sys::object_wait(h, 1 << 24, u64::MAX).status as u32, 0, 0),
+        1 => (sys::port_wait(h, u64::MAX).status as u32, 0, 0),
+        2 => (
+            sys::futex_wait(INTR_WORD.as_ptr(), 0, u64::MAX).status as u32,
+            0,
+            0,
+        ),
+        3 => {
+            let (m, n) = request(33, b'E', b"i");
+            let mut reply = [0u8; 32];
+            let args = CallArgs {
+                req_bytes: m.as_ptr() as u64,
+                req_handles: 0,
+                req_nbytes: n as u32,
+                req_nhandles: 0,
+                rep_bytes: reply.as_mut_ptr() as u64,
+                rep_handles: 0,
+                rep_max_bytes: 32,
+                rep_max_handles: 0,
+                deadline: u64::MAX,
+            };
+            (sys::channel_call(h, &args).status as u32, 0, 0)
+        }
+        4 => (
+            // a poll is not a blocking call: it does not take the flag, a wait then does
+            sys::object_wait(h, 1 << 24, 0).status as u32,
+            sys::object_wait(h, 1 << 24, u64::MAX).status as u32,
+            0,
+        ),
+        5 => (
+            // the signal is already there: the wait succeeds and the flag stays for the next blocking call
+            sys::object_wait(h2, 1 << 24, u64::MAX).status as u32,
+            sys::object_wait(h, 1 << 24, u64::MAX).status as u32,
+            0,
+        ),
+        _ => (
+            sys::object_wait(h, 1 << 24, u64::MAX).status as u32,
+            // the flag was taken once: the next wait blocks, and times out
+            sys::object_wait(h, 1 << 24, sys::clock_get() + 30).status as u32,
+            0,
+        ),
+    };
+    INTR_R1.store(r1, Ordering::SeqCst);
+    INTR_R2.store(r2, Ordering::SeqCst);
+    INTR_R3.store(r3, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// Start the worker `kind`, wait until it is (about to be) blocked, interrupt it and wait for its end.
+fn intr_run(kind: usize, interrupt_first: bool) -> Result<u32, Detail> {
+    intr_reset();
+    let t = new_thread(intr_worker, kind)?;
+    while INTR_STARTED.load(Ordering::SeqCst) == 0 {
+        sys::thread_yield();
+    }
+    if interrupt_first {
+        // (the worker is spinning on GO, not blocked: the flag is set while it runs)
+        ensure_eq!(
+            st(sys::thread_interrupt(t)),
+            Some(S::Ok),
+            "interrupt a running thread"
+        );
+        INTR_GO.store(1, Ordering::SeqCst);
+    } else {
+        INTR_GO.store(1, Ordering::SeqCst);
+        nap_ticks(15); // (let it reach its wait)
+        ensure_eq!(
+            st(sys::thread_interrupt(t)),
+            Some(S::Ok),
+            "interrupt a blocked thread"
+        );
+    }
+    let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 1000);
+    ensure_eq!(w.status, 0, "the worker ended (the interrupt woke it)");
+    sys::handle_close(t);
+    Ok(INTR_R1.load(Ordering::SeqCst))
+}
+
+fn thread_interrupt_ends_an_object_wait() -> Outcome {
+    INTR_H.store(event()?, Ordering::SeqCst);
+    ensure_eq!(
+        intr_run(0, false)?,
+        INTERRUPTED,
+        "an object_wait returns INTERRUPTED"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_ends_a_port_wait() -> Outcome {
+    let p = ok(sys::port_create(), "port_create")?.a1 as u32;
+    let e = event()?;
+    ok(sys::port_bind(p, e, 1 << 24, 5), "bind")?;
+    INTR_H.store(p, Ordering::SeqCst);
+    ensure_eq!(
+        intr_run(1, false)?,
+        INTERRUPTED,
+        "a port_wait returns INTERRUPTED"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_ends_a_futex_wait() -> Outcome {
+    ensure_eq!(
+        intr_run(2, false)?,
+        INTERRUPTED,
+        "a futex_wait returns INTERRUPTED"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_ends_a_channel_call() -> Outcome {
+    let (a, b) = channel()?;
+    INTR_H.store(a, Ordering::SeqCst);
+    ensure_eq!(
+        intr_run(3, false)?,
+        INTERRUPTED,
+        "a channel_call returns INTERRUPTED"
+    );
+    // the request was sent and is not withdrawn (as a timeout leaves it): the server end can still read it
+    let mut buf = [0u8; 64];
+    let r = sys::channel_read(b, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0);
+    ensure_eq!(r.status, 0, "the request is still queued");
+    Ok(())
+}
+
+fn thread_interrupt_before_the_wait_is_not_lost() -> Outcome {
+    INTR_H.store(event()?, Ordering::SeqCst);
+    ensure_eq!(
+        intr_run(0, true)?,
+        INTERRUPTED,
+        "an interrupt that arrived while the thread ran ends its next blocking call at once"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_is_not_taken_by_a_poll() -> Outcome {
+    INTR_H.store(event()?, Ordering::SeqCst);
+    intr_run(4, true)?;
+    ensure_eq!(
+        INTR_R1.load(Ordering::SeqCst),
+        S::TimedOut as i32 as u32,
+        "the poll just timed out"
+    );
+    ensure_eq!(
+        INTR_R2.load(Ordering::SeqCst),
+        INTERRUPTED,
+        "the wait after it took the flag"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_waits_for_a_wait_that_would_block() -> Outcome {
+    let (e, ready) = (event()?, event()?);
+    ok(sys::event_signal(ready, 0, 1 << 24), "signal")?;
+    INTR_H.store(e, Ordering::SeqCst);
+    INTR_H2.store(ready, Ordering::SeqCst);
+    intr_run(5, true)?;
+    ensure_eq!(
+        INTR_R1.load(Ordering::SeqCst),
+        0,
+        "a wait whose condition holds succeeds, flag or no flag"
+    );
+    ensure_eq!(
+        INTR_R2.load(Ordering::SeqCst),
+        INTERRUPTED,
+        "and the flag was still there for the next one"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_is_taken_once() -> Outcome {
+    INTR_H.store(event()?, Ordering::SeqCst);
+    intr_run(6, true)?;
+    ensure_eq!(
+        INTR_R1.load(Ordering::SeqCst),
+        INTERRUPTED,
+        "the first blocking call is interrupted"
+    );
+    ensure_eq!(
+        INTR_R2.load(Ordering::SeqCst),
+        S::TimedOut as i32 as u32,
+        "the next one blocks and times out"
+    );
+    Ok(())
+}
+
+/// The call's own checks: the handle, its type, MANAGE, and a thread that has ended.
+fn thread_interrupt_argument_errors() -> Outcome {
     ensure_eq!(
         st(sys::thread_interrupt(0xdead)),
         Some(S::BadHandle),
@@ -2458,13 +2684,7 @@ fn thread_interrupt_is_reserved() -> Outcome {
         "an event is no thread"
     );
     let t = new_thread(worker_set, 1)?;
-    ensure_eq!(
-        st(sys::thread_interrupt(t)),
-        Some(S::NotSupported),
-        "reserved: not supported yet"
-    );
     sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
-    // a thread handle without MANAGE is refused (the right the real call will need)
     let weak = ok(
         sys::handle_duplicate(t, Rights::INSPECT.0),
         "a thread handle without MANAGE",
@@ -2474,6 +2694,11 @@ fn thread_interrupt_is_reserved() -> Outcome {
         st(sys::thread_interrupt(weak)),
         Some(S::AccessDenied),
         "MANAGE is needed"
+    );
+    ensure_eq!(
+        st(sys::thread_interrupt(t)),
+        Some(S::BadState),
+        "a thread that has ended cannot be interrupted"
     );
     Ok(())
 }
@@ -11295,7 +11520,42 @@ pub fn app_main() -> i32 {
             "a_refused_process_start_changes_nothing_and_can_be_retried",
             a_refused_process_start_changes_nothing_and_can_be_retried,
         ),
-        ("thread_interrupt_is_reserved", thread_interrupt_is_reserved),
+        (
+            "thread_interrupt_argument_errors",
+            thread_interrupt_argument_errors,
+        ),
+        (
+            "thread_interrupt_ends_an_object_wait",
+            thread_interrupt_ends_an_object_wait,
+        ),
+        (
+            "thread_interrupt_ends_a_port_wait",
+            thread_interrupt_ends_a_port_wait,
+        ),
+        (
+            "thread_interrupt_ends_a_futex_wait",
+            thread_interrupt_ends_a_futex_wait,
+        ),
+        (
+            "thread_interrupt_ends_a_channel_call",
+            thread_interrupt_ends_a_channel_call,
+        ),
+        (
+            "thread_interrupt_before_the_wait_is_not_lost",
+            thread_interrupt_before_the_wait_is_not_lost,
+        ),
+        (
+            "thread_interrupt_is_not_taken_by_a_poll",
+            thread_interrupt_is_not_taken_by_a_poll,
+        ),
+        (
+            "thread_interrupt_waits_for_a_wait_that_would_block",
+            thread_interrupt_waits_for_a_wait_that_would_block,
+        ),
+        (
+            "thread_interrupt_is_taken_once",
+            thread_interrupt_is_taken_once,
+        ),
         (
             "thread_priority_is_bounded_by_the_job",
             thread_priority_is_bounded_by_the_job,

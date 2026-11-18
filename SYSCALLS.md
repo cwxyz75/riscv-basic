@@ -633,12 +633,14 @@ With several harts, syscalls on different harts serialise on it (TIDY-UP T11).
 
 ### thread_interrupt(thread) -> status
 
-**Reserved** (slice T, T56; cancellation is wanted and deliberately deferred). It will tell a thread to stop what it is
-blocked in; today it validates the handle (BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED, the right being MANAGE) and answers
-NOT_SUPPORTED, so nothing built meanwhile can assume a wait cannot be interrupted. When it is built, every blocking
-call (`object_wait`, `port_wait`, `channel_call`, `futex_wait`) may return INTERRUPTED (-14): callers must treat that
-status like a retry, and the C library's `pthread_cancel` and the service runtime's request cancellation will be built on
-it. Tests: `thread_interrupt_is_reserved`.
+Built (T56, SCHED-SMP-SPEC task 26). Sets the target thread's interrupt flag and wakes it. The next blocking call of the
+target that would sleep (`object_wait`, `port_wait`, `futex_wait`, `channel_call`, with a deadline other than 0) returns
+INTERRUPTED (-14) and takes the flag. A call that is satisfied without sleeping leaves the flag (so an interrupt is not lost
+between two waits), and a poll (deadline 0) neither sees nor takes it. One interrupt ends one wait. A `channel_call`
+interrupted after its request was sent leaves the request queued, as a timeout does. The call ends waits only: a thread
+running user code is not stopped. Rights: MANAGE on a thread handle (0 names the caller). Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; BAD_STATE (the thread has ended). Callers treat INTERRUPTED as a retry or a cancellation point. Tests:
+`thread_interrupt_*` in the suite (nine).
 
 ### Sockets
 
