@@ -45,9 +45,7 @@ jobs:
         with:
           key: soak-${{ matrix.name }}
       - name: Install QEMU and OpenSBI
-        run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+        uses: ./.github/actions/install-qemu
       - uses: actions/cache@v4
         with:
           path: third_party/fetched
