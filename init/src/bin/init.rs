@@ -880,6 +880,7 @@ fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, firs
                 Some(Event::Interrupt) => String::from("event: interrupt\n"),
                 Some(Event::Hangup) => String::from("event: hangup\n"),
                 Some(Event::JobInterrupt) => String::from("event: job-interrupt\n"),
+                Some(Event::JobQuit) => String::from("event: job-quit\n"),
                 None => String::from("event: ?\n"),
             };
             let _ = io::write_all(tty, line.as_bytes());

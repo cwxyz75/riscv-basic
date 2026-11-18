@@ -356,7 +356,7 @@ pub extern "C" fn _Exit(code: c_int) -> ! {
 
 #[no_mangle]
 pub extern "C" fn abort() -> ! {
-    rt::sys::exit(134) // 128 + SIGABRT, as a shell would show
+    crate::sig::abort_signal()
 }
 
 /// The environment (`NAME=value` strings, NUL-terminated), set by `run_main`; C sees it as `environ`.

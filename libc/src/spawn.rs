@@ -97,11 +97,7 @@ fn wait_status(code: i32) -> c_int {
         c if c < crate::sig::SIGNALED_BASE && c > crate::sig::SIGNALED_BASE - 65 => {
             crate::sig::SIGNALED_BASE - c
         }
-        c if (-1100..=-1000).contains(&c) => match -1000 - c {
-            2 => 4,
-            0 | 4 | 6 => 7,
-            _ => 11,
-        },
+        c if (-1100..=-1000).contains(&c) => cfmt::sigtab::fault_signal((-1000 - c) as u64),
         c => (c & 0xff) << 8,
     }
 }

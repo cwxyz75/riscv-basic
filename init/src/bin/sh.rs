@@ -339,6 +339,8 @@ impl Os {
             match ctl::decode_event(&rb[..r.a1]) {
                 Some(ctl::Event::Interrupt) => self.interrupt = true,
                 Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                Some(ctl::Event::Hangup) => self.hangup_foreground(),
                 _ => {}
             }
         }
@@ -352,6 +354,27 @@ impl Os {
         for pid in self.fg_pids.clone() {
             if let Some(b) = self.brokers.iter().find(|b| b.pid == pid && b.handles_int) {
                 sys::channel_write(b.sig, [2u8].as_ptr(), 1, core::ptr::null(), 0);
+            }
+        }
+    }
+
+    /// Ctrl-\\ reached a running job: the console server has ended the programs on the list it was given, and the shell ends the
+    /// rest, handlers or not (the key does not ask the program: a program that holds Ctrl-C off cannot hold the console, T149).
+    fn quit_foreground(&mut self) {
+        for pid in self.fg_pids.clone() {
+            if let Some(&h) = self.procs.get(&pid) {
+                sys::process_kill(h, -2003);
+            }
+        }
+    }
+
+    /// The terminal hung up while a job runs: SIGHUP goes to every program of the foreground job that holds a signal channel
+    /// (handlers run, the default action ends the program, both at its next wait). The console server gives them a moment and then
+    /// ends what is left.
+    fn hangup_foreground(&mut self) {
+        for b in &self.brokers {
+            if self.fg_pids.contains(&b.pid) || self.fg_pids.contains(&b.root) {
+                sys::channel_write(b.sig, [1u8].as_ptr(), 1, core::ptr::null(), 0);
             }
         }
     }
@@ -474,6 +497,8 @@ impl Os {
                 match ctl::decode_event(&rb[..r.a1]) {
                     Some(ctl::Event::Interrupt) => self.interrupt = true,
                     Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                    Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                    Some(ctl::Event::Hangup) => self.hangup_foreground(),
                     _ => {}
                 }
                 continue;
@@ -520,6 +545,8 @@ impl Os {
                         match ctl::decode_event(&rb[..r.a1]) {
                             Some(ctl::Event::Interrupt) => self.interrupt = true,
                             Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
+                            Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                            Some(ctl::Event::Hangup) => self.hangup_foreground(),
                             _ => {}
                         }
                         continue;

@@ -25,6 +25,7 @@ pub const SIG_ERR: Handler = usize::MAX;
 pub const SIGKILL: c_int = 9;
 pub const SIGSTOP: c_int = 19;
 pub const SIGALRM: c_int = 14;
+const SA_SIGINFO: c_int = 4;
 const SA_RESTART: c_int = 0x1000_0000;
 const SA_NODEFER: c_int = 0x4000_0000;
 const SA_RESETHAND: c_int = 0x8000_0000u32 as c_int;
@@ -191,16 +192,27 @@ pub fn deliver() -> Delivered {
         match h {
             SIG_IGN => {}
             SIG_DFL => {
-                // the default is to end the program, except for the signals about children, windows, urgent data and
-                // stopping and continuing (nothing stops a program here)
-                if !matches!(sig, 17..=23 | 28) {
+                // POSIX's table of default actions (`cfmt::sigtab::default_action`). Stopping and continuing need the kernel to
+                // suspend a program's threads (T149 phase 2): until then they do nothing, as they always did.
+                use cfmt::sigtab::Action;
+                if matches!(
+                    cfmt::sigtab::default_action(sig),
+                    Action::Terminate | Action::Abort
+                ) {
                     terminate(sig);
                 }
             }
             f => {
-                // SAFETY: a function pointer the program registered with `signal` or `sigaction`.
-                let f: extern "C" fn(c_int) = unsafe { core::mem::transmute(f) };
-                f(sig);
+                if flags & SA_SIGINFO != 0 {
+                    // SAFETY: a function pointer the program registered with `sigaction` and `SA_SIGINFO`: three arguments.
+                    let f: extern "C" fn(c_int, *const SigInfo, *const core::ffi::c_void) =
+                        unsafe { core::mem::transmute(f) };
+                    f(sig, &SigInfo::new(sig), core::ptr::null());
+                } else {
+                    // SAFETY: a function pointer the program registered with `signal` or `sigaction`.
+                    let f: extern "C" fn(c_int) = unsafe { core::mem::transmute(f) };
+                    f(sig);
+                }
                 TABLE.lock().blocked = old;
                 out.ran = true;
                 if flags & SA_RESTART == 0 {
@@ -319,7 +331,10 @@ pub fn stream_write(h: u32, data: &[u8]) -> Result<usize, c_int> {
                 nomem_since = None;
                 done += r.a1;
             }
-            Some(Status::PeerClosed) => return Err(32),
+            Some(Status::PeerClosed) => {
+                sigpipe();
+                return Err(32);
+            }
             Some(Status::ShouldWait) => {
                 if let Wait::Interrupted =
                     wait_any(&[(h, sg::WRITABLE | sg::PEER_CLOSED)], u64::MAX, true)
@@ -338,6 +353,55 @@ pub fn stream_write(h: u32, data: &[u8]) -> Result<usize, c_int> {
         }
     }
     Ok(done)
+}
+
+/// `siginfo_t` (Linux layout: 128 bytes, the three ints first, then the sender and the value). The channel carries the signal
+/// number only, so the sender is not known: `si_pid` and `si_uid` are 0 and `si_code` is `SI_USER` (0).
+#[repr(C)]
+pub struct SigInfo {
+    si_signo: c_int,
+    si_errno: c_int,
+    si_code: c_int,
+    _pad: c_int,
+    si_pid: c_int,
+    si_uid: u32,
+    si_value: usize,
+    _rest: [u8; 96],
+}
+
+impl SigInfo {
+    fn new(sig: c_int) -> Self {
+        SigInfo {
+            si_signo: sig,
+            si_errno: 0,
+            si_code: 0,
+            _pad: 0,
+            si_pid: 0,
+            si_uid: 0,
+            si_value: 0,
+            _rest: [0; 96],
+        }
+    }
+}
+
+/// `abort`: raise SIGABRT with it unblocked, so a handler runs; if that returns (or the signal was ignored) the disposition goes
+/// back to the default and the program ends as killed by SIGABRT (POSIX `abort`).
+pub fn abort_signal() -> ! {
+    {
+        let mut t = TABLE.lock();
+        t.blocked &= !bit(6);
+    }
+    post(6);
+    deliver();
+    TABLE.lock().handler[6] = SIG_DFL;
+    terminate(6)
+}
+
+/// A write to a stream or socket nobody reads: SIGPIPE is generated for the writing program (POSIX `write`, `send` without
+/// `MSG_NOSIGNAL`). Its default action ends the program; when it is caught, blocked or ignored the write fails with `EPIPE`.
+pub fn sigpipe() {
+    post(13);
+    deliver();
 }
 
 // ---- the C interface ----
@@ -623,10 +687,10 @@ pub extern "C" fn getppid() -> c_int {
     }
 }
 
-/// `sigwait`: take the lowest-numbered pending signal in `set` (they should be blocked), waiting for one (checked every 10 ms).
-#[no_mangle]
-pub unsafe extern "C" fn sigwait(set: *const u64, sig: *mut c_int) -> c_int {
-    let wanted = *set & !(bit(SIGKILL) | bit(SIGSTOP));
+/// Take the lowest-numbered pending signal in `set` (they should be blocked), waiting until `deadline` (absolute ms; `u64::MAX`
+/// for ever, 0 for a look only). `None` when the time passed first.
+fn wait_for(set: u64, deadline: u64) -> Option<c_int> {
+    let wanted = set & !(bit(SIGKILL) | bit(SIGSTOP));
     loop {
         drain();
         check_alarm();
@@ -636,10 +700,57 @@ pub unsafe extern "C" fn sigwait(set: *const u64, sig: *mut c_int) -> c_int {
             if ready != 0 {
                 let n = ready.trailing_zeros() as c_int + 1;
                 t.pending &= !bit(n);
-                *sig = n;
-                return 0;
+                return Some(n);
             }
         }
-        let _ = wait_any(&[], rt::sys::clock_get() + 10, true);
+        let now = rt::sys::clock_get();
+        if now >= deadline {
+            return None;
+        }
+        let _ = wait_any(&[], deadline.min(now + 10), true);
     }
+}
+
+/// `sigwait`: wait for a signal in `set`.
+#[no_mangle]
+pub unsafe extern "C" fn sigwait(set: *const u64, sig: *mut c_int) -> c_int {
+    *sig = wait_for(*set, u64::MAX).unwrap_or(0);
+    0
+}
+
+/// `sigwaitinfo` and `sigtimedwait`: as `sigwait`, returning the signal number (and its `siginfo_t` if `info` is not null). The
+/// timeout is a `timespec` (`seconds`, `nanoseconds`), null for no limit; when it passes the call fails with `EAGAIN`.
+#[no_mangle]
+pub unsafe extern "C" fn sigtimedwait(
+    set: *const u64,
+    info: *mut SigInfo,
+    timeout: *const [i64; 2],
+) -> c_int {
+    let deadline = if timeout.is_null() {
+        u64::MAX
+    } else {
+        let [s, ns] = *timeout;
+        if s < 0 || !(0..1_000_000_000).contains(&ns) {
+            errno::set(22);
+            return -1;
+        }
+        rt::sys::clock_get() + (s as u64) * 1000 + (ns as u64).div_ceil(1_000_000)
+    };
+    match wait_for(*set, deadline) {
+        Some(n) => {
+            if !info.is_null() {
+                *info = SigInfo::new(n);
+            }
+            n
+        }
+        None => {
+            errno::set(11);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sigwaitinfo(set: *const u64, info: *mut SigInfo) -> c_int {
+    sigtimedwait(set, info, core::ptr::null())
 }

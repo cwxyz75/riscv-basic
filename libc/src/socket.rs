@@ -422,6 +422,23 @@ pub fn sock_recv(
 }
 
 /// Send on a socket descriptor (`write`, `send`, `sendto`). `to` is the destination of a datagram.
+/// `sock_send` as `write` and `send` have it: a send on a closed stream raises SIGPIPE (the lock is not held then) unless
+/// `nosignal` (`MSG_NOSIGNAL`), and fails with `EPIPE` either way.
+pub fn send_signalling(
+    sock: &SockRef,
+    data: &[u8],
+    dontwait: bool,
+    to: Option<([u8; 4], u16)>,
+    nosignal: bool,
+) -> isize {
+    let r = sock_send(sock, data, dontwait, to);
+    if r < 0 && !nosignal && errno::get() == EPIPE {
+        crate::sig::sigpipe();
+        errno::set(EPIPE);
+    }
+    r
+}
+
 pub fn sock_send(sock: &SockRef, data: &[u8], dontwait: bool, to: Option<([u8; 4], u16)>) -> isize {
     let mut s = sock.lock();
     let nonblock = s.nonblock || dontwait;
@@ -527,8 +544,13 @@ pub unsafe extern "C" fn sendto(
     } else {
         core::slice::from_raw_parts(buf as *const u8, n)
     };
-    let _ = MSG_NOSIGNAL; // a write to a closed stream is always EPIPE: there are no signals
-    sock_send(&sock, data, flags & MSG_DONTWAIT != 0, dest)
+    send_signalling(
+        &sock,
+        data,
+        flags & MSG_DONTWAIT != 0,
+        dest,
+        flags & MSG_NOSIGNAL != 0,
+    )
 }
 
 #[no_mangle]

@@ -14,6 +14,11 @@ pub fn set(e: c_int) {
     unsafe { *__errno_location() = e }
 }
 
+pub fn get() -> c_int {
+    // SAFETY: the calling thread's errno.
+    unsafe { *__errno_location() }
+}
+
 pub const ERANGE: c_int = 34;
 pub const EINVAL: c_int = 22;
 pub const ENOMEM: c_int = 12;

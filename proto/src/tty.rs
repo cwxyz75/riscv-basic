@@ -35,6 +35,8 @@ pub struct Input {
     pub kill: bool,
     /// Ctrl-C was seen with signals on and the terminal not canonical: tell the owner (no byte is delivered).
     pub interrupt: bool,
+    /// Ctrl-\\ was seen with signals on: end the foreground set outright (SIGQUIT's key; the job is not asked, T149).
+    pub quit: bool,
     /// A size report answered the pending query: `(cols, rows)`.
     pub resized: Option<(u16, u16)>,
 }
@@ -136,8 +138,8 @@ impl Tty {
     pub fn serial_in(&mut self, bytes: &[u8]) -> Input {
         let mut input = Input::default();
         for &b in bytes {
-            if input.kill {
-                break; // type-ahead behind a Ctrl-C is discarded
+            if input.kill || input.quit {
+                break; // type-ahead behind a Ctrl-C or Ctrl-\\ is discarded
             }
             self.byte(b, &mut input);
         }
@@ -189,7 +191,17 @@ impl Tty {
     }
 
     fn plain(&mut self, b: u8, input: &mut Input) {
-        if input.kill {
+        if input.kill || input.quit {
+            return;
+        }
+        if b == 0x1c && self.mode & mode::ISIG != 0 {
+            if self.mode & mode::ECHO != 0 {
+                self.push_out(b"^\\\r\n");
+            }
+            // (a half-typed line is dropped, as for Ctrl-C)
+            self.editor = LineEditor::new();
+            self.fresh = true;
+            input.quit = true;
             return;
         }
         if self.mode & mode::ICANON == 0 {
@@ -486,6 +498,28 @@ mod tests {
         t.set_mode(mode::ICANON);
         assert_eq!(t.serial_in(b"hi\r").deliver, b"hi\n");
         assert_eq!(drain(&mut t), "hi\r\n"); // the editor echoes in canonical mode
+    }
+
+    #[test]
+    fn ctrl_backslash_is_a_quit_in_cooked_and_cbreak_and_data_without_signals() {
+        // cooked: the key asks the console server to end the foreground set, echoes `^\`, delivers nothing and drops type-ahead
+        let mut t = Tty::new(1024);
+        let i = t.serial_in(b"ab\x1cxyz");
+        assert!(i.quit && !i.kill && !i.interrupt);
+        assert_eq!(i.deliver, b""); // the half-typed line is gone too
+        assert_eq!(drain(&mut t), "ab^\\\r\n");
+        assert_eq!(t.serial_in(b"ok\r").deliver, b"ok\n"); // and the editor works afterwards
+                                                           // cbreak with signals on: the same
+        let mut t = Tty::new(1024);
+        t.set_mode(mode::CBREAK);
+        let i = t.serial_in(b"a\x1cb");
+        assert!(i.quit && !i.kill);
+        assert_eq!(i.deliver, b"a");
+        // raw, or ICANON alone: no ISIG, so the byte is data
+        let mut t = raw();
+        let i = t.serial_in(b"x\x1cy");
+        assert!(!i.quit);
+        assert_eq!(i.deliver, b"x\x1cy");
     }
 
     #[test]
