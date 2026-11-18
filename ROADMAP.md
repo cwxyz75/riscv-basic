@@ -789,6 +789,8 @@ search, so some of it may already be partly covered by a slice above. Rough grou
 
 *Portability and hardware*
 
+- **A complete libc** (noted 2026-11-17, owner). The C standard library as `scripts/libc_gap_survey.py` can measure it, then the POSIX base interfaces (locale and wide characters, `regex`, `iconv`, `*at` calls, `mmap`/`fork` shims), with the host's libc as the oracle wherever behaviour is defined. Phase 1 is item 3 of `WORK-PLAN.md` (plan 2). Done when every fetched program in the survey reports nothing undeclared and the portable corpus passes. It unlocks GNU tar and coreutils (TIDY-UP T145).
+
 - **A second architecture (AArch64).** Approach if ever wanted: an in-tree `arch` layer, not kernel forks.
   Refactor on RISC-V first (arch code behind one module: boot, trap frame, context switch, per-CPU
   register, timer, IPI, TLB and cache maintenance, FP state; the page-table code in `kcore` made generic

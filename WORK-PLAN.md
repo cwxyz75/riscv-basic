@@ -1,9 +1,48 @@
-# Work plan (agreed with the owner, 2026-11-17)
+# Work plan (second plan, agreed with the owner, 2026-11-17 night; the first plan is below as history)
 
 **Standing instruction from the owner: carry on with this plan autonomously until it is complete or the owner interrupts, whichever
 comes first. Do not stop to ask; decide, log (OS decision log, TIDY-UP) and go on. Merge green PRs. Do not vendor third-party
-sources (they are fetched, pinned by sha256, never committed). The kernel step (7) needs the owner's go-ahead first.** If the
+sources (they are fetched, pinned by sha256, never committed).** If the
 conversation was compacted, read this file and `git log` / `gh pr list` to see where things stand, and tick items here as they land.
+
+## Plan 2 (written 2026-11-17, before bedtime; sizes are guesses)
+
+Rules for the night: the lighter local gate (`make fmt-check lint docs-check`, the one targeted test, `make check` when the image or a
+program list changes, `make os-serial-test` when console, sessions, auth, profiles or the trust list change, `-smp 4` only for kernel
+work; CI runs the rest); never force-push (merge main into the branch); batch small slices into one PR; a fresh-context review for
+kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS decision log.
+
+1. [ ] **Merge the docs PR** (this file, branch `workplan-update`).
+2. [ ] **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
+   grant off (T136); say in TIDY-UP what is still open in T139.
+3. [ ] **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
+   coreutils, gnutar, busybox, gzip, sqlite) and write the ranked gap list into a document (`UV0-GAP-SURVEY.md` or a new
+   `LIBC-GAPS.md`). Then, each with a C test (the host's libc as oracle where it can be) and a note in TIDY-UP: `getopt_long` moved
+   from `third_party/compat` into the libc (with `getopt_long_only`, permutation, and a host differential test); `error.h`
+   (`error`, `error_at_line`); `strings.h` (`bcmp`, `bcopy`, `index`, `rindex`); `alloca.h`; `creat`, `ftello`, `fscanf`;
+   `execlp`/`execvp` over the spawn grant; `sigwait`; the `*at` family (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `symlinkat`,
+   `readlinkat`, `fchmodat`, `linkat` as refused) on the existing path code; basic wide characters (`mbrtowc`/`wcrtomb` for UTF-8,
+   `uchar.h`, `wcwidth`). Re-run the GNU tar measurement afterwards and record the new numbers in T145.
+4. [ ] **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical): `proto::file::valid_name`, goldens, `memfs`,
+   `doofs`, `rt::fs`, the libc.
+5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
+   the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
+   finds; the slice I (AIA) review is also still owed.
+6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
+   needs executable memory, say so and stop at "compiles to a file".
+7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the `ish` steps SH0 onward, or L-task work, which are the
+   owner's to choose: do not start the kernel locking tasks unasked).
+
+## Long-range list (not scheduled)
+
+- **A complete libc**: the C standard library as the gap survey can measure it, then POSIX base interfaces (locale and wide
+  characters, `regex`, `iconv`, `mmap` and `fork` shims, `dlopen` refused), with the host's libc as the oracle wherever the behaviour
+  is defined. Phase 1 is item 3 above; the measure is "every fetched program in `scripts/libc_gap_survey.py` reports no undeclared
+  names, and the portable test corpus passes".
+- GNU tar and GNU coreutils (both need gnulib on a libc with the interfaces above; T145), a real `/bin/sh` for interactive use, `tcc`.
+- The native shell `ish` (SH steps), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
+
+## Plan 1 (history)
 
 Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
 
