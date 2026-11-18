@@ -732,7 +732,7 @@ Already built that the track builds on: per-program namespaces and the registry 
   - **SH1 done (2026-11-17)**: the `data` crate (value, exact decimals capped at 38 digits, JSON, CSV, TSV, the access primitives); JSONTestSuite vendored under `third_party/json-test-suite` and run as the oracle (every `y_` accepted except four number-cap and two duplicate-key cases, every `n_` rejected, every `i_` pinned with a reason), property round trips, 11 hand mutations caught. Original entry: **SH1** (`data` crate: JSON, CSV, TSV; JSONTestSuite as the oracle), **SH2** (evaluator over a fake `Host`; differential against `es` where installed) and **SH3** (numbers): pure host work with no OS dependency. Start any time after the open points; they can run beside UV5.
   - **SH4** (replace `sh.rs`: launcher, pipelines, `confine`, `ns`, `/etc/trusted`; every existing shell test passes unchanged) goes **before UV5**, because the session manager and profiles launch the shell and replace `/etc/trusted` with a table built from a profile: UV5 should target `ish`, not a shell about to be replaced.
   - **SH5** (interactive layer on the raw mode, events and size) is **unblocked by UV4**; it follows SH4. Per-program termios (UV4b, T124) is not needed for it, since the shell is the terminal's owner.
-  - **SH6** (TOML, YAML subset) after Q2; **SH7** (compat `/bin/sh`) with UV8 and `posix_spawn`.
+  - **SH6** (TOML, YAML subset) after Q2; **SH7** (compat `/bin/sh`) is **a port, not a shell we write** (owner, 2026-11-17): BusyBox `hush` runs today (`ash` and `dash` need `fork`); what is left is TIDY-UP T139 (here-documents, the `/bin/sh` name, interactive mode, a `configure` corpus).
 
 ### S10: Namespaces and attributes
 

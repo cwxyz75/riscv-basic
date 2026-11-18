@@ -30,7 +30,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
    finds; the slice I (AIA) review is also still owed.
 6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
    needs executable memory, say so and stop at "compiles to a file".
-7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7: a compatible `/bin/sh`, partly covered by the hush port), or L-task work, which are the
+7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7 is the hush port, no shell to write: T139 lists what is left), or L-task work, which are the
    owner's to choose: do not start the kernel locking tasks unasked).
 
 ## Long-range list (not scheduled)
@@ -40,7 +40,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
   is defined. Phase 1 is item 3 above; the measure is "every fetched program in `scripts/libc_gap_survey.py` reports no undeclared
   names, and the portable test corpus passes".
 - GNU tar and GNU coreutils (both need gnulib on a libc with the interfaces above; T145), a real `/bin/sh` for interactive use, `tcc`.
-- The remaining `ish` steps (SH1 to SH5 are done: `sh` is `ish`; SH6 and SH7 are left), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
+- The remaining `ish` steps (SH1 to SH5 are done: `sh` is `ish`; SH6 is left; SH7 is the hush port), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
 
 ## Plan 1 (history)
 
