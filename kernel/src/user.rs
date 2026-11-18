@@ -1961,6 +1961,10 @@ fn channel_call(a: [u64; 6]) -> Reply {
     if nbytes < 4 {
         return fail(Status::InvalidArgs);
     }
+    // An interrupt already pending ends the call before anything is sent (a retry then sends one request, not two).
+    if deadline != 0 && take_interrupt() {
+        return fail(Status::Interrupted);
+    }
     // Send the request.
     let txid = with_proc(|objs, p, k| -> Result<u32, Status> {
         let entry = p.handles.get(ch)?;
@@ -2067,7 +2071,9 @@ fn channel_call(a: [u64; 6]) -> Reply {
     .map_err(|e| (e, None, None))?;
     // (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
     match out {
-        Err((Status::TimedOut, ..)) if take_interrupt() => fail(Status::Interrupted),
+        Err((Status::TimedOut, ..)) if deadline != 0 && take_interrupt() => {
+            fail(Status::Interrupted)
+        }
         other => other,
     }
 }
@@ -3070,7 +3076,7 @@ fn thread_interrupt(a: [u64; 6]) -> Reply {
         s.interrupts.insert(tid);
         Ok(tid)
     })?;
-    // (after the lock is released: a wake can switch threads)
+    // (after the state closure has ended: a wake can switch threads)
     thread::wake(tid);
     Ok((None, None))
 }

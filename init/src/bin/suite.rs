@@ -2519,6 +2519,30 @@ extern "C" fn intr_worker(arg: usize) -> ! {
             sys::object_wait(h, 1 << 24, u64::MAX).status as u32,
             0,
         ),
+        7 => {
+            let (m, n) = request(34, b'E', b"i");
+            let mut reply = [0u8; 32];
+            let mut mk = |deadline| CallArgs {
+                req_bytes: m.as_ptr() as u64,
+                req_handles: 0,
+                req_nbytes: n as u32,
+                req_nhandles: 0,
+                rep_bytes: reply.as_mut_ptr() as u64,
+                rep_handles: 0,
+                rep_max_bytes: 32,
+                rep_max_handles: 0,
+                deadline,
+            };
+            // a call with deadline 0 neither sees nor takes the flag; a blocking one then does, before it sends
+            let first = sys::channel_call(h, &mk(0)).status as u32;
+            let second = sys::channel_call(h, &mk(u64::MAX)).status as u32;
+            (first, second, 0)
+        }
+        8 => (
+            sys::port_wait(h, 0).status as u32,
+            sys::port_wait(h, u64::MAX).status as u32,
+            0,
+        ),
         _ => (
             sys::object_wait(h, 1 << 24, u64::MAX).status as u32,
             // the flag was taken once: the next wait blocks, and times out
@@ -2650,6 +2674,50 @@ fn thread_interrupt_waits_for_a_wait_that_would_block() -> Outcome {
         INTR_R2.load(Ordering::SeqCst),
         INTERRUPTED,
         "and the flag was still there for the next one"
+    );
+    Ok(())
+}
+
+fn thread_interrupt_polls_leave_the_flag_on_every_wait() -> Outcome {
+    let p = ok(sys::port_create(), "port_create")?.a1 as u32;
+    let e = event()?;
+    ok(sys::port_bind(p, e, 1 << 24, 5), "bind")?;
+    INTR_H.store(p, Ordering::SeqCst);
+    intr_run(8, true)?;
+    ensure_eq!(
+        INTR_R1.load(Ordering::SeqCst),
+        S::TimedOut as i32 as u32,
+        "the port poll timed out"
+    );
+    ensure_eq!(
+        INTR_R2.load(Ordering::SeqCst),
+        INTERRUPTED,
+        "the port wait after it took the flag"
+    );
+    let (a, b) = channel()?;
+    INTR_H.store(a, Ordering::SeqCst);
+    intr_run(7, true)?;
+    ensure_eq!(
+        INTR_R1.load(Ordering::SeqCst),
+        S::TimedOut as i32 as u32,
+        "a channel_call with deadline 0 timed out"
+    );
+    ensure_eq!(
+        INTR_R2.load(Ordering::SeqCst),
+        INTERRUPTED,
+        "the blocking call after it took the flag"
+    );
+    // only the poll's request was sent: the interrupted call sent nothing
+    let mut buf = [0u8; 64];
+    ensure_eq!(
+        sys::channel_read(b, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0).status,
+        0,
+        "the first request is queued"
+    );
+    ensure_eq!(
+        sys::channel_read(b, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), 0).status,
+        S::ShouldWait as i32,
+        "and no second one"
     );
     Ok(())
 }
@@ -11551,6 +11619,10 @@ pub fn app_main() -> i32 {
         (
             "thread_interrupt_waits_for_a_wait_that_would_block",
             thread_interrupt_waits_for_a_wait_that_would_block,
+        ),
+        (
+            "thread_interrupt_polls_leave_the_flag_on_every_wait",
+            thread_interrupt_polls_leave_the_flag_on_every_wait,
         ),
         (
             "thread_interrupt_is_taken_once",
