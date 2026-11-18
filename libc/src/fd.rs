@@ -749,14 +749,18 @@ pub fn vfork_enter() {
                 let want = (if f.readable { rights::READ } else { 0 })
                     | (if f.writable { rights::WRITE } else { 0 });
                 if let Ok(c) = f.fs.clone_conn(want) {
+                    // (the child appends, so that what it writes does not overwrite what the parent wrote; the parent keeps its own
+                    // mode and is moved past the child's writes when the child ends: `vfork_leave`)
                     if f.writable {
-                        f.append = true;
+                        if let Ok(size) = f.fs.size() {
+                            VFORK_SIZES.lock().push((i, size));
+                        }
                     }
                     child.fds[i] = Some(Entry::File(OpenFile {
                         fs: c,
                         path: f.path.clone(),
                         off: f.off,
-                        append: f.append,
+                        append: f.append || f.writable,
                         readable: f.readable,
                         writable: f.writable,
                     }));
@@ -770,11 +774,29 @@ pub fn vfork_enter() {
     *VFORK_PARENT.lock() = Some(alloc::boxed::Box::new(parent));
 }
 
+/// The size each shared writable file had when a `vfork` began, by descriptor: if it grew, the child wrote to it, and the parent's
+/// offset moves to the end (a shared file offset would have).
+static VFORK_SIZES: Mutex<alloc::vec::Vec<(usize, u64)>> = Mutex::new(alloc::vec::Vec::new());
+
 pub fn vfork_leave() {
     let Some(parent) = VFORK_PARENT.lock().take() else {
         return;
     };
-    let child = core::mem::replace(&mut *FDS.lock(), *parent);
+    let mut child = core::mem::replace(&mut *FDS.lock(), *parent);
+    {
+        let sizes = core::mem::take(&mut *VFORK_SIZES.lock());
+        let mut t = FDS.lock();
+        for (i, before) in sizes {
+            if let Some(Entry::File(f)) = t.fds.get_mut(i).and_then(Option::as_mut) {
+                if let Ok(now) = f.fs.size() {
+                    if now > before && !f.append {
+                        f.off = now;
+                    }
+                }
+            }
+        }
+    }
+    let _ = &mut child;
     for e in child.fds.into_iter().flatten() {
         match e {
             Entry::Stream(h, true, _) => {

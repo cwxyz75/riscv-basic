@@ -184,7 +184,16 @@ fn start(
         }
     }
     let e: Vec<&[u8]> = env2.iter().map(|v| v.as_slice()).collect();
-    let req = proto::spawn::encode(txid, prog, &a, &e).map_err(|_| 7)?; // E2BIG
+    let req = match proto::spawn::encode(txid, prog, &a, &e) {
+        Ok(r) => r,
+        Err(_) => {
+            // E2BIG: the duplicated handles were not sent
+            for &h in &hs {
+                sys::handle_close(h);
+            }
+            return Err(7);
+        }
+    };
     let w = sys::channel_write(ch, req.as_ptr(), req.len(), hs.as_ptr(), hs.len());
     if w.status != 0 {
         for &h in &hs {

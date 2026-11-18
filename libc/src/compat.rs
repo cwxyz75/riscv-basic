@@ -491,7 +491,10 @@ pub extern "C" fn mmap(
         crate::errno::set(38);
         return failed;
     }
-    let size = len.div_ceil(PAGE) * PAGE;
+    let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
+        crate::errno::set(12);
+        return failed;
+    };
     let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PAGE) else {
         crate::errno::set(12);
         return failed;
@@ -508,7 +511,10 @@ pub extern "C" fn mmap(
 
 #[no_mangle]
 pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
-    let size = len.div_ceil(PAGE) * PAGE;
+    let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
+        crate::errno::set(22);
+        return -1;
+    };
     let mut maps = ANON_MAPS.lock();
     match maps
         .iter()

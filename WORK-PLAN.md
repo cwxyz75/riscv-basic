@@ -32,7 +32,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
    `uchar.h`, `wcwidth`). Re-run the GNU tar measurement afterwards and record the new numbers in T145.
 4. [x] (done in PR 228; T146 lists the rest) **F step 0b: names are UTF-8, through one `names` crate** (decided 2026-11-17: a small `no_std`, `forbid(unsafe_code)` crate owns the rule, `validate` first; `proto::file::valid_name` becomes a wrapper; invalid names are refused with `EILSEQ`, names are stored as given; normalised comparison is a later slice, T141, with no flags word). **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical; TIDY-UP T146 lists what has to follow): `proto::file::valid_name`,
    goldens, `memfs`, `doofs`, `rt::fs`, the libc.
-5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
+5. [x] (done: findings fixed in PR 229, the rest in T148; policy items (1), (3) and (5) are for the owner) **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
    the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
    finds; the slice I (AIA) review is also still owed.
 6. [x] (finding, no code: the fetched tcc 0.9.27 has **no RISC-V back end**; see "Decisions to discuss in the morning") **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
@@ -86,4 +86,6 @@ not run.
 
 - **`tcc` cannot be our C compiler as pinned** (2026-11-17 night): `third_party/fetched/tcc` is tcc 0.9.27, whose source has back ends for i386, x86_64, arm, arm64, c67 and il, not RISC-V (`riscv64-gen.c` arrived after 0.9.27, in the development branch). So there was nothing to spike. Alternatives for "compile C on the OS", none started: tcc from its development branch (a git snapshot, not a release tarball: a pin and a hash from a commit archive), or QBE with `cproc` (QBE has a riscv64 back end; two small programs, no self-hosting of the libc headers), or neither (the OS is cross-built on the host, which is how everything works today). The pinned tcc entry in `third_party/fetch-manifest.txt` is therefore unused.
 - **GNU tar is not the next port; the libc is** (owner's own call, recorded): after the libc batch only gnulib's own `localcharset.h` remains undeclared for it.
+- **Review finding that needs a policy (T148 (1))**: a program that says it handles SIGINT and never waits can keep Ctrl-C from ever ending it. Options: a second Ctrl-C within a second kills the job (what I'd do), or a deadline on the hold. Not changed tonight.
+- **Mount intersection by name (T148 (3))**: tighten `parse_trust` (ban `/tmp`, `/dev`, `/proc`) and intersect by volume; small, left for you because it changes `/etc/trusted` rules.
 - (Add any further night decisions here.)
