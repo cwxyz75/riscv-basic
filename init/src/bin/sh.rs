@@ -555,6 +555,7 @@ impl Os {
             })
             .collect();
         self.session_env = p.session_env();
+        self.spawn_grant = p.spawn;
         true
     }
 

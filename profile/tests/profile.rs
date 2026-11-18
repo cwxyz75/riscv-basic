@@ -213,3 +213,20 @@ fn no_input_panics() {
         let _ = Profile::parse(&s);
     }
 }
+
+#[test]
+fn spawn_defaults_to_granted_and_can_be_turned_off() {
+    let p = |extra: &str| {
+        Profile::parse(&format!(
+            r#"{{"name":"a","uid":1,"home":"homes/a"{extra}}}"#
+        ))
+    };
+    assert!(
+        p("").unwrap().spawn,
+        "the grant is on unless the profile says otherwise"
+    );
+    assert!(p(r#","spawn":true"#).unwrap().spawn);
+    assert!(!p(r#","spawn":false"#).unwrap().spawn);
+    assert!(p(r#","spawn":"no""#).is_err(), "a string is not a boolean");
+    assert!(p(r#","spawn":0"#).is_err(), "nor is a number");
+}

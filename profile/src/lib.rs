@@ -12,8 +12,12 @@
 //!   "env": { "EDITOR": "kilo" },
 //!   "programs": { "ls": { "root": true, "mounts": [ { "path": "/mnt/store", "volume": "store", "rights": "rw" } ] } },
 //!   "quota": { "memory_mib": 64, "processes": 32 },
-//!   "autologin": true }
+//!   "autologin": true,
+//!   "spawn": true }
 //! ```
+//!
+//! `spawn` (default true) says whether the session's programs may ask the shell to start programs (`posix_spawn`, `xargs`,
+//! `system`: the spawn grant, OD118); false denies it for the whole session.
 //!
 //! `home` names the directory of the boot image that is `/home` in the session (until home volumes exist), `programs` replaces
 //! `/etc/trusted`: a program listed gets a read-only root if `root` is true and the listed volumes at the listed paths.
@@ -79,6 +83,8 @@ pub struct Profile {
     /// Limits for the programs of the session; `None` leaves the system's defaults.
     pub quota: Option<Quota>,
     pub autologin: bool,
+    /// May the session's programs ask the shell to start programs for them (the spawn grant, OD118)? On unless the profile says `false`.
+    pub spawn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +194,7 @@ impl Profile {
                 "programs",
                 "quota",
                 "autologin",
+                "spawn",
             ],
         )?;
         let name = str_of("name", m.get("name").ok_or(ProfileError::Missing("name"))?)?;
@@ -351,6 +358,11 @@ impl Profile {
                 ))
             }
         };
+        let spawn = match m.get("spawn") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(ProfileError::Bad(String::from("spawn"), "true or false")),
+        };
         Ok(Profile {
             name: String::from(name),
             uid,
@@ -361,6 +373,7 @@ impl Profile {
             programs,
             quota,
             autologin,
+            spawn,
         })
     }
 
