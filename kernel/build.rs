@@ -62,6 +62,7 @@ fn main() {
         "busybox",
         "kilo",
         "sqlite3",
+        "gzip",
         "sessiond",
         "procd",
         "ps",
