@@ -1,6 +1,6 @@
 # USER-VIEW-SPEC: the command-line view of the system (specification, draft v0, 2026-11-15)
 
-Status: **draft written from the 2026-11-15 design discussion with the owner. Nothing in it is built.** It covers what
+Version: v0, 2026-11-15, from the design discussion with the owner, with later decisions marked inline. It covers what
 the system looks like from a command line, whether the one looking is a person at a console or software: the POSIX
 surface and which existing programs should work, the filesystem as a program sees it, the terminal, sessions and
 login, and the shell (detailed in `SHELL-SPEC.md`, which this file does not repeat).
@@ -78,7 +78,7 @@ Notes (**Decided** unless marked):
 | Memory | `mmap` private and shared (S11); `MAP_NORESERVE`-style reserve and commit for tier D |
 | Threads | pthreads as a shim over cheap one-to-one kernel threads (OD73); ELF TLS (`__thread`) added before tier D, and pthreads wants it too (OD67 excluded it from S7) |
 | Locale and time | UTF-8 with a **C locale only** (**Proposal**); a timezone database in `/share`; `date` and `localtime` |
-| Refused (so far) | hard links; setuid and real privilege changes; `ptrace` as Linux does it; `/proc/sys`, `kcore`; SysV IPC; the rest of the refusals are accumulated in `TIDY-UP.md` |
+| Refused (so far) | hard links; setuid and real privilege changes; `ptrace` as Linux does it; `/proc/sys`, `kcore`; SysV IPC; the rest of the refusals are recorded as tidy items in `work/` |
 
 ## 5. Namespaces and paths (**Decided**; amends OD11)
 
@@ -99,7 +99,7 @@ Notes (**Decided** unless marked):
   symlinks and the empty mount points), with table entries mounted over it. So `ls /`, `ls -l` and `readlink` give
   honest answers and a launcher can build a different skeleton for a different kind of program. Intermediate
   directories above mounts therefore exist as real entries, not as a libc fiction.
-* **Known deviations (go in `TIDY-UP.md`):** lexical `..` differs from physical `..` across symlinks; a cwd whose
+* **Known deviations (recorded as tidy items):** lexical `..` differs from physical `..` across symlinks; a cwd whose
   parent is renamed keeps the old name; `shell-core::resolve` currently returns an error above the root where the
   chroot rule clamps (to change in step UV1).
 * **9P stays an adapter** (OD11, section 10 of the architecture); unions, `/svc` and the rest are unchanged.
@@ -248,7 +248,7 @@ mode, no window size, no terminal types, and no notion of a session.
 * **Sharing between profiles is by handle** (Decided); the mechanism is deferred. A sketch (not a decision): one
   session sends an attenuated handle to a named inbox in the session manager and the recipient's next session receives it
   in its table.
-* **Multi-user identity is not built** (Decided): no ACLs, no groups, no identity in servers. Revisit only if a real
+* **No multi-user identity** (Decided): no ACLs, no groups, no identity in servers. Revisit only if a real
   sharing need shows up; the session manager is where it could be added without touching servers.
 
 ### 10.1 Authentication, enrolment and recovery (**Decided** in the 2026-11-16 discussion unless marked)
@@ -436,7 +436,7 @@ Acceptance for anything that touches SMP is said plainly as `-smp 2` and `-smp 4
 * **UVI8** The setup session exists only while no profile does, and can only create one; `autologin` exists only where
   the manifest enables it.
 
-## 17. Shortcuts to record in `TIDY-UP.md` when built
+## 17. Shortcuts to record as tidy items
 
 `/etc/passwd` and `/etc/group` are static one-entry files from the boot image until the session manager (UV5) synthesizes them; authentication and the profile format are decided at UV5 (owner, 2026-11-17); lexical `..` deviation and stale cwd after a parent rename; advisory metadata that enforces nothing; no hard links;
 `/proc` kept minimal and scoped; a C locale only; no `/usr/local`; the `shell-core::resolve` error above the root until

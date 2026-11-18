@@ -1,11 +1,12 @@
 # S9-SPEC: TCP, sockets in the C library, HTTP and DNS (specification, draft v0)
 
-Status: **draft v0, 2026-11-14; a proposal for the owner; nothing here is built and nothing here is decided.** This is the written
+Version: v0, 2026-11-14; accepted by the owner 2026-11-15 with the recommendations of section 17; "Revision" notes
+record where the contract was settled differently. This is the
 acceptance contract for S9 (CLAUDE.md: spec, then acceptance checks, then code, then an independent review). It continues
-`NET-DESIGN.md` (the architecture and its reasons) and `NET-SPEC.md` (the S8 contract, whose format this file follows) and it
-assumes S8 is built as `NET-SPEC.md` says. Where this file and `NET-DESIGN.md` disagree, `NET-DESIGN.md` is the intent and this
-file is the contract; fix the other one in the same PR. Everything marked **PROPOSAL** is a choice the owner has to accept before
-code is written; accepted ones are logged as OD102 and later in `OS-ARCHITECTURE.md` section 17 (section 15 lists them). Section 19
+`NET-DESIGN.md` (the architecture and its reasons) and `NET-SPEC.md` (the S8 contract, whose format this file follows).
+Where this file and `NET-DESIGN.md` disagree, `NET-DESIGN.md` is the intent and this
+file is the contract; fix the other one in the same PR. Items marked **PROPOSAL** were the owner's to accept; accepted ones
+are OD102 and later in `docs/records/decisions.md` (section 15 lists them). Section 19
 separates what was checked while writing this from what is stated from memory.
 
 Reading order: 1 (what S9 is), 2 (steps), 3 (the environment, with the facts checked against slirp), **4 (the stream data path: the
@@ -63,7 +64,7 @@ them.
 | 8 | The QEMU lossy relay (Q30), the benchmarks (14.3), churn and soak tests (Q32, Q33), documents (SYSCALLS unchanged, INVARIANTS N11 to N24, TIDY-UP, ROADMAP ticks only after the QEMU runs at `-smp 2` and `-smp 4`, OD102 onwards) | 7 | default |
 | 9 (optional) | An unmodified third-party C HTTP server ported onto the C library as an oracle the writing context did not produce (open point 9) | 6 | default |
 
-Sizes are not estimated (NET-SPEC section 2 says why). Order against the scheduler work (`ROADMAP.md`, the gate of 2026-11-14):
+Sizes are not estimated (NET-SPEC section 2 says why). Order against the scheduler work (SCHED-SMP-SPEC, the gate of 2026-11-14):
 tasks 1 to 10 land before S8 and tasks 11 and 12 after S8's first milestone, so **S9 may assume tasks 1 to 12 and nothing
 later**. In particular it does not assume timer slack or one-shot timers (task 13), the wake-one baton and the exact ready
 set on ports (task 21, T60), donation through `channel_call` (22), direct hand-off (24), `thread_interrupt` (26) or
@@ -422,7 +423,7 @@ SYN costs the peer 6 s under slirp (3.2), so the C library posts the whole `list
 
 `ISN = M + F(local address, local port, remote address, remote port, secret)` (RFC 6528), where `M` is the kernel's monotonic
 clock in 4-microsecond units and `F` is SipHash-2-4 truncated to 32 bits. The **secret** is 16 bytes in a one-page **secret
-VMO** that `netsup` creates at boot and holds for the whole boot; `netd` gets a read-only handle and nobody else gets any. (As built the key travels in `netd`'s startup environment instead: see the note at the end of this section and TIDY-UP T99.)
+VMO** that `netsup` creates at boot and holds for the whole boot; `netd` gets a read-only handle and nobody else gets any. (Revision: the key travels in `netd`'s startup environment instead: see the note at the end of this section and work item T99.)
 Because `M` is the kernel's clock and the secret outlives `netd`, **a restarted stack continues the same ISN sequence**: for
 any connection four-tuple the ISN only moves forward within a boot, which is the property NET-DESIGN section 9 asked the
 supervisor to keep, with no TCP state persisted. Ephemeral ports (49152 to 65535) are chosen with RFC 6056's hash-based
@@ -441,7 +442,7 @@ Where the 16 bytes come from is Q11 (entropy), which is open, and design review 
 
 Tests always inject a fixed secret, so nothing in section 14 depends on which is chosen.
 
-**As built (step 5):** option (a), generalised: `rngd` is a **system random service** (`/svc/random`, `proto::random`), not private to the stack: it claims the entropy device through `devmgr` (`OP_CLAIM_RNG`), runs `rngcore::Drbg` (ChaCha20 with fast key erasure, reseeded from the device), and answers `NOT_SEEDED` rather than inventing bytes. `netsup` draws 32 bytes, derives the stack's key with HKDF-SHA256 and passes it to `netd` in its environment (TIDY-UP T99). The libc's `getrandom` and Lua's seeding will use the same service.
+**Revision (step 5).** option (a), generalised: `rngd` is a **system random service** (`/svc/random`, `proto::random`), not private to the stack: it claims the entropy device through `devmgr` (`OP_CLAIM_RNG`), runs `rngcore::Drbg` (ChaCha20 with fast key erasure, reseeded from the device), and answers `NOT_SEEDED` rather than inventing bytes. `netsup` draws 32 bytes, derives the stack's key with HKDF-SHA256 and passes it to `netd` in its environment (TIDY-UP T99). The libc's `getrandom` and Lua's seeding will use the same service.
 
 ### 5.11 The stack restarts: connections die with `netd` (the contract)
 
@@ -642,7 +643,7 @@ Stack to client (all `Notice`-shaped, op 0x83 with these codes, `cookie` echoing
 | 18 | `PeerFin` | the peer closed its side; the socket's end-of-file after this is clean |
 | 19 | `Reset` | a reason: 1 the peer reset, 2 retransmission gave up, 3 aborted locally, 4 the link or configuration went away |
 
-**As built (step 4b):** `Connected` and `Accepted` carry the four-tuple, which a `Notice` (`cookie`, `detail`) cannot, so they ride on a
+**Revision (step 4b).** `Connected` and `Accepted` carry the four-tuple, which a `Notice` (`cookie`, `detail`) cannot, so they ride on a
 second stack-to-client message, `CONN_INFO` (op `0x84`: `code u16, cookie u32, local addr/port, remote port/addr`, 24 bytes); the other
 codes are ordinary `Notice`s. A refused `Connect` or `Accept` (bad handle, quota, no route) is answered with a `CONNECT_FAILED` notice
 whose `detail` is the status, on the stream's channel for `Connect` and on the listener's for `Accept`. The kinds, statuses, ops and

@@ -1,10 +1,9 @@
 # S7: libc, threads on futexes, and ported software (spec, v2)
 
-Status: v2, after a Fable review of v1 against the real code (findings folded in below). S7a, S7b
-and all of S7c (the `cfmt` cores, the C ABI library with the first C program, files and time, threads) is built (see their sections for what differs from the plan); the rest is not. One question for the product owner is open (section 10): the C toolchain. This
-file is the written acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
-acceptance check, written before the code). Decisions are logged as OD67 to OD70 in
-`OS-ARCHITECTURE.md` section 17 when the spec is accepted.
+Version: v2, after a Fable review of v1 against the real code (findings folded in below). The "Revision" paragraphs
+record where the contract was settled differently from the plan. The C toolchain question of section 10 is settled by
+OD69 (clang). This file is the acceptance contract for S7 (CLAUDE.md: every milestone needs a runnable
+acceptance check, written before the code). Decisions are OD67 to OD70 in `docs/records/decisions.md`.
 
 ## 1. Goal and non-goals
 
@@ -69,7 +68,7 @@ clock. To make that one implementation the scripted console moves out of the hos
 `<LOAD>` through a file-reading callback instead of `CARGO_MANIFEST_DIR`), used by both the host
 golden test and the userland program. The `.out` files stay the only oracle and are not regenerated.
 
-**As built (S7a).** The suite test `basic_golden_corpus_on_the_target` runs all 68 scripts and reports
+**Revision (S7a).** The suite test `basic_golden_corpus_on_the_target` runs all 68 scripts and reports
 *one* `##TEST` (it lists the first failing names), not 68; its negative control checks that two scripts'
 transcripts are told apart, and a mutation (the clock step 250 to 251) was caught by the `timer` golden.
 The shell passes `Role::Stderr` (a duplicate of stdout, so stdout handles now carry DUPLICATE) and sets
@@ -133,12 +132,12 @@ decision, not part of S7. A thread's stack is a 64 KiB mapping plus an unmapped 
 stack (a thread cannot unmap its own); a detached thread's stack is released when the process ends
 (documented leak).
 
-**As built (S7b).** `kcore::futex` (table, random model against a plain list, loom/shuttle test of
+**Revision (S7b).** `kcore::futex` (table, random model against a plain list, loom/shuttle test of
 the check-then-enqueue step with a mutant that makes it fail), `futex_wait`/`futex_wake` (syscalls 110
 and 111; the value is read by `usercopy::read_user_u32`, one aligned 64-bit load), a backstop that
 forgets a process's sleepers at teardown, and a kernel check that no futex sleeper survives the test
 run. `rt::sync` has `Mutex`, `Condvar`, `Once` and `Semaphore`, each with a deadline form; replacing
-the spin lock in the `rt` heap (T26) is not done. The tests below pass at `-smp 1`, `2`, `4` and in
+the spin lock in the `rt` heap is T26. The tests below pass at `-smp 1`, `2`, `4` and in
 single-hart icount mode; a mutant that never sleeps fails three of them. Differences from the list below:
 `futex_wake_counts` and `futex_wakes_fifo` are one test, `futex_wake_counts_and_fifo` (counts and the
 other-process case first, where only the *set* of the two oldest woken is checked because two harts
@@ -171,7 +170,7 @@ is thin, with a `// SAFETY:` comment on every `unsafe`. The ABI crate is `#![no_
 LLVM turns a Rust `strlen` or `memset` body into a call to itself) and does not define `mem*`
 (`compiler_builtins` already exports them).
 
-**As built (S7c-1).** The cores are the crate `cfmt/`: `format` (the printf engine, over an `Args`
+**Revision (S7c-1).** The cores are the crate `cfmt/`: `format` (the printf engine, over an `Args`
 trait the C layer implements on `va_list`), `strtod` (decimal by Rust's correctly rounded parser,
 hexadecimal by our own half-to-even rounding), `strtol`, `strtoul`. `tests/differential.rs` compares
 them with the host's libc over ~78,000 generated `snprintf` conversions and 60,000 generated
@@ -179,7 +178,7 @@ strings each for `strtod` and `strtol`/`strtoul`, all agreeing; two mutants (a d
 hex rounding, a wrong `%g` exponent precision) are caught. `%a` with a precision that must round is
 compared only on Linux (Apple's libc truncates where glibc rounds), so CI's glibc checks that corner.
 
-**As built (S7c-2).** The crate `libc/` (package `oslibc`, user target only) exports the C ABI:
+**Revision (S7c-2).** The crate `libc/` (package `oslibc`, user target only) exports the C ABI:
 `string.h`, `ctype.h`, `errno.h`, `assert.h`, `setjmp.h`, `stdlib.h` (malloc over the runtime heap with a
 16-byte size header, strto*, qsort as heapsort, bsearch, rand, atexit, exit, getenv), `math.h` (over
 `libm`) and the first part of `stdio.h`: the printf family over `cfmt` and *unbuffered* output to
@@ -196,7 +195,7 @@ covering printf, strings, ctype, stdlib, malloc, math, setjmp and stdio). A muta
 `qsort` comparison is caught at once. Not yet: `FILE` with buffering and files, the fd layer, time,
 pthreads, per-thread `errno` (S7c-3).
 
-**As built (S7c-3a).** `FILE` with real buffering (stdout line buffered on a terminal and fully
+**Revision (S7c-3a).** `FILE` with real buffering (stdout line buffered on a terminal and fully
 buffered otherwise, stderr unbuffered, files fully buffered, `setvbuf`, one push-back for `ungetc`,
 `fseek`/`ftell`/`rewind` that account for read-ahead and pending output, flush of every stream at
 `exit`), `fopen` with all the modes, `freopen`, `tmpfile`, `tmpnam`, `remove`, `perror`; the fd layer
@@ -220,7 +219,7 @@ writing, and `bkl_is_released_on_user_entry_and_idle` (flaky under load, T49) no
 to be free at least as often as held. Still to do in S7c-3b: pthreads, per-thread `errno`, the 1 MiB
 main stack.
 
-**As built (S7c-3b).** `pthread_create`/`join`/`detach`/`exit`/`self`/`equal` and attributes, mutexes
+**Revision (S7c-3b).** `pthread_create`/`join`/`detach`/`exit`/`self`/`equal` and attributes, mutexes
 (normal, recursive, error-checking) and condition variables (with `pthread_cond_timedwait` against
 `CLOCK_REALTIME`, which is time since boot) on the S7b futexes, `pthread_once`, thread-specific keys
 (no destructors run), `sched_yield`, `nanosleep`, `sleep`, `usleep`, `clock_gettime`. A thread's state
@@ -235,7 +234,7 @@ transcript's threads section (a mutex-protected counter, joins with return value
 a condition-variable queue with two consumers, `pthread_once`, keys, recursive mutex and `trylock`
 from another thread, a detached thread, and a 700 KiB recursion that needs the big stack) matches the
 host program under `-pthread` at one, two and four harts; mutants that make `errno` process-wide or
-drop the big stack are caught. Not done (T52): stdio is not thread safe per stream, detached threads
+drop the big stack are caught. Left for T52: stdio is not thread safe per stream, detached threads
 and their stacks are reclaimed only at process end, key destructors, `pthread_cancel`, barriers, read-write
 locks, thread stacks other than the default size.
 
@@ -316,7 +315,7 @@ patterns), `math`, `table.sort`, `utf8`, `os.time`/`os.clock`/`os.getenv`, and `
 two must match byte for byte (clock-dependent lines are normalised by the script). The Lua test also
 checks the exit status and that the per-program job's ledger is back to zero.
 
-**As built (S7d).** Lua 5.4.8 is vendored unmodified in `third_party/lua/` (`SOURCE.md` has the URL and the
+**Revision (S7d).** Lua 5.4.8 is vendored unmodified in `third_party/lua/` (`SOURCE.md` has the URL and the
 SHA-256, matching lua.org's published value; `LICENSE` is the MIT text). `os_lua.h` (`-include`d by both builds)
 is the only configuration: plain ISO C, no POSIX, so `lua_stdin_is_tty` answers 1 and `popen`/`dlopen` are
 absent. `init/build.rs` compiles every source but `luac.c` with the cross clang into an archive linked into
@@ -346,7 +345,7 @@ run under `bin/lua` with the documented flags, each its own `##TEST`. It is the 
 oracle there is and may expose libc bugs S7d did not; its findings are fixed in the libc, not
 patched around in the tests.
 
-**As built (S7e).** The upstream test suite for 5.4.8 (`lua-5.4.8-tests.tar.gz`, checksum in `third_party/lua-tests/SOURCE.md`)
+**Revision (S7e).** The upstream test suite for 5.4.8 (`lua-5.4.8-tests.tar.gz`, checksum in `third_party/lua-tests/SOURCE.md`)
 is vendored unmodified (the `.lua` files; its C libraries are not) and carried in the boot image under
 `/etc/lua-tests`. Each file is its own `##TEST` (`lua_upstream_NAME`): the suite runs `lua -e "package.path=...;
 _port=true _soft=true _nomsg=true" /etc/lua-tests/NAME.lua` with `/` read-only and `.` the writable /tmp, and the

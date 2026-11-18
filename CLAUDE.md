@@ -8,7 +8,8 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
   before working on it.
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
-  human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it before working on it, then
+  human as product owner. Spec: `docs/specs/OS-ARCHITECTURE.md` (the documents are indexed in
+  `docs/README.md`). Read it before working on it, then
   `WORK-PLAN.md` (what is next) and `work/README.md` (the work queue). What is left to do is
   in `work/`, one file per item, queried with `scripts/work.py`; never read the whole
   directory. How the system got here is in `docs/records/` and git history.
@@ -79,6 +80,10 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
   language semantic; settle it in the spec, then code it.
 - Only close a work item (`scripts/work.py done`) when its acceptance criterion has actually
   been verified (for kernel work, that means booted in QEMU, not just compiled).
+- **Documents come in three kinds** (`docs/README.md`): specs (`docs/specs/`: the end state,
+  versioned; a change is a dated amendment appended at the end, never a rewrite of the body),
+  reference (`docs/reference/`: SYSCALLS, INVARIANTS, TESTING, changed in place with the code)
+  and records (`docs/records/`: reviews, decisions, measurements, notes; append-only).
 - **Work lists and documentation are separate.** Plans, to-dos, progress and "not built yet"
   go in `work/` and `WORK-PLAN.md`, never in a spec. A spec describes the end state; it has
   no opinion about how far the build has got.
@@ -92,8 +97,8 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 Everything above still applies (one milestone per PR, `main` always builds and
 boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
 
-- The spec is `OS-ARCHITECTURE.md`. Design decisions are logged in its section 17
-  (OD numbers), not in `home/DESIGN.md`. Open questions are `kind: decision` items
+- The spec is `docs/specs/OS-ARCHITECTURE.md`. Design decisions are logged in
+  `docs/records/decisions.md` (OD numbers, append-only), not in `home/DESIGN.md`. Open questions are `kind: decision` items
   (`scripts/work.py decisions`): stop and ask rather than guessing.
 - All code is AI-written and the human is the product owner, so nothing relies on a
   human reading the code. Every milestone needs a **runnable acceptance check,

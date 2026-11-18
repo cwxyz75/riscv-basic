@@ -2,11 +2,11 @@
 
 **Name:** doofs (a deliberately silly working name, chosen by the owner 2026-11-15). **If we ever want a serious name, the proposal is Cambium** (the growing layer of a tree: new wood added, old rings untouched, which is copy-on-write and generations); switching is a rename in docs, crates and tool names. Tools follow the Unix convention: `mkfs.doofs`, `fsck.doofs`, `dump.doofs`; crates `doofs` (pure format) and `doofsd` (server) are proposed, nothing claims the bare `fsck`.
 
-Status: **draft v0; the four decisions in section 2 are the owner's (2026-11-15); everything else is a proposal.** Nothing is
-built. This is the written acceptance contract for slice F (CLAUDE.md: spec, acceptance checks, code, independent review). Basis:
-`reviews/2026-11-15-filesystem-survey.md` (Fable's survey, facts from memory, not re-verified). It resolves Q7 (OS-ARCHITECTURE
-section 18): **our own format, no ext2.** OD numbers are assigned when the slice merges (S9 has claimed OD102 onward for its own
-proposals). Slice C (the wall clock) is split out of it in the roadmap.
+Version: v0, 2026-11-15, with later decisions noted inline (F6, 2026-11-17). The four decisions in section 2 are the
+owner's (2026-11-15); a choice not marked as the owner's is a proposal. This is the acceptance contract for slice F (CLAUDE.md:
+spec, acceptance checks, code, independent review). Basis: `docs/records/reviews/2026-11-15-filesystem-survey.md` (Fable's survey,
+facts from memory, not re-verified). It resolves Q7 (OS-ARCHITECTURE section 18 as it stood): **our own format, no ext2.**
+Decisions taken from it are in `docs/records/decisions.md`. The wall clock (slice C) is part of it.
 
 ## 1. Goal and non-goals
 
@@ -28,7 +28,7 @@ persisted free map, an intent log, live queries, multithreaded `fsd`, writable s
 | F5 | **Who pays**: persistent quota domains on directory subtrees for disk space; the block cache is charged to `fsd`'s own job with a cap until pager-backed VMOs (Q4) allow per-client charging | 2026-11-15 |
 | F6 | **Names are UTF-8**: valid UTF-8, no NUL, no `/`, no control characters (C0, DEL, C1), not empty, not `.` or `..`, at most 255 bytes; compared byte for byte and case-sensitively, with no normalisation; the same rule for symlink targets and attribute names (attribute *values* stay typed). One validator in `proto::file`, shared by `memfs` and doofs | 2026-11-17 |
 
-F6 is firm for v1 but its gaps (normalisation, look-alikes, bidirectional controls) are T141. Decided with the owner (2026-11-17): a name that is not valid UTF-8 is **refused** (`EILSEQ` in the libc), never repaired or replaced (replacing makes distinct names collide: an archive's two members could overwrite each other), and names are stored exactly as given, with no normalisation (the cost, accepted: two names can look identical and differ). If extracting archives with such names ever matters, the escape belongs in a patched `tar` (a special mode that maps invalid bytes reversibly), not in the file system. F3, F4 and F5 are provisional: they are recorded in `TIDY-UP.md` as T94, T93 and T95 to be reconsidered, and before the
+F6 is firm for v1 but its gaps (normalisation, look-alikes, bidirectional controls) are T141. Decided with the owner (2026-11-17): a name that is not valid UTF-8 is **refused** (`EILSEQ` in the libc), never repaired or replaced (replacing makes distinct names collide: an archive's two members could overwrite each other), and names are stored exactly as given, with no normalisation (the cost, accepted: two names can look identical and differ). If extracting archives with such names ever matters, the escape belongs in a patched `tar` (a special mode that maps invalid bytes reversibly), not in the file system. F3, F4 and F5 are provisional: they are recorded as tidy items as T94, T93 and T95 to be reconsidered, and before the
 format is frozen we decide whether it reserves room for each (a log-root field, a link count behind the parent id).
 
 ## 3. Format (proposal)
@@ -265,7 +265,7 @@ support them answers NOT_SUPPORTED, as with `Account` (OD84). Byte layouts are n
 Name 255 bytes, attribute name 255, inline attribute 1 KiB, attribute total per node bounded by its quota, index value 255 bytes,
 query result 1000 entries per reply, open connections per account as in OD84.
 
-## 13. Shortcuts to record in `TIDY-UP.md` when built
+## 13. Shortcuts to record as tidy items
 
 Flush trusted on QEMU (T44); mount time grows with metadata (free-map rebuild); `GetVmo` on a disk file read-only or copied until
 Q4; cache charged to `fsd` not clients; no self-healing (single device); single-threaded `fsd`. Mounting and clock: T105 and T106.

@@ -19,12 +19,9 @@ def read(name):
 
 # Phrases that were true once and are false now: (file, phrase, why)
 STALE = [
-    ("OS-ARCHITECTURE.md", "Nothing here is implemented", "S0-S7 are built"),
-    ("OS-ARCHITECTURE.md", "# OS Architecture (proposal)", "the title should not call a built system a proposal"),
-    ("SYSCALLS.md", "The kernel takes no lock", "syscalls run under the big kernel lock (OD60)"),
-    ("SYSCALLS.md", "which do not exist yet", "per-job quotas exist (S4.5)"),
-    ("S5-SPEC.md", "Nothing here is built yet", "S5 is built"),
-    ("INVARIANTS.md", "(single hart)", "the scheduler state is under the big kernel lock (C6)"),
+    ("docs/reference/SYSCALLS.md", "The kernel takes no lock", "syscalls run under the big kernel lock (OD60)"),
+    ("docs/reference/SYSCALLS.md", "which do not exist yet", "per-job quotas exist (S4.5)"),
+    ("docs/reference/INVARIANTS.md", "(single hart)", "the scheduler state is under the big kernel lock (C6)"),
     ("CLAUDE.md", "S7 (libc, futexes, BASIC and Lua as userland programs) is specified", "S7 is done"),
     ("CLAUDE.md", "both\n  normal and icount modes", "icount runs only one hart (T21)"),
 ]
@@ -72,8 +69,91 @@ def check_tiers():
         names = SOAK_SPLIT.get(t, []) + [t]
         if not any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", soakyml) for n in names):
             out.append(f"soak.yml does not run the soak target {t}")
-    if "TESTING.md" not in os.listdir(ROOT):
-        out.append("TESTING.md is missing")
+    if not os.path.exists(os.path.join(ROOT, "docs", "reference", "TESTING.md")):
+        out.append("docs/reference/TESTING.md is missing")
+    return out
+
+
+LIVING = ["CLAUDE.md", "README.md", "WORK-PLAN.md", "docs/README.md", "docs/specs", "docs/reference", "work", "home"]
+RETIRED = {"ROADMAP.md": "work/ (open items) or docs/records/roadmap-2026-11-18.md (history)",
+           "TIDY-UP.md": "work/ (tidy items) or docs/records/done.md (closed ones)"}
+# Words that say how far the build has got. A spec describes the end state (owner, 2026-11-18): progress belongs in work/.
+PROGRESS = re.compile(r"(?i)\b(nothing (here )?is built|nothing in it is built|not built yet|not yet built|is not built|are not built|"
+                      r"not started|built on 20\d\d|built in step|steps? \d+(?: (?:to|and) \d+)? (?:is|are) (?:built|done)|"
+                      r"\bas built\b|^status:)", re.M)
+
+
+def md_files(paths):
+    for p in paths:
+        full = os.path.join(ROOT, p)
+        if os.path.isfile(full):
+            yield p
+        for d, dirs, files in os.walk(full):
+            dirs[:] = [x for x in dirs if x not in ("target", "third_party", "node_modules")]
+            for f in files:
+                if f.endswith(".md"):
+                    yield os.path.relpath(os.path.join(d, f), ROOT)
+
+
+def check_layout():
+    """Only the work lists and the two entry points live at the root (owner, 2026-11-18)."""
+    allowed = {"README.md", "CLAUDE.md", "WORK-PLAN.md"}
+    return [f"{f}: documents live under docs/ (specs, reference, records); only {sorted(allowed)} stay at the root"
+            for f in os.listdir(ROOT) if f.endswith(".md") and f not in allowed]
+
+
+def check_links():
+    """A document named in living text exists: a bare `NAME.md` by its file name anywhere in the tree, a path by its path."""
+    names = set()
+    for d, dirs, files in os.walk(ROOT):
+        dirs[:] = [x for x in dirs if x not in ("target", ".git", "node_modules")]
+        names.update(f for f in files if f.endswith(".md"))
+    out = []
+    for f in md_files(LIVING):
+        text = read(f)
+        for m in re.finditer(r"(?<![\w/.-])((?:[\w.-]+/)*[A-Za-z0-9_-]+\.md)\b", text):
+            ref = m.group(1)
+            line = text.count("\n", 0, m.start()) + 1
+            base = os.path.basename(ref)
+            if base in RETIRED:
+                out.append(f"{f}:{line}: names {base}, which is gone; use {RETIRED[base]}")
+            elif "/" in ref:
+                here = os.path.normpath(os.path.join(os.path.dirname(f), ref))
+                if not (os.path.exists(os.path.join(ROOT, ref)) or os.path.exists(os.path.join(ROOT, here))):
+                    out.append(f"{f}:{line}: {ref} does not exist")
+            elif base not in names and not re.match(r"^[a-z]", base):
+                out.append(f"{f}:{line}: {ref} does not exist anywhere in the tree")
+    return out
+
+
+def check_specs():
+    out = []
+    for f in md_files(["docs/specs"]):
+        if not re.search(r"^Version: ", read(f), re.M):
+            out.append(f"{f}: no `Version:` line under the title")
+        for i, line in enumerate(read(f).splitlines(), 1):
+            m = PROGRESS.search(line)
+            if m:
+                out.append(f"{f}:{i}: says {m.group(0)!r}: build progress belongs in work/, not in a spec")
+    return out
+
+
+def check_records_append_only():
+    """docs/records/ only grows: against the merge base with origin/main (when there is one), no line may be removed."""
+    import subprocess
+    try:
+        base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=ROOT, capture_output=True, text=True,
+                              check=True).stdout.strip()
+        diff = subprocess.run(["git", "diff", "--no-renames", "--diff-filter=MD", "-U0", base, "--", "docs/records"],
+                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []  # no git or no origin/main (a shallow CI checkout): nothing to compare with
+    out, cur = [], None
+    for line in diff.splitlines():
+        if line.startswith("--- a/"):
+            cur = line[6:]
+        elif line.startswith("-") and not line.startswith("---"):
+            out.append(f"{cur}: a line was changed or removed; records are append-only: {line[1:60]!r}")
     return out
 
 
@@ -84,17 +164,17 @@ def main():
             problems.append(f"{name}: still says {phrase!r} ({why})")
 
     # Decision log: OD numbers are unique and consecutive.
-    log = read("OS-ARCHITECTURE.md")
+    log = read("docs/records/decisions.md")
     nums = [int(m.group(1)) for m in re.finditer(r"^\| OD(\d+) \|", log, re.M)]
     seen = set()
     for n in nums:
         if n in seen:
-            problems.append(f"OS-ARCHITECTURE.md: OD{n} appears twice")
+            problems.append(f"decisions.md: OD{n} appears twice")
         seen.add(n)
     if nums:
         missing = [n for n in range(min(nums), max(nums) + 1) if n not in seen]
         if missing:
-            problems.append("OS-ARCHITECTURE.md: decision log has gaps: " + ", ".join(f"OD{n}" for n in missing))
+            problems.append("decisions.md: the decision log has gaps: " + ", ".join(f"OD{n}" for n in missing))
 
     # The work queue (work/, scripts/work.py): ids, fields, blockers, cycles, the near-term cap.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -103,10 +183,13 @@ def main():
     problems += errors + work.check(items)
 
     # Every document the README and CLAUDE.md point at exists.
-    for name in ["OS-ARCHITECTURE.md", "SYSCALLS.md", "INVARIANTS.md", "WORK-PLAN.md", "work/README.md",
-                 "docs/records/done.md", "S4-SPEC.md", "S5-SPEC.md", "S6-SPEC.md", "S7-SPEC.md"]:
+    for name in ["docs/README.md", "docs/specs/OS-ARCHITECTURE.md", "docs/reference/SYSCALLS.md",
+                 "docs/reference/INVARIANTS.md", "docs/records/decisions.md", "docs/records/done.md",
+                 "WORK-PLAN.md", "work/README.md"]:
         if not os.path.exists(os.path.join(ROOT, name)):
             problems.append(f"{name} is missing")
+
+    problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
     problems += check_tiers()
     if problems:

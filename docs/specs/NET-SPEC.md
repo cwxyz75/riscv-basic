@@ -1,10 +1,11 @@
 # NET-SPEC: S8, the network stack's lower layers (specification, draft v0)
 
-Status: **draft v0, 2026-11-14; steps 1 to 5 built on 2026-11-15 (see ROADMAP S8 and TIDY-UP T86, T87 for what differs).** This is the written acceptance contract for S8 (CLAUDE.md: spec,
+Version: v0, 2026-11-14, with notes added 2026-11-15 where the contract was settled differently (the differences still
+to be accepted or reverted are work items T86 and T87, and decision Q-NETDEV). This is the acceptance contract for S8 (CLAUDE.md: spec,
 then acceptance checks, then code, then an independent review). It makes `NET-DESIGN.md` (the architecture and its reasons)
 concrete: every message, constant, state machine and check an implementer needs. Where the two disagree, `NET-DESIGN.md`
-is the intent and this file is the contract; fix the other one in the same PR. Decisions made here are logged as OD98 and
-later in `OS-ARCHITECTURE.md` section 17 once the owner accepts them (section 13 lists them). Open points are in section 15. The draft for S9, `S9-SPEC.md`, lists in its section 18 what it would like this file to leave room for.
+is the intent and this file is the contract; fix the other one in the same PR. Decisions made here are OD98 and
+later in `docs/records/decisions.md` (section 13 lists them). Open points are in section 15. `S9-SPEC.md` lists in its section 18 what it needs this file to leave room for.
 
 Reading order: section 1 (what S8 is), 2 (steps), 3 (the environment, with facts checked), 4 to 9 (the parts), 10 (limits), 11
 (invariants), 12 (acceptance: the part that matters most), 13 to 15 (records, risks, open points).
@@ -105,19 +106,19 @@ corruptions to be reported, so it is known to be able to fail; the committed cap
 
 ### 3.3 Existing pieces this relies on
 
-| Piece | State | Use |
+| Piece (as of 2026-11-14) | From | Use |
 |---|---|---|
 | Modern virtio-mmio and DMA/MMIO VMOs, `blkd`'s register code | built (S6) | the driver's transport |
-| `devmgr` table-driven, several devices and clients (`proto::devmgr` ops 1 and 2) | built (DM) | extended with a net claim (section 4.3) |
-| Interrupt objects on AIA delivered to the requesting hart, or polling | built (I) | driver wake source |
-| `rt::service` (`Core`, `Service`, `other_event`), accounts (`svc`), `memfsd` accounts | built (R) | `netd`'s loop and endpoint accounting |
-| Registry service, `PUBLISH` right, `Publish`/`View`, `UNAVAILABLE`, arbitrary namespace prefixes | built (SD steps 1 to 3) | naming; **step 4 is built here** |
+| `devmgr` table-driven, several devices and clients (`proto::devmgr` ops 1 and 2) | slice DM | extended with a net claim (section 4.3) |
+| Interrupt objects on AIA delivered to the requesting hart, or polling | slice I | driver wake source |
+| `rt::service` (`Core`, `Service`, `other_event`), accounts (`svc`), `memfsd` accounts | slice R | `netd`'s loop and endpoint accounting |
+| Registry service, `PUBLISH` right, `Publish`/`View`, `UNAVAILABLE`, arbitrary namespace prefixes | slice SD, steps 1 to 3 | naming; **SD step 4 is part of this slice** |
 | Events (8 user bits, `event_signal`), ports with one-shot bindings and `port_rearm` | built (W) | doorbells |
 | `vmo_commit` and the foreign-mapping rule | built (V) | pools are committed at creation, so mapping them in `netd` is allowed |
 | `thread_spawn`, job-derived thread limits | built (task 9) | unused by S8 (one thread per process), noted for T67 |
 | `##BENCH`, `make os-bench`, `bench/baseline.tsv` | built (task 1) | the network workload (step 6) |
-| Typed request/reply client in `rt` | **not built** | built in step 4 |
-| The nanosecond clock ABI | **not built** (task 6 flag day; confirm status) | the core uses an opaque `Instant` so it does not matter |
+| Typed request/reply client in `rt` | part of this slice | step 4 |
+| The nanosecond clock ABI | SCHED-SMP-SPEC task 6 (flag day) | the core uses an opaque `Instant` so it does not matter |
 
 ### 3.4 No kernel change
 
@@ -143,7 +144,7 @@ stops and the owner decides** (a kernel change would make step 3 a kernel slice 
 The MMIO slot and interrupt (from `devmgr`), the three DMA VMOs, the ring VMO, the two doorbell events, the config blob VMO, the
 flight-recorder VMO, the stats page (inside the ring VMO's header). S9 (`S9-SPEC.md` 18.7) adds one more thing it holds: the secret
 VMO (the key for sequence numbers and ephemeral ports), which `netsup` passes read-only to `netd` and to nothing else. The flight
-recorder's event kinds are numbered with a reserved block (kinds 32 to 63) for TCP; S8 as built prints one `##NETFR` line and has no
+recorder's event kinds are numbered with a reserved block (kinds 32 to 63) for TCP; Revision: S8 prints one `##NETFR` line and has no
 enum to extend. It resets the device (virtio status 0) before any new driver
 starts, exactly as OD65 describes for `blkd`.
 
@@ -347,11 +348,11 @@ core.configure(cfg) / core.clear_config() / core.link(up: bool)
 trait Device { fn rx(&mut self) -> Option<RxFrame>; fn tx_slot(&mut self) -> Option<TxFrame>; }   // none = full
 ```
 
-**As built, stated here because S9 depends on it** (`S9-SPEC.md` 18.8): the IP identification field is a counter, starting at 1 and
+**Revision, stated here because S9 depends on it** (`S9-SPEC.md` 18.8): the IP identification field is a counter, starting at 1 and
 increasing by one for every IP packet the core builds (wrapping at 65536), and **the DF bit is set on everything the core sends**
 (`S9-SPEC.md` assumed DF clear: S9 step 2 must decide, and DF set is the ordinary choice for TCP at MSS 1460 on MTU 1500). There is no
 loopback path (a send to our own address goes to the ARP and gateway logic and fails or leaves the machine); S9 adds one in `netcore`
-(`TIDY-UP.md` T89). A received destination-unreachable is routed by the protocol it quotes (UDP, TCP and others each have a hook;
+(tidy item T89, since closed). A received destination-unreachable is routed by the protocol it quotes (UDP, TCP and others each have a hook;
 in S8 each only counts: `icmp_error_udp`, `icmp_error_tcp`, `icmp_error_other_protocol`, `icmp_error_malformed`), and a received TCP
 segment reaches a dispatch point that counts it as `rx_unknown_protocol`.
 
@@ -436,7 +437,7 @@ Status (`i32`): 0 `Ok`, 1 `BadRequest`, 2 `Refused`, 3 `AddrInUse`, 4 `TooBig`, 
 violation like any unknown op; a client skips a notice code it does not know; a reply with a reserved status decodes. **A request
 may carry more than one handle** (S9's `Accept` carries two): the decoders and the typed client (`Net::call_with`) allow it, and the
 stack closes every handle it is sent whether or not it accepts the request (S8's `Open` wants exactly one: anything else is
-`BadRequest`). The `Info` reply is 28 bytes as built (the 26 above counted the padding short).
+`BadRequest`). Revision: the `Info` reply is 28 bytes (the 26 above counted the padding short).
 
 ### 7.2 Endpoint channel
 
@@ -489,7 +490,7 @@ charge, refund, parent-cap and close-refusal rules, so S9 does not change the ac
 
 ### 7.5 The client library (`rt::net`)
 
-Built on the typed request/reply client that slice R has not yet built (built here, in `rt`). Every call carries a **mandatory
+Built on the typed request/reply client of slice R (part of this slice, in `rt`). Every call carries a **mandatory
 deadline** (no forever form; the default helper uses 5 s). It reconnects on `UNAVAILABLE` with a bounded retry (the policy SD step 4
 shapes: first retry after 100 ms, doubling to 1 s, giving up at 10 s). API sketch: `Net::connect(name)`, `net.info()`,
 `net.open_udp(port) -> Udp`, `udp.send_to(addr, port, payload, deadline)`, `udp.recv(deadline) -> Datagram` (with `dropped`),
@@ -752,7 +753,7 @@ rows; they are the load tasks 11 and 12 of `SCHED-SMP-SPEC.md` are planned to us
 
 * **A kernel assumption in 3.4 is false** (a pool cannot be mapped read-only in another job, or a narrowed DMA duplicate misbehaves). Step 3 would stop and ask.
 * **The re-attach protocol is subtle** (5.6). Mitigations: two tiny state machines, the generation number, Q11 and Q12, and the fallback of restarting both together (NET-DESIGN 14).
-* **The typed request/reply client and SD step 4 are not built**, so step 4 is larger than a typical one. Mitigation: they land first in that step, each with its own tests, and may be split into their own PR.
+* **The typed request/reply client and SD step 4 are part of this slice**, so step 4 is larger than a typical one. Mitigation: they land first in that step, each with its own tests, and may be split into their own PR.
 * **Facts in 3.2 not yet checked** could change a constant (the lease option set, slirp's ARP behaviour). Step 0 checks them first; the cost is small.
 * **Timing on the shared big lock:** latency and throughput numbers will be poor before tasks 11 and 12; the benchmarks record that rather than hide it, and no S8 check asserts a latency bound
   tighter than the 10 ms safety poll.

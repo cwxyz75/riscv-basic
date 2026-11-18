@@ -1,8 +1,7 @@
 # R: the service runtime (specification draft, v0)
 
-Status: **decided 2026-11-14 (OD84; the owner answered section 4: yes to every recommendation). The pure core (`svc`) is built; the runtime, the file-protocol change and the ports are not.** Originally a draft written unattended. Decisions
-OD77 (a shared service runtime, accounted connections) fixes the direction; this file proposes the shape and
-lists what needs the owner. Basis: design review findings D7, D8, D11, D12 (`reviews/2026-11-14-design-review.md`)
+Version: v0, decided 2026-11-14 (OD84; the owner answered section 4: yes to every recommendation). Originally a draft written unattended. Decision
+OD77 (a shared service runtime, accounted connections) fixes the direction; this file gives the shape. Basis: design review findings D7, D8, D11, D12 (`docs/records/reviews/2026-11-14-design-review.md`)
 and a reading of the five server loops (`memfsd`, `consoled`, `launcher`, `devmgr`, `blkd`).
 
 ## 1. What the five loops have in common (read from the code)
@@ -72,7 +71,7 @@ Decided: (1) a fixed default per account, about 16 connections and 64 KiB held, 
 3. **Library or macro**: a `Service` trait with callbacks (above), or a plain event loop the service drives itself
    (closer to today's code, less to learn, less enforced)? I propose the trait.
 4. **Multiple threads per service**: one loop per port, or a thread pool sharing a port? That needs the wake-one rule
-   (W-SPEC PW, not yet built) to avoid duplicate wakes; until then one thread per port.
+   (W-SPEC PW) to avoid duplicate wakes; until then one thread per port.
 5. **Order of porting**: `memfsd` first (the most complex, the proof), then `consoled`, `launcher`, `devmgr`, `blkd`.
 
 ## 5. Acceptance (to write before code)

@@ -100,8 +100,8 @@ data (message bytes, headers, queued handles, port bindings) in the whole system
 `MAX_PROCESSES` 64.
 
 These keep the kernel from panicking and from running out of heap (OD50; the heap grows at safe points, slice T step 2, so the caps also bound its growth); they are
-not per-process limits. A real bound needs per-job quotas (OS-ARCHITECTURE Q9, `TIDY-UP.md`
-T1). Per-job limits exist since S4.5 (processes, threads, memory pages, child jobs, objects and queued IPC
+not per-process limits. A real bound needs per-job quotas (work items Q-OS9
+and T1). Per-job limits exist since S4.5 (processes, threads, memory pages, child jobs, objects and queued IPC
 bytes, enforced through the job tree: OD54-OD59), and every program the launcher starts runs in a job of its own;
 the system-wide caps above remain as the safety net for the kernel's own memory (kernel stacks and kernel
 heap use are not yet charged to a job, T1). Stated plainly so nobody relies on more than this.
