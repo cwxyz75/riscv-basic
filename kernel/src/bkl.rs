@@ -46,10 +46,10 @@ pub fn violates(class: Class) -> bool {
     percpu::this().held.with(|h| h.check(class, 0).is_err())
 }
 
-fn note_acquire(class: Class) {
+fn note_acquire(class: Class, instance: u32) {
     let bad = percpu::this().held.with(|h| {
-        let bad = h.check(class, 0);
-        h.push(class, 0);
+        let bad = h.check(class, instance);
+        h.push(class, instance);
         bad
     });
     if let Err(v) = bad {
@@ -63,16 +63,16 @@ fn note_acquire(class: Class) {
     }
 }
 
-fn note_release(class: Class) {
-    percpu::this().held.with(|h| h.pop(class, 0));
+fn note_release(class: Class, instance: u32) {
+    percpu::this().held.with(|h| h.pop(class, instance));
 }
 
 /// The heap and UART locks tell the checker when they are held.
 pub fn lock_taken(class: Class) {
-    note_acquire(class);
+    note_acquire(class, 0);
 }
 pub fn lock_released(class: Class) {
-    note_release(class);
+    note_release(class, 0);
 }
 
 /// Test support: pretend the calling hart holds `held`, then really take `probe` through the
@@ -103,7 +103,7 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             crate::console::with_uart_for_test();
         }
         // (the other classes have no lock in the kernel yet: the pure pair table covers them, `klock/tests/order.rs`)
-        other => note_acquire(other),
+        other => note_acquire(other, 0),
     }
     let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
     VIOLATIONS.store(before, Ordering::SeqCst);
@@ -138,7 +138,7 @@ pub fn lock() {
         }
     }
     if !LOCK.held_by(me) {
-        note_acquire(Class::Legacy);
+        note_acquire(Class::Legacy, 0);
     }
     let outermost = !LOCK.held_by(me);
     #[cfg(feature = "latency-trace")]
@@ -167,7 +167,7 @@ pub fn try_lock() -> bool {
     let reentrant = LOCK.held_by(me);
     if LOCK.try_lock(me, &percpu::this().bkl_depth) {
         if !reentrant {
-            note_acquire(Class::Legacy);
+            note_acquire(Class::Legacy, 0);
         }
         OWNER.store(me as usize + 1, Ordering::Relaxed);
         true
@@ -186,7 +186,7 @@ pub fn unlock() {
     // clear the mirror before the release: another hart may take the lock the moment it is out
     let outermost = percpu::this().bkl_depth.get() == 1;
     if outermost {
-        note_release(Class::Legacy);
+        note_release(Class::Legacy, 0);
         OWNER.store(0, Ordering::Relaxed);
         crate::latency::bkl_released();
     }
@@ -242,15 +242,15 @@ impl klock::Machine for Machine {
         spin_watchdog(&mut n, "a spin lock");
         percpu::this().spins.store(n, Ordering::Relaxed);
     }
-    fn acquired(class: Class, _instance: u32) {
+    fn acquired(class: Class, instance: u32) {
         percpu::this()
             .last_class
             .store(class as u32, Ordering::Relaxed);
         // (a new wait: the detector counts one wait, not everything since boot)
         percpu::this().spins.store(0, Ordering::Relaxed);
-        note_acquire(class);
+        note_acquire(class, instance);
     }
-    fn released(class: Class, _instance: u32) {
-        note_release(class);
+    fn released(class: Class, instance: u32) {
+        note_release(class, instance);
     }
 }

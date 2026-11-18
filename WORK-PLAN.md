@@ -64,7 +64,7 @@ the scheduler work starts from a quieter tree.
   SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), CPU-time itimers and queued real-time signals, as SIG2 and T149 describe.
   Acceptance (from SIG2): a host-oracle C program and a shell test that stops a spinning program with Ctrl-Z and resumes it
   with `fg`, at `-smp 2` and `-smp 4`. Also settles Q-SH7 (shell-level job control): record the shape chosen as a decision.
-- [~] (design note PR 248; L11a built, PR below; L11b next) **L11: per-hart run queues under RQ locks, the kernel half**, then **L12: the rest of the first peel** (SCHED-SMP-SPEC
+- [~] (design note PR 248; L11a PR 249; L11b built, PR below; L11c and L11d next) **L11: per-hart run queues under RQ locks, the kernel half**, then **L12: the rest of the first peel** (SCHED-SMP-SPEC
   tasks 11 and 12; T107, T108 are their stand-ins). Each step its own PR with a Fable review and soak; the negative-control
   kernels the tasks name.
 

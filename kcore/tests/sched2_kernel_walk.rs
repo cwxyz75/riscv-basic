@@ -459,7 +459,7 @@ fn kernel_style_walk_round_robin() {
 
 #[test]
 fn a_hart_that_has_not_joined_is_never_marked_and_picks_its_pinned_thread_up_when_it_joins() {
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     s.set_online(1, false);
     let boot = s
         .adopt_current_on(
@@ -514,7 +514,7 @@ fn a_hart_that_has_not_joined_is_never_marked_and_picks_its_pinned_thread_up_whe
 
 #[test]
 fn a_sleeper_wakes_on_its_home_harts_tick_and_never_before_its_deadline() {
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     // hart 1 runs the sleeper (pinned there), hart 0 the boot thread
     let _boot = s
         .adopt_current_on(
@@ -563,7 +563,7 @@ fn a_sleeper_wakes_on_its_home_harts_tick_and_never_before_its_deadline() {
 
 #[test]
 fn waiters_wake_in_fifo_order_and_a_stale_entry_does_not_swallow_a_wake() {
-    let mut s = Sched2::new(1, FixedPrio::new);
+    let s = Sched2::new(1, FixedPrio::new);
     let a = s
         .adopt_current_on(
             0,
@@ -597,31 +597,31 @@ fn waiters_wake_in_fifo_order_and_a_stale_entry_does_not_swallow_a_wake() {
     let mut q = Waiters2::new();
     // a waits and blocks; b runs, waits and blocks; c runs, waits and blocks: the queue is a, b, c
     assert_eq!(s.current_on(0), a);
-    assert!(q.wait_on(&mut s, 0).unwrap());
+    assert!(q.wait_on(&s, 0).unwrap());
     assert_eq!(s.current_on(0), b);
-    assert!(q.wait_on(&mut s, 0).unwrap());
+    assert!(q.wait_on(&s, 0).unwrap());
     assert_eq!(s.current_on(0), c);
-    assert!(q.wait_on(&mut s, 0).unwrap());
+    assert!(q.wait_on(&s, 0).unwrap());
     assert_eq!(q.len(), 3);
     // first in, first woken
-    assert_eq!(q.wake_one_on(&mut s, 0), Some(a));
+    assert_eq!(q.wake_one_on(&s, 0), Some(a));
     // b is woken some other way (not through the queue): its entry is now stale
     s.wake_on(0, b).unwrap();
     // the next wake skips the stale entry and takes c, whose wake counts
-    assert_eq!(q.wake_one_on(&mut s, 0), Some(c));
+    assert_eq!(q.wake_one_on(&s, 0), Some(c));
     assert!(q.is_empty());
-    assert_eq!(q.wake_one_on(&mut s, 0), None, "nothing left to wake");
+    assert_eq!(q.wake_one_on(&s, 0), None, "nothing left to wake");
     // wake_all counts what it woke
     let d = s.current_on(0);
-    assert!(q.wait_on(&mut s, 0).unwrap());
+    assert!(q.wait_on(&s, 0).unwrap());
     let e = s.current_on(0);
     assert_ne!(d, e);
-    assert_eq!(q.wake_all_on(&mut s, 0), 1);
+    assert_eq!(q.wake_all_on(&s, 0), 1);
 }
 
 #[test]
 fn priority_zero_is_refused() {
-    let mut s = Sched2::new(1, FixedPrio::new);
+    let s = Sched2::new(1, FixedPrio::new);
     let t = s
         .adopt_current_on(
             0,
@@ -641,7 +641,7 @@ fn priority_zero_is_refused() {
 #[test]
 fn round_robin_does_not_ping_pong_a_higher_priority_thread_between_harts() {
     // review finding 1: a higher-priority normal thread is not pulled to, or marked for, a hart that would only queue it
-    let mut s = Sched2::new(2, RoundRobin::new);
+    let s = Sched2::new(2, RoundRobin::new);
     let _a = s
         .adopt_current_on(0, SchedAttr { prio: 5, rr: false }, None)
         .unwrap();
@@ -672,9 +672,9 @@ fn round_robin_does_not_ping_pong_a_higher_priority_thread_between_harts() {
         "no mark is left pending"
     );
     assert!(
-        s.pulls <= 1,
+        s.pulls() <= 1,
         "at most one pull, not a ping-pong: {}",
-        s.pulls
+        s.pulls()
     );
     s.audit(true).unwrap();
 }
@@ -682,7 +682,7 @@ fn round_robin_does_not_ping_pong_a_higher_priority_thread_between_harts() {
 #[test]
 fn one_thread_marks_one_hart() {
     // review finding 2: eight harts, seven idle: a spawn owes one poke, not seven
-    let mut s = Sched2::new(8, FixedPrio::new);
+    let s = Sched2::new(8, FixedPrio::new);
     let _boot = s
         .adopt_current_on(
             0,
@@ -717,7 +717,7 @@ fn one_thread_marks_one_hart() {
 fn a_hart_that_joins_late_starts_its_clock_at_the_join_not_at_zero() {
     // review finding 3 (M9): without `set_clock`, the first tick of a hart that joined at 500 ms would account 501 ms to the
     // thread running there and rotate it at once
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     s.set_online(1, false);
     let _boot = s
         .adopt_current_on(
@@ -771,7 +771,7 @@ fn a_hart_that_joins_late_starts_its_clock_at_the_join_not_at_zero() {
 fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
     // all harts busy, one with a long queue of equal-priority threads: equals are not pulled by priority, so the tick moves
     // them by queue length, one per tick per hart, until the queues are within one of each other
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     let _boot = s
         .adopt_current_on(
             0,
@@ -823,13 +823,13 @@ fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
         a.abs_diff(c) <= 1,
         "queues of {a} and {c}: within one of each other"
     );
-    let pulls = s.pulls;
+    let pulls = s.pulls();
     for _ in 0..20 {
         now += MS;
         s.tick_on(0, now);
         s.tick_on(1, now);
     }
-    assert_eq!(s.pulls, pulls, "balanced queues do not churn");
+    assert_eq!(s.pulls(), pulls, "balanced queues do not churn");
     s.audit(true).unwrap();
 }
 
@@ -837,7 +837,7 @@ fn a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone() {
 fn a_thread_switched_away_is_not_available_to_other_harts_until_its_switch_completes() {
     // the race a kernel without a lock across the switch would have: hart 0's tick rotates A out (queued, still executing); an
     // idle hart 1 must not take A and run it while hart 0 is still saving its context
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     let a = s
         .adopt_current_on(
             0,
@@ -882,7 +882,7 @@ fn a_tick_that_rotates_and_then_pulls_still_protects_the_thread_that_is_executin
     // the review of task 12 (its reproduction): hart 0's tick rotates A out, and the same settle pulls C from hart 1 over B;
     // the transit marker must stay on A, which is still executing, so that hart 2 cannot take it
     let at = |prio: u8| SchedAttr { prio, rr: false };
-    let mut s = Sched2::new(3, FixedPrio::new);
+    let s = Sched2::new(3, FixedPrio::new);
     s.set_online(2, false);
     let a = s.adopt_current_on(0, at(10), None).unwrap(); // A runs on hart 0, free
     let c = s.adopt_current_on(1, at(20), None).unwrap(); // C runs on hart 1, free

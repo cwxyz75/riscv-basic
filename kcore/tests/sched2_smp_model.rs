@@ -337,7 +337,7 @@ fn gp1_and_gp2_hold_on_random_walks_over_one_to_eight_harts() {
 
 #[test]
 fn an_idle_hart_takes_a_new_thread_and_a_freed_hart_pulls_a_waiting_one() {
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     // hart 0 runs the boot thread at 20; a thread of 10 is placed on idle hart 1 at once
     let boot = s
         .adopt_current_on(
@@ -389,7 +389,7 @@ fn an_idle_hart_takes_a_new_thread_and_a_freed_hart_pulls_a_waiting_one() {
 
 #[test]
 fn a_pinned_thread_is_never_moved() {
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     let boot = s
         .adopt_current_on(
             0,
@@ -427,7 +427,7 @@ fn a_pinned_thread_is_never_moved() {
 #[test]
 fn equal_priority_threads_are_not_pulled_back_and_forth() {
     // a pull needs a strictly better thread: an equal one stays where it is (no migration churn between equals)
-    let mut s = Sched2::new(2, FixedPrio::new);
+    let s = Sched2::new(2, FixedPrio::new);
     let _boot = s
         .adopt_current_on(
             0,
@@ -471,6 +471,6 @@ fn equal_priority_threads_are_not_pulled_back_and_forth() {
         s.yield_on(0).unwrap();
         s.switched(0);
     }
-    assert_eq!(s.pulls, 0, "equals never migrate");
+    assert_eq!(s.pulls(), 0, "equals never migrate");
     s.audit(true).unwrap();
 }
