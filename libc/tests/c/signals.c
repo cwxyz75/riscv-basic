@@ -23,6 +23,10 @@ static void on_sig(int s) {
     got = s;
     if (norder < 8) order[norder++] = s;
 }
+static void on_info(int s, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    got = info->si_signo == s ? s : -1;
+}
 static void on_term_exit7(int s) {
     (void)s;
     _exit(7);
@@ -131,6 +135,41 @@ static int self_tests(void) {
     sigprocmask(SIG_SETMASK, NULL, &was);
     printf("vfork child's signal changes stay in the child: %d\n", old.sa_handler == on_sig && !sigismember(&was, SIGUSR2));
 
+    /* SA_SIGINFO: the handler gets the signal number in a siginfo_t */
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_info;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    got = 0;
+    raise(SIGUSR1);
+    printf("SA_SIGINFO handler saw si_signo: %d\n", got == SIGUSR1);
+    signal(SIGUSR1, SIG_DFL);
+
+    /* the signals whose default action is to do nothing */
+    got = 0;
+    raise(SIGURG);
+    raise(SIGCONT);
+    raise(SIGWINCH);
+    raise(SIGCHLD);
+    printf("URG, CONT, WINCH and CHLD are ignored by default: %d\n", got == 0);
+
+    /* SIGPIPE: a write to a pipe nobody reads raises it; caught or ignored, the write fails with EPIPE */
+    int pp[2];
+    if (pipe(pp) == 0) {
+        close(pp[0]);
+        signal(SIGPIPE, on_sig);
+        got = 0;
+        r = write(pp[1], "x", 1);
+        printf("write to a closed pipe: %d errno EPIPE %d handler SIGPIPE %d\n", (int)r, errno == EPIPE, got == SIGPIPE);
+        signal(SIGPIPE, SIG_IGN);
+        got = 0;
+        r = write(pp[1], "x", 1);
+        printf("ignored SIGPIPE: %d errno EPIPE %d handler ran %d\n", (int)r, errno == EPIPE, got != 0);
+        signal(SIGPIPE, SIG_DFL);
+        close(pp[1]);
+    }
+
     /* alarm returns what was left of the previous one */
     alarm(5);
     unsigned prev_left = alarm(0);
@@ -156,6 +195,15 @@ static int child_tests(const char *self) {
     kill(pid, SIGTERM);
     waitpid(pid, &status, 0);
     printf("default SIGTERM: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    /* the other default actions end a program as killed by the signal: abort, a write to a closed pipe */
+    char *argv5[] = {(char *)self, "signals", "child-abort", NULL};
+    if (posix_spawn(&pid, self, NULL, NULL, argv5, environ) != 0) { printf("spawn failed\n"); return 1; }
+    waitpid(pid, &status, 0);
+    printf("abort: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    char *argv6[] = {(char *)self, "signals", "child-pipe", NULL};
+    if (posix_spawn(&pid, self, NULL, NULL, argv6, environ) != 0) { printf("spawn failed\n"); return 1; }
+    waitpid(pid, &status, 0);
+    printf("default SIGPIPE: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     /* an ignored signal does not end it; SIGKILL cannot be ignored */
     char *argv3[] = {(char *)self, "signals", "child-ignores", NULL};
     if (posix_spawn(&pid, self, NULL, NULL, argv3, environ) != 0) { printf("spawn failed\n"); return 1; }
@@ -248,6 +296,13 @@ int signals_test(int argc, char **argv) {
         write(1, "survived\n", 9);
         return 0;
     }
+    /* a program that ignores SIGINT and never waits: Ctrl-C cannot end it, Ctrl-\\ does (T149) */
+    if (argc > 2 && strcmp(argv[2], "int-hold") == 0) {
+        signal(SIGINT, SIG_IGN);
+        write(1, "ready\n", 6);
+        for (;;) {
+        }
+    }
     /* a program kills the program that started it (SIGKILL goes through the shell: the parent is not the caller's child) */
     if (argc > 2 && strcmp(argv[2], "killparent") == 0) {
         char *a[] = {argv[0], "signals", "killparent-child", NULL};
@@ -266,6 +321,16 @@ int signals_test(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[2], "child-handled") == 0) {
         signal(SIGTERM, on_term_exit7);
         for (;;) sleep(10);
+    }
+    if (argc > 2 && strcmp(argv[2], "child-abort") == 0) {
+        abort();
+    }
+    if (argc > 2 && strcmp(argv[2], "child-pipe") == 0) {
+        int fds[2];
+        if (pipe(fds) != 0) return 1;
+        close(fds[0]);
+        write(fds[1], "x", 1);
+        return 0; /* not reached: SIGPIPE ends the program */
     }
     if (argc > 2 && strcmp(argv[2], "child-quick") == 0) {
         return 0;

@@ -29,6 +29,10 @@ use rt::sys;
 
 /// Exit code given to a job killed by Ctrl-C (128 + SIGINT).
 const KILLED: i32 = -130;
+/// What Ctrl-\\ ends a job with: killed by SIGQUIT (`-2000 - 3`, as the C library's default action does).
+const QUIT_KILLED: i32 = -2003;
+/// How long a hangup lets the foreground programs act on SIGHUP before the console server ends them.
+const HANGUP_GRACE_MS: u64 = 500;
 /// Bytes held for the serial line, and for the client.
 const OUT_CAP: usize = 16 * 1024;
 const DELIVER_CAP: usize = 4 * 1024;
@@ -88,9 +92,13 @@ impl Console {
     }
 
     fn kill_jobs(&self) {
+        self.kill_jobs_with(KILLED);
+    }
+
+    fn kill_jobs_with(&self, code: i32) {
         // no IPC: this works with the shared IPC budget exhausted; BAD_STATE (already dead) is fine
         for &h in &self.jobs {
-            sys::process_kill(h, KILLED);
+            sys::process_kill(h, code);
         }
     }
 
@@ -264,6 +272,11 @@ impl Console {
         if input.interrupt {
             self.event(ctl::Event::Interrupt);
         }
+        if input.quit && self.fg_active {
+            // Ctrl-\\: the jobs it was given end; the shell ends the rest of the foreground job (it does not ask the program)
+            self.kill_jobs_with(QUIT_KILLED);
+            self.event(ctl::Event::JobQuit);
+        }
         if let Some((cols, rows)) = input.resized {
             self.query_deadline = None;
             self.event(ctl::Event::Resize { cols, rows });
@@ -422,6 +435,11 @@ impl Console {
             Some((txid, _hangup)) => {
                 self.reply(ch, txid, 0);
                 self.event(ctl::Event::Hangup);
+                // SIGHUP reaches the programs through the shell (it has just been told): they get a moment to run their handlers
+                // or end by the default action before what is left is ended (the terminal is going, nothing else waits for this)
+                if !self.jobs.is_empty() {
+                    rt::io::nap(HANGUP_GRACE_MS);
+                }
                 self.kill_jobs();
                 false
             }

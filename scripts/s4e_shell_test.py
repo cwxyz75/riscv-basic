@@ -516,6 +516,14 @@ def main():
     time.sleep(0.5)
     step(b"\x03", [b"^C", b"survived"], "Ctrl-C does not end a program that ignores it")
     s.wait_for_prompt = True
+    # a program that holds Ctrl-C off and never waits cannot hold the console: Ctrl-\\ ends the job without asking it (T149)
+    step(b"ctest signals int-hold\n", [b"$ ctest signals int-hold", b"ready"], "a program that ignores SIGINT and never waits")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x03", [b"^C"], "Ctrl-C does not end a program that ignores it and never waits")
+    time.sleep(0.5)
+    step(b"\x1c", [b"^\\", b"[exit -2003]"], "Ctrl-backslash ends a job that ignores Ctrl-C (killed by SIGQUIT)")
+    s.wait_for_prompt = True
     # a Ctrl-C typed together with the command, before the job is even registered, still ends it
     # (the job may or may not have printed its first line yet)
     step(b"spin\n\x03", [b"$ spin"], "a command and Ctrl-C in one write")

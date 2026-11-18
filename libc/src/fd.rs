@@ -480,7 +480,7 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, n: usize) -> isize
         Entry::Socket(s) => {
             let s = s.clone();
             drop(t);
-            crate::socket::sock_send(&s, data, false, None)
+            crate::socket::send_signalling(&s, data, false, None, false)
         }
         Entry::File(f) => {
             if !f.writable {

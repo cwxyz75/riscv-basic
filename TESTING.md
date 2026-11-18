@@ -10,7 +10,7 @@ which is what happened after the previous adjustment.
 | Tier | What | When | Budget | Make target | CI |
 |---|---|---|---|---|---|
 | 0, unit | fmt, docs check, host unit/model/property tests of every crate, clippy, the OS host tests with loom and shuttle | every edit; the inner loop | about 2 minutes | `make quick` (fast part), `make test lint os-test` | the `host` job |
-| 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (`core`, `net`), the release smoke, the home computer's boot | every PR: the merge gate | 10 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
+| 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (shards `a` and `b`), the release smoke, the home computer's boot | every PR: the merge gate | 7 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
 | 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | on demand; nightly on `main`; on a PR labelled `soak` (recommended for kernel, SMP and security slices); before a release; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
 
 Rules:
@@ -39,11 +39,13 @@ Rules:
 
 ## When the smoke boot outgrows its budget
 
-The smoke boot is the whole suite at four harts, run as **two shards in parallel CI jobs** since 2026-11-18 (OD121): `core`
-(everything but the network tests; the guest has no network device) and `net` (the `net_*` tests and the C sockets test). The
-guest filters by the `shard=core` / `shard=net` kernel argument (`debug_stat` 13); the harness (`OS_SHARD`) has the same rule, checks
-each shard reports only its own required tests, and runs the host-side checks of the part it has (the net shard does the network
-ones, the core shard the disk, C and Lua ones). `make os-boot-test-smoke` runs both one after the other, locally. The release smoke is
+The smoke boot is the whole suite at four harts, run as **two shards in parallel CI jobs** since 2026-11-18 (OD121): `a`
+(everything not in `b`; the guest has no network device) and `b` (the `net_*` tests, the C sockets test and the three heaviest
+stress tests, `ten_thousand_threads_leak_nothing`, `a_thread_hog_cannot_exhaust_the_kernel` and `cycles_do_not_grow_memory`, which are
+CPU-bound and slow on a CI runner, where the network tests mostly wait; first split 2026-11-18: shard a took 6 minutes and b 2.5; shard b also runs `fetch_the_program_image`, which the hog test needs, so a test that starts children carries its prerequisite along). The
+guest filters by the `shard=a` / `shard=b` kernel argument (`debug_stat` 13); the harness (`OS_SHARD`) has the same rule, checks
+each shard reports only its own required tests, and runs the host-side checks of the part it has (shard b does the network
+ones, shard a the disk, C and Lua ones). `make os-boot-test-smoke` runs both one after the other, locally. The release smoke is
 its own job, so a gate job is a boot of about half the suite or the release build, with a 7-minute budget (the docs check enforces it).
 
 Measured 2026-11-16 (after S9): 217 tests, about 101 seconds of guest time on the development machine, a little under half of it in

@@ -61,13 +61,13 @@ jobs:
       - name: Check the demo pictures against the independent renderer
         run: python3 home/scripts/verify_demo_images.py
 
-  # Tier 1: the suite boots twice on the default (AIA) machine at four harts, as two parallel jobs (OD121: `core` is everything but
-  # the network tests, `net` is the network tests; the harness checks each ran only its part), and the release smoke is a third.
+  # Tier 1: the suite boots twice on the default (AIA) machine at four harts, as two parallel jobs (OD121: shard `b` is the network tests and
+  # the three heaviest stress tests, `a` is the rest; the harness checks each ran only its part), and the release smoke is a third.
   # Budget: 7 minutes each (the docs check enforces it). The one job that held all of it took 9.6 minutes of its 10 on 2026-11-18;
   # a shard that nears the budget is split again by the same mechanism (TESTING.md "When the smoke boot outgrows its budget").
   # (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
   kernel:
-    name: kernel (smoke core)
+    name: kernel (smoke a)
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
@@ -90,10 +90,10 @@ jobs:
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
           dpkg -l opensbi | tail -1
-      - run: make os-boot-test-smoke-core
+      - run: make os-boot-test-smoke-a
 
   kernel-net:
-    name: kernel (smoke net)
+    name: kernel (smoke b)
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
@@ -116,7 +116,7 @@ jobs:
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
           dpkg -l opensbi | tail -1
-      - run: make os-boot-test-smoke-net
+      - run: make os-boot-test-smoke-b
 
   # The release smoke: the release image boots to the shell and reports no test banners (its own job, in parallel with the boots).
   release-smoke:

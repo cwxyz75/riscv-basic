@@ -72,8 +72,114 @@ impl SigTable {
     }
 }
 
+/// What a signal does to a program that has not asked for anything else (POSIX 2.4.3, the table of default actions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// T: end the program as killed by the signal.
+    Terminate,
+    /// A: end it as killed by the signal, "with additional actions" (a core file on Unix; there are none here, so the same).
+    Abort,
+    /// I: nothing.
+    Ignore,
+    /// S: stop the program (needs the kernel's suspend; until then the library treats it as `Ignore`).
+    Stop,
+    /// C: continue a stopped program, otherwise nothing.
+    Continue,
+}
+
+/// The default action of signal `sig` (Linux numbers). Signals with no number of their own (the real-time range) terminate; the
+/// non-POSIX `SIGWINCH` is ignored, as everywhere.
+pub fn default_action(sig: i32) -> Action {
+    match sig {
+        1 | 2 | 9 | 10 | 12 | 13 | 14 | 15 | 26 | 27 | 29 => Action::Terminate,
+        3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31 => Action::Abort,
+        17 | 23 | 28 => Action::Ignore,
+        19..=22 => Action::Stop,
+        18 => Action::Continue,
+        _ => Action::Terminate,
+    }
+}
+
+/// The signal a hardware fault (the supervisor `scause`) stands for, as Linux maps it on RISC-V: misaligned access SIGBUS,
+/// illegal instruction SIGILL, breakpoint SIGTRAP, every access and page fault SIGSEGV.
+pub fn fault_signal(scause: u64) -> i32 {
+    match scause {
+        0 | 4 | 6 => 7,
+        2 => 4,
+        3 => 5,
+        _ => 11,
+    }
+}
+
 impl Default for SigTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Action::*;
+
+    /// POSIX 2.4.3's table (and `SIGSTKFLT`'s absence): every signal of the base and XSI lists, Linux numbers.
+    #[test]
+    fn default_actions_are_the_posix_table() {
+        let table: &[(i32, &str, Action)] = &[
+            (6, "ABRT", Abort),
+            (14, "ALRM", Terminate),
+            (7, "BUS", Abort),
+            (17, "CHLD", Ignore),
+            (18, "CONT", Continue),
+            (8, "FPE", Abort),
+            (1, "HUP", Terminate),
+            (4, "ILL", Abort),
+            (2, "INT", Terminate),
+            (9, "KILL", Terminate),
+            (13, "PIPE", Terminate),
+            (3, "QUIT", Abort),
+            (11, "SEGV", Abort),
+            (19, "STOP", Stop),
+            (15, "TERM", Terminate),
+            (20, "TSTP", Stop),
+            (21, "TTIN", Stop),
+            (22, "TTOU", Stop),
+            (10, "USR1", Terminate),
+            (12, "USR2", Terminate),
+            (29, "POLL", Terminate),
+            (27, "PROF", Terminate),
+            (31, "SYS", Abort),
+            (5, "TRAP", Abort),
+            (23, "URG", Ignore),
+            (26, "VTALRM", Terminate),
+            (24, "XCPU", Abort),
+            (25, "XFSZ", Abort),
+        ];
+        for &(n, name, want) in table {
+            assert_eq!(default_action(n), want, "SIG{name}");
+        }
+        assert_eq!(default_action(28), Ignore); // SIGWINCH
+        for rt in 34..=64 {
+            assert_eq!(default_action(rt), Terminate, "real-time {rt}");
+        }
+    }
+
+    #[test]
+    fn faults_become_the_signals_linux_gives() {
+        for (scause, sig) in [
+            (0, 7),
+            (4, 7),
+            (6, 7),
+            (2, 4),
+            (3, 5),
+            (1, 11),
+            (5, 11),
+            (7, 11),
+            (12, 11),
+            (13, 11),
+            (15, 11),
+        ] {
+            assert_eq!(fault_signal(scause), sig, "scause {scause}");
+        }
     }
 }

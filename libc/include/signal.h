@@ -30,20 +30,42 @@ typedef unsigned long sigset_t;
 #define SIGTSTP 20
 #define SIGTTIN 21
 #define SIGTTOU 22
+#define SIGURG 23
 #define SIGXCPU 24
 #define SIGXFSZ 25
+#define SIGPROF 27
 #define SIGVTALRM 26
 #define SIGWINCH 28
+#define SIGPOLL 29
+#define SIGIO SIGPOLL
+#define SIGSYS 31
+#define SIGRTMIN 34
+#define SIGRTMAX 64
 #define NSIG 65
 #define SA_NOCLDSTOP 1
+#define SA_SIGINFO 4
 #define SA_RESTART 0x10000000
 #define SA_NODEFER 0x40000000
 #define SA_RESETHAND 0x80000000
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
+#define SI_USER 0
+typedef struct {
+int si_signo;
+int si_errno;
+int si_code;
+int _pad;
+int si_pid;
+unsigned si_uid;
+void *si_value;
+char _rest[96];
+} siginfo_t;
 struct sigaction {
+    union {
     sighandler_t sa_handler;
+    void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
 };
@@ -53,6 +75,9 @@ int kill(pid_t pid, int sig);
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 int sigprocmask(int how, const sigset_t *set, sigset_t *old);
 int sigwait(const sigset_t *set, int *sig);
+struct timespec;
+int sigwaitinfo(const sigset_t *set, siginfo_t *info);
+int sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout);
 int pthread_sigmask(int how, const sigset_t *set, sigset_t *old);
 int sigsuspend(const sigset_t *mask);
 int sigemptyset(sigset_t *set);

@@ -190,6 +190,9 @@ pub enum Event {
     /// Ctrl-C while a foreground job runs (canonical mode): the console server has ended the jobs it was given; the shell
     /// passes SIGINT on to the programs it kept back because they handle it (S11).
     JobInterrupt,
+    /// Ctrl-\\ while a foreground job runs: the console server has ended the jobs it was given; the shell ends the rest (the ones
+    /// it kept back because they handle SIGINT), as the quit key does not ask the program (T149).
+    JobQuit,
 }
 
 pub fn encode_event(e: Event) -> Vec<u8> {
@@ -198,6 +201,7 @@ pub fn encode_event(e: Event) -> Vec<u8> {
         Event::Interrupt => (2, 0, 0),
         Event::Hangup => (3, 0, 0),
         Event::JobInterrupt => (4, 0, 0),
+        Event::JobQuit => (5, 0, 0),
     };
     let mut out = Vec::new();
     out.extend_from_slice(&EVENT_TXID.to_le_bytes());
@@ -218,6 +222,7 @@ pub fn decode_event(b: &[u8]) -> Option<Event> {
         (2, 0, 0) => Some(Event::Interrupt),
         (3, 0, 0) => Some(Event::Hangup),
         (4, 0, 0) => Some(Event::JobInterrupt),
+        (5, 0, 0) => Some(Event::JobQuit),
         _ => None,
     }
 }
@@ -386,6 +391,8 @@ mod tests {
         assert_eq!(h, [0xff, 0xff, 0xff, 0xff, 3, 0, 0, 0, 0, 0]);
         let j = encode_event(Event::JobInterrupt);
         assert_eq!(j, [0xff, 0xff, 0xff, 0xff, 4, 0, 0, 0, 0, 0]);
+        let q = encode_event(Event::JobQuit);
+        assert_eq!(q, [0xff, 0xff, 0xff, 0xff, 5, 0, 0, 0, 0, 0]);
         assert_ne!(i, h);
         for (b, e) in [
             (
@@ -398,6 +405,7 @@ mod tests {
             (&i, Event::Interrupt),
             (&h, Event::Hangup),
             (&j, Event::JobInterrupt),
+            (&q, Event::JobQuit),
         ] {
             assert_eq!(decode_event(b), Some(e));
             for n in 0..b.len() {
