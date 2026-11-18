@@ -1,6 +1,7 @@
 #ifndef _OS_STDLIB_H
 #define _OS_STDLIB_H
 #include <stddef.h>
+#define MB_CUR_MAX 4 /* UTF-8, the one encoding */
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define RAND_MAX 2147483647

@@ -68,6 +68,9 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int {
     cc[2] = 0x7f; // VERASE
     cc[3] = 0x15; // VKILL
     cc[4] = 4; // VEOF ^D
+    cc[8] = 0x11; // VSTART ^Q
+    cc[9] = 0x13; // VSTOP ^S
+    cc[10] = 0x1a; // VSUSP ^Z (the console stops the foreground job, OD124)
     cc[VTIME] = TERM_VTIME.load(Ordering::Relaxed);
     cc[VMIN] = TERM_VMIN.load(Ordering::Relaxed);
     *t = Termios {
