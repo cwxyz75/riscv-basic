@@ -541,6 +541,7 @@ name = "profile"
 version = "0.1.0"
 dependencies = [
  "data",
+ "shell-core",
 ]
 
 [[package]]

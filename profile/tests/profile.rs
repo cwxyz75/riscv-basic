@@ -109,6 +109,14 @@ fn bad_profiles_are_refused_with_a_reason() {
             "`path`",
         ),
         (
+            r#"{"name":"a","uid":1,"home":"h","programs":{"ls":{"mounts":[{"volume":"v","path":"/tmp"}]}}}"#,
+            "`path`",
+        ),
+        (
+            r#"{"name":"a","uid":1,"home":"h","programs":{"ls":{"mounts":[{"volume":"v","path":"/proc/x"}]}}}"#,
+            "`path`",
+        ),
+        (
             r#"{"name":"a","uid":1,"home":"h","programs":{"ls":{"mounts":[{"volume":"v","path":"rel"}]}}}"#,
             "`path`",
         ),
