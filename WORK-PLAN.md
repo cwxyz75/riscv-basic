@@ -22,10 +22,10 @@ Order (the owner approved it; sizes are guesses, and tend to be over-estimates):
    `configure` scripts run; dash's results are the second oracle on a shared corpus. Do the spawn rate first.
 6. [x] **Ctrl-C as SIGINT** (T47, done) **and `termios` for programs** (T124, done for the foreground job: modes, size, `VMIN`/`VTIME`): the shell sends SIGINT to a program that has a handler for it and keeps the kill otherwise
    (BASIC's BREAK key needs it); then **`termios` for programs** (T124: raw mode, for `kilo` and friends).
-7. [ ] **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
+7. [x] (done: PR 223; the library half, `pthread_cancel` and `alarm` in a CPU loop, is still open in T56) **Kernel `thread_interrupt`** (SCHED-SMP-SPEC task 26, T56): signals into a program in a CPU loop. **Owner's go-ahead
    needed**; its own PR; soak at `-smp 2` and `-smp 4`; Fable review.
 
-Then: a first real port from `third_party/fetched` (**`kilo` and `sqlite3` done**; next `gzip`, `gnutar`), and the design-review slice queue before S8 (`ROADMAP.md`,
+Then: a first real port from `third_party/fetched` (**`kilo`, `sqlite3` and GNU `gzip` done** (PRs 220, 222, 224); `tar` is BusyBox's (PR 225) and GNU tar is deferred: T145), and the design-review slice queue before S8 (`ROADMAP.md`,
 `reviews/`).
 
 Working rules that apply throughout (CLAUDE.md, the owner's earlier instructions): a runnable acceptance check first; one mutation
