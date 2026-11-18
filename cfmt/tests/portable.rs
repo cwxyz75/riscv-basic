@@ -438,6 +438,7 @@ mod host_sig {
     }
     #[cfg(target_os = "linux")]
     #[repr(C)]
+    #[allow(dead_code)] // (the kernel's layout has a field the test never reads)
     pub struct SigAction {
         pub handler: usize,
         pub mask: [u64; 16],
