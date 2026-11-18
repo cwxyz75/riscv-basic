@@ -637,12 +637,16 @@ static void searching(void) {
     printf("lfind %d, ", lfind(&key, arr, &n, sizeof(int), cmp_int) == &arr[2]);
     key = 4;
     printf("lfind absent %d, ", lfind(&key, arr, &n, sizeof(int), cmp_int) == NULL);
-    printf("lsearch adds %d (n=%zu), ", *(int *)lsearch(&key, arr, &n, sizeof(int), cmp_int), n);
-    printf("again %d (n=%zu)\n", lsearch(&key, arr, &n, sizeof(int), cmp_int) == &arr[3], n);
+    int *added = lsearch(&key, arr, &n, sizeof(int), cmp_int); /* (statements, not arguments: the order they are evaluated in is unspecified) */
+    printf("lsearch adds %d (n=%zu), ", *added, n);
+    int *again = lsearch(&key, arr, &n, sizeof(int), cmp_int);
+    printf("again %d (n=%zu)\n", again == &arr[3], n);
     /* the hash table */
     printf("hcreate %d, ", hcreate(10) != 0);
     ENTRY e1 = {"alpha", (void *)1}, e2 = {"beta", (void *)2};
-    printf("enter %d %d, ", hsearch(e1, ENTER) != NULL, hsearch(e2, ENTER) != NULL);
+    int in1 = hsearch(e1, ENTER) != NULL;
+    int in2 = hsearch(e2, ENTER) != NULL;
+    printf("enter %d %d, ", in1, in2);
     ENTRY look = {"beta", NULL};
     ENTRY *f = hsearch(look, FIND);
     printf("find beta -> %ld, ", f ? (long)f->data : -1L);
@@ -661,7 +665,9 @@ static void searching(void) {
     twalk(root, visit);
     for (int i = 0; i < nwalked; i++) printf("%d ", walked[i]);
     int gone = 20;
-    printf("| delete 20 %d, again %d, ", tdelete(&gone, &root, cmp_int) != NULL, tdelete(&gone, &root, cmp_int) == NULL);
+    int deleted = tdelete(&gone, &root, cmp_int) != NULL;
+    int deleted_again = tdelete(&gone, &root, cmp_int) == NULL;
+    printf("| delete 20 %d, again %d, ", deleted, deleted_again);
     printf("find 20 %d, find 30 %d | ", tfind(&gone, &root, cmp_int) == NULL, tfind(&keys[4], &root, cmp_int) != NULL);
     nwalked = 0;
     twalk(root, visit);
