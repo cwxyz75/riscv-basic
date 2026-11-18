@@ -151,6 +151,8 @@ pub mod status {
     /// again (`pathres`, USER-VIEW-SPEC section 5): a server never follows a link. Given for `OPEN`, `STAT`, `SYMLINK` and
     /// `READLINK` paths; the final component is reported only by `OPEN` and `STAT` without `NOFOLLOW`.
     pub const SYMLINK: i32 = -115;
+    /// A name that is not valid UTF-8 or has a control character (FS-SPEC F6): the library says `EILSEQ`.
+    pub const BAD_NAME: i32 = -116;
 }
 
 /// A request, borrowing its payload.
@@ -283,20 +285,34 @@ pub enum PathError {
     Dots,
     TooLong,
     TooDeep,
+    /// A name that is not valid UTF-8 or contains a control character (FS-SPEC F6, `names`): `EILSEQ` in the C library.
+    BadEncoding,
 }
 
-/// Validate one name (a directory entry, or a path component).
+/// Validate one name (a directory entry, or a path component) by the one rule in the `names` crate (FS-SPEC F6).
 pub fn valid_name(n: &[u8]) -> Result<(), PathError> {
-    if n.is_empty() || n.contains(&0) || n.contains(&b'/') {
-        return Err(PathError::Malformed);
+    names::validate(n).map_err(|e| match e {
+        names::NameError::Empty | names::NameError::Nul | names::NameError::Slash => {
+            PathError::Malformed
+        }
+        names::NameError::Dots => PathError::Dots,
+        names::NameError::TooLong => PathError::TooLong,
+        names::NameError::NotUtf8 | names::NameError::Control => PathError::BadEncoding,
+    })
+}
+
+/// The text rule alone (valid UTF-8, no control characters) for names that may contain dots and are not path components: attribute
+/// names (FS-SPEC F6).
+pub fn valid_text(n: &[u8]) -> Result<(), PathError> {
+    names::validate_text(n).map_err(|_| PathError::BadEncoding)
+}
+
+/// The reply status for a path or name the rule refuses: `BAD_NAME` for a bad encoding, `BAD_REQUEST` for the rest.
+pub fn path_status(e: PathError) -> i32 {
+    match e {
+        PathError::BadEncoding => status::BAD_NAME,
+        _ => status::BAD_REQUEST,
     }
-    if n == b"." || n == b".." {
-        return Err(PathError::Dots);
-    }
-    if n.len() > MAX_COMPONENT {
-        return Err(PathError::TooLong);
-    }
-    Ok(())
 }
 
 /// Longest symlink target.

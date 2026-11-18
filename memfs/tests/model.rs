@@ -37,6 +37,27 @@ fn names_are_validated() {
         assert_eq!(fs.lookup(ROOT, bad), Err(Error::BadName));
         assert_eq!(fs.unlink(ROOT, bad), Err(Error::BadName));
     }
+    // not UTF-8, or a control character: refused as a bad encoding (FS-SPEC F6)
+    for bad in [
+        &b"\xff"[..],
+        b"caf\xe9",
+        b"\xed\xa0\x80",
+        b"a\nb",
+        b"\x7f",
+        b"\xc2\x85",
+    ] {
+        assert_eq!(
+            fs.create_file(ROOT, bad),
+            Err(Error::BadEncoding),
+            "{bad:?}"
+        );
+        assert_eq!(fs.mkdir(ROOT, bad), Err(Error::BadEncoding));
+        assert_eq!(fs.lookup(ROOT, bad), Err(Error::BadEncoding));
+        assert_eq!(fs.unlink(ROOT, bad), Err(Error::BadEncoding));
+    }
+    // two names that look alike are two names (no normalisation)
+    assert!(fs.create_file(ROOT, "caf\u{e9}".as_bytes()).is_ok());
+    assert!(fs.create_file(ROOT, "cafe\u{301}".as_bytes()).is_ok());
     assert!(fs.create_file(ROOT, &[b'x'; 255]).is_ok());
     assert!(fs.create_file(ROOT, "é-ünï.txt".as_bytes()).is_ok());
 }

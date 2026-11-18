@@ -13,6 +13,7 @@ int *__errno_location(void);
 #define ENAMETOOLONG 36
 #define ENOTEMPTY 39
 #define EOVERFLOW 75
+#define EILSEQ 84
 #define ETIMEDOUT 110
 #define ENOENT 2
 #define EIO 5

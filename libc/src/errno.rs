@@ -47,6 +47,7 @@ pub fn message(e: c_int) -> &'static [u8] {
         36 => b"File name too long\0",
         39 => b"Directory not empty\0",
         75 => b"Value too large for defined data type\0",
+        84 => b"Illegal byte sequence\0",
         33 => b"Numerical argument out of domain\0",
         34 => b"Numerical result out of range\0",
         38 => b"Function not implemented\0",

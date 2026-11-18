@@ -122,7 +122,7 @@ fn check_attr_name(name: &[u8]) -> Result<(), Error> {
     {
         return Err(Error::BadName);
     }
-    Ok(())
+    proto::file::valid_text(name).map_err(memfs::name_error)
 }
 
 fn ty_of(code: u8) -> R<AttrType> {

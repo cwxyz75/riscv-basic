@@ -72,6 +72,7 @@ fn err_status(e: Error, name_len: usize) -> i32 {
         Error::TooBig => Status::TooBig.code(),
         Error::ReadOnly => Status::AccessDenied.code(),
         Error::BadName if name_len > file::MAX_COMPONENT => status::NAME_TOO_LONG,
+        Error::BadEncoding => status::BAD_NAME,
         Error::BadName | Error::BadRange | Error::Invalid => status::BAD_REQUEST,
         // (attributes, indexes, queries and symlinks arrive with the server step; the statuses are defined, nothing sends them yet)
         Error::NoAttr => status::NO_ATTR,
@@ -373,8 +374,11 @@ impl Server {
                     return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
                 };
                 let (old, new) = req.payload.split_at(n);
-                let (Ok(old), Ok(new)) = (file::split_path(old), file::split_path(new)) else {
-                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                let (old, new) = match (file::split_path(old), file::split_path(new)) {
+                    (Ok(o), Ok(n)) => (o, n),
+                    (Err(e), _) | (_, Err(e)) => {
+                        return self.send(key, txid, file::path_status(e), 0, &[], None)
+                    }
                 };
                 let (old_last, old_parents) =
                     old.split_last().expect("a split path is never empty");
@@ -405,7 +409,7 @@ impl Server {
                             }
                             self.fs.walk(node, &comps)
                         }
-                        Err(_) => return self.send(key, txid, status::BAD_REQUEST, 0, &[], None),
+                        Err(e) => return self.send(key, txid, file::path_status(e), 0, &[], None),
                     }
                 };
                 self.stat_reply(key, txid, target);
@@ -483,8 +487,9 @@ impl Server {
                 if !need(pr::READ) {
                     return self.send(key, txid, denied, 0, &[], None);
                 }
-                let Ok(comps) = file::split_path(req.payload) else {
-                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                let comps = match file::split_path(req.payload) {
+                    Ok(c) => c,
+                    Err(e) => return self.send(key, txid, file::path_status(e), 0, &[], None),
                 };
                 // (the link is the last component: only links in the middle stop the walk)
                 if self.link_on_path(node, &comps, false) {
@@ -615,7 +620,7 @@ impl Server {
         let (target, created_new) = if path.is_empty() {
             (dir, false)
         } else {
-            let comps = file::split_path(path).map_err(|_| status::BAD_REQUEST)?;
+            let comps = file::split_path(path).map_err(file::path_status)?;
             let (last, parents) = comps.split_last().expect("a split path is never empty");
             let follow = fl & flags::NOFOLLOW == 0 && fl & flags::EXCLUSIVE == 0;
             if self.link_on_path(dir, &comps, follow) {

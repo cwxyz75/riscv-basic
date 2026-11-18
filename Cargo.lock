@@ -422,6 +422,10 @@ name = "mounts"
 version = "0.1.0"
 
 [[package]]
+name = "names"
+version = "0.1.0"
+
+[[package]]
 name = "netcore"
 version = "0.1.0"
 dependencies = [
@@ -544,6 +548,7 @@ name = "proto"
 version = "0.1.0"
 dependencies = [
  "console",
+ "names",
  "svc",
 ]
 
