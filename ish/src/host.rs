@@ -49,6 +49,26 @@ pub enum WaitOutcome {
     Interrupted,
 }
 
+/// What `wait` answers for a program the terminal stopped (Ctrl-Z): 128 + SIGTSTP. The host has put it in its job table (`jobs`,
+/// `fg` and `bg`); the shell neither waits for the rest of the pipeline nor reports a failure.
+pub const STOPPED_STATUS: i32 = 148;
+
+/// One entry of the host's job table: a pipeline the terminal stopped, or that `bg` set running again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobLine {
+    pub id: u32,
+    pub run: JobRun,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobRun {
+    Running,
+    Stopped,
+    /// Ended while in the background, with this status (listed once, then forgotten).
+    Done(i32),
+}
+
 /// The three standard streams of a started program.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcIo {
@@ -125,6 +145,20 @@ pub trait Host {
     fn kill(&mut self, _pid: Pid) {}
     /// The `halt` builtin: ask the system to end the session.
     fn halt(&mut self) {}
+
+    /// The job table: stopped jobs and jobs `bg` set running (oldest first). Done jobs are listed once and forgotten.
+    fn job_list(&mut self) -> Vec<JobLine> {
+        Vec::new()
+    }
+    /// Let job `id` (the newest if `None`) go on. For the foreground the host takes the terminal back for it and returns its
+    /// stages: the shell waits for them. For the background it returns them too, and does not wait.
+    fn job_continue(
+        &mut self,
+        _id: Option<u32>,
+        _foreground: bool,
+    ) -> Result<Vec<(Pid, String)>, String> {
+        Err(String::from("no job control here"))
+    }
 
     /// The namespace table the shell holds: `(path, rights)` with rights written `r`, `rw`.
     fn table(&self) -> Vec<(String, String)> {

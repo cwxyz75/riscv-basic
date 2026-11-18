@@ -37,6 +37,8 @@ pub struct Input {
     pub interrupt: bool,
     /// Ctrl-\\ was seen with signals on: end the foreground set outright (SIGQUIT's key; the job is not asked, T149).
     pub quit: bool,
+    /// Ctrl-Z was seen with signals on: stop the foreground job (the shell does it; nothing is delivered).
+    pub stop: bool,
     /// A size report answered the pending query: `(cols, rows)`.
     pub resized: Option<(u16, u16)>,
 }
@@ -138,8 +140,8 @@ impl Tty {
     pub fn serial_in(&mut self, bytes: &[u8]) -> Input {
         let mut input = Input::default();
         for &b in bytes {
-            if input.kill || input.quit {
-                break; // type-ahead behind a Ctrl-C or Ctrl-\\ is discarded
+            if input.kill || input.quit || input.stop {
+                break; // type-ahead behind a Ctrl-C, Ctrl-\\ or Ctrl-Z is discarded
             }
             self.byte(b, &mut input);
         }
@@ -191,7 +193,17 @@ impl Tty {
     }
 
     fn plain(&mut self, b: u8, input: &mut Input) {
-        if input.kill || input.quit {
+        if input.kill || input.quit || input.stop {
+            return;
+        }
+        if b == 0x1a && self.mode & mode::ISIG != 0 {
+            if self.mode & mode::ECHO != 0 {
+                self.push_out(b"^Z\r\n");
+            }
+            // (a half-typed line is dropped, as for Ctrl-C)
+            self.editor = LineEditor::new();
+            self.fresh = true;
+            input.stop = true;
             return;
         }
         if b == 0x1c && self.mode & mode::ISIG != 0 {
@@ -520,6 +532,25 @@ mod tests {
         let i = t.serial_in(b"x\x1cy");
         assert!(!i.quit);
         assert_eq!(i.deliver, b"x\x1cy");
+    }
+
+    #[test]
+    fn ctrl_z_is_a_stop_request_with_signals_on_and_data_without() {
+        let mut t = Tty::new(1024);
+        let i = t.serial_in(b"ab\x1azz");
+        assert!(i.stop && !i.kill && !i.quit && !i.interrupt);
+        assert_eq!(i.deliver, b""); // the half-typed line and the type-ahead are gone
+        assert_eq!(drain(&mut t), "ab^Z\r\n");
+        assert_eq!(t.serial_in(b"ok\r").deliver, b"ok\n");
+        let mut t = Tty::new(1024);
+        t.set_mode(mode::CBREAK);
+        let i = t.serial_in(b"a\x1ab");
+        assert!(i.stop);
+        assert_eq!(i.deliver, b"a");
+        let mut t = raw();
+        let i = t.serial_in(b"x\x1ay");
+        assert!(!i.stop);
+        assert_eq!(i.deliver, b"x\x1ay");
     }
 
     #[test]

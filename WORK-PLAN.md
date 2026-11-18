@@ -59,7 +59,7 @@ the scheduler work starts from a quieter tree.
 - [~] (decision item Q-T42 written; no kernel change, see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
   supervisor does by convention today, or a design note and a decision item if enforcement turns out to need an OD-level
   choice (that would be a major decision point: stop). Fable review, soak.
-- [ ] **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
+- [~] (kernel half merged: PR 238; shell job control and the libc half in the next PR; CPU-time itimers and queued real-time signals remain) **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
   PR, Fable review, soak); then job control on top (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP/SIGTSTP/SIGCONT, SIGTTIN/SIGTTOU,
   SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), CPU-time itimers and queued real-time signals, as SIG2 and T149 describe.
   Acceptance (from SIG2): a host-oracle C program and a shell test that stops a spinning program with Ctrl-Z and resumes it
