@@ -169,6 +169,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
+| 57 | process_suspend | `a0` process | |
+| 58 | process_resume | `a0` process | |
 | 70 | socket_create | | `a1`, `a2` the two handles |
 | 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
 | 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
@@ -492,6 +494,17 @@ End the process with exit code `code` (as if it had called `process_exit(code)`)
 stop, its handle table is closed, its address space is torn down, TERMINATED is raised.
 Rights: KILL (MANAGE alone is not enough). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (already ended).
 A thread blocked in a wait is woken to die. Tests: `process_kill_*`.
+
+### process_suspend(process) / process_resume(process) -> status
+
+Stop every thread of the process, or let them go on (SIG2, OD123). Rights: KILL (the right to end a process is the right
+to stop it; MANAGE alone is not enough). Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process ended, or was killed and is ending).
+Both are idempotent (stopping a stopped process, or resuming one that runs, is OK), and a process may stop itself: its
+calling thread parks as the call returns. A stopped thread **parks at its next return to user mode**, the point where a
+kill takes effect: a thread running on another hart is kicked and parks at once, a thread blocked in a call stays blocked and
+parks when the call returns (its timeout still runs, its signals still arrive), and a thread created in a stopped process
+runs no user code until the process is resumed. A kill ends a stopped process as usual. The process's other state (handles,
+memory, channels) is untouched and servers keep answering it. While stopped, the process object has the signal `STOPPED` (bit 6; waitable, cleared by `process_resume`; a process that ended has TERMINATED only), so a parent can wait for a stop. `process_info` still answers BAD_STATE. Tests: `process_suspend_*`.
 
 ### process_info(process) -> status, exit_code
 
@@ -880,6 +893,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_set_size, vmo_create_child | planned, later |
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
+| process_suspend, process_resume | specified and implemented (SIG2) |
 | thread_create, thread_exit, thread_info | specified (S3c-2b) |
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |

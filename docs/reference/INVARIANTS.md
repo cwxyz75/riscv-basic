@@ -145,7 +145,7 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | 1 | `LEGACY` | one | Everything not yet peeled. Transitional (3.5); absent in the final state | timer, external | reentrant (a depth count) until task 20 |
 | 2 | `AS` | per process | The region map, the page table, the ASID and the `ran_on` hart mask of one address space | no (page faults are traps, not interrupts) | never two (a syscall touches one address space) |
 | 3 | `OBJ` | one | The object registry, every handle table, the wait table and dirty log, port and channel state including pending-call records, the IPC meter | external (interrupt objects) | no |
-| 4 | `PROCS` | one | The process table and each process's lifecycle state (state, killed, exit code, thread count) | no | no |
+| 4 | `PROCS` | one | The process table and each process's lifecycle state (state, killed, stopped, exit code, thread count) | no | no |
 | 5 | `FUTEX` | 64 buckets, by hash of the key | Futex queues, PI-futex owner and waiter records | no | never two |
 | 6 | `VMO` | one | The VMO store: pages, commit state, mapping references | no | no |
 | 7 | `JOBS` | one | The job ledger, including each job's scheduling limits | no | no |

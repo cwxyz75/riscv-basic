@@ -461,6 +461,36 @@ pub fn app_main() -> i32 {
                 }
             }
         }
+        71 => {
+            // SIG2: count in a loop and report the count on the bootstrap channel now and then (a full channel drops the
+            // report): a parent sees whether the process runs by whether reports arrive.
+            let mut n: u64 = 0;
+            loop {
+                n = n.wrapping_add(1);
+                if n & 0x1fff == 0 {
+                    rt::sys::channel_write(
+                        rt::BOOTSTRAP,
+                        n.to_le_bytes().as_ptr(),
+                        8,
+                        core::ptr::null(),
+                        0,
+                    );
+                }
+                core::hint::spin_loop();
+            }
+        }
+        72 => {
+            // SIG2: stop the whole process (this thread included), and say so once resumed, then exit 4
+            // (its own `process_self` handle has no KILL, so the parent sends it a handle to the process that has)
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
+            let (mut buf, mut got) = ([0u8; 4], [0u32; 1]);
+            let r = rt::sys::channel_read(rt::BOOTSTRAP, buf.as_mut_ptr(), 4, got.as_mut_ptr(), 1);
+            if r.status != 0 || r.a2 != 1 || rt::sys::process_suspend(got[0]).status != 0 {
+                return 1;
+            }
+            rt::sys::channel_write(rt::BOOTSTRAP, b"r".as_ptr(), 1, core::ptr::null(), 0);
+            return 4;
+        }
         52 => {
             // S7b: sleep on a futex forever (until killed): nothing may be left behind
             static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

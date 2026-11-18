@@ -57,6 +57,8 @@ pub struct Event {
 pub struct ProcessObj {
     pub pid: u32,
     pub terminated: bool,
+    /// Stopped by `process_suspend`: raises STOPPED.
+    pub stopped: bool,
     pub exit_code: i32,
     /// Destroying this object (the last handle closing) kills a still-running process. False
     /// for processes the kernel itself started: their `process_self` handles are only views.
@@ -627,6 +629,8 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
         KObj::Process(p) => {
             if p.terminated {
                 signals::TERMINATED
+            } else if p.stopped {
+                signals::STOPPED
             } else {
                 0
             }
@@ -1285,6 +1289,7 @@ pub fn process_object_create_in(
         KObj::Process(ProcessObj {
             pid,
             terminated: false,
+            stopped: false,
             exit_code: 0,
             kill_on_close,
         }),
@@ -1324,6 +1329,13 @@ pub fn process_mark_terminated(reg: &mut Kobjs, obj: ObjId, code: i32) {
     if let Some(KObj::Process(p)) = reg.get_mut(obj) {
         p.terminated = true;
         p.exit_code = code;
+    }
+}
+
+/// Record that the process behind `obj` was stopped or continued (raises or clears STOPPED).
+pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
+    if let Some(KObj::Process(p)) = reg.get_mut(obj) {
+        p.stopped = stopped;
     }
 }
 

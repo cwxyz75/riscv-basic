@@ -62,4 +62,28 @@ int *__errno_location(void);
 #define ELOOP 40
 #define ENOSYS 38
 #define ENOTSUP EOPNOTSUPP
+/* the rest of POSIX's list (Linux numbers) */
+#define EBADMSG 74
+#define ECANCELED 125
+#define ECONNABORTED 103
+#define EDQUOT 122
+#define EFBIG 27
+#define EIDRM 43
+#define EMLINK 31
+#define EMULTIHOP 72
+#define ENETRESET 102
+#define ENODATA 61
+#define ENOLINK 67
+#define ENOMSG 42
+#define ENOSR 63
+#define ENOSTR 60
+#define ENOTRECOVERABLE 131
+#define EOWNERDEAD 130
+#define EPROTO 71
+#define EPROTOTYPE 91
+#define EROFS 30
+#define ESTALE 116
+#define ETIME 62
+#define ETXTBSY 26
+#define ENOTBLK 15
 #endif
