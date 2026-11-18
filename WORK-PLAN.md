@@ -35,7 +35,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
 5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
    the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
    finds; the slice I (AIA) review is also still owed.
-6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
+6. [x] (finding, no code: the fetched tcc 0.9.27 has **no RISC-V back end**; see "Decisions to discuss in the morning") **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
    needs executable memory, say so and stop at "compiles to a file".
 7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7 is the hush port, no shell to write: T139 lists what is left), or L-task work, which are the
    owner's to choose: do not start the kernel locking tasks unasked).
@@ -84,4 +84,6 @@ not run.
 
 (Add one line per decision taken without the owner: what, the alternative, why, where it is recorded.)
 
-- (none yet)
+- **`tcc` cannot be our C compiler as pinned** (2026-11-17 night): `third_party/fetched/tcc` is tcc 0.9.27, whose source has back ends for i386, x86_64, arm, arm64, c67 and il, not RISC-V (`riscv64-gen.c` arrived after 0.9.27, in the development branch). So there was nothing to spike. Alternatives for "compile C on the OS", none started: tcc from its development branch (a git snapshot, not a release tarball: a pin and a hash from a commit archive), or QBE with `cproc` (QBE has a riscv64 back end; two small programs, no self-hosting of the libc headers), or neither (the OS is cross-built on the host, which is how everything works today). The pinned tcc entry in `third_party/fetch-manifest.txt` is therefore unused.
+- **GNU tar is not the next port; the libc is** (owner's own call, recorded): after the libc batch only `fscanf`, `sigwait` and gnulib's own header remain undeclared for it.
+- (Add any further night decisions here.)
