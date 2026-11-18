@@ -530,3 +530,11 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
 No floating point (T-number to link: FP context saving); no streaming parsers; lexical `..` and the cwd-after-rename
 deviation (shared with the libc, see the namespace decision); `/etc/trusted` as the temporary grant source; YAML
 absent or a strict subset.
+
+## Amendment 2026-11-18: job control (Q7 resolved, OD124)
+
+Q7 is settled: an interactive shell has **Ctrl-Z, `jobs`, `fg` and `bg`**. Ctrl-Z stops the foreground job (the command ends with
+status 148 and is not a failure) and puts it in the job table; `jobs` returns the table as a list of `{id, state, name}` records;
+`fg [n]` brings a job to the foreground and waits for it as for any pipeline; `bg [n]` lets it run on. The `spawn` jobs of
+section 5.2 (J1 to J10) are unchanged: they are values a script holds, not entries of this table.
+

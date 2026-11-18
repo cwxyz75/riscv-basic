@@ -42,6 +42,9 @@ struct Pipe {
     readers: u32,
 }
 
+/// A job of the fake's table: (id, stages, running).
+type FakeJob = (u32, Vec<(Pid, String)>, bool);
+
 pub struct FakeHost {
     pub files: BTreeMap<String, Vec<u8>>,
     env: BTreeMap<String, String>,
@@ -69,7 +72,7 @@ pub struct FakeHost {
     /// The command line of each program started, by pid (for the job table).
     cmdlines: BTreeMap<u32, String>,
     /// The job table: (id, stages, running).
-    jobs: Vec<(u32, Vec<(Pid, String)>, bool)>,
+    jobs: Vec<FakeJob>,
     next_job: u32,
 }
 
