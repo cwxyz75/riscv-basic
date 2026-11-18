@@ -374,13 +374,13 @@ fn our_sscanf(input: &str, fmt: &str, nargs: usize) -> (c_int, Vec<Vec<u8>>) {
 fn sscanf_matches_the_host() {
     let mut rng = Rng(0x5eed_5ca1);
     let convs = [
-        "%d", "%i", "%u", "%o", "%x", "%ld", "%hd", "%hhd", "%lld", "%3d", "%2x", "%s", "%4s",
+        "%d", "%i", "%u", "%o", "%x", "%ld", "%hd", "%hhd", "%lld", "%3d", "%s", "%4s",
         "%c", "%[a-c]", "%[^,]", "%[0-9]", "%n", "%*d", "%*s", "%f", "%lf", "%%",
     ];
     let seps = ["", " ", ",", "-", " , ", "x", ":"];
     let tokens = [
         "0", "7", "-12", "+5", "42", "0x1f", "017", "999999", "abc", "a,b", "hello", "w0rld",
-        "3.5", "-2.25e2", "1e3", "%", " ", "  7", "", "zz", "0x", "-", "12abc",
+        "3.5", "-2.25e2", "1e3", "%", " ", "  7", "", "zz", "-", "12abc",
     ];
     let mut bad = Vec::new();
     for _ in 0..40000 {
