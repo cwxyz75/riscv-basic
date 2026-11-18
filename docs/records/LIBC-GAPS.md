@@ -84,3 +84,18 @@ Not taken: `optreset` and `sys_siglist` (BSD and glibc-private names; dash and b
 `USER_PROCESS` (network device ioctls and `utmpx`, not planned), `strtold` (128-bit `long double`). The conformance corpus that
 would measure the rest of the C library is still the owner's choice (which public libc test suite is the oracle); the plan does not
 answer it.
+
+## Phase 2, batch 2 (2026-11-18)
+
+Header-level POSIX interfaces that need no new system support, each checked by the C transcript against the host's own libc (the
+transcript harness compares the guest with a host build line by line): `<search.h>` (`insque`, `remque`, `lsearch`, `lfind`, the
+`hsearch` family, `tsearch`/`tfind`/`tdelete`/`twalk`/`tdestroy`; T154 says where the tree differs from glibc's), `<sys/uio.h>`
+(`readv`, `writev`), `<langinfo.h>` (`nl_langinfo`: `CODESET` is UTF-8, the one encoding), `<tar.h>`, `<cpio.h>` (constants) and
+`<netinet/tcp.h>` (a wrapper: `TCP_NODELAY` was in `netinet/in.h`). The constants headers and `nl_langinfo` are not run against a host
+(the macOS development host answers `nl_langinfo(CODESET)` differently and CI's Linux has no oracle step for them).
+
+Still missing from the POSIX base list (headers that do not exist): `iconv.h` (UTF-8 and the single-byte sets), `wordexp.h`,
+`monetary.h`, `nl_types.h`, `ftw.h`, `semaphore.h` (the OS has semaphores through `pthread`/futex but no `sem_*`), `syslog.h`,
+`ulimit.h`, `complex.h`, `fenv.h`, `threads.h`, `aio.h`, `mqueue.h`, `sys/ipc.h` and the System V IPC set (not planned), `utmpx.h`
+(not planned), `dlfcn.h` (not by design), `stropts.h`, `trace.h`, `fmtmsg.h`, `ndbm.h`.
+

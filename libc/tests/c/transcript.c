@@ -14,6 +14,9 @@
 #include <locale.h>
 #include <signal.h>
 #include <time.h>
+#include <search.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 static void section(const char *name) { printf("== %s\n", name); }
 
@@ -609,6 +612,75 @@ static void streams(void) {
     printf("va_arg %d\n", sum(4, 10, 20, 30, 40));
 }
 
+static int walked[16], nwalked;
+static void visit(const void *node, VISIT v, int depth) {
+    (void)depth;
+    /* in-order on any binary search tree: the key at the middle visit of an inner node, and at a leaf */
+    if (v == postorder || v == leaf) walked[nwalked++] = **(int *const *)node;
+}
+
+static void searching(void) {
+    section("search.h and sys/uio.h");
+    /* insque and remque */
+    struct qe { struct qe *next, *prev; int v; } a = {0, 0, 1}, b = {0, 0, 2}, c = {0, 0, 3};
+    insque(&a, NULL);
+    insque(&b, &a);
+    insque(&c, &b);
+    for (struct qe *p = &a; p; p = p->next) printf("q%d ", p->v);
+    remque(&b);
+    for (struct qe *p = &a; p; p = p->next) printf("q%d ", p->v);
+    printf("\n");
+    /* lfind and lsearch */
+    int arr[8] = {5, 3, 9};
+    size_t n = 3;
+    int key = 9;
+    printf("lfind %d, ", lfind(&key, arr, &n, sizeof(int), cmp_int) == &arr[2]);
+    key = 4;
+    printf("lfind absent %d, ", lfind(&key, arr, &n, sizeof(int), cmp_int) == NULL);
+    printf("lsearch adds %d (n=%zu), ", *(int *)lsearch(&key, arr, &n, sizeof(int), cmp_int), n);
+    printf("again %d (n=%zu)\n", lsearch(&key, arr, &n, sizeof(int), cmp_int) == &arr[3], n);
+    /* the hash table */
+    printf("hcreate %d, ", hcreate(10) != 0);
+    ENTRY e1 = {"alpha", (void *)1}, e2 = {"beta", (void *)2};
+    printf("enter %d %d, ", hsearch(e1, ENTER) != NULL, hsearch(e2, ENTER) != NULL);
+    ENTRY look = {"beta", NULL};
+    ENTRY *f = hsearch(look, FIND);
+    printf("find beta -> %ld, ", f ? (long)f->data : -1L);
+    look.key = "gamma";
+    printf("find gamma %d, ", hsearch(look, FIND) == NULL);
+    ENTRY dup = {"alpha", (void *)9};
+    f = hsearch(dup, ENTER);
+    printf("enter an existing key keeps %ld\n", f ? (long)f->data : -1L);
+    /* (no hdestroy: the BSD one frees the keys, glibc's does not, so the oracle cannot call it) */
+    /* the tree, walked in order, and deletion */
+    int keys[7] = {40, 20, 60, 10, 30, 50, 70};
+    void *root = NULL;
+    for (int i = 0; i < 7; i++) tsearch(&keys[i], &root, cmp_int);
+    printf("tsearch of a present key does not add: %d, ", **(int **)tsearch(&keys[2], &root, cmp_int) == 60);
+    nwalked = 0;
+    twalk(root, visit);
+    for (int i = 0; i < nwalked; i++) printf("%d ", walked[i]);
+    int gone = 20;
+    printf("| delete 20 %d, again %d, ", tdelete(&gone, &root, cmp_int) != NULL, tdelete(&gone, &root, cmp_int) == NULL);
+    printf("find 20 %d, find 30 %d | ", tfind(&gone, &root, cmp_int) == NULL, tfind(&keys[4], &root, cmp_int) != NULL);
+    nwalked = 0;
+    twalk(root, visit);
+    for (int i = 0; i < nwalked; i++) printf("%d ", walked[i]);
+    printf("\n");
+    /* readv and writev through a pipe */
+    int p[2];
+    if (pipe(p) == 0) {
+        char x[] = "hello ", y[] = "scatter";
+        struct iovec out[2] = {{x, 6}, {y, 7}};
+        printf("writev %zd, ", writev(p[1], out, 2));
+        char r1[4] = {0}, r2[16] = {0};
+        struct iovec in[2] = {{r1, 3}, {r2, 15}};
+        close(p[1]);
+        printf("readv %zd: [%s][%s]\n", readv(p[0], in, 2), r1, r2);
+        close(p[0]);
+    }
+}
+
 /* the socket test exists only in the OS build (a strong reference pulls its object out of the archive); the host oracle
  * has no such function and never takes this branch */
 #ifdef __riscv
@@ -649,6 +721,7 @@ int main(int argc, char **argv) {
     files();
     times();
     misc();
+    searching();
     threads();
     printf("done\n");
     return 0;
