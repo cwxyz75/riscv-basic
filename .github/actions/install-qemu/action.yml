@@ -1,0 +1,33 @@
+name: Install QEMU and OpenSBI
+description: >
+  apt-get install of the packages the boot tests need, from a cache of the downloaded .deb files when there is one (T153): the mirror's speed
+  decided whether a 7-minute gate job passed. A warm cache installs without the network; a cold or stale one falls back to update and install.
+inputs:
+  packages:
+    description: Packages to install
+    default: qemu-system-riscv opensbi clang llvm
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      with:
+        path: ~/apt-archives
+        key: apt-${{ runner.os }}-${{ runner.arch }}-${{ inputs.packages }}-v1
+    - name: Install
+      shell: bash
+      env:
+        PKGS: ${{ inputs.packages }}
+      run: |
+        mkdir -p "$HOME/apt-archives/partial"
+        OPTS="-o Dir::Cache::archives=$HOME/apt-archives -o Acquire::Retries=3 -o Acquire::http::Timeout=20"
+        # (a stalled mirror must not eat the job: each try is cut off, and the whole install is tried three times)
+        if ! sudo timeout 120 apt-get $OPTS install -y --no-download $PKGS; then
+          for try in 1 2 3; do
+            if sudo timeout 150 apt-get $OPTS update && sudo timeout 240 apt-get $OPTS install -y $PKGS; then
+              break
+            fi
+            echo "apt try $try failed"
+            [ "$try" = 3 ] && exit 1
+          done
+        fi
+        sudo chown -R "$USER" "$HOME/apt-archives"
