@@ -11,3 +11,7 @@ horizon: near
 From WORK-PLAN.md's long-range list:
 
 > a kernel `process_suspend`/`process_resume` (today `thread_suspend` and `thread_resume` are reserved and answer NOT_SUPPORTED; a process-level pair is what the shell can use, since it holds process handles) with a stopped state in the scheduler, a fresh-context review and the `soak` label; then, on top of it, Ctrl-Z and the real SIGSTOP, SIGTSTP and SIGCONT, `fg`, `bg` and `jobs` in the shell, SIGTTIN and SIGTTOU for background jobs that use the terminal, SIGCHLD for stops and `SA_NOCLDSTOP`, `waitpid` with `WUNTRACED` and `WCONTINUED`; per-process CPU time in `job_info` (selector 8 reads 0 today) for `ITIMER_PROF` and `ITIMER_VIRTUAL`; queued real-time signals (`sigqueue`, a value in the signal channel's message). Not in it: signals into a loop that never waits and handlers for faults (both need a kernel upcall; a separate, larger item).
+
+## Progress (2026-11-18)
+
+Kernel half built (OD123): `process_suspend` and `process_resume` (syscalls 57, 58). Next: `libc`/shell job control on top (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP/SIGTSTP/SIGCONT, SIGTTIN/SIGTTOU, SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), then CPU-time itimers and queued real-time signals.
