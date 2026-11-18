@@ -28,7 +28,7 @@ persisted free map, an intent log, live queries, multithreaded `fsd`, writable s
 | F5 | **Who pays**: persistent quota domains on directory subtrees for disk space; the block cache is charged to `fsd`'s own job with a cap until pager-backed VMOs (Q4) allow per-client charging | 2026-11-15 |
 | F6 | **Names are UTF-8**: valid UTF-8, no NUL, no `/`, no control characters (C0, DEL, C1), not empty, not `.` or `..`, at most 255 bytes; compared byte for byte and case-sensitively, with no normalisation; the same rule for symlink targets and attribute names (attribute *values* stay typed). One validator in `proto::file`, shared by `memfs` and doofs | 2026-11-17 |
 
-F6 is firm for v1 but its gaps (normalisation, look-alikes, bidirectional controls) are T141. F3, F4 and F5 are provisional: they are recorded in `TIDY-UP.md` as T94, T93 and T95 to be reconsidered, and before the
+F6 is firm for v1 but its gaps (normalisation, look-alikes, bidirectional controls) are T141. Decided with the owner (2026-11-17): a name that is not valid UTF-8 is **refused** (`EILSEQ` in the libc), never repaired or replaced (replacing makes distinct names collide: an archive's two members could overwrite each other), and names are stored exactly as given, with no normalisation (the cost, accepted: two names can look identical and differ). If extracting archives with such names ever matters, the escape belongs in a patched `tar` (a special mode that maps invalid bytes reversibly), not in the file system. F3, F4 and F5 are provisional: they are recorded in `TIDY-UP.md` as T94, T93 and T95 to be reconsidered, and before the
 format is frozen we decide whether it reserves room for each (a log-root field, a link count behind the parent id).
 
 ## 3. Format (proposal)
