@@ -41,5 +41,6 @@ mod string;
 mod term;
 mod thread;
 mod time;
+mod wchar;
 
 pub use start::run_main;

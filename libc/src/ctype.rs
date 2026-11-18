@@ -29,6 +29,7 @@ class!(isgraph, |c| (0x21..0x7f).contains(&c));
 class!(ispunct, |c| c.is_ascii_punctuation());
 class!(iscntrl, |c| c < 0x20 || c == 0x7f);
 class!(isxdigit, |c| c.is_ascii_hexdigit());
+class!(isblank, |c| c == b' ' || c == b'\t');
 
 #[no_mangle]
 pub extern "C" fn tolower(c: c_int) -> c_int {

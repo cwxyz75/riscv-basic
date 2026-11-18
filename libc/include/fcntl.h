@@ -7,6 +7,8 @@
 #define O_EXCL 0x80
 #define O_TRUNC 0x200
 #define O_DIRECTORY 0x10000
+/* O_SEARCH: open a directory only to resolve names below it (here: a read-only open) */
+#define O_SEARCH 0
 #define AT_FDCWD (-100)
 #define O_APPEND 0x400
 #define O_NONBLOCK 04000

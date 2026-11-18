@@ -331,9 +331,14 @@ pub unsafe extern "C" fn strxfrm(dst: *mut c_char, src: *const c_char, n: usize)
     len
 }
 
-/// `__fpurge`: drop what is buffered in the stream (no read-ahead is kept here beyond one pushed-back character).
+/// `fpurge` (the BSD name) and `__fpurge` (glibc's): drop what is buffered in the stream (no read-ahead is kept here beyond one pushed-back character).
 #[no_mangle]
 pub unsafe extern "C" fn __fpurge(_f: *mut crate::file::File) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn fpurge(_f: *mut crate::file::File) -> c_int {
+    0
+}
 
 /// `flock`: advisory locks do nothing here (see `sys/file.h`).
 #[no_mangle]

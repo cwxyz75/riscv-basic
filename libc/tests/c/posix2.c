@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <wchar.h>
+#include <wctype.h>
 
 static int failures;
 
@@ -82,6 +84,26 @@ int posix2_test(void) {
         opterr = 0;
         char *av3[] = {"prog", "--nope", NULL};
         CHECK(getopt_long(2, av3, "a", lo, &li) == '?', "an unknown long option is '?'");
+    }
+    /* wide characters: UTF-8 is the one encoding */
+    {
+        wchar_t w = 0;
+        mbstate_t ps;
+        memset(&ps, 0, sizeof ps);
+        CHECK(mbrtowc(&w, "\xc3\xa9", 2, &ps) == 2 && w == 0xe9 && mbsinit(&ps), "mbrtowc decodes a two-byte character");
+        errno = 0;
+        CHECK(mbrtowc(&w, "\xff", 1, &ps) == (size_t)-1 && errno == EILSEQ, "mbrtowc refuses bytes that are not UTF-8 with EILSEQ");
+        memset(&ps, 0, sizeof ps);
+        size_t r1 = mbrtowc(&w, "\xe6\x97", 2, &ps);
+        CHECK(r1 == (size_t)-2 && !mbsinit(&ps) && mbrtowc(&w, "\xa5", 1, &ps) == 1 && w == 0x65e5, "a character split across two calls (-2, then the rest)");
+        char out[4];
+        CHECK(wcrtomb(out, 0x65e5, NULL) == 3 && (unsigned char)out[0] == 0xe6 && (unsigned char)out[2] == 0xa5, "wcrtomb encodes three bytes");
+        CHECK(wcrtomb(out, 0xd800, NULL) == (size_t)-1 && errno == EILSEQ, "and refuses a surrogate");
+        wchar_t ws[8];
+        CHECK(mbstowcs(ws, "a\xc3\xb1" "b", 8) == 3 && ws[1] == 0xf1 && ws[3] == 0 && wcslen(ws) == 3, "mbstowcs and wcslen");
+        CHECK(wcwidth(0x65e5) == 2 && wcwidth('a') == 1 && wcwidth(0x301) == 0 && wcswidth(ws, 3) == 3, "wcwidth: wide, narrow, combining");
+        CHECK(iswalpha(0xe9) && !iswalpha('1') && iswspace(0x3000) && iswupper(0xc9) && towupper(0xe9) == 0xc9 && towlower(0xc9) == 0xe9, "the wide classes and case");
+        CHECK(iswctype('x', wctype("alpha")) && !iswctype('x', wctype("digit")) && wctype("nope") == 0, "wctype and iswctype");
     }
     /* error() */
     unsigned before = error_message_count;

@@ -50,6 +50,10 @@ struct stat {
 #define S_IROTH 0004
 #define S_IWOTH 0002
 #define S_IXOTH 0001
+/* (the file offsets are 64 bits already: the `64` names are the same calls) */
+#define stat64 stat
+#define fstat64 fstat
+#define lstat64 lstat
 int stat(const char *path, struct stat *out);
 int lstat(const char *path, struct stat *out);
 int fstat(int fd, struct stat *out);

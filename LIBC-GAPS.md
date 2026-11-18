@@ -44,3 +44,20 @@ record it in T145.
 The rest of the C standard library as measured by a conformance corpus, not only by what our ports reference: `locale`, `regex`
 (`pregex` exists), `iconv` (UTF-8 and ASCII/Latin-1), `setlocale`, `wordexp`, `mmap` for files and `fork` (S11, a separate decision),
 and a portable test corpus (a public libc test suite is the oracle; which one is a decision for when phase 1 is done).
+
+## Result of phase 1 (2026-11-17, same survey after the batch)
+
+| Program | Undeclared functions before, after | Headers before, after |
+|---|---|---|
+| gzip | 2, 0 | 1, 0 |
+| dash | 3, 0 | 2, 1 (`histedit.h`, optional) |
+| coreutils | 26, 4 (`copy` and `S_TYPEIS*` are macros or its own, `strtold`) | 2, 0 |
+| gnutar | 22, 2 (`fscanf`, `sigwait`) | 5, 1 (`localcharset.h` is gnulib's) |
+| busybox | 5, 4 (`crypt` and the `utmpx` calls: not planned) | 0, 0 |
+
+Built: the `*at` family (on the volume; `symlinkat` needs a file server with symlinks, which `memfsd` does not have yet), `getopt_long`
+(`cfmt::getopt_long`, with the host's as oracle), `error`, `execl`/`execlp`/`execle`, `strings.h`, `creat`, `ftello`, `mkostemp`,
+`pthread_sigmask`, `isblank`, `fpurge`, a no-op `flock`, `alloca.h`, `sysexits.h`, `stdbool.h`, `O_SEARCH`, the `stat64` names, and the
+UTF-8 wide-character core (`cfmt::mb`, tested against `std`: `mbrtowc`, `wcrtomb`, `mbstowcs`, `wcstombs`, `wcs*`/`wmem*`, the `isw*`
+classes, `towupper`/`towlower`, `wcwidth`, `uchar.h`). Not built: `fscanf` and `sigwait` (the two things GNU tar still asks for),
+`strtold` (`long double` is a 128-bit float on this ABI), `crypt`, `utmpx`, `dlopen`, `libedit`.

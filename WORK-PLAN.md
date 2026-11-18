@@ -20,9 +20,9 @@ work; CI runs the rest); never force-push (merge main into the branch); batch sm
 kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS decision log.
 
 1. [ ] **Merge the docs PR** (this file, branch `workplan-update`).
-2. [ ] **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
+2. [x] (done in PR 227) **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
    grant off (T136); say in TIDY-UP what is still open in T139.
-3. [ ] **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
+3. [x] (done in PR 229; `LIBC-GAPS.md` has the measured result, T147 the shortcuts; `fscanf`, `sigwait` and `strtold` are left) **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
    coreutils, gnutar, busybox, gzip, sqlite) and write the ranked gap list into a document (`UV0-GAP-SURVEY.md` or a new
    `LIBC-GAPS.md`). Then, each with a C test (the host's libc as oracle where it can be) and a note in TIDY-UP: `getopt_long` moved
    from `third_party/compat` into the libc (with `getopt_long_only`, permutation, and a host differential test); `error.h`
