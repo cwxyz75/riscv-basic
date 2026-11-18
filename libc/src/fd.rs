@@ -315,11 +315,21 @@ pub unsafe extern "C" fn openat(
 /// `chdir`: open the directory (following links), make it the cwd and remember its path.
 #[no_mangle]
 pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
-    match open_path(
+    // (all the rights the directory gives: relative names are made and removed through this handle, and a handle cannot gain
+    // rights; a directory that refuses writing is opened for reading only)
+    let opened = open_path(
         path_bytes(path),
         pf::DIRECTORY,
-        rights::READ | rights::ENUMERATE,
-    ) {
+        rights::READ | rights::WRITE | rights::ENUMERATE | rights::CREATE,
+    )
+    .or_else(|_| {
+        open_path(
+            path_bytes(path),
+            pf::DIRECTORY,
+            rights::READ | rights::ENUMERATE,
+        )
+    });
+    match opened {
         Ok((fs, abs)) => {
             let old = OWN_CWD.swap(fs.ch, Ordering::Relaxed);
             let mut t = TABLE.lock();
@@ -1013,7 +1023,9 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
             }
             Err(e) => fail(e),
         },
-        Some(Entry::Stream(_, _, _)) => {
+        Some(Entry::Stream(_, _, tty)) => {
+            // (the flag from the entry: `is_tty` would lock the table again, which is held here)
+            let tty = *tty;
             let info = proto::file::StatInfo {
                 kind: 1,
                 size: 0,
@@ -1023,7 +1035,6 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
                 gid: proto::file::ABSENT,
             };
             fill_stat(out, &info, 0, &[]);
-            let tty = is_tty(fd);
             (*out).st_mode = if tty {
                 S_IFCHR | 0o620
             } else {

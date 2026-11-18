@@ -6291,12 +6291,19 @@ fn memfsd_rights_are_checked_op_by_op() -> Outcome {
     // a connection with no rights at all can do nothing
     let mut none = tmp_rw.clone_conn(0).map_err(|e| msg_e(e, line!()))?;
     ensure_eq!(code(none.stat(b"keep")), Some(DENIED), "stat without READ");
-    // a write-only file connection can neither stat nor ask for a VMO
+    // a write-only file connection may describe itself (POSIX `fstat` needs no access: `tar` does it on its archive), but not ask
+    // for a VMO; a connection with no rights at all can do neither
     let mut f = tmp_rw
         .open(b"f", pfl::CREATE, prt::READ | prt::WRITE)
         .map_err(|e| msg_e(e, line!()))?;
     let mut wo = f.clone_conn(prt::WRITE).map_err(|e| msg_e(e, line!()))?;
-    ensure_eq!(code(wo.fstat()), Some(DENIED), "fstat without READ");
+    ensure_eq!(code(wo.fstat()), None, "a writer may fstat");
+    let mut nothing = f.clone_conn(0).map_err(|e| msg_e(e, line!()))?;
+    ensure_eq!(
+        code(nothing.fstat()),
+        Some(DENIED),
+        "fstat without READ or WRITE"
+    );
     ensure_eq!(code(wo.get_vmo()), Some(DENIED), "get_vmo without READ");
     ensure_eq!(wo.size(), Ok(0), "a writer may ask the size");
     // a file connection never gets directory rights

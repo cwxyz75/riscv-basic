@@ -357,25 +357,68 @@ pub unsafe extern "C" fn fseeko(f: *mut c_void, off: i64, whence: c_int) -> c_in
     fseek(f, off, whence)
 }
 
-/// Not built: there is no `mmap` (a program that needs it gets `MAP_FAILED` and `ENOSYS`) and no call that sets file times
-/// (the file protocol has none yet: TIDY-UP T134).
+/// Anonymous private memory only (`MAP_ANONYMOUS | MAP_PRIVATE`, as programs use for big page-aligned buffers): zeroed memory from the
+/// heap, page aligned, remembered so that `munmap` of exactly that region gives it back. A file mapping, `MAP_FIXED` or `MAP_SHARED`
+/// gets `MAP_FAILED` and `ENOSYS`. (No `mprotect`, no partial unmap.)
+static ANON_MAPS: rt::sync::Mutex<alloc::vec::Vec<(usize, usize)>> =
+    rt::sync::Mutex::new(alloc::vec::Vec::new());
+const PAGE: usize = 4096;
+
 #[no_mangle]
 pub extern "C" fn mmap(
-    _addr: *mut c_void,
-    _len: usize,
+    addr: *mut c_void,
+    len: usize,
     _prot: c_int,
-    _flags: c_int,
+    flags: c_int,
     _fd: c_int,
     _off: i64,
 ) -> *mut c_void {
-    crate::errno::set(38);
-    usize::MAX as *mut c_void
+    let failed = usize::MAX as *mut c_void;
+    if flags & 0x20 == 0 || flags & 0x2 == 0 || flags & 0x10 != 0 || !addr.is_null() || len == 0 {
+        crate::errno::set(38);
+        return failed;
+    }
+    let size = len.div_ceil(PAGE) * PAGE;
+    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PAGE) else {
+        crate::errno::set(12);
+        return failed;
+    };
+    // SAFETY: a non-zero-size layout.
+    let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if p.is_null() {
+        crate::errno::set(12);
+        return failed;
+    }
+    ANON_MAPS.lock().push((p as usize, size));
+    p as *mut c_void
 }
+
 #[no_mangle]
-pub extern "C" fn munmap(_addr: *mut c_void, _len: usize) -> c_int {
-    crate::errno::set(22);
-    -1
+pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
+    let size = len.div_ceil(PAGE) * PAGE;
+    let mut maps = ANON_MAPS.lock();
+    match maps
+        .iter()
+        .position(|&(a, n)| a == addr as usize && n == size)
+    {
+        Some(i) => {
+            maps.swap_remove(i);
+            // SAFETY: the block came from `alloc_zeroed` with this layout in `mmap` and was recorded exactly once.
+            unsafe {
+                alloc::alloc::dealloc(
+                    addr as *mut u8,
+                    alloc::alloc::Layout::from_size_align_unchecked(size, PAGE),
+                )
+            };
+            0
+        }
+        None => {
+            crate::errno::set(22);
+            -1
+        }
+    }
 }
+/// No call that sets file times (the file protocol has none yet: TIDY-UP T134).
 #[no_mangle]
 pub extern "C" fn utimensat(
     _dirfd: c_int,
