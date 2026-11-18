@@ -30,6 +30,7 @@ mod misc;
 mod netdb;
 mod posix2;
 mod random;
+mod search;
 mod setjmp;
 mod sig;
 mod socket;
