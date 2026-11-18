@@ -374,8 +374,8 @@ fn our_sscanf(input: &str, fmt: &str, nargs: usize) -> (c_int, Vec<Vec<u8>>) {
 fn sscanf_matches_the_host() {
     let mut rng = Rng(0x5eed_5ca1);
     let convs = [
-        "%d", "%i", "%u", "%o", "%x", "%ld", "%hd", "%hhd", "%lld", "%3d", "%s", "%4s",
-        "%c", "%[a-c]", "%[^,]", "%[0-9]", "%n", "%*d", "%*s", "%f", "%lf", "%%",
+        "%d", "%i", "%u", "%o", "%x", "%ld", "%hd", "%hhd", "%lld", "%3d", "%s", "%4s", "%c",
+        "%[a-c]", "%[^,]", "%[0-9]", "%n", "%*d", "%*s", "%f", "%lf", "%%",
     ];
     let seps = ["", " ", ",", "-", " , ", "x", ":"];
     let tokens = [
