@@ -56,7 +56,7 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 Order chosen (owner left it to me): smallest and only high-risk item first; then the user-visible one; the deepest last, so
 the scheduler work starts from a quieter tree.
 
-- [ ] **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
+- [~] (decision item Q-T42 written; no kernel change, see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
   supervisor does by convention today, or a design note and a decision item if enforcement turns out to need an OD-level
   choice (that would be a major decision point: stop). Fable review, soak.
 - [ ] **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
@@ -92,3 +92,4 @@ whatever time is left.
 
 - 2026-11-18: plan 3's order of the kernel slices (T42, SIG2, L11/L12) and of the feature slices (T139, SD4, LIBC2), as
   explained above; the owner left both to me.
+- 2026-11-18: T42 needs an OD-level choice (the kernel enforcing DMA frame lifetime reverses S6b's "ownership, not a kernel mechanism" and adds a syscall), so I wrote `Q-T42` with three options and a recommendation (keep the policy while drivers are trusted) and made no kernel change. The plan says to stop at such a point; I did not stop the whole plan because nothing after it depends on this choice, and went on to SIG2. Recorded in `work/Q-T42.md`.
