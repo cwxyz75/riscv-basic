@@ -178,7 +178,7 @@ fn build_sqlite(dir: &str) -> Option<PathBuf> {
 }
 
 /// GNU gzip 1.13: the fetched sources, built without `configure` against the small shims in `third_party/compat` (a
-/// hand-written `config.h`, `getopt_long`, the gnulib interfaces it uses). Without the sources `gzip` is a stub.
+/// hand-written `config.h`, the gnulib interfaces it uses; `getopt_long` is the libc's). Without the sources `gzip` is a stub.
 fn build_gzip(dir: &str) -> Option<PathBuf> {
     let root = Path::new(dir).join("../third_party");
     let src = root.join("fetched/gzip/src");
@@ -195,7 +195,6 @@ fn build_gzip(dir: &str) -> Option<PathBuf> {
     .map(|f| src.join(format!("{f}.c")))
     .collect();
     for f in [
-        "getopt_long.c",
         "gzip/xalloc.c",
         "gzip/yesno.c",
         "gzip/utimens.c",

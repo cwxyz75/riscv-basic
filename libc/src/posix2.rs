@@ -10,7 +10,11 @@ const ENOSYS: c_int = 38;
 const EPERM: c_int = 1;
 
 /// Run `f` on the resolved path of (`dirfd`, `path`), or set `errno` and return -1.
-unsafe fn at<R: From<i8>>(dirfd: c_int, path: *const c_char, f: impl FnOnce(*const c_char) -> R) -> R {
+unsafe fn at<R: From<i8>>(
+    dirfd: c_int,
+    path: *const c_char,
+    f: impl FnOnce(*const c_char) -> R,
+) -> R {
     match fd::resolve_at(dirfd, path) {
         Ok(p) => f(p.as_ptr() as *const c_char),
         Err(e) => {
@@ -21,7 +25,12 @@ unsafe fn at<R: From<i8>>(dirfd: c_int, path: *const c_char, f: impl FnOnce(*con
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fstatat(dirfd: c_int, path: *const c_char, out: *mut fd::Stat, flags: c_int) -> c_int {
+pub unsafe extern "C" fn fstatat(
+    dirfd: c_int,
+    path: *const c_char,
+    out: *mut fd::Stat,
+    flags: c_int,
+) -> c_int {
     at(dirfd, path, |p| {
         if flags & AT_SYMLINK_NOFOLLOW != 0 {
             fd::lstat(p, out)
@@ -43,17 +52,33 @@ pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_in
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn faccessat(dirfd: c_int, path: *const c_char, mode: c_int, _flags: c_int) -> c_int {
+pub unsafe extern "C" fn faccessat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    _flags: c_int,
+) -> c_int {
     at(dirfd, path, |p| fd::access(p, mode))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fchmodat(dirfd: c_int, path: *const c_char, mode: u32, _flags: c_int) -> c_int {
+pub unsafe extern "C" fn fchmodat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+    _flags: c_int,
+) -> c_int {
     at(dirfd, path, |p| fd::chmod(p, mode))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fchownat(dirfd: c_int, path: *const c_char, uid: c_int, gid: c_int, flags: c_int) -> c_int {
+pub unsafe extern "C" fn fchownat(
+    dirfd: c_int,
+    path: *const c_char,
+    uid: c_int,
+    gid: c_int,
+    flags: c_int,
+) -> c_int {
     at(dirfd, path, |p| {
         if flags & AT_SYMLINK_NOFOLLOW != 0 {
             crate::compat::lchown(p, uid, gid)
@@ -69,17 +94,31 @@ pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: u32) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, size: usize) -> isize {
+pub unsafe extern "C" fn readlinkat(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut c_char,
+    size: usize,
+) -> isize {
     at(dirfd, path, |p| fd::readlink(p, buf, size) as i64 as isize) as isize
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn symlinkat(target: *const c_char, dirfd: c_int, linkpath: *const c_char) -> c_int {
+pub unsafe extern "C" fn symlinkat(
+    target: *const c_char,
+    dirfd: c_int,
+    linkpath: *const c_char,
+) -> c_int {
     at(dirfd, linkpath, |p| fd::symlink(target, p))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn renameat(olddirfd: c_int, old: *const c_char, newdirfd: c_int, new: *const c_char) -> c_int {
+pub unsafe extern "C" fn renameat(
+    olddirfd: c_int,
+    old: *const c_char,
+    newdirfd: c_int,
+    new: *const c_char,
+) -> c_int {
     let (Ok(a), Ok(b)) = (fd::resolve_at(olddirfd, old), fd::resolve_at(newdirfd, new)) else {
         errno::set(9);
         return -1;
@@ -89,7 +128,13 @@ pub unsafe extern "C" fn renameat(olddirfd: c_int, old: *const c_char, newdirfd:
 
 /// Hard links are refused (the file protocol has none: `EPERM`, as `link`).
 #[no_mangle]
-pub extern "C" fn linkat(_oldfd: c_int, _old: *const c_char, _newfd: c_int, _new: *const c_char, _flags: c_int) -> c_int {
+pub extern "C" fn linkat(
+    _oldfd: c_int,
+    _old: *const c_char,
+    _newfd: c_int,
+    _new: *const c_char,
+    _flags: c_int,
+) -> c_int {
     errno::set(EPERM);
     -1
 }
@@ -170,7 +215,10 @@ core::arch::global_asm!(include_str!("variadic_posix2.s"));
 
 // ---- exec with a list of arguments ----
 
-unsafe fn collect(first: *const c_char, ap: *const u64) -> (alloc::vec::Vec<*const c_char>, *const u64) {
+unsafe fn collect(
+    first: *const c_char,
+    ap: *const u64,
+) -> (alloc::vec::Vec<*const c_char>, *const u64) {
     let mut args = alloc::vec::Vec::new();
     args.push(first);
     let mut p = ap;
@@ -192,13 +240,21 @@ pub unsafe extern "C" fn vexecl(path: *const c_char, arg0: *const c_char, ap: *c
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vexeclp(file: *const c_char, arg0: *const c_char, ap: *const u64) -> c_int {
+pub unsafe extern "C" fn vexeclp(
+    file: *const c_char,
+    arg0: *const c_char,
+    ap: *const u64,
+) -> c_int {
     let (args, _) = collect(arg0, ap);
     crate::spawn::execvp(file, args.as_ptr())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vexecle(path: *const c_char, arg0: *const c_char, ap: *const u64) -> c_int {
+pub unsafe extern "C" fn vexecle(
+    path: *const c_char,
+    arg0: *const c_char,
+    ap: *const u64,
+) -> c_int {
     let (args, after) = collect(arg0, ap);
     let envp = *after as *const *const c_char;
     crate::spawn::execve(path, args.as_ptr(), envp)

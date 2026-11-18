@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,28 @@ int posix2_test(void) {
     CHECK(t >= 0 && close(t) == 0 && unlink(tmpl) == 0, "mkostemp");
     char x[8];
     CHECK(strxfrm(x, "abc", sizeof x) == 3 && strcmp(x, "abc") == 0, "strxfrm in the C locale is a copy");
+    /* getopt_long: options after operands are found, and the vector is permuted so that the operands come last */
+    {
+        char *av[] = {"prog", "x", "-a", "--beta=1", "y", "--gamma", "-c", "z", "--", "-q", NULL};
+        static struct option lo[] = {{"alpha", no_argument, 0, 'A'}, {"beta", required_argument, 0, 'B'}, {"gamma", optional_argument, 0, 'G'}, {0, 0, 0, 0}};
+        int ac = 9, r, got[8], n = 0, li = -1;
+        char *bval = NULL;
+        optind = 0;
+        while ((r = getopt_long(ac, av, "ac:", lo, &li)) != -1 && n < 8) {
+            got[n++] = r;
+            if (r == 'B') bval = optarg;
+        }
+        CHECK(n == 4 && got[0] == 'a' && got[1] == 'B' && got[2] == 'G' && got[3] == 'c' && bval && strcmp(bval, "1") == 0, "getopt_long returns short and long options in order");
+        CHECK(optind == 7 && strcmp(av[7], "x") == 0 && strcmp(av[8], "y") == 0, "and the operands are moved behind them (`--` ends the options)");
+        char *av2[] = {"prog", "--al", "q", NULL};
+        optind = 0;
+        r = getopt_long(3, av2, "a", lo, &li);
+        CHECK(r == 'A' && li == 0 && getopt_long(3, av2, "a", lo, &li) == -1 && optind == 2, "an abbreviated long option and its index");
+        optind = 0;
+        opterr = 0;
+        char *av3[] = {"prog", "--nope", NULL};
+        CHECK(getopt_long(2, av3, "a", lo, &li) == '?', "an unknown long option is '?'");
+    }
     /* error() */
     unsigned before = error_message_count;
     error(0, ENOENT, "cannot open %s", "file");

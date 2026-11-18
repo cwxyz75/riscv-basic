@@ -10,7 +10,8 @@ extern "C" {
     fn main(argc: c_int, argv: *mut *mut c_char) -> c_int;
 }
 
-static PROG_NAME: core::sync::atomic::AtomicPtr<c_char> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static PROG_NAME: core::sync::atomic::AtomicPtr<c_char> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// The program's name (the last component of `argv[0]`), or `?`.
 pub fn program_name() -> *const c_char {
