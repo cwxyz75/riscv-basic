@@ -20,9 +20,9 @@ work; CI runs the rest); never force-push (merge main into the branch); batch sm
 kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS decision log.
 
 1. [ ] **Merge the docs PR** (this file, branch `workplan-update`).
-2. [ ] **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
+2. [x] (done in PR 227) **Leftovers of plan 1** (small): host tests for `sscanf` and the signal table (T134(3)); the profile field that turns the spawn
    grant off (T136); say in TIDY-UP what is still open in T139.
-3. [ ] **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
+3. [x] (done in PR 229; `LIBC-GAPS.md` has the measured result, T147 the shortcuts; `strtold` is left) **Complete libc, phase 1: measure, then the cheap batch.** Run `scripts/libc_gap_survey.py` over every fetched program (tcc, dash,
    coreutils, gnutar, busybox, gzip, sqlite) and write the ranked gap list into a document (`UV0-GAP-SURVEY.md` or a new
    `LIBC-GAPS.md`). Then, each with a C test (the host's libc as oracle where it can be) and a note in TIDY-UP: `getopt_long` moved
    from `third_party/compat` into the libc (with `getopt_long_only`, permutation, and a host differential test); `error.h`
@@ -32,10 +32,10 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
    `uchar.h`, `wcwidth`). Re-run the GNU tar measurement afterwards and record the new numbers in T145.
 4. [x] (done in PR 228; T146 lists the rest) **F step 0b: names are UTF-8, through one `names` crate** (decided 2026-11-17: a small `no_std`, `forbid(unsafe_code)` crate owns the rule, `validate` first; `proto::file::valid_name` becomes a wrapper; invalid names are refused with `EILSEQ`, names are stored as given; normalised comparison is a later slice, T141, with no flags word). **F step 0b: names are UTF-8** (FS-SPEC F6, check 14; specified, mechanical; TIDY-UP T146 lists what has to follow): `proto::file::valid_name`,
    goldens, `memfs`, `doofs`, `rt::fs`, the libc.
-5. [ ] **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
+5. [x] (done: findings fixed in PR 229, the rest in T148; policy items (1), (3) and (5) are for the owner) **An independent review of this session's work** (fresh context, against `INVARIANTS.md` and `SYSCALLS.md`): the spawn broker and
    the signal and terminal paths in `init/src/bin/sh.rs` and `consoled.rs`, the libc signal/vfork code, `memfsd` attributes. Fix what it
    finds; the slice I (AIA) review is also still owed.
-6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
+6. [x] (finding, no code: the fetched tcc 0.9.27 has **no RISC-V back end**; see "Decisions to discuss in the morning") **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
    needs executable memory, say so and stop at "compiles to a file".
 7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7 is the hush port, no shell to write: T139 lists what is left), or L-task work, which are the
    owner's to choose: do not start the kernel locking tasks unasked).
@@ -84,4 +84,9 @@ not run.
 
 (Add one line per decision taken without the owner: what, the alternative, why, where it is recorded.)
 
-- (none yet)
+- **`tcc` cannot be our C compiler as pinned** (2026-11-17 night): `third_party/fetched/tcc` is tcc 0.9.27, whose source has back ends for i386, x86_64, arm, arm64, c67 and il, not RISC-V (`riscv64-gen.c` arrived after 0.9.27, in the development branch). So there was nothing to spike. Alternatives for "compile C on the OS", none started: tcc from its development branch (a git snapshot, not a release tarball: a pin and a hash from a commit archive), or QBE with `cproc` (QBE has a riscv64 back end; two small programs, no self-hosting of the libc headers), or neither (the OS is cross-built on the host, which is how everything works today). The pinned tcc entry in `third_party/fetch-manifest.txt` is therefore unused.
+- **GNU tar is not the next port; the libc is** (owner's own call, recorded): after the libc batch only gnulib's own `localcharset.h` remains undeclared for it.
+- **Review finding that needs a policy (T148 (1))**: a program that says it handles SIGINT and never waits can keep Ctrl-C from ever ending it. Options: a second Ctrl-C within a second kills the job (what I'd do), or a deadline on the hold. Not changed tonight.
+- **Mount intersection by name (T148 (3))**: tighten `parse_trust` (ban `/tmp`, `/dev`, `/proc`) and intersect by volume; small, left for you because it changes `/etc/trusted` rules.
+- **The smoke gate is at its 10-minute budget** (TESTING.md and `scripts/check_docs.py` cap a gate job at 10): the run on PR 229 was cancelled at 10 minutes after the boot test had passed (306 tests), during the release build; the suite and the image have grown and that runner was slow. I did not raise the cap (the docs check forbids it) and re-ran the job. The proper fix is yours to pick: move the release smoke (build + boot) into its own job, as the harness fail-demo already is, or trim the smoke boot.
+- (Add any further night decisions here.)

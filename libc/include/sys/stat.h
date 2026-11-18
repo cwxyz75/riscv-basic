@@ -50,10 +50,19 @@ struct stat {
 #define S_IROTH 0004
 #define S_IWOTH 0002
 #define S_IXOTH 0001
+/* (the file offsets are 64 bits already: the `64` names are the same calls) */
+#define stat64 stat
+#define fstat64 fstat
+#define lstat64 lstat
 int stat(const char *path, struct stat *out);
 int lstat(const char *path, struct stat *out);
 int fstat(int fd, struct stat *out);
 int mkdir(const char *path, unsigned mode);
+int fstatat(int dirfd, const char *path, struct stat *out, int flags);
+int mkdirat(int dirfd, const char *path, unsigned mode);
+int fchmodat(int dirfd, const char *path, unsigned mode, int flags);
+int mkfifoat(int dirfd, const char *path, unsigned mode);
+int mknodat(int dirfd, const char *path, unsigned mode, unsigned long long dev);
 int chmod(const char *path, unsigned mode);
 int fchmod(int fd, unsigned mode);
 unsigned umask(unsigned mask);

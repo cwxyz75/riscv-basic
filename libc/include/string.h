@@ -25,6 +25,7 @@ char *strdup(const char *s);
 char *strerror(int e);
 char *strchrnul(const char *s, int c);
 int strcasecmp(const char *a, const char *b);
+size_t strxfrm(char *dst, const char *src, size_t n);
 int strncasecmp(const char *a, const char *b, size_t n);
 char *strcasestr(const char *h, const char *n);
 void *mempcpy(void *d, const void *s, size_t n);

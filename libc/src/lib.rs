@@ -28,6 +28,7 @@ mod glob;
 mod math;
 mod misc;
 mod netdb;
+mod posix2;
 mod random;
 mod setjmp;
 mod sig;
@@ -40,5 +41,6 @@ mod string;
 mod term;
 mod thread;
 mod time;
+mod wchar;
 
 pub use start::run_main;

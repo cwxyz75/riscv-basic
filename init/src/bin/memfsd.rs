@@ -228,7 +228,12 @@ impl Server {
                 .expect("a request came from a live connection");
             (c.is_dir, c.rights, c.node)
         };
-        if req.op != op::CLONE && req.op != op::ACCOUNT && op::is_directory_op(req.op) != is_dir {
+        if req.op != op::CLONE
+            && req.op != op::ACCOUNT
+            && req.op != op::SYNC
+            && !matches!(req.op, op::ATTR_SET | op::ATTR_GET | op::ATTR_REMOVE)
+            && op::is_directory_op(req.op) != is_dir
+        {
             close_ep(endpoint);
             let st = if is_dir {
                 status::IS_DIRECTORY

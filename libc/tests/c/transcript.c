@@ -618,6 +618,8 @@ int mount_test(const char *mnt);
 #define RUN_MOUNT(argc, argv) ((argc) > 2 && strcmp((argv)[1], "mount") == 0)
 int signals_test(int argc, char **argv);
 #define RUN_SIGNALS(argc, argv) ((argc) > 1 && strcmp((argv)[1], "signals") == 0)
+int posix2_test(void);
+#define RUN_POSIX2(argc, argv) ((argc) > 1 && strcmp((argv)[1], "posix2") == 0)
 #else
 static int sockets_test(void) { return 0; }
 #define RUN_SOCKETS(argc, argv) 0
@@ -625,12 +627,15 @@ static int mount_test(const char *mnt) { (void)mnt; return 0; }
 #define RUN_MOUNT(argc, argv) 0
 static int signals_test(int argc, char **argv) { (void)argc; (void)argv; return 0; }
 #define RUN_SIGNALS(argc, argv) 0
+static int posix2_test(void) { return 0; }
+#define RUN_POSIX2(argc, argv) 0
 #endif
 
 int main(int argc, char **argv) {
     if (RUN_SOCKETS(argc, argv)) return sockets_test();
     if (RUN_MOUNT(argc, argv)) return mount_test(argv[2]);
     if (RUN_SIGNALS(argc, argv)) return signals_test(argc, argv);
+    if (RUN_POSIX2(argc, argv)) return posix2_test();
     atexit(tail);
     printf("argc %d\n", argc);
     formats();

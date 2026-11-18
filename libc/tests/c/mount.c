@@ -97,6 +97,9 @@ int mount_test(const char *mnt) {
     char tb[64];
     long tn = readlink(lp, tb, sizeof tb);
     CHECK(tn == 10 && memcmp(tb, "posix-file", 10) == 0, "readlink gives the target text");
+    char sb[64];
+    CHECK(symlinkat("posix-file", AT_FDCWD, hp) == 0 && readlinkat(AT_FDCWD, hp, sb, sizeof sb) == 10 && memcmp(sb, "posix-file", 10) == 0, "symlinkat and readlinkat");
+    unlink(hp);
     CHECK(symlink("/etc/passwd", hp) != 0 && errno == EINVAL, "an absolute link target is refused");
     CHECK(link(path, hp) != 0 && errno == EPERM, "hard links are refused");
     unlink(lp); unlink(path); rmdir(dp);

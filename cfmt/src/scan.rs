@@ -28,6 +28,8 @@ pub struct Scanned {
     /// What `sscanf` returns: the number of assigned conversions (`%n` does not count), or -1 when the input ended before the first
     /// conversion (or the first literal) matched.
     pub ret: i32,
+    /// How many input bytes the scan used (what a stream reader has to take out of the stream).
+    pub consumed: usize,
 }
 
 fn in_set(set: &[u8], b: u8) -> bool {
@@ -215,7 +217,11 @@ pub fn scan(input: &[u8], f: &[u8]) -> Scanned {
     let mut stored_any = false;
     macro_rules! out {
         ($v:expr) => {
-            return Scanned { items, ret: $v }
+            return Scanned {
+                items,
+                ret: $v,
+                consumed: i,
+            }
         };
     }
     while j < f.len() {
@@ -411,5 +417,9 @@ pub fn scan(input: &[u8], f: &[u8]) -> Scanned {
             _ => out!(done),
         }
     }
-    Scanned { items, ret: done }
+    Scanned {
+        items,
+        ret: done,
+        consumed: i,
+    }
 }

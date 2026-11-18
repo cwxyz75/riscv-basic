@@ -8,7 +8,9 @@
 extern crate alloc;
 
 pub mod getopt;
+pub mod getopt_long;
 pub mod glob;
+pub mod mb;
 mod parse;
 mod printf;
 pub mod scan;

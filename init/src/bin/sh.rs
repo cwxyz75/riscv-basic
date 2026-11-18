@@ -384,11 +384,18 @@ impl Os {
     fn service_signal_notes(&mut self) {
         let mut changed = false;
         for b in self.brokers.iter_mut() {
-            loop {
-                let mut m = [0u8; 8];
-                let r = sys::channel_read(b.sig, m.as_mut_ptr(), m.len(), core::ptr::null_mut(), 0);
+            // (a few messages per pass, and room for a message that carries handles: a program's note is three bytes, anything else
+            // is read and dropped so that it does not keep the channel readable)
+            for _ in 0..8 {
+                let mut m = [0u8; 64];
+                let mut hs = [0u32; 8];
+                let r =
+                    sys::channel_read(b.sig, m.as_mut_ptr(), m.len(), hs.as_mut_ptr(), hs.len());
                 if r.status != 0 {
                     break;
+                }
+                for &h in &hs[..r.a2 as usize] {
+                    sys::handle_close(h);
                 }
                 if r.a1 == 3 && m[0] == b'H' && m[1] == 2 {
                     let now = m[2] != 0;

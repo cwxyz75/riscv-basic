@@ -281,6 +281,119 @@ pub unsafe extern "C" fn getopt(
     step.ret
 }
 
+/// A long option as the C caller declares it (`struct option`).
+#[repr(C)]
+pub struct COption {
+    name: *const c_char,
+    has_arg: c_int,
+    flag: *mut c_int,
+    val: c_int,
+}
+
+static GETOPT_LONG: rt::sync::Mutex<cfmt::getopt_long::GetOptLong> =
+    rt::sync::Mutex::new(cfmt::getopt_long::GetOptLong::new());
+
+/// GNU `getopt_long` (the core is `cfmt::getopt_long`, tested against the host's): options may follow operands (the vector is
+/// permuted so that the options come first) unless the option string starts with `+` or `POSIXLY_CORRECT` is set.
+#[no_mangle]
+pub unsafe extern "C" fn getopt_long(
+    argc: c_int,
+    argv: *const *mut c_char,
+    optstring: *const c_char,
+    longopts: *const COption,
+    longind: *mut c_int,
+) -> c_int {
+    use cfmt::getopt_long::{Fault, LongOpt};
+    optarg = core::ptr::null_mut();
+    let mut st = GETOPT_LONG.lock();
+    if optind == 0 {
+        optind = 1;
+        st.reset();
+    }
+    st.optind = optind.max(1) as usize;
+    let mut args: alloc::vec::Vec<&[u8]> = (0..argc.max(0) as usize)
+        .map(|i| {
+            let p = *argv.add(i);
+            if p.is_null() {
+                &[][..]
+            } else {
+                core::ffi::CStr::from_ptr(p).to_bytes()
+            }
+        })
+        .collect();
+    let mut flags: alloc::vec::Vec<*mut c_int> = alloc::vec::Vec::new();
+    let mut lo: alloc::vec::Vec<LongOpt> = alloc::vec::Vec::new();
+    let mut k = 0;
+    while !longopts.is_null() && !(*longopts.add(k)).name.is_null() {
+        let o = &*longopts.add(k);
+        lo.push(LongOpt {
+            name: core::ffi::CStr::from_ptr(o.name).to_bytes(),
+            has_arg: o.has_arg as u8,
+            flag: !o.flag.is_null(),
+            val: o.val,
+        });
+        flags.push(o.flag);
+        k += 1;
+    }
+    let optstr = core::ffi::CStr::from_ptr(optstring).to_bytes();
+    let posixly = !getenv(c"POSIXLY_CORRECT".as_ptr()).is_null();
+    let step = st.next(&mut args, optstr, &lo, posixly);
+    // the permuted vector goes back (the slices are the original C strings)
+    for (i, a) in args.iter().enumerate() {
+        *(argv.add(i) as *mut *const c_char) = a.as_ptr() as *const c_char;
+    }
+    optind = st.optind as c_int;
+    if let Some((i, off)) = step.optarg {
+        optarg = (*argv.add(i)).add(off);
+    }
+    if let Some(c) = step.optopt {
+        optopt = c;
+    }
+    if let (Some(l), false) = (step.longind, longind.is_null()) {
+        *longind = l as c_int;
+    }
+    if let (Some(v), Some(l)) = (step.flag_val, step.longind) {
+        *flags[l] = v;
+    }
+    let body = optstr
+        .strip_prefix(b"+")
+        .or(optstr.strip_prefix(b"-"))
+        .unwrap_or(optstr);
+    if opterr != 0 && body.first() != Some(&b':') {
+        let prog = args.first().copied().unwrap_or(b"?");
+        let name = |i: usize| lo[i].name;
+        let msg = match &step.fault {
+            Some(Fault::Invalid(c)) => Some(alloc::format!("invalid option -- '{}'", *c as char)),
+            Some(Fault::MissingShort(c)) => Some(alloc::format!(
+                "option requires an argument -- '{}'",
+                *c as char
+            )),
+            Some(Fault::Ambiguous(n)) => Some(alloc::format!(
+                "option '--{}' is ambiguous",
+                alloc::string::String::from_utf8_lossy(n)
+            )),
+            Some(Fault::Unrecognized(n)) => Some(alloc::format!(
+                "unrecognized option '--{}'",
+                alloc::string::String::from_utf8_lossy(n)
+            )),
+            Some(Fault::NoArgument(i)) => Some(alloc::format!(
+                "option '--{}' doesn't allow an argument",
+                alloc::string::String::from_utf8_lossy(name(*i))
+            )),
+            Some(Fault::MissingLong(i)) => Some(alloc::format!(
+                "option '--{}' requires an argument",
+                alloc::string::String::from_utf8_lossy(name(*i))
+            )),
+            None => None,
+        };
+        if let Some(m) = msg {
+            let full = alloc::format!("{}: {m}\n", alloc::string::String::from_utf8_lossy(prog));
+            write(2, full.as_ptr() as *const c_void, full.len());
+        }
+    }
+    step.ret
+}
+
 // ---- identity ----
 
 /// The number in the environment variable `name` (the session's profile puts `UID` and `GID` there), or `default`.
@@ -378,7 +491,10 @@ pub extern "C" fn mmap(
         crate::errno::set(38);
         return failed;
     }
-    let size = len.div_ceil(PAGE) * PAGE;
+    let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
+        crate::errno::set(12);
+        return failed;
+    };
     let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PAGE) else {
         crate::errno::set(12);
         return failed;
@@ -395,7 +511,10 @@ pub extern "C" fn mmap(
 
 #[no_mangle]
 pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
-    let size = len.div_ceil(PAGE) * PAGE;
+    let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
+        crate::errno::set(22);
+        return -1;
+    };
     let mut maps = ANON_MAPS.lock();
     match maps
         .iter()
@@ -1231,11 +1350,17 @@ impl ArgSlots {
 /// pointers in the argument slots, in order.
 #[no_mangle]
 pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *const u64) -> c_int {
-    use cfmt::scan::Item;
     let input = core::ffi::CStr::from_ptr(s).to_bytes();
     let f = core::ffi::CStr::from_ptr(fmt).to_bytes();
-    let mut args = ArgSlots(ap);
     let r = cfmt::scan::scan(input, f);
+    store_scanned(&r, ap);
+    r.ret
+}
+
+/// Store what a scan found through the pointers in the argument slots, in order.
+pub(crate) unsafe fn store_scanned(r: &cfmt::scan::Scanned, ap: *const u64) {
+    use cfmt::scan::Item;
+    let mut args = ArgSlots(ap);
     for item in &r.items {
         let p = args.next_ptr();
         match item {
@@ -1261,7 +1386,6 @@ pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *cons
             Item::Count(n) => *(p as *mut c_int) = *n,
         }
     }
-    r.ret
 }
 
 // ---- ctime ----

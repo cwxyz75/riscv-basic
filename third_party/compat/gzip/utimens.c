@@ -8,13 +8,6 @@ int fdutimens(int fd, const char *file, const struct timespec ts[2]) {
 }
 
 #include <errno.h>
-/* gzip only calls this when it opened a directory with openat, which it does not do here (HAVE_OPENAT is 0). */
-int unlinkat(int dirfd, const char *name, int flags) {
-    (void)dirfd; (void)name; (void)flags;
-    errno = 38;
-    return -1;
-}
-
 #include <dirent.h>
 /* (same: only reached after an openat-opened directory) */
 DIR *fdopendir(int fd) {

@@ -730,3 +730,250 @@ fn the_signal_table_matches_the_host() {
         bad.iter().take(2).cloned().collect::<Vec<_>>().join("\n")
     );
 }
+
+// ---- getopt_long ----
+
+mod host_long {
+    use std::ffi::{c_char, c_int};
+    #[repr(C)]
+    pub struct Opt {
+        pub name: *const c_char,
+        pub has_arg: c_int,
+        pub flag: *mut c_int,
+        pub val: c_int,
+    }
+    extern "C" {
+        pub fn getopt_long(
+            argc: c_int,
+            argv: *const *mut c_char,
+            optstring: *const c_char,
+            longopts: *const Opt,
+            longindex: *mut c_int,
+        ) -> c_int;
+    }
+}
+
+#[test]
+fn getopt_long_agrees_with_the_host() {
+    use cfmt::getopt_long::{GetOptLong, LongOpt};
+    let _g = GETOPT_LOCK.lock().unwrap();
+    let optstrings = ["ab", "abc:", ":ab:", "a:bd", "+ab", "+abc:"];
+    let longs: [(&str, u8, i32); 5] = [
+        ("alpha", 0, 1001),
+        ("alpine", 0, 1002),
+        ("beta", 1, 1003),
+        ("gamma", 2, 1004),
+        ("verbose", 0, 1005),
+    ];
+    let words = [
+        "-a",
+        "-b",
+        "-c",
+        "-cX",
+        "-ab",
+        "-ba",
+        "-bcX",
+        "--alpha",
+        "--al",
+        "--alp",
+        "--alph",
+        "--beta",
+        "--beta=1",
+        "--bet",
+        "--gamma",
+        "--gamma=2",
+        "--gam",
+        "--verb",
+        "--verbose",
+        "--zz",
+        "--alpha=3",
+        "X",
+        "Y",
+        "--",
+        "-",
+        "--beta=",
+        "1",
+        "-d",
+        "--v=1",
+    ];
+    let mut rng = Rng(0x0dd5_eed5_1234_5678);
+    let (mut compared, mut skipped) = (0, 0);
+    for _ in 0..30_000 {
+        let optstring = rng.pick(&optstrings);
+        let mut args: Vec<String> = vec!["prog".to_string()];
+        for _ in 0..rng.below(7) {
+            args.push(rng.pick(&words).to_string());
+        }
+        // ours
+        let mut argv: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        let lo: Vec<LongOpt> = longs
+            .iter()
+            .map(|(n, h, v)| LongOpt {
+                name: n.as_bytes(),
+                has_arg: *h,
+                flag: false,
+                val: *v,
+            })
+            .collect();
+        let mut st = GetOptLong::new();
+        let mut ours: Vec<(i32, Option<String>, Option<usize>)> = Vec::new();
+        let mut had_fault = false;
+        let mut delicate = false;
+        loop {
+            let s = st.next(&mut argv, optstring.as_bytes(), &lo, false);
+            if s.ret == -1 {
+                break;
+            }
+            had_fault |= s.fault.is_some();
+            delicate |= matches!(
+                s.fault,
+                Some(
+                    cfmt::getopt_long::Fault::MissingShort(_)
+                        | cfmt::getopt_long::Fault::MissingLong(_)
+                        | cfmt::getopt_long::Fault::NoArgument(_)
+                )
+            );
+            let oa = s
+                .optarg
+                .map(|(i, off)| String::from_utf8_lossy(&argv[i][off..]).into_owned());
+            ours.push((s.ret, oa, s.longind));
+        }
+        let ours_argv: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let ours_optind = st.optind;
+        // the host's (glibc permutes unless `+`; Apple's does the same)
+        let cstrs: Vec<CString> = args
+            .iter()
+            .map(|a| CString::new(a.clone()).unwrap())
+            .collect();
+        let mut ptrs: Vec<*mut c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut c_char).collect();
+        let argc = ptrs.len();
+        ptrs.push(std::ptr::null_mut()); // (an argument vector ends with a NULL)
+        let names: Vec<CString> = longs
+            .iter()
+            .map(|(n, _, _)| CString::new(*n).unwrap())
+            .collect();
+        let mut hl: Vec<host_long::Opt> = longs
+            .iter()
+            .zip(&names)
+            .map(|((_, h, v), n)| host_long::Opt {
+                name: n.as_ptr(),
+                has_arg: i32::from(*h),
+                flag: std::ptr::null_mut(),
+                val: *v,
+            })
+            .collect();
+        hl.push(host_long::Opt {
+            name: std::ptr::null(),
+            has_arg: 0,
+            flag: std::ptr::null_mut(),
+            val: 0,
+        });
+        let copt = CString::new(optstring).unwrap();
+        host_getopt_reset();
+        let mut theirs: Vec<(i32, Option<String>, Option<usize>)> = Vec::new();
+        loop {
+            let mut idx: c_int = -1;
+            // (an `optarg` left by an earlier run would point into freed memory)
+            unsafe { host::optarg = std::ptr::null_mut() };
+            // SAFETY: argv is argc valid NUL-terminated strings, the option table ends with a NULL name; the globals are the host's.
+            let r = unsafe {
+                host_long::getopt_long(
+                    argc as c_int,
+                    ptrs.as_ptr(),
+                    copt.as_ptr(),
+                    hl.as_ptr(),
+                    &mut idx,
+                )
+            };
+            if r == -1 {
+                break;
+            }
+            let oa = unsafe {
+                if host::optarg.is_null() {
+                    None
+                } else {
+                    Some(
+                        std::ffi::CStr::from_ptr(host::optarg)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+            };
+            let long_hit = r >= 1001;
+            // (the host leaves `optarg` stale after an option that takes none, and `longindex` stale for short options)
+            theirs.push((r, oa, if long_hit { Some(idx as usize) } else { None }));
+        }
+        let host_argv: Vec<String> = ptrs[..argc]
+            .iter()
+            .map(|p| unsafe { std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned() })
+            .collect();
+        let host_optind = unsafe { host::optind } as usize;
+        // what each side says about `optarg` is only meaningful for options that take one
+        let norm = |v: &[(i32, Option<String>, Option<usize>)]| -> Vec<(i32, Option<String>)> {
+            v.iter()
+                .map(|(r, oa, _)| {
+                    (
+                        *r,
+                        if matches!(*r, 1001 | 1002 | 1005) {
+                            None
+                        } else {
+                            oa.clone()
+                        },
+                    )
+                })
+                .collect()
+        };
+        // a fault (an unknown or ambiguous option, a missing argument, an argument to a flag-less no-argument option) is where the two
+        // libcs differ in details (where `optind` stops, the stale `optarg`): such runs compare only the returned options
+        if had_fault {
+            skipped += 1;
+            if delicate {
+                // (a missing or unwanted argument: Apple's libc returns the option's value for a missing long argument at the end)
+                continue;
+            }
+            let (a, b): (Vec<i32>, Vec<i32>) = (
+                ours.iter().map(|x| x.0).collect(),
+                theirs.iter().map(|x| x.0).collect(),
+            );
+            assert_eq!(a, b, "options of {args:?} with {optstring:?}");
+            continue;
+        }
+        assert_eq!(norm(&ours), norm(&theirs), "{args:?} with {optstring:?}");
+        assert_eq!(
+            ours.iter().map(|x| x.2).collect::<Vec<_>>(),
+            theirs.iter().map(|x| x.2).collect::<Vec<_>>(),
+            "long indexes of {args:?} with {optstring:?}"
+        );
+        assert_eq!(
+            ours_argv, host_argv,
+            "the permuted vector of {args:?} with {optstring:?}"
+        );
+        assert_eq!(
+            ours_optind, host_optind,
+            "optind of {args:?} with {optstring:?}"
+        );
+        compared += 1;
+    }
+    assert!(
+        compared > 8000,
+        "compared {compared} runs ({skipped} with faults)"
+    );
+}
+
+#[test]
+fn sscanf_reports_how_much_it_used() {
+    use cfmt::scan::scan;
+    assert_eq!(scan(b"12 abc", b"%d").consumed, 2);
+    assert_eq!(scan(b"  12 abc", b"%d %s").consumed, 8);
+    assert_eq!(scan(b"12abc", b"%d").consumed, 2, "the letters stay");
+    assert_eq!(
+        scan(b"x", b"%d").consumed,
+        0,
+        "nothing matched: nothing used"
+    );
+    assert_eq!(scan(b"7,8", b"%d,%d").consumed, 3);
+    assert_eq!(scan(b"abc", b"%2c").consumed, 2);
+}
