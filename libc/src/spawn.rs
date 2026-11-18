@@ -354,7 +354,11 @@ fn command_name(file: &[u8]) -> Option<&[u8]> {
 /// `argv`. A bare name or `/bin/name` is a program of the image; **`sh` is the compat shell** (BusyBox `hush`, `ish` being the system
 /// shell, which programs do not talk to: T139), so `execl("/bin/sh", "sh", "-c", cmd)` and `system` work the way programs expect;
 /// a path to a file that starts with `#!` is that interpreter run on the file (`#!/bin/sh`, `#!/bin/busybox sh`).
-unsafe fn plan(file: &[u8], args: Vec<Vec<u8>>, depth: u32) -> Result<(Vec<u8>, Vec<Vec<u8>>), c_int> {
+unsafe fn plan(
+    file: &[u8],
+    args: Vec<Vec<u8>>,
+    depth: u32,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), c_int> {
     if let Some(name) = command_name(file) {
         if name == b"sh" {
             let mut v: Vec<Vec<u8>> = alloc::vec![b"busybox".to_vec(), b"hush".to_vec()];
