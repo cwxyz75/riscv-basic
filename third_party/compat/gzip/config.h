@@ -26,7 +26,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 int fdatasync(int);
-int unlinkat(int, const char *, int);
 #define O_SEARCH 0
 #define O_BINARY 0
 #define TIMESPEC_RESOLUTION 1000000000

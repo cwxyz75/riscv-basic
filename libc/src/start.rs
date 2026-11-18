@@ -10,6 +10,18 @@ extern "C" {
     fn main(argc: c_int, argv: *mut *mut c_char) -> c_int;
 }
 
+static PROG_NAME: core::sync::atomic::AtomicPtr<c_char> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The program's name (the last component of `argv[0]`), or `?`.
+pub fn program_name() -> *const c_char {
+    let p = PROG_NAME.load(core::sync::atomic::Ordering::Relaxed);
+    if p.is_null() {
+        c"?".as_ptr()
+    } else {
+        p
+    }
+}
+
 /// A NUL-terminated copy of `s`, leaked (argv and environ live as long as the process).
 fn leak_c_string(s: &[u8]) -> *mut c_char {
     let mut v: Vec<u8> = Vec::with_capacity(s.len() + 1);
@@ -117,6 +129,24 @@ pub fn run_main() -> i32 {
     }
     crate::file::init_std_buffering();
     let argv = leak_array(&env.startup.args);
+    // (the program's name, for `error` and friends: the last component of `argv[0]`)
+    // SAFETY: `argv` is a leaked array of `args.len()` strings followed by NULL.
+    unsafe {
+        {
+            let a0 = *argv as *const c_char;
+            if !a0.is_null() {
+                let mut last = a0;
+                let mut p = a0;
+                while *p != 0 {
+                    if *p == b'/' as c_char && *p.add(1) != 0 {
+                        last = p.add(1);
+                    }
+                    p = p.add(1);
+                }
+                PROG_NAME.store(last as *mut c_char, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     // SAFETY: single-threaded start-up; the array is leaked and NULL-terminated.
     unsafe { crate::stdlib::ENVIRON = leak_array(&env.startup.env) };
     crate::thread::init_main_thread();

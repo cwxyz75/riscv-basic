@@ -179,7 +179,7 @@ def main():
           b"ok: open a directory by path", b"ok: openat with .. from a path-annotated directory descriptor",
           b"ok: `..` above the root stays at the root", b"ok: the empty path names nothing",
           b"ok: write to /dev/null", b"ok: read zeros from /dev/zero", b"ok: write a file in the private /tmp",
-          b"ok: a new file has the default mode 0644", b"ok: one link, its size and a modification time", b"ok: chmod, then stat shows the mode", b"ok: access sees the execute bit", b"ok: and sees it cleared", b"ok: chown sets the advisory owner and group", b"ok: fchmod and fstat on a descriptor", b"ok: mkdir applies the umask", b"ok: make a symlink", b"ok: lstat describes the link itself", b"ok: stat follows it", b"ok: readlink gives the target text", b"ok: an absolute link target is refused", b"ok: hard links are refused",
+          b"ok: a new file has the default mode 0644", b"ok: one link, its size and a modification time", b"ok: chmod, then stat shows the mode", b"ok: access sees the execute bit", b"ok: and sees it cleared", b"ok: chown sets the advisory owner and group", b"ok: fchmod and fstat on a descriptor", b"ok: mkdir applies the umask", b"ok: make a symlink", b"ok: lstat describes the link itself", b"ok: stat follows it", b"ok: readlink gives the target text", b"ok: symlinkat and readlinkat", b"ok: an absolute link target is refused", b"ok: hard links are refused", b"ok: a UTF-8 name works on the volume and is listed as it was written", b"ok: a name that is not UTF-8 is refused with EILSEQ on the volume", b"ok: and in /tmp", b"ok: a control character in a name is refused (mkdir)", b"ok: a UTF-8 name works in /tmp",
           b"ok: leave a file for the next session",
           b"mount: 0 failures"],
          "a C program makes, reads, renames and removes files in the granted volume")
@@ -390,6 +390,8 @@ def main():
         pass  # (cat's output follows kilo's last screen on the same line: the cursor is shown again, then the file)
     s.wait_for_prompt = True
     step(b"echo after kilo\n", [b"$ echo after kilo", b"after kilo"], "the terminal is cooked again after the editor")
+    # the POSIX additions of the libc gap survey (LIBC-GAPS.md): the *at family, error, execlp, strings.h, creat, ...
+    step(b"ctest posix2\n", [b"$ ctest posix2", b"ok: open a directory descriptor", b"ok: openat makes a file below the descriptor", b"ok: fstatat sees it", b"ok: fstatat with AT_FDCWD and an absolute path", b"ok: fstatat of a missing name is ENOENT", b"ok: faccessat", b"ok: fchmodat", b"ok: mkdirat", b"ok: renameat", b"ok: linkat is refused", b"ok: mkfifoat is not supported", b"ok: unlinkat removes a file", b"ok: unlinkat with AT_REMOVEDIR removes a directory", b"ok: and a missing name fails", b"ok: a bad descriptor is EBADF", b"ok: bcmp", b"ok: bcopy overlaps like memmove", b"ok: index and rindex", b"ok: creat", b"ok: creat truncates", b"ok: ftello", b"ok: mkostemp", b"ok: strxfrm in the C locale is a copy", b"ctest: cannot open file: No such file or directory", b"ctest:f.c:7: bad 3", b"ok: error counts its messages (the text is on standard error)", b"from execlp", b"ok: execlp runs a program found by name", b"posix2: 0 failures"], "the POSIX additions")
     # SQLite, unmodified: the same SQL through ours and the host's sqlite3 (the oracle); then a database file that two processes use
     # (a journal, fsync, truncate, rename on the memory file system) and one on the disk volume (the file system under test)
     import subprocess as sp

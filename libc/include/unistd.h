@@ -59,6 +59,18 @@ int execv(const char *path, char *const argv[]);
 int execve(const char *path, char *const argv[], char *const envp[]);
 int execvp(const char *file, char *const argv[]);
 int execvpe(const char *file, char *const argv[], char *const envp[]);
+int execl(const char *path, const char *arg, ...);
+int execlp(const char *file, const char *arg, ...);
+int execle(const char *path, const char *arg, ...);
+/* the `*at` family: `dirfd` is a directory descriptor or AT_FDCWD (fcntl.h); `linkat` is refused (EPERM), `mkfifoat` and `mknodat` are ENOSYS */
+int unlinkat(int dirfd, const char *path, int flags);
+int faccessat(int dirfd, const char *path, int mode, int flags);
+int fchownat(int dirfd, const char *path, int uid, int gid, int flags);
+long readlinkat(int dirfd, const char *path, char *buf, size_t size);
+int symlinkat(const char *target, int dirfd, const char *linkpath);
+int linkat(int olddirfd, const char *old, int newdirfd, const char *new_, int flags);
+int creat(const char *path, unsigned mode);
+void tzset(void);
 int getlogin_r(char *buf, size_t n);
 int ttyname_r(int fd, char *buf, size_t n);
 int getpagesize(void);

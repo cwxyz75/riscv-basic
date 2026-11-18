@@ -47,6 +47,8 @@ void clearerr(FILE *f);
 int fileno(FILE *f);
 int fseek(FILE *f, long off, int whence);
 long ftell(FILE *f);
+long long ftello(FILE *f);
+int renameat(int olddirfd, const char *old, int newdirfd, const char *new_);
 void rewind(FILE *f);
 int setvbuf(FILE *f, char *buf, int mode, size_t size);
 void setbuf(FILE *f, char *buf);

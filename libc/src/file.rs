@@ -201,7 +201,7 @@ static mut STD: [File; 3] = [
 ];
 
 #[repr(transparent)]
-pub struct FilePtr(*mut File);
+pub struct FilePtr(pub(crate) *mut File);
 // SAFETY: the pointers name the static streams; every access follows C's rules for FILE (no
 // concurrent use of one stream without the caller's own locking).
 unsafe impl Sync for FilePtr {}

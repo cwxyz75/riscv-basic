@@ -281,6 +281,30 @@ fn open_bytes(path: &[u8], flags: c_int) -> c_int {
     }
 }
 
+/// The path `path` names relative to the directory `dirfd` (`AT_FDCWD` or an absolute path: itself), NUL-terminated, for the `*at`
+/// calls. A relative path that climbs (`..`) works only from a descriptor that remembers the path it was opened by.
+pub unsafe fn resolve_at(dirfd: c_int, path: *const c_char) -> Result<alloc::vec::Vec<u8>, c_int> {
+    let p = path_bytes(path);
+    let mut out = alloc::vec::Vec::new();
+    if p.first() == Some(&b'/') || dirfd == AT_FDCWD {
+        out.extend_from_slice(p);
+    } else {
+        let base = {
+            let t = FDS.lock();
+            match t.fds.get(dirfd as usize).and_then(Option::as_ref) {
+                Some(Entry::File(f)) => f.path.clone(),
+                _ => return Err(9), // EBADF
+            }
+        };
+        let Some(base) = base else {
+            return Err(13); // EACCES: no path to resolve from
+        };
+        out.extend_from_slice(&pathres::join_abs(&pathres::clamp(&base, p)));
+    }
+    out.push(0);
+    Ok(out)
+}
+
 /// `openat`: `path` relative to the directory `dirfd` (or the cwd for `AT_FDCWD`). A relative path that climbs (`..`) works only
 /// from a descriptor that remembers the path it was opened by; a descriptor without one refuses it.
 #[no_mangle]

@@ -34,6 +34,7 @@ int setenv(const char *name, const char *value, int overwrite);
 int unsetenv(const char *name);
 int putenv(char *s);
 int mkstemp(char *tmpl);
+int mkostemp(char *tmpl, int flags);
 char *mkdtemp(char *tmpl);
 char *mktemp(char *tmpl);
 char *realpath(const char *path, char *resolved);

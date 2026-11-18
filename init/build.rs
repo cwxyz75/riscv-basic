@@ -114,6 +114,7 @@ fn build_c_tests(dir: &str) -> Option<PathBuf> {
             Path::new(dir).join("../libc/tests/c/sockets.c"),
             Path::new(dir).join("../libc/tests/c/mount.c"),
             Path::new(dir).join("../libc/tests/c/signals.c"),
+            Path::new(dir).join("../libc/tests/c/posix2.c"),
         ],
         &["-Wall".to_string()],
     )

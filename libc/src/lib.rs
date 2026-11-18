@@ -28,6 +28,7 @@ mod glob;
 mod math;
 mod misc;
 mod netdb;
+mod posix2;
 mod random;
 mod setjmp;
 mod sig;
