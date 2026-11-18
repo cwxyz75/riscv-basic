@@ -30,7 +30,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
    finds; the slice I (AIA) review is also still owed.
 6. [ ] **`tcc` spike** (time-boxed; fetched, pinned): compile and link C on the OS with the libc and run it; needs the batch in 3. If it
    needs executable memory, say so and stop at "compiles to a file".
-7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the `ish` steps SH0 onward, or L-task work, which are the
+7. [ ] If time is left: the next slice in `ROADMAP.md` order (SD step 4, the remaining `ish` steps (SH6: TOML and YAML after Q2; SH7: a compatible `/bin/sh`, partly covered by the hush port), or L-task work, which are the
    owner's to choose: do not start the kernel locking tasks unasked).
 
 ## Long-range list (not scheduled)
