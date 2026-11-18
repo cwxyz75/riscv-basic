@@ -9822,6 +9822,9 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     let probe = sys::interrupt_create(res, b.irq);
     if st(probe) == Some(S::NotSupported) {
         // no interrupt controller (plain `virt`): drivers poll; the harness checks which machine this is
+        // (the window stays mapped otherwise, and the next test that looks for the disk cannot map it)
+        let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+        sys::process_unmap(me, MMIO_VA);
         return Ok(());
     }
     let irq = ok(probe, "interrupt_create")?.a1 as u32;
