@@ -524,6 +524,27 @@ def main():
     time.sleep(0.5)
     step(b"\x1c", [b"^\\", b"[exit -2003]"], "Ctrl-backslash ends a job that ignores Ctrl-C (killed by SIGQUIT)")
     s.wait_for_prompt = True
+    # Ctrl-Z stops the foreground job (the kernel's process_suspend), the shell lists it, `fg` brings it back, Ctrl-C ends it (SIG2)
+    step(b"spin\n", [b"$ spin", b"spinning"], "a job to stop")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x1a", [b"^Z", b"[1]+  Stopped  spin"], "Ctrl-Z stops the job")
+    s.wait_for_prompt = True
+    step(b"print (jobs)\n", [b"$ print (jobs)", b'[{"id":1,"state":"Stopped","name":"spin"}]'], "jobs lists the stopped job")
+    step(b"bg\n", [b"$ bg", b"[1]+  spin &"], "bg lets it run in the background")
+    step(b"print (jobs)\n", [b"$ print (jobs)", b'[{"id":1,"state":"Running","name":"spin"}]'], "jobs shows it running")
+    step(b"echo the shell is free\n", [b"$ echo the shell is free", b"the shell is free"], "the shell is free while the job runs")
+    step(b"fg\n", [b"$ fg", b"spin"], "fg brings the job to the foreground")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x1a", [b"^Z", b"[1]+  Stopped  spin"], "Ctrl-Z stops it again")
+    s.wait_for_prompt = True
+    step(b"fg\n", [b"$ fg", b"spin"], "fg again")
+    s.wait_for_prompt = False
+    time.sleep(0.5)
+    step(b"\x03", [b"^C", b"[exit -130]"], "Ctrl-C ends the foreground job")
+    s.wait_for_prompt = True
+    step(b"print (len (jobs))\n", [b"$ print (len (jobs))", b"0"], "the table is empty again")
     # a Ctrl-C typed together with the command, before the job is even registered, still ends it
     # (the job may or may not have printed its first line yet)
     step(b"spin\n\x03", [b"$ spin"], "a command and Ctrl-C in one write")

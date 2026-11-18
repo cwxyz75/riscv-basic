@@ -66,6 +66,11 @@ pub struct FakeHost {
     pub term_in: VecDeque<TermIn>,
     /// `interrupted()` answers true on this many polls from now (0 = never).
     pub interrupt_after_polls: u32,
+    /// The command line of each program started, by pid (for the job table).
+    cmdlines: BTreeMap<u32, String>,
+    /// The job table: (id, stages, running).
+    jobs: Vec<(u32, Vec<(Pid, String)>, bool)>,
+    next_job: u32,
 }
 
 fn norm(cwd: &str, p: &str) -> String {
@@ -107,6 +112,9 @@ impl FakeHost {
             confined: Vec::new(),
             term_in: VecDeque::new(),
             interrupt_after_polls: 0,
+            cmdlines: BTreeMap::new(),
+            jobs: Vec::new(),
+            next_job: 1,
         };
         h.objs.insert(0, Obj::Stdin);
         h.objs.insert(1, Obj::Stdout);
@@ -295,6 +303,7 @@ impl Host for FakeHost {
             self.now_ms + ctx.run_ms
         };
         self.statuses.insert(pid, (status, ends));
+        self.cmdlines.insert(pid, argv.join(" "));
         Ok(Pid(pid))
     }
 
@@ -304,9 +313,60 @@ impl Host for FakeHost {
                 if ends != u64::MAX {
                     self.now_ms = self.now_ms.max(ends);
                 }
+                if st == crate::host::STOPPED_STATUS {
+                    // the terminal stopped it: a job now, and it ends with 0 when it is let go
+                    let name = self.cmdlines.get(&pid.0).cloned().unwrap_or_default();
+                    self.jobs
+                        .push((self.next_job, alloc::vec![(pid, name)], false));
+                    self.next_job += 1;
+                    self.statuses.insert(pid.0, (0, 0));
+                }
                 st
             }
             None => -1,
+        }
+    }
+
+    fn job_list(&mut self) -> Vec<crate::host::JobLine> {
+        use crate::host::{JobLine, JobRun};
+        self.jobs
+            .iter()
+            .map(|(id, stages, running)| JobLine {
+                id: *id,
+                run: if *running {
+                    JobRun::Running
+                } else {
+                    JobRun::Stopped
+                },
+                name: stages
+                    .iter()
+                    .map(|(_, n)| n.clone())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            })
+            .collect()
+    }
+
+    fn job_continue(
+        &mut self,
+        id: Option<u32>,
+        foreground: bool,
+    ) -> Result<Vec<(Pid, String)>, String> {
+        let at = match id {
+            Some(i) => self.jobs.iter().position(|j| j.0 == i),
+            None => self.jobs.len().checked_sub(1),
+        };
+        let Some(at) = at else {
+            return Err(match id {
+                Some(i) => alloc::format!("{}: no such job", i),
+                None => String::from("no jobs"),
+            });
+        };
+        if foreground {
+            Ok(self.jobs.remove(at).1)
+        } else {
+            self.jobs[at].2 = true;
+            Ok(self.jobs[at].1.clone())
         }
     }
 
@@ -753,6 +813,10 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
             .extend_from_slice(alloc::format!("slow {} done\n", c.run_ms).as_bytes());
         c.args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0)
     }
+    fn stopme(_c: &mut ProgCtx) -> i32 {
+        // the terminal stops it (Ctrl-Z): the host's `wait` says so with this status
+        crate::host::STOPPED_STATUS
+    }
     fn hang(c: &mut ProgCtx) -> i32 {
         c.run_ms = u64::MAX;
         c.out.extend_from_slice(b"hanging\n");
@@ -778,6 +842,7 @@ fn standard_programs() -> Vec<(&'static str, Prog)> {
         ("show-table", show_table),
         ("slow", slow),
         ("hang", hang),
+        ("stopme", stopme),
     ])
 }
 

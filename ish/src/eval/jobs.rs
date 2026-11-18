@@ -440,6 +440,22 @@ impl<H: Host> Shell<H> {
     }
 
     /// `kill`: end the job (J6).
+    /// `fg` and `bg` (SIG2): let a stopped job go on; for the foreground, wait for it as for any pipeline.
+    pub(crate) fn continue_job(&mut self, id: Option<u32>, foreground: bool) -> Res<Val> {
+        let label = if foreground { "fg" } else { "bg" };
+        let stages = self
+            .host
+            .job_continue(id, foreground)
+            .map_err(|m| error(&format!("{label}: {m}")))?;
+        if foreground {
+            self.begin_job(&stages)?;
+            let waited = self.wait_all(&stages, false);
+            self.host.finished();
+            waited?;
+        }
+        Ok(Val::Null)
+    }
+
     pub(crate) fn kill_job(&mut self, j: &Rc<RefCell<JobState>>) {
         let pids: Vec<Pid> = j.borrow().pids.iter().map(|(p, _)| *p).collect();
         for p in pids {

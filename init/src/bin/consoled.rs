@@ -277,6 +277,10 @@ impl Console {
             self.kill_jobs_with(QUIT_KILLED);
             self.event(ctl::Event::JobQuit);
         }
+        if input.stop && self.fg_active {
+            // Ctrl-Z: the shell stops the job (it holds the handles of everything it started); nothing is ended here
+            self.event(ctl::Event::JobStop);
+        }
         if let Some((cols, rows)) = input.resized {
             self.query_deadline = None;
             self.event(ctl::Event::Resize { cols, rows });

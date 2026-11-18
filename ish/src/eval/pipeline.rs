@@ -353,6 +353,10 @@ impl<H: Host> Shell<H> {
         let mut all = Vec::new();
         for (pid, name) in pids {
             let st = self.host.wait(*pid);
+            if st == crate::host::STOPPED_STATUS {
+                // the terminal stopped the job: it is in the host's job table now, and the rest of the stages with it
+                return Ok(());
+            }
             all.push(Val::int(i64::from(st)));
             if st != 0 && first.is_none() {
                 first = Some((st, name.clone()));
