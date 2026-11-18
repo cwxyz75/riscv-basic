@@ -99,3 +99,10 @@ Still missing from the POSIX base list (headers that do not exist): `iconv.h` (U
 `ulimit.h`, `complex.h`, `fenv.h`, `threads.h`, `aio.h`, `mqueue.h`, `sys/ipc.h` and the System V IPC set (not planned), `utmpx.h`
 (not planned), `dlfcn.h` (not by design), `stropts.h`, `trace.h`, `fmtmsg.h`, `ndbm.h`.
 
+## Phase 2, batch 3 (2026-11-18)
+
+`<threads.h>` (C11 threads: `thrd_*`, `mtx_*`, `cnd_*`, `tss_*`, `call_once`) and `<semaphore.h>` (unnamed `sem_*`; `sem_open` and friends are
+`ENOSYS`: no name to put a semaphore under), both header-only over the pthread layer, checked on the OS in `ctest posix2` (the macOS
+development host has neither header, so the host transcript cannot cover them). Removed from the missing list above: `threads.h`,
+`semaphore.h`.
+

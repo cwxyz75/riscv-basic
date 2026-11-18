@@ -16,12 +16,33 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <spawn.h>
+#include <semaphore.h>
+#include <threads.h>
 extern char **environ;
 #include <locale.h>
 #include <fnmatch.h>
 #include <termios.h>
 
 static int failures;
+
+static mtx_t t_mtx;
+static cnd_t t_cnd;
+static int t_ready, t_once_count, t_sum;
+static once_flag t_once = ONCE_FLAG_INIT;
+static tss_t t_key;
+static sem_t t_sem;
+static void t_once_fn(void) { t_once_count++; }
+static int t_worker(void *arg) {
+    call_once(&t_once, t_once_fn);
+    tss_set(t_key, arg);
+    mtx_lock(&t_mtx);
+    t_sum += (int)(long)tss_get(t_key);
+    t_ready++;
+    cnd_signal(&t_cnd);
+    mtx_unlock(&t_mtx);
+    sem_post(&t_sem);
+    return (int)(long)arg + 100;
+}
 
 #define CHECK(cond, what) do { if (cond) printf("ok: %s\n", what); else { printf("FAIL: %s (errno %d)\n", what, errno); failures++; } fflush(stdout); } while (0)
 
@@ -197,6 +218,32 @@ int posix2_test(void) {
     /* constants gnulib and busybox ask for */
     CHECK(MB_CUR_MAX == 4 && LC_MESSAGES == 5 && AT_EACCESS == 0x200 && FNM_FILE_NAME == FNM_PATHNAME && FNM_LEADING_DIR == 8, "MB_CUR_MAX, LC_MESSAGES, AT_EACCESS, FNM_FILE_NAME and FNM_LEADING_DIR");
     CHECK(VEOL == 11 && VSTART == 8 && VSTOP == 9 && VSUSP == 10 && CS5 == 0 && CS6 == 0020 && CS7 == 0040 && FLUSHO == 0010000, "the remaining termios names");
+    /* C11 threads and POSIX semaphores, over the pthread layer */
+    {
+        mtx_init(&t_mtx, mtx_plain);
+        cnd_init(&t_cnd);
+        sem_init(&t_sem, 0, 0);
+        tss_create(&t_key, NULL);
+        thrd_t a, b;
+        CHECK(thrd_create(&a, t_worker, (void *)1) == thrd_success && thrd_create(&b, t_worker, (void *)2) == thrd_success, "thrd_create");
+        mtx_lock(&t_mtx);
+        while (t_ready < 2) cnd_wait(&t_cnd, &t_mtx);
+        mtx_unlock(&t_mtx);
+        int ra = 0, rb = 0;
+        CHECK(thrd_join(a, &ra) == thrd_success && thrd_join(b, &rb) == thrd_success && ra == 101 && rb == 102, "thrd_join returns the result");
+        CHECK(t_sum == 3 && t_once_count == 1, "a mutex, a condition variable, thread-specific data and call_once");
+        int v = -1;
+        sem_getvalue(&t_sem, &v);
+        CHECK(v == 2 && sem_trywait(&t_sem) == 0 && sem_wait(&t_sem) == 0 && sem_trywait(&t_sem) == -1 && errno == EAGAIN, "semaphore counts");
+        struct timespec soon;
+        clock_gettime(CLOCK_REALTIME, &soon);
+        soon.tv_nsec += 20 * 1000 * 1000;
+        if (soon.tv_nsec >= 1000000000L) { soon.tv_sec++; soon.tv_nsec -= 1000000000L; }
+        CHECK(sem_timedwait(&t_sem, &soon) == -1 && errno == ETIMEDOUT, "sem_timedwait times out");
+        CHECK(sem_post(&t_sem) == 0 && sem_timedwait(&t_sem, &soon) == 0, "and succeeds after a post");
+        CHECK(sem_open("/x", 0) == SEM_FAILED && errno == ENOSYS, "named semaphores are not supported");
+        CHECK(mtx_trylock(&t_mtx) == thrd_success && mtx_trylock(&t_mtx) == thrd_busy && mtx_unlock(&t_mtx) == thrd_success, "mtx_trylock");
+    }
     printf("posix2: %d failures\n", failures);
     return failures;
 }
