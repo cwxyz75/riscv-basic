@@ -43,7 +43,7 @@ entries before their implementation (S3b, S3c).
 | BUFFER_TOO_SMALL | -8 | the caller's buffer cannot hold the result (sizes are returned) |
 | TOO_BIG | -9 | a message or list is over a limit |
 | BAD_STATE | -10 | the object is not in a state that allows this |
-| INTERRUPTED | -14 | **reserved** (T56): a blocking call that was told to stop; nothing returns it yet |
+| INTERRUPTED | -14 | a blocking call that `thread_interrupt` told to stop (`object_wait`, `port_wait`, `futex_wait`, `channel_call`) |
 | NOT_SUPPORTED | -11 | valid request the kernel will not do (e.g. a channel endpoint sent over itself) |
 | TIMED_OUT | -12 | a wait reached its deadline |
 | BAD_SYSCALL | -13 | no such syscall number |
@@ -180,7 +180,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
-| 63 | thread_interrupt | `a0` thread | reserved: NOT_SUPPORTED |
+| 63 | thread_interrupt | `a0` thread (MANAGE) | |
 | 65 | thread_set_sched | `a0` thread (0: the caller), `a1` priority 1-63, `a2` flags | |
 | 66 | thread_get_sched | `a0` thread (0: the caller) | `a1` packed priorities, `a2` tid |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
@@ -633,12 +633,14 @@ With several harts, syscalls on different harts serialise on it (TIDY-UP T11).
 
 ### thread_interrupt(thread) -> status
 
-**Reserved** (slice T, T56; cancellation is wanted and deliberately deferred). It will tell a thread to stop what it is
-blocked in; today it validates the handle (BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED, the right being MANAGE) and answers
-NOT_SUPPORTED, so nothing built meanwhile can assume a wait cannot be interrupted. When it is built, every blocking
-call (`object_wait`, `port_wait`, `channel_call`, `futex_wait`) may return INTERRUPTED (-14): callers must treat that
-status like a retry, and the C library's `pthread_cancel` and the service runtime's request cancellation will be built on
-it. Tests: `thread_interrupt_is_reserved`.
+Built (T56, SCHED-SMP-SPEC task 26). Sets the target thread's interrupt flag and wakes it. The next blocking call of the
+target that would sleep (`object_wait`, `port_wait`, `futex_wait`, `channel_call`, with a deadline other than 0) returns
+INTERRUPTED (-14) and takes the flag. A call that is satisfied without sleeping leaves the flag (so an interrupt is not lost
+between two waits), and a poll (deadline 0) neither sees nor takes it. One interrupt ends one wait. A `channel_call`
+interrupted while waiting leaves the request queued, as a timeout does; one interrupted before it sent anything (the flag was already pending) sends nothing, so a retry sends one request. The call ends waits only: a thread
+running user code is not stopped. Rights: MANAGE on a thread handle (0 names the caller). Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; BAD_STATE (the thread has ended). Callers treat INTERRUPTED as a retry or a cancellation point. Tests:
+`thread_interrupt_*` in the suite (nine).
 
 ### Sockets
 

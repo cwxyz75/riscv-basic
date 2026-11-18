@@ -97,7 +97,7 @@ not built. "Proposed" means this document.
 | Jobs and quotas | `kcore/src/job.rs:37-47` | Processes, threads, pages, jobs, objects, IPC bytes. Kernel stacks are billed (4 pages per thread). No CPU or priority fields. |
 | Thread creation | `user.rs:2646-2695`, SYSCALLS.md `thread_create` | **One** syscall creates and starts the thread. The *user* stack is the caller's to provide: `vmo_create`, `process_map`, `thread_create` and a `handle_close`, four syscalls in all (`libc/src/thread.rs:231-254`). |
 | Limits | `abi/src/lib.rs:217-248` | `MAX_THREADS_PER_PROCESS` 256, `MAX_USER_THREADS` 1024, `MAX_OBJECTS` 16384, `MAX_HANDLES` 4096, `MAX_REGIONS` 1024, `MAX_PROCESSES` 64. SYSCALLS.md agrees (256 and 1024). The launcher's per-program job still allows 4 threads. |
-| Reserved cancellation | `abi/src/lib.rs:41, 292`, `user.rs:2700-2710` | `INTERRUPTED` (-14) and `thread_interrupt` (63, NOT_SUPPORTED). |
+| Reserved cancellation | `abi/src/lib.rs:41, 292`, `user.rs:2700-2710` | `INTERRUPTED` (-14) and `thread_interrupt` (63): built in task 26. |
 | Latency check | `kernel/src/sched_tests.rs:436-500` | A *kernel* thread at RT priority wakes at most 1 tick late under three kernel hogs, with a negative control. Nothing measures a user thread. |
 
 ### 2.2 Specified but not built
