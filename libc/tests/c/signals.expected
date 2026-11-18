@@ -26,6 +26,11 @@ abort: signaled 1 signal 6
 default SIGPIPE: signaled 1 signal 13
 ignored SIGTERM: still there: 0
 SIGKILL: signaled 1 signal 9
+a child that stops itself: stopped 1 by SIGSTOP 1
+SIGCONT: continued 1
+then it ends: exited 1 status 7
+SIGSTOP from outside: stopped 1 by SIGSTOP 1
+killed while stopped: signaled 1 signal 9
 a child's end: pause -1 errno EINTR 1 handler SIGCHLD 1
 from system
 system: 0

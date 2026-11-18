@@ -958,6 +958,35 @@ impl Os {
                             None => proto::file::status::NOT_FOUND,
                         }
                     }
+                    Some(_) if sig == 19 || sig == 18 => {
+                        // SIGSTOP and SIGCONT are not messages either: the shell suspends or resumes the process (SIG2, OD123); a
+                        // SIGCONT also goes to the program's signal channel, so that a handler runs where it waits
+                        let h = self
+                            .procs
+                            .get(&pid)
+                            .copied()
+                            .or_else(|| self.desc.get(&pid).map(|d| d.h));
+                        match h {
+                            Some(h) => {
+                                if sig == 19 {
+                                    sys::process_suspend(h);
+                                } else {
+                                    sys::process_resume(h);
+                                    if let Some(t) = target {
+                                        sys::channel_write(
+                                            t,
+                                            [18u8].as_ptr(),
+                                            1,
+                                            core::ptr::null(),
+                                            0,
+                                        );
+                                    }
+                                }
+                                0
+                            }
+                            None => proto::file::status::NOT_FOUND,
+                        }
+                    }
                     Some(_) if sig == 0 => 0,
                     Some(t) if (1..=64).contains(&sig) => {
                         // (a full queue drops it: a signal that is already waiting coalesces with this one)

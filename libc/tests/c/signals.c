@@ -214,6 +214,25 @@ static int child_tests(const char *self) {
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
     printf("SIGKILL: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+    /* stop and continue: a child that stops itself, and one stopped from outside (and killed while it is stopped) */
+    char *argv7[] = {(char *)self, "signals", "child-stops-itself", NULL};
+    if (posix_spawn(&pid, self, NULL, NULL, argv7, environ) != 0) { printf("spawn failed\n"); return 1; }
+    waitpid(pid, &status, WUNTRACED);
+    printf("a child that stops itself: stopped %d by SIGSTOP %d\n", WIFSTOPPED(status), WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    kill(pid, SIGCONT);
+    waitpid(pid, &status, WCONTINUED);
+    printf("SIGCONT: continued %d\n", WIFCONTINUED(status));
+    waitpid(pid, &status, 0);
+    printf("then it ends: exited %d status %d\n", WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    char *argv8[] = {(char *)self, "signals", "child-default", NULL};
+    if (posix_spawn(&pid, self, NULL, NULL, argv8, environ) != 0) { printf("spawn failed\n"); return 1; }
+    sleep(1);
+    kill(pid, SIGSTOP);
+    waitpid(pid, &status, WUNTRACED);
+    printf("SIGSTOP from outside: stopped %d by SIGSTOP %d\n", WIFSTOPPED(status), WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    printf("killed while stopped: signaled %d signal %d\n", WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : -1);
     /* a child's end is a SIGCHLD: it wakes pause() */
     got = 0;
     signal(SIGCHLD, on_sig);
@@ -331,6 +350,11 @@ int signals_test(int argc, char **argv) {
         close(fds[0]);
         write(fds[1], "x", 1);
         return 0; /* not reached: SIGPIPE ends the program */
+    }
+    if (argc > 2 && strcmp(argv[2], "child-stops-itself") == 0) {
+        raise(SIGSTOP);
+        sleep(1); /* (so that the parent sees the continue before the end) */
+        return 7;
     }
     if (argc > 2 && strcmp(argv[2], "child-quick") == 0) {
         return 0;

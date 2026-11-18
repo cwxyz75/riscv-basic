@@ -24,6 +24,7 @@ pub const SIG_ERR: Handler = usize::MAX;
 
 pub const SIGKILL: c_int = 9;
 pub const SIGSTOP: c_int = 19;
+const SA_NOCLDSTOP: c_int = 1;
 pub const SIGALRM: c_int = 14;
 const SA_SIGINFO: c_int = 4;
 const SA_RESTART: c_int = 0x1000_0000;
@@ -169,6 +170,9 @@ pub fn deliver() -> Delivered {
         if crate::spawn::newly_exited() {
             post(17); // SIGCHLD (its default is to do nothing; hush's `wait` and `sigsuspend` callers wait for it)
         }
+        if crate::spawn::newly_stopped() && TABLE.lock().flags[17] & SA_NOCLDSTOP == 0 {
+            post(17); // a child stopped or went on
+        }
         // a process waiting for the program it `exec`'d passes its signals on to it
         let fwd = crate::spawn::FORWARD_TO.load(Ordering::Relaxed);
         if fwd != 0 {
@@ -189,17 +193,21 @@ pub fn deliver() -> Delivered {
         else {
             return out;
         };
+        if sig == SIGSTOP {
+            // SIGSTOP cannot be caught, blocked or ignored (a blocked one never gets here: `take_ready` leaves it pending)
+            crate::spawn::stop_self();
+            continue;
+        }
         match h {
             SIG_IGN => {}
             SIG_DFL => {
-                // POSIX's table of default actions (`cfmt::sigtab::default_action`). Stopping and continuing need the kernel to
-                // suspend a program's threads (T149 phase 2): until then they do nothing, as they always did.
+                // POSIX's table of default actions (`cfmt::sigtab::default_action`): ending a program, or stopping it (the shell
+                // that holds its handle suspends it, SIG2); continuing needs nothing, the resume comes from outside.
                 use cfmt::sigtab::Action;
-                if matches!(
-                    cfmt::sigtab::default_action(sig),
-                    Action::Terminate | Action::Abort
-                ) {
-                    terminate(sig);
+                match cfmt::sigtab::default_action(sig) {
+                    Action::Terminate | Action::Abort => terminate(sig),
+                    Action::Stop => crate::spawn::stop_self(),
+                    Action::Ignore | Action::Continue => {}
                 }
             }
             f => {

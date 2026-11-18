@@ -14,7 +14,7 @@ From WORK-PLAN.md's long-range list:
 
 ## Progress (2026-11-18, later)
 
-Shell job control built (OD124, T152 lists what it leaves): Ctrl-Z, `jobs`, `fg`, `bg`; Q-SH7 closed. Still to do: the libc half (kill(SIGSTOP/SIGCONT/SIGTSTP), `WUNTRACED`, SIGCHLD for stops, default actions), CPU-time itimers and queued real-time signals.
+Shell job control built (OD124, T152 lists what it leaves): Ctrl-Z, `jobs`, `fg`, `bg`; Q-SH7 closed. The libc half is built too (kill of SIGSTOP and SIGCONT, `WUNTRACED`/`WCONTINUED`, SIGCHLD for stops, default actions; the host-oracle C test and the shell test pass). Still to do: CPU-time itimers (`ITIMER_PROF`, `ITIMER_VIRTUAL`: needs the kernel to measure per-process CPU time) and queued real-time signals (`sigqueue`).
 
 ## Progress (2026-11-18)
 
