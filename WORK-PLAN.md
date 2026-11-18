@@ -47,7 +47,7 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 
 ### 2. T151: re-check the migrated tidy items against the code
 
-- [ ] At least the `shell` and `session` areas, where spot checks already found stale items; more areas if they go quickly.
+- [x] (shell and session done, PR: t151-tidy-recheck; T151 stays open for the other areas) At least the `shell` and `session` areas, where spot checks already found stale items; more areas if they go quickly.
   For each item: check its claim against the code it names; close it (`work.py done`), narrow it (edit the title and text, add
   a dated note) or leave it. One PR for the batch. T151 stays open until every area has been through once.
 
