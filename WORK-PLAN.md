@@ -9,7 +9,7 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 ## Now (2026-11-18)
 
 1. **Documentation and work-queue reorganisation** (agreed with the owner 2026-11-18). Work lists out of the documents:
-   `work/` replaces `ROADMAP.md`, `TIDY-UP.md` and the old plan; documentation moves to `docs/specs`, `docs/reference` and
+   `work/` replaces the old roadmap, the old tidy-up register and the old plan; documentation moves to `docs/specs`, `docs/reference` and
    `docs/records`; specs say what the system is, not how far it is built; changes to a spec are dated amendments appended
    to it; records are append-only. Then every review finding that still needs action is checked to have an item, and the
    migrated items are checked against the code (stale ones closed).

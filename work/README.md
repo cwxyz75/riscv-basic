@@ -61,7 +61,7 @@ you update what pointed at it), cycles in `blocked_by`, and more than 15 near-te
 
 ## Ids
 
-- `T<n>`: tidy items (the numbers of the old `TIDY-UP.md` are kept; "TIDY-UP T42" in older text means `work/T42.md`, or
+- `T<n>`: tidy items (the numbers of the old tidy-up register are kept; "TIDY-UP T42" in older text means `work/T42.md`, or
   `docs/records/done.md` if it is closed). New ones take `work.py next T`.
 - `L<n>`: the scheduler and SMP tasks of `SCHED-SMP-SPEC.md` (task n).
 - Other slices by name: `SD4`, `R4`, `SIG2`, `S10-UNION`, ...

@@ -1,9 +1,9 @@
 # SCHED-SMP: threads, the scheduler and the SMP execution model (specification, v1, 2026-11-14)
 
-Status: **accepted by the owner 2026-11-14 (specified; nothing built)**, with the answers to the open questions of
+Version: v1, accepted by the owner 2026-11-14, with the answers to the open questions of
 section 9 recorded there (Q1 is deferred to this document's recommendation: one object lock). A design for the *final state* of three things that cannot be designed apart (the threading
-model, the scheduler structure, the SMP execution model) and an ordered task list to get there from today's code.
-Nothing in sections 3 to 5 is built unless section 2 says so. The owner's direction is recorded in section 1; the
+model, the scheduler structure, the SMP execution model) and an ordered task list to get there from the code of
+2026-11-14 (section 2 describes that starting point; the tasks are work items `L1` to `L28`). The owner's direction is recorded in section 1; the
 choices made here are marked "Chosen here" and are the lead's and the owner's to veto. This document follows the
 shape of `T-SPEC.md` and `W-SPEC.md`: decisions with reasons and rejected alternatives, invariants that each get a
 check, acceptance written before code, risks, and open points.
@@ -60,7 +60,7 @@ sections 3 to 6 that the task names. Section 8 holds text to paste into the othe
 ### 1.3 Non-goals
 
 * M:N threading, scheduler activations, user-level scheduling in the kernel ABI (OD73).
-* The fair class itself (EEVDF, group scheduling). Only its preconditions are built (section 4.7).
+* The fair class itself (EEVDF, group scheduling). Only its preconditions are in this design (section 4.7).
 * Sleeping locks (mutexes, rwlocks) inside the kernel, RCU, and per-object locks. Section 3.1 says why not now and
   what keeps them possible.
 * Deadline scheduling (EDF/CBS), CPU affinity masks beyond "pinned to one hart or free", CPU hotplug, NUMA,
@@ -71,7 +71,7 @@ sections 3 to 6 that the task names. Section 8 holds text to paste into the othe
 
 ---
 
-## 2. Current state (as built, checked in the code)
+## 2. Starting point (the code of 2026-11-14, checked)
 
 "Built" means in the tree and exercised by the suite. "Specified" means written in a spec or the decision log but
 not built. "Proposed" means this document.
@@ -978,7 +978,7 @@ so it is scheduled (task 26) rather than left reserved, but after S8: nothing be
 ### 5.7 Futex scope
 
 * Private futexes stay as they are (key: address space and address), with bucket locks.
-* **Shared futexes are reserved, not built**: a flag bit in `futex_wait`/`futex_wake` (NOT_SUPPORTED when set) for a
+* **Shared futexes are reserved**: a flag bit in `futex_wait`/`futex_wake` (NOT_SUPPORTED when set) for a
   key of (VMO, offset), found by translating the address under `AS`. Nothing needs them until a shared-memory ring
   wants to sleep without a channel; the network design uses events as doorbells (`NET-DESIGN.md` 5.3), so it does not need them.
 * PI futexes are private only.
@@ -1207,7 +1207,7 @@ had proposed OD84 to OD87 for the network design; those proposals are renumbered
 | OD95 | **`klock`**: a small crate written here holding the spinlock type over `kcore::ticket`, the only pure-side crate allowed `unsafe`, run under Miri, loom and shuttle; the kernel supplies interrupts, the hart identity and the order checker through a trait | decided (specified) |
 | OD96 | **Measurement** (sections 3.12, 6.1). `##BENCH` lines (amends OD28), `make os-bench` with a checked-in baseline, the `latency-trace` kernel feature, and a stated latency budget that the soak tier compares against | decided (specified) |
 
-### 8.2 TIDY-UP.md
+### 8.2 Tidy items (the tidy-up register of 2026-11-14)
 
 New entries (the next free number is T69):
 
@@ -1344,7 +1344,7 @@ bit 0 (shared key) is reserved: NOT_SUPPORTED.
 "From task 22 the caller lends its effective priority to the thread that reads its request, until a message with the
 same transaction id is written back, the call ends for any reason, or that thread ends."
 
-### 8.5 ROADMAP.md
+### 8.5 The roadmap of 2026-11-14
 
 * In "Queue before S8", after item 5 (slice T): "5a. Slices **B** (benchmark and latency instrumentation), **SC**
   (two-band scheduler, priority API) and the first lock peel of slice **L** (tasks 1 to 10 of `SCHED-SMP-SPEC.md`)", then "10a. Tasks 11 and 12 after S8's first milestone", and change item 10 to "S8, then S9; then the measured peels of L (tasks 15 to 20)".

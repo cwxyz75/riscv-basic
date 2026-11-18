@@ -1,13 +1,11 @@
 # SD: the service directory and namespaces (specification, v1, 2026-11-14)
 
-Status: specified for roadmap slice SD (OD78 direction, OD97 this document). Step 1, the pure directory logic
-(`svc::directory`: names, listeners, stale entries, views), is built and model-tested; the registry service, the startup
-message change and the migration of the servers are not. Basis: design review D10 (`reviews/2026-11-14-design-review.md`).
+Version: v1, 2026-11-14, for slice SD (OD78 direction, OD97 this document). Basis: design review D10 (`docs/records/reviews/2026-11-14-design-review.md`).
 The owner's decisions (OD78): a **registry service** holds the directory, not `init`; a service publishes a name by
 handing the registry a **listener channel**; a client opens `/svc/<name>` with the file protocol's open-with-endpoint,
 which the registry forwards to the listener; a dead service's entry goes stale and the client sees `UNAVAILABLE` and
 retries (no queueing in the registry); a program is handed a **view** with only the names it may use (that is the grant);
-the startup message's closed `Role` enum gives way to generic named entries. **Deliberately undecided** (with Q10, later):
+the startup message's closed `Role` enum gives way to generic named entries. **Deliberately undecided** (with Q-OS10):
 passing a service connection to another program, and revocation.
 
 ## 1. Why
@@ -82,9 +80,9 @@ hostile client (floods, malformed frames), with the budgets of OD84; leak checks
 
 ## 6. Steps
 
-0. This document and OD97. 1. (built) The pure directory logic with model tests. 2. (built) The registry service `registryd` on
+0. This document and OD97. 1. The pure directory logic with model tests. 2. The registry service `registryd` on
 `rt::service`: the `PUBLISH` right (bit 16) and ops 16 to 18 in `proto::file` (ops 9 to 15 are the file operations), status `UNAVAILABLE`, a QEMU test with a toy
-service. 3. (built) Arbitrary namespace prefixes in the startup message (`proto::startup::valid_prefix`; the launcher validates through the same decoder). 4. The shell grants a
+service. 3. Arbitrary namespace prefixes in the startup message (`proto::startup::valid_prefix`; the launcher validates through the same decoder). 4. The shell grants a
 `/svc` view; `memfsd`, `launcher`, `devmgr`, `blkd` publish themselves; clients (`rt::fs`, the shell) reconnect on
 UNAVAILABLE. 5. Documents; T15 and T30 narrowed.
 

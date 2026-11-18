@@ -1,10 +1,9 @@
 # S4: the first interactive system (specification, v2)
 
-Status: v2, built (S4a-S4e and the jobs of S4.5; 2026-11-13), revised after an independent spec review (Fable, 2026-11-11) that found the draft
-contradicted the real syscall contract in several places. Written before any S4 code (OS track
-rule: spec, then acceptance checks, then code, then independent review). Parent documents:
+Version: v2 (2026-11-13), revised after an independent spec review (Fable, 2026-11-11) that found the draft
+contradicted the real syscall contract in several places. Parent documents:
 `OS-ARCHITECTURE.md` (sections 9, 10, 12, 14), `SYSCALLS.md`, `INVARIANTS.md`. Decisions
-become OD51+ once the slices land. Section 14 lists what changed and the defaults I chose for
+are OD51 onward in `docs/records/decisions.md`. Section 14 lists what changed and the defaults chosen for
 the review's product-owner questions.
 
 ## 1. Goal and acceptance
@@ -55,7 +54,7 @@ union directories, per-job quotas (Q9), SMP.
    preceded by a line break when the physical line is not at its start**, so no user program,
    and no file `cat`ed to the terminal, can forge a verdict line (`##TEST`, `##PANIC`,
    `##DONE`) or swallow a real one. Bytes pass through unchanged (no text conversion). The
-   bridge is a polling thread (`TIDY-UP.md` T14); input it cannot deliver yet is kept (4 KiB)
+   bridge is a polling thread (tidy item T14); input it cannot deliver yet is kept (4 KiB)
    and retried every tick, and bytes lost beyond that are counted and checked. `debug_write` stays for test programs (OS-ARCH `##` protocol); S4 services use it only for
    `init`'s own `##` lines and the `rt` panic handler.
 4. **`SYSCALLS.md` fixes:** `MAX_OBJECTS` is 16384 (document drift); the launcher's default
@@ -139,7 +138,7 @@ created is released (leak checks must show it). It reads requests with exactly
 (`BUFFER_TOO_SMALL`) is a protocol violation: the launcher closes that client connection (it
 would otherwise block the queue head forever) and closes every handle that arrived with a bad
 request. The launcher serves **one client**, so closing that connection ends the launcher (and
-the supervisor rebuilds the stack; `TIDY-UP.md` T30).
+the supervisor rebuilds the stack; tidy item T30).
 
 ## 7. File protocol (memfs)
 
@@ -197,7 +196,7 @@ Rules:
   cannot be written (`SHOULD_WAIT`, queue full; or `NO_MEMORY`, the kernel's global IPC budget)
   is held as that connection's single pending reply and the connection is polled on a 10 ms
   timer instead of being bound to the port (a channel's WRITABLE means room for *some* message,
-  so a binding would spin: `TIDY-UP.md` T28); a client that never reads therefore stalls only
+  so a binding would spin: tidy item T28); a client that never reads therefore stalls only
   itself, and the connection is closed after 30 s. Requests are read with exact `max_handles` for their op; `BUFFER_TOO_SMALL` or any
   unexpected handle is a protocol violation (close the connection, close every received
   handle). A malformed request gets `BAD_REQUEST` when a `txid` can be read, else the connection
@@ -381,7 +380,7 @@ exits on `halt` (section 8).
   `rt` heap's mapped VMOs do not "shrink", so no baseline comparison is attempted between
   rounds inside a process.
 
-## 13. Syscall authority S4 leaves ambient (to tighten with jobs, Q9; see `TIDY-UP.md` T1, T2, T4)
+## 13. Syscall authority S4 leaves ambient (to tighten with jobs, Q9; see tidy item T1, T2, T4)
 
 `process_create`, `vmo_create`, `socket_create`, `channel_create`, `event_create`,
 `debug_write`, thread creation in one's own process. A confined program can therefore create
@@ -402,8 +401,7 @@ deputy (no paths: `GetVmo` plus VMO slices, no channel copies of programs); `##`
 serial bridge; stale statements.
 
 Defaults chosen for the product-owner questions (change any by saying so):
-1. `ls` and `cat` are in `/etc/trusted` (they get a read-only root; recorded as `TIDY-UP.md`
-   T3); other programs are confined. A fuller powerbox (the shell opens path arguments) waits for the manifest-driven
+1. `ls` and `cat` are in `/etc/trusted` (they get a read-only root; recorded as tidy item T3); other programs are confined. A fuller powerbox (the shell opens path arguments) waits for the manifest-driven
    shell milestone.
 2. A child's `CWD` is read-only.
 3. A kill-only `KILL` right is added to the kernel in S4a.

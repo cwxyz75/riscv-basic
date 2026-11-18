@@ -1,8 +1,7 @@
 # W: targeted wake and ports as registrations (specification, v1)
 
-Status: v1, written 2026-11-14 from the Fable design recommendation (`reviews/2026-11-14-wake-path-design.md`,
-finding D1 of `reviews/2026-11-14-design-review.md`) and the owner's decisions recorded in `ROADMAP.md` (slice W).
-Nothing in sections 3 and 4 is built yet; step 0 (counters, the baseline, this document) is. This file is the written
+Version: v1, written 2026-11-14 from the Fable design recommendation (`docs/records/reviews/2026-11-14-wake-path-design.md`,
+finding D1 of `docs/records/reviews/2026-11-14-design-review.md`) and the owner's decisions of 2026-11-14 (OD80). This file is the
 acceptance contract for W (CLAUDE.md: spec, then acceptance checks, then code, then independent review).
 
 ## 1. The problem, measured
@@ -88,8 +87,8 @@ kcore API is written as prepare / commit / cancel now.
 
 ## 5. Acceptance (written first)
 
-Step 0 (done): counters and the bystander baseline (section 1); the baseline test asserts that the defect is visible
-(`busy spurious > quiet spurious`) and that the counters count, and is flipped by `TARGETED_WAKE`. Still to write with
+Step 0: counters and the bystander baseline (section 1); the baseline test asserts that the defect is visible
+(`busy spurious > quiet spurious`) and that the counters count, and is flipped by `TARGETED_WAKE`. Written with
 step 2: the shuttle model of the idle/wake/IPI protocol (T38; the storm currently hides any lost reschedule poke) and the
 `channel_call` round-trip benchmark with 0 and N bystanders.
 
@@ -106,12 +105,12 @@ that evaluates every blocked waiter's real predicate after each commit and panic
 
 ## 6. Migration (each step green and bootable)
 
-0. Counters, baseline, this document (built). 1. (built) The dirty log and touch rules in `kcore`, no behaviour change, with the
-completeness property test. 2. Wake by thread id for futex and kill (built; the T38 shuttle model and the `channel_call` benchmark move to step 3). 3. `kcore::wait` with thread waiters (`object_wait`,
+0. Counters, baseline, this document. 1. The dirty log and touch rules in `kcore`, no behaviour change, with the
+completeness property test. 2. Wake by thread id for futex and kill (the T38 shuttle model and the `channel_call` benchmark move to step 3). 3. `kcore::wait` with thread waiters (`object_wait`,
 `channel_call`, kernel reads, IRQ); ports still use the global queue, woken only when a port could be affected. 4. Ports as
-registrations (built in part: port waits are woken by id and bindings are quota-limited; the exact ready set, wake-one baton and per-handle lifetime are not: T60, T61). 5. Retire the queue (built) and the hand-kept syscall list; documents
+registrations (the exact ready set, the wake-one baton and per-handle lifetime are SCHED-SMP-SPEC task 21). 5. Retire the queue and the hand-kept syscall list; documents
 (SYSCALLS execution model, `object_wait`, ports; INVARIANTS C3b rewritten, W1-W4, P1, PW; T12 and the futex half of T49
-resolved). 6. One-shot bindings and `port_rearm` (built, with the removal of the 256-binding cap: the job quota is the limit).
+resolved). 6. One-shot bindings and `port_rearm` (with the removal of the 256-binding cap: the job quota is the limit).
 
 ## 7. Risks
 

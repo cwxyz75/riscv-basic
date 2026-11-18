@@ -1,10 +1,9 @@
 # S5: SMP (spec, v2)
 
-Status: v2, after a Fable review of v1 against the real code (findings folded in below and
-marked *[R#]*). S5a-S5e are built (2026-11-13; as-built notes and later amendments are in the decision log, OD60-OD62). This file is the written acceptance
+Version: v2, after a Fable review of v1 against the real code (findings folded in below and
+marked *[R#]*), 2026-11-13; later amendments are in the decision log (OD60 to OD62, `docs/records/decisions.md`). This file is the acceptance
 contract for S5 (CLAUDE.md: every milestone needs a runnable acceptance check written before
-the code). Decisions made here are logged as OD60 and later in `OS-ARCHITECTURE.md` section 17
-when the spec is accepted.
+the code).
 
 ## 1. Goal and non-goals
 
@@ -155,14 +154,14 @@ nothing shared).
 
 ## 7. Slices, in order (each leaves `main` green, one PR each)
 
-**S5a: bring-up with parked harts (built).** *(Deviation: `ticks()` stays the boot hart's counter in S5a, since only the boot hart schedules; the time-CSR clock moves to S5b/S5c where several harts tick. Each hart has its own deadline already.)* `PerHart`, the `tp`/`sscratch` convention (landed first, with the
+**S5a: bring-up with parked harts.** *(Revision: `ticks()` stays the boot hart's counter in S5a, since only the boot hart schedules; the time-CSR clock moves to S5b/S5c where several harts tick. Each hart has its own deadline already.)* `PerHart`, the `tp`/`sscratch` convention (landed first, with the
 existing S3 suites as its regression test, before any second hart runs), per-hart `satp`, HSM discovery and
 start through `EARLY_ROOT`, per-hart timers on the time-CSR clock, idle threads that only idle; the
 scheduler still schedules on the boot hart only. Heap and console locks (K5) land here (secondaries print).
 Acceptance: `make os-boot-test` passes unchanged with `-smp 4`; `harts_come_online` sees `N` harts with
 distinct `tp`, each having taken at least 3 timer interrupts; `ipi_reaches_every_hart` (the boot hart sends
 `RESCHED`, every other hart's counter increments); `-smp 1` output unchanged.
-**S5b: the BKL and the multi-hart scheduler core, host first (built).** *(Deviations: the kernel keeps using the single-hart interface of `Sched` (hart 0) until S5c; the multi-hart interface, affinity, the pending-reschedule protocol and the audit are in and tested on the host. The loom/shuttle models of the lock hand-over and the wake/IPI/idle race were not written (TIDY-UP T38). Parked harts do not loop on the lock during the suite: the exact-count test is one bounded burst, and sustained contention comes with S5c, when every hart ticks and schedules under the lock.)* `kcore::sched` with `harts`, affinity and
+**S5b: the BKL and the multi-hart scheduler core, host first.** *(Revisions: the kernel keeps using the single-hart interface of `Sched` (hart 0) until S5c; the multi-hart interface, affinity, the pending-reschedule protocol and the audit are in and tested on the host. The loom/shuttle models of the lock hand-over and the wake/IPI/idle race were not written (TIDY-UP T38). Parked harts do not loop on the lock during the suite: the exact-count test is one bounded burst, and sustained contention comes with S5c, when every hart ticks and schedules under the lock.)* `kcore::sched` with `harts`, affinity and
 `current[hart]`, the weakened audit, a per-class model/property suite (random wake/sleep/priority/yield/
 exit across up to 8 harts: no thread lost, none on two harts, a pending reschedule or the best thread),
 and loom/shuttle models of the BKL hand-over (K3) and the wake/IPI/idle race. Kernel: `kernel_lock`, the
@@ -187,7 +186,7 @@ read), `teardown_with_threads_on_other_harts`, `kill_a_spinner_on_another_hart` 
 **Negative controls**: kernel features `fault-skip-shootdown` and `fault-skip-kernel-satp` that disable the
 shootdown and the kernel-`satp` switch must make the corresponding tests fail (the harness runs them like
 `fail-demo`).
-**S5e: stress and icount (built, without SMP icount).** *(Deviation: the suite is NOT run under `-icount` with more than one hart. QEMU then runs the virtual CPUs one at a time in fixed turns, and a spin lock hands over only when the other CPU gets its turn, so even `-smp 2` did not get through the first tests in 25 minutes; the single-hart icount run stays in the gate. TIDY-UP T21 records it; the negative controls and the churn stress stand in for deterministic interleaving.)* A long stress run (random channel/VMO/process/thread/job churn from several
+**S5e: stress and icount, without SMP icount.** *(Revision: the suite is NOT run under `-icount` with more than one hart. QEMU then runs the virtual CPUs one at a time in fixed turns, and a spin lock hands over only when the other CPU gets its turn, so even `-smp 2` did not get through the first tests in 25 minutes; the single-hart icount run stays in the gate. TIDY-UP T21 records it; the negative controls and the churn stress stand in for deterministic interleaving.)* A long stress run (random channel/VMO/process/thread/job churn from several
 processes) with the lock-order checker and the end-of-run leak oracles (`job_ledger`, frames, objects,
 threads); the whole suite in icount mode with `-smp 4`; TIDY-UP T9, T10, T12, T21 updated (T11 recorded
 as worse, pointing at rung 3).

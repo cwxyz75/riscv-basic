@@ -1,6 +1,6 @@
 # LOGO language spec (draft v0.2)
 
-The second language of the machine, chosen at boot (see `ROADMAP.md`, M9).
+The second language of the machine, chosen at boot (see milestone M9 in `docs/records/roadmap-2026-11-18.md`).
 Like `BASIC.md`, this is the contract the implementation is built and tested
 against. The v0.2 open questions are all settled below (see "Decisions"); if you
 find a new ambiguity, mark it **(open)**, settle it here, and only then code it.

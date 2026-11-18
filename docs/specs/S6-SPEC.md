@@ -1,8 +1,8 @@
 # S6: storage drivers (spec, v1)
 
-Status: v1. S6a (section 3, including interrupt objects) and S6b (the driver and protocol) and S6c (device tree and driver manager) are built. This file is the written acceptance contract for S6
+Version: v1. This file is the acceptance contract for S6
 (CLAUDE.md: every milestone needs a runnable acceptance check, written before the code). Decisions
-made here are logged as OD64 and later in `OS-ARCHITECTURE.md` section 17.
+made here are OD64 and later in `docs/records/decisions.md`.
 
 ## 1. Goal and non-goals
 
@@ -122,9 +122,9 @@ Requests carry a transaction id the reply echoes.
 | `Write` | `sector: u64`, `count: u32`, data | status |
 | `Flush` | | status |
 
-Status: `Ok`, `BadRange`, `TooBig`, `ReadOnly`, `IoError`, `Timeout`, `BadRequest`. Bulk transfers
+Statuses: `Ok`, `BadRange`, `TooBig`, `ReadOnly`, `IoError`, `Timeout`, `BadRequest`. Bulk transfers
 through messages (small, <= 8 KiB) for S6; shared-buffer bulk transfer is a later optimisation
-(OS-ARCHITECTURE section 11, "moving data") recorded in TIDY-UP.
+(OS-ARCHITECTURE section 11, "moving data").
 
 ## 6. Test hardware
 

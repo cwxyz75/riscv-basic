@@ -1,7 +1,6 @@
 # T: kernel memory and cheap threads (specification, v1, 2026-11-14)
 
-Status: design for roadmap slice T (OD79 direction, OD82 this document). Step 0 (measurement, 16 KiB stacks) and
-step 3 (kernel stacks from frames with a guard page and an emergency stack) are built; see "Revision" below for what
+Version: v1, 2026-11-14, for slice T (OD79 direction, OD82 this document); see "Revision" below for what
 changed from the first draft and why. Tests come first, as always.
 
 **Revision (2026-11-14, while building).** Sections 3 and 7 below were drafted around a *kernel frame pool with its own
@@ -12,7 +11,7 @@ take frames from the frame database directly (`kernel/src/kstack.rs`); (2) a gro
 headroom for. So the pool and the slab allocator are dropped from this slice (the frame-pool crate was written and
 model-tested, then deleted as unused). What remains of section 3 is a growable heap window (a virtually contiguous
 window whose pages come from the frame database at safe points; `linked_list_allocator`'s `extend` already supports it);
-it is built (step 2 of the roadmap: grow-only, never inline, at the tail of syscalls and in the idle loop; `heap.rs`), because the thread limits and the per-job charging (steps 4 and 5) matter more and need
+it grows only (never inline, at the tail of syscalls and in the idle loop; `heap.rs`). The thread limits and the per-job charging (steps 4 and 5) need
 only the stacks off the heap. Stack slots keep their frames and mapping once made (a recycled slot can never meet a stale
 remote translation); returning them needs a shootdown and is deferred (T68).
 
@@ -104,13 +103,13 @@ after instead of the frame database's free count while the pool is the holder.
 * **One-syscall creation.** `thread_create` gets a variant that takes the entry, the stack top and the argument and
   returns the thread handle *and* starts it (today: create, then a second call to start). The old calls stay. The limits
   are raised to what the job quota allows (the fixed 8 and 4 go; the per-process cap becomes the handle-table size).
-* **Reserved, not built (T56):** `INTERRUPTED` in the status table; a per-thread `interrupt` flag in `kcore::sched`;
+* **Reserved (T56):** `INTERRUPTED` in the status table; a per-thread `interrupt` flag in `kcore::sched`;
   syscall `thread_interrupt(thread)` returning NOT_SUPPORTED; SYSCALLS.md says every wait may in future return
   INTERRUPTED and tells callers to treat it like a retry.
 
 ## 7. Migration (each step green and bootable; each its own small PR)
 
-0. (built) Measurement, 16 KiB stacks, this document, OD82.
+0. Measurement, 16 KiB stacks, this document, OD82.
 1. `KPool` and the service step in `kernel/src/kpool.rs` with host tests of the pure pool in `kcore` (`kcore::pool`,
    model-tested: no double free, no overlap, run splitting and merging); nothing uses it yet.
 2. Slab allocator replaces the fixed region as the global allocator; the region is kept as a bootstrap pool until the
@@ -118,7 +117,7 @@ after instead of the frame database's free count while the pool is the holder.
 3. Kernel stacks from the pool with a guard page and the emergency stack; the canary stays; negative control.
 4. Kernel-memory level in `kcore::job`; stacks and page tables charged; caps recomputed; T1 narrowed, T13 resolved.
 5. Deferred reaper, per-job stack free lists, one-syscall creation, raised limits.
-6. The reserved interrupt places and the documents; T56 stays open (cancellation itself is not built).
+6. The reserved interrupt places and the documents; cancellation itself is SCHED-SMP-SPEC task 26 (T56).
 
 ## 8. Acceptance (written first)
 

@@ -1,16 +1,15 @@
 # NET-DESIGN: an architecture proposal for the network stack (S8 and S9)
 
-Status: **draft v1, 2026-11-14, a proposal for discussion; nothing here is decided or built.** The concrete contract for S8, with
+Version: v1, 2026-11-14. The concrete contract for S8, with
 every message, constant and acceptance check, is `NET-SPEC.md`; this file is the architecture and its reasons. v1 folds in the scheduler,
-threads and service-directory work that landed after v0 (`SCHED-SMP-SPEC.md`, slices R, SD, DM, T) and three owner
+threads and service-directory work that came after v0 (`SCHED-SMP-SPEC.md`, slices R, SD, DM, T) and three owner
 settlements: doorbells are events, the threading model is left alone for now, and priorities are allowed for but not set
-(section 15 lists exactly what changed). It is design only (no code
-was written for it). It turns OD74's direction into something concrete enough to write an S8 spec from, and it
-records what a survey of existing stacks suggests we keep and avoid. When the owner accepts parts of it they become
-ODs (section 13) and `NET-SPEC.md` (the S8 slice spec, with its acceptance checks, written before any code).
+(section 15 lists exactly what changed). It turns OD74's direction into something concrete enough to write an S8 spec from, and it
+records what a survey of existing stacks suggests we keep and avoid. The parts that were accepted are ODs (OD98 onward,
+`docs/records/decisions.md`) and `NET-SPEC.md`.
 
 Sources of constraint: `OS-ARCHITECTURE.md` section 13 and OD18, OD59, OD64-OD66, OD73-OD97; `R-SPEC.md`; `W-SPEC.md`;
-`SD-SPEC.md`; `SCHED-SMP-SPEC.md`; `S6-SPEC.md`; `SYSCALLS.md`; `reviews/2026-11-14-design-review.md` (D4, D8, D10, D11, D12).
+`SD-SPEC.md`; `SCHED-SMP-SPEC.md`; `S6-SPEC.md`; `SYSCALLS.md`; `docs/records/reviews/2026-11-14-design-review.md` (D4, D8, D10, D11, D12).
 
 ## 1. What the platform gives us, and what it does not
 
@@ -407,7 +406,7 @@ sets its own per-account and pool limits for endpoints, and the S8 spec must cho
 a few hundred in all, each endpoint also charged its stack-side state). The accounts themselves are R's (OD77, OD84): a client's
 root connection comes from whoever launches it, and every endpoint it opens is charged to that account. `rt` gains a small
 client library for the service (typed requests with a mandatory deadline, reconnect on `UNAVAILABLE`), which is the typed
-request/reply client slice R has not yet built.
+request/reply client of slice R.
 
 ## 8. Threads, and how far OTP goes
 
@@ -423,7 +422,7 @@ The question was whether an OTP-like model helps given our threading limits. The
 * **Connections are temporary**: never restarted by the supervisor; the client reconnects.
 
 **What we do not take (for now): a process or thread per connection.** Owner decision, 2026-11-14: leave the threading model
-alone; T67 in `TIDY-UP.md` records that we want to reconsider it. Reasons as they stand after the scheduler work:
+alone; work item T67 records that we want to reconsider it. Reasons as they stand after the scheduler work:
 
 * Thread *creation* is now cheap and thousands fit, but each thread costs about 25 to 30 KiB of memory **charged to the job that
   makes it**, which for a thread inside `netd` is `netd`'s job, not the client's. A thread per connection would put the memory
@@ -491,7 +490,7 @@ recorder** VMO (the last few dozen frame headers and events) that `netsup` print
 
 **Dependency:** slice SD does not currently include a supervisor library (R explicitly leaves restart strategies to the
 registry work). `netsup` therefore needs one of (a) the supervisor library to land first, (b) a hand-rolled supervisor with
-the restart-intensity logic as a pure, host-tested module and a `TIDY-UP.md` entry to port it. Recommended: (b) written so it
+the restart-intensity logic as a pure, host-tested module and a tidy item to port it. Recommended: (b) written so it
 *becomes* that library (section 12, Q3).
 
 ## 10. Time
@@ -561,7 +560,7 @@ contracts are the parts most worth attacking), and of the finished slice against
 
 ## 13. Dependencies, order and proposed records
 
-Needs before S8 starts, and where each stands (re-read from the roadmap):
+Needs before S8 starts, and where each stood when this was written (2026-11-14, the starting point; progress is in `work/`):
 
 * **W** (targeted wake, so a doorbell wakes one waiter by id): built. Wake-one on ports (task 21) is *not* needed.
 * **V** (creator-pays commit, the read-only mapping of a foreign VMO): built.
@@ -585,7 +584,7 @@ directory, so numbers continue from OD98):
 * **OD100** the native network protocol, the datagram drop rule and the endpoint accounting (section 7), including that S9's
   stream data path is a prototype, not a given.
 * **OD101** the failure contracts and the one_for_one plus re-attach strategy (section 9).
-* A **`TIDY-UP.md`** entry for the hand-rolled supervisor, and one for "client-creates-the-socket is unproven". (T67, one
+* A **tidy item** for the hand-rolled supervisor, and one for "client-creates-the-socket is unproven". (T67, one
   thread per connection, already exists.)
 
 Suggested slice shape for S8 (to be turned into `NET-SPEC.md`): step 0 the spec and acceptance tests; 1 `netwire` and `netsim`;

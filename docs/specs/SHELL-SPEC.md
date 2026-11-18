@@ -1,10 +1,10 @@
 # SHELL-SPEC: the native shell (specification, draft v0, 2026-11-15)
 
-Status: **draft written from the 2026-11-15 design discussion with the owner. Nothing is built.** Items marked
-**Decided** were answered by the owner in that discussion; items marked **Proposal** are the drafter's and need a
-yes; items under **Open** (section 12) are deliberately undecided. None of it is in the decision log
-(`OS-ARCHITECTURE.md` section 17) yet. When accepted it amends **OD20** (the shell is a POSIX-ish powerbox):
-the powerbox role stays, the POSIX-ish syntax does not.
+Version: v0, 2026-11-15, from the design discussion with the owner, with later decisions marked inline (grammar v2,
+2026-11-16; section 12, 2026-11-17). Items marked
+**Decided** were answered by the owner; items marked **Proposal** are the drafter's and need a
+yes; items under **Open** (section 12) are deliberately undecided. It amends **OD20** (the shell is a POSIX-ish powerbox):
+the powerbox role stays, the POSIX-ish syntax does not; OD110 records the shell as the system's shell.
 
 Basis: the current shell is `init/src/bin/sh.rs` over the pure `shell-core` (a line grammar of `stage ('|' stage)*`,
 quotes, `#` comments, lexical `cd`/`pwd`; no variables, no control flow, no expansion), the confinement rules of OD20
@@ -149,7 +149,7 @@ transcripts) before the evaluator, in step SH0.
   Literal values pass to builtins, closures and the `data` primitives; at the **exec boundary** (an external program's
   argument) a map or list is still an error (rule 2). **Accessor sugar** (`$m.key`, `$l(2)`) is **Decided** (Q1b); `get-or`, `set-in`, `del-in`, `keys`, `len` remain the function forms.
 
-## 5.1 Grammar v1 (as built; superseded by grammar v2, section 5.2)
+## 5.1 Grammar v1 (superseded by grammar v2, section 5.2)
 
 This section records what `ish/` implemented before step SH2b replaced it (the goldens now pin grammar v2). Everything here is implemented in `ish/` (`parser.rs`) and pinned by `ish/tests/golden/*.t`. Where the sections above left a
 shape open, the choice made is marked **(chosen)**; changing one is a small edit in the parser and the goldens.
@@ -204,7 +204,7 @@ An uncaught failure prints its value to stderr as `ish: ...` and ends the script
 ## 5.2 Grammar v2 (**Decided** 2026-11-16; implemented in steps SH2b and SH4b, leftovers in TIDY-UP T129)
 
 One sentence per rule. **(new)** marks a change from grammar v1 (section 5.1), **(changed)** a revision of something v1
-has; unmarked rules are as built. The value model (section 4) is unchanged.
+has; unmarked rules are as in v1. The value model (section 4) is unchanged.
 
 **Values.**
 * **V1.** A value is text, a number, a boolean, `null`, a list, a map, a closure or a handle, and every value is immutable.
@@ -525,7 +525,7 @@ and `!` stay the success-based flow between commands. The markers are `calc` (yi
     SHELL-CORPUS asked for), templates (finding 11), `??` (finding 10), the no-value error (finding 3), jobs (finding 7),
     `parse-args`, `with-env` and `lossy-lines`.
 
-## 13. Shortcuts to record in `TIDY-UP.md` when built
+## 13. Shortcuts to record as tidy items
 
 No floating point (T-number to link: FP context saving); no streaming parsers; lexical `..` and the cwd-after-rename
 deviation (shared with the libc, see the namespace decision); `/etc/trusted` as the temporary grant source; YAML

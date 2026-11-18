@@ -220,11 +220,11 @@ reports every problem as a BASIC error and returns to `READY.`.
 
 ## The OS track
 
-A second, separate track (the S-series in `ROADMAP.md`) builds a multicore
+A second, separate track (the S-series; `docs/README.md`) builds a multicore
 capability microkernel with userspace servers, written entirely by AI. It has its
 own kernel binary and new crates, and may reuse the pure crates here without
-forking them. Its architecture, decision log (OD numbers) and open questions are in
-`OS-ARCHITECTURE.md`; none of it changes the design described in this file.
+forking them. Its architecture is `docs/specs/OS-ARCHITECTURE.md`, its decision log (OD numbers)
+`docs/records/decisions.md`, and its open questions are decision items in `work/`; none of it changes the design described in this file.
 
 ## Decision log
 
