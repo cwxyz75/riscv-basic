@@ -5,6 +5,13 @@ comes first. Do not stop to ask; decide, log (OS decision log, TIDY-UP) and go o
 sources (they are fetched, pinned by sha256, never committed).** If the
 conversation was compacted, read this file and `git log` / `gh pr list` to see where things stand, and tick items here as they land.
 
+**Overnight instruction from the owner (2026-11-17): the owner is asleep. Keep working through plan 2 until one of these: you truly
+cannot continue, the plan is complete, or the owner interrupts (which means they have woken). Do not stop to ask. For any important
+decision, use your best judgement, write the decision down (the OS decision log and a line in the "Decisions to discuss in the
+morning" list at the end of this file, with what was chosen, the alternative and why) and carry on. `fork()` is out of scope tonight
+(owner: ignore it). Do not start kernel locking tasks, namespaces or anything else that needs the owner's choice. Merge green PRs.
+Say plainly what was and was not run.**
+
 ## Plan 2 (written 2026-11-17, before bedtime; sizes are guesses)
 
 Rules for the night: the lighter local gate (`make fmt-check lint docs-check`, the one targeted test, `make check` when the image or a
@@ -72,3 +79,9 @@ check per new test; `make fmt-check lint docs-check` and `make check` before a p
 `-smp 4` when the shell, libc or protocols change; a fresh-context Fable review for authority and kernel slices (they have found real
 bugs twice: PR 208 and 209); shortcuts into TIDY-UP.md; tick ROADMAP boxes only when verified in QEMU; say plainly what was and was
 not run.
+
+## Decisions to discuss in the morning
+
+(Add one line per decision taken without the owner: what, the alternative, why, where it is recorded.)
+
+- (none yet)
