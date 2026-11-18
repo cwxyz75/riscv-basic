@@ -77,7 +77,7 @@ whatever time is left.
   and a corpus of real `configure` scripts checked against the host shell.
 - [ ] (not started: see "Decisions taken without the owner") **SD4: servers publish in the registry; clients reconnect on `UNAVAILABLE`** (`memfsd`, `launcher`, `devmgr`, `blkd`;
   `rt::fs` and the shell reconnect; T15 and T30 narrowed). Fable review (it touches every older server and the boot path).
-- [~] (batches 1 and 2 done: PRs 239 and 243; stays open) **LIBC2: libc phase 2.** Re-run `scripts/libc_gap_survey.py`, take the next cheap batch with host oracles, and record the
+- [~] (batches 1 to 3 done: PRs 239, 243 and 245; stays open) **LIBC2: libc phase 2.** Re-run `scripts/libc_gap_survey.py`, take the next cheap batch with host oracles, and record the
   new counts as a dated record next to `docs/records/LIBC-GAPS.md`. Stop when the plan's time runs out; LIBC2 stays open.
 
 ### Not in this plan
