@@ -17,7 +17,7 @@ printf '#define bswap_16(x) __builtin_bswap16(x)\n#define bswap_32(x) __builtin_
 make allnoconfig HOSTCC=cc >/dev/null 2>&1 || true
 python3 - "$@" <<'PY'
 import re
-APPLETS = ['BASENAME','DIRNAME','WC','HEAD','TAIL','UNIQ','CUT','TR','SEQ','TEE','SORT','MD5SUM','SHA256SUM','CAT','ECHO','TRUE','FALSE','NL','FOLD','EXPAND','UNEXPAND','REV','TAC','COMM','PASTE','CMP','OD','HEXDUMP','XXD','CKSUM','SHA1SUM','SHA512SUM','BASE64','YES','SLEEP','PRINTF','TEST','TEST1','TEST2','MKDIR','RM','LN','TOUCH','DD','TRUNCATE','FACTOR','SPLIT','FALSE','TRUE','GREP','EGREP','FGREP','SED','AWK','EXPR','FIND','LS','CP','MV','DIFF','DATE','UNAME','ID','WHOAMI','STAT','READLINK','REALPATH','CHMOD','MKTEMP','DU','DF','WHICH','LOGNAME','GROUPS','PWD','DIRNAME','TIMEOUT','KILL','HUSH','XARGS','ENV','NOHUP','TIME','TSORT','SUM','SHUF','NPROC','INSTALL','RMDIR','LINK','UNLINK','MKFIFO','TOUCH','TR','OD']
+APPLETS = ['BASENAME','DIRNAME','WC','HEAD','TAIL','UNIQ','CUT','TR','SEQ','TEE','SORT','MD5SUM','SHA256SUM','CAT','ECHO','TRUE','FALSE','NL','FOLD','EXPAND','UNEXPAND','REV','TAC','COMM','PASTE','CMP','OD','HEXDUMP','XXD','CKSUM','SHA1SUM','SHA512SUM','BASE64','YES','SLEEP','PRINTF','TEST','TEST1','TEST2','MKDIR','RM','LN','TOUCH','DD','TRUNCATE','FACTOR','SPLIT','FALSE','TRUE','GREP','EGREP','FGREP','SED','AWK','EXPR','FIND','LS','CP','MV','DIFF','DATE','UNAME','ID','WHOAMI','STAT','READLINK','REALPATH','CHMOD','MKTEMP','DU','DF','WHICH','LOGNAME','GROUPS','PWD','DIRNAME','TIMEOUT','KILL','HUSH','XARGS','ENV','NOHUP','TIME','TSORT','SUM','SHUF','NPROC','INSTALL','RMDIR','LINK','UNLINK','MKFIFO','TOUCH','TR','OD','TAR','FEATURE_TAR_CREATE','FEATURE_TAR_FROM','FEATURE_TAR_LONG_OPTIONS','FEATURE_TAR_GNU_EXTENSIONS','FEATURE_TAR_UNAME_GNAME']
 t = open('.config').read()
 def setopt(name, val='y'):
     global t
@@ -64,7 +64,7 @@ for d, _, names in os.walk('.'):
     if d.startswith(('scripts', 'docs', 'testsuite', 'examples')): continue
     txt = open(os.path.join(d, 'Kbuild')).read().replace('\\\n', ' ')
     for l in txt.split('\n'):
-        m = re.match(r'\s*lib-(\S+)\s*[:+]?=\s*(.*)', l)
+        m = re.match(r'\s*lib-([^\s:+=]+)\s*[:+]?=\s*(.*)', l)
         if not m: continue
         cond, objs = m.groups()
         c = re.match(r'\$\(CONFIG_(\w+)\)', cond)
@@ -72,6 +72,13 @@ for d, _, names in os.walk('.'):
             for o in objs.split():
                 if o.endswith('.o') and os.path.exists(os.path.join(d, o[:-2] + '.c')):
                     files.add(os.path.join(d, o[:-2] + '.c'))
+# archival/libarchive/Kbuild.src: COMMON_FILES are added by an INSERT step of the real build (its `lib-y += $(COMMON_FILES)`); the
+# archive applets (tar) need them
+if cfg.get('TAR') == 'y':
+    k = open('archival/libarchive/Kbuild.src').read().replace('\\\n', ' ')
+    m = re.search(r'COMMON_FILES:=(.*?)\n\n', k, re.S)
+    for o in re.findall(r'\w+\.o', m.group(1)):
+        files.add('archival/libarchive/' + o[:-2] + '.c')
 open(sys.argv[1], 'w').write('\n'.join(sorted(files)) + '\n')
 PY
 echo "busybox: $(wc -l < "$out/files.txt") source files, $(grep -c '=y' "$out/config") options set"

@@ -1,12 +1,12 @@
 /* This is a generated file, don't edit */
 
-#define NUM_APPLETS 89
+#define NUM_APPLETS 90
 #define KNOWN_APPNAME_OFFSETS 4
 
 const uint16_t applet_nameofs[] ALIGN2 = {
 106,
-232,
-359,
+235,
+364,
 };
 
 const char applet_names[] ALIGN1 = ""
@@ -80,6 +80,7 @@ const char applet_names[] ALIGN1 = ""
 "sum" "\0"
 "tac" "\0"
 "tail" "\0"
+"tar" "\0"
 "tee" "\0"
 "test" "\0"
 "time" "\0"
@@ -169,25 +170,26 @@ const char applet_names[] ALIGN1 = ""
 #define APPLET_NO_sum 67
 #define APPLET_NO_tac 68
 #define APPLET_NO_tail 69
-#define APPLET_NO_tee 70
-#define APPLET_NO_test 71
-#define APPLET_NO_time 72
-#define APPLET_NO_timeout 73
-#define APPLET_NO_touch 74
-#define APPLET_NO_tr 75
-#define APPLET_NO_true 76
-#define APPLET_NO_truncate 77
-#define APPLET_NO_tsort 78
-#define APPLET_NO_uname 79
-#define APPLET_NO_unexpand 80
-#define APPLET_NO_uniq 81
-#define APPLET_NO_unlink 82
-#define APPLET_NO_wc 83
-#define APPLET_NO_which 84
-#define APPLET_NO_whoami 85
-#define APPLET_NO_xargs 86
-#define APPLET_NO_xxd 87
-#define APPLET_NO_yes 88
+#define APPLET_NO_tar 70
+#define APPLET_NO_tee 71
+#define APPLET_NO_test 72
+#define APPLET_NO_time 73
+#define APPLET_NO_timeout 74
+#define APPLET_NO_touch 75
+#define APPLET_NO_tr 76
+#define APPLET_NO_true 77
+#define APPLET_NO_truncate 78
+#define APPLET_NO_tsort 79
+#define APPLET_NO_uname 80
+#define APPLET_NO_unexpand 81
+#define APPLET_NO_uniq 82
+#define APPLET_NO_unlink 83
+#define APPLET_NO_wc 84
+#define APPLET_NO_which 85
+#define APPLET_NO_whoami 86
+#define APPLET_NO_xargs 87
+#define APPLET_NO_xxd 88
+#define APPLET_NO_yes 89
 
 #ifndef SKIP_applet_main
 int (*const applet_main[])(int argc, char **argv) = {
@@ -261,6 +263,7 @@ stat_main,
 sum_main,
 tac_main,
 tail_main,
+tar_main,
 tee_main,
 test_main,
 time_main,
@@ -301,11 +304,11 @@ const uint8_t applet_flags[] ALIGN1 = {
 0xa3,
 0x2a,
 0x22,
-0xc2,
-0x30,
-0xcf,
-0x30,
-0xaf,
 0x02,
+0xc3,
+0x3c,
+0xc3,
+0xbc,
+0x0a,
 };
 

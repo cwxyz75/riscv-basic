@@ -411,7 +411,8 @@ impl Server {
                 self.stat_reply(key, txid, target);
             }
             op::FSTAT => {
-                if !need(pr::READ) {
+                // (a descriptor opened for writing may describe itself, as POSIX `fstat` allows: `tar` does it on its archive)
+                if !need(pr::READ) && !need(pr::WRITE) {
                     return self.send(key, txid, denied, 0, &[], None);
                 }
                 self.stat_reply(key, txid, Ok(node));

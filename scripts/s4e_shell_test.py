@@ -458,6 +458,51 @@ def main():
         rest.append(line)
     if rest != [b"2", want_md5, b"/tmp/t.txt.gz"]:
         fail(s, f"gzip: -l, the round trip or -k: {rest}")
+    # tar (the BusyBox applet): an archive it writes is read by the host's tar module, and it extracts what it wrote, also through gzip
+    import io
+    import tarfile
+    script = (
+        "busybox mkdir /tmp/d /tmp/e; busybox printf \"hello\\n\" > /tmp/d/a.txt; busybox printf \"world!\\n\" > /tmp/d/b.txt; "
+        "busybox tar cf /tmp/x.tar -C /tmp d; busybox ls -l /tmp/x.tar | busybox wc -l; "
+        "busybox tar cf - -C /tmp d | busybox od -b; echo END-TAR; "
+        "busybox tar xf /tmp/x.tar -C /tmp/e; busybox cat /tmp/e/d/a.txt /tmp/e/d/b.txt; "
+        "busybox tar cf - -C /tmp d | gzip -c | gzip -dc | busybox tar tf - | busybox sort; echo END-ALL"
+    )
+    s.prompt()
+    s.p.stdin.write(("busybox hush -c '" + script + "'\n").encode())
+    s.p.stdin.flush()
+    got = []
+    while True:
+        line = s.next_line("tar script")
+        if line == b"END-TAR":
+            break
+        got.append(line)
+    data = bytearray()
+    for l in got:
+        if re.fullmatch(rb"[0-7]{7}", l.strip()):  # (the closing offset: the length, after a `*`)
+            data += bytes(data[-16:]) * ((int(l, 8) - len(data)) // 16)
+        m = re.fullmatch(rb"([0-7]{7})( +[0-7]{3})+", l.strip())
+        if m:
+            off = int(l.split()[0], 8)
+            if off > len(data):  # (`*`: od left out lines equal to the one before)
+                data += bytes(data[-16:]) * ((off - len(data)) // 16)
+            data += bytes(int(w, 8) for w in l.split()[1:])
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(bytes(data)))
+        names = sorted(m.name for m in tf.getmembers())
+        contents = {m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()}
+    except tarfile.TarError as e:
+        fail(s, f"tar: the host's tarfile could not read the archive ({e})")
+    if names != ["d", "d/a.txt", "d/b.txt"] or contents != {"d/a.txt": b"hello\n", "d/b.txt": b"world!\n"}:
+        fail(s, f"tar: the host read {names} {contents}")
+    rest = []
+    while True:
+        line = s.next_line("tar script end")
+        if line == b"END-ALL":
+            break
+        rest.append(line)
+    if rest != [b"hello", b"world!", b"d/", b"d/a.txt", b"d/b.txt"]:
+        fail(s, f"tar: extract and the pipe through gzip: {rest}")
     # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
     step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
     s.wait_for_prompt = False
