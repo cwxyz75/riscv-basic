@@ -57,3 +57,4 @@ dated; a later record may correct an earlier one, which stays as written.
 | `records/S9-STEP1-RESULT.md` | The S9 data-path prototype's result. |
 | `records/S8-FOLLOWUP-SPEC.md`, `records/S9-STEP0-SPEC.md` | Briefs for single slices, as given. |
 | `records/SHELL-CORPUS.md` | The design probe that shaped the shell's syntax. |
+| `records/review-dispositions-2026-11-18.md` | What became of every review finding (fixed, tracked, or not recorded: T150). |

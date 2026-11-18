@@ -8,11 +8,10 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 
 ## Now (2026-11-18)
 
-1. **Documentation and work-queue reorganisation** (agreed with the owner 2026-11-18). Work lists out of the documents:
-   `work/` replaces the old roadmap, the old tidy-up register and the old plan; documentation moves to `docs/specs`, `docs/reference` and
-   `docs/records`; specs say what the system is, not how far it is built; changes to a spec are dated amendments appended
-   to it; records are append-only. Then every review finding that still needs action is checked to have an item, and the
-   migrated items are checked against the code (stale ones closed).
+1. **Documentation and work-queue reorganisation** (agreed with the owner 2026-11-18). Done in PRs 232 (the work queue),
+   233 (`docs/`: specs, reference, records; progress out of the specs) and 234 (review dispositions). Left:
+   - `T151`: re-check the migrated tidy items against the code, one area at a time.
+   - `T150`: the review findings with no recorded outcome.
 
 ## Next: the owner's choice
 
