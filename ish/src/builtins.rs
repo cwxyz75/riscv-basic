@@ -79,6 +79,9 @@ const NAMES: &[&str] = &[
     "halt",
     "ns",
     "confine",
+    "jobs",
+    "fg",
+    "bg",
 ];
 
 /// The builtin names, for completion.
@@ -816,6 +819,37 @@ impl<H: Host> Shell<H> {
                     }
                     Err(e) => Err(error(&format!("cd: {p}: {}", e.message()))),
                 }
+            }
+            "jobs" => {
+                arity(name, a, 0, 0)?;
+                let rows: Vec<Val> = self
+                    .host
+                    .job_list()
+                    .into_iter()
+                    .map(|j| {
+                        let state = match j.run {
+                            crate::host::JobRun::Running => String::from("Running"),
+                            crate::host::JobRun::Stopped => String::from("Stopped"),
+                            crate::host::JobRun::Done(0) => String::from("Done"),
+                            crate::host::JobRun::Done(n) => format!("Done {n}"),
+                        };
+                        Val::record(vec![
+                            ("id", Val::int(i64::from(j.id))),
+                            ("state", Val::string(state)),
+                            ("name", Val::string(j.name)),
+                        ])
+                    })
+                    .collect();
+                Ok(Val::list(rows))
+            }
+            "fg" | "bg" => {
+                arity(name, a, 0, 1)?;
+                let id = match a.first() {
+                    None => None,
+                    Some(Val::Num(Number::Int(i))) if *i > 0 && *i <= i64::from(u32::MAX) => Some(*i as u32),
+                    Some(v) => return Err(error(&format!("{name} needs a job number, got {}", echo_line(v)))),
+                };
+                self.continue_job(id, name == "fg")
             }
             "ns" => {
                 arity(name, a, 0, 0)?;

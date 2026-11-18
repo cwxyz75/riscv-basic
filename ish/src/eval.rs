@@ -426,7 +426,9 @@ impl<H: Host> Shell<H> {
                             _ => Vec::new(),
                         };
                         let mut text = String::new();
-                        for st in list.into_iter().filter(|&s| s != 0 && s != 141) {
+                        for st in list.into_iter().filter(|&s| {
+                            s != 0 && s != 141 && s != i64::from(crate::host::STOPPED_STATUS)
+                        }) {
                             text.push_str(&format!("[exit {st}]\n"));
                         }
                         let _ = self.out(text.as_bytes());

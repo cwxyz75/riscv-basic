@@ -18,7 +18,10 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ish::host::{Host, HostError, OpenMode, Pid, ProcIo, Stream, TermIn, WaitOutcome};
+use ish::host::{
+    Host, HostError, JobLine, JobRun, OpenMode, Pid, ProcIo, Stream, TermIn, WaitOutcome,
+    STOPPED_STATUS,
+};
 use proto::console::{self as ctl, Control};
 use proto::file::{flags, rights};
 use proto::startup::{Role, Startup};
@@ -101,6 +104,15 @@ struct Os {
     next_stream: u32,
     procs: BTreeMap<u32, u32>,
     next_pid: u32,
+    /// What each started program was run as (argv joined), for the job table.
+    cmdlines: BTreeMap<u32, String>,
+    /// Pipelines the terminal stopped (Ctrl-Z) or `bg` set running again (SIG2): the job table of `jobs`, `fg` and `bg`.
+    job_table: Vec<JobEntry>,
+    next_job: u32,
+    /// Ctrl-Z arrived (the console server's `JobStop`): the wait for the foreground job stops it.
+    stop_req: bool,
+    /// The number of the job `fg` brought back: if it is stopped again it keeps its number.
+    resumed_job: Option<u32>,
     killed: bool,
     /// The session's profile (UV5): its program grants replace `/etc/trusted`, and its identity is in every program's environment.
     session_env: Vec<(String, String)>,
@@ -298,6 +310,15 @@ fn host_err(e: i32) -> HostError {
     }
 }
 
+/// One entry of the shell's job table: a pipeline the terminal stopped, or one `bg` let go on.
+struct JobEntry {
+    id: u32,
+    pids: Vec<u32>,
+    running: bool,
+    /// The terminal mode the program had set when it was stopped.
+    mode: Option<u8>,
+}
+
 impl Os {
     fn say(&self, bytes: &[u8]) {
         say(self.tty, bytes);
@@ -340,6 +361,7 @@ impl Os {
                 Some(ctl::Event::Interrupt) => self.interrupt = true,
                 Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
                 Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                Some(ctl::Event::JobStop) => self.stop_req = true,
                 Some(ctl::Event::Hangup) => self.hangup_foreground(),
                 _ => {}
             }
@@ -356,6 +378,48 @@ impl Os {
                 sys::channel_write(b.sig, [2u8].as_ptr(), 1, core::ptr::null(), 0);
             }
         }
+    }
+
+    /// Ctrl-Z reached a running job (SIG2): stop every program of the foreground job (`process_suspend`) and keep them as a job
+    /// of the table. `false` if there is nothing to stop.
+    fn stop_foreground(&mut self) -> bool {
+        let pids: Vec<u32> = self
+            .fg_pids
+            .iter()
+            .copied()
+            .filter(|p| self.procs.contains_key(p))
+            .collect();
+        if pids.is_empty() {
+            return false;
+        }
+        for p in &pids {
+            sys::process_suspend(self.procs[p]);
+        }
+        // the program's terminal mode goes with the job: `fg` puts it back
+        let mode = self
+            .control_query(Control::GetMode)
+            .and_then(|m| u8::try_from(m).ok());
+        let id = self.resumed_job.take().unwrap_or_else(|| {
+            self.next_job += 1;
+            self.next_job - 1
+        });
+        let name = self.job_name(&pids);
+        self.say(format!("[{id}]+  Stopped  {name}\r\n").as_bytes());
+        self.job_table.push(JobEntry {
+            id,
+            pids,
+            running: false,
+            mode,
+        });
+        true
+    }
+
+    fn job_name(&self, pids: &[u32]) -> String {
+        let names: Vec<&str> = pids
+            .iter()
+            .map(|p| self.cmdlines.get(p).map_or("?", |s| s.as_str()))
+            .collect();
+        names.join(" | ")
     }
 
     /// Ctrl-\\ reached a running job: the console server has ended the programs on the list it was given, and the shell ends the
@@ -498,6 +562,7 @@ impl Os {
                     Some(ctl::Event::Interrupt) => self.interrupt = true,
                     Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
                     Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                    Some(ctl::Event::JobStop) => self.stop_req = true,
                     Some(ctl::Event::Hangup) => self.hangup_foreground(),
                     _ => {}
                 }
@@ -546,6 +611,7 @@ impl Os {
                             Some(ctl::Event::Interrupt) => self.interrupt = true,
                             Some(ctl::Event::JobInterrupt) => self.sigint_foreground(),
                             Some(ctl::Event::JobQuit) => self.quit_foreground(),
+                            Some(ctl::Event::JobStop) => self.stop_req = true,
                             Some(ctl::Event::Hangup) => self.hangup_foreground(),
                             _ => {}
                         }
@@ -887,6 +953,35 @@ impl Os {
                         {
                             Some(h) => {
                                 sys::process_kill(h, -1);
+                                0
+                            }
+                            None => proto::file::status::NOT_FOUND,
+                        }
+                    }
+                    Some(_) if sig == 19 || sig == 18 => {
+                        // SIGSTOP and SIGCONT are not messages either: the shell suspends or resumes the process (SIG2, OD123); a
+                        // SIGCONT also goes to the program's signal channel, so that a handler runs where it waits
+                        let h = self
+                            .procs
+                            .get(&pid)
+                            .copied()
+                            .or_else(|| self.desc.get(&pid).map(|d| d.h));
+                        match h {
+                            Some(h) => {
+                                if sig == 19 {
+                                    sys::process_suspend(h);
+                                } else {
+                                    sys::process_resume(h);
+                                    if let Some(t) = target {
+                                        sys::channel_write(
+                                            t,
+                                            [18u8].as_ptr(),
+                                            1,
+                                            core::ptr::null(),
+                                            0,
+                                        );
+                                    }
+                                }
                                 0
                             }
                             None => proto::file::status::NOT_FOUND,
@@ -1604,6 +1699,7 @@ impl Host for Os {
             }
         };
         self.procs.insert(id, h);
+        self.cmdlines.insert(id, argv.join(" "));
         self.attach_broker(id, id);
         let announced: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
         self.proc_announce(id, h, &announced);
@@ -1625,6 +1721,9 @@ impl Host for Os {
             self.poll_ctl();
             if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
                 break;
+            }
+            if core::mem::take(&mut self.stop_req) && self.stop_foreground() {
+                return STOPPED_STATUS;
             }
             self.idle(&[h], u64::MAX);
         }
@@ -2051,7 +2150,105 @@ impl Host for Os {
         true
     }
 
+    fn job_list(&mut self) -> Vec<JobLine> {
+        let mut out = Vec::new();
+        let mut keep = Vec::new();
+        for e in core::mem::take(&mut self.job_table) {
+            let name = self.job_name(&e.pids);
+            if !e.running {
+                out.push(JobLine {
+                    id: e.id,
+                    run: JobRun::Stopped,
+                    name,
+                });
+                keep.push(e);
+                continue;
+            }
+            // a job in the background: done once every program of it has ended (then reaped and forgotten)
+            let ended = e.pids.iter().all(|p| {
+                self.procs
+                    .get(p)
+                    .is_none_or(|&h| sys::object_wait(h, signals::TERMINATED, 0).status == 0)
+            });
+            if ended {
+                let mut status = 0;
+                for p in &e.pids {
+                    if let Some(h) = self.procs.remove(p) {
+                        status = self.reap(*p, h);
+                    }
+                }
+                out.push(JobLine {
+                    id: e.id,
+                    run: JobRun::Done(status),
+                    name,
+                });
+            } else {
+                out.push(JobLine {
+                    id: e.id,
+                    run: JobRun::Running,
+                    name,
+                });
+                keep.push(e);
+            }
+        }
+        self.job_table = keep;
+        out
+    }
+
+    fn job_continue(
+        &mut self,
+        id: Option<u32>,
+        foreground: bool,
+    ) -> Result<Vec<(Pid, String)>, String> {
+        let at = match id {
+            Some(i) => self.job_table.iter().position(|e| e.id == i),
+            None => self
+                .job_table
+                .iter()
+                .rposition(|e| !foreground || !e.running)
+                .or_else(|| self.job_table.len().checked_sub(1)),
+        };
+        let Some(at) = at else {
+            return Err(match id {
+                Some(i) => format!("{i}: no such job"),
+                None => String::from("no jobs"),
+            });
+        };
+        if !foreground && self.job_table[at].running {
+            return Err(format!("{}: already running", self.job_table[at].id));
+        }
+        for p in &self.job_table[at].pids {
+            if let Some(&h) = self.procs.get(p) {
+                sys::process_resume(h);
+            }
+        }
+        let stages: Vec<(Pid, String)> = self.job_table[at]
+            .pids
+            .iter()
+            .map(|p| (Pid(*p), self.cmdlines.get(p).cloned().unwrap_or_default()))
+            .collect();
+        if foreground {
+            let e = self.job_table.remove(at);
+            self.resumed_job = Some(e.id);
+            // the terminal is the job's again, in the mode it left it
+            self.go_cooked();
+            if let Some(m) = e.mode {
+                self.control(Control::SetMode(m), &[]);
+            }
+            let name = self.job_name(&e.pids);
+            self.say(format!("{name}\r\n").as_bytes());
+        } else {
+            self.job_table[at].running = true;
+            let name = self.job_name(&self.job_table[at].pids);
+            let id = self.job_table[at].id;
+            self.say(format!("[{id}]+  {name} &\r\n").as_bytes());
+        }
+        Ok(stages)
+    }
+
     fn finished(&mut self) {
+        self.stop_req = false;
+        self.resumed_job = None;
         // a program's redirected output arrives a moment after it ends: let the files be stored before the next command
         let until = sys::clock_get() + 2000;
         while self.has_pumps() && sys::clock_get() < until {
@@ -2297,6 +2494,11 @@ pub fn app_main() -> i32 {
         next_stream: 3,
         procs: BTreeMap::new(),
         next_pid: 2,
+        cmdlines: BTreeMap::new(),
+        job_table: Vec::new(),
+        next_job: 1,
+        stop_req: false,
+        resumed_job: None,
         killed: false,
         session_env: Vec::new(),
         confined: Vec::new(),

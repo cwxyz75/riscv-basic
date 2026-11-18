@@ -38,6 +38,10 @@ struct Child {
     /// The process handle, or 0 for a child that ended before it began (a `vfork` child whose `exec` failed).
     h: u32,
     done: Option<i32>,
+    /// A stop was reported to `waitpid(WUNTRACED)` (so a continue can be reported to `WCONTINUED`).
+    stop_seen: bool,
+    /// SIGCHLD has been posted for this child's stop.
+    stop_notified: bool,
 }
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
@@ -53,6 +57,8 @@ fn register(pid: c_int, h: u32, done: Option<i32>) -> c_int {
         pid,
         h,
         done,
+        stop_seen: false,
+        stop_notified: false,
     });
     pid
 }
@@ -70,6 +76,31 @@ pub fn newly_exited() -> bool {
         }
     }
     any
+}
+
+/// Has a child stopped or continued since the last look? (SIGCHLD is posted for it, unless the program set `SA_NOCLDSTOP`.)
+pub fn newly_stopped() -> bool {
+    let mut any = false;
+    for c in CHILDREN.lock().iter_mut() {
+        if c.done.is_some() || c.h == 0 {
+            continue;
+        }
+        let stopped = sys::object_signals(c.h).a1 as u32 & signals::STOPPED != 0;
+        if stopped != c.stop_notified {
+            c.stop_notified = stopped;
+            any = true;
+        }
+    }
+    any
+}
+
+/// Stop the calling process (the default action of SIGSTOP and its kin): the shell that holds its handle suspends it, and the reply to
+/// this request comes only after something resumes it. Without a spawn grant nothing can stop it, and nothing happens.
+pub fn stop_self() {
+    let me = crate::sig::own_pid();
+    if me != 0 {
+        let _ = signal_via_shell(me as c_int, 19);
+    }
 }
 
 /// The process handles of the children that have not ended yet, for a wait that a child's end should wake.
@@ -285,6 +316,27 @@ pub fn kill_pid(pid: c_int, sig: c_int) -> c_int {
         if let Some(c) = g.iter().find(|c| c.pid == pid && c.h != 0) {
             sys::process_kill(c.h, -1);
             return 0;
+        }
+    }
+    if sig == 19 || sig == 18 {
+        // a child this process holds a handle to is stopped or continued directly (the handle carries KILL)
+        let h = CHILDREN
+            .lock()
+            .iter()
+            .find(|c| c.pid == pid && c.h != 0)
+            .map(|c| c.h);
+        if let Some(h) = h {
+            let r = if sig == 19 {
+                sys::process_suspend(h)
+            } else {
+                sys::process_resume(h)
+            };
+            if r.status == 0 {
+                if sig == 18 {
+                    let _ = signal_via_shell(pid, 18); // (a handler of SIGCONT runs where the child waits)
+                }
+                return 0;
+            }
         }
     }
     // a child this process holds exists until it is waited for, whatever the shell says (it has no grant of its own below the
@@ -664,8 +716,10 @@ pub unsafe extern "C" fn posix_spawnp(
 
 // ---- waiting and killing ----
 
-/// `WNOHANG`.
+/// `WNOHANG`, `WUNTRACED` and `WCONTINUED`.
 const WNOHANG: c_int = 1;
+const WUNTRACED: c_int = 2;
+const WCONTINUED: c_int = 8;
 
 #[no_mangle]
 pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
@@ -674,7 +728,7 @@ pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int)
             let mut g = CHILDREN.lock();
             let mut any = false;
             let mut found = None;
-            for (i, c) in g.iter().enumerate() {
+            for (i, c) in g.iter_mut().enumerate() {
                 if pid > 0 && c.pid != pid {
                     continue;
                 }
@@ -686,6 +740,26 @@ pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int)
                 if over {
                     found = Some(i);
                     break;
+                }
+                // a stop is reported once to `WUNTRACED`, and the continue after it once to `WCONTINUED`
+                if c.h != 0 {
+                    let stopped = sys::object_signals(c.h).a1 as u32 & signals::STOPPED != 0;
+                    if stopped && !c.stop_seen && options & WUNTRACED != 0 {
+                        c.stop_seen = true;
+                        if !status.is_null() {
+                            *status = (19 << 8) | 0x7f; // stopped by SIGSTOP
+                        }
+                        return c.pid;
+                    }
+                    if !stopped && c.stop_seen {
+                        c.stop_seen = false;
+                        if options & WCONTINUED != 0 {
+                            if !status.is_null() {
+                                *status = 0xffff;
+                            }
+                            return c.pid;
+                        }
+                    }
                 }
             }
             if let Some(i) = found {
@@ -715,8 +789,32 @@ pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int)
                 .map(|c| c.h)
                 .collect()
         };
-        let items: Vec<(u32, u32)> = handles.iter().map(|&h| (h, signals::TERMINATED)).collect();
-        if let crate::sig::Wait::Interrupted = crate::sig::wait_any(&items, u64::MAX, true) {
+        // (a child that is stopped and already reported does not wake the wait: the level signal would spin it)
+        let want_stop = options & WUNTRACED != 0;
+        let mut watching_continue = false;
+        let items: Vec<(u32, u32)> = {
+            let g = CHILDREN.lock();
+            handles
+                .iter()
+                .map(|&h| {
+                    let seen = g.iter().any(|c| c.h == h && c.stop_seen);
+                    watching_continue |= seen;
+                    let mask = if want_stop && !seen {
+                        signals::TERMINATED | signals::STOPPED
+                    } else {
+                        signals::TERMINATED
+                    };
+                    (h, mask)
+                })
+                .collect()
+        };
+        // (the end of a stop is a level that goes away, which wakes nothing: look again soon when a continue is asked for)
+        let deadline = if watching_continue && options & WCONTINUED != 0 {
+            sys::clock_get() + 10
+        } else {
+            u64::MAX
+        };
+        if let crate::sig::Wait::Interrupted = crate::sig::wait_any(&items, deadline, true) {
             errno::set(4); // EINTR
             return -1;
         }
