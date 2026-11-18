@@ -43,22 +43,9 @@ static PARENT_PID: AtomicU32 = AtomicU32::new(0);
 static ALARM_AT: AtomicU64 = AtomicU64::new(0);
 static ALARM_EVERY: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy)]
-struct Table {
-    handler: [Handler; 65],
-    mask: [u64; 65],
-    flags: [c_int; 65],
-    blocked: u64,
-    pending: u64,
-}
+use cfmt::sigtab::SigTable as Table;
 
-static TABLE: Mutex<Table> = Mutex::new(Table {
-    handler: [SIG_DFL; 65],
-    mask: [0; 65],
-    flags: [0; 65],
-    blocked: 0,
-    pending: 0,
-});
+static TABLE: Mutex<Table> = Mutex::new(Table::new());
 
 /// The signal state a `vfork` child must not change for its parent: saved when `vfork` is called, put back when the child ends
 /// (the signals that arrived meanwhile stay pending).
@@ -192,27 +179,14 @@ pub fn deliver() -> Delivered {
             }
             return out;
         }
-        let (sig, h, flags, old) = {
-            let mut t = TABLE.lock();
-            let ready = t.pending & !t.blocked;
-            if ready == 0 {
-                return out;
-            }
-            let sig = ready.trailing_zeros() as c_int + 1;
-            t.pending &= !bit(sig);
-            let (h, mask, flags) = (
-                t.handler[sig as usize],
-                t.mask[sig as usize],
-                t.flags[sig as usize],
-            );
-            let old = t.blocked;
-            if h > SIG_IGN {
-                t.blocked |= mask | if flags & SA_NODEFER == 0 { bit(sig) } else { 0 };
-                if flags & SA_RESETHAND != 0 {
-                    t.handler[sig as usize] = SIG_DFL;
-                }
-            }
-            (sig, h, flags, old)
+        let Some(cfmt::sigtab::Ready {
+            sig,
+            handler: h,
+            flags,
+            old_blocked: old,
+        }) = TABLE.lock().take_ready(SA_NODEFER, SA_RESETHAND)
+        else {
+            return out;
         };
         match h {
             SIG_IGN => {}

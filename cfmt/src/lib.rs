@@ -11,6 +11,8 @@ pub mod getopt;
 pub mod glob;
 mod parse;
 mod printf;
+pub mod scan;
+pub mod sigtab;
 pub mod time;
 
 pub use parse::{strtod, strtol, strtoul, ParsedFloat, ParsedInt, ParsedUInt};

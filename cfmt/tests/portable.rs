@@ -1,4 +1,4 @@
-//! `fnmatch`, `getopt` and `strverscmp` (the pure cores in `cfmt::glob` and `cfmt::getopt`) against the host's own libc: generated
+//! `sscanf`, `fnmatch`, `getopt` and `strverscmp` (the pure cores in `cfmt::glob` and `cfmt::getopt`) against the host's own libc: generated
 //! patterns, option strings and argument vectors. The host is Apple's libc locally and glibc in CI, so a case that the two disagree
 //! about is left out: equivalence classes and collating symbols in brackets (`[[=a=]]`, `[[.a.]]`), unclosed brackets, GNU option
 //! permutation (the host option string gets a leading `+` on glibc) and optional arguments (`::`), and, for `strverscmp` (glibc only), digit runs
@@ -307,4 +307,426 @@ fn strverscmp_agrees_with_glibc() {
         compared += 1;
     }
     assert!(compared > 10_000);
+}
+
+// ---- sscanf ----
+
+mod host_scan {
+    use std::ffi::{c_char, c_int};
+    extern "C" {
+        pub fn sscanf(s: *const c_char, fmt: *const c_char, ...) -> c_int;
+    }
+}
+
+/// What the host's `sscanf` did with `fmt` on `input`: the return value and, for each of the conversions in `kinds`, the bytes it wrote
+/// (each into a 64-byte buffer that started as 0xAA, so "wrote nothing" shows). Up to four conversions are supported.
+fn host_sscanf(input: &str, fmt: &str, nargs: usize) -> (c_int, Vec<Vec<u8>>) {
+    let s = CString::new(input).unwrap();
+    let f = CString::new(fmt).unwrap();
+    let mut bufs = vec![[0xAAu8; 64]; 4];
+    let p: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+    let r = unsafe {
+        match nargs {
+            0 => host_scan::sscanf(s.as_ptr(), f.as_ptr()),
+            1 => host_scan::sscanf(s.as_ptr(), f.as_ptr(), p[0]),
+            2 => host_scan::sscanf(s.as_ptr(), f.as_ptr(), p[0], p[1]),
+            3 => host_scan::sscanf(s.as_ptr(), f.as_ptr(), p[0], p[1], p[2]),
+            _ => host_scan::sscanf(s.as_ptr(), f.as_ptr(), p[0], p[1], p[2], p[3]),
+        }
+    };
+    (r, bufs.iter().map(|b| b.to_vec()).collect())
+}
+
+/// The same, through `cfmt::scan`: the bytes the library would store in the same buffers.
+fn our_sscanf(input: &str, fmt: &str, nargs: usize) -> (c_int, Vec<Vec<u8>>) {
+    use cfmt::scan::{scan, Item};
+    let r = scan(input.as_bytes(), fmt.as_bytes());
+    let mut bufs = vec![vec![0xAAu8; 64]; 4];
+    assert!(r.items.len() <= nargs.max(r.items.len()));
+    for (k, item) in r.items.iter().enumerate() {
+        let b = &mut bufs[k];
+        match item {
+            Item::Int { value, len } => match len {
+                0 => b[..4].copy_from_slice(&(*value as u32).to_le_bytes()),
+                1 | 2 | 5 => b[..8].copy_from_slice(&value.to_le_bytes()),
+                3 => b[..2].copy_from_slice(&(*value as u16).to_le_bytes()),
+                _ => b[0] = *value as u8,
+            },
+            Item::Float { value, len } => {
+                if *len == 1 || *len == 5 {
+                    b[..8].copy_from_slice(&value.to_le_bytes());
+                } else {
+                    b[..4].copy_from_slice(&(*value as f32).to_le_bytes());
+                }
+            }
+            Item::Str(v) => {
+                b[..v.len()].copy_from_slice(v);
+                b[v.len()] = 0;
+            }
+            Item::Chars(v) => b[..v.len()].copy_from_slice(v),
+            Item::Count(n) => b[..4].copy_from_slice(&n.to_le_bytes()),
+        }
+    }
+    (r.ret, bufs)
+}
+
+#[test]
+fn sscanf_matches_the_host() {
+    let mut rng = Rng(0x5eed_5ca1);
+    let convs = [
+        "%d", "%i", "%u", "%o", "%x", "%ld", "%hd", "%hhd", "%lld", "%3d", "%s", "%4s", "%c",
+        "%[a-c]", "%[^,]", "%[0-9]", "%n", "%*d", "%*s", "%f", "%lf", "%%",
+    ];
+    let seps = ["", " ", ",", "-", " , ", "x", ":"];
+    let tokens = [
+        "0", "7", "-12", "+5", "42", "0x1f", "017", "999999", "abc", "a,b", "hello", "w0rld",
+        "3.5", "-2.25e2", "1e3", "%", " ", "  7", "", "zz", "-", "12abc",
+    ];
+    let mut bad = Vec::new();
+    for _ in 0..40000 {
+        let nconv = 1 + rng.below(3);
+        let mut fmt = String::new();
+        let mut nargs = 0;
+        for k in 0..nconv {
+            if k > 0 {
+                fmt.push_str(rng.pick(&seps));
+            }
+            let c = rng.pick(&convs);
+            fmt.push_str(c);
+            if !c.contains('*') && c != "%%" {
+                nargs += 1;
+            }
+        }
+        let mut input = String::new();
+        for k in 0..1 + rng.below(4) {
+            if k > 0 {
+                input.push_str(rng.pick(&seps));
+            }
+            input.push_str(rng.pick(&tokens));
+        }
+        if nargs > 4 {
+            continue;
+        }
+        // a `0x` with no hex digit after it: glibc fails the whole number, Apple's libc and this library read the `0` and stop (as
+        // `strtoul` does)
+        let ib = input.as_bytes();
+        if ib
+            .windows(3)
+            .any(|w| w[0] == b'0' && (w[1] == b'x' || w[1] == b'X') && !w[2].is_ascii_hexdigit())
+            || ib.ends_with(b"0x")
+            || ib.ends_with(b"0X")
+        {
+            continue;
+        }
+        // (the host needs an argument per conversion; float conversions write 4 or 8 bytes: compare what was written)
+        let h = host_sscanf(&input, &fmt, nargs);
+        let o = our_sscanf(&input, &fmt, nargs);
+        if h != o {
+            bad.push(format!(
+                "fmt {fmt:?} input {input:?}: host {:?} ours {:?}",
+                h.0, o.0
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} disagreements, first ones:\n{}",
+        bad.len(),
+        bad.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+// ---- the signal table ----
+
+mod host_sig {
+    use std::ffi::c_int;
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub struct SigAction {
+        pub handler: usize,
+        pub mask: u32,
+        pub flags: c_int,
+    }
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    #[allow(dead_code)] // (the kernel's layout has a field the test never reads)
+    pub struct SigAction {
+        pub handler: usize,
+        pub mask: [u64; 16],
+        pub flags: c_int,
+        pub restorer: usize,
+    }
+    #[cfg(target_os = "macos")]
+    pub type SigSet = u32;
+    #[cfg(target_os = "linux")]
+    pub type SigSet = [u64; 16];
+    extern "C" {
+        pub fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
+        pub fn sigprocmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+        pub fn sigemptyset(set: *mut SigSet) -> c_int;
+        pub fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
+        pub fn sigismember(set: *const SigSet, sig: c_int) -> c_int;
+        pub fn raise(sig: c_int) -> c_int;
+    }
+    #[cfg(target_os = "macos")]
+    pub const NODEFER: c_int = 0x10;
+    #[cfg(target_os = "macos")]
+    pub const RESETHAND: c_int = 0x4;
+    #[cfg(target_os = "linux")]
+    pub const NODEFER: c_int = 0x4000_0000;
+    #[cfg(target_os = "linux")]
+    pub const RESETHAND: c_int = 0x8000_0000u32 as c_int;
+    pub const SIG_BLOCK: c_int = if cfg!(target_os = "macos") { 1 } else { 0 };
+    pub const SIG_UNBLOCK: c_int = if cfg!(target_os = "macos") { 2 } else { 1 };
+    pub const SIGS: [c_int; 3] = [
+        1,
+        if cfg!(target_os = "macos") { 30 } else { 10 },
+        if cfg!(target_os = "macos") { 31 } else { 12 },
+    ];
+}
+
+/// One scenario for three signals: each handler logs, then raises some signals (only the first time it runs).
+#[derive(Clone)]
+struct SigCfg {
+    mask: [bool; 3],
+    nodefer: bool,
+    resethand: bool,
+    raises: Vec<usize>,
+}
+
+static SIG_LOG: std::sync::Mutex<Vec<(u8, usize, u8)>> = std::sync::Mutex::new(Vec::new());
+static SIG_CFGS: std::sync::Mutex<Vec<SigCfg>> = std::sync::Mutex::new(Vec::new());
+static SIG_SEEN: std::sync::Mutex<[bool; 3]> = std::sync::Mutex::new([false; 3]);
+
+fn host_blocked_bits() -> u8 {
+    let mut cur: host_sig::SigSet = Default::default();
+    unsafe {
+        host_sig::sigprocmask(host_sig::SIG_BLOCK, std::ptr::null(), &mut cur);
+    }
+    let mut b = 0;
+    for (k, s) in host_sig::SIGS.iter().enumerate() {
+        if unsafe { host_sig::sigismember(&cur, *s) } == 1 {
+            b |= 1 << k;
+        }
+    }
+    b
+}
+
+fn host_install(k: usize, cfg: &SigCfg, handler: usize) {
+    let mut set: host_sig::SigSet = Default::default();
+    unsafe {
+        host_sig::sigemptyset(&mut set);
+        for (m, on) in cfg.mask.iter().enumerate() {
+            if *on {
+                host_sig::sigaddset(&mut set, host_sig::SIGS[m]);
+            }
+        }
+    }
+    let flags = if cfg.nodefer { host_sig::NODEFER } else { 0 }
+        | if cfg.resethand {
+            host_sig::RESETHAND
+        } else {
+            0
+        };
+    #[cfg(target_os = "macos")]
+    let act = host_sig::SigAction {
+        handler,
+        mask: set,
+        flags,
+    };
+    #[cfg(target_os = "linux")]
+    let act = host_sig::SigAction {
+        handler,
+        mask: set,
+        flags,
+        restorer: 0,
+    };
+    assert_eq!(
+        unsafe { host_sig::sigaction(host_sig::SIGS[k], &act, std::ptr::null_mut()) },
+        0
+    );
+}
+
+extern "C" fn host_handler(sig: c_int) {
+    let k = host_sig::SIGS.iter().position(|s| *s == sig).unwrap();
+    let cfg = SIG_CFGS.lock().unwrap()[k].clone();
+    // (a one-shot handler is the default now: observe it, then install it again so a later raise does not end the process)
+    let mut old = std::mem::MaybeUninit::<host_sig::SigAction>::zeroed();
+    unsafe { host_sig::sigaction(sig, std::ptr::null(), old.as_mut_ptr()) };
+    let was_default = unsafe { old.assume_init_ref().handler } == 0;
+    SIG_LOG.lock().unwrap().push((
+        b'e',
+        k,
+        host_blocked_bits() | if was_default { 8 } else { 0 },
+    ));
+    if was_default {
+        host_install(k, &cfg, host_handler as *const () as usize);
+    }
+    let first = !std::mem::replace(&mut SIG_SEEN.lock().unwrap()[k], true);
+    if first {
+        for r in &cfg.raises {
+            unsafe { host_sig::raise(host_sig::SIGS[*r]) };
+        }
+    }
+    SIG_LOG.lock().unwrap().push((b'x', k, 0));
+}
+
+/// The same scenario on `SigTable`.
+/// Also says whether two different signals were ever ready together: the order between them is the system's (unspecified by POSIX,
+/// and Apple's differs from Linux's), so such scenarios are not compared.
+fn model_run(cfgs: &[SigCfg], initial: usize, blocked_first: bool) -> (Vec<(u8, usize, u8)>, bool) {
+    use cfmt::sigtab::{bit, SigTable, SIG_DFL};
+    struct M<'a> {
+        t: SigTable,
+        cfgs: &'a [SigCfg],
+        log: Vec<(u8, usize, u8)>,
+        seen: [bool; 3],
+        ambiguous: bool,
+    }
+    fn blocked_bits(t: &SigTable) -> u8 {
+        let mut b = 0;
+        for (k, s) in host_sig::SIGS.iter().enumerate() {
+            if t.blocked & bit(*s) != 0 {
+                b |= 1 << k;
+            }
+        }
+        b
+    }
+    fn install(m: &mut M, k: usize) {
+        let s = host_sig::SIGS[k] as usize;
+        let c = &m.cfgs[k];
+        m.t.handler[s] = 2;
+        m.t.mask[s] = c
+            .mask
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(i, _)| bit(host_sig::SIGS[i]))
+            .fold(0, |a, b| a | b);
+        m.t.flags[s] = (if c.nodefer { host_sig::NODEFER } else { 0 })
+            | (if c.resethand { host_sig::RESETHAND } else { 0 });
+    }
+    fn deliver(m: &mut M) {
+        loop {
+            if (m.t.pending & !m.t.blocked).count_ones() > 1 {
+                m.ambiguous = true;
+            }
+            let Some(r) = m.t.take_ready(host_sig::NODEFER, host_sig::RESETHAND) else {
+                break;
+            };
+            let k = host_sig::SIGS.iter().position(|s| *s == r.sig).unwrap();
+            assert!(r.handler > 1);
+            let was_default = m.t.handler[r.sig as usize] == SIG_DFL;
+            let b = blocked_bits(&m.t) | if was_default { 8 } else { 0 };
+            m.log.push((b'e', k, b));
+            if was_default {
+                install(m, k);
+            }
+            let first = !std::mem::replace(&mut m.seen[k], true);
+            if first {
+                for r2 in m.cfgs[k].raises.clone() {
+                    m.t.pending |= bit(host_sig::SIGS[r2]);
+                    deliver(m);
+                }
+            }
+            m.log.push((b'x', k, 0));
+            m.t.blocked = r.old_blocked;
+        }
+    }
+    let mut m = M {
+        t: SigTable::new(),
+        cfgs,
+        log: Vec::new(),
+        seen: [false; 3],
+        ambiguous: false,
+    };
+    for k in 0..3 {
+        install(&mut m, k);
+    }
+    if blocked_first {
+        for s in host_sig::SIGS {
+            m.t.blocked |= bit(s);
+        }
+    }
+    m.t.pending |= bit(host_sig::SIGS[initial]);
+    deliver(&mut m);
+    if blocked_first {
+        m.t.blocked = 0;
+        deliver(&mut m);
+    }
+    (m.log, m.ambiguous)
+}
+
+#[test]
+fn the_signal_table_matches_the_host() {
+    let mut rng = Rng(0x516_7ab1e);
+    let mut bad = Vec::new();
+    let mut skipped = 0;
+    for round in 0..1500 {
+        let mut cfgs: Vec<SigCfg> = Vec::new();
+        for k in 0..3 {
+            let mask = [rng.below(2) == 1, rng.below(2) == 1, rng.below(2) == 1];
+            // (Apple's `SA_RESETHAND` does not behave as the standard says in a nested handler: the scenario uses it on Linux only)
+            let (nodefer, resethand) = (
+                rng.below(3) == 0,
+                cfg!(target_os = "linux") && rng.below(3) == 0,
+            );
+            let mut raises = Vec::new();
+            for _ in 0..rng.below(3) {
+                let r = rng.below(3);
+                // (a handler that raises itself runs again at once only without a mask: the scenario bounds it by running once)
+                if r != k || rng.below(2) == 0 {
+                    raises.push(r);
+                }
+            }
+            cfgs.push(SigCfg {
+                mask,
+                nodefer,
+                resethand,
+                raises,
+            });
+        }
+        let initial = rng.below(3);
+        let blocked_first = rng.below(2) == 1;
+        // the host
+        *SIG_CFGS.lock().unwrap() = cfgs.clone();
+        *SIG_SEEN.lock().unwrap() = [false; 3];
+        SIG_LOG.lock().unwrap().clear();
+        for (k, c) in cfgs.iter().enumerate() {
+            host_install(k, c, host_handler as *const () as usize);
+        }
+        unsafe {
+            if blocked_first {
+                let mut all: host_sig::SigSet = Default::default();
+                host_sig::sigemptyset(&mut all);
+                for s in host_sig::SIGS {
+                    host_sig::sigaddset(&mut all, s);
+                }
+                host_sig::sigprocmask(host_sig::SIG_BLOCK, &all, std::ptr::null_mut());
+                host_sig::raise(host_sig::SIGS[initial]);
+                host_sig::sigprocmask(host_sig::SIG_UNBLOCK, &all, std::ptr::null_mut());
+            } else {
+                host_sig::raise(host_sig::SIGS[initial]);
+            }
+        }
+        let host = SIG_LOG.lock().unwrap().clone();
+        let (model, ambiguous) = model_run(&cfgs, initial, blocked_first);
+        if ambiguous {
+            skipped += 1;
+            continue;
+        }
+        if host != model {
+            bad.push(format!("round {round}: initial {initial} blocked_first {blocked_first}\n  host  {host:?}\n  model {model:?}\n  masks {:?} nodefer {:?} resethand {:?} raises {:?}", cfgs.iter().map(|c| c.mask).collect::<Vec<_>>(), cfgs.iter().map(|c| c.nodefer).collect::<Vec<_>>(), cfgs.iter().map(|c| c.resethand).collect::<Vec<_>>(), cfgs.iter().map(|c| c.raises.clone()).collect::<Vec<_>>()));
+        }
+    }
+    assert!(
+        skipped < 1300,
+        "too many scenarios skipped as ambiguous: {skipped}"
+    );
+    assert!(
+        bad.is_empty(),
+        "{} disagreements; first:\n{}",
+        bad.len(),
+        bad.iter().take(2).cloned().collect::<Vec<_>>().join("\n")
+    );
 }

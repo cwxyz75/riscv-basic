@@ -1227,233 +1227,41 @@ impl ArgSlots {
     }
 }
 
-/// `vsscanf`: `%d %i %u %o %x %f %s %c %[set] %n %%`, with `*`, a field width and the `hh h l ll z j t L` modifiers.
+/// `vsscanf`: the scan itself is `cfmt::scan::scan` (host-tested against the host's `sscanf`); this stores what it found through the
+/// pointers in the argument slots, in order.
 #[no_mangle]
 pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *const u64) -> c_int {
+    use cfmt::scan::Item;
     let input = core::ffi::CStr::from_ptr(s).to_bytes();
     let f = core::ffi::CStr::from_ptr(fmt).to_bytes();
     let mut args = ArgSlots(ap);
-    let (mut i, mut j, mut done) = (0usize, 0usize, 0 as c_int);
-    let mut stored_any = false;
-    while j < f.len() {
-        let c = f[j];
-        if c.is_ascii_whitespace() {
-            while input.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-                i += 1;
-            }
-            j += 1;
-            continue;
-        }
-        if c != b'%' {
-            if input.get(i) != Some(&c) {
-                return if i >= input.len() && !stored_any {
-                    -1
+    let r = cfmt::scan::scan(input, f);
+    for item in &r.items {
+        let p = args.next_ptr();
+        match item {
+            Item::Int { value, len } => match len {
+                0 => *(p as *mut u32) = *value as u32,
+                1 | 2 | 5 => *(p as *mut u64) = *value,
+                3 => *(p as *mut u16) = *value as u16,
+                _ => *(p as *mut u8) = *value as u8,
+            },
+            Item::Float { value, len } => {
+                if *len == 1 || *len == 5 {
+                    *(p as *mut f64) = *value;
                 } else {
-                    done
-                };
-            }
-            i += 1;
-            j += 1;
-            continue;
-        }
-        j += 1;
-        let suppress = f.get(j) == Some(&b'*');
-        if suppress {
-            j += 1;
-        }
-        let mut width = 0usize;
-        while f.get(j).is_some_and(|b| b.is_ascii_digit()) {
-            width = width * 10 + usize::from(f[j] - b'0');
-            j += 1;
-        }
-        let mut len = 0u8; // 0 int, 1 long, 2 long long, 3 short, 4 char, 5 long double
-        loop {
-            match f.get(j) {
-                Some(b'l') => len = if len == 1 { 2 } else { 1 },
-                Some(b'h') => len = if len == 3 { 4 } else { 3 },
-                Some(b'z') | Some(b'j') | Some(b't') => len = 1,
-                Some(b'L') => len = 5,
-                _ => break,
-            }
-            j += 1;
-        }
-        let Some(&conv) = f.get(j) else { break };
-        j += 1;
-        if conv == b'%' {
-            if input.get(i) != Some(&b'%') {
-                return done;
-            }
-            i += 1;
-            continue;
-        }
-        if conv == b'n' {
-            if !suppress {
-                *(args.next_ptr() as *mut c_int) = i as c_int;
-            }
-            continue;
-        }
-        if conv != b'c' && conv != b'[' {
-            while input.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-                i += 1;
-            }
-        }
-        if i >= input.len() {
-            return if stored_any { done } else { -1 };
-        }
-        let limit = if width == 0 { usize::MAX } else { width };
-        match conv {
-            b'd' | b'i' | b'u' | b'o' | b'x' | b'X' => {
-                let start = i;
-                let mut neg = false;
-                if matches!(input.get(i), Some(b'+') | Some(b'-')) && i - start < limit {
-                    neg = input[i] == b'-';
-                    i += 1;
-                }
-                let mut base = match conv {
-                    b'o' => 8,
-                    b'x' | b'X' => 16,
-                    _ => 10,
-                };
-                if (conv == b'i' || base == 16)
-                    && input.get(i) == Some(&b'0')
-                    && matches!(input.get(i + 1), Some(b'x') | Some(b'X'))
-                {
-                    base = 16;
-                    i += 2;
-                } else if conv == b'i' && input.get(i) == Some(&b'0') {
-                    base = 8;
-                }
-                let digits = i;
-                let mut v: u64 = 0;
-                while i - start < limit && input.get(i).is_some_and(|b| (*b as char).is_digit(base))
-                {
-                    v = v
-                        .wrapping_mul(u64::from(base))
-                        .wrapping_add(u64::from((input[i] as char).to_digit(base).unwrap()));
-                    i += 1;
-                }
-                if i == digits {
-                    return done;
-                }
-                let v = if neg {
-                    (v as i64).wrapping_neg() as u64
-                } else {
-                    v
-                };
-                if !suppress {
-                    let p = args.next_ptr();
-                    match len {
-                        0 => *(p as *mut u32) = v as u32,
-                        1 | 2 | 5 => *(p as *mut u64) = v,
-                        3 => *(p as *mut u16) = v as u16,
-                        _ => *(p as *mut u8) = v as u8,
-                    }
-                    done += 1;
-                    stored_any = true;
+                    *(p as *mut f32) = *value as f32;
                 }
             }
-            b'f' | b'e' | b'g' | b'E' | b'G' | b'a' => {
-                let start = i;
-                while i - start < limit
-                    && input.get(i).is_some_and(|b| {
-                        b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')
-                    })
-                {
-                    i += 1;
-                }
-                let Ok(v) = core::str::from_utf8(&input[start..i])
-                    .unwrap_or("")
-                    .parse::<f64>()
-                else {
-                    return done;
-                };
-                if !suppress {
-                    let p = args.next_ptr();
-                    if len == 1 || len == 5 {
-                        *(p as *mut f64) = v;
-                    } else {
-                        *(p as *mut f32) = v as f32;
-                    }
-                    done += 1;
-                    stored_any = true;
-                }
+            Item::Str(b) => {
+                let d = p as *mut u8;
+                core::ptr::copy_nonoverlapping(b.as_ptr(), d, b.len());
+                *d.add(b.len()) = 0;
             }
-            b's' => {
-                let start = i;
-                while i - start < limit && input.get(i).is_some_and(|b| !b.is_ascii_whitespace()) {
-                    i += 1;
-                }
-                if !suppress {
-                    let d = args.next_ptr() as *mut u8;
-                    core::ptr::copy_nonoverlapping(input.as_ptr().add(start), d, i - start);
-                    *d.add(i - start) = 0;
-                    done += 1;
-                    stored_any = true;
-                }
-            }
-            b'c' => {
-                let n = if width == 0 { 1 } else { width };
-                if i + n > input.len() {
-                    return if stored_any { done } else { -1 };
-                }
-                if !suppress {
-                    let d = args.next_ptr() as *mut u8;
-                    core::ptr::copy_nonoverlapping(input.as_ptr().add(i), d, n);
-                    done += 1;
-                    stored_any = true;
-                }
-                i += n;
-            }
-            b'[' => {
-                let negate = f.get(j) == Some(&b'^');
-                if negate {
-                    j += 1;
-                }
-                let set_start = j;
-                if f.get(j) == Some(&b']') {
-                    j += 1;
-                }
-                while f.get(j).is_some_and(|&b| b != b']') {
-                    j += 1;
-                }
-                let set = &f[set_start..j];
-                j += 1; // ]
-                let in_set = |b: u8| -> bool {
-                    let mut k = 0;
-                    while k < set.len() {
-                        if k + 2 < set.len() && set[k + 1] == b'-' {
-                            if set[k] <= b && b <= set[k + 2] {
-                                return true;
-                            }
-                            k += 3;
-                        } else {
-                            if set[k] == b {
-                                return true;
-                            }
-                            k += 1;
-                        }
-                    }
-                    false
-                };
-                let start = i;
-                while i - start < limit && input.get(i).is_some_and(|&b| in_set(b) != negate) {
-                    i += 1;
-                }
-                if i == start {
-                    return done;
-                }
-                if !suppress {
-                    let d = args.next_ptr() as *mut u8;
-                    core::ptr::copy_nonoverlapping(input.as_ptr().add(start), d, i - start);
-                    *d.add(i - start) = 0;
-                    done += 1;
-                    stored_any = true;
-                }
-            }
-            _ => return done,
+            Item::Chars(b) => core::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len()),
+            Item::Count(n) => *(p as *mut c_int) = *n,
         }
     }
-    done
+    r.ret
 }
 
 // ---- ctime ----
