@@ -537,7 +537,7 @@ pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
         }
     }
 }
-/// No call that sets file times (the file protocol has none yet: TIDY-UP T134).
+/// No call that sets file times (the file protocol has none yet: work item T134).
 #[no_mangle]
 pub extern "C" fn utimensat(
     _dirfd: c_int,
@@ -648,7 +648,7 @@ pub unsafe extern "C" fn fnmatch(
 // ---- descriptors ----
 
 /// `dup2` for descriptors that are standard streams (a handle is duplicated); anything else is `ENOSYS`: duplicating a file
-/// connection with its offset is not built (TIDY-UP).
+/// connection with its offset is not built (work/).
 #[no_mangle]
 pub extern "C" fn dup2(from: c_int, to: c_int) -> c_int {
     if from == to {
@@ -830,7 +830,7 @@ pub extern "C" fn clock_settime(_clock: c_int, _ts: *const c_void) -> c_int {
     -1
 }
 
-/// Not built (TIDY-UP T134): a program that parses dates with a format gets `NULL`.
+/// Not built (work item T134): a program that parses dates with a format gets `NULL`.
 #[no_mangle]
 pub extern "C" fn strptime(
     _s: *const c_char,
@@ -1171,7 +1171,7 @@ pub unsafe extern "C" fn lchown(path: *const c_char, uid: c_int, gid: c_int) -> 
     chown(path, uid, gid)
 }
 
-/// Not built (TIDY-UP T134): no devices or fifos can be made by a program, no file-system statistics, no file times.
+/// Not built (work item T134): no devices or fifos can be made by a program, no file-system statistics, no file times.
 macro_rules! unsupported {
     ($($name:ident($($a:ident: $t:ty),*) -> $r:ty = $v:expr;)*) => {
         $( #[no_mangle] pub extern "C" fn $name($(_: $t),*) -> $r { crate::errno::set(38); $v } )*

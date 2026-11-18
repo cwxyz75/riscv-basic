@@ -6,7 +6,7 @@
 //! (it remounts from the newest valid superblock), its names republished; clients see `UNAVAILABLE` meanwhile.
 //!
 //! (The registry's names are flat, so the spec's `/svc/vol/by-uuid/<hex>` and `/svc/vol/<name>` are `vol-uuid-<hex>` and
-//! `vol-<name>` for now: TIDY-UP T118.)
+//! `vol-<name>` for now: work item T118.)
 //!
 //! Handles: `ServiceDevmgr`, `ServiceRegistry` (a connection with PUBLISH), `BootImage` (for `bin/fsd` and `etc/mounts`).
 #![no_std]

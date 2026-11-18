@@ -1,4 +1,4 @@
-//! The wake / IPI / idle protocol of the kernel (TIDY-UP T38, T65; SCHED-SMP-SPEC section 3.9, task 4): a model
+//! The wake / IPI / idle protocol of the kernel (work item T38, T65; SCHED-SMP-SPEC section 3.9, task 4): a model
 //! of two harts and a waker over the real `kcore::sched_smp::Sched2` (the scheduler the kernel runs since task 11), explored by random schedules (shuttle). The
 //! kernel's glue (`send_pokes`, the IPI handler, `join_scheduler`, the idle `wfi`) cannot run on the host, so
 //! it is written out here once, with the protocol the spec requires and, as **negative controls**, the three

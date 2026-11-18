@@ -173,7 +173,8 @@ live only until the machine is switched off.
 | `third_party/` | Vendored upstream sources, unmodified: Lua 5.4 and its test suite (`SOURCE.md` in each says where from, with checksums). |
 | `tests/`, `reviews/` | The Lua acceptance script; independent design reviews and their reports. |
 | `OS-ARCHITECTURE.md`, `SYSCALLS.md`, `INVARIANTS.md` | The OS track's spec, syscall reference and invariants. |
-| `ROADMAP.md` | Milestones with acceptance criteria; the task tracker. |
+| `WORK-PLAN.md`, `work/` | The near-term plan, and the work queue: one file per open item (`work/README.md`; query it with `scripts/work.py`). |
+| `docs/records/` | Append-only records: what was done (`done.md`), the old roadmap and work plans. |
 | `CLAUDE.md` | Working agreement for AI coding sessions. |
 
 ## Limits

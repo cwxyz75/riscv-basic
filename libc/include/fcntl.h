@@ -21,7 +21,7 @@
 int fcntl(int fd, int cmd, ...);
 int open(const char *path, int flags, ...);
 int openat(int dirfd, const char *path, int flags, ...);
-/* advisory record locks (SQLite): the library answers every request as granted, nothing is enforced between processes (TIDY-UP T142) */
+/* advisory record locks (SQLite): the library answers every request as granted, nothing is enforced between processes (work item T142) */
 #define F_GETLK 5
 #define F_SETLK 6
 #define F_SETLKW 7

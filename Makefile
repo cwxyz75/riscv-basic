@@ -312,7 +312,7 @@ fetch-third-party:
 libc-gap: fetch-third-party
 	python3 -I scripts/libc_gap_survey.py $(LIBC_GAP_ARGS)
 
-# Contract-document checks (TIDY-UP T55): known-stale statements and the decision log's bookkeeping.
+# Contract-document checks (work item T55): known-stale statements and the decision log's bookkeeping.
 docs-check:
 	python3 scripts/check_docs.py
 	python3 scripts/bench_compare.py --self-test

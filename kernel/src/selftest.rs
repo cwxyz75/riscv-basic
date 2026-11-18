@@ -1,7 +1,7 @@
 //! The kernel's self-tests (S1: memory). Each reports as a `##TEST` line. Tests
 //! that touch lazily committed memory run inside `balanced`, which also checks the
 //! frame count returns to what it was: "map/unmap/fault sequences return
-//! allocation counts to baseline" (ROADMAP S1).
+//! allocation counts to baseline" (the old roadmap, S1).
 
 use crate::{kmem, trap};
 use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, LAZY_TEST_BASE};

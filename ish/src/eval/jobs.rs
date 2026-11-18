@@ -231,7 +231,7 @@ impl<H: Host> Shell<H> {
                 cap: self.cap,
             }
         } else if resolved.len() == 1 {
-            // a shell command: run now, to the end (there are no threads in the shell yet: TIDY-UP)
+            // a shell command: run now, to the end (there are no threads in the shell yet: work/)
             let out = self.mem();
             let err = self.mem();
             let mut new = self.io.clone();

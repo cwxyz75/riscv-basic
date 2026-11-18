@@ -2,7 +2,7 @@
 //! node, on top of the pure `doofs` crate and one block channel (`rt::blk::BlkDevice`). It mounts the volume at start (the
 //! newest superblock slot that verifies; the free map is rebuilt by the walk), serves, and commits every few seconds, on
 //! `Sync` and when its last client has gone. Single-threaded: one port, every connection bound. A copy of `memfsd`'s
-//! request handling on the other filesystem (TIDY-UP T114).
+//! request handling on the other filesystem (work item T114).
 #![no_std]
 #![no_main]
 

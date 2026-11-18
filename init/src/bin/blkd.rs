@@ -6,7 +6,7 @@
 //! slot's interrupt (`BlkIrq`: absent on machines without an AIA, then it polls), and the channel
 //! it serves (`ServiceBlk`). It never owns the memory: its supervisor keeps its own handles to the
 //! DMA buffer and the MMIO slot, so killing the driver frees nothing the device may still write
-//! to; the supervisor resets the device before it hands the buffer to the next driver (TIDY-UP T42).
+//! to; the supervisor resets the device before it hands the buffer to the next driver (work item T42).
 //!
 //! One request in flight. A device that does not answer within two seconds gets TIMEOUT back to
 //! the client and the driver exits, so a supervisor can restart it.
