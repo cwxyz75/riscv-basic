@@ -11817,15 +11817,26 @@ pub fn app_main() -> i32 {
         "net_httpd_for_the_host",
         "net_tcp_echo_for_the_host",
     ];
-    // The smoke tier runs the suite as two parallel boots (`shard=core`, `shard=net`; TESTING.md, OD121): the network tests are
-    // `net_*` and the C sockets test. `scripts/os_boot_test.py` has the same rule and checks each shard ran only its own.
+    // The smoke tier runs the suite as two parallel boots (`shard=a`, `shard=b`; TESTING.md, OD121): shard b is the network tests
+    // (`net_*` and the C sockets test) and the three heaviest stress tests. `scripts/os_boot_test.py` has the same rule and checks each shard ran only its own.
     let shard = sys::debug_stat(13);
-    let is_net = |n: &str| n.starts_with("net_") || n == "c_sockets_over_the_stack";
+    // (the stress test that starts children needs the program image the first of these fetches: shard b runs that one too)
+    const PREREQ_OF_B: &str = "fetch_the_program_image";
+    let in_b = |n: &str| {
+        n.starts_with("net_")
+            || [
+                "c_sockets_over_the_stack",
+                "ten_thousand_threads_leak_nothing",
+                "a_thread_hog_cannot_exhaust_the_kernel",
+                "cycles_do_not_grow_memory",
+            ]
+            .contains(&n)
+    };
     for (name, test) in tests {
         if lossy && !LOSSY_TESTS.contains(name) {
             continue;
         }
-        if (shard == 1 && is_net(name)) || (shard == 2 && !is_net(name)) {
+        if (shard == 1 && in_b(name)) || (shard == 2 && !in_b(name) && *name != PREREQ_OF_B) {
             continue;
         }
         if !timed(name, *test) {

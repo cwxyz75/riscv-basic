@@ -748,12 +748,19 @@ def run_streaming(cmd):
     return b"".join(chunks), status, timed_out
 
 
-# The smoke tier runs the suite as two boots that CI starts as parallel jobs (OS_SHARD=core | net; TESTING.md, OD121): the guest
-# runs only its part when the kernel line says `shard=core` or `shard=net`. The network tests are `net_*` and the C sockets test
+# The smoke tier runs the suite as two boots that CI starts as parallel jobs (OS_SHARD=a | b; TESTING.md, OD121): the guest
+# runs only its part when the kernel line says `shard=a` or `shard=b`. Shard b is the network tests (`net_*` and the C sockets test) and the three heaviest stress tests
 # (the same rule is in init/src/bin/suite.rs). Without OS_SHARD the whole suite runs, as the soak tier does.
 SHARD = os.environ.get("OS_SHARD", "")
-if SHARD not in ("", "core", "net"):
-    sys.exit(f"OS_SHARD must be core or net, not {SHARD!r}")
+if SHARD not in ("", "a", "b"):
+    sys.exit(f"OS_SHARD must be a or b, not {SHARD!r}")
+
+
+SHARD_B_STRESS = ["ten_thousand_threads_leak_nothing", "a_thread_hog_cannot_exhaust_the_kernel", "cycles_do_not_grow_memory"]
+
+
+def is_shard_b_test(name):
+    return name.startswith("net_") or name == "c_sockets_over_the_stack" or name in SHARD_B_STRESS
 
 
 def is_net_test(name):
@@ -763,18 +770,18 @@ def is_net_test(name):
 def shard_required(required):
     """The required tests of this run: the whole list, or the part the shard runs (the kernel's own tests run in both)."""
     names = REQUIRED if required is None else required
-    if SHARD == "core":
-        return [n for n in names if not is_net_test(n)]
-    if SHARD == "net":
-        return [n for n in names if is_net_test(n)]
+    if SHARD == "a":
+        return [n for n in names if not is_shard_b_test(n)]
+    if SHARD == "b":
+        return [n for n in names if is_shard_b_test(n)]
     return names
 
 
 def net_problems(text):
     """The host's view of the network tests (NET-SPEC Q4, Q5): the echo client's verdict and the capture's checksums."""
     found = []
-    if SHARD == "core":
-        return found  # (no network device, and no network tests: the net shard has them)
+    if SHARD == "a":
+        return found  # (no network device, and no network tests: shard b has them)
     lossy = bool(os.environ.get("OS_NET_LOSSY"))
     if os.environ.get("OS_NET") != "0" and not lossy and "s8: udpecho ready" not in text and "net tests skipped" not in text:
         found.append("the network tests did not run (no marker from the UDP echo test)")
@@ -972,7 +979,7 @@ def run(kernel: str, extra=()):
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;
         # OS_NET_HOSTPORT names the forwarded host port (otherwise a free one is chosen).
-        *([] if os.environ.get("OS_NET") == "0" or SHARD == "core" else net_args()),
+        *([] if os.environ.get("OS_NET") == "0" or SHARD == "a" else net_args()),
         *extra, "-kernel", kernel,
     ]
     if os.environ.get("OS_PROFILE"):
@@ -1031,8 +1038,8 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
         if not expect_fail and failed:
             found.append(f"failing tests: {[n for n, ok, _ in tests if not ok]}")
     missing = [n for n in shard_required(required) if n not in {n for n, _, _ in tests}]
-    if SHARD == "core" and any(is_net_test(n) for n, _, _ in tests):
-        found.append("the core shard ran network tests")
+    if SHARD == "a" and any(is_shard_b_test(n) for n, _, _ in tests):
+        found.append("shard a ran tests that belong to shard b")
     if missing:
         found.append(f"required tests not reported: {missing}")
     if len({n for n, _, _ in tests}) != len(tests):
@@ -1136,7 +1143,7 @@ def main() -> int:
         if want_harts > 1 and f"harts online: {want_harts}" not in text.split("\n"):
             found.append(f"the kernel did not report 'harts online: {want_harts}'")
         # (the lossy mode runs only the bulk TCP tests, and the net shard only the network tests: the checks for the other tests would fail by design)
-        strict = not expect_fail and not os.environ.get("OS_NET_LOSSY") and SHARD != "net"
+        strict = not expect_fail and not os.environ.get("OS_NET_LOSSY") and SHARD != "b"
         # The interrupt controller the kernel found must be the one the machine has (S6a-2): a PLIC on
         # the default board, the AIA (APLIC + IMSIC, OD75) on the aia machine. Otherwise the interrupt-object test
         # could pass by skipping.

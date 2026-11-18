@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main os-boot-test-smoke os-boot-test-smoke-core os-boot-test-smoke-net quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -138,15 +138,15 @@ os-miri:
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
 # kernel at four harts is also the fastest full run (35 s: waits overlap).
-# The suite is two boots, `core` and `net` (OD121), so CI can run them as parallel jobs and each fits its budget with room;
+# The suite is two boots, shards `a` and `b` (OD121), so CI can run them as parallel jobs and each fits its budget with room;
 # locally `make os-boot-test-smoke` runs both, one after the other.
-os-boot-test-smoke: os-boot-test-smoke-core os-boot-test-smoke-net
+os-boot-test-smoke: os-boot-test-smoke-a os-boot-test-smoke-b
 
-os-boot-test-smoke-core: kernel-main
-	OS_SHARD=core OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+os-boot-test-smoke-a: kernel-main
+	OS_SHARD=a OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
-os-boot-test-smoke-net: kernel-main
-	OS_SHARD=net OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+os-boot-test-smoke-b: kernel-main
+	OS_SHARD=b OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
@@ -160,7 +160,7 @@ os-boot-test-main: kernel
 # normal kernel was just booted by the smoke run).
 # (the deliberate failure is a kernel test that runs in every shard, so the short one is enough to prove the harness sees it)
 os-boot-test-fail-demo: kernel
-	OS_SHARD=net python3 scripts/os_boot_test.py --fail-demo $(OS_FAIL_ELF)
+	OS_SHARD=b python3 scripts/os_boot_test.py --fail-demo $(OS_FAIL_ELF)
 
 os-boot-test-rr: kernel
 	python3 scripts/os_boot_test.py --rr $(OS_RR_ELF)
