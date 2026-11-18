@@ -61,3 +61,26 @@ Built: the `*at` family (on the volume; `symlinkat` needs a file server with sym
 UTF-8 wide-character core (`cfmt::mb`, tested against `std`: `mbrtowc`, `wcrtomb`, `mbstowcs`, `wcstombs`, `wcs*`/`wmem*`, the `isw*`
 classes, `towupper`/`towlower`, `wcwidth`, `uchar.h`), `fscanf`/`scanf` (over `cfmt::scan`, which now reports how much it used) and
 `sigwait`. Not built: `strtold` (`long double` is a 128-bit float on this ABI), `crypt`, `utmpx`, `dlopen`, `libedit`.
+
+## Phase 2, batch 1 (2026-11-18)
+
+Survey re-run after phase 1 and before this batch: functions 8 (`crypt`, the three `utmpx` calls, `strtold`, and gnulib's `copy` and
+`S_TYPEIS*`, which are its own or macros), constants and variables 104 distinct, headers 3 (`dlfcn.h`, `histedit.h`,
+`localcharset.h`, none to be built). Most of the 104 are not libc: a program's own local names the survey cannot tell apart, and
+configuration macros (`PACKAGE`, `VERSION`). The ones that are libc names, taken as this batch:
+
+- the rest of POSIX's errno list with Linux's numbers and glibc's messages (`EROFS`, `EMLINK`, `EDQUOT`, `ETXTBSY`, `EFBIG`, `EPROTO`,
+  `ESTALE`, `ECANCELED`, `EOWNERDEAD`, ... 23 names; the message table also gained the entries it was missing for 6, 8, 15, 16, 18, 19, 23,
+  35, 37, 40 and the socket errors);
+- `MB_CUR_MAX` (4: UTF-8), `LC_MESSAGES`, `AT_EACCESS`, `FNM_FILE_NAME`, `FNM_LEADING_DIR`;
+- the termios names `VSTART`, `VSTOP`, `VSUSP`, `VEOL`, `CS5` to `CS7`, `FLUSHO`; `tcgetattr` now reports `VSTART` ^Q, `VSTOP` ^S and
+  `VSUSP` ^Z (the console server's Ctrl-Z, OD124).
+
+Checked on the OS in `ctest posix2` (the numbers against Linux's, every message present); the numbers and texts come from the Linux
+headers and glibc, which the macOS development host cannot confirm, so they are not checked against a host run here. After: constants
+and variables 87 distinct (busybox 30 to 20, coreutils 39 to 32, gnutar 23 to 20).
+
+Not taken: `optreset` and `sys_siglist` (BSD and glibc-private names; dash and busybox have fallbacks), `ARPHRD_ETHER` and
+`USER_PROCESS` (network device ioctls and `utmpx`, not planned), `strtold` (128-bit `long double`). The conformance corpus that
+would measure the rest of the C library is still the owner's choice (which public libc test suite is the oracle); the plan does not
+answer it.

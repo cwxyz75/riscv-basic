@@ -36,18 +36,18 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 
 ### 0. Land the documentation reorganisation
 
-- [ ] Merge PR 233 (`docs/`) when green, then retarget PR 234 (review dispositions, which carries this plan) to `main` and
+- [x] Merge PR 233 (`docs/`) when green, then retarget PR 234 (review dispositions, which carries this plan) to `main` and
   merge it when green. PR 232 is merged. If PR 233's shell test fails in the `alarm` check again, that is T143: re-run.
 
 ### 1. T143: the flaky `alarm` check
 
-- [ ] The alarm check of `libc/tests/c/signals.c` fails intermittently in CI (it failed PR 233's first run). Find the cause from
+- [x] (PR: t143-alarm-check) The alarm check of `libc/tests/c/signals.c` fails intermittently in CI (it failed PR 233's first run). Find the cause from
   the failure output (the item says what to look at: `sig::wait_any` and the alarm deadline against `clock_get` under a
   loaded host), fix the test or the code, and show it is fixed (repeat the shell test several times locally; say how many).
 
 ### 2. T151: re-check the migrated tidy items against the code
 
-- [ ] At least the `shell` and `session` areas, where spot checks already found stale items; more areas if they go quickly.
+- [x] (shell and session done, PR: t151-tidy-recheck; T151 stays open for the other areas) At least the `shell` and `session` areas, where spot checks already found stale items; more areas if they go quickly.
   For each item: check its claim against the code it names; close it (`work.py done`), narrow it (edit the title and text, add
   a dated note) or leave it. One PR for the batch. T151 stays open until every area has been through once.
 
@@ -56,7 +56,7 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 Order chosen (owner left it to me): smallest and only high-risk item first; then the user-visible one; the deepest last, so
 the scheduler work starts from a quieter tree.
 
-- [ ] **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
+- [~] (decision item Q-T42 written; no kernel change, see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
   supervisor does by convention today, or a design note and a decision item if enforcement turns out to need an OD-level
   choice (that would be a major decision point: stop). Fable review, soak.
 - [ ] **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
@@ -92,3 +92,4 @@ whatever time is left.
 
 - 2026-11-18: plan 3's order of the kernel slices (T42, SIG2, L11/L12) and of the feature slices (T139, SD4, LIBC2), as
   explained above; the owner left both to me.
+- 2026-11-18: T42 needs an OD-level choice (the kernel enforcing DMA frame lifetime reverses S6b's "ownership, not a kernel mechanism" and adds a syscall), so I wrote `Q-T42` with three options and a recommendation (keep the policy while drivers are trusted) and made no kernel change. The plan says to stop at such a point; I did not stop the whole plan because nothing after it depends on this choice, and went on to SIG2. Recorded in `work/Q-T42.md`.
