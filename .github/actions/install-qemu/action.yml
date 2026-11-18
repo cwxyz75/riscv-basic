@@ -20,8 +20,14 @@ runs:
       run: |
         mkdir -p "$HOME/apt-archives/partial"
         OPTS="-o Dir::Cache::archives=$HOME/apt-archives -o Acquire::Retries=3 -o Acquire::http::Timeout=20"
-        if ! sudo apt-get $OPTS install -y --no-download $PKGS; then
-          sudo apt-get $OPTS update
-          sudo apt-get $OPTS install -y $PKGS
+        # (a stalled mirror must not eat the job: each try is cut off, and the whole install is tried three times)
+        if ! sudo timeout 120 apt-get $OPTS install -y --no-download $PKGS; then
+          for try in 1 2 3; do
+            if sudo timeout 150 apt-get $OPTS update && sudo timeout 240 apt-get $OPTS install -y $PKGS; then
+              break
+            fi
+            echo "apt try $try failed"
+            [ "$try" = 3 ] && exit 1
+          done
         fi
         sudo chown -R "$USER" "$HOME/apt-archives"
