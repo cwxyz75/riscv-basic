@@ -26,6 +26,8 @@ pub mod park;
 pub mod sched;
 pub mod sched2;
 pub mod sched_smp;
+#[doc(hidden)]
+pub mod sched_smp_v0;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;
