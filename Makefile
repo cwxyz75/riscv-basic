@@ -158,8 +158,9 @@ os-boot-test-main: kernel
 
 # Only the fail-demo kernel: the check that the harness still sees a failure (CI runs it when the harness changed; the
 # normal kernel was just booted by the smoke run).
+# (the deliberate failure is a kernel test that runs in every shard, so the short one is enough to prove the harness sees it)
 os-boot-test-fail-demo: kernel
-	python3 scripts/os_boot_test.py --fail-demo $(OS_FAIL_ELF)
+	OS_SHARD=net python3 scripts/os_boot_test.py --fail-demo $(OS_FAIL_ELF)
 
 os-boot-test-rr: kernel
 	python3 scripts/os_boot_test.py --rr $(OS_RR_ELF)
