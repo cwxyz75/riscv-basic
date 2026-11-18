@@ -334,7 +334,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
         // switch threads. A tick that interrupted **user mode** still takes it, as every user-mode trap does: the return
         // to user mode is where a killed process dies (`activate_current`), which needs the lock until the kill flag is
-        // per thread (TIDY-UP T107).
+        // per thread (work item T107).
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);

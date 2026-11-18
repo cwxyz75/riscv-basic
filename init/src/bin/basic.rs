@@ -4,7 +4,7 @@
 //! `basic` runs an interactive session on stdin/stdout: lines come from the stdin byte stream (the
 //! console server delivers whole lines, and `0x04` at the start of a line is end of input), output
 //! goes to stdout, the clock is `clock_get`. Ctrl-C ends the foreground job (the console server kills
-//! it), so `break_pressed` never fires (TIDY-UP T47). PEEK and POKE act on a private sparse map;
+//! it), so `break_pressed` never fires (work item T47). PEEK and POKE act on a private sparse map;
 //! there is no disk.
 //!
 //! `basic --golden NAME` runs one script of the golden corpus (`/etc/basic/golden/NAME.bas`, `<LOAD>`

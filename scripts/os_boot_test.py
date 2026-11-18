@@ -958,7 +958,7 @@ def run(kernel: str, extra=()):
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
-        # the host is (TIDY-UP T21). e.g. OS_ICOUNT=shift=4,sleep=off
+        # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off
         *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") else []),
         # The scratch disk (S6): a virtio block device on the modern transport. The kernel itself
         # never touches it; OS_DISK=0 leaves it off.

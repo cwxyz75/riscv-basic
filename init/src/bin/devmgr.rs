@@ -4,7 +4,7 @@
 //! window, one DMA buffer and (on a PLIC machine) the slot's interrupt. Each device has its own driver
 //! slot, so two devices can be in use at once.
 //!
-//! The manager is the *supervisor* of the driver in the sense of TIDY-UP T42: it holds its own
+//! The manager is the *supervisor* of the driver in the sense of work item T42: it holds its own
 //! handles to the MMIO window and the DMA buffer for as long as it runs, so killing or losing a
 //! driver frees nothing the device may still write to, and it resets the device before every new
 //! driver gets the buffer.
@@ -365,7 +365,7 @@ impl Service for DevMgr {
 
 impl DevMgr {
     /// `ClaimNet`: hand the claimant the device and its DMA memory (NET-SPEC 4.3). The DMA VMOs are made here (only the
-    /// root resource can) and are charged to this manager (TIDY-UP T84).
+    /// root resource can) and are charged to this manager (work item T84).
     fn claim_net(&mut self, key: u64, txid: u32, index: u16) {
         let fail = |this: &mut DevMgr, st: Status| {
             let _ = this.core.send(key, devmgr::encode_reply(txid, st), None);

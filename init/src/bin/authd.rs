@@ -9,7 +9,7 @@
 //!
 //! The reply never carries a verifier, a hash or a salt. The seed credentials come from the boot image (`etc/credentials`,
 //! read here, never by the manager) and the cost from the manifest (`etc/boot`, line `cost=test` for development images).
-//! Salts are unique, not random, until the session stack has the random service (TIDY-UP T130).
+//! Salts are unique, not random, until the session stack has the random service (work item T130).
 //!
 //! Handles: `ServiceAuth` (the channel), `BootImage`. Environment: `RECOVERY=1` when the console asked for recovery.
 #![no_std]

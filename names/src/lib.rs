@@ -1,4 +1,4 @@
-//! File names (FS-SPEC F6, TIDY-UP T146). **One rule, in one place**: the servers, the pure file-system crates, the client library
+//! File names (FS-SPEC F6, work item T146). **One rule, in one place**: the servers, the pure file-system crates, the client library
 //! and the libc all validate through this crate, so that no layer can disagree about what a name is.
 //!
 //! A name is a directory entry, one component of a path, or (with [`validate_text`]) an attribute name:

@@ -813,7 +813,7 @@ pub fn vfork_leave() {
 #[no_mangle]
 pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
     // F_GETLK, F_SETLK, F_SETLKW: every lock is granted and nothing is held (advisory, and one writer at a time is the caller's
-    // business: TIDY-UP T142); F_GETLK says the region is unlocked. `arg` is the pointer to the `struct flock`.
+    // business: work item T142); F_GETLK says the region is unlocked. `arg` is the pointer to the `struct flock`.
     if (5..=7).contains(&cmd) {
         if cmd == 5 && arg != 0 {
             // SAFETY: the caller passes a `struct flock` for F_GETLK; `l_type` is its first field (a `short`)
@@ -1286,7 +1286,7 @@ pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int
 
 /// A scratch name no other open file of this process has, in the working directory (`.`): the
 /// program's writable scratch place is whatever directory it was given as `.`, there is no ambient
-/// `/tmp` to reach (TIDY-UP T51).
+/// `/tmp` to reach (work item T51).
 pub fn scratch_name() -> Vec<u8> {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);

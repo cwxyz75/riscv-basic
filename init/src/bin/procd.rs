@@ -10,7 +10,7 @@
 //! /proc/meminfo        MemTotal, MemFree, MemAvailable in kB: the session job's pages (a compat rendering of `job_info`)
 //! /proc/cpuinfo        one `processor : N` stanza per online hart
 //! /proc/uptime         seconds since boot, and an idle time of 0.00
-//! /proc/loadavg        `0.00 0.00 0.00 <running>/<known> <last pid>`: the averages are not measured (TIDY-UP T131)
+//! /proc/loadavg        `0.00 0.00 0.00 <running>/<known> <last pid>`: the averages are not measured (work item T131)
 //! ```
 //!
 //! The shell sends, on the control channel, `A<pid:u32 LE><arguments NUL-separated>` with a duplicate of the process handle,

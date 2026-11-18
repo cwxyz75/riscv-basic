@@ -1,5 +1,5 @@
 //! `netsup`: the network stack's supervisor (S8, NET-SPEC 4.2 and 9). It holds everything that must outlive a child
-//! (TIDY-UP T42's rule): the device claim and its DMA memory, the ring VMO, the doorbell events, and starts and restarts
+//! (work item T42's rule): the device claim and its DMA memory, the ring VMO, the doorbell events, and starts and restarts
 //! the driver `netdrv` (and, in the full system, `netd` and `dhcpc`) under the restart-intensity policy of `supervise`.
 //!
 //! Startup: `ServiceDevmgr` (a connection to the device manager: the claim lives as long as this connection),
@@ -667,7 +667,7 @@ fn spawn_netd(
 /// The TCP secret for `netd` (S9-SPEC 5.10), derived with HKDF-SHA256 from 32 bytes of the system's generator
 /// (`/svc/random`, seeded by the entropy device). Without it (no entropy device, or `rngd` not running) a stand-in is used
 /// and said so in the entry `SECRET_SRC=standin`: a hash of the clock, which an observer of the boot could guess
-/// (TIDY-UP T99); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
+/// (work item T99); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
 fn secret_env(registry: Option<u32>) -> Vec<Vec<u8>> {
     let mut seed = [0u8; 32];
     let mut from_rngd = false;

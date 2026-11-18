@@ -708,7 +708,7 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     kill_pid(pid, sig)
 }
 
-// ---- system and popen: the command goes to the compat shell (BusyBox `hush`, TIDY-UP T139) ----
+// ---- system and popen: the command goes to the compat shell (BusyBox `hush`, work item T139) ----
 
 /// Start `busybox hush -c cmd` with the standard streams from `fds`.
 unsafe fn start_shell(cmd: *const c_char, fds: [c_int; 3]) -> Result<(u32, c_int), c_int> {

@@ -5,9 +5,9 @@
 //! are registered with the console server as the foreground job so Ctrl-C reaches them.
 //!
 //! The S4e behaviour the suite checks is kept by the evaluator's compatibility profile (`legacy`: `sh:` messages, one
-//! `[exit N]` per failed stage, `cd` printing its own errors); TIDY-UP records what it papers over.
+//! `[exit N]` per failed stage, `cd` printing its own errors); work/ records what it papers over.
 //!
-//! Known gap (TIDY-UP T31): a Ctrl-C between a stage starting and the registration being acknowledged is handled by reading
+//! Known gap (work item T31): a Ctrl-C between a stage starting and the registration being acknowledged is handled by reading
 //! ahead after the registration, not by the specified start gate.
 #![no_std]
 #![no_main]
@@ -1645,7 +1645,7 @@ impl Host for Os {
     }
 
     fn wait_any(&mut self, pids: &[Pid]) -> (usize, i32) {
-        // there is no wait-for-many call yet (TIDY-UP): look at each, then sleep a little
+        // there is no wait-for-many call yet (work/): look at each, then sleep a little
         loop {
             for (i, p) in pids.iter().enumerate() {
                 if !self.procs.contains_key(&p.0) {

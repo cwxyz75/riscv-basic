@@ -4,12 +4,14 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 
 - **The home computer** (BASIC and LOGO behind a boot menu): finished, v0.2. It
   lives in `home/` (its kernel is `home/kernel/`, plus the language crates). Read
-  `ROADMAP.md` (M and L series), `home/DESIGN.md`, `home/BASIC.md` and `home/LOGO.md`
+  `home/DESIGN.md`, `home/BASIC.md` and `home/LOGO.md`
   before working on it.
 - **The OS track** (S-series): a multicore capability microkernel with userspace
   servers, a network stack and a POSIX-ish layer, written entirely by AI with the
-  human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it, plus the S-series in
-  `ROADMAP.md`, before working on it. S0 through S7 (foundation, memory, threads, user mode and handles, servers and the shell, jobs and quotas, SMP, storage drivers, libc, futexes, BASIC and Lua as userland programs) are done. A queue of design-review slices comes before S8 (network); it is in `ROADMAP.md`, and the reviews are in `reviews/`.
+  human as product owner. Spec: `OS-ARCHITECTURE.md`. Read it before working on it, then
+  `WORK-PLAN.md` (what is next) and `work/README.md` (the work queue). What is left to do is
+  in `work/`, one file per item, queried with `scripts/work.py`; never read the whole
+  directory. How the system got here is in `docs/records/` and git history.
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").
@@ -75,8 +77,11 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
   logic on the host, syscall behaviour in the suite, only what the machine shows in QEMU.
 - If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
-- Only tick a `ROADMAP.md` box when its acceptance criterion has actually been
-  verified (for kernel work, that means booted in QEMU, not just compiled).
+- Only close a work item (`scripts/work.py done`) when its acceptance criterion has actually
+  been verified (for kernel work, that means booted in QEMU, not just compiled).
+- **Work lists and documentation are separate.** Plans, to-dos, progress and "not built yet"
+  go in `work/` and `WORK-PLAN.md`, never in a spec. A spec describes the end state; it has
+  no opinion about how far the build has got.
 - Binary size is not a goal. Prefer simple over small; `core::fmt` is fine.
 - Record real design choices in the decision log in `home/DESIGN.md`.
 - If something can't be verified in your environment (e.g. no QEMU), say so
@@ -88,8 +93,8 @@ Everything above still applies (one milestone per PR, `main` always builds and
 boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
 
 - The spec is `OS-ARCHITECTURE.md`. Design decisions are logged in its section 17
-  (OD numbers), not in `home/DESIGN.md`. Open questions are in its section 18: stop and
-  ask rather than guessing.
+  (OD numbers), not in `home/DESIGN.md`. Open questions are `kind: decision` items
+  (`scripts/work.py decisions`): stop and ask rather than guessing.
 - All code is AI-written and the human is the product owner, so nothing relies on a
   human reading the code. Every milestone needs a **runnable acceptance check,
   written before the code**.
@@ -101,17 +106,18 @@ boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In additio
   narrow traits, tested with model-based and property tests; concurrency-sensitive
   logic is also run under loom/shuttle and Miri.
 - `INVARIANTS.md` (handle unforgeability, rights monotonicity, lock ordering, memory
-  ownership) and `SYSCALLS.md` (every syscall: preconditions, rights, errors) are
-  exist (skeletons from S0, filled in by each milestone). Every change preserves them, and the lock ordering is not negotiable.
+  ownership) and `SYSCALLS.md` (every syscall: preconditions, rights, errors) describe
+  the system as it is. Every change preserves them, and the lock ordering is not negotiable.
 - Architecture target: **RVA23** (OD47). The OS track does not support hardware below that
   profile; the home computer under `home/` keeps its rv64gc contract.
-- **Shortcuts go in `TIDY-UP.md`.** Any stand-in, ambient authority, deferred review finding or
-  "good enough for now" is recorded there in the same PR (what, why acceptable, risk, proper
-  fix and when). Fixed ones move to its Resolved table.
+- **Shortcuts become tidy items in `work/`.** Any stand-in, ambient authority, deferred review
+  finding or "good enough for now" gets an item (`kind: tidy`, `work.py next T` for its id) in
+  the same PR (what, why acceptable, risk, proper fix and when). A question only the owner
+  can answer is a `kind: decision` item. Fixed items are closed with `work.py done`.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
-- Tick an S-series box only when verified in QEMU. For SMP work that means the
-  normal mode at `-smp 2` and `-smp 4`; icount runs only one hart (TIDY-UP T21). Say plainly which was run.
+- Close an OS-track item only when verified in QEMU. For SMP work that means the
+  normal mode at `-smp 2` and `-smp 4`; icount runs only one hart (T21). Say plainly which was run.
 - Always leave a bootable, green system. No big-bang rewrites.
 - Small utility crates are allowed (the repo already uses `linked_list_allocator` and
   `libm`), each with its own OS decision-log entry. The kernel, network stack,

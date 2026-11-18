@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract-document checks (TIDY-UP T55): nobody reads the code, so the documents are the contract, and a
+"""Contract-document checks (T55): nobody reads the code, so the documents are the contract, and a
 document that says something false is a bug. This cannot prove the documents right; it keeps the known-stale
 statements from coming back and checks the decision log's bookkeeping.
 
@@ -23,8 +23,6 @@ STALE = [
     ("OS-ARCHITECTURE.md", "# OS Architecture (proposal)", "the title should not call a built system a proposal"),
     ("SYSCALLS.md", "The kernel takes no lock", "syscalls run under the big kernel lock (OD60)"),
     ("SYSCALLS.md", "which do not exist yet", "per-job quotas exist (S4.5)"),
-    ("ROADMAP.md", "S3 onwards is not", "S0-S7 are built"),
-    ("ROADMAP.md", "`abi`, `kcore`, `os-kernel`; more arrive", "crate names are fixed"),
     ("S5-SPEC.md", "Nothing here is built yet", "S5 is built"),
     ("INVARIANTS.md", "(single hart)", "the scheduler state is under the big kernel lock (C6)"),
     ("CLAUDE.md", "S7 (libc, futexes, BASIC and Lua as userland programs) is specified", "S7 is done"),
@@ -98,19 +96,15 @@ def main():
         if missing:
             problems.append("OS-ARCHITECTURE.md: decision log has gaps: " + ", ".join(f"OD{n}" for n in missing))
 
-    # TIDY-UP: no T-number is both open and resolved, and ids are unique.
-    tidy = read("TIDY-UP.md")
-    open_ids = re.findall(r"^\| (T\d+) \|", tidy, re.M)
-    if len(open_ids) != len(set(open_ids)):
-        problems.append("TIDY-UP.md: a T-number appears twice")
-    resolved = re.findall(r"^\| R\d+ \| (T\d+)[: ]", tidy, re.M)
-    for t in resolved:
-        if t in open_ids:
-            problems.append(f"TIDY-UP.md: {t} is in the open list and also resolved")
+    # The work queue (work/, scripts/work.py): ids, fields, blockers, cycles, the near-term cap.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import work
+    items, errors = work.load()
+    problems += errors + work.check(items)
 
     # Every document the README and CLAUDE.md point at exists.
-    for name in ["OS-ARCHITECTURE.md", "SYSCALLS.md", "INVARIANTS.md", "TIDY-UP.md", "ROADMAP.md",
-                 "S4-SPEC.md", "S5-SPEC.md", "S6-SPEC.md", "S7-SPEC.md"]:
+    for name in ["OS-ARCHITECTURE.md", "SYSCALLS.md", "INVARIANTS.md", "WORK-PLAN.md", "work/README.md",
+                 "docs/records/done.md", "S4-SPEC.md", "S5-SPEC.md", "S6-SPEC.md", "S7-SPEC.md"]:
         if not os.path.exists(os.path.join(ROOT, name)):
             problems.append(f"{name} is missing")
 
@@ -120,7 +114,7 @@ def main():
         for p in problems:
             print("  " + p)
         return 1
-    print(f"docs check passed ({len(STALE)} stale phrases absent, {len(nums)} decisions, {len(open_ids)} open debts)")
+    print(f"docs check passed ({len(STALE)} stale phrases absent, {len(nums)} decisions, {len(items)} work items)")
     return 0
 
 
