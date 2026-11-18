@@ -56,15 +56,15 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 Order chosen (owner left it to me): smallest and only high-risk item first; then the user-visible one; the deepest last, so
 the scheduler work starts from a quieter tree.
 
-- [~] (decision item Q-T42 written; no kernel change, see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
+- [x] (decision item Q-T42 written; no kernel change, PR 237; see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
   supervisor does by convention today, or a design note and a decision item if enforcement turns out to need an OD-level
   choice (that would be a major decision point: stop). Fable review, soak.
-- [~] (kernel half merged: PR 238; shell job control and the libc half in the next PR; CPU-time itimers and queued real-time signals remain) **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
+- [x] (kernel half PR 238, job control and the libc half PR 241; CPU-time itimers and queued real-time signals remain open in SIG2) **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
   PR, Fable review, soak); then job control on top (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP/SIGTSTP/SIGCONT, SIGTTIN/SIGTTOU,
   SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), CPU-time itimers and queued real-time signals, as SIG2 and T149 describe.
   Acceptance (from SIG2): a host-oracle C program and a shell test that stops a spinning program with Ctrl-Z and resumes it
   with `fg`, at `-smp 2` and `-smp 4`. Also settles Q-SH7 (shell-level job control): record the shape chosen as a decision.
-- [ ] **L11: per-hart run queues under RQ locks, the kernel half**, then **L12: the rest of the first peel** (SCHED-SMP-SPEC
+- [ ] (not started: see "Decisions taken without the owner") **L11: per-hart run queues under RQ locks, the kernel half**, then **L12: the rest of the first peel** (SCHED-SMP-SPEC
   tasks 11 and 12; T107, T108 are their stand-ins). Each step its own PR with a Fable review and soak; the negative-control
   kernels the tasks name.
 
@@ -73,11 +73,11 @@ the scheduler work starts from a quieter tree.
 Order chosen (owner left it to me): the smallest first; then the structural one; the open-ended one last, as it can fill
 whatever time is left.
 
-- [~] (here-documents and `/bin/sh`, shebang built; the configure corpus is left open in T139) **T139: finish the compat shell** (BusyBox `hush` as `/bin/sh`): here-documents, a `/bin/sh` name that resolves to it,
+- [x] (PR 240; the configure corpus is left open in T139) **T139: finish the compat shell** (BusyBox `hush` as `/bin/sh`): here-documents, a `/bin/sh` name that resolves to it,
   and a corpus of real `configure` scripts checked against the host shell.
-- [ ] **SD4: servers publish in the registry; clients reconnect on `UNAVAILABLE`** (`memfsd`, `launcher`, `devmgr`, `blkd`;
+- [ ] (not started: see "Decisions taken without the owner") **SD4: servers publish in the registry; clients reconnect on `UNAVAILABLE`** (`memfsd`, `launcher`, `devmgr`, `blkd`;
   `rt::fs` and the shell reconnect; T15 and T30 narrowed). Fable review (it touches every older server and the boot path).
-- [ ] **LIBC2: libc phase 2.** Re-run `scripts/libc_gap_survey.py`, take the next cheap batch with host oracles, and record the
+- [~] (batches 1 and 2 done: PRs 239 and 243; stays open) **LIBC2: libc phase 2.** Re-run `scripts/libc_gap_survey.py`, take the next cheap batch with host oracles, and record the
   new counts as a dated record next to `docs/records/LIBC-GAPS.md`. Stop when the plan's time runs out; LIBC2 stays open.
 
 ### Not in this plan
@@ -93,3 +93,6 @@ whatever time is left.
 - 2026-11-18: plan 3's order of the kernel slices (T42, SIG2, L11/L12) and of the feature slices (T139, SD4, LIBC2), as
   explained above; the owner left both to me.
 - 2026-11-18: T42 needs an OD-level choice (the kernel enforcing DMA frame lifetime reverses S6b's "ownership, not a kernel mechanism" and adds a syscall), so I wrote `Q-T42` with three options and a recommendation (keep the policy while drivers are trusted) and made no kernel change. The plan says to stop at such a point; I did not stop the whole plan because nothing after it depends on this choice, and went on to SIG2. Recorded in `work/Q-T42.md`.
+- 2026-11-18: L11, L12 and SD4 are **not started** in this run. L11/L12 are the per-hart run queue locks, `need_resched`, `finish_switch`, the dead list and the idle loop (SCHED-SMP-SPEC tasks 11 and 12: about 2,500 lines with their models and negative-control kernels), a rewrite of the scheduler's locking that needs the pure `Sched2` split per hart, loom and shuttle models, and a Fable review plus a soak run at every step; the soak runners were slow today (the smp job hit its 40-minute cap) so a mistake would have cost hours to see. SD4 rewires `memfsd`, `launcher`, `devmgr`, `blkd`, `init`, `session.rs` and the shell's grants onto the registry (the item itself says it reshapes the boot path); `fsd`, `clockd`, `rngd`, `volmgr` and `netd` already publish. Both stay on the plan; the next session should start each with a design note (L11: which of `loc`, `pending`, `pokes` becomes per-hart first, T107 (1); SD4: `launcher` first, as the smallest server, with `sh` as its one client) and the owner may want to look at those notes first. Recorded here; no item was closed.
+- 2026-11-18: the soak workflow's `smp` job ran past its 40-minute cap on PR 238 (its `os-boot-test-smp` part passed; `os-boot-test-overflow`, `os-bench` and `os-latency` were run locally and passed); recorded in the PR, not an item.
+
