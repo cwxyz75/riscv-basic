@@ -73,7 +73,7 @@ the scheduler work starts from a quieter tree.
 Order chosen (owner left it to me): the smallest first; then the structural one; the open-ended one last, as it can fill
 whatever time is left.
 
-- [ ] **T139: finish the compat shell** (BusyBox `hush` as `/bin/sh`): here-documents, a `/bin/sh` name that resolves to it,
+- [~] (here-documents and `/bin/sh`, shebang built; the configure corpus is left open in T139) **T139: finish the compat shell** (BusyBox `hush` as `/bin/sh`): here-documents, a `/bin/sh` name that resolves to it,
   and a corpus of real `configure` scripts checked against the host shell.
 - [ ] **SD4: servers publish in the registry; clients reconnect on `UNAVAILABLE`** (`memfsd`, `launcher`, `devmgr`, `blkd`;
   `rt::fs` and the shell reconnect; T15 and T30 narrowed). Fable review (it touches every older server and the boot path).

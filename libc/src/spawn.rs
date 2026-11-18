@@ -350,6 +350,52 @@ fn command_name(file: &[u8]) -> Option<&[u8]> {
     (!n.is_empty() && !n.contains(&b'/')).then_some(n)
 }
 
+/// What to ask the shell to start for `exec*(file, args)` or `posix_spawn(file, args)`: the program's name in the image, and its
+/// `argv`. A bare name or `/bin/name` is a program of the image; **`sh` is the compat shell** (BusyBox `hush`, `ish` being the system
+/// shell, which programs do not talk to: T139), so `execl("/bin/sh", "sh", "-c", cmd)` and `system` work the way programs expect;
+/// a path to a file that starts with `#!` is that interpreter run on the file (`#!/bin/sh`, `#!/bin/busybox sh`).
+unsafe fn plan(file: &[u8], args: Vec<Vec<u8>>, depth: u32) -> Result<(Vec<u8>, Vec<Vec<u8>>), c_int> {
+    if let Some(name) = command_name(file) {
+        if name == b"sh" {
+            let mut v: Vec<Vec<u8>> = alloc::vec![b"busybox".to_vec(), b"hush".to_vec()];
+            v.extend(args.into_iter().skip(1));
+            return Ok((b"busybox".to_vec(), v));
+        }
+        return Ok((name.to_vec(), args));
+    }
+    if depth >= 4 {
+        return Err(40); // ELOOP: interpreters naming scripts
+    }
+    // a script: its first line names the interpreter
+    let mut path = file.to_vec();
+    path.push(0);
+    let fd = crate::fd::open(path.as_ptr() as *const c_char, 0, 0);
+    if fd < 0 {
+        return Err(2);
+    }
+    let mut head = [0u8; 256];
+    let n = crate::fd::read(fd, head.as_mut_ptr() as *mut c_void, head.len());
+    crate::fd::close(fd);
+    let n = n.max(0) as usize;
+    if n < 3 || &head[..2] != b"#!" {
+        return Err(8); // ENOEXEC
+    }
+    let line = head[2..n].split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let mut words = line
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|w| !w.is_empty());
+    let Some(interp) = words.next() else {
+        return Err(8);
+    };
+    let mut argv: Vec<Vec<u8>> = alloc::vec![interp.to_vec()];
+    if let Some(opt) = words.next() {
+        argv.push(opt.to_vec()); // (one optional argument, as on Linux: the rest of the line is not split)
+    }
+    argv.push(file.to_vec());
+    argv.extend(args.into_iter().skip(1));
+    plan(interp, argv, depth + 1)
+}
+
 // SAFETY (callers): `p` is a NULL-terminated array of NUL-terminated strings.
 unsafe fn string_array(p: *const *const c_char) -> Vec<Vec<u8>> {
     let mut v = Vec::new();
@@ -432,16 +478,13 @@ unsafe fn exec_start(
     if file.is_null() || argv.is_null() {
         return Err(14);
     }
-    let args = string_array(argv);
-    let Some(name) = command_name(CStr::from_ptr(file).to_bytes()) else {
-        return Err(2);
-    };
+    let (name, args) = plan(CStr::from_ptr(file).to_bytes(), string_array(argv), 0)?;
     let env = match envp {
         Some(e) => string_array(e),
         None => current_env(),
     };
     // the program is named by the file; `argv[0]` is what the program sees (an applet name, usually)
-    start(name, &args, &env, [0, 1, 2])
+    start(&name, &args, &env, [0, 1, 2])
 }
 
 unsafe fn exec_with(
@@ -555,10 +598,10 @@ unsafe fn spawn_impl(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    let Some(name) = command_name(CStr::from_ptr(file).to_bytes()) else {
-        return 2;
+    let (name, args) = match plan(CStr::from_ptr(file).to_bytes(), string_array(argv), 0) {
+        Ok(p) => p,
+        Err(e) => return e,
     };
-    let args = string_array(argv);
     // the child's standard streams: ours, then what the file actions say (dup2 of one standard stream onto another, close)
     let mut map = [0 as c_int, 1, 2];
     let mut closed = [false; 3];
@@ -579,7 +622,7 @@ unsafe fn spawn_impl(
             map[i] = -1;
         }
     }
-    match start(name, &args, &string_array(envp), map) {
+    match start(&name, &args, &string_array(envp), map) {
         Ok((h, spid)) => {
             let p = register(spid, h, None);
             if !pid.is_null() {
