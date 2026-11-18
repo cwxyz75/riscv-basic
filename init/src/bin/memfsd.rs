@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use memfs::{Error, Fs, Kind, Limits, NodeId, ROOT};
+use memfs::{AttrType, Error, Fs, Kind, Limits, NodeId, ROOT};
 use proto::file::{self, flags, op, rights as pr, status};
 use proto::startup::Role;
 use rt::abi::rights::Rights;
@@ -497,6 +497,42 @@ impl Server {
                     Ok(t) => self.send(key, txid, 0, t.len() as u64, &t, None),
                     Err(e) => self.send(key, txid, err_status(e, 0), 0, &[], None),
                 }
+            }
+            // (the advisory POSIX attributes: `chmod`, `chown` and their descriptor forms; the files of /tmp can carry them)
+            op::ATTR_SET => {
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let Ok((ty, name, value)) = file::decode_attr_set(req.payload) else {
+                    return self.send(key, txid, status::BAD_REQUEST, 0, &[], None);
+                };
+                let Some(ty) = AttrType::from_code(ty) else {
+                    return self.send(key, txid, status::BAD_VALUE, 0, &[], None);
+                };
+                let st = self
+                    .fs
+                    .attr_set(node, name, ty, value)
+                    .map_or_else(|e| err_status(e, name.len()), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
+            }
+            op::ATTR_GET => {
+                if !need(pr::READ) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                match self.fs.attr_get(node, req.payload) {
+                    Ok((ty, v)) => self.send(key, txid, 0, ty as u64, &v, None),
+                    Err(e) => self.send(key, txid, err_status(e, req.payload.len()), 0, &[], None),
+                }
+            }
+            op::ATTR_REMOVE => {
+                if !need(pr::WRITE) {
+                    return self.send(key, txid, denied, 0, &[], None);
+                }
+                let st = self
+                    .fs
+                    .attr_remove(node, req.payload)
+                    .map_or_else(|e| err_status(e, req.payload.len()), |_| 0);
+                self.send(key, txid, st, 0, &[], None);
             }
             op::GETVMO => {
                 if !need(pr::READ) {

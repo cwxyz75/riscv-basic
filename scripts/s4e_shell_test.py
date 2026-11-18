@@ -72,7 +72,7 @@ class Session(base.Session):
 BANNER = b"riscv-os S4 ready"
 LINES_TXT_LINES = 3  # bootfs/home/lines.txt: one, two, three
 LINES_HEAD2 = [b"one", b"two"]
-BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"kilo", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"sqlite3", b"udpecho", b"volmgr"]
+BIN = [b"authd", b"basic", b"blkd", b"bomb", b"busybox", b"cat", b"clockd", b"consoled", b"crash", b"ctest", b"devd", b"devmgr", b"dhcpc", b"echo", b"fetch", b"free", b"fsd", b"gzip", b"hello", b"hog", b"httpd", b"init", b"ipchog", b"kilo", b"launcher", b"ls", b"lua", b"memfsd", b"netd", b"netdrv", b"netinfo", b"netsup", b"nproc", b"ping", b"probe", b"procd", b"ps", b"registryd", b"rngd", b"sessiond", b"sh", b"spin", b"sqlite3", b"udpecho", b"volmgr"]
 
 
 UUID = "6673642d73756974652d766f6c756d65"  # the volume etc/mounts calls `store`
@@ -415,6 +415,49 @@ def main():
     vol = "sqlite3 /mnt/store/s.db 'create table if not exists t(a); delete from t; insert into t values (1),(2),(3); select count(*) from t'\n"
     step(vol.encode(), [b"$ " + vol.strip().encode(), b"3"], "sqlite: a database on the disk volume")
     step(b"sqlite3 /mnt/store/s.db 'select sum(a) from t; pragma integrity_check'\n", [b"$ sqlite3 /mnt/store/s.db 'select sum(a) from t; pragma integrity_check'", b"6", b"ok"], "sqlite: it is still there, and intact")
+    # GNU gzip, unmodified: it reads what the host's gzip wrote, and what it writes the host's zlib reads (the oracles)
+    import gzip as pygz
+    import zlib
+    text = "".join(f"row {i}: the quick brown fox {i * 7919 % 1000}\n" for i in range(6)).encode()
+    host_gz = pygz.compress(text, 9, mtime=0)
+    octal = "".join(f"\\{b:03o}" for b in host_gz)
+    text_oct = "".join(f"\\{b:03o}" if b in b"\\%" or b < 32 and b != 10 else chr(b) if b != 10 else "\\n" for b in text)
+    md5 = __import__("hashlib").md5(text).hexdigest() + "  -"
+    # (one script: /tmp is private to a command)
+    script = (
+        f'busybox printf "{octal}" > /tmp/h.gz; gzip -dc /tmp/h.gz | busybox md5sum; '
+        f'busybox printf "{text_oct}" > /tmp/t.txt; gzip -9nc /tmp/t.txt | busybox od -b; echo END-GZ; '
+        "gzip -9nc /tmp/t.txt > /tmp/t.gz; gzip -l /tmp/t.gz | busybox wc -l; gzip -dc /tmp/t.gz | busybox md5sum; "
+        "busybox rm /tmp/t.gz; gzip -nk /tmp/t.txt && busybox ls /tmp/t.txt.gz; echo END-ALL"
+    )
+    assert len(script) < 1000, len(script)  # (an argument is at most 1024 bytes)
+    s.prompt()
+    s.p.stdin.write(("busybox hush -c '" + script + "'\n").encode())
+    s.p.stdin.flush()
+    got = []
+    while True:
+        line = s.next_line("gzip script")
+        if line == b"END-GZ":
+            break
+        got.append(line)
+    want_md5 = md5.encode()
+    if want_md5 not in got:
+        fail(s, f"gzip: it did not inflate what the host deflated: {got[-3:]}")
+    data = bytes(int(w, 8) for l in got if re.fullmatch(rb"[0-7]{7}( +[0-7]{3})+", l.strip()) for w in l.split()[1:])
+    try:
+        back = zlib.decompress(data, 31)
+    except zlib.error as e:
+        fail(s, f"gzip: the host's zlib could not read our output ({e}): {got}")
+    if back != text:
+        fail(s, "gzip: the host's zlib did not read back what our gzip wrote")
+    rest = []
+    while True:
+        line = s.next_line("gzip script end")
+        if line == b"END-ALL":
+            break
+        rest.append(line)
+    if rest != [b"2", want_md5, b"/tmp/t.txt.gz"]:
+        fail(s, f"gzip: -l, the round trip or -k: {rest}")
     # Ctrl-C is the signal SIGINT for a program that handles it (the shell keeps it off the console server's kill list)
     step(b"ctest signals int-handler\n", [b"$ ctest signals int-handler", b"ready"], "a program that handles SIGINT")
     s.wait_for_prompt = False

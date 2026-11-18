@@ -176,6 +176,43 @@ fn build_sqlite(dir: &str) -> Option<PathBuf> {
     )
 }
 
+/// GNU gzip 1.13: the fetched sources, built without `configure` against the small shims in `third_party/compat` (a
+/// hand-written `config.h`, `getopt_long`, the gnulib interfaces it uses). Without the sources `gzip` is a stub.
+fn build_gzip(dir: &str) -> Option<PathBuf> {
+    let root = Path::new(dir).join("../third_party");
+    let src = root.join("fetched/gzip/src");
+    println!("cargo:rerun-if-changed={}", src.join("gzip.c").display());
+    println!("cargo:rerun-if-changed={}", root.join("compat").display());
+    if !src.join("gzip.c").exists() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = [
+        "gzip", "util", "bits", "deflate", "inflate", "trees", "unlzh", "unlzw", "unpack", "unzip",
+        "zip",
+    ]
+    .iter()
+    .map(|f| src.join(format!("{f}.c")))
+    .collect();
+    for f in [
+        "getopt_long.c",
+        "gzip/xalloc.c",
+        "gzip/yesno.c",
+        "gzip/utimens.c",
+        "gzip/savedir.c",
+    ] {
+        files.push(root.join("compat").join(f));
+    }
+    let flags = vec![
+        "-w".to_string(),
+        "-O2".to_string(),
+        "-DHAVE_CONFIG_H".to_string(),
+        format!("-I{}", root.join("compat/gzip").display()),
+        format!("-I{}", root.join("compat").display()),
+        format!("-I{}", src.display()),
+    ];
+    build_c_archive("gzip", &files, &flags)
+}
+
 /// kilo (a 1300-line editor): the single file fetched by `make fetch-third-party`; without it `kilo` is a stub.
 fn build_kilo(dir: &str) -> Option<PathBuf> {
     let src = Path::new(dir).join("../third_party/fetched/kilo/src/kilo.c");
@@ -262,6 +299,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_busybox)");
     println!("cargo:rustc-check-cfg=cfg(have_kilo)");
     println!("cargo:rustc-check-cfg=cfg(have_sqlite)");
+    println!("cargo:rustc-check-cfg=cfg(have_gzip)");
     if let Some(archive) = build_c_tests(&dir) {
         println!("cargo:rustc-cfg=have_c");
         println!("cargo:rustc-link-arg-bin=ctest={}", archive.display());
@@ -273,6 +311,11 @@ fn main() {
             println!("cargo:rustc-cfg=have_sqlite");
             println!("cargo:rustc-link-arg-bin=sqlite3={}", q.display());
             println!("cargo:rustc-link-arg-bin=sqlite3=--error-limit=0");
+        }
+        if let Some(g) = build_gzip(&dir) {
+            println!("cargo:rustc-cfg=have_gzip");
+            println!("cargo:rustc-link-arg-bin=gzip={}", g.display());
+            println!("cargo:rustc-link-arg-bin=gzip=--error-limit=0");
         }
         if let Some(k) = build_kilo(&dir) {
             println!("cargo:rustc-cfg=have_kilo");

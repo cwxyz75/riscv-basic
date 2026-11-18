@@ -5129,6 +5129,7 @@ fn memfsd_serves_the_boot_image() -> Outcome {
             b"fetch".to_vec(),
             b"free".to_vec(),
             b"fsd".to_vec(),
+            b"gzip".to_vec(),
             b"hello".to_vec(),
             b"hog".to_vec(),
             b"httpd".to_vec(),
