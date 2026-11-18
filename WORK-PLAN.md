@@ -36,12 +36,12 @@ Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finis
 
 ### 0. Land the documentation reorganisation
 
-- [ ] Merge PR 233 (`docs/`) when green, then retarget PR 234 (review dispositions, which carries this plan) to `main` and
+- [x] Merge PR 233 (`docs/`) when green, then retarget PR 234 (review dispositions, which carries this plan) to `main` and
   merge it when green. PR 232 is merged. If PR 233's shell test fails in the `alarm` check again, that is T143: re-run.
 
 ### 1. T143: the flaky `alarm` check
 
-- [ ] The alarm check of `libc/tests/c/signals.c` fails intermittently in CI (it failed PR 233's first run). Find the cause from
+- [x] (PR: t143-alarm-check) The alarm check of `libc/tests/c/signals.c` fails intermittently in CI (it failed PR 233's first run). Find the cause from
   the failure output (the item says what to look at: `sig::wait_any` and the alarm deadline against `clock_get` under a
   loaded host), fix the test or the code, and show it is fixed (repeat the shell test several times locally; say how many).
 

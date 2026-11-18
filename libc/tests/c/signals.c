@@ -86,13 +86,13 @@ static int self_tests(void) {
     sigemptyset(&set);
     sigprocmask(SIG_SETMASK, &set, NULL);
 
-    /* alarm interrupts sleep: the handler runs and sleep reports the time left (a loaded machine may take longer than the second: any time left below ten will do) */
+    /* alarm interrupts sleep: the handler runs and sleep reports the time left (the time left is 9 when sleep starts right after alarm; a stall between the two calls makes it 10, which the host libc does too, so 1 to 10 is correct) */
     signal(SIGALRM, on_sig);
     got = 0;
     alarm(1);
     unsigned left = sleep(10);
-    if (left < 1 || left > 9) printf("DEBUG sleep left %u, handler %d\n", left, got == SIGALRM);
-    printf("alarm interrupted sleep: handler %d, time left %s\n", got == SIGALRM, left >= 1 && left <= 9 ? "about 9" : "wrong");
+    if (left < 1 || left > 10) printf("DEBUG sleep left %u, handler %d\n", left, got == SIGALRM);
+    printf("alarm interrupted sleep: handler %d, time left %s\n", got == SIGALRM, left >= 1 && left <= 10 ? "about 9" : "wrong");
     printf("alarm(0) with nothing set returns %u\n", alarm(0));
 
     /* pause() returns -1 with EINTR once a handler has run */
