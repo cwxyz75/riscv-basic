@@ -10,7 +10,7 @@ which is what happened after the previous adjustment.
 | Tier | What | When | Budget | Make target | CI |
 |---|---|---|---|---|---|
 | 0, unit | fmt, docs check, host unit/model/property tests of every crate, clippy, the OS host tests with loom and shuttle | every edit; the inner loop | about 2 minutes | `make quick` (fast part), `make test lint os-test` | the `host` job |
-| 1, smoke | tier 0, then **one** boot of the whole suite on the default machine (AIA) at four harts, the release smoke, the home computer's boot | every PR: the merge gate | 10 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
+| 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (`core`, `net`), the release smoke, the home computer's boot | every PR: the merge gate | 10 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
 | 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | on demand; nightly on `main`; on a PR labelled `soak` (recommended for kernel, SMP and security slices); before a release; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
 
 Rules:
@@ -18,7 +18,7 @@ Rules:
 1. **The gate is tiers 0 and 1 and nothing else.** `make check` is exactly `smoke`. `ci.yml` runs only smoke targets (plus the
    fail-demo harness check when the harness itself changed, and `kernel (shell test)`: the interactive shell test, the one job that
    builds BusyBox, from sources fetched by sha256 and cached), has no build matrix, and every job's `timeout-minutes` is at most
-   the budget. A job that outgrows its budget fails loudly: raise the budget on purpose here, or cut work, do not let it grow.
+   the budget (7 minutes). A job that outgrows its budget fails loudly: raise the budget on purpose here, or cut work, do not let it grow.
 2. **Locally, run tier 0 and the one targeted test** while iterating (`make quick`, or `cargo test -p kcore --test X`). Run
    `make smoke` (about three minutes warm) before a push if you want the whole gate; CI runs it anyway. Do not run the soak
    tier by hand before every push: that is what it is for on demand, and nightly.
@@ -39,14 +39,20 @@ Rules:
 
 ## When the smoke boot outgrows its budget
 
-The smoke boot is the whole suite at four harts. Measured 2026-11-16 (after S9): 217 tests, about 101 seconds of guest time on the
-development machine, more than half of it in the network tests (mostly deliberate waits: timeouts, drains, restarts), and about
-5.5 minutes of boot on a CI runner, which is about 3.3 times slower; the whole job took 7.3 minutes against a 10-minute budget, so
-there are about 2.5 minutes of room (the budget is enforced by `check_docs.py`). The harness prints `suite guest time` and the six slowest tests after every passing boot, so
-the growth is visible in every log. Shard before a run passes 9 minutes. The order: (1) shard the suite across parallel QEMU instances
-(the `net=lossy` boot argument and the harness's `required` list are the model for a per-shard filter); (2)
-tag tests soak-only and add a filter (a `SOAK` list in the suite's registry and a flag the init program reads), starting
-with the slowest in the profile (`profile_check.py` prints them); (3) move the logic of QEMU tests to the host (below).
+The smoke boot is the whole suite at four harts, run as **two shards in parallel CI jobs** since 2026-11-18 (OD121): `core`
+(everything but the network tests; the guest has no network device) and `net` (the `net_*` tests and the C sockets test). The
+guest filters by the `shard=core` / `shard=net` kernel argument (`debug_stat` 13); the harness (`OS_SHARD`) has the same rule, checks
+each shard reports only its own required tests, and runs the host-side checks of the part it has (the net shard does the network
+ones, the core shard the disk, C and Lua ones). `make os-boot-test-smoke` runs both one after the other, locally. The release smoke is
+its own job, so a gate job is a boot of about half the suite or the release build, with a 7-minute budget (the docs check enforces it).
+
+Measured 2026-11-16 (after S9): 217 tests, about 101 seconds of guest time on the development machine, a little under half of it in
+the network tests, and, on a CI runner, which is about 2 to 3 times slower, 6.6 minutes of boot as one job; with the release smoke and
+setup the one job took 9.6 minutes of its 10 (2026-11-18). The harness prints `suite guest time` and the six slowest tests after every
+passing boot, so the growth is visible in every log. Split a shard again, by the same mechanism, before a job passes 6 minutes; after
+that, in this order: (1) a third shard (the filter is a name rule in the suite and the harness: add a value of `debug_stat` 13);
+(2) tag tests soak-only and add a filter, starting with the slowest in the profile (`profile_check.py` prints them); (3) move the
+logic of QEMU tests to the host (below).
 The profile is the guide: do not guess.
 
 ## Moving logic out of QEMU (slice TS step 3, done incrementally)

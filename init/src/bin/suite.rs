@@ -11817,8 +11817,15 @@ pub fn app_main() -> i32 {
         "net_httpd_for_the_host",
         "net_tcp_echo_for_the_host",
     ];
+    // The smoke tier runs the suite as two parallel boots (`shard=core`, `shard=net`; TESTING.md, OD121): the network tests are
+    // `net_*` and the C sockets test. `scripts/os_boot_test.py` has the same rule and checks each shard ran only its own.
+    let shard = sys::debug_stat(13);
+    let is_net = |n: &str| n.starts_with("net_") || n == "c_sockets_over_the_stack";
     for (name, test) in tests {
         if lossy && !LOSSY_TESTS.contains(name) {
+            continue;
+        }
+        if (shard == 1 && is_net(name)) || (shard == 2 && !is_net(name)) {
             continue;
         }
         if !timed(name, *test) {

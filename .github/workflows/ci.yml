@@ -46,7 +46,7 @@ jobs:
 
   host:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -61,16 +61,17 @@ jobs:
       - name: Check the demo pictures against the independent renderer
         run: python3 home/scripts/verify_demo_images.py
 
-  # Tier 1: one boot of the whole suite on the default (AIA) machine at four harts, and the release smoke.
-  # Budget: 10 minutes (the docs check enforces it). Measured 2026-11-16: about 7.3 minutes, the boot being 5.5 of them; shard the
-  # suite (TESTING.md "When the smoke boot outgrows its budget") before a run passes 9. (The fail-demo check, when the harness changed,
-  # is the separate job `harness (fail-demo)`.)
+  # Tier 1: the suite boots twice on the default (AIA) machine at four harts, as two parallel jobs (OD121: `core` is everything but
+  # the network tests, `net` is the network tests; the harness checks each ran only its part), and the release smoke is a third.
+  # Budget: 7 minutes each (the docs check enforces it). The one job that held all of it took 9.6 minutes of its 10 on 2026-11-18;
+  # a shard that nears the budget is split again by the same mechanism (TESTING.md "When the smoke boot outgrows its budget").
+  # (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
   kernel:
-    name: kernel (smoke)
+    name: kernel (smoke core)
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,7 +90,55 @@ jobs:
           qemu-system-riscv64 --version | head -1
           qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
           dpkg -l opensbi | tail -1
-      - run: make os-boot-test-smoke os-release-smoke
+      - run: make os-boot-test-smoke-core
+
+  kernel-net:
+    name: kernel (smoke net)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+      - name: Install QEMU and OpenSBI
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+      - name: QEMU and OpenSBI versions, and whether this QEMU has AIA
+        run: |
+          qemu-system-riscv64 --version | head -1
+          qemu-system-riscv64 -machine virt,help | grep -i "aia" || echo "NO AIA OPTION"
+          dpkg -l opensbi | tail -1
+      - run: make os-boot-test-smoke-net
+
+  # The release smoke: the release image boots to the shell and reports no test banners (its own job, in parallel with the boots).
+  release-smoke:
+    name: kernel (release smoke)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-smoke
+      - name: Install QEMU and OpenSBI
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y qemu-system-riscv opensbi clang llvm
+      - run: make os-release-smoke
 
   # The shell test (BusyBox applets, programs that start programs, signals) needs the BusyBox sources, which are fetched (and cached:
   # the archive is pinned by its sha256 in third_party/fetch-manifest.txt), not committed. Without them `busybox` is a stub.
@@ -98,7 +147,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -128,7 +177,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.os == 'true' && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
         with:
@@ -164,7 +213,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.home == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
