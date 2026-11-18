@@ -48,6 +48,8 @@ int fileno(FILE *f);
 int fseek(FILE *f, long off, int whence);
 long ftell(FILE *f);
 long long ftello(FILE *f);
+int fscanf(FILE *f, const char *fmt, ...);
+int scanf(const char *fmt, ...);
 int fpurge(FILE *f);
 void __fpurge(FILE *f);
 int renameat(int olddirfd, const char *old, int newdirfd, const char *new_);

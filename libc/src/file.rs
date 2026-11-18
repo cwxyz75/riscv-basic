@@ -153,6 +153,54 @@ impl File {
         self.ungot = -1;
     }
 
+    /// `fscanf`'s reader: scan the buffered input (reading more when a number or word may continue past the end), and leave the
+    /// unconsumed bytes in the stream. A token that runs on past what the format takes is read from the stream and cannot all be
+    /// given back (the buffer and one pushed-back byte hold what is left), so reading several fields from one very long word
+    /// loses its tail.
+    pub(crate) fn scan_stream(&mut self, fmt: &[u8]) -> cfmt::scan::Scanned {
+        let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if self.ungot >= 0 {
+            data.push(self.ungot as u8);
+            self.ungot = -1;
+        }
+        if self.rpos == self.rlen {
+            let c = self.getc();
+            if c != EOF {
+                data.push(c as u8);
+            }
+        }
+        if self.rpos < self.rlen {
+            // SAFETY: `rpos..rlen` is initialised input in `buf`.
+            data.extend_from_slice(unsafe {
+                core::slice::from_raw_parts(self.buf.add(self.rpos), self.rlen - self.rpos)
+            });
+            self.rpos = self.rlen;
+        }
+        let mut r = cfmt::scan::scan(&data, fmt);
+        // everything was used: the input may continue (a number or word at the end of the buffer): read on to the next white space
+        if r.consumed == data.len() && self.flags & F_EOF == 0 && data.len() < 4096 {
+            loop {
+                let c = self.getc();
+                if c == EOF {
+                    break;
+                }
+                data.push(c as u8);
+                if (c as u8).is_ascii_whitespace() || data.len() >= 4096 {
+                    break;
+                }
+            }
+            r = cfmt::scan::scan(&data, fmt);
+        }
+        let tail = &data[r.consumed.min(data.len())..];
+        if !tail.is_empty() && self.ensure_buf() && tail.len() <= self.cap {
+            // SAFETY: `buf` has `cap >= tail.len()` bytes.
+            unsafe { core::ptr::copy_nonoverlapping(tail.as_ptr(), self.buf, tail.len()) };
+            self.rpos = 0;
+            self.rlen = tail.len();
+        }
+        r
+    }
+
     /// The next byte, or EOF.
     fn getc(&mut self) -> c_int {
         if self.ungot >= 0 {

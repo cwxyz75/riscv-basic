@@ -951,3 +951,18 @@ fn getopt_long_agrees_with_the_host() {
         "compared {compared} runs ({skipped} with faults)"
     );
 }
+
+#[test]
+fn sscanf_reports_how_much_it_used() {
+    use cfmt::scan::scan;
+    assert_eq!(scan(b"12 abc", b"%d").consumed, 2);
+    assert_eq!(scan(b"  12 abc", b"%d %s").consumed, 8);
+    assert_eq!(scan(b"12abc", b"%d").consumed, 2, "the letters stay");
+    assert_eq!(
+        scan(b"x", b"%d").consumed,
+        0,
+        "nothing matched: nothing used"
+    );
+    assert_eq!(scan(b"7,8", b"%d,%d").consumed, 3);
+    assert_eq!(scan(b"abc", b"%2c").consumed, 2);
+}

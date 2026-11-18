@@ -25,3 +25,5 @@ variadic error_at_line, verror_at_line, 5, 56
 variadic execl, vexecl, 2, 32
 variadic execlp, vexeclp, 2, 32
 variadic execle, vexecle, 2, 32
+variadic fscanf, vfscanf, 2, 32
+variadic scanf, vscanf, 1, 24

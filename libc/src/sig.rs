@@ -622,3 +622,24 @@ pub extern "C" fn getppid() -> c_int {
         p => p as c_int,
     }
 }
+
+/// `sigwait`: take the lowest-numbered pending signal in `set` (they should be blocked), waiting for one (checked every 10 ms).
+#[no_mangle]
+pub unsafe extern "C" fn sigwait(set: *const u64, sig: *mut c_int) -> c_int {
+    let wanted = *set & !(bit(SIGKILL) | bit(SIGSTOP));
+    loop {
+        drain();
+        check_alarm();
+        {
+            let mut t = TABLE.lock();
+            let ready = t.pending & wanted;
+            if ready != 0 {
+                let n = ready.trailing_zeros() as c_int + 1;
+                t.pending &= !bit(n);
+                *sig = n;
+                return 0;
+            }
+        }
+        let _ = wait_any(&[], rt::sys::clock_get() + 10, true);
+    }
+}

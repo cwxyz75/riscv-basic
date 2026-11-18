@@ -1344,11 +1344,17 @@ impl ArgSlots {
 /// pointers in the argument slots, in order.
 #[no_mangle]
 pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *const u64) -> c_int {
-    use cfmt::scan::Item;
     let input = core::ffi::CStr::from_ptr(s).to_bytes();
     let f = core::ffi::CStr::from_ptr(fmt).to_bytes();
-    let mut args = ArgSlots(ap);
     let r = cfmt::scan::scan(input, f);
+    store_scanned(&r, ap);
+    r.ret
+}
+
+/// Store what a scan found through the pointers in the argument slots, in order.
+pub(crate) unsafe fn store_scanned(r: &cfmt::scan::Scanned, ap: *const u64) {
+    use cfmt::scan::Item;
+    let mut args = ArgSlots(ap);
     for item in &r.items {
         let p = args.next_ptr();
         match item {
@@ -1374,7 +1380,6 @@ pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *cons
             Item::Count(n) => *(p as *mut c_int) = *n,
         }
     }
-    r.ret
 }
 
 // ---- ctime ----

@@ -52,12 +52,12 @@ and a portable test corpus (a public libc test suite is the oracle; which one is
 | gzip | 2, 0 | 1, 0 |
 | dash | 3, 0 | 2, 1 (`histedit.h`, optional) |
 | coreutils | 26, 4 (`copy` and `S_TYPEIS*` are macros or its own, `strtold`) | 2, 0 |
-| gnutar | 22, 2 (`fscanf`, `sigwait`) | 5, 1 (`localcharset.h` is gnulib's) |
+| gnutar | 22, 0 (`fscanf` and `sigwait` were added after the first measurement) | 5, 1 (`localcharset.h` is gnulib's) |
 | busybox | 5, 4 (`crypt` and the `utmpx` calls: not planned) | 0, 0 |
 
 Built: the `*at` family (on the volume; `symlinkat` needs a file server with symlinks, which `memfsd` does not have yet), `getopt_long`
 (`cfmt::getopt_long`, with the host's as oracle), `error`, `execl`/`execlp`/`execle`, `strings.h`, `creat`, `ftello`, `mkostemp`,
 `pthread_sigmask`, `isblank`, `fpurge`, a no-op `flock`, `alloca.h`, `sysexits.h`, `stdbool.h`, `O_SEARCH`, the `stat64` names, and the
 UTF-8 wide-character core (`cfmt::mb`, tested against `std`: `mbrtowc`, `wcrtomb`, `mbstowcs`, `wcstombs`, `wcs*`/`wmem*`, the `isw*`
-classes, `towupper`/`towlower`, `wcwidth`, `uchar.h`). Not built: `fscanf` and `sigwait` (the two things GNU tar still asks for),
-`strtold` (`long double` is a 128-bit float on this ABI), `crypt`, `utmpx`, `dlopen`, `libedit`.
+classes, `towupper`/`towlower`, `wcwidth`, `uchar.h`), `fscanf`/`scanf` (over `cfmt::scan`, which now reports how much it used) and
+`sigwait`. Not built: `strtold` (`long double` is a 128-bit float on this ABI), `crypt`, `utmpx`, `dlopen`, `libedit`.

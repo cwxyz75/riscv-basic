@@ -345,3 +345,23 @@ pub unsafe extern "C" fn fpurge(_f: *mut crate::file::File) -> c_int {
 pub extern "C" fn flock(_fd: c_int, _op: c_int) -> c_int {
     0
 }
+
+// ---- fscanf ----
+
+/// `vfscanf`: the format applied to the stream (`cfmt::scan`); see `File::scan_stream` for the one limitation.
+#[no_mangle]
+pub unsafe extern "C" fn vfscanf(
+    f: *mut crate::file::File,
+    fmt: *const c_char,
+    ap: *const u64,
+) -> c_int {
+    let fmt = core::ffi::CStr::from_ptr(fmt).to_bytes();
+    let r = (*f).scan_stream(fmt);
+    crate::compat::store_scanned(&r, ap);
+    r.ret
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vscanf(fmt: *const c_char, ap: *const u64) -> c_int {
+    vfscanf(crate::file::stdin.0, fmt, ap)
+}

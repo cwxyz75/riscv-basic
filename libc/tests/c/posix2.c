@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -104,6 +105,39 @@ int posix2_test(void) {
         CHECK(wcwidth(0x65e5) == 2 && wcwidth('a') == 1 && wcwidth(0x301) == 0 && wcswidth(ws, 3) == 3, "wcwidth: wide, narrow, combining");
         CHECK(iswalpha(0xe9) && !iswalpha('1') && iswspace(0x3000) && iswupper(0xc9) && towupper(0xe9) == 0xc9 && towlower(0xc9) == 0xe9, "the wide classes and case");
         CHECK(iswctype('x', wctype("alpha")) && !iswctype('x', wctype("digit")) && wctype("nope") == 0, "wctype and iswctype");
+    }
+    /* fscanf reads fields in turn and leaves the rest of the stream */
+    {
+        FILE *sf = fopen("/tmp/scan.txt", "w");
+        fputs("12 abc 3.5\nline two 7\n", sf);
+        fclose(sf);
+        sf = fopen("/tmp/scan.txt", "r");
+        int a = 0, b = 0;
+        char w[16];
+        double dv = 0;
+        int n1 = fscanf(sf, "%d %15s %lf", &a, w, &dv);
+        CHECK(n1 == 3 && a == 12 && strcmp(w, "abc") == 0 && dv == 3.5, "fscanf reads three fields");
+        char l2[32];
+        CHECK(fgets(l2, sizeof l2, sf) != NULL && strcmp(l2, "\n") == 0 && fgets(l2, sizeof l2, sf) != NULL && strcmp(l2, "line two 7\n") == 0, "the rest of the stream is where the format stopped");
+        rewind(sf);
+        n1 = fscanf(sf, "%d", &a);
+        int n2 = fscanf(sf, "%s", w);
+        int n3 = fscanf(sf, "%lf", &dv);
+        CHECK(n1 == 1 && n2 == 1 && n3 == 1 && a == 12 && strcmp(w, "abc") == 0 && dv == 3.5, "repeated fscanf calls continue where the last one ended");
+        CHECK(fscanf(sf, "%d", &b) == 0, "a field that is not a number fails with no conversions");
+        fclose(sf);
+        unlink("/tmp/scan.txt");
+    }
+    /* sigwait takes a blocked, pending signal */
+    {
+        sigset_t ss;
+        sigemptyset(&ss);
+        sigaddset(&ss, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &ss, NULL);
+        kill(getpid(), SIGUSR1);
+        int got = 0;
+        CHECK(sigwait(&ss, &got) == 0 && got == SIGUSR1, "sigwait returns a blocked pending signal");
+        sigprocmask(SIG_UNBLOCK, &ss, NULL);
     }
     /* error() */
     unsigned before = error_message_count;
