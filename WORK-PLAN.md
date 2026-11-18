@@ -40,7 +40,7 @@ kernel and authority slices; shortcuts into TIDY-UP.md; decisions into the OS de
   is defined. Phase 1 is item 3 above; the measure is "every fetched program in `scripts/libc_gap_survey.py` reports no undeclared
   names, and the portable test corpus passes".
 - GNU tar and GNU coreutils (both need gnulib on a libc with the interfaces above; T145), a real `/bin/sh` for interactive use, `tcc`.
-- The native shell `ish` (SH steps), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
+- The remaining `ish` steps (SH1 to SH5 are done: `sh` is `ish`; SH6 and SH7 are left), S10 namespaces and attributes, S11 compatibility, the S-series locking peels (L tasks 11 to 28).
 
 ## Plan 1 (history)
 
