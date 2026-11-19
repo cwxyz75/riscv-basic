@@ -419,6 +419,16 @@ impl Vmos {
     }
 }
 
+/// Pages a fault mapped (the faulting page and the committed ones around it): flush `first..=last`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedPages {
+    pub first: u64,
+    pub last: u64,
+}
+
+/// Fault-around works inside a window of this many pages (64 KiB), aligned (KERNEL-V1-SPEC 4.5): at most 15 neighbours.
+pub const FAULT_AROUND_WINDOW_PAGES: u64 = 16;
+
 struct Region {
     pages: u64,
     vmo: u64,
@@ -566,8 +576,8 @@ impl AddressSpace {
     }
 
     /// Handle a page fault at `va` for `access`: map the page if the region allows
-    /// the access. A fault on a page that is already mapped (and allowed) is
-    /// spurious and succeeds.
+    /// the access, and the committed pages around it (fault-around, MM1). A fault on a page
+    /// that is already mapped (and allowed) is spurious and succeeds.
     pub fn handle_fault<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -575,6 +585,21 @@ impl AddressSpace {
         va: u64,
         access: Access,
     ) -> Result<(), FaultError> {
+        self.handle_fault_mapped(mm, vmos, va, access).map(|_| ())
+    }
+
+    /// `handle_fault`, saying which pages it mapped: the faulting page and, in the same 64 KiB aligned window and the same region,
+    /// every page the VMO has **already committed** and that was not mapped yet (never one it would have to commit). The
+    /// caller flushes `first..=last` (page by page) before returning to the faulting instruction: a mapping that was absent may
+    /// still be cached as absent unless the implementation has Svvptc, and a stale entry is harmless but a fault. A neighbour that
+    /// cannot be mapped (no memory for a table) is simply left for its own fault. Device memory is not mapped around.
+    pub fn handle_fault_mapped<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        va: u64,
+        access: Access,
+    ) -> Result<MappedPages, FaultError> {
         let (&start, region) = self
             .regions
             .range(..=va)
@@ -602,10 +627,18 @@ impl AddressSpace {
                 Access::Write => existing.perms.write,
                 Access::Exec => existing.perms.exec,
             };
-            return if ok { Ok(()) } else { Err(FaultError::Denied) };
+            return if ok {
+                Ok(MappedPages {
+                    first: page_va,
+                    last: page_va,
+                })
+            } else {
+                Err(FaultError::Denied)
+            };
         }
-        let (vmo, perms) = (region.vmo, region.perms);
-        let pfn = vmos.page_for(mm, vmo, region.vmo_page + page)?;
+        let (vmo, perms, region_pages, vmo_page0) =
+            (region.vmo, region.perms, region.pages, region.vmo_page);
+        let pfn = vmos.page_for(mm, vmo, vmo_page0 + page)?;
         let managed = mm.db.is_managed(pfn);
         if managed {
             mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
@@ -623,7 +656,41 @@ impl AddressSpace {
                 other => FaultError::MapFailed(other),
             });
         }
-        Ok(())
+        let mut out = MappedPages {
+            first: page_va,
+            last: page_va,
+        };
+        if vmos.kind(vmo) == Some(VmoKind::Device) {
+            return Ok(out);
+        }
+        // fault-around: the 64 KiB aligned window, clipped to the region
+        let window = FAULT_AROUND_WINDOW_PAGES * PAGE_SIZE;
+        let lo = (page_va & !(window - 1)).max(start);
+        let hi = ((page_va & !(window - 1)) + window).min(start + region_pages * PAGE_SIZE);
+        let mut q = lo;
+        while q < hi {
+            if q != page_va {
+                let qpage = (q - start) / PAGE_SIZE;
+                if let Some(qpfn) = vmos.frame(vmo, vmo_page0 + qpage) {
+                    if self.table.translate(mm, q).is_none() {
+                        let qmanaged = mm.db.is_managed(qpfn);
+                        if qmanaged && mm.db.inc(qpfn).is_err() {
+                            break;
+                        }
+                        if self.table.map(mm, q, qpfn, perms).is_err() {
+                            if qmanaged {
+                                let _ = mm.db.dec(qpfn);
+                            }
+                            break;
+                        }
+                        out.first = out.first.min(q);
+                        out.last = out.last.max(q);
+                    }
+                }
+            }
+            q += PAGE_SIZE;
+        }
+        Ok(out)
     }
 
     /// Unmap everything and free the tables of a process whose table shares the kernel's

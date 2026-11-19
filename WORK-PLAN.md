@@ -58,8 +58,8 @@ owner's go-ahead: the sentences in older `L` items about waiting for one are sup
 
 Why first: the owner's complaint is that editing the kernel is slow on testing, and every later phase is a kernel edit.
 
-- [ ] **KT1** the kernel-only boot (`make kquick`, `os-ktest` at 1, 2, 4 harts and the release kernel, in the gate)
-- [ ] **MM1** single-page flush after a fault, fault-around (small, and a real cost on every fault)
+- [x] **KT1** the kernel-only boot (`make kquick`, `os-ktest` at 1, 2, 4 harts and the release kernel, in the gate) (PR 252)
+- [x] **MM1** single-page flush after a fault, fault-around (small, and a real cost on every fault) (PR 253)
 - [ ] **KT3** panic lints, overflow checks, `unsafe` documentation as errors (by file, `kcore` first)
 - [ ] **KT4** the C5 atomics gate and the syscall-error-to-test table
 - [ ] **KT2** record and replay capture, the repeat target

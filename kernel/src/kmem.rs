@@ -202,6 +202,17 @@ pub fn flush_tlb() {
     unsafe { core::arch::asm!("sfence.vma zero, zero") };
 }
 
+/// Flush the translations of the pages `first..=last` (virtual addresses, 4 KiB apart) of address space `asid`, one `sfence.vma`
+/// each (MM1): a resolved page fault drops only what it changed, not every other page this hart has cached.
+pub fn flush_pages(first: u64, last: u64, asid: u16) {
+    let mut va = first & !0xfff;
+    while va <= last {
+        // SAFETY: `sfence.vma` with an address and an ASID drops cached translations of that page; no other effect.
+        unsafe { core::arch::asm!("sfence.vma {}, {}", in(reg) va, in(reg) u64::from(asid)) };
+        va += 4096;
+    }
+}
+
 /// The kernel's top-level (upper half) page-table entries as `init` left them. Process page
 /// tables copy these at creation, so the kernel must never create or free a top-level slot
 /// afterwards (OD41); `kernel_half_unchanged` checks.

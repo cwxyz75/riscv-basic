@@ -4,7 +4,7 @@ kind: slice
 title: Allocation-failure sweep: fail the Nth kernel allocation, for every N
 area: testing
 horizon: long
-blocked_by: [KT6, KT1]
+blocked_by: [KT6]
 refs: [KERNEL-V1-SPEC, OD139, OD140]
 ---
 

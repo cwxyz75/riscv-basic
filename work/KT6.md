@@ -4,7 +4,6 @@ kind: slice
 title: Tier 3: the long-run workflow, started only by the owner
 area: testing
 horizon: long
-blocked_by: [KT1]
 refs: [KERNEL-V1-SPEC, OD140]
 ---
 
