@@ -55,6 +55,16 @@ jobs:
           dpkg -l opensbi | tail -1
           clang --version | head -1
       - run: make ${{ matrix.targets }}
+      # the serial log of every failing boot (scripts/os_boot_test.py writes it to target/fail-logs/) and of a failing repeat run
+      - name: Keep the logs of failing boots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-logs-${{ strategy.job-index }}
+          path: |
+            target/fail-logs/
+            target/repeat/
+          if-no-files-found: ignore
 
   miri:
     name: soak (miri)

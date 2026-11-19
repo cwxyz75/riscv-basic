@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main lint-kernel os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -174,6 +174,17 @@ os-ktest-release:
 	cd init && cargo build --release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-krelease
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KREL_ELF)
+
+# `make os-repeat TARGET=<target> N=<n>`: run a target N times with SOAK_JOBS=1 and print `pass/N` (KT2, OD140); the serial log of
+# every failing run is saved under target/repeat/. Over a soak target this is a soak run, which only the owner starts (OD142).
+N ?= 20
+# The fail-demo kernel run as if it should pass (the kernel-only boot at one hart): a target that always fails, for the check of the repeat
+# tooling (`make os-repeat TARGET=os-boot-test-fail-run N=3` reports 0/3 with three logs).
+os-boot-test-fail-run: kernel
+	OS_SHARD=k OS_SMP=1 python3 scripts/os_boot_test.py $(OS_FAIL_ELF)
+
+os-repeat:
+	python3 scripts/os_repeat.py $(TARGET) $(N)
 
 # The inner loop for kernel edits: format, the pure kernel crates' host tests, the kernel-only boot at four harts.
 kquick: fmt-check kernel-main
