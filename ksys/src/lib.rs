@@ -20,7 +20,9 @@
 
 extern crate alloc;
 
+mod job;
 mod vmo;
+pub use job::{job_call, job_status};
 pub use vmo::vmo_call;
 
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
@@ -61,6 +63,8 @@ pub struct Ctx<'a, M: PhysMem> {
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
     pub faults: Faults,
+    /// The processors that are online (`job_info` 7).
+    pub harts_online: u64,
 }
 
 pub(crate) fn fail(s: Status) -> Reply {
@@ -91,6 +95,7 @@ pub fn wide_argument_error(n: usize, a: &[u64; 6]) -> Option<Status> {
         {
             Some(Status::BadHandle)
         }
+        nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO if over(0) => Some(Status::BadHandle),
         nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
         nr::SOCKET_WRITE
         | nr::SOCKET_READ
@@ -131,6 +136,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         mm,
         vmos,
         faults,
+        ..
     } = c;
     let (job, skip_forced_touch) = (*job, faults.skip_forced_touch);
     if !matches!(

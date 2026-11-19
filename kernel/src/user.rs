@@ -29,7 +29,7 @@ use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
-use kcore::job::{JobError, JobId, Limits, Resource};
+use kcore::job::{JobError, JobId, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::sched::Tid;
 use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
@@ -951,12 +951,9 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, r);
         }
         nr::PROCESS_CREATE
-        | nr::JOB_CREATE
-        | nr::JOB_SET_LIMITS
         | nr::JOB_SET_SCHED
         | nr::THREAD_SET_SCHED
         | nr::THREAD_GET_SCHED
-        | nr::JOB_INFO
         | nr::JOB_KILL
         | nr::JOB_ROOT
         | nr::RESOURCE_ROOT
@@ -1087,11 +1084,15 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             faults: ksys::Faults {
                 skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
             },
+            harts_online: crate::smp::online() as u64,
         };
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
             return r;
         }
         if let Some(r) = ksys::vmo_call(n, a, &mut ctx) {
+            return r;
+        }
+        if let Some(r) = ksys::job_call(n, a, &mut ctx) {
             return r;
         }
     }
@@ -2132,17 +2133,11 @@ fn process_call(n: usize, a: [u64; 6]) -> Reply {
     match n {
         nr::PROCESS_CREATE if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_CREATE => process_create(a),
-        nr::JOB_CREATE if wide(0) => bad(Status::BadHandle),
-        nr::JOB_CREATE => job_create(a),
-        nr::JOB_SET_LIMITS | nr::JOB_INFO | nr::JOB_KILL | nr::JOB_SET_SCHED if wide(0) => {
-            bad(Status::BadHandle)
-        }
+        nr::JOB_KILL | nr::JOB_SET_SCHED if wide(0) => bad(Status::BadHandle),
         nr::JOB_SET_SCHED => job_set_sched(a),
         nr::THREAD_SET_SCHED | nr::THREAD_GET_SCHED if wide(0) => bad(Status::BadHandle),
         nr::THREAD_SET_SCHED => thread_set_sched(a),
         nr::THREAD_GET_SCHED => thread_get_sched(a),
-        nr::JOB_SET_LIMITS => job_set_limits(a),
-        nr::JOB_INFO => job_info(a),
         nr::JOB_KILL => job_kill(a),
         nr::JOB_ROOT => job_root(),
         nr::RESOURCE_ROOT => resource_root(),
@@ -2916,106 +2911,7 @@ fn thread_info(a: [u64; 6]) -> Reply {
 
 // ---- jobs (S4.5, OD56-OD58) ----
 
-/// What a failed ledger call looks like to a program: running into a limit is "out of memory"
-/// (the one resource-exhausted status), a job that is gone is a bad state.
-fn job_status(e: JobError) -> Status {
-    match e {
-        JobError::Exceeded | JobError::TooManyJobs => Status::NoMemory,
-        JobError::NoSuchJob => Status::BadState,
-    }
-}
-
-/// Read six limits (processes, threads, pages, jobs, objects, ipc_bytes: `u64::MAX` means none)
-/// from the 48 bytes of user memory at `ptr`.
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing
-)] // INVARIANT: the record is six words (48 bytes, copied in whole), read at word indices 0 to 5, so the slices are inside it and `try_into` of eight bytes cannot fail
-fn read_limits(s: &mut UserState, me: u32, ptr: u64) -> Result<Limits, ReplyErr> {
-    let k = kmem::get();
-    let p = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-    let raw = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, ptr, 48)
-        .map_err(|e| (e, None, None))?;
-    let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
-    Ok(Limits {
-        processes: w(0),
-        threads: w(1),
-        pages: w(2),
-        jobs: w(3),
-        objects: w(4),
-        ipc_bytes: w(5),
-    })
-}
-
-/// `job_create(parent, limits_ptr) -> handle`: a child job of the job `parent` (needs MANAGE) with
-/// the six limits at `limits_ptr`. The child can never use more than any ancestor allows, whatever its own
-/// limits say.
-fn job_create(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        // credits of objects destroyed since the last charge come first: a job that has just
-        // closed its children must be able to make another at once
-        ipc::settle(&mut s.objs, &mut kmem::get().vmos.jobs);
-        {
-            let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-            ipc::job_of(
-                &s.objs,
-                &caller.handles,
-                Handle(a[0] as u32),
-                Rights::MANAGE,
-            )
-            .map_err(|e| (e, None, None))?;
-        }
-        let limits = read_limits(s, me, a[1])?;
-        let UserState { objs, procs, .. } = s;
-        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let parent = ipc::job_of(objs, &caller.handles, Handle(a[0] as u32), Rights::MANAGE)
-            .map_err(|e| (e, None, None))?;
-        let jobs = &mut kmem::get().vmos.jobs;
-        let id = jobs
-            .create(parent, limits)
-            .map_err(|e| (job_status(e), None, None))?;
-        match ipc::job_object_create(
-            objs,
-            &mut caller.handles,
-            id,
-            Rights::JOB,
-            &mut quota(caller.job),
-        ) {
-            Ok(h) => Ok((Some(u64::from(h.0)), None)),
-            Err(e) => {
-                jobs.release(id);
-                Err((e, None, None))
-            }
-        }
-    })
-}
-
-/// `job_set_limits(job, limits_ptr)`: needs SET_LIMITS (not MANAGE). Usage above a new limit is
-/// not undone: later charges fail until it is back under.
-fn job_set_limits(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let job = ipc::job_of(
-            &s.objs,
-            &caller.handles,
-            Handle(a[0] as u32),
-            Rights::SET_LIMITS,
-        )
-        .map_err(|e| (e, None, None))?;
-        let limits = read_limits(s, me, a[1])?;
-        kmem::get()
-            .vmos
-            .jobs
-            .set_limits(job, limits)
-            .map_err(|e| (job_status(e), None, None))?;
-        Ok((None, None))
-    })
-}
+use ksys::job_status;
 
 /// The base priority a new thread starts at (SCHED-SMP-SPEC 4.9): `want`, clamped to the job's `max_prio` (and at
 /// least 1: a user thread is never the idle priority).
@@ -3145,62 +3041,6 @@ fn job_set_sched(a: [u64; 6]) -> Reply {
             .collect();
         thread::set_priorities(&clamp);
         Ok((None, None))
-    })
-}
-
-/// `job_info(job, which) -> used, limit` for `which` 0 processes, 1 threads, 2 pages (everything
-/// in the job and below it). Needs INSPECT.
-fn job_info(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let job = ipc::job_of(
-            &s.objs,
-            &caller.handles,
-            Handle(a[0] as u32),
-            Rights::INSPECT,
-        )
-        .map_err(|e| (e, None, None))?;
-        let res = match a[1] {
-            0 => Resource::Processes,
-            1 => Resource::Threads,
-            2 => Resource::Pages,
-            3 => Resource::Jobs,
-            4 => Resource::Objects,
-            5 => Resource::IpcBytes,
-            // 6: the job's scheduling limits: `max_prio` and `rt_budget` (nanoseconds per 100 ms window)
-            6 => {
-                let s = kmem::get()
-                    .vmos
-                    .jobs
-                    .sched(job)
-                    .ok_or((Status::BadState, None, None))?;
-                return Ok((Some(u64::from(s.max_prio)), Some(s.rt_budget)));
-            }
-            // 7: the processors a job's threads may run on: every hart that is online (there is no affinity yet), the
-            // count in both `a1` and `a2` (UV6: what `/proc/cpuinfo` and `nproc` report)
-            7 => {
-                let n = crate::smp::online() as u64;
-                return Ok((Some(n), Some(n)));
-            }
-            _ => return bad(Status::InvalidArgs),
-        };
-        let jobs = &kmem::get().vmos.jobs;
-        let used = jobs
-            .usage(job)
-            .ok_or((Status::BadState, None, None))?
-            .get(res);
-        let limits = jobs.limits(job).ok_or((Status::BadState, None, None))?;
-        let limit = match res {
-            Resource::Processes => limits.processes,
-            Resource::Threads => limits.threads,
-            Resource::Pages => limits.pages,
-            Resource::Jobs => limits.jobs,
-            Resource::Objects => limits.objects,
-            Resource::IpcBytes => limits.ipc_bytes,
-        };
-        Ok((Some(used), Some(limit)))
     })
 }
 

@@ -10,7 +10,7 @@ use kcore::ipc::Kobjs;
 use kcore::job::JobId;
 use kcore::pagetable::{PageTable, Perms, PhysMem};
 use kcore::Mm;
-use ksys::{ipc_call, vmo_call, Ctx, Faults, Reply};
+use ksys::{ipc_call, job_call, vmo_call, Ctx, Faults, Reply};
 use std::collections::HashMap;
 
 /// Physical memory as a map from frame number to 512 words, created on demand (the kernel's direct map, on the host).
@@ -87,8 +87,11 @@ impl World {
             mm: &mut self.mm,
             vmos: &mut self.vmos,
             faults: self.faults,
+            harts_online: 4,
         };
-        ipc_call(n, a, &mut c).or_else(|| vmo_call(n, a, &mut c))
+        ipc_call(n, a, &mut c)
+            .or_else(|| vmo_call(n, a, &mut c))
+            .or_else(|| job_call(n, a, &mut c))
     }
     pub fn ok(&mut self, n: usize, a: [u64; 6]) -> (Option<u64>, Option<u64>) {
         self.call(n, a).expect("handled").expect("succeeds")
