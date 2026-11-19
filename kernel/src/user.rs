@@ -312,7 +312,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     let (pid, asid) = irq::without(|| {
         let s = state();
         let pid = s.next_pid;
-        s.next_pid += 1;
+        s.next_pid = pid.wrapping_add(1).max(1);
         (pid, (pid & 0xffff) as u16)
     });
     if let Err(e) = built {
@@ -1527,11 +1527,11 @@ fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
         });
         match verdict {
             Some(true) => {
-                *pass += 1;
+                *pass = pass.saturating_add(1);
                 let _ = writeln!(Console, "{text}");
             }
             Some(false) => {
-                *fail += 1;
+                *fail = fail.saturating_add(1);
                 let _ = writeln!(Console, "{text}");
             }
             None if text.starts_with("##") => {
@@ -1984,12 +1984,12 @@ fn port_wait(a: [u64; 6]) -> Reply {
     }
 }
 
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: callers pass an offset inside the fixed-size record they just copied in (24 or 40 bytes)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller passes a constant offset whose four or eight bytes lie inside the fixed-size record it just copied in (the longest, offset 48, is in a record of 56 bytes)
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: callers pass an offset inside the fixed-size record they just copied in (24 or 40 bytes)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller passes a constant offset whose four or eight bytes lie inside the fixed-size record it just copied in (the longest, offset 48, is in a record of 56 bytes)
 fn le64(b: &[u8], at: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[at..at + 8]);
@@ -2533,8 +2533,18 @@ fn process_create(a: [u64; 6]) -> Reply {
             give_back(k);
             return bad(Status::NoMemory);
         };
-        let pid = s.next_pid;
-        s.next_pid += 1;
+        // (pids wrap after 2^32 creations and skip the live ones: a loop of create and close must not end in an overflow)
+        let pid = loop {
+            let candidate = s.next_pid;
+            s.next_pid = if candidate == u32::MAX {
+                1
+            } else {
+                candidate + 1
+            };
+            if !s.procs.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let UserState { objs, procs, .. } = s;
         let creator = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
         let (handle, obj) = match ipc::process_object_create_in(
@@ -2581,7 +2591,7 @@ fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
-#[allow(clippy::expect_used)] // INVARIANT: room in the handle table was checked just above; the handle was just inserted
+#[allow(clippy::expect_used)] // INVARIANT: room in the handle table was checked just above, so the insert of another view cannot fail
 fn process_self() -> Reply {
     irq::without(|| -> Reply {
         let s = state();
@@ -2617,7 +2627,11 @@ fn process_self() -> Reply {
                 )
                 .map_err(|e| (e, None, None))?;
                 // narrow the default rights: a self handle cannot be sent away
-                let h = p.handles.replace(objs, h, rights).expect("just created");
+                // (a table whose last free slot is on its last generation refuses the replace: give the new object back)
+                let Ok(h) = p.handles.replace(objs, h, rights) else {
+                    let _ = p.handles.close(objs, h);
+                    return bad(Status::NoMemory);
+                };
                 if own.is_none() {
                     p.obj = Some(obj);
                 }
@@ -3229,7 +3243,7 @@ fn job_status(e: JobError) -> Status {
     clippy::arithmetic_side_effects,
     clippy::expect_used,
     clippy::indexing_slicing
-)] // INVARIANT: the record read is of fixed size (40 bytes) at indices below 5
+)] // INVARIANT: the record is six words (48 bytes, copied in whole), read at word indices 0 to 5, so the slices are inside it and `try_into` of eight bytes cannot fail
 fn read_limits(s: &mut UserState, me: u32, ptr: u64) -> Result<Limits, ReplyErr> {
     let k = kmem::get();
     let p = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;

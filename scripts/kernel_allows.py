@@ -15,15 +15,23 @@ for crate in CRATES:
             if not f.endswith(".rs"):
                 continue
             path = os.path.join(d, f)
-            for i, line in enumerate(open(path), 1):
-                s = line.strip()
-                if (s.startswith("#[allow(") or s.startswith("#![allow(")) and LINT.search(s):
-                    n += 1
-                    rel = os.path.relpath(path, ROOT)
-                    if "INVARIANT:" not in s:
-                        bad.append(f"{rel}:{i}: an allow of a panic-finding lint with no `// INVARIANT:` reason")
-                    elif "--list" in sys.argv:
-                        print(f"{rel}:{i}: {s.split('INVARIANT:', 1)[1].strip()}")
+            lines = open(path).read().split("\n")
+            i = 0
+            while i < len(lines):
+                s = lines[i].strip()
+                start = i
+                if s.startswith("#[allow(") or s.startswith("#![allow("):
+                    while ")]" not in lines[i] and i + 1 < len(lines):  # a multi-line allow runs to its `)]`
+                        i += 1
+                        s += " " + lines[i].strip()
+                    if LINT.search(s):
+                        n += 1
+                        rel = os.path.relpath(path, ROOT)
+                        if "INVARIANT:" not in s:
+                            bad.append(f"{rel}:{start + 1}: an allow of a panic-finding lint with no `// INVARIANT:` reason")
+                        elif "--list" in sys.argv:
+                            print(f"{rel}:{start + 1}: {s.split('INVARIANT:', 1)[1].strip()}")
+                i += 1
     counts[crate] = n
 print("allowed sites per crate:", counts, "total", sum(counts.values()))
 for b in bad:

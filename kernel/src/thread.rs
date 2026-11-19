@@ -930,7 +930,7 @@ fn count_sleep(slept: &mut bool) {
 }
 
 /// The counter `which` (0 sleeps, 1 spurious wakes, 2 wakes); 0 for an unknown index.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: which was matched into 16..=23 and the hart index is below the hart count
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the sums are on `which` in the arms that match a range (16..=23 and the like) and on a hart index below the hart count
 pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
