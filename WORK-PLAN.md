@@ -200,6 +200,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **T157** (PR 258): the round-robin kernel boot (`os-boot-test-rr`, soak) with the stall-based timeout and the widened clock window passed 3 of 3 under full CPU load on the development machine; one soak run confirms it on CI's runners. A red `os-boot-test-rr` would mean a stall (the log names the last line) or a different cause.
 - **L11c part 1** (PR 262): the dead-list reap in `finish_switch` wants the soak run of the smp targets at `-smp 1`, `2` and `4` (and the round-robin and polling kernels). A red one would mean a leaked or double-freed kernel stack.
 - **L11c part 2** (PR to follow): the deferred switch wants the same soak run as part 1 (smp targets at `-smp 1`, `2`, `4`, round-robin and polling kernels): a red one would mean a lost switch or a wrong thread blocked.
+- **L11d** (PR to follow): `make os-boot-test-sched-neg` (the three scheduler negative controls) is in the soak tier and was run by hand once per control only. A red one means a control no longer detects its fault.
 
 ## Decisions taken without the owner
 

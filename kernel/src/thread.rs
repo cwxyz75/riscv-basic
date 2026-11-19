@@ -339,7 +339,8 @@ fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
         let was = irq::save_and_disable();
-        if sched().idle_has_work(hart()) {
+        // (negative control `fault-skip-poke`: the idle hart's only wake is a poke, which that kernel drops; a tick must not rescue it)
+        if !cfg!(feature = "fault-skip-poke") && sched().idle_has_work(hart()) {
             irq::restore(was);
             irq::without(reschedule_this_hart);
             continue;
@@ -601,6 +602,11 @@ pub fn switch_if_designated() {
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pokes is a non-zero mask of harts (the loop condition), so pokes - 1 cannot underflow
 fn send_pokes(mut pokes: u32, me: usize) {
+    #[cfg(feature = "fault-skip-poke")]
+    {
+        let _ = (&mut pokes, me);
+        return; // negative control (L11d): every poke is lost
+    }
     // A poke for this hart itself (another hart marked it after this hart's own settle began, and this hart took the mask first):
     // the mark is real and `pending` is set, so the hart must look again: an IPI to itself, taken as soon as interrupts are on.
     if pokes & (1 << me) != 0 {
@@ -671,6 +677,11 @@ pub fn timer_tick_fast() -> bool {
     };
     #[cfg(debug_assertions)]
     starvation_watchdog(h, now);
+    // negative control: an idle hart takes no tick (tickless idle, L13), so a lost poke is never made up
+    #[cfg(feature = "fault-skip-poke")]
+    if h != 0 && running_here() == sched().idle(h) {
+        return false;
+    }
     let (pokes, switch) = {
         let sc = sched();
         sc.tick_on(h, ticks_to_ns(now));
@@ -809,6 +820,9 @@ pub fn exit() -> ! {
             // switch, or the mark would stay set with no flag and no poke owed (PR 263 review)
             sc.reschedule_on(h);
         }
+        // negative control (L11d): the stack is freed while this thread still runs on it
+        #[cfg(feature = "fault-early-reap")]
+        reap_if_dead(running_here());
         reschedule();
     });
     unreachable!("an exited thread was scheduled again");

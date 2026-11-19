@@ -542,8 +542,18 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Pull into `h` the best queued thread of each other hart that outranks everything `h` has. Returns how many.
-    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
     fn pull(&self, h: usize) -> usize {
+        #[cfg(feature = "fault-skip-pull")]
+        {
+            let _ = h;
+            return 0; // negative control (L11d): no hart ever pulls
+        }
+        #[cfg(not(feature = "fault-skip-pull"))]
+        self.pull_work(h)
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
+    fn pull_work(&self, h: usize) -> usize {
         let mut n = 0;
         for g in 0..self.harts() {
             if g == h {
