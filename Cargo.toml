@@ -108,6 +108,13 @@ opt-level = 2
 opt-level = 3
 codegen-units = 1
 
+# KT12: the optimised build with the debug assertions on (INVARIANTS K1 and its successors are `debug_assert!`, so plain release checks none
+# of them) and overflow checks everywhere. The overnight target `os-boot-test-checked` runs the suite on it.
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
 # KT3 (KERNEL-V1-SPEC 7.4): the kernel crates keep overflow checks in the release build, so an arithmetic overflow a program could
 # cause is a panic the tests see, never a silent wrap.
 [profile.release.package.kernel]

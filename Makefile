@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all overnight-repeat-smp kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -395,10 +395,22 @@ soak:
 
 # Tier 3 (overnight): hours-long runs, started ONLY by the owner (OD142, KT6): `overnight.yml` has a manual trigger and nothing else.
 # Each KT item that adds a long run adds its target here, and `overnight.yml` runs it as a job. Never required to merge.
-OVERNIGHT_TARGETS := overnight-repeat-smp
+OVERNIGHT_TARGETS := overnight-repeat-smp os-boot-test-checked
 # 20 consecutive boots of the smp suite: the intermittent-failure hunt of OD140 (a red run is a work item the same day).
 overnight-repeat-smp:
 	$(MAKE) os-repeat TARGET=os-boot-test-smp N=20
+
+# KT12: the release kernel with the debug assertions on, through the whole suite at four harts and the kernel-only shard at one, two and eight.
+OS_KCHK_ELF := target/os-kchecked/$(KERNEL_TARGET)/release-checked/kernel
+os-boot-test-checked:
+	$(MAKE) os-kchecked-build
+	OS_SHARD= OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KCHK_ELF)
+	OS_SHARD=k OS_SMP=1 python3 scripts/os_boot_test.py $(OS_KCHK_ELF)
+	OS_SHARD=k OS_SMP=2 python3 scripts/os_boot_test.py $(OS_KCHK_ELF)
+	OS_SHARD=k OS_SMP=8 python3 scripts/os_boot_test.py $(OS_KCHK_ELF)
+os-kchecked-build:
+	cd init && cargo build --release
+	cd kernel && OS_USER_PROFILE=release cargo build --profile release-checked --target-dir ../target/os-kchecked
 
 # `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).
 check: smoke
