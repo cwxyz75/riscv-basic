@@ -70,7 +70,7 @@ Why first: the owner's complaint is that editing the kernel is slow on testing, 
 
 Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 
-- [ ] **L11** (L11c: `need_resched`, `finish_switch`, the dead list; L11d: the idle loop, the watchdog, the negative controls)
+- [x] **L11** (L11c: `need_resched`, `finish_switch`, the dead list; L11d: the idle loop, the watchdog, the negative controls) (PRs 262, 263, 264, and T162 in 260)
 - [ ] **L12** the scheduler leaves the big kernel lock
 - [ ] **AB2** nanosecond time (flag day)
 - [ ] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it)
