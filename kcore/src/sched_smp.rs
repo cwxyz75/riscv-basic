@@ -425,7 +425,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
     }
 
-    fn is_in_transit(&self, t: Tid) -> bool {
+    pub fn is_in_transit(&self, t: Tid) -> bool {
         self.transit.iter().any(|x| x.load(Ordering::Acquire) == t)
     }
 
@@ -447,6 +447,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if t != 0 {
             if let Some(g) = self.home_of(t) {
                 self.push_marks(t, g, h);
+                // a thread woken while it was still executing here (G4) waits in this hart's own queue: nobody else was marked for
+                // it, so this hart looks again (a preempted thread requeued here is not better than what runs here: no mark)
+                if g == h && self.lq(h).wants_resched() {
+                    self.mark(h);
+                }
             }
         }
     }
@@ -463,7 +468,10 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if self.transit[h].load(Ordering::Acquire) != 0 {
             return;
         }
-        if Some(before) != q.current() && q.state(before) == Some(State::Runnable) {
+        // (any state: a thread that blocked or exited is still executing its last instructions on this hart, and with the lock released
+        // at the switch (G4) a wake or a reap on another hart could otherwise reach it before its context is saved)
+        if Some(before) != q.current() && q.idle_tid() != Some(before) && q.state(before).is_some()
+        {
             self.transit[h].store(before, Ordering::Release);
         }
     }
@@ -772,7 +780,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Block the current thread of `hart` unless a notification is waiting. Returns whether it blocked.
     pub fn block_on(&self, hart: usize) -> Result<bool, Error> {
-        let blocked = self.lq(hart).block_current()?;
+        let blocked = {
+            let mut q = self.lq(hart);
+            let before = q.current();
+            let blocked = q.block_current()?;
+            if let (true, Some(b)) = (blocked, before) {
+                self.displaced(hart, &q, b); // (still executing until the switch completes)
+            }
+            blocked
+        };
         if blocked {
             self.settle(hart);
         }
@@ -781,7 +797,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Sleep until `deadline` (nanoseconds on this hart's clock).
     pub fn sleep_until_on(&self, hart: usize, deadline: Time) -> Result<bool, Error> {
-        let blocked = self.lq(hart).sleep_until(deadline)?;
+        let blocked = {
+            let mut q = self.lq(hart);
+            let before = q.current();
+            let blocked = q.sleep_until(deadline)?;
+            if let (true, Some(b)) = (blocked, before) {
+                self.displaced(hart, &q, b);
+            }
+            blocked
+        };
         if blocked {
             self.settle(hart);
         }
@@ -810,7 +834,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 self.home_of(tid).ok_or(Error::NoSuchThread)?; // gone (reaped)
                 continue; // it moved (or is moving): look again
             };
-            let target = if rec.state == State::Blocked {
+            // (a blocked thread still in transit is queued on the hart that is still executing it: that hart's own queue is the only one
+            // that cannot be served before its switch is done, and no other hart may pull it until then, G4)
+            let target = if rec.state == State::Blocked && !self.is_in_transit(tid) {
                 self.select_hart(&rec)
             } else {
                 home
@@ -893,7 +919,14 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn exit_on(&self, hart: usize) -> Result<(), Error> {
-        self.lq(hart).exit_current()?;
+        {
+            let mut q = self.lq(hart);
+            let before = q.current();
+            q.exit_current()?;
+            if let Some(b) = before {
+                self.displaced(hart, &q, b);
+            }
+        }
         self.settle(hart);
         Ok(())
     }
@@ -1041,10 +1074,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             let t = t.load(Ordering::Acquire);
             if t != 0
                 && (table.get(&t).map(|x| x.get()) != Some(h)
-                    || qs[h].state(t) != Some(State::Runnable))
+                    || qs[h].state(t).is_none()
+                    || (qs[h].state(t) == Some(State::Runnable) && !qs[h].is_queued(t)))
             {
                 return Err(alloc::format!(
-                    "thread {t} in transit on hart {h} is not queued there"
+                    "thread {t} in transit on hart {h} has no record there"
                 ));
             }
         }

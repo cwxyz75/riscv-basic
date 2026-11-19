@@ -45,6 +45,8 @@ struct World {
     t: BTreeMap<Tid, Ref>,
     now: u64,
     harts: usize,
+    /// Exited threads waiting to be reaped: only once their switch is done (G4), never while in transit.
+    dead: Vec<Tid>,
 }
 
 impl World {
@@ -54,6 +56,7 @@ impl World {
             t: BTreeMap::new(),
             now: 0,
             harts,
+            dead: Vec::new(),
         }
     }
 
@@ -196,6 +199,16 @@ fn walk(harts: usize, seed: u64, steps: usize) {
     for step in 1..=steps {
         let caller = r.below(harts as u64) as usize;
         w.finish(caller);
+        let reapable: Vec<Tid> = w
+            .dead
+            .iter()
+            .copied()
+            .filter(|&d| !w.s.is_in_transit(d))
+            .collect();
+        for d in reapable {
+            w.s.reap(d).unwrap();
+            w.dead.retain(|&x| x != d);
+        }
         let what;
         match r.below(100) {
             // spawn
@@ -277,8 +290,8 @@ fn walk(harts: usize, seed: u64, steps: usize) {
                     if w.live_runnable().len() > harts + 2 {
                         w.s.exit_on(h).unwrap();
                         w.t.get_mut(&c).unwrap().state = R::Exited;
-                        w.s.reap(c).unwrap();
                         w.t.remove(&c);
+                        w.dead.push(c);
                     }
                 }
                 what = "exit";

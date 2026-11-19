@@ -54,6 +54,8 @@ struct World {
     /// and by `finish_switch` when a mark is still set; the hart switches only when it sees the flag (or takes an IPI).
     need: Vec<AtomicBool>,
     deferred: bool,
+    /// SCHED-SMP-SPEC G4: the big lock is released at the switch (the thread's last instructions run outside it).
+    g4: bool,
 }
 
 impl World {
@@ -76,6 +78,22 @@ impl World {
         self.s.switched(h);
         self.deliver(h);
         self.finish_flag(h);
+    }
+
+    /// The end of a path that held the big lock and switched: with the lock following the thread (K3) the lock is held until the
+    /// switch is finished; with G4 it is released first, so other harts' wakes, pulls and reaps run while this hart is still executing
+    /// the thread it is leaving.
+    fn finish_g(&self, h: usize, g: MutexGuard<'_, ()>) {
+        if self.g4 {
+            drop(g);
+            // (the switch itself: saving the old context and loading the new takes time during which other harts run)
+            thread::yield_now();
+            thread::yield_now();
+            self.finish(h);
+        } else {
+            self.finish(h);
+            drop(g);
+        }
     }
 
     /// `finish_switch`: a mark still set when the switch is over is not left without its flag.
@@ -137,23 +155,23 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     assert!(w.s.wake_on(h, t).is_ok(), "wake of live thread {t} failed");
                 }
                 w.note(h);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             4 if running_user => {
                 let _g = w.bkl.lock().unwrap();
                 let _ = w.s.prepare_block_on(h);
                 let _ = w.s.block_on(h);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             5 if running_user => {
                 let _g = w.bkl.lock().unwrap();
                 let _ = w.s.yield_on(h);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             6 if running_user => {
                 let _g = w.bkl.lock().unwrap();
                 let _ = w.s.sleep_until_on(h, now + 2 * MS);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             7 if running_user && rng.gen_range(0..3u32) == 0 => {
                 let _g = w.bkl.lock().unwrap();
@@ -168,7 +186,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     }
                     w.s.reschedule_on(h);
                 }
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             8 => {
                 // the reaper: free an exited thread nobody executes any more
@@ -191,7 +209,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     let _ = w.s.set_priority_on(h, t, rng.gen_range(1..8u8));
                 }
                 w.note(h);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
             _ => {
                 let _g = w.bkl.lock().unwrap();
@@ -202,7 +220,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     }
                 }
                 w.note(h);
-                w.finish(h);
+                w.finish_g(h, _g);
             }
         }
     }
@@ -217,11 +235,11 @@ fn finish_fast(w: &World, h: usize) {
         w.finish_flag(h);
     } else {
         let _g = w.bkl.lock().unwrap();
-        w.finish(h);
+        w.finish_g(h, _g);
     }
 }
 
-fn model(steps: usize, deferred: bool) {
+fn model(steps: usize, deferred: bool, g4: bool) {
     let rqs = SRqs {
         rq: (0..HARTS)
             .map(|_| Mutex::new(HartRq::new(FixedPrio::new())))
@@ -237,6 +255,7 @@ fn model(steps: usize, deferred: bool) {
         ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
         need: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
         deferred,
+        g4,
     });
     w.s.set_deferred(deferred);
     for h in 0..HARTS {
@@ -280,13 +299,13 @@ fn model(steps: usize, deferred: bool) {
         .expect("every thread is in exactly one place, and GP1 holds at quiescence");
 }
 
-fn explore(steps: usize, iterations: usize, deferred: bool) {
-    shuttle::check_random(move || model(steps, deferred), iterations);
+fn explore(steps: usize, iterations: usize, deferred: bool, g4: bool) {
+    shuttle::check_random(move || model(steps, deferred, g4), iterations);
 }
 
 #[test]
 fn no_thread_executes_on_two_harts_under_per_hart_locks() {
-    explore(14, 20000, false);
+    explore(14, 20000, false, false);
 }
 
 /// X7: a wake never switches. The same model with the scheduler in deferred mode: wakes, spawns and priority changes mark the caller's own
@@ -294,7 +313,14 @@ fn no_thread_executes_on_two_harts_under_per_hart_locks() {
 /// harts, and GP1 must hold at quiescence once every hart has had its point.
 #[test]
 fn no_thread_executes_on_two_harts_when_wakes_are_deferred() {
-    explore(14, 20000, true);
+    explore(14, 20000, true, false);
+}
+
+/// G4 (the lock released at the switch, the deployed kernel's mode from L12): the same model with the lock dropped before each switch
+/// is finished. A thread that blocked or exited is still executing on its hart until then: no other hart may run, pull or reap it.
+#[test]
+fn no_thread_executes_on_two_harts_when_the_lock_is_released_at_the_switch() {
+    explore(14, 20000, true, true);
 }
 
 /// Replay one recorded schedule (`REPLAY_SCHEDULE=<file>`): how a failure that CI printed is reproduced here (T162).
@@ -303,6 +329,9 @@ fn replay_a_recorded_schedule() {
     if let Ok(f) = std::env::var("REPLAY_SCHEDULE") {
         let sched = std::fs::read_to_string(f).unwrap();
         let deferred = std::env::var("REPLAY_DEFERRED").is_ok();
-        shuttle::replay(move || model(14, deferred), sched.trim());
+        shuttle::replay(
+            move || model(14, deferred, std::env::var("REPLAY_G4").is_ok()),
+            sched.trim(),
+        );
     }
 }
