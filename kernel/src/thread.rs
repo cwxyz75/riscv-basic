@@ -459,9 +459,14 @@ fn reap_if_dead(tid: Tid) {
     let k = kernel();
     let dead = k.threads.get(&tid).is_some_and(|t| t.detached)
         && sched().state(tid) == Some(State::Exited);
-    if dead && sched().reap(tid).is_ok() {
-        if let Some(t) = k.threads.remove(&tid) {
-            note_stack_use(&t);
+    if dead {
+        let reaped = sched().reap(tid).is_ok();
+        // (it cannot fail under the big lock: a failure would leak the thread's stack, so it is loud in a debug build)
+        debug_assert!(reaped, "reap of exited thread {tid} failed");
+        if reaped {
+            if let Some(t) = k.threads.remove(&tid) {
+                note_stack_use(&t);
+            }
         }
     }
 }
@@ -723,7 +728,8 @@ pub fn set_priority(tid: Tid, prio: Prio) {
     });
 }
 
-/// End the calling thread. Its stack is freed by whoever `join`s it.
+/// End the calling thread. Its stack is freed by whoever `join`s it, or, if it is detached, by the hart that switches away from it
+/// (`finish_switch`); `join` of a detached thread therefore returns false.
 #[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the caller is a running thread; an exited thread is never scheduled again
 pub fn exit() -> ! {
     irq::without(|| {
