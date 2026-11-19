@@ -22,10 +22,10 @@ boundaries").
 - `make test`: host tests for the home-computer crates (`home/basic/`, `home/console/`, ...). Fast; run constantly.
 - `make home-kernel` / `make home-run` / `make home-debug`: build / boot / boot-paused-for-gdb.
 - `make home-boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
-- `make check` (an alias of `make smoke`, tiers 0 and 1: fmt, tests, clippy, one boot of the suite at four harts, the home boot, the release smoke; about three minutes warm). `make soak` is the full matrix (on demand, tier 2); `make check-all` is both. The testing tiers and their rules are in `TESTING.md` (OD83).
+- `make check` (an alias of `make smoke`, tiers 0 and 1: fmt, tests, clippy, one boot of the suite at four harts, the home boot, the release smoke; about three minutes warm). `make soak` is the full matrix (tier 2: **run it only when the owner asks**, OD142); `make check-all` is both. The testing tiers and their rules are in `TESTING.md` (OD83).
 - OS track: `make kernel` / `make os-test` (host tests plus loom and shuttle) /
   `make os-boot-test` (headless QEMU, structured output) / `make os-miri` (needs
-  nightly; the soak workflow runs it). OS-track cargo commands
+  the nightly toolchain; part of the soak tier). OS-track cargo commands
   run from inside `kernel/`, like `home/kernel/`.
 - Kernel cargo commands must run from inside the kernel's own directory (each has its
   own `.cargo/config.toml` that sets the target). The Makefile handles this. The two
@@ -71,8 +71,9 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 - **Test cost is the bottleneck, so spend it deliberately (tiers: `TESTING.md`).** While iterating run
   `make quick` or the one targeted test. The merge gate is tiers 0 and 1 (`make smoke`, which CI runs
   too); merge on a green gate. The soak tier (`make soak`, `soak.yml`: the full matrix, negative controls,
-  Miri) is on demand, nightly and on the `soak` label, never required: run it by hand only for kernel,
-  SMP, memory or security changes. Do not run the whole matrix before every push. Batch related slices
+  Miri) and the long-run tier **run only when the owner asks for them** (OD142): never start a soak target, locally
+  or in CI, on your own judgement, and never put it on a schedule or a label. A change that would have had a soak run
+  says so in its PR and is listed under "Runs owed to the owner" in `WORK-PLAN.md`. Batch related slices
   into one PR (several commits); keep kernel/security slices that get a Fable review in their own small
   PR. Run mutation checks once per new test, not once per push. New tests go where `TESTING.md` says:
   logic on the host, syscall behaviour in the suite, only what the machine shows in QEMU.
@@ -97,7 +98,8 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 Everything above still applies (one milestone per PR, `main` always builds and
 boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
 
-- The spec is `docs/specs/OS-ARCHITECTURE.md`. Design decisions are logged in
+- The spec is `docs/specs/OS-ARCHITECTURE.md`; for kernel work also read `docs/specs/KERNEL-V1-SPEC.md` (the kernel
+  that is frozen: its targets, contract and testing regime). Design decisions are logged in
   `docs/records/decisions.md` (OD numbers, append-only), not in `home/DESIGN.md`. Open questions are `kind: decision` items
   (`scripts/work.py decisions`): stop and ask rather than guessing.
 - All code is AI-written and the human is the product owner, so nothing relies on a
@@ -113,8 +115,9 @@ boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In additio
 - `INVARIANTS.md` (handle unforgeability, rights monotonicity, lock ordering, memory
   ownership) and `SYSCALLS.md` (every syscall: preconditions, rights, errors) describe
   the system as it is. Every change preserves them, and the lock ordering is not negotiable.
-- Architecture target: **RVA23** (OD47). The OS track does not support hardware below that
-  profile; the home computer under `home/` keeps its rv64gc contract.
+- Architecture target: **RVA23, enforced** (OD47, OD127): the kernel refuses to boot below the profile, `-cpu rva23s64` is
+  the only test CPU, AIA and Sstc are required, and there are no fallbacks. The home computer under `home/` keeps its
+  rv64gc contract.
 - **Shortcuts become tidy items in `work/`.** Any stand-in, ambient authority, deferred review
   finding or "good enough for now" gets an item (`kind: tidy`, `work.py next T` for its id) in
   the same PR (what, why acceptable, risk, proper fix and when). A question only the owner

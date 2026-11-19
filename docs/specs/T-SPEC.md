@@ -141,3 +141,15 @@ after instead of the frame database's free count while the pool is the holder.
   pre-created at boot (all its top-level entries exist before any process does) to avoid that.
 * The emergency-stack check adds instructions to the kernel-mode trap entry; the cost is measured with the benchmark.
 * Open for the owner: the low and high water marks (proposed 1 MiB and 4 MiB) and the per-job free list size (4).
+
+---
+
+## Amendment 2026-11-18: the allocator of the v1 kernel (KERNEL-V1-SPEC 4.1, 4.2; OD138)
+
+The revision at the top of this document dropped the slab allocator and kept `linked_list_allocator` over a boot
+region and a grown window. For the v1 kernel that is replaced: frames come from a buddy allocator whose metadata is
+sized from RAM, and the kernel allocator is a size-class slab allocator over frames with per-hart magazines, which
+returns empty slabs and has no fixed window. Section 3's size classes stand; its frame pool with a refill at safe
+points is not needed, because the frame allocator has its own lock (`FRAME`) below the allocator's in the order
+and per-hart caches above it. Section 5 (charging kernel memory to jobs) is restated and completed by
+KERNEL-V1-SPEC 4.7.

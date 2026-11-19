@@ -709,3 +709,28 @@ ones are OD26 (Q1), OD27 (Q2), OD35 (Q3), FS-SPEC (Q7) and OD20 (Q8).
   (documented, accepted).
 - Context drift across long builds. Mitigation: the docs in section 3.2, small
   modules and the decision log.
+
+---
+
+## Amendment 2026-11-18: the v1 kernel (OD126 to OD143)
+
+`KERNEL-V1-SPEC.md` states the kernel that is frozen. It replaces the following statements of this document; the rest
+stands.
+
+| Section | Statement here | Replaced by |
+|---|---|---|
+| 1, non-goals | "more than a handful of identical harts", no hotplug | Up to 64 harts; harts go offline and come back; heterogeneous harts, NUMA and physical hotplug stay out (KERNEL-V1-SPEC 1, 5.2, 5.3; OD126, OD132) |
+| 1, non-goals | Self-hosting is not paid for | Unchanged, but the memory model a compiler needs is part of v1 (KERNEL-V1-SPEC 3.5, 4) |
+| 4 | RV64GC; timer and inter-hart interrupts through SBI; "Sstc later if wanted" | RVA23, enforced at boot; AIA and Sstc required; inter-hart interrupts through the IMSIC; no SBI timer (KERNEL-V1-SPEC 2; OD127) |
+| 4 | "the kernel needs only what it must" from the device tree | Every machine fact comes from the device tree (KERNEL-V1-SPEC 2.3) |
+| 5.1 | A handle value with a generation counter | 64 bits: 24 slot bits, 40 generation bits (KERNEL-V1-SPEC 3.2; OD129) |
+| 3.2 rule 7 | "A readable syscall table ... about 50 syscalls" | The contract is the system library; syscall numbers are private (KERNEL-V1-SPEC 3.1; OD128) |
+| 6.1 | "Frame allocator (buddy or free lists ...)", "Slab-style allocator" as proposals | A buddy allocator and a slab allocator, specified (KERNEL-V1-SPEC 4.1, 4.2; OD138) |
+| 6.3 | `fork` and `mmap` are "not first-milestone work"; pagers "later" | Copy-on-write children, protect, partial unmap, decommit, resize and pager-backed objects are kernel v1 (KERNEL-V1-SPEC 3.5, 4.3, 4.4; OD133). The `fork` shim and `mmap` in the C library remain user-space work |
+| 8 | "periodic tick first, tickless later if wanted" | No tick (KERNEL-V1-SPEC 5.1; OD131) |
+| 9 | "`exec` is either spawn-and-replace or a kernel operation ... (keep this open)" | Spawn-and-replace; no kernel operation (OD134) |
+| 9 | "POSIX signals are the ugly part ...; defer them" | The kernel provides exception channels, thread suspend and thread state; signals are composed from them in user space (KERNEL-V1-SPEC 3.6; OD137) |
+| 14 | "Static binaries first; dynamic linking later" | Dynamic linking is required by the system-library boundary; the loader is user-space work after v1 (OD128) |
+| 18 | Q4, Q5, Q6, Q9 | Decided: OD133, OD134, OD133, OD135 |
+| 4, 16 | One architecture, with its code spread through the kernel binary | Still one architecture implemented, but behind a boundary (`kernel/src/arch/`, a page-table format, `abi::arch`) so a second is an addition (KERNEL-V1-SPEC 2.6; OD143) |
+| 3.2, 7 | Soak under `-smp N` as part of every milestone's acceptance | The soak tier and the long-run tier run only when the owner asks (OD142); what a change needs at one, two and four harts is in the gate |

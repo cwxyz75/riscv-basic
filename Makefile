@@ -302,7 +302,7 @@ os-boot-test-rva23: kernel
 
 # The inner-loop gate (about a minute): format, the OS host tests without the model checkers, and a
 # headless boot of the release system to the shell and a BASIC session. Run this while iterating;
-# run `make smoke` before the push if you want the whole gate locally (CI runs it); the soak tier is on demand.
+# run `make smoke` before the push if you want the whole gate locally (CI runs it); the soak tier runs only when the owner asks.
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
 fetch-third-party:
@@ -329,8 +329,8 @@ quick: fmt-check docs-check
 SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
-# Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required; run it on demand,
-# on a label, nightly (CI), and before a release. The boots are independent (each makes its own disk), so they run
+# Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
+# owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
 SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3

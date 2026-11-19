@@ -456,3 +456,15 @@ only** (a system that needs a second credential, a recovery key or no recovery w
   UV4 to UV7 are sliced so each is useful alone.
 * **A custom shell language.** Fewer ecosystem scripts, and models know POSIX sh better; mitigated by a small,
   specified grammar, golden transcripts and a differential check against upstream `es` on the shared subset.
+
+---
+
+## Amendment 2026-11-18: dynamic linking and the program contract (OD128; closes Q2 of section 15)
+
+Dynamic linking is decided: the stable interface for programs is the kernel's system library and, above it, a
+dynamically linked C library (KERNEL-V1-SPEC 3.1). Statically linked programs remain valid, but a program that is to
+keep working across system versions links the libraries dynamically, because the server protocols behind them are
+private. This replaces "Cross-built bring-up ... Open Q2 covers dynamic linking" in section 3 and the tier D note that
+`dlopen` is an open question. The kernel side is part of the v1 kernel; the loader is user-space work after it.
+Section 4's "Signals" row stands as the policy for the C library; the mechanism under it is the kernel's exception
+channels and thread state (KERNEL-V1-SPEC 3.6), which lifts the limit "delivery only where a program waits".

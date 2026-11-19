@@ -1,19 +1,14 @@
 name: soak
 
-# Tier 2 of TESTING.md / OD83: the full matrix, every negative control, the serial sessions, Miri.
-# Never required to merge. It runs nightly on main (a red night means "fix next"), when a pull request
-# carries the `soak` label (recommended for kernel, SMP and security slices), and on demand.
+# Tier 2 of TESTING.md / OD83, as changed by OD142: the full matrix, every negative control, the serial sessions,
+# Miri. It runs ONLY when the owner starts it by hand (Actions > soak > Run workflow, or `gh workflow run soak.yml`).
+# There is no schedule and no pull-request trigger, and nobody else starts it. Never required to merge.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
-  pull_request:
-    types: [labeled, synchronize]
 
 jobs:
   kernel:
     name: soak (${{ matrix.name }})
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'soak') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -63,7 +58,6 @@ jobs:
 
   miri:
     name: soak (miri)
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'soak') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

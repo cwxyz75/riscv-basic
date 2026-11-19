@@ -1,0 +1,15 @@
+---
+id: PM1
+kind: slice
+title: Harts go offline and come back: `hart_set_online`, `hart_info`
+area: sched
+horizon: long
+blocked_by: [SC1, L13, L18, L19, PL6]
+refs: [KERNEL-V1-SPEC, OD132]
+---
+
+**How.** KERNEL-V1-SPEC 5.3. Per-hart state (Offline, Starting, Online, Draining) in an atomic; the `online` mask is what placement, push, pull, shootdown targets (`ran_on & online`) and interrupt routing use. `hart_set_online(resource, index, false)`, called from any hart: (1) refuse if it is the last online hart or a thread is pinned there (BAD_STATE); (2) set Draining, clear the bit in `online` under the scheduler's locks; (3) retarget APLIC sources aimed at it to the lowest online hart; (4) migrate: under `RQ[victim]` and `RQ[dest]` in index order, move every thread record homed there (queued and blocked) with its timer entries to destinations chosen by placement; the hart's current thread is displaced and migrated at its next `schedule()`; (5) the victim, in its idle loop with nothing left, drains its dead list, returns its frame and slab caches, clears its bit in every live address space's `ran_on` after a full local flush, and calls SBI HSM `hart_stop`; state becomes Offline. Bringing it back: SBI HSM `hart_start` at the secondary entry, the existing bring-up, then Online and the mask bit. `hart_info(resource, index)` returns state and hart id. `job_info` 7 reports online harts. Both calls need the root resource with MANAGE. Pure logic (the state machine and the migration choreography over `Sched2`) in `kcore` with the kernel as a thin layer.
+
+**Acceptance, written first.** Shuttle: a hart going offline against wakes, sleeps expiring, pulls and a second hart going offline (HT1, HT2: no thread homed on an offline hart, none stranded, no wake lost; negative controls: clearing `online` after migrating; not moving blocked threads' timers). QEMU at `-smp 4` and `8`: a loop takes harts offline and online at random while the `k` shard's thread, futex, sleep and IPC tests run; a sleeping thread homed on a hart that goes offline still wakes on time; a device interrupt aimed at an offline hart is delivered; all but one hart offline and back; a thread pinned to the hart blocks the call. INVARIANTS gains HT1 and HT2.
+
+**Review.** Fable, soak, and a perturbation run (KT7) of the offline loop.

@@ -11,7 +11,7 @@ which is what happened after the previous adjustment.
 |---|---|---|---|---|---|
 | 0, unit | fmt, docs check, host unit/model/property tests of every crate, clippy, the OS host tests with loom and shuttle | every edit; the inner loop | about 2 minutes | `make quick` (fast part), `make test lint os-test` | the `host` job |
 | 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (shards `a` and `b`), the release smoke, the home computer's boot | every PR: the merge gate | 7 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
-| 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | on demand; nightly on `main`; on a PR labelled `soak` (recommended for kernel, SMP and security slices); before a release; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
+| 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | **only when the owner asks for it** (OD142): no schedule, no label, no run started by anyone else; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
 
 Rules:
 
@@ -21,11 +21,15 @@ Rules:
    the budget (7 minutes). A job that outgrows its budget fails loudly: raise the budget on purpose here, or cut work, do not let it grow.
 2. **Locally, run tier 0 and the one targeted test** while iterating (`make quick`, or `cargo test -p kcore --test X`). Run
    `make smoke` (about three minutes warm) before a push if you want the whole gate; CI runs it anyway. Do not run the soak
-   tier by hand before every push: that is what it is for on demand, and nightly.
-3. **Merge on a green gate.** A red nightly soak means "fix next", not "revert".
-4. **Soak when it matters:** put the `soak` label on a PR that changes the kernel's locking, SMP, memory-management or
-   security-relevant paths, or that adds or changes a negative-control mechanism, and run `make soak` once for it. (The Fable
-   review of such slices stays as before.)
+   tier, or any single soak target, yourself: see rule 4.
+3. **Merge on a green gate.** A red soak run means "fix next", not "revert".
+4. **The soak tier runs only when the owner asks for it** (OD142, 2026-11-18). Nobody else starts it: not `make soak` or one
+   of its targets locally, not `soak.yml` (its only trigger is a manual start), not a schedule, not a label. The same holds
+   for the long-run tier of KERNEL-V1-SPEC section 8. A change that would have had a soak run before (the kernel's locking,
+   SMP, memory management, security-relevant paths, a negative-control mechanism) says so in its pull request and adds a
+   line to "Runs owed to the owner" in `WORK-PLAN.md`; it merges on the green gate like any other. (The Fable review of such
+   slices stays as before.) What a change needs at one and two harts is in the gate, not in soak (KERNEL-V1-SPEC section 8,
+   tier 1).
 5. **Where a new test goes.** Pure logic (a decision, a data structure, a codec, an accounting rule): a host test in a pure
    crate (`kcore`, `proto`, ...), model-based or property-based where it can be. A syscall or server behaviour: the QEMU suite
    (`init/src/bin/suite.rs`, the smoke boot runs it all). Only what the machine itself shows (traps, the MMU and TLB, SMP races,
@@ -36,6 +40,9 @@ Rules:
 7. **Independent oracles** (the upstream Lua suite, the C transcript against the host build, the BASIC golden corpus, real
    clients) stay in the suite: while the whole suite fits the budget (about 100 s of guest time at four harts, see below) they run in smoke. They are what
    the roadmap means by an oracle that the writing context did not produce.
+8. **An intermittent failure of a kernel test is a defect until its cause is known** (OD140). It gets a work item at once
+   and is investigated; it is not re-run and noted. (A job that fails for infrastructure reasons, such as a package mirror
+   timing out, is still simply re-run.)
 
 ## When the smoke boot outgrows its budget
 
@@ -133,7 +140,7 @@ What this says:
 |---|---|---|
 | Local, every change (tier 0) | 30 minutes | fmt, docs, `test`, lint, `os-test`: about 2 minutes |
 | PR gate (tier 1) | 30 minutes locally then about 12 in CI | the normal kernel at four harts (35 s), the release smoke, the home boot (37 s), plus builds: about 4 to 5 minutes in CI |
-| Soak (tier 2), on demand and nightly | (part of every PR) | everything else, about 25 minutes, in parallel jobs |
+| Soak (tier 2), only when the owner asks (OD142) | (part of every PR) | everything else, about 25 minutes, in parallel jobs |
 
 ## Measured after slice TS (same machine, warm build)
 
@@ -196,3 +203,12 @@ measured: the transfers from and to the host and `net_bkl_profile_tcp` (TIDY-UP 
 harness's checks for the others are off in it; the lossy tests' post-close waits are longer in it (`drain_ms`).
 
 **Soak parallelism (2026-11-17).** `make soak` runs three boots at once (`SOAK_JOBS=3`). On a ten-core laptop that is also running anything else, the network tests and the benchmark comparison fail from load (a `net_tcp_to_the_host_server` timeout, a `thread_create_join` ratio over 3, QEMU's "Guest moved used index"), and the same targets pass when run alone. Use `SOAK_JOBS=1` for a trustworthy run, and rerun a failing target alone before calling it a failure.
+
+## The kernel's regime (KERNEL-V1-SPEC section 8, OD140)
+
+The target regime for the kernel crates (`kernel/`, `kcore`, `klock`, `abi`) is stated in `docs/specs/KERNEL-V1-SPEC.md`,
+section 8: the syscall layer tested on the host, a kernel-only boot at one, two and four harts in the gate, and a third
+tier of long runs (hours; started only by the owner, like the soak tier; never required to merge) for the long checks: schedule perturbation,
+syscall fuzzing, allocation-failure sweeps, mutation testing, a release build with assertions, wide SMP and repeat runs.
+Long-running tests stay out of the gate; that rule does not change. Each check is added to the tables of this file, with
+its make target and its measured cost, in the change that builds it.
