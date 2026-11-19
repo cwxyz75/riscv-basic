@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod aia;
 mod bkl;
+mod chaos;
 mod boot;
 mod console;
 mod dtb;
@@ -128,6 +129,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         );
     }
     // S5a: start the other harts (they only idle and count interrupts until S5c).
+    chaos::init(); // (KT7: no effect unless built with the `chaos` feature and booted with `chaos=<seed>`)
     let harts = smp::start_secondaries(hart_id);
     if harts > 1 && !RELEASE {
         let _ = writeln!(out, "harts online: {}", smp::online());

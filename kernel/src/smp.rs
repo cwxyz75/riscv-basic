@@ -171,6 +171,7 @@ pub fn ipi_interrupt() -> u32 {
 
 /// Send `reason` to hart `index` (an IPI through SBI).
 pub fn send_ipi(index: usize, reason: u32) {
+    crate::chaos::point(crate::chaos::Point::BeforeIpi);
     let target = percpu::hart(index);
     target.pending.fetch_or(reason, Ordering::SeqCst);
     let id = target.hart_id.load(Ordering::Relaxed);

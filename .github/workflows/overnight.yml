@@ -42,3 +42,32 @@ jobs:
             target/fail-logs/
             target/repeat/
           if-no-files-found: ignore
+
+  chaos:
+    name: overnight (schedule perturbation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BENCH_RATIO: "10"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-chaos
+      - name: Install QEMU and OpenSBI
+        uses: ./.github/actions/install-qemu
+      - run: make os-chaos
+      - name: Summary
+        if: always()
+        run: |
+          echo "## overnight (schedule perturbation): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          ls target/chaos 2>/dev/null | sed 's/^/- failing: /' >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Keep the logs of failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-logs-chaos
+          path: target/chaos/
+          if-no-files-found: ignore

@@ -258,8 +258,10 @@ impl klock::Machine for Machine {
         // (a new wait: the detector counts one wait, not everything since boot)
         percpu::this().spins.store(0, Ordering::Relaxed);
         note_acquire(class, instance);
+        crate::chaos::point(crate::chaos::Point::Acquired);
     }
     fn released(class: Class, instance: u32) {
         note_release(class, instance);
+        crate::chaos::point(crate::chaos::Point::Released);
     }
 }
