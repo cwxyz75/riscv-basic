@@ -26,7 +26,7 @@ help:
 	@echo "make check      everything CI runs"
 
 test:
-	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
+	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
 	python3 home/scripts/verify_demo_images.py
 
 fmt:
@@ -36,7 +36,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
@@ -116,7 +116,7 @@ kernel: kernel-main
 # Host tests of the OS crates: plain, then the same code under the loom and
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
-	cargo test -p abi -p kcore -p klock
+	cargo test -p abi -p kcore -p ksys -p klock
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
@@ -142,6 +142,7 @@ os-test:
 # so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
+	cargo +nightly miri test -p ksys --target-dir target/miri
 	cargo +nightly miri test -p klock --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
@@ -191,7 +192,7 @@ os-repeat:
 
 # The inner loop for kernel edits: format, the pure kernel crates' host tests, the kernel-only boot at four harts.
 kquick: fmt-check kernel-main
-	cargo test -p kcore -p klock
+	cargo test -p kcore -p ksys -p klock
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test: kernel

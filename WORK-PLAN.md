@@ -203,6 +203,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **L11d** (PR to follow): `make os-boot-test-sched-neg` (the three scheduler negative controls) is in the soak tier and was run by hand once per control only. A red one means a control no longer detects its fault.
 - **AB2, L12b, L12c** (PRs 267, 268, 270): the soak tier at `-smp 1`, `2`, `4` also covers the quiet-trap paths (kill of a spinner) and the real-time deadlines of the suite (about 2.6 times tighter under load than when the clock was a tick count): a red one is a flaky bound or a missed kill.
 - **L13** (PRs 272, 273): the soak tier shows the real-timer margins (the latency bounds were widened for the emulator's interrupt jitter) and the starvation watchdog under a loaded host; a red `starved thread` is a lost wake or pull, not noise.
+- **TS3a** (PR 276): `make os-miri` now includes `cargo miri test -p ksys` (the host tests of the syscall layer, over the real address-space code). A red one would be undefined behaviour or a leak in code the kernel runs, found on the host.
 
 ## Decisions taken without the owner
 
