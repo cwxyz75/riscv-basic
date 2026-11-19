@@ -95,15 +95,9 @@ impl<N: Class> World<N> {
         }
     }
 
-    /// An operation that takes the big kernel lock starts: every switch made under that lock has finished (its hart held the
-    /// lock until then); only switches begun by a tick or a served mark, which take it later, may still be open.
-    fn bkl_barrier(&mut self) {
-        for h in 0..self.harts {
-            if !self.fast[h] {
-                self.finish(h);
-            }
-        }
-    }
+    /// An operation that takes the big kernel lock starts. With the lock released at a switch (G4) nothing is finished for it: the
+    /// other harts' switches stay open while it runs, which is the point (a wake, a pull or a reap inside a switch window).
+    fn bkl_barrier(&mut self) {}
 
     fn pending(&self) -> Vec<bool> {
         (0..self.harts).map(|h| self.s.resched_pending(h)).collect()
