@@ -501,13 +501,12 @@ pub struct Timespec {
     pub tv_nsec: c_long,
 }
 
-/// An absolute `CLOCK_REALTIME` time as a kernel tick deadline (a tick is a millisecond; time since
-/// boot is the wall clock here).
+/// An absolute `CLOCK_REALTIME` time as a millisecond deadline for `rt::sys` (time since boot is the wall clock here).
 fn deadline_of(ts: &Timespec) -> u64 {
     let ms = ts
         .tv_sec
         .saturating_mul(1000)
-        .saturating_add(ts.tv_nsec / 1_000_000);
+        .saturating_add((ts.tv_nsec + 999_999) / 1_000_000); // (rounded up: a timed wait must not end before the time)
     ms.max(1) as u64
 }
 
@@ -634,7 +633,7 @@ pub unsafe extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> 
         .saturating_mul(1000)
         .saturating_add(((*req).tv_nsec + 999_999) / 1_000_000);
     let left = if ms > 0 {
-        sleep_until(rt::sys::clock_get() + ms as u64)
+        sleep_until(rt::sys::clock_get() + ms as u64 + 1) // (+1: `clock_get` floors, so the sleep is never short)
     } else {
         0
     };
@@ -651,12 +650,12 @@ pub unsafe extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> 
 
 #[no_mangle]
 pub extern "C" fn sleep(s: u32) -> u32 {
-    sleep_until(rt::sys::clock_get() + u64::from(s) * 1000).div_ceil(1000) as u32
+    sleep_until(rt::sys::clock_get() + u64::from(s) * 1000 + 1).div_ceil(1000) as u32
 }
 
 #[no_mangle]
 pub extern "C" fn usleep(us: u32) -> c_int {
-    if sleep_until(rt::sys::clock_get() + u64::from(us).div_ceil(1000)) > 0 {
+    if sleep_until(rt::sys::clock_get() + u64::from(us).div_ceil(1000) + 1) > 0 {
         crate::errno::set(4);
         return -1;
     }

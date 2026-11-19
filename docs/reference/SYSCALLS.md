@@ -247,7 +247,7 @@ TOO_BIG (len over 4096).
 Ends the calling process: its threads stop, its handle table is closed (INVARIANTS H6),
 its address space is torn down.
 
-### thread_yield() -> status, clock_get() -> status, ticks, object_signals(handle) -> status, signals
+### thread_yield() -> status, clock_get() -> status, nanoseconds, object_signals(handle) -> status, signals
 
 `thread_yield` gives up the rest of the time slice. `clock_get` returns the **nanoseconds since boot**, from the `time` counter and its
 frequency (AB2: one flag-day change from 1 ms ticks; every deadline below is an absolute time on this clock, in nanoseconds; the system

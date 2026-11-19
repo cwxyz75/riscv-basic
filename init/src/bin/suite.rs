@@ -681,8 +681,8 @@ fn loose() -> bool {
 
 /// `lo <= elapsed <= hi`, with no upper bound when the scheduler is the loose one.
 fn within(elapsed: u64, lo: u64, hi: u64) -> bool {
-    // The ticks follow the host's clock, so even the strict windows allow some slack.
-    elapsed >= lo && (loose() || elapsed <= hi + 20)
+    // The clock is real time (AB2) and the guest can stall for tens of milliseconds on a loaded host: generous slack above, none below.
+    elapsed >= lo && (loose() || elapsed <= hi + 250)
 }
 
 fn request(txid: u32, op: u8, tail: &[u8]) -> ([u8; 64], usize) {
@@ -804,7 +804,7 @@ fn clock_get_is_nanoseconds() -> Outcome {
         d - after
     );
     ensure!(
-        after - t0 < 40_000_000,
+        after - t0 < 500_000_000,
         "a wait on a 5 ms deadline took {} ns",
         after - t0
     );

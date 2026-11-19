@@ -145,7 +145,7 @@ pub fn app_main() -> i32 {
         let now_t = sys::clock_get();
         let deadline = client
             .next_deadline()
-            .map_or(now_t + 1000, |ns| (ns / 1_000_000).max(now_t));
+            .map_or(now_t + 1000, |ns| ns.div_ceil(1_000_000).max(now_t));
         match udp.recv(deadline.min(now_t + 1000)) {
             Ok(d) => {
                 let acts = client.on_packet(&d.payload, now_ns());
