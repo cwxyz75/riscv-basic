@@ -107,3 +107,14 @@ opt-level = 2
 [profile.release]
 opt-level = 3
 codegen-units = 1
+
+# KT3 (KERNEL-V1-SPEC 7.4): the kernel crates keep overflow checks in the release build, so an arithmetic overflow a program could
+# cause is a panic the tests see, never a silent wrap.
+[profile.release.package.kernel]
+overflow-checks = true
+[profile.release.package.kcore]
+overflow-checks = true
+[profile.release.package.klock]
+overflow-checks = true
+[profile.release.package.abi]
+overflow-checks = true

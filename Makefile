@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -39,6 +39,10 @@ lint:
 	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
+	cd kernel && cargo clippy -- -D warnings
+
+# The kernel crate's own clippy run (the panic-finding lints of KT3 are denied in its syscall, trap, memory and scheduler modules); `lint` runs it too.
+lint-kernel:
 	cd kernel && cargo clippy -- -D warnings
 
 home-kernel:

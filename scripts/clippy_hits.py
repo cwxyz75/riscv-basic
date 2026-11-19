@@ -5,7 +5,7 @@ crate = sys.argv[1]
 only = next((a for a in sys.argv[2:] if not a.startswith("--")), "")
 LINTS = ["clippy::unwrap_used", "clippy::expect_used", "clippy::indexing_slicing", "clippy::arithmetic_side_effects",
          "clippy::panic", "clippy::unreachable"]
-cmd = ["cargo", "clippy", "--lib", "--message-format=json", "--"] + [f"-W{l}" for l in LINTS]
+cmd = ["cargo", "clippy"] + ([] if os.path.basename(os.path.abspath(crate)) == "kernel" else ["--lib"]) + ["--message-format=json", "--"] + [f"-W{l}" for l in LINTS]
 out = subprocess.run(cmd, cwd=crate, capture_output=True, text=True).stdout
 root = os.path.abspath(os.path.join(crate, ".."))
 hits = []

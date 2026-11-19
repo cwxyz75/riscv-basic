@@ -1,6 +1,14 @@
 //! Kernel traps. S1 handles page faults (the lazy-commit path through
 //! `kcore::aspace`) and treats everything else as fatal. No user mode yet, so every
 //! trap comes from the kernel itself, on the kernel stack.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use crate::{console::Console, finisher, kmem};
 use core::arch::global_asm;
@@ -21,6 +29,7 @@ pub struct TrapFrame {
 
 impl TrapFrame {
     /// The user's register `x{n}` (a0 is 10, a7 is 17).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: n < 32, the register count of the trap frame (callers pass constants)
     pub fn arg(&self, n: usize) -> u64 {
         self.x[n]
     }
@@ -41,6 +50,7 @@ impl TrapFrame {
 /// emergency stack; reports through the panic handler (the structured `##PANIC` line the boot harness
 /// reads) and ends the run.
 #[no_mangle]
+#[allow(clippy::panic)] // INVARIANT: a kernel stack overflow is fatal by design: this is the panic that reports it
 extern "C" fn stack_overflow(sepc: u64, stval: u64, sp: u64) -> ! {
     panic!("kernel stack overflow: sp {sp:#x} in a guard page (sepc {sepc:#x}, stval {stval:#x})")
 }
@@ -376,6 +386,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     }
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the kernel's own fault path: va steps over the pages a fault mapped; sepc plus an instruction length stays in kernel text
 fn trap_body(frame: &mut TrapFrame) {
     let cause = frame.scause;
     if cause == (1 << 63) | 1 {

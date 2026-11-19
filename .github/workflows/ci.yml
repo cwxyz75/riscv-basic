@@ -54,7 +54,7 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: python3 scripts/check_docs.py
-      - run: cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+      - run: cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
       - run: cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
       - name: OS crates under the loom and shuttle model checkers
         run: make os-test
@@ -132,6 +132,7 @@ jobs:
           key: ktest
       - name: Install QEMU and OpenSBI
         uses: ./.github/actions/install-qemu
+      - run: make lint-kernel
       - run: make os-ktest-small
 
   kernel-only-4:
