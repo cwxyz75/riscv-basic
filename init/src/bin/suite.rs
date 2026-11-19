@@ -3757,7 +3757,8 @@ extern "C" fn worker_write_later(arg: usize) -> ! {
     let r = sys::socket_write(arg as u32, b"ping".as_ptr(), 4);
     // Linger without making any syscall that wakes waiters, so that only the write's own
     // wake-up can end a waiter's sleep (an exit would wake everyone and hide a missing one).
-    let until = sys::clock_get() + 40;
+    // (400 ms: the readers' bound is the slack of `within`, 250 ms above the expected time, and a wake by the exit must fall outside it.)
+    let until = sys::clock_get() + 400;
     while sys::clock_get() < until {
         core::hint::spin_loop();
     }
@@ -4097,13 +4098,10 @@ fn a_blocked_reader_wakes_when_data_arrives() -> Outcome {
     let t0 = sys::clock_get();
     let r = sys::object_wait(b, sig::READABLE, sys::clock_get() + 500);
     ensure_eq!(r.status, 0, "woken by the write");
-    // Strictly: the writer lingers 40 ticks after its write without waking anyone, so a
-    // reader woken only by the writer's exit would be about 45 ticks late.
+    // Strictly: the writer lingers 400 ms after its write without waking anyone, so a reader woken only by the
+    // writer's exit would be about 400 ms late; the bound allows a stalled guest (AB2) and still excludes that.
     let took = sys::clock_get() - t0;
-    ensure!(
-        took >= 5 && (loose() || took <= 25),
-        "after about 6 ticks, not {took}"
-    );
+    ensure!(within(took, 5, 25), "after about 6 ms, not {took}");
     sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
     Ok(())
 }

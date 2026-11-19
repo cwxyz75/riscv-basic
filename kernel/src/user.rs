@@ -169,27 +169,6 @@ impl UserState {
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the
 /// kernel's own objects).
-/// The calling process's memory and the job ledger, for the `ksys` calls.
-struct KernelMem<'a> {
-    aspace: &'a mut AddressSpace,
-    k: &'a mut kmem::Kmem,
-}
-
-impl ksys::UserMem for KernelMem<'_> {
-    fn copy_in(&mut self, ptr: u64, len: usize) -> Result<Vec<u8>, Status> {
-        copy_from_user(self.aspace, &mut self.k.mm, &mut self.k.vmos, ptr, len)
-    }
-    fn verify_writable(&mut self, ptr: u64, len: usize) -> Result<(), Status> {
-        verify_writable(self.aspace, &mut self.k.mm, &mut self.k.vmos, ptr, len)
-    }
-    fn copy_out_verified(&mut self, ptr: u64, data: &[u8]) -> Result<(), Status> {
-        copy_to_user_verified(self.aspace, &mut self.k.mm, ptr, data)
-    }
-    fn jobs(&mut self) -> &mut kcore::job::Jobs {
-        &mut self.k.vmos.jobs
-    }
-}
-
 fn quota(job: JobId) -> ipc::Quota<'static> {
     ipc::Quota {
         jobs: &mut kmem::get().vmos.jobs,
@@ -1098,16 +1077,16 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         return fail(status);
     }
     {
-        let mut mem = KernelMem {
-            aspace: &mut p.aspace,
-            k: &mut *k,
-        };
         let mut ctx = ksys::Ctx {
             objs: &mut *objs,
             handles: &mut p.handles,
             job: p.job,
-            mem: &mut mem,
-            skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
+            aspace: &mut p.aspace,
+            mm: &mut k.mm,
+            vmos: &mut k.vmos,
+            faults: ksys::Faults {
+                skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
+            },
         };
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
             return r;

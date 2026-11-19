@@ -26,38 +26,38 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::Handle;
 use alloc::vec::Vec;
+use kcore::aspace::{AddressSpace, Vmos};
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
-use kcore::job::{JobId, Jobs};
+use kcore::job::JobId;
+use kcore::pagetable::PhysMem;
+use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
+use kcore::Mm;
 
 /// The failure half of a syscall's reply: the status and the two result registers some errors carry.
 pub type ReplyErr = (Status, Option<u64>, Option<u64>);
 /// A syscall's reply: the success values (`a1`, `a2`) or a failure.
 pub type Reply = Result<(Option<u64>, Option<u64>), ReplyErr>;
 
-/// What the calls in this crate need from the machine: the calling process's user memory and the job ledger the objects are charged
-/// to. The kernel implements it over the address space, the page allocator and the VMO table; the host tests over a `Vec`.
-pub trait UserMem {
-    /// Copy `len` bytes from user address `ptr` into a kernel buffer.
-    fn copy_in(&mut self, ptr: u64, len: usize) -> Result<Vec<u8>, Status>;
-    /// Check that `len` bytes at `ptr` can be written, committing what it must, so a later `copy_out_verified` allocates nothing and
-    /// fails for no reason (a bad pointer must never lose a message).
-    fn verify_writable(&mut self, ptr: u64, len: usize) -> Result<(), Status>;
-    /// Copy to a destination `verify_writable` has passed.
-    fn copy_out_verified(&mut self, ptr: u64, data: &[u8]) -> Result<(), Status>;
-    /// The job ledger.
-    fn jobs(&mut self) -> &mut Jobs;
+/// The negative-control kernels' switches (the `fault-*` features of `kernel`): each is off in every real kernel.
+#[derive(Clone, Copy, Default)]
+pub struct Faults {
+    /// `fault-skip-forced-touch`: a replaced handle is not reported to the wait table.
+    pub skip_forced_touch: bool,
 }
 
-/// One calling process, as these calls see it.
-pub struct Ctx<'a, M: UserMem> {
+/// One calling process, as these calls see it: its handles and address space, and the kernel state the calls act on. User memory
+/// goes through the real `kcore::usercopy` over whatever `PhysMem` the machine has (the direct map in the kernel, a `Vec` on the
+/// host), so pointer rules are the kernel's own rules in both.
+pub struct Ctx<'a, M: PhysMem> {
     pub objs: &'a mut Kobjs,
     pub handles: &'a mut HandleTable,
-    /// The job the process's new objects are charged to.
+    /// The job the process's new objects are charged to (the ledger is `vmos.jobs`).
     pub job: JobId,
-    pub mem: &'a mut M,
-    /// The negative-control kernel `fault-skip-forced-touch`: a replaced handle is not reported to the wait table.
-    pub skip_forced_touch: bool,
+    pub aspace: &'a mut AddressSpace,
+    pub mm: &'a mut Mm<M>,
+    pub vmos: &'a mut Vmos,
+    pub faults: Faults,
 }
 
 fn fail(s: Status) -> Reply {
@@ -119,15 +119,41 @@ fn handle_list(args: &[u8]) -> Vec<Handle> {
 /// The calls on handles, events, channels, sockets and ports. `None`: `n` is not one of them (the caller handles it). The width of
 /// 32-bit arguments is checked by the caller with [`wide_argument_error`].
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 is small)
-pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
+pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
     let Ctx {
         objs,
         handles,
         job,
-        mem,
-        skip_forced_touch,
+        aspace,
+        mm,
+        vmos,
+        faults,
     } = c;
-    let (job, skip_forced_touch) = (*job, *skip_forced_touch);
+    let (job, skip_forced_touch) = (*job, faults.skip_forced_touch);
+    if !matches!(
+        n,
+        nr::HANDLE_CLOSE
+            | nr::HANDLE_DUPLICATE
+            | nr::HANDLE_REPLACE
+            | nr::CHANNEL_CREATE
+            | nr::SOCKET_CREATE
+            | nr::SOCKET_WRITE
+            | nr::SOCKET_READ
+            | nr::SOCKET_SHUTDOWN
+            | nr::PORT_CREATE
+            | nr::PORT_BIND
+            | nr::PORT_REARM
+            | nr::PORT_UNBIND
+            | nr::EVENT_CREATE
+            | nr::EVENT_SIGNAL
+            | nr::OBJECT_INFO
+            | nr::OBJECT_SIGNALS
+            | nr::CHANNEL_WRITE
+            | nr::CHANNEL_READ
+            | nr::CHANNEL_READ_TXID
+    ) {
+        return None;
+    }
     let h = |i: usize| Handle(a[i] as u32);
     let r: Reply = (|| match n {
         nr::HANDLE_CLOSE => handles
@@ -156,7 +182,7 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: mem.jobs(),
+                    jobs: &mut vmos.jobs,
                     job: Some(job),
                 },
             )
@@ -168,7 +194,7 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: mem.jobs(),
+                    jobs: &mut vmos.jobs,
                     job: Some(job),
                 },
             )
@@ -178,8 +204,8 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::SOCKET_WRITE => {
             let len = a[2] as usize;
             ipc::socket_write_check(objs, handles, h(0), len).map_err(|e| (e, None, None))?;
-            let data = mem.copy_in(a[1], len).map_err(|e| (e, None, None))?;
-            ipc::socket_write_in(objs, handles, h(0), &data, mem.jobs())
+            let data = copy_from_user(aspace, mm, vmos, a[1], len).map_err(|e| (e, None, None))?;
+            ipc::socket_write_in(objs, handles, h(0), &data, &mut vmos.jobs)
                 .map(|n| (Some(n as u64), None))
                 .map_err(|e| (e, None, None))
         }
@@ -188,11 +214,10 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             // What a read would deliver, checked against the destination before anything is
             // removed, so a bad pointer never loses data.
             let n = ipc::socket_peek(objs, handles, h(0), max).map_err(|e| (e, None, None))?;
-            mem.verify_writable(a[1], n).map_err(|e| (e, None, None))?;
-            let data = ipc::socket_read_in(objs, handles, h(0), max, mem.jobs())
+            verify_writable(aspace, mm, vmos, a[1], n).map_err(|e| (e, None, None))?;
+            let data = ipc::socket_read_in(objs, handles, h(0), max, &mut vmos.jobs)
                 .map_err(|e| (e, None, None))?;
-            mem.copy_out_verified(a[1], &data)
-                .map_err(|e| (e, None, None))?;
+            copy_to_user_verified(aspace, mm, a[1], &data).map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
         nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, handles, h(0))
@@ -203,7 +228,7 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: mem.jobs(),
+                    jobs: &mut vmos.jobs,
                     job: Some(job),
                 },
             )
@@ -211,14 +236,14 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             Ok((Some(u64::from(port.0)), None))
         }
         nr::PORT_BIND => {
-            ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], mem.jobs())
+            ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], &mut vmos.jobs)
                 .map(|_| (None, None))
                 .map_err(|e| (e, None, None))
         }
-        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(0), a[1], mem.jobs())
+        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(0), a[1], &mut vmos.jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(0), a[1], mem.jobs())
+        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(0), a[1], &mut vmos.jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
         nr::EVENT_CREATE => {
@@ -226,7 +251,7 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: mem.jobs(),
+                    jobs: &mut vmos.jobs,
                     job: Some(job),
                 },
             )
@@ -248,13 +273,20 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
                 return fail(Status::TooBig);
             }
-            let data = mem.copy_in(a[1], nbytes).map_err(|e| (e, None, None))?;
-            let raw = mem
-                .copy_in(a[3], nhandles * 4)
+            let data =
+                copy_from_user(aspace, mm, vmos, a[1], nbytes).map_err(|e| (e, None, None))?;
+            let raw = copy_from_user(aspace, mm, vmos, a[3], nhandles * 4)
                 .map_err(|e| (e, None, None))?;
-            ipc::channel_write_in(objs, handles, h(0), &data, &handle_list(&raw), mem.jobs())
-                .map(|_| (None, None))
-                .map_err(|e| (e, None, None))
+            ipc::channel_write_in(
+                objs,
+                handles,
+                h(0),
+                &data,
+                &handle_list(&raw),
+                &mut vmos.jobs,
+            )
+            .map(|_| (None, None))
+            .map_err(|e| (e, None, None))
         }
         nr::CHANNEL_READ | nr::CHANNEL_READ_TXID => {
             let (txid, bytes_at, max_bytes, handles_at, max_handles) = if n == nr::CHANNEL_READ {
@@ -282,21 +314,22 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 }
                 Err(ReadError::Status(st)) => return fail(st),
             };
-            mem.verify_writable(bytes_at, nbytes)
-                .map_err(|e| (e, None, None))?;
-            mem.verify_writable(handles_at, nhandles * 4)
+            verify_writable(aspace, mm, vmos, bytes_at, nbytes).map_err(|e| (e, None, None))?;
+            verify_writable(aspace, mm, vmos, handles_at, nhandles * 4)
                 .map_err(|e| (e, None, None))?;
             let got = match txid {
-                None => ipc::channel_read_in(objs, handles, h(0), mb, mh, mem.jobs()),
-                Some(t) => ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, mem.jobs()),
+                None => ipc::channel_read_in(objs, handles, h(0), mb, mh, &mut vmos.jobs),
+                Some(t) => {
+                    ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, &mut vmos.jobs)
+                }
             };
             match got {
                 Ok(r) => {
                     let raw: Vec<u8> = r.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
                     // The destinations were verified: these writes allocate nothing (T10).
-                    mem.copy_out_verified(bytes_at, &r.data)
+                    copy_to_user_verified(aspace, mm, bytes_at, &r.data)
                         .map_err(|e| (e, None, None))?;
-                    mem.copy_out_verified(handles_at, &raw)
+                    copy_to_user_verified(aspace, mm, handles_at, &raw)
                         .map_err(|e| (e, None, None))?;
                     Ok((Some(r.data.len() as u64), Some(r.handles.len() as u64)))
                 }
@@ -308,10 +341,8 @@ pub fn ipc_call<M: UserMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 Err(ReadError::Status(st)) => Err((st, None, None)),
             }
         }
-        _ => Err((Status::Ok, None, None)), // (the marker for "not one of these": see below)
+        // (not reached: the guard above returned `None` for every call that is not one of these)
+        _ => fail(Status::BadSyscall),
     })();
-    if matches!(r, Err((Status::Ok, None, None))) {
-        return None;
-    }
     Some(r)
 }

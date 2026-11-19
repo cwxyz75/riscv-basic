@@ -142,6 +142,7 @@ os-test:
 # so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
+	cargo +nightly miri test -p ksys --target-dir target/miri
 	cargo +nightly miri test -p klock --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
