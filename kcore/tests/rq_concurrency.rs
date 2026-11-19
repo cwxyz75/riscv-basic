@@ -50,6 +50,10 @@ struct World {
     dead: Mutex<Vec<Tid>>,
     /// The reschedule IPI each hart has been sent (every poke, a poke for the hart itself included: the kernel sends itself one).
     ipi: Vec<AtomicBool>,
+    /// Deferred mode: the kernel's `need_resched`, set where the kernel calls `note_resched` (after a wake, a spawn, a priority change)
+    /// and by `finish_switch` when a mark is still set; the hart switches only when it sees the flag (or takes an IPI).
+    need: Vec<AtomicBool>,
+    deferred: bool,
 }
 
 impl World {
@@ -71,6 +75,22 @@ impl World {
         }
         self.s.switched(h);
         self.deliver(h);
+        self.finish_flag(h);
+    }
+
+    /// `finish_switch`: a mark still set when the switch is over is not left without its flag.
+    fn finish_flag(&self, h: usize) {
+        if self.deferred && self.s.resched_pending(h) {
+            self.need[h].store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// `note_resched`: after a wake, a spawn or a priority change.
+    fn note(&self, h: usize) {
+        if self.deferred {
+            self.deliver(h);
+            self.finish_flag(h);
+        }
     }
 
     /// `send_pokes`: an IPI to every poked hart; a poke for the hart itself becomes an IPI to itself.
@@ -88,7 +108,9 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
     let mut now = 0u64;
     let mut rng = shuttle::rand::thread_rng();
     for _ in 0..steps {
-        if w.ipi[h].swap(false, Ordering::SeqCst) || (deferred && w.s.resched_pending(h)) {
+        if w.ipi[h].swap(false, Ordering::SeqCst)
+            || (deferred && w.need[h].swap(false, Ordering::SeqCst))
+        {
             // (deferred mode: the defined point of a hart that a wake of its own marked, no IPI owed)
             w.s.reschedule_on(h);
             finish_fast(&w, h);
@@ -114,6 +136,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     // a thread that exists is always found, whatever migrations race with the look
                     assert!(w.s.wake_on(h, t).is_ok(), "wake of live thread {t} failed");
                 }
+                w.note(h);
                 w.finish(h);
             }
             4 if running_user => {
@@ -136,6 +159,15 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                 let _g = w.bkl.lock().unwrap();
                 w.dead.lock().unwrap().push(exec);
                 let _ = w.s.exit_on(h);
+                if deferred {
+                    // the kernel's `exit`: wake the joiners, then settle once more before the switch
+                    let list = w.tids.lock().unwrap().clone();
+                    if !list.is_empty() {
+                        let t = list[rng.gen_range(0..list.len())];
+                        let _ = w.s.wake_on(h, t);
+                    }
+                    w.s.reschedule_on(h);
+                }
                 w.finish(h);
             }
             8 => {
@@ -158,6 +190,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                     let t = list[rng.gen_range(0..list.len())];
                     let _ = w.s.set_priority_on(h, t, rng.gen_range(1..8u8));
                 }
+                w.note(h);
                 w.finish(h);
             }
             _ => {
@@ -168,6 +201,7 @@ fn hart(w: Arc<World>, h: usize, steps: usize, deferred: bool) {
                         w.tids.lock().unwrap().push(t);
                     }
                 }
+                w.note(h);
                 w.finish(h);
             }
         }
@@ -180,6 +214,7 @@ fn finish_fast(w: &World, h: usize) {
     if w.s.current_on(h) == w.exec[h].load(Ordering::SeqCst) {
         w.s.switched(h);
         w.deliver(h);
+        w.finish_flag(h);
     } else {
         let _g = w.bkl.lock().unwrap();
         w.finish(h);
@@ -200,6 +235,8 @@ fn model(steps: usize, deferred: bool) {
         tids: Mutex::new(Vec::new()),
         dead: Mutex::new(Vec::new()),
         ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
+        need: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
+        deferred,
     });
     w.s.set_deferred(deferred);
     for h in 0..HARTS {
@@ -219,7 +256,9 @@ fn model(steps: usize, deferred: bool) {
     for _ in 0..30 {
         let mut again = false;
         for h in 0..HARTS {
-            if w.ipi[h].swap(false, Ordering::SeqCst) || (deferred && w.s.resched_pending(h)) {
+            if w.ipi[h].swap(false, Ordering::SeqCst)
+                || (deferred && w.need[h].swap(false, Ordering::SeqCst))
+            {
                 w.s.reschedule_on(h);
                 let _g = w.bkl.lock().unwrap();
                 w.finish(h);
@@ -263,6 +302,7 @@ fn no_thread_executes_on_two_harts_when_wakes_are_deferred() {
 fn replay_a_recorded_schedule() {
     if let Ok(f) = std::env::var("REPLAY_SCHEDULE") {
         let sched = std::fs::read_to_string(f).unwrap();
-        shuttle::replay(move || model(14, false), sched.trim());
+        let deferred = std::env::var("REPLAY_DEFERRED").is_ok();
+        shuttle::replay(move || model(14, deferred), sched.trim());
     }
 }

@@ -354,6 +354,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             let _ = crate::thread::timer_tick_fast();
             crate::thread::switch_if_designated();
             crate::user::commit_wake();
+            crate::thread::preempt_point();
             crate::user::activate_current();
             crate::heap::service();
             crate::bkl::unlock();
@@ -399,6 +400,7 @@ fn trap_body(frame: &mut TrapFrame) {
                 crate::bkl::lock();
                 crate::fp::trap_entry(frame);
                 crate::thread::reschedule_this_hart();
+                crate::thread::preempt_point();
                 crate::user::activate_current();
                 crate::bkl::unlock();
             } else if crate::thread::reschedule_fast() {

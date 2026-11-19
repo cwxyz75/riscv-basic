@@ -476,6 +476,8 @@ fn user_thread_main(token: usize) {
     // A thread created in a stopped process waits here: it runs no user code before `process_resume` (or dies with the
     // process).
     park_while_stopped();
+    // (the return to user mode is a defined point for a switch a wake asked for: X7)
+    thread::preempt_point();
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();

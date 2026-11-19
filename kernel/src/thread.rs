@@ -446,6 +446,12 @@ fn finish_switch() {
         sc.take_pokes()
     };
     send_pokes(pokes, h);
+    // a mark that is still set (a wake that came after this hart's last settle) must not be left without its flag
+    if sched().resched_pending(h) {
+        crate::percpu::this()
+            .need_resched
+            .store(true, Ordering::Relaxed);
+    }
     // The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack
     // is in nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaces needed a wake and a
     // switch for every thread that ended). The big kernel lock is held (it follows the thread), so the table is ours.
@@ -774,6 +780,9 @@ pub fn exit() -> ! {
             sc.exit_on(h).expect("running thread");
             exits.wake_all_on(sc, h);
             // (a thread nobody joins is freed by the hart that switches away from it: `finish_switch`)
+            // a joiner just woken on this hart marked it (deferred mode): the hart makes its own designation right before the
+            // switch, or the mark would stay set with no flag and no poke owed (PR 263 review)
+            sc.reschedule_on(h);
         }
         reschedule();
     });
