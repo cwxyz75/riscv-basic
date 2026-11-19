@@ -83,6 +83,75 @@ PROGRESS = re.compile(r"(?i)\b(nothing (here )?is built|nothing in it is built|n
                       r"\bas built\b|^status:)", re.M)
 
 
+# C5 (INVARIANTS.md): atomics live only in `kcore::sync` and a small audited layer. The kernel crates are scanned for atomic types; a
+# file may mention them at most as often as recorded here, with the reason (the layer the file belongs to). A new atomic in a
+# file that is not listed, or one more than recorded, fails the docs check: add it to the audited layer, or raise the count here
+# with a reason a reviewer can judge.
+ATOMICS = {
+    "kcore/src/sync.rs": (15, "the re-export of the atomics (core's, loom's or shuttle's): the layer itself"),
+    "kcore/src/ticket.rs": (13, "the ticket lock protocol, modelled under loom and shuttle"),
+    "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
+    "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
+    "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
+    "kcore/src/sched_smp.rs": (27, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
+    "kernel/src/percpu.rs": (50, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
+    "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
+    "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
+    "kernel/src/smp.rs": (5, "hart bring-up and IPI flags"),
+    "kernel/src/aia.rs": (12, "interrupt controller statistics and masks"),
+    "kernel/src/thread.rs": (19, "the tick counter, scheduler ready flags and wake statistics"),
+    "kernel/src/user.rs": (9, "diagnostic counters and the deferred-reap flag"),
+    "kernel/src/trap.rs": (10, "the expected-fault test hook and its log words"),
+    "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
+    "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
+    "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
+    "kernel/src/console.rs": (2, "the console's panic flag and line state"),
+    "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
+    "kernel/src/sched_tests.rs": (38, "self-test flags and counters"),
+    "kernel/src/smp_tests.rs": (8, "self-test flags and counters"),
+}
+ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
+
+
+def check_atomics():
+    """C5: no new atomics outside the audited layer (KT4)."""
+    out = []
+    for crate in ("kernel", "kcore", "klock", "abi"):
+        for d, _, files in os.walk(os.path.join(ROOT, crate, "src")):
+            for f in files:
+                if not f.endswith(".rs"):
+                    continue
+                rel = os.path.relpath(os.path.join(d, f), ROOT)
+                n = 0
+                for line in open(os.path.join(d, f)):
+                    if not line.lstrip().startswith("//"):
+                        n += len(ATOMIC_RE.findall(line.split("//")[0]))
+                if n == 0:
+                    continue
+                allowed = ATOMICS.get(rel)
+                if allowed is None:
+                    out.append(f"C5: {rel} uses {n} atomic type(s) and is not in the audited allow-list (scripts/check_docs.py ATOMICS)")
+                elif n > allowed[0]:
+                    out.append(f"C5: {rel} uses {n} atomic types, the audited count is {allowed[0]} ({allowed[1]}): add them to the audited layer or raise the count with a reason")
+    return out
+
+
+def check_syscall_tests():
+    """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
+    import io, contextlib
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import syscall_tests
+    buf = io.StringIO()
+    saved = sys.argv
+    sys.argv = ["syscall_tests.py", "--quiet"]
+    try:
+        with contextlib.redirect_stdout(buf):
+            syscall_tests.main()
+    finally:
+        sys.argv = saved
+    return [l for l in buf.getvalue().splitlines() if l.strip()]
+
+
 def md_files(paths):
     for p in paths:
         full = os.path.join(ROOT, p)
@@ -191,7 +260,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers()
+    problems += check_tiers() + check_atomics() + check_syscall_tests()
     if problems:
         print("docs check FAILED:")
         for p in problems:
