@@ -929,7 +929,7 @@ fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::THREAD_EXIT => leave(a[0] as i32, false),
-        nr::CLOCK_GET => frame.set_return(0, Some(thread::ticks()), None),
+        nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
         nr::DEBUG_STAT => frame.set_return(0, Some(thread::wake_stat(a[0])), None),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
@@ -1982,7 +1982,7 @@ fn port_wait(a: [u64; 6]) -> Reply {
     let mut got = poll()?;
     while got.is_none()
         && deadline != 0
-        && thread::ticks() < deadline
+        && thread::now_ns() < deadline
         && irq::without(killed_now).is_none()
         && !irq::without(interrupted_now)
     {

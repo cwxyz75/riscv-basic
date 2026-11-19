@@ -335,7 +335,7 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     }
     frame.sepc += 4; // past the ecall
     if n == nr::CLOCK_GET {
-        frame.set_return(0, Some(crate::thread::ticks()), None);
+        frame.set_return(0, Some(crate::thread::now_ns()), None);
     } else {
         frame.set_return(0, None, None);
         if crate::thread::yield_fast() {

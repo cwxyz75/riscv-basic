@@ -300,7 +300,7 @@ pub fn join_scheduler() -> ! {
         let k = kernel();
         // the hart's boot context becomes its idle thread (the scheduler made the id when it was built)
         let tid = sched().idle(h);
-        sched().set_clock(h, ticks_to_ns(TICKS.load(Ordering::SeqCst)));
+        sched().set_clock(h, now_ns());
         sched().set_online(h, true);
         k.threads.insert(
             tid,
@@ -675,7 +675,7 @@ fn starvation_watchdog(h: usize, now: u64) {
     static LAST: [core::sync::atomic::AtomicU32; 32] =
         [const { core::sync::atomic::AtomicU32::new(0) }; 32];
     if now % 100 == h as u64 {
-        let found = sched().starved(ticks_to_ns(now), 500 * MS);
+        let found = sched().starved(now_ns(), 500 * MS);
         let tid = found.map_or(0, |f| f.0);
         let before = LAST[h & 31].swap(tid, Ordering::Relaxed);
         if let Some((t, on, idle)) = found {
@@ -709,7 +709,7 @@ pub fn timer_tick_fast() -> bool {
     }
     let (pokes, switch) = {
         let sc = sched();
-        sc.tick_on(h, ticks_to_ns(now));
+        sc.tick_on(h, now_ns());
         let switch = sc.current_on(h) != running_here();
         if !switch {
             sc.switched(h); // the designation came back to the running thread: nothing is in transit
@@ -723,6 +723,11 @@ pub fn timer_tick_fast() -> bool {
 /// Ticks (1 ms) to the scheduler's nanoseconds; "never" (`u64::MAX`) stays never.
 fn ticks_to_ns(t: u64) -> u64 {
     t.saturating_mul(MS)
+}
+
+/// Nanoseconds since boot (the clock user mode sees; AB2).
+pub fn now_ns() -> u64 {
+    crate::timer::now_ns()
 }
 
 /// Ticks since the timer started (1 ms each).
@@ -802,16 +807,16 @@ pub fn wake(tid: Tid) {
 /// Sleep for `n` ticks (or until woken).
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: ticks() + n: ticks far below u64::MAX and n is a kernel-chosen duration; the caller is a running thread
 pub fn sleep_ticks(n: u64) {
-    let deadline = ticks() + n;
+    let deadline = now_ns().saturating_add(ticks_to_ns(n));
     // A loop: a stale entry on a wait queue can wake a sleeper early, and the sleep must not
     // end before its deadline.
     loop {
         let done = irq::without(|| {
-            if ticks() >= deadline {
+            if now_ns() >= deadline {
                 return true;
             }
             if sched()
-                .sleep_until_on(hart(), ticks_to_ns(deadline))
+                .sleep_until_on(hart(), deadline)
                 .expect("running thread")
             {
                 reschedule();
@@ -924,7 +929,7 @@ pub fn new_queue() -> usize {
     })
 }
 
-/// Sleep until `ready()` holds or `deadline` (absolute ticks), **not queued anywhere**: only
+/// Sleep until `ready()` holds or `deadline` (absolute nanoseconds on `now_ns`'s clock), **not queued anywhere**: only
 /// `wake_blocked(tid)` or the deadline ends the sleep early (slice W step 2: futex sleepers and
 /// other waiters that are woken by id). `ready` runs with interrupts off with the big lock held, so
 /// checking and sleeping are one step against any waker. Returns whether `ready()` held.
@@ -947,7 +952,7 @@ pub fn wait_deadline_registered(
             if ready() {
                 return Some(true);
             }
-            if ticks() >= deadline {
+            if now_ns() >= deadline {
                 return Some(false);
             }
             // (prepared before registering: the order of 3.7 — under the big lock nothing can interleave, but the
@@ -956,7 +961,7 @@ pub fn wait_deadline_registered(
             register();
             count_sleep(&mut slept);
             if sched()
-                .sleep_until_on(hart(), ticks_to_ns(deadline))
+                .sleep_until_on(hart(), deadline)
                 .expect("running thread")
             {
                 reschedule();

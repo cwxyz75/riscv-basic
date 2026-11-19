@@ -115,12 +115,14 @@ fn many_threads_do_not_leak() -> Outcome {
 }
 
 fn sleep_wakes_on_time() -> Outcome {
-    let t0 = thread::ticks();
+    // (on the precise clock, AB2: a sleep is a number of milliseconds from the instant it starts, and the tick count of one hart
+    // can differ by one from it)
+    let t0 = thread::now_ns();
     thread::sleep_ticks(5);
-    let elapsed = thread::ticks() - t0;
+    let elapsed_ns = thread::now_ns() - t0;
     ensure(
-        (5..=6 + LATE_TICKS).contains(&elapsed),
-        &format!("slept {elapsed} ticks, wanted 5"),
+        (5_000_000..=(6 + LATE_TICKS) * 1_000_000 + 40_000_000).contains(&elapsed_ns), // (a real clock: a host stall adds to it)
+        &format!("slept {elapsed_ns} ns, wanted 5 ms"),
     )
 }
 

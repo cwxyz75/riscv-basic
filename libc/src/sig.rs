@@ -742,7 +742,7 @@ pub unsafe extern "C" fn sigtimedwait(
             errno::set(22);
             return -1;
         }
-        rt::sys::clock_get() + (s as u64) * 1000 + (ns as u64).div_ceil(1_000_000)
+        rt::sys::clock_get() + (s as u64) * 1000 + (ns as u64).div_ceil(1_000_000) + 1
     };
     match wait_for(*set, deadline) {
         Some(n) => {

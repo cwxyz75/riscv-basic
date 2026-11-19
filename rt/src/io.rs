@@ -83,7 +83,7 @@ pub fn nap(ticks: u64) {
     let e = sys::event_create();
     if e.status == 0 {
         let h = e.a1 as u32;
-        sys::object_wait(h, signals::USER_MASK, sys::clock_get() + ticks);
+        sys::object_wait(h, signals::USER_MASK, sys::clock_get() + ticks + 1); // (+1: the clock floors)
         sys::handle_close(h);
     }
 }
