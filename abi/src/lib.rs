@@ -268,6 +268,15 @@ pub mod limits {
     pub const MAX_REGIONS: usize = 16384;
 }
 
+/// Time (SYSCALLS.md, "Time"): `clock_get` returns nanoseconds since boot and every deadline argument is an absolute time in
+/// nanoseconds on that clock (AB2). 0 means "do not wait", `DEADLINE_NEVER` means "no deadline".
+pub mod time {
+    pub const NS_PER_MS: u64 = 1_000_000;
+    pub const NS_PER_SEC: u64 = 1_000_000_000;
+    /// No deadline: wait for ever.
+    pub const DEADLINE_NEVER: u64 = u64::MAX;
+}
+
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
 pub mod syscall {
     pub const DEBUG_WRITE: usize = 0;

@@ -613,9 +613,9 @@ pub extern "C" fn sched_yield() -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn clock_gettime(_clock: c_int, ts: *mut Timespec) -> c_int {
-    let ms = rt::sys::clock_get();
-    (*ts).tv_sec = (ms / 1000) as i64;
-    (*ts).tv_nsec = ((ms % 1000) * 1_000_000) as c_long;
+    let ns = rt::sys::clock_ns();
+    (*ts).tv_sec = (ns / 1_000_000_000) as i64;
+    (*ts).tv_nsec = (ns % 1_000_000_000) as c_long;
     0
 }
 

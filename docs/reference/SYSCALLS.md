@@ -140,7 +140,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 0 | debug_write | `a0` ptr, `a1` len | |
 | 1 | process_exit | `a0` code | does not return |
 | 2 | thread_yield | | |
-| 3 | clock_get | | `a1` ticks since boot (1 ms each) |
+| 3 | clock_get | | `a1` nanoseconds since boot |
 | 4 | debug_stat | `a0` which | `a1` the kernel counter |
 | 10 | handle_close | `a0` handle | |
 | 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
@@ -249,8 +249,9 @@ its address space is torn down.
 
 ### thread_yield() -> status, clock_get() -> status, ticks, object_signals(handle) -> status, signals
 
-`thread_yield` gives up the rest of the time slice. `clock_get` returns ticks of 1 ms
-since boot. `object_signals` reads the signal word of the object a handle names
+`thread_yield` gives up the rest of the time slice. `clock_get` returns the **nanoseconds since boot**, from the `time` counter and its
+frequency (AB2: one flag-day change from 1 ms ticks; every deadline below is an absolute time on this clock, in nanoseconds; the system
+library `rt` offers millisecond conveniences, `clock_get()` and deadlines in ms, and converts at the boundary). `object_signals` reads the signal word of the object a handle names
 (BAD_HANDLE for a bad handle; no right needed, the signals are not secret to a holder).
 
 ## Waiting, calling and the bootstrap handle (S3c-1)
@@ -266,7 +267,7 @@ Errors: BAD_HANDLE (also a handle value wider than 32 bits). Tests: `object_info
 ### object_wait(handle, mask, deadline) -> status, observed
 
 Blocks the calling thread until `signals(handle) & mask != 0` or the clock reaches
-`deadline` (absolute ticks, as `clock_get` counts; `0` means "do not wait", `u64::MAX`
+`deadline` (absolute nanoseconds, as `clock_get` counts; `0` means "do not wait", `u64::MAX`
 "forever"). The result `observed` is the signal word when the call returned (also on
 TIMED_OUT).
 Rights: WAIT on `handle`. Blocking: until a signal in `mask` is set, the deadline, or the
@@ -296,7 +297,7 @@ Sends one request and waits for the reply with the same transaction id, in one c
 | 32 | `u64` reply handles buffer |
 | 40 | `u32` reply buffer capacity (bytes) |
 | 44 | `u32` reply buffer capacity (handles) |
-| 48 | `u64` deadline (absolute ticks, `u64::MAX` for none) |
+| 48 | `u64` deadline (absolute nanoseconds, `u64::MAX` for none) |
 
 Rights: WRITE and READ on `channel`; TRANSFER on the request handles.
 Effects: as `channel_write` then `channel_read_txid` with the request's transaction id.
@@ -413,7 +414,7 @@ pages. The tree is data from the firmware: the reader (`kcore::fdt::parse`) is h
 Sleep if the 32-bit word at `address` (in the caller's address space) still equals `expected`. The
 check and the enqueue are one step under the big kernel lock, so a wake that follows a user-mode store
 to the word is never lost; the word is read with one aligned atomic load. `deadline` is an absolute
-tick: `0` polls (equal: TIMED_OUT at once, no sleep), `u64::MAX` waits forever. OK when woken (the
+time in nanoseconds: `0` polls (equal: TIMED_OUT at once, no sleep), `u64::MAX` waits forever. OK when woken (the
 sleeper left the table because of a `futex_wake`); spurious wakeups are allowed, so callers re-check.
 Errors, in order: INVALID_ARGS (`address` not 4-aligned, outside user memory, not readable or not
 mappable; `expected` wider than 32 bits); SHOULD_WAIT (the word differs from `expected`: nothing
@@ -728,7 +729,7 @@ Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no 
 
 ### port_wait(port, deadline) -> status, key, observed
 
-Wait until some binding is ready or the absolute tick `deadline` passes (0: do not block;
+Wait until some binding is ready or the absolute time `deadline` (nanoseconds) passes (0: do not block;
 `u64::MAX`: no deadline), then return one ready binding's `key` and `observed` (`signals &
 mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
 Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;

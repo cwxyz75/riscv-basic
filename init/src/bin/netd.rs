@@ -191,7 +191,7 @@ struct Netd {
 }
 
 fn now_ns() -> u64 {
-    sys::clock_get().saturating_mul(1_000_000)
+    sys::clock_ns()
 }
 
 fn rx_byte(off: usize) -> u8 {

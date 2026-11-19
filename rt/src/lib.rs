@@ -109,8 +109,21 @@ pub mod sys {
     pub fn thread_yield() -> Ret {
         syscall(THREAD_YIELD, [0; 6])
     }
-    pub fn clock_get() -> u64 {
+    /// The kernel clock in nanoseconds since boot (the ABI's unit, SYSCALLS.md "Time").
+    pub fn clock_ns() -> u64 {
         syscall(CLOCK_GET, [0; 6]).a1 as u64
+    }
+    /// The kernel clock in **milliseconds** since boot: the convenience unit of the servers and tests (`clock_ns() / 1e6`). Deadlines
+    /// built on it (`clock_get() + 500`) are milliseconds too, and the wrappers below convert them to the ABI's nanoseconds.
+    pub fn clock_get() -> u64 {
+        clock_ns() / abi::time::NS_PER_MS
+    }
+    /// A deadline in absolute milliseconds as the ABI wants it: 0 (poll) and `u64::MAX` (never) stay, the rest becomes nanoseconds.
+    pub fn deadline_ns(ms: u64) -> u64 {
+        match ms {
+            0 | u64::MAX => ms,
+            _ => ms.saturating_mul(abi::time::NS_PER_MS),
+        }
     }
     /// A kernel counter (see SYSCALLS.md `debug_stat`): 0 blocking waits entered, 1 waits that were woken
     /// without being satisfied (spurious wakes), 2 threads woken.
@@ -199,8 +212,13 @@ pub mod sys {
     pub fn object_signals(h: u32) -> Ret {
         syscall(OBJECT_SIGNALS, [h as usize, 0, 0, 0, 0, 0])
     }
-    /// Wait until `signals(h) & mask != 0` or tick `deadline` (0: do not wait, u64::MAX: forever).
+    /// Wait until `signals(h) & mask != 0` or the absolute time `deadline` in **milliseconds** on the `clock_get` clock (0: do not
+    /// wait, u64::MAX: forever).
     pub fn object_wait(h: u32, mask: u32, deadline: u64) -> Ret {
+        object_wait_ns(h, mask, deadline_ns(deadline))
+    }
+    /// `object_wait` with the deadline in nanoseconds on the `clock_ns` clock (the ABI's own unit).
+    pub fn object_wait_ns(h: u32, mask: u32, deadline: u64) -> Ret {
         syscall(
             OBJECT_WAIT,
             [h as usize, mask as usize, deadline as usize, 0, 0, 0],
@@ -258,9 +276,13 @@ pub mod sys {
     pub fn resource_dtb(resource: u32) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])
     }
-    /// Sleep if the 32-bit word at `addr` still equals `expected`; `deadline` is an absolute tick
-    /// (0: poll, `u64::MAX`: forever). OK when woken, SHOULD_WAIT if the word differed, TIMED_OUT.
+    /// Sleep if the 32-bit word at `addr` still equals `expected`; `deadline` is an absolute time in milliseconds on the `clock_get`
+    /// clock (0: poll, `u64::MAX`: forever). OK when woken, SHOULD_WAIT if the word differed, TIMED_OUT.
     pub fn futex_wait(addr: *const u32, expected: u32, deadline: u64) -> Ret {
+        futex_wait_ns(addr, expected, deadline_ns(deadline))
+    }
+    /// `futex_wait` with the deadline in nanoseconds.
+    pub fn futex_wait_ns(addr: *const u32, expected: u32, deadline: u64) -> Ret {
         syscall(
             FUTEX_WAIT,
             [addr as usize, expected as usize, deadline as usize, 0, 0, 0],
@@ -434,7 +456,12 @@ pub mod sys {
     pub fn port_unbind(port: u32, key: u64) -> Ret {
         syscall(PORT_UNBIND, [port as usize, key as usize, 0, 0, 0, 0])
     }
+    /// Wait for a binding to be ready; `deadline` in absolute milliseconds as for `object_wait`.
     pub fn port_wait(port: u32, deadline: u64) -> Ret {
+        port_wait_ns(port, deadline_ns(deadline))
+    }
+    /// `port_wait` with the deadline in nanoseconds.
+    pub fn port_wait_ns(port: u32, deadline: u64) -> Ret {
         syscall(PORT_WAIT, [port as usize, deadline as usize, 0, 0, 0, 0])
     }
     pub fn thread_create(process: u32, entry: u64, sp: u64, arg: u64) -> Ret {
@@ -490,7 +517,23 @@ pub mod sys {
     pub fn process_info(process: u32) -> Ret {
         syscall(PROCESS_INFO, [process as usize, 0, 0, 0, 0, 0])
     }
+    /// `channel_call`; `args.deadline` is an absolute time in **milliseconds** on the `clock_get` clock (0: poll, `u64::MAX`: never).
     pub fn channel_call(ch: u32, args: &super::CallArgs) -> Ret {
+        let ns = super::CallArgs {
+            req_bytes: args.req_bytes,
+            req_handles: args.req_handles,
+            req_nbytes: args.req_nbytes,
+            req_nhandles: args.req_nhandles,
+            rep_bytes: args.rep_bytes,
+            rep_handles: args.rep_handles,
+            rep_max_bytes: args.rep_max_bytes,
+            rep_max_handles: args.rep_max_handles,
+            deadline: deadline_ns(args.deadline),
+        };
+        channel_call_ns(ch, &ns)
+    }
+    /// `channel_call` with `args.deadline` in nanoseconds (the ABI's own unit).
+    pub fn channel_call_ns(ch: u32, args: &super::CallArgs) -> Ret {
         syscall(
             CHANNEL_CALL,
             [

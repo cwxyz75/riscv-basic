@@ -778,6 +778,61 @@ fn wait_with_deadline_zero_polls() -> Outcome {
     Ok(())
 }
 
+/// AB2: `clock_get` is nanoseconds since boot, from the `time` counter, not a tick count: readings are not all whole milliseconds,
+/// and a wait of five milliseconds on the ns clock lasts between five and a few more.
+fn clock_get_is_nanoseconds() -> Outcome {
+    let t0 = sys::clock_ns();
+    let mut fractional = false;
+    let mut last = t0;
+    for _ in 0..200 {
+        let t = sys::clock_ns();
+        ensure!(t >= last, "the clock went backwards: {last} then {t}");
+        fractional |= !t.is_multiple_of(1_000_000);
+        last = t;
+    }
+    ensure!(
+        fractional,
+        "200 readings, every one a whole millisecond: this is a tick count"
+    );
+    let d = t0 + 5_000_000;
+    let r = sys::object_wait_ns(BOOTSTRAP, sig::READABLE, d);
+    let after = sys::clock_ns();
+    ensure_eq!(r.status, S::TimedOut.code(), "nothing arrives");
+    ensure!(
+        after >= d,
+        "a wait on a 5 ms deadline ended {} ns early",
+        d - after
+    );
+    ensure!(
+        after - t0 < 40_000_000,
+        "a wait on a 5 ms deadline took {} ns",
+        after - t0
+    );
+    Ok(())
+}
+
+/// AB2 acceptance: no wait ends before its deadline, whatever the length (the kernel rounds a deadline up to the next tick, never
+/// down): 300 waits of random length from 0 to 3 ms.
+fn sleep_never_wakes_early() -> Outcome {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ sys::clock_ns();
+    for i in 0..300 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let len = (seed >> 33) % 3_000_000 + 1;
+        let d = sys::clock_ns() + len;
+        let r = sys::object_wait_ns(BOOTSTRAP, sig::READABLE, d);
+        let after = sys::clock_ns();
+        ensure_eq!(r.status, S::TimedOut.code(), "wait {i}");
+        ensure!(
+            after >= d,
+            "wait {i}: a {len} ns wait ended {} ns early",
+            d - after
+        );
+    }
+    Ok(())
+}
+
 fn wait_times_out_at_the_deadline() -> Outcome {
     let t0 = sys::clock_get();
     let r = sys::object_wait(BOOTSTRAP, sig::READABLE, t0 + 5);
@@ -2535,8 +2590,12 @@ extern "C" fn worker_set(arg: usize) -> ! {
 }
 
 /// `arg` is an event handle: wait for user signal 0 and record when and how the wait ended.
+/// A deadline for the tests that start thousands of threads (AB2): the clock is real time now, not a tick count that slows down with
+/// the machine, and creating two thousand threads takes about twenty seconds of it on QEMU's software CPU.
+const SLOW_MS: u64 = 120_000;
+
 extern "C" fn worker_wait_event(arg: usize) -> ! {
-    let r = sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + 2000);
+    let r = sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + SLOW_MS);
     WOKEN_AT.store(sys::clock_get(), Ordering::SeqCst);
     WOKEN_STATUS.store(r.status as u32, Ordering::SeqCst);
     sys::thread_exit(if r.status == 0 { 0 } else { 1 })
@@ -3220,7 +3279,7 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
         "wake them all"
     );
     for &t in &ts {
-        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + SLOW_MS);
         ensure_eq!(r.status, 0, "a thread ended");
         sys::handle_close(t);
     }
@@ -10964,7 +11023,7 @@ fn thread_spawn_arena_is_bounded_and_reused() -> Outcome {
         "release them"
     );
     for &t in &ts {
-        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + SLOW_MS);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(t);
     }
@@ -10988,6 +11047,7 @@ fn two_thousand_threads_live() -> Outcome {
         arg: u64::from(ev),
         ..spawn_rec(spawn_wait_event)
     };
+    let started = sys::clock_get();
     let mut ts: Vec<u32> = Vec::new();
     for _ in 0..2000 {
         let r = sys::thread_spawn(me, &rec);
@@ -11004,9 +11064,15 @@ fn two_thousand_threads_live() -> Outcome {
         Some(S::Ok),
         "wake them all"
     );
-    for &t in &ts {
-        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 8000);
-        ensure_eq!(w.status, 0, "a thread ended");
+    let spawned = sys::clock_get() - started;
+    for (i, &t) in ts.iter().enumerate() {
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + SLOW_MS);
+        ensure!(
+            w.status == 0,
+            "a thread ended: status {} for thread {i} (spawned in {spawned} ms, {} ms in)",
+            w.status,
+            sys::clock_get() - started
+        );
         sys::handle_close(t);
     }
     sys::handle_close(ev);
@@ -11431,6 +11497,8 @@ pub fn app_main() -> i32 {
             "wait_times_out_at_the_deadline",
             wait_times_out_at_the_deadline,
         ),
+        ("clock_get_is_nanoseconds", clock_get_is_nanoseconds),
+        ("sleep_never_wakes_early", sleep_never_wakes_early),
         ("wait_is_woken_by_a_message", wait_is_woken_by_a_message),
         ("channel_call_round_trip", channel_call_round_trip),
         (

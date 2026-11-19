@@ -41,9 +41,9 @@ enum Conn {
     Client,
 }
 
-/// Nanoseconds from the monotonic clock (ticks are milliseconds).
+/// Nanoseconds from the monotonic clock (the kernel's own unit).
 fn mono_ns() -> u64 {
-    sys::clock_get().saturating_mul(1_000_000)
+    sys::clock_ns()
 }
 
 fn read_rtc() -> u64 {

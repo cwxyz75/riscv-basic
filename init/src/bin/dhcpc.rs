@@ -24,7 +24,7 @@ use rt::sys;
 const BLOB_VA: u64 = 0x540_0000;
 
 fn now_ns() -> u64 {
-    sys::clock_get().saturating_mul(1_000_000)
+    sys::clock_ns()
 }
 
 fn dotted(a: [u8; 4]) -> alloc::string::String {
