@@ -21,8 +21,8 @@ use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::sched::{Prio, State, Tid};
-use kcore::sched2::{SchedAttr, MS};
-use kcore::sched_smp::{Sched2, Waiters2};
+use kcore::sched2::{HartRq, SchedAttr, MS};
+use kcore::sched_smp::{Rqs, Sched2, Table, Waiters2};
 
 #[cfg(not(feature = "sched-round-robin"))]
 pub type Class = kcore::sched2::FixedPrio;
@@ -30,7 +30,28 @@ pub type Class = kcore::sched2::FixedPrio;
 pub type Class = kcore::sched2::RoundRobin;
 
 /// The scheduler: one run queue per hart, placement, push and pull (`kcore::sched_smp`, SCHED-SMP-SPEC 4.4).
-type KSched = Sched2<Class>;
+type KSched = Sched2<Class, KRqs>;
+
+/// The per-hart run queues, each behind its own lock of class `RQ` (instance: the hart), and the thread table behind one of class
+/// `TT` (L11b). `Sched2` takes at most two `RQ` locks, in ascending hart order, and never the table while it holds one.
+struct KRqs {
+    rq: Vec<klock::Spin<HartRq<Class>, crate::bkl::Machine>>,
+    table: klock::Spin<Table, crate::bkl::Machine>,
+}
+
+impl Rqs<Class> for KRqs {
+    type Guard<'a> = klock::Guard<'a, HartRq<Class>, crate::bkl::Machine>;
+    type TableGuard<'a> = klock::Guard<'a, Table, crate::bkl::Machine>;
+    fn len(&self) -> usize {
+        self.rq.len()
+    }
+    fn lock(&self, x: usize) -> Self::Guard<'_> {
+        self.rq[x].lock()
+    }
+    fn table(&self) -> Self::TableGuard<'_> {
+        self.table.lock()
+    }
+}
 
 fn new_class() -> Class {
     Class::default()
@@ -132,30 +153,19 @@ struct Kernel {
 
 static mut KERNEL: Option<Kernel> = None;
 
-/// The scheduler core, behind its own lock (class `RQ`, SCHED-SMP-SPEC task 12): taken for one operation at a time, with
-/// interrupts off, by code that holds the big kernel lock (which comes first in the order) and by the timer and reschedule
-/// interrupts that do not. Nothing here is held across a context switch: `cur[h]` is only ever changed by hart `h`, and the
-/// switch itself (`reschedule`) is done under the big lock, which is handed from thread to thread as before.
-static SCHED: klock::Spin<Option<KSched>, crate::bkl::Machine> =
-    klock::Spin::new(klock::Class::Rq, 0, None);
+/// The scheduler core: its run queues are behind their own per-hart locks (class `RQ`, SCHED-SMP-SPEC task 11), so it is shared by
+/// every hart with no lock of its own; each call takes the locks it needs and says which. Set once, by `init`.
+static mut SCHED: Option<KSched> = None;
 
-struct SchedGuard(klock::Guard<'static, Option<KSched>, crate::bkl::Machine>);
-
-impl core::ops::Deref for SchedGuard {
-    type Target = KSched;
-    fn deref(&self) -> &KSched {
-        self.0.as_ref().expect("thread::init was not called")
+/// The scheduler (every method takes `&self`; interrupts must be off).
+fn sched() -> &'static KSched {
+    // SAFETY: written once by `init` before any other hart is started or any scheduler call is made, and never again; after that
+    // it is only read through a shared reference.
+    unsafe {
+        (*core::ptr::addr_of!(SCHED))
+            .as_ref()
+            .expect("thread::init was not called")
     }
-}
-impl core::ops::DerefMut for SchedGuard {
-    fn deref_mut(&mut self) -> &mut KSched {
-        self.0.as_mut().expect("thread::init was not called")
-    }
-}
-
-/// Take the scheduler lock (one operation at a time: do not call this while holding the guard).
-fn sched() -> SchedGuard {
-    SchedGuard(SCHED.lock())
 }
 
 /// The thread this hart is running (its own record: only this hart writes it).
@@ -197,7 +207,12 @@ pub fn init(boot_prio: Prio) {
     // SAFETY: clears sstatus.FS and sstatus.VS only.
     unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     let harts = crate::smp::started();
-    let mut sched = KSched::new(harts, new_class);
+    let sched = KSched::over(KRqs {
+        rq: (0..harts)
+            .map(|h| klock::Spin::new(klock::Class::Rq, h as u32, HartRq::new(new_class())))
+            .collect(),
+        table: klock::Spin::new(klock::Class::Tt, 0, Table::new()),
+    });
     // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
     for h in 1..harts {
         sched.set_online(h, false);
@@ -234,7 +249,8 @@ pub fn init(boot_prio: Prio) {
             reaper_queue: 0,
         });
     }
-    *SCHED.lock() = Some(sched);
+    // SAFETY: the one write (see `sched`): interrupts off, one hart.
+    unsafe { *addr_of_mut!(SCHED) = Some(sched) };
     set_running(boot);
     // hart 0's idle thread (the other harts use their own boot context when they join): the scheduler made its id, this
     // gives it a stack and a first instruction
@@ -415,7 +431,7 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
 fn finish_switch() {
     let h = hart();
     let pokes = {
-        let mut sc = sched();
+        let sc = sched();
         sc.switched(h);
         sc.take_pokes()
     };
@@ -431,7 +447,7 @@ fn reschedule() {
         let k = kernel();
         let h = hart();
         let (pokes, next) = {
-            let mut sc = sched();
+            let sc = sched();
             (sc.take_pokes(), sc.current_on(h))
         };
         send_pokes(pokes, h);
@@ -499,6 +515,11 @@ pub fn switch_if_designated() {
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
 fn send_pokes(mut pokes: u32, me: usize) {
+    // A poke for this hart itself (another hart marked it after this hart's own settle began, and this hart took the mask first):
+    // the mark is real and `pending` is set, so the hart must look again: an IPI to itself, taken as soon as interrupts are on.
+    if pokes & (1 << me) != 0 {
+        crate::smp::send_ipi(me, crate::percpu::IPI_RESCHED);
+    }
     pokes &= !(1 << me);
     while pokes != 0 {
         let i = pokes.trailing_zeros() as usize;
@@ -524,7 +545,7 @@ pub fn reschedule_this_hart() {
 pub fn reschedule_fast() -> bool {
     let h = hart();
     let (pokes, switch) = {
-        let mut sc = sched();
+        let sc = sched();
         sc.reschedule_on(h);
         let switch = sc.current_on(h) != running_here();
         if !switch {
@@ -550,7 +571,7 @@ pub fn timer_tick_fast() -> bool {
         TICKS.load(Ordering::SeqCst)
     };
     let (pokes, switch) = {
-        let mut sc = sched();
+        let sc = sched();
         sc.tick_on(h, ticks_to_ns(now));
         let switch = sc.current_on(h) != running_here();
         if !switch {
@@ -681,14 +702,14 @@ pub fn exit() -> ! {
             ..
         } = k;
         {
-            let mut sc = sched();
+            let sc = sched();
             sc.exit_on(h).expect("running thread");
-            exits.wake_all_on(&mut sc, h);
+            exits.wake_all_on(sc, h);
             if detached {
                 // Nobody will join it: hand it to the reaper (which runs once we have switched
                 // away, so its stack is no longer in use when it is freed).
                 zombies.push(me);
-                queues[*reaper_queue].wake_all_on(&mut sc, h);
+                queues[*reaper_queue].wake_all_on(sc, h);
             }
         }
         reschedule();
@@ -719,8 +740,8 @@ pub fn join(tid: Tid) -> bool {
                 }
                 Some(_) => {
                     let blocked = {
-                        let mut sc = sched();
-                        k.exits.wait_on(&mut sc, hart()).expect("running thread")
+                        let sc = sched();
+                        k.exits.wait_on(sc, hart()).expect("running thread")
                     };
                     if blocked {
                         reschedule();
@@ -823,10 +844,8 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
             count_sleep(&mut slept);
             let k = kernel();
             let blocked = {
-                let mut sc = sched();
-                k.queues[q]
-                    .wait_on(&mut sc, hart())
-                    .expect("running thread")
+                let sc = sched();
+                k.queues[q].wait_on(sc, hart()).expect("running thread")
             };
             if blocked {
                 reschedule();
@@ -843,8 +862,8 @@ pub fn wake_one(q: usize) -> bool {
     irq::without(|| {
         let k = kernel();
         let woke = {
-            let mut sc = sched();
-            k.queues[q].wake_one_on(&mut sc, hart()).is_some()
+            let sc = sched();
+            k.queues[q].wake_one_on(sc, hart()).is_some()
         };
         reschedule();
         woke
@@ -855,8 +874,8 @@ pub fn wake_all(q: usize) {
     irq::without(|| {
         let k = kernel();
         let n = {
-            let mut sc = sched();
-            k.queues[q].wake_all_on(&mut sc, hart())
+            let sc = sched();
+            k.queues[q].wake_all_on(sc, hart())
         };
         WAKES.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
         reschedule();
@@ -1054,8 +1073,8 @@ pub fn debug_state(tid: Tid) -> alloc::string::String {
 fn sched_stat(which: u64) -> u64 {
     let sc = sched();
     match which {
-        10 => sc.pulls,
-        11 => sc.settles,
-        _ => sc.marks,
+        10 => sc.pulls(),
+        11 => sc.settles(),
+        _ => sc.marks(),
     }
 }

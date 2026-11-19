@@ -54,9 +54,35 @@ pub struct SchedAttr {
     pub rr: bool,
 }
 
+/// Which hart holds a thread's record: an atomic that travels in the record, so that a hart that moves the record (a pull, a
+/// migrating wake) updates it under the run-queue locks it holds, and a waker that holds no run-queue lock can read it (and
+/// re-check it under the lock, L11 design note section 3.1). The thread table (`sched_smp`) maps each thread to its `Home`.
+pub struct Home(crate::sync::AtomicU8);
+
+impl Home {
+    pub fn new(hart: usize) -> Home {
+        Home(crate::sync::AtomicU8::new(hart as u8))
+    }
+    pub fn get(&self) -> usize {
+        usize::from(self.0.load(crate::sync::Ordering::Acquire))
+    }
+    pub fn set(&self, hart: usize) {
+        self.0
+            .store(hart as u8, core::sync::atomic::Ordering::Release);
+    }
+}
+
+impl core::fmt::Debug for Home {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Home({})", self.get())
+    }
+}
+
 /// The per-thread record (SCHED-SMP-SPEC 4.3).
 #[derive(Clone, Debug)]
 pub struct ThreadSched {
+    /// Shared with the thread table; set by `HartRq::attach` and at creation.
+    pub home: alloc::sync::Arc<Home>,
     pub tid: Tid,
     pub base: SchedAttr,
     /// Copy of the donation graph's answer (`kcore::donate`, task 7); equal to `base.prio` until then.
@@ -583,6 +609,7 @@ impl<N: Class> HartRq<N> {
         self.threads.insert(
             tid,
             ThreadSched {
+                home: alloc::sync::Arc::new(Home::new(0)),
                 tid,
                 base: attr,
                 eff: attr.prio,
@@ -925,6 +952,7 @@ impl<N: Class> HartRq<N> {
         self.threads.insert(
             tid,
             ThreadSched {
+                home: alloc::sync::Arc::new(Home::new(usize::from(last_hart))),
                 tid,
                 base: attr,
                 eff: attr.prio,
@@ -1064,6 +1092,7 @@ impl<N: Class> HartRq<N> {
     /// Put a record here and queue it.
     pub(crate) fn attach(&mut self, mut rec: ThreadSched, how: Enq, hart: u8) {
         rec.last_hart = hart;
+        rec.home.set(usize::from(hart));
         let tid = rec.tid;
         self.threads.insert(tid, rec);
         self.class_enqueue(tid, how);

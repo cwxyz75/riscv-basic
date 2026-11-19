@@ -48,7 +48,7 @@ fn compare<N: Class>(
     }
     assert_eq!(
         (o.pulls, o.marks, o.settles),
-        (n.pulls, n.marks, n.settles),
+        (n.pulls(), n.marks(), n.settles()),
         "{} counters",
         ctx()
     );

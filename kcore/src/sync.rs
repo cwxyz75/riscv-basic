@@ -3,8 +3,14 @@
 //! explored over all (or many random) interleavings on the host.
 
 #[cfg(not(any(loom, shuttle)))]
-pub use core::sync::atomic::{fence, AtomicU32, Ordering};
+pub use core::sync::atomic::{
+    fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 #[cfg(loom)]
-pub use loom::sync::atomic::{fence, AtomicU32, Ordering};
+pub use loom::sync::atomic::{
+    fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 #[cfg(shuttle)]
-pub use shuttle::sync::atomic::{fence, AtomicU32, Ordering};
+pub use shuttle::sync::atomic::{
+    fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};

@@ -381,6 +381,7 @@ impl<N: Class> Sched2<N> {
         }
         let tid = self.alloc_tid();
         let probe = ThreadSched {
+            home: alloc::sync::Arc::new(crate::sched2::Home::new(0)),
             tid,
             base: attr,
             eff: attr.prio,
