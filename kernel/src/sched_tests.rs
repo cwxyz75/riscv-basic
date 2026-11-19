@@ -203,6 +203,58 @@ fn producer_consumer_loses_no_wakeup() -> Outcome {
     })
 }
 
+static NR_GO: AtomicBool = AtomicBool::new(false);
+static NR_RAN: AtomicBool = AtomicBool::new(false);
+static NR_QUEUE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn nr_waiter(_: usize) {
+    let q = NR_QUEUE.load(SeqCst) as usize;
+    thread::wait_until(q, || NR_GO.load(SeqCst));
+    NR_RAN.store(true, SeqCst);
+}
+
+/// X7 (SCHED-SMP-SPEC): a wake never switches; the switch happens at the next defined point, here the end of the outermost critical
+/// section. A higher-priority thread, pinned to this hart so no other hart can run it, is woken inside two nested sections: it must
+/// not have run when the inner one ends, and must have run when the outer one does.
+fn a_wake_switches_at_the_end_of_the_outermost_section() -> Outcome {
+    clean(|| {
+        NR_GO.store(false, SeqCst);
+        NR_RAN.store(false, SeqCst);
+        let q = thread::new_queue();
+        NR_QUEUE.store(q as u64, SeqCst);
+        let me = crate::percpu::this()
+            .index
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let before = thread::DEFAULT_AFFINITY.swap(me, SeqCst);
+        let w = thread::spawn("nr_waiter", MAIN_PRIO + 5, nr_waiter, 0); // preempts at once and blocks
+        thread::DEFAULT_AFFINITY.store(before, SeqCst);
+        let mut early = true;
+        let mut after_inner = true;
+        crate::irq::without(|| {
+            crate::irq::without(|| {
+                NR_GO.store(true, SeqCst);
+                thread::wake_one(q);
+                early = NR_RAN.load(SeqCst);
+            });
+            after_inner = NR_RAN.load(SeqCst);
+        });
+        let late = NR_RAN.load(SeqCst);
+        thread::join(w);
+        ensure(
+            !early && !after_inner,
+            "the woken thread ran inside a critical section",
+        )?;
+        ensure(
+            late,
+            &format!(
+                "the woken thread had not run when the outermost section ended (depth {}, need {})",
+                crate::percpu::this().bkl_depth.get(),
+                crate::percpu::this().need_resched.load(SeqCst)
+            ),
+        )
+    })
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 static HOG_A: AtomicU64 = AtomicU64::new(0);
 static HOG_B: AtomicU64 = AtomicU64::new(0);
@@ -590,6 +642,10 @@ pub const TESTS: &[Test] = &[
     (
         "producer_consumer_loses_no_wakeup",
         producer_consumer_loses_no_wakeup,
+    ),
+    (
+        "a_wake_switches_at_the_end_of_the_outermost_section",
+        a_wake_switches_at_the_end_of_the_outermost_section,
     ),
     (
         "equal_priority_hogs_share_the_cpu",

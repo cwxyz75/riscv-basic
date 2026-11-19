@@ -372,8 +372,9 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         if from_user {
             // whatever this trap touched is committed before the lock is released (W1)
             crate::user::commit_wake();
-            // (waking a higher-priority thread can switch away and back: load this thread's address
-            // space again, as every other path through `trap_body` does)
+            // the return to user mode is a defined point for the switch a wake asked for (X7)
+            crate::thread::preempt_point();
+            // (a switch away and back: load this thread's address space again, as every other path through `trap_body` does)
             crate::user::activate_current();
         }
         crate::heap::service(); // (a safe point: headroom for the next allocations, see heap.rs)

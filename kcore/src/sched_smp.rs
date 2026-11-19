@@ -166,6 +166,10 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// push) until `switched(h)`: the spec's "the switch completes under the lock" (3.7), for kernels whose lock is not held
     /// across the switch.
     transit: Vec<AtomicU32>,
+    /// Deferred mode (SCHED-SMP-SPEC X7: a wake never switches): a wake, a spawn or a priority change that would make the caller's own
+    /// hart look at its queues marks it (`pending`) instead of settling at once, so `current_on` stays the thread that is running
+    /// until the hart's next defined point calls `reschedule_on`. The kernel sets it; the pure models run both ways.
+    deferred: AtomicBool,
     pokes: AtomicU32,
     pulls: AtomicU64,
     settles: AtomicU64,
@@ -199,6 +203,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             online: (0..harts).map(|_| AtomicBool::new(true)).collect(),
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU32::new(0)).collect(),
+            deferred: AtomicBool::new(false),
             pokes: AtomicU32::new(0),
             pulls: AtomicU64::new(0),
             settles: AtomicU64::new(0),
@@ -680,6 +685,28 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     fn after_enqueue(&self, tid: Tid, home: usize, caller: usize) {
         let me_first = self.push_marks(tid, home, caller);
         if home == caller || me_first {
+            self.settle_or_defer(caller);
+        }
+    }
+
+    /// Deferred mode on or off (see the field).
+    pub fn set_deferred(&self, on: bool) {
+        self.deferred.store(on, Ordering::Relaxed);
+    }
+
+    /// The caller's hart must look at its queues now (a wake or a change made something here worth running): at once, or, in
+    /// deferred mode, at its next defined point: it is marked, and the caller's `resched_pending` tells the kernel to switch there. No
+    /// poke is owed (the hart is the one that set the mark and it acts on it itself).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: caller is a hart index below the hart count
+    fn settle_or_defer(&self, caller: usize) {
+        if self.deferred.load(Ordering::Relaxed) {
+            let _ = self.pending[caller].compare_exchange(
+                false,
+                true,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else {
             self.settle(caller);
         }
     }
@@ -838,7 +865,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
         let me_first = self.push_marks(tid, home, caller);
         if home == caller || me_first {
-            self.settle(caller);
+            self.settle_or_defer(caller);
         } else {
             self.mark(home);
         }

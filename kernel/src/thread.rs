@@ -223,6 +223,8 @@ pub fn init(boot_prio: Prio) {
             .collect(),
         table: klock::Spin::new(klock::Class::Tt, 0, Table::new()),
     });
+    // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
+    sched.set_deferred(true);
     // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
     for h in 1..harts {
         sched.set_online(h, false);
@@ -408,7 +410,7 @@ fn spawn_with_affinity(
             .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
             .expect("valid priority");
         k.threads.insert(tid, thread);
-        reschedule();
+        note_resched();
         tid
     })
 }
@@ -471,10 +473,41 @@ fn reap_if_dead(tid: Tid) {
     }
 }
 
+/// A wake (or a priority change, or a new thread) may have designated another thread for this hart: send the pokes it owes, and if
+/// the designation is no longer the thread that is running, remember it (`need_resched`). **A wake never switches** (SCHED-SMP-SPEC
+/// X7): the switch happens at the next defined point, `preempt_point`: the end of the outermost critical section (`irq::without`),
+/// the return to user mode, or the thread's own block, yield or exit. Interrupts are off and the big kernel lock is held.
+fn note_resched() {
+    let h = hart();
+    let (pokes, switch) = {
+        let sc = sched();
+        (sc.take_pokes(), sc.resched_pending(h))
+    };
+    send_pokes(pokes, h);
+    if switch {
+        crate::percpu::this()
+            .need_resched
+            .store(true, Ordering::Relaxed);
+    }
+}
+
+/// A defined point at which a thread may be replaced (X7): switch if a wake asked for it. Cheap when nothing did. Interrupts off,
+/// big kernel lock held.
+#[inline]
+pub fn preempt_point() {
+    if crate::percpu::this().need_resched.load(Ordering::Relaxed) {
+        // (the hart makes its own designation right, then switches: the settle a wake deferred)
+        reschedule_this_hart();
+    }
+}
+
 /// Switch to whichever thread the core says should run, if it is not this one.
 /// Interrupts must be off.
 #[allow(clippy::expect_used)] // INVARIANT: the running and the next thread are threads the scheduler knows and the kernel table holds (every scheduler thread has a KThread: the same insert)
 fn reschedule() {
+    crate::percpu::this()
+        .need_resched
+        .store(false, Ordering::Relaxed);
     // First, tell the harts that should look at the run queues (a wake or a priority change on
     // this hart found something better for them). They are poked, never changed from here.
     let (old, new) = {
@@ -676,7 +709,7 @@ pub fn block() {
 pub fn wake(tid: Tid) {
     irq::without(|| {
         let _ = sched().wake_on(hart(), tid);
-        reschedule();
+        note_resched();
     });
 }
 
@@ -717,14 +750,14 @@ pub fn set_priorities(changes: &[(Tid, Prio)]) {
         for &(tid, prio) in changes {
             let _ = sched().set_priority_on(hart(), tid, prio);
         }
-        reschedule();
+        note_resched();
     });
 }
 
 pub fn set_priority(tid: Tid, prio: Prio) {
     irq::without(|| {
         let _ = sched().set_priority_on(hart(), tid, prio);
-        reschedule();
+        note_resched();
     });
 }
 
@@ -855,7 +888,7 @@ pub fn wake_many(tids: &[Tid]) {
             }
             let _ = sched().wake_on(hart(), tid);
         }
-        reschedule();
+        note_resched();
     });
 }
 
@@ -900,7 +933,7 @@ pub fn wake_one(q: usize) -> bool {
             let sc = sched();
             k.queues[q].wake_one_on(sc, hart()).is_some()
         };
-        reschedule();
+        note_resched();
         woke
     })
 }
@@ -914,7 +947,7 @@ pub fn wake_all(q: usize) {
             k.queues[q].wake_all_on(sc, hart())
         };
         WAKES.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
-        reschedule();
+        note_resched();
     });
 }
 
