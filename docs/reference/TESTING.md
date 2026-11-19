@@ -27,6 +27,17 @@ boots of 72 to 116 s here took over six minutes there. Three of the kernel's own
 23 s of host time, `thread_limit_and_slots_are_reused` 19 s, `two_thousand_threads_live` 18 s. The slow suite tests are skipped at one and two harts.)
 CI runs the three targets as parallel jobs `kernel (ktest)`, `kernel (ktest 4 harts)` and `kernel (ktest release)`.
 
+**Flake tooling** (KT2; OD140: an intermittent kernel failure is a defect until its cause is known). `OS_RECORD=<dir>` on `scripts/os_boot_test.py`
+boots under QEMU's record mode (`-icount shift=auto,rr=record`) and keeps the recording only when the boot fails (the fail-demo kernel, which fails by
+design, keeps it, for the acceptance check); `OS_REPLAY=<file>` replays it, with `OS_GDB=1` adding `-s -S` to wait for gdb on :1234. Recording needs a
+boot with no disk and no network device, so use `OS_SHARD=k` (the kernel-only boot). **Record mode runs the harts in one TCG thread**: a race that needs
+true parallel harts may not reproduce under it, and its instruction-counted time changes what timing-dependent tests see (the fail-demo recording
+fails `threads_created_but_not_run_when_the_process_ends` with a timeout as well, in the recording and again identically in the replay). `make
+os-repeat TARGET=<target> N=<n>` runs a target N times with `SOAK_JOBS=1`, prints `pass/N` and keeps the serial log of every failing run in `target/repeat/`;
+every failing boot also leaves its serial log in `target/fail-logs/`, and the soak workflow uploads both as artifacts of a failed job. Checked by:
+`make os-repeat TARGET=os-boot-test-fail-run N=3` reports `0/3` with three logs, and a recording of the fail-demo kernel replays to the same failing
+`##TEST` lines. Running `os-repeat` over a soak target is a soak run, which only the owner starts (OD142).
+
 Rules:
 
 1. **The gate is tiers 0 and 1 and nothing else.** `make check` is exactly `smoke`. `ci.yml` runs only smoke targets (plus the
