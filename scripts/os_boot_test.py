@@ -34,7 +34,12 @@ import sys
 # The machine the OS track runs on (OD75): AIA (APLIC + IMSIC). A plain `virt` has only a PLIC, which the
 # kernel does not drive: no interrupt controller, drivers poll (`make os-boot-test-polling`).
 DEFAULT_MACHINE = "virt,aia=aplic-imsic"
-TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "600"))
+# A boot is judged on progress, not on total time (T157, OD140): it fails when the guest prints nothing for STALL seconds (a hang),
+# or when it runs past TIMEOUT (a ceiling far above any healthy run, a runaway). A loaded host (a CI runner, ten busy cores) slows
+# a healthy suite several times over; a fixed total budget then reads that slowness as a failure.
+TIMEOUT = int(os.environ.get("OS_BOOT_TIMEOUT", "1800"))
+STALL = int(os.environ.get("OS_BOOT_STALL", "180"))
+TIMEOUT_REASON = [f"timed out after {TIMEOUT} s"]
 
 # Tests the kernel must report, by name. A kernel that silently drops a test must
 # not pass (S1). Keep in step with `kernel/src/selftest.rs` and `main.rs`.
@@ -707,6 +712,7 @@ def run_streaming(cmd):
     HOST_NET.clear()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     chunks = []
+    last_out = [time.monotonic()]
     client = []
     tcp_client = []
     http_client = []
@@ -716,6 +722,7 @@ def run_streaming(cmd):
     def pump():
         for raw in proc.stdout:
             chunks.append(raw)
+            last_out[0] = time.monotonic()
             if b"httpd: listening on" in raw and not http_client:
                 tp = int(os.environ.get("OS_NET_LAST_TCP_HOSTPORT", "0"))
                 t = threading.Thread(target=host_httpd_client, args=(tp, HOST_NET.append), daemon=True)
@@ -734,13 +741,24 @@ def run_streaming(cmd):
 
     t = threading.Thread(target=pump, daemon=True)
     t.start()
-    try:
-        status = proc.wait(timeout=TIMEOUT)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        status, timed_out = None, True
+    started = time.monotonic()
+    status, timed_out = None, False
+    while True:
+        try:
+            status = proc.wait(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            if now - started > TIMEOUT:
+                TIMEOUT_REASON[0] = f"timed out after {TIMEOUT} s"
+            elif now - last_out[0] > STALL:
+                TIMEOUT_REASON[0] = f"stalled: no output for {STALL} s (the last line: {b''.join(chunks[-1:]).decode(errors='replace').strip()[:100]!r})"
+            else:
+                continue
+            proc.kill()
+            proc.wait()
+            status, timed_out = None, True
+            break
     t.join(timeout=5)
     for c in client + tcp_client + http_client:
         c.join(timeout=60)
@@ -1073,7 +1091,7 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
     boot, tests, done, panics, bad = parse(lines)
     found = []
     if timed_out:
-        found.append(f"timed out after {TIMEOUT} s")
+        found.append(TIMEOUT_REASON[0])
     if boot is None:
         found.append("no ##BOOT line")
     if bad:

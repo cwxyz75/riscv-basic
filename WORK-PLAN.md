@@ -63,7 +63,7 @@ Why first: the owner's complaint is that editing the kernel is slow on testing, 
 - [x] **KT3** panic lints, overflow checks, `unsafe` documentation as errors (by file, `kcore` first) (PRs 254, 255)
 - [x] **KT4** the C5 atomics gate and the syscall-error-to-test table (PR 256)
 - [x] **KT2** record and replay capture, the repeat target (PR 257)
-- [ ] **T157**, then **T155**, then **T158**: root-cause the three intermittent failures with KT2's tools (T157 first: it may
+- [ ] **T157** (done, PR 258), then **T155**, then **T158**: root-cause the three intermittent failures with KT2's tools (T157 first: it may
   be a scheduler race, and L11c builds on that code)
 
 ### Phase 2: finish the first peel; time without a tick
@@ -195,7 +195,7 @@ Soak and long runs that an item wanted and only the owner may start (OD142). One
 or tier, and what a red result would mean. The owner starts a run when they choose (`gh workflow run soak.yml`, or Actions >
 soak > Run workflow); one run of the tier clears every line above it.
 
-(none yet)
+- **T157** (PR 258): the round-robin kernel boot (`os-boot-test-rr`, soak) with the stall-based timeout and the widened clock window passed 3 of 3 under full CPU load on the development machine; one soak run confirms it on CI's runners. A red `os-boot-test-rr` would mean a stall (the log names the last line) or a different cause.
 
 ## Decisions taken without the owner
 
