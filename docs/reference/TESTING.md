@@ -20,8 +20,8 @@ of the suite that exercise syscalls, handles, channels, ports, sockets, VMOs, pr
 heavy stress tests stay in shard b for their time. The harness (`OS_SHARD=k`) requires exactly those names, and `os_boot_test.py --selftest-k` (the first
 line of `os-ktest`) proves it fails a boot that lacks a Kernel test or ran a System test. `make kquick` = fmt-check, the `kcore` and `klock` host tests and
 the k boot at four harts: the inner loop for kernel edits. Measured 2026-11-18 on the development machine: 152 suite tests plus the kernel's own, about 13 s of
-guest time, **72 to 78 s wall per boot at one and two harts, 116 s at four, 115 s for the release build including its compile**; CI job `kernel (ktest)`
-runs both targets in its 7-minute budget.
+guest time, **72 to 78 s wall per boot at one and two harts, 116 s at four, 115 s for the release build including its compile**; CI jobs `kernel (ktest)` and
+`kernel (ktest release)` run the two targets in parallel (together in one job they took 6 minutes 2 seconds, over the 6-minute aim).
 
 Rules:
 
