@@ -329,6 +329,9 @@ pub fn join_scheduler() -> ! {
 /// switch; otherwise `wfi`, which returns when an enabled interrupt is pending even with `sstatus.SIE` clear, so a wake that
 /// lands after the check (it has enqueued and sent its IPI) cannot be slept through, and then enable interrupts, which takes
 /// the interrupt that woke the hart. (Today's 1 ms tick would end the sleep anyway; with no tick, L13, this is the whole protocol.)
+/// A hart whose next timer event is further away than this (or has none) suspends through the firmware instead of `wfi` (PM2).
+const SUSPEND_AFTER: u64 = MS;
+
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
@@ -342,10 +345,23 @@ fn idle_main(_: usize) {
         if crate::heap::needs_service() {
             irq::without(crate::heap::service); // an idle hart is a safe point too
         }
-        program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
-                         // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled (the architecture
-                         // resumes on any pending and individually enabled interrupt), which is the point of the protocol above.
-        unsafe { core::arch::asm!("wfi") };
+        let ev = program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
+        let idle_from = now_ns();
+        let me = crate::percpu::this();
+        // A long idle (the next event more than `SUSPEND_AFTER` away, or none) goes through the firmware's retentive suspend; a short
+        // one, or firmware without it, uses `wfi` (PM2, KERNEL-V1-SPEC 5.5). Both return when an interrupt is pending, with interrupts
+        // off, which is the point of the protocol above (the architecture resumes on any pending and individually enabled interrupt).
+        if ev.is_none_or(|e| e > idle_from.saturating_add(SUSPEND_AFTER))
+            && crate::smp::suspend_retentive()
+        {
+            me.idle_suspend.fetch_add(1, Ordering::Relaxed);
+        } else {
+            me.idle_wfi.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled.
+            unsafe { core::arch::asm!("wfi") };
+        }
+        me.idle_ns
+            .fetch_add(now_ns().saturating_sub(idle_from), Ordering::Relaxed);
         irq::restore(was);
     }
 }
@@ -724,7 +740,7 @@ static WD_AT: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 /// expiry, a slice end when an equal peer waits) and, in debug builds while the hart has queued work, the next watchdog sample. Called
 /// wherever the answer can change: after a timer interrupt, at the end of a switch, after a wake or enqueue here, before idling.
 /// Interrupts off.
-pub fn program_timer() {
+pub fn program_timer() -> Option<u64> {
     let h = hart();
     #[allow(unused_mut)] // (`ev` is changed only in debug builds)
     let mut ev = sched().next_event_on(h);
@@ -737,6 +753,7 @@ pub fn program_timer() {
         ev = Some(ev.map_or(at, |e| e.min(at)));
     }
     crate::timer::program(ev);
+    ev
 }
 
 /// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12, 13): read the clock, expire the due
@@ -845,6 +862,29 @@ pub fn wake(tid: Tid) {
         let _ = sched().wake_on(hart(), tid);
         note_resched();
     });
+}
+
+/// Sleep for `ns` nanoseconds (or until woken): the same as `sleep_ticks`, at the clock's own resolution.
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
+pub fn sleep_ns(ns: u64) {
+    let deadline = now_ns().saturating_add(ns);
+    loop {
+        let done = irq::without(|| {
+            if now_ns() >= deadline {
+                return true;
+            }
+            if sched()
+                .sleep_until_on(hart(), deadline)
+                .expect("running thread")
+            {
+                reschedule();
+            }
+            false
+        });
+        if done {
+            return;
+        }
+    }
 }
 
 /// Sleep for `n` ticks (or until woken).

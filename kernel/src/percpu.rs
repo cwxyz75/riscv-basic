@@ -85,6 +85,10 @@ pub struct PerHart {
     /// The attention epoch (`user::ATTENTION`) this hart last saw at a return to user mode: a trap from user mode that finds it
     /// unchanged has no kill or stop to look for and needs no big lock (L12b).
     pub attention_seen: AtomicU64,
+    /// Idle accounting (PM2): entries into `wfi`, entries into the firmware's retentive suspend (a long idle), and the nanoseconds spent idle.
+    pub idle_wfi: AtomicU64,
+    pub idle_suspend: AtomicU64,
+    pub idle_ns: AtomicU64,
     /// Spin iterations in the current wait for a lock (the deadlock detector's counter).
     pub spins: AtomicU64,
     /// The lock class this hart last asked for (diagnostics for the deadlock detector).
@@ -120,6 +124,9 @@ impl PerHart {
             prev: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
             attention_seen: AtomicU64::new(0),
+            idle_wfi: AtomicU64::new(0),
+            idle_suspend: AtomicU64::new(0),
+            idle_ns: AtomicU64::new(0),
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
         }

@@ -81,12 +81,72 @@ fn rt_threads_take_the_harts() -> Result<(), String> {
     Ok(())
 }
 
+static SLEEPER_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn short_sleeper(_: usize) {
+    while !SLEEPER_STOP.load(Ordering::Relaxed) {
+        thread::sleep_ns(100_000); // 100 microseconds
+    }
+}
+
+/// PM2 (KERNEL-V1-SPEC 5.5): a hart with nothing to do for a long time enters the firmware's retentive suspend, and a hart whose next
+/// event is a hundred microseconds away uses `wfi`. On QEMU the two are equivalent in effect (OpenSBI's default retentive suspend is
+/// a `wfi`); the counters are what tells them apart.
+fn long_idle_suspends_and_a_short_sleeper_does_not() -> Result<(), String> {
+    let n = smp::started();
+    if n < 3 {
+        return Ok(());
+    }
+    // hart 1 idle for 100 ms: its entries are suspends (when the firmware has the call)
+    let (s0, w0) = (
+        percpu::hart(1).idle_suspend.load(Ordering::Relaxed),
+        percpu::hart(1).idle_wfi.load(Ordering::Relaxed),
+    );
+    thread::sleep_ticks(100);
+    // (one long idle is one entry, begun before the window: the count since boot is what shows it)
+    let suspends = percpu::hart(1).idle_suspend.load(Ordering::Relaxed);
+    let _ = s0;
+    let _wfis = percpu::hart(1).idle_wfi.load(Ordering::Relaxed) - w0;
+    if smp::suspend_supported() && suspends == 0 {
+        return Err(format!(
+            "an idle hart with no timer event never entered the retentive suspend in 100 ms (wfi entries {_wfis}, idle ns {})",
+            percpu::hart(1).idle_ns.load(Ordering::Relaxed)
+        ));
+    }
+    // hart 2 runs a thread that sleeps 100 us at a time: its idles are short: no suspend entries
+    SLEEPER_STOP.store(false, Ordering::Relaxed);
+    let before = thread::DEFAULT_AFFINITY.swap(2, Ordering::SeqCst);
+    let t = thread::spawn("short_sleeper", 20, short_sleeper, 0);
+    thread::DEFAULT_AFFINITY.store(before, Ordering::SeqCst);
+    thread::sleep_ticks(10); // (let it settle in)
+    let s1 = percpu::hart(2).idle_suspend.load(Ordering::Relaxed);
+    let w1 = percpu::hart(2).idle_wfi.load(Ordering::Relaxed);
+    thread::sleep_ticks(100);
+    let suspends2 = percpu::hart(2).idle_suspend.load(Ordering::Relaxed) - s1;
+    let wfis2 = percpu::hart(2).idle_wfi.load(Ordering::Relaxed) - w1;
+    SLEEPER_STOP.store(true, Ordering::Relaxed);
+    thread::join(t);
+    if wfis2 < 20 {
+        return Err(format!(
+            "hart 2, with a 100 us sleeper, idled through `wfi` only {wfis2} times in 100 ms"
+        ));
+    }
+    if suspends2 > 2 {
+        return Err(format!("hart 2, with a 100 us sleeper, entered the long-idle suspend {suspends2} times in 100 ms"));
+    }
+    Ok(())
+}
+
 pub const TESTS: &[Test] = &[
     (
         "wfi_returns_with_interrupts_masked",
         wfi_returns_with_interrupts_masked,
     ),
     ("rt_threads_take_the_harts", rt_threads_take_the_harts),
+    (
+        "long_idle_suspends_and_a_short_sleeper_does_not",
+        long_idle_suspends_and_a_short_sleeper_does_not,
+    ),
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
     (

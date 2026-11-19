@@ -13,6 +13,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const EID_HSM: usize = 0x48_534D;
 const FID_HART_START: usize = 0;
 const FID_HART_GET_STATUS: usize = 2;
+const FID_HART_SUSPEND: usize = 3;
+/// SBI error: the call is not supported.
+const SBI_ERR_NOT_SUPPORTED: isize = -2;
 const EID_RFENCE: usize = 0x5246_4E43;
 const FID_REMOTE_SFENCE_VMA: usize = 1;
 const EID_IPI: usize = 0x73_5049;
@@ -357,4 +360,29 @@ pub fn kick_others() {
             send_ipi(i, IPI_RESCHED);
         }
     }
+}
+
+/// Does the firmware support a default retentive `hart_suspend`? Learned by trying once: unsupported (or an error) turns it off for good.
+static SUSPEND_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Idle the hart through the firmware's default retentive suspend (SBI HSM `hart_suspend`, KERNEL-V1-SPEC 5.5, PM2): it returns, with
+/// all state kept, when an interrupt is pending, like `wfi`. Returns false, having done nothing, if the firmware has no such call (the
+/// caller uses `wfi`). Interrupts are off, as for `wfi`.
+pub fn suspend_retentive() -> bool {
+    if SUSPEND_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    let r = sbi(EID_HSM, FID_HART_SUSPEND, 0, 0, 0);
+    if r.error != 0 {
+        // (not supported, or any other error: off for good, and the caller uses `wfi`)
+        let _ = SBI_ERR_NOT_SUPPORTED;
+        SUSPEND_OFF.store(true, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Whether the firmware's retentive suspend is in use (false until the first idle tries it, and after it failed).
+pub fn suspend_supported() -> bool {
+    !SUSPEND_OFF.load(Ordering::Relaxed)
 }
