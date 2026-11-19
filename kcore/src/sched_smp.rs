@@ -340,6 +340,48 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     pub fn home(&self, tid: Tid) -> Option<usize> {
         self.home_of(tid)
     }
+    /// Does hart `h` have a reason to leave idle: a mark is set for it, or something is queued on it? The idle loop asks this with
+    /// interrupts off, before `wfi` (SCHED-SMP-SPEC 3.9: the check is made under `RQ[h]`, so a wake that lands after it has enqueued
+    /// and sent an IPI that `wfi` will see).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
+    pub fn idle_has_work(&self, h: usize) -> bool {
+        let q = self.lq(h);
+        self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0
+    }
+
+    /// The starvation watchdog's check (a debug detector, SCHED-SMP-SPEC 3.9; `now` is the caller's clock, since a hart that takes no
+    /// tick has a stale one): a thread queued (or woken: `runnable_since` is the last wake) for more than `limit` ns while a hart
+    /// that may run it is idle. Returns (thread, the hart it is queued on, the idle hart). A thread in transit is not counted. Takes
+    /// one run-queue lock at a time and reads the others' hints, so it is cheap enough for a timer handler in a debug build.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: runnable_since is not after the clock that stamped it (saturating_sub)
+    pub fn starved(&self, now: Time, limit: Time) -> Option<(Tid, usize, usize)> {
+        for g in 0..self.harts() {
+            let late: Vec<(Tid, Option<u8>)> = {
+                let q = self.lq(g);
+                q.tids()
+                    .filter(|&t| q.is_queued(t))
+                    .filter_map(|t| q.record(t).map(|r| (t, r)))
+                    .filter(|(_, r)| now.saturating_sub(r.runnable_since) > limit)
+                    .map(|(t, r)| (t, r.affinity))
+                    .collect()
+            };
+            for (t, aff) in late {
+                if self.is_in_transit(t) {
+                    continue;
+                }
+                let idle_hart = (0..self.harts()).find(|&x| {
+                    self.is_online(x)
+                        && aff.is_none_or(|a| a as usize == x)
+                        && self.view_cur(x) == 0
+                });
+                if let Some(x) = idle_hart {
+                    return Some((t, g, x));
+                }
+            }
+        }
+        None
+    }
+
     pub fn queued_on(&self, hart: usize) -> usize {
         self.lq(hart).queued_len()
     }
@@ -500,8 +542,18 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Pull into `h` the best queued thread of each other hart that outranks everything `h` has. Returns how many.
-    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
     fn pull(&self, h: usize) -> usize {
+        #[cfg(feature = "fault-skip-pull")]
+        {
+            let _ = h;
+            return 0; // negative control (L11d): no hart ever pulls
+        }
+        #[cfg(not(feature = "fault-skip-pull"))]
+        self.pull_work(h)
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
+    fn pull_work(&self, h: usize) -> usize {
         let mut n = 0;
         for g in 0..self.harts() {
             if g == h {
@@ -900,6 +952,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         clippy::indexing_slicing
     )] // INVARIANT: hart indices are below the hart count; the thread was found queued under the same two locks
     fn balance(&self, h: usize) -> bool {
+        #[cfg(feature = "fault-skip-pull")]
+        {
+            let _ = h;
+            return false; // negative control (L11d): nothing moves between harts but by push
+        }
         let len = |x: usize| self.hint[x].queued_len.load(Ordering::Acquire);
         let mine = len(h);
         let busiest = (0..self.harts())

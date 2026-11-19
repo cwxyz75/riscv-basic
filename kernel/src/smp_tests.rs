@@ -26,11 +26,64 @@ fn wfi_returns_with_interrupts_masked() -> Result<(), String> {
     Ok(())
 }
 
+static RT_ARRIVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RT_HARTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RT_WAIT_FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn rt_probe(n: usize) {
+    RT_HARTS.fetch_or(
+        1 << percpu::this().index.load(Ordering::Relaxed),
+        Ordering::SeqCst,
+    );
+    RT_ARRIVED.fetch_add(1, Ordering::SeqCst);
+    let deadline = thread::ticks() + 2000; // (well above the watchdog's 500 ms)
+    while RT_ARRIVED.load(Ordering::SeqCst) < n {
+        if thread::ticks() > deadline {
+            RT_WAIT_FAILED.store(true, Ordering::SeqCst);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// SCHED-SMP-SPEC task 11: as many real-time threads as there are harts, all above the thread that starts them, all free to
+/// run anywhere, take every hart at once (each waits for the others to arrive, so one hart running two of them in turn would
+/// time out): the push marks and pulls spread them, and the starting thread is preempted to make room.
+fn rt_threads_take_the_harts() -> Result<(), String> {
+    let n = smp::started();
+    RT_ARRIVED.store(0, Ordering::SeqCst);
+    RT_HARTS.store(0, Ordering::SeqCst);
+    RT_WAIT_FAILED.store(false, Ordering::SeqCst);
+    let prio = crate::sched_tests::MAIN_PRIO + 10;
+    let mut tids = alloc::vec::Vec::new();
+    // (all in one critical section: a spawn that preempted its caller at once would leave the rest unstarted)
+    crate::irq::without(|| {
+        for _ in 0..n {
+            tids.push(thread::spawn_free("rt_probe", prio, rt_probe, n));
+        }
+    });
+    for t in tids {
+        thread::join(t);
+    }
+    if RT_WAIT_FAILED.load(Ordering::SeqCst) {
+        return Err(format!(
+            "the real-time threads did not run at once on {n} harts (harts used: {:#b})",
+            RT_HARTS.load(Ordering::SeqCst)
+        ));
+    }
+    let used = RT_HARTS.load(Ordering::SeqCst);
+    if used.count_ones() as usize != n {
+        return Err(format!("{n} threads ran on harts {used:#b}"));
+    }
+    Ok(())
+}
+
 pub const TESTS: &[Test] = &[
     (
         "wfi_returns_with_interrupts_masked",
         wfi_returns_with_interrupts_masked,
     ),
+    ("rt_threads_take_the_harts", rt_threads_take_the_harts),
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
     (

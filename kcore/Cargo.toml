@@ -7,6 +7,11 @@ description = "OS track: pure kernel logic (no hardware, no unsafe), tested on t
 [dependencies]
 abi = { path = "../abi" }
 
+[features]
+# Negative control (L11d): a hart never pulls work from another hart's queue. Off in every real build; the kernel's
+# `fault-skip-pull` turns it on and the test that needs the pull must then fail.
+fault-skip-pull = []
+
 # Concurrency checkers, host only (they are dependencies, not dev-dependencies,
 # because the library itself uses their atomics under the cfg). `RUSTFLAGS="--cfg loom"` (or "--cfg shuttle")
 # swaps the atomics in `kcore::sync` for the checker's own; see the Makefile.

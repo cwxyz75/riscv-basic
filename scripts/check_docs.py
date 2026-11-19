@@ -99,7 +99,7 @@ ATOMICS = {
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (5, "hart bring-up and IPI flags"),
     "kernel/src/aia.rs": (12, "interrupt controller statistics and masks"),
-    "kernel/src/thread.rs": (19, "the tick counter, scheduler ready flags and wake statistics"),
+    "kernel/src/thread.rs": (21, "the tick counter, scheduler ready flags and wake statistics"),
     "kernel/src/user.rs": (9, "diagnostic counters and the deferred-reap flag"),
     "kernel/src/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
@@ -108,7 +108,7 @@ ATOMICS = {
     "kernel/src/console.rs": (2, "the console's panic flag and line state"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (44, "self-test flags and counters"),
-    "kernel/src/smp_tests.rs": (8, "self-test flags and counters"),
+    "kernel/src/smp_tests.rs": (14, "self-test flags and counters"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
 

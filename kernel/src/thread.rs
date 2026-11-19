@@ -331,15 +331,27 @@ pub fn join_scheduler() -> ! {
     unreachable!()
 }
 
+/// The idle loop of SCHED-SMP-SPEC 3.9: with interrupts off, look at the hart's queues; if anything is queued or a mark is set,
+/// switch; otherwise `wfi`, which returns when an enabled interrupt is pending even with `sstatus.SIE` clear, so a wake that
+/// lands after the check (it has enqueued and sent its IPI) cannot be slept through, and then enable interrupts, which takes
+/// the interrupt that woke the hart. (Today's 1 ms tick would end the sleep anyway; with no tick, L13, this is the whole protocol.)
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
+        let was = irq::save_and_disable();
+        // (negative control `fault-skip-poke`: the idle hart's only wake is a poke, which that kernel drops; a tick must not rescue it)
+        if !cfg!(feature = "fault-skip-poke") && sched().idle_has_work(hart()) {
+            irq::restore(was);
+            irq::without(reschedule_this_hart);
+            continue;
+        }
         if crate::heap::needs_service() {
             irq::without(crate::heap::service); // an idle hart is a safe point too
         }
-        // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
-        // here (thread_bootstrap enabled them).
+        // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled (the architecture
+        // resumes on any pending and individually enabled interrupt), which is the point of the protocol above.
         unsafe { core::arch::asm!("wfi") };
+        irq::restore(was);
     }
 }
 
@@ -590,6 +602,11 @@ pub fn switch_if_designated() {
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pokes is a non-zero mask of harts (the loop condition), so pokes - 1 cannot underflow
 fn send_pokes(mut pokes: u32, me: usize) {
+    #[cfg(feature = "fault-skip-poke")]
+    {
+        let _ = (&mut pokes, me);
+        return; // negative control (L11d): every poke is lost
+    }
     // A poke for this hart itself (another hart marked it after this hart's own settle began, and this hart took the mask first):
     // the mark is real and `pending` is set, so the hart must look again: an IPI to itself, taken as soon as interrupts are on.
     if pokes & (1 << me) != 0 {
@@ -632,6 +649,31 @@ pub fn reschedule_fast() -> bool {
     switch
 }
 
+/// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds): every 100 ms, each hart at its own phase, a thread queued for more than
+/// 500 ms while a hart that may run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`).
+/// The same thread must be found in two samples in a row: the check reads other harts' idleness from hints at one instant, and a thread
+/// preempted after a long run is queued, "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review).
+#[cfg(debug_assertions)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::indexing_slicing
+)] // INVARIANT: h is a hart index below 32 and now counts 1 ms ticks; the panic is the detector's report
+fn starvation_watchdog(h: usize, now: u64) {
+    static LAST: [core::sync::atomic::AtomicU32; 32] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; 32];
+    if now % 100 == h as u64 {
+        let found = sched().starved(ticks_to_ns(now), 500 * MS);
+        let tid = found.map_or(0, |f| f.0);
+        let before = LAST[h & 31].swap(tid, Ordering::Relaxed);
+        if let Some((t, on, idle)) = found {
+            if before == t {
+                panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles");
+            }
+        }
+    }
+}
+
 /// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12): advance this hart's clock,
 /// fire its due timers, account the running thread's slice. Returns whether the hart must now switch threads (a rotation, a
 /// timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls `reschedule`.
@@ -646,6 +688,13 @@ pub fn timer_tick_fast() -> bool {
     } else {
         TICKS.load(Ordering::SeqCst)
     };
+    #[cfg(debug_assertions)]
+    starvation_watchdog(h, now);
+    // negative control: an idle hart takes no tick (tickless idle, L13), so a lost poke is never made up
+    #[cfg(feature = "fault-skip-poke")]
+    if h != 0 && running_here() == sched().idle(h) {
+        return false;
+    }
     let (pokes, switch) = {
         let sc = sched();
         sc.tick_on(h, ticks_to_ns(now));
@@ -784,6 +833,9 @@ pub fn exit() -> ! {
             // switch, or the mark would stay set with no flag and no poke owed (PR 263 review)
             sc.reschedule_on(h);
         }
+        // negative control (L11d): the stack is freed while this thread still runs on it
+        #[cfg(feature = "fault-early-reap")]
+        reap_if_dead(running_here());
         reschedule();
     });
     unreachable!("an exited thread was scheduled again");

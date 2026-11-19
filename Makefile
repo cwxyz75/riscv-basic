@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -94,6 +94,9 @@ OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
 OS_OVERFLOW_ELF := target/os-overflow/$(KERNEL_TARGET)/debug/kernel
 OS_NOUNMASK_ELF := target/os-fault-unmask/$(KERNEL_TARGET)/debug/kernel
 OS_NOFORCED_ELF := target/os-fault-forced/$(KERNEL_TARGET)/debug/kernel
+OS_NOPOKE_ELF  := target/os-fault-poke/$(KERNEL_TARGET)/debug/kernel
+OS_NOPULL_ELF  := target/os-fault-pull/$(KERNEL_TARGET)/debug/kernel
+OS_EARLYREAP_ELF := target/os-fault-earlyreap/$(KERNEL_TARGET)/debug/kernel
 
 # The OS kernel, plus a build with `fail-demo` (one test fails on purpose) that the
 # boot test uses to prove it can see a failure.
@@ -228,6 +231,16 @@ os-boot-test-smp: kernel os-interactive
 # The SMP negative controls (each disables one safety mechanism and the guarding test must fail) and the
 # serial sessions at four harts. A separate target so CI can run it as its own job: the whole SMP part took
 # about 28 minutes, too close to the job's timeout.
+# The scheduler's negative controls (L11d, SCHED-SMP-SPEC task 11): each kernel breaks one mechanism and the guarding test must fail (or the
+# kernel must stop). Kernel-only boots (shard k): no disk, no network. Part of the soak tier (OD142): the owner starts it.
+os-boot-test-sched-neg: kernel
+	cd kernel && cargo build --features fault-skip-poke --target-dir ../target/os-fault-poke
+	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --expect-panic "starved thread" $(OS_NOPOKE_ELF)
+	cd kernel && cargo build --features fault-skip-pull --target-dir ../target/os-fault-pull
+	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --expect-panic "starved thread" $(OS_NOPULL_ELF)
+	cd kernel && cargo build --features fault-early-reap --target-dir ../target/os-fault-earlyreap
+	OS_SHARD=k OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_EARLYREAP_ELF) teardown_with_threads_on_other_harts
+
 os-boot-test-smp-neg: kernel os-interactive
 	cd kernel && cargo build --features fault-skip-shootdown --target-dir ../target/os-fault-shootdown
 	cd kernel && cargo build --features fault-skip-kernel-satp --target-dir ../target/os-fault-satp
@@ -374,7 +387,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
