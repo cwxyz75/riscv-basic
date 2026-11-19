@@ -74,7 +74,7 @@ Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 - [x] **L12** the scheduler leaves the big kernel lock (PRs 266, 267, 268; pure sleeps still take it)
 - [x] **AB2** nanosecond time (flag day) (PR 270; leftovers T168)
 - [x] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it) (PRs 272, 273; leftovers T169, T170)
-- [ ] **PM2** long idles suspend through firmware
+- [x] **PM2** long idles suspend through firmware (PR to follow)
 
 ### Phase 3: the syscall layer on the host; the long-run tier
 
