@@ -185,66 +185,74 @@ fn finish_fast(w: &World, h: usize) {
     }
 }
 
+fn model(steps: usize) {
+    let rqs = SRqs {
+        rq: (0..HARTS)
+            .map(|_| Mutex::new(HartRq::new(FixedPrio::new())))
+            .collect(),
+        table: Mutex::new(Table::new()),
+    };
+    let w = Arc::new(World {
+        s: Sched2::over(rqs),
+        bkl: Mutex::new(()),
+        exec: (0..HARTS).map(|_| AtomicU32::new(0)).collect(),
+        tids: Mutex::new(Vec::new()),
+        dead: Mutex::new(Vec::new()),
+        ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
+    });
+    for h in 0..HARTS {
+        let i = w.s.idle(h);
+        w.exec[h].store(i, Ordering::SeqCst);
+    }
+    let hs: Vec<_> = (0..HARTS)
+        .map(|h| {
+            let w = w.clone();
+            thread::spawn(move || hart(w, h, steps))
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    // quiesce: deliver every poke and look at the queues until nothing is pending; then GP1 as well as GP2 must hold
+    for _ in 0..30 {
+        let mut again = false;
+        for h in 0..HARTS {
+            if w.ipi[h].swap(false, Ordering::SeqCst) {
+                w.s.reschedule_on(h);
+                let _g = w.bkl.lock().unwrap();
+                w.finish(h);
+                again = true;
+            }
+        }
+        if !again {
+            break;
+        }
+    }
+    // every mark owed an IPI got one (a mark whose poke was dropped leaves the hart pending for a whole tick)
+    for h in 0..HARTS {
+        assert!(
+            !w.s.resched_pending(h),
+            "hart {h} is marked but no IPI reached it"
+        );
+    }
+    w.s.audit(true)
+        .expect("every thread is in exactly one place, and GP1 holds at quiescence");
+}
+
 fn explore(steps: usize, iterations: usize) {
-    shuttle::check_random(
-        move || {
-            let rqs = SRqs {
-                rq: (0..HARTS)
-                    .map(|_| Mutex::new(HartRq::new(FixedPrio::new())))
-                    .collect(),
-                table: Mutex::new(Table::new()),
-            };
-            let w = Arc::new(World {
-                s: Sched2::over(rqs),
-                bkl: Mutex::new(()),
-                exec: (0..HARTS).map(|_| AtomicU32::new(0)).collect(),
-                tids: Mutex::new(Vec::new()),
-                dead: Mutex::new(Vec::new()),
-                ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),
-            });
-            for h in 0..HARTS {
-                let i = w.s.idle(h);
-                w.exec[h].store(i, Ordering::SeqCst);
-            }
-            let hs: Vec<_> = (0..HARTS)
-                .map(|h| {
-                    let w = w.clone();
-                    thread::spawn(move || hart(w, h, steps))
-                })
-                .collect();
-            for h in hs {
-                h.join().unwrap();
-            }
-            // quiesce: deliver every poke and look at the queues until nothing is pending; then GP1 as well as GP2 must hold
-            for _ in 0..30 {
-                let mut again = false;
-                for h in 0..HARTS {
-                    if w.ipi[h].swap(false, Ordering::SeqCst) {
-                        w.s.reschedule_on(h);
-                        let _g = w.bkl.lock().unwrap();
-                        w.finish(h);
-                        again = true;
-                    }
-                }
-                if !again {
-                    break;
-                }
-            }
-            // every mark owed an IPI got one (a mark whose poke was dropped leaves the hart pending for a whole tick)
-            for h in 0..HARTS {
-                assert!(
-                    !w.s.resched_pending(h),
-                    "hart {h} is marked but no IPI reached it"
-                );
-            }
-            w.s.audit(true)
-                .expect("every thread is in exactly one place, and GP1 holds at quiescence");
-        },
-        iterations,
-    );
+    shuttle::check_random(move || model(steps), iterations);
 }
 
 #[test]
 fn no_thread_executes_on_two_harts_under_per_hart_locks() {
     explore(14, 20000);
+}
+
+/// Replay one recorded schedule (`REPLAY_SCHEDULE=<file>`): how a failure that CI printed is reproduced here (T162).
+#[test]
+fn replay_a_recorded_schedule() {
+    if let Ok(f) = std::env::var("REPLAY_SCHEDULE") {
+        let sched = std::fs::read_to_string(f).unwrap();
+        shuttle::replay(move || model(14), sched.trim());
+    }
 }
