@@ -107,7 +107,7 @@ ATOMICS = {
     "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
     "kernel/src/console.rs": (2, "the console's panic flag and line state"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (38, "self-test flags and counters"),
+    "kernel/src/sched_tests.rs": (44, "self-test flags and counters"),
     "kernel/src/smp_tests.rs": (8, "self-test flags and counters"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
