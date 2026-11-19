@@ -93,7 +93,7 @@ ATOMICS = {
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
-    "kcore/src/sched_smp.rs": (27, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
+    "kcore/src/sched_smp.rs": (29, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
     "kernel/src/percpu.rs": (52, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
