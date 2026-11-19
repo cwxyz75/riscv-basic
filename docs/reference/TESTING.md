@@ -13,6 +13,20 @@ which is what happened after the previous adjustment.
 | 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (shards `a` and `b`), the release smoke, the home computer's boot | every PR: the merge gate | 7 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
 | 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | **only when the owner asks for it** (OD142): no schedule, no label, no run started by anyone else; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
 
+The **kernel-only boot** (KT1, 2026-11-18) is part of tier 1: `make os-ktest` runs `os-ktest-small` (the test build at one and two harts, without the tests
+marked `slow` in `init/ktests.txt`) and `os-ktest-4` (four harts, every Kernel test); `make os-ktest-release` boots the optimised build (debug assertions and
+overflow checks off, no fat LTO so that the build is short) at four. Each boot runs **only the Kernel tests** (`init/ktests.txt`: a test that starts no
+server and needs no disk, network or console service; shard `k`, `debug_stat` 13 = 3, or 4 with `kfast`) and the kernel's own self-tests, with no disk
+and no network device. A Kernel test is one of the 150 or so tests of the suite that exercise syscalls, handles, channels, ports, sockets, VMOs,
+processes, threads, futexes, jobs and quotas, scheduling and SMP; the three heavy stress tests stay in shard b. The harness (`OS_SHARD=k`) requires
+exactly those names, and `os_boot_test.py --selftest-k` (the first line of `os-ktest-small`) proves it fails a boot that lacks a Kernel test or ran a
+System test. `make kquick` = fmt-check, the `kcore` and `klock` host tests and the four-hart boot: the inner loop for kernel edits.
+Measured 2026-11-18 on the development machine: 150 suite tests plus the kernel's own, 8 to 13 s of guest time per boot; **both small boots together
+69 s, the four-hart boot 116 s, the release build with its compile 115 s**. (On CI the first cut, one job, was cancelled at its 7-minute cap: three
+boots of 72 to 116 s here took over six minutes there. Three of the kernel's own tests and four suite tests dominate a one-hart boot: `unmap_while_siblings_touch`
+23 s of host time, `thread_limit_and_slots_are_reused` 19 s, `two_thousand_threads_live` 18 s. The slow suite tests are skipped at one and two harts.)
+CI runs the three targets as parallel jobs `kernel (ktest)`, `kernel (ktest 4 harts)` and `kernel (ktest release)`.
+
 Rules:
 
 1. **The gate is tiers 0 and 1 and nothing else.** `make check` is exactly `smoke`. `ci.yml` runs only smoke targets (plus the

@@ -12079,6 +12079,8 @@ pub fn app_main() -> i32 {
     let shard = sys::debug_stat(13);
     // (the stress test that starts children needs the program image the first of these fetches: shard b runs that one too)
     const PREREQ_OF_B: &str = "fetch_the_program_image";
+    /// The names of the Kernel tests, one per line (comments start with `#`); the harness reads the same file.
+    const KERNEL_TESTS: &str = include_str!("../../ktests.txt");
     let in_b = |n: &str| {
         n.starts_with("net_")
             || [
@@ -12095,6 +12097,19 @@ pub fn app_main() -> i32 {
         }
         if (shard == 1 && in_b(name)) || (shard == 2 && !in_b(name) && *name != PREREQ_OF_B) {
             continue;
+        }
+        // the kernel-only boot (`shard=k`, KT1): the Kernel tests, which start no server and need no disk or network
+        if shard >= 3 {
+            let listed = KERNEL_TESTS
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.split(' ').collect::<Vec<_>>())
+                .find(|w| w[0] == *name);
+            match listed {
+                None => continue,
+                Some(w) if shard == 4 && w.get(1) == Some(&"slow") => continue,
+                Some(_) => {}
+            }
         }
         if !timed(name, *test) {
             failed += 1;

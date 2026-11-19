@@ -752,8 +752,36 @@ def run_streaming(cmd):
 # runs only its part when the kernel line says `shard=a` or `shard=b`. Shard b is the network tests (`net_*` and the C sockets test) and the three heaviest stress tests
 # (the same rule is in init/src/bin/suite.rs). Without OS_SHARD the whole suite runs, as the soak tier does.
 SHARD = os.environ.get("OS_SHARD", "")
-if SHARD not in ("", "a", "b"):
-    sys.exit(f"OS_SHARD must be a or b, not {SHARD!r}")
+if SHARD not in ("", "a", "b", "k"):
+    sys.exit(f"OS_SHARD must be a, b or k, not {SHARD!r}")
+if SHARD == "k":
+    # the kernel-only boot (KT1, KERNEL-V1-SPEC 8): the Kernel tests of `init/ktests.txt` and the kernel's own, no disk, no network
+    os.environ["OS_DISK"] = "0"
+    os.environ["OS_NET"] = "0"
+
+
+def _read_lines(path):
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", path)) as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+
+# The Kernel tests of the suite (`init/ktests.txt`, which the guest reads too) and every test the suite defines.
+KERNEL_TESTS = {l.split()[0] for l in _read_lines("init/ktests.txt")}
+SLOW_TESTS = {l.split()[0] for l in _read_lines("init/ktests.txt") if len(l.split()) > 1 and l.split()[1] == "slow"}
+KFAST = os.environ.get("OS_KFAST") == "1"
+def _suite_tests():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "init", "src", "bin", "suite.rs")).read()
+    body = src[src.index("let tests: &[Test] = &["):]
+    body = body[:body.index("\n    ];")]
+    return set(re.findall(r'\(\s*"([a-z0-9_]+)",\s*[a-z0-9_:]+\s*,?\s*\)', body))
+
+
+SUITE_TESTS = _suite_tests()
+
+
+def is_system_test(name):
+    """A test of the suite that a kernel-only boot must not run (it starts a server or needs a disk or the network)."""
+    return name.startswith("lua_upstream_") or (name in SUITE_TESTS and name not in KERNEL_TESTS)
 
 
 SHARD_B_STRESS = ["ten_thousand_threads_leak_nothing", "a_thread_hog_cannot_exhaust_the_kernel", "cycles_do_not_grow_memory"]
@@ -774,13 +802,15 @@ def shard_required(required):
         return [n for n in names if not is_shard_b_test(n)]
     if SHARD == "b":
         return [n for n in names if is_shard_b_test(n)]
+    if SHARD == "k":
+        return [n for n in names if not is_system_test(n) and not (KFAST and n in SLOW_TESTS)]
     return names
 
 
 def net_problems(text):
     """The host's view of the network tests (NET-SPEC Q4, Q5): the echo client's verdict and the capture's checksums."""
     found = []
-    if SHARD == "a":
+    if SHARD in ("a", "k"):
         return found  # (no network device, and no network tests: shard b has them)
     lossy = bool(os.environ.get("OS_NET_LOSSY"))
     if os.environ.get("OS_NET") != "0" and not lossy and "s8: udpecho ready" not in text and "net tests skipped" not in text:
@@ -973,13 +1003,14 @@ def run(kernel: str, extra=()):
             "-device", "virtio-blk-device,drive=hd0"]),
         *(["-append", " ".join(a for a in ("bench=full" if os.environ.get("OS_BENCH_FULL") == "1" else "",
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
-                                           f"shard={SHARD}" if SHARD else "") if a)]
+                                           f"shard={SHARD}" if SHARD else "",
+                                           "kfast" if SHARD == "k" and KFAST else "") if a)]
           if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") or SHARD else []),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;
         # OS_NET_HOSTPORT names the forwarded host port (otherwise a free one is chosen).
-        *([] if os.environ.get("OS_NET") == "0" or SHARD == "a" else net_args()),
+        *([] if os.environ.get("OS_NET") == "0" or SHARD in ("a", "k") else net_args()),
         *extra, "-kernel", kernel,
     ]
     if os.environ.get("OS_PROFILE"):
@@ -1040,6 +1071,10 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
     missing = [n for n in shard_required(required) if n not in {n for n, _, _ in tests}]
     if SHARD == "a" and any(is_shard_b_test(n) for n, _, _ in tests):
         found.append("shard a ran tests that belong to shard b")
+    if SHARD == "k" and KFAST and any(n in SLOW_TESTS for n, _, _ in tests):
+        found.append("a kfast boot ran tests marked slow")
+    if SHARD == "k" and any(is_system_test(n) for n, _, _ in tests):
+        found.append(f"a kernel-only boot ran System tests: {[n for n, _, _ in tests if is_system_test(n)]}")
     if missing:
         found.append(f"required tests not reported: {missing}")
     if len({n for n, _, _ in tests}) != len(tests):
@@ -1104,7 +1139,31 @@ def expect_panic(kernel, needle):
     return 0
 
 
+def selftest_k() -> int:
+    """The harness must fail a kernel-only boot that lacks a Kernel test or ran a System test (KT1 acceptance)."""
+    global SHARD
+    SHARD = "k"
+    need = shard_required(None)
+    assert need and all(not is_system_test(n) for n in need), "the required list of a k boot holds a System test"
+    def lines_for(names):
+        out = ["##BOOT kernel test"]
+        out += [f"##TEST {n} PASS" for n in names]
+        out.append(f"##DONE pass={len(names)} fail=0")
+        return out
+    ok = problems(lines_for(need), 0, False, False)
+    missing_case = problems(lines_for(need[1:]), 0, False, False)
+    extra_case = problems(lines_for(need + ["memfsd_rename"]), 0, False, False)
+    results = {"a complete boot passes": not any("required" in f or "System" in f for f in ok),
+               "a missing Kernel test is reported": any("required tests not reported" in f for f in missing_case),
+               "a System test is reported": any("System tests" in f for f in extra_case)}
+    for what, good in results.items():
+        print(("ok: " if good else "FAIL: ") + what)
+    return 0 if all(results.values()) else 1
+
+
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--selftest-k":
+        return selftest_k()
     # `--expect-panic NEEDLE KERNEL`: a kernel that must stop with a panic containing NEEDLE
     if len(sys.argv) == 4 and sys.argv[1] == "--expect-panic":
         return expect_panic(sys.argv[3], sys.argv[2])
@@ -1179,7 +1238,7 @@ def main() -> int:
             if LAST_DISK2[0]:
                 found += fsck_second_disk()
         # The device manager found the disk (or, with OS_DISK=0, found none and started nothing).
-        if strict:
+        if strict and SHARD != "k":  # (the servers these checks look for are System tests: a kernel-only boot has none)
             want_dm = ("s6: devmgr: no block device" if os.environ.get("OS_DISK") == "0"
                        else "s6: devmgr found the disk")
             if want_dm not in text:
@@ -1203,7 +1262,7 @@ def main() -> int:
         # The C library (S7c): the guest's transcript must equal the same C program run on the host.
         if not expect_fail:
             found += net_problems(text)
-        if strict:
+        if strict and SHARD != "k":
             found += c_transcript_problems(text)
             found += lua_transcript_problems(text)
         if found:
