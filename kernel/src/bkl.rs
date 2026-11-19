@@ -193,12 +193,22 @@ pub fn unlock() {
     LOCK.unlock(me, &percpu::this().bkl_depth);
 }
 
-/// The context switch's hand-over (K3): this hart keeps the lock, but the nesting depth now
-/// belongs to the incoming thread. Returns the outgoing thread's depth (to be saved in it).
-pub fn swap_depth(incoming: u32) -> u32 {
-    let me = who();
-    debug_assert!(!ENFORCED.load(Ordering::Relaxed) || LOCK.held_by(me));
-    LOCK.swap_depth(me, &percpu::this().bkl_depth, incoming)
+/// Release the lock completely, however deeply this hart holds it, and return the depth (SCHED-SMP-SPEC G4: the lock does not
+/// follow a thread across a context switch; the switching thread keeps its depth and takes it back with `reacquire` when it
+/// resumes). Interrupts stay off throughout.
+pub fn release_all() -> u32 {
+    let depth = percpu::this().bkl_depth.get();
+    for _ in 0..depth {
+        unlock();
+    }
+    depth
+}
+
+/// Take the lock again to `depth` levels (the counterpart of `release_all`, run by the thread that resumed).
+pub fn reacquire(depth: u32) {
+    for _ in 0..depth {
+        lock();
+    }
 }
 
 /// A debug-build deadlock detector: a hart that has spun this long for one lock is stuck, not waiting (a lock is held for

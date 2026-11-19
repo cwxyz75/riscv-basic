@@ -146,10 +146,6 @@ struct KThread {
     name: &'static str,
     /// Nobody will `join` this thread: when it exits, the hart that switches away from it frees it (`finish_switch`).
     detached: bool,
-    /// The big kernel lock's nesting depth this thread had when it was switched out (K3); a new
-    /// thread starts at 1: it is born inside the context switch that first runs it, and its
-    /// bootstrap leaves that region.
-    bkl_depth: u32,
 }
 
 struct Kernel {
@@ -248,7 +244,6 @@ pub fn init(boot_prio: Prio) {
             stack: None,
             name: "boot",
             detached: false,
-            bkl_depth: 0,
         },
     );
     // SAFETY: called once, interrupts off, before any other use of KERNEL.
@@ -314,7 +309,6 @@ pub fn join_scheduler() -> ! {
                 stack: None,
                 name: "idle",
                 detached: false,
-                bkl_depth: 0,
             },
         );
         set_running(tid);
@@ -361,7 +355,10 @@ extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
     // A new thread starts inside a context switch, with interrupts off and the big kernel lock
     // handed over at depth 1: it leaves that region now and runs outside the lock (K4).
     crate::latency::switch_in();
-    finish_switch();
+    // (the lock was released by the thread that switched here: G4)
+    switch_done();
+    crate::bkl::lock();
+    reap_prev();
     crate::bkl::unlock();
     irq::enable();
     // SAFETY: `entry` is the `fn(usize)` that `spawn` stored, round-tripped through
@@ -444,13 +441,19 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
         stack: Some(stack),
         name,
         detached,
-        bkl_depth: 1,
     }
 }
 
 /// This hart's context switch is complete (the thread it left has been saved), or it decided not to switch: the thread it
 /// left, if any, is now available to the other harts (`Sched2::switched`). Interrupts are off.
 fn finish_switch() {
+    switch_done();
+    reap_prev();
+}
+
+/// The switch on this hart is complete: the thread it left is available to every hart, and the pokes that owes are sent. Needs no
+/// lock but the scheduler's own (interrupts off), so the resumed thread runs it before it waits for the big kernel lock.
+fn switch_done() {
     let h = hart();
     let pokes = {
         let sc = sched();
@@ -464,9 +467,12 @@ fn finish_switch() {
             .need_resched
             .store(true, Ordering::Relaxed);
     }
-    // The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack
-    // is in nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaces needed a wake and a
-    // switch for every thread that ended). The big kernel lock is held (it follows the thread), so the table is ours.
+}
+
+/// The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack is in
+/// nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaced needed a wake and a switch for
+/// every thread that ended). The big kernel lock is held, so the table is ours.
+fn reap_prev() {
     let prev = crate::percpu::this().prev.swap(0, Ordering::Relaxed);
     if prev != 0 {
         reap_if_dead(prev);
@@ -567,14 +573,6 @@ fn reschedule() {
             );
         }
         let new: *const Context = &*incoming.ctx;
-        // The lock stays with this hart across the switch, but its nesting depth now belongs to
-        // the incoming thread (K3); the outgoing thread keeps its own for when it resumes.
-        let in_depth = incoming.bkl_depth;
-        let out_depth = crate::bkl::swap_depth(in_depth);
-        k.threads
-            .get_mut(&running)
-            .expect("outgoing thread exists")
-            .bkl_depth = out_depth;
         (old, new)
     };
     // A hart must never keep a user process's page table in `satp` across a switch: another hart
@@ -583,14 +581,20 @@ fn reschedule() {
     // loads the right one (`user::activate_current`).
     crate::kmem::use_kernel_table_if_needed();
     crate::latency::switch_out();
+    // The lock does not follow the thread (SCHED-SMP-SPEC G4): this thread's depth stays on its stack, the lock is released here, and
+    // the thread takes it back when it resumes. The thread it leaves is in transit (`Sched2::displaced`: any state) until the
+    // incoming thread's `switch_done`, so no other hart can wake-and-run it, pull it or reap it before its context is saved.
+    let depth = crate::bkl::release_all();
     // SAFETY: `old` and `new` point into boxed contexts that stay alive and in
     // place (threads are only reaped once exited and switched away from); the
     // switch saves this thread's state and resumes the other's, as `context_switch`
-    // documents. Interrupts are off, the big kernel lock is held (and handed over), and no
+    // documents. Interrupts are off, the big kernel lock was released just above, and no
     // reference to KERNEL is live.
     unsafe { context_switch(old, new) };
     // (resumed: on whichever hart now runs this thread, the switch that brought it here has finished saving the one before)
-    finish_switch();
+    switch_done();
+    crate::bkl::reacquire(depth);
+    reap_prev();
     crate::latency::switch_in();
 }
 
@@ -856,6 +860,8 @@ pub fn join(tid: Tid) -> bool {
             let state = sched().state(tid);
             match state {
                 None => Some(false),
+                // (an exited thread whose switch is not yet complete, G4, is still on its stack: look again)
+                Some(State::Exited) if sched().is_in_transit(tid) => None,
                 Some(State::Exited) => {
                     sched().reap(tid).expect("exited thread");
                     if let Some(t) = k.threads.remove(&tid) {

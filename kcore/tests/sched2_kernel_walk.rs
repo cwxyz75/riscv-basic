@@ -60,6 +60,8 @@ struct World<N: Class> {
     /// the big kernel lock, which the hart keeps until the switch is done, so no other hart's big-lock operation can run
     /// while it is open (`bkl_barrier`).
     fast: Vec<bool>,
+    /// Exited threads waiting to be reaped (G4: only once their switch is done).
+    dead: Vec<Tid>,
 }
 
 impl<N: Class> World<N> {
@@ -252,6 +254,7 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
         carry: vec![false; harts],
         executing: vec![None; harts],
         fast: vec![false; harts],
+        dead: Vec::new(),
     };
     for h in 1..harts {
         w.s.set_online(h, false);
@@ -284,6 +287,17 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
             }
         };
         w.finish(caller);
+        // (G4: an exited thread is reaped only once its switch is done, never while it is in transit)
+        let reapable: Vec<Tid> = w
+            .dead
+            .iter()
+            .copied()
+            .filter(|&d| !w.s.is_in_transit(d))
+            .collect();
+        for d in reapable {
+            w.s.reap(d).unwrap();
+            w.dead.retain(|&x| x != d);
+        }
         let before = w.pending();
         let what;
         let op = r.below(100);
@@ -388,8 +402,8 @@ fn walk<N: Class>(make: fn() -> N, rr: bool, harts: usize, seed: u64, steps: usi
                     let runnable = w.t.values().filter(|x| x.state == R::Runnable).count();
                     if runnable > harts + 2 {
                         w.s.exit_on(h).unwrap();
-                        w.s.reap(c).unwrap();
                         w.t.remove(&c);
+                        w.dead.push(c);
                     }
                 }
                 what = "exit";
