@@ -4,7 +4,6 @@ kind: slice
 title: Nanosecond time: every deadline and `clock_get` in nanoseconds, one flag-day change
 area: sched
 horizon: near
-blocked_by: [L12]
 refs: [SCHED-SMP-SPEC, KERNEL-V1-SPEC, OD131]
 ---
 

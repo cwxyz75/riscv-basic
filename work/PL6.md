@@ -4,7 +4,7 @@ kind: slice
 title: AIA only: delete the polling mode; inter-hart interrupts through the IMSIC
 area: platform
 horizon: long
-blocked_by: [PL5, L12]
+blocked_by: [PL5]
 refs: [KERNEL-V1-SPEC, OD127]
 ---
 
