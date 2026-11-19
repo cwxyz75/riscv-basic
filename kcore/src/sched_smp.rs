@@ -821,6 +821,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Block the current thread of `hart` unless a notification is waiting. Returns whether it blocked.
     pub fn block_on(&self, hart: usize) -> Result<bool, Error> {
+        self.charge_now(hart); // (the outgoing thread's run is charged to it, before the designation changes: PR 273 review)
         let blocked = {
             let mut q = self.lq(hart);
             let before = q.current();
@@ -838,6 +839,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Sleep until `deadline` (nanoseconds on this hart's clock).
     pub fn sleep_until_on(&self, hart: usize, deadline: Time) -> Result<bool, Error> {
+        self.charge_now(hart);
         let blocked = {
             let mut q = self.lq(hart);
             let before = q.current();
@@ -867,7 +869,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     fn wake_inner(&self, caller: usize, tid: Tid) -> Result<bool, Error> {
         loop {
             let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
-            // where would it go? (a blocked thread is placed; the placement reads hints and needs the record)
+            self.charge_now(home); // (a tickless hart's clock is as old as its last look: the wake is stamped with the time it happens)
+                                   // where would it go? (a blocked thread is placed; the placement reads hints and needs the record)
             let Some(rec) = ({
                 let q = self.lq(home);
                 q.record(tid).filter(|r| r.home.get() == home).cloned()
@@ -947,6 +950,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn yield_on(&self, hart: usize) -> Result<(), Error> {
+        self.charge_now(hart);
         {
             let mut q = self.lq(hart);
             let cur = q.current();
@@ -960,6 +964,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn exit_on(&self, hart: usize) -> Result<(), Error> {
+        self.charge_now(hart);
         {
             let mut q = self.lq(hart);
             let before = q.current();

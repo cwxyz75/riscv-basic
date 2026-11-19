@@ -65,7 +65,7 @@ pub fn program(event: Option<u64>) {
             let hz = timebase();
             // (no 128-bit division, as in `now_ns`)
             BOOT_COUNT.load(Ordering::Relaxed).saturating_add(
-                (ns / 1_000_000_000) * hz + (ns % 1_000_000_000) * hz / 1_000_000_000,
+                (ns / 1_000_000_000) * hz + ((ns % 1_000_000_000) * hz).div_ceil(1_000_000_000), // (rounded up: never early)
             )
         }
     };
