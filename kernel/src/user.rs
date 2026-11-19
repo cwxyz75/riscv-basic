@@ -2317,12 +2317,7 @@ fn process_kill(a: [u64; 6]) -> Reply {
     let (tpid, me) = irq::without(|| -> Result<(u32, u32), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let (_, tpid, terminated, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::KILL)
-            .map_err(|e| (e, None, None))?;
-        if terminated || !s.procs.contains_key(&tpid) {
-            return Err((Status::BadState, None, None));
-        }
+        let tpid = ksys::kill_target(&s.objs, &s.procs, me, ph).map_err(|e| (e, None, None))?;
         Ok((tpid, me))
     })?;
     if tpid == me {
@@ -2340,21 +2335,9 @@ fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     let tpid = irq::without(|| -> Result<u32, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let (_, tpid, terminated, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::KILL)
+        let tpid = ksys::stop_target(&mut s.objs, &mut s.procs, me, ph, stop)
             .map_err(|e| (e, None, None))?;
-        let target = s
-            .procs
-            .get_mut(&tpid)
-            .ok_or((Status::BadState, None, None))?;
-        if terminated || target.exit_code.is_some() || target.killed.is_some() {
-            return Err((Status::BadState, None, None));
-        }
-        target.stopped = stop;
         bump_attention();
-        if let Some(obj) = target.obj {
-            ipc::process_set_stopped(&mut s.objs, obj, stop);
-        }
         if stop {
             // a thread running user code on another hart parks at its next trap: the flag is set first and the kick comes
             // in the same locked region (as for a kill)
@@ -2673,53 +2656,28 @@ fn creator_prio(s: &UserState) -> u8 {
 
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to.
 fn thread_target(s: &UserState, me: u32, h: u64, need: Rights) -> Result<(Tid, u32), ReplyErr> {
-    if h == 0 {
-        return Ok((thread::current(), me));
-    }
-    let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-    let handle = Handle(h as u32);
-    ipc::thread_of(&s.objs, &caller.handles, handle, need).map_err(|e| (e, None, None))?;
-    let obj = caller.handles.get(handle).map_err(|e| (e, None, None))?.obj;
-    let pid = match s.objs.get(obj) {
-        Some(ipc::KObj::Thread(t)) => t.pid,
-        _ => return Err((Status::WrongType, None, None)),
-    };
-    let tid = s.procs.get(&pid).and_then(|p| {
-        p.thread_objs
-            .iter()
-            .find(|(_, o)| **o == obj)
-            .map(|(t, _)| *t)
-    });
-    match tid {
-        Some(t) => Ok((t, pid)),
-        None => Err((Status::BadState, None, None)), // the thread has ended (or never started)
-    }
+    ksys::thread_target(&s.objs, &s.procs, me, thread::current(), h, need)
+        .map_err(|e| (e, None, None))
 }
 
 /// `thread_set_sched(thread, priority, flags)`: set a thread's base priority (1 to 63) and flags (bit 0: round robin
 /// within its level). Needs MANAGE on the handle (none for 0, the caller), and the priority may not exceed the
 /// thread's job's `max_prio`.
 fn thread_set_sched(a: [u64; 6]) -> Reply {
-    let (prio, flags) = (a[1], a[2]);
-    if !(1..=63).contains(&prio) || flags & !1 != 0 {
-        return bad(Status::InvalidArgs);
-    }
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let (tid, pid) = thread_target(s, me, a[0], Rights::MANAGE)?;
-        let job = s.procs.get(&pid).ok_or((Status::BadState, None, None))?.job;
-        let max = kmem::get()
-            .vmos
-            .jobs
-            .sched(job)
-            .ok_or((Status::BadState, None, None))?
-            .max_prio;
-        if prio as u8 > max {
-            return bad(Status::AccessDenied);
-        }
-        s.sched_flags.insert(tid, flags as u8);
-        thread::set_priority(tid, prio as u8);
+        let (tid, prio, flags) = ksys::thread_set_sched_target(
+            &s.objs,
+            &s.procs,
+            &kmem::get().vmos.jobs,
+            me,
+            thread::current(),
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
+        s.sched_flags.insert(tid, flags);
+        thread::set_priority(tid, prio);
         Ok((None, None))
     })
 }
@@ -2740,34 +2698,12 @@ fn thread_get_sched(a: [u64; 6]) -> Reply {
 /// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
 /// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
 fn job_set_sched(a: [u64; 6]) -> Reply {
-    if a[1] > 63 || a[3] > 65536 {
-        return bad(Status::InvalidArgs);
-    }
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let job = ipc::job_of(
-            &s.objs,
-            &caller.handles,
-            Handle(a[0] as u32),
-            Rights::SET_LIMITS,
-        )
-        .map_err(|e| (e, None, None))?;
-        let limits = kcore::job::SchedLimits {
-            max_prio: a[1] as u8,
-            rt_budget: a[2],
-            cpu_weight: a[3] as u32,
-        };
         let jobs = &mut kmem::get().vmos.jobs;
-        jobs.set_sched(job, limits).map_err(|e| {
-            let st = match e {
-                kcore::job::SchedError::NoSuchJob => Status::BadState,
-                kcore::job::SchedError::AboveParent => Status::AccessDenied,
-                kcore::job::SchedError::Invalid => Status::InvalidArgs,
-            };
-            (st, None, None)
-        })?;
+        let job =
+            ksys::job_set_sched(&s.objs, &s.procs, jobs, me, a).map_err(|e| (e, None, None))?;
         // PR1: clamp the threads of the job and everything below it
         let clamp: Vec<(Tid, u8)> = s
             .thread_pid
@@ -2792,26 +2728,15 @@ fn job_kill(a: [u64; 6]) -> Reply {
     let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u32>, bool, u32), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let job = ipc::job_of(&s.objs, &caller.handles, Handle(a[0] as u32), Rights::KILL)
-            .map_err(|e| (e, None, None))?;
-        let jobs = &mut kmem::get().vmos.jobs;
-        let mut limits = jobs.limits(job).ok_or((Status::BadState, None, None))?;
-        limits.processes = 0;
-        limits.threads = 0;
-        let _ = jobs.set_limits(job, limits);
-        let inside: Vec<u32> = s
-            .procs
-            .iter()
-            .filter(|(_, p)| jobs.is_within(p.job, job))
-            .map(|(&pid, _)| pid)
-            .collect();
-        let me_inside = inside.contains(&me);
-        Ok((
-            inside.into_iter().filter(|&p| p != me).collect(),
-            me_inside,
+        let (victims, me_inside) = ksys::job_kill_victims(
+            &s.objs,
+            &s.procs,
+            &mut kmem::get().vmos.jobs,
             me,
-        ))
+            Handle(a[0] as u32),
+        )
+        .map_err(|e| (e, None, None))?;
+        Ok((victims, me_inside, me))
     })?;
     for pid in victims {
         request_kill(pid, code);
