@@ -77,13 +77,23 @@ def main():
         if line == b"flood: end":
             break
         lines.append(line)
-    stream = b"\r\n".join(lines) + b"\r\n"  # everything before the "flood: end" line
-    if stream.count(b"flood: done\r\n") != 1:
-        fail(s, "the flood's own marker is missing or repeated (the newest bytes must survive)")
-    stream = stream.replace(b"flood: done\r\n", b"")
     notice = re.compile(rb"\r\n\[console: (\d+) bytes dropped\]\r\n")
-    dropped = sum(int(m.group(1)) for m in notice.finditer(stream))
-    rest = notice.sub(b"", stream)
+
+    def account():
+        stream = b"\r\n".join(lines) + b"\r\n"  # everything before the "flood: end" line, and what came after it
+        if stream.count(b"flood: done\r\n") != 1:
+            fail(s, "the flood's own marker is missing or repeated (the newest bytes must survive)")
+        stream = stream.replace(b"flood: done\r\n", b"")
+        dropped = sum(int(m.group(1)) for m in notice.finditer(stream))
+        return dropped, notice.sub(b"", stream)
+
+    dropped, rest = account()
+    # The console says what it dropped when its queue next runs empty, which the client's pause before "flood: end" is meant to
+    # allow but cannot promise on a slow host (T158): so the notice may follow the end marker. While the accounting is short, the
+    # notice is still to come; read on until it does (a notice that never comes times out below).
+    while len(rest) + dropped < 500000 + 2:
+        lines.append(s.next_line("the drop notice after the end marker"))
+        dropped, rest = account()
     if dropped == 0:
         fail(s, "nothing was dropped by a 500000-byte flood (queue bound not enforced?)")
     if set(rest) - set(b"f\r\n"):
