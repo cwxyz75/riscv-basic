@@ -144,7 +144,7 @@ struct KThread {
     /// `None` for the boot thread, which runs on the boot stack.
     stack: Option<crate::kstack::KStack>,
     name: &'static str,
-    /// Nobody will `join` this thread: when it exits the reaper frees it.
+    /// Nobody will `join` this thread: when it exits, the hart that switches away from it frees it (`finish_switch`).
     detached: bool,
     /// The big kernel lock's nesting depth this thread had when it was switched out (K3); a new
     /// thread starts at 1: it is born inside the context switch that first runs it, and its
@@ -156,9 +156,6 @@ struct Kernel {
     threads: BTreeMap<Tid, KThread>,
     exits: Waiters2,
     queues: Vec<Waiters2>,
-    /// Exited detached threads waiting for the reaper.
-    zombies: Vec<Tid>,
-    reaper_queue: usize,
 }
 
 static mut KERNEL: Option<Kernel> = None;
@@ -258,8 +255,6 @@ pub fn init(boot_prio: Prio) {
             threads,
             exits: Waiters2::new(),
             queues: Vec::new(),
-            zombies: Vec::new(),
-            reaper_queue: 0,
         });
     }
     // SAFETY: the one write (see `sched`): interrupts off, one hart.
@@ -269,9 +264,6 @@ pub fn init(boot_prio: Prio) {
     // gives it a stack and a first instruction
     let idle_thread = new_kthread("idle", idle_main, 0, false);
     kernel().threads.insert(idle0, idle_thread);
-    let q = new_queue();
-    kernel().reaper_queue = q;
-    spawn("reaper", REAPER_PRIO, reaper_main, 0);
     crate::percpu::this()
         .in_sched
         .store(true, Ordering::Release);
@@ -371,7 +363,7 @@ pub fn spawn(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Ti
     spawn_with(name, prio, entry, arg, false)
 }
 
-/// A thread nobody joins: when it exits the reaper thread frees its stack and record.
+/// A thread nobody joins: when it exits, the hart that switches away from it frees its stack and record.
 #[allow(dead_code)]
 pub fn spawn_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
     spawn_with(name, prio, entry, arg, true)
@@ -452,6 +444,26 @@ fn finish_switch() {
         sc.take_pokes()
     };
     send_pokes(pokes, h);
+    // The thread this hart replaced, if it has exited and nobody will join it, is dead now: its context is saved, so its stack
+    // is in nobody's use (SCHED-SMP-SPEC 3.6: `Dead`, then reap by the hart; the reaper thread this replaces needed a wake and a
+    // switch for every thread that ended). The big kernel lock is held (it follows the thread), so the table is ours.
+    let prev = crate::percpu::this().prev.swap(0, Ordering::Relaxed);
+    if prev != 0 {
+        reap_if_dead(prev);
+    }
+}
+
+/// Free `tid` if it is an exited detached thread (a joined one is freed by its joiner). The caller has completed the switch away
+/// from it and holds the big kernel lock.
+fn reap_if_dead(tid: Tid) {
+    let k = kernel();
+    let dead = k.threads.get(&tid).is_some_and(|t| t.detached)
+        && sched().state(tid) == Some(State::Exited);
+    if dead && sched().reap(tid).is_ok() {
+        if let Some(t) = k.threads.remove(&tid) {
+            note_stack_use(&t);
+        }
+    }
 }
 
 /// Switch to whichever thread the core says should run, if it is not this one.
@@ -489,6 +501,7 @@ fn reschedule() {
         }
         let old: *mut Context = &mut *outgoing.ctx;
         set_running(next);
+        crate::percpu::this().prev.store(running, Ordering::Relaxed);
         let incoming = k.threads.get(&next).expect("next thread exists");
         if let Some(stack) = &incoming.stack {
             assert!(
@@ -711,30 +724,17 @@ pub fn set_priority(tid: Tid, prio: Prio) {
 }
 
 /// End the calling thread. Its stack is freed by whoever `join`s it.
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: the caller is a running thread; the reaper queue index was created by `init`
+#[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the caller is a running thread; an exited thread is never scheduled again
 pub fn exit() -> ! {
     irq::without(|| {
         let k = kernel();
         let h = hart();
-        let me = running_here();
-        let detached = k.threads.get(&me).is_some_and(|t| t.detached);
-        let Kernel {
-            exits,
-            queues,
-            zombies,
-            reaper_queue,
-            ..
-        } = k;
+        let Kernel { exits, .. } = k;
         {
             let sc = sched();
             sc.exit_on(h).expect("running thread");
             exits.wake_all_on(sc, h);
-            if detached {
-                // Nobody will join it: hand it to the reaper (which runs once we have switched
-                // away, so its stack is no longer in use when it is freed).
-                zombies.push(me);
-                queues[*reaper_queue].wake_all_on(sc, h);
-            }
+            // (a thread nobody joins is freed by the hart that switches away from it: `finish_switch`)
         }
         reschedule();
     });
@@ -1046,28 +1046,6 @@ pub fn current_stack_top() -> u64 {
             .expect("a user thread has its own kernel stack");
         (stack.top() & !15) as u64
     })
-}
-
-/// Priority of the reaper: above everything that can create work for it.
-const REAPER_PRIO: Prio = 50;
-
-/// Frees detached threads once they have exited (stack, context, scheduler record).
-fn reaper_main(_: usize) {
-    loop {
-        let q = irq::without(|| kernel().reaper_queue);
-        wait_until(q, || !kernel().zombies.is_empty());
-        irq::without(|| {
-            let k = kernel();
-            let dead: Vec<Tid> = core::mem::take(&mut k.zombies);
-            for tid in dead {
-                if sched().reap(tid).is_ok() {
-                    if let Some(t) = k.threads.remove(&tid) {
-                        note_stack_use(&t);
-                    }
-                }
-            }
-        });
-    }
 }
 
 /// The deepest any kernel stack has been, in bytes (a measurement for slice T: stacks start zeroed, so
