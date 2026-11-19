@@ -4,7 +4,6 @@ kind: slice
 title: RVA23 in the gate: `rva23s64` the only test CPU, a boot-time extension check, the kernel compiled for the profile
 area: platform
 horizon: long
-blocked_by: [KT1]
 refs: [KERNEL-V1-SPEC, OD127]
 ---
 

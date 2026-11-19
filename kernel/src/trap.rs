@@ -433,9 +433,17 @@ fn trap_body(frame: &mut TrapFrame) {
     let k = kmem::get();
     match k
         .aspace
-        .handle_fault(&mut k.mm, &mut k.vmos, frame.stval, access)
+        .handle_fault_mapped(&mut k.mm, &mut k.vmos, frame.stval, access)
     {
-        Ok(()) => flush_tlb(),
+        // (the kernel's own table: every ASID, the pages the fault mapped)
+        Ok(m) => {
+            let mut va = m.first;
+            while va <= m.last {
+                // SAFETY: `sfence.vma` with an address drops the cached translations of that page for every ASID; no other effect.
+                unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) va) };
+                va += 4096;
+            }
+        }
         // Only data faults can be stepped over: after an instruction-fetch fault
         // `sepc` is the unmapped target, not an instruction we can skip.
         Err(error) if cause != 12 && EXPECT.swap(false, Ordering::SeqCst) => {

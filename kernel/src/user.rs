@@ -786,7 +786,12 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
                     Some(pid) if va < abi::user::TOP => {
                         let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
-                        let r = p.aspace.handle_fault(&mut k.mm, &mut k.vmos, va, access);
+                        let r = p
+                            .aspace
+                            .handle_fault_mapped(&mut k.mm, &mut k.vmos, va, access);
+                        if let Ok(m) = &r {
+                            kmem::flush_pages(m.first, m.last, p.asid);
+                        }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {
                                 let _ = core::fmt::Write::write_fmt(
@@ -821,7 +826,7 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
                 }
             };
             if resolved {
-                kmem::flush_tlb();
+                // (the pages the fault mapped were flushed one by one above)
             } else {
                 // a diagnostic for headless debugging (off by default: the tests crash programs
                 // on purpose and the shell tests read the console line by line)

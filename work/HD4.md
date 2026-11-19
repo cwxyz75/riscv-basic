@@ -4,7 +4,6 @@ kind: slice
 title: No ambient debug calls; a release kernel with no test-only code
 area: security
 horizon: long
-blocked_by: [KT1]
 refs: [KERNEL-V1-SPEC, OD139]
 ---
 

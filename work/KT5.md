@@ -4,7 +4,6 @@ kind: slice
 title: Instruction-count checks of the main syscall paths
 area: testing
 horizon: long
-blocked_by: [KT1]
 refs: [KERNEL-V1-SPEC, OD140]
 ---
 
