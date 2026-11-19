@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import sys
 
 # The machine the OS track runs on (OD75): AIA (APLIC + IMSIC). A plain `virt` has only a PLIC, which the
@@ -976,6 +977,27 @@ def net_args():
     ]
 
 
+LAST_RECORD = [None]
+
+
+def rr_args():
+    """The QEMU arguments of record/replay mode (KT2), or []. Recording needs no disk and no network device (they would need
+    block and network replay filters): run it with OS_SHARD=k, or OS_DISK=0 OS_NET=0. Record mode runs the harts in one TCG thread
+    (deterministic), so a race that needs true parallel harts may not reproduce under it (TESTING.md)."""
+    rec, rep = os.environ.get("OS_RECORD"), os.environ.get("OS_REPLAY")
+    if not rec and not rep:
+        return []
+    if os.environ.get("OS_DISK") != "0" or os.environ.get("OS_NET") != "0":
+        sys.exit("OS_RECORD / OS_REPLAY need a boot with no disk and no network: OS_SHARD=k (or OS_DISK=0 OS_NET=0)")
+    shift = "shift=auto"
+    if rep:
+        LAST_RECORD[0] = None
+        return ["-icount", f"{shift},rr=replay,rrfile={rep}", *(["-s", "-S"] if os.environ.get("OS_GDB") == "1" else [])]
+    os.makedirs(rec, exist_ok=True)
+    LAST_RECORD[0] = os.path.join(rec, f"boot-{os.getpid()}-{int(time.time())}.rr")
+    return ["-icount", f"{shift},rr=record,rrfile={LAST_RECORD[0]}"]
+
+
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
@@ -989,7 +1011,10 @@ def run(kernel: str, extra=()):
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
         # the host is (work item T21). e.g. OS_ICOUNT=shift=4,sleep=off
-        *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") else []),
+        *(["-icount", os.environ["OS_ICOUNT"]] if os.environ.get("OS_ICOUNT") and not rr_args() else []),
+        # Record and replay (KT2, TESTING.md): `OS_RECORD=<dir>` boots under QEMU's record mode and the harness keeps the recording only
+        # when the boot fails; `OS_REPLAY=<file>` replays one (add OS_GDB=1 to wait for gdb on :1234 first)
+        *rr_args(),
         # The scratch disk (S6): a virtio block device on the modern transport. The kernel itself
         # never touches it; OS_DISK=0 leaves it off.
         *([] if os.environ.get("OS_DISK") == "0" else [
@@ -1189,6 +1214,12 @@ def main() -> int:
     for kernel, expect_fail, required, label in runs:
         lines, status, timed_out, text = run(kernel)
         found = problems(lines, status, timed_out, expect_fail, required)
+        # a recording is kept only for a failing boot (the fail-demo kernel fails by design: it is the acceptance check)
+        if LAST_RECORD[0] and os.path.exists(LAST_RECORD[0]):
+            if found or expect_fail:
+                print(f"recorded: {LAST_RECORD[0]}  (replay: OS_REPLAY={LAST_RECORD[0]} OS_SHARD=k python3 scripts/os_boot_test.py ...)", file=sys.stderr)
+            else:
+                os.remove(LAST_RECORD[0])
         if os.environ.get("OS_SHOW"):
             for l in text.split("\n"):
                 if l.startswith(os.environ["OS_SHOW"]):
@@ -1267,6 +1298,13 @@ def main() -> int:
             found += lua_transcript_problems(text)
         if found:
             failed = 1
+            # (the log goes to a file too, for CI to keep as an artifact and for a person to read: KT2)
+            try:
+                os.makedirs("target/fail-logs", exist_ok=True)
+                with open(f"target/fail-logs/{re.sub(r'[^a-z0-9]+', '-', label.lower())}-{int(time.time())}.log", "w") as lf:
+                    lf.write("\n".join(found) + "\n--- serial output ---\n" + text)
+            except OSError:
+                pass
             print(f"os boot test FAILED for {label}:", *found, sep="\n  ", file=sys.stderr)
             print("--- serial output ---", text, sep="\n", file=sys.stderr)
         else:
