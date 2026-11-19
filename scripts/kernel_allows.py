@@ -5,7 +5,7 @@ Fails (exit 1) when an allow of those lints has no `INVARIANT:` reason on the sa
 Usage: kernel_allows.py [--list]"""
 import os, re, sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-CRATES = ["kcore", "klock", "abi", "kernel"]
+CRATES = ["kcore", "klock", "abi", "ksys", "kernel"]
 LINT = re.compile(r"clippy::(unwrap_used|expect_used|indexing_slicing|arithmetic_side_effects|panic|unreachable)")
 bad, counts = [], {}
 for crate in CRATES:
