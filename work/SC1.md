@@ -4,7 +4,7 @@ kind: slice
 title: Sixty-four harts: hart index and hart id apart, per-hart records allocated at boot, 64-bit masks
 area: sched
 horizon: long
-blocked_by: [PL5, L12]
+blocked_by: [PL5]
 refs: [KERNEL-V1-SPEC, OD126]
 ---
 

@@ -3,7 +3,6 @@ id: TS3
 kind: slice
 area: testing
 horizon: near
-blocked_by: [L12]
 title: The syscall layer on the host: `kernel/src/user.rs` behind a `Machine` trait
 refs: [KERNEL-V1-SPEC, OD140]
 ---

@@ -4,7 +4,6 @@ kind: slice
 title: A buddy frame allocator with metadata sized from RAM
 area: kernel
 horizon: long
-blocked_by: [L12]
 refs: [KERNEL-V1-SPEC, OD138]
 ---
 

@@ -4,7 +4,7 @@ kind: slice
 title: Schedule perturbation: seeded random delays at lock and inter-hart-interrupt points
 area: testing
 horizon: long
-blocked_by: [KT6, L12]
+blocked_by: [KT6]
 refs: [KERNEL-V1-SPEC, OD140]
 ---
 
