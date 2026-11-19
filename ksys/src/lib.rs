@@ -21,8 +21,10 @@
 extern crate alloc;
 
 mod job;
+mod proc;
 mod vmo;
 pub use job::{job_call, job_status};
+pub use proc::{proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
 pub use vmo::vmo_call;
 
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
