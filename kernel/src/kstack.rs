@@ -104,7 +104,10 @@ impl Drop for KStack {
 
 /// Make a slot with frames: map the four stack pages of the next unused slot. `None` if the window is
 /// full or no frames (or page-table frames) are left; nothing is changed then.
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < PAGES indexes the frames array of PAGES entries; the addresses are inside the kernel-stack window; the slot counter is far below u32::MAX
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+// INVARIANT: i < PAGES indexes the frames array of PAGES entries; the addresses are inside the kernel-stack window; the slot counter is far below u32::MAX
 fn make_slot() -> Option<u32> {
     let s = slots();
     if s.next >= MAX_SLOTS {

@@ -202,7 +202,10 @@ fn kernel() -> &'static mut Kernel {
 
 /// Turn the code that is running (the boot thread) into a thread (its id follows the harts' idle ids) and start the idle
 /// thread. Needs the heap. Interrupts must still be off.
-#[allow(clippy::expect_used)] // INVARIANT: boot code: the boot thread's priority is valid and the idle and boot records are created once
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::expect_used)]
+// INVARIANT: boot code: the boot thread's priority is valid and the idle and boot records are created once
 pub fn init(boot_prio: Prio) {
     // The kernel does no floating point and thread switches do not save FP state:
     // keep the FPU off (sstatus.FS = 0) so any accidental use traps instead of
@@ -512,7 +515,7 @@ fn reap_if_dead(tid: Tid) {
         debug_assert!(reaped, "reap of exited thread {tid} failed");
         if reaped {
             if let Some(t) = k.threads.remove(&tid) {
-                note_stack_use(&t);
+                note_stack_use(tid, &t);
             }
         }
     }
@@ -980,7 +983,7 @@ pub fn join(tid: Tid) -> bool {
                 Some(State::Exited) => {
                     sched().reap(tid).expect("exited thread");
                     if let Some(t) = k.threads.remove(&tid) {
-                        note_stack_use(&t);
+                        note_stack_use(tid, &t);
                     }
                     Some(true)
                 }
@@ -1274,21 +1277,100 @@ pub fn current_stack_top() -> u64 {
 /// shallower, so this is a lower bound, close in practice).
 static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// The kernel stack budget (KT13): a stack is 16 KiB, and no thread may go deeper than half of it, so the unmeasured worst case
+/// (an interrupt on top of the deepest call chain, a longer path than the suite takes) has as much room again.
+pub const STACK_BUDGET: usize = 8 * 1024;
+
+/// The first thread seen over the budget: `(use << 32) | tid`, or 0 while none is. (One word, so the check at a thread's exit is
+/// lock-free.)
+static OVER_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first 16 bytes of that thread's name, as two words (written before `OVER_BUDGET`, read after it).
+static OVER_BUDGET_NAME: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// What a stack has used: the bytes from the top down to the lowest word that is not zero (stacks start zeroed).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: first < the stack's words (it is the index of a changed word)
-fn note_stack_use(t: &KThread) {
+fn stack_used(stack: &[u64]) -> usize {
+    stack
+        .iter()
+        .skip(GUARD_WORDS)
+        .position(|&w| w != 0)
+        .map_or(0, |first| STACK_BYTES - (GUARD_WORDS + first) * 8)
+}
+
+/// Does `used` bytes of stack break the budget?
+pub fn over_budget(used: usize) -> bool {
+    used > STACK_BUDGET
+}
+
+/// The use of the calling thread's own stack so far (a test of the budget check reads it).
+pub fn current_stack_use() -> usize {
+    irq::without(|| {
+        let me = current();
+        let k = kernel();
+        k.threads
+            .get(&me)
+            .and_then(|t| t.stack.as_ref())
+            .map_or(0, |s| stack_used(s))
+    })
+}
+
+/// Exempt the calling thread from the budget check when it ends (the test that recurses on purpose).
+pub fn exempt_from_stack_budget() {
+    EXEMPT.store(current() as u64 + 1, core::sync::atomic::Ordering::SeqCst);
+}
+static EXEMPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: i is below 16 (take(16)), so i % 8 * 8 is below 64 and the shift cannot overflow; the byte is shifted into its own lane
+fn note_stack_use(tid: Tid, t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
-        let used = stack
-            .iter()
-            .skip(GUARD_WORDS)
-            .position(|&w| w != 0)
-            .map_or(0, |first| STACK_BYTES - (GUARD_WORDS + first) * 8);
+        let used = stack_used(stack);
         STACK_HIGH_WATER.fetch_max(used, core::sync::atomic::Ordering::Relaxed);
+        if over_budget(used) && EXEMPT.load(core::sync::atomic::Ordering::SeqCst) != tid as u64 + 1
+        {
+            let mut words = [0u64; 2];
+            for (i, b) in t.name.bytes().take(16).enumerate() {
+                if let Some(w) = words.get_mut(i / 8) {
+                    *w |= u64::from(b) << ((i % 8) * 8);
+                }
+            }
+            for (slot, w) in OVER_BUDGET_NAME.iter().zip(words) {
+                slot.store(w, core::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = OVER_BUDGET.compare_exchange(
+                0,
+                ((used as u64) << 32) | u64::from(tid),
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            );
+        }
     }
 }
 
 /// The deepest kernel stack use seen so far among threads that have ended.
 pub fn stack_high_water() -> usize {
     STACK_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The first thread that ended over the budget: the start of its name, its id and its use; `None` while every ended thread was
+/// inside it.
+pub fn stack_budget_violation() -> Option<(alloc::string::String, Tid, usize)> {
+    let v = OVER_BUDGET.load(core::sync::atomic::Ordering::SeqCst);
+    if v == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = OVER_BUDGET_NAME
+        .iter()
+        .flat_map(|w| w.load(core::sync::atomic::Ordering::SeqCst).to_le_bytes())
+        .take_while(|&b| b != 0)
+        .collect();
+    Some((
+        alloc::string::String::from_utf8_lossy(&bytes).into_owned(),
+        (v & 0xffff_ffff) as Tid,
+        (v >> 32) as usize,
+    ))
 }
 
 /// The scheduler's view of a thread (diagnostics for the SMP tests).

@@ -160,6 +160,7 @@ pub struct Report {
     pub user_reported: (u32, u32),
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn run_all() -> Report {
     let mut tests: alloc::vec::Vec<(String, Outcome)> = alloc::vec::Vec::new();
     let mut push = |name: &str, r: Outcome| tests.push((String::from(name), r));
@@ -259,25 +260,27 @@ pub fn run_all() -> Report {
             ))
         },
     );
-    // Slice T measurement: how deep the kernel stacks of the threads that ended went (they are 16 KiB).
+    // KT13: how deep the kernel stacks of the threads that ended went, against the budget (half a stack). The offender, if any,
+    // is named, and the perturbation, fuzz and allocation-failure runs inherit the check.
     {
         let used = thread::stack_high_water();
         let _ = core::fmt::Write::write_fmt(
             &mut crate::console::Console,
             format_args!(
-                "kernel: deepest kernel stack use among ended threads: {used} of {} bytes\n",
-                thread::STACK_BYTES
+                "kernel: deepest kernel stack use among ended threads: {used} of {} bytes (budget {})\n",
+                thread::STACK_BYTES,
+                thread::STACK_BUDGET
             ),
         );
         push(
-            "kernel_stacks_stay_well_inside_their_size",
-            if used < thread::STACK_BYTES * 3 / 4 {
-                Ok(())
-            } else {
-                Err(format!(
-                    "a kernel stack went {used} of {} bytes deep",
-                    thread::STACK_BYTES
-                ))
+            "kernel_stack_budget",
+            match thread::stack_budget_violation() {
+                None => Ok(()),
+                Some((name, tid, used)) => Err(format!(
+                    "kernel thread {name} (tid {tid}) used {used} of its {} byte stack, over the {} byte budget",
+                    thread::STACK_BYTES,
+                    thread::STACK_BUDGET
+                )),
             },
         );
     }
