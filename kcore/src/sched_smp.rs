@@ -348,8 +348,31 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// and sent an IPI that `wfi` will see).
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     pub fn idle_has_work(&self, h: usize) -> bool {
-        let q = self.lq(h);
-        self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0
+        {
+            let q = self.lq(h);
+            if self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0 {
+                return true;
+            }
+        }
+        // A hart that is about to sleep looks at the others' queues first (the spec's `overloaded` mask, read the slow way): with no
+        // periodic tick nothing else would make it pull work whose mark was spent while it was busy or already asleep (a thread queued
+        // behind others on a busy hart, with every mark for it consumed). Only a thread this hart may take counts, so an idle hart does
+        // not spin on work that is pinned elsewhere or in transit.
+        for g in 0..self.harts() {
+            if g == h || !self.is_online(g) {
+                continue;
+            }
+            let src = self.lq(g);
+            if src
+                .queued_top_where(&|t| {
+                    src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+                })
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The starvation watchdog's check (a debug detector, SCHED-SMP-SPEC 3.9; `now` is the caller's clock, since a hart that takes no
@@ -376,6 +399,10 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     self.is_online(x)
                         && aff.is_none_or(|a| a as usize == x)
                         && self.view_cur(x) == 0
+                        // (a hart in the middle of a switch (a thread in transit on it) is on its way to look at its queue, not an idle
+                        // hart nobody told; with thousands of threads queued behind two busy harts and the big lock contended it is
+                        // routinely so. A hart that is only *marked* is the lost-poke case and is still reported)
+                        && self.transit.get(x).is_none_or(|t| t.load(Ordering::Acquire) == 0)
                 });
                 if let Some(x) = idle_hart {
                     return Some((t, g, x));
