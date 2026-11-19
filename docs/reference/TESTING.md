@@ -27,6 +27,12 @@ boots of 72 to 116 s here took over six minutes there. Three of the kernel's own
 23 s of host time, `thread_limit_and_slots_are_reused` 19 s, `two_thousand_threads_live` 18 s. The slow suite tests are skipped at one and two harts.)
 CI runs the three targets as parallel jobs `kernel (ktest)`, `kernel (ktest 4 harts)` and `kernel (ktest release)`.
 
+**A boot is judged on progress, not on total time** (T157, OD140). `scripts/os_boot_test.py` fails a boot when the guest prints nothing for
+`OS_BOOT_STALL` seconds (180: a hang, reported as "stalled" with the last line) or runs past `OS_BOOT_TIMEOUT` (1800: a runaway ceiling). A loaded host
+(measured: a CPU burner on every core) slows a healthy suite more than three times, so a fixed 600 s budget read slowness as failure. A test must not assume
+the boot is young either: guest time on a loaded host runs well ahead of the guest's tick count, so a window on the RTC or the clock since boot is wide
+(`clock_service_reports_the_rtc` allows two hours after the base).
+
 **Flake tooling** (KT2; OD140: an intermittent kernel failure is a defect until its cause is known). `OS_RECORD=<dir>` on `scripts/os_boot_test.py`
 boots under QEMU's record mode (`-icount shift=auto,rr=record`) and keeps the recording only when the boot fails (the fail-demo kernel, which fails by
 design, keeps it, for the acceptance check); `OS_REPLAY=<file>` replays it, with `OS_GDB=1` adding `-s -S` to wait for gdb on :1234. Recording needs a
