@@ -331,15 +331,26 @@ pub fn join_scheduler() -> ! {
     unreachable!()
 }
 
+/// The idle loop of SCHED-SMP-SPEC 3.9: with interrupts off, look at the hart's queues; if anything is queued or a mark is set,
+/// switch; otherwise `wfi`, which returns when an enabled interrupt is pending even with `sstatus.SIE` clear, so a wake that
+/// lands after the check (it has enqueued and sent its IPI) cannot be slept through, and then enable interrupts, which takes
+/// the interrupt that woke the hart. (Today's 1 ms tick would end the sleep anyway; with no tick, L13, this is the whole protocol.)
 fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
+        let was = irq::save_and_disable();
+        if sched().idle_has_work(hart()) {
+            irq::restore(was);
+            irq::without(reschedule_this_hart);
+            continue;
+        }
         if crate::heap::needs_service() {
             irq::without(crate::heap::service); // an idle hart is a safe point too
         }
-        // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled
-        // here (thread_bootstrap enabled them).
+        // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled (the architecture
+        // resumes on any pending and individually enabled interrupt), which is the point of the protocol above.
         unsafe { core::arch::asm!("wfi") };
+        irq::restore(was);
     }
 }
 
@@ -632,6 +643,18 @@ pub fn reschedule_fast() -> bool {
     switch
 }
 
+/// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds): every 100 ms, each hart at its own phase, a thread queued for more than
+/// 500 ms while a hart that may run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`).
+#[cfg(debug_assertions)]
+#[allow(clippy::arithmetic_side_effects, clippy::panic)] // INVARIANT: h is a hart index below 32 and now counts 1 ms ticks; the panic is the detector's report
+fn starvation_watchdog(h: usize, now: u64) {
+    if now % 100 == h as u64 {
+        if let Some((t, on, idle)) = sched().starved(500 * MS) {
+            panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles");
+        }
+    }
+}
+
 /// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12): advance this hart's clock,
 /// fire its due timers, account the running thread's slice. Returns whether the hart must now switch threads (a rotation, a
 /// timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls `reschedule`.
@@ -646,6 +669,8 @@ pub fn timer_tick_fast() -> bool {
     } else {
         TICKS.load(Ordering::SeqCst)
     };
+    #[cfg(debug_assertions)]
+    starvation_watchdog(h, now);
     let (pokes, switch) = {
         let sc = sched();
         sc.tick_on(h, ticks_to_ns(now));
