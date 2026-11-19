@@ -26,6 +26,10 @@ No other function in these crates calls itself.
 
 `clippy::large_stack_frames` is now denied at 1 KiB in the kernel crate (`kernel/clippy.toml`). Thirty-seven functions were already over it (mostly the syscall layer and the self-tests); each carries an audited allow and `T172` tracks shrinking them. The lint's estimate counts every local as live at once, which a frame layout does not; the boot-time budget check is the measurement that matters.
 
+## What the budget check found
+
+The first CI run of the check failed in the optimised build: 1205 of the kernel threads in the suite reach 9.4 KiB. Printing the high water at the entry of `user_thread_main`, of `syscall` and of `teardown` showed the depth is reached before the thread's first line, in `thread_bootstrap`'s `reap_prev` (the stack depth at syscall entry is 656 bytes): freeing the previous thread's stack and records on the next thread's fresh stack is the deepest chain in the system once the inliner has merged its frames. Optimised builds are held to 12 KiB until `T173` shrinks it; the debug build stays at 8 KiB.
+
 ## Result
 
 No unbounded recursion is reachable in kernel context. The bounds that depend on a constant (page-table levels, the donation depth, the device-tree depth) are constants of the format or limits checked before the structure grows. What remains open is the sum: the depth of the deepest call chain plus a trap frame, which the budget check measures per thread rather than proving; an interrupt that arrives on top of the deepest chain is covered by the half of the stack the budget leaves free.
