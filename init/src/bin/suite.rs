@@ -8925,8 +8925,11 @@ fn clock_service_reports_the_rtc() -> Outcome {
     let a = c.now(t(3000)).map_err(|_| msg_at(line!()))?;
     ensure_eq!(a.quality, quality::FROM_RTC, "the time comes from the RTC");
     ensure!(
-        a.nanos >= RTC_BASE_NS && a.nanos < RTC_BASE_NS + 600 * 1_000_000_000,
-        "within ten minutes after the base the harness set: {} ns",
+        // (the RTC follows the virtual clock from the base the harness set; the bound only tells a real RTC reading from a made-up
+        // one, so it is far above the harness's ceiling on a boot (OS_BOOT_TIMEOUT, 30 minutes) and below a day; a ten-minute window
+        // failed on a loaded host, where the guest's tick count also falls behind the virtual clock: T157)
+        a.nanos >= RTC_BASE_NS && a.nanos < RTC_BASE_NS + 2 * 3_600 * 1_000_000_000,
+        "within two hours after the base the harness set: {} ns",
         a.nanos
     );
     nap_ticks(60);

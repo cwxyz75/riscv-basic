@@ -856,7 +856,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             }
         }
         self.settle(hart);
-        self.balance(hart);
+        // (a thread the balance moved here may outrank what this hart runs, and nothing else will mark a hart for it: it looks
+        // again at once, or the thread would wait for this hart's next tick, and for ever on a hart that takes none: T162)
+        if self.balance(hart) {
+            self.settle(hart);
+        }
     }
 
     /// Equal-priority work does not move by priority (no pull of an equal, 4.4), so queues of equals would stay as lopsided as
@@ -868,15 +872,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         clippy::expect_used,
         clippy::indexing_slicing
     )] // INVARIANT: hart indices are below the hart count; the thread was found queued under the same two locks
-    fn balance(&self, h: usize) {
+    fn balance(&self, h: usize) -> bool {
         let len = |x: usize| self.hint[x].queued_len.load(Ordering::Acquire);
         let mine = len(h);
         let busiest = (0..self.harts())
             .filter(|&g| g != h && self.is_online(g))
             .max_by_key(|&g| (len(g), core::cmp::Reverse(g)));
-        let Some(g) = busiest else { return };
+        let Some(g) = busiest else { return false };
         if len(g) < mine + 2 {
-            return;
+            return false;
         }
         let cur = self.view_cur(h);
         let find = |src: &Hq<'_, N, R>| {
@@ -885,9 +889,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             })
         };
         let found = find(&self.lq(g));
-        let Some((tid, p)) = found else { return };
+        let Some((tid, p)) = found else { return false };
         if p < cur {
-            return;
+            return false;
         }
         let (mut dst, mut src) = self.lq2(h, g);
         // everything that chose this move is looked at again under both locks (the lengths and the running priority were hints)
@@ -895,11 +899,12 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             || src.queued_len() < dst.queued_len() + 2
             || p < dst.cur_eff()
         {
-            return; // it moved, or the picture changed, while no lock was held
+            return false; // it moved, or the picture changed, while no lock was held
         }
         let rec = src.detach_queued(tid).expect("it was queued");
         dst.attach(rec, Enq::Migrated, h as u8);
         self.pulls.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub fn bad_picks(&self) -> u32 {
@@ -985,9 +990,25 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     continue;
                 }
                 if aff.is_none_or(|a| a as usize == x) && qx.would_run(eff) {
+                    let state: Vec<String> = qs
+                        .iter()
+                        .enumerate()
+                        .map(|(h, q)| {
+                            alloc::format!(
+                                "hart {h}: runs {:?} (priority {}), queued {:?}",
+                                q.current(),
+                                q.cur_eff(),
+                                q.tids()
+                                    .filter(|&u| q.is_queued(u))
+                                    .map(|u| (u, q.record(u).map(|r| r.eff)))
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                        .collect();
                     return Err(alloc::format!(
-                        "GP1: hart {x} runs priority {} while thread {t} (priority {eff}) waits on hart {g}",
-                        qx.cur_eff()
+                        "GP1: hart {x} runs priority {} while thread {t} (priority {eff}) waits on hart {g}; {}",
+                        qx.cur_eff(),
+                        state.join("; ")
                     ));
                 }
             }
