@@ -321,6 +321,12 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     crate::latency::off_end(span, core::panic::Location::caller());
 }
 
+/// Are the interrupted user thread's FP registers dirty (`sstatus.FS` = 3)? Saving them needs the FP tables, so the big lock.
+fn user_fp_dirty(frame: &TrapFrame) -> bool {
+    const FS_MASK: u64 = 3 << 13;
+    frame.sstatus & FS_MASK == FS_MASK
+}
+
 fn trap_handler_inner(frame: &mut TrapFrame) {
     let from_user = frame.sstatus & (1 << 8) == 0;
     if from_user {
@@ -348,7 +354,27 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        if from_user {
+        // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
+        // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
+        // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
+        if from_user && !user_fp_dirty(frame) {
+            let switch = crate::thread::timer_tick_fast();
+            if !switch
+                && crate::user::user_return_is_quiet()
+                && !crate::heap::needs_service()
+                && !crate::thread::need_resched_pending()
+            {
+                // nothing to do under the lock
+            } else {
+                crate::bkl::lock();
+                crate::thread::switch_if_designated();
+                crate::user::commit_wake();
+                crate::thread::preempt_point();
+                crate::user::activate_current();
+                crate::heap::service();
+                crate::bkl::unlock();
+            }
+        } else if from_user {
             crate::bkl::lock();
             crate::fp::trap_entry(frame);
             let _ = crate::thread::timer_tick_fast();
@@ -396,7 +422,15 @@ fn trap_body(frame: &mut TrapFrame) {
         let reasons = crate::smp::ipi_interrupt();
         if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
             if frame.sstatus & (1 << 8) == 0 {
-                // interrupted user mode: the full path (the return to user mode is where a killed process dies)
+                // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
+                // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
+                if !user_fp_dirty(frame)
+                    && !crate::thread::reschedule_fast()
+                    && crate::user::user_return_is_quiet()
+                    && !crate::thread::need_resched_pending()
+                {
+                    return;
+                }
                 crate::bkl::lock();
                 crate::fp::trap_entry(frame);
                 crate::thread::reschedule_this_hart();
