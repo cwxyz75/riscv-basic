@@ -4,7 +4,6 @@ kind: slice
 title: CPU time readable for a thread, a process and a job
 area: sched
 horizon: long
-blocked_by: [L13]
 refs: [KERNEL-V1-SPEC, SCHED-SMP-SPEC]
 ---
 

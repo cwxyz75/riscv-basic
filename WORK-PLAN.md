@@ -73,7 +73,7 @@ Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 - [x] **L11** (L11c: `need_resched`, `finish_switch`, the dead list; L11d: the idle loop, the watchdog, the negative controls) (PRs 262, 263, 264, and T162 in 260)
 - [x] **L12** the scheduler leaves the big kernel lock (PRs 266, 267, 268; pure sleeps still take it)
 - [x] **AB2** nanosecond time (flag day) (PR 270; leftovers T168)
-- [ ] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it)
+- [x] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it) (PRs 272, 273; leftovers T169, T170)
 - [ ] **PM2** long idles suspend through firmware
 
 ### Phase 3: the syscall layer on the host; the long-run tier
@@ -202,6 +202,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **L11c part 2** (PR to follow): the deferred switch wants the same soak run as part 1 (smp targets at `-smp 1`, `2`, `4`, round-robin and polling kernels): a red one would mean a lost switch or a wrong thread blocked.
 - **L11d** (PR to follow): `make os-boot-test-sched-neg` (the three scheduler negative controls) is in the soak tier and was run by hand once per control only. A red one means a control no longer detects its fault.
 - **AB2, L12b, L12c** (PRs 267, 268, 270): the soak tier at `-smp 1`, `2`, `4` also covers the quiet-trap paths (kill of a spinner) and the real-time deadlines of the suite (about 2.6 times tighter under load than when the clock was a tick count): a red one is a flaky bound or a missed kill.
+- **L13** (PRs 272, 273): the soak tier shows the real-timer margins (the latency bounds were widened for the emulator's interrupt jitter) and the starvation watchdog under a loaded host; a red `starved thread` is a lost wake or pull, not noise.
 
 ## Decisions taken without the owner
 

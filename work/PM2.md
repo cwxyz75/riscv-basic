@@ -4,7 +4,6 @@ kind: slice
 title: Idle states: a long idle suspends the hart through firmware
 area: sched
 horizon: long
-blocked_by: [L13]
 refs: [KERNEL-V1-SPEC, OD132]
 ---
 
