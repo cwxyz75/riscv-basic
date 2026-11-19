@@ -63,10 +63,12 @@ Why first: the owner's complaint is that editing the kernel is slow on testing, 
 - [x] **KT3** panic lints, overflow checks, `unsafe` documentation as errors (by file, `kcore` first) (PRs 254, 255)
 - [x] **KT4** the C5 atomics gate and the syscall-error-to-test table (PR 256)
 - [x] **KT2** record and replay capture, the repeat target (PR 257)
-- [ ] **T157** (done, PR 258), then **T155** (done, PR 259), then **T158** (done, PR 261): root-cause the three intermittent failures with KT2's tools (T157 first: it may
+- [x] **T157** (PR 258), **T155** (PR 259), **T158** (PR 261), and T162 (PR 260, a real scheduler defect the model found meanwhile): root-cause the three intermittent failures with KT2's tools (T157 first: it may
   be a scheduler race, and L11c builds on that code)
 
 ### Phase 2: finish the first peel; time without a tick
+
+Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 
 - [ ] **L11** (L11c: `need_resched`, `finish_switch`, the dead list; L11d: the idle loop, the watchdog, the negative controls)
 - [ ] **L12** the scheduler leaves the big kernel lock
@@ -196,6 +198,7 @@ or tier, and what a red result would mean. The owner starts a run when they choo
 soak > Run workflow); one run of the tier clears every line above it.
 
 - **T157** (PR 258): the round-robin kernel boot (`os-boot-test-rr`, soak) with the stall-based timeout and the widened clock window passed 3 of 3 under full CPU load on the development machine; one soak run confirms it on CI's runners. A red `os-boot-test-rr` would mean a stall (the log names the last line) or a different cause.
+- **L11c part 1** (PR 262): the dead-list reap in `finish_switch` wants the soak run of the smp targets at `-smp 1`, `2` and `4` (and the round-robin and polling kernels). A red one would mean a leaked or double-freed kernel stack.
 
 ## Decisions taken without the owner
 
