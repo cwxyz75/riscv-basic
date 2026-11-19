@@ -97,7 +97,8 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 Everything above still applies (one milestone per PR, `main` always builds and
 boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
 
-- The spec is `docs/specs/OS-ARCHITECTURE.md`. Design decisions are logged in
+- The spec is `docs/specs/OS-ARCHITECTURE.md`; for kernel work also read `docs/specs/KERNEL-V1-SPEC.md` (the kernel
+  that is frozen: its targets, contract and testing regime). Design decisions are logged in
   `docs/records/decisions.md` (OD numbers, append-only), not in `home/DESIGN.md`. Open questions are `kind: decision` items
   (`scripts/work.py decisions`): stop and ask rather than guessing.
 - All code is AI-written and the human is the product owner, so nothing relies on a
@@ -113,8 +114,9 @@ boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In additio
 - `INVARIANTS.md` (handle unforgeability, rights monotonicity, lock ordering, memory
   ownership) and `SYSCALLS.md` (every syscall: preconditions, rights, errors) describe
   the system as it is. Every change preserves them, and the lock ordering is not negotiable.
-- Architecture target: **RVA23** (OD47). The OS track does not support hardware below that
-  profile; the home computer under `home/` keeps its rv64gc contract.
+- Architecture target: **RVA23, enforced** (OD47, OD127): the kernel refuses to boot below the profile, `-cpu rva23s64` is
+  the only test CPU, AIA and Sstc are required, and there are no fallbacks. The home computer under `home/` keeps its
+  rv64gc contract.
 - **Shortcuts become tidy items in `work/`.** Any stand-in, ambient authority, deferred review
   finding or "good enough for now" gets an item (`kind: tidy`, `work.py next T` for its id) in
   the same PR (what, why acceptable, risk, proper fix and when). A question only the owner

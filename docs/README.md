@@ -14,6 +14,7 @@ contract was settled differently while it was built; amendments from now on go a
 | Spec | Subject |
 |---|---|
 | `specs/OS-ARCHITECTURE.md` | The whole OS: object model, memory, IPC, namespaces, drivers, the milestone ladder. Start here. |
+| `specs/KERNEL-V1-SPEC.md` | The kernel that is frozen: targets, the system-library contract, memory, harts and power, hardening, how it is tested. Read after OS-ARCHITECTURE. |
 | `specs/S4-SPEC.md` | S4: the first interactive system (boot image, launcher, memfs, console, shell). |
 | `specs/S5-SPEC.md` | S5: SMP. |
 | `specs/S6-SPEC.md` | S6: storage drivers (interrupt objects, virtio-blk, device tree, device manager). |

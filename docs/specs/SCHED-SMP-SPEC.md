@@ -1428,3 +1428,29 @@ same transaction id is written back, the call ends for any reason, or that threa
   more than 8 harts (per-hart frame and heap arenas, non-sticky `ran_on`); a need for sleeping in the kernel (a pager
   in S11 that blocks a fault on a userspace server needs a wait while holding nothing, which the park protocol
   already allows, but a lock held across it would need a sleeping lock).
+
+---
+
+## Amendment 2026-11-18: the v1 kernel (KERNEL-V1-SPEC, OD126 to OD141)
+
+What this amendment replaces; everything else in this document stands.
+
+| Section | Statement here | Replaced by |
+|---|---|---|
+| 1.3 | Non-goals: "CPU hotplug", "more than 8 harts" | 64 harts; harts go offline and come back (KERNEL-V1-SPEC 5.2, 5.3). Physical hotplug, NUMA and heterogeneous harts stay non-goals |
+| 1.3 | Non-goal: POSIX signals | Unchanged for the kernel, which gains exception channels, `thread_suspend`, `thread_resume` and thread state access instead (KERNEL-V1-SPEC 3.6) |
+| 1.2, 4.11 | "Sstc when present, SBI otherwise"; "A periodic tick exists only while a hart has more than one runnable thread" | Sstc is required and there is no SBI timer path. There is no tick: a slice end is a timer-queue entry (KERNEL-V1-SPEC 2.4, 5.1; OD127, OD131) |
+| 4.12, 7.1 | Tickless idle as its own late task (28), after task 13 | Tasks 13 and 28 are one design and one piece of work |
+| 3.3 | `VMO`: one instance | One instance per VMO family, same place in the order, never two held (KERNEL-V1-SPEC 4.3) |
+| 3.3, 3.10 | A page fault holds `AS` while it asks the VMO for a page | The fault releases `AS` before the VMO's slow path and re-validates by region generation; a thread waiting for a pager holds no lock (KERNEL-V1-SPEC 4.5, PG1) |
+| 3.9 | Inter-hart interrupts through SBI | Sent by writing the target's IMSIC file (KERNEL-V1-SPEC 2.4). X5 is unchanged: remote flushes stay SBI RFENCE |
+| 3.10 | "`MAX_PROCESSES` is 64 ... No generations are needed"; a flush-on-every-switch mode for short ASID fields | An ASID allocator with generations; no flush-on-every-switch mode (KERNEL-V1-SPEC 5.4) |
+| 3.10 | `ran_on` bits are never cleared while the process lives | A hart's bit is cleared when it goes offline (KERNEL-V1-SPEC 5.3) |
+| 3.10 | Frames: `FrameDb` with per-hart caches | A buddy allocator with the same per-hart caches (KERNEL-V1-SPEC 4.1) |
+| 3.11 | Every charge takes `JOBS` | Address spaces hold prepaid page reservations; `JOBS` is taken per batch (KERNEL-V1-SPEC 4.7) |
+| 3.6 | "`Tid` is a `u32` ... never a wrap" | Thread ids are 64 bits; CNT1 forbids every wrap (KERNEL-V1-SPEC 3.3) |
+| 3.12, 10 | The incremental sweep "is not settled" | Marking in slices of 256 objects with a sweep epoch (KERNEL-V1-SPEC 4.6) |
+| 3.13 | The trigger is evaluated at four harts | At 16 harts |
+| 4.4 | Placement by push and pull over all harts | The same rule (GP1), implemented with the `online`, `idle` and `overloaded` masks so that no periodic path visits every hart; the choice of hart is a replaceable policy (KERNEL-V1-SPEC 5.2, 5.6) |
+| 5.1 | "The older `thread_create` stays"; suspend and resume reserved | `thread_create` is removed; `thread_suspend` and `thread_resume` exist; `thread_spawn` gains SUSPENDED (KERNEL-V1-SPEC 3.6) |
+| 6.1, 6.4 | Scaling measured at 4 harts | Also at 16 and 32 (KERNEL-V1-SPEC 5.2, 8) |

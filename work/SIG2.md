@@ -3,7 +3,7 @@ id: SIG2
 kind: slice
 title: Signals phase 2: process suspend and resume, job control, CPU-time itimers, queued real-time signals
 area: signals
-horizon: near
+horizon: long
 ---
 
 - [ ] **Signals phase 2 (T149, OD122; S11)**: kernel suspend and resume of a process, then job control (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP, SIGTSTP, SIGCONT, SIGTTIN, SIGTTOU, `WUNTRACED`), CPU-time itimers (`ITIMER_PROF`, `ITIMER_VIRTUAL`) and queued real-time signals. Acceptance: a host-oracle C program (`libc/tests/c/signals.c`) and a shell test that stops a spinning program with Ctrl-Z and resumes it with `fg`, at `-smp 2` and `-smp 4`. Phase 1 (default actions, SIGPIPE, SIGHUP, the quit key) is built.
@@ -19,3 +19,7 @@ Shell job control built (OD124, T152 lists what it leaves): Ctrl-Z, `jobs`, `fg`
 ## Progress (2026-11-18)
 
 Kernel half built (OD123): `process_suspend` and `process_resume` (syscalls 57, 58). Next: `libc`/shell job control on top (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP/SIGTSTP/SIGCONT, SIGTTIN/SIGTTOU, SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), then CPU-time itimers and queued real-time signals.
+
+## Note (2026-11-18, plan 4: the v1 kernel)
+
+Plan 4 (OD141) parks this until the kernel is frozen (FZ1): it is user-space work that plan 3 left open, and it is not ordered now. Nothing in plan 4 depends on it.

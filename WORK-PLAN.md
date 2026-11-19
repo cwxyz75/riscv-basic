@@ -1,99 +1,200 @@
 # Work plan
 
-The near-term plan: what comes next and why, by work-item id (`work/`, `scripts/work.py`). Items on it have
-`horizon: near`. When the plan is finished or replaced, the old text goes to `docs/records/` as a dated record and this file
-starts again.
+The plan: what comes next and why, by work-item id (`work/`, `scripts/work.py`). The items being worked now have
+`horizon: near` (at most 15); as a phase finishes, the next phase's items are moved to `near`. When the plan is finished or
+replaced, the old text goes to `docs/records/` as a dated record and this file starts again.
 
-Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, both finished).
+Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, finished) and `docs/records/work-plan-2026-11-18.md`
+(plan 3, replaced by this one).
 
-## Plan 3 (agreed with the owner, 2026-11-18 morning)
+## Plan 4: the v1 kernel (agreed with the owner, 2026-11-18; OD126 to OD141)
+
+**Goal.** Finish the kernel so it can be left alone: `docs/specs/KERNEL-V1-SPEC.md` is the end state, its section 9 says what
+"frozen" means, and item FZ1 is the last step. The plan covers the kernel plus what must change in `rt`, the C library and
+the servers to keep the system green. It is long (twelve phases, about seventy items); every phase leaves a better, bootable
+system, so stopping between phases loses nothing.
+
+**Start.** The plan starts when the owner says so. From then on every item in it, the lock-peel tasks included, has the
+owner's go-ahead: the sentences in older `L` items about waiting for one are superseded (each carries a note).
 
 ### Standing instructions from the owner (read these first, every session, and again after any compaction)
 
-- **The owner is busy and cannot be reached.** Work through this plan autonomously, in order, until it is done or the owner
-  interrupts. Do not stop to ask.
-- **Track CI yourself.** The owner will not tell you when a run finishes. Watching CI on your own PRs (`gh pr checks`,
-  `gh run watch`, a Monitor or a background wait) is explicitly allowed for this plan. A job that fails for infrastructure
-  reasons (apt mirror timeouts, cancelled runners) is re-run (`gh run rerun <id> --failed`); a known flake (T143 until it is
-  fixed) is re-run once and noted; anything else is a real failure to fix.
-- **Merge green PRs** (squash, delete the branch). Never force-push and never `git reset --hard`: merge `main` into a branch
-  instead. Do not stack PRs if it can be avoided; if one is stacked, retarget it to `main` before its base branch is deleted.
-- **Stop only at a truly major decision point**: one that changes an architectural decision (an OD), the security model, a
-  public ABI in a way that cannot be undone cheaply, or that needs something only the owner can give (an account, a download
-  the environment refuses, money). Then write it up as a `kind: decision` work item, add a line below, and stop.
-- **Every other judgement call: decide, record, carry on.** Record it as a line in "Decisions taken without the owner" at the
-  end of this file (what was chosen, the alternative, why, and where it is recorded: an OD in `docs/records/decisions.md`,
-  a tidy item, a spec amendment).
-- **The kernel slices below have the owner's go-ahead** (T42, SIG2, L11, L12). Each kernel or security slice gets a
-  fresh-context Fable review in its own small PR, the `soak` label, and is verified at `-smp 2` and `-smp 4`. Say plainly
-  what was and was not run.
-- The working rules of `CLAUDE.md` and `docs/reference/TESTING.md` apply throughout: acceptance check first, one mutation
-  check per new test, the local gate of the 2026-11-17 policy (`make fmt-check lint docs-check`, the targeted test, `make check`
-  when the image or program lists change, `make os-serial-test` when console, sessions, trust or profiles change), shortcuts
-  as tidy items in the same PR, decisions as OD rows, specs changed only by appended dated amendments, close items with
-  `work.py done` only when verified.
-- Tick the boxes here as items land (with the PR number), so a new session can see where things stand.
+- **The owner is not to be asked.** Every question that came up in the review of 2026-11-18 was settled then and is recorded
+  (OD126 to OD141, the spec, the items). Work through the plan in order until it is done or the owner interrupts.
+- **Each item says what to build, how, its acceptance check and its review.** Write the acceptance check first and watch it
+  fail. Where an item leaves a detail open, decide, record it under "Decisions taken without the owner" below, and carry on.
+- **Stop only at a truly major decision point**: something that contradicts a decision OD126 to OD141 or the spec's section
+  1, that changes the security model, or that needs something only the owner can give (an account, a download the
+  environment refuses, money). Then write a `kind: decision` item, add a line below, and go on with whatever does not depend
+  on it. **FZ1 ends with a report to the owner**; the follow-on work does not start without one.
+- **First thing each session:** look at the last overnight run (`gh run list --workflow overnight.yml --limit 1`, once KT6
+  exists) and the last soak run. A red one is a work item today (OD140), ahead of the next plan item.
+- **An intermittent kernel failure is a defect** (`docs/reference/TESTING.md` rule 8): never "re-run once and note". A job
+  that fails for infrastructure reasons (a package mirror, a cancelled runner) is re-run.
+- **Reviews.** An item marked Fable gets a fresh-context Fable review in its own small PR before it merges; "default" gets
+  the default reviewer. Findings are fixed in the PR or become tidy items in it.
+- **Testing.** While iterating: `make kquick` once KT1 exists (before it: `make quick` and the one targeted test). The gate
+  is `make smoke`; merge on a green gate. Items marked soak get the `soak` label and are verified at `-smp 1`, `2` and `4`
+  (and wider where the item says). One mutation check per new test. Say plainly what was and was not run.
+- **Track CI yourself; merge green PRs** (squash, delete the branch). Never force-push and never `git reset --hard`; merge
+  `main` into a branch instead. Do not stack PRs.
+- **One item (or one named part of an item) per PR.** `main` always builds and boots. A flag-day item (AB1, AB2, AB3) is one
+  PR by nature; everything else is cut as small as its acceptance check allows.
+- The rules of `CLAUDE.md` apply throughout: shortcuts as tidy items in the same PR, decisions as OD rows, specs changed
+  only by dated amendments, reference documents changed with the code, items closed with `work.py done` only when verified
+  in QEMU.
+- **Keep this file current:** tick the boxes with the PR number as items land, and when a phase is done move the next
+  phase's items to `horizon: near` (and finished phases' leftovers to `long`).
 
-### 0. Land the documentation reorganisation
+### Phase 1: make kernel work cheap to test
 
-- [x] Merge PR 233 (`docs/`) when green, then retarget PR 234 (review dispositions, which carries this plan) to `main` and
-  merge it when green. PR 232 is merged. If PR 233's shell test fails in the `alarm` check again, that is T143: re-run.
+Why first: the owner's complaint is that editing the kernel is slow on testing, and every later phase is a kernel edit.
 
-### 1. T143: the flaky `alarm` check
+- [ ] **KT1** the kernel-only boot (`make kquick`, `os-ktest` at 1, 2, 4 harts and the release kernel, in the gate)
+- [ ] **MM1** single-page flush after a fault, fault-around (small, and a real cost on every fault)
+- [ ] **KT3** panic lints, overflow checks, `unsafe` documentation as errors (by file, `kcore` first)
+- [ ] **KT4** the C5 atomics gate and the syscall-error-to-test table
+- [ ] **KT2** record and replay capture, the repeat target
+- [ ] **T157**, then **T155**, then **T158**: root-cause the three intermittent failures with KT2's tools (T157 first: it may
+  be a scheduler race, and L11c builds on that code)
 
-- [x] (PR: t143-alarm-check) The alarm check of `libc/tests/c/signals.c` fails intermittently in CI (it failed PR 233's first run). Find the cause from
-  the failure output (the item says what to look at: `sig::wait_any` and the alarm deadline against `clock_get` under a
-  loaded host), fix the test or the code, and show it is fixed (repeat the shell test several times locally; say how many).
+### Phase 2: finish the first peel; time without a tick
 
-### 2. T151: re-check the migrated tidy items against the code
+- [ ] **L11** (L11c: `need_resched`, `finish_switch`, the dead list; L11d: the idle loop, the watchdog, the negative controls)
+- [ ] **L12** the scheduler leaves the big kernel lock
+- [ ] **AB2** nanosecond time (flag day)
+- [ ] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it)
+- [ ] **PM2** long idles suspend through firmware
 
-- [x] (shell and session done, PR: t151-tidy-recheck; T151 stays open for the other areas) At least the `shell` and `session` areas, where spot checks already found stale items; more areas if they go quickly.
-  For each item: check its claim against the code it names; close it (`work.py done`), narrow it (edit the title and text, add
-  a dated note) or leave it. One PR for the batch. T151 stays open until every area has been through once.
+### Phase 3: the syscall layer on the host; the overnight tier
 
-### 3. Kernel slices, in this order
+Why here: the scheduler glue is stable after phase 2, and everything after this phase changes the syscall layer, so it should
+be host-testable, fuzzable and covered before that starts.
 
-Order chosen (owner left it to me): smallest and only high-risk item first; then the user-visible one; the deepest last, so
-the scheduler work starts from a quieter tree.
+- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`
+- [ ] **KT6** tier 3, the overnight workflow
+- [ ] **KT7** schedule perturbation
+- [ ] **KT10** automated mutation testing
+- [ ] **KT12** the checked release build
+- [ ] **KT13** the kernel stack budget
+- [ ] **KT5** instruction-count checks
+- [ ] **KT8** syscall fuzzing (host and guest)
+- [ ] **KT9** the allocation-failure sweep
+- [ ] **KT11** coverage report
 
-- [x] (decision item Q-T42 written; no kernel change, PR 237; see "Decisions taken without the owner") **T42: DMA frames outlive a killed driver only by policy** (the only `risk: H` item). Make the kernel enforce what the
-  supervisor does by convention today, or a design note and a decision item if enforcement turns out to need an OD-level
-  choice (that would be a major decision point: stop). Fable review, soak.
-- [x] (kernel half PR 238, job control and the libc half PR 241; CPU-time itimers and queued real-time signals remain open in SIG2) **SIG2: signals phase 2.** Kernel `process_suspend`/`process_resume` with a stopped state in the scheduler (its own small
-  PR, Fable review, soak); then job control on top (Ctrl-Z, `fg`, `bg`, `jobs`, SIGSTOP/SIGTSTP/SIGCONT, SIGTTIN/SIGTTOU,
-  SIGCHLD for stops, `WUNTRACED`/`WCONTINUED`), CPU-time itimers and queued real-time signals, as SIG2 and T149 describe.
-  Acceptance (from SIG2): a host-oracle C program and a shell test that stops a spinning program with Ctrl-Z and resumes it
-  with `fg`, at `-smp 2` and `-smp 4`. Also settles Q-SH7 (shell-level job control): record the shape chosen as a decision.
-- [~] (design note PR 248; L11a PR 249; L11b built, PR below; L11c and L11d next) **L11: per-hart run queues under RQ locks, the kernel half**, then **L12: the rest of the first peel** (SCHED-SMP-SPEC
-  tasks 11 and 12; T107, T108 are their stand-ins). Each step its own PR with a Fable review and soak; the negative-control
-  kernels the tasks name.
+### Phase 4: the platform as it really is
 
-### 4. Feature slices, in this order
+- [ ] **PL1** RVA23 in the gate, the boot-time extension check
+- [ ] **MM2** the buddy frame allocator
+- [ ] **MM3** large pages in the direct map
+- [ ] **PL4** discovery: memory, load address, device tree pointer, timer frequency
+- [ ] **PL5** discovery: console, interrupt controller, device windows, reset
+- [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
+- [ ] **SC1** sixty-four harts
+- [ ] **HD1** the kernel entropy pool
+- [ ] **PL2** vector state
+- [ ] **PL3** user code built for RVA23U64
 
-Order chosen (owner left it to me): the smallest first; then the structural one; the open-ended one last, as it can fill
-whatever time is left.
+### Phase 5: the ABI flag days
 
-- [x] (PR 240; the configure corpus is left open in T139) **T139: finish the compat shell** (BusyBox `hush` as `/bin/sh`): here-documents, a `/bin/sh` name that resolves to it,
-  and a corpus of real `configure` scripts checked against the host shell.
-- [ ] (not started: see "Decisions taken without the owner") **SD4: servers publish in the registry; clients reconnect on `UNAVAILABLE`** (`memfsd`, `launcher`, `devmgr`, `blkd`;
-  `rt::fs` and the shell reconnect; T15 and T30 narrowed). Fable review (it touches every older server and the boot path).
-- [~] (batches 1 to 3 done: PRs 239, 243 and 245; stays open) **LIBC2: libc phase 2.** Re-run `scripts/libc_gap_survey.py`, take the next cheap batch with host oracles, and record the
-  new counts as a dated record next to `docs/records/LIBC-GAPS.md`. Stop when the plan's time runs out; LIBC2 stays open.
+Each rebuilds all of user space; they are grouped so the churn happens once.
 
-### Not in this plan
+- [ ] **AB1** 64-bit handles
+- [ ] **AB3** 64-bit identifiers, no counter wraps, the fast-forward tests
+- [ ] **AB5** remove `thread_create`
+- [ ] **AB4** `port_wait_many`
 
-- The owner's decision items (`work.py decisions`): the owner has no time for them now. Do not answer them; if one blocks an
-  item above, skip that part, record it, and go on.
-- T150 (review findings with no recorded outcome): after this plan, unless an item above touches one of its findings.
+### Phase 6: kernel memory and the remaining lock peels
+
+- [ ] **MM4** the slab allocator
+- [ ] **L15** mappings hold a VMO reference
+- [ ] **L16** `JOBS`, per-family `VMO`, `FRAME`; page reservations
+- [ ] **MM5** all kernel memory charged to jobs
+- [ ] **L17** per-process address-space locks, with the fault path shaped for pagers
+- [ ] **L18** the ASID allocator with generations; batched shootdown
+- [ ] **PL7** instruction-cache flush on executable mappings
+- [ ] **L14** futex bucket locks
+- [ ] **L19** `PROCS` and `TT`; teardown out of the big lock
+- [ ] **MM10** the sweep in slices
+- [ ] **L21** the W remainder (exact ready set, wake-one)
+- [ ] **L20** the end of the big kernel lock; the `&'static mut` accessors deleted
+- [ ] **PL8** limits derived from RAM; per-process ceilings as quotas
+
+The order of L14 to L19 is the default of SCHED-SMP-SPEC 7.2. If the lock profile after L12 says another class of syscalls
+holds the big lock longest, reorder on that evidence and record it below.
+
+### Phase 7: the memory model programs need
+
+- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit`
+- [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info`
+- [ ] **MM8** copy-on-write children, `process_clone_region`
+
+### Phase 8: threads, exceptions, pagers
+
+- [ ] **EX1** thread suspend, resume and state
+- [ ] **EX2** exception channels
+- [ ] **MM9** pager-backed VMOs, blocking faults
+
+### Phase 9: the scheduler's remaining tasks
+
+- [ ] **L1** the remaining benchmarks (`pair_scaling`, `rt_latency`) and absolute targets
+- [ ] **L8** RT budget accounting and the priority policy of the launcher and the device manager
+- [ ] **L22** donation through `channel_call`
+- [ ] **L23** PI futex
+- [ ] **L24** direct hand-off
+- [ ] **L25** RT budgets enforced
+- [ ] **AB6** CPU time for threads, processes and jobs
+
+### Phase 10: scale and power
+
+- [ ] **SC2** placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
+- [ ] **PM1** harts offline and online
+- [ ] **PM4** the placement policy (`spread`, `pack`)
+- [ ] **PM3** `system_suspend`
+
+### Phase 11: hardening
+
+- [ ] **HD2** position-independent programs, address randomisation
+- [ ] **HD3** kernel address randomisation
+- [ ] **HD4** the debug resource; a release kernel with no test code
+- [ ] **HD5** reserved ABI space (and the X-SPECULATION record)
+
+### Phase 12: the boundary and the freeze
+
+- [ ] **AB7** the system library
+- [ ] **AB8** entry enforcement, shuffled numbers
+- [ ] **AB9** the conformance program, `SYSCALLS.md` rewritten, the versioning rule
+- [ ] **KT14** the audit of every `unsafe` block
+- [ ] **FZ1** the freeze: the last review, seven green nights, the declaration, **and a report to the owner**
+
+### Not in this plan (after the freeze, unordered)
+
+- User-space consequences of the new kernel: **DL1** (the dynamic loader and a dynamically linked C library), **S11-FORK**,
+  **S11-MMAP**, **SIG3** (asynchronous signals over exception channels), **UV10** (the Rust `std`), **L27** (`rt::looper`).
+- Plan 3's user-space leftovers: **SD4**, **LIBC2**, and the open parts of **SIG2**, **T139**, **T151**, **T152**.
+- Recorded and not designed: heterogeneous harts and frequency scaling (X-POWER), speculation (X-SPECULATION), shadow stacks
+  and pointer masking beyond their reserved places (X-HARDENING), a physical board, an IOMMU (T42), Sv48, large pages for
+  user mappings, splitting the object lock (T70, unless SC2's measurement triggers it), a fair scheduling class (T72).
+- The owner's other decision items (`work.py decisions`): none blocks this plan.
 
 ## Decisions taken without the owner
 
-(One line each: what, the alternative, why, where it is recorded.)
+(One line each: what, the alternative, why, and where it is recorded.)
 
-- 2026-11-18: plan 3's order of the kernel slices (T42, SIG2, L11/L12) and of the feature slices (T139, SD4, LIBC2), as
-  explained above; the owner left both to me.
-- 2026-11-18: T42 needs an OD-level choice (the kernel enforcing DMA frame lifetime reverses S6b's "ownership, not a kernel mechanism" and adds a syscall), so I wrote `Q-T42` with three options and a recommendation (keep the policy while drivers are trusted) and made no kernel change. The plan says to stop at such a point; I did not stop the whole plan because nothing after it depends on this choice, and went on to SIG2. Recorded in `work/Q-T42.md`.
-- 2026-11-18: L11, L12 and SD4 are **not started** in this run. L11/L12 are the per-hart run queue locks, `need_resched`, `finish_switch`, the dead list and the idle loop (SCHED-SMP-SPEC tasks 11 and 12: about 2,500 lines with their models and negative-control kernels), a rewrite of the scheduler's locking that needs the pure `Sched2` split per hart, loom and shuttle models, and a Fable review plus a soak run at every step; the soak runners were slow today (the smp job hit its 40-minute cap) so a mistake would have cost hours to see. SD4 rewires `memfsd`, `launcher`, `devmgr`, `blkd`, `init`, `session.rs` and the shell's grants onto the registry (the item itself says it reshapes the boot path); `fsd`, `clockd`, `rngd`, `volmgr` and `netd` already publish. Both stay on the plan; the next session should start each with a design note (L11: which of `loc`, `pending`, `pokes` becomes per-hart first, T107 (1); SD4: `launcher` first, as the smallest server, with `sh` as its one client) and the owner may want to look at those notes first. Recorded here; no item was closed.
-- 2026-11-18: the soak workflow's `smp` job ran past its 40-minute cap on PR 238 (its `os-boot-test-smp` part passed; `os-boot-test-overflow`, `os-bench` and `os-latency` were run locally and passed); recorded in the PR, not an item.
-- 2026-11-18: the owner answered the L11 design note's questions: follow my recommendations (a per-thread `transit` flag in L11 and the `RQ` hand-over in L12; `home` in the thread table; L11a first). Recorded in `work/L11.md`; `Q-L11` closed.
-
+- 2026-11-18, while writing the plan (all inside the owner's answers of that day, each recorded in the spec or an item):
+  - The order of the twelve phases: testing first (the owner's stated pain), then the first peel, then the host syscall
+    layer before anything else touches it; the ABI flag days grouped; the system library last so it is cut once from the
+    finished call set. Alternative: the ABI first. Recorded here.
+  - Two kinds of copy-on-write child, with SNAPSHOT restricted to one job so a page never changes payer; the alternative
+    (one kind with charges that move between jobs) breaks J1. KERNEL-V1-SPEC 4.3, MM8.
+  - Pager requests and exceptions are delivered on kernel-written channels, not as port packets with payloads: it reuses
+    the bootstrap channel's mechanism and needs no new wait path. KERNEL-V1-SPEC 3.6, 4.4.
+  - Dirty-page tracking for pagers is reserved, not built: the owner's "the filesystem side comes later". MM9.
+  - The reachability sweep becomes incremental by slices with an epoch, on the calling thread (SCHED-SMP-SPEC left three
+    options open). KERNEL-V1-SPEC 4.6, MM10.
+  - The syscall layer moves to a new crate `ksys`; the name and the three-PR cut are mine. TS3.
+  - Syscall numbers are shuffled only in an overnight build, not every build, so logs stay readable. AB8.
+  - Kernel address randomisation is built although Sv39 leaves it about 9 and 7 bits; the owner chose the option that
+    includes it, and the entropy is stated. HD3.
+  - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
+    threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

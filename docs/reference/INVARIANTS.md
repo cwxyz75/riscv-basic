@@ -178,6 +178,22 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | TLB1 | Live address spaces have distinct ASIDs; an ASID is reused only after it was flushed on every hart that ran its last owner | allocator model; `fault-asid-reuse-no-flush` |
 | TLB2 | A frame that was mapped is freed only after every hart in the address space's `ran_on` mask has been flushed for that page (replaces SMP5). **Platform requirement:** SBI remote fence calls return after the target harts have flushed | `unmap_while_siblings_touch`, the negative controls |
 
+### Planned invariants of the v1 kernel (KERNEL-V1-SPEC; OD126 to OD141)
+
+Each becomes a row above, with its check, in the change that builds its mechanism.
+
+| # | Invariant | Where specified |
+|---|---|---|
+| CNT1 | No kernel counter wraps: a counter retires what it counts or refuses with NO_MEMORY at its limit | KERNEL-V1-SPEC 3.3 |
+| ABI1 | A program enters the kernel only through the system library; an `ecall` from anywhere else is an exception | 3.1 |
+| COW1 | A write through one member of a VMO family is never visible through another member entitled to the old contents | 4.3 |
+| COW2 | Every page of a family is charged to exactly one job; a charge moves only with its page and within one job | 4.3 |
+| PG1 | A thread waiting for a pager holds no kernel lock and can always be killed | 4.4 |
+| HT1 | No thread is homed on, no interrupt is routed to and no shootdown waits for a hart that is not Online | 5.3 |
+| HT2 | A thread that could run is never stranded by a hart going offline | 5.3 |
+| EX1 | A stopped thread's state changes only through `thread_write_state` by a holder of MANAGE; an exception is resumed, passed on or killed exactly once | 3.6 |
+| VS1 | Vector state is private to its thread, as FP1 and FP2 say for floating point | 2.2 |
+
 ## Namespaces and paths
 
 | # | Invariant | How checked |

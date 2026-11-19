@@ -36,6 +36,9 @@ Rules:
 7. **Independent oracles** (the upstream Lua suite, the C transcript against the host build, the BASIC golden corpus, real
    clients) stay in the suite: while the whole suite fits the budget (about 100 s of guest time at four harts, see below) they run in smoke. They are what
    the roadmap means by an oracle that the writing context did not produce.
+8. **An intermittent failure of a kernel test is a defect until its cause is known** (OD140). It gets a work item at once
+   and is investigated; it is not re-run and noted. (A job that fails for infrastructure reasons, such as a package mirror
+   timing out, is still simply re-run.)
 
 ## When the smoke boot outgrows its budget
 
@@ -196,3 +199,12 @@ measured: the transfers from and to the host and `net_bkl_profile_tcp` (TIDY-UP 
 harness's checks for the others are off in it; the lossy tests' post-close waits are longer in it (`drain_ms`).
 
 **Soak parallelism (2026-11-17).** `make soak` runs three boots at once (`SOAK_JOBS=3`). On a ten-core laptop that is also running anything else, the network tests and the benchmark comparison fail from load (a `net_tcp_to_the_host_server` timeout, a `thread_create_join` ratio over 3, QEMU's "Guest moved used index"), and the same targets pass when run alone. Use `SOAK_JOBS=1` for a trustworthy run, and rerun a failing target alone before calling it a failure.
+
+## The kernel's regime (KERNEL-V1-SPEC section 8, OD140)
+
+The target regime for the kernel crates (`kernel/`, `kcore`, `klock`, `abi`) is stated in `docs/specs/KERNEL-V1-SPEC.md`,
+section 8: the syscall layer tested on the host, a kernel-only boot at one, two and four harts in the gate, and a third
+tier that runs overnight (hours, nightly on `main`, never required to merge) for the long checks: schedule perturbation,
+syscall fuzzing, allocation-failure sweeps, mutation testing, a release build with assertions, wide SMP and repeat runs.
+Long-running tests stay out of the gate; that rule does not change. Each check is added to the tables of this file, with
+its make target and its measured cost, in the change that builds it.

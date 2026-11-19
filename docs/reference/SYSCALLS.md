@@ -1004,3 +1004,24 @@ bit 0 (shared key) is reserved: NOT_SUPPORTED.
 
 "From task 22 the caller lends its effective priority to the thread that reads its request, until a message with the
 same transaction id is written back, the call ends for any reason, or that thread ends."
+
+## Planned changes (KERNEL-V1-SPEC.md, OD126 to OD141)
+
+The v1 kernel changes this contract in the ways listed here; the entries above describe the kernel as it is and are
+rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-V1-SPEC.md` section 3.
+
+* **The boundary moves.** Programs call the functions of the system library the kernel maps into every process
+  (`sys_<name>`); syscall numbers and registers become private, and this file becomes the reference of that library.
+* **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle.
+* **Times are nanoseconds**; `clock_get` is computed in user mode by the system library.
+* **Identifiers** (koid, thread id) are 64-bit and never reused; no counter wraps.
+* **Memory:** `vmo_create` by bytes with RESIZABLE, `vmo_set_size`, `vmo_decommit`, `vmo_create_child` (SNAPSHOT,
+  PRIVATE), `process_map` with ANYWHERE returning the address, `process_unmap` and `process_protect` over ranges,
+  `process_map_info`, `process_clone_region`, and the pager calls.
+* **Threads and exceptions:** `thread_create` is removed; `thread_spawn` gains SUSPENDED; `thread_suspend`,
+  `thread_resume`, `thread_read_state`, `thread_write_state`; `process_exception_channel`, `job_exception_channel`,
+  `exception_resume`.
+* **Waiting:** `port_wait_many`.
+* **Harts and power** (root resource): `hart_set_online`, `hart_info`, `system_suspend`, `system_set_placement`.
+* **Debug calls** need a debug resource handle.
+* **Limits:** the system-wide caps become backstops computed from RAM; per-process ceilings are job quotas.
