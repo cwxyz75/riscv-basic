@@ -108,6 +108,10 @@ pub const TESTS: &[Test] = &[
         "kill_a_spinner_on_another_hart",
         kill_a_spinner_on_another_hart,
     ),
+    (
+        "user_mode_ticks_take_no_big_lock",
+        user_mode_ticks_take_no_big_lock,
+    ),
     ("smp_churn_stress", smp_churn_stress),
 ];
 
@@ -458,6 +462,49 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
         return Err(format!("frames {frames_before} -> {frames_after}"));
     }
     Ok(())
+}
+
+/// L12b (SCHED-SMP-SPEC task 12, acceptance): a hart running a user thread that does nothing but spin takes no big kernel lock for its
+/// timer ticks. A secondary hart's count of outermost big-lock takes must hardly move over 80 ticks; it took one per tick when every
+/// trap from user mode took the lock.
+fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
+    use crate::user;
+    let n = smp::started();
+    if n < 2 {
+        return Ok(());
+    }
+    let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
+    let mut host = None;
+    for _ in 0..1000 {
+        host = (1..n).find(|&i| percpu::hart(i).in_user.load(Ordering::SeqCst));
+        if host.is_some() {
+            break;
+        }
+        thread::sleep_ticks(1);
+    }
+    let result = (|| {
+        let h = host.ok_or_else(|| String::from("the spinner never ran on a secondary hart"))?;
+        thread::sleep_ticks(20); // the start-up traps settle (the first tick's full path records the epoch)
+        let (takes0, ticks0) = (
+            percpu::hart(h).bkl_takes.load(Ordering::Relaxed),
+            percpu::hart(h).timer_ticks.load(Ordering::Relaxed),
+        );
+        thread::sleep_ticks(80);
+        let takes = percpu::hart(h).bkl_takes.load(Ordering::Relaxed) - takes0;
+        let ticks = percpu::hart(h).timer_ticks.load(Ordering::Relaxed) - ticks0;
+        if ticks < 50 || !percpu::hart(h).in_user.load(Ordering::SeqCst) {
+            return Err(format!("hart {h} took only {ticks} timer ticks"));
+        }
+        if takes > 8 {
+            return Err(format!(
+                "hart {h}, running a spinning user thread, took the big kernel lock {takes} times for {ticks} ticks"
+            ));
+        }
+        Ok(())
+    })();
+    user::end_process(pid, -3);
+    user::finish(pid, tid);
+    result
 }
 
 /// A spinner in user mode on another hart is ended promptly. The kill sends a reschedule IPI to the

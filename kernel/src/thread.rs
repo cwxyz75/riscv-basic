@@ -518,6 +518,11 @@ fn note_resched() {
     }
 }
 
+/// Is a switch asked for on this hart (a wake marked it)? Lock-free: the per-hart flag.
+pub fn need_resched_pending() -> bool {
+    crate::percpu::this().need_resched.load(Ordering::Relaxed)
+}
+
 /// A defined point at which a thread may be replaced (X7): switch if a wake asked for it. Cheap when nothing did. Interrupts off,
 /// big kernel lock held.
 #[inline]

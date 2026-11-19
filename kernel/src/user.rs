@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
@@ -478,6 +478,11 @@ fn user_thread_main(token: usize) {
     park_while_stopped();
     // (the return to user mode is a defined point for a switch a wake asked for: X7)
     thread::preempt_point();
+    // The marks above were read before `preempt_point`, which can switch and let a kill or stop land (and another thread on this hart
+    // record the new epoch) before this thread resumes: its first trap takes the full path, which looks again (PR 267 review)
+    crate::percpu::this()
+        .attention_seen
+        .store(0, Ordering::SeqCst);
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();
@@ -687,6 +692,7 @@ fn leave(code: i32, whole: bool) -> ! {
         if whole {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
+            bump_attention();
         } else if p.threads_alive == 0 {
             p.exit_code.get_or_insert(code);
         }
@@ -759,6 +765,10 @@ fn satp_of(p: &Process) -> u64 {
 /// threads of different processes are switched between, and the kernel half is shared so
 /// kernel code runs under any of them, but returning to user mode must use *this* one.
 pub fn activate_current() {
+    // (the epoch first, then the marks: a kill that lands after this load moves the epoch and is seen at the next trap)
+    crate::percpu::this()
+        .attention_seen
+        .store(ATTENTION.load(Ordering::SeqCst), Ordering::SeqCst);
     // A process that was killed while its thread was not running dies here, at the point
     // where it would otherwise return to user mode.
     park_while_stopped();
@@ -781,6 +791,21 @@ pub fn activate_current() {
             unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp) };
         }
     }
+}
+
+/// The attention epoch (L12b): bumped, under the big lock, whenever a process is marked killed or stopped, **after** the mark is set and
+/// before any IPI that tells a hart to look. A hart that returns to user mode records the epoch it saw (`activate_current`, before it
+/// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
+static ATTENTION: AtomicU64 = AtomicU64::new(1);
+
+fn bump_attention() {
+    ATTENTION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Has nothing happened since this hart last returned to user mode that could end or stop the thread it is about to resume? (No
+/// lock needed: both sides are atomics, and the marks are set before the epoch moves.)
+pub fn user_return_is_quiet() -> bool {
+    crate::percpu::this().attention_seen.load(Ordering::SeqCst) == ATTENTION.load(Ordering::SeqCst)
 }
 
 /// A trap from user mode (called from the trap handler with interrupts off).
@@ -1757,6 +1782,7 @@ fn request_kill(pid: u32, code: i32) {
             }
             Some(p) => {
                 p.killed.get_or_insert(code);
+                bump_attention();
                 false
             }
             None => false,
@@ -2900,6 +2926,7 @@ fn process_stop(a: [u64; 6], stop: bool) -> Reply {
             return Err((Status::BadState, None, None));
         }
         target.stopped = stop;
+        bump_attention();
         if let Some(obj) = target.obj {
             ipc::process_set_stopped(&mut s.objs, obj, stop);
         }
