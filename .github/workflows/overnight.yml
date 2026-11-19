@@ -42,3 +42,37 @@ jobs:
             target/fail-logs/
             target/repeat/
           if-no-files-found: ignore
+
+  checked:
+    name: overnight (checked release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BENCH_RATIO: "10"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-checked
+      - name: Install QEMU and OpenSBI
+        uses: ./.github/actions/install-qemu
+      - uses: actions/cache@v4
+        with:
+          path: third_party/fetched
+          key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
+      - name: Fetch BusyBox (pinned by sha256)
+        run: FETCH_ONLY="busybox kilo sqlite gzip" make fetch-third-party
+      - run: make os-boot-test-checked
+      - name: Summary
+        if: always()
+        run: |
+          echo "## overnight (checked release): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the logs of failing boots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-logs-checked
+          path: target/fail-logs/
+          if-no-files-found: ignore

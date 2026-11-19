@@ -85,7 +85,7 @@ be host-testable, fuzzable and covered before that starts.
 - [x] **KT6** (PR 281) tier 3, the long-run workflow (manual start only)
 - [ ] **KT7** schedule perturbation
 - [ ] **KT10** automated mutation testing
-- [ ] **KT12** the checked release build
+- [x] **KT12** (PR 282) the checked release build
 - [x] **KT13** (PR 283) the kernel stack budget
 - [ ] **KT5** instruction-count checks
 - [ ] **KT8** syscall fuzzing (host and guest)
@@ -204,6 +204,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **AB2, L12b, L12c** (PRs 267, 268, 270): the soak tier at `-smp 1`, `2`, `4` also covers the quiet-trap paths (kill of a spinner) and the real-time deadlines of the suite (about 2.6 times tighter under load than when the clock was a tick count): a red one is a flaky bound or a missed kill.
 - **L13** (PRs 272, 273): the soak tier shows the real-timer margins (the latency bounds were widened for the emulator's interrupt jitter) and the starvation watchdog under a loaded host; a red `starved thread` is a lost wake or pull, not noise.
 - **KT6** (PR 281): the first overnight run, `gh workflow run overnight.yml` (20 consecutive boots of the smp suite, up to 300 minutes). A red one is a work item the same day (OD140): the log of the failing boot is uploaded as an artifact.
+- **KT12** (PR 282): the first `overnight.yml` run also runs `os-boot-test-checked` (the whole suite at four harts and the kernel shard at one, two and eight on the checked release kernel; the kernel shard at four and eight was run once by hand and passed). A red one is an invariant (`debug_assert!`) that the optimised build breaks.
 - **TS3a** (PR 276): `make os-miri` now includes `cargo miri test -p ksys` (the host tests of the syscall layer, over the real address-space code). A red one would be undefined behaviour or a leak in code the kernel runs, found on the host.
 
 ## Decisions taken without the owner
