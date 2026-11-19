@@ -47,7 +47,7 @@ fn a_thread_that_blocked_is_not_run_elsewhere_before_its_switch_is_done() {
 #[test]
 fn a_thread_that_slept_is_not_run_elsewhere_before_its_switch_is_done() {
     let (s, a) = two_harts();
-    s.set_clock(0, 1 * MS);
+    s.set_clock(0, MS);
     s.prepare_block_on(0).unwrap();
     assert!(s.sleep_until_on(0, 3 * MS).unwrap());
     s.wake_on(1, a).unwrap(); // woken early from another hart
