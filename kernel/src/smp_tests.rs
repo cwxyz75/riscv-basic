@@ -517,7 +517,11 @@ fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
         let takes = percpu::hart(h).bkl_takes.load(Ordering::Relaxed) - takes0;
         let ticks = percpu::hart(h).timer_ticks.load(Ordering::Relaxed) - ticks0;
         // (a thread that traps all the time is often between `user_mode_left` and `user_mode_entered`: `in_user` is no test of it)
-        if ticks < 50 || thread::debug_state(tid).contains("Exited") {
+        // (still on the hart it was measured on: a thread that moved away leaves the hart idle and the count proves nothing)
+        if percpu::hart(h).running.load(Ordering::Relaxed) != tid {
+            return Err(format!("{what} left hart {h} during the measurement"));
+        }
+        if ticks < 50 {
             return Err(format!("hart {h} took only {ticks} timer ticks"));
         }
         if takes > 8 {

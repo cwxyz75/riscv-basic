@@ -342,7 +342,9 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
             crate::bkl::lock();
             crate::thread::switch_if_designated();
             crate::user::commit_wake();
+            crate::thread::preempt_point();
             crate::user::activate_current();
+            crate::heap::service();
             crate::bkl::unlock();
         }
     }
@@ -364,7 +366,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // SAFETY: clears sstatus.FS only.
         unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
     }
-    // Every trap holds the big kernel lock while the kernel handles it (S5, K2); interrupts are
+    // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
     // which the lock's reentrancy covers.
     //
