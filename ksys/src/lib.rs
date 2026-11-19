@@ -20,6 +20,9 @@
 
 extern crate alloc;
 
+mod vmo;
+pub use vmo::vmo_call;
+
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
 use abi::rights::Rights;
 use abi::status::Status;
@@ -60,7 +63,7 @@ pub struct Ctx<'a, M: PhysMem> {
     pub faults: Faults,
 }
 
-fn fail(s: Status) -> Reply {
+pub(crate) fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
