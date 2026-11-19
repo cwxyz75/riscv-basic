@@ -484,7 +484,7 @@ fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
     }
     let result = (|| {
         let h = host.ok_or_else(|| String::from("the spinner never ran on a secondary hart"))?;
-        thread::sleep_ticks(20); // the start-up traps settle (the first return to user mode records the epoch)
+        thread::sleep_ticks(20); // the start-up traps settle (the first tick's full path records the epoch)
         let (takes0, ticks0) = (
             percpu::hart(h).bkl_takes.load(Ordering::Relaxed),
             percpu::hart(h).timer_ticks.load(Ordering::Relaxed),
@@ -492,7 +492,7 @@ fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
         thread::sleep_ticks(80);
         let takes = percpu::hart(h).bkl_takes.load(Ordering::Relaxed) - takes0;
         let ticks = percpu::hart(h).timer_ticks.load(Ordering::Relaxed) - ticks0;
-        if !percpu::hart(h).in_user.load(Ordering::SeqCst) && ticks < 50 {
+        if ticks < 50 || !percpu::hart(h).in_user.load(Ordering::SeqCst) {
             return Err(format!("hart {h} took only {ticks} timer ticks"));
         }
         if takes > 8 {

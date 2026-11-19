@@ -348,9 +348,9 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     if cause == (1 << 63) | 5 && ready {
         // The scheduler's tick (SCHED-SMP-SPEC task 12). Its work is done under the scheduler's own lock. A tick that
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
-        // switch threads. A tick that interrupted **user mode** still takes it, as every user-mode trap does: the return
-        // to user mode is where a killed process dies (`activate_current`), which needs the lock until the kill flag is
-        // per thread (work item T107).
+        // switch threads. A tick that interrupted **user mode** takes it only when something needs it (L12b, below): the return
+        // to user mode is where a killed process dies (`activate_current`), which needs the lock, so a kill moves an epoch the tick looks at.
+        // (A thread whose FP state is not Off still takes it at `fp::return_to_user`: tidy T166.)
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);

@@ -478,6 +478,11 @@ fn user_thread_main(token: usize) {
     park_while_stopped();
     // (the return to user mode is a defined point for a switch a wake asked for: X7)
     thread::preempt_point();
+    // The marks above were read before `preempt_point`, which can switch and let a kill or stop land (and another thread on this hart
+    // record the new epoch) before this thread resumes: its first trap takes the full path, which looks again (PR 267 review)
+    crate::percpu::this()
+        .attention_seen
+        .store(0, Ordering::SeqCst);
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();
