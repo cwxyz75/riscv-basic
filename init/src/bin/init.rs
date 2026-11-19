@@ -624,7 +624,7 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                         let data = alloc::vec![b'f'; 500_000];
                         let _ = io::write_all(tty_mine, &data);
                         let _ = io::write_all(tty_mine, b"\nflood: done\n");
-                        // let the serial line drain, so the drop notice precedes the end marker
+                        // let the serial line drain, so the drop notice usually precedes the end marker (the harness accepts it after, T158)
                         io::nap(1500);
                         let _ = io::write_all(tty_mine, b"flood: end\n");
                     } else {
