@@ -128,6 +128,7 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
     // shared), then this hart joins it for good.
     irq::enable();
+    timer::program(Some(timer::now_ns() + 1_000_000)); // (the poll for the scheduler: see the timer branch of the trap handler)
     loop {
         if crate::thread::scheduler_exists() {
             crate::thread::join_scheduler();

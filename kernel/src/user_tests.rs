@@ -133,20 +133,21 @@ fn idle_harts_take_no_big_lock_for_their_ticks() -> Outcome {
     let ticks0 = crate::percpu::hart(1)
         .timer_ticks
         .load(core::sync::atomic::Ordering::Relaxed);
-    thread::sleep_ticks(80);
+    // (L13, acceptance: an idle hart takes no timer interrupt over a second: there is no tick, and nothing is armed on it)
+    thread::sleep_ticks(1000);
     let takes = thread::wake_stat(17) - before;
     let ticks = crate::percpu::hart(1)
         .timer_ticks
         .load(core::sync::atomic::Ordering::Relaxed)
         - ticks0;
-    if ticks < 50 {
+    if ticks > 2 {
         return Err(format!(
-            "hart 1 took only {ticks} timer ticks in the window"
+            "idle hart 1 took {ticks} timer interrupts in a second: it should take none"
         ));
     }
     if takes > 4 {
         return Err(format!(
-            "hart 1 took the big kernel lock {takes} times for {ticks} ticks of nothing"
+            "hart 1 took the big kernel lock {takes} times for {ticks} timer interrupts in a second of nothing"
         ));
     }
     Ok(())

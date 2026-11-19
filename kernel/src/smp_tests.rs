@@ -15,12 +15,12 @@ fn wfi_returns_with_interrupts_masked() -> Result<(), String> {
     let start = crate::timer::now();
     crate::irq::without(|| {
         // the timer interrupt is enabled (STIE) but globally masked here; program it one tick ahead
-        crate::timer::next_tick();
+        crate::timer::program(Some(crate::timer::now_ns() + 1_000_000));
         // SAFETY: `wfi` idles until an interrupt is pending (it returns at once if one already is); no memory.
         unsafe { core::arch::asm!("wfi") };
     });
     let waited = crate::timer::now() - start;
-    if waited > 200 * crate::timer::TICK_CYCLES {
+    if waited > 200 * 10_000 {
         return Err(alloc::format!("wfi took {waited} cycles to return"));
     }
     Ok(())
@@ -67,8 +67,11 @@ fn rt_threads_take_the_harts() -> Result<(), String> {
     }
     if RT_WAIT_FAILED.load(Ordering::SeqCst) {
         return Err(format!(
-            "the real-time threads did not run at once on {n} harts (harts used: {:#b})",
-            RT_HARTS.load(Ordering::SeqCst)
+            "the real-time threads did not run at once on {n} harts (harts used: {:#b}; ipis {:?}; timer {:?}; online {:?})",
+            RT_HARTS.load(Ordering::SeqCst),
+            (0..n).map(|i| percpu::hart(i).resched_ipis.load(Ordering::SeqCst)).collect::<alloc::vec::Vec<_>>(),
+            (0..n).map(|i| percpu::hart(i).timer_ticks.load(Ordering::SeqCst)).collect::<alloc::vec::Vec<_>>(),
+            (0..n).map(|i| percpu::hart(i).online.load(Ordering::SeqCst)).collect::<alloc::vec::Vec<_>>()
         ));
     }
     let used = RT_HARTS.load(Ordering::SeqCst);
@@ -177,16 +180,7 @@ fn harts_come_online() -> Result<(), String> {
     if !(0..n).any(|i| core::ptr::eq(me, percpu::hart(i))) {
         return Err(String::from("tp is not one of the hart records"));
     }
-    // each hart takes its own timer interrupts
-    for i in 0..n {
-        let h = percpu::hart(i);
-        if !wait_for(1000, || h.timer_ticks.load(Ordering::SeqCst) >= 3) {
-            return Err(format!(
-                "hart {i} took only {} timer interrupts in a second",
-                h.timer_ticks.load(Ordering::SeqCst)
-            ));
-        }
-    }
+    // (no hart has a periodic timer any more, L13: the timer tests are `idle_harts_take_no_big_lock_for_their_ticks` and the one-shot checks)
     Ok(())
 }
 
@@ -233,8 +227,10 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
         if h.ipis.load(Ordering::SeqCst) != ipis {
             return Err(format!("hart {i} keeps taking IPIs nobody sent"));
         }
-        if h.timer_ticks.load(Ordering::SeqCst) < ticks + 10 {
-            return Err(format!("hart {i}'s timer stalled after the IPIs"));
+        if h.timer_ticks.load(Ordering::SeqCst) > ticks + 3 {
+            return Err(format!(
+                "hart {i} takes timer interrupts nobody asked for after the IPIs"
+            ));
         }
     }
     Ok(())
@@ -521,12 +517,15 @@ fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
         if percpu::hart(h).running.load(Ordering::Relaxed) != tid {
             return Err(format!("{what} left hart {h} during the measurement"));
         }
-        if ticks < 50 {
-            return Err(format!("hart {h} took only {ticks} timer ticks"));
+        // (L13: no periodic tick: a hart with one runnable thread and no deadline takes no timer interrupt at all)
+        if ticks > 3 {
+            return Err(format!(
+                "hart {h}, running {what} alone, took {ticks} timer interrupts in 80 ms"
+            ));
         }
         if takes > 8 {
             return Err(format!(
-                "hart {h}, running {what}, took the big kernel lock {takes} times for {ticks} ticks"
+                "hart {h}, running {what}, took the big kernel lock {takes} times for {ticks} timer interrupts"
             ));
         }
         Ok(())

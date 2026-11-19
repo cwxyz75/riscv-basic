@@ -1,12 +1,7 @@
-//! The supervisor timer, through the SBI TIME extension (OpenSBI), at a 1 ms tick.
-//! QEMU `virt`'s `time` counter runs at 10 MHz.
+//! The supervisor timer: Sstc `stimecmp`, one-shot, no periodic tick (L13). QEMU `virt`'s `time` counter runs at 10 MHz.
 
 use core::arch::asm;
 use core::sync::atomic::Ordering;
-
-const EID_TIME: usize = 0x5449_4D45;
-/// Counter cycles per tick: 10 MHz / 1000 = 1 ms.
-pub const TICK_CYCLES: u64 = 10_000;
 
 /// The frequency of the `time` counter in Hz: 10 MHz on QEMU `virt`. One place: PL4 reads it from the device tree and changes only
 /// this function.
@@ -33,41 +28,46 @@ pub fn now() -> u64 {
     t
 }
 
-fn set(deadline: u64) {
-    // SAFETY: `ecall` from S-mode into OpenSBI's TIME extension (a7 = extension,
-    // a6 = function 0 = set_timer, a0 = deadline); it also clears a pending timer
-    // interrupt. Standard SBI calling convention.
-    unsafe {
-        asm!(
-            "ecall",
-            in("a7") EID_TIME,
-            in("a6") 0usize,
-            inout("a0") deadline as usize => _,
-            out("a1") _,
-        );
-    }
+/// Write `stimecmp` (Sstc): the supervisor timer interrupt becomes pending when `time >= value` and stays pending until a larger value is
+/// written. Needs `menvcfg.STCE`, which the firmware sets when the hart has Sstc; the kernel requires it (KERNEL-V1-SPEC 2.1).
+fn write_stimecmp(value: u64) {
+    // SAFETY: `stimecmp` (CSR 0x14d) only schedules this hart's own supervisor timer interrupt.
+    unsafe { asm!("csrw 0x14d, {}", in(reg) value) };
 }
 
-/// Program this hart's first tick (each hart has its own deadline and its own timer).
+/// Read `stimecmp` back (the boot probe).
+fn read_stimecmp() -> u64 {
+    let v: u64;
+    // SAFETY: reads a CSR with no side effect.
+    unsafe { asm!("csrr {}, 0x14d", out(reg) v) };
+    v
+}
+
+/// Bring this hart's timer up: record the clock's zero (the first hart's first call), check that `stimecmp` works and leave the timer
+/// off (no event). The kernel has no periodic tick (KERNEL-V1-SPEC 5.1): `program` arms the next event.
+#[allow(clippy::panic)] // INVARIANT: boot-time profile check: a hart without Sstc cannot run this kernel (OD127)
 pub fn start() {
     let _ = BOOT_COUNT.compare_exchange(0, now(), Ordering::SeqCst, Ordering::SeqCst);
-    let first = now() + TICK_CYCLES;
-    crate::percpu::this()
-        .deadline
-        .store(first, Ordering::SeqCst);
-    set(first);
+    write_stimecmp(0x5a5a_5a5a_0000_0001);
+    assert!(
+        read_stimecmp() == 0x5a5a_5a5a_0000_0001,
+        "this hart has no Sstc (`stimecmp` is not writable): the kernel requires it (OD127)"
+    );
+    write_stimecmp(u64::MAX);
 }
 
-/// Program the next tick (called from the timer interrupt). Deadlines advance by
-/// exact multiples, so ticks do not drift; if we fell behind (the host stalled the
-/// emulator) the next one is a full tick away rather than a burst.
-pub fn next_tick() {
-    let hart = crate::percpu::this();
-    let mut next = hart.deadline.load(Ordering::SeqCst) + TICK_CYCLES;
-    let t = now();
-    if next <= t {
-        next = t + TICK_CYCLES;
-    }
-    hart.deadline.store(next, Ordering::SeqCst);
-    set(next);
+/// Arm this hart's one-shot timer for `event` (nanoseconds on the `now_ns` clock; `None`: never). An event already past fires at once.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the event is a nanosecond time far below the range where scaling to counter cycles overflows (584 years)
+pub fn program(event: Option<u64>) {
+    let cycles = match event {
+        None => u64::MAX,
+        Some(ns) => {
+            let hz = timebase();
+            // (no 128-bit division, as in `now_ns`)
+            BOOT_COUNT.load(Ordering::Relaxed).saturating_add(
+                (ns / 1_000_000_000) * hz + (ns % 1_000_000_000) * hz / 1_000_000_000,
+            )
+        }
+    };
+    write_stimecmp(cycles);
 }

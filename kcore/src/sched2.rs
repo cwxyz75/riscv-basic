@@ -953,6 +953,25 @@ impl<N: Class> HartRq<N> {
         }
     }
 
+    /// Bring the hart's clock to `now` and charge the elapsed time to the thread that is running, without firing timers or changing any
+    /// designation. Tickless kernels (L13) call it before every change of designation, so a switch between two interrupts charges each
+    /// thread what it used; the rotation decision itself waits for the next timer event.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the nanosecond clock is far below u64::MAX within a boot
+    pub fn charge(&mut self, now: Time) {
+        let dt = now.saturating_sub(self.now);
+        if dt == 0 {
+            return;
+        }
+        self.now += dt;
+        if let Some(c) = self.cur.filter(|&c| Some(c) != self.idle) {
+            if let Some(mut t) = self.threads.remove(&c) {
+                t.cpu += dt;
+                t.slice_left = t.slice_left.saturating_sub(dt);
+                self.threads.insert(c, t);
+            }
+        }
+    }
+
     /// Set a thread's timer slack (nanoseconds, clamped to `MAX_SLACK`); it applies to its next sleep.
     pub fn set_timer_slack(&mut self, tid: Tid, slack: Time) -> Result<(), Error> {
         self.threads
@@ -975,6 +994,11 @@ impl<N: Class> HartRq<N> {
         let due: Vec<(Time, Tid)> = self.timers.range(..(self.now + 1, 0)).copied().collect();
         for (d, tid) in due {
             self.timers.remove(&(d, tid));
+            if !self.threads.contains_key(&tid) {
+                // (a thread reaped with its timer pending: its hard entry must not outlive it, or the hardware timer would be armed for
+                // a time that is already past for ever)
+                self.hard_timers.retain(|&(_, x)| x != tid);
+            }
             if let Some(t) = self.threads.get_mut(&tid) {
                 self.hard_timers.remove(&(t.timer_hard, tid));
                 t.deadline = None;

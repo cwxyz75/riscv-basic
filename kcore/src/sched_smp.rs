@@ -170,6 +170,8 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// hart look at its queues marks it (`pending`) instead of settling at once, so `current_on` stays the thread that is running
     /// until the hart's next defined point calls `reschedule_on`. The kernel sets it; the pure models run both ways.
     deferred: AtomicBool,
+    /// The time source of a tickless kernel (L13): when set, every settle first charges the hart's running thread up to it.
+    clock: Option<fn() -> Time>,
     pokes: AtomicU32,
     pulls: AtomicU64,
     settles: AtomicU64,
@@ -204,6 +206,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU32::new(0)).collect(),
             deferred: AtomicBool::new(false),
+            clock: None,
             pokes: AtomicU32::new(0),
             pulls: AtomicU64::new(0),
             settles: AtomicU64::new(0),
@@ -618,6 +621,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn settle(&self, h: usize) {
         self.settles.fetch_add(1, Ordering::Relaxed);
+        self.charge_now(h);
         self.pending[h].store(false, Ordering::Release);
         let entry_cur = self.lq(h).current();
         // (a mark is owed for the executing thread this settle displaces, unless a tick or yield already put it in transit)
@@ -759,6 +763,30 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         let me_first = self.push_marks(tid, home, caller);
         if home == caller || me_first {
             self.settle_or_defer(caller);
+        }
+        // A thread queued behind an equal one on another hart that is running something makes that hart's slice end an event (no
+        // periodic tick arms it any more): the hart is marked, looks at its queue and programs its timer (L13). Better threads
+        // already mark their hart through `push_marks`.
+        if home != caller {
+            let eff = self.lq(home).record(tid).map(|r| r.eff);
+            if eff.is_some_and(|e| self.view_cur(home) != 0 && e >= self.view_cur(home)) {
+                self.mark(home);
+            }
+        }
+    }
+
+    /// Give the scheduler a time source (nanoseconds), before it is shared: every settle then charges the running thread the time since
+    /// the hart's last look, which a kernel with no periodic tick needs (the tick used to do it).
+    #[must_use]
+    pub fn with_clock(mut self, f: fn() -> Time) -> Self {
+        self.clock = Some(f);
+        self
+    }
+
+    /// Charge hart `h`'s running thread up to the clock source's now (no-op without a source).
+    fn charge_now(&self, h: usize) {
+        if let Some(f) = self.clock {
+            self.lq(h).charge(f());
         }
     }
 

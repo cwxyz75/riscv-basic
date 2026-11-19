@@ -179,7 +179,6 @@ fn running_here() -> Tid {
 fn set_running(tid: Tid) {
     crate::percpu::this().running.store(tid, Ordering::Relaxed);
 }
-static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Counts iterations of the idle loop (so a test can see that idle ran).
 pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 
@@ -218,8 +217,9 @@ pub fn init(boot_prio: Prio) {
             .map(|h| klock::Spin::new(klock::Class::Rq, h as u32, HartRq::new(new_class())))
             .collect(),
         table: klock::Spin::new(klock::Class::Tt, 0, Table::new()),
-    });
-    // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
+    })
+    .with_clock(crate::timer::now_ns); // (charge the running thread at every settle: no tick does it)
+                                       // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
     sched.set_deferred(true);
     // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
     for h in 1..harts {
@@ -342,8 +342,9 @@ fn idle_main(_: usize) {
         if crate::heap::needs_service() {
             irq::without(crate::heap::service); // an idle hart is a safe point too
         }
-        // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled (the architecture
-        // resumes on any pending and individually enabled interrupt), which is the point of the protocol above.
+        program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
+                         // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled (the architecture
+                         // resumes on any pending and individually enabled interrupt), which is the point of the protocol above.
         unsafe { core::arch::asm!("wfi") };
         irq::restore(was);
     }
@@ -461,6 +462,7 @@ fn switch_done() {
         sc.take_pokes()
     };
     send_pokes(pokes, h);
+    program_timer();
     // a mark that is still set (a wake that came after this hart's last settle) must not be left without its flag
     if sched().resched_pending(h) {
         crate::percpu::this()
@@ -516,6 +518,7 @@ fn note_resched() {
             .need_resched
             .store(true, Ordering::Relaxed);
     }
+    program_timer(); // (a wake or an enqueue here can make a slice end an event)
 }
 
 /// Is a switch asked for on this hart (a wake marked it)? Lock-free: the per-hart flag.
@@ -658,58 +661,96 @@ pub fn reschedule_fast() -> bool {
         (sc.take_pokes(), switch)
     };
     send_pokes(pokes, h);
+    program_timer();
     switch
 }
 
-/// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds): every 100 ms, each hart at its own phase, a thread queued for more than
-/// 500 ms while a hart that may run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`).
-/// The same thread must be found in two samples in a row: the check reads other harts' idleness from hints at one instant, and a thread
-/// preempted after a long run is queued, "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review).
+/// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
+/// 100 ms (`program_timer`), and at each timer interrupt after that long a thread queued for more than 500 ms while a hart that may
+/// run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`). The same thread must be found in two
+/// samples in a row: the check reads other harts' idleness from hints at one instant, and a thread preempted after a long run is queued,
+/// "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review). An idle hart with nothing queued
+/// arms nothing: it takes no timer interrupt.
 #[cfg(debug_assertions)]
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::indexing_slicing
-)] // INVARIANT: h is a hart index below 32 and now counts 1 ms ticks; the panic is the detector's report
+)] // INVARIANT: h is a hart index below 32; the panic is the detector's report
 fn starvation_watchdog(h: usize, now: u64) {
     static LAST: [core::sync::atomic::AtomicU32; 32] =
         [const { core::sync::atomic::AtomicU32::new(0) }; 32];
-    if now % 100 == h as u64 {
-        let found = sched().starved(now_ns(), 500 * MS);
+    static REPEATS: [core::sync::atomic::AtomicU32; 32] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; 32];
+    if now.saturating_sub(WD_AT[h & 31].load(Ordering::Relaxed)) >= WATCHDOG_PERIOD {
+        WD_AT[h & 31].store(now, Ordering::Relaxed);
+        let found = sched().starved(now, 500 * MS);
         let tid = found.map_or(0, |f| f.0);
         let before = LAST[h & 31].swap(tid, Ordering::Relaxed);
+        // (the same thread in three samples in a row: on a loaded host the emulated machine is slow, and a thread queued behind a few
+        // thousand others while a hart is between two pulls would trip a shorter rule)
+        let repeats = if before == tid && tid != 0 {
+            REPEATS[h & 31].fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            REPEATS[h & 31].store(0, Ordering::Relaxed);
+            0
+        };
         if let Some((t, on, idle)) = found {
-            if before == t {
-                panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles");
+            if repeats >= 2 {
+                let sc = sched();
+                let harts: alloc::vec::Vec<_> = (0..crate::smp::started())
+                    .map(|i| {
+                        (
+                            sc.current_on(i),
+                            sc.queued_on(i),
+                            sc.resched_pending(i),
+                            sc.in_transit(i),
+                            sc.next_event_on(i),
+                        )
+                    })
+                    .collect();
+                panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles (per hart: current, queued, marked, in transit, next event: {harts:?}; the thread: {:?})", sc.record(t));
             }
         }
     }
 }
 
-/// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12): advance this hart's clock,
-/// fire its due timers, account the running thread's slice. Returns whether the hart must now switch threads (a rotation, a
-/// timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls `reschedule`.
-/// A tick that changes nothing needs no lock but the scheduler's own.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: TICKS counts 1 ms ticks: far below u64::MAX
-pub fn timer_tick_fast() -> bool {
+#[cfg(debug_assertions)]
+const WATCHDOG_PERIOD: u64 = 100 * MS;
+#[cfg(debug_assertions)]
+static WD_AT: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+/// Arm this hart's one-shot timer (L13: there is no periodic tick) for the earliest of its scheduler's next event (a sleeper's hard
+/// expiry, a slice end when an equal peer waits) and, in debug builds while the hart has queued work, the next watchdog sample. Called
+/// wherever the answer can change: after a timer interrupt, at the end of a switch, after a wake or enqueue here, before idling.
+/// Interrupts off.
+pub fn program_timer() {
     let h = hart();
-    crate::timer::next_tick();
-    // Hart 0 keeps the clock (sleepers' deadlines are in its ticks); every hart runs its own timers and slice from it.
-    let now = if h == 0 {
-        TICKS.fetch_add(1, Ordering::SeqCst) + 1
-    } else {
-        TICKS.load(Ordering::SeqCst)
-    };
+    #[allow(unused_mut)] // (`ev` is changed only in debug builds)
+    let mut ev = sched().next_event_on(h);
+    #[cfg(debug_assertions)]
+    if sched().queued_on(h) > 0 {
+        let at = WD_AT
+            .get(h & 31)
+            .map_or(0, |a| a.load(Ordering::Relaxed))
+            .saturating_add(WATCHDOG_PERIOD);
+        ev = Some(ev.map_or(at, |e| e.min(at)));
+    }
+    crate::timer::program(ev);
+}
+
+/// The timer interrupt's scheduler work **without the big kernel lock** (SCHED-SMP-SPEC task 12, 13): read the clock, expire the due
+/// timers, account the running thread's slice, make the designation right, arm the next event. Returns whether the hart must now switch
+/// threads (a rotation, a timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls
+/// `reschedule`. An interrupt that changes nothing needs no lock but the scheduler's own.
+pub fn timer_interrupt() -> bool {
+    let h = hart();
+    let now = now_ns();
     #[cfg(debug_assertions)]
     starvation_watchdog(h, now);
-    // negative control: an idle hart takes no tick (tickless idle, L13), so a lost poke is never made up
-    #[cfg(feature = "fault-skip-poke")]
-    if h != 0 && running_here() == sched().idle(h) {
-        return false;
-    }
     let (pokes, switch) = {
         let sc = sched();
-        sc.tick_on(h, now_ns());
+        sc.tick_on(h, now);
         let switch = sc.current_on(h) != running_here();
         if !switch {
             sc.switched(h); // the designation came back to the running thread: nothing is in transit
@@ -717,6 +758,7 @@ pub fn timer_tick_fast() -> bool {
         (sc.take_pokes(), switch)
     };
     send_pokes(pokes, h);
+    program_timer();
     switch
 }
 
@@ -730,9 +772,9 @@ pub fn now_ns() -> u64 {
     crate::timer::now_ns()
 }
 
-/// Ticks since the timer started (1 ms each).
+/// Milliseconds since boot (what a 1 ms tick count used to be: the clock rounded down).
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::SeqCst)
+    now_ns() / MS
 }
 
 pub fn current() -> Tid {
@@ -768,6 +810,7 @@ pub fn yield_fast() -> bool {
         (sc.take_pokes(), switch)
     };
     send_pokes(pokes, h);
+    program_timer();
     switch
 }
 
