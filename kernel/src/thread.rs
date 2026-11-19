@@ -747,6 +747,25 @@ pub fn yield_now() {
     });
 }
 
+/// `yield_now` for a trap from user mode without the big lock (L12b/L12c): the scheduler's own locks make the designation; the
+/// big lock is needed only to switch. Returns whether the hart must now switch (the caller then takes the lock and calls
+/// `switch_if_designated`). Interrupts off.
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
+pub fn yield_fast() -> bool {
+    let h = hart();
+    let (pokes, switch) = {
+        let sc = sched();
+        sc.yield_on(h).expect("running thread");
+        let switch = sc.current_on(h) != running_here();
+        if !switch {
+            sc.switched(h); // nothing in transit when the thread stays
+        }
+        (sc.take_pokes(), switch)
+    };
+    send_pokes(pokes, h);
+    switch
+}
+
 /// About to wait (SCHED-SMP-SPEC 3.7 step 1): from now on a wake counts. Call it before registering anywhere; end the
 /// wait with `block` (which returns at once if a wake arrived meanwhile).
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
