@@ -5,6 +5,7 @@
 
 const MAGIC: u32 = 0xd00d_feed;
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get(at..at + 4)` is a checked slice and `at` is a table offset inside the blob
 fn be32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
@@ -15,6 +16,7 @@ pub fn has_compatible(blob: &[u8], name: &str) -> bool {
     scan(blob, name).unwrap_or(false)
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every access is through checked `get` slices; `at` advances by small fixed steps inside the structure block
 fn scan(blob: &[u8], name: &str) -> Option<bool> {
     if be32(blob, 0)? != MAGIC {
         return None;
@@ -111,6 +113,7 @@ impl Node {
     }
 
     /// The first `(address, size)` of `reg`, decoded with the parent's cell counts.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get` is checked; k is below the cell count read from the blob
     pub fn reg(&self) -> Option<(u64, u64)> {
         let v = self.prop("reg")?;
         let cell = |at: usize, n: u32| -> Option<u64> {
@@ -140,6 +143,7 @@ pub struct VirtioMmio {
 }
 
 /// Parse the whole tree. Everything is bounds-checked; limits above bound the cost.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the blob is boot-loader data: every access is through checked `get` slices and offsets advance inside the structure block (a bad blob is an Err, fuzzed in fdt_golden)
 pub fn parse(blob: &[u8]) -> Result<Vec<Node>, FdtError> {
     if be32(blob, 0) != Some(MAGIC) {
         return Err(FdtError::BadHeader);

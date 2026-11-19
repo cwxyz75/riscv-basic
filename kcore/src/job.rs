@@ -213,6 +213,11 @@ impl Jobs {
 
     /// A new child of `parent` with `limits`; the caller holds the one use of the new id (and
     /// the child holds one of the parent).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: the parent was checked to exist just above
     pub fn create(&mut self, parent: JobId, limits: Limits) -> Result<JobId, JobError> {
         if !self.exists(parent) {
             return Err(JobError::NoSuchJob);
@@ -243,6 +248,7 @@ impl Jobs {
     }
 
     /// One more holder of `id`.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: uses is a count of live references, bounded by the object quota
     pub fn retain(&mut self, id: JobId) {
         if id == JobId::ROOT {
             return; // permanent: its use count is never touched
@@ -253,6 +259,7 @@ impl Jobs {
     }
 
     /// One holder less; frees the record at the last one, and then releases the parent in turn.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: uses >= 1 for a reference being released (every release pairs with a retain)
     pub fn release(&mut self, id: JobId) {
         let mut cur = Some(id);
         while let Some(id) = cur {
@@ -303,6 +310,7 @@ impl Jobs {
     /// Set a job's scheduling limits. Each value may not exceed the parent's (PR2); lowering one lowers it in every
     /// descendant too (PR1), so the caller must then clamp the base priority of the threads in the subtree (see
     /// `is_within`).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the job index was bounds-checked by the lookup
     pub fn set_sched(&mut self, id: JobId, s: SchedLimits) -> Result<(), SchedError> {
         let parent = self.rec(id).ok_or(SchedError::NoSuchJob)?.parent;
         // (an RT budget is a share of a 100 ms window: more than the window is meaningless, and without this the
@@ -341,6 +349,7 @@ impl Jobs {
     }
 
     /// Charge `n` of `r` to `id` and every ancestor; all or nothing.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the record was checked to exist just above
     pub fn charge(&mut self, id: JobId, r: Resource, n: u64) -> Result<(), JobError> {
         let mut cur = Some(id);
         while let Some(c) = cur {

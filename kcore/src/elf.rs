@@ -72,6 +72,7 @@ pub struct Segment {
 
 impl Segment {
     /// The pages this segment occupies, as `first..end` page numbers.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: vaddr and memsz were checked against the user limit when the segment was parsed
     pub fn pages(&self) -> (u64, u64) {
         (
             self.vaddr / PAGE_SIZE,
@@ -86,18 +87,22 @@ pub struct Image {
     pub segments: Vec<Segment>,
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller checked `at + 2 <= b.len()` (the header and table sizes were checked against the file length first)
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller checked `at + 4 <= b.len()` first
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller checked `at + 8 <= b.len()` first
 fn u64_at(b: &[u8], at: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(a)
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the file is hostile data: the header length (64 bytes) and every program header's range were checked against the file length before these reads, with checked_add on the offsets
 pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     if bytes.len() < EHDR {
         return Err(ElfError::TooShort);

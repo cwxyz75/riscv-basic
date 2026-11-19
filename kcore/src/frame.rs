@@ -35,6 +35,7 @@ pub struct FrameDb {
 
 impl FrameDb {
     /// A database over frames `base .. base + count`, all free.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: base + count is the frame range the boot code derived from the memory map
     pub fn new(base: Pfn, count: usize) -> FrameDb {
         // Pushed in descending order so allocation hands out ascending frames.
         let free = (base..base + count as u64).rev().collect();
@@ -67,6 +68,7 @@ impl FrameDb {
 
     /// Take `n` physically contiguous free frames (each with reference count 1); the first
     /// frame number. `None` if no run of that length is free.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i and start are indices below refs.len(); run counts frames inside the table
     pub fn alloc_contiguous(&mut self, n: usize) -> Option<Pfn> {
         if n == 0 || n > self.free.len() {
             return None;
@@ -97,6 +99,7 @@ impl FrameDb {
     }
 
     /// Take a free frame (reference count 1).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the pfn came off the free list, so it is a frame of the table (pfn - base < refs.len())
     pub fn alloc(&mut self) -> Option<Pfn> {
         let pfn = self.free.pop()?;
         let i = (pfn - self.base) as usize;
@@ -106,6 +109,7 @@ impl FrameDb {
     }
 
     /// Add a reference to an allocated frame.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length by `index` just above; a count below its limit cannot overflow
     pub fn inc(&mut self, pfn: Pfn) -> Result<(), FrameError> {
         let i = self.index(pfn)?;
         match self.refs[i] {
@@ -119,6 +123,7 @@ impl FrameDb {
     }
 
     /// Drop a reference; `Ok(true)` if that freed the frame.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length just above; the count is at least 1 in the arm that subtracts
     pub fn dec(&mut self, pfn: Pfn) -> Result<bool, FrameError> {
         let i = self.index(pfn)?;
         match self.refs[i] {
@@ -136,6 +141,7 @@ impl FrameDb {
     }
 
     /// The reference count of an allocated frame (`None` if free or unmanaged).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length just above
     pub fn refs(&self, pfn: Pfn) -> Option<u32> {
         let i = self.index(pfn).ok()?;
         (self.refs[i] != 0).then_some(self.refs[i])
@@ -143,6 +149,7 @@ impl FrameDb {
 
     /// Check the database's own consistency: the free list holds exactly the
     /// frames with a count of 0, each once.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every index is below refs.len() (loops over the table)
     pub fn audit(&self) -> Result<(), String> {
         let mut seen = alloc::vec![false; self.refs.len()];
         for &pfn in &self.free {

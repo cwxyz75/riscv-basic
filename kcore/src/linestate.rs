@@ -29,6 +29,7 @@ impl LineState {
         self.pos == 0
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pos is below the line capacity (checked by the caller's loop)
     fn advance(&mut self, b: u8) {
         if b == b'\n' || b == b'\r' {
             self.pos = 0;

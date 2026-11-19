@@ -14,6 +14,7 @@ pub trait PhysMem {
     fn read_u64(&self, pa: u64) -> u64;
     fn write_u64(&mut self, pa: u64, value: u64);
     /// Copy bytes out of physical memory (any alignment). Whole aligned words go at once.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: pa is a frame address the caller got from the frame database; i < out.len() and the 8-byte arm checks out.len() - i >= 8 first
     fn read_bytes(&self, pa: u64, out: &mut [u8]) {
         let mut i = 0;
         while i < out.len() {
@@ -28,6 +29,7 @@ pub trait PhysMem {
         }
     }
     /// Copy bytes into physical memory (any alignment). Whole aligned words go at once.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: as `read_bytes`: i < data.len() and the 8-byte arm checks the room first
     fn write_bytes(&mut self, pa: u64, data: &[u8]) {
         let mut i = 0;
         while i < data.len() {
@@ -49,6 +51,7 @@ pub trait PhysMem {
         }
     }
     /// Fill a frame with zeros.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: word < 512 and pfn is a frame of the table
     fn zero_frame(&mut self, pfn: Pfn) {
         for word in 0..PAGE_SIZE / 8 {
             self.write_u64((pfn << 12) + word * 8, 0);
@@ -153,6 +156,7 @@ fn perms_of(pte: u64) -> Perms {
     }
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the shift is below 64 (level <= 2) and the mask keeps the index below 512
 fn index(va: u64, level: u32) -> u64 {
     (va >> (12 + 9 * level)) & 0x1ff
 }
@@ -180,6 +184,7 @@ impl PageTable {
     /// A fresh table for a user process: empty in the lower half, and sharing the
     /// kernel's upper half (top-level entries 256..512 are copied, so every process sees
     /// the same kernel mappings; OD41). Free it with `destroy_user`, never `destroy`.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 512 table slots, and the roots are frames of the table
     pub fn new_with_kernel_half<M: PhysMem>(
         mm: &mut Mm<M>,
         kernel: &PageTable,
@@ -194,7 +199,9 @@ impl PageTable {
 
     /// Free the root and every table of the lower (user) half. The shared kernel half is
     /// not touched. The user leaves must already be unmapped.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 256 slots of the root table, and the root is a frame of the table
     pub fn destroy_user<M: PhysMem>(self, mm: &mut Mm<M>) {
+        #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
         fn walk<M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
             if level > 0 {
                 for i in 0..512 {
@@ -226,6 +233,7 @@ impl PageTable {
 
     /// Map the page at `va` to frame `pfn`. Allocates intermediate tables as needed;
     /// if it cannot, nothing changes.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the slot is a table frame plus index * 8 with index < 512; level decreases only while above 0; the fresh frame was reserved by the free-count check at the top
     pub fn map<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -297,6 +305,7 @@ impl PageTable {
     /// Unmap the page at `va`, returning what it mapped. Tables left empty are freed.
     /// **The caller must flush the TLB (`sfence.vma`) before any frame freed here is
     /// reused**: this crate has no notion of TLBs.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: level is 0 to 2 and the path array has three entries; indices are below 512
     pub fn unmap<M: PhysMem>(&mut self, mm: &mut Mm<M>, va: u64) -> Option<(Pfn, Perms)> {
         if !va.is_multiple_of(PAGE_SIZE) || !is_canonical(va) {
             return None;
@@ -339,6 +348,7 @@ impl PageTable {
     }
 
     /// Translate `va` (any byte of a page). Huge leaves translate too.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level <= 2; a leaf's ppn plus an in-span page offset stays a frame number
     pub fn translate<M: PhysMem>(&self, mm: &Mm<M>, va: u64) -> Option<Translation> {
         if !is_canonical(va) {
             return None;
@@ -370,6 +380,7 @@ impl PageTable {
     /// `level` is 0 for a 4 KiB page, 1 for 2 MiB, 2 for 1 GiB. Used to audit a
     /// table (for example: no leaf is both writable and executable).
     pub fn for_each_leaf<M: PhysMem>(&self, mm: &Mm<M>, f: &mut dyn FnMut(u64, Translation, u32)) {
+        #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
         fn walk<M: PhysMem>(
             mm: &Mm<M>,
             table: Pfn,
@@ -409,6 +420,7 @@ impl PageTable {
     /// Free every table frame (the root too). The leaves must be unmapped (or are
     /// not ours to free): their frames are not touched.
     pub fn destroy<M: PhysMem>(self, mm: &mut Mm<M>) {
+        #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
         fn walk<M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
             if level > 0 {
                 for i in 0..512 {

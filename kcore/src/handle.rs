@@ -64,11 +64,13 @@ impl HandleTable {
     /// (a slot that has been through every generation is retired for good, so a table can run out of
     /// slots while far below its limit; `insert` must then fail, and callers that checked `room`
     /// must not find it failing).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: live <= limit and slots_left is computed from the table sizes
     pub fn room(&self) -> usize {
         (self.limit - self.live).min(self.slots_left())
     }
 
     /// Slots that can still be handed out (free ones and unused ones).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the free list and the slot table are both at most SLOT_MASK long
     fn slots_left(&self) -> usize {
         self.free.len() + (SLOT_MASK as usize).saturating_sub(self.slots.len())
     }
@@ -81,17 +83,20 @@ impl HandleTable {
         (s.gen == gen && s.entry.is_some()).then_some(slot)
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: gen < GENERATIONS and slot < SLOT_MASK, so the encoded value fits in 32 bits
     fn encode(slot: usize, gen: u32) -> Handle {
         Handle((gen << SLOT_BITS) | (slot as u32 + 1))
     }
 
     /// Look up a handle.
+    #[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: the slot was decoded from a handle and bounds-checked against the table just above, and its entry was checked occupied before decoding succeeded
     pub fn get(&self, h: Handle) -> Result<Entry, Status> {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         Ok(self.slots[slot].entry.expect("decoded slot is occupied"))
     }
 
     /// Add a handle that takes over the caller's reference to `obj`.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: s is a free slot index or the new last slot; live is at most the table's limit
     pub fn insert(&mut self, obj: ObjId, rights: Rights) -> Result<Handle, Status> {
         if self.live >= self.limit {
             return Err(Status::NoMemory);
@@ -116,6 +121,11 @@ impl HandleTable {
     }
 
     /// Free a slot, returning its entry (the reference moves to the caller).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: the slot was resolved by `decode` a few lines above (in range and occupied); gen is reset before it can reach GENERATIONS
     fn remove(&mut self, slot: usize) -> Entry {
         let s = &mut self.slots[slot];
         let entry = s.entry.take().expect("occupied");
@@ -171,6 +181,11 @@ impl HandleTable {
 
     /// Swap a handle for one with fewer rights; the old value stops working. On an
     /// error the handle is untouched.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: the slot was resolved by `decode` just above (in range and occupied); the generation test keeps gen + 1 below GENERATIONS
     pub fn replace<T: Object>(
         &mut self,
         reg: &mut Registry<T>,
@@ -195,6 +210,7 @@ impl HandleTable {
 
     /// Take a handle out of the table to send it somewhere (needs TRANSFER). The
     /// reference goes with the returned entry.
+    #[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: the slot was resolved by `decode` just above (in range and occupied)
     pub fn remove_for_transfer<T: Object>(
         &mut self,
         reg: &mut Registry<T>,
@@ -230,6 +246,7 @@ impl HandleTable {
     }
 
     /// Close everything (process death).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: slot < slots.len() (loop bound)
     pub fn drain<T: Object>(&mut self, reg: &mut Registry<T>) {
         for slot in 0..self.slots.len() {
             if self.slots[slot].entry.is_some() {

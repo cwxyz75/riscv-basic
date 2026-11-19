@@ -20,6 +20,11 @@
 //! and does not block; of one that is neither (idle park word), it does nothing: **a wake is never remembered**.
 //! ([`Sched::block_current`] and [`Sched::sleep_until`] prepare for a caller that has not: under one lock the two
 //! are the same step.)
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: the single-hart scheduler of the first stages, kept as the oracle of the differential tests (the kernel runs sched2 and sched_smp and calls this only from a self-test): its tables are indexed by hart and priority below their lengths, its thread map lookups are of threads it created, and its counters are bounded by the number of threads
 
 use crate::park::Park;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};

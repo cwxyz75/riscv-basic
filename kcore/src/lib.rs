@@ -5,6 +5,20 @@
 //! pieces to the machine.
 #![no_std]
 #![forbid(unsafe_code)]
+// KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause. The compiler finds the candidates; each remaining site carries an
+// `#[allow] // INVARIANT: ...` naming why it cannot fire (`scripts/kernel_allows.py` lists them). Unit tests are exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 extern crate alloc;
 
@@ -26,8 +40,6 @@ pub mod park;
 pub mod sched;
 pub mod sched2;
 pub mod sched_smp;
-#[doc(hidden)]
-pub mod sched_smp_v0;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;

@@ -144,20 +144,24 @@ impl PrioQueues {
             at: BTreeMap::new(),
         }
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: p <= PRIO_MAX = 63 and `levels` has 64 entries
     pub fn push_back(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_back(t);
         self.mask |= 1 << p;
         self.at.insert(t, p);
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: p <= PRIO_MAX = 63 and `levels` has 64 entries
     pub fn push_front(&mut self, p: Prio, t: Tid) {
         self.levels[p as usize].push_front(t);
         self.mask |= 1 << p;
         self.at.insert(t, p);
     }
     /// The best queued level.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the mask is non-zero, so leading_zeros <= 63
     pub fn top(&self) -> Option<Prio> {
         (self.mask != 0).then(|| 63 - self.mask.leading_zeros() as Prio)
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: p comes from the mask, so it is below 64
     pub fn pop_best(&mut self) -> Option<Tid> {
         let p = self.top()?;
         let t = self.levels[p as usize].pop_front();
@@ -169,6 +173,7 @@ impl PrioQueues {
         }
         t
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: p <= PRIO_MAX = 63 and `levels` has 64 entries
     pub fn remove(&mut self, t: Tid) -> bool {
         let Some(p) = self.at.remove(&t) else {
             return false;
@@ -182,6 +187,7 @@ impl PrioQueues {
         }
         true
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: p comes from the mask, so it is below 64
     pub fn top_where(&self, ok: &dyn Fn(Tid) -> bool) -> Option<(Tid, Prio)> {
         (0..=PRIO_MAX).rev().find_map(|p| {
             self.levels[p as usize]
@@ -291,6 +297,7 @@ impl Class for FixedPrio {
     fn preempts(&self, cur: &ThreadSched, _now: Time) -> bool {
         self.q.top().is_some_and(|p| p > cur.eff)
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: cpu time and slices are nanosecond counts far below u64::MAX within a boot
     fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
         cur.cpu += ran;
         cur.slice_left = cur.slice_left.saturating_sub(ran);
@@ -304,6 +311,7 @@ impl Class for FixedPrio {
             false
         }
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
         Some(now + cur.slice_left)
     }
@@ -378,6 +386,7 @@ impl Class for RoundRobin {
     fn displaces(&self, _cand: Prio, _cur_eff: Prio) -> bool {
         false // round robin never preempts: a waiting thread gets its turn at a slice end
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: cpu time and slices are nanosecond counts far below u64::MAX within a boot
     fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
         cur.cpu += ran;
         cur.slice_left = cur.slice_left.saturating_sub(ran);
@@ -391,6 +400,7 @@ impl Class for RoundRobin {
             true
         }
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
         Some(now + cur.slice_left)
     }
@@ -444,6 +454,7 @@ impl Class for RtClass {
     fn preempts(&self, cur: &ThreadSched, _now: Time) -> bool {
         self.q.top().is_some_and(|p| p > cur.eff)
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: cpu time and slices are nanosecond counts far below u64::MAX within a boot
     fn account(&mut self, cur: &mut ThreadSched, ran: Time, _now: Time) -> bool {
         cur.cpu += ran;
         if !cur.base.rr {
@@ -460,6 +471,7 @@ impl Class for RtClass {
             false
         }
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
         cur.base.rr.then(|| now + cur.slice_left)
     }
@@ -535,6 +547,7 @@ impl crate::sched::SchedClass for TwoBand {
     fn contains(&self, tid: Tid) -> bool {
         self.rt.contains(tid) || self.normal.contains(tid)
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: queue lengths are bounded by the thread limit
     fn len(&self) -> usize {
         self.rt.len() + self.normal.len()
     }
@@ -600,6 +613,7 @@ impl<N: Class> HartRq<N> {
         self.threads.get(&tid)
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the thread id counter is a u32 that gains one per thread; the thread limit keeps it far from the end
     fn fresh(&mut self, attr: SchedAttr, state: State) -> Result<Tid, Error> {
         if attr.prio > PRIO_MAX {
             return Err(Error::BadPriority);
@@ -632,6 +646,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// The hart's idle thread: it runs when nothing else can, is never queued, and is pinned here.
+    #[allow(clippy::expect_used)] // INVARIANT: the idle thread was just created
     pub fn adopt_idle(&mut self) -> Tid {
         let tid = self
             .fresh(SchedAttr { prio: 0, rr: false }, State::Running)
@@ -641,6 +656,7 @@ impl<N: Class> HartRq<N> {
         tid
     }
 
+    #[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the thread was found in `threads` by every caller before this call
     fn class_enqueue(&mut self, tid: Tid, how: Enq) {
         let mut t = self.threads.remove(&tid).expect("thread exists");
         match band(t.eff) {
@@ -651,6 +667,7 @@ impl<N: Class> HartRq<N> {
         self.threads.insert(tid, t);
     }
 
+    #[allow(clippy::expect_used)] // INVARIANT: the thread was found in `threads` by every caller before this call
     fn class_dequeue(&mut self, tid: Tid, why: Deq) {
         let mut t = self.threads.remove(&tid).expect("thread exists");
         match band(t.eff) {
@@ -663,6 +680,7 @@ impl<N: Class> HartRq<N> {
 
     /// Strict precedence (core mechanism, not policy): RT, then normal, then idle. Rejects a pick that is not a
     /// runnable thread (the guard against a faulty class).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a counter of bad picks (a test statistic)
     fn pick(&mut self) {
         debug_assert!(self.cur.is_none() || self.cur == self.idle);
         loop {
@@ -687,6 +705,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// Anything queued that should run instead of the current thread? (An idle current is replaced by anything.)
+    #[allow(clippy::indexing_slicing)] // INVARIANT: `c` is the current thread, which has a record
     fn better_waits(&self) -> bool {
         let Some(c) = self.cur else {
             return true;
@@ -700,6 +719,7 @@ impl<N: Class> HartRq<N> {
 
     /// Make the designation right after something changed: dispatch if there is no current thread, preempt the
     /// current one (to the front of its level, keeping its slice) if something better waits.
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     fn reschedule(&mut self) {
         if !self.better_waits() {
             return;
@@ -747,6 +767,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// The current thread is about to wait: a wake now counts (`prepare` before registering, as in 3.7).
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn prepare_block(&mut self) -> Result<(), Error> {
         let c = self
             .cur
@@ -757,6 +778,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// Block the current thread unless a notification is waiting (then it is consumed). Returns whether it blocked.
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn block_current(&mut self) -> Result<bool, Error> {
         let c = self
             .cur
@@ -775,6 +797,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// Sleep until `deadline` (a passed deadline does not block and leaves nothing prepared).
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn sleep_until(&mut self, deadline: Time) -> Result<bool, Error> {
         let c = self
             .cur
@@ -795,6 +818,7 @@ impl<N: Class> HartRq<N> {
         self.block_current()
     }
 
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn yield_now(&mut self) -> Result<(), Error> {
         let c = self
             .cur
@@ -807,6 +831,7 @@ impl<N: Class> HartRq<N> {
         Ok(())
     }
 
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn exit_current(&mut self) -> Result<(), Error> {
         let c = self
             .cur
@@ -832,6 +857,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// Change a thread's base priority (its band may change; `eff` follows until donation exists).
+    #[allow(clippy::expect_used)] // INVARIANT: the thread was looked up by the caller in the same call
     pub fn set_priority(&mut self, tid: Tid, prio: Prio) -> Result<(), Error> {
         if prio > PRIO_MAX {
             return Err(Error::BadPriority);
@@ -858,6 +884,7 @@ impl<N: Class> HartRq<N> {
     /// Set a thread's *effective* priority (what donation, `kcore::donate`, computes) without touching its base: a
     /// queued thread moves to where it now belongs (possibly into the other band's class), the running one may now
     /// be preempted, and the base is what it falls back to. Returns whether the thread is known.
+    #[allow(clippy::expect_used)] // INVARIANT: the thread was looked up by the caller in the same call
     pub fn set_effective(&mut self, tid: Tid, eff: Prio) -> bool {
         let Some(t) = self.threads.get(&tid) else {
             return false;
@@ -883,6 +910,7 @@ impl<N: Class> HartRq<N> {
 
     /// Advance the clock by `dt`: fire the timers that are due, account the running thread's slice (rotating it
     /// when its slice is over and an equal or better peer waits), then make the designation right.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the nanosecond clock is far below u64::MAX within a boot
     pub fn advance(&mut self, dt: Time) {
         // The thread that ran during this tick: it is the one whose slice the tick uses up, even when a timer wake below
         // preempts it. (Charging whoever is current *after* the wakes made a thread that is woken at every tick, such as
@@ -975,6 +1003,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// This hart's idle thread, with a caller-chosen id.
+    #[allow(clippy::expect_used)] // INVARIANT: the priority 0 record is always valid
     pub(crate) fn adopt_idle_as(&mut self, tid: Tid, hart: u8) {
         self.fresh_as(
             tid,
@@ -1011,6 +1040,7 @@ impl<N: Class> HartRq<N> {
         self.threads.keys().copied()
     }
     /// The effective priority of what runs here (0 for the idle thread).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: `c` is the current thread, which has a record
     pub(crate) fn cur_eff(&self) -> Prio {
         match self.cur {
             Some(c) if Some(c) != self.idle => self.threads[&c].eff,
@@ -1047,6 +1077,7 @@ impl<N: Class> HartRq<N> {
     pub(crate) fn is_queued(&self, tid: Tid) -> bool {
         self.rt.contains(tid) || self.normal.contains(tid)
     }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: queue lengths are bounded by the thread limit
     pub(crate) fn queued_len(&self) -> usize {
         self.rt.len() + self.normal.len()
     }
@@ -1074,6 +1105,7 @@ impl<N: Class> HartRq<N> {
 
     /// Take a blocked thread's record (cancelling its timer), made `Runnable`, to place it on another hart. It is not
     /// queued anywhere; the caller attaches it. Returns the record and how long it slept.
+    #[allow(clippy::expect_used)] // INVARIANT: the record was found by the lookup just above
     pub(crate) fn detach_woken(&mut self, tid: Tid) -> Result<(ThreadSched, Time), Error> {
         let t = self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?;
         if t.state != State::Blocked {
@@ -1125,6 +1157,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// `set_priority` without the reschedule: returns whether this hart's designation may now be wrong.
+    #[allow(clippy::expect_used)] // INVARIANT: the thread was looked up in the same call
     pub(crate) fn set_priority_quiet(&mut self, tid: Tid, prio: Prio) -> Result<bool, Error> {
         if prio > PRIO_MAX {
             return Err(Error::BadPriority);
@@ -1155,6 +1188,7 @@ impl<N: Class> HartRq<N> {
     }
 
     /// The per-hart rules (the single-hart form of GP2): every thread is in exactly one place.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a count of running threads, at most the thread count
     pub fn audit(&self) -> Result<(), String> {
         let mut running = 0;
         for (&tid, t) in &self.threads {

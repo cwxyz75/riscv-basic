@@ -62,6 +62,7 @@ impl Tokens {
         Tokens::default()
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread
     fn next(&mut self) -> u64 {
         self.last += 1;
         self.last

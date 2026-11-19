@@ -16,6 +16,11 @@
 //!   revokes; `remove_thread` drops a dying thread's edges).
 //!
 //! Unused until tasks 22 and 23 produce edges (the stub stage).
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: the donation graph is not wired into the kernel yet (task 22): every lookup is of a thread that `add_thread` put in `nodes` and `audit` checks that; the item arrays are sized for the longest chain
 
 use crate::sched::{Prio, Tid};
 use alloc::collections::{BTreeMap, BTreeSet};
