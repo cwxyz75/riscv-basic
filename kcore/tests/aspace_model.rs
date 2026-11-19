@@ -130,6 +130,34 @@ fn random_faults_regions_and_teardown_agree_with_the_model() {
                                 let vp = r.vmo_page + page;
                                 committed.insert((r.vmo, vp));
                                 mapped.insert(slot_va(slot) + page * 4096, (r.vmo, vp));
+                                // fault-around (MM1): the committed pages around it in its 64 KiB window and region are mapped
+                                // too, and the others are not (a fault never commits a page for a neighbour)
+                                let fva = slot_va(slot) + page * 4096;
+                                let win = fva & !0xffff;
+                                for q in 0..16u64 {
+                                    let qva = win + q * 4096;
+                                    let in_region = qva >= slot_va(slot)
+                                        && qva < slot_va(slot) + r.pages * 4096;
+                                    if !in_region || qva == fva {
+                                        continue;
+                                    }
+                                    let qv = r.vmo_page + (qva - slot_va(slot)) / 4096;
+                                    let was = mapped.contains_key(&qva);
+                                    let now = aspace.table().translate(&mm, qva).is_some();
+                                    if !was && now {
+                                        assert!(
+                                            committed.contains(&(r.vmo, qv)),
+                                            "{ctx}: fault-around mapped a page the VMO had not committed"
+                                        );
+                                        mapped.insert(qva, (r.vmo, qv));
+                                    }
+                                    if !was && !now {
+                                        assert!(
+                                            !committed.contains(&(r.vmo, qv)) || vmos.frame(r.vmo, qv).is_none(),
+                                            "{ctx}: a committed neighbour in the window was not mapped"
+                                        );
+                                    }
+                                }
                                 let t = aspace
                                     .table()
                                     .translate(&mm, va)
@@ -545,4 +573,66 @@ fn running_out_of_frames_gives_the_page_charge_back() {
         ok,
         "a refused page is not charged"
     );
+}
+
+/// MM1: touching committed pages in order takes at most one fault per 64 KiB window (fault-around maps the committed neighbours),
+/// and touching uncommitted pages takes one fault each (a fault never commits a page for its neighbours).
+fn touch_in_order(committed_first: bool) -> usize {
+    let (mut mm, mut vmos, mut aspace) = setup(400);
+    let id = vmos.create(64);
+    if committed_first {
+        vmos.commit(&mut mm, id, 0, 64).unwrap();
+    }
+    aspace
+        .map_region(&vmos, BASE, 64, id, 0, Perms::RW)
+        .unwrap();
+    let mut faults = 0;
+    for page in 0..64u64 {
+        let va = BASE + page * 4096;
+        if aspace.table().translate(&mm, va).is_none() {
+            faults += 1;
+            aspace
+                .handle_fault(&mut mm, &mut vmos, va, Access::Write)
+                .unwrap();
+        }
+    }
+    faults
+}
+
+#[test]
+fn fault_around_maps_committed_neighbours_and_never_commits_one() {
+    assert!(
+        touch_in_order(true) <= 5,
+        "64 committed pages touched in order took {} faults",
+        touch_in_order(true)
+    );
+    assert_eq!(
+        touch_in_order(false),
+        64,
+        "an uncommitted page costs its own fault"
+    );
+}
+
+#[test]
+fn fault_around_stays_inside_the_region_and_the_window() {
+    let (mut mm, mut vmos, mut aspace) = setup(400);
+    let id = vmos.create(64);
+    vmos.commit(&mut mm, id, 0, 64).unwrap();
+    // a region of 5 pages that starts 3 pages into a 64 KiB window and runs to the window's end: BASE is 64 KiB aligned
+    aspace
+        .map_region(&vmos, BASE + 3 * 4096, 5, id, 10, Perms::RW)
+        .unwrap();
+    aspace
+        .handle_fault(&mut mm, &mut vmos, BASE + 5 * 4096, Access::Read)
+        .unwrap();
+    for page in 0..16u64 {
+        let mapped = aspace.table().translate(&mm, BASE + page * 4096).is_some();
+        assert_eq!(
+            mapped,
+            (3..8).contains(&page),
+            "page {page} of the window: only the region's own pages are mapped"
+        );
+    }
+    // the next window is untouched
+    assert!(aspace.table().translate(&mm, BASE + 16 * 4096).is_none());
 }
