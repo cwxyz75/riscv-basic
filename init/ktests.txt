@@ -1,5 +1,5 @@
 # The Kernel tests of the suite (KT1): they start no server and need no disk, network or console service. `shard=k` runs
-# exactly these (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
+# exactly these, except that `kfast` boots (one and two harts) skip those marked `slow` (about 40 s of the 77 s a one-hart boot takes on the development machine) (the three heavy stress tests of shard b are not in it, for the time); scripts/os_boot_test.py reads this file too. Everything else is a System test.
 user_mode_runs_and_prints
 clock_advances_in_user_mode
 unknown_syscalls_are_refused
@@ -53,7 +53,7 @@ many_children_do_not_leak
 thread_create_argument_checks
 threads_share_memory_and_report_exit_codes
 a_user_signal_wakes_a_blocked_thread
-thread_limit_and_slots_are_reused
+thread_limit_and_slots_are_reused slow
 second_thread_outlives_the_first
 a_thread_can_end_the_whole_process
 a_fault_in_any_thread_ends_the_process
@@ -145,8 +145,8 @@ a_process_ending_with_spawned_threads_leaks_nothing
 thread_spawn_starts_with_the_documented_state
 thread_spawn_error_cases
 thread_spawn_gives_every_stack_back
-thread_spawn_arena_is_bounded_and_reused
-two_thousand_threads_live
+thread_spawn_arena_is_bounded_and_reused slow
+two_thousand_threads_live slow
 thousands_of_threads_come_and_go
 a_job_limits_how_many_jobs_may_exist_below_it
 job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back

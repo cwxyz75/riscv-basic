@@ -923,7 +923,12 @@ pub fn wake_stat(which: u64) -> u64 {
             } else if crate::dtb::boot_arg_present("shard=b") {
                 2
             } else if crate::dtb::boot_arg_present("shard=k") {
-                3
+                // 3: the kernel-only boot; 4: the same without the tests marked `slow` (`kfast`)
+                if crate::dtb::boot_arg_present("kfast") {
+                    4
+                } else {
+                    3
+                }
             } else {
                 0
             }

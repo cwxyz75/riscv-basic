@@ -766,7 +766,9 @@ def _read_lines(path):
 
 
 # The Kernel tests of the suite (`init/ktests.txt`, which the guest reads too) and every test the suite defines.
-KERNEL_TESTS = set(_read_lines("init/ktests.txt"))
+KERNEL_TESTS = {l.split()[0] for l in _read_lines("init/ktests.txt")}
+SLOW_TESTS = {l.split()[0] for l in _read_lines("init/ktests.txt") if len(l.split()) > 1 and l.split()[1] == "slow"}
+KFAST = os.environ.get("OS_KFAST") == "1"
 def _suite_tests():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "init", "src", "bin", "suite.rs")).read()
     body = src[src.index("let tests: &[Test] = &["):]
@@ -801,7 +803,7 @@ def shard_required(required):
     if SHARD == "b":
         return [n for n in names if is_shard_b_test(n)]
     if SHARD == "k":
-        return [n for n in names if not is_system_test(n)]
+        return [n for n in names if not is_system_test(n) and not (KFAST and n in SLOW_TESTS)]
     return names
 
 
@@ -1001,7 +1003,8 @@ def run(kernel: str, extra=()):
             "-device", "virtio-blk-device,drive=hd0"]),
         *(["-append", " ".join(a for a in ("bench=full" if os.environ.get("OS_BENCH_FULL") == "1" else "",
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
-                                           f"shard={SHARD}" if SHARD else "") if a)]
+                                           f"shard={SHARD}" if SHARD else "",
+                                           "kfast" if SHARD == "k" and KFAST else "") if a)]
           if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") or SHARD else []),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
@@ -1068,6 +1071,8 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
     missing = [n for n in shard_required(required) if n not in {n for n, _, _ in tests}]
     if SHARD == "a" and any(is_shard_b_test(n) for n, _, _ in tests):
         found.append("shard a ran tests that belong to shard b")
+    if SHARD == "k" and KFAST and any(n in SLOW_TESTS for n, _, _ in tests):
+        found.append("a kfast boot ran tests marked slow")
     if SHARD == "k" and any(is_system_test(n) for n, _, _ in tests):
         found.append(f"a kernel-only boot ran System tests: {[n for n, _, _ in tests if is_system_test(n)]}")
     if missing:

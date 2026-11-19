@@ -32,7 +32,7 @@ GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of the merge gate (ci.yml) may 
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
 # Targets besides the smoke ones that the gate may run, conditionally (see ci.yml): the harness check.
 # (the smoke boot is two parallel jobs, one per shard of the suite, and the release smoke is a third: OD121)
-GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b"}
+GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b", "os-ktest-small", "os-ktest-4"}
 
 
 def make_var(makefile, name):

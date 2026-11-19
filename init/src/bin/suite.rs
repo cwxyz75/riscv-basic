@@ -12099,8 +12099,17 @@ pub fn app_main() -> i32 {
             continue;
         }
         // the kernel-only boot (`shard=k`, KT1): the Kernel tests, which start no server and need no disk or network
-        if shard == 3 && !KERNEL_TESTS.lines().any(|l| l == *name) {
-            continue;
+        if shard >= 3 {
+            let listed = KERNEL_TESTS
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.split(' ').collect::<Vec<_>>())
+                .find(|w| w[0] == *name);
+            match listed {
+                None => continue,
+                Some(w) if shard == 4 && w.get(1) == Some(&"slow") => continue,
+                Some(_) => {}
+            }
         }
         if !timed(name, *test) {
             failed += 1;

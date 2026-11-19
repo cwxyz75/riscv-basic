@@ -114,7 +114,7 @@ jobs:
           dpkg -l opensbi | tail -1
       - run: make os-boot-test-smoke-b
 
-  # The kernel-only boot (KT1): the Kernel tests of the suite at one, two and four harts; and, as its own job, the optimised kernel at four.
+  # The kernel-only boot (KT1), in three parallel jobs: one and two harts (without the slow tests), four harts, and the optimised kernel at four.
   kernel-only:
     name: kernel (ktest)
     needs: changes
@@ -132,7 +132,26 @@ jobs:
           key: ktest
       - name: Install QEMU and OpenSBI
         uses: ./.github/actions/install-qemu
-      - run: make os-ktest
+      - run: make os-ktest-small
+
+  kernel-only-4:
+    name: kernel (ktest 4 harts)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ktest4
+      - name: Install QEMU and OpenSBI
+        uses: ./.github/actions/install-qemu
+      - run: make os-ktest-4
 
   kernel-only-release:
     name: kernel (ktest release)
