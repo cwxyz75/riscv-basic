@@ -112,6 +112,10 @@ pub const TESTS: &[Test] = &[
         "user_mode_ticks_take_no_big_lock",
         user_mode_ticks_take_no_big_lock,
     ),
+    (
+        "user_clock_get_and_yield_take_no_big_lock",
+        user_clock_get_and_yield_take_no_big_lock,
+    ),
     ("smp_churn_stress", smp_churn_stress),
 ];
 
@@ -468,22 +472,42 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
 /// timer ticks. A secondary hart's count of outermost big-lock takes must hardly move over 80 ticks; it took one per tick when every
 /// trap from user mode took the lock.
 fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
+    no_big_lock_for(15, "a spinning user thread")
+}
+
+/// L12c: the same for a user thread that does nothing but call `clock_get`, and for one that only calls `thread_yield`.
+fn user_clock_get_and_yield_take_no_big_lock() -> Result<(), String> {
+    no_big_lock_for(80, "a user thread calling clock_get")?;
+    no_big_lock_for(81, "a user thread calling thread_yield")
+}
+
+fn no_big_lock_for(program: u64, what: &str) -> Result<(), String> {
     use crate::user;
     let n = smp::started();
     if n < 2 {
         return Ok(());
     }
-    let (pid, tid) = user::start(user::CRASH_ELF, 15).map_err(|e| format!("{e:?}"))?;
+    let (pid, tid) = user::start(user::CRASH_ELF, program).map_err(|e| format!("{e:?}"))?;
     let mut host = None;
-    for _ in 0..1000 {
-        host = (1..n).find(|&i| percpu::hart(i).in_user.load(Ordering::SeqCst));
+    for _ in 0..5000 {
+        // (the hart that is running the thread: `in_user` is no test for one that traps all the time; the test thread itself sleeps, so
+        // hart 0 is as good a host as any other)
+        host = (0..n).find(|&i| percpu::hart(i).running.load(Ordering::Relaxed) == tid);
         if host.is_some() {
             break;
         }
         thread::sleep_ticks(1);
     }
     let result = (|| {
-        let h = host.ok_or_else(|| String::from("the spinner never ran on a secondary hart"))?;
+        let h = host.ok_or_else(|| {
+            format!(
+                "{what} (thread {tid}) never ran on any hart (state {}; running {:?})",
+                thread::debug_state(tid),
+                (0..n)
+                    .map(|i| percpu::hart(i).running.load(Ordering::Relaxed))
+                    .collect::<alloc::vec::Vec<_>>()
+            )
+        })?;
         thread::sleep_ticks(20); // the start-up traps settle (the first tick's full path records the epoch)
         let (takes0, ticks0) = (
             percpu::hart(h).bkl_takes.load(Ordering::Relaxed),
@@ -492,12 +516,17 @@ fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
         thread::sleep_ticks(80);
         let takes = percpu::hart(h).bkl_takes.load(Ordering::Relaxed) - takes0;
         let ticks = percpu::hart(h).timer_ticks.load(Ordering::Relaxed) - ticks0;
-        if ticks < 50 || !percpu::hart(h).in_user.load(Ordering::SeqCst) {
+        // (a thread that traps all the time is often between `user_mode_left` and `user_mode_entered`: `in_user` is no test of it)
+        // (still on the hart it was measured on: a thread that moved away leaves the hart idle and the count proves nothing)
+        if percpu::hart(h).running.load(Ordering::Relaxed) != tid {
+            return Err(format!("{what} left hart {h} during the measurement"));
+        }
+        if ticks < 50 {
             return Err(format!("hart {h} took only {ticks} timer ticks"));
         }
         if takes > 8 {
             return Err(format!(
-                "hart {h}, running a spinning user thread, took the big kernel lock {takes} times for {ticks} ticks"
+                "hart {h}, running {what}, took the big kernel lock {takes} times for {ticks} ticks"
             ));
         }
         Ok(())

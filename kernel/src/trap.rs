@@ -321,6 +321,36 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     crate::latency::off_end(span, core::panic::Location::caller());
 }
 
+/// `clock_get` and `thread_yield` from user mode without the big kernel lock (L12c). False: not one of those, or the return is not
+/// quiet (a kill or stop to look for) or the FP registers are dirty: the full path.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: sepc + 4 steps past an ecall
+fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
+    use abi::syscall as nr;
+    let n = frame.arg(17) as usize;
+    if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD)
+        || user_fp_dirty(frame)
+        || !crate::user::user_return_is_quiet()
+    {
+        return false;
+    }
+    frame.sepc += 4; // past the ecall
+    if n == nr::CLOCK_GET {
+        frame.set_return(0, Some(crate::thread::ticks()), None);
+    } else {
+        frame.set_return(0, None, None);
+        if crate::thread::yield_fast() {
+            crate::bkl::lock();
+            crate::thread::switch_if_designated();
+            crate::user::commit_wake();
+            crate::thread::preempt_point();
+            crate::user::activate_current();
+            crate::heap::service();
+            crate::bkl::unlock();
+        }
+    }
+    true
+}
+
 /// Are the interrupted user thread's FP registers dirty (`sstatus.FS` = 3)? Saving them needs the FP tables, so the big lock.
 fn user_fp_dirty(frame: &TrapFrame) -> bool {
     const FS_MASK: u64 = 3 << 13;
@@ -336,7 +366,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // SAFETY: clears sstatus.FS only.
         unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
     }
-    // Every trap holds the big kernel lock while the kernel handles it (S5, K2); interrupts are
+    // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
     // which the lock's reentrancy covers.
     //
@@ -345,7 +375,11 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && !ready);
-    if cause == (1 << 63) | 5 && ready {
+    // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
+    // (no kill or stop recorded) and the user's FP state is not dirty.
+    if from_user && cause == 8 && ready && lock_free_syscall(frame) {
+        // handled
+    } else if cause == (1 << 63) | 5 && ready {
         // The scheduler's tick (SCHED-SMP-SPEC task 12). Its work is done under the scheduler's own lock. A tick that
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
         // switch threads. A tick that interrupted **user mode** takes it only when something needs it (L12b, below): the return

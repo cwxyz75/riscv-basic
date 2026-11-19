@@ -102,6 +102,18 @@ pub fn app_main() -> i32 {
                 core::hint::spin_loop();
             }
         }
+        80 => {
+            // spin calling `clock_get` (L12c: a hart running this should take no big kernel lock for it)
+            loop {
+                core::hint::black_box(rt::sys::clock_get());
+            }
+        }
+        81 => {
+            // spin calling `thread_yield` (L12c)
+            loop {
+                let _ = rt::sys::thread_yield();
+            }
+        }
         16 => {
             // block forever in a wait (only a kill ends this)
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
