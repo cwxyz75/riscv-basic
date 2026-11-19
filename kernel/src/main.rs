@@ -7,6 +7,7 @@
 #![no_std]
 #![cfg_attr(feature = "interactive", allow(dead_code))]
 #![no_main]
+#![deny(clippy::undocumented_unsafe_blocks)] // KT3: every unsafe block says why it holds
 
 extern crate alloc;
 

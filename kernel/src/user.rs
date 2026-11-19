@@ -2,6 +2,14 @@
 //! handling of traps from U-mode. The logic that can be pure (ELF validation, user memory
 //! copies, handle tables, channels) lives in `kcore` and is tested on the host; this file
 //! wires it to the machine.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use crate::console::Console;
 use crate::{irq, kmem, thread};
@@ -256,6 +264,11 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     irq::without(|| start_locked(image, arg))
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); pids are a counter far below u32::MAX
 fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);
@@ -380,6 +393,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
 }
 
 /// Register a thread start and return its token.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread start
 fn new_start(
     s: &mut UserState,
     pid: u32,
@@ -407,6 +421,7 @@ fn new_start(
     token
 }
 
+#[allow(clippy::expect_used)] // INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
 fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
     // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
@@ -642,6 +657,7 @@ fn exit_process(code: i32) -> ! {
 /// kill): every other thread is told to die. Without it (`thread_exit`) only this thread goes,
 /// and the process ends when the last thread does. The process is torn down by its last thread
 /// (a process started by `process_start`), or by `finish` (one the kernel started).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: threads_alive >= 1 for a thread that is leaving
 fn leave(code: i32, whole: bool) -> ! {
     if whole {
         LAST_EXIT_CYCLES.store(crate::timer::now(), Ordering::SeqCst);
@@ -766,6 +782,7 @@ pub fn activate_current() {
 }
 
 /// A trap from user mode (called from the trap handler with interrupts off).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: sepc + 4 steps past an ecall; the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
 pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
     let cause = frame.scause;
     match cause {
@@ -986,6 +1003,11 @@ fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
 fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let tid = thread::current();
     let s = state();
@@ -1486,6 +1508,7 @@ fn is_bench_line(text: &str) -> bool {
 /// message. A well-formed `##TEST name PASS|FAIL ...` line is a result and is counted;
 /// any other line starting `##` is prefixed so user code cannot forge the kernel's
 /// verdict lines (`##DONE`, `##PANIC`, `##BOOT`).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a pair of test counters
 fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
     let mut flush = |text: String| {
         // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
@@ -1595,6 +1618,7 @@ pub fn notify() {
 /// below is its own locked section); what a thread must not do is recurse into itself, so a thread
 /// already cleaning skips, and its loop sees the work the nested call would have done (T63: the guard used
 /// to be one global flag, so while a cleaner was preempted every other hart skipped the cleanup).
+#[allow(clippy::indexing_slicing)] // INVARIANT: the irq slot comes from an interrupt object the kernel made, below the table size; the time counter is far below u64::MAX
 fn cleanup_dead() {
     let me = thread::current();
     if !irq::without(|| state().cleaning.insert(me)) {
@@ -1676,6 +1700,7 @@ static USER_NOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 static USER_MAX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// A hart is about to return to user mode.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: USER_NOW counts events, far below u64::MAX
 pub fn user_mode_entered() {
     crate::latency::interrupts_on(); // (the return to user mode turns interrupts on: the span ends)
     crate::percpu::this().in_user.store(true, Ordering::SeqCst);
@@ -1959,16 +1984,19 @@ fn port_wait(a: [u64; 6]) -> Reply {
     }
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: callers pass an offset inside the fixed-size record they just copied in (24 or 40 bytes)
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: callers pass an offset inside the fixed-size record they just copied in (24 or 40 bytes)
 fn le64(b: &[u8], at: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(a)
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
 fn channel_call(a: [u64; 6]) -> Reply {
     if a[0] > u64::from(u32::MAX) {
         return fail(Status::BadHandle);
@@ -2410,6 +2438,7 @@ fn bad(s: Status) -> Reply {
     Err((s, None, None))
 }
 
+#[allow(clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and `wide(i)` is called with constants below 6
 fn process_call(n: usize, a: [u64; 6]) -> Reply {
     // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
     let wide = |i: usize| a[i] > u64::from(u32::MAX);
@@ -2462,6 +2491,7 @@ fn caller_pid(s: &UserState) -> Result<u32, Status> {
         .ok_or(Status::BadState)
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: pids are a counter far below u32::MAX; the new process's handle was made with room checked
 fn process_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
@@ -2551,6 +2581,7 @@ fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
+#[allow(clippy::expect_used)] // INVARIANT: room in the handle table was checked just above; the handle was just inserted
 fn process_self() -> Reply {
     irq::without(|| -> Reply {
         let s = state();
@@ -2630,6 +2661,7 @@ fn resolve_map_args(
     Ok((tpid, vid))
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4
 fn process_map(a: [u64; 6]) -> Reply {
     let (ph, vh) = (Handle(a[0] as u32), Handle(a[1] as u32));
     let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
@@ -2740,6 +2772,7 @@ fn process_unmap(a: [u64; 6]) -> Reply {
     })
 }
 
+#[allow(clippy::expect_used)] // INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists
 fn process_start(a: [u64; 6]) -> Reply {
     let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
@@ -2907,6 +2940,7 @@ fn credit_thread(jobs: &mut kcore::job::Jobs, job: JobId) {
 /// Frames in a kernel stack.
 const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the target process was looked up under the same lock; threads_alive is below MAX_THREADS_PER_PROCESS (checked just above)
 fn thread_create(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0] as u32);
     let (entry, sp, arg) = (a[1], a[2], a[3]);
@@ -2966,6 +3000,11 @@ fn thread_create(a: [u64; 6]) -> Reply {
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a
 /// stack the kernel maps in the process's stack arena (freed when the thread ends) unless the caller brings its own.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (40 bytes) at indices below 5
 fn thread_spawn(a: [u64; 6]) -> Reply {
     use abi::spawn as sp;
     let ph = Handle(a[0] as u32);
@@ -3186,6 +3225,11 @@ fn job_status(e: JobError) -> Status {
 
 /// Read six limits (processes, threads, pages, jobs, objects, ipc_bytes: `u64::MAX` means none)
 /// from the 48 bytes of user memory at `ptr`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)] // INVARIANT: the record read is of fixed size (40 bytes) at indices below 5
 fn read_limits(s: &mut UserState, me: u32, ptr: u64) -> Result<Limits, ReplyErr> {
     let k = kmem::get();
     let p = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;

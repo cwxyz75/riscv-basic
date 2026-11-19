@@ -1,6 +1,14 @@
 //! Kernel memory: the frame database, the real kernel page table (built with the
 //! same pure `kcore` code the host tests exercise), and the kernel's own address
 //! space, whose lazily committed regions the self-tests use.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, RAM_BASE, RAM_SIZE};
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
@@ -13,6 +21,7 @@ use kcore::Mm;
 pub struct DirectMap;
 
 impl PhysMem for DirectMap {
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
     fn read_u64(&self, pa: u64) -> u64 {
         // SAFETY: callers pass the address of a frame the frame database manages
         // (page tables and VMO pages), which `init` direct-maps read-write; the
@@ -20,6 +29,7 @@ impl PhysMem for DirectMap {
         unsafe { read_volatile((DIRECT_BASE + pa) as *const u64) }
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
     fn write_u64(&mut self, pa: u64, value: u64) {
         // SAFETY: as for `read_u64`.
         unsafe { write_volatile((DIRECT_BASE + pa) as *mut u64, value) }
@@ -41,6 +51,7 @@ static mut KMEM: Option<Kmem> = None;
 ///
 /// A safe function only because the aliasing rule is enforced by the lock and by convention.
 #[track_caller]
+#[allow(clippy::expect_used)] // INVARIANT: KMEM is set by `init` before anything else calls this (boot order); a panic is the right answer to a kernel bug
 pub fn get() -> &'static mut Kmem {
     debug_assert!(
         crate::bkl::held(),
@@ -85,6 +96,7 @@ pub fn sections() -> Sections {
     }
 }
 
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: boot code: the linker's section bounds, mapped once; a failure to map is a kernel that cannot run
 fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64), perms: Perms) {
     let mut va = start;
     while va < end {
@@ -96,6 +108,7 @@ fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64
 
 /// Build the kernel page table and switch to it. Needs the heap and the early
 /// boot table (which maps the direct map, so new tables can be written).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: boot code: addresses come from the device tree and the linker script; a kernel that cannot build its own page table cannot run
 pub fn init() {
     let s = sections();
     let kernel_end_phys = s.data.1 - KERNEL_OFFSET;
@@ -204,6 +217,7 @@ pub fn flush_tlb() {
 
 /// Flush the translations of the pages `first..=last` (virtual addresses, 4 KiB apart) of address space `asid`, one `sfence.vma`
 /// each (MM1): a resolved page fault drops only what it changed, not every other page this hart has cached.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: va runs over page-aligned addresses of pages a fault mapped inside the user half or the kernel's own table
 pub fn flush_pages(first: u64, last: u64, asid: u16) {
     let mut va = first & !0xfff;
     while va <= last {
@@ -218,6 +232,7 @@ pub fn flush_pages(first: u64, last: u64, asid: u16) {
 /// afterwards (OD41); `kernel_half_unchanged` checks.
 static mut KERNEL_HALF: [u64; 256] = [0; 256];
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 256 slots of the root table plus 256, and the root is a frame of the direct map
 fn kernel_half_now() -> [u64; 256] {
     crate::irq::without(|| {
         let root = get().aspace.table().root();
@@ -246,6 +261,7 @@ pub fn kernel_half_unchanged() -> bool {
 /// Free frames, plus the frames held by kernel stack slots (which keep theirs for ever once made, so
 /// a leak check that compares before and after must not count a slot made in between as a leak).
 /// Must be called with the big kernel lock held, like `get`.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a sum of three frame counts, each at most the number of frames
 pub fn free_frames_accounted() -> usize {
     get().mm.db.free_count() + crate::kstack::frames_held() + crate::heap::frames_held()
 }

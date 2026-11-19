@@ -12,6 +12,14 @@
 //!     interrupted thread's trap frame.
 //!
 //! Either way the thread that is switched out resumes exactly where it left off.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use crate::{heap, irq};
 use alloc::boxed::Box;
@@ -45,6 +53,7 @@ impl Rqs<Class> for KRqs {
     fn len(&self) -> usize {
         self.rq.len()
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count (callers pass harts they were given)
     fn lock(&self, x: usize) -> Self::Guard<'_> {
         self.rq[x].lock()
     }
@@ -65,6 +74,7 @@ const CANARY: u64 = 0xdead_c0de_5ca1_ab1e;
 /// Words of guard pattern at the bottom of every stack (the overflow detector).
 const GUARD_WORDS: usize = 8;
 
+#[allow(clippy::indexing_slicing)] // INVARIANT: the stack is a whole stack (many words): GUARD_WORDS is far below its length
 fn guard_intact(stack: &[u64]) -> bool {
     stack[..GUARD_WORDS].iter().all(|&w| w == CANARY)
 }
@@ -158,6 +168,7 @@ static mut KERNEL: Option<Kernel> = None;
 static mut SCHED: Option<KSched> = None;
 
 /// The scheduler (every method takes `&self`; interrupts must be off).
+#[allow(clippy::expect_used)] // INVARIANT: SCHED is set by `init` before any other hart starts or any scheduler call is made
 fn sched() -> &'static KSched {
     // SAFETY: written once by `init` before any other hart is started or any scheduler call is made, and never again; after that
     // it is only read through a shared reference.
@@ -182,6 +193,7 @@ pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 /// The scheduler state. Callers hold interrupts disabled (so the timer interrupt
 /// cannot re-enter) and do not keep the reference across a context switch.
 #[track_caller]
+#[allow(clippy::expect_used)] // INVARIANT: KERNEL is set by `init` before the first use (boot order)
 fn kernel() -> &'static mut Kernel {
     debug_assert!(
         !irq::enabled() && crate::bkl::held(),
@@ -198,6 +210,7 @@ fn kernel() -> &'static mut Kernel {
 
 /// Turn the code that is running (the boot thread) into a thread (its id follows the harts' idle ids) and start the idle
 /// thread. Needs the heap. Interrupts must still be off.
+#[allow(clippy::expect_used)] // INVARIANT: boot code: the boot thread's priority is valid and the idle and boot records are created once
 pub fn init(boot_prio: Prio) {
     // The kernel does no floating point and thread switches do not save FP state:
     // keep the FPU off (sstatus.FS = 0) so any accidental use traps instead of
@@ -291,6 +304,7 @@ pub fn joined() -> usize {
 
 /// A secondary hart joins the scheduler: its boot context becomes its idle thread (pinned to it)
 /// and it never returns.
+#[allow(clippy::unreachable)] // INVARIANT: a secondary hart that cannot join the scheduler cannot run; the loop never returns
 pub fn join_scheduler() -> ! {
     irq::without(|| {
         let h = hart();
@@ -386,6 +400,7 @@ fn spawn_with(name: &'static str, prio: Prio, entry: fn(usize), arg: usize, deta
     spawn_with_affinity(name, prio, entry, arg, detached, default_affinity())
 }
 
+#[allow(clippy::expect_used)] // INVARIANT: the priority passed by kernel code is valid (it was chosen in this crate)
 fn spawn_with_affinity(
     name: &'static str,
     prio: Prio,
@@ -408,6 +423,7 @@ fn spawn_with_affinity(
 
 /// A kernel thread's stack and first context. The stack comes from frames, not the heap, and has a guard page below it
 /// (`kstack.rs`).
+#[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: memory for a kernel thread's stack at boot or at thread creation by kernel code: running out is the kernel's own bug (the user thread limit and the job's stack charge are checked first); GUARD_WORDS is far below the stack's length
 fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool) -> KThread {
     let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
     stack[..GUARD_WORDS].fill(CANARY);
@@ -440,6 +456,7 @@ fn finish_switch() {
 
 /// Switch to whichever thread the core says should run, if it is not this one.
 /// Interrupts must be off.
+#[allow(clippy::expect_used)] // INVARIANT: the running and the next thread are threads the scheduler knows and the kernel table holds (every scheduler thread has a KThread: the same insert)
 fn reschedule() {
     // First, tell the harts that should look at the run queues (a wake or a priority change on
     // this hart found something better for them). They are poked, never changed from here.
@@ -496,12 +513,12 @@ fn reschedule() {
     // a thread of some other process. Back to the kernel's own table; the return to user mode
     // loads the right one (`user::activate_current`).
     crate::kmem::use_kernel_table_if_needed();
+    crate::latency::switch_out();
     // SAFETY: `old` and `new` point into boxed contexts that stay alive and in
     // place (threads are only reaped once exited and switched away from); the
     // switch saves this thread's state and resumes the other's, as `context_switch`
     // documents. Interrupts are off, the big kernel lock is held (and handed over), and no
     // reference to KERNEL is live.
-    crate::latency::switch_out();
     unsafe { context_switch(old, new) };
     // (resumed: on whichever hart now runs this thread, the switch that brought it here has finished saving the one before)
     finish_switch();
@@ -514,6 +531,7 @@ pub fn switch_if_designated() {
 }
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: pokes is a non-zero mask of harts (the loop condition), so pokes - 1 cannot underflow
 fn send_pokes(mut pokes: u32, me: usize) {
     // A poke for this hart itself (another hart marked it after this hart's own settle began, and this hart took the mask first):
     // the mark is real and `pending` is set, so the hart must look again: an IPI to itself, taken as soon as interrupts are on.
@@ -561,6 +579,7 @@ pub fn reschedule_fast() -> bool {
 /// fire its due timers, account the running thread's slice. Returns whether the hart must now switch threads (a rotation, a
 /// timer wake that outranks the running thread, a mark served): the caller then takes the big lock and calls `reschedule`.
 /// A tick that changes nothing needs no lock but the scheduler's own.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: TICKS counts 1 ms ticks: far below u64::MAX
 pub fn timer_tick_fast() -> bool {
     let h = hart();
     crate::timer::next_tick();
@@ -602,6 +621,7 @@ pub fn current() -> Tid {
 }
 
 /// Give up the rest of the time slice.
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn yield_now() {
     irq::without(|| {
         sched().yield_on(hart()).expect("running thread");
@@ -611,6 +631,7 @@ pub fn yield_now() {
 
 /// About to wait (SCHED-SMP-SPEC 3.7 step 1): from now on a wake counts. Call it before registering anywhere; end the
 /// wait with `block` (which returns at once if a wake arrived meanwhile).
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn prepare_block() {
     irq::without(|| {
         sched().prepare_block_on(hart()).expect("running thread");
@@ -623,6 +644,7 @@ pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
 }
 
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn block() {
     irq::without(|| {
         if sched().block_on(hart()).expect("running thread") {
@@ -641,6 +663,7 @@ pub fn wake(tid: Tid) {
 }
 
 /// Sleep for `n` ticks (or until woken).
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: ticks() + n: ticks far below u64::MAX and n is a kernel-chosen duration; the caller is a running thread
 pub fn sleep_ticks(n: u64) {
     let deadline = ticks() + n;
     // A loop: a stale entry on a wait queue can wake a sleeper early, and the sleep must not
@@ -688,6 +711,7 @@ pub fn set_priority(tid: Tid, prio: Prio) {
 }
 
 /// End the calling thread. Its stack is freed by whoever `join`s it.
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: the caller is a running thread; the reaper queue index was created by `init`
 pub fn exit() -> ! {
     irq::without(|| {
         let k = kernel();
@@ -720,6 +744,7 @@ pub fn exit() -> ! {
 /// Wait for `tid` to exit, then free its stack and record. Returns false, without
 /// waiting, if there is nothing to join: the thread is the caller itself, unknown, or
 /// already joined by someone else (a thread can be joined once).
+#[allow(clippy::expect_used)] // INVARIANT: the thread being reaped has exited (checked a few lines above) and the caller is a running thread
 pub fn join(tid: Tid) -> bool {
     loop {
         let result = irq::without(|| {
@@ -757,6 +782,7 @@ pub fn join(tid: Tid) -> bool {
 }
 
 /// A wait queue, by id.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: queues.len() >= 1 after the push just above
 pub fn new_queue() -> usize {
     irq::without(|| {
         let k = kernel();
@@ -776,6 +802,7 @@ pub fn wait_deadline_private(ready: impl FnMut() -> bool, deadline: u64) -> bool
 /// `wait_deadline_private`, calling `register` (in the same interrupts-off region, with the lock held)
 /// just before each sleep: the waiter's registration in the wait table, so that the thread that makes
 /// its condition true wakes exactly it. The caller removes the registration after the wait returns.
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn wait_deadline_registered(
     mut ready: impl FnMut() -> bool,
     mut register: impl FnMut(),
@@ -834,6 +861,7 @@ pub fn is_blocked(tid: Tid) -> bool {
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts
 /// off, so checking and queueing are one atomic step with respect to wakers: this is
 /// the "no lost wakeup" path.
+#[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned; the caller is a running thread
 pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
     let mut slept = false;
     loop {
@@ -858,6 +886,7 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_one(q: usize) -> bool {
     irq::without(|| {
         let k = kernel();
@@ -870,6 +899,7 @@ pub fn wake_one(q: usize) -> bool {
     })
 }
 
+#[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_all(q: usize) {
     irq::without(|| {
         let k = kernel();
@@ -900,6 +930,7 @@ fn count_sleep(slept: &mut bool) {
 }
 
 /// The counter `which` (0 sleeps, 1 spurious wakes, 2 wakes); 0 for an unknown index.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: which was matched into 16..=23 and the hart index is below the hart count
 pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
@@ -960,6 +991,7 @@ pub fn fp_off() -> bool {
     v >> 13 & 3 == 0 && v >> 9 & 3 == 0
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the heap's total free bytes are at least its grown bytes
 pub fn heap_free() -> usize {
     // (growth at a safe point adds free bytes that are not a leak)
     heap::free_bytes() - heap::grown_bytes()
@@ -976,6 +1008,7 @@ pub fn sched_thread_count() -> usize {
 
 /// Test hook: damage (or repair) a thread's stack guard, to show the overflow
 /// detector sees it.
+#[allow(clippy::indexing_slicing)] // INVARIANT: a test hook: the thread's stack has at least one word
 pub fn debug_set_guard(tid: Tid, intact: bool) {
     irq::without(|| {
         if let Some(stack) = kernel()
@@ -999,6 +1032,7 @@ pub fn class_name() -> &'static str {
 }
 
 /// The top of the calling thread's kernel stack (where a trap from user mode starts).
+#[allow(clippy::expect_used)] // INVARIANT: the running thread is in the kernel's table, with a stack unless it is the boot thread
 pub fn current_stack_top() -> u64 {
     irq::without(|| {
         let k = kernel();
@@ -1041,6 +1075,7 @@ fn reaper_main(_: usize) {
 /// shallower, so this is a lower bound, close in practice).
 static STACK_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: first < the stack's words (it is the index of a changed word)
 fn note_stack_use(t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
         let used = stack

@@ -13,6 +13,14 @@
 //! Frames come from the frame database like any kernel frame; leak checks add `frames_held` to the free count.
 //! Interrupts are disabled around every operation: an interrupt that allocated while a thread held the lock would
 //! spin for ever.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use crate::irq;
 use abi::layout::{HEAP_WINDOW_BASE, HEAP_WINDOW_SIZE};
@@ -52,6 +60,7 @@ fn with_heaps<R>(f: impl FnOnce(&mut Heaps) -> R) -> R {
 /// safe points cost one load when the heap is healthy.
 static LOW: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: free() of both heaps is at most their sizes (a few MiB)
 fn note_free(h: &Heaps) {
     LOW.store(
         h.boot.free() + h.grown.free() < LOW_WATER,
@@ -81,6 +90,7 @@ unsafe impl GlobalAlloc for IrqSafeHeap {
         })
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the window base plus its size is a kernel virtual address range, far below usize::MAX
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         with_heaps(|h| {
             let a = ptr as usize;
@@ -120,6 +130,7 @@ pub fn init() {
 }
 
 /// Free bytes in both heaps (for leak checks in the self-tests).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: free() of both heaps is at most their sizes
 pub fn free_bytes() -> usize {
     irq::without(|| with_heaps(|h| h.boot.free() + h.grown.free()))
 }
@@ -131,6 +142,7 @@ pub fn grown_bytes() -> usize {
 
 /// Frames the grown heap holds (stack pages for leak checks): its pages plus the page-table frames under them (one
 /// level-1 table for the window and one level-0 table per 2 MiB).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: page counts of a window of HEAP_WINDOW_SIZE bytes
 pub fn frames_held() -> usize {
     let pages = GROWN_BYTES.load(Ordering::Relaxed) / PAGE_SIZE as usize;
     if pages == 0 {
@@ -143,6 +155,7 @@ pub fn frames_held() -> usize {
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
 /// of the window, extend the heap. Needs the big kernel lock (frames and the kernel page table). Returns how many
 /// bytes were added (0 when the window is full or no frames are left; nothing is left half done).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: `have` is at most HEAP_WINDOW_SIZE (checked into `room`), mapped <= room; the sums are inside the heap window
 pub fn grow(bytes: usize) -> usize {
     debug_assert!(crate::bkl::held());
     let want = bytes.div_ceil(PAGE_SIZE as usize);

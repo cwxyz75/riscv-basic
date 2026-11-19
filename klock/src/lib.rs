@@ -9,7 +9,18 @@
 //!   lock keep their own reentrancy).
 //!
 //! This is the one pure-side crate that contains `unsafe` (the lock's `UnsafeCell`), run under Miri, loom and shuttle.
-
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::undocumented_unsafe_blocks
+    )
+)] // KT3 (KERNEL-V1-SPEC 7.4); sites that remain carry `#[allow] // INVARIANT:`
 #![no_std]
 
 use core::cell::UnsafeCell;
@@ -110,6 +121,7 @@ impl Held {
         self.len == 0
     }
 
+    #[allow(clippy::indexing_slicing)] // INVARIANT: len <= MAX_HELD, the stack's length, by `push`
     pub fn holds(&self, class: Class) -> bool {
         self.stack[..self.len].iter().any(|&(c, _)| c == class)
     }
@@ -117,6 +129,7 @@ impl Held {
     /// Would taking `(class, instance)` now be legal? Legal when nothing is held, or the new class is greater than
     /// the top's, or the classes are equal and the table allows two and the instance is greater, or the class is
     /// reentrant and the hart already holds it (a recursive take: it is not pushed again).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: len <= MAX_HELD; the slice is of the entries in use
     pub fn check(&self, class: Class, instance: u32) -> Result<(), Violation> {
         let Some(&(top, top_instance)) = self.stack[..self.len].last() else {
             return Ok(());
@@ -150,6 +163,7 @@ impl Held {
 
     /// Record an acquisition (after `check`). A recursive take of a reentrant class is not pushed again. Panics when
     /// more than [`MAX_HELD`] locks are held.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: `push` asserts len < MAX_HELD first (a kernel bug panics, with a message): the index and the increment are in range
     pub fn push(&mut self, class: Class, instance: u32) {
         if class.reentrant() && self.holds(class) {
             return;
@@ -161,6 +175,7 @@ impl Held {
 
     /// Record a release. Locks are normally released in reverse order, but any held lock may go (a guard can be
     /// dropped out of order); a lock that is not held is a bug.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i is the position of a held entry, below len; len >= 1 when an entry was found
     pub fn pop(&mut self, class: Class, instance: u32) {
         let at = self.stack[..self.len]
             .iter()

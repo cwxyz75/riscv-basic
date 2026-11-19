@@ -1,6 +1,18 @@
 //! The contract between the OS-track kernel and everything that talks to it.
 //! S0 holds only what the boot test needs; the syscall table arrives with S3 and
 //! is specified in `SYSCALLS.md` first.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::undocumented_unsafe_blocks
+    )
+)] // KT3 (KERNEL-V1-SPEC 7.4); sites that remain carry `#[allow] // INVARIANT:`
 #![no_std]
 #![forbid(unsafe_code)]
 

@@ -9,6 +9,14 @@
 //! creating a thread after the first few costs no frame traffic. (Returning frames needs a shootdown;
 //! a later step can add it.) The first slot is made at boot, so the window's top-level page-table entry
 //! exists before the kernel half is snapshotted (OD41).
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
+)] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
 use abi::layout::{KSTACK_BYTES, KSTACK_SLOT_BYTES, KSTACK_WINDOW_BASE, KSTACK_WINDOW_SIZE};
 use alloc::vec::Vec;
@@ -49,16 +57,19 @@ pub struct KStack {
 
 impl KStack {
     /// The lowest address of the usable stack (just above the guard).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: slot_base is inside the kernel-stack window, so adding a stack's size stays a kernel address
     pub fn bottom(&self) -> usize {
         slot_base(self.slot) as usize + KSTACK_BYTES as usize
     }
 
     /// One past the highest address of the stack: where the stack pointer starts.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: slot_base is inside the kernel-stack window, so adding a stack's size stays a kernel address
     pub fn top(&self) -> usize {
         self.bottom() + KSTACK_BYTES as usize
     }
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: slot < the window's slot count (the allocator hands out indices below it)
 fn slot_base(slot: u32) -> u64 {
     KSTACK_WINDOW_BASE + u64::from(slot) * KSTACK_SLOT_BYTES
 }
@@ -93,6 +104,7 @@ impl Drop for KStack {
 
 /// Make a slot with frames: map the four stack pages of the next unused slot. `None` if the window is
 /// full or no frames (or page-table frames) are left; nothing is changed then.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < PAGES indexes the frames array of PAGES entries; the addresses are inside the kernel-stack window; the slot counter is far below u32::MAX
 fn make_slot() -> Option<u32> {
     let s = slots();
     if s.next >= MAX_SLOTS {
@@ -150,6 +162,7 @@ pub fn alloc() -> Option<KStack> {
 
 /// Make the first slot now (boot, before the kernel half is snapshotted), so the window's top-level
 /// page-table entry exists; the slot goes on the free list.
+#[allow(clippy::expect_used)] // INVARIANT: boot code: the first slot must exist for the boot thread to get a stack
 pub fn init() {
     crate::irq::without(|| {
         let slot = make_slot().expect("memory for the first kernel stack slot");
@@ -158,6 +171,7 @@ pub fn init() {
 }
 
 /// Frames held by slots (made and kept): leak checks add this to the free count.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: made is the slot count, at most the window's slots
 pub fn frames_held() -> usize {
     let made = slots().next as usize;
     // the stack pages, plus the page-table frames under them: one level-1 table for the window and one
