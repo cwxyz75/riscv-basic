@@ -317,6 +317,7 @@ dependencies = [
  "abi",
  "kcore",
  "klock",
+ "ksys",
  "linked_list_allocator",
  "proto",
 ]
@@ -328,6 +329,14 @@ dependencies = [
  "kcore",
  "loom",
  "shuttle",
+]
+
+[[package]]
+name = "ksys"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "kcore",
 ]
 
 [[package]]

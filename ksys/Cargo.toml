@@ -1,0 +1,12 @@
+[package]
+name = "ksys"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: the kernel's syscall layer as host-testable logic behind a small machine trait (TS3)"
+
+[dependencies]
+abi = { path = "../abi" }
+kcore = { path = "../kcore" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }

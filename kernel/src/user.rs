@@ -169,6 +169,27 @@ impl UserState {
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the
 /// kernel's own objects).
+/// The calling process's memory and the job ledger, for the `ksys` calls.
+struct KernelMem<'a> {
+    aspace: &'a mut AddressSpace,
+    k: &'a mut kmem::Kmem,
+}
+
+impl ksys::UserMem for KernelMem<'_> {
+    fn copy_in(&mut self, ptr: u64, len: usize) -> Result<Vec<u8>, Status> {
+        copy_from_user(self.aspace, &mut self.k.mm, &mut self.k.vmos, ptr, len)
+    }
+    fn verify_writable(&mut self, ptr: u64, len: usize) -> Result<(), Status> {
+        verify_writable(self.aspace, &mut self.k.mm, &mut self.k.vmos, ptr, len)
+    }
+    fn copy_out_verified(&mut self, ptr: u64, data: &[u8]) -> Result<(), Status> {
+        copy_to_user_verified(self.aspace, &mut self.k.mm, ptr, data)
+    }
+    fn jobs(&mut self) -> &mut kcore::job::Jobs {
+        &mut self.k.vmos.jobs
+    }
+}
+
 fn quota(job: JobId) -> ipc::Quota<'static> {
     ipc::Quota {
         jobs: &mut kmem::get().vmos.jobs,
@@ -1070,48 +1091,27 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     } = s;
     let p = procs.get_mut(&pid).expect("process exists");
     let h = |i: usize| Handle(a[i] as u32);
-    // Every 32-bit argument must really fit 32 bits: a value with high bits set names no
-    // handle, grants no right and sets no signal, instead of being silently truncated.
-    let over = |i: usize| a[i] > u64::from(u32::MAX);
-    let bad_args = match n {
-        nr::HANDLE_CLOSE | nr::OBJECT_SIGNALS | nr::OBJECT_INFO | nr::CHANNEL_WRITE if over(0) => {
-            Some(Status::BadHandle)
-        }
-        nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
-        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR | nr::VMO_COMMIT
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::VMO_CREATE_PHYSICAL
-        | nr::VMO_CREATE_DMA
-        | nr::RESOURCE_DTB
-        | nr::INTERRUPT_CREATE
-        | nr::INTERRUPT_ACK
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
-        nr::SOCKET_WRITE
-        | nr::SOCKET_READ
-        | nr::SOCKET_SHUTDOWN
-        | nr::PORT_UNBIND
-        | nr::PORT_REARM
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
-        nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
-        nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
-        nr::EVENT_SIGNAL if over(0) => Some(Status::BadHandle),
-        nr::EVENT_SIGNAL if over(1) || over(2) => Some(Status::InvalidArgs),
-        nr::CHANNEL_READ_TXID if over(1) => Some(Status::InvalidArgs),
-        _ => None,
-    };
+    // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
+    // on handles, events, channels, sockets and ports, over this machine's memory.
+    let bad_args = ksys::wide_argument_error(n, &a);
     if let Some(status) = bad_args {
         return fail(status);
+    }
+    {
+        let mut mem = KernelMem {
+            aspace: &mut p.aspace,
+            k: &mut *k,
+        };
+        let mut ctx = ksys::Ctx {
+            objs: &mut *objs,
+            handles: &mut p.handles,
+            job: p.job,
+            mem: &mut mem,
+            skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
+        };
+        if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
+            return r;
+        }
     }
     match n {
         nr::DEBUG_WRITE => {
@@ -1123,200 +1123,6 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);
             Ok((None, None))
-        }
-        nr::HANDLE_CLOSE => p
-            .handles
-            .close(objs, h(0))
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::HANDLE_DUPLICATE => {
-            let nh = p
-                .handles
-                .duplicate(objs, h(0), Rights(a[1] as u32))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(nh.0)), None))
-        }
-        nr::HANDLE_REPLACE => {
-            let nh = p
-                .handles
-                .replace(objs, h(0), Rights(a[1] as u32))
-                .map_err(|e| (e, None, None))?;
-            // (the negative-control kernel forgets the forced touch: a waiter on the replaced handle
-            // must then sleep on, and the test that guards the wake must fail)
-            if cfg!(feature = "fault-skip-forced-touch") {
-                objs.take_dirty();
-            }
-            Ok((Some(u64::from(nh.0)), None))
-        }
-        nr::CHANNEL_CREATE => {
-            let (x, y) = ipc::channel_create_in(objs, &mut p.handles, &mut quota(p.job))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
-        }
-        nr::SOCKET_CREATE => {
-            let (x, y) = ipc::socket_create_in(objs, &mut p.handles, &mut quota(p.job))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
-        }
-        nr::SOCKET_WRITE => {
-            let len = a[2] as usize;
-            ipc::socket_write_check(objs, &p.handles, h(0), len).map_err(|e| (e, None, None))?;
-            let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], len)
-                .map_err(|e| (e, None, None))?;
-            ipc::socket_write_in(objs, &p.handles, h(0), &data, &mut kmem::get().vmos.jobs)
-                .map(|n| (Some(n as u64), None))
-                .map_err(|e| (e, None, None))
-        }
-        nr::SOCKET_READ => {
-            let max = a[2] as usize;
-            // What a read would deliver, checked against the destination before anything is
-            // removed, so a bad pointer never loses data.
-            let n = ipc::socket_peek(objs, &p.handles, h(0), max).map_err(|e| (e, None, None))?;
-            verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], n)
-                .map_err(|e| (e, None, None))?;
-            let data = ipc::socket_read_in(objs, &p.handles, h(0), max, &mut kmem::get().vmos.jobs)
-                .map_err(|e| (e, None, None))?;
-            copy_to_user_verified(&mut p.aspace, &mut k.mm, a[1], &data)
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(data.len() as u64), None))
-        }
-        nr::SOCKET_SHUTDOWN => ipc::socket_shutdown(objs, &p.handles, h(0))
-            .map(|()| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::PORT_CREATE => {
-            let port = ipc::port_create_in(objs, &mut p.handles, &mut quota(p.job))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(port.0)), None))
-        }
-        nr::PORT_BIND => ipc::port_bind_flags_in(
-            objs,
-            &p.handles,
-            h(0),
-            h(1),
-            a[2],
-            a[3],
-            a[4],
-            &mut kmem::get().vmos.jobs,
-        )
-        .map(|_| (None, None))
-        .map_err(|e| (e, None, None)),
-        nr::PORT_REARM => {
-            ipc::port_rearm_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
-                .map(|_| (None, None))
-                .map_err(|e| (e, None, None))
-        }
-        nr::PORT_UNBIND => {
-            ipc::port_unbind_in(objs, &p.handles, h(0), a[1], &mut kmem::get().vmos.jobs)
-                .map(|_| (None, None))
-                .map_err(|e| (e, None, None))
-        }
-        nr::EVENT_CREATE => {
-            let e = ipc::event_create_in(objs, &mut p.handles, &mut quota(p.job))
-                .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(e.0)), None))
-        }
-        nr::EVENT_SIGNAL => ipc::event_signal(objs, &p.handles, h(0), a[1] as u32, a[2] as u32)
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None)),
-        nr::OBJECT_INFO => ipc::object_info(objs, &p.handles, h(0))
-            .map(|(k, peer)| (Some(k), Some(peer)))
-            .map_err(|e| (e, None, None)),
-        nr::OBJECT_SIGNALS => ipc::signals_of(objs, &p.handles, h(0))
-            .map(|s| (Some(u64::from(s)), None))
-            .map_err(|e| (e, None, None)),
-        nr::CHANNEL_WRITE => {
-            let (nbytes, nhandles) = (a[2] as usize, a[4] as usize);
-            // Sizes first: they bound everything that follows (SYSCALLS.md).
-            if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
-                return fail(Status::TooBig);
-            }
-            let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[1], nbytes)
-                .map_err(|e| (e, None, None))?;
-            let raw = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, a[3], nhandles * 4)
-                .map_err(|e| (e, None, None))?;
-            ipc::channel_write_in(
-                objs,
-                &mut p.handles,
-                h(0),
-                &data,
-                &handle_list(&raw),
-                &mut kmem::get().vmos.jobs,
-            )
-            .map(|_| (None, None))
-            .map_err(|e| (e, None, None))
-        }
-        nr::CHANNEL_READ | nr::CHANNEL_READ_TXID => {
-            let (txid, bytes_at, max_bytes, handles_at, max_handles) = if n == nr::CHANNEL_READ {
-                (None, a[1], a[2] as usize, a[3], a[4] as usize)
-            } else {
-                (Some(a[1] as u32), a[2], a[3] as usize, a[4], a[5] as usize)
-            };
-            // A message never exceeds the limits, so larger declared buffers act as the limit.
-            let (mb, mh) = (
-                max_bytes.min(MAX_MSG_BYTES),
-                max_handles.min(MAX_MSG_HANDLES),
-            );
-            // Find out what this read would deliver, and check the destinations against the
-            // *actual* message (not the declared capacity) before dequeuing anything, so a
-            // bad pointer can never lose a message and a generous `max_bytes` needs no
-            // generous mapping.
-            let (nbytes, nhandles) = match ipc::channel_peek(objs, &p.handles, h(0), txid, mb, mh) {
-                Ok(sizes) => sizes,
-                Err(ReadError::TooSmall { bytes, handles }) => {
-                    return Err((
-                        Status::BufferTooSmall,
-                        Some(bytes as u64),
-                        Some(handles as u64),
-                    ))
-                }
-                Err(ReadError::Status(st)) => return fail(st),
-            };
-            verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, bytes_at, nbytes)
-                .map_err(|e| (e, None, None))?;
-            verify_writable(
-                &mut p.aspace,
-                &mut k.mm,
-                &mut k.vmos,
-                handles_at,
-                nhandles * 4,
-            )
-            .map_err(|e| (e, None, None))?;
-            let got = match txid {
-                None => ipc::channel_read_in(
-                    objs,
-                    &mut p.handles,
-                    h(0),
-                    mb,
-                    mh,
-                    &mut kmem::get().vmos.jobs,
-                ),
-                Some(t) => ipc::channel_read_txid_in(
-                    objs,
-                    &mut p.handles,
-                    h(0),
-                    t,
-                    mb,
-                    mh,
-                    &mut kmem::get().vmos.jobs,
-                ),
-            };
-            match got {
-                Ok(r) => {
-                    let raw: Vec<u8> = r.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
-                    // The destinations were verified: these writes allocate nothing (T10).
-                    copy_to_user_verified(&mut p.aspace, &mut k.mm, bytes_at, &r.data)
-                        .map_err(|e| (e, None, None))?;
-                    copy_to_user_verified(&mut p.aspace, &mut k.mm, handles_at, &raw)
-                        .map_err(|e| (e, None, None))?;
-                    Ok((Some(r.data.len() as u64), Some(r.handles.len() as u64)))
-                }
-                Err(ReadError::TooSmall { bytes, handles }) => Err((
-                    Status::BufferTooSmall,
-                    Some(bytes as u64),
-                    Some(handles as u64),
-                )),
-                Err(ReadError::Status(st)) => Err((st, None, None)),
-            }
         }
         nr::VMO_CREATE => {
             if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {

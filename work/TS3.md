@@ -18,3 +18,7 @@ Scoped for plan 4 to the kernel part (the server-protocol harnesses of the origi
 **Acceptance, written first.** Per PR: the host tests cover every error row of `SYSCALLS.md` for the moved calls (KT4's table shows them), run under Miri in the soak tier, and the QEMU suite is unchanged at 1, 2 and 4 harts. `kernel/src/user.rs` ends under 600 lines.
 
 **Review.** Fable for TS3a (the trait's shape decides everything after it); default for b and c; soak each.
+
+## Progress (2026-11-19)
+
+**TS3a** (PR pending): the crate `ksys` exists, with `UserMem` (copy in, verify-writable, copy-out-verified, the job ledger) as the machine seam, `wide_argument_error` (the 32-bit argument table) and `ipc_call` (handles, channels, sockets, events, ports, object info). `kernel/src/user.rs` calls it first in `dispatch`. Host tests in `ksys/tests/ipc_calls.rs` run the error rows of those calls against a fake machine. Verified: kquick, the QEMU suite at `-smp 1`, `2` and `4`. The seam is a narrower trait than the `Machine` of the plan, because these calls need only memory and the ledger; it grows with TS3b and TS3c. Miri over `ksys` joins the soak tier's list (owed).
