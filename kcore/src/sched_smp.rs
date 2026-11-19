@@ -382,6 +382,17 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         None
     }
 
+    /// When hart `hart`'s one-shot timer must fire next (`HartRq::next_event`): `None` is never.
+    pub fn next_event_on(&self, hart: usize) -> Option<Time> {
+        self.lq(hart).next_event()
+    }
+
+    /// Set a thread's timer slack (SCHED-SMP-SPEC 4.11): nanoseconds, clamped to 1 ms, applied to its next sleep.
+    pub fn set_timer_slack(&self, tid: Tid, slack: Time) -> Result<(), Error> {
+        let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+        self.lq(home).set_timer_slack(tid, slack)
+    }
+
     pub fn queued_on(&self, hart: usize) -> usize {
         self.lq(hart).queued_len()
     }
@@ -714,6 +725,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             last_hart: caller as u8,
             slice_left: 0,
             deadline: None,
+            timer_hard: 0,
+            timer_slack: crate::sched2::DEFAULT_SLACK,
             runnable_since: 0,
             started: 0,
             cpu: 0,

@@ -23,6 +23,9 @@ pub type Prio = u8;
 pub type Time = u64;
 
 pub const MS: Time = 1_000_000;
+/// The default timer slack of a thread in the normal band (SCHED-SMP-SPEC 4.11): 50 microseconds; 0 in the real-time band; at most `MAX_SLACK`.
+pub const DEFAULT_SLACK: Time = 50_000;
+pub const MAX_SLACK: Time = MS;
 /// The normal band's round robin slice (OD33's 10 ticks, now in nanoseconds).
 pub const TIMESLICE: Time = 10 * MS;
 /// RT window and limits (SCHED-SMP-SPEC 4.5); accounted, not enforced yet.
@@ -93,6 +96,11 @@ pub struct ThreadSched {
     pub last_hart: u8,
     pub slice_left: Time,
     pub deadline: Option<Time>,
+    /// The hard expiry of `deadline` (soft expiry plus the slack at the time it was set): the hardware timer is programmed to the
+    /// earliest of these; every entry whose soft expiry has passed is expired in the same interrupt.
+    pub timer_hard: Time,
+    /// This thread's timer slack when it sleeps in the normal band (nanoseconds; 0 in the real-time band whatever this says).
+    pub timer_slack: Time,
     pub runnable_since: Time,
     pub started: Time,
     pub cpu: Time,
@@ -313,7 +321,11 @@ impl Class for FixedPrio {
     }
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
-        Some(now + cur.slice_left)
+        // (a slice end matters only when an equal or better peer waits: otherwise the thread would just get a new slice)
+        self.q
+            .top()
+            .filter(|&p| p >= cur.eff)
+            .map(|_| now + cur.slice_left)
     }
     fn contains(&self, tid: Tid) -> bool {
         self.q.contains(tid)
@@ -402,7 +414,7 @@ impl Class for RoundRobin {
     }
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
-        Some(now + cur.slice_left)
+        (!self.q.is_empty()).then(|| now + cur.slice_left)
     }
     fn contains(&self, tid: Tid) -> bool {
         self.q.iter().any(|&(t, _)| t == tid)
@@ -473,7 +485,7 @@ impl Class for RtClass {
     }
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a slice is far below u64::MAX
     fn next_event(&self, cur: &ThreadSched, now: Time) -> Option<Time> {
-        cur.base.rr.then(|| now + cur.slice_left)
+        (cur.base.rr && self.q.top().is_some_and(|p| p >= cur.eff)).then(|| now + cur.slice_left)
     }
     fn contains(&self, tid: Tid) -> bool {
         self.q.contains(tid)
@@ -577,6 +589,8 @@ pub struct HartRq<N: Class> {
     threads: BTreeMap<Tid, ThreadSched>,
     now: Time,
     timers: BTreeSet<(Time, Tid)>,
+    /// The same entries ordered by hard expiry (soft expiry plus slack): the first is when the hardware timer must fire.
+    hard_timers: BTreeSet<(Time, Tid)>,
     next_tid: Tid,
     pub bad_picks: u32,
 }
@@ -591,6 +605,7 @@ impl<N: Class> HartRq<N> {
             threads: BTreeMap::new(),
             now: 0,
             timers: BTreeSet::new(),
+            hard_timers: BTreeSet::new(),
             next_tid: 1,
             bad_picks: 0,
         }
@@ -633,6 +648,8 @@ impl<N: Class> HartRq<N> {
                 last_hart: 0,
                 slice_left: TIMESLICE,
                 deadline: None,
+                timer_hard: 0,
+                timer_slack: DEFAULT_SLACK,
                 runnable_since: self.now,
                 started: self.now,
                 cpu: 0,
@@ -747,6 +764,7 @@ impl<N: Class> HartRq<N> {
             State::Blocked => {
                 if let Some(d) = t.deadline.take() {
                     self.timers.remove(&(d, tid));
+                    self.hard_timers.remove(&(t.timer_hard, tid));
                 }
                 let slept = self.now.saturating_sub(t.started);
                 t.park = crate::park::ParkState::Idle;
@@ -814,7 +832,14 @@ impl<N: Class> HartRq<N> {
             return Ok(false);
         }
         t.deadline = Some(deadline);
+        let slack = if band(t.eff) == Band::Rt {
+            0
+        } else {
+            t.timer_slack.min(MAX_SLACK)
+        };
+        t.timer_hard = deadline.saturating_add(slack);
         self.timers.insert((deadline, c));
+        self.hard_timers.insert((t.timer_hard, c));
         self.block_current()
     }
 
@@ -908,6 +933,35 @@ impl<N: Class> HartRq<N> {
         true
     }
 
+    /// When this hart's one-shot hardware timer must fire next (SCHED-SMP-SPEC 4.11, KERNEL-V1-SPEC 5.1): the earliest **hard** expiry of
+    /// a sleeper's deadline, or the running thread's slice end when an equal or better peer waits; `None` is "never" (a hart with one
+    /// runnable thread and no deadline takes no timer interrupt). Absolute nanoseconds on the hart's clock. The caller programs the
+    /// hardware to it whenever it may have changed (after an interrupt, a switch, an enqueue).
+    pub fn next_event(&self) -> Option<Time> {
+        let timer = self.hard_timers.first().map(|&(h, _)| h);
+        let slice = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .and_then(|c| self.threads.get(&c))
+            .and_then(|t| match band(t.eff) {
+                Band::Rt => self.rt.next_event(t, self.now),
+                _ => self.normal.next_event(t, self.now),
+            });
+        match (timer, slice) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Set a thread's timer slack (nanoseconds, clamped to `MAX_SLACK`); it applies to its next sleep.
+    pub fn set_timer_slack(&mut self, tid: Tid, slack: Time) -> Result<(), Error> {
+        self.threads
+            .get_mut(&tid)
+            .ok_or(Error::NoSuchThread)?
+            .timer_slack = slack.min(MAX_SLACK);
+        Ok(())
+    }
+
     /// Advance the clock by `dt`: fire the timers that are due, account the running thread's slice (rotating it
     /// when its slice is over and an equal or better peer waits), then make the designation right.
     #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the nanosecond clock is far below u64::MAX within a boot
@@ -922,6 +976,7 @@ impl<N: Class> HartRq<N> {
         for (d, tid) in due {
             self.timers.remove(&(d, tid));
             if let Some(t) = self.threads.get_mut(&tid) {
+                self.hard_timers.remove(&(t.timer_hard, tid));
                 t.deadline = None;
                 if t.state == State::Blocked {
                     t.park = crate::park::ParkState::Idle;
@@ -990,6 +1045,8 @@ impl<N: Class> HartRq<N> {
                 last_hart,
                 slice_left: TIMESLICE,
                 deadline: None,
+                timer_hard: 0,
+                timer_slack: DEFAULT_SLACK,
                 runnable_since: self.now,
                 started: self.now,
                 cpu: 0,
@@ -1113,6 +1170,7 @@ impl<N: Class> HartRq<N> {
         }
         if let Some(d) = t.deadline.take() {
             self.timers.remove(&(d, tid));
+            self.hard_timers.remove(&(t.timer_hard, tid));
         }
         let slept = self.now.saturating_sub(t.started);
         t.park = crate::park::ParkState::Idle;
@@ -1138,6 +1196,7 @@ impl<N: Class> HartRq<N> {
             State::Blocked => {
                 if let Some(d) = t.deadline.take() {
                     self.timers.remove(&(d, tid));
+                    self.hard_timers.remove(&(t.timer_hard, tid));
                 }
                 let slept = self.now.saturating_sub(t.started);
                 t.park = crate::park::ParkState::Idle;
