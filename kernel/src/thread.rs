@@ -651,12 +651,25 @@ pub fn reschedule_fast() -> bool {
 
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds): every 100 ms, each hart at its own phase, a thread queued for more than
 /// 500 ms while a hart that may run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`).
+/// The same thread must be found in two samples in a row: the check reads other harts' idleness from hints at one instant, and a thread
+/// preempted after a long run is queued, "late" and briefly in front of an idle hart that is on its way to pull it (PR 264 review).
 #[cfg(debug_assertions)]
-#[allow(clippy::arithmetic_side_effects, clippy::panic)] // INVARIANT: h is a hart index below 32 and now counts 1 ms ticks; the panic is the detector's report
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::indexing_slicing
+)] // INVARIANT: h is a hart index below 32 and now counts 1 ms ticks; the panic is the detector's report
 fn starvation_watchdog(h: usize, now: u64) {
+    static LAST: [core::sync::atomic::AtomicU32; 32] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; 32];
     if now % 100 == h as u64 {
-        if let Some((t, on, idle)) = sched().starved(500 * MS) {
-            panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles");
+        let found = sched().starved(ticks_to_ns(now), 500 * MS);
+        let tid = found.map_or(0, |f| f.0);
+        let before = LAST[h & 31].swap(tid, Ordering::Relaxed);
+        if let Some((t, on, idle)) = found {
+            if before == t {
+                panic!("starved thread {t}: queued on hart {on} for more than 500 ms while hart {idle} idles");
+            }
         }
     }
 }

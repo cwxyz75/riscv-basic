@@ -36,7 +36,7 @@ fn rt_probe(n: usize) {
         Ordering::SeqCst,
     );
     RT_ARRIVED.fetch_add(1, Ordering::SeqCst);
-    let deadline = thread::ticks() + 500;
+    let deadline = thread::ticks() + 2000; // (well above the watchdog's 500 ms)
     while RT_ARRIVED.load(Ordering::SeqCst) < n {
         if thread::ticks() > deadline {
             RT_WAIT_FAILED.store(true, Ordering::SeqCst);

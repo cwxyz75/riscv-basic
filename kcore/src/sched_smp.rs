@@ -349,15 +349,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0
     }
 
-    /// The starvation watchdog's check (a debug detector, SCHED-SMP-SPEC 3.9): a thread queued for more than `limit` ns while a hart
+    /// The starvation watchdog's check (a debug detector, SCHED-SMP-SPEC 3.9; `now` is the caller's clock, since a hart that takes no
+    /// tick has a stale one): a thread queued (or woken: `runnable_since` is the last wake) for more than `limit` ns while a hart
     /// that may run it is idle. Returns (thread, the hart it is queued on, the idle hart). A thread in transit is not counted. Takes
     /// one run-queue lock at a time and reads the others' hints, so it is cheap enough for a timer handler in a debug build.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: runnable_since is not after the clock that stamped it (saturating_sub)
-    pub fn starved(&self, limit: Time) -> Option<(Tid, usize, usize)> {
+    pub fn starved(&self, now: Time, limit: Time) -> Option<(Tid, usize, usize)> {
         for g in 0..self.harts() {
             let late: Vec<(Tid, Option<u8>)> = {
                 let q = self.lq(g);
-                let now = q.now();
                 q.tids()
                     .filter(|&t| q.is_queued(t))
                     .filter_map(|t| q.record(t).map(|r| (t, r)))
@@ -952,6 +952,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         clippy::indexing_slicing
     )] // INVARIANT: hart indices are below the hart count; the thread was found queued under the same two locks
     fn balance(&self, h: usize) -> bool {
+        #[cfg(feature = "fault-skip-pull")]
+        {
+            let _ = h;
+            return false; // negative control (L11d): nothing moves between harts but by push
+        }
         let len = |x: usize| self.hint[x].queued_len.load(Ordering::Acquire);
         let mine = len(h);
         let busiest = (0..self.harts())
