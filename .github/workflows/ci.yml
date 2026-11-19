@@ -3,7 +3,7 @@ name: ci
 # The merge gate (tiers 0 and 1 of TESTING.md / OD83): host tests and lint, one boot of the suite at four
 # harts, the release smoke, the home computer's boot. Every job's timeout is its budget; a job that
 # outgrows it fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The
-# full matrix (tier 2) is `soak.yml`: nightly, on the `soak` label and on demand, never required.
+# full matrix (tier 2) is `soak.yml`: started only by the owner, by hand (OD142); never required.
 # Pull requests run the suite once; pushes only matter on main (a branch push with an open PR would
 # run exactly the same jobs a second time).
 on:

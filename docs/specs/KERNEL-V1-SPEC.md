@@ -4,7 +4,7 @@ Version: v1, 2026-11-18.
 
 This document states what the OS-track kernel is when it is declared finished for a while ("v1"): its targets, its
 contract with user programs, its memory model, its scaling, power and hardening properties, and how it is tested. It is
-the result of the owner's kernel review of 2026-11-18 and the decisions OD126 to OD141 (`docs/records/decisions.md`).
+the result of the owner's kernel review of 2026-11-18 and the decisions OD126 to OD143 (`docs/records/decisions.md`).
 
 It **amends** `OS-ARCHITECTURE.md` (sections 1, 4, 5, 6, 7, 9, 11), `SCHED-SMP-SPEC.md` (sections 1.3, 3, 4.4, 4.11,
 4.12, 5.1) and `T-SPEC.md` (section 3); each of those carries a dated amendment that points here. Where this document
@@ -26,10 +26,11 @@ decisions; a change to it is a dated amendment at the end.
 | Power | No periodic tick. Harts can be taken offline and brought back. Deeper idle states and suspend-to-RAM through firmware. Timer slack. Heterogeneous harts stay out, but hart placement is a replaceable policy |
 | Contract | The stable interface for programs is the **system library** the kernel provides, not the syscall instruction or its numbers (section 3.1) |
 | Hardening | Address randomisation for programs and for the kernel; a kernel entropy pool; no ambient debug calls. Shadow stacks, landing pads, pointer masking and speculation mitigations have reserved ABI space only (section 7.5) |
+| Architectures | RISC-V is the only one implemented. The kernel is organised so that a second one (AArch64 is the one in mind) is an added directory, not a rewrite (section 2.6) |
 | Scope of the work | The kernel, plus whatever must change in `rt`, the C library and the servers to keep the system green at every step |
 
-Non-goals of v1: heterogeneous harts, NUMA, physical hotplug, Sv48, large pages for user mappings, an IOMMU, a second
-architecture, a fair scheduling class (SCHED-SMP-SPEC 4.7 stays deferred), splitting the object lock (SCHED-SMP-SPEC
+Non-goals of v1: heterogeneous harts, NUMA, physical hotplug, Sv48, large pages for user mappings, an IOMMU, implementing a second
+architecture (its place is prepared: section 2.6), a fair scheduling class (SCHED-SMP-SPEC 4.7 stays deferred), splitting the object lock (SCHED-SMP-SPEC
 3.13 keeps its trigger), bring-up on a physical board.
 
 ---
@@ -111,6 +112,42 @@ Per-object limits that are part of the contract stay constants: 64 KiB and 64 ha
 256 KiB queued per channel end, 64 KiB per socket buffer. Per-process ceilings (handles, regions, threads) are the
 job's quota, with no constant below it.
 
+### 2.6 The architecture boundary (Decided, OD143)
+
+Everything that depends on the processor architecture lives behind one boundary, so that AArch64 can be added later
+without touching the rest of the kernel. Nothing below is an AArch64 implementation; it is how the RISC-V code is
+arranged.
+
+* **Where the code lives.** `kernel/src/arch/riscv64/` holds all of it: boot entry and early paging, the trap entry
+  and exit assembly, the trap frame, the context switch, the per-hart register (`tp`), control-register access,
+  firmware calls (SBI), the timer, inter-hart interrupts, TLB and cache maintenance, FP and vector state save and
+  restore, the interrupt controller driver (AIA), idle and suspend entry, and the extension check of 2.1.
+  `kernel/src/arch/mod.rs` re-exports the selected architecture as `arch::*`.
+* **The interface.** The rest of the kernel uses only the items `arch/mod.rs` documents: a `TrapFrame` type with
+  accessors (syscall number and arguments, return values, program counter, the stack pointer, "came from user
+  mode"); `Context` and `switch`; `this_cpu()`; `irq_save` and `irq_restore`; `timer_set` and `clock_read`;
+  `ipi_send`; `tlb_flush_page`, `tlb_flush_asid`, `tlb_shootdown`, `icache_sync`; `MachineState` save and restore
+  for each lazily switched unit; `trait IrqChip` (enable, mask, unmask, claim, route) with the AIA as its one
+  implementation; `cpu_idle`, `cpu_suspend`, `cpu_start`, `cpu_stop`, `system_suspend`, `system_reset`; a
+  `Fault` decoded from the trap (kind, address, access) so no code outside `arch` reads a cause register.
+* **Page tables.** `kcore::pagetable` is generic over a `PageTableFormat` (entry encoding, levels, large-page
+  levels, the software bits, how an address-space identifier is installed); Sv39 is its one implementation. The
+  address-space code above it names no bit of an entry.
+* **Constants that differ by architecture** are in `abi::arch`: the user address range, the stack arena, the layout
+  of each `thread_read_state` kind, the raw cause value carried in an exception message. Everything else in `abi`
+  is the same on every architecture, including handles, rights, statuses, limits and the call set.
+* **Names.** Kernel code outside `arch` says "hart" for a processor as today; nothing outside `arch` names a
+  RISC-V register, control register, instruction or firmware call. Exit codes for unhandled faults use the
+  exception kind of section 3.6 (`-1000 - kind`), not a RISC-V cause number.
+* **What is already shared.** The device tree (section 2.3) is what AArch64 firmware provides too; the pure crates
+  have no architecture in them apart from the page-table format; the system library is built per architecture
+  from the same call table.
+* **The check.** The docs check refuses `asm!`, `global_asm!`, a control-register name or an SBI call outside
+  `kernel/src/arch/` and `libsys`. The kernel crate compiles (`cargo check`) for `aarch64-unknown-none` against a
+  stub `arch/aarch64/` whose every function is `unimplemented!()`: that proves the boundary is complete without
+  implementing anything. The stub carries no behaviour and is never booted.
+* A second architecture needs its own profile-floor decision beside OD127 before it is implemented.
+
 ---
 
 ## 3. The contract with programs
@@ -191,12 +228,12 @@ All sizes and offsets are bytes and multiples of the page size unless said other
 |---|---|
 | `thread_spawn` | The only way to make a thread (`thread_create` is removed). New flag SUSPENDED: the thread exists but does not run until `thread_resume` |
 | `thread_suspend(thread)`, `thread_resume(thread)` | MANAGE. A suspend count. A suspended thread stops at its next return to user mode; a thread blocked in a call counts as stopped where it is. The thread object raises the signal SUSPENDED when it has stopped |
-| `thread_read_state(thread, kind, buffer, length)`, `thread_write_state(...)` | MANAGE. `kind`: GENERAL (x1 to x31 and pc), FP, VECTOR. Only for a thread that is stopped (suspended, never started, or in an exception); BAD_STATE otherwise. Writing is refused while the thread is inside a blocking call; the pc must be a user address |
+| `thread_read_state(thread, kind, buffer, length)`, `thread_write_state(...)` | MANAGE. `kind`: GENERAL (on RISC-V x1 to x31 and pc), FP, VECTOR; the layouts are per architecture (`abi::arch`). Only for a thread that is stopped (suspended, never started, or in an exception); BAD_STATE otherwise. Writing is refused while the thread is inside a blocking call; the pc must be a user address |
 | `process_exception_channel(process) -> channel`, `job_exception_channel(job) -> channel` | MANAGE. At most one each. When a thread takes a fault or an illegal instruction the kernel stops it and writes a message to the process's channel: kind, tid, pc, address, and two handles (the thread, and an **exception** object) |
 | `exception_resume(exception, how)` | `how`: RETRY (the thread continues from its state, which the handler may have changed), NEXT (offer it to the job's channel, then to each ancestor job's; with none left the process ends as today), KILL. Closing the exception handle is NEXT |
 | `port_wait_many(port, buffer, capacity, deadline) -> count` | Up to 64 packets in one call; `port_wait` is the library's wrapper for one |
 
-A process with no exception channel anywhere above it behaves exactly as today (exit code `-1000 - scause`). A
+A process with no exception channel anywhere above it ends as today, with exit code `-1000 - kind` (section 2.6). A
 process may serve its own channel from a dedicated thread; that, with suspend and state access, is everything a C
 library needs for asynchronous signals and fault handlers, and everything a debugger needs. The kernel has no notion
 of signals.
@@ -427,7 +464,8 @@ an allocation-failure sweep (section 8) are the standing checks.
 
 ## 8. How the kernel is tested
 
-The tiers of `docs/reference/TESTING.md` stand: the gate is tiers 0 and 1, the soak tier is on demand. For the
+The tiers of `docs/reference/TESTING.md` stand: the gate is tiers 0 and 1. **The soak tier and tier 3 below run only when
+the owner asks for them** (OD142): no schedule, no label, nobody else starts them. For the
 kernel (`kernel/`, `kcore`, `klock`, `abi`) the regime is:
 
 **Tier 0, host.** The syscall and thread layer builds on the host behind a `Machine` trait and is tested there
@@ -441,9 +479,10 @@ servers, at one, two and four harts, in the test build and the release build. Co
 Instruction-count checks: at one hart under icount, the instruction count of the main syscall paths is compared
 with a recorded value within 5%.
 
-**Tier 2, soak** (on demand, and on kernel pull requests): as today.
+**Tier 2, soak** (only when the owner asks): as today.
 
-**Tier 3, overnight** (nightly on `main`, hours not minutes, never required to merge):
+**Tier 3, long runs** (hours not minutes; only when the owner asks; never required to merge; its make targets and
+workflow are named `overnight`, since that is when it is meant to be started):
 
 | Check | What it does |
 |---|---|
@@ -460,6 +499,8 @@ with a recorded value within 5%.
 
 * An intermittent failure of a kernel test is a defect until its cause is known. It gets a work item at once, a
   failing run is captured with QEMU record and replay, and it is not waved through by re-running.
+* A change that needs evidence from tier 2 or tier 3 is listed as a run owed to the owner; it is not held back, and
+  nobody but the owner starts the run.
 * The kernel stack: every boot reports each thread's stack high-water mark and fails above half the stack;
   recursion in kernel code is bounded by a stated depth.
 * Every `unsafe` block in the kernel binary is covered by an audit recorded in `docs/records/reviews/`, renewed
@@ -473,7 +514,8 @@ The kernel is declared v1 and left alone when all of these hold:
 
 1. `abi-conformance` passes, and `docs/reference/SYSCALLS.md` describes the system library, not syscall numbers.
 2. The legacy lock is gone and the `&'static mut` accessors with it.
-3. Every item of section 8 runs, and tier 3 has been green for seven consecutive nights.
+3. Every item of section 8 runs, and the soak tier and tier 3 have each been green on three consecutive runs that the
+   owner started.
 4. An independent review, fresh context, has attacked the whole kernel against this document, `INVARIANTS.md` and
    `SYSCALLS.md`, and every finding is fixed or is a work item.
 5. No open work item of risk H names the kernel.

@@ -7,7 +7,7 @@ replaced, the old text goes to `docs/records/` as a dated record and this file s
 Earlier plans: `docs/records/work-plan-2026-11-17.md` (plans 1 and 2, finished) and `docs/records/work-plan-2026-11-18.md`
 (plan 3, replaced by this one).
 
-## Plan 4: the v1 kernel (agreed with the owner, 2026-11-18; OD126 to OD141)
+## Plan 4: the v1 kernel (agreed with the owner, 2026-11-18; OD126 to OD143)
 
 **Goal.** Finish the kernel so it can be left alone: `docs/specs/KERNEL-V1-SPEC.md` is the end state, its section 9 says what
 "frozen" means, and item FZ1 is the last step. The plan covers the kernel plus what must change in `rt`, the C library and
@@ -20,22 +20,30 @@ owner's go-ahead: the sentences in older `L` items about waiting for one are sup
 ### Standing instructions from the owner (read these first, every session, and again after any compaction)
 
 - **The owner is not to be asked.** Every question that came up in the review of 2026-11-18 was settled then and is recorded
-  (OD126 to OD141, the spec, the items). Work through the plan in order until it is done or the owner interrupts.
+  (OD126 to OD143, the spec, the items). Work through the plan in order until it is done or the owner interrupts.
 - **Each item says what to build, how, its acceptance check and its review.** Write the acceptance check first and watch it
   fail. Where an item leaves a detail open, decide, record it under "Decisions taken without the owner" below, and carry on.
-- **Stop only at a truly major decision point**: something that contradicts a decision OD126 to OD141 or the spec's section
+- **Stop only at a truly major decision point**: something that contradicts a decision OD126 to OD143 or the spec's section
   1, that changes the security model, or that needs something only the owner can give (an account, a download the
   environment refuses, money). Then write a `kind: decision` item, add a line below, and go on with whatever does not depend
   on it. **FZ1 ends with a report to the owner**; the follow-on work does not start without one.
-- **First thing each session:** look at the last overnight run (`gh run list --workflow overnight.yml --limit 1`, once KT6
-  exists) and the last soak run. A red one is a work item today (OD140), ahead of the next plan item.
+- **Never start a soak run or a long run** (OD142). Not `make soak`, not one of its targets, not `soak.yml` or
+  `overnight.yml`, not a schedule, not a label, however kernel-heavy the change. Only the owner starts them. Where an item
+  says "soak" or names an overnight target, that means: wire the check in, say in the PR that the run is owed, and add a
+  line to "Runs owed to the owner" below. The item still merges on the green gate and is closed on its acceptance check.
+- **First thing each session:** if the owner has started a soak or long run since the last session (`gh run list --workflow
+  soak.yml --limit 1`, and `overnight.yml` once KT6 exists), read its result. A red one is a work item today (OD140), ahead
+  of the next plan item; a green one clears the matching lines below.
 - **An intermittent kernel failure is a defect** (`docs/reference/TESTING.md` rule 8): never "re-run once and note". A job
   that fails for infrastructure reasons (a package mirror, a cancelled runner) is re-run.
 - **Reviews.** An item marked Fable gets a fresh-context Fable review in its own small PR before it merges; "default" gets
   the default reviewer. Findings are fixed in the PR or become tidy items in it.
 - **Testing.** While iterating: `make kquick` once KT1 exists (before it: `make quick` and the one targeted test). The gate
-  is `make smoke`; merge on a green gate. Items marked soak get the `soak` label and are verified at `-smp 1`, `2` and `4`
-  (and wider where the item says). One mutation check per new test. Say plainly what was and was not run.
+  is `make smoke`; merge on a green gate. Verification at one, two and four harts comes from the gate's kernel-only boots
+  (KT1, the first item, for that reason); before KT1 lands, and for wider hart counts, the run is owed, not started. One
+  mutation check per new test. Say plainly what was and was not run.
+- **Architecture code goes behind the boundary** once AR1 has landed: in `kernel/src/arch/riscv64/`, with its interface item
+  added to `arch/mod.rs` and the AArch64 stub in the same PR (KERNEL-V1-SPEC 2.6).
 - **Track CI yourself; merge green PRs** (squash, delete the branch). Never force-push and never `git reset --hard`; merge
   `main` into a branch instead. Do not stack PRs.
 - **One item (or one named part of an item) per PR.** `main` always builds and boots. A flag-day item (AB1, AB2, AB3) is one
@@ -66,13 +74,13 @@ Why first: the owner's complaint is that editing the kernel is slow on testing, 
 - [ ] **L13** no tick: timer queues, `stimecmp`, tickless idle, slack (closes **L28** with it)
 - [ ] **PM2** long idles suspend through firmware
 
-### Phase 3: the syscall layer on the host; the overnight tier
+### Phase 3: the syscall layer on the host; the long-run tier
 
 Why here: the scheduler glue is stable after phase 2, and everything after this phase changes the syscall layer, so it should
 be host-testable, fuzzable and covered before that starts.
 
 - [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`
-- [ ] **KT6** tier 3, the overnight workflow
+- [ ] **KT6** tier 3, the long-run workflow (manual start only)
 - [ ] **KT7** schedule perturbation
 - [ ] **KT10** automated mutation testing
 - [ ] **KT12** the checked release build
@@ -82,8 +90,11 @@ be host-testable, fuzzable and covered before that starts.
 - [ ] **KT9** the allocation-failure sweep
 - [ ] **KT11** coverage report
 
-### Phase 4: the platform as it really is
+### Phase 4: the architecture boundary, then the platform as it really is
 
+AR1 goes first so that everything after it is written on the right side of the boundary.
+
+- [ ] **AR1** (a, b, c, d) all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, the AArch64 stub
 - [ ] **PL1** RVA23 in the gate, the boot-time extension check
 - [ ] **MM2** the buddy frame allocator
 - [ ] **MM3** large pages in the direct map
@@ -165,7 +176,8 @@ holds the big lock longest, reorder on that evidence and record it below.
 - [ ] **AB8** entry enforcement, shuffled numbers
 - [ ] **AB9** the conformance program, `SYSCALLS.md` rewritten, the versioning rule
 - [ ] **KT14** the audit of every `unsafe` block
-- [ ] **FZ1** the freeze: the last review, seven green nights, the declaration, **and a report to the owner**
+- [ ] **FZ1** the freeze: the last review, three green soak and long runs **that the owner starts**, the declaration, **and a
+  report to the owner**
 
 ### Not in this plan (after the freeze, unordered)
 
@@ -176,6 +188,14 @@ holds the big lock longest, reorder on that evidence and record it below.
   and pointer masking beyond their reserved places (X-HARDENING), a physical board, an IOMMU (T42), Sv48, large pages for
   user mappings, splitting the object lock (T70, unless SC2's measurement triggers it), a fair scheduling class (T72).
 - The owner's other decision items (`work.py decisions`): none blocks this plan.
+
+## Runs owed to the owner
+
+Soak and long runs that an item wanted and only the owner may start (OD142). One line each: the item, the PR, which target
+or tier, and what a red result would mean. The owner starts a run when they choose (`gh workflow run soak.yml`, or Actions >
+soak > Run workflow); one run of the tier clears every line above it.
+
+(none yet)
 
 ## Decisions taken without the owner
 
@@ -193,7 +213,10 @@ holds the big lock longest, reorder on that evidence and record it below.
   - The reachability sweep becomes incremental by slices with an epoch, on the calling thread (SCHED-SMP-SPEC left three
     options open). KERNEL-V1-SPEC 4.6, MM10.
   - The syscall layer moves to a new crate `ksys`; the name and the three-PR cut are mine. TS3.
-  - Syscall numbers are shuffled only in an overnight build, not every build, so logs stay readable. AB8.
+  - Syscall numbers are shuffled only in a long-run build, not every build, so logs stay readable. AB8.
+  - The architecture boundary is a static facade (`arch::*` re-exports), not a trait object, and its completeness is
+    checked by compiling an AArch64 stub; unhandled-fault exit codes change from the RISC-V cause to the neutral
+    exception kind. KERNEL-V1-SPEC 2.6, AR1.
   - Kernel address randomisation is built although Sv39 leaves it about 9 and 7 bits; the owner chose the option that
     includes it, and the entropy is stated. HD3.
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend

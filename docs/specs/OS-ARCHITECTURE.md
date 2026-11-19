@@ -712,7 +712,7 @@ ones are OD26 (Q1), OD27 (Q2), OD35 (Q3), FS-SPEC (Q7) and OD20 (Q8).
 
 ---
 
-## Amendment 2026-11-18: the v1 kernel (OD126 to OD141)
+## Amendment 2026-11-18: the v1 kernel (OD126 to OD143)
 
 `KERNEL-V1-SPEC.md` states the kernel that is frozen. It replaces the following statements of this document; the rest
 stands.
@@ -732,3 +732,5 @@ stands.
 | 9 | "POSIX signals are the ugly part ...; defer them" | The kernel provides exception channels, thread suspend and thread state; signals are composed from them in user space (KERNEL-V1-SPEC 3.6; OD137) |
 | 14 | "Static binaries first; dynamic linking later" | Dynamic linking is required by the system-library boundary; the loader is user-space work after v1 (OD128) |
 | 18 | Q4, Q5, Q6, Q9 | Decided: OD133, OD134, OD133, OD135 |
+| 4, 16 | One architecture, with its code spread through the kernel binary | Still one architecture implemented, but behind a boundary (`kernel/src/arch/`, a page-table format, `abi::arch`) so a second is an addition (KERNEL-V1-SPEC 2.6; OD143) |
+| 3.2, 7 | Soak under `-smp N` as part of every milestone's acceptance | The soak tier and the long-run tier run only when the owner asks (OD142); what a change needs at one, two and four harts is in the gate |

@@ -14,3 +14,7 @@ refs: [KERNEL-V1-SPEC, OD140]
 **Acceptance, written first.** The fail-demo kernel under `OS_RECORD` leaves a record file, and `OS_REPLAY` of it reproduces the same failing `##TEST` line. `make os-repeat TARGET=os-boot-test-fail-demo N=3` reports `0/3` with three logs.
 
 **Review.** Default.
+
+## Note (2026-11-18, later the same day)
+
+OD142: the repeat target and record mode are tools. Their acceptance uses only the fail-demo kernel (a few short boots, not a soak target). Running `os-repeat` over a soak target is a soak run and is the owner's to start.
