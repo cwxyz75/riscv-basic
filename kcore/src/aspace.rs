@@ -115,6 +115,7 @@ impl Vmos {
     }
 
     /// A new lazily committed VMO whose pages are charged to `job` as they are committed.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter is a u64 that starts at 1 and gains one per VMO, bounded by the object quota
     pub fn create_in(&mut self, pages: u64, job: JobId) -> u64 {
         self.jobs.retain(job);
         self.next += 1;
@@ -132,6 +133,7 @@ impl Vmos {
 
     /// A VMO over device memory starting at frame `first` (the caller has checked the range is
     /// inside an allowed device window). Holds one use of the root job.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter as above; `first + i` for i < pages: the caller passed the device-window check (a range inside one window, so no overflow)
     pub fn create_physical(&mut self, first: Pfn, pages: u64) -> u64 {
         self.jobs.retain(JobId::ROOT);
         self.next += 1;
@@ -149,6 +151,7 @@ impl Vmos {
 
     /// A VMO of `pages` physically contiguous zeroed frames, charged to `job` now. At most
     /// `MAX_DMA_PAGES` per object and `MAX_DMA_TOTAL_PAGES` in the system.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pages is checked against MAX_DMA_PAGES and the system total just above, so the sums are small; `first + i` is inside the contiguous run the allocator returned
     pub fn create_dma<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -213,6 +216,7 @@ impl Vmos {
     }
 
     /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
     pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
         let vmo = self.map.remove(&id).ok_or(VmoGone)?;
         if vmo.kind == VmoKind::Device {
@@ -239,6 +243,7 @@ impl Vmos {
     /// Write bytes into a VMO at `offset`, committing pages as needed (loading a program
     /// image, filling a buffer before it is shared). Nothing is written if the range does
     /// not fit inside the VMO.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: `range` comes from `access`, which computed it inside `data`
     pub fn write<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -252,6 +257,7 @@ impl Vmos {
     }
 
     /// Read bytes out of a VMO (uncommitted pages read as zeros and stay uncommitted).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: offset + len was checked with checked_add against the VMO's size (pages <= MAX_VMO_PAGES, so the product is small); `done < len` bounds every slice
     pub fn read<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -284,6 +290,11 @@ impl Vmos {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: as `read`: the range was checked first; the committed lookup is of a page `page_for` committed in the loop above (nothing runs in between)
     fn access<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -326,6 +337,7 @@ impl Vmos {
     /// nothing: if the job's limit or the frames run out, everything this call committed is given back
     /// and `NoMemory` is returned, with the VMO and the ledger exactly as before. Pages already
     /// committed are left as they are. Device memory is never committed this way.
+    #[allow(clippy::expect_used, clippy::indexing_slicing)] // INVARIANT: the id was looked up at the top and `committed` was checked in the same call; first + pages was checked against the VMO's size
     pub fn commit<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -446,6 +458,7 @@ impl AddressSpace {
 
     /// Describe `pages` pages at `start` as a window onto `vmo` from `vmo_page`.
     /// Nothing is mapped until a fault asks for it.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add and canonical-ness first; pages <= MAX_REGION_PAGES keeps the products small; `end - 1` cannot underflow because len > 0
     pub fn map_region(
         &mut self,
         vmos: &Vmos,
@@ -504,6 +517,7 @@ impl AddressSpace {
     /// The lowest page-aligned address at or after `from` where `bytes` bytes fit between regions and inside
     /// `[lo, hi)`: the stack arena search (`thread_spawn`). `from` below `lo` starts at `lo`. `None` when no gap at or
     /// after `from` is big enough; callers wrap by asking again from `lo`.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: region addresses and sizes were checked when the regions were inserted (map_region): s + r.pages * PAGE_SIZE is below the canonical limit
     pub fn find_gap(&self, lo: u64, hi: u64, bytes: u64, from: u64) -> Option<u64> {
         if bytes == 0 || !bytes.is_multiple_of(PAGE_SIZE) || hi < lo {
             return None;
@@ -536,6 +550,7 @@ impl AddressSpace {
     }
 
     /// The permissions of the region covering `va`, if there is one (mapped yet or not).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
         let (&start, r) = self.regions.range(..=va).next_back()?;
         (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
@@ -544,6 +559,7 @@ impl AddressSpace {
     /// Remove the region starting at `start`, unmapping its pages and dropping the
     /// mappings' references. **The caller must flush the TLB (`sfence.vma`) before
     /// any frame freed here can be reused**: this crate has no notion of TLBs.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: p < r.pages and the region's range was checked when it was inserted
     pub fn unmap_region<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -568,6 +584,7 @@ impl AddressSpace {
     /// Handle a page fault at `va` for `access`: map the page if the region allows
     /// the access. A fault on a page that is already mapped (and allowed) is
     /// spurious and succeeds.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums; the window arithmetic is on page-aligned addresses inside the region
     pub fn handle_fault<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,

@@ -81,6 +81,7 @@ impl<N: Class> Rqs<N> for Local<N> {
     fn len(&self) -> usize {
         self.rq.len()
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count (callers pass harts they were given)
     fn lock(&self, x: usize) -> Self::Guard<'_> {
         self.rq[x].borrow_mut()
     }
@@ -187,6 +188,7 @@ impl<N: Class> Sched2<N, Local<N>> {
 
 impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// The scheduler over run queues that already exist (`rqs.len()` harts), each given its idle thread.
+    #[allow(clippy::expect_used)] // INVARIANT: the record was just created on this hart
     pub fn over(rqs: R) -> Sched2<N, R> {
         let harts = rqs.len();
         assert!((1..=MAX_HARTS).contains(&harts), "1 to 32 harts");
@@ -220,6 +222,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Take hart `x`'s run-queue lock (it publishes the hart's hints when released after a change).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count
     fn lq(&self, x: usize) -> Hq<'_, N, R> {
         Hq {
             g: self.rqs.lock(x),
@@ -228,11 +231,13 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
     }
 
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count
     fn is_online(&self, x: usize) -> bool {
         self.online[x].load(Ordering::Acquire)
     }
 
     /// The hint for `would_run`: would a thread of priority `p` queued on hart `x` run instead of what runs there?
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count; p <= PRIO_MAX = 63, so the shift is below 64
     fn would_run_hint(&self, x: usize, p: Prio) -> bool {
         p <= PRIO_MAX && self.hint[x].would_run.load(Ordering::Acquire) & (1 << p) != 0
     }
@@ -257,6 +262,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.rqs.len()
     }
     /// Take `hart` into the scheduler or out of it (placement and push skip a hart that is not online).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: hart is a hart index below the hart count
     pub fn set_online(&self, hart: usize, online: bool) {
         self.online[hart].store(online, Ordering::Release);
     }
@@ -280,17 +286,20 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.record(tid).map(|r| r.park)
     }
     /// The idle thread of `hart`.
+    #[allow(clippy::expect_used)] // INVARIANT: every hart has an idle thread from `over`
     pub fn idle(&self, hart: usize) -> Tid {
         self.lq(hart)
             .idle_tid()
             .expect("every hart has an idle thread")
     }
     /// The thread designated to run on `hart` (its idle thread when nothing else does).
+    #[allow(clippy::expect_used)] // INVARIANT: a hart always has a current thread (its idle thread at least)
     pub fn current_on(&self, hart: usize) -> Tid {
         self.lq(hart)
             .current()
             .expect("a hart always has a current thread")
     }
+    #[allow(clippy::indexing_slicing)] // INVARIANT: hart is a hart index below the hart count
     pub fn resched_pending(&self, hart: usize) -> bool {
         self.pending[hart].load(Ordering::Acquire)
     }
@@ -330,6 +339,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.lq(hart).queued_len()
     }
     /// The threads the scheduler tracks, not counting the idle threads of harts that are not online.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: offline harts' idle threads are in the table
     pub fn thread_count(&self) -> usize {
         let offline = (0..self.harts()).filter(|&h| !self.is_online(h)).count();
         self.rqs.table().len() - offline
@@ -338,12 +348,14 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.rqs.table().keys().copied().collect()
     }
 
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn view_cur(&self, h: usize) -> Prio {
         self.hint[h].cur_eff.load(Ordering::Acquire)
     }
 
     /// 4.4 `select_hart` (rules 1, 3, 4 and 5; the synchronous-wake hint of rule 2 arrives with direct hand-off). Reads only
     /// hints.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: harts() >= 1
     fn select_hart(&self, rec: &ThreadSched) -> usize {
         if let Some(a) = rec.affinity {
             return a as usize;
@@ -371,6 +383,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// The thread hart `h` has switched away from but whose context is not yet saved, if any.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: hart is a hart index below the hart count
     pub fn in_transit(&self, hart: usize) -> Option<Tid> {
         match self.transit[hart].load(Ordering::Acquire) {
             0 => None,
@@ -381,6 +394,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// Hart `h`'s context switch is complete (called by the thread that resumes on `h`, or by a new thread starting there,
     /// or by `h` when it decided not to switch after all): the thread it left is now available to every hart. Marks owed
     /// for it (it may belong on a lower hart) are set; the caller sends the pokes.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     pub fn switched(&self, h: usize) {
         let t = self.transit[h].swap(0, Ordering::AcqRel);
         if t != 0 {
@@ -394,6 +408,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// a preemption): if the thread `before` that was executing there is now queued, record that it is in transit, so no other hart
     /// can pull it (it is still executing) until `switched(h)`. Doing this after the lock was released would leave a window in
     /// which another hart's pull found it queued and ran it a second time.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn displaced(&self, h: usize, q: &HartRq<N>, before: Tid) {
         // The first thread displaced is the one still executing; a later change of designation (a pull after a tick's
         // rotation, say) displaces only a thread that was never run, so the first one stays protected until `switched`
@@ -407,6 +422,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Mark `x` for a reschedule (one poke owed to whoever turns the mark on).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count
     fn mark(&self, x: usize) {
         // (a hart that is not in the scheduler is never marked: it looks at its queues when it joins, 3.9)
         if self.is_online(x)
@@ -479,6 +495,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Pull into `h` the best queued thread of each other hart that outranks everything `h` has. Returns how many.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
     fn pull(&self, h: usize) -> usize {
         let mut n = 0;
         for g in 0..self.harts() {
@@ -522,6 +539,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// Hart `h` makes its own designation right: pull what outranks it, preempt for what waits, and push what it leaves.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn settle(&self, h: usize) {
         self.settles.fetch_add(1, Ordering::Relaxed);
         self.pending[h].store(false, Ordering::Release);
@@ -588,6 +606,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     // ---- creating threads
 
     /// Adopt the code running on `hart` (the boot thread) as a thread.
+    #[allow(clippy::expect_used)] // INVARIANT: the record was just created on this hart
     pub fn adopt_current_on(
         &self,
         hart: usize,
@@ -605,6 +624,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     /// A new runnable thread created by code running on `caller`.
+    #[allow(clippy::expect_used)] // INVARIANT: the record was just created on the target hart
     pub fn spawn_on(
         &self,
         caller: usize,
@@ -843,6 +863,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// they were made: a thread on a long queue waits a whole rotation of it. At a tick, a hart whose queue is at least two
     /// shorter than another's takes one thread from it that it may run and that is not worse than what it runs. One per
     /// tick; with queues within one of each other nothing moves, so equals do not churn between harts.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: hart indices are below the hart count; the thread was found queued under the same two locks
     fn balance(&self, h: usize) {
         let len = |x: usize| self.hint[x].queued_len.load(Ordering::Acquire);
         let mine = len(h);
@@ -885,6 +910,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// **GP2** (always) and, when `quiescent`, **GP1**. Takes every run-queue lock, in ascending order, and holds them all (a
     /// test and debug facility: it must not be called with any run-queue lock held).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: a count of the records seen
     pub fn audit(&self, quiescent: bool) -> Result<(), String> {
         let n = self.harts();
         let table = self.rqs.table(); // (`TT` is ahead of `RQ` in the order)
@@ -1030,6 +1060,7 @@ impl Waiters2 {
         None
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a count of woken waiters, bounded by the thread limit
     pub fn wake_all_on<N: Class, R: Rqs<N>>(
         &mut self,
         sched: &Sched2<N, R>,

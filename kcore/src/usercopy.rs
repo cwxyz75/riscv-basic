@@ -56,6 +56,7 @@ fn check_range(va: u64, len: usize) -> Result<(), Status> {
 /// Read the 32-bit word at user address `va` with **one aligned 64-bit load** (so a store by another
 /// hart's user thread is seen whole, never half: a bytewise copy could tear). `va` must be 4-aligned
 /// and readable (`INVALID_ARGS`); a lazily backed page is committed first.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: (pa & 4) * 8 is 0 or 32, below the shift width of a u64
 pub fn read_user_u32<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
@@ -72,6 +73,7 @@ pub fn read_user_u32<M: PhysMem>(
 }
 
 /// Read `len` bytes at user address `va`. A zero length succeeds without looking at `va`.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: check_range proved va + len does not overflow and stays below the user limit; done < len bounds every slice and sum
 pub fn copy_from_user<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
@@ -99,6 +101,7 @@ pub fn copy_from_user<M: PhysMem>(
 
 /// Write `data` at user address `va`. Every page is checked before the first byte is
 /// written, so a bad range leaves user memory untouched.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: check_range proved va + len does not overflow; done < data.len() bounds every slice and sum; the page list was reserved for len / PAGE_SIZE + 2 entries
 pub fn copy_to_user<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
@@ -133,6 +136,7 @@ pub fn copy_to_user<M: PhysMem>(
 /// accessible and writable) without writing anything. A zero length succeeds without
 /// looking at `va`. Used before a call that consumes something (a channel read) so a bad
 /// destination cannot lose the data.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: check_range proved va + len does not overflow; done < len bounds the sums
 pub fn verify_writable<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
@@ -158,6 +162,7 @@ pub fn verify_writable<M: PhysMem>(
 /// the data a call has already taken (a channel message) is never lost to a late failure. (It
 /// still reports an error, rather than ignoring it, for the case that a page is no longer there;
 /// with one hart that cannot happen, and with several it is the case the lock must exclude.)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: check_range proved va + len does not overflow; done < data.len() bounds every slice and sum
 pub fn copy_to_user_verified<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,

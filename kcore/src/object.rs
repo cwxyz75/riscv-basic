@@ -209,6 +209,7 @@ impl<T: Object> Registry<T> {
     }
 
     /// `create` / `create_in` with the job as an option.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: live is bounded by MAX_OBJECTS (checked by every caller's quota test)
     pub fn create_charged(&mut self, obj: T, job: Option<JobId>) -> ObjId {
         self.live += 1;
         if let Some(index) = self.free.pop() {
@@ -278,6 +279,7 @@ impl<T: Object> Registry<T> {
         self.meter
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the meter is bounded by the global IPC budget
     pub fn meter_add(&mut self, n: usize) {
         self.meter += n;
     }
@@ -309,6 +311,7 @@ impl<T: Object> Registry<T> {
     }
 
     /// Take another reference. `false` if the id is not live.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: refs is bounded by the handle quota
     pub fn retain(&mut self, id: ObjId) -> bool {
         match self.slot_mut(id) {
             Some(slot) => {
@@ -321,6 +324,7 @@ impl<T: Object> Registry<T> {
 
     /// Drop a reference; destroy the object, and whatever that frees in turn, when
     /// it was the last.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released
     pub fn release(&mut self, id: ObjId) {
         let mut work = alloc::vec![id];
         while let Some(id) = work.pop() {
@@ -380,6 +384,11 @@ impl<T: Object> Registry<T> {
     /// table) still refers to: **an omitted root is destroyed even though a handle to it
     /// exists** (the handle then fails with BAD_HANDLE, never with a wrong object). The
     /// caller passes the objects of *all* handle tables.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: ids come from the registry's own slot table and index it
     pub fn sweep(&mut self, roots: &[ObjId]) -> usize {
         let mut reached = alloc::vec![false; self.slots.len()];
         let mut work: Vec<ObjId> = roots.to_vec();

@@ -16,3 +16,8 @@ refs: [KERNEL-V1-SPEC, OD139, OD140]
 **Review.** Fable (the allowed lines are the review's subject). Soak.
 
 **Size.** Large by line count (expect several hundred sites); do it in PRs by file, `kcore` first.
+
+## Progress (2026-11-18)
+
+Part 1 (kcore) built: the panic-finding lints are `deny` in `kcore` outside tests, and every one of the 141 remaining sites carries `#[allow] // INVARIANT: <why>` (`scripts/kernel_allows.py --list` prints them and fails on one without a reason; `scripts/clippy_hits.py CRATE --by-fn` lists the hits of a crate). A planted `unwrap()` in `frame.rs` fails `make lint` (checked once). The frozen `sched_smp_v0` copy and its differential test were deleted (L11b changed the behaviour it froze). Left: `klock`, `abi`, the kernel modules `user.rs`, `thread.rs`, `trap.rs`, `kmem.rs`, `kstack.rs`, `heap.rs`, `undocumented_unsafe_blocks` in the kernel, `overflow-checks = true` in the kernel's release profile, and the Fable review of the allowed lines.
+

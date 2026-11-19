@@ -58,12 +58,14 @@ impl Ticket {
     }
 
     /// Does `who` hold the lock?
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: owner ids are hart indices below 32
     pub fn held_by(&self, who: u32) -> bool {
         self.owner.load(Ordering::Relaxed) == who + 1
     }
 
     /// Take the lock for `who` (spinning with `relax` between looks), or deepen it if `who`
     /// already holds it.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: owner ids are hart indices below 32
     pub fn lock(&self, who: u32, depth: &Depth, relax: impl Fn()) {
         if self.held_by(who) {
             depth.0.fetch_add(1, Ordering::Relaxed);
@@ -78,6 +80,7 @@ impl Ticket {
     }
 
     /// Take the lock only if nobody holds or waits for it (or deepen it if `who` holds it).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: owner ids are hart indices below 32
     pub fn try_lock(&self, who: u32, depth: &Depth) -> bool {
         if self.held_by(who) {
             depth.0.fetch_add(1, Ordering::Relaxed);

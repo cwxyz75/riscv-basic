@@ -31,6 +31,7 @@ const BINDING_COST: usize = 32;
 impl Message {
     /// What this message counts against the IPC budget: bytes, a fixed overhead, and its
     /// handle entries (they are kernel memory too: found by the trust-boundary audit).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: message sizes are bounded by MAX_MSG_BYTES and MAX_MSG_HANDLES
     fn cost(&self) -> usize {
         self.data.len() + MSG_OVERHEAD + self.handles.len() * core::mem::size_of::<Entry>()
     }
@@ -150,6 +151,7 @@ impl Object for KObj {
         )
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: binding counts are bounded by the port's binding limit
     fn meter(&self) -> usize {
         match self {
             KObj::Channel(c) => c.queue.iter().map(Message::cost).sum(),
@@ -159,6 +161,7 @@ impl Object for KObj {
         }
     }
 
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: binding counts are bounded by the port's binding limit
     fn charged_bytes(&self) -> usize {
         match self {
             KObj::Channel(c) => c.queue.iter().map(Message::cost).sum(),
@@ -282,6 +285,7 @@ fn channel_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 }
 
 /// A connected pair of channel endpoints, both with the default channel rights.
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: live is below MAX_OBJECTS, so + 2 cannot overflow
 pub fn channel_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -313,6 +317,12 @@ pub fn channel_create_in(
 /// into it. Changes nothing unless it succeeds. The checks run in the order SYSCALLS.md
 /// lists them: sizes first (they bound the work of everything after), then handles,
 /// then the channel itself.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unreachable
+)] // INVARIANT: i < handles.len() (the duplicate check loop); the queue and byte counts are bounded by the per-channel limits checked first
 pub fn channel_write_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -419,6 +429,7 @@ pub fn channel_write_in(
     Ok(())
 }
 
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel by the caller in the same call
 fn read_at(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -473,6 +484,7 @@ fn read_at(
 /// return (including BUFFER_TOO_SMALL with the sizes, and NO_MEMORY for a full table).
 /// The syscall layer uses it to validate the destination buffers against the *actual*
 /// message before dequeuing anything.
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unreachable)] // INVARIANT: `me` was resolved to a live channel by the caller in the same call
 pub fn channel_peek(
     reg: &Kobjs,
     table: &HandleTable,
@@ -535,6 +547,7 @@ pub fn channel_read_in(
 }
 
 /// Read the oldest message whose first four bytes (little endian) are `txid`.
+#[allow(clippy::indexing_slicing)] // INVARIANT: the length test precedes the slice
 pub fn channel_read_txid_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -553,6 +566,7 @@ pub fn channel_read_txid_in(
 }
 
 /// A new event with all user signals clear.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn event_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -705,6 +719,7 @@ fn socket_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resul
 }
 
 /// A connected pair of socket endpoints with the default socket rights.
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: live is below MAX_OBJECTS, so + 2 cannot overflow
 pub fn socket_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -748,6 +763,7 @@ pub fn socket_write_check(
 }
 
 /// Append as much of `data` as fits to the peer's buffer; returns how many bytes that was.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: buf.len() <= SOCKET_BUFFER is the buffer's own bound
 pub fn socket_write_in(
     reg: &mut Kobjs,
     table: &HandleTable,
@@ -880,6 +896,7 @@ fn port_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<
     Ok(entry.obj)
 }
 
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn port_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -901,6 +918,7 @@ pub fn port_create_in(
 
 /// Drop the bindings whose object has been destroyed (the spec says they disappear at once,
 /// so every operation that looks at the binding set prunes first).
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < bindings.len() (loop bound)
 fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
     // One pass (not a search and a shift per dead binding: quadratic under the big kernel lock when
     // thousands of bindings die at once, review 2026-11-14). `next` keeps pointing at the same
@@ -996,6 +1014,7 @@ pub fn port_bind_flags_in(
     Ok(())
 }
 
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: next is at least 1 when a binding is removed behind it
 pub fn port_unbind_in(
     reg: &mut Kobjs,
     table: &HandleTable,
@@ -1024,6 +1043,7 @@ pub fn port_unbind_in(
 
 /// One ready binding as `(key, observed)`, rotating, after pruning bindings whose object is
 /// gone; `None` if nothing is ready. Needs WAIT on the port.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: n is the binding count and is non-zero here; next < n
 pub fn port_poll_in(
     reg: &mut Kobjs,
     table: &HandleTable,
@@ -1094,6 +1114,7 @@ pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, 
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
 /// The root resource object, with a handle carrying `Rights::RESOURCE`.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn resource_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -1111,6 +1132,7 @@ pub fn resource_object_create_in(
 
 /// A new interrupt object for PLIC source `irq` (the caller has checked the resource, the range
 /// and that no live object already owns the source).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn interrupt_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -1158,6 +1180,7 @@ pub fn interrupt_of(
 
 /// The source fired: returns true if `obj` is a live interrupt object for `irq` that was not
 /// already waiting for its ack (the caller has already masked the source).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 claim counter
 pub fn interrupt_fire(reg: &mut Kobjs, obj: ObjId, irq: u32) -> bool {
     match reg.get_mut(obj) {
         Some(KObj::Interrupt(i)) if i.irq == irq => {
@@ -1209,6 +1232,7 @@ pub fn vmo_object_create_in(
 }
 
 /// A VMO object with a handle carrying exactly `rights`.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn vmo_object_create_with(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -1226,6 +1250,7 @@ pub fn vmo_object_create_with(
 
 /// A job object for ledger job `id` (whose use the object takes over), with a handle in
 /// `table` carrying `rights`.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn job_object_create(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -1274,6 +1299,7 @@ pub fn vmo_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 }
 
 /// A process object for `pid`, with a handle in `table` (default process rights).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn process_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -1340,6 +1366,7 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 }
 
 /// A thread object for a user thread of `pid`, with a handle in `table` (default thread rights).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn thread_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
