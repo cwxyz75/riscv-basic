@@ -1072,7 +1072,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
         for (h, t) in self.transit.iter().enumerate() {
             let t = t.load(Ordering::Acquire);
-            if t != 0 && (table.get(&t).map(|x| x.get()) != Some(h) || qs[h].state(t).is_none()) {
+            if t != 0
+                && (table.get(&t).map(|x| x.get()) != Some(h)
+                    || qs[h].state(t).is_none()
+                    || (qs[h].state(t) == Some(State::Runnable) && !qs[h].is_queued(t)))
+            {
                 return Err(alloc::format!(
                     "thread {t} in transit on hart {h} has no record there"
                 ));

@@ -50,10 +50,13 @@ fn a_thread_that_slept_is_not_run_elsewhere_before_its_switch_is_done() {
     s.set_clock(0, 1 * MS);
     s.prepare_block_on(0).unwrap();
     assert!(s.sleep_until_on(0, 3 * MS).unwrap());
-    s.set_clock(1, 5 * MS);
-    s.tick_on(1, 5 * MS); // its deadline passes on hart 1's clock
+    s.wake_on(1, a).unwrap(); // woken early from another hart
     s.reschedule_on(1);
-    assert_ne!(s.current_on(1), a);
+    assert_ne!(
+        s.current_on(1),
+        a,
+        "run on hart 1 while hart 0 still executes it"
+    );
     s.switched(0);
 }
 

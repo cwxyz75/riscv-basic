@@ -3,10 +3,9 @@
 //! One lock protects all shared kernel state. It is taken by `irq::without` (disable interrupts,
 //! lock, run, unlock, restore), explicitly at the entry of every trap, and released on every path
 //! that leaves kernel code (the trap exit, `enter_user`, the idle loop's `wfi`). It is
-//! **reentrant per hart** (a depth count) and **the lock follows the thread** (K3): the depth is
-//! saved in the `KThread` that blocks or is switched out, and the context switch hands the held
-//! lock to the incoming thread with *its* saved depth, so a hart that switches threads never
-//! releases and re-takes it and a thread may resume on another hart.
+//! **reentrant per hart** (a depth count) and **released at a context switch** (K3, SCHED-SMP-SPEC
+//! G4): the switching thread releases it completely (`release_all`, keeping its depth on its own
+//! stack) and the thread that resumes, on whatever hart, takes it back to that depth (`reacquire`).
 //!
 //! Until the kernel has finished booting (`enforce`), there is one hart and no concurrency, and
 //! `held()` is true; after it, kernel entry points assert that the calling hart holds the lock.

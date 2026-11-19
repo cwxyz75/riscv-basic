@@ -353,7 +353,7 @@ fn idle_main(_: usize) {
 #[no_mangle]
 extern "C" fn thread_bootstrap(entry: usize, arg: usize) -> ! {
     // A new thread starts inside a context switch, with interrupts off and the big kernel lock
-    // handed over at depth 1: it leaves that region now and runs outside the lock (K4).
+    // released by the thread that switched here (G4): it takes it for its own finish_switch and then runs outside it (K4).
     crate::latency::switch_in();
     // (the lock was released by the thread that switched here: G4)
     switch_done();
@@ -483,8 +483,11 @@ fn reap_prev() {
 /// from it and holds the big kernel lock.
 fn reap_if_dead(tid: Tid) {
     let k = kernel();
+    // (not while it is in transit: `prev` is consumed after the lock is taken again, which can wait, and by then the thread may have
+    // resumed on another hart and exited there; the thread that replaces it on that hart reaps it once that switch is done: PR 266 review)
     let dead = k.threads.get(&tid).is_some_and(|t| t.detached)
-        && sched().state(tid) == Some(State::Exited);
+        && sched().state(tid) == Some(State::Exited)
+        && !sched().is_in_transit(tid);
     if dead {
         let reaped = sched().reap(tid).is_ok();
         // (it cannot fail under the big lock: a failure would leak the thread's stack, so it is loud in a debug build)
