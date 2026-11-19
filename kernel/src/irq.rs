@@ -50,6 +50,10 @@ pub fn without<R>(f: impl FnOnce() -> R) -> R {
     let started = crate::latency::off_begin(was);
     crate::bkl::lock();
     let r = f();
+    // the outermost critical section ends here: a defined point for a switch a wake asked for (SCHED-SMP-SPEC X7)
+    if crate::percpu::this().bkl_depth.get() == 1 {
+        crate::thread::preempt_point();
+    }
     crate::bkl::unlock();
     crate::latency::off_end(started, site);
     restore(was);

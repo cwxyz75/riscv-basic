@@ -93,8 +93,8 @@ ATOMICS = {
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
-    "kcore/src/sched_smp.rs": (27, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
-    "kernel/src/percpu.rs": (52, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
+    "kcore/src/sched_smp.rs": (29, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
+    "kernel/src/percpu.rs": (54, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (5, "hart bring-up and IPI flags"),
@@ -107,7 +107,7 @@ ATOMICS = {
     "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
     "kernel/src/console.rs": (2, "the console's panic flag and line state"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (38, "self-test flags and counters"),
+    "kernel/src/sched_tests.rs": (44, "self-test flags and counters"),
     "kernel/src/smp_tests.rs": (8, "self-test flags and counters"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
