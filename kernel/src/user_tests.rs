@@ -245,7 +245,7 @@ pub fn run_all() -> Report {
             ))
         },
     );
-    thread::sleep_ticks(3); // detached user threads and their stacks are freed by the reaper
+    thread::sleep_ticks(3); // detached user threads and their stacks are freed as the hart switches away from them
     push(
         "no_kernel_thread_survives_init",
         if thread::thread_count() == threads_before {

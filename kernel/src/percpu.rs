@@ -76,6 +76,9 @@ pub struct PerHart {
     pub bkl_takes: AtomicU64,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
     pub running: AtomicU32,
+    /// The thread this hart is switching away from (set just before the switch, taken by the `finish_switch` that completes it; 0:
+    /// none): the thread that resumes here finds out whether the one it replaced has exited and must be reaped (SCHED-SMP-SPEC 3.6).
+    pub prev: AtomicU32,
     /// Spin iterations in the current wait for a lock (the deadlock detector's counter).
     pub spins: AtomicU64,
     /// The lock class this hart last asked for (diagnostics for the deadlock detector).
@@ -108,6 +111,7 @@ impl PerHart {
             active_satp: AtomicU64::new(0),
             bkl_takes: AtomicU64::new(0),
             running: AtomicU32::new(0),
+            prev: AtomicU32::new(0),
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
         }
