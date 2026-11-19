@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: smoke soak check-all kernel-main os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: smoke soak check-all kernel-main os-ktest os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -148,6 +148,27 @@ os-boot-test-smoke-a: kernel-main
 
 os-boot-test-smoke-b: kernel-main
 	OS_SHARD=b OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+
+# The kernel-only boot (KT1, KERNEL-V1-SPEC 8): the kernel, `init` and the Kernel tests of the suite (`init/ktests.txt`: no server, no
+# disk, no network), as shard `k`. `os-ktest` boots the test build at one, two and four harts; `os-ktest-release` the optimised build
+# (debug assertions and overflow checks off, no fat LTO so that the build is short) at four. The harness check proves the shard's
+# required list holds no System test and fails when a Kernel test is missing.
+os-ktest: kernel-main
+	OS_SHARD=k python3 scripts/os_boot_test.py --selftest-k
+	OS_SHARD=k OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+
+OS_KREL_ELF := target/os-krelease/$(KERNEL_TARGET)/release/kernel
+os-ktest-release:
+	cd init && cargo build --release
+	cd kernel && OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-krelease
+	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KREL_ELF)
+
+# The inner loop for kernel edits: format, the pure kernel crates' host tests, the kernel-only boot at four harts.
+kquick: fmt-check kernel-main
+	cargo test -p kcore -p klock
+	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
 os-boot-test: kernel
 	python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
@@ -326,7 +347,7 @@ quick: fmt-check docs-check
 
 # Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
 # the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
-SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-release-smoke
+SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
