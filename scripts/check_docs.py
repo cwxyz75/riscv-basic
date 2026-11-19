@@ -69,6 +69,24 @@ def check_tiers():
         names = SOAK_SPLIT.get(t, []) + [t]
         if not any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", soakyml) for n in names):
             out.append(f"soak.yml does not run the soak target {t}")
+    # tier 3 (KT6): the overnight targets are their own tier, run by overnight.yml, never by the gate or by soak
+    night = make_var(makefile, "OVERNIGHT_TARGETS")
+    if not os.path.exists(os.path.join(ROOT, ".github", "workflows", "overnight.yml")):
+        out.append(".github/workflows/overnight.yml is missing (KT6)")
+    else:
+        nightyml = read(".github/workflows/overnight.yml")
+        run_lines = " ".join(re.findall(r"^\s*(?:- )?run: make (.*)$", nightyml, re.M)).split()
+        for t in night:
+            if t not in run_lines:
+                out.append(f"overnight.yml does not run the overnight target {t}")
+            if t in smoke or t in soak:
+                out.append(f"Makefile: the overnight target {t} is also in a lower tier")
+            if re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", ci) or re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", soakyml):
+                out.append(f"{t} is an overnight target: ci.yml and soak.yml must not run it")
+        for name in ("soak.yml", "overnight.yml"):
+            text = read(f".github/workflows/{name}")
+            if re.search(r"^\s*schedule\s*:", text, re.M) or re.search(r"^\s*pull_request(_target)?\s*:", text, re.M) or re.search(r"^\s*push\s*:", text, re.M):
+                out.append(f"{name}: a schedule, push or pull_request trigger is forbidden; the owner starts it by hand (OD142)")
     if not os.path.exists(os.path.join(ROOT, "docs", "reference", "TESTING.md")):
         out.append("docs/reference/TESTING.md is missing")
     return out

@@ -1,0 +1,44 @@
+name: overnight
+
+# Tier 3 of TESTING.md (KT6, OD142): the long runs, hours each. It runs ONLY when the owner starts it by hand
+# (Actions > overnight > Run workflow, or `gh workflow run overnight.yml`). There is no schedule and no pull-request trigger, and
+# nobody else starts it. Never required to merge. A red run is a work item the same day (OD140), not noise.
+on:
+  workflow_dispatch:
+
+jobs:
+  repeat-smp:
+    name: overnight (repeat smp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BENCH_RATIO: "10"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-repeat-smp
+      - name: Install QEMU and OpenSBI
+        uses: ./.github/actions/install-qemu
+      - uses: actions/cache@v4
+        with:
+          path: third_party/fetched
+          key: fetched-busybox-${{ hashFiles('third_party/fetch-manifest.txt') }}
+      - name: Fetch BusyBox (pinned by sha256)
+        run: FETCH_ONLY="busybox kilo sqlite gzip" make fetch-third-party
+      - run: make overnight-repeat-smp
+      - name: Summary
+        if: always()
+        run: |
+          echo "## overnight (repeat smp): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the logs of failing boots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-logs-repeat-smp
+          path: |
+            target/fail-logs/
+            target/repeat/
+          if-no-files-found: ignore
