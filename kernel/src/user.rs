@@ -1091,6 +1091,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
             return r;
         }
+        if let Some(r) = ksys::vmo_call(n, a, &mut ctx) {
+            return r;
+        }
     }
     match n {
         nr::DEBUG_WRITE => {
@@ -1102,71 +1105,6 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);
             Ok((None, None))
-        }
-        nr::VMO_CREATE => {
-            if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {
-                return fail(Status::InvalidArgs);
-            }
-            // a1: the job the memory is charged to (a handle with MANAGE), or 0 for the caller's own
-            let job = if a[1] == 0 {
-                p.job
-            } else {
-                ipc::job_of(objs, &p.handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
-            };
-            let id = k.vmos.create_in(a[0], job);
-            match ipc::vmo_object_create_in(objs, &mut p.handles, id, &mut quota(job)) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
-                Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
-                    fail(e)
-                }
-            }
-        }
-        nr::VMO_CREATE_PHYSICAL => {
-            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            let (pa, bytes) = (a[1], a[2]);
-            if !abi::layout::in_device_window(pa, bytes) {
-                return fail(Status::InvalidArgs);
-            }
-            let id = k.vmos.create_physical(pa >> 12, bytes >> 12);
-            let rights = Rights(
-                Rights::READ.0
-                    | Rights::WRITE.0
-                    | Rights::MAP.0
-                    | Rights::DUPLICATE.0
-                    | Rights::TRANSFER.0,
-            );
-            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
-                Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
-                    fail(e)
-                }
-            }
-        }
-        nr::VMO_CREATE_DMA => {
-            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            let id = match k.vmos.create_dma(&mut k.mm, a[1], p.job) {
-                Ok(id) => id,
-                Err(kcore::aspace::VmoError::OutOfRange) => return fail(Status::InvalidArgs),
-                Err(_) => return fail(Status::NoMemory),
-            };
-            // the creator's handle carries DMA; duplicates may drop it
-            let rights = Rights(
-                Rights::READ.0
-                    | Rights::WRITE.0
-                    | Rights::MAP.0
-                    | Rights::DUPLICATE.0
-                    | Rights::TRANSFER.0
-                    | Rights::DMA.0,
-            );
-            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
-                Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
-                    fail(e)
-                }
-            }
         }
         nr::RESOURCE_DTB => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
@@ -1226,74 +1164,6 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let (irq, claims) = ipc::interrupt_ack(objs, obj).map_err(|e| (e, None, None))?;
             crate::aia::reenable(irq);
             Ok((Some(claims), None))
-        }
-        nr::VMO_PHYS_ADDR => {
-            let id =
-                ipc::vmo_of(objs, &p.handles, h(0), Rights::DMA).map_err(|e| (e, None, None))?;
-            match k.vmos.phys_addr(id) {
-                Some(pa) => Ok((Some(pa), None)),
-                None => fail(Status::WrongType),
-            }
-        }
-        nr::VMO_COMMIT => {
-            // (offset, length) in bytes, page aligned: commit those pages now (slice V)
-            let id =
-                ipc::vmo_of(objs, &p.handles, h(0), Rights::COMMIT).map_err(|e| (e, None, None))?;
-            let (offset, len) = (a[1], a[2]);
-            if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
-                return fail(Status::InvalidArgs);
-            }
-            // (bounded: the call zeroes every frame it takes with the big lock held)
-            if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
-                return fail(Status::TooBig);
-            }
-            match k.vmos.commit(&mut k.mm, id, offset / 4096, len / 4096) {
-                Ok(()) => Ok((None, None)),
-                Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
-                Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
-                Err(_) => fail(Status::InvalidArgs),
-            }
-        }
-        nr::VMO_GET_SIZE => {
-            let id =
-                ipc::vmo_of(objs, &p.handles, h(0), Rights::NONE).map_err(|e| (e, None, None))?;
-            let pages = k.vmos.pages(id).ok_or((Status::BadHandle, None, None))?;
-            Ok((Some(pages * 4096), None))
-        }
-        nr::VMO_READ | nr::VMO_WRITE => {
-            let writing = n == nr::VMO_WRITE;
-            let need = if writing { Rights::WRITE } else { Rights::READ };
-            let id = ipc::vmo_of(objs, &p.handles, h(0), need).map_err(|e| (e, None, None))?;
-            if k.vmos.kind(id) == Some(kcore::aspace::VmoKind::Device) {
-                // device memory is reached only by mapping it, never through the kernel
-                return fail(Status::NotSupported);
-            }
-            let (offset, buf, len) = (a[1], a[2], a[3]);
-            if len > MAX_MSG_BYTES as u64 {
-                return fail(Status::TooBig);
-            }
-            let len = len as usize;
-            let size = k.vmos.pages(id).ok_or((Status::BadHandle, None, None))? * 4096;
-            if offset.checked_add(len as u64).is_none_or(|end| end > size) {
-                return fail(Status::InvalidArgs);
-            }
-            if writing {
-                let data = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, len)
-                    .map_err(|e| (e, None, None))?;
-                k.vmos
-                    .write(&mut k.mm, id, offset, &data)
-                    .map_err(|_| (Status::NoMemory, None, None))?;
-            } else {
-                verify_writable(&mut p.aspace, &mut k.mm, &mut k.vmos, buf, len)
-                    .map_err(|e| (e, None, None))?;
-                let mut data = alloc::vec![0u8; len];
-                k.vmos
-                    .read(&mut k.mm, id, offset, &mut data)
-                    .map_err(|_| (Status::InvalidArgs, None, None))?;
-                copy_to_user_verified(&mut p.aspace, &mut k.mm, buf, &data)
-                    .map_err(|e| (e, None, None))?;
-            }
-            Ok((None, None))
         }
         _ => fail(Status::BadSyscall),
     }
