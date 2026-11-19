@@ -492,3 +492,277 @@ fn process_self_gives_views_that_cannot_be_sent_away() {
     }
     assert_eq!(st, Some(Status::NoMemory));
 }
+
+// ---- the decisions of kill, suspend, job_kill and the scheduling calls ----
+
+fn narrow(w: &mut W, h: u64, r: Rights) -> abi::Handle {
+    let p = w.procs.get_mut(&1).unwrap();
+    p.handles
+        .duplicate(&mut w.objs, abi::Handle(h as u32), r)
+        .unwrap()
+}
+
+fn job_handle(w: &mut W, job: JobId) -> u64 {
+    let p = w.procs.get_mut(&1).unwrap();
+    u64::from(
+        ipc::job_object_create(
+            &mut w.objs,
+            &mut p.handles,
+            job,
+            Rights::JOB,
+            &mut W::q(&mut w.vmos),
+        )
+        .unwrap()
+        .0,
+    )
+}
+
+#[test]
+fn kill_and_stop_name_their_target_and_refuse_the_ended() {
+    let (mut w, ph) = world();
+    let h = abi::Handle(ph as u32);
+    assert_eq!(
+        ksys::kill_target(&w.objs, &w.procs, 1, abi::Handle(0x999)),
+        Err(Status::BadHandle)
+    );
+    let v = w.vmo(1, JobId::ROOT);
+    assert_eq!(
+        ksys::kill_target(&w.objs, &w.procs, 1, abi::Handle(v as u32)),
+        Err(Status::WrongType)
+    );
+    let no_kill = narrow(&mut w, ph, Rights::INSPECT);
+    assert_eq!(
+        ksys::kill_target(&w.objs, &w.procs, 1, no_kill),
+        Err(Status::AccessDenied)
+    );
+    assert_eq!(
+        ksys::stop_target(&mut w.objs, &mut w.procs, 1, no_kill, true),
+        Err(Status::AccessDenied)
+    );
+    assert_eq!(ksys::kill_target(&w.objs, &w.procs, 1, h), Ok(2));
+    // stop and resume: idempotent, and the flag follows
+    assert_eq!(
+        ksys::stop_target(&mut w.objs, &mut w.procs, 1, h, true),
+        Ok(2)
+    );
+    assert_eq!(
+        ksys::stop_target(&mut w.objs, &mut w.procs, 1, h, true),
+        Ok(2)
+    );
+    assert!(w.procs[&2].stopped);
+    assert_eq!(
+        ksys::stop_target(&mut w.objs, &mut w.procs, 1, h, false),
+        Ok(2)
+    );
+    assert!(!w.procs[&2].stopped);
+    // a process that has ended, been killed, or is gone
+    w.procs.get_mut(&2).unwrap().killed = Some(1);
+    assert_eq!(
+        ksys::stop_target(&mut w.objs, &mut w.procs, 1, h, true),
+        Err(Status::BadState)
+    );
+    let (obj, ..) = ipc::process_of(&w.objs, &w.procs[&1].handles, h, Rights::INSPECT).unwrap();
+    ipc::process_mark_terminated(&mut w.objs, obj, 0);
+    assert_eq!(
+        ksys::kill_target(&w.objs, &w.procs, 1, h),
+        Err(Status::BadState)
+    );
+    w.procs.remove(&2);
+    assert_eq!(
+        ksys::kill_target(&w.objs, &w.procs, 1, h),
+        Err(Status::BadState)
+    );
+}
+
+#[test]
+fn job_kill_closes_the_job_and_names_the_victims() {
+    let (mut w, _) = world();
+    let sub = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let deeper = w.vmos.jobs.create(sub, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = deeper;
+    let jh = job_handle(&mut w, sub);
+    // the caller (1) is outside the job: it is not a victim and not inside
+    let (v, inside) = ksys::job_kill_victims(
+        &w.objs,
+        &w.procs,
+        &mut w.vmos.jobs,
+        1,
+        abi::Handle(jh as u32),
+    )
+    .unwrap();
+    assert_eq!(
+        (v, inside),
+        (vec![2], false),
+        "a process in a descendant job is a victim"
+    );
+    let l = w.vmos.jobs.limits(sub).unwrap();
+    assert_eq!(
+        (l.processes, l.threads),
+        (0, 0),
+        "no new processes or threads"
+    );
+    // the caller inside: ends last, not named
+    w.procs.get_mut(&1).unwrap().job = sub;
+    let (v, inside) = ksys::job_kill_victims(
+        &w.objs,
+        &w.procs,
+        &mut w.vmos.jobs,
+        1,
+        abi::Handle(jh as u32),
+    )
+    .unwrap();
+    assert_eq!((v, inside), (vec![2], true));
+    let weak = narrow(&mut w, jh, Rights::MANAGE);
+    assert_eq!(
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, weak),
+        Err(Status::AccessDenied)
+    );
+    assert_eq!(
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(0x999)),
+        Err(Status::BadHandle)
+    );
+}
+
+#[test]
+fn thread_target_and_set_sched_rows() {
+    let (mut w, _) = world();
+    let (me_tid, other) = (7u32, 9u32);
+    // 0 is the calling thread
+    assert_eq!(
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, 0, Rights::MANAGE),
+        Ok((me_tid, 1))
+    );
+    assert_eq!(
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, 0x999, Rights::MANAGE),
+        Err(Status::BadHandle)
+    );
+    let v = w.vmo(1, JobId::ROOT);
+    assert_eq!(
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, v, Rights::MANAGE),
+        Err(Status::WrongType)
+    );
+    // a thread object of process 2 that has a live kernel thread, and one that has ended
+    let (th, tobj) = {
+        let p = w.procs.get_mut(&1).unwrap();
+        ipc::thread_object_create_in(&mut w.objs, &mut p.handles, 2, &mut W::q(&mut w.vmos))
+            .unwrap()
+    };
+    assert_eq!(
+        ksys::thread_target(
+            &w.objs,
+            &w.procs,
+            1,
+            me_tid,
+            u64::from(th.0),
+            Rights::MANAGE
+        ),
+        Err(Status::BadState),
+        "never started"
+    );
+    w.procs.get_mut(&2).unwrap().thread_objs.insert(other, tobj);
+    assert_eq!(
+        ksys::thread_target(
+            &w.objs,
+            &w.procs,
+            1,
+            me_tid,
+            u64::from(th.0),
+            Rights::MANAGE
+        ),
+        Ok((other, 2))
+    );
+    let weak = narrow(&mut w, u64::from(th.0), Rights::INSPECT);
+    assert_eq!(
+        ksys::thread_target(
+            &w.objs,
+            &w.procs,
+            1,
+            me_tid,
+            u64::from(weak.0),
+            Rights::MANAGE
+        ),
+        Err(Status::AccessDenied)
+    );
+    // set_sched: range of the priority and flags, then the job's maximum
+    let a = |prio, flags| [u64::from(th.0), prio, flags, 0, 0, 0];
+    let jobs = &w.vmos.jobs;
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(0, 0)),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(64, 0)),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(5, 2)),
+        Err(Status::InvalidArgs)
+    );
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(5, 1)),
+        Ok((other, 5, 1))
+    );
+    let low = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.vmos
+        .jobs
+        .set_sched(
+            low,
+            kcore::job::SchedLimits {
+                max_prio: 5,
+                ..w.vmos.jobs.sched(low).unwrap()
+            },
+        )
+        .unwrap();
+    w.procs.get_mut(&2).unwrap().job = low;
+    let jobs = &w.vmos.jobs;
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(6, 0)),
+        Err(Status::AccessDenied),
+        "above the job's maximum"
+    );
+    assert_eq!(
+        ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(5, 0)),
+        Ok((other, 5, 0))
+    );
+}
+
+#[test]
+fn job_set_sched_rows() {
+    let (mut w, _) = world();
+    let sub = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let jh = job_handle(&mut w, sub);
+    let call = |w: &mut W, h: u64, a1: u64, a2: u64, a3: u64| {
+        ksys::job_set_sched(
+            &w.objs,
+            &w.procs,
+            &mut w.vmos.jobs,
+            1,
+            [h, a1, a2, a3, 0, 0],
+        )
+    };
+    assert_eq!(call(&mut w, jh, 64, 0, 1), Err(Status::InvalidArgs));
+    assert_eq!(call(&mut w, jh, 5, 0, 65537), Err(Status::InvalidArgs));
+    assert_eq!(
+        call(&mut w, jh, 5, 0, 0),
+        Err(Status::InvalidArgs),
+        "a zero weight is not a weight"
+    );
+    assert_eq!(call(&mut w, 0x999, 5, 0, 1), Err(Status::BadHandle));
+    let weak = u64::from(narrow(&mut w, jh, Rights::MANAGE).0);
+    assert_eq!(
+        call(&mut w, weak, 5, 0, 1),
+        Err(Status::AccessDenied),
+        "SET_LIMITS is needed"
+    );
+    assert_eq!(call(&mut w, jh, 5, 0, 100), Ok(sub));
+    assert_eq!(w.vmos.jobs.sched(sub).unwrap().max_prio, 5);
+    // a child cannot exceed its parent
+    let child = w.vmos.jobs.create(sub, Limits::UNLIMITED).unwrap();
+    let ch = job_handle(&mut w, child);
+    assert_eq!(call(&mut w, ch, 6, 0, 1), Err(Status::AccessDenied));
+    assert_eq!(
+        call(&mut w, jh, 5, 200_000_000, 1),
+        Err(Status::InvalidArgs),
+        "a budget over the 100 ms window"
+    );
+}

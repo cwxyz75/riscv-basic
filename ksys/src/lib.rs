@@ -21,9 +21,14 @@
 extern crate alloc;
 
 mod job;
+mod lifecycle;
 mod proc;
 mod vmo;
 pub use job::{job_call, job_status};
+pub use lifecycle::{
+    job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
+    thread_target,
+};
 pub use proc::{proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
 pub use vmo::vmo_call;
 
