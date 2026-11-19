@@ -693,6 +693,10 @@ fn leave(code: i32, whole: bool) -> ! {
             p.exit_code.get_or_insert(code);
             p.killed.get_or_insert(code);
             bump_attention();
+            // (siblings spinning in user mode on other harts must be told: with no periodic tick (L13) nothing else would stop them)
+            if !cfg!(feature = "fault-skip-kill-ipi") {
+                crate::smp::kick_others();
+            }
         } else if p.threads_alive == 0 {
             p.exit_code.get_or_insert(code);
         }

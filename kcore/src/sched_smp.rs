@@ -170,6 +170,8 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// hart look at its queues marks it (`pending`) instead of settling at once, so `current_on` stays the thread that is running
     /// until the hart's next defined point calls `reschedule_on`. The kernel sets it; the pure models run both ways.
     deferred: AtomicBool,
+    /// The time source of a tickless kernel (L13): when set, every settle first charges the hart's running thread up to it.
+    clock: Option<fn() -> Time>,
     pokes: AtomicU32,
     pulls: AtomicU64,
     settles: AtomicU64,
@@ -204,6 +206,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU32::new(0)).collect(),
             deferred: AtomicBool::new(false),
+            clock: None,
             pokes: AtomicU32::new(0),
             pulls: AtomicU64::new(0),
             settles: AtomicU64::new(0),
@@ -345,8 +348,31 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// and sent an IPI that `wfi` will see).
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     pub fn idle_has_work(&self, h: usize) -> bool {
-        let q = self.lq(h);
-        self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0
+        {
+            let q = self.lq(h);
+            if self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0 {
+                return true;
+            }
+        }
+        // A hart that is about to sleep looks at the others' queues first (the spec's `overloaded` mask, read the slow way): with no
+        // periodic tick nothing else would make it pull work whose mark was spent while it was busy or already asleep (a thread queued
+        // behind others on a busy hart, with every mark for it consumed). Only a thread this hart may take counts, so an idle hart does
+        // not spin on work that is pinned elsewhere or in transit.
+        for g in 0..self.harts() {
+            if g == h || !self.is_online(g) {
+                continue;
+            }
+            let src = self.lq(g);
+            if src
+                .queued_top_where(&|t| {
+                    src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+                })
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The starvation watchdog's check (a debug detector, SCHED-SMP-SPEC 3.9; `now` is the caller's clock, since a hart that takes no
@@ -373,6 +399,10 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     self.is_online(x)
                         && aff.is_none_or(|a| a as usize == x)
                         && self.view_cur(x) == 0
+                        // (a hart in the middle of a switch (a thread in transit on it) is on its way to look at its queue, not an idle
+                        // hart nobody told; with thousands of threads queued behind two busy harts and the big lock contended it is
+                        // routinely so. A hart that is only *marked* is the lost-poke case and is still reported)
+                        && self.transit.get(x).is_none_or(|t| t.load(Ordering::Acquire) == 0)
                 });
                 if let Some(x) = idle_hart {
                     return Some((t, g, x));
@@ -618,6 +648,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn settle(&self, h: usize) {
         self.settles.fetch_add(1, Ordering::Relaxed);
+        self.charge_now(h);
         self.pending[h].store(false, Ordering::Release);
         let entry_cur = self.lq(h).current();
         // (a mark is owed for the executing thread this settle displaces, unless a tick or yield already put it in transit)
@@ -760,6 +791,30 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if home == caller || me_first {
             self.settle_or_defer(caller);
         }
+        // A thread queued behind an equal one on another hart that is running something makes that hart's slice end an event (no
+        // periodic tick arms it any more): the hart is marked, looks at its queue and programs its timer (L13). Better threads
+        // already mark their hart through `push_marks`.
+        if home != caller {
+            let eff = self.lq(home).record(tid).map(|r| r.eff);
+            if eff.is_some_and(|e| self.view_cur(home) != 0 && e >= self.view_cur(home)) {
+                self.mark(home);
+            }
+        }
+    }
+
+    /// Give the scheduler a time source (nanoseconds), before it is shared: every settle then charges the running thread the time since
+    /// the hart's last look, which a kernel with no periodic tick needs (the tick used to do it).
+    #[must_use]
+    pub fn with_clock(mut self, f: fn() -> Time) -> Self {
+        self.clock = Some(f);
+        self
+    }
+
+    /// Charge hart `h`'s running thread up to the clock source's now (no-op without a source).
+    fn charge_now(&self, h: usize) {
+        if let Some(f) = self.clock {
+            self.lq(h).charge(f());
+        }
     }
 
     /// Deferred mode on or off (see the field).
@@ -793,6 +848,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Block the current thread of `hart` unless a notification is waiting. Returns whether it blocked.
     pub fn block_on(&self, hart: usize) -> Result<bool, Error> {
+        self.charge_now(hart); // (the outgoing thread's run is charged to it, before the designation changes: PR 273 review)
         let blocked = {
             let mut q = self.lq(hart);
             let before = q.current();
@@ -810,6 +866,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Sleep until `deadline` (nanoseconds on this hart's clock).
     pub fn sleep_until_on(&self, hart: usize, deadline: Time) -> Result<bool, Error> {
+        self.charge_now(hart);
         let blocked = {
             let mut q = self.lq(hart);
             let before = q.current();
@@ -839,7 +896,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     fn wake_inner(&self, caller: usize, tid: Tid) -> Result<bool, Error> {
         loop {
             let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
-            // where would it go? (a blocked thread is placed; the placement reads hints and needs the record)
+            self.charge_now(home); // (a tickless hart's clock is as old as its last look: the wake is stamped with the time it happens)
+                                   // where would it go? (a blocked thread is placed; the placement reads hints and needs the record)
             let Some(rec) = ({
                 let q = self.lq(home);
                 q.record(tid).filter(|r| r.home.get() == home).cloned()
@@ -919,6 +977,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn yield_on(&self, hart: usize) -> Result<(), Error> {
+        self.charge_now(hart);
         {
             let mut q = self.lq(hart);
             let cur = q.current();
@@ -932,6 +991,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     }
 
     pub fn exit_on(&self, hart: usize) -> Result<(), Error> {
+        self.charge_now(hart);
         {
             let mut q = self.lq(hart);
             let before = q.current();

@@ -168,7 +168,7 @@ fn wake_before_block_is_not_lost() -> Outcome {
     let waited = thread::ticks() - t1;
     thread::join(waker);
     ensure(
-        (3..=5 + LATE_TICKS).contains(&waited),
+        (3..=12 + LATE_TICKS).contains(&waited), // (a real clock and one-shot timers: the emulator's interrupt jitter shows)
         &format!("blocked for {waited} ticks, wanted about 3"),
     )
 }
@@ -565,9 +565,10 @@ mod priority {
     fn probe(_: usize) {
         let mut worst = 0;
         for _ in 0..50 {
-            let target = thread::ticks() + 3;
+            // (nanoseconds on the real clock: there is no tick to round to)
+            let target = thread::now_ns() + 3_000_000;
             thread::sleep_ticks(3);
-            worst = worst.max(thread::ticks().saturating_sub(target));
+            worst = worst.max(thread::now_ns().saturating_sub(target));
         }
         MAX_LATE.store(worst, SeqCst);
         LATE_DONE.store(true, SeqCst);
@@ -605,9 +606,11 @@ mod priority {
         clean(|| {
             let late = lateness_under_load(MAIN_PRIO + 10)?;
             ensure(
-                late <= 1,
+                // (the emulator delivers a timer interrupt up to a few milliseconds late on a loaded host: observed 2.2 ms; a thread of the hogs'
+                // own priority is held for whole slices, 10 ms, which is what the negative control checks)
+                late <= 4_000_000,
                 &format!(
-                    "a real-time thread woke {late} ticks late with three hogs running (bound: 1)"
+                    "a real-time thread woke {late} ns late with three hogs running (bound: 4 ms)"
                 ),
             )
         })
@@ -619,9 +622,9 @@ mod priority {
         clean(|| {
             let late = lateness_under_load(NORMAL)?;
             ensure(
-                late > 3,
+                late > 6_000_000,
                 &format!(
-                    "an equal-priority probe was only {late} ticks late: the load is not loading"
+                    "an equal-priority probe was only {late} ns late: the load is not loading"
                 ),
             )
         })

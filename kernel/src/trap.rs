@@ -392,7 +392,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
         // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
         if from_user && !user_fp_dirty(frame) {
-            let switch = crate::thread::timer_tick_fast();
+            let switch = crate::thread::timer_interrupt();
             if !switch
                 && crate::user::user_return_is_quiet()
                 && !crate::heap::needs_service()
@@ -411,14 +411,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         } else if from_user {
             crate::bkl::lock();
             crate::fp::trap_entry(frame);
-            let _ = crate::thread::timer_tick_fast();
+            let _ = crate::thread::timer_interrupt();
             crate::thread::switch_if_designated();
             crate::user::commit_wake();
             crate::thread::preempt_point();
             crate::user::activate_current();
             crate::heap::service();
             crate::bkl::unlock();
-        } else if crate::thread::timer_tick_fast() {
+        } else if crate::thread::timer_interrupt() {
             crate::bkl::lock();
             crate::thread::switch_if_designated();
             crate::heap::service();
@@ -497,7 +497,8 @@ fn trap_body(frame: &mut TrapFrame) {
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        crate::timer::next_tick();
+        // (a hart parked until the scheduler exists polls for it once a millisecond: nothing else would wake it)
+        crate::timer::program(Some(crate::timer::now_ns() + 1_000_000));
         return;
     }
     if frame.sstatus & (1 << 8) == 0 {

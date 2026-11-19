@@ -99,7 +99,7 @@ ATOMICS = {
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (5, "hart bring-up and IPI flags"),
     "kernel/src/aia.rs": (12, "interrupt controller statistics and masks"),
-    "kernel/src/thread.rs": (21, "the tick counter, scheduler ready flags and wake statistics"),
+    "kernel/src/thread.rs": (23, "scheduler ready flags, wake statistics and the watchdog's per-hart sample times"),
     "kernel/src/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
     "kernel/src/user.rs": (12, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it)"),
     "kernel/src/trap.rs": (10, "the expected-fault test hook and its log words"),
