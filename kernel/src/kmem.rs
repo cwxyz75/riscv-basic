@@ -108,6 +108,8 @@ fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64
 
 /// Build the kernel page table and switch to it. Needs the heap and the early
 /// boot table (which maps the direct map, so new tables can be written).
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: boot code: addresses come from the device tree and the linker script; a kernel that cannot build its own page table cannot run
 pub fn init() {
     let s = sections();
@@ -233,6 +235,7 @@ pub fn flush_pages(first: u64, last: u64, asid: u16) {
 static mut KERNEL_HALF: [u64; 256] = [0; 256];
 
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 256 slots of the root table plus 256, and the root is a frame of the direct map
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn kernel_half_now() -> [u64; 256] {
     crate::irq::without(|| {
         let root = get().aspace.table().root();
@@ -248,11 +251,13 @@ fn kernel_half_now() -> [u64; 256] {
 }
 
 /// Remember the kernel half now (called once, after the S1 memory tests, before any process).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn snapshot_kernel_half() {
     // SAFETY: called once at boot, interrupts off or a single thread, before `kernel_half_unchanged`.
     unsafe { *addr_of_mut!(KERNEL_HALF) = kernel_half_now() };
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn kernel_half_unchanged() -> bool {
     // SAFETY: read of a static written once by `snapshot_kernel_half`.
     kernel_half_now() == unsafe { *addr_of!(KERNEL_HALF) }

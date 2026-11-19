@@ -86,7 +86,7 @@ be host-testable, fuzzable and covered before that starts.
 - [ ] **KT7** schedule perturbation
 - [ ] **KT10** automated mutation testing
 - [x] **KT12** (PR 282) the checked release build
-- [ ] **KT13** the kernel stack budget
+- [x] **KT13** (PR 283) the kernel stack budget
 - [ ] **KT5** instruction-count checks
 - [ ] **KT8** syscall fuzzing (host and guest)
 - [ ] **KT9** the allocation-failure sweep

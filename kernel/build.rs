@@ -14,6 +14,11 @@ fn main() {
     println!("cargo:rustc-link-arg=--no-relax");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");
+    // KT13: an optimised build gets the wider stack budget (thread.rs, T173)
+    println!("cargo:rustc-check-cfg=cfg(kernel_optimized)");
+    if std::env::var("OPT_LEVEL").is_ok_and(|l| l != "0") {
+        println!("cargo:rustc-cfg=kernel_optimized");
+    }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     // The user programs come from the dev build unless the release boot test asks otherwise.
