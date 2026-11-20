@@ -260,7 +260,8 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
 
 use ksys::new_start;
 
-#[allow(clippy::expect_used)] // INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
+#[allow(clippy::expect_used)]
+// INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
