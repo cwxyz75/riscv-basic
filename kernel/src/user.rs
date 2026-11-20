@@ -2080,106 +2080,23 @@ fn caller_pid(s: &UserState) -> Result<u32, Status> {
         .ok_or(Status::BadState)
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::arithmetic_side_effects)]
-// INVARIANT: pids are a counter far below u32::MAX; the new process's handle was made with room checked
 fn process_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        if s.procs.len() >= abi::limits::MAX_PROCESSES || !kmem::kernel_half_unchanged() {
-            return bad(Status::NoMemory);
-        }
-        // The job the new process is charged to: the one named by the handle in a0 (MANAGE), or
-        // the caller's own when a0 is 0.
-        let creator = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let job = if a[0] == 0 {
-            creator.job
-        } else {
-            ipc::job_of(
-                &s.objs,
-                &creator.handles,
-                Handle(a[0] as u32),
-                Rights::MANAGE,
-            )
-            .map_err(|e| (e, None, None))?
-        };
         let k = kmem::get();
-        k.vmos
-            .jobs
-            .charge(job, Resource::Processes, 1)
-            .map_err(|e| (job_status(e), None, None))?;
-        // the process's root page table is charged to its job too (one page)
-        if let Err(e) = k.vmos.jobs.charge(job, Resource::Pages, 1) {
-            k.vmos.jobs.credit(job, Resource::Processes, 1);
-            return bad(job_status(e));
-        }
-        k.vmos.jobs.retain(job);
-        let give_back = |k: &mut kmem::Kmem| {
-            k.vmos.jobs.credit(job, Resource::Pages, 1);
-            k.vmos.jobs.credit(job, Resource::Processes, 1);
-            k.vmos.jobs.release(job);
-        };
-        let Some(table) = PageTable::new_with_kernel_half(&mut k.mm, k.aspace.table()) else {
-            give_back(k);
-            return bad(Status::NoMemory);
-        };
-        // (pids wrap after 2^32 creations and skip the live ones: a loop of create and close must not end in an overflow)
-        let pid = loop {
-            let candidate = s.next_pid;
-            s.next_pid = if candidate == u32::MAX {
-                1
-            } else {
-                candidate + 1
-            };
-            if !s.procs.contains_key(&candidate) {
-                break candidate;
-            }
-        };
-        let UserState { objs, procs, .. } = s;
-        let creator = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let (handle, obj) = match ipc::process_object_create_in(
-            objs,
-            &mut creator.handles,
-            pid,
-            true,
-            &mut quota(job),
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                PageTable::destroy_user(table, &mut k.mm);
-                give_back(k);
-                return bad(e);
-            }
-        };
-        procs.insert(
-            pid,
-            Box::new(Process {
-                aspace: AddressSpace::new(table),
-                handles: HandleTable::new(MAX_HANDLES),
-                asid: (pid & 0xffff) as u16,
-                vmos: Vec::new(),
-                entry: 0,
-                arg: 0,
-                exit_code: None,
-                kernel_end: None,
-                start_sp: 0,
-                obj: Some(obj),
-                state: ProcState::Created,
-                detached: true,
-                killed: None,
-                stopped: false,
-                threads_alive: 0,
-                thread_objs: BTreeMap::new(),
-                job,
-                table_charge: BTreeMap::from([(u64::MAX, 1)]),
-                stacks: BTreeMap::new(),
-                stack_hint: abi::user::STACK_ARENA_BASE,
-                privileged: false,
-            }),
-        );
-        Ok((Some(u64::from(handle.0)), None))
+        let kernel_half_ok = kmem::kernel_half_unchanged();
+        let handle = ksys::process_create(
+            s,
+            &mut k.mm,
+            &mut k.vmos,
+            k.aspace.table(),
+            kernel_half_ok,
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
+        Ok((Some(u64::from(handle)), None))
     })
 }
 
