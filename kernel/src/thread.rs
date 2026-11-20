@@ -1133,6 +1133,8 @@ pub fn wake_stat(which: u64) -> u64 {
         104 => crate::kmem::stats().image_first << 12,
         // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
         105 => crate::timer::timebase(),
+        // 106: calls the kernel made to the SBI IPI extension (0: inter-hart interrupts are IMSIC messages, PL6)
+        106 => crate::arch::sbi::ipi_calls() as u64,
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
         // 16 + h: how often hart h took the big kernel lock from free

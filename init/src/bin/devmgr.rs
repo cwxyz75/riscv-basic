@@ -513,7 +513,7 @@ pub fn app_main() -> i32 {
             continue;
         }
         let va = mmio_va(blocks.len() + nets.len() + rngs.len());
-        // an interrupt where the machine has a controller we drive; NOT_SUPPORTED (AIA) means the driver polls
+        // the device's interrupt (the AIA is required, PL6); a source the kernel will not give (taken already) leaves the device without one
         let irq_of = || {
             let i = sys::interrupt_create(res, slot.irq);
             (i.status == 0).then_some(i.a1 as u32)

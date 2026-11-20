@@ -93,17 +93,3 @@ pub fn lazy_units_are_off() -> bool {
     unsafe { asm!("csrr {}, sstatus", out(reg) v) };
     v >> 13 & 3 == 0 && v >> 9 & 3 == 0
 }
-
-/// Enable the software interrupt (the inter-hart interrupt) on this hart.
-#[inline(always)]
-pub fn software_interrupt_enable() {
-    // SAFETY: sets sie.SSIE only (the supervisor software interrupt, used for IPIs).
-    unsafe { asm!("csrs sie, {}", in(reg) 1usize << 1) };
-}
-
-/// Clear this hart's pending software interrupt.
-#[inline(always)]
-pub fn software_interrupt_clear() {
-    // SAFETY: clears sip.SSIP, the pending bit of the software interrupt; nothing else.
-    unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
-}

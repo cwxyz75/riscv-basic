@@ -7345,11 +7345,11 @@ fn blk_round_trip() -> Outcome {
     let Some(rig) = blk_rig()? else {
         return Ok(()); // no disk attached (OS_DISK=0)
     };
-    sys::debug_write(if rig.irq.is_some() {
-        b"s6: blkd exercised (interrupts)\n"
-    } else {
-        b"s6: blkd exercised (polling)\n"
-    });
+    ensure!(
+        rig.irq.is_some(),
+        "the block device has an interrupt (the AIA is required, PL6)"
+    );
+    sys::debug_write(b"s6: blkd exercised (interrupts)\n");
     let (p, ch) = rig.spawn()?;
     let (st, body) = blk_call(ch, 1, blk::Op::Info)?;
     ensure_eq!(st, blk::Status::Ok, "info");

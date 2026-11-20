@@ -4,7 +4,7 @@
 //! the admitted devices name: virtio-mmio 1 to 8 and the RTC, 11. Synthetic trees cover hart ids that are not dense or not in order.
 mod common;
 use common::Dt;
-use kcore::aiatree::{device_sources, discover};
+use kcore::aiatree::discover;
 use kcore::fdt;
 
 const ONE: &[u8] = include_bytes!("fixtures/virt-aia.dtb");
@@ -16,6 +16,7 @@ fn the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_s
     let a = discover(&fdt::parse(ONE).unwrap()).unwrap();
     assert_eq!(a.aplic_base, 0xd00_0000);
     assert_eq!(a.num_sources, 96);
+    assert_eq!(a.imsic_base, 0x2800_0000);
     assert_eq!(a.hart_order, vec![0]);
     assert_eq!(a.sources, vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
     let a = discover(&fdt::parse(FOUR).unwrap()).unwrap();
@@ -256,29 +257,29 @@ fn the_supervisor_controller_and_its_own_imsic_are_chosen_over_the_machine_level
 
 #[test]
 fn the_source_limits_are_exact() {
-    // each of: 63 (the last an eie register holds), 64 (past it), the controller's own count as a source, one past it
-    let t = two_levels(&|_| {}, 63, 9, &[(63, false), (64, false), (62, false)]);
+    // each of: 62 (the last: its message id, 63, is the last an eie register holds), 63 (past it), the controller's own count as a source, one past it
+    let t = two_levels(&|_| {}, 62, 9, &[(62, false), (63, false), (61, false)]);
     assert_eq!(
         discover(&fdt::parse(&t).unwrap()).unwrap().sources,
-        vec![62, 63]
+        vec![61, 62]
     );
-    let t = two_levels(&|_| {}, 63, 9, &[(63, false)]);
-    assert_eq!(
-        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
-        vec![63],
-        "source == num-sources is a source"
-    );
-    let t = two_levels(&|_| {}, 62, 9, &[(63, false), (62, false)]);
+    let t = two_levels(&|_| {}, 62, 9, &[(62, false)]);
     assert_eq!(
         discover(&fdt::parse(&t).unwrap()).unwrap().sources,
         vec![62],
-        "one past the count is not"
+        "source == num-sources is a source"
     );
-    // on a big controller the 63 bound alone decides: 64 does not fit the one `eie` register the kernel opens
-    let t = two_levels(&|_| {}, 96, 9, &[(64, false), (63, false), (65, false)]);
+    let t = two_levels(&|_| {}, 61, 9, &[(62, false), (61, false)]);
     assert_eq!(
         discover(&fdt::parse(&t).unwrap()).unwrap().sources,
-        vec![63]
+        vec![61],
+        "one past the count is not"
+    );
+    // on a big controller the 62 bound alone decides: 63 would be message id 64, which the one `eie` register the kernel opens lacks
+    let t = two_levels(&|_| {}, 96, 9, &[(63, false), (62, false), (64, false)]);
+    assert_eq!(
+        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
+        vec![62]
     );
     // an APLIC has at most 1023 sources
     assert_eq!(
@@ -327,16 +328,6 @@ fn imsic_groups_are_refused_and_a_device_that_names_its_parents_elsewhere_is_not
     // a device with interrupts-extended names its parents itself
     let t = two_levels(&|_| {}, 96, 9, &[(5, true), (6, false)]);
     assert_eq!(discover(&fdt::parse(&t).unwrap()).unwrap().sources, vec![6]);
-}
-
-#[test]
-fn the_sources_of_admitted_devices_are_known_without_any_controller() {
-    // a machine with a PLIC (no APLIC): the virtio sources are still the devices' (the call then says NOT_SUPPORTED, not INVALID_ARGS)
-    let nodes = fdt::parse(NO_AIA).unwrap();
-    assert_eq!(discover(&nodes), None);
-    assert_eq!(device_sources(&nodes), vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
-    let nodes = fdt::parse(FOUR).unwrap();
-    assert_eq!(device_sources(&nodes), vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
 }
 
 #[test]
@@ -396,4 +387,14 @@ fn a_device_behind_an_interrupt_nexus_does_not_inherit_the_roots_parent() {
         vec![4],
         "the device under the nexus is not the APLIC's"
     );
+}
+
+#[test]
+fn the_imsic_window_must_hold_a_page_per_listed_hart() {
+    // five harts listed, a window of four pages (the `machine` builder writes 0x4000)
+    let ids = [0, 1, 2, 3, 4];
+    let ok = machine(&ids[..4], &ids[..4], &[], 96);
+    assert!(discover(&fdt::parse(&ok).unwrap()).is_some());
+    let small = machine(&ids, &ids, &[], 96);
+    assert_eq!(discover(&fdt::parse(&small).unwrap()), None);
 }

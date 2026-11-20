@@ -734,3 +734,7 @@ stands.
 | 18 | Q4, Q5, Q6, Q9 | Decided: OD133, OD134, OD133, OD135 |
 | 4, 16 | One architecture, with its code spread through the kernel binary | Still one architecture implemented, but behind a boundary (`kernel/src/arch/`, a page-table format, `abi::arch`) so a second is an addition (KERNEL-V1-SPEC 2.6; OD143) |
 | 3.2, 7 | Soak under `-smp N` as part of every milestone's acceptance | The soak tier and the long-run tier run only when the owner asks (OD142); what a change needs at one, two and four harts is in the gate |
+
+## Amendment 2026-11-20: inter-hart interrupts (PL6)
+
+Section "IPIs and TLB shootdowns" (SBI IPI and RFENCE): the inter-hart interrupt is a message to the target hart's IMSIC supervisor file (message id 1), not the SBI IPI extension; the AIA is required. Remote fences stay SBI RFENCE.

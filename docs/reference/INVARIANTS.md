@@ -115,7 +115,7 @@ get filled in as each area is built.
 ### Lock order
 
 1. **BKL** (`kernel/src/bkl.rs`): protects all shared kernel state. Taken by `irq::without` and by
-   every trap handler (except an IPI and a parked secondary's timer in S5b); reentrant per hart;
+   every trap handler (except an inter-hart interrupt, an external interrupt carrying only IMSIC message 1, and a parked secondary's timer in S5b); reentrant per hart;
    released on every path that leaves kernel code; released at a context switch and taken again, to the same depth, by the thread that resumes (K3, SCHED-SMP-SPEC G4).
 2. **HEAP** (the allocator's spin lock, interrupts off): used inside and outside the BKL, so it
    comes after it.

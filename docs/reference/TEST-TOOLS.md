@@ -136,7 +136,7 @@ kernel-only shard at one, two and eight on the `release-checked` profile: optimi
 overflow checks on.
 
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
-kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`, `os-boot-test-polling` (plain `virt`),
+kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
 `os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
 mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`.
 

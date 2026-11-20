@@ -10,7 +10,17 @@ pub mod aia {
     pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
         unimplemented!()
     }
-    pub fn source_known(irq: u32) -> bool {
+    pub const IPI_BIT: u64 = 0;
+    pub fn lists_hart(hart_id: usize) -> bool {
+        unimplemented!()
+    }
+    pub fn send_ipi(hart_id: usize) {
+        unimplemented!()
+    }
+    pub fn claim() -> u64 {
+        unimplemented!()
+    }
+    pub fn deliver(mask: u64, fired: impl FnMut(u32) -> bool) -> bool {
         unimplemented!()
     }
     pub fn slots() -> usize {
@@ -178,7 +188,9 @@ pub mod sbi {
     pub const EID_RFENCE: usize = 0;
     pub const FID_REMOTE_SFENCE_VMA: usize = 0;
     pub const EID_IPI: usize = 0;
-    pub const FID_SEND_IPI: usize = 0;
+    pub fn ipi_calls() -> usize {
+        unimplemented!()
+    }
     pub const HSM_STOPPED: usize = 0;
     pub struct SbiRet {
         pub error: isize,
@@ -244,12 +256,6 @@ pub mod cpu {
         unimplemented!()
     }
     pub fn lazy_units_are_off() -> bool {
-        unimplemented!()
-    }
-    pub fn software_interrupt_enable() {
-        unimplemented!()
-    }
-    pub fn software_interrupt_clear() {
         unimplemented!()
     }
 }

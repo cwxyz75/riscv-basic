@@ -12,8 +12,8 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##PANIC <message>
     ##DONE pass=<n> fail=<n>
 
-The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
-`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 256M` (the
+The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA, which the kernel requires: plain
+`virt` has only a PLIC and the kernel refuses to boot on it, PL6); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 256M` (the
 size the harness gives it: `OS_RAM`, default 256M, and `ram=` on the kernel line says which). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -31,8 +31,7 @@ import tempfile
 import time
 import sys
 
-# The machine the OS track runs on (OD75): AIA (APLIC + IMSIC). A plain `virt` has only a PLIC, which the
-# kernel does not drive: no interrupt controller, drivers poll (`make os-boot-test-polling`).
+# The machine the OS track runs on (OD75): AIA (APLIC + IMSIC), required since PL6 (inter-hart interrupts are IMSIC messages).
 DEFAULT_MACHINE = "virt,aia=aplic-imsic"
 # A boot is judged on progress, not on total time (T157, OD140): it fails when the guest prints nothing for STALL seconds (a hang),
 # or when it runs past TIMEOUT (a ceiling far above any healthy run, a runaway). A loaded host (a CI runner, ten busy cores) slows
@@ -1278,25 +1277,21 @@ def main() -> int:
             found.append(f"the kernel did not report 'harts online: {want_harts}'")
         # (the lossy mode runs only the bulk TCP tests, and the net shard only the network tests: the checks for the other tests would fail by design)
         strict = not expect_fail and not os.environ.get("OS_NET_LOSSY") and SHARD != "b"
-        # The interrupt controller the kernel found must be the one the machine has (S6a-2): a PLIC on
-        # the default board, the AIA (APLIC + IMSIC, OD75) on the aia machine. Otherwise the interrupt-object test
-        # could pass by skipping.
-        aia = "aia" in os.environ.get("OS_MACHINE", DEFAULT_MACHINE)
-        want_ic = "interrupt controller: AIA" if aia else "interrupt controller: none"
+        # The kernel must have found the AIA (APLIC + IMSIC, OD75); otherwise the interrupt-object test could pass by skipping.
+        want_ic = "interrupt controller: AIA"
         if strict and want_ic not in text.split("\n"):
             found.append(f"the kernel did not report '{want_ic}'")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (strict and os.environ.get("OS_DISK") != "0" and aia
+        if (strict and os.environ.get("OS_DISK") != "0"
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
-        # The block-driver tests must have found the disk and run (with interrupts on both machines, OD75).
+        # The block-driver tests must have found the disk and run, with interrupts.
         if (strict and os.environ.get("OS_DISK") != "0"
-                and f"s6: blkd exercised ({'interrupts' if aia else 'polling'})" not in text):
-            found.append("the block-driver tests did not run in the expected mode "
-                         f"({'interrupts' if aia else 'polling'})")
+                and "s6: blkd exercised (interrupts)" not in text):
+            found.append("the block-driver tests did not run with interrupts")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if strict and aia and os.environ.get("OS_DISK") != "0":
+        if strict and os.environ.get("OS_DISK") != "0":
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")

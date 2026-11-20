@@ -419,9 +419,9 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     //
     let cause = frame.scause;
     let ready = crate::thread::scheduler_ready();
-    // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
+    // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
-    let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && !ready);
+    let light = cause == (1 << 63) | 5 && !ready;
     // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
     // (no kill or stop recorded) and the user's FP state is not dirty.
     if from_user && cause == 8 && ready && lock_free_syscall(frame) {
@@ -471,6 +471,8 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             crate::heap::service();
             crate::bkl::unlock();
         }
+    } else if cause == (1 << 63) | 9 {
+        external_trap(frame, from_user);
     } else if light {
         trap_body(frame);
     } else {
@@ -495,50 +497,73 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     }
 }
 
+/// An inter-hart interrupt on its own (no device message came with it): the quiet paths of L12b, the lock only when the hart has scheduling to do.
+fn ipi_trap(frame: &mut TrapFrame) {
+    let reasons = crate::smp::ipi_interrupt();
+    if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
+        if frame.sstatus & (1 << 8) == 0 {
+            // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
+            // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
+            if !user_fp_dirty(frame)
+                && !crate::thread::reschedule_fast()
+                && crate::user::user_return_is_quiet()
+                && !crate::thread::need_resched_pending()
+            {
+                return;
+            }
+            crate::bkl::lock();
+            crate::fp::trap_entry(frame);
+            crate::thread::reschedule_this_hart();
+            crate::thread::preempt_point();
+            crate::user::activate_current();
+            crate::bkl::unlock();
+        } else if crate::thread::reschedule_fast() {
+            // interrupted kernel code and the hart must switch: only now the big kernel lock
+            crate::bkl::lock();
+            crate::thread::switch_if_designated();
+            crate::bkl::unlock();
+        }
+    }
+}
+
+/// A supervisor external interrupt: take every message in this hart's IMSIC file. The inter-hart interrupt (message 1) is the hot one and needs
+/// no lock unless the hart must switch; a device message goes to its interrupt object under the big lock (S6a-2).
+fn external_trap(frame: &mut TrapFrame, from_user: bool) {
+    let ids = crate::aia::claim();
+    let devices = ids & !crate::aia::IPI_BIT;
+    if devices == 0 {
+        if ids & crate::aia::IPI_BIT != 0 {
+            ipi_trap(frame);
+        }
+        return;
+    }
+    // (the inter-hart part first, with no lock: its test jobs probe the lock)
+    let reasons = if ids & crate::aia::IPI_BIT != 0 {
+        crate::smp::ipi_interrupt()
+    } else {
+        0
+    };
+    crate::bkl::lock();
+    crate::fp::trap_entry(frame);
+    let any = crate::aia::deliver(devices, crate::user::irq_fired);
+    if (any || reasons & crate::percpu::IPI_RESCHED != 0) && crate::thread::scheduler_ready() {
+        if any {
+            crate::user::wake_signal_waiters();
+        }
+        crate::thread::reschedule_this_hart();
+    }
+    if from_user {
+        crate::user::commit_wake();
+        crate::thread::preempt_point();
+        crate::user::activate_current();
+    }
+    crate::heap::service();
+    crate::bkl::unlock();
+}
+
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the kernel's own fault path: va steps over the pages a fault mapped; sepc plus an instruction length stays in kernel text
 fn trap_body(frame: &mut TrapFrame) {
     let cause = frame.scause;
-    if cause == (1 << 63) | 1 {
-        // Supervisor software interrupt: an IPI.
-        let reasons = crate::smp::ipi_interrupt();
-        if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
-            if frame.sstatus & (1 << 8) == 0 {
-                // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
-                // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
-                if !user_fp_dirty(frame)
-                    && !crate::thread::reschedule_fast()
-                    && crate::user::user_return_is_quiet()
-                    && !crate::thread::need_resched_pending()
-                {
-                    return;
-                }
-                crate::bkl::lock();
-                crate::fp::trap_entry(frame);
-                crate::thread::reschedule_this_hart();
-                crate::thread::preempt_point();
-                crate::user::activate_current();
-                crate::bkl::unlock();
-            } else if crate::thread::reschedule_fast() {
-                // interrupted kernel code and the hart must switch: only now the big kernel lock
-                crate::bkl::lock();
-                crate::thread::switch_if_designated();
-                crate::bkl::unlock();
-            }
-        }
-        return;
-    }
-    if cause == (1 << 63) | 9 {
-        // Supervisor external interrupt (S6a-2): a device source, owned by an interrupt object.
-        let any = crate::aia::handle(crate::user::irq_fired);
-        if any && crate::thread::scheduler_ready() {
-            crate::user::wake_signal_waiters();
-            crate::thread::reschedule_this_hart();
-            if frame.sstatus & (1 << 8) == 0 {
-                crate::user::activate_current();
-            }
-        }
-        return;
-    }
     if cause == (1 << 63) | 5 && !crate::thread::scheduler_ready() {
         // A secondary hart's timer before the scheduler exists: count and re-arm.
         crate::percpu::this()
