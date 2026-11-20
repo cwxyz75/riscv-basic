@@ -96,6 +96,32 @@ mod tests {
         );
     }
 
+    /// The algorithm is the contract: a failing seed recorded by an overnight run must reproduce the same delays tomorrow, so the first
+    /// sixty-four answers for seed 1 on hart 0 (and the generator's state after them) are pinned. Change the generator on purpose and these
+    /// numbers change with it.
+    #[test]
+    fn the_sequence_is_pinned() {
+        let mut c = Chaos::new(1, 0);
+        let hits: Vec<(usize, u32)> = (0..64)
+            .filter_map(|i| c.next_delay().map(|d| (i, d)))
+            .collect();
+        assert_eq!(
+            hits,
+            [
+                (4, 1677),
+                (16, 1153),
+                (39, 275),
+                (42, 952),
+                (47, 1075),
+                (49, 1428),
+                (55, 1219),
+                (56, 237),
+                (63, 477)
+            ]
+        );
+        assert_eq!(c.to_raw(), 0x05ba_222a_716f_81c8);
+    }
+
     #[test]
     fn the_same_seed_and_hart_give_the_same_sequence() {
         assert_eq!(run(7, 0, 1000), run(7, 0, 1000));
