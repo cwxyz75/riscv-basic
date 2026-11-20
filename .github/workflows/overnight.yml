@@ -105,3 +105,41 @@ jobs:
           name: failing-logs-chaos
           path: target/chaos/
           if-no-files-found: ignore
+
+  mutants:
+    name: overnight (mutants ${{ matrix.pkg }} ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {pkg: klock, shard: "0/1"}
+          - {pkg: kcore, shard: "0/8"}
+          - {pkg: kcore, shard: "1/8"}
+          - {pkg: kcore, shard: "2/8"}
+          - {pkg: kcore, shard: "3/8"}
+          - {pkg: kcore, shard: "4/8"}
+          - {pkg: kcore, shard: "5/8"}
+          - {pkg: kcore, shard: "6/8"}
+          - {pkg: kcore, shard: "7/8"}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-mutants-${{ matrix.pkg }}
+      - name: Install cargo-mutants (a tool, not a dependency of any crate; pinned)
+        run: cargo install cargo-mutants --locked --version 25.3.1
+      - run: make os-mutants PKG=${{ matrix.pkg }} SHARD=${{ matrix.shard }}
+      - name: Keep the mutant lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ matrix.pkg }}-${{ strategy.job-index }}
+          path: |
+            target/mutants-*/mutants.out/missed.txt
+            target/mutants-*/mutants.out/timeout.txt
+            target/mutants-*/mutants.out/caught.txt
+          if-no-files-found: ignore

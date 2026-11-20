@@ -1,0 +1,2 @@
+# Survivors of `make os-mutants` that no test can or should kill (KT10): one per line, `path: replace X with Y in fn  # reason`.
+# The first full run is owed to the owner (WORK-PLAN.md); its survivors are either killed by a new test or listed here with a reason.

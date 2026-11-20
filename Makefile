@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -395,7 +395,7 @@ soak:
 
 # Tier 3 (overnight): hours-long runs, started ONLY by the owner (OD142, KT6): `overnight.yml` has a manual trigger and nothing else.
 # Each KT item that adds a long run adds its target here, and `overnight.yml` runs it as a job. Never required to merge.
-OVERNIGHT_TARGETS := overnight-repeat-smp os-boot-test-checked os-chaos
+OVERNIGHT_TARGETS := overnight-repeat-smp os-boot-test-checked os-chaos os-mutants
 # 20 consecutive boots of the smp suite: the intermittent-failure hunt of OD140 (a red run is a work item the same day).
 overnight-repeat-smp:
 	$(MAKE) os-repeat TARGET=os-boot-test-smp N=20
@@ -420,6 +420,17 @@ os-chaos:
 	cd init && cargo build
 	cd kernel && cargo build --features chaos --target-dir ../target/os-chaos
 	python3 scripts/chaos.py $(OS_CHAOS_ELF) "$(CHAOS_SEEDS)"
+
+# KT10: mutation testing of kcore and klock with their host tests as the oracle (needs `cargo install cargo-mutants --locked --version 25.3.1`).
+# `make os-mutants` runs both crates; `make os-mutants PKG=kcore SHARD=3/8` one slice, which is how overnight.yml fits the job budget.
+# Fails on a surviving mutant that is not in mutants-accepted.txt with a reason. Hours: the owner starts it (OD142).
+os-mutants:
+ifeq ($(PKG),)
+	python3 scripts/mutants.py klock
+	python3 scripts/mutants.py kcore
+else
+	python3 scripts/mutants.py $(PKG) $(if $(SHARD),--shard $(SHARD),)
+endif
 
 # `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).
 check: smoke
