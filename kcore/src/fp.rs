@@ -134,11 +134,16 @@ impl Tokens {
 /// The state of one unit for a thread.
 pub struct UnitThread<R> {
     state: Option<(Box<R>, u64)>,
+    /// The hart whose register file holds this thread's latest state, if any (the kernel's lock-free return path keeps a claim on that hart).
+    holder: Option<usize>,
 }
 
 impl<R> Default for UnitThread<R> {
     fn default() -> Self {
-        UnitThread { state: None }
+        UnitThread {
+            state: None,
+            holder: None,
+        }
     }
 }
 
@@ -150,6 +155,20 @@ pub type VecThread = UnitThread<VecRegs>;
 impl<R> UnitThread<R> {
     pub fn new() -> UnitThread<R> {
         UnitThread::default()
+    }
+
+    /// The hart that holds the thread's latest state in its registers, as the kernel last recorded it.
+    pub fn holder(&self) -> Option<usize> {
+        self.holder
+    }
+
+    pub fn set_holder(&mut self, hart: Option<usize>) {
+        self.holder = hart;
+    }
+
+    /// Where the saved registers live (the address of the box; stable until the thread's state is dropped), for a save made without a table lookup.
+    pub fn regs_ptr(&mut self) -> Option<*mut R> {
+        self.state.as_mut().map(|(r, _)| &mut **r as *mut R)
     }
 
     /// Does the thread use the FP unit (has it been enabled)?
@@ -189,6 +208,11 @@ pub struct FpHart {
 impl FpHart {
     pub const fn new() -> FpHart {
         FpHart { owner: 0 }
+    }
+
+    /// This hart no longer holds anything known: the next return to user mode loads (another hart took the thread's state over).
+    pub fn forget(&mut self) {
+        self.owner = 0;
     }
 
     /// Does this hart's register file hold exactly `thread`'s current state?

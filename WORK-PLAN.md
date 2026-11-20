@@ -120,7 +120,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **SC1** sixty-four harts (PR 317: harts from `/cpus`, the SBI hart-mask builder, 64-bit pokes; the records and stacks stay static at 64, T185; the `-smp` 8/16/32 boots are the owner's soak)
 - [x] **HD1** the kernel entropy pool
 - [x] **PL2** vector state (PR 319: `kcore::fp` as one model with two instances; the `vlen=128` boot and one hart are the gate's and the soak's)
-- [ ] **PL3** user code built for RVA23U64
+- [x] **PL3** user code built for RVA23U64 (PR 320; T54 and R16 were closed before; the C and Lua transcripts and BusyBox are the epic gate's)
 
 ### Phase 5: the ABI flag days
 
@@ -249,5 +249,10 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     not allocated at boot for the harts found as KERNEL-V1-SPEC 2.3 says; the rest of the item (ids from the tree, the hart-mask builder,
     64-bit masks) is done. The first hart's record must exist before the heap does, and the saving is memory only. Alternative: allocate.
     `work/T185.md`.
+  - 2026-11-20, PL3: the user Rust build enables `+v,+zvbb,+zba,+zbb,+zbs,+zicond,+zcb,+zfa,+zicbom,+zicboz,+zihintpause,+zkt,+zimop,+zcmop,+zawrs` (the
+    RVA23U64 mandatory extensions rustc has features for; `init/.cargo/config.toml`), and user C is built with `-march=rva23u64` where the clang knows
+    it, else the same set spelled out, else the part LLVM 17 accepts (`init/build.rs`). `v`, `zfa` and `zvbb` are unstable features on the stable
+    toolchain and warn "will become a hard error": `work/T187.md`. `senvcfg` enables CBZE, CBCFE and CBIE (flush) on every hart and the boot
+    stops if a bit does not stick. Alternative: a target specification (nightly only).
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

@@ -423,6 +423,7 @@ docs-check:
 # Everything that is compiled for the target, built and not run: the OS kernel with its user programs, and the home computer's kernel.
 # (The optimised build is `os-release`; CI builds it in its own job.)
 build: kernel-main home-kernel
+	python3 scripts/check_vector_codegen.py
 
 # The commit hook (scripts/hooks/pre-commit): format, the docs check and clippy, on every commit; no tests. Once per clone
 # (worktrees share the setting).

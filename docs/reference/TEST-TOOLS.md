@@ -85,6 +85,7 @@ test between tiers, and put the numbers in a dated record.
 | `make os-aarch64-check` | the kernel compiles against the AArch64 stub (the architecture boundary is complete) |
 | `make lint` | clippy with warnings denied: `lint-host` (the host crates) and `lint-target` (the home kernel, the user programs, the OS kernel with its panic-finding deny list) |
 | `make docs-check` | `scripts/check_docs.py` (documents, the decision log, the work queue, the testing tiers, the atomics allow-list, the architecture boundary, the workflows, the syscall-error table) and the self-tests of the benchmark comparison and the packet-capture checker |
+| `make build` | the OS kernel (with its user programs) and the home kernel, then `scripts/check_vector_codegen.py` (PL3): the built C code (Lua, the C tests) must hold vector instructions, so a `-march` that lost the V extension cannot pass silently |
 | `make os-miri` | the unit tests and the frame-database model under Miri (nightly toolchain; soak) |
 
 **The fuzzer of the syscall layer.** `kfuzz-gen` generates call sequences from a model of what the process holds

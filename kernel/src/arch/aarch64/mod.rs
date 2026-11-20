@@ -84,6 +84,9 @@ pub mod fp {
     pub fn init_boot_hart() {
         unimplemented!()
     }
+    pub fn enable_cache_block_ops_or_stop() {
+        unimplemented!()
+    }
     pub fn check_hart() {
         unimplemented!()
     }
@@ -247,6 +250,9 @@ pub mod cpu {
         unimplemented!()
     }
     pub fn tlb_flush_page(va: u64, asid: u16) {
+        unimplemented!()
+    }
+    pub fn enable_cache_block_ops() -> bool {
         unimplemented!()
     }
     pub fn vlenb_read() -> usize {

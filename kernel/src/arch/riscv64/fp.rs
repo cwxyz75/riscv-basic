@@ -37,6 +37,14 @@ pub fn init_boot_hart() {
     VLENB.store(n, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Enable `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval` for user mode on this hart; the boot stops if a bit does not stick (PL3).
+pub fn enable_cache_block_ops_or_stop() {
+    assert!(
+        crate::arch::enable_cache_block_ops(),
+        "senvcfg: the cache-block bits (CBZE, CBCFE, CBIE) did not stick: M-mode must enable them (menvcfg) and the hart needs Zicbom and Zicboz"
+    );
+}
+
 /// A secondary hart: its vector registers must be as long as the boot hart's, or the saved state of a thread would not fit.
 pub fn check_hart() {
     let n = crate::arch::vlenb_read();
@@ -267,6 +275,79 @@ fn hart() -> usize {
         .load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// This hart's register file now holds `tid`'s latest FP (`fp`) or vector state: record the claim, and drop the one the thread's previous holder
+/// hart had (that copy is stale now). Under the big lock.
+fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u32, h: usize, fp: bool) {
+    use core::sync::atomic::Ordering::Release;
+    let cells = |hart: usize| {
+        let p = crate::percpu::hart(hart);
+        if fp {
+            (&p.fs_claim, &p.fs_buf)
+        } else {
+            (&p.vs_claim, &p.vs_buf)
+        }
+    };
+    if let Some(old) = t.holder() {
+        if old != h {
+            let (c, b) = cells(old);
+            // (only if the old hart still holds this thread: another thread's load there has replaced the claim already)
+            if c.load(core::sync::atomic::Ordering::Acquire) == tid {
+                c.store(0, Release);
+                b.store(0, Release);
+                // (a save that takes no lock keeps the token, so the old hart's token must stop matching)
+                if let Some(f) = harts.get_mut(old) {
+                    f.forget();
+                }
+            }
+        }
+    }
+    t.set_holder(Some(h));
+    let (c, b) = cells(h);
+    b.store(t.regs_ptr().map_or(0, |p| p as usize), Release);
+    c.store(tid, Release);
+}
+
+/// Save what the user left dirty in the FP and vector units without the big lock, when this hart's claim names the running thread (so its
+/// registers are in the unit and its saved copy is at a known address): the trap paths that take no lock (L12b, L12c) use it so that a thread
+/// whose compiled code touches vector registers (the whole user build is RVA23U64) still gets the quiet path. Returns false if state is
+/// dirty that it could not save: the caller takes the full path, whose `trap_entry` saves under the lock.
+pub fn light_save(frame: &mut TrapFrame) -> bool {
+    use core::sync::atomic::Ordering::Acquire;
+    if frame.sstatus & (1 << 8) != 0 {
+        return true;
+    }
+    let (fsb, vsb) = (frame.sstatus & FS_MASK, frame.sstatus & VS_MASK);
+    if fsb != FS_DIRTY && vsb != VS_DIRTY {
+        return true;
+    }
+    if cfg!(feature = "fault-skip-fp-save") {
+        return false;
+    }
+    let tid = crate::thread::current();
+    let me = crate::percpu::this();
+    if vsb == VS_DIRTY {
+        let buf = me.vs_buf.load(Acquire);
+        if me.vs_claim.load(Acquire) != tid || buf == 0 {
+            return false;
+        }
+        // SAFETY: the claim names the thread running here, so its registers are in this hart's unit and nothing else touches its saved copy;
+        // `buf` is the address of that copy's box, which lives until `thread_gone` (which clears the claim first and runs only for a thread that
+        // is not running).
+        unsafe { VecHartUnit.save_into(&mut *(buf as *mut VecRegs)) };
+        frame.sstatus = (frame.sstatus & !VS_MASK) | VS_CLEAN;
+    }
+    if fsb == FS_DIRTY {
+        let buf = me.fs_buf.load(Acquire);
+        if me.fs_claim.load(Acquire) != tid || buf == 0 {
+            return false;
+        }
+        // SAFETY: as above, for the FP unit's copy.
+        unsafe { HartUnit.save_into(&mut *(buf as *mut FpRegs)) };
+        frame.sstatus = (frame.sstatus & !FS_MASK) | FS_CLEAN;
+    }
+    true
+}
+
 /// A trap from user mode, before anything else can use this hart's FP registers: save what the user
 /// dirtied, and switch the unit off for the kernel. (Idempotent for one trap: the frame says Clean
 /// afterwards.)
@@ -287,7 +368,11 @@ pub fn trap_entry(frame: &mut TrapFrame) {
             ..
         } = s;
         let ok = match vthreads.get_mut(&tid) {
-            Some(t) => vharts[hart()].trap_entry(t, true, vtokens, &mut VecHartUnit),
+            Some(t) => {
+                let ok = vharts[hart()].trap_entry(t, true, vtokens, &mut VecHartUnit);
+                claim(t, vharts, tid, hart(), false);
+                ok
+            }
             None => false,
         };
         assert!(
@@ -306,7 +391,11 @@ pub fn trap_entry(frame: &mut TrapFrame) {
             ..
         } = s;
         let ok = match threads.get_mut(&tid) {
-            Some(t) => harts[hart()].trap_entry(t, true, tokens, &mut HartUnit),
+            Some(t) => {
+                let ok = harts[hart()].trap_entry(t, true, tokens, &mut HartUnit);
+                claim(t, harts, tid, hart(), true);
+                ok
+            }
             None => false,
         };
         assert!(
@@ -329,21 +418,34 @@ pub fn return_to_user(frame: &mut TrapFrame) {
     // with Clean or Dirty, and `first_use` sets Initial), so the common case takes no lock at all:
     // taking the big lock on every return to user mode made syscalls with many live processes at four
     // harts several times slower (found by `syscalls_stay_fast_with_many_live_processes` in CI).
-    if frame.sstatus & (FS_MASK | VS_MASK) == 0 {
+    let (fsb, vsb) = (frame.sstatus & FS_MASK, frame.sstatus & VS_MASK);
+    if fsb | vsb == 0 {
+        return;
+    }
+    // A thread that has used a unit takes no lock either while this hart's registers still hold its latest state (T166; with the user build on
+    // RVA23U64 nearly every thread has used the vector unit): the frame says Clean or Dirty (not Initial: no load is owed) and this hart's claim
+    // names the thread. The claim is set where the state is saved or loaded and is cleared when another hart saves or loads the thread's state.
+    let tid = crate::thread::current();
+    let me = crate::percpu::this();
+    let fs_ok = fsb == 0
+        || (fsb >= FS_CLEAN && me.fs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
+    let vs_ok = vsb == 0
+        || (vsb >= VS_CLEAN && me.vs_claim.load(core::sync::atomic::Ordering::Acquire) == tid);
+    if fs_ok && vs_ok {
         return;
     }
     crate::bkl::lock();
     let s = state();
-    let tid = crate::thread::current();
-    let fs = if frame.sstatus & FS_MASK == 0 {
+    let fs = if fsb == 0 {
         None
     } else {
-        Some(match s.threads.get(&tid) {
+        Some(match s.threads.get_mut(&tid) {
             Some(t) => {
                 let fs = s.harts[hart()].return_to_user(t, &mut HartUnit);
+                claim(t, &mut s.harts, tid, hart(), true);
                 // dirty state still in the unit (a trap that skipped `trap_entry`) is the thread's own
                 debug_assert!(
-                    frame.sstatus & FS_MASK != FS_DIRTY || s.harts[hart()].holds(t),
+                    fsb != FS_DIRTY || s.harts[hart()].holds(t),
                     "returning to a thread with unsaved dirty FP state that is not in this hart's unit"
                 );
                 fs
@@ -351,14 +453,15 @@ pub fn return_to_user(frame: &mut TrapFrame) {
             None => Fs::Off,
         })
     };
-    let vs = if frame.sstatus & VS_MASK == 0 {
+    let vs = if vsb == 0 {
         None
     } else {
-        Some(match s.vthreads.get(&tid) {
+        Some(match s.vthreads.get_mut(&tid) {
             Some(t) => {
                 let vs = s.vharts[hart()].return_to_user(t, &mut VecHartUnit);
+                claim(t, &mut s.vharts, tid, hart(), false);
                 debug_assert!(
-                    frame.sstatus & VS_MASK != VS_DIRTY || s.vharts[hart()].holds(t),
+                    vsb != VS_DIRTY || s.vharts[hart()].holds(t),
                     "returning to a thread with unsaved dirty vector state that is not in this hart's unit"
                 );
                 vs
@@ -437,6 +540,19 @@ fn vec_first_use(frame: &mut TrapFrame) -> bool {
 /// A thread has ended: forget its FP and vector state.
 pub fn thread_gone(tid: u32) {
     let s = state();
+    // (a claim must not outlive the state it names)
+    for (t, fp) in [
+        (s.threads.get(&tid).and_then(|t| t.holder()), true),
+        (s.vthreads.get(&tid).and_then(|t| t.holder()), false),
+    ] {
+        if let Some(h) = t {
+            let p = crate::percpu::hart(h);
+            let cell = if fp { &p.fs_claim } else { &p.vs_claim };
+            if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
+                cell.store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
     s.threads.remove(&tid);
     s.vthreads.remove(&tid);
 }

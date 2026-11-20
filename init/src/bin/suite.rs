@@ -1892,6 +1892,7 @@ fn vector_state_is_private_to_each_thread_and_process() -> Outcome {
     for (arg, what) in [
         (96u64, "vill and vstart survive a yield"),
         (97, "a vector load enables the unit"),
+        (98, "a vector loop and cbo.zero work in the RVA23U64 build"),
     ] {
         let (e, _m) = launch(arg)?;
         wait_ended(e, 3000)?;

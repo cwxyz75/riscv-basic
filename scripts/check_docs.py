@@ -177,7 +177,7 @@ ATOMICS = {
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (29, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
-    "kernel/src/percpu.rs": (62, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
+    "kernel/src/percpu.rs": (70, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166)"),
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
