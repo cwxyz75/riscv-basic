@@ -297,3 +297,10 @@ allocating; `prune_port` allocated a marking vector (now in place); the VMO stor
 generations and the two-level `PageMap`, both fallible); `vmo_commit`'s undo list and `vmo_read`'s buffer. The page map also cut a fresh-page fault from 19.6 thousand to 10.9 thousand
 instructions (`bench/counts.tsv`). A planted infallible `Vec::push` in the `vmo_commit` handler is reported by scenario and N. What the sweep does not reach is `T177`; the guest half (`fault-alloc` in the
 kernel, a `kalloc` program) is not built.
+
+## Before a push
+
+`make preflight` (about five minutes) runs what CI has failed pull requests for: `fmt-check`, `docs-check`, `lint` (clippy on the host crates), `lint-kernel` (clippy on the kernel, with its own deny list) and the
+host tests. `make preflight-full` adds `kquick` (the kernel-only boot at four harts) and `os-ktest-release` (the same in the optimised build, whose kernel stack budget changes with every move of code between
+crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts, the two-shard suite, the shell test and the release smoke.
+`scripts/check_docs.py` caps the near-term work items at 15.

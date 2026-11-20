@@ -2100,74 +2100,11 @@ fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::expect_used)]
-// INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists
 fn process_start(a: [u64; 6]) -> Reply {
-    let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
-    let (entry, sp, arg) = (a[1], a[2], a[4]);
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let pe = caller.handles.get(ph).map_err(|e| (e, None, None))?;
-        let be = caller.handles.get(bh).map_err(|e| (e, None, None))?;
-        let tpid = match s.objs.get(pe.obj) {
-            Some(ipc::KObj::Process(p)) => p.pid,
-            _ => return bad(Status::WrongType).map(|_| (0, 0)),
-        };
-        if !matches!(s.objs.get(be.obj), Some(ipc::KObj::Channel(_))) {
-            return bad(Status::WrongType).map(|_| (0, 0));
-        }
-        if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
-            return bad(Status::AccessDenied).map(|_| (0, 0));
-        }
-        let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
-        if target.state != ProcState::Created
-            || target.exit_code.is_some()
-            || target.killed.is_some()
-        {
-            return bad(Status::BadState).map(|_| (0, 0));
-        }
-        if total_threads(s) >= abi::limits::MAX_USER_THREADS {
-            return bad(Status::NoMemory).map(|_| (0, 0));
-        }
-        let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
-        let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
-        if !entry_ok || !sp_ok {
-            return bad(Status::InvalidArgs).map(|_| (0, 0));
-        }
-        // The thread's charge comes before anything changes: a refusal must leave the caller's
-        // handle with the caller and the process exactly as it was (SYSCALLS.md: on any error
-        // nothing changes), or a retry would find handle 1 taken.
-        charge_thread(&mut kmem::get().vmos.jobs, target.job)
-            .map_err(|e| (job_status(e), None, None))?;
-        // Commit: the channel end moves into the new process as its handle 1.
-        let UserState { procs, objs, .. } = s;
-        let caller = procs.get_mut(&me).expect("caller exists");
-        let moved = caller
-            .handles
-            .remove_for_transfer(objs, bh)
-            .map_err(|e| (e, None, None))?;
-        let target = procs.get_mut(&tpid).expect("target exists");
-        let first = target
-            .handles
-            .insert(moved.obj, moved.rights)
-            .expect("an empty table has room");
-        assert_eq!(
-            first,
-            abi::BOOTSTRAP_HANDLE,
-            "the bootstrap channel must be handle 1"
-        );
-        target.entry = entry;
-        target.arg = arg;
-        target.start_sp = sp;
-        target.state = ProcState::Running;
-        target.threads_alive = 1;
-        // the first thread of a process starts at the default priority, clamped to its job's maximum
-        let first_prio = clamp_prio(target.job, 10);
-        Ok((new_start(s, tpid, entry, sp, arg, None), first_prio))
+        ksys::process_start(s, &mut kmem::get().vmos.jobs, me, a).map_err(|e| (e, None, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
@@ -2214,8 +2151,6 @@ fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     }
     Ok((None, None))
 }
-
-use ksys::total_threads;
 
 use ksys::{charge_thread, credit_thread};
 
@@ -2267,15 +2202,6 @@ fn thread_interrupt(a: [u64; 6]) -> Reply {
 }
 
 // ---- jobs (S4.5, OD56-OD58) ----
-
-use ksys::job_status;
-
-/// The base priority a new thread starts at (SCHED-SMP-SPEC 4.9): `want`, clamped to the job's `max_prio` (and at
-/// least 1: a user thread is never the idle priority).
-fn clamp_prio(job: JobId, want: u8) -> u8 {
-    let max = kmem::get().vmos.jobs.sched(job).map_or(10, |s| s.max_prio);
-    want.min(max).max(1)
-}
 
 /// The priority a thread created by the calling thread inherits: the caller's own base if it is a user thread, else
 /// the default (10).
