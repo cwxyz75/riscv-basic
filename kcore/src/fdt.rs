@@ -59,6 +59,196 @@ fn scan(blob: &[u8], name: &str) -> Option<bool> {
     }
 }
 
+// ---- the early devices (PL5b): allocation-free, because the console is needed before the heap exists ----
+
+/// Deepest nesting the allocation-free walker follows (the same bound as the whole-tree parse).
+const WALK_DEPTH: usize = MAX_DEPTH_EARLY;
+const MAX_DEPTH_EARLY: usize = 16;
+
+/// What `walk_props` calls for each property: the node's path components, its parent's cell counts, the property name and value.
+type PropVisitor<'a, 'f> = dyn FnMut(&[&'a str], (u32, u32), &'a str, &'a [u8]) + 'f;
+
+/// A node's `reg` (the first range) and `compatible` value, as `node_at` collects them.
+type NodeFacts<'a> = (Option<(u64, u64)>, Option<&'a [u8]>);
+
+/// Walk every property of the tree without allocating: `f(path, cells, name, value)` is called for each, where `path` is the node's name
+/// components from the root (`["soc", "serial@10000000"]`; the root itself is `[]`) and `cells` is the pair `(#address-cells,
+/// #size-cells)` its parent gave its children (the specification's defaults, 2 and 1, until a parent says otherwise; properties come
+/// before child nodes in the format, so the counts are known when the children are met). A malformed tree ends the walk.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every access is through checked `get` slices or a depth checked against WALK_DEPTH; `at` advances inside the structure block
+fn walk_props<'a>(blob: &'a [u8], f: &mut PropVisitor<'a, '_>) -> Option<()> {
+    if be32(blob, 0)? != MAGIC {
+        return None;
+    }
+    let total = be32(blob, 4)? as usize;
+    let off_struct = be32(blob, 8)? as usize;
+    let off_strings = be32(blob, 12)? as usize;
+    let size_struct = be32(blob, 36)? as usize;
+    let blob = blob.get(..total)?;
+    let strings = blob.get(off_strings..)?;
+    let structure = blob.get(off_struct..off_struct.checked_add(size_struct)?)?;
+    let mut names: [&str; WALK_DEPTH] = [""; WALK_DEPTH];
+    // cells[d]: the counts the node at depth d gives its children
+    let mut cells = [(2u32, 1u32); WALK_DEPTH + 1];
+    let mut depth = 0usize; // 0 before the root; the root is depth 1
+    let mut at = 0usize;
+    loop {
+        match be32(structure, at)? {
+            1 => {
+                let rest = structure.get(at + 4..)?;
+                let len = rest.iter().position(|&b| b == 0)?;
+                let name = core::str::from_utf8(&rest[..len]).ok()?;
+                at = at.checked_add(4 + (len + 1).next_multiple_of(4))?;
+                if depth >= WALK_DEPTH {
+                    return None;
+                }
+                if depth >= 1 {
+                    names[depth - 1] = name;
+                }
+                depth += 1;
+                cells[depth] = (2, 1);
+            }
+            2 => {
+                depth = depth.checked_sub(1)?;
+                at += 4;
+            }
+            3 => {
+                let len = be32(structure, at + 4)? as usize;
+                let nameoff = be32(structure, at + 8)? as usize;
+                let value = structure.get(at + 12..at.checked_add(12)?.checked_add(len)?)?;
+                let pname = strings.get(nameoff..)?;
+                let pend = pname.iter().position(|&b| b == 0)?;
+                let pname = core::str::from_utf8(&pname[..pend]).ok()?;
+                if pname == "#address-cells" {
+                    cells[depth] = (be32(value, 0)?, cells[depth].1);
+                } else if pname == "#size-cells" {
+                    cells[depth] = (cells[depth].0, be32(value, 0)?);
+                }
+                // the parent's counts apply to this node's `reg`
+                let parent = cells[depth.saturating_sub(1)];
+                let path: &[&str] = names.get(..depth.saturating_sub(1))?;
+                f(path, parent, pname, value);
+                at = at.checked_add(12 + len.next_multiple_of(4))?;
+            }
+            4 => at += 4,
+            9 => return Some(()),
+            _ => return None,
+        }
+    }
+}
+
+/// The first `(address, size)` of a `reg` value written with the given cell counts (one or two cells each; a size of zero cells reads as 0).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get` is checked; the cell counts are at most 2, so the offsets are at most 16
+fn first_reg(v: &[u8], (a, s): (u32, u32)) -> Option<(u64, u64)> {
+    if a == 0 || a > 2 || s > 2 {
+        return None;
+    }
+    let cell = |at: usize, n: u32| -> Option<u64> {
+        let mut x = 0u64;
+        for k in 0..n as usize {
+            let w = u32::from_be_bytes(v.get(at + 4 * k..at + 4 * k + 4)?.try_into().ok()?);
+            x = (x << 32) | u64::from(w);
+        }
+        Some(x)
+    };
+    Some((cell(0, a)?, cell(4 * a as usize, s)?))
+}
+
+/// Does `path` (a node's name components from the root) equal the absolute path string `want` (`/soc/serial@10000000`)? No wildcards.
+fn path_is(path: &[&str], want: &str) -> bool {
+    let Some(rest) = want.strip_prefix('/') else {
+        return false;
+    };
+    let mut parts = rest.split('/').filter(|p| !p.is_empty());
+    for c in path {
+        if parts.next() != Some(*c) {
+            return false;
+        }
+    }
+    parts.next().is_none()
+}
+
+/// The `reg` and `compatible` of the node at an absolute path (collected by walking the whole tree: properties arrive node by node).
+fn node_at<'a>(blob: &'a [u8], want: &str) -> Option<NodeFacts<'a>> {
+    let (mut reg, mut compat): (Option<(u64, u64)>, Option<&[u8]>) = (None, None);
+    walk_props(blob, &mut |path, cells, name, value| {
+        if path_is(path, want) {
+            match name {
+                "reg" => reg = first_reg(value, cells),
+                "compatible" => compat = Some(value),
+                _ => {}
+            }
+        }
+    })?;
+    Some((reg, compat))
+}
+
+/// The base address of the console UART the tree names: `/chosen/stdout-path` (an absolute path or an alias from `/aliases`, either with
+/// `:options` after it) naming a node whose `compatible` is an NS16550 and whose `reg` gives the base. `None` when the tree names no
+/// console, names one that is not a 16550 or is malformed: the caller falls back to the firmware's console.
+pub fn console_base(blob: &[u8]) -> Option<u64> {
+    let mut stdout: Option<&str> = None;
+    let mut aliases: [(&str, &str); 8] = [("", ""); 8];
+    let mut n_alias = 0usize;
+    walk_props(blob, &mut |path, _, name, value| {
+        let text = core::str::from_utf8(value.split(|&b| b == 0).next().unwrap_or(&[])).ok();
+        match (path, name) {
+            (["chosen"], "stdout-path") => stdout = text,
+            (["aliases"], k) => {
+                if let (Some(t), Some(slot)) = (text, aliases.get_mut(n_alias)) {
+                    *slot = (k, t);
+                    n_alias = n_alias.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    })?;
+    let want = stdout?.split(':').next()?;
+    let want = if want.starts_with('/') {
+        want
+    } else {
+        aliases.iter().take(n_alias).find(|a| a.0 == want)?.1
+    };
+    let (reg, compat) = node_at(blob, want)?;
+    let is_16550 = compat?
+        .split(|&b| b == 0)
+        .any(|c| c == b"ns16550a" || c == b"ns16550");
+    if is_16550 {
+        reg.map(|r| r.0)
+    } else {
+        None
+    }
+}
+
+/// The base address of the test finisher, a SiFive test device (`sifive,test1` or `sifive,test0`): the way a headless test run says pass or
+/// fail. `None` when the tree has none (real hardware): the kernel then ends through the firmware.
+pub fn test_finisher_base(blob: &[u8]) -> Option<u64> {
+    // pass one: the path of the first node whose compatible names a SiFive test device (`reg` may come before `compatible` in a node, so
+    // the address is read in a second pass)
+    let mut found: Option<([&str; MAX_DEPTH_EARLY], usize)> = None;
+    walk_props(blob, &mut |path, _, name, value| {
+        let matches = name == "compatible"
+            && value
+                .split(|&b| b == 0)
+                .any(|c| c == b"sifive,test1" || c == b"sifive,test0");
+        if matches && found.is_none() {
+            let mut copy = [""; MAX_DEPTH_EARLY];
+            for (d, c) in copy.iter_mut().zip(path.iter()) {
+                *d = c;
+            }
+            found = Some((copy, path.len()));
+        }
+    })?;
+    let (comps, len) = found?;
+    let mut reg: Option<u64> = None;
+    walk_props(blob, &mut |path, cells, name, value| {
+        if name == "reg" && path == comps.get(..len).unwrap_or(&[]) {
+            reg = first_reg(value, cells).map(|r| r.0);
+        }
+    })?;
+    reg
+}
+
 // ---- the whole tree (S6c) ----
 
 use alloc::string::String;

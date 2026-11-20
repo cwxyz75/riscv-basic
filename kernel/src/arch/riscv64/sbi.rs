@@ -11,6 +11,12 @@ pub const SBI_ERR_NOT_SUPPORTED: isize = -2;
 pub const EID_RFENCE: usize = 0x5246_4E43;
 pub const FID_REMOTE_SFENCE_VMA: usize = 1;
 pub const EID_IPI: usize = 0x73_5049;
+/// The debug console extension (DBCN), function write_byte.
+pub const EID_DBCN: usize = 0x4442_434E;
+pub const FID_DBCN_WRITE_BYTE: usize = 2;
+/// The system reset extension (SRST), function system_reset (a0: 0 shutdown, 1 cold reboot; a1: 0 no reason, 1 system failure).
+pub const EID_SRST: usize = 0x5352_5354;
+pub const FID_SRST_RESET: usize = 0;
 pub const FID_SEND_IPI: usize = 0;
 /// `hart_get_status` result for a hart that exists and is waiting to be started.
 pub const HSM_STOPPED: usize = 1;
@@ -41,6 +47,25 @@ pub fn sbi5(eid: usize, fid: usize, a: [usize; 5]) -> SbiRet {
         );
     }
     SbiRet { error, value }
+}
+
+/// Write one byte to the firmware's debug console (SBI DBCN, `sbi_debug_console_write_byte`): the console when the device tree names no
+/// UART the kernel can drive. `false` if the firmware refused (it lacks the extension): the byte is lost, there is nowhere else to say so;
+/// the console counts the refusals.
+pub fn debug_console_write_byte(byte: u8) -> bool {
+    sbi(EID_DBCN, FID_DBCN_WRITE_BYTE, usize::from(byte), 0, 0).error == 0
+}
+
+/// Ask the firmware to end the run: a shutdown, or a cold reboot (SBI SRST). `failure` is the reason code the firmware may report.
+/// Returns only if the firmware refuses (a machine without the extension).
+pub fn system_reset(reboot: bool, failure: bool) {
+    let _ = sbi(
+        EID_SRST,
+        FID_SRST_RESET,
+        usize::from(reboot),
+        usize::from(failure),
+        0,
+    );
 }
 
 global_asm!(

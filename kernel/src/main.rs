@@ -75,7 +75,12 @@ impl Tally {
 #[no_mangle]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
-    // First of all: this hart's record in `tp` (the trap entry needs it).
+    // First of all, before anything can print: where the tree is (the early table maps all physical space below 64 GiB, and the pointer is
+    // bounds-checked), then the console it names and the test device (allocation-free: there is no heap yet).
+    dtb::locate(dtb);
+    console::init_from_tree();
+    finisher::init(dtb::dtb_blob().and_then(kcore::fdt::test_finisher_base));
+    // this hart's record in `tp` (the trap entry needs it)
     percpu::bind(0, hart_id);
     percpu::this()
         .online
@@ -110,7 +115,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
 
     heap::init();
     trap::init();
-    dtb::locate(dtb); // (the extent of the tree, read once the trap vector can report a fault: `kmem::init` needs it)
+    if dtb::boot_arg_present("console=sbi") {
+        console::use_sbi(); // (the fallback path, exercised on a machine that has a UART: `make os-boot-test-sbi-console`)
+    }
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)

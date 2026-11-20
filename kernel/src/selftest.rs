@@ -278,6 +278,34 @@ fn ram_matches_the_machine() -> Outcome {
     )
 }
 
+/// PL5b: the console fallback proves itself. Under the boot word `console=sbi` (`make os-boot-test-sbi-console`) output must really go through the
+/// firmware: the switch happened, bytes went that way (this test's own line included) and the firmware refused none. Without the word the
+/// kernel prints on the UART the tree named, and nothing went through the firmware.
+fn the_console_is_where_the_boot_line_says() -> Outcome {
+    let (bytes, refused) = crate::console::sbi_counts();
+    if crate::dtb::boot_arg_present("console=sbi") {
+        ensure(
+            crate::console::sbi_forced(),
+            "console=sbi switched the console",
+        )?;
+        ensure(
+            bytes > 0,
+            "output went through the firmware's debug console",
+        )?;
+        ensure_eq(refused, 0, "bytes the firmware's debug console refused")
+    } else {
+        ensure(
+            !crate::console::sbi_forced(),
+            "the console was not switched without the word",
+        )?;
+        ensure(
+            crate::console::base().is_some(),
+            "the tree named a UART and the kernel found it",
+        )?;
+        ensure_eq(bytes, 0, "bytes sent through the firmware without the word")
+    }
+}
+
 /// PL4c: the image is where the loader put it, and the kernel found out. The harness names the address it built the image for
 /// (`load=0x...` on the kernel line; only the load-address boot test does) and the image's physical start, worked out by the early boot
 /// code from its own address, must be that: a kernel that quietly ran from the default address would pass every other test.
@@ -591,6 +619,10 @@ pub const TESTS: &[Test] = &[
         direct_map_does_not_alias_the_image,
     ),
     ("ram_matches_the_machine", ram_matches_the_machine),
+    (
+        "the_console_is_where_the_boot_line_says",
+        the_console_is_where_the_boot_line_says,
+    ),
     (
         "the_image_is_where_the_loader_put_it",
         the_image_is_where_the_loader_put_it,
