@@ -4,7 +4,6 @@ kind: slice
 title: Syscall fuzzing: on the host against the syscall layer, and in the guest
 area: testing
 horizon: long
-blocked_by: [TS3]
 refs: [KERNEL-V1-SPEC, OD139, OD140]
 ---
 

@@ -300,6 +300,10 @@ kernel, a `kalloc` program) is not built.
 
 ## Before a push
 
+Owner, 2026-11-20: the quick `make preflight` is fine before a push (it catches the formatting, clippy and docs-check failures CI would otherwise report); `make preflight-full` (the QEMU boots) is on demand only, when the owner asks. CI is the check for everything else.
+
+What they do:
+
 `make preflight` (about five minutes) runs what CI has failed pull requests for: `fmt-check`, `docs-check`, `lint` (clippy on the host crates), `lint-kernel` (clippy on the kernel, with its own deny list) and the
 host tests. `make preflight-full` adds `kquick` (the kernel-only boot at four harts) and `os-ktest-release` (the same in the optimised build, whose kernel stack budget changes with every move of code between
 crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts, the two-shard suite, the shell test and the release smoke.
