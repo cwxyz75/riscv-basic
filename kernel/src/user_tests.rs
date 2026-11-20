@@ -90,11 +90,12 @@ fn bkl_is_released() -> Outcome {
     if smp::started() < 2 {
         return Ok(());
     }
-    const PROBE_CYCLES: u64 = 400_000; // 40 ms of the 10 MHz counter
+    let probe_cycles = crate::timer::cycles_from_ns(40_000_000); // 40 ms of the counter
     let probe = |phase: &str| -> Outcome {
-        smp::start_work(1, smp::WORK_BKL_PROBE, PROBE_CYCLES);
+        smp::start_work(1, smp::WORK_BKL_PROBE, probe_cycles);
         thread::sleep_ticks(60);
-        let r = smp::wait_work(1, 10 * 10_000_000).ok_or_else(|| format!("{phase}: no answer"))?;
+        let r = smp::wait_work(1, 10 * crate::timer::timebase())
+            .ok_or_else(|| format!("{phase}: no answer"))?;
         let (ok, fail) = (r & 0xffff_ffff, r >> 32);
         // A lock held by user-mode execution would be found held almost always (ok near 0). Timer
         // ticks and a host that preempts a vCPU inside a locked region (CI, a busy laptop) make

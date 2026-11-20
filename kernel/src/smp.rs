@@ -141,7 +141,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
     }
     STARTED.store(next, Ordering::SeqCst);
     // wait (bounded) for every started hart
-    let deadline = timer::now() + 2 * 10_000_000; // 2 s at 10 MHz
+    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000); // 2 s
     for i in 1..next {
         while !percpu::hart(i).online.load(Ordering::Acquire) {
             if timer::now() > deadline {

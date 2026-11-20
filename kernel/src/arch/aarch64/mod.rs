@@ -85,6 +85,12 @@ pub mod irq {
 }
 
 pub mod timer {
+    pub fn set_frequency(hz: u64) -> bool {
+        unimplemented!()
+    }
+    pub fn cycles_from_ns(ns: u64) -> u64 {
+        unimplemented!()
+    }
     pub fn timebase() -> u64 {
         unimplemented!()
     }

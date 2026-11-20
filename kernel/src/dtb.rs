@@ -64,11 +64,18 @@ pub fn memory_map() -> Option<(Ranges, Ranges)> {
     Some((memory, reserved))
 }
 
-/// The timebase frequency of the tree (`/cpus/timebase-frequency`), in hertz.
-#[allow(dead_code)] // PL4b feeds the clock from it
-pub fn timebase_frequency() -> Option<u64> {
-    let nodes = kcore::fdt::parse(dtb_blob()?).ok()?;
-    kcore::fdt::timebase_frequency(&nodes)
+/// Set the clock's rate from the tree's `/cpus/timebase-frequency` (PL4b). A tree without one, or with a rate the kernel cannot convert, stops
+/// the boot: nothing in the kernel assumes a rate.
+#[allow(clippy::expect_used)] // INVARIANT: boot-time refusal by design: without a rate the clock and every timer are meaningless
+pub fn init_timebase() {
+    let hz = dtb_blob()
+        .and_then(|b| kcore::fdt::parse(b).ok())
+        .and_then(|nodes| kcore::fdt::timebase_frequency(&nodes))
+        .expect("a timebase-frequency in the device tree");
+    assert!(
+        crate::timer::set_frequency(hz),
+        "a timebase-frequency the kernel can convert (1 Hz to 4 GHz)"
+    );
 }
 
 /// Refuse to run on a hart that lacks an extension the kernel relies on (PL1, OD47, OD127): `kcore::isa::REQUIRED_EXTENSIONS` and Sv39,

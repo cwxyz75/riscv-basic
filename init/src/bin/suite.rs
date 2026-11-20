@@ -11318,14 +11318,16 @@ fn job_create_sees_the_credit_of_a_job_closed_just_before() -> Outcome {
 
 // --- Benchmarks (slice B, SCHED-SMP-SPEC 6.1) ------------------------------------------------------------------
 
-/// The `time` counter (10 MHz on QEMU `virt`: one cycle is 100 ns).
+/// The `time` counter (its rate is `debug_stat(105)`, from the device tree: 10 MHz on QEMU `virt`).
 fn cycles() -> u64 {
     sys::debug_stat(6)
 }
 
 /// Report one benchmark as a structured line: ns per operation (smaller is better).
 fn bench_line(name: &str, cycles: u64, ops: u64) -> u64 {
-    let ns = cycles * 100 / ops.max(1);
+    let ns = (u128::from(cycles) * 1_000_000_000
+        / u128::from(sys::debug_stat(105).max(1))
+        / u128::from(ops.max(1))) as u64;
     println!("##BENCH {name} {ns} ns");
     ns
 }
