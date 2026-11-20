@@ -48,6 +48,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             } else {
                 ipc::job_of(objs, handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
             };
+            vmos.reserve_one().map_err(|e| (e, None, None))?;
             let id = vmos.create_in(a[0], job);
             match ipc::vmo_object_create_in(
                 objs,
@@ -71,6 +72,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if !abi::layout::in_device_window(pa, bytes) {
                 return fail(Status::InvalidArgs);
             }
+            vmos.reserve_one().map_err(|e| (e, None, None))?;
             let id = vmos.create_physical(pa >> 12, bytes >> 12);
             let rights = Rights(
                 Rights::READ.0
@@ -98,6 +100,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         }
         nr::VMO_CREATE_DMA => {
             ipc::resource_of(objs, handles, h(0)).map_err(|e| (e, None, None))?;
+            vmos.reserve_one().map_err(|e| (e, None, None))?;
             let id = match vmos.create_dma(mm, a[1], job) {
                 Ok(id) => id,
                 Err(kcore::aspace::VmoError::OutOfRange) => return fail(Status::InvalidArgs),
@@ -184,7 +187,10 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     .map_err(|_| (Status::NoMemory, None, None))?;
             } else {
                 verify_writable(aspace, mm, vmos, buf, len).map_err(|e| (e, None, None))?;
-                let mut data = alloc::vec![0u8; len];
+                let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                data.try_reserve_exact(len)
+                    .map_err(|_| (Status::NoMemory, None, None))?;
+                data.resize(len, 0);
                 vmos.read(mm, id, offset, &mut data)
                     .map_err(|_| (Status::InvalidArgs, None, None))?;
                 copy_to_user_verified(aspace, mm, buf, &data).map_err(|e| (e, None, None))?;

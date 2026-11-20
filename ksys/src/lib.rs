@@ -123,12 +123,17 @@ pub fn wide_argument_error(n: usize, a: &[u64; 6]) -> Option<Status> {
     }
 }
 
-fn handle_list(args: &[u8]) -> Vec<Handle> {
-    args.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| Handle(u32::from_le_bytes(*c)))
-        .collect()
+fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(args.len() / 4)
+        .map_err(|_| Status::NoMemory)?;
+    v.extend(
+        args.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| Handle(u32::from_le_bytes(*c))),
+    );
+    Ok(v)
 }
 
 /// The calls on handles, events, channels, sockets and ports. `None`: `n` is not one of them (the caller handles it). The width of
@@ -298,7 +303,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 handles,
                 h(0),
                 &data,
-                &handle_list(&raw),
+                &handle_list(&raw).map_err(|e| (e, None, None))?,
                 &mut vmos.jobs,
             )
             .map(|_| (None, None))
@@ -341,12 +346,19 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             };
             match got {
                 Ok(r) => {
-                    let raw: Vec<u8> = r.handles.iter().flat_map(|h| h.0.to_le_bytes()).collect();
-                    // The destinations were verified: these writes allocate nothing (T10).
+                    // The destinations were verified: these writes allocate nothing (T10), and the handle numbers go out one at a time from the
+                    // stack, so nothing here can fail for lack of memory after the message has been taken (KT9).
                     copy_to_user_verified(aspace, mm, bytes_at, &r.data)
                         .map_err(|e| (e, None, None))?;
-                    copy_to_user_verified(aspace, mm, handles_at, &raw)
+                    for (i, h) in r.handles.iter().enumerate() {
+                        copy_to_user_verified(
+                            aspace,
+                            mm,
+                            handles_at + (i as u64) * 4,
+                            &h.0.to_le_bytes(),
+                        )
                         .map_err(|e| (e, None, None))?;
+                    }
                     Ok((Some(r.data.len() as u64), Some(r.handles.len() as u64)))
                 }
                 Err(ReadError::TooSmall { bytes, handles }) => Err((

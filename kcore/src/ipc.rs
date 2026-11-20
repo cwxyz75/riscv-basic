@@ -199,6 +199,8 @@ impl Quota<'_> {
     /// Charge `n` new objects to the job (after applying what destroyed objects gave back).
     fn objects(&mut self, reg: &mut Kobjs, n: u64) -> Result<(), Status> {
         settle(reg, self.jobs);
+        // (room for the object's destruction to record itself, before anything is charged or made: KT9)
+        reg.reserve_one()?;
         match self.job {
             Some(job) => {
                 self.jobs
@@ -220,7 +222,7 @@ impl Quota<'_> {
 /// bytes each held. Every function that charges a job calls this first, so a job that has just
 /// closed things can use the room at once.
 pub fn settle(reg: &mut Kobjs, jobs: &mut Jobs) {
-    for (job, bytes) in reg.take_credits() {
+    for (job, bytes) in reg.drain_credits() {
         jobs.credit(job, Resource::Objects, 1);
         jobs.credit(job, Resource::IpcBytes, bytes as u64);
         jobs.release(job); // the use the object held (see `Quota::objects`)
@@ -291,7 +293,7 @@ pub fn channel_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<(Handle, Handle), Status> {
-    if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
+    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
@@ -465,14 +467,17 @@ fn read_at(
     let KObj::Channel(c) = reg.get_mut(me).expect("resolved") else {
         unreachable!()
     };
+    // Everything that can fail for lack of memory is done before the message leaves the queue: the table's room and the result vector.
+    let n = c.queue[i].handles.len();
+    table.reserve(n)?;
+    let mut handles = Vec::new();
+    handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
     let msg = c.queue.remove(i).expect("picked");
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());
-    let handles = msg
-        .handles
-        .iter()
-        .map(|e| table.insert(e.obj, e.rights).expect("room was checked"))
-        .collect();
+    for e in &msg.handles {
+        handles.push(table.insert(e.obj, e.rights).expect("room was checked"));
+    }
     Ok(Received {
         data: msg.data,
         handles,
@@ -572,7 +577,7 @@ pub fn event_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -725,7 +730,7 @@ pub fn socket_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<(Handle, Handle), Status> {
-    if table.room() < 2 || reg.live() + 2 > MAX_OBJECTS {
+    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
@@ -860,7 +865,10 @@ pub fn socket_read_in(
     let Some(KObj::Socket(s)) = reg.get_mut(me) else {
         return Err(Status::BadHandle);
     };
-    let out: Vec<u8> = s.buf.drain(..n).collect();
+    // (the result is allocated before anything leaves the buffer, so a failed allocation loses no data)
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
+    out.extend(s.buf.drain(..n));
     if s.buf.is_empty() {
         // give the memory back: an idle socket holds nothing
         s.buf = VecDeque::new();
@@ -902,7 +910,7 @@ pub fn port_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -922,20 +930,26 @@ pub fn port_create_in(
 fn prune_port(reg: &mut Kobjs, jobs: &mut Jobs, port_obj: ObjId) {
     // One pass (not a search and a shift per dead binding: quadratic under the big kernel lock when
     // thousands of bindings die at once, review 2026-11-14). `next` keeps pointing at the same
-    // surviving binding.
-    let keep: Vec<bool> = match reg.get(port_obj) {
-        Some(KObj::Port(p)) => p.bindings.iter().map(|b| reg.is_alive(b.obj)).collect(),
+    // surviving binding. The bindings are moved out while they are checked against the registry and moved back: no allocation, so a pruning
+    // cannot fail for lack of memory (KT9).
+    let mut bindings = match reg.get_mut(port_obj) {
+        Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
         _ => return,
     };
-    let mut removed = 0;
+    let next = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => p.next,
+        _ => 0,
+    };
+    let before_next = bindings
+        .iter()
+        .take(next)
+        .filter(|b| !reg.is_alive(b.obj))
+        .count();
+    let before = bindings.len();
+    bindings.retain(|b| reg.is_alive(b.obj));
+    let removed = before - bindings.len();
     if let Some(KObj::Port(p)) = reg.get_mut(port_obj) {
-        let before_next = keep.iter().take(p.next).filter(|&&k| !k).count();
-        let mut i = 0;
-        p.bindings.retain(|_| {
-            i += 1;
-            keep[i - 1]
-        });
-        removed = keep.len() - p.bindings.len();
+        p.bindings = bindings;
         p.next -= before_next.min(p.next);
     }
     reg.meter_sub(removed * BINDING_COST);
@@ -1120,7 +1134,7 @@ pub fn resource_object_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1139,7 +1153,7 @@ pub fn interrupt_object_create_in(
     irq: u32,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1240,7 +1254,7 @@ pub fn vmo_object_create_with(
     rights: Rights,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1258,7 +1272,7 @@ pub fn job_object_create(
     rights: Rights,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1307,7 +1321,7 @@ pub fn process_object_create_in(
     kill_on_close: bool,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1373,7 +1387,7 @@ pub fn thread_object_create_in(
     pid: u32,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;

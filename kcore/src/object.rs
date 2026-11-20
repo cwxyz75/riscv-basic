@@ -92,6 +92,10 @@ pub struct Registry<T: Object> {
     dirty: Vec<(ObjId, bool)>,
     /// The log filled up and was dropped: the consumer must treat every object as touched.
     dirty_overflow: bool,
+    /// The work list of `release` (objects whose last reference just went), kept between calls so a release never allocates.
+    work: Vec<ObjId>,
+    /// The graveyard's twin: `drain_dead` hands out one and keeps the other, so its capacity survives (`recycle` returns it).
+    spare: Vec<T>,
 }
 
 /// How many log entries are kept before the log is compacted and, failing that, dropped (the
@@ -121,14 +125,18 @@ impl<T: Object> Registry<T> {
             // (found by the trust-boundary audit). Owners cap `live` at `MAX_OBJECTS`, and
             // slots are reused, so the table never needs to grow.
             slots: Vec::with_capacity(PREALLOC_SLOTS),
-            free: Vec::new(),
+            // (everything a destruction pushes to is sized for the most objects there can be, once, so that destroying an object, which cannot be
+            // allowed to fail, never allocates: KT9)
+            free: Vec::with_capacity(PREALLOC_SLOTS),
             live: 0,
             threshold: SWEEP_MIN,
             graveyard: Vec::new(),
             meter: 0,
-            credits: Vec::new(),
-            dirty: Vec::new(),
+            credits: Vec::with_capacity(PREALLOC_SLOTS),
+            dirty: Vec::with_capacity(DIRTY_CAP),
             dirty_overflow: false,
+            work: Vec::with_capacity(PREALLOC_SLOTS),
+            spare: Vec::new(),
         }
     }
 
@@ -274,6 +282,11 @@ impl<T: Object> Registry<T> {
         core::mem::take(&mut self.credits)
     }
 
+    /// The same credits, drained in place: the vector keeps its capacity, so the next destruction of a charged object does not allocate.
+    pub fn drain_credits(&mut self) -> alloc::vec::Drain<'_, (JobId, usize)> {
+        self.credits.drain(..)
+    }
+
     /// Bytes currently counted by the meter.
     pub fn meter(&self) -> usize {
         self.meter
@@ -326,7 +339,9 @@ impl<T: Object> Registry<T> {
     /// it was the last.
     #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released
     pub fn release(&mut self, id: ObjId) {
-        let mut work = alloc::vec![id];
+        let mut work = core::mem::take(&mut self.work);
+        work.clear();
+        work.push(id);
         while let Some(id) = work.pop() {
             let Some(slot) = self.slot_mut(id) else {
                 continue;
@@ -355,13 +370,34 @@ impl<T: Object> Registry<T> {
                 self.graveyard.push(obj);
             }
         }
+        self.work = work;
+    }
+
+    /// Make room for one more object and for everything its destruction will need to record (the graveyard slot of an object that needs
+    /// cleanup): the caller creates the object only after this returned `Ok`, so creating and then destroying it cannot fail for lack of
+    /// memory (KT9).
+    pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
+        self.graveyard
+            .try_reserve(1)
+            .map_err(|_| abi::status::Status::NoMemory)
     }
 
     /// The destroyed objects whose destruction needs work from the owner (since the last
     /// call), oldest first. Call after any operation that can destroy objects: `release`,
     /// `sweep`, closing handles, draining a table.
     pub fn drain_dead(&mut self) -> Vec<T> {
-        core::mem::take(&mut self.graveyard)
+        // (the graveyard keeps its capacity: the empty twin takes its place, and `recycle` brings the emptied one back)
+        core::mem::swap(&mut self.graveyard, &mut self.spare);
+        core::mem::take(&mut self.spare)
+    }
+
+    /// Give a vector from `drain_dead` back once it is empty, so the next destruction does not allocate.
+    pub fn recycle(&mut self, mut v: Vec<T>) {
+        v.clear();
+        if v.capacity() > self.graveyard.capacity() {
+            core::mem::swap(&mut self.graveyard, &mut v);
+            self.graveyard.append(&mut v);
+        }
     }
 
     /// Is any destroyed object waiting in the graveyard?

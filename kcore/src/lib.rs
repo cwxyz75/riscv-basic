@@ -36,6 +36,7 @@ pub mod job;
 pub mod latch;
 pub mod linestate;
 pub mod object;
+pub mod pagemap;
 pub mod pagetable;
 pub mod park;
 pub mod sched;

@@ -281,3 +281,19 @@ checks that a seed replays to the same hash of calls and replies. Run once here:
 replayed: an unchecked index in the `event_signal` handler (a panic), a charge on an error path never credited (the object ledger), a queued-byte charge never credited (the byte ledger) and a
 reference nobody releases (the reference audit). The Fable review's findings that this does not yet cover are `T176`. The guest half (a `kfuzz` program in the boot image driving the real kernel,
 with the audits behind `debug_stat`) is not built.
+
+## The allocation-failure sweep (KT9, host half)
+
+`ksys/tests/allocfail.rs` runs each of seventeen scenarios (create each object kind, duplicate and replace, send and receive a message with a handle, read by transaction id, write and read a socket, bind
+a port, write and read and commit a VMO, make a job, close a channel with a queued handle, and four that run thirty to seventy of the same call to cross every node and chunk boundary) with its N-th
+allocation failing, for N = 1, 2, ... until the scenario finishes without reaching N. A test global allocator counts the allocations made while a scenario call runs (the fake machine's own are
+exempt) and returns null for the N-th. Rust's infallible allocations abort on null, so each (scenario, N) runs in a **child process** (the test binary re-executed): a child that dies is reported with
+the scenario, the N and the first `kcore`/`ksys` frames of the failing allocation's backtrace. A child that survives must have returned NO_MEMORY from the call that met the failure, and the state must
+pass the fuzzer's audits (references, ledger, peers) and, after everything is closed, hold nothing. It runs in `cargo test` (about 35 s, in the host job) and, with `KALLOC_SCENARIO=<name>` and
+`KALLOC_MAX=<n>`, one scenario at a time; `KALLOC_CHILD=<scenario>:<n>` replays one failing allocation. Findings of the first run, all fixed: the registry's dirty log, free list, credits, work list and
+graveyard grew on the destruction path (now sized once, with `reserve_one` making room before an object is made); the handle table's slot and free-list growth (`HandleTable::reserve`, called by every
+creator and by `duplicate` and `channel_read` before anything is taken); `channel_read` built its result after the message had left the queue (and `ksys` its handle-number buffer); `socket_read` drained before
+allocating; `prune_port` allocated a marking vector (now in place); the VMO store and the committed-page map were `BTreeMap`s whose node allocations cannot report failure (now a slab with
+generations and the two-level `PageMap`, both fallible); `vmo_commit`'s undo list and `vmo_read`'s buffer. The page map also cut a fresh-page fault from 19.6 thousand to 10.9 thousand
+instructions (`bench/counts.tsv`). A planted infallible `Vec::push` in the `vmo_commit` handler is reported by scenario and N. What the sweep does not reach is `T177`; the guest half (`fault-alloc` in the
+kernel, a `kalloc` program) is not built.
