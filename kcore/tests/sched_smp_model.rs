@@ -18,7 +18,7 @@ fn world<C: SchedClass>(class: C, harts: usize) -> (Sched<C>, Vec<Tid>) {
 /// What the harts would do on their IPIs: each hart that was *poked* reschedules itself. A hart
 /// that is marked pending but was never poked is not served (it would wait for its next timer
 /// tick in the kernel): `owed` is the set of poked harts not yet served, kept by the caller.
-fn serve_pokes<C: SchedClass>(s: &mut Sched<C>, owed: &mut u32) {
+fn serve_pokes<C: SchedClass>(s: &mut Sched<C>, owed: &mut u64) {
     // (serving one hart can queue a thread another hart should take: go on until nothing is left)
     for _ in 0..100 {
         *owed |= s.take_pokes();
@@ -111,7 +111,7 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
             let mut rng = Rng::new(seed * 8 + harts as u64);
             let (mut s, idle) = world(make(), harts);
             let mut live: Vec<Tid> = Vec::new(); // non-idle, not exited
-            let mut owed = 0u32; // harts poked and not yet served
+            let mut owed = 0u64; // harts poked and not yet served
             for step in 0..STEPS {
                 let ctx = format!(
                     "class {} harts {harts} seed {seed} step {step}",
@@ -199,7 +199,7 @@ fn random_run<C: SchedClass>(make: impl Fn() -> C, strict_priority: bool) {
 }
 
 /// Serve every pending reschedule, then check the strong property for the priority policy.
-fn world_copy_check<C: SchedClass>(s: &mut Sched<C>, owed: &mut u32, ctx: &str) {
+fn world_copy_check<C: SchedClass>(s: &mut Sched<C>, owed: &mut u64, ctx: &str) {
     serve_pokes(s, owed);
     // `audit` now has no pending excuse left: it fails if a better thread waits for any hart
     for h in 0..s.harts() {
@@ -274,5 +274,26 @@ fn a_wake_after_prepare_is_not_lost_across_harts() {
         "the notification let it through"
     );
     assert_eq!(s.block_current_on(1), Ok(true), "and only once");
+    s.audit().unwrap();
+}
+
+#[test]
+fn sixty_four_harts_spread_threads_and_the_poke_mask_reaches_the_last_hart() {
+    // SC1: the poke set is a 64-bit mask; hart 63 is the last bit. One thread per hart, all spawned by hart 0.
+    let (mut s, _idle) = world(FixedPriority::new(), 64);
+    let ts: Vec<Tid> = (0..64).map(|_| s.spawn_on(0, 4, None).unwrap()).collect();
+    let mut owed = 0u64;
+    let pokes = s.take_pokes();
+    assert!(
+        pokes & (1 << 63) != 0,
+        "hart 63 was poked (the mask has its bit)"
+    );
+    owed |= pokes;
+    serve_pokes(&mut s, &mut owed);
+    let mut on: Vec<Tid> = (0..64).map(|h| s.current_on(h).unwrap()).collect();
+    on.sort();
+    let mut want = ts.clone();
+    want.sort();
+    assert_eq!(on, want, "sixty-four threads on sixty-four harts");
     s.audit().unwrap();
 }

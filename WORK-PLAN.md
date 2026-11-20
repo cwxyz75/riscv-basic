@@ -117,7 +117,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
 - [x] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a PR 313, PL5b PR 314, PL5c PR 315)
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
-- [ ] **SC1** sixty-four harts
+- [x] **SC1** sixty-four harts (PR 317: harts from `/cpus`, the SBI hart-mask builder, 64-bit pokes; the records and stacks stay static at 64, T185; the `-smp` 8/16/32 boots are the owner's soak)
 - [ ] **HD1** the kernel entropy pool
 - [ ] **PL2** vector state
 - [ ] **PL3** user code built for RVA23U64
@@ -245,5 +245,9 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     not driven by the kernel), because a denylist fails open: on `virt` it would have made fw-cfg (DMA into guest RAM), the flash banks
     and the PCI ECAM window mappable. Narrower than the item, so safer; the ranges still come from the tree. Alternative: follow the
     item's text. KERNEL-V1-SPEC 2.3 (dated amendment), `work/PL5.md`.
+  - 2026-11-20, SC1: the per-hart records, boot stacks and emergency stacks are static arrays sized for 64 harts (about 2.6 MiB of `.bss`),
+    not allocated at boot for the harts found as KERNEL-V1-SPEC 2.3 says; the rest of the item (ids from the tree, the hart-mask builder,
+    64-bit masks) is done. The first hart's record must exist before the heap does, and the saving is memory only. Alternative: allocate.
+    `work/T185.md`.
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

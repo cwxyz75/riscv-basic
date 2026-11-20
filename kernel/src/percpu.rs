@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Most harts the kernel manages (QEMU `-smp` up to this).
-pub const MAX_HARTS: usize = 8;
+pub const MAX_HARTS: usize = 64;
 
 /// Why a hart was sent an IPI (bits of `PerHart::pending`).
 pub const IPI_RESCHED: u32 = 1;

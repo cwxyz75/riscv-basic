@@ -571,7 +571,7 @@ pub fn switch_if_designated() {
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pokes is a non-zero mask of harts (the loop condition), so pokes - 1 cannot underflow
-fn send_pokes(mut pokes: u32, me: usize) {
+fn send_pokes(mut pokes: u64, me: usize) {
     #[cfg(feature = "fault-skip-poke")]
     {
         let _ = (&mut pokes, me);

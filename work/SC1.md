@@ -13,3 +13,5 @@ refs: [KERNEL-V1-SPEC, OD126]
 **Acceptance, written first.** The `k` shard at `-smp 8`, `16` and `32` (soak; 16 and 32 overnight if slow under TCG: measure and say). `kcore` scheduler models run at 1 to 64 harts for the cheap properties and 1 to 8 for the random walks. A host test of the hart-mask builder with ids 0, 63, 64, 200.
 
 **Review.** Fable, soak.
+
+Progress (2026-11-20): `kcore::harts` (`hart_ids` from `/cpus`, boot hart first; `for_each_hart_mask` for the SBI fence calls, ids above 63 with their base), `MAX_HARTS` 64 in kernel and `kcore::sched`/`sched_smp` (pokes are `u64`), `start_secondaries` walks the tree's ids, `shootdown` makes one call per group of 64 ids. Host tests: `kcore/tests/harts.rs` (ids 0, 63, 64, 200), a 64-hart case in `sched_smp_model.rs` (mutation-checked). Left: T185 (allocation at boot); the `-smp` 8/16/32 boots and the 16/32 hart scaling checks are soak, not run.
