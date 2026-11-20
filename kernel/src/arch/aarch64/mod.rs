@@ -81,6 +81,12 @@ pub mod fp {
     pub fn first_use(frame: &mut TrapFrame) -> bool {
         unimplemented!()
     }
+    pub fn init_boot_hart() {
+        unimplemented!()
+    }
+    pub fn check_hart() {
+        unimplemented!()
+    }
     pub fn thread_gone(tid: u32) {
         unimplemented!()
     }
@@ -241,6 +247,9 @@ pub mod cpu {
         unimplemented!()
     }
     pub fn tlb_flush_page(va: u64, asid: u16) {
+        unimplemented!()
+    }
+    pub fn vlenb_read() -> usize {
         unimplemented!()
     }
     pub fn seed_csr_read() -> usize {

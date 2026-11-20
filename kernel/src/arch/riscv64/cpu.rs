@@ -61,6 +61,24 @@ pub fn seed_csr_read() -> usize {
     v
 }
 
+/// This hart's vector register length in bytes (`vlenb`; the CSR is readable only with `sstatus.VS` on).
+pub fn vlenb_read() -> usize {
+    let v: usize;
+    // SAFETY: switches the vector unit on for one CSR read and off again; it changes no other state and runs with interrupts as the caller has them
+    // (boot, before any user thread), so no user state can be in the unit.
+    unsafe {
+        asm!(
+            "csrs sstatus, {on}",
+            "csrr {v}, 0xc22",
+            "csrc sstatus, {on2}",
+            v = out(reg) v,
+            on = in(reg) 1usize << 9,
+            on2 = in(reg) 3usize << 9,
+        )
+    };
+    v
+}
+
 /// The per-hart pointer register's value.
 #[inline(always)]
 pub fn thread_pointer() -> usize {

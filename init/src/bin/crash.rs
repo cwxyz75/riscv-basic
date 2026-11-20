@@ -173,12 +173,6 @@ pub fn app_main() -> i32 {
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::USER_MASK, u64::MAX);
             return 9;
         }
-        28 => {
-            // vsetvli t0, zero, e8, m1, ta, ma: illegal while sstatus.VS is off
-            // SAFETY: either traps (the process dies) or only changes vl/vtype and t0.
-            unsafe { asm!(".4byte 0x0c0072d7", out("t0") _) };
-            return 77;
-        }
         26 => {
             // take a socket end from the bootstrap channel and drain it to the end of the
             // stream; the exit code is how many bytes arrived
@@ -386,6 +380,19 @@ pub fn app_main() -> i32 {
         // with its own pattern.
         n if n & 0xff == 60 => return fp_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64),
         61 => return fp_fresh(),
+        // PL2: the vector twins. 92: keep a private vector state across preemption and yields (mode in bits 8-15, seed above); 93: read every
+        // vector register at first use (all zero); 94: three threads, each with its own pattern; 95: use the vector unit, then run an
+        // instruction user mode may not: the process dies
+        n if n & 0xff == 92 => return vec_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64, 0),
+        93 => return vec_fresh(),
+        96 => return vec_edges(),
+        97 => return vec_load_first(),
+        94 => return vec_threads(),
+        95 => {
+            let _ = vlenb();
+            // SAFETY: as variant 5: traps and ends the process.
+            unsafe { asm!("csrr t0, sstatus") };
+        }
         62 => return fp_threads(),
         // 63: use FP, then run an instruction user mode may not: the process dies (the unit being
         // enabled must not turn a genuine illegal instruction into anything else)
@@ -1020,6 +1027,269 @@ fn fp_threads() -> i32 {
             .all(|r| r.load(Ordering::Acquire) != 99)
         {
             let worst = FP_THREAD_RESULT
+                .iter()
+                .map(|r| r.load(Ordering::Acquire) as i32)
+                .max()
+                .unwrap_or(0);
+            return mine.max(worst);
+        }
+        rt::sys::thread_yield();
+    }
+    901
+}
+
+// PL2: vector state. The user programs are built for rv64gc, so the vector instructions are assembled with the extension on for these blocks;
+// the kernel enables the unit at the first one (an illegal instruction until then, `csrr vlenb` included).
+
+/// The longest vector register this test handles (bytes), and the buffers: a pattern and a readback for each of three harts of threads.
+const VMAX: usize = 256;
+#[repr(align(16))]
+struct VecBufs([[u8; 32 * VMAX]; 6]);
+static mut VBUFS: VecBufs = VecBufs([[0; 32 * VMAX]; 6]);
+
+fn vlenb() -> usize {
+    let v: usize;
+    // SAFETY: reads a vector CSR (the kernel enables the unit at the first use).
+    unsafe { asm!("csrr {v}, 0xc22", v = out(reg) v) };
+    v
+}
+
+/// Load `v0`-`v31` from `p` (32 * vlenb bytes).
+fn vec_load(p: *const u8, vlenb: usize) {
+    // SAFETY: reads `32 * vlenb` bytes at `p` (the caller's buffer) and writes the vector registers.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +v",
+            "vl8re8.v v0, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v8, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v16, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v24, ({p})",
+            ".option pop",
+            p = inout(reg) p => _,
+            s = in(reg) vlenb * 8,
+        );
+    }
+}
+
+/// Store `v0`-`v31` to `p` (32 * vlenb bytes).
+fn vec_store(p: *mut u8, vlenb: usize) {
+    // SAFETY: writes `32 * vlenb` bytes at `p` (the caller's buffer) and reads the vector registers.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +v",
+            "vs8r.v v0, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v8, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v16, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v24, ({p})",
+            ".option pop",
+            p = inout(reg) p => _,
+            s = in(reg) vlenb * 8,
+        );
+    }
+}
+
+/// `vsetvl` for `avl` elements of `8 << sew` bits (LMUL 1, tail and mask agnostic): returns (`vl`, `vtype`) as the hardware now has them.
+fn vec_set(avl: usize, sew: u64) -> (u64, u64) {
+    let (vl, vt): (u64, u64);
+    // SAFETY: only changes `vl` and `vtype`.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +v",
+            "vsetvl {t}, {avl}, {vtype}",
+            "csrr {vl}, vl",
+            "csrr {vt}, vtype",
+            ".option pop",
+            avl = in(reg) avl,
+            vtype = in(reg) (sew & 3) << 3 | 0xc0,
+            t = out(reg) _,
+            vl = out(reg) vl,
+            vt = out(reg) vt,
+        );
+    }
+    (vl, vt)
+}
+
+fn vec_csr() -> u64 {
+    let v: u64;
+    // SAFETY: reads `vcsr`.
+    unsafe { asm!("csrr {v}, 0x00f", v = out(reg) v) };
+    v
+}
+
+fn vec_set_csr(v: u64) {
+    // SAFETY: writes `vcsr` (the fixed-point rounding mode and saturation flag).
+    unsafe { asm!("csrw 0x00f, {v}", v = in(reg) v) };
+}
+
+fn vec_pattern(buf: &mut [u8], seed: u64) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = (seed
+            .wrapping_add(i as u64 + 1)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> 29) as u8;
+    }
+}
+
+/// Keep a private pattern in the vector registers, `vcsr`, `vl` and `vtype` for a while (`slot` picks the buffers: one per thread). Returns 0 if
+/// everything always held this program's own values, else 1.
+fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
+    let n = vlenb();
+    if n == 0 || n > VMAX || !n.is_power_of_two() {
+        return 800;
+    }
+    // SAFETY: only the addresses of this thread's two buffers are taken.
+    let (want, got) = unsafe {
+        let b = core::ptr::addr_of_mut!(VBUFS.0);
+        (
+            core::slice::from_raw_parts_mut((b as *mut u8).add(2 * slot * 32 * VMAX), 32 * n),
+            core::slice::from_raw_parts_mut((b as *mut u8).add((2 * slot + 1) * 32 * VMAX), 32 * n),
+        )
+    };
+    let mut round = 0u64;
+    let mut cur = seed;
+    vec_pattern(want, cur);
+    let (mut vl, mut vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
+    let mut csr = cur & 7;
+    vec_load(want.as_ptr(), n);
+    vec_set_csr(csr);
+    let until = rt::sys::clock_get() + 30;
+    while rt::sys::clock_get() < until {
+        for _ in 0..2000 {
+            core::hint::spin_loop();
+        }
+        if mode == 1 {
+            rt::sys::thread_yield();
+        }
+        vec_store(got.as_mut_ptr(), n);
+        let (gc, gl, gt) = (vec_csr(), read_vl(), read_vtype());
+        if got[..] != want[..] || gc != csr || gl != vl || gt != vt {
+            return 1;
+        }
+        round += 1;
+        if round.is_multiple_of(5) {
+            cur = seed.wrapping_add(round);
+            vec_pattern(want, cur);
+            (vl, vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
+            csr = cur & 7;
+            vec_load(want.as_ptr(), n);
+            vec_set_csr(csr);
+        }
+    }
+    0
+}
+
+fn read_vl() -> u64 {
+    let v: u64;
+    // SAFETY: reads `vl`.
+    unsafe { asm!("csrr {v}, 0xc20", v = out(reg) v) };
+    v
+}
+
+fn read_vtype() -> u64 {
+    let v: u64;
+    // SAFETY: reads `vtype`.
+    unsafe { asm!("csrr {v}, 0xc21", v = out(reg) v) };
+    v
+}
+
+/// First vector use: every register, `vcsr`, `vl` and `vtype` must read as zero.
+fn vec_fresh() -> i32 {
+    let n = vlenb(); // (the first vector instruction: the kernel enables the unit here, from zeros)
+    if n == 0 || n > VMAX {
+        return 800;
+    }
+    // SAFETY: only the address of the last buffer is taken.
+    let got = unsafe {
+        core::slice::from_raw_parts_mut(
+            (core::ptr::addr_of_mut!(VBUFS.0) as *mut u8).add(5 * 32 * VMAX),
+            32 * n,
+        )
+    };
+    vec_store(got.as_mut_ptr(), n);
+    let nonzero = got.iter().filter(|&&b| b != 0).count() as i32;
+    let csrs = (vec_csr() | read_vl() | read_vtype()) != 0;
+    nonzero + if csrs { 10_000 } else { 0 }
+}
+
+/// Edge states: the first vector instruction is a `vsetvli` (not a CSR read); an illegal `vtype` (`vill`) and a non-zero `vstart` survive a trap
+/// (a yield here). Returns 0 or a code for the first thing that was wrong.
+fn vec_edges() -> i32 {
+    let (vl, vt) = vec_set(3, 2); // (the first vector instruction)
+    if vl != 3 || vt >> 63 != 0 {
+        return 1;
+    }
+    let (vl, vt): (u64, u64);
+    // SAFETY: only changes `vl` and `vtype`: an illegal `vtype` (a reserved bit) sets `vill` and clears `vl`.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +v",
+            "vsetvl zero, zero, {bad}",
+            "csrr {vl}, vl",
+            "csrr {vt}, vtype",
+            ".option pop",
+            bad = in(reg) 1u64 << 8,
+            vl = out(reg) vl,
+            vt = out(reg) vt,
+        );
+    }
+    if vt >> 63 != 1 || vl != 0 {
+        return 2;
+    }
+    rt::sys::thread_yield();
+    if read_vtype() >> 63 != 1 || read_vl() != 0 {
+        return 3;
+    }
+    let vs: u64;
+    // SAFETY: writes and reads `vstart` (the element a trapped vector instruction resumes at).
+    unsafe { asm!("csrw 0x008, {v}", v = in(reg) 2u64) };
+    rt::sys::thread_yield();
+    // SAFETY: reads `vstart`.
+    unsafe { asm!("csrr {v}, 0x008", v = out(reg) vs) };
+    if vs != 2 {
+        return 4;
+    }
+    // SAFETY: clears `vstart` again.
+    unsafe { asm!("csrw 0x008, zero") };
+    0
+}
+
+/// First vector instruction is a vector load (a whole-register load from a zeroed buffer): the unit must be enabled by it too.
+fn vec_load_first() -> i32 {
+    // SAFETY: only the address of the last buffer is taken; the load reads 16 bytes at most (one register, at least 16 bytes long).
+    let p = unsafe { core::ptr::addr_of_mut!(VBUFS.0) as *mut u8 }.wrapping_add(5 * 32 * VMAX);
+    // SAFETY: reads one vector register's worth of the buffer and writes `v0`.
+    unsafe {
+        asm!(".option push", ".option arch, +v", "vl1re8.v v0, ({p})", ".option pop", p = in(reg) p)
+    };
+    0
+}
+
+static VEC_THREAD_RESULT: [AtomicU32; 2] = [AtomicU32::new(99), AtomicU32::new(99)];
+
+extern "C" fn vec_worker(k: usize) -> ! {
+    let r = vec_keep(1000 + k as u64 * 77, 1, 1 + k) as u32;
+    VEC_THREAD_RESULT[k].store(r, Ordering::Release);
+    rt::sys::thread_exit(0)
+}
+
+fn vec_threads() -> i32 {
+    let me = rt::sys::process_self().a1 as u32;
+    #[allow(clippy::needless_range_loop)]
+    for k in 0..2usize {
+        // SAFETY: only the address of the static stack is taken; each worker owns its own.
+        let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+        let t = rt::sys::thread_create(me, vec_worker as *const () as usize as u64, top, k as u64);
+        if t.status != 0 {
+            return 900;
+        }
+    }
+    let mine = vec_keep(5, 0, 0);
+    for _ in 0..1_000_000u32 {
+        if VEC_THREAD_RESULT
+            .iter()
+            .all(|r| r.load(Ordering::Acquire) != 99)
+        {
+            let worst = VEC_THREAD_RESULT
                 .iter()
                 .map(|r| r.load(Ordering::Acquire) as i32)
                 .max()

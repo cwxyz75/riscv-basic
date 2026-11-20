@@ -41,6 +41,7 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     unsafe { crate::arch::aspace_install(token) };
     timer::start();
     irq::enable_timer_interrupt();
+    crate::fp::check_hart(); // (PL2: the same vector register length as the boot hart)
     crate::aia::init_hart(); // (the inter-hart interrupt is a message in this hart's IMSIC file)
     percpu::this().online.store(true, Ordering::Release);
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing

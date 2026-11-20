@@ -19,7 +19,7 @@ pub use aarch64::*;
 
 // The interface the rest of the kernel uses (AR1b, KERNEL-V1-SPEC 2.6), by file under `riscv64/`:
 //   cpu.rs      aspace_token, aspace_token_asid, aspace_current, aspace_install, tlb_flush_all, tlb_flush_page, cpu_idle,
-//               thread_pointer, set_thread_pointer, lazy_units_off, lazy_units_are_off, seed_csr_read
+//               thread_pointer, set_thread_pointer, lazy_units_off, lazy_units_are_off, seed_csr_read, vlenb_read
 //   switch.rs   Context (new), switch
 //   usermode.rs enter_user
 //   trap.rs     TrapFrame (arg, set_return, decode_user, skip_trap_instruction), Fault, FaultKind, UserTrap

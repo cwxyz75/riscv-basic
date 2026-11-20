@@ -400,8 +400,10 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
 
 /// Are the interrupted user thread's FP registers dirty (`sstatus.FS` = 3)? Saving them needs the FP tables, so the big lock.
 fn user_fp_dirty(frame: &TrapFrame) -> bool {
+    // (the FP unit or the vector unit: either needs its state saved before another thread can use the hart)
     const FS_MASK: u64 = 3 << 13;
-    frame.sstatus & FS_MASK == FS_MASK
+    const VS_MASK: u64 = 3 << 9;
+    frame.sstatus & FS_MASK == FS_MASK || frame.sstatus & VS_MASK == VS_MASK
 }
 
 fn trap_handler_inner(frame: &mut TrapFrame) {
@@ -411,7 +413,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // The kernel runs with the FP unit off (INVARIANTS FP3) on every path, including the light
         // IPI one that saves nothing: the frame keeps the user's FS for the return.
         // SAFETY: clears sstatus.FS only.
-        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
