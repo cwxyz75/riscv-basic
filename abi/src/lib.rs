@@ -395,9 +395,6 @@ pub mod layout {
     /// The direct map reaches physical addresses below this (64 GiB: top-level slots 256 to 319); the slots above it belong to other
     /// kernel windows (the self-test region at 320, the stacks at 384, the heap at 416, the image at 510). RAM above it is not used.
     pub const DIRECT_MAP_PHYS_LIMIT: u64 = 64 << 30;
-    /// Highest PLIC source an interrupt object may name (QEMU `virt`: the eight virtio-mmio slots
-    /// are sources 1..=8; the UART, 10, belongs to the kernel).
-    pub const MAX_IRQ: u32 = 8;
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
     pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;

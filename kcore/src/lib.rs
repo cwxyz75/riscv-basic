@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+pub mod aiatree;
 pub mod aspace;
 pub mod buddy;
 pub mod chaos;

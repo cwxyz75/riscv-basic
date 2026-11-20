@@ -221,7 +221,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
     ensure(leaves < 3000, "the direct map has few leaves")?;
     ensure_eq(
         devices,
-        2 + crate::aia::PAGE_COUNT,
+        2 + crate::aia::pages().count(),
         "device pages in the direct map",
     )?;
     ensure_eq(

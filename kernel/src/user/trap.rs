@@ -383,11 +383,17 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::INTERRUPT_CREATE => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
             let irq = a[1];
-            if irq == 0 || irq > u64::from(abi::layout::MAX_IRQ) {
+            // (only the sources the tree's admitted devices name: 0, a number past 32 bits and a source no admitted device has are refused; a
+            // machine without a working AIA says NOT_SUPPORTED for the sources that are devices'; a device whose interrupts go to some other
+            // controller is refused too)
+            if irq == 0 || irq > u64::from(u32::MAX) || !crate::aia::source_known(irq as u32) {
                 return fail(Status::InvalidArgs);
             }
             if !crate::aia::present() {
                 return fail(Status::NotSupported);
+            }
+            if !crate::aia::irq_allowed(irq as u32) {
+                return fail(Status::InvalidArgs);
             }
             let slot = irq as usize;
             let owned = matches!(*irq_objs.get(slot).unwrap_or(&None), Some(o)
@@ -402,7 +408,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 &mut quota(p.job),
             ) {
                 Ok((hd, obj)) => {
-                    irq_objs[slot] = Some(obj);
+                    if let Some(s) = irq_objs.get_mut(slot) {
+                        *s = Some(obj);
+                    }
                     crate::aia::enable(irq as u32);
                     Ok((Some(u64::from(hd.0)), None))
                 }

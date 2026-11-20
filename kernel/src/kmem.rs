@@ -213,22 +213,21 @@ pub fn init() {
             image_end: image_end.div_ceil(PAGE_SIZE),
         };
     }
-    // The device windows a physical VMO may name (PL5, D1): every device range the tree names minus what the kernel itself drives
-    // (the console and the test finisher, found in the tree, and the interrupt controller's pages, still constants until PL5c) and minus RAM.
+    // What the tree says about the devices (parsed once): the interrupt controller (PL5c) and the windows a physical VMO may name (PL5, D1):
+    // every admitted device range minus what the kernel itself drives (the console, the test finisher and the APLIC's pages, all found in the
+    // tree) and minus RAM and everything reserved.
     {
+        let nodes = crate::dtb::dtb_blob()
+            .and_then(|b| kcore::fdt::parse(b).ok())
+            .unwrap_or_default();
+        let ram: alloc::vec::Vec<(u64, u64)> =
+            memory.iter().chain(reserved.iter()).copied().collect();
+        crate::aia::discover(&nodes, &ram);
         let mut driven: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
         driven.extend(crate::console::base().map(|b| (b, 0x1000)));
         driven.extend(crate::finisher::base().map(|b| (b, 0x1000)));
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
-        let windows = crate::dtb::dtb_blob()
-            .and_then(|b| kcore::fdt::parse(b).ok())
-            .map(|nodes| {
-                // RAM and everything reserved (firmware, the image, the tree) is cut from the windows
-                let ram: alloc::vec::Vec<(u64, u64)> =
-                    memory.iter().chain(reserved.iter()).copied().collect();
-                kcore::devwin::device_windows(&nodes, &driven, &ram)
-            })
-            .unwrap_or_default();
+        let windows = kcore::devwin::device_windows(&nodes, &driven, &ram);
         // SAFETY: boot code, one hart, before anything reads it.
         unsafe { *addr_of_mut!(WINDOWS) = windows };
     }
@@ -305,7 +304,7 @@ pub fn init() {
     let token = crate::arch::aspace_token(root);
     KERNEL_ASPACE.store(token, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the new table maps everything the kernel is executing from and
-    // touching: text, rodata, data/bss/stack, the direct map and the two devices;
+    // touching: text, rodata, data/bss/stack, the direct map and the devices;
     // installing it drops the translations of the early table.
     unsafe { crate::arch::aspace_install(token) };
 }
