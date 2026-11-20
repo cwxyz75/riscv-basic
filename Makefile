@@ -399,7 +399,7 @@ quick: fmt-check docs-check
 
 # Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
 # the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
-SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
+SMOKE_TARGETS := fmt-check docs-check test lint os-test os-models home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
