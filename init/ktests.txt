@@ -83,6 +83,7 @@ socket_half_close
 device_caps_need_the_resource
 port_oneshot_rearm_and_many_bindings
 benchmarks_run_and_report
+instruction_counts_report
 futex_argument_errors
 futex_times_out_not_early
 futex_wake_counts_and_fifo
