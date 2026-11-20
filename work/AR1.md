@@ -4,7 +4,6 @@ kind: slice
 title: The architecture boundary: all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, an AArch64 stub that compiles
 area: platform
 horizon: long
-blocked_by: [TS3]
 refs: [KERNEL-V1-SPEC, OD143]
 ---
 
