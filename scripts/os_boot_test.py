@@ -46,7 +46,7 @@ REQUIRED = [
     "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "teardown_with_threads_on_other_harts", "unmap_while_siblings_touch", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle", "idle_harts_take_no_big_lock_for_their_ticks",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
-    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "the_console_is_where_the_boot_line_says", "the_image_is_where_the_loader_put_it", "heap_works", "frame_database_is_sane",
+    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "the_console_is_where_the_boot_line_says", "the_image_is_where_the_loader_put_it", "the_entropy_pool_is_seeded_as_the_tree_says", "heap_works", "frame_database_is_sane",
     "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
@@ -1044,6 +1044,8 @@ def run(kernel: str, extra=()):
         # The clock (FS-SPEC section 7, step C1): the RTC starts from a known date and follows the virtual clock, so the test can
         # tell the time it is given from a made-up one.
         "-rtc", "base=2030-06-15T12:00:00,clock=vm",
+        # HD1: `OS_DTB=<file>` boots with that device tree (`scripts/entropy_boot_test.py` strips the seeds from QEMU's own)
+        *(["-dtb", os.environ["OS_DTB"]] if os.environ.get("OS_DTB") else []),
         "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),

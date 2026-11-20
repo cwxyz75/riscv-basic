@@ -31,7 +31,7 @@ jobs:
           - name: lossy relay
             targets: os-boot-test-lossy
           - name: AIA, RVA23, no disk, serial
-            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-serial-test os-release-smoke
+            targets: os-boot-test-aia os-boot-test-nodisk os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-serial-test os-release-smoke
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -41,6 +41,8 @@ jobs:
           key: soak-${{ matrix.name }}
       - name: Install QEMU and OpenSBI
         uses: ./.github/actions/install-qemu
+        with:
+          packages: qemu-system-riscv opensbi clang llvm device-tree-compiler
       - uses: actions/cache@v4
         with:
           path: third_party/fetched

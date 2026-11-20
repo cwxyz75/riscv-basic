@@ -134,7 +134,7 @@ list, with the reason for their position, in the change that adds them.
 | K6 | A trap from user mode takes the big lock unless it is a quiet one (L12b, L12c): a timer tick or reschedule IPI that needs no switch, or a `clock_get` or `thread_yield` ecall that needs none, with the user's FP registers not dirty, no `need_resched`, the heap not low, and the **attention epoch** (`user::ATTENTION`, bumped under the lock *after* a process is marked killed or stopped and before any kick) equal to the one this hart saw at its last `activate_current`. A new thread's first entry zeroes the seen epoch, so its first trap takes the full path | `user_mode_ticks_take_no_big_lock`, `user_clock_get_and_yield_take_no_big_lock`, `kill_a_spinner_on_another_hart` |
 | K4 | The lock is mutually exclusive | `bkl_is_exclusive_under_contention` (every hart does 20,000 racy read-modify-write increments; mutation-checked) |
 | RQ1 | A thread displaced from a hart (a tick's rotation, a yield, a preemption) is recorded as **in transit** in the same critical section, under that hart's RQ lock, as the change of designation, and stays out of reach of every other hart's pull, balance and push until that hart's `switched` (OD125: recording it after the lock was released let another hart run a still-executing thread) | `kcore/tests/rq_concurrency.rs` (shuttle; two mutations caught: transit recorded after the lock, pull ignoring transit), the whole suite at -smp 1 to 4 |
-| K5 | Lock order BKL, TT, RQ (per hart: two only in ascending hart order; never TT while holding one), HEAP, UART (since task 10 part 1 the checker is `klock`'s `Held` over the full 14-class table of SCHED-SMP-SPEC 3.3; the heap lock is a `klock::Spin` of class HEAP, the BKL is class LEGACY) | `lock_order_violations_are_detected`, the pair table in `klock/tests/order.rs`, and the checker panics in the real run |
+| K5 | Lock order BKL, TT, RQ (per hart: two only in ascending hart order; never TT while holding one), HEAP, UART (since task 10 part 1 the checker is `klock`'s `Held` over the full 15-class table of SCHED-SMP-SPEC 3.3; the heap lock is a `klock::Spin` of class HEAP, the BKL is class LEGACY) | `lock_order_violations_are_detected`, the pair table in `klock/tests/order.rs`, and the checker panics in the real run |
 | K6 | The heap grows only at safe points holding the BKL (`heap::service`, tail of a BKL-taking trap, idle): `grow` takes frames and maps window pages under BKL, then the HEAP lock innermost; the allocator itself never calls the frame database | `heap_grows_at_a_safe_point`, the debug assert in `grow` |
 
 ### Planned lock order and invariants (SCHED-SMP-SPEC sections 3 and 8.3; OD85 to OD96; **not built**)
@@ -158,7 +158,8 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. No
 | 11 | `KSTACK` | one | The kernel-stack slot allocator and the kernel page-table entries of the stack window | no | no |
 | 12 | `FRAME` | one | The frame database (the per-hart frame caches need no lock, 3.10) | no | no |
 | 13 | `HEAP` | one | The kernel allocator | yes | no |
-| 14 | `UART` | one | The console line | yes | reentrant per hart (a panic breaks it) |
+| 14 | `ENTROPY` | one | The kernel entropy pool's generator (HD1): taken only for a draw, never across a call out | no | no |
+| 15 | `UART` | one | The console line | yes | reentrant per hart (a panic breaks it) |
 
 | # | Invariant | How checked |
 |---|---|---|

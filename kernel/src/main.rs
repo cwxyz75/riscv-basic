@@ -20,6 +20,7 @@ mod bkl;
 mod chaos;
 mod console;
 mod dtb;
+mod entropy;
 mod heap;
 #[cfg(feature = "interactive")]
 mod interactive;
@@ -120,6 +121,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     heap::init();
     trap::init();
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
+    entropy::init(hart_id); // (HD1: the pool is seeded before any address is chosen)
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here

@@ -320,6 +320,7 @@ dependencies = [
  "ksys",
  "linked_list_allocator",
  "proto",
+ "rngcore",
 ]
 
 [[package]]

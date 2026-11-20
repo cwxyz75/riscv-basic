@@ -366,7 +366,16 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 return fail(Status::NoMemory);
             }
             let id = k.vmos.create_in(pages, p.job);
-            if k.vmos.write(&mut k.mm, id, 0, blob).is_err() {
+            // the firmware's seeds are the kernel's (HD1): the copy the device manager sees has them zeroed
+            // (scrubbed in a heap copy first, so no frame of the VMO ever holds them)
+            let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
+            let mut copy = blob.to_vec();
+            for (off, len) in [seeds.rng_seed, seeds.kaslr_seed].into_iter().flatten() {
+                if let Some(range) = copy.get_mut(off..off.saturating_add(len)) {
+                    range.fill(0);
+                }
+            }
+            if k.vmos.write(&mut k.mm, id, 0, &copy).is_err() {
                 let _ = k.vmos.destroy(&mut k.mm, id);
                 return fail(Status::NoMemory);
             }

@@ -8,6 +8,7 @@ description = "OS track: the bare-metal kernel binary (S0: a stub that boots, ru
 abi = { path = "../abi" }
 proto = { path = "../proto" }
 kcore = { path = "../kcore" }
+rngcore = { path = "../rngcore" }
 ksys = { path = "../ksys" }
 klock = { path = "../klock" }
 # Free-list heap for the kernel (OD29). Small utility crate, as the home computer's

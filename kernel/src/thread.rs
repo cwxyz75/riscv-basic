@@ -1136,6 +1136,10 @@ pub fn wake_stat(which: u64) -> u64 {
         104 => crate::kmem::stats().image_first << 12,
         // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
         105 => crate::timer::timebase(),
+        // 107: the first eight bytes the entropy pool produced after it was keyed (test builds; 0 in release), different at every boot; 108: 1 if
+        // the pool had a real seed (rng-seed, kaslr-seed or Zkr), 0 if not (then the kernel does not randomise addresses)
+        107 => crate::entropy::first_output(),
+        108 => u64::from(crate::entropy::seeded()),
         // 106: calls the kernel made to the SBI IPI extension (0: inter-hart interrupts are IMSIC messages, PL6)
         106 => crate::arch::sbi::ipi_calls() as u64,
         // 10 to 12: scheduler statistics (pulls, settles, marks)

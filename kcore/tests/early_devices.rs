@@ -370,3 +370,46 @@ fn boot_words_are_found_without_allocating() {
     );
     assert!(!bootarg_present(&[], "console=sbi"));
 }
+
+#[test]
+fn the_seeds_in_chosen_are_found_by_offset_and_nothing_else_is_taken() {
+    use kcore::fdt::{chosen_seeds, ChosenSeeds};
+    // synthetic: a 32-byte rng-seed, an 8-byte kaslr-seed, and look-alikes elsewhere that must not count
+    let mut d = Dt::new();
+    d.begin("");
+    d.begin("chosen");
+    d.prop("rng-seed", &[0xaa; 32]);
+    d.prop("kaslr-seed", &[0xbb; 8]);
+    d.end();
+    d.begin("other");
+    d.prop("rng-seed", &[0xcc; 4]);
+    d.end();
+    d.end();
+    let blob = d.finish();
+    let s = chosen_seeds(&blob).unwrap();
+    let (o, l) = s.rng_seed.unwrap();
+    assert_eq!((l, &blob[o..o + l]), (32, &[0xaa; 32][..]));
+    let (o, l) = s.kaslr_seed.unwrap();
+    assert_eq!((l, &blob[o..o + l]), (8, &[0xbb; 8][..]));
+    // none: no chosen seeds
+    let mut d = Dt::new();
+    d.begin("");
+    d.begin("chosen");
+    d.prop("bootargs", b"x\0");
+    d.end();
+    d.end();
+    assert_eq!(chosen_seeds(&d.finish()), Some(ChosenSeeds::default()));
+    assert_eq!(chosen_seeds(&[0u8; 64]), None);
+    // the real trees: whichever seed QEMU wrote, the range is inside the blob
+    for t in TREES {
+        let s = chosen_seeds(t).unwrap();
+        assert_eq!(
+            s.rng_seed.map(|r| r.1),
+            Some(32),
+            "QEMU virt writes a 32-byte rng-seed"
+        );
+        for (o, l) in [s.rng_seed, s.kaslr_seed].into_iter().flatten() {
+            assert!(o + l <= t.len());
+        }
+    }
+}
