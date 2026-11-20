@@ -156,12 +156,11 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
     ensure_eq(stray, 0, "executable pages outside text")
 }
 
-/// Every direct-map leaf maps a frame the frame database manages (never the
-/// kernel image, whose frames sit below the first managed frame), or is one of
-/// the two device pages.
+/// Every direct-map leaf maps RAM above the kernel image (the frames the database manages and the metadata the database lives in; never
+/// the image, whose frames sit below the first frame after it), or is one of the device pages.
 fn direct_map_does_not_alias_the_image() -> Outcome {
     let k = kmem::get();
-    let first = kmem::first_managed_frame();
+    let first = kmem::first_frame_after_image();
     let image_pa = abi::layout::KERNEL_PHYS;
     ensure(
         k.aspace
@@ -175,7 +174,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
             in_map += 1;
             if t.pfn >= abi::layout::RAM_BASE >> 12 && t.pfn < first {
-                aliases += 1; // a RAM frame below the first managed one: the image or firmware
+                aliases += 1; // a RAM frame below the first one after the image: the image or firmware
             }
             if t.pfn < abi::layout::RAM_BASE >> 12 {
                 devices += 1;

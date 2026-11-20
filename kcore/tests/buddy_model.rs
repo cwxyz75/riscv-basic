@@ -110,6 +110,7 @@ fn frame_db_over_two_ranges_with_partial_runs_and_shared_frames_agrees_with_a_co
         .is_none());
         assert_eq!(db.total(), 2200);
         let mut refs: BTreeMap<u64, u32> = BTreeMap::new(); // the reference: frame -> holders
+        let mut from_second = false; // some frame came from the second range
         for step in 0..STEPS {
             let ctx = format!("seed {seed} step {step}");
             match rng.below(6) {
@@ -128,14 +129,26 @@ fn frame_db_over_two_ranges_with_partial_runs_and_shared_frames_agrees_with_a_co
                                 );
                             }
                         }
-                        None => assert!(n > 1 || db.free_count() == 0 || before > 0, "{ctx}"),
+                        None => {
+                            // refused: no aligned free block of the rounded-up order exists in any range
+                            let order = n.next_power_of_two().trailing_zeros() as usize;
+                            let any = db.free_blocks().iter().any(|&(_, o)| o >= order);
+                            assert!(
+                                !any,
+                                "{ctx}: refused {n} frames with an order-{order} block free"
+                            );
+                            assert_eq!(db.free_count(), before, "{ctx}: a refusal changes nothing");
+                        }
                     }
                 }
-                2 => {
-                    if let Some(f) = db.alloc() {
-                        assert_eq!(refs.insert(f, 1), None, "{ctx}");
-                    }
-                }
+                2 => match db.alloc() {
+                    Some(f) => assert_eq!(refs.insert(f, 1), None, "{ctx}"),
+                    None => assert_eq!(
+                        db.free_count(),
+                        0,
+                        "{ctx}: a frame is free but alloc refused"
+                    ),
+                },
                 3 => {
                     if let Some((&f, _)) = refs
                         .iter()
@@ -160,9 +173,14 @@ fn frame_db_over_two_ranges_with_partial_runs_and_shared_frames_agrees_with_a_co
                     }
                 }
             }
+            from_second |= refs.keys().any(|&f| f >= 8192);
             assert_eq!(db.free_count(), 2200 - refs.len(), "{ctx}: free_count");
             db.audit().unwrap_or_else(|e| panic!("{ctx}: {e}"));
         }
+        assert!(
+            from_second,
+            "seed {seed}: nothing was ever taken from the second range"
+        );
         for (&f, &n) in &refs {
             assert_eq!(db.refs(f), Some(n), "seed {seed}: frame {f}");
         }
@@ -181,4 +199,88 @@ fn frame_db_over_two_ranges_with_partial_runs_and_shared_frames_agrees_with_a_co
             "seed {seed}: a whole 512-frame block is free again"
         );
     }
+}
+
+#[test]
+fn every_frame_of_every_range_can_be_taken_one_at_a_time_and_given_back() {
+    let ranges = [(1000u64, 700usize), (8192, 1500)];
+    let storage: &'static mut [Meta] =
+        Box::leak(vec![Meta::default(); FrameDb::meta_len(&ranges)].into_boxed_slice());
+    let mut db = FrameDb::with_ranges(&ranges, storage).unwrap();
+    let mut got = Vec::new();
+    while let Some(f) = db.alloc() {
+        got.push(f);
+    }
+    assert_eq!(got.len(), 2200);
+    got.sort();
+    got.dedup();
+    assert_eq!(got.len(), 2200, "no frame twice");
+    assert!(got
+        .iter()
+        .all(|&f| (1000..1700).contains(&f) || (8192..9692).contains(&f)));
+    assert_eq!(db.free_count(), 0);
+    for f in got {
+        assert_eq!(db.dec(f), Ok(true));
+    }
+    db.audit().unwrap();
+    assert_eq!(db.free_count(), 2200);
+}
+
+/// The largest order, and frame number 0: two order-18 blocks that never merge, the unaligned tail cut into the largest blocks that fit,
+/// a request above order 18 refused.
+#[test]
+fn the_largest_order_and_frame_zero() {
+    let count = (1usize << 19) + 5;
+    let mut meta = vec![Meta::default(); count];
+    let mut b = Buddy::new(0, count, &mut meta);
+    b.audit(&meta).unwrap();
+    assert_eq!(
+        b.free_blocks(&meta),
+        vec![(0, 18), (1 << 18, 18), (1 << 19, 2), ((1 << 19) + 4, 0)]
+    );
+    assert_eq!(b.alloc(&mut meta, 19), None, "above the largest order");
+    let a = b.alloc(&mut meta, 18).unwrap();
+    let c = b.alloc(&mut meta, 18).unwrap();
+    assert_ne!(a, c);
+    assert_eq!(b.alloc(&mut meta, 18), None, "both big blocks are taken");
+    for f in [a, c] {
+        b.free_block(&mut meta, f, 18);
+    }
+    b.audit(&meta).unwrap();
+    assert_eq!(
+        b.free_blocks(&meta),
+        vec![(0, 18), (1 << 18, 18), (1 << 19, 2), ((1 << 19) + 4, 0)],
+        "two order-18 blocks do not merge"
+    );
+    let mut db = FrameDb::new(0, count);
+    assert_eq!(
+        db.alloc_contiguous((1 << 18) + 1),
+        None,
+        "a run needing order 19"
+    );
+    assert!(db.alloc_contiguous(1 << 18).is_some());
+    db.audit().unwrap();
+}
+
+#[test]
+fn ranges_that_overlap_overflow_or_have_too_little_storage_are_refused() {
+    let leak = |n: usize| -> &'static mut [Meta] {
+        Box::leak(vec![Meta::default(); n].into_boxed_slice())
+    };
+    assert!(
+        FrameDb::with_ranges(&[(10, 100), (50, 100)], leak(200)).is_none(),
+        "overlap"
+    );
+    assert!(
+        FrameDb::with_ranges(&[(u64::MAX - 5, 100)], leak(100)).is_none(),
+        "overflow"
+    );
+    assert!(
+        FrameDb::with_ranges(&[(10, 100), (110, 100)], leak(150)).is_none(),
+        "too little storage"
+    );
+    assert!(
+        FrameDb::with_ranges(&[(10, 100), (110, 100)], leak(200)).is_some(),
+        "adjacent ranges are fine"
+    );
 }

@@ -145,7 +145,7 @@ pub fn init() {
     map_image(&mut pt, &mut mm, s.text, Perms::RX);
     map_image(&mut pt, &mut mm, s.rodata, Perms::R);
     map_image(&mut pt, &mut mm, s.data, Perms::RW);
-    // The direct map: every frame the frame database manages (never the image, so
+    // The direct map: every frame the frame database manages and the frames its metadata occupies (never the image, so
     // the code cannot be written through an alias), and the two device pages we use.
     for pfn in first..end {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::RW)
@@ -184,7 +184,7 @@ pub fn init() {
 
 /// The first frame after the kernel image: everything below it is the image, the firmware or unused. (The frame metadata sits just
 /// above it, in frames the database does not manage.)
-pub fn first_managed_frame() -> u64 {
+pub fn first_frame_after_image() -> u64 {
     sections()
         .data
         .1

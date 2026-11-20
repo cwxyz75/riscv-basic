@@ -80,6 +80,19 @@ impl FrameDb {
         if storage.len() < FrameDb::meta_len(ranges) {
             return None;
         }
+        // Each range must be a real range of frames: no overflow, links that fit (`u32`, index + 1), and no overlap with another.
+        for (k, &(base, count)) in ranges.iter().enumerate() {
+            let end = base.checked_add(count as u64)?;
+            if count >= u32::MAX as usize {
+                return None;
+            }
+            for &(b2, c2) in ranges.iter().skip(k.saturating_add(1)) {
+                let e2 = b2.checked_add(c2 as u64)?;
+                if base < e2 && b2 < end {
+                    return None;
+                }
+            }
+        }
         let mut out = Vec::new();
         let mut off = 0;
         for &(base, count) in ranges {
@@ -112,6 +125,17 @@ impl FrameDb {
         Err(FrameError::NotManaged)
     }
 
+    /// The free blocks of every range as `(first frame, order)`, lowest address first within each range (for tests and diagnostics).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: off + count is inside the storage by construction
+    pub fn free_blocks(&self) -> Vec<(Pfn, usize)> {
+        let mut out = Vec::new();
+        for range in &self.ranges {
+            let window = &self.storage.get()[range.off..range.off + range.buddy.count()];
+            out.extend(range.buddy.free_blocks(window));
+        }
+        out
+    }
+
     pub fn total(&self) -> usize {
         self.ranges.iter().map(|r| r.buddy.count()).sum()
     }
@@ -125,7 +149,7 @@ impl FrameDb {
         self.locate(pfn).is_ok()
     }
 
-    /// Take a block of `order` from the first range that has one, giving each of its frames a reference count of 1.
+    /// Take a block of `order` from the first range that has one. The caller sets the reference counts of the frames it keeps.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the block came off a free list of the range, so off + index .. + 2^order is inside the storage
     fn take(&mut self, order: usize) -> Option<(usize, Pfn)> {
         let FrameDb { ranges, storage } = self;
@@ -165,8 +189,14 @@ impl FrameDb {
     }
 
     /// Take a free frame (reference count 1).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the frame came off a free list of range r, so its index is inside that range's window
     pub fn alloc(&mut self) -> Option<Pfn> {
-        self.alloc_contiguous(1)
+        let (r, pfn) = self.take(0)?;
+        let FrameDb { ranges, storage } = self;
+        let range = ranges.get(r)?;
+        let i = range.off.saturating_add(range.buddy.index(pfn)?);
+        storage.get_mut()[i].refs = 1;
+        Some(pfn)
     }
 
     /// Add a reference to an allocated frame.

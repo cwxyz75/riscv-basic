@@ -64,11 +64,7 @@ impl Buddy {
         let end = base + count as u64;
         let mut p = base;
         while p < end {
-            let align = if p == 0 {
-                MAX_ORDER
-            } else {
-                (p.trailing_zeros() as usize).min(MAX_ORDER)
-            };
+            let align = (p.trailing_zeros() as usize).min(MAX_ORDER);
             let fit = floor_log2(end - p);
             let order = align.min(fit);
             b.push(meta, p, order);
@@ -149,7 +145,9 @@ impl Buddy {
         Some(pfn)
     }
 
-    /// Return a block to the free lists, merging with its buddy while the buddy is a free head of the same order.
+    /// Return a block to the free lists, merging with its buddy while the buddy is a free head of the same order. **Precondition** (the
+    /// caller, `FrameDb`, guarantees it): the block was allocated from this range, is aligned to its order, and is not already free; a
+    /// frame outside the range or a block freed twice corrupts the lists.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: pfn is a frame of the range and the block lies inside it; order is at most MAX_ORDER
     pub fn free_block(&mut self, meta: &mut [Meta], pfn: Pfn, order: usize) {
         self.free += 1usize << order;
@@ -173,11 +171,7 @@ impl Buddy {
         let end = pfn + n as u64;
         let mut p = pfn;
         while p < end {
-            let align = if p == 0 {
-                MAX_ORDER
-            } else {
-                (p.trailing_zeros() as usize).min(MAX_ORDER)
-            };
+            let align = (p.trailing_zeros() as usize).min(MAX_ORDER);
             let order = align.min(floor_log2(end - p));
             self.free_block(meta, p, order);
             p += 1u64 << order;
