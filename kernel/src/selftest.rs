@@ -161,6 +161,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
 
 /// Every direct-map leaf maps RAM above the kernel image (the frames the database manages and the metadata the database lives in; never
 /// the image, whose frames sit below the first frame after it), or is one of the device pages.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn direct_map_does_not_alias_the_image() -> Outcome {
     let k = kmem::get();
     let first = kmem::first_frame_after_image();
@@ -172,10 +173,23 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
             .is_none(),
         "the kernel image must not be reachable through the direct map",
     )?;
+    // (the whole image, page by page: nothing of it is reachable through the direct map, whatever the leaf sizes)
+    for pfn in (image_pa >> 12)..first {
+        ensure(
+            k.aspace
+                .table()
+                .translate(&k.mm, DIRECT_BASE + (pfn << 12))
+                .is_none(),
+            "a page of the kernel image or firmware is reachable through the direct map",
+        )?;
+    }
     let (mut in_map, mut aliases, mut devices) = (0, 0, 0);
+    let (mut leaves, mut level1) = (0, 0);
     k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
             in_map += 1u64 << (9 * level); // pages, whatever the leaf's size
+            leaves += 1;
+            level1 += u32::from(level == 1);
             if t.pfn >= abi::layout::RAM_BASE >> 12 && t.pfn < first {
                 aliases += 1; // a RAM frame below the first one after the image: the image or firmware
             }
@@ -188,6 +202,9 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         }
     });
     ensure(in_map > 1000, "the direct map has pages")?;
+    // MM3: RAM is mapped with 2 MiB pages (256 MiB is about 126 of them) and 4 KiB pages only at the edges, not 65,000 small leaves
+    ensure(level1 >= 100, "the direct map uses 2 MiB pages")?;
+    ensure(leaves < 1200, "the direct map has few leaves")?;
     ensure_eq(
         devices,
         2 + crate::aia::PAGE_COUNT,
