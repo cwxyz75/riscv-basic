@@ -120,7 +120,7 @@ pub fn in_vfork_child() -> bool {
 
 /// The wait status of a child: exited with `code`, or killed. Killed is the shell's Ctrl-C (-130: SIGINT), a kill (-1:
 /// SIGKILL), a default signal action (`-2000 - signal`, `sig.rs`) or a fault the kernel ended the program for (`-1000 -
-/// scause`: SIGILL, SIGBUS or SIGSEGV).
+/// kind`: SIGILL, SIGBUS or SIGSEGV).
 fn wait_status(code: i32) -> c_int {
     match code {
         -130 => 2,

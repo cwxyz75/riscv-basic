@@ -54,7 +54,7 @@ get filled in as each area is built.
 |---|---|---|
 | P1 | Returning to user mode always uses the returning thread's own address space (satp), however many processes ran in between, on both return paths (syscall and timer interrupt) | QEMU `two_processes_do_not_share_memory`, `yielding_processes_do_not_share_memory`; each return-path hook was shown necessary by removing it |
 | P2 | The kernel's top-level page-table slots never change after the first process exists | `kmem::kernel_half_unchanged`, checked at every process start and by QEMU `kernel_top_level_slots_are_stable` |
-| P3 | A user fault the kernel cannot resolve ends the process, never the kernel; the exit code says why (`-1000 - scause`) | QEMU: eight fault kinds, `the_stack_has_a_guard_page`, `a_syscall_with_sp_in_the_kernel_is_harmless` |
+| P3 | A user fault the kernel cannot resolve ends the process, never the kernel; the exit code says why (`-1000 - kind`) | QEMU: eight fault kinds, `the_stack_has_a_guard_page`, `a_syscall_with_sp_in_the_kernel_is_harmless` |
 | P4 | A user program can only reach the kernel through syscalls: registers other than a0-a2 are preserved, no kernel value is left in a user register | QEMU `registers_survive_a_syscall`; `enter_user` zeroes every register but a0 and sp |
 
 ### Job and limit rules (S4.5)

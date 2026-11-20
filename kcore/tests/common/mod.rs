@@ -54,3 +54,64 @@ impl Rng {
 /// How many random sequences to run (fewer under Miri, which is slow).
 pub const SEEDS: u64 = if cfg!(miri) { 5 } else { 300 };
 pub const STEPS: u64 = if cfg!(miri) { 60 } else { 400 };
+
+/// A second page-table format, modelled on AArch64's descriptors, that exists only to prove the page-table and address-space code
+/// is generic (AR1c): four levels, 48-bit addresses, the "table or page" bit at bit 1 (so a leaf above level 0 is a block with
+/// that bit clear), read-only and user bits that mean the opposite of RISC-V's, an execute-never bit, and the frame number at
+/// bit 12. A software bit (5) carries "readable" so execute-only mappings round-trip.
+pub struct TestFmt48;
+
+impl kcore::pagetable::PageTableFormat for TestFmt48 {
+    const LEVELS: u32 = 4;
+    fn is_valid(pte: u64) -> bool {
+        pte & 1 != 0
+    }
+    fn is_leaf(pte: u64, level: u32) -> bool {
+        if level == 0 {
+            pte & 2 != 0
+        } else {
+            pte & 2 == 0
+        }
+    }
+    fn pfn_of(pte: u64) -> Pfn {
+        (pte >> 12) & ((1 << 36) - 1)
+    }
+    fn table_entry(pfn: Pfn) -> u64 {
+        (pfn << 12) | 3
+    }
+    fn leaf_entry(pfn: Pfn, p: kcore::pagetable::Perms) -> u64 {
+        let mut pte = (pfn << 12) | 3 | (1 << 10);
+        if p.read {
+            pte |= 1 << 5;
+        }
+        if !p.write {
+            pte |= 1 << 7;
+        }
+        if p.user {
+            pte |= 1 << 6;
+        }
+        if !p.exec {
+            pte |= 1 << 54;
+        }
+        pte
+    }
+    fn perms_of(pte: u64) -> kcore::pagetable::Perms {
+        kcore::pagetable::Perms {
+            read: pte & (1 << 5) != 0,
+            write: pte & (1 << 7) == 0,
+            exec: pte & (1 << 54) == 0,
+            user: pte & (1 << 6) != 0,
+        }
+    }
+    fn is_canonical(va: u64) -> bool {
+        let top = (va as i64) >> 47;
+        top == 0 || top == -1
+    }
+    fn extend(va: u64) -> u64 {
+        if va & (1 << 47) != 0 {
+            va | 0xffff_8000_0000_0000
+        } else {
+            va
+        }
+    }
+}

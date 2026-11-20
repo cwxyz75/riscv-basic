@@ -100,11 +100,11 @@ pub fn default_action(sig: i32) -> Action {
     }
 }
 
-/// The signal a hardware fault (the supervisor `scause`) stands for, as Linux maps it on RISC-V: misaligned access SIGBUS,
-/// illegal instruction SIGILL, breakpoint SIGTRAP, every access and page fault SIGSEGV.
-pub fn fault_signal(scause: u64) -> i32 {
-    match scause {
-        0 | 4 | 6 => 7,
+/// The signal a fault kind (`abi::arch::fault`, the number in a fault exit code `-1000 - kind`) stands for: a misaligned access
+/// SIGBUS, an illegal instruction SIGILL, a breakpoint SIGTRAP, every access and page fault SIGSEGV.
+pub fn fault_signal(kind: u64) -> i32 {
+    match kind {
+        4 => 7,
         2 => 4,
         3 => 5,
         _ => 11,
@@ -166,20 +166,9 @@ mod tests {
 
     #[test]
     fn faults_become_the_signals_linux_gives() {
-        for (scause, sig) in [
-            (0, 7),
-            (4, 7),
-            (6, 7),
-            (2, 4),
-            (3, 5),
-            (1, 11),
-            (5, 11),
-            (7, 11),
-            (12, 11),
-            (13, 11),
-            (15, 11),
-        ] {
-            assert_eq!(fault_signal(scause), sig, "scause {scause}");
+        // the kinds of `abi::arch::fault`: PAGE_FAULT 1, ILLEGAL 2, BREAKPOINT 3, MISALIGNED 4, ACCESS 5, PAGER 6
+        for (kind, sig) in [(1, 11), (2, 4), (3, 5), (4, 7), (5, 11), (6, 11)] {
+            assert_eq!(fault_signal(kind), sig, "kind {kind}");
         }
     }
 }

@@ -1801,7 +1801,7 @@ fn child_exit_code_and_terminated_signal() -> Outcome {
 }
 
 fn child_faults_are_contained() -> Outcome {
-    for (variant, want) in [(1u64, -1015i64), (7, -1013), (5, -1002)] {
+    for (variant, want) in [(1u64, -1001i64), (7, -1001), (5, -1002)] {
         let (p, _mine) = launch(variant)?;
         wait_ended(p, 500)?;
         let r = sys::process_info(p);
@@ -3327,7 +3327,7 @@ fn a_thread_can_end_the_whole_process() -> Outcome {
 fn a_fault_in_any_thread_ends_the_process() -> Outcome {
     let (p, _m) = launch(19)?;
     wait_ended(p, 500)?;
-    ensure_eq!(sys::process_info(p).a1 as i64, -1013, "the load fault");
+    ensure_eq!(sys::process_info(p).a1 as i64, -1001, "the page fault");
     Ok(())
 }
 
@@ -3682,9 +3682,9 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     nap(3)?;
     let t = child_thread(p, 1, 7)?; // null load
     wait_ended(p, 1000)?;
-    ensure_eq!(sys::process_info(p).a1 as i64, -1013, "the fault code");
-    thread_ended_with(t, -1013)?;
-    thread_ended_with(b, -1013)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -1001, "the fault code");
+    thread_ended_with(t, -1001)?;
+    thread_ended_with(b, -1001)?;
     let (p, _m) = launch(16)?;
     nap(3)?;
     let b = child_thread(p, 0, 16)?;
@@ -10729,7 +10729,7 @@ fn a_process_ending_with_spawned_threads_leaks_nothing() -> Outcome {
         }
         wait_ended(p, 3000)?;
         let code = sys::process_info(p).a1 as i64;
-        let want = [0, -1015, 9][mode as usize];
+        let want = [0, -1001, 9][mode as usize];
         ensure_eq!(code, want, "exit code, mode {mode}");
         job_use_settles(j, 2, 0, 1000)?;
         job_use_settles(j, 1, 0, 1000)?;

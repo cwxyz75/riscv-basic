@@ -129,7 +129,8 @@ process copies them when it is created); the kernel never creates or frees one a
 
 A user thread that faults on an address no region covers, on a permission its region
 does not give, or that executes an illegal instruction, ends its process (exit code
-`-1000 - scause`); the kernel never trusts a user fault.
+`-1000 - kind`, where `kind` is one of `abi::arch::fault`: 1 PAGE_FAULT, 2 ILLEGAL, 3 BREAKPOINT, 4 MISALIGNED,
+5 ACCESS, 6 PAGER; every page fault is kind 1 whatever the access); the kernel never trusts a user fault.
 
 ## Syscall numbers and registers (S3b)
 
@@ -509,7 +510,7 @@ memory, channels) is untouched and servers keep answering it. While stopped, the
 
 ### process_info(process) -> status, exit_code
 
-The exit code of an ended process (`-1000 - scause` after a fault). Rights: INSPECT.
+The exit code of an ended process (`-1000 - kind` after a fault). Rights: INSPECT.
 Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 
 ## Jobs and limits (S4.5, OD56-OD58)
@@ -635,7 +636,7 @@ End the calling thread (see above). Its thread object is TERMINATED with exit co
 
 ### thread_info(thread) -> status, exit_code
 
-The exit code of an ended thread (`-1000 - scause` is *not* used: a fault ends the process
+The exit code of an ended thread (`-1000 - kind` is *not* used: a fault ends the process
 and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 

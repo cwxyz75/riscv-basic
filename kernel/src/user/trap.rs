@@ -137,7 +137,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         ),
                     );
                 }
-                exit_process(-1000 - cause as i32);
+                exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind()));
             }
         }
         UserTrap::Fault(fault)
@@ -147,7 +147,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             // for it, from zeros; the instruction is retried. (A real illegal instruction traps again
             // with the unit on and ends the process below.)
         }
-        UserTrap::Fault(fault) => exit_process(-1000 - fault.code as i32),
+        UserTrap::Fault(fault) => exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind())),
     }
 }
 

@@ -2,8 +2,20 @@
 //! Code outside this directory names no register, control-register, instruction or firmware call. RISC-V is the only
 //! implementation; a second would be a sibling directory with the same items.
 
+pub mod fault;
+pub use fault::{Fault, FaultKind, UserTrap};
+
+#[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+#[cfg(target_arch = "riscv64")]
 pub use riscv64::*;
+
+/// The AArch64 stub: every interface item present, every body `unimplemented!()`. It carries no behaviour and is never booted;
+/// it exists so that `cargo check --target aarch64-unknown-none` proves the boundary is complete.
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::*;
 
 // The interface the rest of the kernel uses (AR1b, KERNEL-V1-SPEC 2.6), by file under `riscv64/`:
 //   cpu.rs      aspace_token, aspace_token_asid, aspace_current, aspace_install, tlb_flush_all, tlb_flush_page, cpu_idle,

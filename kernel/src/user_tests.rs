@@ -10,12 +10,9 @@ use alloc::string::String;
 
 type Outcome = Result<(), String>;
 
-/// scause values (RISC-V privileged spec): the exit code of a process ended by a fault
-/// is `-1000 - scause` (SYSCALLS.md, "User address space and process start").
-const ILLEGAL_INSTRUCTION: i32 = 2;
-const INSTRUCTION_PAGE_FAULT: i32 = 12;
-const LOAD_PAGE_FAULT: i32 = 13;
-const STORE_PAGE_FAULT: i32 = 15;
+/// The exit code of a process ended by a fault is `-1000 - kind` (SYSCALLS.md, "User address space and process start";
+/// `abi::arch::fault`): every page fault is one kind, whatever the access.
+use abi::arch::fault::{exit_code, ILLEGAL, PAGE_FAULT};
 
 fn free_frames() -> usize {
     crate::irq::without(kmem::free_frames_accounted)
@@ -301,49 +298,37 @@ pub fn run_all() -> Report {
         (
             1,
             "user_store_to_kernel_memory_is_fatal",
-            -1000 - STORE_PAGE_FAULT,
+            exit_code(PAGE_FAULT),
         ),
         (
             2,
             "user_load_from_kernel_memory_is_fatal",
-            -1000 - LOAD_PAGE_FAULT,
+            exit_code(PAGE_FAULT),
         ),
-        (
-            3,
-            "user_store_to_own_text_is_fatal",
-            -1000 - STORE_PAGE_FAULT,
-        ),
-        (
-            4,
-            "user_jump_to_data_is_fatal",
-            -1000 - INSTRUCTION_PAGE_FAULT,
-        ),
+        (3, "user_store_to_own_text_is_fatal", exit_code(PAGE_FAULT)),
+        (4, "user_jump_to_data_is_fatal", exit_code(PAGE_FAULT)),
         (
             5,
             "user_privileged_instruction_is_fatal",
-            -1000 - ILLEGAL_INSTRUCTION,
+            exit_code(ILLEGAL),
         ),
         (
             28,
             // the vector unit (mandatory in RVA23) is off in user mode: no vector state is
             // saved per thread, so a `vsetvli` must trap, on any CPU
             "user_vector_instruction_is_fatal",
-            -1000 - ILLEGAL_INSTRUCTION,
+            exit_code(ILLEGAL),
         ),
         (
             6,
             "user_jump_to_unmapped_memory_is_fatal",
-            -1000 - INSTRUCTION_PAGE_FAULT,
+            exit_code(PAGE_FAULT),
         ),
-        (
-            7,
-            "user_null_pointer_load_is_fatal",
-            -1000 - LOAD_PAGE_FAULT,
-        ),
+        (7, "user_null_pointer_load_is_fatal", exit_code(PAGE_FAULT)),
         (
             10,
             "user_jump_to_kernel_text_is_fatal",
-            -1000 - INSTRUCTION_PAGE_FAULT,
+            exit_code(PAGE_FAULT),
         ),
     ];
     for (arg, name, want) in faults {
@@ -371,7 +356,7 @@ pub fn run_all() -> Report {
     push(
         "the_stack_has_a_guard_page",
         match run(user::CRASH_ELF, 12) {
-            Ok(c) if c == -1000 - STORE_PAGE_FAULT || c == -1000 - LOAD_PAGE_FAULT => Ok(()),
+            Ok(c) if c == exit_code(PAGE_FAULT) => Ok(()),
             Ok(c) => Err(format!("exit code {c}, want a page fault")),
             Err(e) => Err(e),
         },

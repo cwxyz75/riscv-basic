@@ -14,7 +14,7 @@
 use crate::frame::{Pfn, PAGE_SIZE};
 use crate::job::{JobId, Jobs, Resource};
 use crate::pagemap::PageMap;
-use crate::pagetable::{is_canonical, MapError, PageTable, Perms, PhysMem};
+use crate::pagetable::{MapError, PageTable, PageTableFormat, Perms, PhysMem, Sv39};
 use crate::Mm;
 use alloc::collections::BTreeMap;
 
@@ -513,20 +513,20 @@ struct Region {
 }
 
 /// A page table plus the regions that say what its holes mean.
-pub struct AddressSpace {
-    table: PageTable,
+pub struct AddressSpace<F: PageTableFormat = Sv39> {
+    table: PageTable<F>,
     regions: BTreeMap<u64, Region>,
 }
 
-impl AddressSpace {
-    pub fn new(table: PageTable) -> AddressSpace {
+impl<F: PageTableFormat> AddressSpace<F> {
+    pub fn new(table: PageTable<F>) -> AddressSpace<F> {
         AddressSpace {
             table,
             regions: BTreeMap::new(),
         }
     }
 
-    pub fn table(&self) -> &PageTable {
+    pub fn table(&self) -> &PageTable<F> {
         &self.table
     }
 
@@ -545,7 +545,7 @@ impl AddressSpace {
         if !start.is_multiple_of(PAGE_SIZE) {
             return Err(RegionError::Misaligned);
         }
-        if !is_canonical(start) {
+        if !F::is_canonical(start) {
             return Err(RegionError::NonCanonical);
         }
         if pages > MAX_REGION_PAGES {
@@ -556,7 +556,7 @@ impl AddressSpace {
             .filter(|&l| l > 0)
             .ok_or(RegionError::BadRange)?;
         let end = start.checked_add(len).ok_or(RegionError::BadRange)?;
-        if !is_canonical(end - 1) || (start as i64) < 0 && (end - 1) as i64 >= 0 {
+        if !F::is_canonical(end - 1) || (start as i64) < 0 && (end - 1) as i64 >= 0 {
             return Err(RegionError::BadRange);
         }
         perms.validate().map_err(RegionError::BadPerms)?;
@@ -631,7 +631,7 @@ impl AddressSpace {
     }
 
     /// Remove the region starting at `start`, unmapping its pages and dropping the
-    /// mappings' references. **The caller must flush the TLB (`sfence.vma`) before
+    /// mappings' references. **The caller must flush the TLB before
     /// any frame freed here can be reused**: this crate has no notion of TLBs.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: p < r.pages and the region's range was checked when it was inserted
     pub fn unmap_region<M: PhysMem>(

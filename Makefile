@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: os-models preflight preflight-full os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: os-aarch64-check os-models preflight preflight-full os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -118,6 +118,10 @@ kernel: kernel-main
 os-test:
 	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock
 	$(MAKE) os-models
+
+# AR1 (OD143): the kernel compiles against the AArch64 stub in kernel/src/arch/aarch64 (no code is built or run for it).
+os-aarch64-check:
+	cd kernel && cargo check --target aarch64-unknown-none
 
 # The loom and shuttle model checkers alone (CI runs them as their own job, parallel to the host tests).
 os-models:
@@ -399,7 +403,7 @@ quick: fmt-check docs-check
 
 # Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
 # the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
-SMOKE_TARGETS := fmt-check docs-check test lint os-test os-models home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
+SMOKE_TARGETS := fmt-check docs-check test lint os-test os-models os-aarch64-check home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
@@ -473,7 +477,7 @@ os-allocfail:
 # boot at four harts in the debug and the optimised build (the optimised build's stack budget, KT13, moves with every change that moves code between
 # crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts,
 # the two-shard suite, the shell test and the release smoke.
-preflight: fmt-check docs-check lint lint-kernel test
+preflight: fmt-check docs-check lint lint-kernel os-aarch64-check test
 preflight-full: preflight kquick os-ktest-release
 
 # `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).

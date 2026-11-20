@@ -18,6 +18,8 @@
 
 /// QEMU `virt`'s test finisher (a SiFive test device): writing a value here ends
 /// the emulation with an exit status.
+pub mod arch;
+
 pub mod finisher {
     /// Physical address of the device.
     pub const BASE: usize = 0x10_0000;
@@ -354,18 +356,18 @@ pub mod syscall {
 /// The user address space (SYSCALLS.md, "User address space and process start").
 pub mod user {
     /// Lowest mappable user address; page 0 is never mapped.
-    pub const BASE: u64 = 0x1000;
+    pub const BASE: u64 = crate::arch::USER_BASE;
     /// First address above the user half.
-    pub const TOP: u64 = 0x0000_0040_0000_0000;
+    pub const TOP: u64 = crate::arch::USER_TOP;
     /// Initial `sp`.
-    pub const STACK_TOP: u64 = 0x0000_0020_0000_0000;
+    pub const STACK_TOP: u64 = crate::arch::USER_STACK_TOP;
     /// Pages of lazily committed stack below `STACK_TOP`.
     pub const STACK_PAGES: u64 = 64;
     /// Longest `debug_write`.
     pub const MAX_DEBUG_WRITE: usize = 4096;
     /// The stack arena: where `thread_spawn` maps the stacks it provisions (32 GiB nothing else is given).
-    pub const STACK_ARENA_BASE: u64 = 0x30_0000_0000;
-    pub const STACK_ARENA_END: u64 = 0x38_0000_0000;
+    pub const STACK_ARENA_BASE: u64 = crate::arch::USER_STACK_ARENA_BASE;
+    pub const STACK_ARENA_END: u64 = crate::arch::USER_STACK_ARENA_END;
 }
 
 /// `thread_spawn` (SYSCALLS.md): the argument record and its limits.
