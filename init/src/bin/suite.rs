@@ -11325,7 +11325,9 @@ fn cycles() -> u64 {
 
 /// Report one benchmark as a structured line: ns per operation (smaller is better).
 fn bench_line(name: &str, cycles: u64, ops: u64) -> u64 {
-    let ns = cycles * 1_000_000_000 / sys::debug_stat(105).max(1) / ops.max(1);
+    let ns = (u128::from(cycles) * 1_000_000_000
+        / u128::from(sys::debug_stat(105).max(1))
+        / u128::from(ops.max(1))) as u64;
     println!("##BENCH {name} {ns} ns");
     ns
 }

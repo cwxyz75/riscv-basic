@@ -15,6 +15,8 @@ pub fn set_frequency(hz: u64) -> bool {
     };
     MULT.store(tb.mult(), Ordering::Relaxed);
     HZ.store(tb.hz(), Ordering::Relaxed);
+    // the clock's zero is here, once, on the boot hart, before any reader: the clock never steps back when the first tick is armed
+    let _ = BOOT_COUNT.compare_exchange(0, now(), Ordering::SeqCst, Ordering::SeqCst);
     true
 }
 
@@ -77,8 +79,11 @@ pub fn start() {
 }
 
 /// Arm this hart's one-shot timer for `event` (nanoseconds on the `now_ns` clock; `None`: never). An event already past fires at once.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the event is a nanosecond time far below the range where scaling to counter cycles overflows (584 years)
 pub fn program(event: Option<u64>) {
+    debug_assert!(
+        MULT.load(Ordering::Relaxed) != 0,
+        "the timer is armed before the timebase is set"
+    );
     let cycles = match event {
         None => u64::MAX,
         // (rounded up: never early)

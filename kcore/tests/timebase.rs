@@ -4,18 +4,33 @@ mod common;
 use common::{Rng, SEEDS};
 use kcore::timebase::{Timebase, MAX_HZ};
 
+/// Rates real boards have, including the ones whose multiplier rounds down when rounded to nearest (12, 19.2, 26 and 48 MHz, 3 GHz).
 const RATES: &[u64] = &[
     1,
     32_768,
     1_000_000,
     10_000_000,
+    12_000_000,
+    19_200_000,
     24_000_000,
     25_000_000,
+    26_000_000,
+    48_000_000,
     100_000_000,
     333_333_333,
     1_000_000_000,
+    3_000_000_000,
     MAX_HZ,
 ];
+
+/// The rates for one seed: the fixed list and a few random ones.
+fn rates(rng: &mut Rng) -> Vec<u64> {
+    let mut v = RATES.to_vec();
+    for _ in 0..4 {
+        v.push(1 + rng.below(MAX_HZ));
+    }
+    v
+}
 
 fn exact_ns(cycles: u64, hz: u64) -> u128 {
     u128::from(cycles) * 1_000_000_000 / u128::from(hz)
@@ -53,20 +68,23 @@ fn a_rate_that_divides_a_billion_converts_exactly() {
 }
 
 #[test]
-fn cycles_to_ns_stays_within_a_nanosecond_and_a_relative_two_to_the_minus_thirty() {
+fn cycles_to_ns_is_never_below_the_exact_time_and_close_above_it() {
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
-        for &hz in RATES {
+        for hz in rates(&mut rng) {
             let t = Timebase::new(hz).unwrap();
             let c = rng.next() >> rng.below(40);
             let want = exact_ns(c, hz);
-            let got = u128::from(t.cycles_to_ns(c));
             if want > u128::from(u64::MAX) {
                 continue; // saturation is its own test
             }
-            let slack = 1 + (want >> 30);
+            let got = u128::from(t.cycles_to_ns(c));
             assert!(
-                got.abs_diff(want) <= slack,
+                got >= want,
+                "{hz} Hz, {c} cycles: got {got} is below the exact {want}"
+            );
+            assert!(
+                got <= want + 1 + (want >> 30),
                 "{hz} Hz, {c} cycles: got {got}, exact {want}"
             );
         }
@@ -74,22 +92,24 @@ fn cycles_to_ns_stays_within_a_nanosecond_and_a_relative_two_to_the_minus_thirty
 }
 
 #[test]
-fn ns_to_cycles_is_the_exact_ceiling_and_never_early() {
+fn ns_to_cycles_is_the_exact_ceiling_and_a_timer_armed_by_it_is_never_early() {
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
-        for &hz in RATES {
+        for hz in rates(&mut rng) {
             let t = Timebase::new(hz).unwrap();
-            let ns = rng.next() >> rng.below(36);
+            // times up to years of uptime: the error of a rounded-down multiplier grows with the time, so reach for large values too
+            let ns = rng.next() >> (rng.below(40) + 2);
             let want = (u128::from(ns) * u128::from(hz)).div_ceil(1_000_000_000);
             if want > u128::from(u64::MAX) {
                 continue;
             }
-            assert_eq!(u128::from(t.ns_to_cycles(ns)), want, "{hz} Hz, {ns} ns");
-            // converting back never lands earlier than the time asked for (the one nanosecond of rounding aside)
+            let cycles = t.ns_to_cycles(ns);
+            assert_eq!(u128::from(cycles), want, "{hz} Hz, {ns} ns");
+            // the clock has reached the deadline by the time the counter reaches the cycles the timer was armed for: no early interrupt
             assert!(
-                u128::from(t.cycles_to_ns(t.ns_to_cycles(ns))) + 1 >= u128::from(ns)
-                    || ns > 1 << 60,
-                "{hz} Hz, {ns} ns"
+                t.cycles_to_ns(cycles) >= ns,
+                "{hz} Hz, {ns} ns: the clock reads {} at the timer's cycle",
+                t.cycles_to_ns(cycles)
             );
         }
     }
@@ -123,4 +143,9 @@ fn huge_values_saturate_instead_of_wrapping() {
     let f = Timebase::new(MAX_HZ).unwrap();
     assert_eq!(f.ns_to_cycles(u64::MAX), u64::MAX);
     assert_eq!(Timebase::from_parts(f.hz(), f.mult()), f);
+    // from_parts takes the frequency first and the multiplier second: a swap would turn a second into nonsense
+    let t = Timebase::new(24_000_000).unwrap();
+    let r = Timebase::from_parts(t.hz(), t.mult());
+    assert_eq!(r.cycles_to_ns(24_000_000), t.cycles_to_ns(24_000_000));
+    assert_eq!(r.ns_to_cycles(1_000_000_000), 24_000_000);
 }

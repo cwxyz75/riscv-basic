@@ -1423,7 +1423,7 @@ pub fn net_ping_round_trip_is_measured() -> Outcome {
                 .ping([10, 0, 2, 2], 100 + seq, &[7u8; 32], t(1500))
                 .is_ok()
             {
-                rtts.push((sys::debug_stat(6) - c0) * 100);
+                rtts.push(counter_ns(sys::debug_stat(6) - c0));
             }
         }
         ensure!(
@@ -1523,7 +1523,7 @@ pub fn net_streams_over_loopback() -> Outcome {
         // (14.3: the lockstep round trip of 4 KiB through the stack and back, per round trip)
         println!(
             "##BENCH tcp_echo_rt_4k {} ns",
-            (sys::debug_stat(6) - echo0) * 100 / 64
+            counter_ns(sys::debug_stat(6) - echo0) / 64
         );
         // ---- a megabyte one way, both ends pumped from here with immediate deadlines
         let total = 1024 * 1024usize;
@@ -1561,7 +1561,7 @@ pub fn net_streams_over_loopback() -> Outcome {
         // (14.3: the whole megabyte through loopback, the stack and the IPC with no device)
         println!(
             "##BENCH tcp_loopback_1mib {} ns",
-            (sys::debug_stat(6) - mb0) * 100
+            counter_ns(sys::debug_stat(6) - mb0)
         );
         // ---- half-close both ways: end-of-file is clean only because PeerFin came first
         c.shutdown_write();
@@ -2512,4 +2512,9 @@ pub fn net_httpd_for_the_host() -> Outcome {
     })();
     f.close();
     r
+}
+
+/// Nanoseconds in `cycles` of the `time` counter, at the rate the device tree gave the kernel (`debug_stat(105)`).
+fn counter_ns(cycles: u64) -> u64 {
+    (u128::from(cycles) * 1_000_000_000 / u128::from(sys::debug_stat(105).max(1))) as u64
 }

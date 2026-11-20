@@ -4,7 +4,7 @@
 //! inlined away, so the hot paths (`irq::without`, `bkl::lock`) cost nothing.
 //!
 //! Interrupts-off spans are measured at `irq::without` (the kernel's critical section, by far the common way) and
-//! around every trap; the site is the caller's `Location`. The numbers are `time` counter cycles (100 ns each).
+//! around every trap; the site is the caller's `Location`. The numbers are `time` counter cycles (the counter's rate is the device tree's, `timer::timebase`).
 
 #![allow(dead_code)]
 
