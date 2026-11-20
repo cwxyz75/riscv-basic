@@ -96,7 +96,7 @@ pub struct SpawnStack {
     pub vmo: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcState {
     /// Created and possibly populated, no thread yet.
     Created,

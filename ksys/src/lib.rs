@@ -20,12 +20,14 @@
 
 extern crate alloc;
 
+mod create;
 mod job;
 mod lifecycle;
 mod proc;
 mod state;
 mod thread;
 mod vmo;
+pub use create::process_create;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
     job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
