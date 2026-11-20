@@ -323,6 +323,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kfuzz-gen"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "klock"
 version = "0.1.0"
 dependencies = [
@@ -337,6 +344,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "kcore",
+ "kfuzz-gen",
 ]
 
 [[package]]

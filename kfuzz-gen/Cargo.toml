@@ -1,0 +1,11 @@
+[package]
+name = "kfuzz-gen"
+version = "0.1.0"
+edition = "2021"
+description = "OS track: a seeded generator of syscall sequences from a model of plausible state, for the host and guest fuzzers (KT8)"
+
+[dependencies]
+abi = { path = "../abi" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }

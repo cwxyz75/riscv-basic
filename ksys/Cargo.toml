@@ -8,5 +8,8 @@ description = "OS track: the kernel's syscall layer as host-testable logic behin
 abi = { path = "../abi" }
 kcore = { path = "../kcore" }
 
+[dev-dependencies]
+kfuzz-gen = { path = "../kfuzz-gen" }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
