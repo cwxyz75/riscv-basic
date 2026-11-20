@@ -521,3 +521,13 @@ The kernel is declared v1 and left alone when all of these hold:
 5. No open work item of risk H names the kernel.
 
 After that a kernel change needs a reason recorded as a decision, and may only add to the system library.
+
+## Amendment 2026-11-20 (PL5a): the device windows fail closed
+
+Section 2.3 lists, as the source of "device memory a physical VMO may name", "every `reg` range of a device node that is not RAM and not a
+device the kernel drives". The rule is narrower: the windows come from the device tree, but a node contributes a window only if its
+`compatible` is on a list of the devices the system drives (`virtio,mmio` and `google,goldfish-rtc` today), its `status` is not disabled and
+every bus above it has an empty `ranges` property; RAM, everything reserved, the console and the ranges of every interrupt controller, timer,
+test finisher and power or reset node are cut from every window. A device not on the list is unmappable until someone adds it
+(`kcore::devwin::ALLOWED`). Reason: a denylist fails open for any device nobody thought of, and on QEMU `virt` it would have made fw-cfg
+(whose DMA interface writes guest RAM), the writable flash banks and the PCI ECAM window mappable by the holder of the resource handle.

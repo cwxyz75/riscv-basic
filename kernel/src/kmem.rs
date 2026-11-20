@@ -221,7 +221,12 @@ pub fn init() {
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
         let windows = crate::dtb::dtb_blob()
             .and_then(|b| kcore::fdt::parse(b).ok())
-            .map(|nodes| kcore::devwin::device_windows(&nodes, &driven, &memory))
+            .map(|nodes| {
+                // RAM and everything reserved (firmware, the image, the tree) is cut from the windows
+                let ram: alloc::vec::Vec<(u64, u64)> =
+                    memory.iter().chain(reserved.iter()).copied().collect();
+                kcore::devwin::device_windows(&nodes, &driven, &ram)
+            })
             .unwrap_or_default();
         // SAFETY: boot code, one hart, before anything reads it.
         unsafe { *addr_of_mut!(WINDOWS) = windows };

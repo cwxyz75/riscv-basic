@@ -1,13 +1,20 @@
 //! The device windows a physical VMO may name (PL5, KERNEL-V1-SPEC 2.3, work item D1): built at boot from the device tree instead of
-//! a constant table. A window is a page-aligned range of physical addresses that a device node's `reg` names and the kernel does not
-//! itself drive. The rule is a security boundary: a physical VMO is never RAM, never the console, the interrupt controllers, the
-//! timer or the test finisher, and never a range the tree does not name.
+//! a constant table. A window is a page-aligned range of physical addresses that the `reg` of a device the system knows how to use names.
+//! The rule is a security boundary, so it fails closed: a node is admitted only if its `compatible` is on [`ALLOWED`] (a new kind of device
+//! is unmappable until someone decides it should be: an earlier version admitted everything but a denylist, and fw-cfg's DMA interface and
+//! the flash banks were then mappable), its `status` is not disabled, and every bus above it passes addresses through unchanged. From the
+//! admitted ranges are cut the kernel's own devices, RAM, and the ranges of every node the kernel or firmware drives ([`NEVER`]), so that
+//! a device sharing a page with an interrupt controller does not make the controller mappable.
 
 use crate::fdt::Node;
 use alloc::vec::Vec;
 
+/// The devices a physical VMO may name, by `compatible` (exact match of one string of the property): what the device manager drives.
+/// Adding a device here is a deliberate decision about what a holder of the resource handle may touch.
+pub const ALLOWED: &[&str] = &["virtio,mmio", "google,goldfish-rtc"];
+
 /// Compatible strings of nodes the kernel (or the firmware) drives or that are not memory-mapped devices at all: interrupt controllers
-/// and timers, the test finisher, the power and reset syscons. A node listing any of them contributes no window.
+/// and timers, the test finisher, the power and reset syscons. Their `reg` ranges are cut from every window.
 const NEVER: &[&str] = &[
     "riscv,aplic",
     "riscv,imsics",
@@ -24,20 +31,32 @@ const NEVER: &[&str] = &[
     "syscon-reboot",
 ];
 
-/// Nodes by path that are not devices: the CPUs (their `reg` is a hart id), the memory and the reserved memory (`reg` is RAM), the chosen
-/// and alias nodes.
-fn not_a_device(n: &Node) -> bool {
-    let p = n.path.as_str();
-    p == "/"
-        || p == "/cpus"
-        || p.starts_with("/cpus/")
-        || p.starts_with("/memory")
-        || p == "/reserved-memory"
-        || p.starts_with("/reserved-memory/")
-        || p == "/chosen"
-        || p == "/aliases"
-        || n.prop("device_type")
-            .is_some_and(|v| v.split(|&b| b == 0).next() == Some(b"memory"))
+/// A node that is disabled (`status` other than `okay`) is not in use: firmware marks the devices it owns that way.
+fn disabled(n: &Node) -> bool {
+    n.prop("status").is_some_and(|v| {
+        let s = v.split(|&b| b == 0).next().unwrap_or(&[]);
+        s != b"okay" && s != b"ok"
+    })
+}
+
+/// Does every ancestor of `n` pass addresses through unchanged (a `ranges` property that is empty)? A bus with translating `ranges`, or
+/// none, makes the child's `reg` a bus-local address, not a physical one: such a node is refused rather than translated.
+fn physical(n: &Node, nodes: &[Node]) -> bool {
+    let mut path = n.path.as_str();
+    while let Some(slash) = path.rfind('/') {
+        path = &path[..slash];
+        if path.is_empty() {
+            return true; // reached the root
+        }
+        let Some(parent) = nodes.iter().find(|p| p.path == path) else {
+            return false;
+        };
+        match parent.prop("ranges") {
+            Some([]) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The page range `[start, end)` that the byte range `(address, size)` touches (widened outward to whole pages); `None` for an empty or
@@ -51,32 +70,40 @@ fn pages(addr: u64, size: u64) -> Option<(u64, u64)> {
     Some((addr & !4095, end))
 }
 
-/// The device windows: every `reg` range of every node that is a device, minus `excluded` byte ranges (what the kernel drives: the console
-/// UART, and anything else the caller names) and minus `ram` byte ranges (a device range that overlaps RAM is not a window), as sorted,
-/// non-overlapping page ranges `(start, end)` in bytes, adjacent ones merged.
+/// The device windows: every `reg` range of every admitted node (see the module comment), minus `excluded` byte ranges (what the kernel
+/// drives: the console UART, and anything else the caller names), minus `ram` byte ranges (a device range that overlaps RAM or a reserved
+/// range is not a window) and minus the ranges of the nodes the kernel or firmware drives, as sorted, non-overlapping page ranges
+/// `(start, end)` in bytes, adjacent ones merged.
 pub fn device_windows(
     nodes: &[Node],
     excluded: &[(u64, u64)],
     ram: &[(u64, u64)],
 ) -> Vec<(u64, u64)> {
     let mut want: Vec<(u64, u64)> = Vec::new();
-    for n in nodes {
-        if not_a_device(n) || NEVER.iter().any(|c| n.is_compatible(c)) {
-            continue;
-        }
-        want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
-    }
     let mut cut: Vec<(u64, u64)> = excluded
         .iter()
         .chain(ram.iter())
         .filter_map(|&(a, s)| pages(a, s))
         .collect();
+    for n in nodes {
+        // what the kernel or firmware drives is cut from every window, wherever its range sits
+        if NEVER.iter().any(|c| n.is_compatible(c)) {
+            cut.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+            continue;
+        }
+        if ALLOWED.iter().any(|c| n.is_compatible(c)) && !disabled(n) && physical(n, nodes) {
+            want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+        }
+    }
     cut.sort_unstable();
     want.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (mut a, b) in want {
         for &(ca, cb) in &cut {
-            if cb <= a || ca >= b {
+            if ca >= b {
+                break; // sorted by start: nothing further can overlap
+            }
+            if cb <= a {
                 continue;
             }
             if ca > a {

@@ -9636,10 +9636,31 @@ fn device_caps_need_the_resource() -> Outcome {
         (0x1000_1000, 0, "empty"),
         (0x1000_1000, 100, "not a whole page"),
         (u64::MAX - 4095, 4096, "wrapping"),
+        // PL5a: the windows come from the device tree and fail closed. What the kernel or the firmware drives, and what nobody decided
+        // a process may touch, on the live tree, are refused: the test finisher, the CLINT, the M-level APLIC, the S-level APLIC and its
+        // upper half, both IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the PCI ECAM window
+        (0x10_0000, 4096, "the test finisher"),
+        (0x200_0000, 4096, "the CLINT"),
+        (0xc00_0000, 4096, "the M-level APLIC"),
+        (0xd00_0000, 4096, "the S-level APLIC"),
+        (0xd00_4000, 4096, "the S-level APLIC's upper half"),
+        (0x2400_0000, 4096, "the M-level IMSIC file"),
+        (0x2800_0000, 4096, "the S-level IMSIC file"),
+        (0x1010_0000, 4096, "fw-cfg"),
+        (0x2000_0000, 4096, "flash bank 0"),
+        (0x2200_0000, 4096, "flash bank 1"),
+        (0x3000_0000, 4096, "the PCI ECAM window"),
     ] {
         let r = sys::vmo_create_physical(res, pa, len);
         ensure!(st(r) == Some(S::InvalidArgs), "{what}: {:?}", st(r));
     }
+    // the RTC page is a window too (the first entry of the table the kernel built from the tree)
+    let rtc = ok(
+        sys::vmo_create_physical(res, 0x10_1000, 4096),
+        "the RTC page",
+    )?
+    .a1 as u32;
+    sys::handle_close(rtc);
     // a good one; the kernel will not copy through it
     let dev = ok(
         sys::vmo_create_physical(res, 0x1000_1000, 4096),

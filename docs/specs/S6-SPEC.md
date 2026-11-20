@@ -174,3 +174,9 @@ and `proto`.
 
 None blocking. Chosen defaults to revisit later: polling fallback under AIA (a real APLIC driver is
 TIDY-UP work), one request in flight, message-copied bulk data.
+
+## Amendment 2026-11-20 (PL5a)
+
+The device windows a physical VMO may name are no longer the fixed table this document describes (the eight virtio-mmio slots and the
+RTC page): the kernel builds them at boot from the device tree under a rule that fails closed (`KERNEL-V1-SPEC.md`, amendment 2026-11-20). On
+QEMU `virt` the result is the same two ranges.
