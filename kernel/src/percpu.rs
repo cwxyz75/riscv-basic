@@ -46,7 +46,7 @@ pub struct PerHart {
     pub online: AtomicBool,
     /// Timer interrupts this hart has taken.
     pub timer_ticks: AtomicU64,
-    /// Software interrupts (IPIs) this hart has taken.
+    /// Inter-hart interrupts (IPIs) this hart has taken.
     pub ipis: AtomicU64,
     /// Is the hart in (or entering) user mode right now?
     pub in_user: AtomicBool,

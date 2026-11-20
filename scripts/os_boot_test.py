@@ -1278,12 +1278,11 @@ def main() -> int:
         # (the lossy mode runs only the bulk TCP tests, and the net shard only the network tests: the checks for the other tests would fail by design)
         strict = not expect_fail and not os.environ.get("OS_NET_LOSSY") and SHARD != "b"
         # The kernel must have found the AIA (APLIC + IMSIC, OD75); otherwise the interrupt-object test could pass by skipping.
-        aia = True
         want_ic = "interrupt controller: AIA"
         if strict and want_ic not in text.split("\n"):
             found.append(f"the kernel did not report '{want_ic}'")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (strict and os.environ.get("OS_DISK") != "0" and aia
+        if (strict and os.environ.get("OS_DISK") != "0"
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
         # The block-driver tests must have found the disk and run, with interrupts.
@@ -1292,7 +1291,7 @@ def main() -> int:
             found.append("the block-driver tests did not run with interrupts")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if strict and aia and os.environ.get("OS_DISK") != "0":
+        if strict and os.environ.get("OS_DISK") != "0":
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")

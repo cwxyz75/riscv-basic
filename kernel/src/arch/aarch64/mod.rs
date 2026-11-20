@@ -11,6 +11,9 @@ pub mod aia {
         unimplemented!()
     }
     pub const IPI_BIT: u64 = 0;
+    pub fn lists_hart(hart_id: usize) -> bool {
+        unimplemented!()
+    }
     pub fn send_ipi(hart_id: usize) {
         unimplemented!()
     }

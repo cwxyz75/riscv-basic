@@ -5,7 +5,7 @@
 //! Message id 1 of every hart's file is the inter-hart interrupt: `send_ipi` writes it to the target's `seteipnum_le` and the handler claims it
 //! with the rest. A device source `n` is message id `n + 1`.
 //!
-//! A source a process may take (the tree's admitted devices' interrupts, `kcore::aiatree`) is delivered as message id `n` to the hart that asked for it
+//! A source a process may take (the tree's admitted devices' interrupts, `kcore::aiatree`) is delivered as message id `n + 1` to the hart that asked for it
 //! (`enable` points the source's target at the calling hart). Every hart enables all of the ids
 //! in its own IMSIC at start, so retargeting is one APLIC write, never a cross-hart call. A source that fires is **masked** at the APLIC by the trap handler and unmasked by
 //! `interrupt_ack`, so a level-triggered line cannot storm. There is no claim to hold open: the
@@ -76,6 +76,11 @@ pub const IPI_BIT: u64 = 1 << IPI_ID;
 /// Message id of device source `source`.
 const fn eiid(source: u32) -> u32 {
     source + 1
+}
+
+/// Does the IMSIC list hart `hart_id` (can it be sent a message)?
+pub fn lists_hart(hart_id: usize) -> bool {
+    info().is_some_and(|i| i.hart_order.iter().any(|&h| h as usize == hart_id))
 }
 
 /// Interrupt `hart_id` (the firmware's id): write the inter-hart id to its IMSIC file's `seteipnum_le`. The caller has recorded the reason.
@@ -175,7 +180,7 @@ pub fn init() {
     PRESENT.store(true, Ordering::SeqCst);
 }
 
-/// Open this hart's IMSIC supervisor file to the ids of the sources a process may take (all below 64: one `eie` register) and allow
+/// Open this hart's IMSIC supervisor file to the inter-hart id (1) and the ids of the sources a process may take (source + 1, all below 64: one `eie` register) and allow
 /// supervisor external interrupts on this hart.
 pub fn init_hart() {
     let ids: usize = info().map_or(0, |i| {

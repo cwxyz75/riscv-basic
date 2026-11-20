@@ -1,6 +1,6 @@
 //! Secondary harts (S5a, spec section 3): discovery through the SBI hart-state-management
 //! extension, the entry code they start in, and the IPI. In S5a the secondaries only idle: each
-//! takes its own timer interrupts and software interrupts and counts them; the scheduler and every
+//! takes its own timer interrupts and inter-hart interrupts and counts them; the scheduler and every
 //! piece of shared kernel state stay on the boot hart (the big kernel lock arrives in S5b).
 
 use crate::arch::sbi::*;
@@ -111,6 +111,11 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
                 "hart {id}: not stopped (state {}), left alone",
                 r.value
             );
+            continue;
+        }
+        if !crate::aia::lists_hart(id) {
+            // an inter-hart interrupt could never reach it (PL6): it stays stopped
+            let _ = writeln!(Console, "hart {id}: not in the IMSIC, left stopped");
             continue;
         }
         // dense index `next`; the record's ids are filled in by the hart itself, but the target

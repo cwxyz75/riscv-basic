@@ -419,7 +419,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     //
     let cause = frame.scause;
     let ready = crate::thread::scheduler_ready();
-    // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
+    // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 5 && !ready;
     // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
@@ -537,13 +537,14 @@ fn external_trap(frame: &mut TrapFrame, from_user: bool) {
         }
         return;
     }
-    crate::bkl::lock();
-    crate::fp::trap_entry(frame);
+    // (the inter-hart part first, with no lock: its test jobs probe the lock)
     let reasons = if ids & crate::aia::IPI_BIT != 0 {
         crate::smp::ipi_interrupt()
     } else {
         0
     };
+    crate::bkl::lock();
+    crate::fp::trap_entry(frame);
     let any = crate::aia::deliver(devices, crate::user::irq_fired);
     if (any || reasons & crate::percpu::IPI_RESCHED != 0) && crate::thread::scheduler_ready() {
         if any {

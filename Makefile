@@ -241,7 +241,7 @@ os-boot-test-release:
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_REL_ELF)
 
 # The same suite with several harts (S5): the secondary harts must come online, take timer and
-# software interrupts, and leave every other test as it was.
+# inter-hart interrupts, and leave every other test as it was.
 os-boot-test-smp: kernel os-interactive
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
