@@ -1,0 +1,321 @@
+//! The process, thread and job syscalls that need the scheduler (what the pure half in `ksys` decides, the kernel carries out).
+
+use super::*;
+
+// ---------------------------------------------------------------------------
+// Process syscalls (S3c-2a). They touch two processes (the caller and a target), so they
+// work in short interrupts-off steps that never hold both at once.
+
+pub(super) fn bad(s: Status) -> Reply {
+    Err((s, None, None))
+}
+
+#[allow(clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and `wide(i)` is called with constants below 6
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
+    // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
+    let wide = |i: usize| a[i] > u64::from(u32::MAX);
+    match n {
+        nr::PROCESS_CREATE if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_CREATE => process_create(a),
+        nr::JOB_KILL | nr::JOB_SET_SCHED if wide(0) => bad(Status::BadHandle),
+        nr::JOB_SET_SCHED => job_set_sched(a),
+        nr::THREAD_SET_SCHED | nr::THREAD_GET_SCHED if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_SET_SCHED => thread_set_sched(a),
+        nr::THREAD_GET_SCHED => thread_get_sched(a),
+        nr::JOB_KILL => job_kill(a),
+        nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::PROCESS_SELF => process_table_call(n, a),
+        nr::PROCESS_MAP if wide(0) || wide(1) => bad(Status::BadHandle),
+        nr::PROCESS_MAP => process_table_call(n, a),
+        nr::PROCESS_UNMAP if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_UNMAP => process_table_call(n, a).inspect(|_| {
+            REAP_DIRTY.store(true, Ordering::SeqCst);
+            reap_vmos();
+        }),
+        nr::PROCESS_START if wide(0) || wide(3) => bad(Status::BadHandle),
+        nr::PROCESS_START => process_start(a),
+        nr::PROCESS_KILL | nr::PROCESS_INFO if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_KILL => process_kill(a),
+        nr::PROCESS_SUSPEND | nr::PROCESS_RESUME if wide(0) => bad(Status::BadHandle),
+        nr::PROCESS_SUSPEND => process_stop(a, true),
+        nr::PROCESS_RESUME => process_stop(a, false),
+        nr::PROCESS_INFO => process_table_call(n, a),
+        nr::THREAD_CREATE if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_CREATE => thread_create(a),
+        nr::THREAD_SPAWN if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_SPAWN => thread_spawn(a),
+        nr::THREAD_INFO if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_INFO => process_table_call(n, a),
+        nr::THREAD_INTERRUPT if wide(0) => bad(Status::BadHandle),
+        nr::THREAD_INTERRUPT => thread_interrupt(a),
+        _ => bad(Status::BadSyscall),
+    }
+}
+
+/// What the process calls of `ksys` need of this machine.
+pub(super) struct KernelMachine;
+
+impl ksys::Machine for KernelMachine {
+    fn shootdown(&mut self) {
+        crate::smp::shootdown();
+    }
+    fn flush_tlb(&mut self) {
+        kmem::flush_tlb();
+    }
+}
+
+/// The calls that only read and change the process table (`ksys::proc_call`).
+pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        let mut ctx = ksys::PCtx {
+            objs: &mut s.objs,
+            procs: &mut s.procs,
+            me,
+            mm: &mut k.mm,
+            vmos: &mut k.vmos,
+            machine: &mut KernelMachine,
+        };
+        ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
+    })
+}
+
+pub(super) fn caller_pid(s: &UserState) -> Result<u32, Status> {
+    s.thread_pid
+        .get(&thread::current())
+        .copied()
+        .ok_or(Status::BadState)
+}
+
+pub(super) fn process_create(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        let kernel_half_ok = kmem::kernel_half_unchanged();
+        let handle = ksys::process_create(
+            s,
+            &mut k.mm,
+            &mut k.vmos,
+            k.aspace.table(),
+            kernel_half_ok,
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
+        Ok((Some(u64::from(handle)), None))
+    })
+}
+
+pub(super) fn process_start(a: [u64; 6]) -> Reply {
+    let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        ksys::process_start(s, &mut kmem::get().vmos.jobs, me, a).map_err(|e| (e, None, None))
+    })?;
+    // The new thread (registered by itself once it runs). Spawned after the state borrow is
+    // gone: spawning can switch to it at once.
+    thread::spawn_free_detached("user", first_prio, user_thread_main, started);
+    Ok((None, None))
+}
+
+pub(super) fn process_kill(a: [u64; 6]) -> Reply {
+    let ph = Handle(a[0] as u32);
+    let code = a[1] as i32;
+    let (tpid, me) = irq::without(|| -> Result<(u32, u32), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let tpid = ksys::kill_target(&s.objs, &s.procs, me, ph).map_err(|e| (e, None, None))?;
+        Ok((tpid, me))
+    })?;
+    if tpid == me {
+        exit_process(code);
+    }
+    request_kill(tpid, code);
+    Ok((None, None))
+}
+
+/// `process_suspend(process)` and `process_resume(process)` (SIG2): stop or continue every thread of a process. Both need
+/// KILL on the handle (the right to end a process is the right to stop it), are idempotent, and refuse an ended process
+/// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
+pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
+    let ph = Handle(a[0] as u32);
+    let tpid = irq::without(|| -> Result<u32, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let tpid = ksys::stop_target(&mut s.objs, &mut s.procs, me, ph, stop)
+            .map_err(|e| (e, None, None))?;
+        bump_attention();
+        if stop {
+            // a thread running user code on another hart parks at its next trap: the flag is set first and the kick comes
+            // in the same locked region (as for a kill)
+            crate::smp::kick_others();
+        }
+        Ok(tpid)
+    })?;
+    if !stop {
+        wake_threads_of(tpid);
+    }
+    Ok((None, None))
+}
+
+pub(super) fn thread_create(a: [u64; 6]) -> Reply {
+    let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let creator = creator_prio(s);
+        ksys::thread_create(s, &mut kmem::get().vmos.jobs, me, creator, a)
+            .map_err(|e| (e, None, None))
+    })?;
+    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
+    thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
+    Ok((Some(u64::from(spawn.handle)), None))
+}
+
+/// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
+pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
+    let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let creator = creator_prio(s);
+        let k = kmem::get();
+        ksys::thread_spawn(s, &mut k.mm, &mut k.vmos, me, creator, a).map_err(|e| (e, None, None))
+    })?;
+    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
+    let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
+    Ok((Some(u64::from(spawn.handle)), Some(u64::from(tid))))
+}
+
+/// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
+/// wait that would sleep (object_wait, port_wait, futex_wait, channel_call, with a deadline other than 0) returns
+/// INTERRUPTED and takes the flag; one that is satisfied, or a poll, leaves it. It ends waits, not running code.
+/// Needs MANAGE on a thread handle; a thread that has ended is BAD_STATE.
+pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
+    if a[0] > u64::from(u32::MAX) {
+        return fail(Status::BadHandle);
+    }
+    let tid = irq::without(|| -> Result<Tid, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, _) = thread_target(s, me, a[0], Rights::MANAGE)?;
+        s.interrupts.insert(tid);
+        Ok(tid)
+    })?;
+    // (after the state closure has ended: a wake can switch threads)
+    thread::wake(tid);
+    Ok((None, None))
+}
+
+// ---- jobs (S4.5, OD56-OD58) ----
+
+/// The priority a thread created by the calling thread inherits: the caller's own base if it is a user thread, else
+/// the default (10).
+pub(super) fn creator_prio(s: &UserState) -> u8 {
+    let me = thread::current();
+    if s.thread_pid.contains_key(&me) {
+        thread::priority_of(me).unwrap_or(10)
+    } else {
+        10
+    }
+}
+
+/// The kernel thread behind a thread handle with `need`, and the process it belongs to.
+pub(super) fn thread_target(
+    s: &UserState,
+    me: u32,
+    h: u64,
+    need: Rights,
+) -> Result<(Tid, u32), ReplyErr> {
+    ksys::thread_target(&s.objs, &s.procs, me, thread::current(), h, need)
+        .map_err(|e| (e, None, None))
+}
+
+/// `thread_set_sched(thread, priority, flags)`: set a thread's base priority (1 to 63) and flags (bit 0: round robin
+/// within its level). Needs MANAGE on the handle (none for 0, the caller), and the priority may not exceed the
+/// thread's job's `max_prio`.
+pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, prio, flags) = ksys::thread_set_sched_target(
+            &s.objs,
+            &s.procs,
+            &kmem::get().vmos.jobs,
+            me,
+            thread::current(),
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
+        s.sched_flags.insert(tid, flags);
+        thread::set_priority(tid, prio);
+        Ok((None, None))
+    })
+}
+
+/// `thread_get_sched(thread) -> sched, tid`: `sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and
+/// the effective priority (16 to 23; equal to the base until donation exists). Needs INSPECT (none for 0).
+pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
+        let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
+        let flags = u64::from(s.sched_flags.get(&tid).copied().unwrap_or(0));
+        Ok((Some(prio | flags << 8 | prio << 16), Some(u64::from(tid))))
+    })
+}
+
+/// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
+/// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
+pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let jobs = &mut kmem::get().vmos.jobs;
+        let job =
+            ksys::job_set_sched(&s.objs, &s.procs, jobs, me, a).map_err(|e| (e, None, None))?;
+        // PR1: clamp the threads of the job and everything below it
+        let clamp: Vec<(Tid, u8)> = s
+            .thread_pid
+            .iter()
+            .filter_map(|(&tid, pid)| {
+                let pj = s.procs.get(pid)?.job;
+                let max = jobs.sched(pj)?.max_prio;
+                let now = thread::priority_of(tid)?;
+                (jobs.is_within(pj, job) && now > max).then_some((tid, max.max(1)))
+            })
+            .collect();
+        thread::set_priorities(&clamp);
+        Ok((None, None))
+    })
+}
+
+/// `job_kill(job, code)`: end every process in the job and its descendants with exit code
+/// `code` and forbid new processes and threads there (their limits become 0). Needs KILL. A
+/// caller inside the job ends too, last.
+pub(super) fn job_kill(a: [u64; 6]) -> Reply {
+    let code = a[1] as i32;
+    let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u32>, bool, u32), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (victims, me_inside) = ksys::job_kill_victims(
+            &s.objs,
+            &s.procs,
+            &mut kmem::get().vmos.jobs,
+            me,
+            Handle(a[0] as u32),
+        )
+        .map_err(|e| (e, None, None))?;
+        Ok((victims, me_inside, me))
+    })?;
+    for pid in victims {
+        request_kill(pid, code);
+    }
+    if me_inside {
+        let _ = me;
+        exit_process(code);
+    }
+    Ok((None, None))
+}

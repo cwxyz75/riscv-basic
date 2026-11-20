@@ -333,3 +333,89 @@ pub fn thread_spawn<M: PhysMem>(
         prio,
     })
 }
+
+/// `process_start(process, entry, sp, channel, arg)` (SYSCALLS.md): move the bootstrap channel end into a Created process as its handle 1 and register
+/// its first thread. The caller spawns the kernel thread `token` names at `prio`. On any error nothing has changed.
+#[allow(clippy::expect_used, clippy::panic)]
+// INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists; a Created process's table is empty, so the moved handle is handle 1
+#[inline(never)]
+pub fn process_start(
+    us: &mut UserState,
+    jobs: &mut Jobs,
+    me: u32,
+    a: [u64; 6],
+) -> Result<(usize, u8), Status> {
+    let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
+    let (entry, sp, arg) = (a[1], a[2], a[4]);
+    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
+    let pe = caller.handles.get(ph)?;
+    let be = caller.handles.get(bh)?;
+    let tpid = match us.objs.get(pe.obj) {
+        Some(ipc::KObj::Process(p)) => p.pid,
+        _ => return Err(Status::WrongType),
+    };
+    if !matches!(us.objs.get(be.obj), Some(ipc::KObj::Channel(_))) {
+        return Err(Status::WrongType);
+    }
+    if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
+        return Err(Status::AccessDenied);
+    }
+    let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
+    if target.state != crate::ProcState::Created
+        || target.exit_code.is_some()
+        || target.killed.is_some()
+    {
+        return Err(Status::BadState);
+    }
+    if total_threads(us) >= abi::limits::MAX_USER_THREADS {
+        return Err(Status::NoMemory);
+    }
+    let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+    let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
+    if !entry_ok || !sp_ok {
+        return Err(Status::InvalidArgs);
+    }
+    let tjob = target.job;
+    // The thread's charge comes before anything changes: a refusal must leave the caller's handle with the caller and the process exactly as it
+    // was (SYSCALLS.md: on any error nothing changes), or a retry would find handle 1 taken.
+    charge_thread(jobs, tjob).map_err(crate::job_status)?;
+    // (room in the target's table first, in memory: the handle is moved only when its arrival cannot fail)
+    if let Err(e) = us
+        .procs
+        .get_mut(&tpid)
+        .expect("target exists")
+        .handles
+        .reserve(1)
+    {
+        credit_thread(jobs, tjob);
+        return Err(e);
+    }
+    // Commit: the channel end moves into the new process as its handle 1.
+    let UserState { procs, objs, .. } = us;
+    let caller = procs.get_mut(&me).expect("caller exists");
+    let moved = match caller.handles.remove_for_transfer(objs, bh) {
+        Ok(m) => m,
+        Err(e) => {
+            credit_thread(jobs, tjob);
+            return Err(e);
+        }
+    };
+    let target = procs.get_mut(&tpid).expect("target exists");
+    let first = target
+        .handles
+        .insert(moved.obj, moved.rights)
+        .expect("an empty table has room, and its memory was reserved");
+    assert_eq!(
+        first,
+        abi::BOOTSTRAP_HANDLE,
+        "the bootstrap channel must be handle 1"
+    );
+    target.entry = entry;
+    target.arg = arg;
+    target.start_sp = sp;
+    target.state = crate::ProcState::Running;
+    target.threads_alive = 1;
+    // the first thread of a process starts at the default priority, clamped to its job's maximum
+    let prio = clamp_prio(jobs, tjob, 10);
+    Ok((new_start(us, tpid, entry, sp, arg, None), prio))
+}
