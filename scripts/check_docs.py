@@ -114,11 +114,11 @@ ATOMICS = {
     "kcore/src/sched_smp.rs": (29, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
     "kernel/src/percpu.rs": (62, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
-    "kernel/src/chaos.rs": (8, "the chaos feature's per-hart generator states, enable flag and delay counter (KT7: test-build diagnostics, no code without the feature)"),
+    "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (7, "hart bring-up and IPI flags"),
     "kernel/src/aia.rs": (12, "interrupt controller statistics and masks"),
-    "kernel/src/thread.rs": (23, "scheduler ready flags, wake statistics and the watchdog's per-hart sample times"),
+    "kernel/src/thread.rs": (30, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender as one word and its name as two, the exempt thread)"),
     "kernel/src/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
     "kernel/src/user.rs": (12, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it)"),
     "kernel/src/trap.rs": (10, "the expected-fault test hook and its log words"),
@@ -127,7 +127,7 @@ ATOMICS = {
     "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
     "kernel/src/console.rs": (2, "the console's panic flag and line state"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (44, "self-test flags and counters"),
+    "kernel/src/sched_tests.rs": (47, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured)"),
     "kernel/src/smp_tests.rs": (16, "self-test flags and counters"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")

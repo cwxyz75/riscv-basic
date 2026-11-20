@@ -27,6 +27,10 @@ for crate in CRATES:
                     if LINT.search(s):
                         n += 1
                         rel = os.path.relpath(path, ROOT)
+                        # (rustfmt moves a long trailing comment to the next line when more attributes follow: accept it there)
+                        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                        if nxt.startswith("// INVARIANT:"):
+                            s += " " + nxt
                         if "INVARIANT:" not in s:
                             bad.append(f"{rel}:{start + 1}: an allow of a panic-finding lint with no `// INVARIANT:` reason")
                         elif "--list" in sys.argv:

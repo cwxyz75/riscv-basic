@@ -8,6 +8,7 @@
 #![cfg_attr(feature = "interactive", allow(dead_code))]
 #![no_main]
 #![deny(clippy::undocumented_unsafe_blocks)] // KT3: every unsafe block says why it holds
+#![deny(clippy::large_stack_frames)] // KT13: no frame over 1 KiB (kernel/clippy.toml) on a 16 KiB kernel stack
 
 extern crate alloc;
 
@@ -75,6 +76,7 @@ impl Tally {
 }
 
 #[no_mangle]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     dtb::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
     // First of all: this hart's record in `tp` (the trap entry needs it).

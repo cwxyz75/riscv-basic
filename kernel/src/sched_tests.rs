@@ -8,7 +8,7 @@ use crate::thread::{self, IDLE_SPINS};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
 type Outcome = Result<(), String>;
 type Test = (&'static str, fn() -> Outcome);
@@ -303,6 +303,7 @@ fn queue_waiter(id: usize) {
     DONE_COUNT.fetch_add(1, SeqCst);
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn two_waiters_on_one_queue_wake_in_order() -> Outcome {
     clean(|| {
         RELEASED.store(0, SeqCst);
@@ -395,6 +396,54 @@ fn stack_guard_damage_is_detected() -> Outcome {
         ensure(thread::stacks_intact(), "guards intact after the repair")?;
         thread::wake(t);
         ensure(thread::join(t), "joining the sleeper")
+    })
+}
+
+/// A frame the optimiser cannot drop, recursing until the thread's own stack has used `target` bytes: KT13's deliberate deep stack
+/// (measured with the same scan as the boot's check, so the test does not depend on the size of a debug or release frame).
+#[inline(never)]
+fn recurse(target: usize) -> usize {
+    let mut pad = [0u8; 256];
+    pad[target % 256] = 1;
+    let pad = core::hint::black_box(pad);
+    if thread::current_stack_use() >= target {
+        usize::from(pad[0])
+    } else {
+        recurse(target).wrapping_add(usize::from(pad[target % 256]))
+    }
+}
+
+static DEEP_USE: AtomicUsize = AtomicUsize::new(0);
+
+fn deep_thread(_: usize) {
+    core::hint::black_box(recurse(thread::STACK_BUDGET + 1024));
+    DEEP_USE.store(thread::current_stack_use(), SeqCst);
+    // this thread went over the budget on purpose: it does not count against the boot's check
+    thread::exempt_from_stack_budget();
+}
+
+/// KT13: a thread that recurses to about 9 KiB is over the budget (8 KiB) and the check says so, while an ordinary thread is not.
+fn the_stack_budget_check_trips_on_deep_recursion() -> Outcome {
+    clean(|| {
+        let t = thread::spawn("deep", NORMAL, deep_thread, 0);
+        ensure(thread::join(t), "joining the deep thread")?;
+        let used = DEEP_USE.load(SeqCst);
+        ensure(
+            thread::over_budget(used),
+            "a thread that recursed to about 9 KiB was not over the stack budget",
+        )?;
+        ensure(
+            used < thread::STACK_BYTES,
+            "the deep thread reached the guard: the test's recursion is too deep",
+        )?;
+        ensure(
+            !thread::over_budget(thread::STACK_BUDGET),
+            "the budget itself is inside the budget",
+        )?;
+        ensure(
+            thread::over_budget(thread::STACK_BUDGET + 1),
+            "one byte over is over",
+        )
     })
 }
 
@@ -668,6 +717,10 @@ pub const TESTS: &[Test] = &[
     (
         "stack_guard_damage_is_detected",
         stack_guard_damage_is_detected,
+    ),
+    (
+        "the_stack_budget_check_trips_on_deep_recursion",
+        the_stack_budget_check_trips_on_deep_recursion,
     ),
     ("fp_unit_is_off", fp_unit_is_off),
 ];

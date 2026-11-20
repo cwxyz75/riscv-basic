@@ -180,6 +180,7 @@ pub fn send_ipi(index: usize, reason: u32) {
 
 /// Find the other harts and start them. Needs `kmem::init` (the kernel table) and the heap.
 /// Returns how many harts run (the boot hart included).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn start_secondaries(boot_hart_id: usize) -> usize {
     // SAFETY: only this function writes the table, once, before any secondary starts; the stacks
     // are private statics.

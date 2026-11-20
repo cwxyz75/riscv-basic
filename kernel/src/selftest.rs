@@ -116,6 +116,7 @@ fn kernel_mappings_are_w_xor_x() -> Outcome {
     ensure_eq(bad, 0, "leaves that are W+X, huge or user-accessible")
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn kernel_sections_have_the_right_permissions() -> Outcome {
     let k = kmem::get();
     let s = kmem::sections();
@@ -193,6 +194,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
     )
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn heap_works() -> Outcome {
     let mut v: Vec<u64> = Vec::new();
     for i in 0..10_000 {
@@ -330,6 +332,7 @@ fn write_to_read_only_region_is_refused() -> Outcome {
     })
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn shared_vmo_is_one_memory() -> Outcome {
     balanced(|| {
         let a = LAZY_TEST_BASE;
@@ -398,6 +401,7 @@ type Test = (&'static str, fn() -> Outcome);
 
 /// The heap grows at a safe point when it runs low: fill the boot heap's free space, call `service`, and a block
 /// that no longer fits the boot heap is allocated in the grown one (in the window), then everything is freed.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn heap_grows_at_a_safe_point() -> Outcome {
     use alloc::vec::Vec;
     let grown_before = crate::heap::grown_bytes();

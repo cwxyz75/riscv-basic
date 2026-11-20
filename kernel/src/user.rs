@@ -118,6 +118,7 @@ fn quota(job: JobId) -> ipc::Quota<'static> {
 static mut USER: Option<UserState> = None;
 
 #[track_caller]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn state() -> &'static mut UserState {
     debug_assert!(
         !irq::enabled() && crate::bkl::held(),
@@ -203,11 +204,14 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     irq::without(|| start_locked(image, arg))
 }
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::expect_used,
     clippy::indexing_slicing
-)] // INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); pids are a counter far below u32::MAX
+)]
+// INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); pids are a counter far below u32::MAX
 fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);
@@ -757,6 +761,8 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
     crate::chaos::point(crate::chaos::Point::ReturnToUser);
 }
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: sepc + 4 steps past an ecall; the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
 fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     let cause = frame.scause;
@@ -857,6 +863,7 @@ fn handle_list(args: &[u8]) -> Vec<Handle> {
         .collect()
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
     let (n, a) = (
@@ -975,11 +982,14 @@ fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::expect_used,
     clippy::indexing_slicing
-)] // INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
+)]
+// INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
 fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let tid = thread::current();
     let s = state();
@@ -1454,6 +1464,7 @@ fn register_wait(thread: Tid, h: Handle, mask: u32) {
     }
 }
 
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn object_wait(a: [u64; 6]) -> Reply {
     if a[0] > u64::from(u32::MAX) {
         return fail(Status::BadHandle);
@@ -1628,7 +1639,10 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
 fn channel_call(a: [u64; 6]) -> Reply {
     if a[0] > u64::from(u32::MAX) {
         return fail(Status::BadHandle);
@@ -2067,6 +2081,7 @@ fn bad(s: Status) -> Reply {
 }
 
 #[allow(clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and `wide(i)` is called with constants below 6
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn process_call(n: usize, a: [u64; 6]) -> Reply {
     // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
     let wide = |i: usize| a[i] > u64::from(u32::MAX);
@@ -2144,7 +2159,10 @@ fn caller_pid(s: &UserState) -> Result<u32, Status> {
         .ok_or(Status::BadState)
 }
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: pids are a counter far below u32::MAX; the new process's handle was made with room checked
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects)]
+// INVARIANT: pids are a counter far below u32::MAX; the new process's handle was made with room checked
 fn process_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
@@ -2244,7 +2262,10 @@ fn process_create(a: [u64; 6]) -> Reply {
     })
 }
 
-#[allow(clippy::expect_used)] // INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::expect_used)]
+// INVARIANT: the caller and the target were looked up under the same lock a few lines above; the first thread's record exists
 fn process_start(a: [u64; 6]) -> Reply {
     let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
@@ -2380,6 +2401,8 @@ fn credit_thread(jobs: &mut kcore::job::Jobs, job: JobId) {
 /// Frames in a kernel stack.
 const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the target process was looked up under the same lock; threads_alive is below MAX_THREADS_PER_PROCESS (checked just above)
 fn thread_create(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0] as u32);
@@ -2440,11 +2463,14 @@ fn thread_create(a: [u64; 6]) -> Reply {
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a
 /// stack the kernel maps in the process's stack arena (freed when the thread ends) unless the caller brings its own.
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::expect_used,
     clippy::indexing_slicing
-)] // INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (40 bytes) at indices below 5
+)]
+// INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (40 bytes) at indices below 5
 fn thread_spawn(a: [u64; 6]) -> Reply {
     use abi::spawn as sp;
     let ph = Handle(a[0] as u32);
