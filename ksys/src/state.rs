@@ -2,6 +2,7 @@
 //! syscall functions that act on it take `&mut UserState` and what the machine provides, so they run on the host.
 
 use crate::proc::{Process, SpawnStack};
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -26,7 +27,7 @@ pub struct ThreadStart {
 /// Everything the syscall layer keeps about user mode: the kernel objects, the processes and threads, the wait tables, and the kernel's own handles.
 pub struct UserState {
     pub objs: Kobjs,
-    pub procs: BTreeMap<u32, Process>,
+    pub procs: BTreeMap<u32, Box<Process>>,
     pub thread_pid: BTreeMap<Tid, u32>,
     /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
     pub sched_flags: BTreeMap<Tid, u8>,

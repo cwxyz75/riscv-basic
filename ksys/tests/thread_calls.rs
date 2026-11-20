@@ -59,8 +59,10 @@ fn world() -> W {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut us = UserState::new();
-    us.procs.insert(1, process(&mut mm, &kernel, JobId::ROOT));
-    us.procs.insert(2, process(&mut mm, &kernel, JobId::ROOT));
+    us.procs
+        .insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    us.procs
+        .insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
     let mut vmos = Vmos::new();
     let code = vmos.create(1);
     us.procs

@@ -7,6 +7,7 @@ use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
 use abi::Handle;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::AddressSpace;
@@ -33,7 +34,7 @@ pub trait Machine {
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
 pub struct PCtx<'a, M: PhysMem, X: Machine> {
     pub objs: &'a mut Kobjs,
-    pub procs: &'a mut BTreeMap<u32, Process>,
+    pub procs: &'a mut BTreeMap<u32, Box<Process>>,
     /// The calling process.
     pub me: u32,
     pub mm: &'a mut Mm<M>,

@@ -19,6 +19,7 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::user::{MAX_DEBUG_WRITE, STACK_PAGES, STACK_TOP};
 use abi::Handle;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -249,7 +250,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         let jobs = &mut kmem::get().vmos.jobs;
         let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
         let _ = charge_thread(jobs, JobId::ROOT);
-        s.procs.insert(pid, process);
+        s.procs.insert(pid, Box::new(process));
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
     // user threads may run on any hart (kernel threads stay on the boot hart by default)
@@ -598,7 +599,7 @@ fn stopped_now() -> bool {
         .is_some_and(|p| p.stopped)
 }
 
-fn satp_of(p: &Process) -> u64 {
+fn satp_of(p: &Box<Process>) -> u64 {
     (8u64 << 60) | (u64::from(p.asid) << 44) | p.aspace.table().root()
 }
 
@@ -2134,7 +2135,7 @@ fn process_create(a: [u64; 6]) -> Reply {
         };
         procs.insert(
             pid,
-            Process {
+            Box::new(Process {
                 aspace: AddressSpace::new(table),
                 handles: HandleTable::new(MAX_HANDLES),
                 asid: (pid & 0xffff) as u16,
@@ -2156,7 +2157,7 @@ fn process_create(a: [u64; 6]) -> Reply {
                 stacks: BTreeMap::new(),
                 stack_hint: abi::user::STACK_ARENA_BASE,
                 privileged: false,
-            },
+            }),
         );
         Ok((Some(u64::from(handle.0)), None))
     })
@@ -2424,7 +2425,7 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
             let t = procs.get_mut(&tpid).expect("target exists");
             let tables = stack_len / 4096 / 512 + 4;
             let undo = |made: Option<(Handle, kcore::object::ObjId)>,
-                        procs: &mut BTreeMap<u32, Process>,
+                        procs: &mut BTreeMap<u32, Box<Process>>,
                         objs: &mut Kobjs,
                         jobs: &mut kcore::job::Jobs| {
                 if let Some((h, _)) = made {
