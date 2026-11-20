@@ -152,7 +152,8 @@ pub fn init(boot_prio: Prio) {
     // silently corrupting another thread's registers.
     // The same for the vector unit (sstatus.VS, bits 10:9; mandatory in RVA23, OD47): no vector
     // state is saved per thread, so user mode must not be able to use it either.
-    crate::arch::lazy_units_off();
+    // SAFETY: boot, before any user thread has run.
+    unsafe { crate::arch::lazy_units_off() };
     let harts = crate::smp::started();
     let sched = KSched::over(KRqs {
         rq: (0..harts)
@@ -389,7 +390,7 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
     let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.top();
-    let ctx = Context::new(entry as usize, arg, top);
+    let ctx = Context::new(entry, arg, top);
     KThread {
         ctx,
         stack: Some(stack),

@@ -32,7 +32,8 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     percpu::this().tp_seen.store(tp, Ordering::Relaxed);
     crate::trap::init(); // the trap vector
                          // FPU and vector unit off, like the boot hart (thread::init), so any use traps.
-    crate::arch::lazy_units_off();
+                         // SAFETY: a secondary hart's own start, before any user thread has run on it.
+    unsafe { crate::arch::lazy_units_off() };
     // Leave the early table for the kernel's own.
     let token = kmem::KERNEL_ASPACE.load(Ordering::SeqCst);
     // SAFETY: the kernel table maps everything this code runs from and touches (the image, the

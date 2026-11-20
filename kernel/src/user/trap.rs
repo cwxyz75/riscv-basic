@@ -65,11 +65,13 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
 pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     use crate::arch::{FaultKind, UserTrap};
+    if frame.is_syscall() {
+        frame.skip_trap_instruction(); // past the call instruction
+        syscall(frame);
+        return;
+    }
     match frame.decode_user() {
-        UserTrap::Syscall => {
-            frame.skip_trap_instruction(); // past the call instruction
-            syscall(frame);
-        }
+        UserTrap::Syscall => unreachable_syscall(),
         UserTrap::Fault(fault) if fault.kind == FaultKind::PageFault => {
             let cause = fault.code;
             let access = fault.access.unwrap_or(Access::Read);
@@ -496,3 +498,7 @@ pub(super) fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u
         flush(core::mem::take(line));
     }
 }
+
+/// `decode_user` says Syscall only for a trap `is_syscall` already took.
+#[cold]
+fn unreachable_syscall() {}

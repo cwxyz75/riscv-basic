@@ -61,6 +61,12 @@ pub enum UserTrap {
 }
 
 impl TrapFrame {
+    /// Is this trap from user mode a system call? (The hot path: cheaper than building the whole decoded trap.)
+    #[inline(always)]
+    pub fn is_syscall(&self) -> bool {
+        self.scause == 8
+    }
+
     /// Decode a trap taken from user mode.
     pub fn decode_user(&self) -> UserTrap {
         let (kind, access) = match self.scause {
@@ -85,6 +91,7 @@ impl TrapFrame {
 
     /// Step past the instruction that trapped (a system call returns to the next instruction).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the program counter of a user trap is a user address, far from u64::MAX
+    #[inline(always)]
     pub fn skip_trap_instruction(&mut self) {
         self.sepc += 4;
     }
