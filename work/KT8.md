@@ -12,4 +12,4 @@ refs: [KERNEL-V1-SPEC, OD139, OD140]
 
 **Acceptance, written first.** A planted defect is found by each within the overnight budget: an unchecked index in a handler (host: a panic; guest: `##PANIC`), and a missing credit on an error path (both: the ledger audit). A failing seed replays to the same failure.
 
-**Review.** Fable (the generator's model decides what is reachable; a reviewer should attack what it cannot generate).
+**Progress (2026-11-20).** Part (1), the host half, is built: `kfuzz-gen`, `ksys/tests/fuzz.rs`, `make os-fuzz-host`, with both planted defects of the acceptance found on the host and replayed (TESTING.md, "Fuzzing the syscall layer on the host"). Not built: part (2), the guest `kfuzz` program in the boot image and `os-fuzz-guest`, and with it the guest halves of the acceptance; the calls that still live in `kernel/src/user.rs` (process, thread, wait, futex, `channel_call`) are not reached by the host fuzzer until TS3c moves them. **Review.** Fable (the generator's model decides what is reachable; a reviewer should attack what it cannot generate).

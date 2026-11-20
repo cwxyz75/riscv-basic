@@ -172,3 +172,19 @@ jobs:
           name: coverage-html
           path: target/cov/html
           if-no-files-found: ignore
+
+  fuzz-host:
+    name: overnight (host fuzz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-fuzz-host
+      - run: make os-fuzz-host
+      - name: Summary
+        if: always()
+        run: echo "## overnight (host fuzz): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
