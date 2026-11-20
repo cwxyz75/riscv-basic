@@ -384,9 +384,10 @@ it on deliberately. A process without it cannot reach device memory.
 ### vmo_create_physical(resource, pa, bytes) -> status, handle
 
 A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
-non-empty, a whole number of pages and inside one *device window* (`abi::layout::DEVICE_WINDOWS`:
-the eight QEMU `virt` virtio-mmio slots, `0x1000_1000..0x1000_9000`, and the one-page goldfish RTC, `0x10_1000..0x10_2000`); anything else, RAM
-included, is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
+non-empty, a whole number of pages and inside one *device window*: the kernel builds the windows at boot from the device tree (`kcore::devwin`): every `reg` range of a device
+node, widened to whole pages, minus RAM and minus what the kernel or the firmware drives (the console, the interrupt controllers, the
+timer, the test finisher; the CPU, memory and reserved-memory nodes are not devices). On QEMU `virt` that is the virtio-mmio slots, the
+goldfish RTC, fw-cfg, the flash banks and the PCI ECAM window. Anything else, RAM included, is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
 DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
 and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device
 memory**: a syscall buffer pointer that lands in an MMIO mapping is INVALID_ARGS. Errors, in

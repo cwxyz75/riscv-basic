@@ -115,7 +115,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **MM2** the buddy frame allocator (PR 307)
 - [x] **MM3** large pages in the direct map (PR 308)
 - [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
-- [ ] **PL5** discovery: console, interrupt controller, device windows, reset
+- [ ] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a, the windows: PR to follow; the console, the AIA and the reset left)
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
 - [ ] **SC1** sixty-four harts
 - [ ] **HD1** the kernel entropy pool

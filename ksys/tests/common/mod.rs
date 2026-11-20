@@ -82,6 +82,9 @@ pub fn world_with(handles: usize) -> World {
     }
 }
 
+/// The device windows of QEMU `virt`'s tree minus what the kernel drives (the host tests' fixed table: the RTC page and the eight virtio slots).
+pub const WINDOWS: [(u64, u64); 2] = [(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
+
 pub fn world() -> World {
     world_with(64)
 }
@@ -97,6 +100,7 @@ impl World {
             vmos: &mut self.vmos,
             faults: self.faults,
             harts_online: 4,
+            windows: &WINDOWS,
         };
         ipc_call(n, a, &mut c)
             .or_else(|| vmo_call(n, a, &mut c))

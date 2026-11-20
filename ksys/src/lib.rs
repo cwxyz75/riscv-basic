@@ -87,6 +87,8 @@ pub struct Ctx<'a, M: PhysMem> {
     pub faults: Faults,
     /// The processors that are online (`job_info` 7).
     pub harts_online: u64,
+    /// The device windows a physical VMO may name (page-aligned `(start, end)` byte ranges, built from the device tree at boot: PL5).
+    pub windows: &'a [(u64, u64)],
 }
 
 pub(crate) fn fail(s: Status) -> Reply {

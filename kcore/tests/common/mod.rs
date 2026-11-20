@@ -119,3 +119,100 @@ impl kcore::pagetable::PageTableFormat for TestFmt48 {
         }
     }
 }
+
+/// A tiny flattened-device-tree writer.
+pub struct Dt {
+    pub strings: Vec<u8>,
+    pub structure: Vec<u8>,
+    pub rsv: Vec<(u64, u64)>,
+}
+
+impl Dt {
+    pub fn new() -> Dt {
+        Dt {
+            strings: vec![],
+            structure: vec![],
+            rsv: vec![],
+        }
+    }
+    pub fn pad(v: &mut Vec<u8>) {
+        while !v.len().is_multiple_of(4) {
+            v.push(0);
+        }
+    }
+    pub fn begin(&mut self, name: &str) {
+        self.structure.extend(1u32.to_be_bytes());
+        self.structure.extend(name.as_bytes());
+        self.structure.push(0);
+        Self::pad(&mut self.structure);
+    }
+    pub fn end(&mut self) {
+        self.structure.extend(2u32.to_be_bytes());
+    }
+    pub fn prop(&mut self, name: &str, val: &[u8]) {
+        let off = self.strings.len() as u32;
+        self.strings.extend(name.as_bytes());
+        self.strings.push(0);
+        self.structure.extend(3u32.to_be_bytes());
+        self.structure.extend((val.len() as u32).to_be_bytes());
+        self.structure.extend(off.to_be_bytes());
+        self.structure.extend(val);
+        Self::pad(&mut self.structure);
+    }
+    pub fn u32s(&mut self, name: &str, v: &[u32]) {
+        let b: Vec<u8> = v.iter().flat_map(|x| x.to_be_bytes()).collect();
+        self.prop(name, &b);
+    }
+    /// `reg` of one (address, size) pair in one-cell form.
+    pub fn reg_1cell(&mut self, a: u32, s: u32) {
+        let mut b = vec![];
+        b.extend(a.to_be_bytes());
+        b.extend(s.to_be_bytes());
+        self.prop("reg", &b);
+    }
+    /// `reg` bytes as given.
+    pub fn raw_reg(&mut self, b: &[u8]) {
+        self.prop("reg", b);
+    }
+    /// `reg` of (address, size) pairs in two-cell form.
+    pub fn reg(&mut self, ranges: &[(u64, u64)]) {
+        let mut b = vec![];
+        for &(a, s) in ranges {
+            b.extend(a.to_be_bytes());
+            b.extend(s.to_be_bytes());
+        }
+        self.prop("reg", &b);
+    }
+    pub fn finish(mut self) -> Vec<u8> {
+        self.structure.extend(9u32.to_be_bytes());
+        let mut rsv = vec![];
+        for &(a, s) in &self.rsv {
+            rsv.extend(a.to_be_bytes());
+            rsv.extend(s.to_be_bytes());
+        }
+        rsv.extend([0u8; 16]);
+        let off_rsv = 40;
+        let off_struct = off_rsv + rsv.len();
+        let off_strings = off_struct + self.structure.len();
+        let total = off_strings + self.strings.len();
+        let mut b = vec![];
+        for x in [
+            0xd00d_feedu32,
+            total as u32,
+            off_struct as u32,
+            off_strings as u32,
+            off_rsv as u32,
+            17,
+            16,
+            0,
+            self.strings.len() as u32,
+            self.structure.len() as u32,
+        ] {
+            b.extend(x.to_be_bytes());
+        }
+        b.extend(rsv);
+        b.extend(self.structure);
+        b.extend(self.strings);
+        b
+    }
+}

@@ -397,19 +397,6 @@ pub mod layout {
     /// The direct map reaches physical addresses below this (64 GiB: top-level slots 256 to 319); the slots above it belong to other
     /// kernel windows (the self-test region at 320, the stacks at 384, the heap at 416, the image at 510). RAM above it is not used.
     pub const DIRECT_MAP_PHYS_LIMIT: u64 = 64 << 30;
-    /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots, and the goldfish real-time clock
-    /// (one page, `0x101000`: the wall clock, FS-SPEC section 7; the device manager hands clients a read-only VMO of it).
-    pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
-    /// Is `[pa, pa + bytes)` page aligned, non-empty and inside one device window?
-    pub fn in_device_window(pa: u64, bytes: u64) -> bool {
-        let Some(end) = pa.checked_add(bytes) else {
-            return false;
-        };
-        pa.is_multiple_of(4096)
-            && bytes != 0
-            && bytes.is_multiple_of(4096)
-            && DEVICE_WINDOWS.iter().any(|&(s, e)| pa >= s && end <= e)
-    }
     /// Highest PLIC source an interrupt object may name (QEMU `virt`: the eight virtio-mmio slots
     /// are sources 1..=8; the UART, 10, belongs to the kernel).
     pub const MAX_IRQ: u32 = 8;
