@@ -165,11 +165,6 @@ ARCH_RE = re.compile(
     r"\b(?:asm|global_asm)!|\bcsr[rwsc]i?\b|\bsfence\b|\becall\b|\bwfi\b|\bsret\b"
     r"|\b(?:satp|sstatus|scause|stvec|sepc|stval|sscratch|stimecmp|sie|sip)\b")
 ARCH_PENDING = {
-    "kernel/src/sched_tests.rs",
-    "kernel/src/selftest.rs",
-    "kernel/src/smp.rs",
-    "kernel/src/thread.rs",
-    "kernel/src/user/trap.rs",
 }
 ARCH_EXEMPT = {"kcore/src/pagetable.rs"}
 

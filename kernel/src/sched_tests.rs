@@ -450,7 +450,7 @@ fn the_stack_budget_check_trips_on_deep_recursion() -> Outcome {
 fn fp_unit_is_off() -> Outcome {
     ensure(
         thread::fp_off(),
-        "sstatus.FS is not Off: thread switches do not save FP state",
+        "the FP unit is not off: thread switches do not save FP state",
     )
 }
 

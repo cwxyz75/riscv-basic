@@ -311,8 +311,8 @@ fn fault_outside_region_is_refused() -> Outcome {
         });
         let r = refused.ok_or("no fault was refused")?;
         ensure_eq(r.error, FaultError::NoRegion, "error")?;
-        ensure_eq(r.cause, 13, "scause (load page fault)")?;
-        ensure_eq(r.addr, LAZY_TEST_BASE + 4 * PAGE, "stval")?;
+        ensure_eq(r.access, kcore::aspace::Access::Read, "the access (a load)")?;
+        ensure_eq(r.addr, LAZY_TEST_BASE + 4 * PAGE, "the faulting address")?;
         teardown(vmo, &[LAZY_TEST_BASE]);
         Ok(())
     })
@@ -325,7 +325,11 @@ fn write_to_read_only_region_is_refused() -> Outcome {
         let r =
             trap::expect_refused(|| write(LAZY_TEST_BASE + 8, 1)).ok_or("no fault was refused")?;
         ensure_eq(r.error, FaultError::Denied, "error")?;
-        ensure_eq(r.cause, 15, "scause (store page fault)")?;
+        ensure_eq(
+            r.access,
+            kcore::aspace::Access::Write,
+            "the access (a store)",
+        )?;
         ensure_eq(
             read(LAZY_TEST_BASE + 8),
             0,

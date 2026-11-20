@@ -27,7 +27,68 @@ pub struct TrapFrame {
     pub sstatus: u64,
 }
 
+/// What kind of exception a trap from user mode was (the same kinds on every architecture; EX2 uses these numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    PageFault,
+    Illegal,
+    Breakpoint,
+    Misaligned,
+    Access,
+    Other,
+}
+
+/// A trap from user mode, decoded: nothing outside `arch` reads a cause register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fault {
+    pub kind: FaultKind,
+    /// The faulting address (for a page fault, an access fault or a misaligned access).
+    pub address: u64,
+    /// The program counter of the trapping instruction.
+    pub pc: u64,
+    /// The access that faulted, for a page fault.
+    pub access: Option<Access>,
+    /// The architecture's raw cause value: the exit code of an unhandled fault is `-1000 - code` until AR1d
+    /// replaces it with the kind.
+    pub code: u64,
+}
+
+/// A trap from user mode: a system call or a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserTrap {
+    Syscall,
+    Fault(Fault),
+}
+
 impl TrapFrame {
+    /// Decode a trap taken from user mode.
+    pub fn decode_user(&self) -> UserTrap {
+        let (kind, access) = match self.scause {
+            8 => return UserTrap::Syscall,
+            12 => (FaultKind::PageFault, Some(Access::Exec)),
+            13 => (FaultKind::PageFault, Some(Access::Read)),
+            15 => (FaultKind::PageFault, Some(Access::Write)),
+            2 => (FaultKind::Illegal, None),
+            3 => (FaultKind::Breakpoint, None),
+            0 | 4 | 6 => (FaultKind::Misaligned, None),
+            1 | 5 | 7 => (FaultKind::Access, None),
+            _ => (FaultKind::Other, None),
+        };
+        UserTrap::Fault(Fault {
+            kind,
+            address: self.stval,
+            pc: self.sepc,
+            access,
+            code: self.scause,
+        })
+    }
+
+    /// Step past the instruction that trapped (a system call returns to the next instruction).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the program counter of a user trap is a user address, far from u64::MAX
+    pub fn skip_trap_instruction(&mut self) {
+        self.sepc += 4;
+    }
+
     /// The user's register `x{n}` (a0 is 10, a7 is 17).
     #[allow(clippy::indexing_slicing)] // INVARIANT: n < 32, the register count of the trap frame (callers pass constants)
     pub fn arg(&self, n: usize) -> u64 {
@@ -268,14 +329,14 @@ pub fn init() {
 // handler then records it and steps over the faulting instruction instead of
 // dying. (The refusal itself is what is being tested.)
 static EXPECT: AtomicBool = AtomicBool::new(false);
-static LOG_CAUSE: AtomicU64 = AtomicU64::new(0);
+static LOG_ACCESS: AtomicU64 = AtomicU64::new(0);
 static LOG_ADDR: AtomicU64 = AtomicU64::new(0);
 static LOG_ERROR: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// A refused fault, as the handler saw it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Refused {
-    pub cause: u64,
+    pub access: Access,
     pub addr: u64,
     pub error: FaultError,
 }
@@ -306,7 +367,11 @@ pub fn expect_refused(access: impl FnOnce()) -> Option<Refused> {
         _ => return None,
     };
     Some(Refused {
-        cause: LOG_CAUSE.load(Ordering::SeqCst),
+        access: match LOG_ACCESS.load(Ordering::SeqCst) {
+            1 => Access::Write,
+            2 => Access::Exec,
+            _ => Access::Read,
+        },
         addr: LOG_ADDR.load(Ordering::SeqCst),
         error,
     })
@@ -537,7 +602,14 @@ fn trap_body(frame: &mut TrapFrame) {
         // Only data faults can be stepped over: after an instruction-fetch fault
         // `sepc` is the unmapped target, not an instruction we can skip.
         Err(error) if cause != 12 && EXPECT.swap(false, Ordering::SeqCst) => {
-            LOG_CAUSE.store(cause, Ordering::SeqCst);
+            LOG_ACCESS.store(
+                match access {
+                    Access::Read => 0,
+                    Access::Write => 1,
+                    Access::Exec => 2,
+                },
+                Ordering::SeqCst,
+            );
             LOG_ADDR.store(frame.stval, Ordering::SeqCst);
             LOG_ERROR.store(error_code(error), Ordering::SeqCst);
             frame.sepc += instruction_length(frame.sepc);

@@ -21,11 +21,11 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
+use crate::arch::Context;
 use crate::{heap, irq};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::sched::{Prio, State, Tid};
@@ -77,66 +77,6 @@ const GUARD_WORDS: usize = 8;
 #[allow(clippy::indexing_slicing)] // INVARIANT: the stack is a whole stack (many words): GUARD_WORDS is far below its length
 fn guard_intact(stack: &[u64]) -> bool {
     stack[..GUARD_WORDS].iter().all(|&w| w == CANARY)
-}
-
-/// Callee-saved state, saved and restored by `context_switch`.
-#[repr(C)]
-#[derive(Default)]
-struct Context {
-    ra: u64,
-    sp: u64,
-    s: [u64; 12],
-}
-
-global_asm!(
-    r#"
-    .section .text
-    .globl context_switch
-    .balign 4
-context_switch:                  # a0 = old *mut Context, a1 = new *const Context
-    sd   ra,   0(a0)
-    sd   sp,   8(a0)
-    sd   s0,  16(a0)
-    sd   s1,  24(a0)
-    sd   s2,  32(a0)
-    sd   s3,  40(a0)
-    sd   s4,  48(a0)
-    sd   s5,  56(a0)
-    sd   s6,  64(a0)
-    sd   s7,  72(a0)
-    sd   s8,  80(a0)
-    sd   s9,  88(a0)
-    sd   s10, 96(a0)
-    sd   s11, 104(a0)
-    ld   ra,   0(a1)
-    ld   sp,   8(a1)
-    ld   s0,  16(a1)
-    ld   s1,  24(a1)
-    ld   s2,  32(a1)
-    ld   s3,  40(a1)
-    ld   s4,  48(a1)
-    ld   s5,  56(a1)
-    ld   s6,  64(a1)
-    ld   s7,  72(a1)
-    ld   s8,  80(a1)
-    ld   s9,  88(a1)
-    ld   s10, 96(a1)
-    ld   s11, 104(a1)
-    ret
-
-    .globl thread_trampoline
-    .balign 4
-thread_trampoline:               # a new thread's first instruction (via `ret` above)
-    mv   a0, s0                  # entry
-    mv   a1, s1                  # argument
-    call thread_bootstrap
-    ebreak
-"#
-);
-
-extern "C" {
-    fn context_switch(old: *mut Context, new: *const Context);
-    fn thread_trampoline();
 }
 
 struct KThread {
@@ -449,11 +389,7 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
     let mut stack = crate::kstack::alloc().expect("memory for a kernel stack");
     stack[..GUARD_WORDS].fill(CANARY);
     let top = stack.top();
-    let mut ctx = Box::<Context>::default();
-    ctx.ra = thread_trampoline as *const () as u64;
-    ctx.sp = (top & !15) as u64;
-    ctx.s[0] = entry as usize as u64;
-    ctx.s[1] = arg as u64;
+    let ctx = Context::new(entry as usize, arg, top);
     KThread {
         ctx,
         stack: Some(stack),
@@ -619,7 +555,7 @@ fn reschedule() {
     // switch saves this thread's state and resumes the other's, as `context_switch`
     // documents. Interrupts are off, the big kernel lock was released just above, and no
     // reference to KERNEL is live.
-    unsafe { context_switch(old, new) };
+    unsafe { crate::arch::switch(old, new) };
     // (resumed: on whichever hart now runs this thread, the switch that brought it here has finished saving the one before)
     switch_done();
     crate::bkl::reacquire(depth);

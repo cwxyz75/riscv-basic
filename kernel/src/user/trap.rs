@@ -62,21 +62,18 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
 
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: sepc + 4 steps past an ecall; the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
+#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
 pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
-    let cause = frame.scause;
-    match cause {
-        8 => {
-            frame.sepc += 4; // past the ecall
+    use crate::arch::{FaultKind, UserTrap};
+    match frame.decode_user() {
+        UserTrap::Syscall => {
+            frame.skip_trap_instruction(); // past the call instruction
             syscall(frame);
         }
-        12 | 13 | 15 => {
-            let access = match cause {
-                12 => Access::Exec,
-                13 => Access::Read,
-                _ => Access::Write,
-            };
-            let va = frame.stval;
+        UserTrap::Fault(fault) if fault.kind == FaultKind::PageFault => {
+            let cause = fault.code;
+            let access = fault.access.unwrap_or(Access::Read);
+            let va = fault.address;
             let resolved = {
                 let pid = state().thread_pid.get(&thread::current()).copied();
                 match pid {
@@ -132,7 +129,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         &mut crate::console::Console,
                         format_args!(
                             "kernel: user fault, cause {cause}, pc {:#x}, address {va:#x}, ra {:#x}, sp {:#x}\n",
-                            frame.sepc,
+                            fault.pc,
                             frame.arg(1),
                             frame.arg(2)
                         ),
@@ -141,12 +138,14 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                 exit_process(-1000 - cause as i32);
             }
         }
-        2 if crate::fp::first_use(frame) => {
+        UserTrap::Fault(fault)
+            if fault.kind == FaultKind::Illegal && crate::fp::first_use(frame) =>
+        {
             // The first floating-point instruction of this thread (slice A): the unit is now enabled
             // for it, from zeros; the instruction is retried. (A real illegal instruction traps again
             // with the unit on and ends the process below.)
         }
-        _ => exit_process(-1000 - cause as i32),
+        UserTrap::Fault(fault) => exit_process(-1000 - fault.code as i32),
     }
 }
 
