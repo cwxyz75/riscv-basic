@@ -4,7 +4,6 @@ kind: slice
 title: Handles become 64 bits (24 slot bits, 40 generation bits): one flag-day change
 area: kernel
 horizon: long
-blocked_by: [TS3]
 refs: [KERNEL-V1-SPEC, OD129]
 ---
 

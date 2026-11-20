@@ -56,10 +56,20 @@ jobs:
       - run: python3 scripts/check_docs.py
       - run: cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
       - run: cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
-      - name: OS crates under the loom and shuttle model checkers
-        run: make os-test
       - name: Check the demo pictures against the independent renderer
         run: python3 home/scripts/verify_demo_images.py
+
+  # The loom and shuttle model checkers, apart from the host tests so the two run side by side (about 3.5 minutes each).
+  models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: OS crates under the loom and shuttle model checkers
+        run: make os-models
 
   # Tier 1: the suite boots twice on the default (AIA) machine at four harts, as two parallel jobs (OD121: shard `b` is the network tests and
   # the three heaviest stress tests, `a` is the rest; the harness checks each ran only its part), and the release smoke is a third.
