@@ -98,7 +98,7 @@ The profile is the guide: do not guess.
 
 ## Moving logic out of QEMU (slice TS step 3, done incrementally)
 
-* The syscall layer (`kernel/src/user.rs`, about 2,900 lines) behind a small `Machine` trait (copy in and out, the current
+* The syscall layer (`kernel/src/user/`, about 2,300 lines in eight files, with the pure half in `ksys`) behind a small `Machine` trait (copy in and out, the current
   process, the clock), so argument errors, rights, quotas and accounting run on the host against the real code with a fake
   machine; the matching suite tests move over as each piece lands.
 * Server protocols (memfsd, devmgr, launcher, blkd): host harnesses that drive a server's logic over in-memory channels; the
@@ -263,7 +263,7 @@ coverage 92.3 %, functions 90.7 %. By file, the lowest: `abi/src/lib.rs` 55.7 % 
 tests), `ksys/src/vmo.rs` 59.1 % (the success paths of the physical and DMA VMO calls need a resource handle in the fake machine), `kcore/src/object.rs` 87.0 %, `kcore/src/ticket.rs`
 86.1 % (the lock's contention paths are modelled under loom and shuttle, which this run does not include), `kcore/src/frame.rs` 86.2 %, `kcore/src/wait.rs` 88.4 %,
 `kcore/src/sched.rs` 88.4 %, `kcore/src/sched_smp.rs` 89.1 %; everything else is above 90 %. Branch coverage needs a nightly compiler and is not measured. `ksys` is
-the host build of the syscall layer: the files of `kernel/src/user.rs` that TS3 has moved appear here (`ksys/src/{lib,vmo,job,proc,lifecycle}.rs`), the rest of `user.rs` is
+the host build of the syscall layer: the code of `kernel/src/user/` that TS3 has moved appear here (`ksys/src/{lib,vmo,job,proc,lifecycle}.rs`), the rest of `user.rs` is
 not on the host and not in this report. T175 names the functions the two files below 80 % do not reach.
 
 ## Fuzzing the syscall layer on the host (KT8, first half)

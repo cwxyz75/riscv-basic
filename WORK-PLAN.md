@@ -81,7 +81,7 @@ Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 Why here: the scheduler glue is stable after phase 2, and everything after this phase changes the syscall layer, so it should
 be host-testable, fuzzable and covered before that starts.
 
-- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`: a (PR 276), b (PRs 277, 278, 279: VMO, job and process-table calls, the process record) and the decision half of kill/suspend/job_kill/scheduling (PR 280) are merged; `user.rs` is 2.7 thousand lines, not 600: `process_create`/`start`, `thread_*`, waits, futexes and `channel_call` still need the scheduler behind the seam
+- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`: a (PR 276), b (PRs 277, 278, 279: VMO, job and process-table calls, the process record) and the decision half of kill/suspend/job_kill/scheduling (PR 280) are merged; UserState, `thread_create`/`spawn` and `process_create`/`start` are in `ksys` too (PRs 294 to 296 and the next), and `kernel/src/user.rs` is the directory `kernel/src/user/` (no file over 507 lines); what is left is the decision half of the waits, futexes and `channel_call`, which need the blocking-outcome type
 - [x] **KT6** (PR 281) tier 3, the long-run workflow (manual start only)
 - [x] **KT7** (PR 284) schedule perturbation
 - [x] **KT10** (PR 286) automated mutation testing
