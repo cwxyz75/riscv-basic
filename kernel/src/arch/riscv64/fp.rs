@@ -29,7 +29,7 @@ static STATE: Cell = Cell(UnsafeCell::new(None));
 
 /// Build the FP bookkeeping once into `slot` (its per-hart array is MAX_HARTS entries: out of line, so `state` has a small frame).
 #[inline(never)]
-#[allow(clippy::large_stack_frames)] // KT13: audited, once at first use, on the boot thread's stack
+#[allow(clippy::large_stack_frames)] // KT13: audited, once, at the first use of the FP state
 fn init_state(slot: &mut Option<FpState>) {
     *slot = Some(FpState {
         tokens: Tokens::new(),

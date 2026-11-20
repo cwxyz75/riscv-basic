@@ -96,7 +96,13 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
     let ids: alloc::vec::Vec<u32> = crate::dtb::dtb_blob()
         .and_then(|b| kcore::fdt::parse(b).ok())
         .and_then(|nodes| kcore::harts::hart_ids(&nodes, boot_hart_id as u32))
-        .unwrap_or_else(|| alloc::vec![boot_hart_id as u32]);
+        .unwrap_or_else(|| {
+            let _ = writeln!(
+                Console,
+                "the tree does not list the boot hart {boot_hart_id}: one hart"
+            );
+            alloc::vec![boot_hart_id as u32]
+        });
     let mut next = 1;
     for &id in ids.iter().skip(1) {
         let id = id as usize;
@@ -138,7 +144,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
     }
     STARTED.store(next, Ordering::SeqCst);
     // wait (bounded) for every started hart
-    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000); // 2 s
+    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * next as u64); // 2 s and 0.1 s per hart (emulated harts start slowly)
     for i in 1..next {
         while !percpu::hart(i).online.load(Ordering::Acquire) {
             if timer::now() > deadline {
