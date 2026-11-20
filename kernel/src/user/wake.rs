@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// A PLIC source fired (trap context, BKL held): hand it to the interrupt object that owns it.
+/// An interrupt source fired (trap context, BKL held): hand it to the interrupt object that owns it.
 pub fn irq_fired(irq: u32) -> bool {
     let s = state();
     let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {

@@ -7,7 +7,10 @@
 
 pub mod aia {
     pub const PAGE_COUNT: usize = 0;
-    pub fn discover(nodes: &[kcore::fdt::Node]) {
+    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+        unimplemented!()
+    }
+    pub fn source_known(irq: u32) -> bool {
         unimplemented!()
     }
     pub fn slots() -> usize {

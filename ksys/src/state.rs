@@ -50,7 +50,7 @@ pub struct UserState {
     /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
     /// signals match, instead of by the global queue.
     pub waits: kcore::wait::WaitTable,
-    /// The interrupt object that owns each PLIC source (S6a-2).
+    /// The interrupt object that owns each interrupt source (S6a-2).
     /// The interrupt object that owns each source, by source number: sized once at boot to the controller's source count (`with_irq_slots`;
     /// empty without a controller) and never grown, so no syscall allocates here.
     pub irq_objs: alloc::vec::Vec<Option<kcore::object::ObjId>>,

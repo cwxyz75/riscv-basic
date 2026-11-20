@@ -26,11 +26,33 @@ pub fn info() -> Option<&'static kcore::aiatree::Aia> {
 /// Pages of the APLIC the kernel maps: domaincfg, sourcecfg, the set/clear banks and the targets.
 pub const PAGE_COUNT: usize = 4;
 
-/// Read the interrupt controller out of the parsed tree and size the per-source state (needs the heap).
-pub fn discover(nodes: &[kcore::fdt::Node]) {
+/// The sources of the admitted devices, whatever controller they go to: what `interrupt_create` may be asked for (set once at boot). A machine
+/// without a usable AIA still knows them, so the call says NOT_SUPPORTED there and INVALID_ARGS for a source no device has.
+static mut KNOWN: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+
+/// Is `irq` a source of an admitted device?
+pub fn source_known(irq: u32) -> bool {
+    // SAFETY: written once by `discover` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { (&*core::ptr::addr_of!(KNOWN)).binary_search(&irq).is_ok() }
+}
+
+/// Read the interrupt controller out of the parsed tree and size the per-source state (needs the heap). `ram` is every range that is RAM or
+/// reserved: a controller whose registers lie in it, or beyond the direct map, is not used (it would alias memory the kernel owns).
+pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+    // SAFETY: boot code, one hart, before anything reads it.
+    unsafe { *core::ptr::addr_of_mut!(KNOWN) = kcore::aiatree::device_sources(nodes) };
     let Some(aia) = kcore::aiatree::discover(nodes) else {
         return;
     };
+    let span = (aia.aplic_base, PAGE_COUNT as u64 * 0x1000);
+    let end = span.0.saturating_add(span.1);
+    if end > abi::layout::DIRECT_MAP_PHYS_LIMIT
+        || ram
+            .iter()
+            .any(|&(a, s)| span.0 < a.saturating_add(s) && a < end)
+    {
+        return;
+    }
     let aimed: alloc::vec::Vec<AtomicUsize> = (0..=aia.num_sources)
         .map(|_| AtomicUsize::new(usize::MAX))
         .collect();

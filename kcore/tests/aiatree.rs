@@ -4,7 +4,7 @@
 //! the admitted devices name: virtio-mmio 1 to 8 and the RTC, 11. Synthetic trees cover hart ids that are not dense or not in order.
 mod common;
 use common::Dt;
-use kcore::aiatree::discover;
+use kcore::aiatree::{device_sources, discover};
 use kcore::fdt;
 
 const ONE: &[u8] = include_bytes!("fixtures/virt-aia.dtb");
@@ -71,6 +71,7 @@ fn machine(
         })
         .collect();
     d.u32s("interrupts-extended", &ext);
+    d.reg(&[(0x2800_0000, 0x4000)]);
     d.prop("compatible", b"riscv,imsics\0");
     d.end();
     d.begin("aplic@d000000");
@@ -159,4 +160,240 @@ fn a_controller_without_message_delivery_or_without_harts_is_not_usable() {
     // an IMSIC that lists no harts
     let t = machine(&[0], &[], &[], 96);
     assert_eq!(discover(&fdt::parse(&t).unwrap()), None);
+}
+
+/// A tree whose M-level APLIC (it has children) and M-level IMSIC come first in the blob, with another base and another hart order, then the
+/// S-level pair: the S-level controller and its own IMSIC must be the ones used. Extra knobs for the odd shapes below.
+fn two_levels(
+    imsic_extra: &dyn Fn(&mut Dt),
+    aplic_sources: u32,
+    s_irq_cell: u32,
+    devices: &[(u32, bool)],
+) -> Vec<u8> {
+    let mut d = Dt::new();
+    d.begin("");
+    d.u32s("#address-cells", &[2]);
+    d.u32s("#size-cells", &[2]);
+    d.u32s("interrupt-parent", &[0x10]);
+    d.begin("cpus");
+    for id in 0..3u32 {
+        d.begin(&format!("cpu@{id}"));
+        d.u32s("reg", &[id]);
+        d.u32s("phandle", &[0x100 + id * 2]);
+        d.begin("interrupt-controller");
+        d.u32s("phandle", &[0x101 + id * 2]);
+        d.end();
+        d.end();
+    }
+    d.end();
+    d.begin("soc");
+    d.u32s("#address-cells", &[2]);
+    d.u32s("#size-cells", &[2]);
+    d.prop("ranges", &[]);
+    // machine level first: another base, children, a different order and the machine external interrupt (11)
+    d.begin("imsic@24000000");
+    d.u32s("phandle", &[0x21]);
+    d.u32s("interrupts-extended", &[0x105, 11, 0x103, 11, 0x101, 11]);
+    d.reg(&[(0x2400_0000, 0x4000)]);
+    d.prop("compatible", b"riscv,imsics\0");
+    d.end();
+    d.begin("aplic@c000000");
+    d.u32s("phandle", &[0x11]);
+    d.reg(&[(0xc00_0000, 0x8000)]);
+    d.u32s("riscv,num-sources", &[96]);
+    d.u32s("msi-parent", &[0x21]);
+    d.u32s("riscv,children", &[0x10]);
+    d.prop("compatible", b"riscv,aplic\0");
+    d.end();
+    // supervisor level
+    d.begin("imsic@28000000");
+    d.u32s("phandle", &[0x20]);
+    d.u32s(
+        "interrupts-extended",
+        &[0x101, s_irq_cell, 0x103, s_irq_cell, 0x105, s_irq_cell],
+    );
+    d.reg(&[(0x2800_0000, 0x4000)]);
+    imsic_extra(&mut d);
+    d.prop("compatible", b"riscv,imsics\0");
+    d.end();
+    d.begin("aplic@d000000");
+    d.u32s("phandle", &[0x10]);
+    d.reg(&[(0xd00_0000, 0x8000)]);
+    d.u32s("riscv,num-sources", &[aplic_sources]);
+    d.u32s("msi-parent", &[0x20]);
+    d.prop("compatible", b"riscv,aplic\0");
+    d.end();
+    for (i, (src, with_ext)) in devices.iter().enumerate() {
+        d.begin(&format!("dev@{:x}", 0x1000_0000 + i * 0x1000));
+        d.prop("compatible", b"virtio,mmio\0");
+        d.reg(&[(0x1000_0000 + i as u64 * 0x1000, 0x1000)]);
+        d.u32s("interrupts", &[*src, 4]);
+        if *with_ext {
+            d.u32s("interrupts-extended", &[0x10, *src, 4]);
+        }
+        d.end();
+    }
+    d.end();
+    d.end();
+    d.finish()
+}
+
+#[test]
+fn the_supervisor_controller_and_its_own_imsic_are_chosen_over_the_machine_level_pair() {
+    let t = two_levels(&|_| {}, 96, 9, &[(5, false)]);
+    let a = discover(&fdt::parse(&t).unwrap()).unwrap();
+    assert_eq!(a.aplic_base, 0xd00_0000, "the one without children");
+    assert_eq!(
+        a.hart_order,
+        vec![0, 1, 2],
+        "its own IMSIC's order, not the machine level's (2, 1, 0)"
+    );
+    assert_eq!(a.sources, vec![5]);
+    // an IMSIC that lists the machine external interrupt (11) is not the supervisor's file
+    let t = two_levels(&|_| {}, 96, 11, &[(5, false)]);
+    assert_eq!(discover(&fdt::parse(&t).unwrap()), None);
+}
+
+#[test]
+fn the_source_limits_are_exact() {
+    // each of: 63 (the last an eie register holds), 64 (past it), the controller's own count as a source, one past it
+    let t = two_levels(&|_| {}, 63, 9, &[(63, false), (64, false), (62, false)]);
+    assert_eq!(
+        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
+        vec![62, 63]
+    );
+    let t = two_levels(&|_| {}, 63, 9, &[(63, false)]);
+    assert_eq!(
+        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
+        vec![63],
+        "source == num-sources is a source"
+    );
+    let t = two_levels(&|_| {}, 62, 9, &[(63, false), (62, false)]);
+    assert_eq!(
+        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
+        vec![62],
+        "one past the count is not"
+    );
+    // on a big controller the 63 bound alone decides: 64 does not fit the one `eie` register the kernel opens
+    let t = two_levels(&|_| {}, 96, 9, &[(64, false), (63, false), (65, false)]);
+    assert_eq!(
+        discover(&fdt::parse(&t).unwrap()).unwrap().sources,
+        vec![63]
+    );
+    // an APLIC has at most 1023 sources
+    assert_eq!(
+        discover(&fdt::parse(&two_levels(&|_| {}, 1024, 9, &[(5, false)])).unwrap()),
+        None
+    );
+    assert!(discover(&fdt::parse(&two_levels(&|_| {}, 1023, 9, &[(5, false)])).unwrap()).is_some());
+    assert_eq!(
+        discover(&fdt::parse(&two_levels(&|_| {}, 0, 9, &[(5, false)])).unwrap()),
+        None
+    );
+    assert_eq!(
+        discover(&fdt::parse(&two_levels(&|_| {}, 0xffff_ffff, 9, &[(5, false)])).unwrap()),
+        None
+    );
+}
+
+#[test]
+fn imsic_groups_are_refused_and_a_device_that_names_its_parents_elsewhere_is_not_read() {
+    // several groups change how the hart index is formed: not read, fail closed
+    let t = two_levels(
+        &|d| d.u32s("riscv,group-index-bits", &[1]),
+        96,
+        9,
+        &[(5, false)],
+    );
+    assert_eq!(discover(&fdt::parse(&t).unwrap()), None);
+    let t = two_levels(
+        &|d| d.u32s("riscv,group-index-bits", &[0]),
+        96,
+        9,
+        &[(5, false)],
+    );
+    assert!(
+        discover(&fdt::parse(&t).unwrap()).is_some(),
+        "zero group bits is the single-group layout"
+    );
+    let t = two_levels(
+        &|d| d.reg(&[(0x2800_0000, 0x4000), (0x2900_0000, 0x4000)]),
+        96,
+        9,
+        &[(5, false)],
+    );
+    // (a second `reg` property replaces the first in this builder; the real two-region case is the one `regs()` counts)
+    let _ = t;
+    // a device with interrupts-extended names its parents itself
+    let t = two_levels(&|_| {}, 96, 9, &[(5, true), (6, false)]);
+    assert_eq!(discover(&fdt::parse(&t).unwrap()).unwrap().sources, vec![6]);
+}
+
+#[test]
+fn the_sources_of_admitted_devices_are_known_without_any_controller() {
+    // a machine with a PLIC (no APLIC): the virtio sources are still the devices' (the call then says NOT_SUPPORTED, not INVALID_ARGS)
+    let nodes = fdt::parse(NO_AIA).unwrap();
+    assert_eq!(discover(&nodes), None);
+    assert_eq!(device_sources(&nodes), vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+    let nodes = fdt::parse(FOUR).unwrap();
+    assert_eq!(device_sources(&nodes), vec![1, 2, 3, 4, 5, 6, 7, 8, 11]);
+}
+
+#[test]
+fn a_device_behind_an_interrupt_nexus_does_not_inherit_the_roots_parent() {
+    let mut d = Dt::new();
+    d.begin("");
+    d.u32s("#address-cells", &[2]);
+    d.u32s("#size-cells", &[2]);
+    d.u32s("interrupt-parent", &[0x10]);
+    d.begin("cpus");
+    d.begin("cpu@0");
+    d.u32s("reg", &[0]);
+    d.u32s("phandle", &[0x100]);
+    d.begin("interrupt-controller");
+    d.u32s("phandle", &[0x101]);
+    d.end();
+    d.end();
+    d.end();
+    d.begin("soc");
+    d.u32s("#address-cells", &[2]);
+    d.u32s("#size-cells", &[2]);
+    d.prop("ranges", &[]);
+    d.begin("imsic@28000000");
+    d.u32s("phandle", &[0x20]);
+    d.u32s("interrupts-extended", &[0x101, 9]);
+    d.reg(&[(0x2800_0000, 0x4000)]);
+    d.prop("compatible", b"riscv,imsics\0");
+    d.end();
+    d.begin("aplic@d000000");
+    d.u32s("phandle", &[0x10]);
+    d.reg(&[(0xd00_0000, 0x8000)]);
+    d.u32s("riscv,num-sources", &[96]);
+    d.u32s("msi-parent", &[0x20]);
+    d.prop("compatible", b"riscv,aplic\0");
+    d.end();
+    d.begin("bridge"); // an interrupt nexus: its children's interrupts are local numbers, not the APLIC's sources
+    d.u32s("#address-cells", &[2]);
+    d.u32s("#size-cells", &[2]);
+    d.prop("interrupt-map", &[]);
+    d.prop("ranges", &[]);
+    d.begin("dev@1000");
+    d.prop("compatible", b"virtio,mmio\0");
+    d.reg(&[(0x1000, 0x1000)]);
+    d.u32s("interrupts", &[3]);
+    d.end();
+    d.end();
+    d.begin("dev@2000");
+    d.prop("compatible", b"virtio,mmio\0");
+    d.reg(&[(0x2000, 0x1000)]);
+    d.u32s("interrupts", &[4]);
+    d.end();
+    d.end();
+    d.end();
+    let a = discover(&fdt::parse(&d.finish()).unwrap()).unwrap();
+    assert_eq!(
+        a.sources,
+        vec![4],
+        "the device under the nexus is not the APLIC's"
+    );
 }

@@ -220,13 +220,13 @@ pub fn init() {
         let nodes = crate::dtb::dtb_blob()
             .and_then(|b| kcore::fdt::parse(b).ok())
             .unwrap_or_default();
-        crate::aia::discover(&nodes);
+        let ram: alloc::vec::Vec<(u64, u64)> =
+            memory.iter().chain(reserved.iter()).copied().collect();
+        crate::aia::discover(&nodes, &ram);
         let mut driven: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
         driven.extend(crate::console::base().map(|b| (b, 0x1000)));
         driven.extend(crate::finisher::base().map(|b| (b, 0x1000)));
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
-        let ram: alloc::vec::Vec<(u64, u64)> =
-            memory.iter().chain(reserved.iter()).copied().collect();
         let windows = kcore::devwin::device_windows(&nodes, &driven, &ram);
         // SAFETY: boot code, one hart, before anything reads it.
         unsafe { *addr_of_mut!(WINDOWS) = windows };
@@ -304,7 +304,7 @@ pub fn init() {
     let token = crate::arch::aspace_token(root);
     KERNEL_ASPACE.store(token, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the new table maps everything the kernel is executing from and
-    // touching: text, rodata, data/bss/stack, the direct map and the two devices;
+    // touching: text, rodata, data/bss/stack, the direct map and the devices;
     // installing it drops the translations of the early table.
     unsafe { crate::arch::aspace_install(token) };
 }
