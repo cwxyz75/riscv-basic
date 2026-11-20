@@ -2,7 +2,7 @@
 //! domain's APLIC in MSI mode, and each hart's own IMSIC supervisor file, reached through the
 //! indirect CSRs (`siselect`/`sireg`/`stopei`, the Ssaia extension).
 //!
-//! Source `n` (1..=`MAX_IRQ`) is delivered as message id `n` to the hart that asked for it
+//! A source a process may take (the tree's admitted devices' interrupts, `kcore::aiatree`) is delivered as message id `n` to the hart that asked for it
 //! (`enable` points the source's target at the calling hart). Every hart enables all of the ids
 //! in its own IMSIC at start, so retargeting is one APLIC write, never a cross-hart call. A source that fires is **masked** at the APLIC by the trap handler and unmasked by
 //! `interrupt_ack`, so a level-triggered line cannot storm. There is no claim to hold open: the
@@ -13,19 +13,58 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// The supervisor-domain APLIC of the `virt` board (checked against the device tree at start).
-pub const APLIC_BASE: u64 = 0x0d00_0000;
-/// Pages of it the kernel maps: domaincfg, sourcecfg, the set/clear banks and the targets.
+/// What the device tree says about the interrupt controller (`discover`, called by `kmem::init` once the tree is parsed); `None` on a
+/// machine without a message-signalled APLIC (PL5c).
+static mut INFO: Option<kcore::aiatree::Aia> = None;
+
+/// The APLIC and its IMSIC as the tree describes them.
+pub fn info() -> Option<&'static kcore::aiatree::Aia> {
+    // SAFETY: written once by `discover` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { (*core::ptr::addr_of!(INFO)).as_ref() }
+}
+
+/// Pages of the APLIC the kernel maps: domaincfg, sourcecfg, the set/clear banks and the targets.
 pub const PAGE_COUNT: usize = 4;
 
+/// Read the interrupt controller out of the parsed tree and size the per-source state (needs the heap).
+pub fn discover(nodes: &[kcore::fdt::Node]) {
+    let Some(aia) = kcore::aiatree::discover(nodes) else {
+        return;
+    };
+    let aimed: alloc::vec::Vec<AtomicUsize> = (0..=aia.num_sources)
+        .map(|_| AtomicUsize::new(usize::MAX))
+        .collect();
+    // SAFETY: boot code, one hart, before anything reads them.
+    unsafe {
+        *core::ptr::addr_of_mut!(AIMED) = aimed;
+        *core::ptr::addr_of_mut!(INFO) = Some(aia);
+    }
+}
+
+/// The physical pages of the APLIC the kernel maps (none without one).
 pub fn pages() -> impl Iterator<Item = u64> {
-    (0..PAGE_COUNT as u64).map(|i| APLIC_BASE + i * 0x1000)
+    let base = info().map(|i| i.aplic_base);
+    (0..PAGE_COUNT as u64).filter_map(move |i| base.map(|b| b + i * 0x1000))
+}
+
+/// The number of slots an interrupt-object table needs: one per source plus the unused 0 (zero without a controller).
+pub fn slots() -> usize {
+    info().map_or(0, |i| i.num_sources as usize + 1)
+}
+
+/// May a process take source `irq`? Only the sources the admitted devices name in the tree (virtio-mmio and the RTC on `virt`).
+pub fn irq_allowed(irq: u32) -> bool {
+    info().is_some_and(|i| i.sources.binary_search(&irq).is_ok())
 }
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
-/// The hart each source was last aimed at (`enable`), to check delivery went where it was asked.
-static AIMED: [AtomicUsize; abi::layout::MAX_IRQ as usize + 1] =
-    [const { AtomicUsize::new(usize::MAX) }; abi::layout::MAX_IRQ as usize + 1];
+/// The hart each source was last aimed at (`enable`), to check delivery went where it was asked; one slot per source of the controller.
+static mut AIMED: alloc::vec::Vec<AtomicUsize> = alloc::vec::Vec::new();
+
+fn aimed(irq: u32) -> Option<&'static AtomicUsize> {
+    // SAFETY: sized once by `discover` at boot; the atomics inside are the only thing that changes afterwards.
+    unsafe { (&*core::ptr::addr_of!(AIMED)).get(irq as usize) }
+}
 /// Device interrupts taken, taken on a hart other than the boot hart, and taken on a hart other than
 /// the one the source was aimed at (must stay 0). Read through `debug_stat` 3, 4 and 5.
 static TAKEN: AtomicUsize = AtomicUsize::new(0);
@@ -55,49 +94,27 @@ const DOMAINCFG_IE_MSI: u32 = (1 << 8) | (1 << 2);
 const SM_LEVEL_HIGH: u32 = 6;
 
 fn reg(off: u64) -> *mut u32 {
-    (abi::layout::DIRECT_BASE + APLIC_BASE + off) as *mut u32
+    let base = info().map_or(0, |i| i.aplic_base);
+    (abi::layout::DIRECT_BASE + base + off) as *mut u32
 }
 
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
-/// Look for the supervisor APLIC in the device tree; if it is where the board has it, switch it on
-/// in MSI mode with every source level-high and masked, and bring up this hart's IMSIC.
+/// Switch the supervisor APLIC the tree described on in MSI mode with every source a process may take level-high and masked, and bring up
+/// this hart's IMSIC. Does nothing without a message-signalled APLIC (`discover` found none) or on an APLIC that cannot do MSI mode.
 pub fn init() {
-    let Some(blob) = crate::dtb::dtb_blob() else {
+    let Some(aia) = info() else {
         return;
     };
-    let Ok(nodes) = kcore::fdt::parse(blob) else {
-        return;
-    };
-    // The supervisor domain is the APLIC with no children (the machine-level one, if the firmware
-    // left it in the tree, delegates to it).
-    let Some(node) = nodes
-        .iter()
-        .find(|n| n.is_compatible("riscv,aplic") && n.prop("riscv,children").is_none())
-    else {
-        return;
-    };
-    if node.reg().map(|r| r.0) != Some(APLIC_BASE) {
-        return;
-    }
-    // Message-signalled delivery needs an IMSIC to send to: an APLIC without `msi-parent` (QEMU
-    // `aia=aplic`) is direct-mode only, and the IMSIC CSRs below would not exist.
-    if node.prop("msi-parent").is_none() {
-        return;
-    }
-    let sources = node.u32_prop("riscv,num-sources").unwrap_or(0) as usize;
-    if sources <= abi::layout::MAX_IRQ as usize {
-        return;
-    }
     // SAFETY: the APLIC pages are direct-mapped device memory (`kmem::init`); these are its
     // documented registers: per-source configuration (level high), the target, the enable-clear
     // number register (masked until an interrupt object owns the source), then the domain config.
     unsafe {
-        for s in 1..=abi::layout::MAX_IRQ as u64 {
-            write_volatile(reg(SOURCECFG + 4 * (s - 1)), SM_LEVEL_HIGH);
-            write_volatile(reg(CLRIENUM), s as u32);
+        for &s in &aia.sources {
+            write_volatile(reg(SOURCECFG + 4 * (u64::from(s) - 1)), SM_LEVEL_HIGH);
+            write_volatile(reg(CLRIENUM), s);
         }
         write_volatile(reg(DOMAINCFG), DOMAINCFG_IE_MSI);
         // DM is read-only 0 on an APLIC that cannot do MSI mode: then there is nothing to use.
@@ -109,10 +126,12 @@ pub fn init() {
     PRESENT.store(true, Ordering::SeqCst);
 }
 
-/// Open this hart's IMSIC supervisor file to ids `1..=MAX_IRQ` and allow supervisor external
-/// interrupts on this hart.
+/// Open this hart's IMSIC supervisor file to the ids of the sources a process may take (all below 64: one `eie` register) and allow
+/// supervisor external interrupts on this hart.
 pub fn init_hart() {
-    let ids: usize = ((1usize << (abi::layout::MAX_IRQ + 1)) - 1) & !1;
+    let ids: usize = info().map_or(0, |i| {
+        i.sources.iter().fold(0usize, |m, &s| m | (1usize << s))
+    });
     // SAFETY: Ssaia CSRs of this hart: select the IMSIC's `eidelivery` (0x70) and write 1, its
     // `eithreshold` (0x72) and write 0 (everything passes), then `eie0` (0xC0, ids 0..63) and set
     // the ids used; finally sie.SEIE. These touch only this hart's interrupt-file state.
@@ -153,8 +172,16 @@ pub fn reenable(irq: u32) {
 }
 
 fn aim_and_unmask(irq: u32) {
-    let hart = crate::percpu::this().hart_id.load(Ordering::Relaxed) as u32;
-    AIMED[irq as usize].store(hart as usize, Ordering::Relaxed);
+    let hart_id = crate::percpu::this().hart_id.load(Ordering::Relaxed);
+    // the APLIC target wants the hart's index in the IMSIC's interrupt-file order, which the tree gives (the id is the firmware's)
+    let Some(index) = info().and_then(|i| i.hart_order.iter().position(|&h| h as usize == hart_id))
+    else {
+        return; // a hart the IMSIC does not list cannot take messages: the source stays masked
+    };
+    let hart = index as u32;
+    if let Some(a) = aimed(irq) {
+        a.store(hart_id, Ordering::Relaxed);
+    }
     // SAFETY: the source's target word (hart index in bits 31:18, message id in bits 10:0), then
     // the set-pending and enable-set number registers of the supervisor APLIC. Pending goes first:
     // set while masked it is forwarded exactly once when the enable follows (the reverse order could
@@ -186,7 +213,7 @@ pub fn handle(mut fired: impl FnMut(u32) -> bool) -> bool {
         if id == 0 {
             return any;
         }
-        if id > abi::layout::MAX_IRQ {
+        if !irq_allowed(id) {
             continue;
         }
         disable(id);
@@ -195,7 +222,9 @@ pub fn handle(mut fired: impl FnMut(u32) -> bool) -> bool {
         if this.index.load(Ordering::Relaxed) != 0 {
             TAKEN_OFF_BOOT.fetch_add(1, Ordering::Relaxed);
         }
-        if AIMED[id as usize].load(Ordering::Relaxed) != this.hart_id.load(Ordering::Relaxed) {
+        if aimed(id).map(|a| a.load(Ordering::Relaxed))
+            != Some(this.hart_id.load(Ordering::Relaxed))
+        {
             MISROUTED.fetch_add(1, Ordering::Relaxed);
         }
         if fired(id) {

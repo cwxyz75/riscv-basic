@@ -363,6 +363,19 @@ impl Node {
 }
 
 impl Node {
+    /// A property read as big-endian 32-bit cells (empty if absent; a trailing partial cell is dropped).
+    pub fn cells(&self, name: &str) -> Vec<u32> {
+        self.prop(name)
+            .map(|v| {
+                v.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_be_bytes(*c))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every `(address, size)` pair of `reg`, decoded with the parent's cell counts (a node with several ranges, like a machine with two
     /// banks of RAM, lists them all). Empty if there is no `reg` or the cell counts are unusable.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get` is checked; k is below the cell count read from the blob; the entry size is at most 16 bytes

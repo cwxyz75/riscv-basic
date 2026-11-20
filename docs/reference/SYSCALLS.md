@@ -438,12 +438,13 @@ mapped: nobody can be sleeping on an address the sleeper could not read.)
 
 ### interrupt_create(resource, source) -> status, handle
 
-An interrupt object for AIA source `source` (1..=`MAX_IRQ`, 8: the QEMU `virt` virtio-mmio
-slots; slot *n* is source *n*+1). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
+An interrupt object for AIA source `source`: one of the sources the admitted devices of the device tree name in `interrupts` (`kcore::aiatree`: on
+QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is source *n*+1), and at most 63; every other source, the console's
+included, is refused. `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
 INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`**, and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` re-aims the source at the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
 existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
 interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
-INVALID_ARGS (source 0 or above the range); NOT_SUPPORTED (a machine without an AIA, such as plain `virt`; drivers
+INVALID_ARGS (source 0, not a source of an admitted device, or past 32 bits); NOT_SUPPORTED (a machine without an AIA, such as plain `virt`; drivers
 poll); BAD_STATE (a live object already owns the source); NO_MEMORY.
 
 ### interrupt_ack(interrupt) -> status, claims

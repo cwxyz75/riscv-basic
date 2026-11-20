@@ -70,7 +70,7 @@ fn state() -> &'static mut UserState {
     // before any context switch, so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
-        slot.get_or_insert_with(UserState::new)
+        slot.get_or_insert_with(|| UserState::with_irq_slots(crate::aia::slots()))
     }
 }
 

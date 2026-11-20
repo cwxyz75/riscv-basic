@@ -383,7 +383,8 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         nr::INTERRUPT_CREATE => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
             let irq = a[1];
-            if irq == 0 || irq > u64::from(abi::layout::MAX_IRQ) {
+            // (only the sources the tree's admitted devices name: an unknown source, 0 and a number past 32 bits are refused)
+            if irq == 0 || irq > u64::from(u32::MAX) || !crate::aia::irq_allowed(irq as u32) {
                 return fail(Status::InvalidArgs);
             }
             if !crate::aia::present() {
@@ -402,7 +403,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 &mut quota(p.job),
             ) {
                 Ok((hd, obj)) => {
-                    irq_objs[slot] = Some(obj);
+                    if let Some(s) = irq_objs.get_mut(slot) {
+                        *s = Some(obj);
+                    }
                     crate::aia::enable(irq as u32);
                     Ok((Some(u64::from(hd.0)), None))
                 }

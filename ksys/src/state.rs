@@ -51,7 +51,9 @@ pub struct UserState {
     /// signals match, instead of by the global queue.
     pub waits: kcore::wait::WaitTable,
     /// The interrupt object that owns each PLIC source (S6a-2).
-    pub irq_objs: [Option<kcore::object::ObjId>; abi::layout::MAX_IRQ as usize + 1],
+    /// The interrupt object that owns each source, by source number: sized once at boot to the controller's source count (`with_irq_slots`;
+    /// empty without a controller) and never grown, so no syscall allocates here.
+    pub irq_objs: alloc::vec::Vec<Option<kcore::object::ObjId>>,
     /// Output of user programs, assembled into lines.
     pub line: String,
     pub pass: u32,
@@ -72,6 +74,13 @@ impl UserState {
 }
 
 impl UserState {
+    /// A state with room for `slots` interrupt sources (the controller's source count plus one; 0 without a controller).
+    pub fn with_irq_slots(slots: usize) -> UserState {
+        let mut s = UserState::new();
+        s.irq_objs = alloc::vec![None; slots];
+        s
+    }
+
     pub fn new() -> UserState {
         UserState {
             objs: Kobjs::new(),
@@ -87,7 +96,7 @@ impl UserState {
             ktable: HandleTable::new(256),
             futexes: kcore::futex::Futexes::new(),
             waits: kcore::wait::WaitTable::new(),
-            irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
+            irq_objs: alloc::vec::Vec::new(),
             line: String::new(),
             pass: 0,
             fail: 0,

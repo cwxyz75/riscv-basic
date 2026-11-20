@@ -31,6 +31,17 @@ const NEVER: &[&str] = &[
     "syscon-reboot",
 ];
 
+/// The nodes of a tree that are admitted devices: `compatible` on [`ALLOWED`], not disabled, every bus above them passing addresses through.
+/// (Their `reg` ranges are the windows; their `interrupts` are the sources a process may take, `kcore::aiatree`.)
+pub fn admitted(nodes: &[Node]) -> impl Iterator<Item = &Node> {
+    nodes.iter().filter(move |n| {
+        !NEVER.iter().any(|c| n.is_compatible(c))
+            && ALLOWED.iter().any(|c| n.is_compatible(c))
+            && !disabled(n)
+            && physical(n, nodes)
+    })
+}
+
 /// A node that is disabled (`status` other than `okay`) is not in use: firmware marks the devices it owns that way.
 fn disabled(n: &Node) -> bool {
     n.prop("status").is_some_and(|v| {

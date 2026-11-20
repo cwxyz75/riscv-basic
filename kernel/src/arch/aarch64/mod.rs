@@ -6,8 +6,16 @@
 #![allow(dead_code, unused_variables, clippy::missing_safety_doc)]
 
 pub mod aia {
-    pub const APLIC_BASE: u64 = 0;
     pub const PAGE_COUNT: usize = 0;
+    pub fn discover(nodes: &[kcore::fdt::Node]) {
+        unimplemented!()
+    }
+    pub fn slots() -> usize {
+        unimplemented!()
+    }
+    pub fn irq_allowed(irq: u32) -> bool {
+        unimplemented!()
+    }
     pub fn pages() -> impl Iterator<Item = u64> {
         core::iter::empty()
     }
