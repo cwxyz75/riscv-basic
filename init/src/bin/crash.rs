@@ -1336,6 +1336,7 @@ fn rva23_loop_and_cbo() -> i32 {
             "bnez {n}, 1b",
             a = inout(reg) pa, b = inout(reg) pb, c = inout(reg) pc, n = inout(reg) n,
             vl = out(reg) _, t = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _,
         );
     }
     let _ = (pa, pb, pc, n);

@@ -28,20 +28,26 @@ def newest(name):
 
 
 def main():
-    tool = objdump()
-    if not tool:
-        print("check_vector_codegen: no llvm-objdump, skipped")
-        return 0
     archives = [a for a in (newest("liblua.a"), newest("libctests.a")) if a]
     if not archives:
         print("check_vector_codegen: no C archive was built (no RISC-V clang?), skipped")
         return 0
+    tool = objdump()
+    if not tool:
+        print("check_vector_codegen: FAILED: C archives exist but there is no llvm-objdump to read them (set LLVM_OBJDUMP)")
+        return 1
     total = 0
+    lua = 0
     for a in archives:
         out = subprocess.run([tool, "-d", "--mattr=+v", a], capture_output=True, text=True).stdout
         n = sum(1 for line in out.splitlines() if any(f"\t{m}" in line for m in ("vsetvli", "vsetivli", "vle", "vse", "vadd", "vmv")))
         print(f"check_vector_codegen: {os.path.relpath(a, ROOT)}: {n} vector instructions")
         total += n
+        if os.path.basename(a) == "liblua.a":
+            lua = n
+    if lua == 0 and any(os.path.basename(a) == "liblua.a" for a in archives):
+        print("check_vector_codegen: FAILED: no vector instruction in liblua.a (compiler-generated code: the -march lost the V extension?)")
+        return 1
     if total == 0:
         print("check_vector_codegen: FAILED: no vector instruction in the built C code (the -march lost the V extension?)")
         return 1

@@ -369,7 +369,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 }
 
 /// `clock_get` and `thread_yield` from user mode without the big kernel lock (L12c). False: not one of those, or the return is not
-/// quiet (a kill or stop to look for) or the FP registers are dirty: the full path.
+/// quiet (a kill or stop to look for) or dirty FP or vector registers could not be saved without the lock (`fp::light_save`): the full path.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: sepc + 4 steps past an ecall
 fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     use abi::syscall as nr;
@@ -425,7 +425,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
         // switch threads. A tick that interrupted **user mode** takes it only when something needs it (L12b, below): the return
         // to user mode is where a killed process dies (`activate_current`), which needs the lock, so a kill moves an epoch the tick looks at.
-        // (A thread whose FP state is not Off still takes it at `fp::return_to_user`: tidy T166.)
+        // (A thread whose state is in this hart's FP or vector registers returns with no lock: `fp::return_to_user`, T166.)
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);

@@ -4,7 +4,8 @@
 //! switched on only inside `HartUnit`'s and `VecHartUnit`'s save and load, and every trap from user mode switches both off
 //! again after saving what the user left in them. A user thread starts with both off; its first FP or vector
 //! instruction traps as an illegal instruction and `first_use` enables the right unit (told apart by the instruction `stval` holds, or tried in
-//! turn when it does not). All of this runs under the big kernel lock.
+//! turn when it does not). The saves and loads run under the big kernel lock, except that a thread whose state is already in this hart's registers
+//! (the hart's *claim*, T166) returns to user mode with no lock and `light_save` saves dirty state on the lock-free trap paths.
 
 use crate::trap::TrapFrame;
 use alloc::collections::BTreeMap;
@@ -547,9 +548,14 @@ pub fn thread_gone(tid: u32) {
     ] {
         if let Some(h) = t {
             let p = crate::percpu::hart(h);
-            let cell = if fp { &p.fs_claim } else { &p.vs_claim };
+            let (cell, buf) = if fp {
+                (&p.fs_claim, &p.fs_buf)
+            } else {
+                (&p.vs_claim, &p.vs_buf)
+            };
             if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
                 cell.store(0, core::sync::atomic::Ordering::Release);
+                buf.store(0, core::sync::atomic::Ordering::Release);
             }
         }
     }

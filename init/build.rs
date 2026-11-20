@@ -39,10 +39,15 @@ fn find_clang() -> Option<String> {
 /// extensions spelled out (the same set as `init/.cargo/config.toml`), else the part of that set older clangs (LLVM 17 and later) accept.
 /// The first that compiles an empty file wins.
 fn march_for(clang: &str) -> String {
+    static CHOSEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| probe_march(clang)).clone()
+}
+
+fn probe_march(clang: &str) -> String {
     const CANDIDATES: [&str; 3] = [
         "rva23u64",
         "rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_zicond_zcb_zfa_zihintpause_zicbom_zicboz_zkt_zvbb_zimop_zcmop_zawrs",
-        "rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_zicond_zcb_zfa",
+        "rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_zicond_zcb_zfa_zicbom_zicboz",
     ];
     for m in CANDIDATES {
         let ok = Command::new(clang)
@@ -63,6 +68,9 @@ fn march_for(clang: &str) -> String {
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
+            if m != CANDIDATES[0] {
+                println!("cargo:warning=user C is built with -march={m}: this clang does not know rva23u64");
+            }
             return m.to_string();
         }
     }

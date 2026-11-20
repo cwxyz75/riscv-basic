@@ -18,7 +18,7 @@
 //!   state returns with the unit off.
 //!
 //! Tokens are unique and never reused, so a stale hart (the thread ran elsewhere and changed its
-//! state in between) always reloads. Everything here runs under the big kernel lock.
+//! state in between) always reloads. The model runs under the big kernel lock; the kernel's lock-free paths (claims, `kernel/src/arch/riscv64/fp.rs`) only skip a load or save this model would have done as a no-op or do the save into the same buffer.
 
 use alloc::boxed::Box;
 
