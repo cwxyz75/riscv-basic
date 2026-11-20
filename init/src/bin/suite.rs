@@ -9689,7 +9689,7 @@ fn device_caps_need_the_resource() -> Outcome {
     );
     let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
     ensure!(
-        pa.is_multiple_of(4096) && (0x8000_0000..0x8800_0000).contains(&pa),
+        pa.is_multiple_of(4096) && (0x8000_0000..0x9000_0000).contains(&pa),
         "a RAM address: {pa:#x}"
     );
     ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
@@ -10591,6 +10591,49 @@ fn jobs_do_not_leak() -> Outcome {
     }
     job_use_settles(root, 0, procs0, 500)?;
     sys::handle_close(root);
+    Ok(())
+}
+
+/// MM2: contiguous runs come from the buddy allocator and go back to it. A run of 256 frames (1 MiB) is made and closed many times, and
+/// several live at once (each at its own address, all in RAM), and a run of an odd length rounds up and gives the tail back; the kernel's
+/// final audit says nothing leaked and the free lists merged back.
+fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let mut seen = alloc::vec::Vec::new();
+    for round in 0..40u32 {
+        let v = ok(sys::vmo_create_dma(res, 256), "a 256-page DMA run")?.a1 as u32;
+        let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
+        ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
+        ensure!(
+            (0x8000_0000..0x9000_0000).contains(&pa),
+            "inside RAM: {pa:#x}"
+        );
+        seen.push(pa);
+        sys::handle_close(v);
+    }
+    // several at once: no two overlap
+    let mut live = alloc::vec::Vec::new();
+    for _ in 0..8 {
+        let v = ok(sys::vmo_create_dma(res, 256), "eight runs live at once")?.a1 as u32;
+        live.push((v, ok(sys::vmo_phys_addr(v), "address")?.a1));
+    }
+    for (i, (_, a)) in live.iter().enumerate() {
+        for (_, b) in live.iter().skip(i + 1) {
+            ensure!(
+                a.abs_diff(*b) >= 256 * 4096,
+                "runs {a:#x} and {b:#x} overlap"
+            );
+        }
+    }
+    for (v, _) in live {
+        sys::handle_close(v);
+    }
+    // an odd length, repeatedly: the rounded-up tail must come back each time
+    for _ in 0..40 {
+        let v = ok(sys::vmo_create_dma(res, 37), "a 37-page DMA run")?.a1 as u32;
+        sys::handle_close(v);
+    }
+    sys::handle_close(res);
     Ok(())
 }
 
@@ -12050,6 +12093,10 @@ pub fn app_main() -> i32 {
             job_kill_ends_every_process_below_and_forbids_more,
         ),
         ("jobs_do_not_leak", jobs_do_not_leak),
+        (
+            "dma_runs_are_allocated_and_freed_repeatedly",
+            dma_runs_are_allocated_and_freed_repeatedly,
+        ),
         (
             "a_refused_process_start_changes_nothing_and_can_be_retried",
             a_refused_process_start_changes_nothing_and_can_be_retried,

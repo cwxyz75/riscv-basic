@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod aspace;
+pub mod buddy;
 pub mod chaos;
 pub mod donate;
 pub mod elf;

@@ -13,6 +13,7 @@
 use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, RAM_BASE, RAM_SIZE};
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::aspace::{AddressSpace, Vmos};
+use kcore::buddy::{Meta, META_BYTES};
 use kcore::frame::{FrameDb, PAGE_SIZE};
 use kcore::pagetable::{PageTable, Perms, PhysMem};
 use kcore::Mm;
@@ -118,8 +119,25 @@ pub fn init() {
     // QEMU puts the device tree near the top of RAM; keep the top 2 MiB out of the
     // frame database so it survives until the device manager parses it (S6).
     let end = (RAM_BASE + RAM_SIZE - 2 * 1024 * 1024) / PAGE_SIZE;
+    // The frame metadata (MM2): one `Meta` per managed frame, carved from the first frames after the image, before any allocator exists
+    // and never from the kernel heap. The frames it occupies are not managed (the database starts after them) but are direct-mapped
+    // read-write like the rest of RAM, by the loop below.
+    let meta_frames = ((end - first) as usize * META_BYTES).div_ceil(PAGE_SIZE as usize) as u64;
+    let managed_first = first + meta_frames;
+    let managed = (end - managed_first) as usize;
+    let storage: &'static mut [Meta] = {
+        let at = (DIRECT_BASE + first * PAGE_SIZE) as *mut Meta;
+        // SAFETY: `first .. managed_first` are RAM frames above the kernel image that nothing else uses and the database will not hand
+        // out; the early boot table direct-maps all of RAM; `managed` entries fit in `meta_frames` frames (sized from the larger count
+        // above); an all-zero `Meta` is a valid value, and the slice is cleared before it is formed. It is the only reference to that memory.
+        unsafe {
+            core::ptr::write_bytes(at, 0, managed);
+            core::slice::from_raw_parts_mut(at, managed)
+        }
+    };
     let mut mm = Mm {
-        db: FrameDb::new(first, (end - first) as usize),
+        db: FrameDb::with_ranges(&[(managed_first, managed)], storage)
+            .expect("room for the frame metadata"),
         mem: DirectMap,
     };
     let mut pt = PageTable::new(&mut mm).expect("a frame for the kernel root");
@@ -164,8 +182,8 @@ pub fn init() {
     unsafe { crate::arch::aspace_install(token) };
 }
 
-/// The first frame the frame database manages (everything below it is the kernel
-/// image, the firmware or unused).
+/// The first frame after the kernel image: everything below it is the image, the firmware or unused. (The frame metadata sits just
+/// above it, in frames the database does not manage.)
 pub fn first_managed_frame() -> u64 {
     sections()
         .data

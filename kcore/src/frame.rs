@@ -1,13 +1,17 @@
 //! The frame database: which physical frames exist, who holds them, and the free
-//! list. Reference counts exist from day one so sharing and copy-on-write are not
+//! lists. Reference counts exist from day one so sharing and copy-on-write are not
 //! a redesign later (OS-ARCHITECTURE.md, 6.1).
 //!
 //! Frames are identified by frame number (`Pfn`, the physical address >> 12). The
-//! database manages one contiguous range. An allocated frame has a count of at
-//! least 1; it returns to the free list when the count reaches 0. Misuse (freeing
-//! a free frame, touching a frame outside the range) is an error value, never a
-//! panic, because the callers are driven by user-controlled state.
+//! database manages one or more contiguous ranges, each a buddy allocator (`buddy`,
+//! MM2) over a slice of per-frame metadata that is either on the heap (host tests) or
+//! a slice the caller carved out of boot memory (the kernel: never the heap). An
+//! allocated frame has a count of at least 1; it returns to the free lists when the
+//! count reaches 0. Misuse (freeing a free frame, touching a frame outside the
+//! ranges) is an error value, never a panic, because the callers are driven by
+//! user-controlled state.
 
+use crate::buddy::{Buddy, Meta, MAX_ORDER};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -26,153 +30,196 @@ pub enum FrameError {
     Overflow,
 }
 
+/// Where the per-frame metadata lives.
+enum Storage {
+    Heap(Vec<Meta>),
+    Borrowed(&'static mut [Meta]),
+}
+
+impl Storage {
+    fn get(&self) -> &[Meta] {
+        match self {
+            Storage::Heap(v) => v,
+            Storage::Borrowed(s) => s,
+        }
+    }
+    fn get_mut(&mut self) -> &mut [Meta] {
+        match self {
+            Storage::Heap(v) => v,
+            Storage::Borrowed(s) => s,
+        }
+    }
+}
+
+struct Range {
+    buddy: Buddy,
+    /// Where this range's metadata starts in the storage.
+    off: usize,
+}
+
 pub struct FrameDb {
-    base: Pfn,
-    refs: Vec<u32>,
-    /// A stack of free frames; the next allocation takes the top.
-    free: Vec<Pfn>,
+    ranges: Vec<Range>,
+    storage: Storage,
 }
 
 impl FrameDb {
-    /// A database over frames `base .. base + count`, all free.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: base + count is the frame range the boot code derived from the memory map
+    /// A database over frames `base .. base + count`, all free, with its metadata on the heap (the host tests).
     pub fn new(base: Pfn, count: usize) -> FrameDb {
-        // Pushed in descending order so allocation hands out ascending frames.
-        let free = (base..base + count as u64).rev().collect();
+        let mut storage = Storage::Heap(alloc::vec![Meta::default(); count]);
+        let buddy = Buddy::new(base, count, storage.get_mut());
         FrameDb {
-            base,
-            refs: alloc::vec![0; count],
-            free,
+            ranges: alloc::vec![Range { buddy, off: 0 }],
+            storage,
         }
     }
 
-    fn index(&self, pfn: Pfn) -> Result<usize, FrameError> {
-        pfn.checked_sub(self.base)
-            .filter(|&i| i < self.refs.len() as u64)
-            .map(|i| i as usize)
-            .ok_or(FrameError::NotManaged)
+    /// A database over several ranges (frame number, count), all free, with the metadata in `storage` (the kernel carves it out of boot
+    /// memory before any allocator exists). `None` if `storage` is smaller than [`FrameDb::meta_len`] of the ranges.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: off + count is at most storage.len(), checked first
+    pub fn with_ranges(ranges: &[(Pfn, usize)], storage: &'static mut [Meta]) -> Option<FrameDb> {
+        if storage.len() < FrameDb::meta_len(ranges) {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut off = 0;
+        for &(base, count) in ranges {
+            let buddy = Buddy::new(base, count, &mut storage[off..off + count]);
+            out.push(Range { buddy, off });
+            off += count;
+        }
+        Some(FrameDb {
+            ranges: out,
+            storage: Storage::Borrowed(storage),
+        })
+    }
+
+    /// Entries of metadata the ranges need.
+    pub fn meta_len(ranges: &[(Pfn, usize)]) -> usize {
+        ranges
+            .iter()
+            .map(|r| r.1)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// The range holding `pfn` and the frame's index in the storage.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: off + i is below the storage length (i is inside the range)
+    fn locate(&self, pfn: Pfn) -> Result<(usize, usize), FrameError> {
+        for (r, range) in self.ranges.iter().enumerate() {
+            if let Some(i) = range.buddy.index(pfn) {
+                return Ok((r, range.off + i));
+            }
+        }
+        Err(FrameError::NotManaged)
     }
 
     pub fn total(&self) -> usize {
-        self.refs.len()
+        self.ranges.iter().map(|r| r.buddy.count()).sum()
     }
 
     pub fn free_count(&self) -> usize {
-        self.free.len()
+        self.ranges.iter().map(|r| r.buddy.free_count()).sum()
     }
 
     /// Does the database manage this frame (as opposed to device memory, which it never sees)?
     pub fn is_managed(&self, pfn: Pfn) -> bool {
-        self.index(pfn).is_ok()
+        self.locate(pfn).is_ok()
     }
 
-    /// Take `n` physically contiguous free frames (each with reference count 1); the first
-    /// frame number. `None` if no run of that length is free.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i and start are indices below refs.len(); run counts frames inside the table
-    pub fn alloc_contiguous(&mut self, n: usize) -> Option<Pfn> {
-        if n == 0 || n > self.free.len() {
-            return None;
-        }
-        let mut run = 0usize;
-        let mut start = 0usize;
-        for i in 0..self.refs.len() {
-            if self.refs[i] == 0 {
-                if run == 0 {
-                    start = i;
-                }
-                run += 1;
-                if run == n {
-                    let first = self.base + start as u64;
-                    let taken: alloc::collections::BTreeSet<Pfn> =
-                        (first..first + n as u64).collect();
-                    self.free.retain(|p| !taken.contains(p));
-                    for r in &mut self.refs[start..start + n] {
-                        *r = 1;
-                    }
-                    return Some(first);
-                }
-            } else {
-                run = 0;
+    /// Take a block of `order` from the first range that has one, giving each of its frames a reference count of 1.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the block came off a free list of the range, so off + index .. + 2^order is inside the storage
+    fn take(&mut self, order: usize) -> Option<(usize, Pfn)> {
+        let FrameDb { ranges, storage } = self;
+        for (r, range) in ranges.iter_mut().enumerate() {
+            let window = &mut storage.get_mut()[range.off..range.off + range.buddy.count()];
+            if let Some(pfn) = range.buddy.alloc(window, order) {
+                return Some((r, pfn));
             }
         }
         None
     }
 
-    /// Take a free frame (reference count 1).
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the pfn came off the free list, so it is a frame of the table (pfn - base < refs.len())
-    pub fn alloc(&mut self) -> Option<Pfn> {
-        let pfn = self.free.pop()?;
-        let i = (pfn - self.base) as usize;
-        debug_assert_eq!(self.refs[i], 0);
-        self.refs[i] = 1;
+    /// Take `n` physically contiguous free frames (each with reference count 1); the first frame number. The request is rounded up to a
+    /// power of two for the allocation and the unused tail goes straight back. `None` if no block that large is free.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the block and its tail lie inside the range it came from; order is checked against MAX_ORDER first
+    pub fn alloc_contiguous(&mut self, n: usize) -> Option<Pfn> {
+        if n == 0 {
+            return None;
+        }
+        let order = n.checked_next_power_of_two()?.trailing_zeros() as usize;
+        if order > MAX_ORDER {
+            return None;
+        }
+        let (r, pfn) = self.take(order)?;
+        let FrameDb { ranges, storage } = self;
+        let range = &mut ranges[r];
+        let window = &mut storage.get_mut()[range.off..range.off + range.buddy.count()];
+        let tail = (1usize << order) - n;
+        if tail > 0 {
+            range.buddy.free_run(window, pfn + n as u64, tail);
+        }
+        let first = range.buddy.index(pfn)?;
+        for m in &mut window[first..first + n] {
+            m.refs = 1;
+        }
         Some(pfn)
     }
 
+    /// Take a free frame (reference count 1).
+    pub fn alloc(&mut self) -> Option<Pfn> {
+        self.alloc_contiguous(1)
+    }
+
     /// Add a reference to an allocated frame.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length by `index` just above; a count below its limit cannot overflow
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the ranges by `locate` just above; a count below its limit cannot overflow
     pub fn inc(&mut self, pfn: Pfn) -> Result<(), FrameError> {
-        let i = self.index(pfn)?;
-        match self.refs[i] {
+        let (_, i) = self.locate(pfn)?;
+        let m = &mut self.storage.get_mut()[i];
+        match m.refs {
             0 => Err(FrameError::NotAllocated),
             u32::MAX => Err(FrameError::Overflow),
             n => {
-                self.refs[i] = n + 1;
+                m.refs = n + 1;
                 Ok(())
             }
         }
     }
 
     /// Drop a reference; `Ok(true)` if that freed the frame.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length just above; the count is at least 1 in the arm that subtracts
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was checked against the ranges just above; the count is at least 1 in the arm that subtracts
     pub fn dec(&mut self, pfn: Pfn) -> Result<bool, FrameError> {
-        let i = self.index(pfn)?;
-        match self.refs[i] {
+        let (r, i) = self.locate(pfn)?;
+        let FrameDb { ranges, storage } = self;
+        let range = &mut ranges[r];
+        let window = &mut storage.get_mut()[range.off..range.off + range.buddy.count()];
+        let m = &mut window[i - range.off];
+        match m.refs {
             0 => Err(FrameError::NotAllocated),
             1 => {
-                self.refs[i] = 0;
-                self.free.push(pfn);
+                m.refs = 0;
+                range.buddy.free_block(window, pfn, 0);
                 Ok(true)
             }
             n => {
-                self.refs[i] = n - 1;
+                m.refs = n - 1;
                 Ok(false)
             }
         }
     }
 
     /// The reference count of an allocated frame (`None` if free or unmanaged).
-    #[allow(clippy::indexing_slicing)] // INVARIANT: the index was checked against the table length just above
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the index was checked against the ranges just above
     pub fn refs(&self, pfn: Pfn) -> Option<u32> {
-        let i = self.index(pfn).ok()?;
-        (self.refs[i] != 0).then_some(self.refs[i])
+        let (_, i) = self.locate(pfn).ok()?;
+        let n = self.storage.get()[i].refs;
+        (n != 0).then_some(n)
     }
 
-    /// Check the database's own consistency: the free list holds exactly the
-    /// frames with a count of 0, each once.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every index is below refs.len() (loops over the table)
+    /// Check the database's own consistency: each range's free lists and metadata agree (see `Buddy::audit`).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: off + count is inside the storage by construction
     pub fn audit(&self) -> Result<(), String> {
-        let mut seen = alloc::vec![false; self.refs.len()];
-        for &pfn in &self.free {
-            let i = self
-                .index(pfn)
-                .map_err(|_| alloc::format!("free list holds unmanaged frame {pfn}"))?;
-            if self.refs[i] != 0 {
-                return Err(alloc::format!(
-                    "frame {pfn} is free-listed but has {} references",
-                    self.refs[i]
-                ));
-            }
-            if core::mem::replace(&mut seen[i], true) {
-                return Err(alloc::format!("frame {pfn} is on the free list twice"));
-            }
-        }
-        for (i, &n) in self.refs.iter().enumerate() {
-            if n == 0 && !seen[i] {
-                return Err(alloc::format!(
-                    "frame {} has no references and is not on the free list",
-                    self.base + i as u64
-                ));
-            }
+        for range in &self.ranges {
+            let window = &self.storage.get()[range.off..range.off + range.buddy.count()];
+            range.buddy.audit(window)?;
         }
         Ok(())
     }
