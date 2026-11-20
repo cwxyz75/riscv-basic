@@ -8,6 +8,9 @@ with nothing typed yet is unterminated and joins the next thing printed (`$ ^C`)
 
 Usage: s4e_shell_test.py INTERACTIVE_KERNEL_ELF [--break-expectation]
 """
+# 100 spawns may take at most this many times the calibration step below. A healthy kernel measures 4.1 to 4.2 (locally); the old bound of
+# 8 s was 2.7 times the healthy 3 s, and 11 keeps that margin while the old 12.9 s regression (ratio about 18) still fails.
+RATIO_BOUND = 11.0
 import os
 import re
 import sys
@@ -680,16 +683,24 @@ def main():
     step(b"print $cap.status\n", [b"$ print $cap.status", b"0"], "... ends well")
     step(b"print $cap.out\n", [b"$ print $cap.out", b'["found ./hello.txt"]'], "... and its child's output is captured")
     step_re(b"busybox time busybox echo timed\n", [b"$ busybox time busybox echo timed", b"timed", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")], "time runs a program")
+    # a calibration in the same boot: a fixed amount of guest work (200000 lines through a pipe), so that the spawn bound below is a ratio and
+    # the spread of the CI runners (3.9 to 9.8 s for the same code, T174) drops out
+    cal = step_re(b"busybox time busybox seq 200000 | busybox wc -l\n",
+                  [b"$ busybox time busybox seq 200000 | busybox wc -l", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s"), b"200000"],
+                  "the calibration")
+    m = re.fullmatch(rb"real\t(\d+)m ([\d.]+)s", cal[1])
+    cal_secs = max(int(m.group(1)) * 60 + float(m.group(2)), 0.05)
     # the spawn rate: 100 programs started one after another by xargs (a `vfork`, a request to the shell, a launch, a wait each)
     got = step_re(b"busybox seq 100 | busybox time busybox xargs -n 1 busybox true\n",
                   [b"$ busybox seq 100 | busybox time busybox xargs -n 1 busybox true", re.compile(rb"real\t\d+m [\d.]+s"), re.compile(rb"user\t\d+m [\d.]+s"), re.compile(rb"sys\t\d+m [\d.]+s")],
                   "100 spawns")
     m = re.fullmatch(rb"real\t(\d+)m ([\d.]+)s", got[1])
     secs = int(m.group(1)) * 60 + float(m.group(2))
-    print(f"spawn rate: 100 programs in {secs:.2f} s of guest time ({100 / max(secs, 0.01):.0f} per second)", flush=True)
-    # (12.9 s when the shell watched only the first program's spawn channel: a request from any other waited for a 100 ms timeout)
-    if secs > 8:
-        fail(s, f"100 spawns took {secs:.1f} s")
+    print(f"spawn rate: 100 programs in {secs:.2f} s of guest time ({100 / max(secs, 0.01):.0f} per second); calibration {cal_secs:.2f} s, ratio {secs / cal_secs:.1f}", flush=True)
+    # (12.9 s when the shell watched only the first program's spawn channel: a request from any other waited for a 100 ms timeout; a healthy
+    # kernel is at about 4.2 times the calibration)
+    if secs > RATIO_BOUND * cal_secs:
+        fail(s, f"100 spawns took {secs:.1f} s, {secs / cal_secs:.1f} times the calibration ({cal_secs:.2f} s); the bound is {RATIO_BOUND}")
     # the compat shell (SH7): BusyBox hush, which has a mode for systems that cannot fork. Each script's expected output is what the
     # host's own `sh` prints for it (an independent oracle).
     hush_scripts = [
