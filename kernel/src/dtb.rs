@@ -54,7 +54,10 @@ pub fn boot_arg_present(arg: &str) -> bool {
 pub fn boot_arg_value(name: &str) -> Option<alloc::string::String> {
     let blob = dtb_blob()?;
     let nodes = kcore::fdt::parse(blob).ok()?;
-    let v = nodes.iter().find(|n| n.path == "/chosen")?.prop("bootargs")?;
+    let v = nodes
+        .iter()
+        .find(|n| n.path == "/chosen")?
+        .prop("bootargs")?;
     v.split(|&b| b == 0 || b == b' ')
         .filter_map(|w| core::str::from_utf8(w).ok())
         .find_map(|w| w.strip_prefix(name))

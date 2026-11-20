@@ -13,8 +13,8 @@ extern crate alloc;
 
 mod aia;
 mod bkl;
-mod chaos;
 mod boot;
+mod chaos;
 mod console;
 mod dtb;
 mod finisher;

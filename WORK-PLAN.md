@@ -83,7 +83,7 @@ be host-testable, fuzzable and covered before that starts.
 
 - [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`
 - [x] **KT6** (PR 281) tier 3, the long-run workflow (manual start only)
-- [ ] **KT7** schedule perturbation
+- [x] **KT7** (PR 284) schedule perturbation
 - [ ] **KT10** automated mutation testing
 - [x] **KT12** (PR 282) the checked release build
 - [ ] **KT13** the kernel stack budget
@@ -205,6 +205,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **L13** (PRs 272, 273): the soak tier shows the real-timer margins (the latency bounds were widened for the emulator's interrupt jitter) and the starvation watchdog under a loaded host; a red `starved thread` is a lost wake or pull, not noise.
 - **KT6** (PR 281): the first overnight run, `gh workflow run overnight.yml` (20 consecutive boots of the smp suite, up to 300 minutes). A red one is a work item the same day (OD140): the log of the failing boot is uploaded as an artifact.
 - **KT12** (PR 282): the first `overnight.yml` run also runs `os-boot-test-checked` (the whole suite at four harts and the kernel shard at one, two and eight on the checked release kernel; the kernel shard at four and eight was run once by hand and passed). A red one is an invariant (`debug_assert!`) that the optimised build breaks.
+- **KT7** (PR 284): the first `overnight.yml` run also runs `make os-chaos` (200 seeds at `-smp 2`, `4` and `8` on the `chaos` kernel; about 600 boots, hours). Run by hand so far: seed 1 at `-smp 4` on the normal chaos kernel passes. A red seed is a work item the same day: its log is in the `failing-logs-chaos` artifact and `OS_CHAOS_POINTS=<mask>` (1 acquire, 2 release, 4 IPI, 8 switch, 16 user return) narrows the point.
 - **TS3a** (PR 276): `make os-miri` now includes `cargo miri test -p ksys` (the host tests of the syscall layer, over the real address-space code). A red one would be undefined behaviour or a leak in code the kernel runs, found on the host.
 
 ## Decisions taken without the owner

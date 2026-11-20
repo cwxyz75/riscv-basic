@@ -1048,7 +1048,8 @@ def run(kernel: str, extra=()):
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
                                            f"shard={SHARD}" if SHARD else "",
                                            "kfast" if SHARD == "k" and KFAST else "",
-                                           f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "") if a)]
+                                           f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
+                                           f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") or SHARD or os.environ.get("OS_CHAOS_SEED") else []),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet

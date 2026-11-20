@@ -36,6 +36,8 @@ mod on {
     use kcore::chaos::Chaos;
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
+    /// Which hook points are live (bit per `Point`); the boot argument `chaospoints=<mask>` narrows it, to find the point a failing seed needs.
+    static MASK: AtomicU64 = AtomicU64::new(!0);
     /// Each hart's generator state, touched only by that hart.
     static STATE: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
     /// How many delays were injected (a diagnostic the boot prints).
@@ -43,18 +45,27 @@ mod on {
 
     /// Read `chaos=<seed>` from the kernel command line and seed every hart's generator. No argument: no chaos.
     pub fn init() {
-        let Some(seed) = crate::dtb::boot_arg_value("chaos=").and_then(|v| v.parse::<u64>().ok()) else {
+        let Some(seed) = crate::dtb::boot_arg_value("chaos=").and_then(|v| v.parse::<u64>().ok())
+        else {
             return;
         };
         for (hart, slot) in STATE.iter().enumerate() {
             slot.store(Chaos::new(seed, hart).to_raw(), Ordering::Relaxed);
         }
+        if let Some(m) =
+            crate::dtb::boot_arg_value("chaospoints=").and_then(|v| v.parse::<u64>().ok())
+        {
+            MASK.store(m, Ordering::Relaxed);
+        }
         ENABLED.store(true, Ordering::SeqCst);
-        let _ = core::fmt::Write::write_fmt(&mut crate::console::Console, format_args!("kernel: chaos seed {seed}\n"));
+        let _ = core::fmt::Write::write_fmt(
+            &mut crate::console::Console,
+            format_args!("kernel: chaos seed {seed}\n"),
+        );
     }
 
-    pub fn point(_: Point) {
-        if !ENABLED.load(Ordering::Relaxed) {
+    pub fn point(p: Point) {
+        if !ENABLED.load(Ordering::Relaxed) || MASK.load(Ordering::Relaxed) & (1 << p as u32) == 0 {
             return;
         }
         let hart = crate::percpu::this().index.load(Ordering::Relaxed);
@@ -62,7 +73,10 @@ mod on {
             return;
         };
         let mut g = Chaos::from_raw(slot.load(Ordering::Relaxed));
-        let delay = g.next_delay();
+        let delay = match p {
+            Point::Acquired | Point::Released => g.next_delay_one_in(kcore::chaos::ONE_IN_LOCKS),
+            _ => g.next_delay(),
+        };
         slot.store(g.to_raw(), Ordering::Relaxed);
         if let Some(n) = delay {
             DELAYS.fetch_add(1, Ordering::Relaxed);

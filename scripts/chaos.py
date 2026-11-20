@@ -30,7 +30,7 @@ os.makedirs(logdir, exist_ok=True)
 
 
 def boot(seed, smp):
-    env = {**os.environ, "OS_SHARD": "k", "OS_SMP": str(smp), "OS_CHAOS_SEED": str(seed)}
+    env = {"OS_BOOT_STALL": "400", **os.environ, "OS_SHARD": "k", "OS_SMP": str(smp), "OS_CHAOS_SEED": str(seed)}
     r = subprocess.run([sys.executable, os.path.join(here, "os_boot_test.py"), a.elf], capture_output=True, text=True, env=env)
     if r.returncode != 0:
         with open(os.path.join(logdir, f"seed{seed}-smp{smp}.log"), "w") as f:
