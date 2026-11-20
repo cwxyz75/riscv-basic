@@ -130,14 +130,16 @@ impl Vmos {
 
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the index is below 2^32 (slots are bounded by the object quota)
     fn place(&mut self, vmo: Vmo) -> u64 {
-        self.live += 1;
         if let Some(i) = self.free.pop() {
             if let Some(slot) = self.slots.get_mut(i as usize) {
                 slot.vmo = Some(vmo);
+                self.live += 1;
                 return (u64::from(slot.gen) << 32) | (u64::from(i) + 1);
             }
-            return 0; // (not reached: a free index is a slot)
+            // (not reached: a free index is a slot)
+            self.free.push(i);
         }
+        self.live += 1;
         self.slots.push(VmoSlot {
             gen: 0,
             vmo: Some(vmo),

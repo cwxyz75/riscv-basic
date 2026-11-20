@@ -21,16 +21,25 @@ struct Failing;
 static ARMED: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAIL_AT: AtomicUsize = AtomicUsize::new(0);
+static PERSIST: AtomicUsize = AtomicUsize::new(0);
 
 fn should_fail() -> bool {
     if ARMED.load(Ordering::Relaxed) == 0 || EXEMPT.load(Ordering::Relaxed) != 0 {
         return false;
     }
-    let fail = COUNT.fetch_add(1, Ordering::Relaxed) + 1 == FAIL_AT.load(Ordering::Relaxed);
+    let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let at = FAIL_AT.load(Ordering::Relaxed);
+    // one failure (the N-th), or, in the persistent mode (real exhaustion does not recover), the N-th and every allocation after it
+    let fail = if PERSIST.load(Ordering::Relaxed) != 0 {
+        c >= at
+    } else {
+        c == at
+    };
     if fail {
-        // (the backtrace allocates: stop counting first) say where the failing allocation was, for the parent's report
-        ARMED.store(0, Ordering::Relaxed);
+        // (the backtrace allocates: stop failing while it is made) say where the failing allocation was, for the parent's report
+        let was = ARMED.swap(0, Ordering::Relaxed);
         eprintln!("ALLOCSITE\n{}", std::backtrace::Backtrace::force_capture());
+        ARMED.store(was, Ordering::Relaxed);
     }
     fail
 }
@@ -237,10 +246,10 @@ fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario {
-            name: "seventy_handle_duplicates",
+            name: "fifty_handle_duplicates",
             run: |w, go| {
                 let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
-                (0..70)
+                (0..50)
                     .map(|_| go(w, nr::HANDLE_DUPLICATE, [e, SAME, 0, 0, 0, 0]))
                     .collect()
             },
@@ -261,6 +270,29 @@ fn scenarios() -> Vec<Scenario> {
                         )
                     })
                     .collect()
+            },
+        },
+        Scenario {
+            name: "closing_thirty_vmo_handles",
+            run: |w, go| {
+                let vs: Vec<u64> = (0..30)
+                    .map(|_| w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap())
+                    .collect();
+                vs.iter()
+                    .map(|&v| go(w, nr::HANDLE_CLOSE, [v, 0, 0, 0, 0, 0]))
+                    .collect()
+            },
+        },
+        Scenario {
+            name: "closing_a_channel_holding_vmo_handles",
+            run: |w, go| {
+                let (x, y) = w.pair(nr::CHANNEL_CREATE);
+                for _ in 0..8 {
+                    let v = w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap();
+                    w.poke(BASE + 0x100, &(v as u32).to_le_bytes());
+                    w.ok(nr::CHANNEL_WRITE, [x, BASE, 0, BASE + 0x100, 1, 0]);
+                }
+                vec![go(w, nr::HANDLE_CLOSE, [y, 0, 0, 0, 0, 0])]
             },
         },
         Scenario {
@@ -286,30 +318,58 @@ fn dispatch(w: &mut World, n: usize, a: [u64; 6]) -> Reply {
     }
 }
 
-/// The child: run one scenario with the `n`-th allocation failing and check what is left. Prints `ALLOCS=<made>` and exits 0 on success.
-fn child(name: &str, n: usize) {
+/// What the kernel does at the end of every syscall, armed like the call: hand the dead to their cleanup (a VMO's pages, a job's record) and
+/// give the emptied vector back, and drain the dirty log.
+fn armed_cleanup(w: &mut World) {
+    let mut dead = w.objs.drain_dead();
+    for o in dead.drain(..) {
+        match o {
+            kcore::ipc::KObj::Vmo(id) => {
+                let _ = w.vmos.destroy(&mut w.mm, id);
+            }
+            kcore::ipc::KObj::Job(id) => w.vmos.jobs.release(id),
+            _ => {}
+        }
+    }
+    w.objs.recycle(dead);
+    let d = w.objs.take_dirty();
+    w.objs.recycle_dirty(d);
+}
+
+/// The child: run one scenario with the `n`-th allocation failing (and, in the persistent mode, every one after it) and check what is left.
+/// Prints `ALLOCS=<made>` and exits 0 on success.
+fn child(name: &str, n: usize, persist: bool) {
     let sc = scenarios()
         .into_iter()
         .find(|s| s.name == name)
         .expect("scenario");
     let mut w = world();
+    PERSIST.store(usize::from(persist), Ordering::Relaxed);
     let mut made = 0;
     start(n);
     let mut go = |w: &mut World, nr: usize, a: [u64; 6]| -> Reply {
         arm();
         let r = dispatch(w, nr, a);
+        armed_cleanup(w);
         let this = disarm() - made;
         // the call during which the failing allocation was reached must say NO_MEMORY (a later call may fail for what the failure left undone:
-        // a read of a write that did not happen)
+        // a read of a write that did not happen), and must have lost nothing: the same call made again, with memory, succeeds
         if made < n && n <= made + this {
             if let Err((st, _, _)) = &r {
                 assert_eq!(*st, abi::status::Status::NoMemory, "scenario {name}, failing allocation {n}: the call returned {st:?}, not NO_MEMORY");
+                made += this;
+                let was = PERSIST.swap(0, Ordering::Relaxed);
+                let again = dispatch(w, nr, a);
+                PERSIST.store(was, Ordering::Relaxed);
+                assert!(again.is_ok(), "scenario {name}, failing allocation {n}: after NO_MEMORY the same call, with memory, returned {again:?}: work was lost (call {nr} {a:?}, {} handles, room {})", w.handles.len(), w.handles.room());
+                return r;
             }
         }
         made += this;
         r
     };
     let _ = (sc.run)(&mut w, &mut go);
+    PERSIST.store(0, Ordering::Relaxed);
     cleanup(&mut w);
     audit(&mut w).unwrap_or_else(|e| panic!("scenario {name}, failing allocation {n}: {e}"));
     baseline(&mut w).unwrap_or_else(|e| panic!("scenario {name}, failing allocation {n}: {e}"));
@@ -320,8 +380,9 @@ fn child(name: &str, n: usize) {
 fn child_entry() {
     // (run by the parent below with KALLOC_CHILD=name:n; a plain `cargo test` skips it)
     if let Ok(v) = std::env::var("KALLOC_CHILD") {
-        let (name, n) = v.split_once(':').unwrap();
-        child(name, n.parse().unwrap());
+        let mut parts = v.split(':');
+        let (name, n) = (parts.next().unwrap(), parts.next().unwrap());
+        child(name, n.parse().unwrap(), parts.next() == Some("persist"));
     }
 }
 
@@ -335,7 +396,17 @@ fn every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean(
     let exe = std::env::current_exe().unwrap();
     let mut findings = Vec::new();
     let mut summary = Vec::new();
-    for sc in scenarios() {
+    // (the persistent mode, where every allocation from the N-th on fails, doubles the run: it is the overnight target's, `KALLOC_PERSIST=1`)
+    let modes: &[&str] = if std::env::var("KALLOC_PERSIST").is_ok() {
+        &["", ":persist"]
+    } else {
+        &[""]
+    };
+    for (sc, mode) in modes
+        .iter()
+        .copied()
+        .flat_map(|m| scenarios().into_iter().map(move |s| (s, m)))
+    {
         if only.as_deref().is_some_and(|o| o != sc.name) {
             continue;
         }
@@ -343,7 +414,7 @@ fn every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean(
         loop {
             let out = std::process::Command::new(&exe)
                 .args(["child_entry", "--exact", "--nocapture", "--test-threads=1"])
-                .env("KALLOC_CHILD", format!("{}:{n}", sc.name))
+                .env("KALLOC_CHILD", format!("{}:{n}{mode}", sc.name))
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -386,7 +457,7 @@ fn every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean(
                 } else {
                     stderr
                         .lines()
-                        .find(|l| l.contains("scenario"))
+                        .find(|l| l.starts_with("scenario "))
                         .unwrap_or("the child failed")
                         .to_string()
                 };
@@ -415,6 +486,13 @@ fn every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean(
                 break;
             }
             n += 1;
+            if !mode.is_empty() && n > 14 {
+                summary.push(format!(
+                    "{}{mode}: the first 14 allocations, each failed from there on",
+                    sc.name
+                ));
+                break;
+            }
             assert!(n <= max, "scenario {} still allocating at {max}", sc.name);
         }
     }

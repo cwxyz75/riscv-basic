@@ -152,7 +152,8 @@ pub fn cleanup(w: &mut World) {
             w.objs.sweep(&roots);
         }
     }
-    let _ = w.objs.take_dirty();
+    let d = w.objs.take_dirty();
+    w.objs.recycle_dirty(d);
 }
 
 /// Every audit; the first problem found.

@@ -219,6 +219,8 @@ impl HandleTable {
         if self.slots[slot].gen + 1 >= GENERATIONS && self.slots_left() == 0 {
             return Err(Status::NoMemory);
         }
+        // (the room in memory first: the new handle goes into the slot the old one frees, or into a new slot if that one retires)
+        self.reserve(1)?;
         let entry = self.remove(slot);
         // the old value stops working: waiters on it must re-validate (a forced touch)
         reg.touch_forced(entry.obj);

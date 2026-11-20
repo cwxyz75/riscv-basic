@@ -128,6 +128,13 @@ pub enum KObj {
 }
 
 impl Object for KObj {
+    fn held_count(&self) -> usize {
+        match self {
+            KObj::Channel(c) => c.queue.iter().map(|m| m.handles.len()).sum(),
+            _ => 0,
+        }
+    }
+
     fn held(&self, out: &mut Vec<ObjId>) {
         if let KObj::Channel(c) = self {
             for m in &c.queue {

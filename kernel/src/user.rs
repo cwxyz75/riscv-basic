@@ -1238,8 +1238,9 @@ pub fn commit_wake() {
         let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
             |id| matches!(objs.get(id), Some(ipc::KObj::Port(_))),
-            dirty,
+            &dirty,
         );
+        objs.recycle_dirty(dirty);
         thread::wake_many(&woken);
     });
 }

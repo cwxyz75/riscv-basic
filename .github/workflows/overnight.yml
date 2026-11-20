@@ -188,3 +188,19 @@ jobs:
       - name: Summary
         if: always()
         run: echo "## overnight (host fuzz): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  allocfail:
+    name: overnight (allocation failure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-allocfail
+      - run: make os-allocfail
+      - name: Summary
+        if: always()
+        run: echo "## overnight (allocation failure): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
