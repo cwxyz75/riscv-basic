@@ -30,6 +30,22 @@ pub fn dtb_blob() -> Option<&'static [u8]> {
     }
 }
 
+/// Refuse to run on a hart that lacks an extension the kernel relies on (PL1, OD47, OD127): `kcore::isa::REQUIRED_EXTENSIONS` and Sv39,
+/// read from the device tree's `cpu` nodes (every hart is listed, so the boot hart checks them all). Ends in `##PANIC missing extension
+/// <name> (hart <id>)`, which the harness expects on a CPU without the profile (`make os-boot-test-cpu-neg`).
+#[allow(clippy::panic)] // INVARIANT: boot-time refusal by design: a kernel that cannot rely on its extensions must not run
+pub fn require_extensions() {
+    let Some(blob) = dtb_blob() else {
+        panic!("missing extension: no device tree to read the harts' extensions from");
+    };
+    let Ok(nodes) = kcore::fdt::parse(blob) else {
+        panic!("missing extension: the device tree cannot be read");
+    };
+    if let Some((hart, name)) = kcore::isa::missing_extensions(&nodes).first() {
+        panic!("missing extension {name} (hart {hart}): the kernel requires RVA23S64 and the AIA (OD127)");
+    }
+}
+
 /// Does the kernel command line (`/chosen/bootargs`, from QEMU's `-append`) contain the word `arg`? Used by the
 /// benchmark switch (`bench=full`, SCHED-SMP-SPEC 6.1); false if there is no tree or no such property.
 pub fn boot_arg_present(arg: &str) -> bool {

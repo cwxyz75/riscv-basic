@@ -32,6 +32,7 @@ pub mod frame;
 pub mod futex;
 pub mod handle;
 pub mod ipc;
+pub mod isa;
 pub mod job;
 pub mod latch;
 pub mod linestate;

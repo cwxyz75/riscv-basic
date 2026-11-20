@@ -5,3 +5,8 @@ target = "riscv64gc-unknown-none-elf"
 # `cargo run` from here boots the kernel in QEMU.
 [target.riscv64gc-unknown-none-elf]
 runner = "qemu-system-riscv64 -machine virt -nographic -bios default -kernel"
+
+# PL1 (OD47, OD127): the kernel is compiled for the profile's scalar bit-manipulation and conditional-operation extensions (RVA23S64
+# mandates Zba, Zbb, Zbs and Zicond; the boot-time check refuses a hart without them). F, D and V are not used in kernel code: the
+# units stay off in the kernel (FP3), and a use traps.
+rustflags = ["-C", "target-feature=+zba,+zbb,+zbs,+zicond"]

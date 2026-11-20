@@ -12,7 +12,7 @@ exits with pass or fail. Its switches are environment variables:
 |---|---|
 | `OS_SMP` | hart count |
 | `OS_SHARD` | which part of the suite: `a`, `b`, `k` (below), empty for all |
-| `OS_CPU` | the CPU model (`rva23s64`) |
+| `OS_CPU` | the CPU model; always `rva23s64` (the kernel refuses to boot below the profile); only `os-boot-test-cpu-neg` sets it, to `rv64` |
 | `OS_BOOT_STALL` | seconds without output before a boot is called stalled (default 180) |
 | `OS_BOOT_TIMEOUT` | the runaway ceiling in seconds (default 1800) |
 | `OS_PROFILE=<file>` | append host seconds and guest ticks per test to a TSV |
@@ -135,7 +135,7 @@ overflow checks on.
 
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
 kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`, `os-boot-test-polling` (plain `virt`),
-`os-boot-test-rva23`, `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
+`os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
 mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`.
 
 **The network checks by tier.**
