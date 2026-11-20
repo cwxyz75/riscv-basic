@@ -396,7 +396,8 @@ quota).
 A VMO of `pages` physically contiguous, zeroed frames, committed now and charged to the caller's
 job as pages. At most `MAX_DMA_PAGES` (64) per object and `MAX_DMA_TOTAL_PAGES` (1024) in the
 system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of pages or no
-contiguous run is free. The returned handle has VMO rights without EXECUTE plus **DMA**.
+free aligned block of the size rounded up to a power of two exists (a 33-page request needs a free aligned 64-page block; the frame
+allocator is a buddy allocator, MM2). The returned handle has VMO rights without EXECUTE plus **DMA**.
 
 ### vmo_phys_addr(vmo) -> status, address
 

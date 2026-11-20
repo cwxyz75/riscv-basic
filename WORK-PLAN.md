@@ -111,8 +111,8 @@ be host-testable, fuzzable and covered before that starts.
 AR1 goes first so that everything after it is written on the right side of the boundary. Epic: `epic/phase-4` (from PL1 on).
 
 - [x] **AR1** (a, b, c, d) all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, the AArch64 stub (PRs 301, 302, 303, 304; merged to `main` before the epic was cut)
-- [x] **PL1** RVA23 in the gate, the boot-time extension check (PR to follow; the AIA-node check waits for PL6)
-- [ ] **MM2** the buddy frame allocator
+- [x] **PL1** RVA23 in the gate, the boot-time extension check (PR 306; the AIA-node check waits for PL6)
+- [x] **MM2** the buddy frame allocator (PR 307)
 - [ ] **MM3** large pages in the direct map
 - [ ] **PL4** discovery: memory, load address, device tree pointer, timer frequency
 - [ ] **PL5** discovery: console, interrupt controller, device windows, reset
