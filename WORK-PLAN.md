@@ -81,15 +81,15 @@ Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 Why here: the scheduler glue is stable after phase 2, and everything after this phase changes the syscall layer, so it should
 be host-testable, fuzzable and covered before that starts.
 
-- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`
+- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`: a (PR 276), b (PRs 277, 278, 279: VMO, job and process-table calls, the process record) and the decision half of kill/suspend/job_kill/scheduling (PR 280) are merged; `user.rs` is 2.7 thousand lines, not 600: `process_create`/`start`, `thread_*`, waits, futexes and `channel_call` still need the scheduler behind the seam
 - [x] **KT6** (PR 281) tier 3, the long-run workflow (manual start only)
 - [x] **KT7** (PR 284) schedule perturbation
 - [x] **KT10** (PR 286) automated mutation testing
 - [x] **KT12** (PR 282) the checked release build
 - [x] **KT13** (PR 283) the kernel stack budget
 - [x] **KT5** (PR 290) instruction-count checks
-- [ ] **KT8** syscall fuzzing (host and guest)
-- [ ] **KT9** the allocation-failure sweep
+- [ ] **KT8** syscall fuzzing (host and guest): the host half is merged (PR 291; the guest `kfuzz` program is not built; T176 lists what the host fuzzer does not reach)
+- [ ] **KT9** the allocation-failure sweep: the host half is merged (PR 292; the guest sweep with a failing kernel allocator is not built; T177 lists what is not yet swept)
 - [x] **KT11** (PR 289) coverage report
 
 ### Phase 4: the architecture boundary, then the platform as it really is
