@@ -261,6 +261,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
 use ksys::new_start;
 
 #[allow(clippy::expect_used)] // INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
     // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
@@ -599,7 +600,7 @@ fn stopped_now() -> bool {
         .is_some_and(|p| p.stopped)
 }
 
-fn satp_of(p: &Box<Process>) -> u64 {
+fn satp_of(p: &Process) -> u64 {
     (8u64 << 60) | (u64::from(p.asid) << 44) | p.aspace.table().root()
 }
 
@@ -620,7 +621,7 @@ pub fn activate_current() {
         s.thread_pid
             .get(&thread::current())
             .and_then(|pid| s.procs.get(pid))
-            .map(satp_of)
+            .map(|p| satp_of(p))
     });
     if let Some(satp) = satp {
         if crate::percpu::this()
