@@ -300,6 +300,8 @@ kernel, a `kalloc` program) is not built.
 
 ## Before a push
 
+On demand only (owner, 2026-11-20): `make preflight` and `make preflight-full` are not part of any routine; CI is the check, and a failed run is cheap (about five minutes). Run them only when the owner asks. What they do:
+
 `make preflight` (about five minutes) runs what CI has failed pull requests for: `fmt-check`, `docs-check`, `lint` (clippy on the host crates), `lint-kernel` (clippy on the kernel, with its own deny list) and the
 host tests. `make preflight-full` adds `kquick` (the kernel-only boot at four harts) and `os-ktest-release` (the same in the optimised build, whose kernel stack budget changes with every move of code between
 crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts, the two-shard suite, the shell test and the release smoke.

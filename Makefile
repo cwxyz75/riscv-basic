@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: preflight preflight-full os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: os-models preflight preflight-full os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -117,6 +117,10 @@ kernel: kernel-main
 # shuttle model checkers (separate target dirs: the cfg flags rebuild everything).
 os-test:
 	cargo test -p abi -p kcore -p ksys -p kfuzz-gen -p klock
+	$(MAKE) os-models
+
+# The loom and shuttle model checkers alone (CI runs them as their own job, parallel to the host tests).
+os-models:
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
@@ -464,7 +468,7 @@ os-fuzz-host:
 os-allocfail:
 	KALLOC_PERSIST=1 cargo test --profile release-checked -p ksys --test allocfail every -- --nocapture
 
-# Before every push (what CI has failed a PR for). `make preflight` is the quick part, about five minutes: formatting, the docs check, clippy on the host
+# On demand only, when the owner asks (not routine; CI is the check). What CI has failed a PR for. `make preflight` is the quick part, about five minutes: formatting, the docs check, clippy on the host
 # crates and on the kernel, and the host tests (which include the allocation-failure sweep and the fuzzer). `make preflight-full` adds the kernel-only
 # boot at four harts in the debug and the optimised build (the optimised build's stack budget, KT13, moves with every change that moves code between
 # crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts,
