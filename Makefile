@@ -457,7 +457,7 @@ os-coverage:
 FUZZ_SEEDS ?= 0..20000
 FUZZ_CALLS ?= 600
 os-fuzz-host:
-	KFUZZ_SEEDS="$(FUZZ_SEEDS)" KFUZZ_CALLS=$(FUZZ_CALLS) cargo test --release -p ksys --test fuzz sequences
+	KFUZZ_SEEDS="$(FUZZ_SEEDS)" KFUZZ_CALLS=$(FUZZ_CALLS) cargo test --profile release-checked -p ksys --test fuzz sequences
 
 # `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).
 check: smoke

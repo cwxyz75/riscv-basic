@@ -49,6 +49,9 @@ pub struct Call {
 pub struct Model {
     live: Vec<(u64, Kind)>,
     closed: Vec<u64>,
+    /// A handle the generator never closes, replaces, sends or sets limits on (the harness's root job handle: the job calls need a job to act
+    /// on, and limits on the root would starve every other call).
+    pinned: Option<u64>,
 }
 
 impl Model {
@@ -57,6 +60,19 @@ impl Model {
         Model {
             live: handles.to_vec(),
             closed: Vec::new(),
+            pinned: None,
+        }
+    }
+
+    /// Pin a handle (see `pinned`).
+    pub fn pin(&mut self, h: u64) {
+        self.pinned = Some(h);
+    }
+
+    /// Handles a successful `channel_read` delivered, with the kind the harness learned for each (`Kind::Any` if it cannot tell).
+    pub fn received(&mut self, handles: &[(u64, Kind)]) {
+        for &(h, k) in handles {
+            self.add(h, k);
         }
     }
 
@@ -72,8 +88,14 @@ impl Model {
     fn remove(&mut self, h: u64) {
         if let Some(i) = self.live.iter().position(|&(x, _)| x == h) {
             self.live.swap_remove(i);
+            // (a ring: the stale handles are the recent ones too, not only the first 64)
             if self.closed.len() < 64 {
                 self.closed.push(h);
+            } else {
+                let at = (h as usize) % 64;
+                if let Some(slot) = self.closed.get_mut(at) {
+                    *slot = h;
+                }
             }
         }
     }
@@ -129,8 +151,17 @@ impl Model {
     fn of(&self, kind: Kind) -> Vec<u64> {
         self.live
             .iter()
-            .filter(|&&(_, k)| k == kind)
+            .filter(|&&(_, k)| k == kind || k == Kind::Any)
             .map(|&(h, _)| h)
+            .collect()
+    }
+
+    /// Live handles that may be closed, replaced or sent (everything but the pinned one).
+    fn movable(&self) -> Vec<u64> {
+        self.live
+            .iter()
+            .map(|&(h, _)| h)
+            .filter(|&h| Some(h) != self.pinned)
             .collect()
     }
 }
@@ -268,18 +299,34 @@ impl Gen {
     /// A call that should do something: the right handle kind and sane arguments (it may still fail: a full queue, a closed peer).
     fn valid(&mut self, m: &Model) -> Call {
         let n = self.pick(CALLS).unwrap_or(nr::EVENT_CREATE);
+        // set-limits on a job and a permanent shutdown are rarer than the calls that make things happen
+        let n = if matches!(n, nr::SOCKET_SHUTDOWN | nr::JOB_SET_LIMITS) && self.below(4) != 0 {
+            nr::SOCKET_WRITE
+        } else {
+            n
+        };
         let handle = match wants(n) {
             Some(k) => {
-                let hs = m.of(k);
+                let mut hs = m.of(k);
+                if matches!(n, nr::JOB_SET_LIMITS) {
+                    hs.retain(|&h| Some(h) != m.pinned); // never the root's limits
+                }
                 match self.pick(&hs) {
                     Some(h) => h,
                     None => return self.creator(n, m),
                 }
             }
-            None => match self.pick(m.live()) {
-                Some((h, _)) => h,
-                None => return self.creator(n, m),
-            },
+            None => {
+                let hs = if matches!(n, nr::HANDLE_CLOSE | nr::HANDLE_REPLACE) {
+                    m.movable()
+                } else {
+                    m.live().iter().map(|&(h, _)| h).collect()
+                };
+                match self.pick(&hs) {
+                    Some(h) => h,
+                    None => return self.creator(n, m),
+                }
+            }
         };
         let mut c = Call {
             nr: n,
@@ -287,7 +334,29 @@ impl Gen {
             pokes: Vec::new(),
         };
         match n {
-            nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE => c.args[1] = 1 << 31, // SAME
+            nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE => {
+                // the same rights, or (four times in ten) a random subset of the assigned ones
+                c.args[1] = if self.below(10) < 4 {
+                    self.next_u64() & 0x3fff
+                } else {
+                    1 << 31
+                };
+            }
+            nr::VMO_CREATE => {
+                let pages = match self.below(10) {
+                    0 => abi::limits::MAX_VMO_PAGES,
+                    1 => abi::limits::MAX_VMO_PAGES + 1,
+                    _ => 1 + self.below(8),
+                };
+                // charged to a job the process holds (three times in ten), else to its own
+                let jobs = m.of(Kind::Job);
+                let job = if self.below(10) < 3 {
+                    self.pick(&jobs).unwrap_or(0)
+                } else {
+                    0
+                };
+                c.args = [pages, job, 0, 0, 0, 0];
+            }
             nr::CHANNEL_WRITE => {
                 let len = self.below(65);
                 let body = self.ptr(len.max(1));
@@ -295,18 +364,40 @@ impl Gen {
                 let nh = self.below(3).min(m.live().len() as u64);
                 let mut raw = Vec::new();
                 for _ in 0..nh {
-                    if let Some((h, _)) = self.pick(m.live()) {
+                    if let Some(h) = self.pick(&m.movable()) {
                         raw.extend_from_slice(&(h as u32).to_le_bytes());
                     }
                 }
                 let nh = (raw.len() / 4) as u64;
                 c.args = [handle, body, len, list, nh, 0];
-                c.pokes.push((body, (0..len).map(|i| i as u8).collect()));
+                // (the first four bytes are a transaction id for `channel_read_txid` to match)
+                let tx = self.below(8) as u32;
+                let mut bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+                for (b, t) in bytes.iter_mut().zip(tx.to_le_bytes()) {
+                    *b = t;
+                }
+                c.pokes.push((body, bytes));
                 c.pokes.push((list, raw));
             }
-            nr::CHANNEL_READ => c.args = [handle, self.ptr(128), 128, self.ptr2(16), 4, 0],
+            nr::CHANNEL_READ => {
+                c.args = [
+                    handle,
+                    self.ptr(128),
+                    self.below(129),
+                    self.ptr2(16),
+                    self.below(5),
+                    0,
+                ]
+            }
             nr::CHANNEL_READ_TXID => {
-                c.args = [handle, self.below(8), self.ptr(128), 128, self.ptr2(16), 4]
+                c.args = [
+                    handle,
+                    self.below(8),
+                    self.ptr(128),
+                    self.below(129),
+                    self.ptr2(16),
+                    self.below(5),
+                ]
             }
             nr::SOCKET_WRITE => {
                 let len = self.below(129);
@@ -331,7 +422,7 @@ impl Gen {
                 c.args = [
                     handle,
                     obj,
-                    (1 << 24) | (1 << 2),
+                    (self.next_u64() & 0xff00_001f) | 1, // any non-empty subset of the signals a port can watch (and a few it cannot)
                     self.below(8),
                     self.below(2),
                     0,

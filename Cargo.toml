@@ -123,5 +123,7 @@ overflow-checks = true
 overflow-checks = true
 [profile.release.package.klock]
 overflow-checks = true
+[profile.release.package.ksys]
+overflow-checks = true
 [profile.release.package.abi]
 overflow-checks = true

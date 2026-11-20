@@ -269,9 +269,15 @@ not on the host and not in this report. T175 names the functions the two files b
 ## Fuzzing the syscall layer on the host (KT8, first half)
 
 `kfuzz-gen` (pure, `no_std`) generates sequences of calls from a model of what the process holds: 70 % valid, 25 % near-valid (a wrong kind, a closed handle, a size off by one, a pointer
-outside the window or in the read-only page, a wide argument, a widened right), 5 % garbage. `ksys/tests/fuzz.rs` runs them against the real syscall layer (`ksys`, 27 calls: handles, channels,
-sockets, events, ports, VMOs, job create/limits/info) on the fake machine, and after every call checks that **no call panics**, `FrameDb::audit` holds, every handle names a live object, and the
-**job ledger equals what is held** (each job's object usage is the number of live objects charged to it or to a job below it). `cargo test` runs 16 seeds of 400 calls (about 0.2 s; two short ones
-under Miri); `make os-fuzz-host` 20000 seeds of 600. A seed replays exactly: `KFUZZ_SEEDS=<seed> cargo test -p ksys --test fuzz` (`KFUZZ_TRACE=1` prints each call). Run once here: 4000
-seeds of 600 calls (2.4 million calls) found nothing. Planted defects, each found at seed 0 and replayed to the same message: an unchecked index in the `event_signal` handler (a panic) and a
-charge on an error path that is never credited (the ledger audit). The guest half (a `kfuzz` program in the boot image driving the real kernel, with the audits behind `debug_stat`) is not built.
+outside the window or in the read-only page, a wide argument, a widened right), 5 % garbage. The root job handle is pinned (never closed, sent, or given limits), handles received through a
+channel enter the model, and every so often the harness acts for a child job it holds. `ksys/tests/fuzz.rs` runs the sequences against the real syscall layer (`ksys`, 27 calls: handles, channels,
+sockets, events, ports, VMOs, job create/limits/info) on the fake machine, doing around each call what the kernel does (the wide-argument check first; the cleanup of dead objects, the sweep of
+unreachable ones and the drain of the dirty log after) and checking after every call: **no call panics** (a panic is named with its phase and call index), `FrameDb::audit` holds, every handle
+names a live object, a peer is alive and points back, **every object's reference count equals the handles and live objects that name it**, and the **job ledger equals what is held** (each job's
+object usage and queued bytes equal what live objects charged to it or to a job below it hold). At the end of every sequence all handles are closed and the sweep runs: no object, no usage, no meter
+may remain. `cargo test` runs 16 seeds of 400 calls (about 0.5 s; two short ones under Miri); `make os-fuzz-host` 20000 seeds of 600 in the checked release build (debug assertions and overflow checks
+on). A failure prints the exact replay command (`KFUZZ_SEEDS=<seed> KFUZZ_CALLS=<n> cargo test --profile release-checked -p ksys --test fuzz sequences`; `KFUZZ_TRACE=1` prints every call), and a test
+checks that a seed replays to the same hash of calls and replies. Run once here: 2500 seeds of 600 calls in the checked build found nothing. Planted defects, each found within the first seeds and
+replayed: an unchecked index in the `event_signal` handler (a panic), a charge on an error path never credited (the object ledger), a queued-byte charge never credited (the byte ledger) and a
+reference nobody releases (the reference audit). The Fable review's findings that this does not yet cover are `T176`. The guest half (a `kfuzz` program in the boot image driving the real kernel,
+with the audits behind `debug_stat`) is not built.
