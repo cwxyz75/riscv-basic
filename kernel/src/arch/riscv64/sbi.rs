@@ -61,7 +61,8 @@ secondary_entry:                 # a0 = hart id, a1 = dense hart index; paging o
     csrw satp, t3
     sfence.vma zero, zero
     la   t0, 3f
-    li   t1, 0xffffffff00000000  # KERNEL_OFFSET
+    la   t1, KERNEL_DELTA        # where the image is linked minus where it is, worked out by the boot hart's `_start`
+    ld   t1, 0(t1)
     add  t0, t0, t1
     jr   t0
 3:

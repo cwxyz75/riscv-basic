@@ -10,7 +10,7 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
-use abi::layout::{DIRECT_BASE, KERNEL_OFFSET};
+use abi::layout::DIRECT_BASE;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::buddy::{Meta, META_BYTES};
@@ -101,8 +101,13 @@ pub fn sections() -> Sections {
 fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64), perms: Perms) {
     let mut va = start;
     while va < end {
-        pt.map(mm, va, (va - KERNEL_OFFSET) / PAGE_SIZE, perms)
-            .expect("mapping the kernel image");
+        pt.map(
+            mm,
+            va,
+            (va - crate::arch::kernel_delta()) / PAGE_SIZE,
+            perms,
+        )
+        .expect("mapping the kernel image");
         va += PAGE_SIZE;
     }
 }
@@ -116,8 +121,9 @@ pub fn init() {
     let s = sections();
     // What memory exists and which of it the allocator may have (PL4, KERNEL-V1-SPEC 2.3): the tree's `memory` ranges, minus its reserved
     // ranges (firmware), the loader's reservation block, the tree's own frames and the kernel image. Nothing here is a constant.
-    let image_start = s.text.0 - KERNEL_OFFSET;
-    let image_end = s.data.1 - KERNEL_OFFSET;
+    let delta = crate::arch::kernel_delta();
+    let image_start = s.text.0 - delta;
+    let image_end = s.data.1 - delta;
     let (memory, mut reserved) =
         crate::dtb::memory_map().expect("a device tree below 64 GiB that describes the machine's memory (T180: RAM above 64 GiB is not supported yet)");
     reserved.push((image_start, image_end - image_start));
