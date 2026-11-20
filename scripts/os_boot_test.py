@@ -13,7 +13,7 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##DONE pass=<n> fail=<n>
 
 The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
-`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 256M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test

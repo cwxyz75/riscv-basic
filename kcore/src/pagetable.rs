@@ -410,6 +410,9 @@ impl<F: PageTableFormat> PageTable<F> {
             return Err(MapError::NonCanonical);
         }
         perms.validate()?;
+        if perms.user {
+            return Err(MapError::BadPerms); // large pages are the kernel's (KERNEL-V1-SPEC section 1: none for user mappings)
+        }
         let mut table = self.root;
         let mut l = F::LEVELS - 1;
         loop {
@@ -584,11 +587,13 @@ impl<F: PageTableFormat> PageTable<F> {
 
 /// Cut the frames `first .. first + count` into the largest aligned pages up to `max_level` (a page of level `l` is `1 << (9 * l)` frames,
 /// aligned to that many frames): `(frame, level)` in address order, small pages at unaligned edges. Every frame is covered exactly once.
+/// `max_level` is clamped to 3 (a 512 GiB page is the most any format here has); a range reaching the top of the frame-number space is
+/// cut short at it.
 pub fn plan_range(first: Pfn, count: u64, max_level: u32) -> PlanRange {
     PlanRange {
         next: first,
         end: first.saturating_add(count),
-        max_level,
+        max_level: max_level.min(3),
     }
 }
 

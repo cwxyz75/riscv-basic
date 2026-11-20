@@ -130,18 +130,42 @@ fn refusals<F: PageTableFormat>() {
         pt.map_large(&mut mm, D + two_mib * 4096 * 2, 0x2000, 1, Perms::RW),
         Err(MapError::HugeConflict)
     );
-    // no frames for the tables: nothing changes
+    // level-2 alignment is its own: 2 MiB alignment is not enough for a 1 GiB page; and the address must be canonical
+    if F::LEVELS > 2 {
+        assert_eq!(
+            pt.map_large(&mut mm, D + two_mib * 4096, 0x40000, 2, Perms::RW),
+            Err(MapError::Misaligned)
+        );
+        assert_eq!(
+            pt.map_large(&mut mm, D + (1 << 30), 0x40200, 2, Perms::RW),
+            Err(MapError::Misaligned)
+        );
+    }
+    assert_eq!(
+        pt.map_large(&mut mm, 1 << 62, 0x1000, 1, Perms::RW),
+        Err(MapError::NonCanonical)
+    );
+    // large pages are the kernel's: a user page is refused
+    assert_eq!(
+        pt.map_large(&mut mm, D + (1 << 30), 0x40000, 1, Perms::RW.user()),
+        Err(MapError::BadPerms)
+    );
+    // one frame short for the tables: nothing changes (no half-built chain is left behind)
+    let tables = (F::LEVELS - 2) as usize; // a level-1 page needs the levels between the root and 1
     let mut starved = Mm {
-        db: FrameDb::new(1, 1),
+        db: FrameDb::new(1, tables),
         mem: FakeMem::default(),
     };
     let mut p2 = PageTable::<F>::create(&mut starved).unwrap();
-    assert_eq!(starved.db.free_count(), 0);
+    let free = starved.db.free_count();
+    assert_eq!(free, tables - 1);
     assert_eq!(
         p2.map_large(&mut starved, D, 0x1000, 1, Perms::RW),
         Err(MapError::NoMemory)
     );
+    assert_eq!(starved.db.free_count(), free, "no frame was taken");
     assert!(p2.translate(&starved, D).is_none());
+    starved.db.audit().unwrap();
 }
 
 trait IntoWx {
