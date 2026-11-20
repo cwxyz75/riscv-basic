@@ -12,4 +12,4 @@ refs: [KERNEL-V1-SPEC, OD139, OD140]
 
 **Acceptance, written first.** A planted infallible `Vec::push` on a syscall path is reported as `##PANIC` by the sweep with the scenario and N. The sweep completes on the unmodified kernel; every infallible allocation it finds is fixed in this item (T-SPEC decision 5's audit).
 
-**Review.** Fable. Expect real findings.
+**Progress (2026-11-20).** The host half is built (`ksys/tests/allocfail.rs`; TESTING.md, "The allocation-failure sweep"): seventeen scenarios over the syscall layer, a failing allocator, child processes, and the fixes of everything it found there; the planted infallible `Vec::push` is reported with scenario and N. Not built: the guest half (`fault-alloc`, the `kalloc` program, `os-allocfail`), and the calls that are not behind `ksys` yet (T177). **Review.** Fable. Expect real findings.

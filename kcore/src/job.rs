@@ -189,7 +189,8 @@ impl Jobs {
         }));
         Jobs {
             recs,
-            free: Vec::new(),
+            // (a release never allocates: the free list can hold every record there can be, KT9)
+            free: Vec::with_capacity(MAX_JOBS),
             live: 1,
         }
     }

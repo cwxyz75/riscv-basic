@@ -1069,6 +1069,9 @@ fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 return fail(Status::NotSupported);
             };
             let pages = (blob.len() as u64).div_ceil(4096);
+            if k.vmos.reserve_one().is_err() {
+                return fail(Status::NoMemory);
+            }
             let id = k.vmos.create_in(pages, p.job);
             if k.vmos.write(&mut k.mm, id, 0, blob).is_err() {
                 let _ = k.vmos.destroy(&mut k.mm, id);
@@ -1235,8 +1238,9 @@ pub fn commit_wake() {
         let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
             |id| matches!(objs.get(id), Some(ipc::KObj::Port(_))),
-            dirty,
+            &dirty,
         );
+        objs.recycle_dirty(dirty);
         thread::wake_many(&woken);
     });
 }
@@ -1266,12 +1270,12 @@ fn cleanup_dead() {
         return; // a cleanup is already running further up this thread's stack; it will see our work
     }
     loop {
-        let dead = irq::without(|| state().objs.drain_dead());
+        let mut dead = irq::without(|| state().objs.drain_dead());
         if dead.is_empty() {
             irq::without(|| state().cleaning.remove(&me));
             return;
         }
-        for obj in dead {
+        for obj in dead.drain(..) {
             match obj {
                 ipc::KObj::Vmo(id) => {
                     irq::without(|| state().pending_vmos.push(id));
@@ -1294,7 +1298,8 @@ fn cleanup_dead() {
                 _ => {}
             }
         }
-        // One scan for everything that died in this round (not one per VMO).
+        irq::without(|| state().objs.recycle(dead)); // (the emptied vector goes back, so the next destruction does not allocate: KT9)
+                                                     // One scan for everything that died in this round (not one per VMO).
         reap_vmos();
     }
 }
@@ -2604,6 +2609,11 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
             if let Err(e) = k.vmos.jobs.charge(tjob, Resource::Pages, tables) {
                 undo(made, procs, objs, &mut k.vmos.jobs);
                 return Err((job_status(e), None, None));
+            }
+            if k.vmos.reserve_one().is_err() {
+                undo(made, procs, objs, &mut k.vmos.jobs);
+                k.vmos.jobs.credit(tjob, Resource::Pages, tables);
+                return Err((Status::NoMemory, None, None));
             }
             let vmo = k.vmos.create_in(stack_len / 4096, tjob);
             let perms = Perms {

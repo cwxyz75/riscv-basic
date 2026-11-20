@@ -52,6 +52,22 @@ impl HandleTable {
         }
     }
 
+    /// Make room, in memory, for `n` more handles: the slots they may need and the free list that gives them back, so that neither growing nor
+    /// closing a handle can fail for lack of memory after this returned `Ok` (KT9: a message must not be lost, nor a handle leaked, because an
+    /// allocation failed half-way).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len(), and both are below the encoding's 8191 slots
+    pub fn reserve(&mut self, n: usize) -> Result<(), Status> {
+        let fresh = n.saturating_sub(self.free.len());
+        self.slots
+            .try_reserve(fresh)
+            .map_err(|_| Status::NoMemory)?;
+        // the free list can hold every slot there will be
+        self.free
+            .try_reserve(self.slots.len() + fresh - self.free.len())
+            .map_err(|_| Status::NoMemory)?;
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.live
     }
@@ -112,6 +128,7 @@ impl HandleTable {
                 if self.slots.len() >= SLOT_MASK as usize {
                     return Err(Status::NoMemory);
                 }
+                self.reserve(1)?;
                 self.slots.push(Slot { gen: 0, entry });
                 self.slots.len() - 1
             }
@@ -173,6 +190,8 @@ impl HandleTable {
         if self.room() == 0 {
             return Err(Status::NoMemory);
         }
+        // (the room in memory before the reference is taken, so a failure leaves nothing to undo: KT9)
+        self.reserve(1)?;
         if !reg.retain(entry.obj) {
             return Err(Status::BadHandle); // cannot happen: a live handle owns a reference
         }
@@ -200,6 +219,8 @@ impl HandleTable {
         if self.slots[slot].gen + 1 >= GENERATIONS && self.slots_left() == 0 {
             return Err(Status::NoMemory);
         }
+        // (the room in memory first: the new handle goes into the slot the old one frees, or into a new slot if that one retires)
+        self.reserve(1)?;
         let entry = self.remove(slot);
         // the old value stops working: waiters on it must re-validate (a forced touch)
         reg.touch_forced(entry.obj);

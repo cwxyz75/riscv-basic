@@ -76,8 +76,9 @@ impl WaitTable {
         &mut self,
         signals: impl Fn(ObjId) -> Option<u32>,
         derived: impl Fn(ObjId) -> bool,
-        dirty: Dirty,
+        dirty: impl core::borrow::Borrow<Dirty>,
     ) -> Vec<Waiter> {
+        let dirty: &Dirty = dirty.borrow();
         let mut woken = Vec::new();
         let touched = dirty.overflow || !dirty.items.is_empty();
         if dirty.overflow {
@@ -87,7 +88,7 @@ impl WaitTable {
                 self.fire(obj, true, &signals, &mut woken);
             }
         }
-        for (obj, forced) in dirty.items {
+        for &(obj, forced) in &dirty.items {
             self.fire(obj, forced, &signals, &mut woken);
         }
         if touched {

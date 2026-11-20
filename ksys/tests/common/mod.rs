@@ -7,7 +7,10 @@ use kcore::aspace::{AddressSpace, Vmos};
 use kcore::frame::{FrameDb, Pfn};
 use kcore::handle::HandleTable;
 use kcore::ipc::Kobjs;
+use kcore::ipc::{self, KObj};
 use kcore::job::JobId;
+use kcore::job::Resource;
+use kcore::object::{ObjId, Object};
 use kcore::pagetable::{PageTable, Perms, PhysMem};
 use kcore::Mm;
 use ksys::{ipc_call, job_call, vmo_call, Ctx, Faults, Reply};
@@ -19,6 +22,9 @@ pub struct FakeMem {
     frames: HashMap<Pfn, Box<[u64; 512]>>,
 }
 
+/// Non-zero while the fake machine allocates for itself.
+pub static EXEMPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl PhysMem for FakeMem {
     fn read_u64(&self, pa: u64) -> u64 {
         self.frames
@@ -26,9 +32,12 @@ impl PhysMem for FakeMem {
             .map_or(0xdead_beef_dead_beef, |f| f[((pa & 0xfff) / 8) as usize])
     }
     fn write_u64(&mut self, pa: u64, value: u64) {
+        // (the fake machine's own allocation of a frame's words is not the code under test: the allocation-failure sweep must not fail it)
+        EXEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.frames
             .entry(pa >> 12)
             .or_insert_with(|| Box::new([0; 512]))[((pa & 0xfff) / 8) as usize] = value;
+        EXEMPT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -117,4 +126,149 @@ impl World {
             .0
             .unwrap()
     }
+}
+
+// ---- the audits the fuzzer and the allocation-failure sweep share ----
+
+/// What the kernel does after a call: free what died (a VMO's pages, a job's ledger record) and sweep what nothing can reach.
+pub fn cleanup(w: &mut World) {
+    for round in 0..3 {
+        let mut dead = w.objs.drain_dead();
+        if dead.is_empty() && round > 0 {
+            break;
+        }
+        for o in dead.drain(..) {
+            match o {
+                KObj::Vmo(id) => {
+                    let _ = w.vmos.destroy(&mut w.mm, id);
+                }
+                KObj::Job(id) => w.vmos.jobs.release(id),
+                _ => {}
+            }
+        }
+        w.objs.recycle(dead);
+        if round == 0 && w.objs.needs_sweep() {
+            let roots: Vec<ObjId> = w.handles.objects().collect();
+            w.objs.sweep(&roots);
+        }
+    }
+    let d = w.objs.take_dirty();
+    w.objs.recycle_dirty(d);
+}
+
+/// Every audit; the first problem found.
+pub fn audit(w: &mut World) -> Result<(), String> {
+    w.mm.db.audit()?;
+    for o in w.handles.objects() {
+        if !w.objs.is_alive(o) {
+            return Err(format!("a handle names the dead object {o:?}"));
+        }
+    }
+    // references: handles plus what live objects hold
+    let ids = w.objs.live_ids();
+    let mut counts: Vec<(ObjId, u32)> = ids.iter().map(|&i| (i, 0)).collect();
+    let bump = |counts: &mut Vec<(ObjId, u32)>, o: ObjId| {
+        if let Some(c) = counts.iter_mut().find(|(i, _)| *i == o) {
+            c.1 += 1;
+        }
+    };
+    for o in w.handles.objects() {
+        bump(&mut counts, o);
+    }
+    for &id in &ids {
+        let mut held = Vec::new();
+        if let Some(obj) = w.objs.get(id) {
+            obj.held(&mut held);
+            if let Some(p) = obj.peer() {
+                if !w.objs.is_alive(p) {
+                    // (a peer end that has been destroyed is forgotten by the survivor: it must not still be named)
+                    return Err(format!("{id:?} names a dead peer {p:?}"));
+                }
+                if w.objs.get(p).and_then(|x| x.peer()) != Some(id) {
+                    return Err(format!(
+                        "{id:?} names the peer {p:?}, which does not name it back"
+                    ));
+                }
+            }
+        }
+        for h in held {
+            bump(&mut counts, h);
+        }
+    }
+    for (id, n) in &counts {
+        let refs = w.objs.refs(*id).unwrap_or(0);
+        if refs != *n {
+            return Err(format!(
+                "{id:?}: reference count {refs}, but {n} handles and live objects name it"
+            ));
+        }
+    }
+    // the ledger: after the credits of destroyed objects are applied, a job's usage is exactly what live objects charged to it or below hold
+    ipc::settle(&mut w.objs, &mut w.vmos.jobs);
+    let mut charged: Vec<(JobId, usize)> = Vec::new();
+    let mut jobs = vec![JobId::ROOT, w.job];
+    for &id in &ids {
+        if let Some(KObj::Job(j)) = w.objs.get(id) {
+            jobs.push(*j);
+        }
+        if let Some(j) = w.objs.job_of(id) {
+            let bytes = w.objs.get(id).map_or(0, |o| o.charged_bytes());
+            charged.push((j, bytes));
+            jobs.push(j);
+        }
+    }
+    jobs.sort_by_key(|j| format!("{j:?}"));
+    jobs.dedup();
+    for j in jobs {
+        let below = |c: &&(JobId, usize)| w.vmos.jobs.is_within(c.0, j);
+        let held = charged.iter().filter(below).count() as u64;
+        let bytes = charged
+            .iter()
+            .filter(below)
+            .map(|c| c.1 as u64)
+            .sum::<u64>();
+        let u = w.vmos.jobs.usage(j);
+        let (used, used_bytes) = u.map_or((0, 0), |u| {
+            (u.get(Resource::Objects), u.get(Resource::IpcBytes))
+        });
+        if used != held {
+            return Err(format!("job {j:?}: the ledger says {used} objects, {held} are alive and charged to it or below"));
+        }
+        if used_bytes != bytes {
+            return Err(format!(
+                "job {j:?}: the ledger says {used_bytes} queued bytes, the objects hold {bytes}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// After every handle is closed and the sweep has run, nothing may be left.
+pub fn baseline(w: &mut World) -> Result<(), String> {
+    w.handles.drain(&mut w.objs);
+    cleanup(w);
+    w.objs.sweep(&[]);
+    cleanup(w);
+    ipc::settle(&mut w.objs, &mut w.vmos.jobs);
+    if w.objs.live() != 0 {
+        return Err(format!(
+            "{} objects alive after every handle was closed and the sweep ran",
+            w.objs.live()
+        ));
+    }
+    for r in [Resource::Objects, Resource::IpcBytes] {
+        let used = w.vmos.jobs.usage(JobId::ROOT).map_or(0, |u| u.get(r));
+        if used != 0 {
+            return Err(format!(
+                "the root job still holds {used} of {r:?} after everything was closed"
+            ));
+        }
+    }
+    if w.objs.meter() != 0 {
+        return Err(format!(
+            "the object meter reads {} after everything was closed",
+            w.objs.meter()
+        ));
+    }
+    Ok(())
 }

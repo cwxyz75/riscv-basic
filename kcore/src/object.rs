@@ -38,6 +38,10 @@ impl ObjId {
 pub trait Object {
     /// The ids this object holds references to (queued handles, for a channel).
     fn held(&self, out: &mut Vec<ObjId>);
+    /// How many ids `held` would push.
+    fn held_count(&self) -> usize {
+        0
+    }
     /// The object this one is paired with, if any (a channel's other end). A peer
     /// reference is *weak*: it does not keep the peer alive.
     fn peer(&self) -> Option<ObjId> {
@@ -92,11 +96,21 @@ pub struct Registry<T: Object> {
     dirty: Vec<(ObjId, bool)>,
     /// The log filled up and was dropped: the consumer must treat every object as touched.
     dirty_overflow: bool,
+    /// The work list of `release` (objects whose last reference just went), kept between calls so a release never allocates.
+    work: Vec<ObjId>,
+    /// The dirty log's twin: `take_dirty` swaps it in (`recycle_dirty` gives the emptied log back), so taking the log allocates nothing.
+    dirty_spare: Vec<(ObjId, bool)>,
+    /// The graveyard's twin: `drain_dead` hands out one and keeps the other, so its capacity survives (`recycle` returns it).
+    spare: Vec<T>,
 }
 
 /// How many log entries are kept before the log is compacted and, failing that, dropped (the
 /// kernel drains it at the end of every syscall, so this is a safety net).
 const DIRTY_CAP: usize = 4096;
+
+/// What the dirty log reserves at creation and again after every `take_dirty`. The log never grows beyond what it holds: a log that is full is
+/// compacted and, failing that, dropped (`overflow`: every object counts as touched), so `log` cannot allocate (KT9).
+const DIRTY_RESERVE: usize = 256;
 
 /// What `take_dirty` returns.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -121,19 +135,24 @@ impl<T: Object> Registry<T> {
             // (found by the trust-boundary audit). Owners cap `live` at `MAX_OBJECTS`, and
             // slots are reused, so the table never needs to grow.
             slots: Vec::with_capacity(PREALLOC_SLOTS),
-            free: Vec::new(),
+            // (everything a destruction pushes to is sized for the most objects there can be, once, so that destroying an object, which cannot be
+            // allowed to fail, never allocates: KT9)
+            free: Vec::with_capacity(PREALLOC_SLOTS),
             live: 0,
             threshold: SWEEP_MIN,
             graveyard: Vec::new(),
             meter: 0,
-            credits: Vec::new(),
-            dirty: Vec::new(),
+            credits: Vec::with_capacity(PREALLOC_SLOTS),
+            dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
+            work: Vec::with_capacity(PREALLOC_SLOTS),
+            dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
+            spare: Vec::new(),
         }
     }
 
     fn log(&mut self, id: ObjId, forced: bool) {
-        if self.dirty.len() >= DIRTY_CAP {
+        if self.dirty.len() >= DIRTY_CAP.min(self.dirty.capacity()) {
             self.dirty
                 .sort_unstable_by_key(|(i, f)| (i.index, i.gen, !*f));
             self.dirty.dedup_by(|b, a| {
@@ -144,7 +163,7 @@ impl<T: Object> Registry<T> {
                     false
                 }
             });
-            if self.dirty.len() >= DIRTY_CAP {
+            if self.dirty.len() >= DIRTY_CAP.min(self.dirty.capacity()) {
                 self.dirty.clear();
                 self.dirty_overflow = true;
             }
@@ -180,9 +199,28 @@ impl<T: Object> Registry<T> {
 
     /// Everything touched since the last call, oldest first (duplicates possible).
     pub fn take_dirty(&mut self) -> Dirty {
+        if self.dirty.is_empty() && !self.dirty_overflow {
+            return Dirty::default(); // (nothing logged: keep the room, and allocate nothing)
+        }
+        // the twin takes the log's place and the log goes out; `recycle_dirty` brings its emptied vector back as the next twin
+        core::mem::swap(&mut self.dirty, &mut self.dirty_spare);
+        let items = core::mem::take(&mut self.dirty_spare);
+        if self.dirty.capacity() == 0 {
+            // (a caller that did not recycle: make the room here, where a failure is harmless: a log with no room just overflows, which is safe)
+            let _ = self.dirty.try_reserve_exact(DIRTY_RESERVE);
+        }
         Dirty {
-            items: core::mem::take(&mut self.dirty),
+            items,
             overflow: core::mem::take(&mut self.dirty_overflow),
+        }
+    }
+
+    /// Give back a `Dirty` once it has been used, so that the next `take_dirty` allocates nothing.
+    pub fn recycle_dirty(&mut self, d: Dirty) {
+        let mut v = d.items;
+        v.clear();
+        if self.dirty_spare.capacity() < v.capacity() {
+            self.dirty_spare = v;
         }
     }
 
@@ -269,9 +307,9 @@ impl<T: Object> Registry<T> {
         self.slot(id)?.job
     }
 
-    /// The credits owed to jobs for objects destroyed since the last call: (job, bytes held).
-    pub fn take_credits(&mut self) -> Vec<(JobId, usize)> {
-        core::mem::take(&mut self.credits)
+    /// The same credits, drained in place: the vector keeps its capacity, so the next destruction of a charged object does not allocate.
+    pub fn drain_credits(&mut self) -> alloc::vec::Drain<'_, (JobId, usize)> {
+        self.credits.drain(..)
     }
 
     /// Bytes currently counted by the meter.
@@ -326,7 +364,9 @@ impl<T: Object> Registry<T> {
     /// it was the last.
     #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: refs >= 1 for a reference being released
     pub fn release(&mut self, id: ObjId) {
-        let mut work = alloc::vec![id];
+        let mut work = core::mem::take(&mut self.work);
+        work.clear();
+        work.push(id);
         while let Some(id) = work.pop() {
             let Some(slot) = self.slot_mut(id) else {
                 continue;
@@ -345,23 +385,65 @@ impl<T: Object> Registry<T> {
             self.free.push(id.index);
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
-            obj.held(&mut work);
+            // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
+            // rather than failing a destruction: KT9)
+            if work.try_reserve(obj.held_count()).is_ok() {
+                obj.held(&mut work);
+            }
             if let Some(peer) = obj.peer() {
                 if let Some(p) = self.get_mut(peer) {
                     p.peer_destroyed();
                 }
             }
             if obj.needs_cleanup() {
-                self.graveyard.push(obj);
+                self.bury(obj);
             }
         }
+        self.work = work;
+    }
+
+    /// Hand a destroyed object that needs cleanup to the graveyard. The room was made by `reserve_one` (the graveyard holds at least one slot
+    /// per live object); if it is somehow not there the object's cleanup is lost, a leak, never a failure of the destruction.
+    fn bury(&mut self, obj: T) {
+        if self.graveyard.try_reserve(1).is_ok() {
+            self.graveyard.push(obj);
+        }
+    }
+
+    /// Make room for one more object and for everything its destruction will need to record (the graveyard slot of an object that needs
+    /// cleanup): the caller creates the object only after this returned `Ok`, so creating and then destroying it cannot fail for lack of
+    /// memory (KT9).
+    pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
+        // (a slot in the graveyard and in its twin for every live object, so that however many cleanup-needing objects die at once, and
+        // whichever of the two vectors is in place, burying them does not allocate)
+        let want = self.live.saturating_add(1);
+        for v in [&mut self.graveyard, &mut self.spare] {
+            let more = want.saturating_sub(v.len());
+            if v.capacity() < want {
+                v.try_reserve_exact(more)
+                    .map_err(|_| abi::status::Status::NoMemory)?;
+            }
+        }
+        Ok(())
     }
 
     /// The destroyed objects whose destruction needs work from the owner (since the last
     /// call), oldest first. Call after any operation that can destroy objects: `release`,
     /// `sweep`, closing handles, draining a table.
     pub fn drain_dead(&mut self) -> Vec<T> {
-        core::mem::take(&mut self.graveyard)
+        // (the graveyard keeps its capacity: the empty twin takes its place, and `recycle` brings the emptied one back)
+        // (the twin was sized like the graveyard by `reserve_one`)
+        core::mem::swap(&mut self.graveyard, &mut self.spare);
+        core::mem::take(&mut self.spare)
+    }
+
+    /// Give a vector from `drain_dead` back once it is empty, so the next destruction does not allocate.
+    pub fn recycle(&mut self, mut v: Vec<T>) {
+        v.clear();
+        if v.capacity() > self.graveyard.capacity() {
+            core::mem::swap(&mut self.graveyard, &mut v);
+            self.graveyard.append(&mut v);
+        }
     }
 
     /// Is any destroyed object waiting in the graveyard?
@@ -432,7 +514,7 @@ impl<T: Object> Registry<T> {
                 peers.push(peer);
             }
             if obj.needs_cleanup() {
-                self.graveyard.push(obj);
+                self.bury(obj);
             }
         }
         for peer in peers {

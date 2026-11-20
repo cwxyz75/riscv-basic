@@ -13,6 +13,7 @@
 
 use crate::frame::{Pfn, PAGE_SIZE};
 use crate::job::{JobId, Jobs, Resource};
+use crate::pagemap::PageMap;
 use crate::pagetable::{is_canonical, MapError, PageTable, Perms, PhysMem};
 use crate::Mm;
 use alloc::collections::BTreeMap;
@@ -88,14 +89,22 @@ struct Vmo {
     job: JobId,
     pages: u64,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
-    committed: BTreeMap<u64, Pfn>,
+    committed: PageMap,
+}
+
+struct VmoSlot {
+    gen: u32,
+    vmo: Option<Vmo>,
 }
 
 /// All memory objects, by id.
 #[derive(Default)]
 pub struct Vmos {
-    map: BTreeMap<u64, Vmo>,
-    next: u64,
+    /// The VMOs, in slots; an id is `(generation << 32) | (index + 1)`, so a destroyed VMO's id is never valid again. A slab, not a `BTreeMap`,
+    /// because creating a VMO must be able to report that it has no memory (KT9): `reserve_one` makes the room, and `create` then cannot fail.
+    slots: alloc::vec::Vec<VmoSlot>,
+    free: alloc::vec::Vec<u32>,
+    live: usize,
     /// The job ledger lives here because memory is charged at the moment a page is committed,
     /// which happens in this store (`page_for`) and nowhere else.
     pub jobs: Jobs,
@@ -108,6 +117,69 @@ impl Vmos {
         Vmos::default()
     }
 
+    /// Make room for one more VMO, in memory: after `Ok`, `create`, `create_in`, `create_physical` and `create_dma` do not allocate for their
+    /// own bookkeeping, and destroying any VMO never does (KT9).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len()
+    pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
+        let no_memory = |_| abi::status::Status::NoMemory;
+        self.slots.try_reserve(1).map_err(no_memory)?;
+        self.free
+            .try_reserve(self.slots.len() + 1 - self.free.len())
+            .map_err(no_memory)
+    }
+
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the index is below 2^32 (slots are bounded by the object quota)
+    fn place(&mut self, vmo: Vmo) -> u64 {
+        if let Some(i) = self.free.pop() {
+            if let Some(slot) = self.slots.get_mut(i as usize) {
+                slot.vmo = Some(vmo);
+                self.live += 1;
+                return (u64::from(slot.gen) << 32) | (u64::from(i) + 1);
+            }
+            // (not reached: a free index is a slot)
+            self.free.push(i);
+        }
+        self.live += 1;
+        self.slots.push(VmoSlot {
+            gen: 0,
+            vmo: Some(vmo),
+        });
+        self.slots.len() as u64
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index was bounds-checked by `get`
+    fn slot_index(&self, id: u64) -> Option<usize> {
+        let index = (id & 0xffff_ffff).checked_sub(1)? as usize;
+        let s = self.slots.get(index)?;
+        (s.vmo.is_some() && u64::from(s.gen) == id >> 32).then_some(index)
+    }
+
+    fn vmo(&self, id: u64) -> Option<&Vmo> {
+        self.slots.get(self.slot_index(id)?)?.vmo.as_ref()
+    }
+
+    /// The VMO of `id` for modification, on the slot table alone, so that the caller can still use the other fields (the job ledger) while it holds the VMO.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `slot_index`
+    fn vmo_in(slots: &mut [VmoSlot], id: u64) -> Option<&mut Vmo> {
+        let index = (id & 0xffff_ffff).checked_sub(1)? as usize;
+        let s = slots.get_mut(index)?;
+        if u64::from(s.gen) != id >> 32 {
+            return None;
+        }
+        s.vmo.as_mut()
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; the generation wraps (a slot used 2^32 times)
+    fn take(&mut self, id: u64) -> Option<Vmo> {
+        let i = self.slot_index(id)?;
+        let slot = &mut self.slots[i];
+        let v = slot.vmo.take();
+        slot.gen = slot.gen.wrapping_add(1);
+        self.free.push(i as u32);
+        self.live -= 1;
+        v
+    }
+
     /// A new lazily committed VMO of `pages` pages (nothing allocated yet), charged to the
     /// root job (the kernel's own VMOs).
     pub fn create(&mut self, pages: u64) -> u64 {
@@ -118,17 +190,12 @@ impl Vmos {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter is a u64 that starts at 1 and gains one per VMO, bounded by the object quota
     pub fn create_in(&mut self, pages: u64, job: JobId) -> u64 {
         self.jobs.retain(job);
-        self.next += 1;
-        self.map.insert(
-            self.next,
-            Vmo {
-                kind: VmoKind::Plain,
-                job,
-                pages,
-                committed: BTreeMap::new(),
-            },
-        );
-        self.next
+        self.place(Vmo {
+            kind: VmoKind::Plain,
+            job,
+            pages,
+            committed: PageMap::new(),
+        })
     }
 
     /// A VMO over device memory starting at frame `first` (the caller has checked the range is
@@ -136,17 +203,12 @@ impl Vmos {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter as above; `first + i` for i < pages: the caller passed the device-window check (a range inside one window, so no overflow)
     pub fn create_physical(&mut self, first: Pfn, pages: u64) -> u64 {
         self.jobs.retain(JobId::ROOT);
-        self.next += 1;
-        self.map.insert(
-            self.next,
-            Vmo {
-                kind: VmoKind::Device,
-                job: JobId::ROOT,
-                pages,
-                committed: (0..pages).map(|i| (i, first + i)).collect(),
-            },
-        );
-        self.next
+        self.place(Vmo {
+            kind: VmoKind::Device,
+            job: JobId::ROOT,
+            pages,
+            committed: PageMap::from_run(pages, first),
+        })
     }
 
     /// A VMO of `pages` physically contiguous zeroed frames, charged to `job` now. At most
@@ -174,51 +236,46 @@ impl Vmos {
         }
         self.jobs.retain(job);
         self.dma_pages += pages;
-        self.next += 1;
-        self.map.insert(
-            self.next,
-            Vmo {
-                kind: VmoKind::Dma,
-                job,
-                pages,
-                committed: (0..pages).map(|i| (i, first + i)).collect(),
-            },
-        );
-        Ok(self.next)
+        Ok(self.place(Vmo {
+            kind: VmoKind::Dma,
+            job,
+            pages,
+            committed: PageMap::from_run(pages, first),
+        }))
     }
 
     pub fn kind(&self, id: u64) -> Option<VmoKind> {
-        self.map.get(&id).map(|v| v.kind)
+        self.vmo(id).map(|v| v.kind)
     }
 
     /// The physical address of a DMA VMO (its first byte).
     pub fn phys_addr(&self, id: u64) -> Option<u64> {
-        let v = self.map.get(&id).filter(|v| v.kind == VmoKind::Dma)?;
-        v.committed.get(&0).map(|&pfn| pfn << 12)
+        let v = self.vmo(id).filter(|v| v.kind == VmoKind::Dma)?;
+        v.committed.get(0).map(|pfn| pfn << 12)
     }
 
     /// How many VMOs exist (a leak counter for tests).
     pub fn count(&self) -> usize {
-        self.map.len()
+        self.live
     }
 
     pub fn exists(&self, id: u64) -> bool {
-        self.map.contains_key(&id)
+        self.vmo(id).is_some()
     }
 
     pub fn pages(&self, id: u64) -> Option<u64> {
-        self.map.get(&id).map(|v| v.pages)
+        self.vmo(id).map(|v| v.pages)
     }
 
     /// The frame backing a committed page.
     pub fn frame(&self, id: u64, page: u64) -> Option<Pfn> {
-        self.map.get(&id)?.committed.get(&page).copied()
+        self.vmo(id)?.committed.get(page)
     }
 
     /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
     pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
-        let vmo = self.map.remove(&id).ok_or(VmoGone)?;
+        let vmo = self.take(id).ok_or(VmoGone)?;
         if vmo.kind == VmoKind::Device {
             // device frames are not ours: nothing was charged and nothing is freed
             self.jobs.release(vmo.job);
@@ -230,13 +287,14 @@ impl Vmos {
         self.jobs
             .credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
         self.jobs.release(vmo.job);
-        for (_, pfn) in vmo.committed {
+        let mut committed = vmo.committed;
+        committed.drain_pfns(|pfn| {
             let dropped = mm.db.dec(pfn);
             debug_assert!(
                 dropped.is_ok(),
                 "a committed page holds the VMO's reference"
             );
-        }
+        });
         Ok(())
     }
 
@@ -266,7 +324,7 @@ impl Vmos {
         out: &mut [u8],
     ) -> Result<(), VmoError> {
         let len = out.len();
-        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
         if vmo.kind == VmoKind::Device {
             return Err(VmoError::Device);
         }
@@ -279,8 +337,8 @@ impl Vmos {
             let at = offset + done as u64;
             let (page, inner) = (at / PAGE_SIZE, (at % PAGE_SIZE) as usize);
             let n = (PAGE_SIZE as usize - inner).min(len - done);
-            match vmo.committed.get(&page) {
-                Some(&pfn) => mm
+            match vmo.committed.get(page) {
+                Some(pfn) => mm
                     .mem
                     .read_bytes((pfn << 12) + inner as u64, &mut out[done..done + n]),
                 None => out[done..done + n].fill(0),
@@ -303,7 +361,7 @@ impl Vmos {
         len: usize,
         mut each: impl FnMut(&mut Mm<M>, u64, core::ops::Range<usize>),
     ) -> Result<(), VmoError> {
-        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
         if vmo.kind == VmoKind::Device {
             return Err(VmoError::Device);
         }
@@ -319,13 +377,13 @@ impl Vmos {
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
-        let vmo = self.map.get(&id).expect("exists");
+        let vmo = self.vmo(id).expect("exists");
         let mut done = 0;
         while done < len {
             let at = offset + done as u64;
             let (page, inner) = (at / PAGE_SIZE, at % PAGE_SIZE);
             let n = ((PAGE_SIZE - inner) as usize).min(len - done);
-            let pfn = vmo.committed[&page];
+            let pfn = vmo.committed.get(page).expect("committed above");
             each(mm, (pfn << 12) + inner, done..done + n);
             done += n;
         }
@@ -345,7 +403,7 @@ impl Vmos {
         first: u64,
         pages: u64,
     ) -> Result<(), VmoError> {
-        let vmo = self.map.get(&id).ok_or(VmoError::Gone)?;
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
         if vmo.kind == VmoKind::Device {
             return Err(VmoError::Device);
         }
@@ -355,24 +413,25 @@ impl Vmos {
         }
         // Refuse at once what cannot fit (no frames taken and given back for nothing): count the pages
         // this call would commit and compare with the job's room and the free frames.
-        let needed = (first..end)
-            .filter(|p| !vmo.committed.contains_key(p))
-            .count() as u64;
+        let needed = (first..end).filter(|p| !vmo.committed.contains(*p)).count() as u64;
         if needed > self.jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
             return Err(VmoError::NoMemory);
         }
+        // (the list of this call's commits, for undoing them, is allocated before the first frame is taken: KT9)
         let mut done: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        done.try_reserve_exact(needed as usize)
+            .map_err(|_| VmoError::NoMemory)?;
         for page in first..end {
-            if self.map[&id].committed.contains_key(&page) {
+            if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
             match self.page_for(mm, id, page) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
-                    let vmo = self.map.get_mut(&id).expect("checked above");
+                    let vmo = Self::vmo_in(&mut self.slots, id).expect("checked above");
                     for p in done {
-                        if let Some(pfn) = vmo.committed.remove(&p) {
+                        if let Some(pfn) = vmo.committed.remove(p) {
                             let _ = mm.db.dec(pfn);
                             self.jobs.credit(vmo.job, Resource::Pages, 1);
                         }
@@ -387,7 +446,7 @@ impl Vmos {
     /// Are all pages `first .. first + pages` of VMO `id` committed? (Device memory counts as
     /// committed: it is fixed.) False for an unknown VMO or a range past its end.
     pub fn is_committed(&self, id: u64, first: u64, pages: u64) -> bool {
-        let Some(vmo) = self.map.get(&id) else {
+        let Some(vmo) = self.vmo(id) else {
             return false;
         };
         let Some(end) = first.checked_add(pages) else {
@@ -396,12 +455,12 @@ impl Vmos {
         if end > vmo.pages {
             return false;
         }
-        vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains_key(&p))
+        vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains(p))
     }
 
     /// The job a VMO's pages are charged to.
     pub fn job_of(&self, id: u64) -> Option<JobId> {
-        self.map.get(&id).map(|v| v.job)
+        self.vmo(id).map(|v| v.job)
     }
 
     /// "Give me a page for this offset": the committed frame, allocating a zeroed
@@ -412,8 +471,8 @@ impl Vmos {
         id: u64,
         page: u64,
     ) -> Result<Pfn, FaultError> {
-        let vmo = self.map.get_mut(&id).ok_or(FaultError::VmoGone)?;
-        if let Some(&pfn) = vmo.committed.get(&page) {
+        let vmo = Self::vmo_in(&mut self.slots, id).ok_or(FaultError::VmoGone)?;
+        if let Some(pfn) = vmo.committed.get(page) {
             return Ok(pfn);
         }
         // The job's limit first (a full job is "out of memory" for its own programs only),
@@ -425,8 +484,13 @@ impl Vmos {
             self.jobs.credit(vmo.job, Resource::Pages, 1);
             return Err(FaultError::NoMemory);
         };
+        // (the bookkeeping first: if it cannot be had, the frame and the charge go back and nothing was committed)
+        if vmo.committed.insert(page, pfn).is_err() {
+            let _ = mm.db.dec(pfn);
+            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            return Err(FaultError::NoMemory);
+        }
         mm.mem.zero_frame(pfn);
-        vmo.committed.insert(page, pfn);
         Ok(pfn)
     }
 }

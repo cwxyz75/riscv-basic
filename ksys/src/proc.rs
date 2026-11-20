@@ -313,7 +313,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let p = procs.get_mut(&me).ok_or(e(Status::BadState))?;
             let rights =
                 Rights(Rights::MANAGE.0 | Rights::INSPECT.0 | Rights::WAIT.0 | Rights::DUPLICATE.0);
-            if p.handles.room() < 1 {
+            if p.handles.room() < 1 || p.handles.reserve(1).is_err() {
                 return bad(Status::NoMemory);
             }
             // A process its parent created has a kill-on-close object (the parent's handle to it); the child's own view must not be
