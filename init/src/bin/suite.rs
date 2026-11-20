@@ -9689,7 +9689,8 @@ fn device_caps_need_the_resource() -> Outcome {
     );
     let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
     ensure!(
-        pa.is_multiple_of(4096) && (0x8000_0000..0x9000_0000).contains(&pa),
+        pa.is_multiple_of(4096)
+            && (sys::debug_stat(24)..sys::debug_stat(25)).contains(&(pa as u64)),
         "a RAM address: {pa:#x}"
     );
     ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
@@ -10605,7 +10606,7 @@ fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
         let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
         ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
         ensure!(
-            (0x8000_0000..0x9000_0000).contains(&pa),
+            (sys::debug_stat(24)..sys::debug_stat(25)).contains(&(pa as u64)),
             "inside RAM: {pa:#x}"
         );
         sys::handle_close(v);

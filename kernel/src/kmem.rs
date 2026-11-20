@@ -10,7 +10,7 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
-use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, RAM_BASE, RAM_SIZE};
+use abi::layout::{DIRECT_BASE, KERNEL_OFFSET};
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::buddy::{Meta, META_BYTES};
@@ -114,30 +114,71 @@ fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: boot code: addresses come from the device tree and the linker script; a kernel that cannot build its own page table cannot run
 pub fn init() {
     let s = sections();
-    let kernel_end_phys = s.data.1 - KERNEL_OFFSET;
-    let first = kernel_end_phys.div_ceil(PAGE_SIZE);
-    // QEMU puts the device tree near the top of RAM; keep the top 2 MiB out of the
-    // frame database so it survives until the device manager parses it (S6).
-    let end = (RAM_BASE + RAM_SIZE - 2 * 1024 * 1024) / PAGE_SIZE;
-    // The frame metadata (MM2): one `Meta` per managed frame, carved from the first frames after the image, before any allocator exists
-    // and never from the kernel heap. The frames it occupies are not managed (the database starts after them) but are direct-mapped
-    // read-write like the rest of RAM, by the loop below.
-    let meta_frames = ((end - first) as usize * META_BYTES).div_ceil(PAGE_SIZE as usize) as u64;
-    let managed_first = first + meta_frames;
-    let managed = (end - managed_first) as usize;
+    // What memory exists and which of it the allocator may have (PL4, KERNEL-V1-SPEC 2.3): the tree's `memory` ranges, minus its reserved
+    // ranges (firmware), the loader's reservation block, the tree's own frames and the kernel image. Nothing here is a constant.
+    let image_start = s.text.0 - KERNEL_OFFSET;
+    let image_end = s.data.1 - KERNEL_OFFSET;
+    let (memory, mut reserved) =
+        crate::dtb::memory_map().expect("a device tree that describes the machine's memory");
+    reserved.push((image_start, image_end - image_start));
+    let usable = kcore::memmap::usable_frames(&memory, &reserved);
+    let usable_total: usize = usable.iter().map(|r| r.1).sum();
+    // The frame metadata (MM2): one `Meta` per managed frame, carved from the start of the first usable range that can hold it, before any
+    // allocator exists and never from the kernel heap. Its frames are not managed (the database starts after them) but are direct-mapped
+    // read-write with the rest of the usable memory, by the loop below.
+    let meta_frames = (usable_total * META_BYTES).div_ceil(PAGE_SIZE as usize) as u64;
+    let host = usable
+        .iter()
+        .position(|r| r.1 as u64 > meta_frames)
+        .expect("a range of memory big enough for the frame metadata");
+    let managed_ranges: alloc::vec::Vec<(u64, usize)> = usable
+        .iter()
+        .enumerate()
+        .map(|(i, &(f, c))| {
+            if i == host {
+                (f + meta_frames, c - meta_frames as usize)
+            } else {
+                (f, c)
+            }
+        })
+        .collect();
+    let managed: usize = managed_ranges.iter().map(|r| r.1).sum();
     let storage: &'static mut [Meta] = {
-        let at = (DIRECT_BASE + first * PAGE_SIZE) as *mut Meta;
-        // SAFETY: `first .. managed_first` are RAM frames above the kernel image that nothing else uses and the database will not hand
-        // out; the early boot table direct-maps all of RAM; `managed` entries fit in `meta_frames` frames (sized from the larger count
-        // above); an all-zero `Meta` is a valid value, and the slice is cleared before it is formed. It is the only reference to that memory.
+        let at =
+            (DIRECT_BASE + usable.get(host).expect("the host range").0 * PAGE_SIZE) as *mut Meta;
+        // SAFETY: the first `meta_frames` frames of a usable range are RAM that nothing else uses and the database will not hand out;
+        // the early boot table direct-maps all physical space below 128 GiB; `managed` entries fit in `meta_frames` frames (sized from
+        // the larger `usable_total`); an all-zero `Meta` is a valid value and the slice is cleared before it is formed; it is the only
+        // reference to that memory.
         unsafe {
             core::ptr::write_bytes(at, 0, managed);
             core::slice::from_raw_parts_mut(at, managed)
         }
     };
+    let memory_frames: usize = kcore::memmap::usable_frames(&memory, &[])
+        .iter()
+        .map(|r| r.1)
+        .sum();
+    // SAFETY: boot code, one hart, before anything reads it.
+    unsafe {
+        *addr_of_mut!(STATS) = MemStats {
+            memory_frames: memory_frames as u64,
+            usable_frames: usable_total as u64,
+            managed_frames: managed as u64,
+            meta_frames,
+            ram_first: memory.iter().map(|r| r.0).min().unwrap_or(0) / PAGE_SIZE,
+            ram_end: memory
+                .iter()
+                .map(|r| r.0.saturating_add(r.1))
+                .max()
+                .unwrap_or(0)
+                / PAGE_SIZE,
+            image_first: image_start / PAGE_SIZE,
+            image_end: image_end.div_ceil(PAGE_SIZE),
+        };
+    }
     let mut mm = Mm {
-        db: FrameDb::with_ranges(&[(managed_first, managed)], storage)
-            .expect("room for the frame metadata"),
+        db: FrameDb::with_ranges(&managed_ranges, storage).expect("room for the frame metadata"),
         mem: DirectMap,
     };
     let mut pt = PageTable::new(&mut mm).expect("a frame for the kernel root");
@@ -145,22 +186,27 @@ pub fn init() {
     map_image(&mut pt, &mut mm, s.text, Perms::RX);
     map_image(&mut pt, &mut mm, s.rodata, Perms::R);
     map_image(&mut pt, &mut mm, s.data, Perms::RW);
-    // The direct map: every frame the frame database manages and the frames its metadata occupies (never the image, so
-    // the code cannot be written through an alias), and the two device pages we use.
-    // (MM3: the largest aligned pages that fit, 1 GiB then 2 MiB, 4 KiB only at the unaligned edges; user mappings stay 4 KiB)
-    for (pfn, level) in kcore::pagetable::plan_range(first, end - first, 2) {
-        pt.map_large(
-            &mut mm,
-            DIRECT_BASE + pfn * PAGE_SIZE,
-            pfn,
-            level,
-            Perms::RW,
-        )
-        .expect("direct map");
+    // The direct map: every usable frame (the managed ones and the metadata's), never the image or the firmware's reserved ranges, so
+    // the code cannot be written through an alias. MM3: the largest aligned pages that fit, 1 GiB then 2 MiB, 4 KiB only at the
+    // unaligned edges; user mappings stay 4 KiB.
+    for &(first, count) in &usable {
+        for (pfn, level) in kcore::pagetable::plan_range(first, count as u64, 2) {
+            pt.map_large(
+                &mut mm,
+                DIRECT_BASE + pfn * PAGE_SIZE,
+                pfn,
+                level,
+                Perms::RW,
+            )
+            .expect("direct map");
+        }
     }
-    // The device tree sits in the top 2 MiB, which the frame database does not manage: map it
-    // read-only (the interrupt controller probe reads it).
-    for pfn in end..(RAM_BASE + RAM_SIZE) / PAGE_SIZE {
+    // The device tree's own frames (not usable memory: reserved above) are mapped read-only (the interrupt controller probe reads them).
+    let tree = crate::dtb::dtb_blob().map_or(0..0, |b| {
+        let pa = crate::dtb::DTB.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        pa / PAGE_SIZE..(pa + b.len() as u64).div_ceil(PAGE_SIZE)
+    });
+    for pfn in tree {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
             .expect("device tree map");
     }
@@ -189,14 +235,40 @@ pub fn init() {
     unsafe { crate::arch::aspace_install(token) };
 }
 
-/// The first frame after the kernel image: everything below it is the image, the firmware or unused. (The frame metadata sits just
-/// above it, in frames the database does not manage.)
-pub fn first_frame_after_image() -> u64 {
-    sections()
-        .data
-        .1
-        .wrapping_sub(KERNEL_OFFSET)
-        .div_ceil(PAGE_SIZE)
+/// What `init` found, for the self-tests and `debug_stat`.
+#[derive(Clone, Copy, Default)]
+pub struct MemStats {
+    /// Frames of RAM the device tree describes (whole frames).
+    pub memory_frames: u64,
+    /// Of those, the frames not reserved, not the image and not the tree: what the kernel may use.
+    pub usable_frames: u64,
+    /// Of those, the frames the allocator manages (usable minus the metadata's own).
+    pub managed_frames: u64,
+    /// Frames the frame metadata occupies.
+    pub meta_frames: u64,
+    /// The first frame of the lowest RAM range and the frame after the last of the highest.
+    pub ram_first: u64,
+    pub ram_end: u64,
+    /// The kernel image's frames, first to one past the last.
+    pub image_first: u64,
+    pub image_end: u64,
+}
+
+static mut STATS: MemStats = MemStats {
+    memory_frames: 0,
+    usable_frames: 0,
+    managed_frames: 0,
+    meta_frames: 0,
+    ram_first: 0,
+    ram_end: 0,
+    image_first: 0,
+    image_end: 0,
+};
+
+/// What `init` found (read-only after boot).
+pub fn stats() -> MemStats {
+    // SAFETY: written once by `init` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { *addr_of!(STATS) }
 }
 
 /// The kernel's own address-space token, recorded once by `init` (the secondary harts load it).

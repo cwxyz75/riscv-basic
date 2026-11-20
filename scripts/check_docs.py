@@ -191,7 +191,7 @@ ATOMICS = {
     "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
     "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
-    "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
+    "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
     "kernel/src/console.rs": (2, "the console's panic flag and line state"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (47, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured)"),

@@ -12,6 +12,7 @@ exits with pass or fail. Its switches are environment variables:
 |---|---|
 | `OS_SMP` | hart count |
 | `OS_SHARD` | which part of the suite: `a`, `b`, `k` (below), empty for all |
+| `OS_RAM` | the RAM QEMU is given (`-m`; default `256M`); the harness also puts `ram=<size>` on the kernel line, and the kernel test `ram_matches_the_machine` checks the frame count against it |
 | `OS_CPU` | the CPU model; always `rva23s64` (the kernel refuses to boot below the profile); only `os-boot-test-cpu-neg` sets it, to `rv64` |
 | `OS_BOOT_STALL` | seconds without output before a boot is called stalled (default 180) |
 | `OS_BOOT_TIMEOUT` | the runaway ceiling in seconds (default 1800) |

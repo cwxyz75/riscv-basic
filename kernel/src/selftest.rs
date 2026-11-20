@@ -159,22 +159,15 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
     ensure_eq(stray, 0, "executable pages outside text")
 }
 
-/// Every direct-map leaf maps RAM above the kernel image (the frames the database manages and the metadata the database lives in; never
-/// the image, whose frames sit below the first frame after it), or is one of the device pages.
+/// Every direct-map leaf maps usable RAM (the frames the database manages and the metadata the database lives in; never the kernel image
+/// or the firmware's reserved ranges), or is one of the device pages or the tree's own frames.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn direct_map_does_not_alias_the_image() -> Outcome {
     let k = kmem::get();
-    let first = kmem::first_frame_after_image();
-    let image_pa = abi::layout::KERNEL_PHYS;
-    ensure(
-        k.aspace
-            .table()
-            .translate(&k.mm, DIRECT_BASE + image_pa)
-            .is_none(),
-        "the kernel image must not be reachable through the direct map",
-    )?;
-    // (the whole image, page by page: nothing of it is reachable through the direct map, whatever the leaf sizes)
-    for pfn in (image_pa >> 12)..first {
+    let st = kmem::stats();
+    // (the whole image, page by page: nothing of it is reachable through the direct map, whatever the leaf sizes. The firmware's own
+    // reservation is the tree's business; the RAM between it and the image is ordinary usable memory now)
+    for pfn in st.image_first..st.image_end {
         ensure(
             k.aspace
                 .table()
@@ -184,16 +177,19 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         )?;
     }
     let (mut in_map, mut aliases, mut devices) = (0, 0, 0);
-    let (mut leaves, mut level1) = (0, 0);
+    let (mut leaves, mut level1) = (0u64, 0u64);
     k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
-            in_map += 1u64 << (9 * level); // pages, whatever the leaf's size
+            let pages = 1u64 << (9 * level);
+            in_map += pages; // pages, whatever the leaf's size
             leaves += 1;
-            level1 += u32::from(level == 1);
-            if t.pfn >= abi::layout::RAM_BASE >> 12 && t.pfn < first {
-                aliases += 1; // a RAM frame below the first one after the image: the image or firmware
+            if level >= 1 {
+                level1 += pages; // pages covered by large leaves (2 MiB, and 1 GiB on a big machine)
             }
-            if t.pfn < abi::layout::RAM_BASE >> 12 {
+            if t.pfn < st.image_end && t.pfn + pages > st.image_first {
+                aliases += 1; // a leaf that covers part of the image
+            }
+            if t.pfn < st.ram_first {
                 devices += 1;
             }
             if va - DIRECT_BASE != t.pfn << 12 {
@@ -202,9 +198,14 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         }
     });
     ensure(in_map > 1000, "the direct map has pages")?;
-    // MM3: RAM is mapped with 2 MiB pages (256 MiB is about 126 of them) and 4 KiB pages only at the edges, not 65,000 small leaves
-    ensure(level1 >= 100, "the direct map uses 2 MiB pages")?;
-    ensure(leaves < 1200, "the direct map has few leaves")?;
+    // MM3: RAM is mapped with 2 MiB pages (a 256 MiB machine has about 126 of them) and 4 KiB pages only at the edges and around the
+    // tree, not tens of thousands of small leaves
+    ensure(
+        level1 >= st.usable_frames / 2,
+        "most of the direct map is large pages",
+    )?;
+    // leaves: large pages are few; the small ones are the edges and the tree's pages
+    ensure(leaves < 3000, "the direct map has few leaves")?;
     ensure_eq(
         devices,
         2 + crate::aia::PAGE_COUNT,
@@ -215,6 +216,53 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         0,
         "direct-map leaves aliasing the image, firmware or a wrong address",
     )
+}
+
+/// PL4: the frame count matches the machine. The harness says how much RAM it gave QEMU (`ram=<size>` on the kernel line: `128M`, `4G`);
+/// the tree must describe exactly that, and every frame of it is accounted for: managed by the allocator, holding its metadata, or
+/// reserved (firmware, the kernel image, the tree).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn ram_matches_the_machine() -> Outcome {
+    let st = kmem::stats();
+    let Some(want) = crate::dtb::boot_arg_value("ram=") else {
+        return Ok(()); // a boot without the harness (the interactive targets): nothing to compare
+    };
+    let (num, unit) = want.split_at(want.len().saturating_sub(1));
+    let bytes = num.parse::<u64>().map_err(|_| "ram= is not a number")?
+        << match unit {
+            "M" => 20,
+            "G" => 30,
+            _ => return Err("ram= has no M or G".into()),
+        };
+    ensure_eq(
+        st.memory_frames,
+        bytes / 4096,
+        "the frames of RAM the device tree describes",
+    )?;
+    ensure_eq(
+        st.managed_frames + st.meta_frames + (st.memory_frames - st.usable_frames),
+        st.memory_frames,
+        "managed + metadata + reserved is all of RAM",
+    )?;
+    ensure_eq(
+        k_total_frames(),
+        st.managed_frames,
+        "the allocator's total is the managed frames",
+    )?;
+    // the reserved part is the image, the firmware's footprint and the tree: the image plus at most 8 MiB
+    ensure(
+        st.memory_frames - st.usable_frames < st.image_end - st.image_first + 2048,
+        "the reserved part of RAM is the image and a little more",
+    )?;
+    ensure_eq(
+        st.meta_frames,
+        (st.usable_frames * kcore::buddy::META_BYTES as u64).div_ceil(4096),
+        "the metadata is 16 bytes a frame",
+    )
+}
+
+fn k_total_frames() -> u64 {
+    crate::irq::without(|| kmem::get().mm.db.total() as u64)
 }
 
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
@@ -493,6 +541,7 @@ pub const TESTS: &[Test] = &[
         "direct_map_does_not_alias_the_image",
         direct_map_does_not_alias_the_image,
     ),
+    ("ram_matches_the_machine", ram_matches_the_machine),
     ("heap_works", heap_works),
     ("frame_database_is_sane", frame_database_is_sane),
     ("lazy_commit_on_read", lazy_commit_on_read),

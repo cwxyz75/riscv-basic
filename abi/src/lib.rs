@@ -395,8 +395,6 @@ pub mod layout {
     /// Start of the direct map: physical address `pa` is at `DIRECT_BASE + pa`
     /// (RAM outside the kernel image, plus the device pages the kernel uses).
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
-    /// Physical RAM on QEMU's `virt` board starts here.
-    pub const RAM_BASE: u64 = 0x8000_0000;
     /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots, and the goldfish real-time clock
     /// (one page, `0x101000`: the wall clock, FS-SPEC section 7; the device manager hands clients a read-only VMO of it).
     pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
@@ -413,9 +411,6 @@ pub mod layout {
     /// Highest PLIC source an interrupt object may name (QEMU `virt`: the eight virtio-mmio slots
     /// are sources 1..=8; the UART, 10, belongs to the kernel).
     pub const MAX_IRQ: u32 = 8;
-    /// RAM size the kernel assumes (the boot test passes `-m 128M`). Reading it
-    /// from the device tree arrives with the device manager (S6).
-    pub const RAM_SIZE: u64 = 256 * 1024 * 1024;
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
     pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;
@@ -466,7 +461,6 @@ mod tests {
         assert_eq!((KSTACK_WINDOW_BASE as i64) >> 30, -128);
         assert_eq!(KSTACK_WINDOW_SIZE, 1 << 30);
         assert!(KSTACK_SLOT_BYTES.is_power_of_two() && KSTACK_BYTES * 2 == KSTACK_SLOT_BYTES);
-        assert_eq!(RAM_BASE % 4096, 0);
     }
 
     #[test]

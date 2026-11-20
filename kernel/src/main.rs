@@ -75,8 +75,8 @@ impl Tally {
 #[no_mangle]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
-    dtb::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
-    // First of all: this hart's record in `tp` (the trap entry needs it).
+    dtb::locate(dtb); // (the extent of the tree: `kmem::init` reads it)
+                      // First of all: this hart's record in `tp` (the trap entry needs it).
     percpu::bind(0, hart_id);
     percpu::this()
         .online

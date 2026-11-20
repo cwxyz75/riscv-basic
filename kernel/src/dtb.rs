@@ -2,32 +2,73 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// The device tree's physical address.
+/// The device tree's physical address (the pointer firmware passed in `a1`).
 pub static DTB: AtomicUsize = AtomicUsize::new(0);
+/// Its length in bytes, from its header (0 until `locate` has read it).
+static DTB_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// The device tree OpenSBI handed over, as bytes (None if the address is not inside the top 2 MiB
-/// of RAM that `kmem` direct-maps read-only, or does not hold a tree header).
-pub fn dtb_blob() -> Option<&'static [u8]> {
-    let dtb = DTB.load(Ordering::Relaxed) as u64;
-    let ram_top = abi::layout::RAM_BASE + abi::layout::RAM_SIZE;
-    if dtb < ram_top - 2 * 1024 * 1024 || dtb >= ram_top - 64 {
+/// The most a device tree may be and still be trusted: firmware trees are a few tens of kilobytes; this bounds what a hostile header can
+/// make the kernel read and map.
+const MAX_DTB_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read the tree's header through the early boot table's direct map (which reaches all physical space the kernel supports, `boot.rs`) and
+/// remember the extent: `kmem::init` keeps the tree's frames out of the allocator and maps them read-only. Returns `(address, length)`, or
+/// `None` for no tree or one that does not look like a tree.
+pub fn locate(dtb: usize) -> Option<(u64, usize)> {
+    DTB.store(dtb, Ordering::Relaxed);
+    if dtb == 0 {
         return None;
     }
-    let head = (abi::layout::DIRECT_BASE + dtb) as *const u8;
-    // SAFETY: `dtb` lies inside the direct-mapped top 2 MiB (checked above), so the 8 header bytes
-    // exist; the total size is then clamped to what is left of that region before the slice is formed.
-    unsafe {
-        if u32::from_be_bytes([*head, *head.add(1), *head.add(2), *head.add(3)]) != 0xd00d_feed {
-            return None;
-        }
-        let total =
-            u32::from_be_bytes([*head.add(4), *head.add(5), *head.add(6), *head.add(7)]) as u64;
-        if total < 40 {
-            return None;
-        }
-        let len = total.min(ram_top - dtb) as usize;
-        Some(core::slice::from_raw_parts(head, len))
+    let head = (abi::layout::DIRECT_BASE + dtb as u64) as *const u8;
+    // SAFETY: the early table maps physical addresses below 128 GiB through the direct map; a firmware pointer is a physical address inside
+    // RAM, so the 8 header bytes are readable. The length is bounded before anything else reads further.
+    let (magic, total) = unsafe {
+        (
+            u32::from_be_bytes([*head, *head.add(1), *head.add(2), *head.add(3)]),
+            u32::from_be_bytes([*head.add(4), *head.add(5), *head.add(6), *head.add(7)]) as usize,
+        )
+    };
+    if magic != 0xd00d_feed || !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
     }
+    DTB_LEN.store(total, Ordering::Relaxed);
+    Some((dtb as u64, total))
+}
+
+/// The device tree OpenSBI handed over, as bytes (None if there is none or its header was not sound). Reads through the direct map, which
+/// the early table provides and the kernel table keeps for the tree's frames (read-only).
+pub fn dtb_blob() -> Option<&'static [u8]> {
+    let len = DTB_LEN.load(Ordering::Relaxed);
+    if len == 0 {
+        return None;
+    }
+    let head = (abi::layout::DIRECT_BASE + DTB.load(Ordering::Relaxed) as u64) as *const u8;
+    // SAFETY: `locate` checked the header and bounded `len`; the tree's frames are direct-mapped read-only and never freed (they are not
+    // in the frame allocator).
+    Some(unsafe { core::slice::from_raw_parts(head, len) })
+}
+
+/// The tree's `memory` ranges, its reserved ranges (`/reserved-memory`, the loader's reservation block) and its own extent: what
+/// `kmem::init` needs to decide which frames the allocator may have. `None` without a readable tree.
+/// A list of `(address, size)` byte ranges.
+pub type Ranges = alloc::vec::Vec<(u64, u64)>;
+
+pub fn memory_map() -> Option<(Ranges, Ranges)> {
+    let blob = dtb_blob()?;
+    let nodes = kcore::fdt::parse(blob).ok()?;
+    let memory = kcore::fdt::memory_ranges(&nodes);
+    let mut reserved = kcore::fdt::reserved_ranges(&nodes);
+    reserved.extend(kcore::fdt::reservation_block(blob));
+    // the tree itself (its frames are mapped read-only, never handed out)
+    reserved.push((DTB.load(Ordering::Relaxed) as u64, blob.len() as u64));
+    Some((memory, reserved))
+}
+
+/// The timebase frequency of the tree (`/cpus/timebase-frequency`), in hertz.
+#[allow(dead_code)] // PL4b feeds the clock from it
+pub fn timebase_frequency() -> Option<u64> {
+    let nodes = kcore::fdt::parse(dtb_blob()?).ok()?;
+    kcore::fdt::timebase_frequency(&nodes)
 }
 
 /// Refuse to run on a hart that lacks an extension the kernel relies on (PL1, OD47, OD127): `kcore::isa::REQUIRED_EXTENSIONS` and Sv39,

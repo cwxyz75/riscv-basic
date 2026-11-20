@@ -14,7 +14,7 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
 
 The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
 `virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 256M` (the
-size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
+size the harness gives it: `OS_RAM`, default 256M, and `ram=` on the kernel line says which). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
 fail on purpose), this checks that failure is detected: nonzero exit status, a
@@ -47,7 +47,7 @@ REQUIRED = [
     "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "teardown_with_threads_on_other_harts", "unmap_while_siblings_touch", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle", "idle_harts_take_no_big_lock_for_their_ticks",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
-    "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
+    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "heap_works", "frame_database_is_sane",
     "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
@@ -1020,7 +1020,7 @@ def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
-        "-m", "256M", "-display", "none", "-serial", "stdio", "-monitor", "none",
+        "-m", os.environ.get("OS_RAM", "256M"), "-display", "none", "-serial", "stdio", "-monitor", "none",
         # The clock (FS-SPEC section 7, step C1): the RTC starts from a known date and follows the virtual clock, so the test can
         # tell the time it is given from a made-up one.
         "-rtc", "base=2030-06-15T12:00:00,clock=vm",
@@ -1048,9 +1048,10 @@ def run(kernel: str, extra=()):
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
                                            f"shard={SHARD}" if SHARD else "",
                                            "kfast" if SHARD == "k" and KFAST else "",
+                                           f"ram={os.environ.get('OS_RAM', '256M')}",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
-          if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") or SHARD or os.environ.get("OS_CHAOS_SEED") else []),
+          ),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;

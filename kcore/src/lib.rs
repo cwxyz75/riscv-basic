@@ -37,6 +37,7 @@ pub mod isa;
 pub mod job;
 pub mod latch;
 pub mod linestate;
+pub mod memmap;
 pub mod object;
 pub mod pagemap;
 pub mod pagetable;
