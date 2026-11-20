@@ -41,7 +41,7 @@ impl Machine for Tlb {
 
 struct W {
     objs: Kobjs,
-    procs: BTreeMap<u32, Process>,
+    procs: BTreeMap<u32, Box<Process>>,
     mm: Mm<FakeMem>,
     vmos: Vmos,
     tlb: Tlb,
@@ -81,8 +81,8 @@ fn world() -> (W, u64) {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut procs = BTreeMap::new();
-    procs.insert(1, process(&mut mm, &kernel, JobId::ROOT));
-    procs.insert(2, process(&mut mm, &kernel, JobId::ROOT));
+    procs.insert(1, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
+    procs.insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
     let mut w = W {
         objs: Kobjs::new(),
         procs,

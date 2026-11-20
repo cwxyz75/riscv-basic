@@ -19,6 +19,7 @@ use abi::status::Status;
 use abi::syscall as nr;
 use abi::user::{MAX_DEBUG_WRITE, STACK_PAGES, STACK_TOP};
 use abi::Handle;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -29,11 +30,11 @@ use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
-use kcore::job::{JobError, JobId, Resource};
+use kcore::job::{JobId, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::sched::Tid;
 use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
-use ksys::{ProcState, Process, SpawnStack};
+use ksys::{ProcState, Process, SpawnStack, UserState};
 
 /// The embedded user programs (see build.rs); empty if they were not built.
 pub static SUITE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/suite.elf"));
@@ -45,66 +46,6 @@ pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"
 /// archive that becomes a read-only VMO for `init`.
 pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg.bin"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
-
-struct ThreadStart {
-    pid: u32,
-    entry: u64,
-    sp: u64,
-    arg: u64,
-    obj: Option<kcore::object::ObjId>,
-    /// `thread_spawn` extras: the `tp` register, the stack the kernel provisioned, round robin, and whether `a1` is the tid.
-    tp: u64,
-    stack: Option<SpawnStack>,
-    rr: bool,
-    spawned: bool,
-}
-
-/// A stack `thread_spawn` mapped for a thread: its region (start of the mapped stack) and the VMO behind it.
-struct UserState {
-    objs: Kobjs,
-    procs: BTreeMap<u32, Process>,
-    thread_pid: BTreeMap<Tid, u32>,
-    /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
-    sched_flags: BTreeMap<Tid, u8>,
-    next_pid: u32,
-    /// VMOs whose last handle is gone but that some address space still maps: freed when the
-    /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
-    pending_vmos: Vec<u64>,
-    /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
-    /// hart skip the cleanup while one cleaner was preempted).
-    cleaning: alloc::collections::BTreeSet<Tid>,
-    /// Threads with a pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
-    interrupts: alloc::collections::BTreeSet<Tid>,
-    /// Thread starts waiting for their thread to run, by token.
-    starts: BTreeMap<usize, ThreadStart>,
-    next_token: usize,
-    /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
-    ktable: HandleTable,
-    /// The futex wait table (S7b).
-    futexes: kcore::futex::Futexes,
-    /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
-    /// signals match, instead of by the global queue.
-    waits: kcore::wait::WaitTable,
-    /// The interrupt object that owns each PLIC source (S6a-2).
-    irq_objs: [Option<kcore::object::ObjId>; abi::layout::MAX_IRQ as usize + 1],
-    /// Output of user programs, assembled into lines.
-    line: String,
-    pass: u32,
-    fail: u32,
-}
-
-impl UserState {
-    /// Every object something outside the registry can still reach: all processes' handles
-    /// **and the kernel's own** (the creator ends of bootstrap channels). Any sweep must use
-    /// all of these (a root left out is destroyed, whatever still points at it).
-    fn roots(&self) -> Vec<kcore::object::ObjId> {
-        self.procs
-            .values()
-            .flat_map(|q| q.handles.objects())
-            .chain(self.ktable.objects())
-            .collect()
-    }
-}
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the
 /// kernel's own objects).
@@ -128,25 +69,7 @@ fn state() -> &'static mut UserState {
     // before any context switch, so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
-        slot.get_or_insert_with(|| UserState {
-            objs: Kobjs::new(),
-            procs: BTreeMap::new(),
-            thread_pid: BTreeMap::new(),
-            sched_flags: BTreeMap::new(),
-            next_pid: 1,
-            pending_vmos: Vec::new(),
-            cleaning: alloc::collections::BTreeSet::new(),
-            interrupts: alloc::collections::BTreeSet::new(),
-            starts: BTreeMap::new(),
-            next_token: 1,
-            ktable: HandleTable::new(256),
-            futexes: kcore::futex::Futexes::new(),
-            waits: kcore::wait::WaitTable::new(),
-            irq_objs: [None; abi::layout::MAX_IRQ as usize + 1],
-            line: String::new(),
-            pass: 0,
-            fail: 0,
-        })
+        slot.get_or_insert_with(UserState::new)
     }
 }
 
@@ -327,7 +250,7 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
         let jobs = &mut kmem::get().vmos.jobs;
         let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
         let _ = charge_thread(jobs, JobId::ROOT);
-        s.procs.insert(pid, process);
+        s.procs.insert(pid, Box::new(process));
         new_start(s, pid, entry, STACK_TOP, arg, None)
     });
     // user threads may run on any hart (kernel threads stay on the boot hart by default)
@@ -335,36 +258,11 @@ fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     Ok((pid, tid))
 }
 
-/// Register a thread start and return its token.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread start
-fn new_start(
-    s: &mut UserState,
-    pid: u32,
-    entry: u64,
-    sp: u64,
-    arg: u64,
-    obj: Option<kcore::object::ObjId>,
-) -> usize {
-    let token = s.next_token;
-    s.next_token += 1;
-    s.starts.insert(
-        token,
-        ThreadStart {
-            pid,
-            entry,
-            sp,
-            arg,
-            obj,
-            tp: 0,
-            stack: None,
-            rr: false,
-            spawned: false,
-        },
-    );
-    token
-}
+use ksys::new_start;
 
-#[allow(clippy::expect_used)] // INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
+#[allow(clippy::expect_used)]
+// INVARIANT: the start record was registered by the spawner for this token, and the process of a running thread exists (both under the big lock)
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn user_thread_main(token: usize) {
     let top = thread::current_stack_top();
     // Interrupts stay off from here until `enter_user` is in U-mode: a kill that arrives in
@@ -724,7 +622,7 @@ pub fn activate_current() {
         s.thread_pid
             .get(&thread::current())
             .and_then(|pid| s.procs.get(pid))
-            .map(satp_of)
+            .map(|p| satp_of(p))
     });
     if let Some(satp) = satp {
         if crate::percpu::this()
@@ -2239,7 +2137,7 @@ fn process_create(a: [u64; 6]) -> Reply {
         };
         procs.insert(
             pid,
-            Process {
+            Box::new(Process {
                 aspace: AddressSpace::new(table),
                 handles: HandleTable::new(MAX_HANDLES),
                 asid: (pid & 0xffff) as u16,
@@ -2261,7 +2159,7 @@ fn process_create(a: [u64; 6]) -> Reply {
                 stacks: BTreeMap::new(),
                 stack_hint: abi::user::STACK_ARENA_BASE,
                 privileged: false,
-            },
+            }),
         );
         Ok((Some(u64::from(handle.0)), None))
     })
@@ -2382,88 +2280,21 @@ fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     Ok((None, None))
 }
 
-/// User threads alive in the whole system.
-fn total_threads(s: &UserState) -> usize {
-    s.procs.values().map(|p| p.threads_alive).sum()
-}
+use ksys::total_threads;
 
-/// What one more thread costs a job (slice T, T1): a thread slot, and the four pages of its kernel stack
-/// (billed to the job that owns the thread, for as long as it lives). All or nothing.
-fn charge_thread(jobs: &mut kcore::job::Jobs, job: JobId) -> Result<(), JobError> {
-    jobs.charge(job, Resource::Threads, 1)?;
-    if let Err(e) = jobs.charge(job, Resource::Pages, KSTACK_PAGES) {
-        jobs.credit(job, Resource::Threads, 1);
-        return Err(e);
-    }
-    Ok(())
-}
+use ksys::{charge_thread, credit_thread};
 
-fn credit_thread(jobs: &mut kcore::job::Jobs, job: JobId) {
-    jobs.credit(job, Resource::Threads, 1);
-    jobs.credit(job, Resource::Pages, KSTACK_PAGES);
-}
-
-/// Frames in a kernel stack.
-const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
-
-#[allow(clippy::large_stack_frames)]
-// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
-#[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the target process was looked up under the same lock; threads_alive is below MAX_THREADS_PER_PROCESS (checked just above)
 fn thread_create(a: [u64; 6]) -> Reply {
-    let ph = Handle(a[0] as u32);
-    let (entry, sp, arg) = (a[1], a[2], a[3]);
-    let (token, handle, new_prio) = irq::without(|| -> Result<(usize, u32, u8), ReplyErr> {
+    let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let caller = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
-        let (_, tpid, _, _) = ipc::process_of(&s.objs, &caller.handles, ph, Rights::MANAGE)
-            .map_err(|e| (e, None, None))?;
-        let target = s.procs.get(&tpid).ok_or((Status::BadState, None, None))?;
-        if target.state != ProcState::Running
-            || target.exit_code.is_some()
-            || target.killed.is_some()
-        {
-            return bad(Status::BadState).map(|_| (0, 0, 0));
-        }
-        let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
-        let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
-        if !entry_ok || !sp_ok {
-            return bad(Status::InvalidArgs).map(|_| (0, 0, 0));
-        }
-        if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
-            || total_threads(s) >= abi::limits::MAX_USER_THREADS
-        {
-            return bad(Status::NoMemory).map(|_| (0, 0, 0));
-        }
-        let tjob = target.job;
-        // a new thread inherits its creator's base priority, clamped to its job's maximum
-        let prio = clamp_prio(tjob, creator_prio(s));
-        let UserState { objs, procs, .. } = s;
-        let jobs = &mut kmem::get().vmos.jobs;
-        charge_thread(jobs, tjob).map_err(|e| (job_status(e), None, None))?;
-        let caller = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        let (handle, obj) = match ipc::thread_object_create_in(
-            objs,
-            &mut caller.handles,
-            tpid,
-            &mut quota(caller.job),
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                credit_thread(jobs, tjob);
-                return Err((e, None, None));
-            }
-        };
-        procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
-        Ok((
-            new_start(s, tpid, entry, sp, arg, Some(obj)),
-            handle.0,
-            prio,
-        ))
+        let creator = creator_prio(s);
+        ksys::thread_create(s, &mut kmem::get().vmos.jobs, me, creator, a)
+            .map_err(|e| (e, None, None))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
-    thread::spawn_free_detached("user", new_prio, user_thread_main, token);
-    Ok((Some(u64::from(handle)), None))
+    thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
+    Ok((Some(u64::from(spawn.handle)), None))
 }
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a
@@ -2596,7 +2427,7 @@ fn thread_spawn(a: [u64; 6]) -> Reply {
             let t = procs.get_mut(&tpid).expect("target exists");
             let tables = stack_len / 4096 / 512 + 4;
             let undo = |made: Option<(Handle, kcore::object::ObjId)>,
-                        procs: &mut BTreeMap<u32, Process>,
+                        procs: &mut BTreeMap<u32, Box<Process>>,
                         objs: &mut Kobjs,
                         jobs: &mut kcore::job::Jobs| {
                 if let Some((h, _)) = made {

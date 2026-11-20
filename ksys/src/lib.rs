@@ -23,6 +23,8 @@ extern crate alloc;
 mod job;
 mod lifecycle;
 mod proc;
+mod state;
+mod thread;
 mod vmo;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
@@ -30,6 +32,11 @@ pub use lifecycle::{
     thread_target,
 };
 pub use proc::{proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
+pub use state::{ThreadStart, UserState};
+pub use thread::{
+    charge_thread, clamp_prio, credit_thread, new_start, thread_create, total_threads, Spawn,
+    KSTACK_PAGES,
+};
 pub use vmo::vmo_call;
 
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
