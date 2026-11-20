@@ -2,6 +2,9 @@
 //! domain's APLIC in MSI mode, and each hart's own IMSIC supervisor file, reached through the
 //! indirect CSRs (`siselect`/`sireg`/`stopei`, the Ssaia extension).
 //!
+//! Message id 1 of every hart's file is the inter-hart interrupt: `send_ipi` writes it to the target's `seteipnum_le` and the handler claims it
+//! with the rest. A device source `n` is message id `n + 1`.
+//!
 //! A source a process may take (the tree's admitted devices' interrupts, `kcore::aiatree`) is delivered as message id `n` to the hart that asked for it
 //! (`enable` points the source's target at the calling hart). Every hart enables all of the ids
 //! in its own IMSIC at start, so retargeting is one APLIC write, never a cross-hart call. A source that fires is **masked** at the APLIC by the trap handler and unmasked by
@@ -26,32 +29,25 @@ pub fn info() -> Option<&'static kcore::aiatree::Aia> {
 /// Pages of the APLIC the kernel maps: domaincfg, sourcecfg, the set/clear banks and the targets.
 pub const PAGE_COUNT: usize = 4;
 
-/// The sources of the admitted devices, whatever controller they go to: what `interrupt_create` may be asked for (set once at boot). A machine
-/// without a usable AIA still knows them, so the call says NOT_SUPPORTED there and INVALID_ARGS for a source no device has.
-static mut KNOWN: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-
-/// Is `irq` a source of an admitted device?
-pub fn source_known(irq: u32) -> bool {
-    // SAFETY: written once by `discover` at boot, before any other hart or thread runs; read-only afterwards.
-    unsafe { (&*core::ptr::addr_of!(KNOWN)).binary_search(&irq).is_ok() }
-}
-
 /// Read the interrupt controller out of the parsed tree and size the per-source state (needs the heap). `ram` is every range that is RAM or
 /// reserved: a controller whose registers lie in it, or beyond the direct map, is not used (it would alias memory the kernel owns).
 pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
-    // SAFETY: boot code, one hart, before anything reads it.
-    unsafe { *core::ptr::addr_of_mut!(KNOWN) = kcore::aiatree::device_sources(nodes) };
     let Some(aia) = kcore::aiatree::discover(nodes) else {
         return;
     };
-    let span = (aia.aplic_base, PAGE_COUNT as u64 * 0x1000);
-    let end = span.0.saturating_add(span.1);
-    if end > abi::layout::DIRECT_MAP_PHYS_LIMIT
-        || ram
-            .iter()
-            .any(|&(a, s)| span.0 < a.saturating_add(s) && a < end)
-    {
-        return;
+    let imsic_bytes = aia.hart_order.len() as u64 * 0x1000;
+    for span in [
+        (aia.aplic_base, PAGE_COUNT as u64 * 0x1000),
+        (aia.imsic_base, imsic_bytes),
+    ] {
+        let end = span.0.saturating_add(span.1);
+        if end > abi::layout::DIRECT_MAP_PHYS_LIMIT
+            || ram
+                .iter()
+                .any(|&(a, s)| span.0 < a.saturating_add(s) && a < end)
+        {
+            return;
+        }
     }
     let aimed: alloc::vec::Vec<AtomicUsize> = (0..=aia.num_sources)
         .map(|_| AtomicUsize::new(usize::MAX))
@@ -63,10 +59,41 @@ pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
     }
 }
 
-/// The physical pages of the APLIC the kernel maps (none without one).
+/// The physical pages of the interrupt controller the kernel maps: the APLIC's and every hart's IMSIC supervisor file (none without them).
 pub fn pages() -> impl Iterator<Item = u64> {
-    let base = info().map(|i| i.aplic_base);
-    (0..PAGE_COUNT as u64).filter_map(move |i| base.map(|b| b + i * 0x1000))
+    let aplic = info().map(|i| i.aplic_base);
+    let imsic = info().map(|i| (i.imsic_base, i.hart_order.len() as u64));
+    (0..PAGE_COUNT as u64)
+        .filter_map(move |i| aplic.map(|b| b + i * 0x1000))
+        .chain((0..imsic.map_or(0, |m| m.1)).filter_map(move |i| imsic.map(|m| m.0 + i * 0x1000)))
+}
+
+/// The message id of the inter-hart interrupt.
+pub const IPI_ID: u32 = 1;
+/// Its bit in the mask `claim` returns.
+pub const IPI_BIT: u64 = 1 << IPI_ID;
+
+/// Message id of device source `source`.
+const fn eiid(source: u32) -> u32 {
+    source + 1
+}
+
+/// Interrupt `hart_id` (the firmware's id): write the inter-hart id to its IMSIC file's `seteipnum_le`. The caller has recorded the reason.
+pub fn send_ipi(hart_id: usize) {
+    let Some(i) = info() else {
+        return;
+    };
+    let Some(index) = i.hart_order.iter().position(|&h| h as usize == hart_id) else {
+        return;
+    };
+    // SAFETY: the target's IMSIC supervisor-file page is direct-mapped device memory (`pages`, `kmem::init`); `seteipnum_le` is its first
+    // register and writing an id to it only sets that id pending.
+    unsafe {
+        write_volatile(
+            (abi::layout::DIRECT_BASE + i.imsic_base + index as u64 * 0x1000) as *mut u32,
+            IPI_ID,
+        );
+    }
 }
 
 /// The number of slots an interrupt-object table needs: one per source plus the unused 0 (zero without a controller).
@@ -152,7 +179,9 @@ pub fn init() {
 /// supervisor external interrupts on this hart.
 pub fn init_hart() {
     let ids: usize = info().map_or(0, |i| {
-        i.sources.iter().fold(0usize, |m, &s| m | (1usize << s))
+        i.sources
+            .iter()
+            .fold(1usize << IPI_ID, |m, &s| m | (1usize << eiid(s)))
     });
     // SAFETY: Ssaia CSRs of this hart: select the IMSIC's `eidelivery` (0x70) and write 1, its
     // `eithreshold` (0x72) and write 0 (everything passes), then `eie0` (0xC0, ids 0..63) and set
@@ -209,7 +238,10 @@ fn aim_and_unmask(irq: u32) {
     // set while masked it is forwarded exactly once when the enable follows (the reverse order could
     // forward twice). Setting pending on a level source whose line is low is ignored by the hardware.
     unsafe {
-        write_volatile(reg(TARGET + 4 * (u64::from(irq) - 1)), hart << 18 | irq);
+        write_volatile(
+            reg(TARGET + 4 * (u64::from(irq) - 1)),
+            hart << 18 | eiid(irq),
+        );
         #[cfg(not(feature = "fault-aia-no-repend"))]
         write_volatile(reg(SETIPNUM), irq);
         write_volatile(reg(SETIENUM), irq);
@@ -222,10 +254,10 @@ pub fn disable(irq: u32) {
     unsafe { write_volatile(reg(CLRIENUM), irq) };
 }
 
-/// Take every message waiting in this hart's IMSIC (reading `stopei` claims it), mask the source
-/// and tell `fired` (whether an interrupt object took it). Returns whether any object was signalled.
-pub fn handle(mut fired: impl FnMut(u32) -> bool) -> bool {
-    let mut any = false;
+/// Take every message waiting in this hart's IMSIC (reading `stopei` claims one at a time); the result has bit `n` set for each message id `n`
+/// that was pending (ids below 64: bit 1 is the inter-hart interrupt, the others are device sources + 1).
+pub fn claim() -> u64 {
+    let mut mask = 0u64;
     loop {
         let top: usize;
         // SAFETY: `csrrw stopei, x0` reads the top pending-and-enabled id and clears its
@@ -233,24 +265,40 @@ pub fn handle(mut fired: impl FnMut(u32) -> bool) -> bool {
         unsafe { asm!("csrrw {}, 0x15c, zero", out(reg) top) };
         let id = (top >> 16) as u32;
         if id == 0 {
-            return any;
+            return mask;
         }
-        if !irq_allowed(id) {
+        if id < 64 {
+            mask |= 1 << id;
+        }
+    }
+}
+
+/// Deliver the device messages of a `claim` mask: mask each source at the APLIC and tell `fired` (whether an interrupt object took it).
+/// Returns whether any object was signalled.
+pub fn deliver(mask: u64, mut fired: impl FnMut(u32) -> bool) -> bool {
+    let mut any = false;
+    for id in 2..64u32 {
+        if mask & (1 << id) == 0 {
             continue;
         }
-        disable(id);
+        let source = id - 1;
+        if !irq_allowed(source) {
+            continue;
+        }
+        disable(source);
         let this = crate::percpu::this();
         TAKEN.fetch_add(1, Ordering::Relaxed);
         if this.index.load(Ordering::Relaxed) != 0 {
             TAKEN_OFF_BOOT.fetch_add(1, Ordering::Relaxed);
         }
-        if aimed(id).map(|a| a.load(Ordering::Relaxed))
+        if aimed(source).map(|a| a.load(Ordering::Relaxed))
             != Some(this.hart_id.load(Ordering::Relaxed))
         {
             MISROUTED.fetch_add(1, Ordering::Relaxed);
         }
-        if fired(id) {
+        if fired(source) {
             any = true;
         }
     }
+    any
 }

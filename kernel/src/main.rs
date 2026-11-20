@@ -125,12 +125,13 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
     kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
     aia::init();
+    // PL6: the AIA is required (the inter-hart interrupt is an IMSIC message, and there is no polling mode)
+    assert!(
+        aia::present(),
+        "no usable AIA (APLIC in MSI mode with an IMSIC): this kernel needs `-machine virt,aia=aplic-imsic`"
+    );
     if !RELEASE {
-        let _ = writeln!(
-            out,
-            "interrupt controller: {}",
-            if aia::present() { "AIA" } else { "none" }
-        );
+        let _ = writeln!(out, "interrupt controller: AIA");
         let _ = writeln!(
             out,
             "kernel page table active; {} frames free",
@@ -164,7 +165,6 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     }
     timer::start();
     irq::enable_timer_interrupt();
-    smp::enable_ipi_on_this_hart();
     irq::enable();
     let class = thread::class_name();
     if !RELEASE {

@@ -13,3 +13,5 @@ refs: [KERNEL-V1-SPEC, OD127]
 **Acceptance, written first.** `ipi_reaches_every_hart` and `a_wake_preempts_a_lower_priority_hart` pass at 2, 4 and 8 harts with an SBI-call counter showing zero IPI extension calls. `##BENCH wake_latency_event` at four harts is recorded before and after.
 
 **Review.** Fable, soak.
+
+Progress (2026-11-20): the kernel requires the AIA (boot panics without it); `send_ipi` writes message id 1 to the target's IMSIC supervisor file (pages mapped from the tree: `aiatree::Aia::imsic_base`), device sources are message ids 2 and up (so a source is at most 62), the external-interrupt trap claims every message and takes the lock only for a device message; the SBI IPI extension is counted (`debug_stat` 106) and `ipi_reaches_every_hart` checks 0. Polling: `os-boot-test-polling`, the harness branches and `blkd`'s polling mode are deleted. Left: T184. `##BENCH wake_latency_event` before/after is for the owner's soak run (`make os-bench`).

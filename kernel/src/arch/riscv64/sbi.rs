@@ -21,7 +21,6 @@ pub const FID_DBCN_WRITE_BYTE: usize = 2;
 /// The system reset extension (SRST), function system_reset (a0: 0 shutdown, 1 cold reboot; a1: 0 no reason, 1 system failure).
 pub const EID_SRST: usize = 0x5352_5354;
 pub const FID_SRST_RESET: usize = 0;
-pub const FID_SEND_IPI: usize = 0;
 /// `hart_get_status` result for a hart that exists and is waiting to be started.
 pub const HSM_STOPPED: usize = 1;
 
@@ -34,7 +33,17 @@ pub fn sbi(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> SbiRet {
     sbi5(eid, fid, [a0, a1, a2, 0, 0])
 }
 
+/// Calls made to the IPI extension: the kernel interrupts harts through the IMSIC (PL6), so this stays 0 (`debug_stat` 106).
+static IPI_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn ipi_calls() -> usize {
+    IPI_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn sbi5(eid: usize, fid: usize, a: [usize; 5]) -> SbiRet {
+    if eid == EID_IPI {
+        IPI_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let (error, value): (isize, usize);
     // SAFETY: `ecall` from S-mode into OpenSBI with the standard calling convention (a7 =
     // extension, a6 = function, a0-a2 arguments, results in a0/a1); it changes no kernel state.

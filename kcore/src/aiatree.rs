@@ -14,10 +14,12 @@ pub struct Aia {
     pub aplic_base: u64,
     /// The number of interrupt sources it has (`riscv,num-sources`).
     pub num_sources: u32,
+    /// Physical address of the first hart's supervisor interrupt file; the file of hart index `i` is the page at `imsic_base + i * 0x1000`.
+    pub imsic_base: u64,
     /// The firmware ids of the harts in the order of the IMSIC's interrupt files: the position of a hart here is its hart index in an
     /// APLIC target register.
     pub hart_order: Vec<u32>,
-    /// The sources a process may take (sorted, unique, each at most 63: one IMSIC `eie` register holds ids 0 to 63).
+    /// The sources a process may take (sorted, unique, each at most 62: a source is delivered as message id source + 1, and one IMSIC `eie` register holds ids 0 to 63, id 1 being the inter-hart interrupt).
     pub sources: Vec<u32>,
 }
 
@@ -95,9 +97,14 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
             .cells("riscv,group-index-bits")
             .first()
             .is_some_and(|&b| b != 0)
+        || imsic
+            .cells("riscv,guest-index-bits")
+            .first()
+            .is_some_and(|&b| b != 0)
     {
         return None;
     }
+    let (imsic_base, imsic_size) = *imsic.regs().first()?;
     // interrupts-extended: (cpu interrupt controller phandle, interrupt number) per hart, in hart-index order; the interrupt number must be
     // 9, the supervisor external interrupt (11 is the machine's file: not ours to use)
     let ext = imsic.cells("interrupts-extended");
@@ -109,7 +116,8 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
         }
         hart_order.push(hart_of_intc(nodes, *ph)?);
     }
-    if hart_order.is_empty() {
+    // one page per file, all inside the node's register window
+    if hart_order.is_empty() || imsic_size < (hart_order.len() as u64).checked_mul(0x1000)? {
         return None;
     }
     let aplic_ph = phandle(aplic);
@@ -122,7 +130,7 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
             continue;
         }
         if let Some(&src) = n.cells("interrupts").first() {
-            if (1..=63).contains(&src) && src <= num_sources {
+            if (1..=62).contains(&src) && src <= num_sources {
                 sources.push(src);
             }
         }
@@ -132,19 +140,8 @@ pub fn discover(nodes: &[Node]) -> Option<Aia> {
     Some(Aia {
         aplic_base,
         num_sources,
+        imsic_base,
         hart_order,
         sources,
     })
-}
-
-/// The sources the admitted devices name in `interrupts`, whatever controller they go to: what `interrupt_create` may be asked for. A
-/// machine without a usable AIA still knows which sources are devices' (the call then says NOT_SUPPORTED rather than INVALID_ARGS).
-pub fn device_sources(nodes: &[Node]) -> Vec<u32> {
-    let mut v: Vec<u32> = admitted(nodes)
-        .filter_map(|n| n.cells("interrupts").first().copied())
-        .filter(|s| (1..=63).contains(s))
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    v
 }

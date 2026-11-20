@@ -3,7 +3,7 @@
 //!
 //! Authority, all of it handed over in the startup message: the device's virtio-mmio slot
 //! (`BlkMmio`, a physical VMO), one DMA buffer (`BlkDma`, with the DMA right), optionally the
-//! slot's interrupt (`BlkIrq`: absent on machines without an AIA, then it polls), and the channel
+//! slot's interrupt (`BlkIrq`: the driver waits on it; there is no polling mode, PL6), and the channel
 //! it serves (`ServiceBlk`). It never owns the memory: its supervisor keeps its own handles to the
 //! DMA buffer and the MMIO slot, so killing the driver frees nothing the device may still write
 //! to; the supervisor resets the device before it hands the buffer to the next driver (work item T42).
@@ -78,9 +78,7 @@ const TIMEOUT: u64 = 2000;
 
 struct Dev {
     pa: u64,
-    irq: Option<u32>,
-    /// A private event only ever waited on with a deadline: the polling mode's sleep.
-    nap: u32,
+    irq: u32,
     avail_idx: u16,
     last_used: u16,
     sectors: u64,
@@ -184,7 +182,7 @@ impl Dev {
         dma_u16(USED + 2) != self.last_used
     }
 
-    /// Wait for the device (interrupt or polling); false on timeout.
+    /// Wait for the device's interrupt; false on timeout.
     fn wait(&mut self) -> bool {
         let deadline = sys::clock_get() + TIMEOUT;
         loop {
@@ -195,19 +193,12 @@ impl Dev {
             if now >= deadline {
                 return false;
             }
-            match self.irq {
-                Some(irq) => {
-                    let r = sys::object_wait(irq, signals::INTERRUPT, deadline);
-                    if r.status() == Some(Sys::Ok) {
-                        // quiet the device's line, then let the kernel unmask the source
-                        // (spurious interrupts are possible and harmless: `done` decides)
-                        wr(INTERRUPT_ACK, rd(INTERRUPT_STATUS));
-                        sys::interrupt_ack(irq);
-                    }
-                }
-                None => {
-                    sys::object_wait(self.nap, 1 << 24, now + 1);
-                }
+            let r = sys::object_wait(self.irq, signals::INTERRUPT, deadline);
+            if r.status() == Some(Sys::Ok) {
+                // quiet the device's line, then let the kernel unmask the source
+                // (spurious interrupts are possible and harmless: `done` decides)
+                wr(INTERRUPT_ACK, rd(INTERRUPT_STATUS));
+                sys::interrupt_ack(self.irq);
             }
         }
     }
@@ -323,14 +314,14 @@ pub fn app_main() -> i32 {
         Err(startup::EnvError::NoMessage) => return EXIT_NO_STARTUP,
         Err(_) => return EXIT_BAD_STARTUP,
     };
-    let (Some(mmio), Some(dma), Some(chan)) = (
+    let (Some(mmio), Some(dma), Some(chan), Some(irq)) = (
         env.handle(Role::BlkMmio),
         env.handle(Role::BlkDma),
         env.handle(Role::ServiceBlk),
+        env.handle(Role::BlkIrq),
     ) else {
         return 3;
     };
-    let irq = env.handle(Role::BlkIrq);
     let me = sys::process_self().a1 as u32;
     if !map(me, mmio, MMIO_VA, 1) || !map(me, dma, DMA_VA, DMA_PAGES) {
         return 4;
@@ -339,14 +330,9 @@ pub fn app_main() -> i32 {
     if pa.status() != Some(Sys::Ok) {
         return 5;
     }
-    let nap = sys::event_create();
-    if nap.status != 0 {
-        return 6;
-    }
     let mut dev = Dev {
         pa: pa.a1 as u64,
         irq,
-        nap: nap.a1 as u32,
         avail_idx: 0,
         last_used: 0,
         sectors: 0,

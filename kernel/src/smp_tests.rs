@@ -296,6 +296,13 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
             ));
         }
     }
+    // PL6: the interrupts above were messages to the harts' IMSIC files; the firmware's IPI extension was never called
+    if crate::arch::sbi::ipi_calls() != 0 {
+        return Err(format!(
+            "{} calls were made to the SBI IPI extension",
+            crate::arch::sbi::ipi_calls()
+        ));
+    }
     Ok(())
 }
 

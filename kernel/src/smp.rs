@@ -41,10 +41,7 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     unsafe { crate::arch::aspace_install(token) };
     timer::start();
     irq::enable_timer_interrupt();
-    enable_software_interrupt();
-    if crate::aia::present() {
-        crate::aia::init_hart();
-    }
+    crate::aia::init_hart(); // (the inter-hart interrupt is a message in this hart's IMSIC file)
     percpu::this().online.store(true, Ordering::Release);
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
     // shared), then this hart joins it for good.
@@ -58,19 +55,8 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     }
 }
 
-fn enable_software_interrupt() {
-    crate::arch::software_interrupt_enable();
-}
-
-/// The boot hart's share of `enable_software_interrupt`.
-pub fn enable_ipi_on_this_hart() {
-    enable_software_interrupt();
-}
-
-/// The software interrupt handler (called from the trap handler on any hart): clear the pending
-/// bit, take the reasons, count.
+/// The inter-hart interrupt handler (called from the trap handler on any hart, after the IMSIC message was claimed): take the reasons, count.
 pub fn ipi_interrupt() -> u32 {
-    crate::arch::software_interrupt_clear();
     let me = percpu::this();
     // take the reasons first, then count: whoever sees the count move sees the bits already gone
     let reasons = me.pending.swap(0, Ordering::SeqCst);
@@ -84,13 +70,12 @@ pub fn ipi_interrupt() -> u32 {
     reasons
 }
 
-/// Send `reason` to hart `index` (an IPI through SBI).
+/// Send `reason` to hart `index` (a message to its IMSIC file).
 pub fn send_ipi(index: usize, reason: u32) {
     crate::chaos::point(crate::chaos::Point::BeforeIpi);
     let target = percpu::hart(index);
     target.pending.fetch_or(reason, Ordering::SeqCst);
-    let id = target.hart_id.load(Ordering::Relaxed);
-    sbi(EID_IPI, FID_SEND_IPI, 1usize << (id % 64), id - id % 64, 0);
+    crate::aia::send_ipi(target.hart_id.load(Ordering::Relaxed));
 }
 
 /// Find the other harts and start them. Needs `kmem::init` (the kernel table) and the heap.
