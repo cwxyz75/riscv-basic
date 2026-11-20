@@ -38,7 +38,7 @@ owner's go-ahead: the sentences in older `L` items about waiting for one are sup
   that fails for infrastructure reasons (a package mirror, a cancelled runner) is re-run.
 - **Reviews.** An item marked Fable gets a fresh-context Fable review in its own small PR before it merges; "default" gets
   the default reviewer. Findings are fixed in the PR or become tidy items in it.
-- **Testing.** While iterating: `make kquick` once KT1 exists (before it: `make quick` and the one targeted test). The gate
+- **Testing.** `make preflight` (quick) before every PR; `make preflight-full` only when the owner asks, so a PR touching `kernel/`, `ksys/` or `kcore/` gets a line under "Runs owed". While iterating: `make kquick` once KT1 exists (before it: `make quick` and the one targeted test). The gate
   is `make smoke`; merge on a green gate. Verification at one, two and four harts comes from the gate's kernel-only boots
   (KT1, the first item, for that reason); before KT1 lands, and for wider hart counts, the run is owed, not started. One
   mutation check per new test. Say plainly what was and was not run.
@@ -197,6 +197,7 @@ Soak and long runs that an item wanted and only the owner may start (OD142). One
 or tier, and what a red result would mean. The owner starts a run when they choose (`gh workflow run soak.yml`, or Actions >
 soak > Run workflow); one run of the tier clears every line above it.
 
+- **Standing: `make preflight-full`** (the kernel-only boot at four harts in the debug and the optimised build, about fifteen minutes; owner, 2026-11-20: on demand only). Every PR that changes `kernel/`, `ksys/` or `kcore/` adds a line here with its number; the owner runs it (or the soak tier, which covers the same boots) when they choose, and a run clears the lines above it. A red optimised-build run would most likely be the stack budget (KT13) or a `debug_assert!` the optimised build breaks.
 - **T157** (PR 258): the round-robin kernel boot (`os-boot-test-rr`, soak) with the stall-based timeout and the widened clock window passed 3 of 3 under full CPU load on the development machine; one soak run confirms it on CI's runners. A red `os-boot-test-rr` would mean a stall (the log names the last line) or a different cause.
 - **L11c part 1** (PR 262): the dead-list reap in `finish_switch` wants the soak run of the smp targets at `-smp 1`, `2` and `4` (and the round-robin and polling kernels). A red one would mean a leaked or double-freed kernel stack.
 - **L11c part 2** (PR to follow): the deferred switch wants the same soak run as part 1 (smp targets at `-smp 1`, `2`, `4`, round-robin and polling kernels): a red one would mean a lost switch or a wrong thread blocked.

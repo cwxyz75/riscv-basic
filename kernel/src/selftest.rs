@@ -64,7 +64,11 @@ fn write(va: u64, value: u64) {
 }
 
 fn paging_enabled() -> Outcome {
-    ensure_eq(kmem::satp() >> 60, 8, "satp mode (8 = Sv39)")
+    ensure_eq(
+        crate::arch::aspace_current() >> 60,
+        8,
+        "address-space mode (8 = Sv39)",
+    )
 }
 
 fn runs_in_the_upper_half() -> Outcome {

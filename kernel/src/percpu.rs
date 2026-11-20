@@ -70,8 +70,8 @@ pub struct PerHart {
     pub work_arg: AtomicU64,
     pub work_result: AtomicU64,
     pub work_done: AtomicBool,
-    /// The `satp` last written for user mode on this hart (so a switch is made only when needed).
-    pub active_satp: AtomicU64,
+    /// The address-space token last installed for user mode on this hart (so a switch is made only when needed).
+    pub active_aspace: AtomicU64,
     /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
     pub bkl_takes: AtomicU64,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
@@ -118,7 +118,7 @@ impl PerHart {
             work_arg: AtomicU64::new(0),
             work_result: AtomicU64::new(0),
             work_done: AtomicBool::new(false),
-            active_satp: AtomicU64::new(0),
+            active_aspace: AtomicU64::new(0),
             bkl_takes: AtomicU64::new(0),
             running: AtomicU32::new(0),
             prev: AtomicU32::new(0),
@@ -150,9 +150,8 @@ pub fn hart(index: usize) -> &'static PerHart {
 
 /// The calling hart's record, through `tp`.
 pub fn this() -> &'static PerHart {
-    let p: usize;
-    // SAFETY: reads `tp`, which holds `&PerHart` in kernel code (`bind`); no memory is touched.
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) p, options(nomem, nostack, preserves_flags)) };
+    // `tp` holds `&PerHart` in kernel code (`bind`).
+    let p = crate::arch::thread_pointer();
     debug_assert!(
         HARTS.as_ptr_range().contains(&(p as *const PerHart)),
         "tp does not point at a PerHart"
@@ -172,8 +171,6 @@ pub fn bind(index: usize, hart_id: usize) {
         unsafe { core::ptr::addr_of_mut!(EMERGENCY[index]) } as u64 + EMERGENCY_BYTES as u64,
         Ordering::Relaxed,
     );
-    // SAFETY: sets `tp`, which kernel code reserves for this purpose (LLVM never allocates it).
-    unsafe {
-        core::arch::asm!("mv tp, {}", in(reg) h as *const PerHart as usize, options(nomem, nostack, preserves_flags))
-    };
+    // SAFETY: `h` is this hart's own record, which lives for ever.
+    unsafe { crate::arch::set_thread_pointer(h as *const PerHart as usize) };
 }

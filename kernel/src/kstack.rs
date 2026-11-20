@@ -144,8 +144,7 @@ fn make_slot() -> Option<u32> {
     }
     // (a mapping that was invalid is now valid: no remote flush is needed for that, and this hart is the
     // only one that can touch the slot until the stack is handed out)
-    // SAFETY: `sfence.vma` only drops cached translations.
-    unsafe { core::arch::asm!("sfence.vma zero, zero") };
+    crate::arch::tlb_flush_all();
     s.next += 1;
     Some(slot)
 }

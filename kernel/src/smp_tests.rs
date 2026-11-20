@@ -16,12 +16,11 @@ fn wfi_returns_with_interrupts_masked() -> Result<(), String> {
     crate::irq::without(|| {
         // the timer interrupt is enabled (STIE) but globally masked here; program it one tick ahead
         crate::timer::program(Some(crate::timer::now_ns() + 1_000_000));
-        // SAFETY: `wfi` idles until an interrupt is pending (it returns at once if one already is); no memory.
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::cpu_idle(); // returns at once if an interrupt is already pending
     });
     let waited = crate::timer::now() - start;
     if waited > 200 * 10_000 {
-        return Err(alloc::format!("wfi took {waited} cycles to return"));
+        return Err(alloc::format!("idle took {waited} cycles to return"));
     }
     Ok(())
 }
@@ -111,7 +110,7 @@ fn long_idle_suspends_and_a_short_sleeper_does_not() -> Result<(), String> {
     let _wfis = percpu::hart(1).idle_wfi.load(Ordering::Relaxed) - w0;
     if smp::suspend_supported() && suspends == 0 {
         return Err(format!(
-            "an idle hart with no timer event never entered the retentive suspend in 100 ms (wfi entries {_wfis}, idle ns {})",
+            "an idle hart with no timer event never entered the retentive suspend in 100 ms (idle-wait entries {_wfis}, idle ns {})",
             percpu::hart(1).idle_ns.load(Ordering::Relaxed)
         ));
     }
@@ -130,7 +129,7 @@ fn long_idle_suspends_and_a_short_sleeper_does_not() -> Result<(), String> {
     thread::join(t);
     if wfis2 < 20 {
         return Err(format!(
-            "hart 2, with a 100 us sleeper, idled through `wfi` only {wfis2} times in 100 ms"
+            "hart 2, with a 100 us sleeper, idled through the wait instruction only {wfis2} times in 100 ms"
         ));
     }
     if suspends2 > 2 {

@@ -179,8 +179,7 @@ pub fn grow(bytes: usize) -> usize {
     }
     // (a mapping that was invalid is now valid: no remote flush is needed; this hart is the only one that can touch
     // the new pages until the allocator hands them out)
-    // SAFETY: `sfence.vma` only drops cached translations.
-    unsafe { core::arch::asm!("sfence.vma zero, zero") };
+    crate::arch::tlb_flush_all();
     let added = mapped * PAGE_SIZE as usize;
     irq::without(|| {
         with_heaps(|h| {

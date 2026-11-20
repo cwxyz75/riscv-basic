@@ -13,7 +13,7 @@ pub(super) fn user_thread_main(token: usize) {
     // jump to user mode (nothing user-visible runs under it).
     let _ = irq::save_and_disable();
     crate::bkl::lock();
-    let (ts, satp, killed) = {
+    let (ts, token, killed) = {
         let s = state();
         let ts = s
             .starts
@@ -35,7 +35,7 @@ pub(super) fn user_thread_main(token: usize) {
         if ts.rr {
             s.sched_flags.insert(thread::current(), 1);
         }
-        let satp = satp_of(p);
+        let token = aspace_token_of(p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
         let max = kmem::get()
@@ -48,7 +48,7 @@ pub(super) fn user_thread_main(token: usize) {
         if late_clamp {
             thread::set_priority(thread::current(), max);
         }
-        (ts, satp, p.killed)
+        (ts, token, p.killed)
     };
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
@@ -73,11 +73,11 @@ pub(super) fn user_thread_main(token: usize) {
     // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
     // its entry point with the stack and argument chosen above; it never returns.
     unsafe {
-        enter_user(
+        crate::arch::enter_user(
             ts.entry,
             ts.sp,
             ts.arg,
-            satp,
+            token,
             top,
             ts.tp,
             if ts.spawned {
@@ -87,64 +87,6 @@ pub(super) fn user_thread_main(token: usize) {
             },
         )
     }
-}
-
-core::arch::global_asm!(
-    r#"
-    .section .text
-    .globl enter_user
-    .balign 4
-enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 satp, a4 kernel stack top, a5 tp, a6 a1 for the thread
-    csrci sstatus, 2             # interrupts off until we are in U-mode
-    csrw  satp, a3
-    sfence.vma zero, zero
-    csrw  sepc, a0
-    sd    a4, 0(tp)              # PerHart.kstack_top: where the next trap from user mode lands
-    csrw  sscratch, tp           # from now on a trap is a trap from user mode
-    li    t0, 256
-    csrc  sstatus, t0            # SPP = 0: sret goes to U-mode
-    li    t0, 32
-    csrs  sstatus, t0            # SPIE = 1: interrupts on in U-mode
-    li    t0, 0x6600
-    csrc  sstatus, t0            # FP and vector units off: a new thread has no FP state
-    mv    sp, a1
-    mv    a0, a2
-    li x1, 0
-    li x3, 0
-    mv x4, a5
-    li x5, 0
-    li x6, 0
-    li x7, 0
-    li x8, 0
-    li x9, 0
-    mv x11, a6
-    li x12, 0
-    li x13, 0
-    li x14, 0
-    li x15, 0
-    li x16, 0
-    li x17, 0
-    li x18, 0
-    li x19, 0
-    li x20, 0
-    li x21, 0
-    li x22, 0
-    li x23, 0
-    li x24, 0
-    li x25, 0
-    li x26, 0
-    li x27, 0
-    li x28, 0
-    li x29, 0
-    li x30, 0
-    li x31, 0
-    sret
-"#
-);
-
-extern "C" {
-    fn enter_user(entry: u64, sp: u64, arg: u64, satp: u64, kernel_top: u64, tp: u64, a1: u64)
-        -> !;
 }
 
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.

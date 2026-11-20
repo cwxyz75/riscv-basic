@@ -117,13 +117,13 @@ ATOMICS = {
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (7, "hart bring-up and IPI flags"),
-    "kernel/src/aia.rs": (12, "interrupt controller statistics and masks"),
+    "kernel/src/arch/riscv64/aia.rs": (12, "interrupt controller statistics and masks"),
     "kernel/src/thread.rs": (30, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender as one word and its name as two, the exempt thread)"),
-    "kernel/src/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
+    "kernel/src/arch/riscv64/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot)"),
     "kernel/src/user/trap.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch)"),
-    "kernel/src/trap.rs": (10, "the expected-fault test hook and its log words"),
+    "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
     "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
     "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
@@ -155,6 +155,44 @@ def check_atomics():
                     out.append(f"C5: {rel} uses {n} atomic type(s) and is not in the audited allow-list (scripts/check_docs.py ATOMICS)")
                 elif n > allowed[0]:
                     out.append(f"C5: {rel} uses {n} atomic types, the audited count is {allowed[0]} ({allowed[1]}): add them to the audited layer or raise the count with a reason")
+    return out
+
+
+# AR1 (OD143, KERNEL-V1-SPEC 2.6): the architecture boundary. No inline assembly, control-register access, TLB or
+# firmware instruction, or RISC-V register name in the kernel outside kernel/src/arch/, nor in ksys, nor in kcore (kcore's
+# page-table format is the one exception, AR1c). ARCH_PENDING lists the files AR1b has not moved yet; it only shrinks.
+ARCH_RE = re.compile(
+    r"\b(?:asm|global_asm)!|\bcsr[rwsc]i?\b|\bsfence\b|\becall\b|\bwfi\b|\bsret\b"
+    r"|\b(?:satp|sstatus|scause|stvec|sepc|stval|sscratch|stimecmp|sie|sip)\b")
+ARCH_PENDING = {
+    "kernel/src/sched_tests.rs",
+    "kernel/src/selftest.rs",
+    "kernel/src/smp.rs",
+    "kernel/src/thread.rs",
+    "kernel/src/user/trap.rs",
+}
+ARCH_EXEMPT = {"kcore/src/pagetable.rs"}
+
+
+def check_arch():
+    out = []
+    for top in ["kernel/src", "ksys/src", "kcore/src"]:
+        for dp, _, fs in os.walk(os.path.join(ROOT, top)):
+            for f in fs:
+                if not f.endswith(".rs"):
+                    continue
+                path = os.path.join(dp, f)
+                rel = os.path.relpath(path, ROOT)
+                if rel.startswith("kernel/src/arch/") or rel in ARCH_EXEMPT:
+                    continue
+                n = 0
+                for line in open(path):
+                    code = re.sub(r'feature = "[^"]*"', "", line.split("//", 1)[0])
+                    n += len(ARCH_RE.findall(code))
+                if n and rel not in ARCH_PENDING:
+                    out.append(f"AR1: {rel} names the architecture ({n} places): it belongs under kernel/src/arch/")
+                if not n and rel in ARCH_PENDING:
+                    out.append(f"AR1: {rel} is clean now: remove it from ARCH_PENDING in scripts/check_docs.py")
     return out
 
 
@@ -282,7 +320,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch()
     if problems:
         print("docs check FAILED:")
         for p in problems:
