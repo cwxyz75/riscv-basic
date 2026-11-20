@@ -173,6 +173,27 @@ jobs:
         uses: ./.github/actions/install-qemu
       - run: make os-ktest-release
 
+  # KT5: the instruction counts of the main syscall paths, at one hart under `-icount shift=0` (deterministic), against bench/counts.tsv (a rise of
+  # more than 5 % fails).
+  kernel-counts:
+    name: kernel (counts)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: counts
+      - name: Install QEMU and OpenSBI
+        uses: ./.github/actions/install-qemu
+      - run: make os-count
+
   # The release smoke: the release image boots to the shell and reports no test banners (its own job, in parallel with the boots).
   release-smoke:
     name: kernel (release smoke)

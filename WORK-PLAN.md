@@ -87,7 +87,7 @@ be host-testable, fuzzable and covered before that starts.
 - [x] **KT10** (PR 286) automated mutation testing
 - [x] **KT12** (PR 282) the checked release build
 - [x] **KT13** (PR 283) the kernel stack budget
-- [ ] **KT5** instruction-count checks
+- [x] **KT5** (PR 290) instruction-count checks
 - [ ] **KT8** syscall fuzzing (host and guest)
 - [ ] **KT9** the allocation-failure sweep
 - [ ] **KT11** coverage report

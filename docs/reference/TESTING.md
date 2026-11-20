@@ -10,7 +10,7 @@ which is what happened after the previous adjustment.
 | Tier | What | When | Budget | Make target | CI |
 |---|---|---|---|---|---|
 | 0, unit | fmt, docs check, host unit/model/property tests of every crate, clippy, the OS host tests with loom and shuttle | every edit; the inner loop | about 2 minutes | `make quick` (fast part), `make test lint os-test` | the `host` job |
-| 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (shards `a` and `b`), the release smoke, the home computer's boot | every PR: the merge gate | 7 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
+| 1, smoke | tier 0, then the whole suite on the default machine (AIA) at four harts as two parallel boots (shards `a` and `b`), the release smoke, the instruction counts (`os-count`, KT5), the home computer's boot | every PR: the merge gate | 7 minutes per CI job | `make smoke` (`make check` is an alias) | `ci.yml` |
 | 2, soak | the full matrix (1, 2 and 4 harts, round-robin, release, RVA23, plain `virt` polling, no disk, the serial sessions), every negative control, the fail-demo harness check, Miri | **only when the owner asks for it** (OD142): no schedule, no label, no run started by anyone else; **never required to merge** | none (jobs run in parallel) | `make soak` (parallel, `SOAK_JOBS`, default 3), `make check-all` | `soak.yml` |
 | 3, overnight | long runs: 20 consecutive boots of the smp suite to start with (`overnight-repeat-smp`), and the whole suite on the checked release kernel (`os-boot-test-checked`: the `release-checked` profile, optimised with debug assertions and overflow checks on, at four harts, plus the kernel-only shard at one, two and eight); schedule perturbation (`os-chaos`: the kernel-only shard on the `chaos` kernel, one boot per seed in `CHAOS_SEEDS` and per hart count, a failing seed named and its log kept; delays at lock, IPI, switch and user-return points, 1/64 at the lock points and 1/8 at the others: at 1/8 everywhere a long critical section outgrows the big lock's spin watchdog and the harness's stall window); mutation testing of `kcore` and `klock` (`os-mutants`: cargo-mutants with the host tests as the oracle, eight shards for `kcore`; a survivor not in `mutants-accepted.txt` with a reason fails the run); each long-run item of KERNEL-V1-SPEC section 8 adds its target | **only when the owner asks for it** (OD142): `workflow_dispatch` is the only trigger; **never required to merge**; a red run is a work item the same day (OD140) | up to 300 minutes per job | `OVERNIGHT_TARGETS` in the Makefile (`make overnight-repeat-smp`) | `overnight.yml` |
 
@@ -244,3 +244,13 @@ tier of long runs (hours; started only by the owner, like the soak tier; never r
 syscall fuzzing, allocation-failure sweeps, mutation testing, a release build with assertions, wide SMP and repeat runs.
 Long-running tests stay out of the gate; that rule does not change. Each check is added to the tables of this file, with
 its make target and its measured cost, in the change that builds it.
+
+## Instruction counts (KT5)
+
+Wall-time benchmarks move with the host (T75). `make os-count` boots the kernel-only shard at one hart under `-icount shift=0`, where the guest's retired-instruction counter
+(`rdinstret`, opened to user mode through `scounteren` in test builds only) is deterministic, and compares the suite's `##BENCH count_<name> <n> instr` lines
+(`instruction_counts_report`: `handle_duplicate`+`handle_close`, `channel_write`+`channel_read` of 64 bytes, a `channel_call` round trip between two threads, `event_signal`+`object_wait`+clear,
+a page fault on a fresh page, `thread_create`+exit+join, `futex_wake` with no waiter; user and kernel instructions both count) with `bench/counts.tsv`: a rise of more than 5 % fails, a fall of
+more than 5 % is printed with a request to record it (`make os-count-record`, then review the diff of the file). Two consecutive runs give identical numbers. A planted loop of 1000
+iterations in `channel_write` raised that path by 16 % and failed the comparison. The check is its own CI job (`kernel (counts)`, about 1.5 minutes of boot). The recorded counts are those of the
+`kfast` boot (the slow tests skipped): the full boot differs by under 1 % on two paths (heap state), so record and compare in the same configuration.

@@ -3,6 +3,7 @@
 
     bench_compare.py RUN.tsv [BASELINE.tsv] [--max-ratio R]   exit 1 if any benchmark is more than R times slower
     bench_compare.py --self-test                               check that a 3x slowdown is caught
+    ... --prefix count_                                        only the rows whose name starts so (the instruction counts of KT5)
 
 A TSV row is `label <TAB> name <TAB> value <TAB> unit` (the label is the hart count, `smp1`, `smp4`). Every
 benchmark reports a *cost* (ns per operation): smaller is better, so a ratio above R is a slowdown. A name in
@@ -13,7 +14,7 @@ noisy, SCHED-SMP-SPEC T75): it catches a 3x slowdown, not a 10% one; compare the
 import sys
 
 
-def load(path):
+def load(path, prefix=""):
     rows = {}
     for line in open(path):
         line = line.rstrip("\n")
@@ -22,7 +23,8 @@ def load(path):
         parts = line.split("\t")
         if len(parts) != 4 or not parts[2].isdigit():
             raise SystemExit(f"{path}: malformed row {line!r}")
-        rows[(parts[0], parts[1])] = (int(parts[2]), parts[3])
+        if parts[1].startswith(prefix):
+            rows[(parts[0], parts[1])] = (int(parts[2]), parts[3])
     return rows
 
 
@@ -37,7 +39,7 @@ def compare(run, base, max_ratio):
             problems.append(f"{key[0]} {key[1]}: unit {u} (baseline {unit})")
             continue
         ratio = v / bv if bv else float("inf")
-        flag = "  <-- SLOWER" if ratio > max_ratio else ""
+        flag = "  <-- SLOWER" if ratio > max_ratio else ("  <-- FASTER: record the new value in the baseline" if ratio < 1 / max_ratio else "")
         print(f"{key[0]:6} {key[1]:28} {v:>12} {unit:8} baseline {bv:>12}  x{ratio:5.2f}{flag}")
         if ratio > max_ratio:
             problems.append(f"{key[0]} {key[1]}: {v} {unit} is x{ratio:.2f} the baseline {bv}")
@@ -63,6 +65,10 @@ def main(argv):
     if argv[1:] == ["--self-test"]:
         return self_test() or 0
     args = [a for a in argv[1:] if not a.startswith("--")]
+    prefix = ""
+    if "--prefix" in argv:
+        prefix = argv[argv.index("--prefix") + 1]
+        args = [a for a in args if a != prefix]
     max_ratio = 3.0
     if "--max-ratio" in argv:
         max_ratio = float(argv[argv.index("--max-ratio") + 1])
@@ -70,8 +76,8 @@ def main(argv):
     if not 1 <= len(args) <= 2:
         print(__doc__, file=sys.stderr)
         return 2
-    run = load(args[0])
-    base = load(args[1] if len(args) == 2 else "bench/baseline.tsv")
+    run = load(args[0], prefix)
+    base = load(args[1] if len(args) == 2 else "bench/baseline.tsv", prefix)
     problems = compare(run, base, max_ratio)
     if problems:
         print("\nbenchmark problems:", *problems, sep="\n  ", file=sys.stderr)

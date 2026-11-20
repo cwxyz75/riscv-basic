@@ -11525,8 +11525,14 @@ fn instruction_counts_report() -> Outcome {
     let msg = [7u8; 64];
     let mut got = [0u8; 64];
     counted("channel_write_read_64", n, || {
-        ok(sys::channel_write(a, msg.as_ptr(), 64, core::ptr::null(), 0), "write")?;
-        ok(sys::channel_read(b, got.as_mut_ptr(), 64, core::ptr::null_mut(), 0), "read")?;
+        ok(
+            sys::channel_write(a, msg.as_ptr(), 64, core::ptr::null(), 0),
+            "write",
+        )?;
+        ok(
+            sys::channel_read(b, got.as_mut_ptr(), 64, core::ptr::null_mut(), 0),
+            "read",
+        )?;
         Ok(())
     })?;
     // event_signal + object_wait (the condition already holds: the wait returns at once) + the clearing signal
@@ -11540,7 +11546,10 @@ fn instruction_counts_report() -> Outcome {
     let pages = n + 8;
     let v = vmo(pages)?;
     let base = NEXT_STACK.fetch_add(0x100_0000, Ordering::SeqCst);
-    ok(sys::process_map(me()?, v, base, 0, pages * 4096, PF_R | PF_W), "map the touched pages")?;
+    ok(
+        sys::process_map(me()?, v, base, 0, pages * 4096, PF_R | PF_W),
+        "map the touched pages",
+    )?;
     let mut next = 0u64;
     counted("page_fault_fresh_page", n, || {
         // SAFETY: the page is inside the region just mapped read-write; the write commits it through the fault path.
