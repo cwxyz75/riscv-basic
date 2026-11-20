@@ -121,6 +121,8 @@ pub enum MapError {
     /// A huge page is in the way (the early kernel mappings are 1 GiB leaves).
     HugeConflict,
     NoMemory,
+    /// `map_large` was asked for a level the format does not have.
+    BadLevel,
 }
 
 /// What a virtual address translates to.
@@ -146,6 +148,9 @@ pub trait PageTableFormat {
     fn table_entry(pfn: Pfn) -> u64;
     /// A level-0 leaf mapping frame `pfn` with `perms` (already validated).
     fn leaf_entry(pfn: Pfn, perms: Perms) -> u64;
+    /// A leaf above level 0 (a large page: `level` 1 is 2 MiB, 2 is 1 GiB) mapping the frames from `pfn` on, which must be aligned to
+    /// the level's span. In Sv39 it is the same entry as a level-0 leaf; other formats mark blocks differently.
+    fn block_entry(pfn: Pfn, perms: Perms, level: u32) -> u64;
     /// The permissions a leaf entry grants.
     fn perms_of(pte: u64) -> Perms;
     /// Is `va` an address this format can map (sign-extended from its top bit)?
@@ -195,6 +200,9 @@ impl PageTableFormat for Sv39 {
             pte |= U;
         }
         pte
+    }
+    fn block_entry(pfn: Pfn, perms: Perms, _level: u32) -> u64 {
+        Self::leaf_entry(pfn, perms)
     }
     fn perms_of(pte: u64) -> Perms {
         Perms {
@@ -376,6 +384,74 @@ impl<F: PageTableFormat> PageTable<F> {
         Ok(())
     }
 
+    /// Map a large page: `level` 1 (2 MiB) or 2 (1 GiB) in Sv39, `va` and `pfn` aligned to its span. Kernel use only (user mappings stay 4 KiB:
+    /// `AddressSpace` never calls it). Allocates the tables above it as needed; if it cannot, nothing changes. A table or a leaf already in
+    /// the slot is refused (`HugeConflict` for a table with smaller pages under it, `AlreadyMapped` for a leaf). Level 0 is `map`.
+    #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the slot is a table frame plus index * 8 with index < 512; level stays between the leaf level and the top level; the fresh frames were reserved by the free-count check
+    pub fn map_large<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        va: u64,
+        pfn: Pfn,
+        level: u32,
+        perms: Perms,
+    ) -> Result<(), MapError> {
+        if level == 0 {
+            return self.map(mm, va, pfn, perms);
+        }
+        if level >= F::LEVELS {
+            return Err(MapError::BadLevel);
+        }
+        let span_pages = 1u64 << (9 * level);
+        if !va.is_multiple_of(PAGE_SIZE * span_pages) || !pfn.is_multiple_of(span_pages) {
+            return Err(MapError::Misaligned);
+        }
+        if !F::is_canonical(va) {
+            return Err(MapError::NonCanonical);
+        }
+        perms.validate()?;
+        let mut table = self.root;
+        let mut l = F::LEVELS - 1;
+        loop {
+            let pte = mm.mem.read_u64((table << 12) + index(va, l) * 8);
+            if l == level {
+                if F::is_valid(pte) {
+                    return Err(if F::is_leaf(pte, l) {
+                        MapError::AlreadyMapped
+                    } else {
+                        MapError::HugeConflict
+                    });
+                }
+                break;
+            }
+            if !F::is_valid(pte) {
+                break;
+            }
+            if F::is_leaf(pte, l) {
+                return Err(MapError::HugeConflict);
+            }
+            table = F::pfn_of(pte);
+            l -= 1;
+        }
+        // tables for levels `l` down to `level + 1` are missing below `table`
+        if mm.db.free_count() < (l - level) as usize {
+            return Err(MapError::NoMemory);
+        }
+        while l > level {
+            let fresh = mm.db.alloc().expect("free count was checked");
+            mm.mem.zero_frame(fresh);
+            mm.mem
+                .write_u64((table << 12) + index(va, l) * 8, F::table_entry(fresh));
+            table = fresh;
+            l -= 1;
+        }
+        mm.mem.write_u64(
+            (table << 12) + index(va, level) * 8,
+            F::block_entry(pfn, perms, level),
+        );
+        Ok(())
+    }
+
     /// Unmap the page at `va`, returning what it mapped. Tables left empty are freed.
     /// **The caller must flush the TLB before any frame freed here is
     /// reused**: this crate has no notion of TLBs.
@@ -503,5 +579,43 @@ impl<F: PageTableFormat> PageTable<F> {
             let _ = mm.db.dec(table);
         }
         walk::<F, M>(mm, self.root, F::LEVELS.saturating_sub(1));
+    }
+}
+
+/// Cut the frames `first .. first + count` into the largest aligned pages up to `max_level` (a page of level `l` is `1 << (9 * l)` frames,
+/// aligned to that many frames): `(frame, level)` in address order, small pages at unaligned edges. Every frame is covered exactly once.
+pub fn plan_range(first: Pfn, count: u64, max_level: u32) -> PlanRange {
+    PlanRange {
+        next: first,
+        end: first.saturating_add(count),
+        max_level,
+    }
+}
+
+/// The iterator of [`plan_range`].
+pub struct PlanRange {
+    next: Pfn,
+    end: Pfn,
+    max_level: u32,
+}
+
+impl Iterator for PlanRange {
+    type Item = (Pfn, u32);
+
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the span is 1 << (9 * level) with level at most max_level (below 7), and next + span is at most end
+    fn next(&mut self) -> Option<(Pfn, u32)> {
+        if self.next >= self.end {
+            return None;
+        }
+        let mut level = self.max_level;
+        loop {
+            let span = 1u64 << (9 * level);
+            if level == 0 || (self.next.is_multiple_of(span) && self.end - self.next >= span) {
+                let out = (self.next, level);
+                self.next += span;
+                return Some(out);
+            }
+            level -= 1;
+        }
     }
 }

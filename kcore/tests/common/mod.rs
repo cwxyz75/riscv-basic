@@ -95,6 +95,10 @@ impl kcore::pagetable::PageTableFormat for TestFmt48 {
         }
         pte
     }
+    fn block_entry(pfn: Pfn, p: kcore::pagetable::Perms, _level: u32) -> u64 {
+        // a block has the "table" bit clear
+        Self::leaf_entry(pfn, p) & !2
+    }
     fn perms_of(pte: u64) -> kcore::pagetable::Perms {
         kcore::pagetable::Perms {
             read: pte & (1 << 5) != 0,

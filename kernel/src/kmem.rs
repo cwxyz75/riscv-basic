@@ -147,9 +147,16 @@ pub fn init() {
     map_image(&mut pt, &mut mm, s.data, Perms::RW);
     // The direct map: every frame the frame database manages and the frames its metadata occupies (never the image, so
     // the code cannot be written through an alias), and the two device pages we use.
-    for pfn in first..end {
-        pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::RW)
-            .expect("direct map");
+    // (MM3: the largest aligned pages that fit, 1 GiB then 2 MiB, 4 KiB only at the unaligned edges; user mappings stay 4 KiB)
+    for (pfn, level) in kcore::pagetable::plan_range(first, end - first, 2) {
+        pt.map_large(
+            &mut mm,
+            DIRECT_BASE + pfn * PAGE_SIZE,
+            pfn,
+            level,
+            Perms::RW,
+        )
+        .expect("direct map");
     }
     // The device tree sits in the top 2 MiB, which the frame database does not manage: map it
     // read-only (the interrupt controller probe reads it).

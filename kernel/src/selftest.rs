@@ -110,9 +110,12 @@ fn low_half_is_empty() -> Outcome {
 fn kernel_mappings_are_w_xor_x() -> Outcome {
     let k = kmem::get();
     let (mut leaves, mut bad) = (0, 0);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |_va, t, level| {
+    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         leaves += 1;
-        if (t.perms.write && t.perms.exec) || level != 0 || t.perms.user {
+        // a large leaf is legal only in the direct map (MM3) and only as plain data: read-write, never executable, never user
+        let large_ok = level == 0
+            || ((DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) && t.perms == Perms::RW);
+        if (t.perms.write && t.perms.exec) || !large_ok || t.perms.user {
             bad += 1;
         }
     });
@@ -170,9 +173,9 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         "the kernel image must not be reachable through the direct map",
     )?;
     let (mut in_map, mut aliases, mut devices) = (0, 0, 0);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, _| {
+    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
-            in_map += 1;
+            in_map += 1u64 << (9 * level); // pages, whatever the leaf's size
             if t.pfn >= abi::layout::RAM_BASE >> 12 && t.pfn < first {
                 aliases += 1; // a RAM frame below the first one after the image: the image or firmware
             }
@@ -184,7 +187,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
             }
         }
     });
-    ensure(in_map > 1000, "the direct map has leaves")?;
+    ensure(in_map > 1000, "the direct map has pages")?;
     ensure_eq(
         devices,
         2 + crate::aia::PAGE_COUNT,
