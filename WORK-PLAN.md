@@ -90,7 +90,7 @@ be host-testable, fuzzable and covered before that starts.
 - [ ] **KT5** instruction-count checks
 - [ ] **KT8** syscall fuzzing (host and guest)
 - [ ] **KT9** the allocation-failure sweep
-- [ ] **KT11** coverage report
+- [x] **KT11** (PR 289) coverage report
 
 ### Phase 4: the architecture boundary, then the platform as it really is
 
@@ -207,6 +207,7 @@ soak > Run workflow); one run of the tier clears every line above it.
 - **KT12** (PR 282): the first `overnight.yml` run also runs `os-boot-test-checked` (the whole suite at four harts and the kernel shard at one, two and eight on the checked release kernel; the kernel shard at four and eight was run once by hand and passed). A red one is an invariant (`debug_assert!`) that the optimised build breaks.
 - **KT7** (PR 284): the first `overnight.yml` run also runs `make os-chaos` (200 seeds at `-smp 2`, `4` and `8` on the `chaos` kernel; about 600 boots, hours). Run by hand so far: seed 1 at `-smp 4` on the normal chaos kernel passes. A red seed is a work item the same day: its log is in the `failing-logs-chaos` artifact and `OS_CHAOS_POINTS=<mask>` (1 acquire, 2 release, 4 IPI, 8 switch, 16 user return) narrows the point.
 - **KT10** (PR 286): the first full `make os-mutants` run (every mutant of `kcore` and `klock`, nine shards, hours) is owed to the owner via `overnight.yml`. Its survivors are to be killed by new tests or listed in `mutants-accepted.txt` with a reason (the list starts empty); until then the job is red by design, and a red result is the work item. Only `kcore/src/chaos.rs` was run here (27 mutants: 7 survivors before a pinning test, 0 after).
+- **KT11** (PR 289): the first `overnight.yml` run also runs `make os-coverage`; nothing here can be red (it is a report), the numbers it produces replace the local first numbers in `TESTING.md`.
 - **TS3a** (PR 276): `make os-miri` now includes `cargo miri test -p ksys` (the host tests of the syscall layer, over the real address-space code). A red one would be undefined behaviour or a leak in code the kernel runs, found on the host.
 
 ## Decisions taken without the owner

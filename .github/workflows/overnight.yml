@@ -143,3 +143,32 @@ jobs:
             target/mutants-*/mutants.out/timeout.txt
             target/mutants-*/mutants.out/caught.txt
           if-no-files-found: ignore
+
+  coverage:
+    name: overnight (coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overnight-coverage
+      - name: Install llvm-tools and cargo-llvm-cov (tools, not dependencies of any crate; pinned)
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked --version 0.6.16
+      - run: make os-coverage
+      - name: Summary
+        if: always()
+        run: |
+          echo "## overnight (coverage)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only 2>/dev/null | cut -c1-120 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/cov/html
+          if-no-files-found: ignore
