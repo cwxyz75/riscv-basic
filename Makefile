@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: os-aarch64-check os-models preflight preflight-full os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b quick docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -23,7 +23,9 @@ help:
 	@echo "make os-test     OS track: host tests, plus loom and shuttle (os-miri adds Miri)"
 	@echo "make kernel      OS track: build the kernel (with the user programs)"
 	@echo "make os-boot-test OS track: boot the kernel headlessly, check its structured output"
-	@echo "make check      everything CI runs"
+	@echo "make hooks      install the commit hook (format, docs check, clippy); once per clone"
+	@echo "make feature    the feature gate: what CI runs on a pull request into an epic branch (no QEMU)"
+	@echo "make check      the epic gate (smoke): what CI runs on a pull request into main"
 
 test:
 	cargo test -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64
@@ -35,8 +37,14 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-lint:
+# Clippy, in two halves: the host crates, then the crates built for the target (the home kernel, the user programs, the OS kernel).
+# `lint` is both, and is what the commit hook runs (clippy does the whole of `cargo check`, so the hook needs no separate check).
+lint: lint-host lint-target
+
+lint-host:
 	cargo clippy -p abi -p cfmt -p clockmodel -p data -p ish -p kcore -p ksys -p kfuzz-gen -p klock -p netwire -p netcore -p netsim -p nettcp -p rngcore -p sockshim -p dns -p http1 -p supervise -p dhcp -p netring -p proto -p svc -p memfs -p mounts -p pathres -p profile -p fsfmt -p doofs -p doofs-tools -p basic -p basic-script -p cartfs -p console -p turtle -p logo -p rv64 --all-targets -- -D warnings
+
+lint-target:
 	cd home/kernel && cargo clippy -- -D warnings
 	cd init && cargo clippy -p rt -p oslibc -p init -- -D warnings
 	cd kernel && cargo clippy -- -D warnings
@@ -198,7 +206,8 @@ os-boot-test-fail-run: kernel
 os-repeat:
 	python3 scripts/os_repeat.py $(TARGET) $(N)
 
-# The inner loop for kernel edits: format, the pure kernel crates' host tests, the kernel-only boot at four harts.
+# One targeted boot for a kernel change: format, the pure kernel crates' host tests, the kernel-only boot at four harts. A local
+# experiment (watching an acceptance check fail, then pass), not a routine before a commit or a push (TESTING.md).
 kquick: fmt-check kernel-main
 	cargo test -p kcore -p ksys -p kfuzz-gen -p klock
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
@@ -377,9 +386,6 @@ os-serial-test: os-interactive
 os-boot-test-rva23: kernel
 	OS_CPU=rva23s64 python3 scripts/os_boot_test.py $(OS_ELF)
 
-# The inner-loop gate (about a minute): format, the OS host tests without the model checkers, and a
-# headless boot of the release system to the shell and a BASIC session. Run this while iterating;
-# run `make smoke` before the push if you want the whole gate locally (CI runs it); the soak tier runs only when the owner asks.
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
 fetch-third-party:
@@ -397,13 +403,31 @@ docs-check:
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-probe.pcap --self-test
 	python3 -I scripts/net_pcap_check.py net/tests/data/slirp-tcp-probe.pcap --self-test
 
-quick: fmt-check docs-check
-	cargo test -p abi -p kcore -p proto -p svc -p memfs -p cfmt -p clockmodel -p basic-script
-	$(MAKE) os-release-smoke
+# Everything that is compiled for the target, built and not run: the OS kernel with its user programs, and the home computer's kernel.
+# (The optimised build is `os-release`; CI builds it in its own job.)
+build: kernel-main home-kernel
 
-# Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
-# the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
-SMOKE_TARGETS := fmt-check docs-check test lint os-test os-models os-aarch64-check home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
+# The commit hook (scripts/hooks/pre-commit): format, the docs check and clippy, on every commit; no tests. Once per clone
+# (worktrees share the setting).
+hooks:
+	git config core.hooksPath scripts/hooks
+	@echo "commit hook installed (scripts/hooks/pre-commit)"
+
+# Which commit of an epic broke it? Bisects from the epic's fork point on origin/main to HEAD, one run of TARGET per step
+# (default: the kernel-only boot at four harts). `make epic-bisect TARGET=os-boot-test-smoke-a`.
+epic-bisect:
+	sh scripts/epic_bisect.sh $(or $(TARGET),os-ktest-4)
+
+# Tier 0, the feature gate (OD144, TESTING.md): what a pull request into an epic branch must pass. Format, the docs check, clippy,
+# the host tests, the model checkers, and a build of everything for the target. Nothing here starts QEMU (the docs check refuses it).
+# CI runs it (the `host`, `models` and `build` jobs); it is not a local routine.
+FEATURE_TARGETS := fmt-check docs-check lint test os-models os-aarch64-check build os-release
+feature: $(FEATURE_TARGETS)
+
+# Tier 1, the epic gate (OD144, TESTING.md): what an epic branch must pass before it merges into main. The feature gate, then the
+# boots: the suite on the default machine at four harts, the kernel-only boots, the instruction counts, the home computer's boot,
+# the release smoke.
+SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
@@ -472,15 +496,7 @@ os-fuzz-host:
 os-allocfail:
 	KALLOC_PERSIST=1 cargo test --profile release-checked -p ksys --test allocfail every -- --nocapture
 
-# `preflight` is the quick pre-push check (fine to run routinely); `preflight-full` is on demand only, when the owner asks. What CI has failed a PR for. `make preflight` is the quick part, about five minutes: formatting, the docs check, clippy on the host
-# crates and on the kernel, and the host tests (which include the allocation-failure sweep and the fuzzer). `make preflight-full` adds the kernel-only
-# boot at four harts in the debug and the optimised build (the optimised build's stack budget, KT13, moves with every change that moves code between
-# crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts,
-# the two-shard suite, the shell test and the release smoke.
-preflight: fmt-check docs-check lint lint-kernel os-aarch64-check test
-preflight-full: preflight kquick os-ktest-release
-
-# `check` is tier 0 and 1 only (it used to be everything, about 30 minutes: see TESTING.md).
+# `check` is the epic gate, tiers 0 and 1.
 check: smoke
 
 # Everything: smoke, then soak.

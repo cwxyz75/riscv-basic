@@ -17,6 +17,15 @@ system, so stopping between phases loses nothing.
 **Start.** The plan starts when the owner says so. From then on every item in it, the lock-peel tasks included, has the
 owner's go-ahead: the sentences in older `L` items about waiting for one are superseded (each carries a note).
 
+**Paused, 2026-11-20.** The owner stopped the plan after AR1 to change how work is branched and tested (OD144, below). It
+resumes at PL1, on the phase 4 epic, **when the owner says so**; until then no plan item is started.
+
+**Epics (OD144, 2026-11-20).** From phase 4 on, each phase is an epic branch, `epic/phase-<n>`, cut from `main`. Every item is a
+feature branch off the epic and a pull request into it, merged on the feature gate (build and host tests, no QEMU). When the
+phase's items are done the epic is merged into `main` on the epic gate (smoke), and the next epic is cut. A long phase (6, with its
+thirteen items) may be cut into two or three epics at a point where the system is whole. Leftovers of earlier phases and
+code-touching tidy items ride on the open epic. The rules are in `docs/reference/TESTING.md`.
+
 ### Standing instructions from the owner (read these first, every session, and again after any compaction)
 
 - **The owner is not to be asked.** Every question that came up in the review of 2026-11-18 was settled then and is recorded
@@ -29,8 +38,8 @@ owner's go-ahead: the sentences in older `L` items about waiting for one are sup
   on it. **FZ1 ends with a report to the owner**; the follow-on work does not start without one.
 - **Never start a soak run or a long run** (OD142). Not `make soak`, not one of its targets, not `soak.yml` or
   `overnight.yml`, not a schedule, not a label, however kernel-heavy the change. Only the owner starts them. Where an item
-  says "soak" or names an overnight target, that means: wire the check in, say in the PR that the run is owed, and add a
-  line to "Runs owed to the owner" below. The item still merges on the green gate and is closed on its acceptance check.
+  says "soak" or names an overnight target, that means: wire the check in. Nothing is recorded as owed per item (OD144);
+  "Runs owed to the owner" below is one standing line.
 - **First thing each session:** if the owner has started a soak or long run since the last session (`gh run list --workflow
   soak.yml --limit 1`, and `overnight.yml` once KT6 exists), read its result. A red one is a work item today (OD140), ahead
   of the next plan item; a green one clears the matching lines below.
@@ -38,21 +47,26 @@ owner's go-ahead: the sentences in older `L` items about waiting for one are sup
   that fails for infrastructure reasons (a package mirror, a cancelled runner) is re-run.
 - **Reviews.** An item marked Fable gets a fresh-context Fable review in its own small PR before it merges; "default" gets
   the default reviewer. Findings are fixed in the PR or become tidy items in it.
-- **Testing.** `make preflight` (quick) before every PR; `make preflight-full` only when the owner asks, so a PR touching `kernel/`, `ksys/` or `kcore/` gets a line under "Runs owed". While iterating: `make kquick` once KT1 exists (before it: `make quick` and the one targeted test). The gate
-  is `make smoke`; merge on a green gate. Verification at one, two and four harts comes from the gate's kernel-only boots
-  (KT1, the first item, for that reason); before KT1 lands, and for wider hart counts, the run is owed, not started. One
-  mutation check per new test. Say plainly what was and was not run.
+- **Testing** (`docs/reference/TESTING.md`, OD144). `make hooks` once per clone; the commit hook runs format, the docs check and
+  clippy, and no tests. **Run no tests as a routine**, before a commit or a push: CI is the check. A feature pull request merges
+  on the feature gate (no QEMU); the epic merges into `main` on smoke. Experiments are yours to judge: the one test being
+  written, one boot (`make kquick`) to watch an acceptance check fail and pass, one mutation check per new test, a
+  reproduction. After a change that reworks a lock, the scheduler or memory management, a smoke run on the epic by hand
+  (`gh workflow run ci.yml --ref epic/phase-<n>`) is allowed as a checkpoint: a few per epic at most. A red epic gate is
+  bisected (`make epic-bisect`). Say plainly what was and was not run.
 - **Architecture code goes behind the boundary** once AR1 has landed: in `kernel/src/arch/riscv64/`, with its interface item
   added to `arch/mod.rs` and the AArch64 stub in the same PR (KERNEL-V1-SPEC 2.6).
-- **Track CI yourself; merge green PRs** (squash, delete the branch). Never force-push and never `git reset --hard`; merge
-  `main` into a branch instead. Do not stack PRs.
-- **One item (or one named part of an item) per PR.** `main` always builds and boots. A flag-day item (AB1, AB2, AB3) is one
+- **Track CI yourself; merge green PRs.** A feature PR is squash-merged into its epic (delete the branch); an epic is merged
+  into `main` with a merge commit, so its commits survive. Never force-push and never `git reset --hard`; merge `main` into
+  an epic instead. Feature PRs target the epic, never another feature branch.
+- **One item (or one named part of an item) per feature PR.** `main` always builds and boots; an epic always builds and passes
+  its host tests. A flag-day item (AB1, AB2, AB3) is one
   PR by nature; everything else is cut as small as its acceptance check allows.
 - The rules of `CLAUDE.md` apply throughout: shortcuts as tidy items in the same PR, decisions as OD rows, specs changed
-  only by dated amendments, reference documents changed with the code, items closed with `work.py done` only when verified
-  in QEMU.
-- **Keep this file current:** tick the boxes with the PR number as items land, and when a phase is done move the next
-  phase's items to `horizon: near` (and finished phases' leftovers to `long`).
+  only by dated amendments, reference documents changed with the code. An item's box is ticked here when its feature merges;
+  `work.py done` runs in the epic's closing commit, so an item is closed only with its epic's green smoke behind it.
+- **Keep this file current:** tick the boxes with the PR number as items land on the epic, and when a phase is done (its
+  epic merged) move the next phase's items to `horizon: near` (and finished phases' leftovers to `long`).
 
 ### Phase 1: make kernel work cheap to test
 
@@ -81,7 +95,7 @@ Phase 1 is complete (2026-11-19). L11c part 1 (the dead-list reap) is PR 262.
 Why here: the scheduler glue is stable after phase 2, and everything after this phase changes the syscall layer, so it should
 be host-testable, fuzzable and covered before that starts.
 
-- [ ] **TS3** (a, b, c) `kernel/src/user.rs` becomes the host-testable crate `ksys`: a (PR 276), b (PRs 277, 278, 279: VMO, job and process-table calls, the process record) and the decision half of kill/suspend/job_kill/scheduling (PR 280) are merged; UserState, `thread_create`/`spawn` and `process_create`/`start` are in `ksys` too (PRs 294 to 296 and the next), and `kernel/src/user.rs` is the directory `kernel/src/user/` (no file over 507 lines); what is left is the decision half of the waits, futexes and `channel_call`, which need the blocking-outcome type
+- [x] **TS3** (a, b, c, d) `kernel/src/user.rs` becomes the host-testable crate `ksys` (PRs 276 to 280, 294 to 298)
 - [x] **KT6** (PR 281) tier 3, the long-run workflow (manual start only)
 - [x] **KT7** (PR 284) schedule perturbation
 - [x] **KT10** (PR 286) automated mutation testing
@@ -94,9 +108,9 @@ be host-testable, fuzzable and covered before that starts.
 
 ### Phase 4: the architecture boundary, then the platform as it really is
 
-AR1 goes first so that everything after it is written on the right side of the boundary.
+AR1 goes first so that everything after it is written on the right side of the boundary. Epic: `epic/phase-4` (from PL1 on).
 
-- [ ] **AR1** (a, b, c, d) all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, the AArch64 stub
+- [x] **AR1** (a, b, c, d) all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, the AArch64 stub (PRs 301, 302, 303, 304; merged to `main` before the epic was cut)
 - [ ] **PL1** RVA23 in the gate, the boot-time extension check
 - [ ] **MM2** the buddy frame allocator
 - [ ] **MM3** large pages in the direct map
@@ -193,24 +207,14 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ## Runs owed to the owner
 
-Soak and long runs that an item wanted and only the owner may start (OD142). One line each: the item, the PR, which target
-or tier, and what a red result would mean. The owner starts a run when they choose (`gh workflow run soak.yml`, or Actions >
-soak > Run workflow); one run of the tier clears every line above it.
+One standing line (OD144). The per-item list that stood here until 2026-11-20 is in git history (this file as of PR 304).
 
-- **Standing: `make preflight-full`** (the kernel-only boot at four harts in the debug and the optimised build, about fifteen minutes; owner, 2026-11-20: on demand only). Every PR that changes `kernel/`, `ksys/` or `kcore/` adds a line here with its number; the owner runs it (or the soak tier, which covers the same boots) when they choose, and a run clears the lines above it. A red optimised-build run would most likely be the stack budget (KT13) or a `debug_assert!` the optimised build breaks.
-- **AR1b** (PRs 301, 302): the move of the trap, switch and boot paths under `arch/riscv64` wants the soak tier (smp targets at `-smp 1`, `2`, `4`, round-robin and polling kernels) and `make preflight-full`. A red one would most likely be a trap-path or optimised-build stack-budget regression; the code is line for line the old code (Fable review).
-- **T157** (PR 258): the round-robin kernel boot (`os-boot-test-rr`, soak) with the stall-based timeout and the widened clock window passed 3 of 3 under full CPU load on the development machine; one soak run confirms it on CI's runners. A red `os-boot-test-rr` would mean a stall (the log names the last line) or a different cause.
-- **L11c part 1** (PR 262): the dead-list reap in `finish_switch` wants the soak run of the smp targets at `-smp 1`, `2` and `4` (and the round-robin and polling kernels). A red one would mean a leaked or double-freed kernel stack.
-- **L11c part 2** (PR to follow): the deferred switch wants the same soak run as part 1 (smp targets at `-smp 1`, `2`, `4`, round-robin and polling kernels): a red one would mean a lost switch or a wrong thread blocked.
-- **L11d** (PR to follow): `make os-boot-test-sched-neg` (the three scheduler negative controls) is in the soak tier and was run by hand once per control only. A red one means a control no longer detects its fault.
-- **AB2, L12b, L12c** (PRs 267, 268, 270): the soak tier at `-smp 1`, `2`, `4` also covers the quiet-trap paths (kill of a spinner) and the real-time deadlines of the suite (about 2.6 times tighter under load than when the clock was a tick count): a red one is a flaky bound or a missed kill.
-- **L13** (PRs 272, 273): the soak tier shows the real-timer margins (the latency bounds were widened for the emulator's interrupt jitter) and the starvation watchdog under a loaded host; a red `starved thread` is a lost wake or pull, not noise.
-- **KT6** (PR 281): the first overnight run, `gh workflow run overnight.yml` (20 consecutive boots of the smp suite, up to 300 minutes). A red one is a work item the same day (OD140): the log of the failing boot is uploaded as an artifact.
-- **KT12** (PR 282): the first `overnight.yml` run also runs `os-boot-test-checked` (the whole suite at four harts and the kernel shard at one, two and eight on the checked release kernel; the kernel shard at four and eight was run once by hand and passed). A red one is an invariant (`debug_assert!`) that the optimised build breaks.
-- **KT7** (PR 284): the first `overnight.yml` run also runs `make os-chaos` (200 seeds at `-smp 2`, `4` and `8` on the `chaos` kernel; about 600 boots, hours). Run by hand so far: seed 1 at `-smp 4` on the normal chaos kernel passes. A red seed is a work item the same day: its log is in the `failing-logs-chaos` artifact and `OS_CHAOS_POINTS=<mask>` (1 acquire, 2 release, 4 IPI, 8 switch, 16 user return) narrows the point.
-- **KT10** (PR 286): the first full `make os-mutants` run (every mutant of `kcore` and `klock`, nine shards, hours) is owed to the owner via `overnight.yml`. Its survivors are to be killed by new tests or listed in `mutants-accepted.txt` with a reason (the list starts empty); until then the job is red by design, and a red result is the work item. Only `kcore/src/chaos.rs` was run here (27 mutants: 7 survivors before a pinning test, 0 after).
-- **KT11** (PR 289): the first `overnight.yml` run also runs `make os-coverage`; nothing here can be red (it is a report), the numbers it produces replace the local first numbers in `TESTING.md`.
-- **TS3a** (PR 276): `make os-miri` now includes `cargo miri test -p ksys` (the host tests of the syscall layer, over the real address-space code). A red one would be undefined behaviour or a leak in code the kernel runs, found on the host.
+- **One soak run and one overnight run are owed, at the owner's choosing** (`gh workflow run soak.yml`,
+  `gh workflow run overnight.yml`). Neither tier has run since OD142; between them they cover everything merged since
+  (the first peel and the scheduler's exit from the big lock, nanosecond time and the tickless timer, the move behind
+  `arch/`, and the first runs of the checks phase 3 built: chaos, mutants, the checked release kernel, the long fuzz run,
+  the persistent allocation-failure sweep, coverage, Miri over `ksys`). The mutation job is red until its first survivors
+  are triaged. A red result is a work item that day (OD140), ahead of the next plan item.
 
 ## Decisions taken without the owner
 

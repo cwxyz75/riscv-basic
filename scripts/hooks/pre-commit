@@ -1,0 +1,15 @@
+#!/bin/sh
+# The commit hook (TESTING.md, OD144): format, the docs check and clippy on every commit. No tests of any kind: CI runs those.
+# Clippy does the whole of `cargo check`, so there is no separate check. Install once per clone with `make hooks`.
+# A commit that stages no Rust or build file skips clippy (a documentation commit takes about two seconds).
+set -e
+cd "$(git rev-parse --show-toplevel)"
+# The hook runs with git's environment (GIT_DIR, GIT_INDEX_FILE): cargo and the docs check call git themselves, so clear it.
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX
+[ -n "$staged" ] || exit 0
+make -s fmt-check || { echo "pre-commit: formatting (run: make fmt)"; exit 1; }
+make -s docs-check || { echo "pre-commit: the docs check failed"; exit 1; }
+if printf '%s\n' "$staged" | grep -qE '\.(rs|toml|lock|S|ld|c|h)$|(^|/)Makefile$'; then
+    make -s lint || { echo "pre-commit: clippy failed"; exit 1; }
+fi

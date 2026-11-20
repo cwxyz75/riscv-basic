@@ -1,25 +1,30 @@
 name: ci
 
-# The merge gate (tiers 0 and 1 of TESTING.md / OD83): host tests and lint, one boot of the suite at four
-# harts, the release smoke, the home computer's boot. Every job's timeout is its budget; a job that
-# outgrows it fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The
-# full matrix (tier 2) is `soak.yml`: started only by the owner, by hand (OD142); never required.
-# Pull requests run the suite once; pushes only matter on main (a branch push with an open PR would
-# run exactly the same jobs a second time).
+# Two gates (TESTING.md, OD144):
+#   the feature gate (tier 0): every pull request. Format, the docs check, clippy, the host tests, the model checkers and a build
+#     of everything for the target. No QEMU. This is all a pull request into an epic branch runs.
+#   the epic gate (tier 1, smoke): the feature gate plus the boots. Runs on a pull request into main (an epic branch being merged),
+#     on a push to main, and when started by hand on any branch (Actions > ci > Run workflow, or `gh workflow run ci.yml --ref
+#     epic/...`: a checkpoint on a long epic, never required).
+# Every job's timeout is its budget (7 minutes; the jobs run side by side, so the whole gate stays inside 10); a job that outgrows it
+# fails loudly and the budget is raised (or the work cut) on purpose, in TESTING.md. The full matrix (tier 2) is `soak.yml`: started
+# only by the owner, by hand (OD142); never required.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  # What did this change touch? Documentation-only changes skip the boot matrix; changes under
-  # home/ only skip the OS-track boot jobs and the other way round (shared files run everything).
+  # What gate is this, and what did the change touch? `smoke` is true for the epic gate (see above). Documentation-only changes skip
+  # the boots; changes under home/ only skip the OS-track boot jobs and the other way round (shared files run everything).
   # A skipped job counts as passed for branch protection.
   changes:
     runs-on: ubuntu-latest
     outputs:
       os: ${{ steps.scan.outputs.os }}
       home: ${{ steps.scan.outputs.home }}
+      smoke: ${{ steps.scan.outputs.smoke }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,8 +32,10 @@ jobs:
       - id: scan
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "os=true" >> "$GITHUB_OUTPUT"; echo "home=true" >> "$GITHUB_OUTPUT"; exit 0
+            echo "os=true" >> "$GITHUB_OUTPUT"; echo "home=true" >> "$GITHUB_OUTPUT"; echo "smoke=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          if [ "${{ github.base_ref }}" = "main" ]; then smoke=true; else smoke=false; fi
+          echo "smoke=$smoke" >> "$GITHUB_OUTPUT"
           files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
           echo "$files"
           # anything that is not documentation, not under home/, and not a home-only script
@@ -73,15 +80,56 @@ jobs:
       - name: OS crates under the loom and shuttle model checkers
         run: make os-models
 
+  # The feature gate's build: everything that is compiled for the target, built and linted but not run (the OS kernel with its user
+  # programs, the home computer's kernel), and the optimised system image in a second job. No QEMU.
+  build:
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' || needs.changes.outputs.home == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build
+      - name: Install clang (the C programs of the boot image)
+        uses: ./.github/actions/install-qemu
+        with:
+          packages: clang llvm
+      - run: make lint-target
+      - run: make build
+
+  build-release:
+    name: build (release)
+    needs: changes
+    if: ${{ needs.changes.outputs.os == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-smoke
+      - name: Install clang (the C programs of the boot image)
+        uses: ./.github/actions/install-qemu
+        with:
+          packages: clang llvm
+      - run: make os-release
+
+  # The epic gate's boots (tier 1) from here on: each job needs `smoke`.
   # Tier 1: the suite boots twice on the default (AIA) machine at four harts, as two parallel jobs (OD121: shard `b` is the network tests and
   # the three heaviest stress tests, `a` is the rest; the harness checks each ran only its part), and the release smoke is a third.
   # Budget: 7 minutes each (the docs check enforces it). The one job that held all of it took 9.6 minutes of its 10 on 2026-11-18;
-  # a shard that nears the budget is split again by the same mechanism (TESTING.md "When the smoke boot outgrows its budget").
+  # a shard that nears the budget is split again by the same mechanism (TESTING.md, "Budgets").
   # (The fail-demo check, when the harness changed, is the separate job `harness (fail-demo)`.)
   kernel:
     name: kernel (smoke a)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -105,7 +153,7 @@ jobs:
   kernel-net:
     name: kernel (smoke b)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -130,7 +178,7 @@ jobs:
   kernel-only:
     name: kernel (ktest)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -144,13 +192,12 @@ jobs:
           key: ktest
       - name: Install QEMU and OpenSBI
         uses: ./.github/actions/install-qemu
-      - run: make lint-kernel
       - run: make os-ktest-small
 
   kernel-only-4:
     name: kernel (ktest 4 harts)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -169,7 +216,7 @@ jobs:
   kernel-only-release:
     name: kernel (ktest release)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -190,7 +237,7 @@ jobs:
   kernel-counts:
     name: kernel (counts)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -210,7 +257,7 @@ jobs:
   release-smoke:
     name: kernel (release smoke)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -231,7 +278,7 @@ jobs:
   shell-test:
     name: kernel (shell test)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -259,7 +306,7 @@ jobs:
   harness-fail-demo:
     name: harness (fail-demo)
     needs: changes
-    if: ${{ needs.changes.outputs.os == 'true' && github.event_name == 'pull_request' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.os == 'true' && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:
@@ -293,7 +340,7 @@ jobs:
   home-kernel:
     name: kernel (home computer)
     needs: changes
-    if: ${{ needs.changes.outputs.home == 'true' }}
+    if: ${{ needs.changes.outputs.smoke == 'true' && needs.changes.outputs.home == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7
     steps:

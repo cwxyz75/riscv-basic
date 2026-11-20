@@ -136,7 +136,8 @@ make home-debug       # boot paused, gdb stub on :1234
 make home-boot-test   # the scripted QEMU boot tests, as CI runs them
 make kernel           # the OS track: build the new kernel (see OS-ARCHITECTURE.md)
 make os-boot-test     # the OS track: boot it headlessly and check its structured output
-make check       # everything CI runs: fmt, tests, clippy, boot tests
+make hooks            # once per clone: the commit hook (format, docs check, clippy; no tests)
+make check            # the epic gate (what CI runs before a phase merges into main): fmt, tests, clippy, boot tests
 ```
 
 ## Programs to try

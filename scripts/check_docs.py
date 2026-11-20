@@ -27,28 +27,70 @@ STALE = [
 ]
 
 
-GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of the merge gate (ci.yml) may take at most this long
+GATE_BUDGET_MINUTES = 7  # TESTING.md: every job of ci.yml may take at most this long (the jobs run side by side)
 # Soak targets that CI runs split into smaller jobs: the soak workflow may name the parts instead.
 SOAK_SPLIT = {"os-boot-test": ["os-boot-test-main", "os-boot-test-rr", "os-boot-test-release"]}
-# Targets besides the smoke ones that the gate may run, conditionally (see ci.yml): the harness check.
+# Targets besides the smoke ones that ci.yml may run: parts of a smoke target that CI runs as their own jobs.
 # (the smoke boot is two parallel jobs, one per shard of the suite, and the release smoke is a third: OD121)
-GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b", "os-ktest-small", "os-ktest-4", "lint-kernel"}
+GATE_EXTRA = {"os-boot-test-main", "os-boot-test-smoke-a", "os-boot-test-smoke-b", "os-ktest-small", "os-ktest-4", "lint-target",
+              "os-boot-test-fail-demo"}  # the harness check, when the harness itself changed
+# What in a recipe means "this starts the emulator" (or a script that does).
+BOOTS_RE = re.compile(r"qemu-system|\$\(QEMU\)|os_boot_test\.py|os_repeat\.py|chaos\.py|_test\.py")
+SMOKE_IF = "needs.changes.outputs.smoke == 'true'"
 
 
 def make_var(makefile, name):
     m = re.search(rf"^{name}\s*:?=\s*(.*)$", makefile, re.M)
-    return m.group(1).split() if m else []
+    out = []
+    for w in (m.group(1).split() if m else []):
+        ref = re.fullmatch(r"\$\((\w+)\)", w)
+        out += make_var(makefile, ref.group(1)) if ref else [w]
+    return out
+
+
+def make_rules(makefile):
+    """target -> (prerequisites and `$(MAKE) x` calls, recipe text)."""
+    rules, cur = {}, None
+    for line in makefile.splitlines():
+        m = re.match(r"^([A-Za-z0-9_-]+):(?!=)\s*(.*)$", line)
+        if m:
+            cur = m.group(1)
+            rules[cur] = ([d for d in m.group(2).split() if re.fullmatch(r"[A-Za-z0-9_-]+", d)], "")
+        elif line.startswith("\t") and cur:
+            deps, recipe = rules[cur]
+            deps += re.findall(r"\$\(MAKE\)\s+([a-z][A-Za-z0-9_-]*)", line)
+            rules[cur] = (deps, recipe + line + "\n")
+        elif line.strip() and not line.startswith("#"):
+            cur = None
+    return rules
+
+
+def boots(rules, target, seen=None):
+    """Does building this target start the emulator, itself or through anything it depends on?"""
+    seen = set() if seen is None else seen
+    if target in seen or target not in rules:
+        return False
+    seen.add(target)
+    deps, recipe = rules[target]
+    return bool(BOOTS_RE.search(recipe)) or any(boots(rules, d, seen) for d in deps)
 
 
 def check_tiers():
-    """The testing tiers (OD83, TESTING.md) are enforced mechanically, so they cannot drift back: the gate
-    (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget; every soak target
-    is run by soak.yml."""
+    """The testing tiers (OD83, OD144, TESTING.md) are enforced mechanically, so they cannot drift back: the feature gate
+    starts no emulator; the epic gate (`make check`, ci.yml) holds only tier 0 and 1 targets and stays inside its budget;
+    every boot in ci.yml runs only for the epic gate; the commit hook runs no tests; every soak target is run by soak.yml."""
     out = []
     makefile = read("Makefile")
+    feature = make_var(makefile, "FEATURE_TARGETS")
     smoke, soak = make_var(makefile, "SMOKE_TARGETS"), make_var(makefile, "SOAK_TARGETS")
-    if not smoke or not soak:
-        return ["Makefile: SMOKE_TARGETS or SOAK_TARGETS is missing"]
+    if not smoke or not soak or not feature:
+        return ["Makefile: FEATURE_TARGETS, SMOKE_TARGETS or SOAK_TARGETS is missing"]
+    rules = make_rules(makefile)
+    for t in feature:
+        if t not in smoke:
+            out.append(f"Makefile: the feature target {t} is not in SMOKE_TARGETS (the epic gate includes the feature gate)")
+        if boots(rules, t):
+            out.append(f"Makefile: the feature target {t} starts QEMU; the feature gate is build and host tests only (TESTING.md)")
     if set(smoke) & set(soak):
         out.append(f"Makefile: targets in both tiers: {sorted(set(smoke) & set(soak))}")
     m = re.search(r"^check:\s*(.*)$", makefile, re.M)
@@ -56,15 +98,38 @@ def check_tiers():
         out.append("Makefile: `check` must be exactly the smoke tier (`check: smoke`); everything else is `soak` / `check-all`")
     ci, soakyml = read(".github/workflows/ci.yml"), read(".github/workflows/soak.yml")
     allowed = set(smoke) | GATE_EXTRA
-    for line in re.findall(r"^\s*(?:- )?run: make (.*)$", ci, re.M):
-        for t in line.split():
-            if t not in allowed:
+    # one job at a time: its make targets are smoke targets, and a job that boots runs only for the epic gate
+    for job in re.split(r"^  (?=[a-z][\w-]*:\s*$)", ci.split("\njobs:\n", 1)[-1], flags=re.M):
+        name = job.split(":", 1)[0].strip()
+        targets = " ".join(re.findall(r"^\s*(?:- )?run: make (.*)$", job, re.M)).split()
+        targets += re.findall(r"^\s+(?:[A-Z_]+=\S+ )*make ([a-z][\w-]*)", job, re.M)
+        for t in targets:
+            if t not in allowed and t not in rules:
+                out.append(f"ci.yml: job {name} runs `make {t}`, which is not a target")
+            elif t not in allowed and t not in ("os-interactive", "fetch-third-party"):
                 out.append(f"ci.yml (the merge gate) runs `make {t}`, which is not a smoke target (TESTING.md)")
+        starts = any(boots(rules, t) for t in targets) or bool(BOOTS_RE.search(job))
+        cond = re.search(r"^    if:\s*(.*)$", job, re.M)
+        if starts and not (cond and SMOKE_IF in cond.group(1)):
+            out.append(f"ci.yml: job {name} starts QEMU but is not limited to the epic gate (its `if:` needs `{SMOKE_IF}`)")
     for n in re.findall(r"timeout-minutes:\s*(\d+)", ci):
         if int(n) > GATE_BUDGET_MINUTES:
             out.append(f"ci.yml: a gate job's timeout is {n} minutes; the budget is {GATE_BUDGET_MINUTES} (TESTING.md)")
     if "matrix:" in ci:
         out.append("ci.yml: the merge gate has a build matrix; that belongs in soak.yml")
+    # the commit hook: format, docs check, clippy; never a test or a boot
+    try:
+        hook = read("scripts/hooks/pre-commit")
+    except FileNotFoundError:
+        hook = None
+        out.append("scripts/hooks/pre-commit is missing (TESTING.md: the commit hook)")
+    if hook is not None:
+        code = "\n".join(l for l in hook.splitlines() if not l.lstrip().startswith("#"))
+        if re.search(r"cargo\s+(?:\S+\s+)*test|nextest|miri", code) or BOOTS_RE.search(code):
+            out.append("scripts/hooks/pre-commit runs tests; the commit hook is format, docs check and clippy only (TESTING.md)")
+        for t in re.findall(r"make (?:-\w+ )*([a-z][\w-]*)", code):
+            if t not in ("fmt-check", "docs-check", "lint", "fmt"):
+                out.append(f"scripts/hooks/pre-commit runs `make {t}`; the commit hook is format, docs check and clippy only (TESTING.md)")
     for t in soak:
         names = SOAK_SPLIT.get(t, []) + [t]
         if not any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", soakyml) for n in names):
