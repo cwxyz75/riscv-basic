@@ -115,7 +115,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **MM2** the buddy frame allocator (PR 307)
 - [x] **MM3** large pages in the direct map (PR 308)
 - [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
-- [ ] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a, the windows: PR to follow; the console, the AIA and the reset left)
+- [ ] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a, the windows: PR 313; PL5b, the console and reset: PR 314; the AIA left)
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
 - [ ] **SC1** sixty-four harts
 - [ ] **HD1** the kernel entropy pool
@@ -214,7 +214,10 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   (the first peel and the scheduler's exit from the big lock, nanosecond time and the tickless timer, the move behind
   `arch/`, and the first runs of the checks phase 3 built: chaos, mutants, the checked release kernel, the long fuzz run,
   the persistent allocation-failure sweep, coverage, Miri over `ksys`). The mutation job is red until its first survivors
-  are triaged. A red result is a work item that day (OD140), ahead of the next plan item.
+  are triaged. The soak tier also holds three boots added in phase 4, never run by the owner: `os-boot-test-cpu-neg` (a CPU without the
+  profile ends in `##PANIC missing extension`), `os-boot-test-loadaddr` (the image at two other load addresses) and
+  `os-boot-test-sbi-console` (output through the firmware's debug console). A red result is a work item that day (OD140), ahead of the
+  next plan item.
 
 ## Decisions taken without the owner
 

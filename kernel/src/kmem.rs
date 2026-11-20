@@ -214,10 +214,11 @@ pub fn init() {
         };
     }
     // The device windows a physical VMO may name (PL5, D1): every device range the tree names minus what the kernel itself drives
-    // (the console, the test finisher and the interrupt controller's pages, still constants until the rest of PL5) and minus RAM.
+    // (the console and the test finisher, found in the tree, and the interrupt controller's pages, still constants until PL5c) and minus RAM.
     {
-        let mut driven: alloc::vec::Vec<(u64, u64)> =
-            alloc::vec![(0x1000_0000, 0x1000), (abi::finisher::BASE as u64, 0x1000)];
+        let mut driven: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+        driven.extend(crate::console::base().map(|b| (b, 0x1000)));
+        driven.extend(crate::finisher::base().map(|b| (b, 0x1000)));
         driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
         let windows = crate::dtb::dtb_blob()
             .and_then(|b| kcore::fdt::parse(b).ok())
@@ -277,11 +278,18 @@ pub fn init() {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
             .expect("device tree map");
     }
-    for device in [abi::finisher::BASE as u64, 0x1000_0000]
+    // the devices the kernel drives, found in the tree: the console, the test device, the interrupt controller's pages. Each page once (the
+    // console and the test device may share one, and a page may not be mapped twice).
+    let mut pages: alloc::vec::Vec<u64> = crate::console::base()
         .into_iter()
+        .chain(crate::finisher::base().filter(|_| !crate::RELEASE))
         .chain(crate::aia::pages())
-    {
-        pt.map(&mut mm, DIRECT_BASE + device, device / PAGE_SIZE, Perms::RW)
+        .map(|d| d & !(PAGE_SIZE - 1))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    for page in pages {
+        pt.map(&mut mm, DIRECT_BASE + page, page / PAGE_SIZE, Perms::RW)
             .expect("device page");
     }
     let root = pt.root();

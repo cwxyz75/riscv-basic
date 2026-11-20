@@ -47,7 +47,7 @@ REQUIRED = [
     "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "teardown_with_threads_on_other_harts", "unmap_while_siblings_touch", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle", "idle_harts_take_no_big_lock_for_their_ticks",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
-    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "the_image_is_where_the_loader_put_it", "heap_works", "frame_database_is_sane",
+    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "the_console_is_where_the_boot_line_says", "the_image_is_where_the_loader_put_it", "heap_works", "frame_database_is_sane",
     "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
@@ -1071,6 +1071,7 @@ def run(kernel: str, extra=()):
                                            "kfast" if SHARD == "k" and KFAST else "",
                                            f"ram={os.environ.get('OS_RAM', '256M')}",
                                            f"load={elf_load_address(kernel):#x}",
+                                           os.environ.get("OS_BOOT_ARGS", ""),
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),

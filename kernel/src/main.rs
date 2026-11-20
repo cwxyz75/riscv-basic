@@ -75,8 +75,17 @@ impl Tally {
 #[no_mangle]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
-    // First of all: this hart's record in `tp` (the trap entry needs it).
+    // First of all: this hart's record in `tp` (the trap entry and the console's lock need it, so a panic in what follows can still print).
     percpu::bind(0, hart_id);
+    // Then, before anything prints: where the tree is (the early table maps all physical space below 64 GiB, and the pointer is
+    // bounds-checked), the console it names, the boot word that forces the firmware's console (the fallback path, exercised on a machine
+    // that has a UART: `make os-boot-test-sbi-console`) and the test device. All allocation-free: there is no heap yet.
+    dtb::locate(dtb);
+    console::init_from_tree();
+    if dtb::dtb_blob().is_some_and(|b| kcore::fdt::bootarg_present(b, "console=sbi")) {
+        console::use_sbi();
+    }
+    finisher::init(dtb::dtb_blob().and_then(kcore::fdt::test_finisher_base));
     percpu::this()
         .online
         .store(true, core::sync::atomic::Ordering::Release);
@@ -110,7 +119,6 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
 
     heap::init();
     trap::init();
-    dtb::locate(dtb); // (the extent of the tree, read once the trap vector can report a fault: `kmem::init` needs it)
     dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)

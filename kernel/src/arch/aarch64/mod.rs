@@ -38,7 +38,12 @@ pub mod aia {
 }
 
 pub mod finisher {
-    pub const BASE: u64 = 0;
+    pub fn init(base: Option<u64>) {
+        unimplemented!()
+    }
+    pub fn base() -> Option<u64> {
+        unimplemented!()
+    }
     pub fn exit(ok: bool) -> ! {
         unimplemented!()
     }
@@ -180,6 +185,14 @@ pub mod sbi {
 }
 
 pub use cpu::*;
+
+/// The firmware's debug console and reset.
+pub fn debug_console_write_byte(byte: u8) -> bool {
+    unimplemented!()
+}
+pub fn system_reset(reboot: bool, failure: bool) {
+    unimplemented!()
+}
 
 /// Virtual minus physical for the kernel image.
 pub fn kernel_delta() -> u64 {

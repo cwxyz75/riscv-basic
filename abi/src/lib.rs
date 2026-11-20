@@ -16,13 +16,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// QEMU `virt`'s test finisher (a SiFive test device): writing a value here ends
-/// the emulation with an exit status.
+/// The values of QEMU's test finisher (a SiFive test device; its address comes from the device tree): writing one ends the emulation with
+/// an exit status.
 pub mod arch;
 
 pub mod finisher {
-    /// Physical address of the device.
-    pub const BASE: usize = 0x10_0000;
     /// Write this to exit QEMU with status 0.
     pub const PASS: u32 = 0x5555;
     /// The value that exits QEMU with status `code` (1 to 0xffff).
