@@ -118,7 +118,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a PR 313, PL5b PR 314, PL5c PR 315)
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
 - [x] **SC1** sixty-four harts (PR 317: harts from `/cpus`, the SBI hart-mask builder, 64-bit pokes; the records and stacks stay static at 64, T185; the `-smp` 8/16/32 boots are the owner's soak)
-- [ ] **HD1** the kernel entropy pool
+- [x] **HD1** the kernel entropy pool
 - [ ] **PL2** vector state
 - [ ] **PL3** user code built for RVA23U64
 
@@ -214,7 +214,7 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   (the first peel and the scheduler's exit from the big lock, nanosecond time and the tickless timer, the move behind
   `arch/`, and the first runs of the checks phase 3 built: chaos, mutants, the checked release kernel, the long fuzz run,
   the persistent allocation-failure sweep, coverage, Miri over `ksys`). The mutation job is red until its first survivors
-  are triaged. The soak tier also holds three boots added in phase 4, never run by the owner: `os-boot-test-cpu-neg` (a CPU without the
+  are triaged. The soak tier also holds four boots added in phase 4, never run by the owner: `os-boot-test-entropy` (two boots differ in the entropy pool's first output; a tree without a seed boots unseeded), `os-boot-test-cpu-neg` (a CPU without the
   profile ends in `##PANIC missing extension`), `os-boot-test-loadaddr` (the image at two other load addresses) and
   `os-boot-test-sbi-console` (output through the firmware's debug console). A red result is a work item that day (OD140), ahead of the
   next plan item.

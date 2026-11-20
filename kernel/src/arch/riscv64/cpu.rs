@@ -50,6 +50,17 @@ pub fn cpu_idle() {
     unsafe { asm!("wfi") };
 }
 
+/// One read of the `seed` CSR (Zkr): bits 31:30 say what the low 16 bits are (00 the entropy source is still testing itself, 01 it is gathering,
+/// 10 they are 16 fresh entropy bits, 11 it has failed). Only on a hart whose ISA string has Zkr, and only if M-mode lets S-mode read it
+/// (`mseccfg.SSEED`); otherwise the read is an illegal instruction.
+pub fn seed_csr_read() -> usize {
+    let v: usize;
+    // SAFETY: `csrrw rd, seed, x0` reads the entropy source and writes nothing (rs1 = x0 makes the write an unused zero); the caller checked
+    // that the hart has Zkr.
+    unsafe { asm!("csrrw {}, 0x015, zero", out(reg) v) };
+    v
+}
+
 /// The per-hart pointer register's value.
 #[inline(always)]
 pub fn thread_pointer() -> usize {

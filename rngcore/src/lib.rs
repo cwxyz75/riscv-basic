@@ -7,6 +7,7 @@
 
 pub mod chacha;
 pub mod drbg;
+pub mod pool;
 pub mod sha256;
 
 pub use drbg::Drbg;

@@ -210,6 +210,32 @@ fn node_at<'a>(blob: &'a [u8], want: &str) -> Option<NodeFacts<'a>> {
     Some(f)
 }
 
+/// Where the seeds firmware leaves in `/chosen` are in the blob (HD1): the `(offset, length)` of the value of `rng-seed` and of
+/// `kaslr-seed`, either absent. The kernel reads them for its entropy pool and then zeroes them in the copy it hands to the device manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChosenSeeds {
+    pub rng_seed: Option<(usize, usize)>,
+    pub kaslr_seed: Option<(usize, usize)>,
+}
+
+/// Find the seed properties of `/chosen`. `None` for a blob that is not a device tree.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a value slice lies inside the blob, so its address is not below the blob's
+pub fn chosen_seeds(blob: &[u8]) -> Option<ChosenSeeds> {
+    let mut found = ChosenSeeds::default();
+    let base = blob.as_ptr() as usize;
+    walk_props(blob, &mut |path, _, name, value| {
+        if path == ["chosen"] {
+            let at = Some((value.as_ptr() as usize - base, value.len()));
+            match name {
+                "rng-seed" => found.rng_seed = at,
+                "kaslr-seed" => found.kaslr_seed = at,
+                _ => {}
+            }
+        }
+    })?;
+    Some(found)
+}
+
 /// The base address of the console UART the tree names: `/chosen/stdout-path` (an absolute path or an alias from `/aliases`, either with
 /// `:options` after it) naming a node whose `compatible` is an NS16550, whose `status` is not disabled, whose registers are the plain
 /// byte-wide, stride-one kind the kernel drives (`reg-shift` and `reg-io-width` absent or 0 and 1), and whose `reg` gives the base. `None`

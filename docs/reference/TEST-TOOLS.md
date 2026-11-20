@@ -12,6 +12,7 @@ exits with pass or fail. Its switches are environment variables:
 |---|---|
 | `OS_SMP` | hart count |
 | `OS_SHARD` | which part of the suite: `a`, `b`, `k` (below), empty for all |
+| `OS_DTB` | boot with this device tree (`-dtb`); `scripts/entropy_boot_test.py` (`make os-boot-test-entropy`, soak) uses a copy of QEMU's own with `/chosen/rng-seed` removed |
 | `OS_LOAD` | the physical address the image was built for (`make os-boot-test-loadaddr` sets it): the kernel line carries `load=<address>` and the test `the_image_is_where_the_loader_put_it` compares it with where the early boot code found the image |
 | `OS_RAM` | the RAM QEMU is given (`-m`; default `256M`); the harness also puts `ram=<size>` on the kernel line, and the kernel test `ram_matches_the_machine` checks the frame count against it |
 | `OS_CPU` | the CPU model; always `rva23s64` (the kernel refuses to boot below the profile); only `os-boot-test-cpu-neg` sets it, to `rv64` |

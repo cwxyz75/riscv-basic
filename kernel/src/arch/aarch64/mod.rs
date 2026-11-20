@@ -243,6 +243,9 @@ pub mod cpu {
     pub fn tlb_flush_page(va: u64, asid: u16) {
         unimplemented!()
     }
+    pub fn seed_csr_read() -> usize {
+        unimplemented!()
+    }
     pub fn cpu_idle() {
         unimplemented!()
     }

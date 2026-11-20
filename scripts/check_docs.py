@@ -192,6 +192,7 @@ ATOMICS = {
     "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
     "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
+    "kernel/src/entropy.rs": (6, "whether the pool was keyed from a real seed, and its first output for the boot tests (HD1)"),
     "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
     "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),

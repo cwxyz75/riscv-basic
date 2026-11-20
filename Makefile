@@ -9,7 +9,7 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-boot-test-sbi-console os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
+.PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
 .PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
@@ -394,6 +394,10 @@ os-boot-test-loadaddr: os-user
 os-boot-test-sbi-console: kernel
 	OS_BOOT_ARGS=console=sbi OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 
+# HD1: the entropy pool differs at every boot; a tree without a seed boots unseeded and passes (needs dtc).
+os-boot-test-entropy: kernel
+	python3 scripts/entropy_boot_test.py $(OS_ELF)
+
 # The reference CPU of the OS track (OD47).
 # PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
 os-boot-test-cpu-neg: kernel
@@ -446,7 +450,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)

@@ -309,6 +309,38 @@ fn the_console_is_where_the_boot_line_says() -> Outcome {
 /// PL4c: the image is where the loader put it, and the kernel found out. The harness names the address it built the image for
 /// (`load=0x...` on the kernel line; only the load-address boot test does) and the image's physical start, worked out by the early boot
 /// code from its own address, must be that: a kernel that quietly ran from the default address would pass every other test.
+/// HD1: the pool is seeded exactly when the tree has a seed (a stripped tree is booted with `-dtb`), and what it produces is not constant.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn the_entropy_pool_is_seeded_as_the_tree_says() -> Outcome {
+    let blob = crate::dtb::dtb_blob().ok_or_else(|| String::from("no device tree"))?;
+    let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
+    let nonzero = |r: Option<(usize, usize)>| {
+        r.and_then(|(o, l)| blob.get(o..o + l))
+            .is_some_and(|b| b.iter().any(|&x| x != 0))
+    };
+    let want = nonzero(seeds.rng_seed) || nonzero(seeds.kaslr_seed);
+    ensure_eq(
+        crate::entropy::seeded(),
+        want,
+        "seeded exactly when the tree has a non-zero seed (this machine has no Zkr)",
+    )?;
+    let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+    ensure(
+        crate::entropy::fill(&mut a) && crate::entropy::fill(&mut b),
+        "the pool fills",
+    )?;
+    ensure(a != b && a != [0; 16], "two draws differ and are not zero")?;
+    ensure(crate::entropy::below(0).is_none(), "below(0) is refused")?;
+    ensure(
+        (0..50).all(|_| crate::entropy::below(7).is_some_and(|x| x < 7)),
+        "below(7) stays below 7",
+    )?;
+    ensure(
+        crate::entropy::first_output() != 0,
+        "the first output was recorded",
+    )
+}
+
 fn the_image_is_where_the_loader_put_it() -> Outcome {
     let st = kmem::stats();
     let delta = crate::arch::kernel_delta();
@@ -622,6 +654,10 @@ pub const TESTS: &[Test] = &[
     (
         "the_console_is_where_the_boot_line_says",
         the_console_is_where_the_boot_line_says,
+    ),
+    (
+        "the_entropy_pool_is_seeded_as_the_tree_says",
+        the_entropy_pool_is_seeded_as_the_tree_says,
     ),
     (
         "the_image_is_where_the_loader_put_it",
