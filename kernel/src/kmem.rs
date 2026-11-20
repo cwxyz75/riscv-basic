@@ -10,7 +10,7 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
-use abi::layout::{DIRECT_BASE, KERNEL_OFFSET};
+use abi::layout::DIRECT_BASE;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::buddy::{Meta, META_BYTES};
@@ -101,8 +101,13 @@ pub fn sections() -> Sections {
 fn map_image(pt: &mut PageTable, mm: &mut Mm<DirectMap>, (start, end): (u64, u64), perms: Perms) {
     let mut va = start;
     while va < end {
-        pt.map(mm, va, (va - KERNEL_OFFSET) / PAGE_SIZE, perms)
-            .expect("mapping the kernel image");
+        pt.map(
+            mm,
+            va,
+            (va - crate::arch::kernel_delta()) / PAGE_SIZE,
+            perms,
+        )
+        .expect("mapping the kernel image");
         va += PAGE_SIZE;
     }
 }
@@ -116,19 +121,24 @@ pub fn init() {
     let s = sections();
     // What memory exists and which of it the allocator may have (PL4, KERNEL-V1-SPEC 2.3): the tree's `memory` ranges, minus its reserved
     // ranges (firmware), the loader's reservation block, the tree's own frames and the kernel image. Nothing here is a constant.
-    let image_start = s.text.0 - KERNEL_OFFSET;
-    let image_end = s.data.1 - KERNEL_OFFSET;
+    let delta = crate::arch::kernel_delta();
+    let image_start = s.text.0 - delta;
+    let image_end = s.data.1 - delta;
     let (memory, mut reserved) =
         crate::dtb::memory_map().expect("a device tree below 64 GiB that describes the machine's memory (T180: RAM above 64 GiB is not supported yet)");
     reserved.push((image_start, image_end - image_start));
-    // Firmware keeps its footprint below the load address. The tree normally says so (OpenSBI adds `/reserved-memory`), but a tree that
-    // does not must not make the firmware's own memory the first thing handed out (and the frame metadata's home): everything below the
-    // image in the range that holds it stays reserved, as it was when the layout was a constant.
+    // Firmware keeps its footprint just below the load address. The tree normally says so (OpenSBI adds `/reserved-memory`), but a tree
+    // that does not must not make the firmware's own memory the first thing handed out (and the frame metadata's home): the 2 MiB below the
+    // image (where OpenSBI's own region ends at the default load address) stays reserved when it lies in the same RAM range. Nothing more:
+    // the cost is a fixed 2 MiB wherever the image is.
     if let Some(&(base, _)) = memory
         .iter()
         .find(|&&(b, s)| b <= image_start && image_start < b.saturating_add(s))
     {
-        reserved.push((base, image_start - base));
+        reserved.push((
+            base.max(image_start.saturating_sub(2 << 20)),
+            image_start - base.max(image_start.saturating_sub(2 << 20)),
+        ));
     }
     // Only the physical space the direct map reaches is used (`DIRECT_MAP_PHYS_LIMIT`): RAM above it is left alone, loudly.
     let limit = abi::layout::DIRECT_MAP_PHYS_LIMIT;
@@ -173,7 +183,7 @@ pub fn init() {
         let at =
             (DIRECT_BASE + usable.get(host).expect("the host range").0 * PAGE_SIZE) as *mut Meta;
         // SAFETY: the first `meta_frames` frames of a usable range are RAM that nothing else uses and the database will not hand out;
-        // the early boot table direct-maps all physical space below 128 GiB; `managed` entries fit in `meta_frames` frames (sized from
+        // the early boot table direct-maps all physical space below 64 GiB; `managed` entries fit in `meta_frames` frames (sized from
         // the larger `usable_total`); an all-zero `Meta` is a valid value and the slice is cleared before it is formed; it is the only
         // reference to that memory.
         unsafe {

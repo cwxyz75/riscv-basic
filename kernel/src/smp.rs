@@ -106,7 +106,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
             *((stacks + i * STACK_BYTES) as *mut u64) = CANARY;
         }
     }
-    let entry_phys = secondary_entry as *const () as usize - abi::layout::KERNEL_OFFSET as usize;
+    let entry_phys = secondary_entry as *const () as usize - crate::arch::kernel_delta() as usize;
     let mut next = 1;
     for id in 0..MAX_HARTS {
         if id == boot_hart_id {

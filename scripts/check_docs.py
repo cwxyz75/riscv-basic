@@ -273,6 +273,25 @@ def check_workflows():
     return out
 
 
+# PL4 (KERNEL-V1-SPEC 2.3): nothing in the kernel assumes where RAM is, how big it is, or where the image was loaded; all of it comes from the
+# device tree and from the early boot code. The literals below may appear only in test code (the kernel's self-tests and `*_tests.rs`).
+RAM_LITERAL_RE = re.compile(r"\bRAM_SIZE\b|\bRAM_BASE\b|\bKERNEL_PHYS\b|\bKERNEL_OFFSET\b|0x8000_0000|0x8000_00|0x80000000|0x8020_0000|0x80200000")
+
+
+def check_ram_literals():
+    out = []
+    for top in ["kernel/src", "kcore/src", "abi/src", "ksys/src"]:
+        for dp, _, fs in os.walk(os.path.join(ROOT, top)):
+            for f in fs:
+                if not f.endswith(".rs") or f == "selftest.rs" or f.endswith("_tests.rs"):
+                    continue
+                path = os.path.join(dp, f)
+                for n, line in enumerate(open(path), 1):
+                    if RAM_LITERAL_RE.search(line.split("//", 1)[0]):
+                        out.append(f"PL4: {os.path.relpath(path, ROOT)}:{n} assumes where RAM or the image is (RAM_SIZE, 0x8000_0000, KERNEL_PHYS, ...): it comes from the device tree and the boot code")
+    return out
+
+
 def check_syscall_tests():
     """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
     import io, contextlib
@@ -397,7 +416,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

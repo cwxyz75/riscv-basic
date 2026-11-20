@@ -9,7 +9,7 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
+.PHONY: os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
 .PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
@@ -382,6 +382,16 @@ os-serial-test: os-interactive
 	@if python3 scripts/uv7_detach_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the detach test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
+# PL4c: the image loaded at other physical addresses boots the kernel-only shard: 6 MiB above the default (the same gigabyte, a different
+# 2 MiB page) and at 3 GiB + 2 MiB on a 2 GiB machine (another gigabyte, so the early table's identity slot is not the default one). The
+# link address does not change; the early boot code works out the difference. The harness reads each ELF's load address itself and refuses
+# a build that did not take the address it was asked for.
+os-boot-test-loadaddr: os-user
+	cd kernel && KERNEL_LMA=0x80600000 cargo build --target-dir ../target/os-loadaddr
+	OS_LOAD=0x80600000 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr/riscv64gc-unknown-none-elf/debug/kernel
+	cd kernel && KERNEL_LMA=0xc0200000 cargo build --target-dir ../target/os-loadaddr2
+	OS_LOAD=0xc0200000 OS_RAM=2G OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr2/riscv64gc-unknown-none-elf/debug/kernel
+
 # The reference CPU of the OS track (OD47).
 # PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
 os-boot-test-cpu-neg: kernel
@@ -434,7 +444,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-cpu-neg os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)

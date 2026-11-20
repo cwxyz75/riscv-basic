@@ -4,7 +4,7 @@
 //! allocation counts to baseline" (the old roadmap, S1).
 
 use crate::{kmem, trap};
-use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, LAZY_TEST_BASE};
+use abi::layout::{DIRECT_BASE, LAZY_TEST_BASE};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -84,7 +84,7 @@ fn runs_in_the_upper_half() -> Outcome {
         "stack address is in the Sv39 upper half",
     )?;
     ensure(
-        pc >= abi::layout::KERNEL_PHYS + KERNEL_OFFSET,
+        pc >= abi::layout::KERNEL_VIRT_BASE,
         "code is at the kernel's linked address",
     )
 }
@@ -98,6 +98,7 @@ fn low_half_is_empty() -> Outcome {
         0x8000_0000,
         0x8020_0000,
         0x8800_0000,
+        kmem::stats().image_first << 12, // wherever the image actually is
     ] {
         ensure(
             k.aspace.table().translate(&k.mm, va).is_none(),
@@ -143,7 +144,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
             ensure_eq(t.perms, want, &format!("{name} page {va:#x}"))?;
             ensure_eq(
                 t.pfn,
-                (va - KERNEL_OFFSET) >> 12,
+                (va - crate::arch::kernel_delta()) >> 12,
                 &format!("{name} page {va:#x} maps to its physical load address"),
             )?;
             va += PAGE;
@@ -274,6 +275,38 @@ fn ram_matches_the_machine() -> Outcome {
         st.memory_frames,
         bytes.min(abi::layout::DIRECT_MAP_PHYS_LIMIT - st.ram_first * 4096) / 4096,
         "the frames of RAM the device tree describes",
+    )
+}
+
+/// PL4c: the image is where the loader put it, and the kernel found out. The harness names the address it built the image for
+/// (`load=0x...` on the kernel line; only the load-address boot test does) and the image's physical start, worked out by the early boot
+/// code from its own address, must be that: a kernel that quietly ran from the default address would pass every other test.
+fn the_image_is_where_the_loader_put_it() -> Outcome {
+    let st = kmem::stats();
+    let delta = crate::arch::kernel_delta();
+    ensure_eq(
+        abi::layout::KERNEL_VIRT_BASE - delta,
+        st.image_first << 12,
+        "the image's physical start is its link address minus the delta",
+    )?;
+    ensure(
+        (st.image_first << 12).is_multiple_of(2 << 20),
+        "the image is loaded at a multiple of 2 MiB",
+    )?;
+    let Some(want) = crate::dtb::boot_arg_value("load=") else {
+        // a boot without the harness (the interactive targets) says nothing; the harness always does (`ram=` is its mark)
+        return if crate::dtb::boot_arg_value("ram=").is_some() {
+            Err("the harness did not say where it loaded the image (load=)".into())
+        } else {
+            Ok(())
+        };
+    };
+    let want =
+        u64::from_str_radix(want.trim_start_matches("0x"), 16).map_err(|_| "load= is not hex")?;
+    ensure_eq(
+        st.image_first << 12,
+        want,
+        "the image's physical start is where the harness loaded it",
     )
 }
 
@@ -558,6 +591,10 @@ pub const TESTS: &[Test] = &[
         direct_map_does_not_alias_the_image,
     ),
     ("ram_matches_the_machine", ram_matches_the_machine),
+    (
+        "the_image_is_where_the_loader_put_it",
+        the_image_is_where_the_loader_put_it,
+    ),
     ("heap_works", heap_works),
     ("frame_database_is_sane", frame_database_is_sane),
     ("lazy_commit_on_read", lazy_commit_on_read),

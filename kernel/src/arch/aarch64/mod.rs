@@ -180,6 +180,11 @@ pub mod sbi {
 }
 
 pub use cpu::*;
+
+/// Virtual minus physical for the kernel image.
+pub fn kernel_delta() -> u64 {
+    unimplemented!()
+}
 pub use switch::{switch, Context};
 pub use usermode::enter_user_raw as enter_user;
 

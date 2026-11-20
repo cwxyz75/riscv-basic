@@ -8,10 +8,29 @@ use std::path::PathBuf;
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    println!("cargo:rustc-link-arg=-T{dir}/linker.ld");
+    // The linker script is a template: the physical address the image is loaded at is substituted here (the default QEMU's firmware jumps
+    // to, or $KERNEL_LMA for the load-address boot test, `make os-boot-test-loadaddr`). Defining it on the linker's command line does not
+    // work: lld evaluates the script's `AT()` addresses before it sees `--defsym`.
+    let lma = std::env::var("KERNEL_LMA").unwrap_or_else(|_| "0x80200000".to_string());
+    // (the early boot code maps the image with 2 MiB pages: any other load address would stop it before there is a console to say so)
+    let value = u64::from_str_radix(lma.trim_start_matches("0x"), 16)
+        .expect("KERNEL_LMA is a hexadecimal address, like 0x80600000");
+    assert!(
+        value.is_multiple_of(2 << 20),
+        "KERNEL_LMA must be a multiple of 2 MiB"
+    );
+    let template = std::fs::read_to_string(format!("{dir}/linker.ld")).expect("read linker.ld");
+    let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+    std::fs::write(
+        format!("{out_dir}/linker.ld"),
+        template.replace("@KERNEL_LMA@", &lma),
+    )
+    .expect("write the linker script");
+    println!("cargo:rustc-link-arg=-T{out_dir}/linker.ld");
     // We never initialise the global pointer register, so stop the linker from
     // relaxing accesses into gp-relative form.
     println!("cargo:rustc-link-arg=--no-relax");
+    println!("cargo:rerun-if-env-changed=KERNEL_LMA");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");
     // KT13: an optimised build gets the wider stack budget (thread.rs, T173)
