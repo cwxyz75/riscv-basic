@@ -119,7 +119,7 @@ mod tests {
                 (63, 477)
             ]
         );
-        assert_eq!(c.to_raw(), 0x5ba2_22a7_16f8_1c8);
+        assert_eq!(c.to_raw(), 0x05ba_222a_716f_81c8);
     }
 
     #[test]
