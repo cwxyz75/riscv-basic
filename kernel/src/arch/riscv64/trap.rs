@@ -369,13 +369,13 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 }
 
 /// `clock_get` and `thread_yield` from user mode without the big kernel lock (L12c). False: not one of those, or the return is not
-/// quiet (a kill or stop to look for) or the FP registers are dirty: the full path.
+/// quiet (a kill or stop to look for) or dirty FP or vector registers could not be saved without the lock (`fp::light_save`): the full path.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: sepc + 4 steps past an ecall
 fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     use abi::syscall as nr;
     let n = frame.arg(17) as usize;
     if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD)
-        || user_fp_dirty(frame)
+        || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
     {
         return false;
@@ -396,14 +396,6 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
         }
     }
     true
-}
-
-/// Are the interrupted user thread's FP registers dirty (`sstatus.FS` = 3)? Saving them needs the FP tables, so the big lock.
-fn user_fp_dirty(frame: &TrapFrame) -> bool {
-    // (the FP unit or the vector unit: either needs its state saved before another thread can use the hart)
-    const FS_MASK: u64 = 3 << 13;
-    const VS_MASK: u64 = 3 << 9;
-    frame.sstatus & FS_MASK == FS_MASK || frame.sstatus & VS_MASK == VS_MASK
 }
 
 fn trap_handler_inner(frame: &mut TrapFrame) {
@@ -433,14 +425,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
         // switch threads. A tick that interrupted **user mode** takes it only when something needs it (L12b, below): the return
         // to user mode is where a killed process dies (`activate_current`), which needs the lock, so a kill moves an epoch the tick looks at.
-        // (A thread whose FP state is not Off still takes it at `fp::return_to_user`: tidy T166.)
+        // (A thread whose state is in this hart's FP or vector registers returns with no lock: `fp::return_to_user`, T166.)
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
         // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
         // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
-        if from_user && !user_fp_dirty(frame) {
+        if from_user && crate::fp::light_save(frame) {
             let switch = crate::thread::timer_interrupt();
             if !switch
                 && crate::user::user_return_is_quiet()
@@ -506,7 +498,7 @@ fn ipi_trap(frame: &mut TrapFrame) {
         if frame.sstatus & (1 << 8) == 0 {
             // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
             // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
-            if !user_fp_dirty(frame)
+            if crate::fp::light_save(frame)
                 && !crate::thread::reschedule_fast()
                 && crate::user::user_return_is_quiet()
                 && !crate::thread::need_resched_pending()

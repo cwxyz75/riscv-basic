@@ -35,6 +35,48 @@ fn find_clang() -> Option<String> {
     candidates.into_iter().find(|c| works(c))
 }
 
+/// The `-march` for user C code (PL3): the RVA23U64 profile by name where the clang knows it (LLVM 20 and later), else the profile's mandatory
+/// extensions spelled out (the same set as `init/.cargo/config.toml`), else the part of that set older clangs (LLVM 17 and later) accept.
+/// The first that compiles an empty file wins.
+fn march_for(clang: &str) -> String {
+    static CHOSEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| probe_march(clang)).clone()
+}
+
+fn probe_march(clang: &str) -> String {
+    const CANDIDATES: [&str; 3] = [
+        "rva23u64",
+        "rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_zicond_zcb_zfa_zihintpause_zicbom_zicboz_zkt_zvbb_zimop_zcmop_zawrs",
+        "rv64imafdcv_zicsr_zifencei_zba_zbb_zbs_zicond_zcb_zfa_zicbom_zicboz",
+    ];
+    for m in CANDIDATES {
+        let ok = Command::new(clang)
+            .args([
+                "--target=riscv64-unknown-elf",
+                &format!("-march={m}"),
+                "-mabi=lp64d",
+                "-x",
+                "c",
+                "-c",
+                "-o",
+                "/dev/null",
+                "-",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            if m != CANDIDATES[0] {
+                println!("cargo:warning=user C is built with -march={m}: this clang does not know rva23u64");
+            }
+            return m.to_string();
+        }
+    }
+    panic!("{clang} accepts none of the RVA23U64 -march strings; PL3 needs LLVM 17 or later");
+}
+
 /// Archivers to try: `llvm-ar` next to `clang`, `llvm-ar` on the path, then plain `ar` (an
 /// archive of RISC-V objects is just a file format, any `ar` makes it).
 fn archivers(clang: &str) -> Vec<String> {
@@ -64,9 +106,9 @@ fn build_c_archive(name: &str, sources: &[PathBuf], extra: &[String]) -> Option<
             .replace(['/', '\\', ':'], "_");
         let obj = out.join(format!("{stem}.o"));
         let ok = Command::new(&clang)
+            .args(["--target=riscv64-unknown-elf"])
+            .arg(format!("-march={}", march_for(&clang)))
             .args([
-                "--target=riscv64-unknown-elf",
-                "-march=rv64gc",
                 "-mabi=lp64d",
                 "-ffreestanding",
                 "-nostdlibinc",

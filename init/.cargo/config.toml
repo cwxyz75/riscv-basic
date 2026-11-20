@@ -1,5 +1,10 @@
 # Applies when cargo is run from inside init/ (the Makefile does this): user programs
-# are built for the hardware floating-point RISC-V target (rv64gc, lp64d; OD76, which superseded the
-# soft-float user target of OD40), as static executables.
+# are built for the RVA23U64 profile (OD127; PL3; OD76's "vector stays off" is closed): hardware floating point (lp64d) and the profile's
+# mandatory extensions beyond rv64gc that rustc/LLVM have features for: V (with Zvbb), the bit-manipulation set, Zicond, Zcb, Zfa, the cache-block
+# management and zero instructions, the pause hint, Zkt (data-independent latency), the may-be-operations (Zimop, Zcmop) and Zawrs. As static
+# executables. The cache-block instructions work because the kernel sets `senvcfg` on every hart.
 [build]
 target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "target-feature=+v,+zvbb,+zba,+zbb,+zbs,+zicond,+zcb,+zfa,+zicbom,+zicboz,+zihintpause,+zkt,+zimop,+zcmop,+zawrs"]

@@ -386,6 +386,8 @@ pub fn app_main() -> i32 {
         n if n & 0xff == 92 => return vec_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64, 0),
         93 => return vec_fresh(),
         96 => return vec_edges(),
+        // PL3: the user build is RVA23U64: a vector loop and `cbo.zero` over a page with no `.option` (the target features enable them)
+        98 => return rva23_loop_and_cbo(),
         97 => return vec_load_first(),
         94 => return vec_threads(),
         95 => {
@@ -1054,23 +1056,6 @@ fn vlenb() -> usize {
     v
 }
 
-/// Load `v0`-`v31` from `p` (32 * vlenb bytes).
-fn vec_load(p: *const u8, vlenb: usize) {
-    // SAFETY: reads `32 * vlenb` bytes at `p` (the caller's buffer) and writes the vector registers.
-    unsafe {
-        asm!(
-            ".option push", ".option arch, +v",
-            "vl8re8.v v0, ({p})", "add {p}, {p}, {s}",
-            "vl8re8.v v8, ({p})", "add {p}, {p}, {s}",
-            "vl8re8.v v16, ({p})", "add {p}, {p}, {s}",
-            "vl8re8.v v24, ({p})",
-            ".option pop",
-            p = inout(reg) p => _,
-            s = in(reg) vlenb * 8,
-        );
-    }
-}
-
 /// Store `v0`-`v31` to `p` (32 * vlenb bytes).
 fn vec_store(p: *mut u8, vlenb: usize) {
     // SAFETY: writes `32 * vlenb` bytes at `p` (the caller's buffer) and reads the vector registers.
@@ -1088,37 +1073,11 @@ fn vec_store(p: *mut u8, vlenb: usize) {
     }
 }
 
-/// `vsetvl` for `avl` elements of `8 << sew` bits (LMUL 1, tail and mask agnostic): returns (`vl`, `vtype`) as the hardware now has them.
-fn vec_set(avl: usize, sew: u64) -> (u64, u64) {
-    let (vl, vt): (u64, u64);
-    // SAFETY: only changes `vl` and `vtype`.
-    unsafe {
-        asm!(
-            ".option push", ".option arch, +v",
-            "vsetvl {t}, {avl}, {vtype}",
-            "csrr {vl}, vl",
-            "csrr {vt}, vtype",
-            ".option pop",
-            avl = in(reg) avl,
-            vtype = in(reg) (sew & 3) << 3 | 0xc0,
-            t = out(reg) _,
-            vl = out(reg) vl,
-            vt = out(reg) vt,
-        );
-    }
-    (vl, vt)
-}
-
 fn vec_csr() -> u64 {
     let v: u64;
     // SAFETY: reads `vcsr`.
     unsafe { asm!("csrr {v}, 0x00f", v = out(reg) v) };
     v
-}
-
-fn vec_set_csr(v: u64) {
-    // SAFETY: writes `vcsr` (the fixed-point rounding mode and saturation flag).
-    unsafe { asm!("csrw 0x00f, {v}", v = in(reg) v) };
 }
 
 fn vec_pattern(buf: &mut [u8], seed: u64) {
@@ -1128,6 +1087,68 @@ fn vec_pattern(buf: &mut [u8], seed: u64) {
             .wrapping_mul(0x9e37_79b9_7f4a_7c15)
             >> 29) as u8;
     }
+}
+
+/// One round of the privacy test, in ONE assembly block (the user build is RVA23U64, so compiled code uses vector registers too and would
+/// overwrite a pattern held across it): set `vl`/`vtype`, load `v0`-`v31` from `want`, set `vcsr`, spin without touching a vector register,
+/// optionally yield (a system call: the thread is switched out and back, possibly on another hart), store the registers to `got`, and read
+/// `vcsr`, `vl` and `vtype` back. Returns (`vl` as set, `vcsr`, `vl`, `vtype` as read back).
+#[allow(clippy::too_many_arguments)] // one assembly block takes everything it needs: the buffers, the new state and the number of spins
+fn vec_round(
+    want: *const u8,
+    got: *mut u8,
+    vlenb: usize,
+    avl: usize,
+    vtype: u64,
+    csr: u64,
+    spins: u64,
+    yield_after: bool,
+) -> (u64, u64, u64, u64) {
+    let (vl_set, c, vl, vt): (u64, u64, u64, u64);
+    // SAFETY: reads and writes `32 * vlenb` bytes at `want` and `got` (the caller's buffers); every vector register is declared clobbered; the
+    // system call preserves all registers but a0-a2 (declared clobbered).
+    unsafe {
+        asm!(
+            "vsetvl {vl_set}, {avl}, {vtype}",
+            "mv {p}, {want}",
+            "vl8re8.v v0, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v8, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v16, ({p})", "add {p}, {p}, {s}",
+            "vl8re8.v v24, ({p})",
+            "csrw vcsr, {csr}",
+            "2:",
+            "addi {spins}, {spins}, -1",
+            "bnez {spins}, 2b",
+            "beqz {y}, 3f",
+            "ecall",
+            "3:",
+            "mv {p}, {got}",
+            "vs8r.v v0, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v8, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v16, ({p})", "add {p}, {p}, {s}",
+            "vs8r.v v24, ({p})",
+            "csrr {c}, vcsr",
+            "csrr {vl}, vl",
+            "csrr {vt}, vtype",
+            want = in(reg) want,
+            got = in(reg) got,
+            s = in(reg) vlenb * 8,
+            avl = in(reg) avl,
+            vtype = in(reg) vtype,
+            csr = in(reg) csr,
+            spins = inout(reg) spins => _,
+            y = in(reg) yield_after as usize,
+            p = out(reg) _,
+            vl_set = out(reg) vl_set,
+            c = out(reg) c,
+            vl = out(reg) vl,
+            vt = out(reg) vt,
+            in("a7") rt::abi::syscall::THREAD_YIELD,
+            out("a0") _, out("a1") _, out("a2") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _, out("v31") _
+        );
+    }
+    (vl_set, c, vl, vt)
 }
 
 /// Keep a private pattern in the vector registers, `vcsr`, `vl` and `vtype` for a while (`slot` picks the buffers: one per thread). Returns 0 if
@@ -1145,35 +1166,31 @@ fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
             core::slice::from_raw_parts_mut((b as *mut u8).add((2 * slot + 1) * 32 * VMAX), 32 * n),
         )
     };
-    let mut round = 0u64;
-    let mut cur = seed;
-    vec_pattern(want, cur);
-    let (mut vl, mut vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
-    let mut csr = cur & 7;
-    vec_load(want.as_ptr(), n);
-    vec_set_csr(csr);
     let until = rt::sys::clock_get() + 30;
+    let mut round = 0u64;
     while rt::sys::clock_get() < until {
-        for _ in 0..2000 {
-            core::hint::spin_loop();
-        }
-        if mode == 1 {
-            rt::sys::thread_yield();
-        }
-        vec_store(got.as_mut_ptr(), n);
-        let (gc, gl, gt) = (vec_csr(), read_vl(), read_vtype());
-        if got[..] != want[..] || gc != csr || gl != vl || gt != vt {
+        // a new pattern, element width, length and `vcsr` every round, so a stale restore cannot pass
+        let cur = seed.wrapping_add(round);
+        vec_pattern(want, cur);
+        let (avl, vtype, csr) = (
+            1 + (cur % 7) as usize,
+            ((cur >> 3) & 3) << 3 | 0xc0,
+            cur & 7,
+        );
+        let (vl_set, c, vl, vt) = vec_round(
+            want.as_ptr(),
+            got.as_mut_ptr(),
+            n,
+            avl,
+            vtype,
+            csr,
+            2000,
+            mode == 1,
+        );
+        if got[..] != want[..] || c != csr || vl != vl_set || vt != vtype {
             return 1;
         }
         round += 1;
-        if round.is_multiple_of(5) {
-            cur = seed.wrapping_add(round);
-            vec_pattern(want, cur);
-            (vl, vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
-            csr = cur & 7;
-            vec_load(want.as_ptr(), n);
-            vec_set_csr(csr);
-        }
     }
     0
 }
@@ -1212,44 +1229,72 @@ fn vec_fresh() -> i32 {
 }
 
 /// Edge states: the first vector instruction is a `vsetvli` (not a CSR read); an illegal `vtype` (`vill`) and a non-zero `vstart` survive a trap
-/// (a yield here). Returns 0 or a code for the first thing that was wrong.
+/// (a yield). Each is one assembly block, with the system call inside it: compiled code in between could use the vector unit and change the
+/// state (the user build is RVA23U64). Returns 0 or a code for the first thing that was wrong.
 fn vec_edges() -> i32 {
-    let (vl, vt) = vec_set(3, 2); // (the first vector instruction)
+    let (vl, vt): (u64, u64);
+    // SAFETY: only changes `vl` and `vtype` (the first vector instruction is `vsetvli`); the system call preserves all registers but a0-a2.
+    unsafe {
+        asm!(
+            "vsetvl {t}, {avl}, {vtype}",
+            "csrr {vl}, vl",
+            "csrr {vt}, vtype",
+            t = out(reg) _,
+            avl = in(reg) 3usize,
+            vtype = in(reg) (2u64 << 3) | 0xc0,
+            vl = out(reg) vl,
+            vt = out(reg) vt,
+        );
+    }
     if vl != 3 || vt >> 63 != 0 {
         return 1;
     }
-    let (vl, vt): (u64, u64);
-    // SAFETY: only changes `vl` and `vtype`: an illegal `vtype` (a reserved bit) sets `vill` and clears `vl`.
+    let (vl, vt, vl2, vt2): (u64, u64, u64, u64);
+    // SAFETY: an illegal `vtype` (a reserved bit) sets `vill` and clears `vl`; then a yield (the thread may be switched out, and back on another
+    // hart) and the state is read again.
     unsafe {
         asm!(
-            ".option push", ".option arch, +v",
             "vsetvl zero, zero, {bad}",
             "csrr {vl}, vl",
             "csrr {vt}, vtype",
-            ".option pop",
+            "ecall",
+            "csrr {vl2}, vl",
+            "csrr {vt2}, vtype",
             bad = in(reg) 1u64 << 8,
             vl = out(reg) vl,
             vt = out(reg) vt,
+            vl2 = out(reg) vl2,
+            vt2 = out(reg) vt2,
+            in("a7") rt::abi::syscall::THREAD_YIELD,
+            out("a0") _, out("a1") _, out("a2") _,
         );
     }
     if vt >> 63 != 1 || vl != 0 {
         return 2;
     }
-    rt::sys::thread_yield();
-    if read_vtype() >> 63 != 1 || read_vl() != 0 {
+    if vt2 >> 63 != 1 || vl2 != 0 {
         return 3;
     }
-    let vs: u64;
-    // SAFETY: writes and reads `vstart` (the element a trapped vector instruction resumes at).
-    unsafe { asm!("csrw 0x008, {v}", v = in(reg) 2u64) };
-    rt::sys::thread_yield();
-    // SAFETY: reads `vstart`.
-    unsafe { asm!("csrr {v}, 0x008", v = out(reg) vs) };
-    if vs != 2 {
+    let (v1, v2): (u64, u64);
+    // SAFETY: writes `vstart` (the element a trapped vector instruction resumes at), yields, and reads it back; clears it again.
+    unsafe {
+        asm!(
+            "csrw vstart, {two}",
+            "ecall",
+            "csrr {v1}, vstart",
+            "ecall",
+            "csrr {v2}, vstart",
+            "csrw vstart, zero",
+            two = in(reg) 2u64,
+            v1 = out(reg) v1,
+            v2 = out(reg) v2,
+            in("a7") rt::abi::syscall::THREAD_YIELD,
+            out("a0") _, out("a1") _, out("a2") _,
+        );
+    }
+    if v1 != 2 || v2 != 2 {
         return 4;
     }
-    // SAFETY: clears `vstart` again.
-    unsafe { asm!("csrw 0x008, zero") };
     0
 }
 
@@ -1261,6 +1306,53 @@ fn vec_load_first() -> i32 {
     unsafe {
         asm!(".option push", ".option arch, +v", "vl1re8.v v0, ({p})", ".option pop", p = in(reg) p)
     };
+    0
+}
+
+#[repr(align(4096))]
+struct Page(#[allow(dead_code)] [u8; 4096]);
+static mut CBO_PAGE: Page = Page([0; 4096]);
+
+/// PL3: `c[i] = a[i] + b[i]` over 100 words, strip-mined with `vsetvli`, then `cbo.zero` on the first block of a page. Returns 0 if both worked.
+fn rva23_loop_and_cbo() -> i32 {
+    let a: [u32; 100] = core::array::from_fn(|i| i as u32);
+    let b: [u32; 100] = core::array::from_fn(|i| 3 * i as u32);
+    let mut c = [0u32; 100];
+    let (mut pa, mut pb, mut pc, mut n) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 100usize);
+    // SAFETY: reads `a` and `b` and writes `c`, 100 words each, in strips of `vl` words; the vector unit is enabled by the first instruction.
+    unsafe {
+        asm!(
+            "1:",
+            "vsetvli {vl}, {n}, e32, m1, ta, ma",
+            "vle32.v v0, ({a})",
+            "vle32.v v1, ({b})",
+            "vadd.vv v2, v0, v1",
+            "vse32.v v2, ({c})",
+            "slli {t}, {vl}, 2",
+            "add {a}, {a}, {t}",
+            "add {b}, {b}, {t}",
+            "add {c}, {c}, {t}",
+            "sub {n}, {n}, {vl}",
+            "bnez {n}, 1b",
+            a = inout(reg) pa, b = inout(reg) pb, c = inout(reg) pc, n = inout(reg) n,
+            vl = out(reg) _, t = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _,
+        );
+    }
+    let _ = (pa, pb, pc, n);
+    if (0..100).any(|i| c[i] != 4 * i as u32) {
+        return 1;
+    }
+    // SAFETY: only the address of the static page is taken; it is written here by this thread alone.
+    let page = unsafe {
+        core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(CBO_PAGE) as *mut u8, 4096)
+    };
+    page.fill(0xff);
+    // SAFETY: `cbo.zero` zeroes the cache block that holds the address (it needs Zicboz and the kernel's `senvcfg.CBZE`).
+    unsafe { asm!("cbo.zero 0({p})", p = in(reg) page.as_mut_ptr()) };
+    if page[..64].iter().any(|&x| x != 0) || page[256..].iter().any(|&x| x != 0xff) {
+        return 2;
+    }
     0
 }
 

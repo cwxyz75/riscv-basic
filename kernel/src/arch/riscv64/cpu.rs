@@ -61,6 +61,29 @@ pub fn seed_csr_read() -> usize {
     v
 }
 
+/// Enable the cache-block instructions for user mode on this hart (PL3): `senvcfg.CBZE` (`cbo.zero`), `CBCFE` (`cbo.clean` and `cbo.flush`) and `CBIE`
+/// = 01 (`cbo.inval` executes as a flush). Returns whether every bit stuck: M-mode has to allow them first (`menvcfg`), and a hart without the
+/// extensions keeps them zero.
+pub fn enable_cache_block_ops() -> bool {
+    const SENVCFG_CBIE_FLUSH: usize = 1 << 4;
+    const SENVCFG_CBCFE: usize = 1 << 6;
+    const SENVCFG_CBZE: usize = 1 << 7;
+    const WANT: usize = SENVCFG_CBIE_FLUSH | SENVCFG_CBCFE | SENVCFG_CBZE;
+    let v: usize;
+    // SAFETY: sets bits of `senvcfg` (0x10a), the supervisor's environment configuration for user mode, and reads it back; nothing else changes.
+    unsafe {
+        asm!(
+            "csrc 0x10a, {clear}",
+            "csrs 0x10a, {want}",
+            "csrr {v}, 0x10a",
+            clear = in(reg) WANT | (3 << 4),
+            want = in(reg) WANT,
+            v = out(reg) v,
+        )
+    };
+    v & (WANT | (3 << 4)) == WANT
+}
+
 /// This hart's vector register length in bytes (`vlenb`; the CSR is readable only with `sstatus.VS` on).
 pub fn vlenb_read() -> usize {
     let v: usize;
