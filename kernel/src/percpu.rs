@@ -27,7 +27,7 @@ impl HeldCell {
     }
 }
 
-/// The layout of the first three fields is used by the trap assembly (`trap.rs`, `user.rs`).
+/// The layout of the first three fields is used by the trap assembly (`arch/riscv64/trap.rs`, `arch/riscv64/usermode.rs`).
 #[repr(C)]
 pub struct PerHart {
     /// Offset 0: the top of the kernel stack the next trap from user mode will use; written on

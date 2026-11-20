@@ -59,7 +59,8 @@ extern "C" {
     /// Interrupts are off until the drop; nothing returns.
     ///
     /// # Safety
-    /// `token` names a live process root whose upper half is the kernel's; the caller holds no lock.
+    /// `token` names a live process root whose upper half is the kernel's; `tp` holds this hart's `PerHart`, whose first word receives
+    /// `kernel_top` (the calling thread's own kernel stack top); the caller holds no lock and interrupts are off.
     #[link_name = "enter_user"]
     pub fn enter_user_raw(
         entry: u64,

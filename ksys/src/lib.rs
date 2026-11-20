@@ -1,6 +1,6 @@
 //! The kernel's syscall layer on the host (TS3, KERNEL-V1-SPEC): argument checks and the calls on handles, events, channels,
 //! sockets and ports, written against a small trait for everything the machine does (the user's memory, the job ledger) so that the
-//! real code runs under host tests with a fake machine. `kernel/src/user.rs` keeps the parts that need the machine (address spaces,
+//! real code runs under host tests with a fake machine. `kernel/src/user/` keeps the parts that need the machine (address spaces,
 //! processes, threads, waits) and calls in here for these.
 //!
 //! `forbid(unsafe_code)`, `no_std` + `alloc`: nothing here touches hardware.

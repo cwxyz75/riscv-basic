@@ -160,16 +160,11 @@ def check_atomics():
 
 # AR1 (OD143, KERNEL-V1-SPEC 2.6): the architecture boundary. No inline assembly, control-register access, TLB or
 # firmware instruction, or RISC-V register name in the kernel outside kernel/src/arch/, nor in ksys, nor in kcore (kcore's
-# page-table format is the one exception, AR1c). ARCH_PENDING lists the files AR1b has not moved yet; it only shrinks.
+# page-table format is the one exception, AR1c). ARCH_PENDING lists files not yet clean (empty since AR1b; it only shrinks).
 ARCH_RE = re.compile(
     r"\b(?:asm|global_asm)!|\bcsr[rwsc]i?\b|\bsfence\b|\becall\b|\bwfi\b|\bsret\b"
     r"|\b(?:satp|sstatus|scause|stvec|sepc|stval|sscratch|stimecmp|sie|sip)\b")
 ARCH_PENDING = {
-    "kernel/src/sched_tests.rs",
-    "kernel/src/selftest.rs",
-    "kernel/src/smp.rs",
-    "kernel/src/thread.rs",
-    "kernel/src/user/trap.rs",
 }
 ARCH_EXEMPT = {"kcore/src/pagetable.rs"}
 
