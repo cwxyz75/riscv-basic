@@ -255,6 +255,13 @@ pub fn init() {
     // SAFETY: writing stvec only changes where traps go; `trap_entry` is 4-byte
     // aligned code in the kernel text, valid at its upper-half address.
     unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
+    // KT5: test builds let user mode read the retired-instruction counter (`rdinstret`, bit 2 of `scounteren`) so the suite can count the
+    // instructions of a syscall path. The release build leaves it closed: a program has no use for it and it is a timing channel.
+    #[cfg(not(feature = "release"))]
+    // SAFETY: `scounteren` only selects which counters user mode may read; no memory is touched.
+    unsafe {
+        core::arch::asm!("csrs scounteren, {}", in(reg) 4usize);
+    }
 }
 
 // A self-test can declare that the next fault is expected to be refused; the

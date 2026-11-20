@@ -280,6 +280,19 @@ os-bench: kernel-main
 	OS_BENCH=target/bench.tsv OS_BENCH_FULL=1 OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
 	python3 scripts/bench_compare.py target/bench.tsv bench/baseline.tsv --max-ratio $(BENCH_RATIO)
 
+# KT5: the guest's retired-instruction counts of the main syscall paths (`##BENCH count_<name> <n> instr` lines of the suite's
+# `instruction_counts_report`), booted at one hart under `-icount shift=0`, where they are deterministic. bench/counts.tsv holds the recorded
+# values; a rise of more than 5 % fails, a fall of more than 5 % is printed (record it: `make os-count-record`).
+os-count: kernel-main
+	rm -f target/count.tsv
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	python3 scripts/bench_compare.py target/count.tsv bench/counts.tsv --prefix count_ --max-ratio 1.05
+
+os-count-record: kernel-main
+	rm -f target/count.tsv
+	OS_SHARD=k OS_KFAST=1 OS_SMP=1 OS_ICOUNT="shift=0,sleep=off" OS_BENCH=target/count.tsv OS_BENCH_FULL=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	awk -F'\t' '$$2 ~ /^count_/' target/count.tsv > bench/counts.tsv
+
 # S9 Q30 (soak tier): the bulk TCP tests (fetch, httpd, echo) with the guest's network behind the lossy relay
 # (scripts/net_lossy_relay.py: loss 2%, duplication 1%, reordering 5%, delay 5 ms on TCP frames) for each seed, at two and four
 # harts. LOSSY_SEEDS is a list ("1 2 3 ... 20" for the full run). The capture is checked as ever.
@@ -382,7 +395,7 @@ quick: fmt-check docs-check
 
 # Tier 0 and 1 (OD83, TESTING.md): what a change must pass before it merges. Host tests and lint, one boot of
 # the suite on the default machine at four harts, the home computer's boot, the release smoke. About 4 minutes.
-SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-release-smoke
+SMOKE_TARGETS := fmt-check docs-check test lint os-test home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the

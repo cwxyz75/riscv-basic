@@ -11447,6 +11447,137 @@ fn benchmarks() -> Outcome {
     Ok(())
 }
 
+// --- Instruction counts (KT5, KERNEL-V1-SPEC 8) ---------------------------------------------------------------------
+//
+// Wall-time benchmarks move with the host. The guest's own retired-instruction counter does not: under `-icount shift=0` at one hart
+// the count of a path is deterministic, so a change that makes a syscall path cost more instructions shows as a number. The kernel opens
+// `instret` to user mode (`scounteren`) in test builds only.
+
+/// The retired-instruction counter of this hart (user and kernel instructions both count).
+fn instret() -> u64 {
+    let v: u64;
+    // SAFETY: `rdinstret` reads a CSR the kernel enabled for user mode in test builds; it touches no memory.
+    unsafe { core::arch::asm!("rdinstret {}", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Report instructions per operation: `##BENCH count_<name> <n> instr` (the harness keeps it like any benchmark line).
+fn count_line(name: &str, instructions: u64, ops: u64) -> u64 {
+    let per = instructions / ops.max(1);
+    println!("##BENCH count_{name} {per} instr");
+    per
+}
+
+/// Run `f` three times to warm the paths, then `n` times between two `instret` reads.
+fn counted(name: &str, n: u64, mut f: impl FnMut() -> Result<(), Detail>) -> Result<u64, Detail> {
+    for _ in 0..3 {
+        f()?;
+    }
+    let t0 = instret();
+    for _ in 0..n {
+        f()?;
+    }
+    Ok(count_line(name, instret() - t0, n))
+}
+
+fn count_channel_call(n: u64) -> Result<u64, Detail> {
+    let (mine, theirs) = channel()?;
+    let server = new_thread(bench_call_server, theirs as usize)?;
+    nap_ticks(3);
+    let mut reply = [0u8; 16];
+    let mut txid = 0u32;
+    let per = counted("channel_call_round_trip", n, || {
+        txid += 1;
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&txid.to_le_bytes());
+        let args = CallArgs {
+            req_bytes: req.as_ptr() as u64,
+            req_handles: 0,
+            req_nbytes: 8,
+            req_nhandles: 0,
+            rep_bytes: reply.as_mut_ptr() as u64,
+            rep_handles: 0,
+            rep_max_bytes: 16,
+            rep_max_handles: 0,
+            deadline: u64::MAX,
+        };
+        let r = sys::channel_call(mine, &args);
+        ensure!(r.status == 0, "channel_call: status {}", r.status);
+        Ok(())
+    })?;
+    sys::handle_close(mine); // ends the server
+    sys::object_wait(server, sig::TERMINATED, sys::clock_get() + 5000);
+    sys::handle_close(server);
+    Ok(per)
+}
+
+fn instruction_counts_report() -> Outcome {
+    let n: u64 = if sys::debug_stat(7) != 0 { 200 } else { 5 };
+    // handle_duplicate + handle_close
+    let ev = event()?;
+    counted("handle_dup_close", n, || {
+        let d = ok(sys::handle_duplicate(ev, Rights::SAME.0), "dup")?.a1 as u32;
+        ok(sys::handle_close(d), "close")?;
+        Ok(())
+    })?;
+    // channel_write + channel_read of 64 bytes
+    let (a, b) = channel()?;
+    let msg = [7u8; 64];
+    let mut got = [0u8; 64];
+    counted("channel_write_read_64", n, || {
+        ok(
+            sys::channel_write(a, msg.as_ptr(), 64, core::ptr::null(), 0),
+            "write",
+        )?;
+        ok(
+            sys::channel_read(b, got.as_mut_ptr(), 64, core::ptr::null_mut(), 0),
+            "read",
+        )?;
+        Ok(())
+    })?;
+    // event_signal + object_wait (the condition already holds: the wait returns at once) + the clearing signal
+    counted("event_signal_wait", n, || {
+        ok(sys::event_signal(ev, 0, 1 << 24), "signal")?;
+        ok(sys::object_wait(ev, 1 << 24, 0), "wait")?;
+        ok(sys::event_signal(ev, 1 << 24, 0), "clear")?;
+        Ok(())
+    })?;
+    // a page fault on a fresh page: touch the next page of a mapped VMO each time
+    let pages = n + 8;
+    let v = vmo(pages)?;
+    let base = NEXT_STACK.fetch_add(0x100_0000, Ordering::SeqCst);
+    ok(
+        sys::process_map(me()?, v, base, 0, pages * 4096, PF_R | PF_W),
+        "map the touched pages",
+    )?;
+    let mut next = 0u64;
+    counted("page_fault_fresh_page", n, || {
+        // SAFETY: the page is inside the region just mapped read-write; the write commits it through the fault path.
+        unsafe { core::ptr::write_volatile((base + next * 4096) as *mut u8, 1) };
+        next += 1;
+        Ok(())
+    })?;
+    // thread_create + exit + join
+    let top = own_stack()?;
+    let me = me()?;
+    let entry = bench_exit as *const () as usize as u64;
+    counted("thread_create_join", n, || {
+        let t = ok(sys::thread_create(me, entry, top, 0), "thread_create")?.a1 as u32;
+        let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+        ensure_eq!(w.status, 0, "a thread ended");
+        sys::handle_close(t);
+        Ok(())
+    })?;
+    // futex_wake with no waiter
+    let word = AtomicU32::new(0);
+    counted("futex_wake_no_waiter", n, || {
+        ok(sys::futex_wake(word.as_ptr(), 1), "futex_wake")?;
+        Ok(())
+    })?;
+    count_channel_call(n)?;
+    Ok(())
+}
+
 #[no_mangle]
 pub fn app_main() -> i32 {
     let mut failed = 0;
@@ -11684,6 +11815,7 @@ pub fn app_main() -> i32 {
             port_oneshot_rearm_and_many_bindings,
         ),
         ("benchmarks_run_and_report", benchmarks),
+        ("instruction_counts_report", instruction_counts_report),
         ("blk_round_trip", blk_round_trip),
         ("blk_driver_restart", blk_driver_restart),
         (
