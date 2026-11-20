@@ -5,9 +5,13 @@ use crate::UserState;
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
+use kcore::aspace::Vmos;
 use kcore::ipc::{self, Quota};
 use kcore::job::{JobError, JobId, Jobs, Resource};
 use kcore::object::ObjId;
+use kcore::pagetable::{Perms, PhysMem};
+use kcore::usercopy::copy_from_user;
+use kcore::Mm;
 
 /// Frames in a kernel stack.
 pub const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
@@ -135,6 +139,197 @@ pub fn thread_create(
     Ok(Spawn {
         token,
         handle: handle.0,
+        prio,
+    })
+}
+
+/// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a stack the kernel maps in
+/// the process's stack arena (freed when the thread ends) unless the caller brings its own. `handle` is 0 for a detached thread. The caller
+/// spawns the kernel thread `token` names at `prio` and returns the handle and the tid.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+// INVARIANT: stack_bytes and guard_bytes are at most MAX_STACK (checked into `sizes_ok`), so the sums are far below u64::MAX; the target process was looked up under the same lock; the record read is of fixed size (64 bytes) at indices below 8
+#[inline(never)]
+pub fn thread_spawn<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    me: u32,
+    creator_prio: u8,
+    a: [u64; 6],
+) -> Result<Spawn, Status> {
+    use abi::spawn as sp;
+    let ph = Handle(a[0] as u32);
+    // the record first (a bad pointer is the first error), then the handle
+    let raw = {
+        let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
+        copy_from_user(&mut c.aspace, mm, vmos, a[1], sp::ARGS_BYTES)?
+    };
+    let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+    let (entry, arg, tp, stack_bytes, guard_bytes) = (w(0), w(1), w(2), w(3), w(4));
+    let prio_req = (w(5) & 0xffff_ffff) as u32;
+    let flags = (w(5) >> 32) as u32;
+    let (caller_sp, reserved) = (w(6), w(7));
+    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
+    let (_, tpid, _, _) = ipc::process_of(&us.objs, &caller.handles, ph, Rights::MANAGE)?;
+    let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
+    let tjob = target.job;
+    // a priority above the job's maximum is refused (ACCESS_DENIED), not clamped: the program asked for it
+    let max = vmos.jobs.sched(tjob).map_or(10, |j| j.max_prio);
+    if (1..=63).contains(&prio_req) && prio_req as u8 > max {
+        return Err(Status::AccessDenied);
+    }
+    if target.state != crate::ProcState::Running
+        || target.exit_code.is_some()
+        || target.killed.is_some()
+    {
+        return Err(Status::BadState);
+    }
+    let own_stack = flags & sp::CALLER_STACK != 0;
+    let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+    let sizes_ok = stack_bytes <= sp::MAX_STACK && guard_bytes <= sp::MAX_STACK;
+    let sp_ok = if own_stack {
+        caller_sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&caller_sp)
+    } else {
+        caller_sp == 0
+    };
+    // (with a caller stack the sizes mean nothing: asking for some is a mistake)
+    let sizes_ok = sizes_ok && (!own_stack || (stack_bytes == 0 && guard_bytes == 0));
+    if !entry_ok
+        || !sizes_ok
+        || !sp_ok
+        || reserved != 0
+        || prio_req > 63
+        || flags & !(sp::ROUND_ROBIN | sp::DETACHED | sp::CALLER_STACK) != 0
+    {
+        return Err(Status::InvalidArgs);
+    }
+    if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
+        || total_threads(us) >= abi::limits::MAX_USER_THREADS
+    {
+        return Err(Status::NoMemory);
+    }
+    // where the stack goes: a gap in the arena for the guard and the stack, at or after the hint, wrapping once
+    let stack_len = if stack_bytes == 0 {
+        sp::DEFAULT_STACK
+    } else {
+        stack_bytes.next_multiple_of(4096)
+    };
+    let guard_len = if guard_bytes == 0 {
+        4096
+    } else {
+        guard_bytes.next_multiple_of(4096)
+    };
+    let place = if own_stack {
+        None
+    } else {
+        let (lo, hi) = (abi::user::STACK_ARENA_BASE, abi::user::STACK_ARENA_END);
+        // the stack's guard below it, and one more guard above it: the next stack up has a guard of its own below *its* start, so two stacks are
+        // never flush (a neighbour's overflow always faults)
+        let total = guard_len + stack_len + guard_len;
+        let at = target
+            .aspace
+            .find_gap(lo, hi, total, target.stack_hint)
+            .or_else(|| target.aspace.find_gap(lo, hi, total, lo));
+        match at {
+            Some(at) => Some(at + guard_len),
+            None => return Err(Status::NoMemory),
+        }
+    };
+    let prio = if prio_req == 0 {
+        clamp_prio(&vmos.jobs, tjob, creator_prio)
+    } else {
+        prio_req as u8
+    };
+    let detached = flags & sp::DETACHED != 0;
+    charge_thread(&mut vmos.jobs, tjob).map_err(crate::job_status)?;
+    let UserState { objs, procs, .. } = us;
+    // the thread's object and handle (not for a detached thread)
+    let made = if detached {
+        None
+    } else {
+        let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
+        let job = caller.job;
+        match ipc::thread_object_create_in(
+            objs,
+            &mut caller.handles,
+            tpid,
+            &mut Quota {
+                jobs: &mut vmos.jobs,
+                job: Some(job),
+            },
+        ) {
+            Ok(x) => Some(x),
+            Err(e) => {
+                credit_thread(&mut vmos.jobs, tjob);
+                return Err(e);
+            }
+        }
+    };
+    // the stack: a VMO of its own (nobody holds a handle), mapped read-write; its table pages are charged like any mapping's
+    let mut stack = None;
+    let mut top = caller_sp;
+    if let Some(region) = place {
+        let tables = stack_len / 4096 / 512 + 4;
+        let undo =
+            |made: Option<(Handle, ObjId)>,
+             procs: &mut alloc::collections::BTreeMap<u32, alloc::boxed::Box<crate::Process>>,
+             objs: &mut kcore::ipc::Kobjs,
+             jobs: &mut Jobs| {
+                if let Some((h, _)) = made {
+                    if let Some(c) = procs.get_mut(&me) {
+                        let _ = c.handles.close(objs, h);
+                    }
+                }
+                credit_thread(jobs, tjob);
+            };
+        if let Err(e) = vmos.jobs.charge(tjob, Resource::Pages, tables) {
+            undo(made, procs, objs, &mut vmos.jobs);
+            return Err(crate::job_status(e));
+        }
+        if let Err(e) = vmos.reserve_one() {
+            undo(made, procs, objs, &mut vmos.jobs);
+            vmos.jobs.credit(tjob, Resource::Pages, tables);
+            return Err(e);
+        }
+        let vmo = vmos.create_in(stack_len / 4096, tjob);
+        let perms = Perms {
+            read: true,
+            write: true,
+            exec: false,
+            user: true,
+        };
+        let t = procs.get_mut(&tpid).expect("target exists");
+        if let Err(e) = t
+            .aspace
+            .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
+        {
+            let _ = vmos.destroy(mm, vmo);
+            vmos.jobs.credit(tjob, Resource::Pages, tables);
+            undo(made, procs, objs, &mut vmos.jobs);
+            return Err(match e {
+                kcore::aspace::RegionError::TooMany => Status::NoMemory,
+                _ => Status::InvalidArgs,
+            });
+        }
+        t.table_charge.insert(region, tables);
+        t.stack_hint = region + stack_len;
+        stack = Some(crate::SpawnStack { region, vmo });
+        top = region + stack_len;
+    }
+    procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
+    let token = new_start(us, tpid, entry, top, arg, made.map(|(_, o)| o));
+    let st = us.starts.get_mut(&token).expect("just registered");
+    st.tp = tp;
+    st.stack = stack;
+    st.rr = flags & sp::ROUND_ROBIN != 0;
+    st.spawned = true;
+    Ok(Spawn {
+        token,
+        handle: made.map_or(0, |(h, _)| h.0),
         prio,
     })
 }
