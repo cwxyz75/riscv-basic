@@ -19,10 +19,11 @@ boundaries").
 
 ## Commands
 
-- `make test`: host tests for the home-computer crates (`home/basic/`, `home/console/`, ...). Fast; run constantly.
+- `make test`: host tests for the home-computer crates (`home/basic/`, `home/console/`, ...). Run the one test you are working on, not the lot (CI runs the lot).
 - `make home-kernel` / `make home-run` / `make home-debug`: build / boot / boot-paused-for-gdb.
 - `make home-boot-test`: non-interactive QEMU boot check. Needs `qemu-system-riscv64`.
-- `make check` (an alias of `make smoke`, tiers 0 and 1: fmt, tests, clippy, one boot of the suite at four harts, the home boot, the release smoke; about three minutes warm). `make soak` is the full matrix (tier 2: **run it only when the owner asks**, OD142); `make check-all` is both. The testing tiers and their rules are in `TESTING.md` (OD83).
+- `make hooks` (once per clone): installs the commit hook, which runs format, the docs check and clippy on every commit and no tests.
+- `make feature` is the feature gate (tier 0: format, docs check, clippy, host tests, model checkers, a build of everything; no QEMU) and `make check` (an alias of `make smoke`) the epic gate (tier 1: the feature gate plus the boots). **CI runs them; neither is a local routine.** `make kquick` is one targeted kernel boot, for an experiment. `make soak` is the full matrix (tier 2: **run it only when the owner asks**, OD142). The policy is `docs/reference/TESTING.md` (OD144); what each check does is `docs/reference/TEST-TOOLS.md`.
 - OS track: `make kernel` / `make os-test` (host tests plus loom and shuttle) /
   `make os-boot-test` (headless QEMU, structured output) / `make os-miri` (needs
   the nightly toolchain; part of the soak tier). OS-track cargo commands
@@ -64,23 +65,29 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 
 ## Working agreement
 
-- One milestone (or a slice of one) per branch/PR. `main` always builds and boots.
+- **Epic branches** (OD144, `TESTING.md`). A phase of `WORK-PLAN.md` is an epic branch (`epic/<name>`, cut from `main`). One work item
+  (or a named part of one) is a feature branch cut from the epic, with a PR **into the epic**, squash-merged when the feature gate is
+  green: build and host tests, no QEMU. A finished epic is merged into `main` with a merge commit when the epic gate (smoke) is green.
+  Code-touching tidy items and fixes ride on the open epic; documentation-only changes go straight to `main`. `main` always builds
+  and boots; a commit on an epic has built but not booted. Merge `main` into an epic when `main` moves; never rebase or force-push.
 - Interpreter behaviour is specified by `home/BASIC.md` and pinned by golden tests in
   `home/basic/tests/golden/`. Write the golden test first, watch it fail, then implement.
   Never run `BLESS=1` blindly: read the diff of the `.out` files.
-- **Test cost is the bottleneck, so spend it deliberately (tiers: `TESTING.md`).** While iterating run
-  `make quick` or the one targeted test. The merge gate is tiers 0 and 1 (`make smoke`, which CI runs
-  too); merge on a green gate. The soak tier (`make soak`, `soak.yml`: the full matrix, negative controls,
-  Miri) and the long-run tier **run only when the owner asks for them** (OD142): never start a soak target, locally
-  or in CI, on your own judgement, and never put it on a schedule or a label. A change that would have had a soak run
-  says so in its PR and is listed under "Runs owed to the owner" in `WORK-PLAN.md`. Batch related slices
-  into one PR (several commits); keep kernel/security slices that get a Fable review in their own small
-  PR. Run mutation checks once per new test, not once per push. New tests go where `TESTING.md` says:
-  logic on the host, syscall behaviour in the suite, only what the machine shows in QEMU.
+- **Test time stays in proportion to the change (`TESTING.md`).** The project is in primary development: go fast, and accept a longer
+  debugging session now and then. **Run no tests as a routine**: not before a commit (the hook runs format, the docs check and clippy
+  only), not before a push, not "the gate, locally". CI is the check. Targeted experiments are welcome at your judgement: the one test
+  being written, one boot (`make kquick`) to watch an acceptance check fail and then pass, a mutation check of a new test, a
+  reproduction while debugging, static analysis. The soak tier and the long-run tier **run only when the owner asks** (OD142): never
+  start one, locally or in CI, and never put one on a schedule or a label; do not record a run as owed per change (`WORK-PLAN.md` has
+  one standing line). Smoke may be started by hand on an epic (`gh workflow run ci.yml --ref epic/<name>`) as a checkpoint after a risky
+  change: sparingly. When an epic's smoke is red, `make epic-bisect` finds the commit. Kernel/security slices that get a Fable review
+  keep their own small feature PR. New tests go where `TESTING.md` says: logic on the host, syscall behaviour in the suite, only what
+  the machine shows in QEMU.
 - If `home/BASIC.md` is ambiguous or wrong, stop and ask. Don't silently decide a
   language semantic; settle it in the spec, then code it.
 - Only close a work item (`scripts/work.py done`) when its acceptance criterion has actually
-  been verified (for kernel work, that means booted in QEMU, not just compiled).
+  been verified. For anything that needs a boot, that is its epic's green smoke: tick the item's box in `WORK-PLAN.md` when its
+  feature merges, and run `work.py done` in the epic's closing commit.
 - **Documents come in three kinds** (`docs/README.md`): specs (`docs/specs/`: the end state,
   versioned; a change is a dated amendment appended at the end, never a rewrite of the body),
   reference (`docs/reference/`: SYSCALLS, INVARIANTS, TESTING, changed in place with the code)
@@ -96,7 +103,7 @@ the OS track's crates (`abi/`, `kcore/`, `rt/`, `init/`, `kernel/`) are at the t
 ## OS track (S-series)
 
 Everything above still applies (one milestone per PR, `main` always builds and
-boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In addition:
+boots, `// SAFETY:` comments, the feature gate and the epic gate). In addition:
 
 - The spec is `docs/specs/OS-ARCHITECTURE.md`; for kernel work also read `docs/specs/KERNEL-V1-SPEC.md` (the kernel
   that is frozen: its targets, contract and testing regime). Design decisions are logged in
@@ -124,9 +131,9 @@ boots, `// SAFETY:` comments, `make check`, which is the smoke gate). In additio
   can answer is a `kind: decision` item. Fixed items are closed with `work.py done`.
 - Everything must be diagnosable headlessly: structured serial output, QEMU's exit
   device for pass/fail. Debugging by eye is not an available tool.
-- Close an OS-track item only when verified in QEMU. For SMP work that means the
-  normal mode at `-smp 2` and `-smp 4`; icount runs only one hart (T21). Say plainly which was run.
-- Always leave a bootable, green system. No big-bang rewrites.
+- Close an OS-track item only when verified in QEMU, which is its epic's smoke: the kernel-only boots run at one, two and four
+  harts (icount runs only one hart, T21). Say plainly which was run.
+- Always leave `main` bootable and green, and an epic building with its host tests green. No big-bang rewrites.
 - Small utility crates are allowed (the repo already uses `linked_list_allocator` and
   `libm`), each with its own OS decision-log entry. The kernel, network stack,
   filesystem and libc are written here, not imported.

@@ -39,7 +39,8 @@ Indices and policies that change in place with the code, in the same PR.
 |---|---|
 | `reference/SYSCALLS.md` | Every syscall: arguments, preconditions, rights, errors. |
 | `reference/INVARIANTS.md` | The invariants every change keeps: handles, rights, lock order, memory ownership. |
-| `reference/TESTING.md` | The testing tiers, their budgets and where a new test goes. |
+| `reference/TESTING.md` | The testing policy: branches, the gates and their budgets, what is not run, where a new test goes. |
+| `reference/TEST-TOOLS.md` | Every check: what it is, how to run it, how to replay a failure. |
 
 ## records/: what happened
 
@@ -54,6 +55,7 @@ dated; a later record may correct an earlier one, which stays as written.
 | `records/notes/` | Notes left by unattended runs. |
 | `records/roadmap-2026-11-18.md` | The old roadmap, frozen when the work queue replaced it: how each slice was built. |
 | `records/work-plan-2026-11-17.md` | The work plans of 2026-11-17. |
+| `records/testing-2026-11-20.md` | The testing reference as it stood before it became a policy document: measurements, profiles, first findings. |
 | `records/UV0-GAP-SURVEY.md`, `records/LIBC-GAPS.md` | The libc gap measurements of 2026-11-15 and 2026-11-17. |
 | `records/S9-STEP1-RESULT.md` | The S9 data-path prototype's result. |
 | `records/S8-FOLLOWUP-SPEC.md`, `records/S9-STEP0-SPEC.md` | Briefs for single slices, as given. |

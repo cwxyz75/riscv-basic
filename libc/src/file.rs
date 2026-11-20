@@ -137,8 +137,8 @@ impl File {
                 return false;
             }
         }
-        if self.mode() == 1 && data.contains(&b'\n') && !self.flush() {
-            return false;
+        if self.mode() == 1 && data.contains(&b'\n') {
+            return self.flush();
         }
         true
     }

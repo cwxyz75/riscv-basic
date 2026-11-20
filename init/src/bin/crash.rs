@@ -515,6 +515,8 @@ pub fn app_main() -> i32 {
             // S5d: a process with two spinning sibling threads (and itself spinning): ended from
             // outside while they run on other harts.
             let me = rt::sys::process_self().a1 as u32;
+            // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
+            #[allow(clippy::needless_range_loop)]
             for k in 0..2 {
                 // SAFETY: only the address of the static stack is taken; each new thread owns its own.
                 let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
@@ -653,6 +655,8 @@ fn pattern(round: u64) -> u64 {
 /// (a different frame from the new mapping). The exit code is 0, or the first failing round.
 fn unmap_while_siblings_touch() -> i32 {
     let me = rt::sys::process_self().a1 as u32;
+    // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
+    #[allow(clippy::needless_range_loop)]
     for k in 0..2 {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
@@ -999,6 +1003,8 @@ extern "C" fn fp_worker(k: usize) -> ! {
 
 fn fp_threads() -> i32 {
     let me = rt::sys::process_self().a1 as u32;
+    // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
+    #[allow(clippy::needless_range_loop)]
     for k in 0..2usize {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
