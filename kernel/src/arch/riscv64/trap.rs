@@ -10,6 +10,7 @@
     clippy::unreachable
 )] // KT3 (KERNEL-V1-SPEC 7.4): no panic a program can cause; remaining sites carry `#[allow] // INVARIANT:` (scripts/kernel_allows.py)
 
+use crate::arch::{Fault, FaultKind, UserTrap};
 use crate::{console::Console, finisher, kmem};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,39 +26,6 @@ pub struct TrapFrame {
     pub scause: u64,
     pub stval: u64,
     pub sstatus: u64,
-}
-
-/// What kind of exception a trap from user mode was (the same kinds on every architecture; EX2 uses these numbers).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FaultKind {
-    PageFault,
-    Illegal,
-    Breakpoint,
-    Misaligned,
-    Access,
-    Other,
-}
-
-/// A trap from user mode, decoded: nothing outside `arch` reads a cause register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fault {
-    pub kind: FaultKind,
-    /// The faulting address (for a page fault, an access fault or a misaligned access).
-    pub address: u64,
-    /// The program counter of the trapping instruction.
-    pub pc: u64,
-    /// The access that faulted, for a page fault.
-    pub access: Option<Access>,
-    /// The architecture's raw cause value: the exit code of an unhandled fault is `-1000 - code` until AR1d
-    /// replaces it with the kind.
-    pub code: u64,
-}
-
-/// A trap from user mode: a system call or a fault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserTrap {
-    Syscall,
-    Fault(Fault),
 }
 
 impl TrapFrame {

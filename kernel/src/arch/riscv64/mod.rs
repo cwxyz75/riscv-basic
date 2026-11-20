@@ -15,6 +15,4 @@ pub mod usermode;
 
 pub use cpu::*;
 pub use switch::{switch, Context};
-#[allow(unused_imports)]
-pub use trap::{Fault, FaultKind, UserTrap};
 pub use usermode::enter_user_raw as enter_user;

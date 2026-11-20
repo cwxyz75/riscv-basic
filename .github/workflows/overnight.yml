@@ -187,7 +187,8 @@ jobs:
       - run: make os-fuzz-host
       - name: Summary
         if: always()
-        run: echo "## overnight (host fuzz): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "## overnight (host fuzz): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
 
   allocfail:
     name: overnight (allocation failure)
@@ -203,4 +204,5 @@ jobs:
       - run: make os-allocfail
       - name: Summary
         if: always()
-        run: echo "## overnight (allocation failure): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "## overnight (allocation failure): ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"

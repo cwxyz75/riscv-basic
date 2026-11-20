@@ -1,4 +1,4 @@
-//! Sv39 page tables, as pure logic over a [`PhysMem`] (the contents of physical
+//! Page tables, generic over a [`PageTableFormat`] (Sv39 is the one implementation in the kernel), as pure logic over a [`PhysMem`] (the contents of physical
 //! frames) and the frame database. The kernel's `PhysMem` is the direct map; the
 //! tests' is a fake. Tables are made of ordinary frames from [`FrameDb`].
 //!
@@ -130,6 +130,34 @@ pub struct Translation {
     pub perms: Perms,
 }
 
+/// What differs between page-table formats (AR1c, KERNEL-V1-SPEC 2.6): the entry encoding, the number of levels, which entries
+/// are leaves, and which addresses are valid. Tables are 4 KiB frames of 512 eight-byte entries, 9 index bits per level, in every
+/// format here; the top half of the root table (entries 256 and up) is the kernel's.
+pub trait PageTableFormat {
+    /// Levels of the walk (3 for Sv39: levels 2, 1, 0; leaves above level 0 are huge pages).
+    const LEVELS: u32;
+    /// Is this entry present?
+    fn is_valid(pte: u64) -> bool;
+    /// Is a valid entry at `level` a leaf (a mapping) and not a pointer to the next table?
+    fn is_leaf(pte: u64, level: u32) -> bool;
+    /// The frame a valid entry names (a table or a leaf's first frame).
+    fn pfn_of(pte: u64) -> Pfn;
+    /// An entry pointing at the next-level table in frame `pfn`.
+    fn table_entry(pfn: Pfn) -> u64;
+    /// A level-0 leaf mapping frame `pfn` with `perms` (already validated).
+    fn leaf_entry(pfn: Pfn, perms: Perms) -> u64;
+    /// The permissions a leaf entry grants.
+    fn perms_of(pte: u64) -> Perms;
+    /// Is `va` an address this format can map (sign-extended from its top bit)?
+    fn is_canonical(va: u64) -> bool;
+    /// The full virtual address of a walked address whose bits above the format's range are not yet filled in.
+    fn extend(va: u64) -> u64;
+}
+
+/// The Sv39 format (RISC-V): three levels, 39-bit sign-extended addresses.
+#[derive(Debug, Clone, Copy)]
+pub struct Sv39;
+
 const V: u64 = 1 << 0;
 const R: u64 = 1 << 1;
 const W: u64 = 1 << 2;
@@ -137,59 +165,114 @@ const X: u64 = 1 << 3;
 const U: u64 = 1 << 4;
 const A: u64 = 1 << 6;
 const D: u64 = 1 << 7;
-const FLAGS: u64 = 0x3ff;
 
-fn is_leaf(pte: u64) -> bool {
-    pte & (R | W | X) != 0
-}
-
-fn ppn(pte: u64) -> Pfn {
-    (pte >> 10) & ((1 << 44) - 1)
-}
-
-fn perms_of(pte: u64) -> Perms {
-    Perms {
-        read: pte & R != 0,
-        write: pte & W != 0,
-        exec: pte & X != 0,
-        user: pte & U != 0,
+impl PageTableFormat for Sv39 {
+    const LEVELS: u32 = 3;
+    fn is_valid(pte: u64) -> bool {
+        pte & V != 0
+    }
+    fn is_leaf(pte: u64, _level: u32) -> bool {
+        pte & (R | W | X) != 0
+    }
+    fn pfn_of(pte: u64) -> Pfn {
+        (pte >> 10) & ((1 << 44) - 1)
+    }
+    fn table_entry(pfn: Pfn) -> u64 {
+        (pfn << 10) | V
+    }
+    fn leaf_entry(pfn: Pfn, perms: Perms) -> u64 {
+        let mut pte = (pfn << 10) | V | A | D;
+        if perms.read {
+            pte |= R;
+        }
+        if perms.write {
+            pte |= W;
+        }
+        if perms.exec {
+            pte |= X;
+        }
+        if perms.user {
+            pte |= U;
+        }
+        pte
+    }
+    fn perms_of(pte: u64) -> Perms {
+        Perms {
+            read: pte & R != 0,
+            write: pte & W != 0,
+            exec: pte & X != 0,
+            user: pte & U != 0,
+        }
+    }
+    /// Sv39 virtual addresses are 39 bits, sign-extended.
+    fn is_canonical(va: u64) -> bool {
+        let top = (va as i64) >> 38;
+        top == 0 || top == -1
+    }
+    fn extend(va: u64) -> u64 {
+        if va & (1 << 38) != 0 {
+            va | 0xffff_ff80_0000_0000
+        } else {
+            va
+        }
     }
 }
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the shift is below 64 (level <= 2) and the mask keeps the index below 512
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the shift is below 64 (level <= 3) and the mask keeps the index below 512
 fn index(va: u64, level: u32) -> u64 {
     (va >> (12 + 9 * level)) & 0x1ff
 }
 
-/// Sv39 virtual addresses are 39 bits, sign-extended.
-pub fn is_canonical(va: u64) -> bool {
-    let top = (va as i64) >> 38;
-    top == 0 || top == -1
-}
+/// The deepest walk any format here has.
+const MAX_LEVELS: usize = 4;
 
 /// A page-table root. Holds no references: pass the same `Mm` each time.
 #[derive(Debug)]
-pub struct PageTable {
+pub struct PageTable<F: PageTableFormat = Sv39> {
     root: Pfn,
+    _format: core::marker::PhantomData<F>,
 }
 
-impl PageTable {
-    /// A fresh, empty table (one frame for the root).
+impl PageTable<Sv39> {
+    /// A fresh, empty Sv39 table (one frame for the root).
     pub fn new<M: PhysMem>(mm: &mut Mm<M>) -> Option<PageTable> {
+        PageTable::create(mm)
+    }
+
+    /// A fresh Sv39 table for a user process, sharing the kernel's upper half (see `create_with_kernel_half`).
+    pub fn new_with_kernel_half<M: PhysMem>(
+        mm: &mut Mm<M>,
+        kernel: &PageTable,
+    ) -> Option<PageTable> {
+        PageTable::create_with_kernel_half(mm, kernel)
+    }
+
+    /// Wrap an existing Sv39 root (the kernel's boot table). Do not `destroy` it.
+    pub fn from_root(root: Pfn) -> PageTable {
+        PageTable::wrap_root(root)
+    }
+}
+
+impl<F: PageTableFormat> PageTable<F> {
+    /// A fresh, empty table (one frame for the root).
+    pub fn create<M: PhysMem>(mm: &mut Mm<M>) -> Option<PageTable<F>> {
         let root = mm.db.alloc()?;
         mm.mem.zero_frame(root);
-        Some(PageTable { root })
+        Some(PageTable {
+            root,
+            _format: core::marker::PhantomData,
+        })
     }
 
     /// A fresh table for a user process: empty in the lower half, and sharing the
     /// kernel's upper half (top-level entries 256..512 are copied, so every process sees
     /// the same kernel mappings; OD41). Free it with `destroy_user`, never `destroy`.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 512 table slots, and the roots are frames of the table
-    pub fn new_with_kernel_half<M: PhysMem>(
+    pub fn create_with_kernel_half<M: PhysMem>(
         mm: &mut Mm<M>,
-        kernel: &PageTable,
-    ) -> Option<PageTable> {
-        let table = PageTable::new(mm)?;
+        kernel: &PageTable<F>,
+    ) -> Option<PageTable<F>> {
+        let table = PageTable::create(mm)?;
         for i in 256..512u64 {
             let pte = mm.mem.read_u64((kernel.root << 12) + i * 8);
             mm.mem.write_u64((table.root << 12) + i * 8, pte);
@@ -197,34 +280,38 @@ impl PageTable {
         Some(table)
     }
 
+    /// Wrap an existing root (the kernel's boot table). Do not `destroy` it.
+    pub fn wrap_root(root: Pfn) -> PageTable<F> {
+        PageTable {
+            root,
+            _format: core::marker::PhantomData,
+        }
+    }
+
     /// Free the root and every table of the lower (user) half. The shared kernel half is
     /// not touched. The user leaves must already be unmapped.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: i < 256 slots of the root table, and the root is a frame of the table
     pub fn destroy_user<M: PhysMem>(self, mm: &mut Mm<M>) {
         #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
-        fn walk<M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
+        fn walk<F: PageTableFormat, M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
             if level > 0 {
                 for i in 0..512 {
                     let pte = mm.mem.read_u64((table << 12) + i * 8);
-                    if pte & V != 0 && !is_leaf(pte) {
-                        walk(mm, ppn(pte), level - 1);
+                    if F::is_valid(pte) && !F::is_leaf(pte, level) {
+                        walk::<F, M>(mm, F::pfn_of(pte), level - 1);
                     }
                 }
             }
             let _ = mm.db.dec(table);
         }
         for i in 0..256u64 {
+            let top = F::LEVELS - 1;
             let pte = mm.mem.read_u64((self.root << 12) + i * 8);
-            if pte & V != 0 && !is_leaf(pte) {
-                walk(mm, ppn(pte), 1);
+            if F::is_valid(pte) && !F::is_leaf(pte, top) {
+                walk::<F, M>(mm, F::pfn_of(pte), top - 1);
             }
         }
         let _ = mm.db.dec(self.root);
-    }
-
-    /// Wrap an existing root (the kernel's boot table). Do not `destroy` it.
-    pub fn from_root(root: Pfn) -> PageTable {
-        PageTable { root }
     }
 
     pub fn root(&self) -> Pfn {
@@ -244,20 +331,20 @@ impl PageTable {
         if !va.is_multiple_of(PAGE_SIZE) {
             return Err(MapError::Misaligned);
         }
-        if !is_canonical(va) {
+        if !F::is_canonical(va) {
             return Err(MapError::NonCanonical);
         }
         perms.validate()?;
         // Walk down, remembering where the path stops.
         let mut table = self.root;
-        let mut level = 2;
+        let mut level = F::LEVELS - 1;
         loop {
             let slot = (table << 12) + index(va, level) * 8;
             let pte = mm.mem.read_u64(slot);
-            if pte & V == 0 {
+            if !F::is_valid(pte) {
                 break;
             }
-            if is_leaf(pte) {
+            if F::is_leaf(pte, level) {
                 return Err(if level == 0 {
                     MapError::AlreadyMapped
                 } else {
@@ -268,7 +355,7 @@ impl PageTable {
                 // A non-leaf entry at level 0 is malformed; treat the slot as taken.
                 return Err(MapError::AlreadyMapped);
             }
-            table = ppn(pte);
+            table = F::pfn_of(pte);
             level -= 1;
         }
         // `level` tables are missing below `table`: levels `level` down to 1 need new frames.
@@ -280,56 +367,45 @@ impl PageTable {
             let fresh = mm.db.alloc().expect("free count was checked");
             mm.mem.zero_frame(fresh);
             let slot = (table << 12) + index(va, level) * 8;
-            mm.mem.write_u64(slot, (fresh << 10) | V);
+            mm.mem.write_u64(slot, F::table_entry(fresh));
             table = fresh;
             level -= 1;
         }
         let slot = (table << 12) + index(va, 0) * 8;
-        let mut pte = (pfn << 10) | V | A | D;
-        if perms.read {
-            pte |= R;
-        }
-        if perms.write {
-            pte |= W;
-        }
-        if perms.exec {
-            pte |= X;
-        }
-        if perms.user {
-            pte |= U;
-        }
-        mm.mem.write_u64(slot, pte);
+        mm.mem.write_u64(slot, F::leaf_entry(pfn, perms));
         Ok(())
     }
 
     /// Unmap the page at `va`, returning what it mapped. Tables left empty are freed.
-    /// **The caller must flush the TLB (`sfence.vma`) before any frame freed here is
+    /// **The caller must flush the TLB before any frame freed here is
     /// reused**: this crate has no notion of TLBs.
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: level is 0 to 2 and the path array has three entries; indices are below 512
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: level is below LEVELS (at most 4) and the path array has MAX_LEVELS entries; indices are below 512
     pub fn unmap<M: PhysMem>(&mut self, mm: &mut Mm<M>, va: u64) -> Option<(Pfn, Perms)> {
-        if !va.is_multiple_of(PAGE_SIZE) || !is_canonical(va) {
+        if !va.is_multiple_of(PAGE_SIZE) || !F::is_canonical(va) {
             return None;
         }
-        // path[i] = (table frame, slot address) for level 2 - i
-        let mut path: [(Pfn, u64); 3] = [(0, 0); 3];
+        let top = F::LEVELS - 1;
+        // path[i] = (table frame, slot address) for level top - i
+        let mut path: [(Pfn, u64); MAX_LEVELS] = [(0, 0); MAX_LEVELS];
         let mut table = self.root;
-        for level in (0..=2u32).rev() {
+        for level in (0..=top).rev() {
             let slot = (table << 12) + index(va, level) * 8;
-            path[(2 - level) as usize] = (table, slot);
+            path[(top - level) as usize] = (table, slot);
             let pte = mm.mem.read_u64(slot);
-            if pte & V == 0 {
+            if !F::is_valid(pte) {
                 return None;
             }
-            if is_leaf(pte) {
+            if F::is_leaf(pte, level) {
                 if level != 0 {
                     return None; // a huge page is not ours to unmap one 4 KiB page at a time
                 }
                 mm.mem.write_u64(slot, 0);
-                let result = (ppn(pte), perms_of(pte));
+                let result = (F::pfn_of(pte), F::perms_of(pte));
                 // Free tables that became empty, bottom up, never the root.
-                for up in (1..=2usize).rev() {
+                for up in (1..=top as usize).rev() {
                     let (frame, _) = path[up];
-                    let empty = (0..512).all(|i| mm.mem.read_u64((frame << 12) + i * 8) & V == 0);
+                    let empty =
+                        (0..512).all(|i| !F::is_valid(mm.mem.read_u64((frame << 12) + i * 8)));
                     if !empty {
                         break;
                     }
@@ -342,36 +418,36 @@ impl PageTable {
             if level == 0 {
                 return None;
             }
-            table = ppn(pte);
+            table = F::pfn_of(pte);
         }
         None
     }
 
     /// Translate `va` (any byte of a page). Huge leaves translate too.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level <= 2; a leaf's ppn plus an in-span page offset stays a frame number
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level < 4; a leaf's pfn plus an in-span page offset stays a frame number
     pub fn translate<M: PhysMem>(&self, mm: &Mm<M>, va: u64) -> Option<Translation> {
-        if !is_canonical(va) {
+        if !F::is_canonical(va) {
             return None;
         }
         let mut table = self.root;
-        for level in (0..=2u32).rev() {
+        for level in (0..F::LEVELS).rev() {
             let pte = mm.mem.read_u64((table << 12) + index(va, level) * 8);
-            if pte & V == 0 {
+            if !F::is_valid(pte) {
                 return None;
             }
-            if is_leaf(pte) {
+            if F::is_leaf(pte, level) {
                 // For a huge leaf the low frame-number bits come from the address.
                 let span = 1u64 << (9 * level);
                 let offset_pages = (va >> 12) & (span - 1);
                 return Some(Translation {
-                    pfn: ppn(pte) + offset_pages,
-                    perms: perms_of(pte),
+                    pfn: F::pfn_of(pte) + offset_pages,
+                    perms: F::perms_of(pte),
                 });
             }
             if level == 0 {
                 return None;
             }
-            table = ppn(pte);
+            table = F::pfn_of(pte);
         }
         None
     }
@@ -381,7 +457,7 @@ impl PageTable {
     /// table (for example: no leaf is both writable and executable).
     pub fn for_each_leaf<M: PhysMem>(&self, mm: &Mm<M>, f: &mut dyn FnMut(u64, Translation, u32)) {
         #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
-        fn walk<M: PhysMem>(
+        fn walk<F: PageTableFormat, M: PhysMem>(
             mm: &Mm<M>,
             table: Pfn,
             level: u32,
@@ -390,51 +466,42 @@ impl PageTable {
         ) {
             for i in 0..512u64 {
                 let pte = mm.mem.read_u64((table << 12) + i * 8);
-                if pte & V == 0 {
+                if !F::is_valid(pte) {
                     continue;
                 }
                 let va = prefix | (i << (12 + 9 * level));
-                if is_leaf(pte) {
-                    // Sv39 addresses are sign-extended from bit 38.
-                    let full = if va & (1 << 38) != 0 {
-                        va | 0xffff_ff80_0000_0000
-                    } else {
-                        va
-                    };
+                if F::is_leaf(pte, level) {
                     f(
-                        full,
+                        F::extend(va),
                         Translation {
-                            pfn: ppn(pte),
-                            perms: perms_of(pte),
+                            pfn: F::pfn_of(pte),
+                            perms: F::perms_of(pte),
                         },
                         level,
                     );
                 } else if level > 0 {
-                    walk(mm, ppn(pte), level - 1, va, f);
+                    walk::<F, M>(mm, F::pfn_of(pte), level - 1, va, f);
                 }
             }
         }
-        walk(mm, self.root, 2, 0, f);
+        walk::<F, M>(mm, self.root, F::LEVELS.saturating_sub(1), 0, f);
     }
 
     /// Free every table frame (the root too). The leaves must be unmapped (or are
     /// not ours to free): their frames are not touched.
     pub fn destroy<M: PhysMem>(self, mm: &mut Mm<M>) {
         #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; level decreases only while it is above 0
-        fn walk<M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
+        fn walk<F: PageTableFormat, M: PhysMem>(mm: &mut Mm<M>, table: Pfn, level: u32) {
             if level > 0 {
                 for i in 0..512 {
                     let pte = mm.mem.read_u64((table << 12) + i * 8);
-                    if pte & V != 0 && !is_leaf(pte) {
-                        walk(mm, ppn(pte), level - 1);
+                    if F::is_valid(pte) && !F::is_leaf(pte, level) {
+                        walk::<F, M>(mm, F::pfn_of(pte), level - 1);
                     }
                 }
             }
             let _ = mm.db.dec(table);
         }
-        walk(mm, self.root, 2);
+        walk::<F, M>(mm, self.root, F::LEVELS.saturating_sub(1));
     }
 }
-
-#[allow(dead_code)]
-const _: u64 = FLAGS;

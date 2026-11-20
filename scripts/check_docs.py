@@ -191,6 +191,23 @@ def check_arch():
     return out
 
 
+def check_workflows():
+    """A plain (unquoted) YAML scalar cannot contain ': '. overnight.yml had one (`run: echo "...: ..."`): GitHub then cannot read the
+    whole file, every push shows a red run with no jobs, and `gh workflow run` would fail. No YAML parser is needed for this case."""
+    out = []
+    wf = os.path.join(ROOT, ".github", "workflows")
+    for f in sorted(os.listdir(wf)) if os.path.isdir(wf) else []:
+        if not f.endswith(".yml"):
+            continue
+        for n, line in enumerate(open(os.path.join(wf, f)), 1):
+            m = re.match(r"\s*(?:- )?(?:run|name): (.*)$", line)
+            if m:
+                v = m.group(1).strip()
+                if v and v[0] not in "|>'\"[{&*!%@`" and ": " in v.split(" #")[0]:
+                    out.append(f"workflows/{f}:{n}: an unquoted value contains ': ' (invalid YAML: GitHub cannot read the file); quote it or use a block scalar")
+    return out
+
+
 def check_syscall_tests():
     """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
     import io, contextlib
@@ -315,7 +332,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows()
     if problems:
         print("docs check FAILED:")
         for p in problems:

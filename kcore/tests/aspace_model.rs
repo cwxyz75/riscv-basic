@@ -7,10 +7,10 @@
 //! frames in use = table frames + committed VMO pages + mapped pages that outlive
 //! their VMO (the mapping holds its own reference).
 mod common;
-use common::{FakeMem, Rng, SEEDS, STEPS};
+use common::{FakeMem, Rng, TestFmt48, SEEDS, STEPS};
 use kcore::aspace::{Access, AddressSpace, FaultError, Vmos};
 use kcore::frame::FrameDb;
-use kcore::pagetable::{PageTable, Perms};
+use kcore::pagetable::{PageTable, PageTableFormat, Perms, Sv39};
 use kcore::Mm;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,7 +39,16 @@ fn allows(p: Perms, a: Access) -> bool {
 }
 
 #[test]
-fn random_faults_regions_and_teardown_agree_with_the_model() {
+fn random_faults_regions_and_teardown_agree_with_the_model_sv39() {
+    random_model::<Sv39>();
+}
+
+#[test]
+fn random_faults_regions_and_teardown_agree_with_the_model_testfmt48() {
+    random_model::<TestFmt48>();
+}
+
+fn random_model<F: PageTableFormat>() {
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
         let mut mm = Mm {
@@ -48,7 +57,7 @@ fn random_faults_regions_and_teardown_agree_with_the_model() {
         };
         let baseline = mm.db.free_count();
         let mut vmos = Vmos::new();
-        let mut aspace = AddressSpace::new(PageTable::new(&mut mm).unwrap());
+        let mut aspace = AddressSpace::new(PageTable::<F>::create(&mut mm).unwrap());
         let mut model_regions: BTreeMap<u64, ModelRegion> = BTreeMap::new(); // by slot
         let mut model_vmos: BTreeMap<u64, u64> = BTreeMap::new(); // vmo id -> pages
         let mut committed: BTreeSet<(u64, u64)> = BTreeSet::new(); // (vmo, page)
@@ -210,13 +219,16 @@ fn random_faults_regions_and_teardown_agree_with_the_model() {
                 _ => {}
             }
             // Independent frame accounting by formula.
-            let l1: BTreeSet<u64> = mapped.keys().map(|va| (va >> 21) & 0x3_ffff).collect();
-            let l2: BTreeSet<u64> = mapped.keys().map(|va| (va >> 30) & 0x1ff).collect();
-            let tables = 1 + if mapped.is_empty() {
-                0
-            } else {
-                l1.len() + l2.len()
-            };
+            let mut below_root = 0;
+            for j in 1..F::LEVELS {
+                let mask = (1u64 << (9 * (F::LEVELS - j))) - 1;
+                let prefixes: BTreeSet<u64> = mapped
+                    .keys()
+                    .map(|va| (va >> (12 + 9 * j)) & mask)
+                    .collect();
+                below_root += prefixes.len();
+            }
+            let tables = 1 + below_root;
             // Frames referenced by both a VMO and a mapping count once, so count distinct frames.
             let mut data_frames = BTreeSet::new();
             for &(v, p) in &committed {

@@ -1,9 +1,9 @@
 //! The Sv39 page-table walker against a reference model (a map from virtual page
 //! to (frame, permissions)), over a fake physical memory.
 mod common;
-use common::{FakeMem, Rng, SEEDS, STEPS};
+use common::{FakeMem, Rng, TestFmt48, SEEDS, STEPS};
 use kcore::frame::FrameDb;
-use kcore::pagetable::{MapError, PageTable, Perms};
+use kcore::pagetable::{MapError, PageTable, PageTableFormat, Perms, Sv39};
 use kcore::Mm;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,31 +19,38 @@ fn perms(rng: &mut Rng) -> Perms {
 
 /// A virtual address built from chosen page-table indices, so random picks
 /// repeatedly share (and sometimes do not share) upper-level tables. Upper
-/// half addresses are sign-extended as Sv39 requires.
-fn address(rng: &mut Rng) -> u64 {
-    let (i2, i1, i0) = (
-        rng.below(4) * 100 + rng.below(2),
-        rng.below(3),
-        rng.below(4),
-    );
-    let va = (i2 << 30) | (i1 << 21) | (i0 << 12);
-    if va & (1 << 38) != 0 {
-        va | 0xffff_ffc0_0000_0000
-    } else {
-        va
-    }
+/// half addresses are sign-extended as the format requires.
+fn address<F: PageTableFormat>(rng: &mut Rng) -> u64 {
+    let top = rng.below(4) * 100 + rng.below(2);
+    let (i1, i0) = (rng.below(3), rng.below(4));
+    let mut va = (i1 << 21) | (i0 << 12);
+    // the top index sits just below the format's address width; the levels between are zero
+    va |= top << (12 + 9 * (F::LEVELS - 1));
+    F::extend(va)
 }
 
-/// How many table frames a set of mapped pages needs: the root, one level-1 table
-/// per distinct top index, one level-0 table per distinct (top, middle) pair.
-fn tables_needed(model: &BTreeMap<u64, (u64, Perms)>) -> usize {
-    let l2: BTreeSet<u64> = model.keys().map(|va| (va >> 30) & 0x1ff).collect();
-    let l1: BTreeSet<u64> = model.keys().map(|va| (va >> 21) & 0x3_ffff).collect();
-    1 + l2.len() + l1.len()
+/// How many table frames a set of mapped pages needs: the root, and one table per distinct prefix at each level below it.
+fn tables_needed<F: PageTableFormat>(model: &BTreeMap<u64, (u64, Perms)>) -> usize {
+    let mut n = 1;
+    for j in 1..F::LEVELS {
+        let mask = (1u64 << (9 * (F::LEVELS - j))) - 1;
+        let prefixes: BTreeSet<u64> = model.keys().map(|va| (va >> (12 + 9 * j)) & mask).collect();
+        n += prefixes.len();
+    }
+    n
 }
 
 #[test]
-fn random_map_unmap_translate_agree_with_the_model() {
+fn random_map_unmap_translate_agree_with_the_model_sv39() {
+    random_model::<Sv39>();
+}
+
+#[test]
+fn random_map_unmap_translate_agree_with_the_model_testfmt48() {
+    random_model::<TestFmt48>();
+}
+
+fn random_model<F: PageTableFormat>() {
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
         let mut mm = Mm {
@@ -51,11 +58,11 @@ fn random_map_unmap_translate_agree_with_the_model() {
             mem: FakeMem::default(),
         };
         let baseline = mm.db.free_count();
-        let mut pt = PageTable::new(&mut mm).unwrap();
+        let mut pt = PageTable::<F>::create(&mut mm).unwrap();
         let mut model: BTreeMap<u64, (u64, Perms)> = BTreeMap::new();
         for step in 0..STEPS {
             let ctx = format!("seed {seed} step {step}");
-            let va = address(&mut rng);
+            let va = address::<F>(&mut rng);
             match rng.below(4) {
                 0 | 1 => {
                     let (pfn, p) = (5000 + rng.below(100), perms(&mut rng));
@@ -96,7 +103,7 @@ fn random_map_unmap_translate_agree_with_the_model() {
             // mapped pages need (pruned tables really were given back).
             assert_eq!(
                 baseline - mm.db.free_count(),
-                tables_needed(&model),
+                tables_needed::<F>(&model),
                 "{ctx}: table frames in use"
             );
             mm.db.audit().unwrap();
@@ -354,4 +361,45 @@ fn running_out_of_table_frames_changes_nothing() {
         1,
         "the one spare frame was not consumed by the failed map"
     );
+}
+
+/// A block (huge) entry in the second format, written by hand: it translates with the in-block offset, blocks a small mapping
+/// under it, cannot be unmapped one page at a time and is reported by the leaf walk with its level.
+#[test]
+fn testfmt48_block_entries_are_leaves_above_level_zero() {
+    use kcore::pagetable::PhysMem;
+    let mut mm = Mm {
+        db: FrameDb::new(1000, 50),
+        mem: FakeMem::default(),
+    };
+    let mut pt = PageTable::<TestFmt48>::create(&mut mm).unwrap();
+    let f3 = mm.db.alloc().unwrap(); // the level-2 table under root entry 0
+    for w in 0..512 {
+        mm.mem.write_u64((f3 << 12) + w * 8, 0);
+    }
+    mm.mem
+        .write_u64(pt.root() << 12, TestFmt48::table_entry(f3));
+    // a 1 GiB block at index 1 of the level-2 table (f3): no "table" bit, readable, user, execute-never
+    let block = (7000u64 << 12) | 1 | (1 << 5) | (1 << 7) | (1 << 6) | (1 << 54);
+    mm.mem.write_u64((f3 << 12) + 8, block);
+    let va = (1u64 << 30) + 0x5000;
+    let t = pt.translate(&mm, va).unwrap();
+    assert_eq!(
+        t.pfn,
+        7000 + 5,
+        "the in-block offset comes from the address"
+    );
+    assert_eq!(t.perms, Perms::R.user());
+    assert_eq!(
+        pt.map(&mut mm, va, 8000, Perms::RW),
+        Err(MapError::HugeConflict)
+    );
+    assert_eq!(
+        pt.unmap(&mut mm, va),
+        None,
+        "a block is not unmapped a page at a time"
+    );
+    let mut seen = Vec::new();
+    pt.for_each_leaf(&mm, &mut |va, t, level| seen.push((va, t.pfn, level)));
+    assert_eq!(seen, vec![(1u64 << 30, 7000, 2)]);
 }
