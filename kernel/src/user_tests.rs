@@ -295,7 +295,7 @@ pub fn run_all() -> Report {
     );
 
     // Programs that misbehave: the kernel ends them and keeps running.
-    let faults: [(u64, &str, i32); 9] = [
+    let faults: [(u64, &str, i32); 8] = [
         (
             1,
             "user_store_to_kernel_memory_is_fatal",
@@ -311,13 +311,6 @@ pub fn run_all() -> Report {
         (
             5,
             "user_privileged_instruction_is_fatal",
-            exit_code(ILLEGAL),
-        ),
-        (
-            28,
-            // the vector unit (mandatory in RVA23) is off in user mode: no vector state is
-            // saved per thread, so a `vsetvli` must trap, on any CPU
-            "user_vector_instruction_is_fatal",
             exit_code(ILLEGAL),
         ),
         (

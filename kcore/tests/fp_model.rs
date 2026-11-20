@@ -3,7 +3,7 @@
 //! thread that never enables FP never sees anything; a freshly enabled thread starts from zeros.
 //! Written before the kernel code (acceptance first).
 
-use kcore::fp::{FpHart, FpRegs, FpThread, FpUnit, Fs, Tokens};
+use kcore::fp::{FpHart, FpRegs, FpThread, Fs, StateUnit, Tokens};
 
 struct Rng(u64);
 impl Rng {
@@ -43,7 +43,8 @@ impl Unit {
         }
     }
 }
-impl FpUnit for Unit {
+impl StateUnit for Unit {
+    type Regs = FpRegs;
     fn save(&mut self) -> FpRegs {
         self.saves += 1;
         self.regs.clone()

@@ -116,10 +116,10 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **MM3** large pages in the direct map (PR 308)
 - [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
 - [x] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a PR 313, PL5b PR 314, PL5c PR 315)
-- [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
+- [x] **PL6** AIA only; inter-hart interrupts through the IMSIC (PR 316; the wake-latency before/after is a soak bench, `work/T184.md` has the leftovers)
 - [x] **SC1** sixty-four harts (PR 317: harts from `/cpus`, the SBI hart-mask builder, 64-bit pokes; the records and stacks stay static at 64, T185; the `-smp` 8/16/32 boots are the owner's soak)
 - [x] **HD1** the kernel entropy pool
-- [ ] **PL2** vector state
+- [x] **PL2** vector state (PR 319: `kcore::fp` as one model with two instances; the `vlen=128` boot and one hart are the gate's and the soak's)
 - [ ] **PL3** user code built for RVA23U64
 
 ### Phase 5: the ABI flag days
