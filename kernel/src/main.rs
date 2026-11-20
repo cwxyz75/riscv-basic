@@ -113,6 +113,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     trap::init();
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
+    dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
     kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
     aia::init();
     if !RELEASE {

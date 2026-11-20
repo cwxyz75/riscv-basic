@@ -13,7 +13,7 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##DONE pass=<n> fail=<n>
 
 The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
-`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
+`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
 size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
@@ -282,7 +282,7 @@ def run_profiled(cmd, kernel):
     label = os.environ.get("OS_PROFILE_LABEL") or (
         f"{kernel.split('/')[1] if kernel.startswith('target/') else kernel}"
         f"|smp{os.environ.get('OS_SMP', '1')}|{os.environ.get('OS_MACHINE', DEFAULT_MACHINE)}"
-        f"|{os.environ.get('OS_CPU', 'default-cpu')}")
+        f"|{os.environ.get('OS_CPU', 'rva23s64')}")
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     stamped = []
@@ -1024,7 +1024,7 @@ def run(kernel: str, extra=()):
         # The clock (FS-SPEC section 7, step C1): the RTC starts from a known date and follows the virtual clock, so the test can
         # tell the time it is given from a made-up one.
         "-rtc", "base=2030-06-15T12:00:00,clock=vm",
-        *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
+        "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
