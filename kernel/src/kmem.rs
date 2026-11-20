@@ -156,14 +156,12 @@ pub fn init() {
             aspace,
         })
     };
-    let satp = (8u64 << 60) | root;
-    KERNEL_SATP.store(satp, core::sync::atomic::Ordering::SeqCst);
+    let token = crate::arch::aspace_token(root);
+    KERNEL_ASPACE.store(token, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the new table maps everything the kernel is executing from and
-    // touching: text, rodata, data/bss/stack, the direct map and the two devices.
-    // `sfence.vma` then drops the translations of the early table.
-    unsafe {
-        core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp);
-    }
+    // touching: text, rodata, data/bss/stack, the direct map and the two devices;
+    // installing it drops the translations of the early table.
+    unsafe { crate::arch::aspace_install(token) };
 }
 
 /// The first frame the frame database manages (everything below it is the kernel
@@ -176,45 +174,33 @@ pub fn first_managed_frame() -> u64 {
         .div_ceil(PAGE_SIZE)
 }
 
-/// The current `satp` value.
-pub fn satp() -> u64 {
-    let v: u64;
-    // SAFETY: reads a CSR.
-    unsafe { core::arch::asm!("csrr {}, satp", out(reg) v) };
-    v
-}
-
-/// The kernel's own `satp` value, recorded once by `init` (the secondary harts load it).
-pub static KERNEL_SATP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The kernel's own address-space token, recorded once by `init` (the secondary harts load it).
+pub static KERNEL_ASPACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Switch back to the kernel's own page table (before a process's root is freed).
 pub fn use_kernel_table() {
     let root = crate::irq::without(|| get().aspace.table().root());
-    let satp = (8u64 << 60) | root;
     // SAFETY: the kernel's table maps everything the kernel executes from and touches;
-    // the flush drops the translations of the table being left.
-    unsafe {
-        core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp);
-    }
+    // installing it drops the translations of the table being left.
+    unsafe { crate::arch::aspace_install(crate::arch::aspace_token(root)) };
 }
 
-/// Load the kernel's own `satp` if the hart has something else in it (a user process's root).
+/// Load the kernel's own table if the hart has something else in it (a user process's root).
 pub fn use_kernel_table_if_needed() {
     if cfg!(feature = "fault-skip-kernel-satp") {
         return; // negative control: a hart keeps a dead process's page table
     }
-    let want = KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
-    if satp() != want {
-        // SAFETY: the kernel table maps everything the kernel runs from and touches; the flush
+    let want = KERNEL_ASPACE.load(core::sync::atomic::Ordering::Relaxed);
+    if crate::arch::aspace_current() != want {
+        // SAFETY: the kernel table maps everything the kernel runs from and touches; installing it
         // drops the translations of the table being left.
-        unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) want) };
+        unsafe { crate::arch::aspace_install(want) };
     }
 }
 
 /// Flush the whole TLB.
 pub fn flush_tlb() {
-    // SAFETY: `sfence.vma` with no operands flushes all translations; no other effect.
-    unsafe { core::arch::asm!("sfence.vma zero, zero") };
+    crate::arch::tlb_flush_all();
 }
 
 /// Flush the translations of the pages `first..=last` (virtual addresses, 4 KiB apart) of address space `asid`, one `sfence.vma`
@@ -223,8 +209,7 @@ pub fn flush_tlb() {
 pub fn flush_pages(first: u64, last: u64, asid: u16) {
     let mut va = first & !0xfff;
     while va <= last {
-        // SAFETY: `sfence.vma` with an address and an ASID drops cached translations of that page; no other effect.
-        unsafe { core::arch::asm!("sfence.vma {}, {}", in(reg) va, in(reg) u64::from(asid)) };
+        crate::arch::tlb_flush_page(va, asid);
         va += 4096;
     }
 }

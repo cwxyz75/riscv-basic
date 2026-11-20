@@ -12,18 +12,17 @@
 
 extern crate alloc;
 
-mod aia;
+// The architecture's modules keep their short names at the crate root (`crate::trap::...`).
+use arch::{aia, finisher, fp, irq, timer, trap};
+
+mod arch;
 mod bkl;
-mod boot;
 mod chaos;
 mod console;
 mod dtb;
-mod finisher;
-mod fp;
 mod heap;
 #[cfg(feature = "interactive")]
 mod interactive;
-mod irq;
 mod kmem;
 mod kstack;
 mod latency;
@@ -33,8 +32,6 @@ mod selftest;
 mod smp;
 mod smp_tests;
 mod thread;
-mod timer;
-mod trap;
 mod user;
 mod user_tests;
 

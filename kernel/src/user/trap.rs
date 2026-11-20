@@ -2,12 +2,12 @@
 
 use super::*;
 
-pub(super) fn satp_of(p: &Process) -> u64 {
-    (8u64 << 60) | (u64::from(p.asid) << 44) | p.aspace.table().root()
+pub(super) fn aspace_token_of(p: &Process) -> u64 {
+    crate::arch::aspace_token_asid(p.aspace.table().root(), p.asid)
 }
 
 /// Make the calling thread's process the current address space, just before returning to
-/// user mode. Needed because the hart's satp belongs to whichever user thread last ran:
+/// user mode. Needed because the hart's address space belongs to whichever user thread last ran:
 /// threads of different processes are switched between, and the kernel half is shared so
 /// kernel code runs under any of them, but returning to user mode must use *this* one.
 pub fn activate_current() {
@@ -18,23 +18,23 @@ pub fn activate_current() {
     // A process that was killed while its thread was not running dies here, at the point
     // where it would otherwise return to user mode.
     park_while_stopped();
-    let satp = irq::without(|| {
+    let token = irq::without(|| {
         let s = state();
         s.thread_pid
             .get(&thread::current())
             .and_then(|pid| s.procs.get(pid))
-            .map(|p| satp_of(p))
+            .map(|p| aspace_token_of(p))
     });
-    if let Some(satp) = satp {
+    if let Some(token) = token {
         if crate::percpu::this()
-            .active_satp
-            .swap(satp, Ordering::SeqCst)
-            != satp
-            || kmem::satp() != satp
+            .active_aspace
+            .swap(token, Ordering::SeqCst)
+            != token
+            || crate::arch::aspace_current() != token
         {
-            // SAFETY: `satp` names a live process root whose upper half is the kernel's; the
-            // flush drops the translations of whatever table was active.
-            unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp) };
+            // SAFETY: `token` names a live process root whose upper half is the kernel's; installing it
+            // drops the translations of whatever table was active.
+            unsafe { crate::arch::aspace_install(token) };
         }
     }
 }

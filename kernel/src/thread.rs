@@ -212,8 +212,7 @@ pub fn init(boot_prio: Prio) {
     // silently corrupting another thread's registers.
     // The same for the vector unit (sstatus.VS, bits 10:9; mandatory in RVA23, OD47): no vector
     // state is saved per thread, so user mode must not be able to use it either.
-    // SAFETY: clears sstatus.FS and sstatus.VS only.
-    unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
+    crate::arch::lazy_units_off();
     let harts = crate::smp::started();
     let sched = KSched::over(KRqs {
         rq: (0..harts)
@@ -360,8 +359,7 @@ fn idle_main(_: usize) {
             me.idle_suspend.fetch_add(1, Ordering::Relaxed);
         } else {
             me.idle_wfi.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: `wfi` idles the hart until an interrupt is pending; it is legal with interrupts disabled.
-            unsafe { core::arch::asm!("wfi") };
+            crate::arch::cpu_idle();
         }
         me.idle_ns
             .fetch_add(now_ns().saturating_sub(idle_from), Ordering::Relaxed);
@@ -1210,10 +1208,7 @@ pub fn stacks_intact() -> bool {
 }
 
 pub fn fp_off() -> bool {
-    let v: usize;
-    // SAFETY: reads a CSR.
-    unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) v) };
-    v >> 13 & 3 == 0 && v >> 9 & 3 == 0
+    crate::arch::lazy_units_are_off()
 }
 
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the heap's total free bytes are at least its grown bytes

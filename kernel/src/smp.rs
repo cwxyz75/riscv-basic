@@ -108,19 +108,16 @@ extern "C" {
 #[no_mangle]
 extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     percpu::bind(index, hart_id);
-    let tp: usize;
-    // SAFETY: reads `tp`, just bound to this hart's record.
-    unsafe { asm!("mv {}, tp", out(reg) tp) };
+    let tp = crate::arch::thread_pointer();
     percpu::this().tp_seen.store(tp, Ordering::Relaxed);
-    crate::trap::init(); // stvec; sscratch = 0
+    crate::trap::init(); // the trap vector
                          // FPU and vector unit off, like the boot hart (thread::init), so any use traps.
-                         // SAFETY: clears sstatus.FS and sstatus.VS only.
-    unsafe { asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
+    crate::arch::lazy_units_off();
     // Leave the early table for the kernel's own.
-    let satp = kmem::KERNEL_SATP.load(Ordering::SeqCst);
+    let token = kmem::KERNEL_ASPACE.load(Ordering::SeqCst);
     // SAFETY: the kernel table maps everything this code runs from and touches (the image, the
-    // direct map, the devices in use); the flush drops the early table's translations.
-    unsafe { asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) satp) };
+    // direct map, the devices in use); installing it drops the early table's translations.
+    unsafe { crate::arch::aspace_install(token) };
     timer::start();
     irq::enable_timer_interrupt();
     enable_software_interrupt();
@@ -136,14 +133,12 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
         if crate::thread::scheduler_exists() {
             crate::thread::join_scheduler();
         }
-        // SAFETY: `wfi` idles the hart until an interrupt; interrupts are enabled.
-        unsafe { asm!("wfi") };
+        crate::arch::cpu_idle();
     }
 }
 
 fn enable_software_interrupt() {
-    // SAFETY: sets sie.SSIE only (the supervisor software interrupt, used for IPIs).
-    unsafe { asm!("csrs sie, {}", in(reg) 1usize << 1) };
+    crate::arch::software_interrupt_enable();
 }
 
 /// The boot hart's share of `enable_software_interrupt`.
@@ -154,8 +149,7 @@ pub fn enable_ipi_on_this_hart() {
 /// The software interrupt handler (called from the trap handler on any hart): clear the pending
 /// bit, take the reasons, count.
 pub fn ipi_interrupt() -> u32 {
-    // SAFETY: clears sip.SSIP, the pending bit of the software interrupt; nothing else.
-    unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
+    crate::arch::software_interrupt_clear();
     let me = percpu::this();
     // take the reasons first, then count: whoever sees the count move sees the bits already gone
     let reasons = me.pending.swap(0, Ordering::SeqCst);

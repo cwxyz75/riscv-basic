@@ -420,7 +420,7 @@ pub mod layout {
     /// The kernel-stack window (slice T): one top-level slot (1 GiB) of its own, carved into slots of
     /// `KSTACK_SLOT_BYTES`. In each slot the lower half is **unmapped** (the guard: a stack that
     /// overflows runs into it and faults) and the upper half is the stack. The trap entry recognises
-    /// a stack pointer in the guard half by arithmetic alone (see `kernel/src/trap.rs`), so the slot
+    /// a stack pointer in the guard half by arithmetic alone (see `kernel/src/arch/riscv64/trap.rs`), so the slot
     /// size and the guard/stack split must stay powers of two.
     pub const KSTACK_WINDOW_BASE: u64 = 0xffff_ffe0_0000_0000;
     pub const KSTACK_WINDOW_SIZE: u64 = 1 << 30;
