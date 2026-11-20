@@ -218,21 +218,3 @@ pub(super) fn request_kill(pid: u32, code: i32) {
         wake_threads_of(pid);
     }
 }
-
-/// Run `f` on the calling thread's process, with interrupts off. `Err(BadState)` if the
-/// caller is not a user thread.
-pub(super) fn with_proc<R>(
-    f: impl FnOnce(&mut Kobjs, &mut Process, &mut kmem::Kmem) -> R,
-) -> Result<R, Status> {
-    irq::without(|| {
-        let s = state();
-        let pid = *s
-            .thread_pid
-            .get(&thread::current())
-            .ok_or(Status::BadState)?;
-        let k = kmem::get();
-        let UserState { objs, procs, .. } = s;
-        let p = procs.get_mut(&pid).ok_or(Status::BadState)?;
-        Ok(f(objs, p, k))
-    })
-}

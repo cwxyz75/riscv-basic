@@ -27,6 +27,7 @@ mod proc;
 mod state;
 mod thread;
 mod vmo;
+mod wait;
 pub use create::process_create;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
@@ -40,6 +41,11 @@ pub use thread::{
     thread_spawn, total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::vmo_call;
+pub use wait::{
+    channel_call_ready, channel_call_reply, channel_call_send, futex_wait_check, futex_wait_report,
+    futex_wake, object_wait_check, object_wait_report, port_poll, port_wait_check,
+    port_wait_report, signals_of, Call, FutexCheck, ObjectWait,
+};
 
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
 use abi::rights::Rights;
@@ -132,7 +138,7 @@ pub fn wide_argument_error(n: usize, a: &[u64; 6]) -> Option<Status> {
     }
 }
 
-fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
+pub(crate) fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
     let mut v = Vec::new();
     v.try_reserve_exact(args.len() / 4)
         .map_err(|_| Status::NoMemory)?;
