@@ -1124,6 +1124,13 @@ pub fn wake_stat(which: u64) -> u64 {
                 0
             }
         }
+        // 100 and 101: the lowest byte address of RAM and the address after the highest (from the device tree, PL4); 102 and 103: the
+        // frames of RAM the tree describes and the frames the allocator manages; 104: where the kernel image starts
+        100 => crate::kmem::stats().ram_first << 12,
+        101 => crate::kmem::stats().ram_end << 12,
+        102 => crate::kmem::stats().memory_frames,
+        103 => crate::kmem::stats().managed_frames,
+        104 => crate::kmem::stats().image_first << 12,
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
         // 16 + h: how often hart h took the big kernel lock from free

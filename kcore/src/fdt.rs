@@ -133,6 +133,108 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Every `(address, size)` pair of `reg`, decoded with the parent's cell counts (a node with several ranges, like a machine with two
+    /// banks of RAM, lists them all). Empty if there is no `reg` or the cell counts are unusable.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get` is checked; k is below the cell count read from the blob; the entry size is at most 16 bytes
+    pub fn regs(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let Some(v) = self.prop("reg") else {
+            return out;
+        };
+        if self.addr_cells == 0 || self.addr_cells > 2 || self.size_cells > 2 {
+            return out;
+        }
+        let cell = |at: usize, n: u32| -> Option<u64> {
+            let mut x = 0u64;
+            for k in 0..n as usize {
+                let w = u32::from_be_bytes(v.get(at + 4 * k..at + 4 * k + 4)?.try_into().ok()?);
+                x = x.checked_shl(32)? | u64::from(w);
+            }
+            Some(x)
+        };
+        let entry = 4 * (self.addr_cells + self.size_cells) as usize;
+        let mut at = 0;
+        while at + entry <= v.len() {
+            let (Some(a), Some(s)) = (
+                cell(at, self.addr_cells),
+                cell(at + 4 * self.addr_cells as usize, self.size_cells),
+            ) else {
+                break;
+            };
+            out.push((a, s));
+            at += entry;
+        }
+        out
+    }
+}
+
+/// The RAM the tree describes: every `reg` range of a node whose `device_type` is `memory`.
+pub fn memory_ranges(nodes: &[Node]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for n in nodes {
+        let is_memory = n
+            .prop("device_type")
+            .is_some_and(|v| v.split(|&b| b == 0).next() == Some(b"memory"));
+        if is_memory {
+            out.extend(n.regs());
+        }
+    }
+    out
+}
+
+/// The ranges `/reserved-memory` reserves: every `reg` range of a child of that node (firmware, a framebuffer, a ramdisk). A child with
+/// no `reg` (a dynamic allocation request) reserves nothing the kernel can name.
+pub fn reserved_ranges(nodes: &[Node]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for n in nodes {
+        if n.path.starts_with("/reserved-memory/") {
+            out.extend(n.regs());
+        }
+    }
+    out
+}
+
+/// The memory reservation block of the header: `(address, size)` pairs the loader wants kept (the tree's own copy, OpenSBI's region on some
+/// firmware), up to the all-zero terminator. Bounded and bounds-checked like the rest of the reader.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: `get` is checked; `at` advances by 16 inside the blob; the count is capped
+pub fn reservation_block(blob: &[u8]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    if be32(blob, 0) != Some(MAGIC) {
+        return out;
+    }
+    let Some(mut at) = be32(blob, 16).map(|o| o as usize) else {
+        return out;
+    };
+    let be64 = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(blob.get(at..at + 8)?.try_into().ok()?))
+    };
+    while out.len() < 64 {
+        let (Some(a), Some(s)) = (be64(at), be64(at + 8)) else {
+            break;
+        };
+        if a == 0 && s == 0 {
+            break;
+        }
+        out.push((a, s));
+        at += 16;
+    }
+    out
+}
+
+/// `/cpus/timebase-frequency`: the rate of the `time` counter in hertz (one cell, or two for a very fast counter).
+pub fn timebase_frequency(nodes: &[Node]) -> Option<u64> {
+    let v = nodes
+        .iter()
+        .find(|n| n.path == "/cpus")?
+        .prop("timebase-frequency")?;
+    match v.len() {
+        4 => Some(u64::from(u32::from_be_bytes(v.try_into().ok()?))),
+        8 => Some(u64::from_be_bytes(v.try_into().ok()?)),
+        _ => None,
+    }
+}
+
 /// A virtio-mmio slot found in the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioMmio {
