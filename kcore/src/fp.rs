@@ -67,6 +67,11 @@ pub trait StateUnit {
     fn save(&mut self) -> Self::Regs;
     /// Write every register.
     fn load(&mut self, regs: &Self::Regs);
+    /// Read every register into `regs`, which already has the right shape (a unit whose registers are large saves in place: the trap path
+    /// allocates nothing).
+    fn save_into(&mut self, regs: &mut Self::Regs) {
+        *regs = self.save();
+    }
 }
 
 /// A hart's FP register file.
@@ -210,7 +215,7 @@ impl FpHart {
         let Some((regs, token)) = thread.state.as_mut() else {
             return false;
         };
-        **regs = unit.save();
+        unit.save_into(regs);
         *token = tokens.next();
         self.owner = *token;
         true

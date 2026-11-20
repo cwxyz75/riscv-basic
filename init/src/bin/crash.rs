@@ -385,6 +385,8 @@ pub fn app_main() -> i32 {
         // instruction user mode may not: the process dies
         n if n & 0xff == 92 => return vec_keep((n >> 16) as u64, ((n >> 8) & 0xff) as u64, 0),
         93 => return vec_fresh(),
+        96 => return vec_edges(),
+        97 => return vec_load_first(),
         94 => return vec_threads(),
         95 => {
             let _ = vlenb();
@@ -1086,18 +1088,19 @@ fn vec_store(p: *mut u8, vlenb: usize) {
     }
 }
 
-/// `vsetvli` for `avl` elements of 32 bits (LMUL 1): returns (`vl`, `vtype`) as the hardware now has them.
-fn vec_set(avl: usize) -> (u64, u64) {
+/// `vsetvl` for `avl` elements of `8 << sew` bits (LMUL 1, tail and mask agnostic): returns (`vl`, `vtype`) as the hardware now has them.
+fn vec_set(avl: usize, sew: u64) -> (u64, u64) {
     let (vl, vt): (u64, u64);
     // SAFETY: only changes `vl` and `vtype`.
     unsafe {
         asm!(
             ".option push", ".option arch, +v",
-            "vsetvli {t}, {avl}, e32, m1, ta, ma",
+            "vsetvl {t}, {avl}, {vtype}",
             "csrr {vl}, vl",
             "csrr {vt}, vtype",
             ".option pop",
             avl = in(reg) avl,
+            vtype = in(reg) (sew & 3) << 3 | 0xc0,
             t = out(reg) _,
             vl = out(reg) vl,
             vt = out(reg) vt,
@@ -1145,7 +1148,7 @@ fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
     let mut round = 0u64;
     let mut cur = seed;
     vec_pattern(want, cur);
-    let (mut vl, mut vt) = vec_set(1 + (cur % 7) as usize);
+    let (mut vl, mut vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
     let mut csr = cur & 7;
     vec_load(want.as_ptr(), n);
     vec_set_csr(csr);
@@ -1166,7 +1169,7 @@ fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
         if round.is_multiple_of(5) {
             cur = seed.wrapping_add(round);
             vec_pattern(want, cur);
-            (vl, vt) = vec_set(1 + (cur % 7) as usize);
+            (vl, vt) = vec_set(1 + (cur % 7) as usize, cur >> 3);
             csr = cur & 7;
             vec_load(want.as_ptr(), n);
             vec_set_csr(csr);
@@ -1206,6 +1209,59 @@ fn vec_fresh() -> i32 {
     let nonzero = got.iter().filter(|&&b| b != 0).count() as i32;
     let csrs = (vec_csr() | read_vl() | read_vtype()) != 0;
     nonzero + if csrs { 10_000 } else { 0 }
+}
+
+/// Edge states: the first vector instruction is a `vsetvli` (not a CSR read); an illegal `vtype` (`vill`) and a non-zero `vstart` survive a trap
+/// (a yield here). Returns 0 or a code for the first thing that was wrong.
+fn vec_edges() -> i32 {
+    let (vl, vt) = vec_set(3, 2); // (the first vector instruction)
+    if vl != 3 || vt >> 63 != 0 {
+        return 1;
+    }
+    let (vl, vt): (u64, u64);
+    // SAFETY: only changes `vl` and `vtype`: an illegal `vtype` (a reserved bit) sets `vill` and clears `vl`.
+    unsafe {
+        asm!(
+            ".option push", ".option arch, +v",
+            "vsetvl zero, zero, {bad}",
+            "csrr {vl}, vl",
+            "csrr {vt}, vtype",
+            ".option pop",
+            bad = in(reg) 1u64 << 8,
+            vl = out(reg) vl,
+            vt = out(reg) vt,
+        );
+    }
+    if vt >> 63 != 1 || vl != 0 {
+        return 2;
+    }
+    rt::sys::thread_yield();
+    if read_vtype() >> 63 != 1 || read_vl() != 0 {
+        return 3;
+    }
+    let vs: u64;
+    // SAFETY: writes and reads `vstart` (the element a trapped vector instruction resumes at).
+    unsafe { asm!("csrw 0x008, {v}", v = in(reg) 2u64) };
+    rt::sys::thread_yield();
+    // SAFETY: reads `vstart`.
+    unsafe { asm!("csrr {v}, 0x008", v = out(reg) vs) };
+    if vs != 2 {
+        return 4;
+    }
+    // SAFETY: clears `vstart` again.
+    unsafe { asm!("csrw 0x008, zero") };
+    0
+}
+
+/// First vector instruction is a vector load (a whole-register load from a zeroed buffer): the unit must be enabled by it too.
+fn vec_load_first() -> i32 {
+    // SAFETY: only the address of the last buffer is taken; the load reads 16 bytes at most (one register, at least 16 bytes long).
+    let p = unsafe { core::ptr::addr_of_mut!(VBUFS.0) as *mut u8 }.wrapping_add(5 * 32 * VMAX);
+    // SAFETY: reads one vector register's worth of the buffer and writes `v0`.
+    unsafe {
+        asm!(".option push", ".option arch, +v", "vl1re8.v v0, ({p})", ".option pop", p = in(reg) p)
+    };
+    0
 }
 
 static VEC_THREAD_RESULT: [AtomicU32; 2] = [AtomicU32::new(99), AtomicU32::new(99)];

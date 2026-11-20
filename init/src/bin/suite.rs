@@ -1881,11 +1881,22 @@ fn vector_state_is_private_to_each_thread_and_process() -> Outcome {
         0,
         "a process's first vector use sees zero registers"
     );
+    sys::handle_close(fresh);
     for (i, p) in procs.into_iter().enumerate() {
         wait_ended(p, 6000)?;
         let code = sys::process_info(p).a1 as i64;
         sys::handle_close(p);
         ensure_eq!(code, 0, "vector process {i} kept its own registers");
+    }
+    // the edge states: a first instruction that is `vsetvli`, `vill` and `vstart` across a yield, a first instruction that is a vector load
+    for (arg, what) in [
+        (96u64, "vill and vstart survive a yield"),
+        (97, "a vector load enables the unit"),
+    ] {
+        let (e, _m) = launch(arg)?;
+        wait_ended(e, 3000)?;
+        ensure_eq!(sys::process_info(e).a1 as i64, 0, "{}", what);
+        sys::handle_close(e);
     }
     let (bad, _m) = launch(95)?;
     wait_ended(bad, 3000)?;

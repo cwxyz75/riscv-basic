@@ -31,7 +31,7 @@ fn vlenb() -> usize {
 pub fn init_boot_hart() {
     let n = crate::arch::vlenb_read();
     assert!(
-        n.is_power_of_two() && n <= 4096,
+        n.is_power_of_two() && n <= 8192,
         "vlenb {n} is not a vector register length"
     );
     VLENB.store(n, core::sync::atomic::Ordering::Relaxed);
@@ -166,8 +166,17 @@ impl StateUnit for VecHartUnit {
     type Regs = VecRegs;
 
     fn save(&mut self) -> VecRegs {
+        let mut r = VecRegs::zero(vlenb());
+        self.save_into(&mut r);
+        r
+    }
+
+    /// Save into the thread's existing buffer: nothing is allocated in the trap path.
+    fn save_into(&mut self, r: &mut VecRegs) {
         let n = vlenb();
-        let mut r = VecRegs::zero(n);
+        if r.v.len() != n.saturating_mul(32) {
+            return; // (a buffer of another length would be written out of bounds: never made by `first_use`)
+        }
         let mut csrs = [0u64; 4]; // vstart, vcsr, vl, vtype
         let stride = n.saturating_mul(8);
         // SAFETY: the unit is switched on for exactly these instructions. `r.v` is 32 * vlenb bytes and each `vs8r.v` stores eight registers
@@ -178,6 +187,10 @@ impl StateUnit for VecHartUnit {
                 "csrs sstatus, {on}",
                 ".option push",
                 ".option arch, +v",
+                // `vstart` first, then cleared: the whole-register stores skip the elements below it
+                "csrr {vs}, vstart",
+                "sd {vs}, 0({c})",
+                "csrw vstart, zero",
                 "vs8r.v v0, ({p})",
                 "add {p}, {p}, {s}",
                 "vs8r.v v8, ({p})",
@@ -185,27 +198,27 @@ impl StateUnit for VecHartUnit {
                 "vs8r.v v16, ({p})",
                 "add {p}, {p}, {s}",
                 "vs8r.v v24, ({p})",
-                "csrr {t}, vstart",
-                "sd {t}, 0({c})",
                 "csrr {t}, vcsr",
                 "sd {t}, 8({c})",
                 "csrr {t}, vl",
                 "sd {t}, 16({c})",
                 "csrr {t}, vtype",
                 "sd {t}, 24({c})",
+                // the unit goes on holding the thread's state (the hart keeps its token): `vstart` as it was
+                "csrw vstart, {vs}",
                 ".option pop",
                 "csrc sstatus, {off}",
                 p = inout(reg) r.v.as_mut_ptr() => _,
                 s = in(reg) stride,
                 c = in(reg) csrs.as_mut_ptr(),
                 t = out(reg) _,
+                vs = out(reg) _,
                 on = in(reg) 1u64 << 9,
                 off = in(reg) VS_MASK,
                 options(nostack),
             );
         }
         [r.vstart, r.vcsr, r.vl, r.vtype] = csrs;
-        r
     }
 
     fn load(&mut self, r: &VecRegs) {
@@ -379,7 +392,8 @@ pub fn return_to_user(frame: &mut TrapFrame) {
 /// true is returned (the instruction is then retried; if it traps again its unit is on and the trap is a real illegal instruction).
 pub fn first_use(frame: &mut TrapFrame) -> bool {
     if kcore::fp::is_vector_insn(frame.stval) {
-        return vec_first_use(frame);
+        // (a vector-FP instruction such as `vfadd.vv` is a vector instruction that is also the thread's first FP use, with the vector unit already on)
+        return vec_first_use(frame) || fp_first_use(frame);
     }
     fp_first_use(frame) || (frame.stval == 0 && vec_first_use(frame))
 }
