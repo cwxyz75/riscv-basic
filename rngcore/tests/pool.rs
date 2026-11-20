@@ -75,11 +75,12 @@ fn every_input_changes_the_key_and_an_all_zero_seed_is_not_a_seed() {
     };
     assert!(!derive_key(&zero).1, "a scrubbed seed is not a seed");
     assert!(
-        derive_key(&Inputs {
+        !derive_key(&Inputs {
             zkr: &[0, 0, 4],
             ..zero
         })
-        .1
+        .1,
+        "three bytes are not a seed"
     );
 }
 
@@ -92,10 +93,10 @@ fn drbg(seed: u8) -> Drbg {
 #[test]
 fn below_is_in_range_and_refuses_zero() {
     let mut d = drbg(1);
-    assert_eq!(below(|b| assert!(d.fill(b)), 0), None);
+    assert_eq!(below(|b| d.fill(b), 0), None);
     for n in [1u64, 2, 3, 7, 1000, u64::MAX, (1 << 63) + 1] {
         for _ in 0..200 {
-            let x = below(|b| assert!(d.fill(b)), n).unwrap();
+            let x = below(|b| d.fill(b), n).unwrap();
             assert!(x < n);
         }
     }
@@ -107,7 +108,10 @@ fn below_rejects_draws_that_would_bias_the_low_residues() {
     let n = (1u64 << 63) + 1;
     let mut script = vec![5u64, 1 << 62, (1 << 63) - 2, (1 << 63) - 1].into_iter();
     let got = below(
-        |b| b.copy_from_slice(&script.next().expect("a draw left").to_le_bytes()),
+        |b| {
+            b.copy_from_slice(&script.next().expect("a draw left").to_le_bytes());
+            true
+        },
         n,
     );
     assert_eq!(
@@ -131,7 +135,7 @@ fn below_is_uniform_by_a_chi_squared_test_with_a_fixed_seed() {
         let draws = 20_000 * n;
         let mut count = vec![0u64; n as usize];
         for _ in 0..draws {
-            count[below(|b| assert!(d.fill(b)), n).unwrap() as usize] += 1;
+            count[below(|b| d.fill(b), n).unwrap() as usize] += 1;
         }
         let expect = (draws / n) as f64;
         let chi2: f64 = count
@@ -143,4 +147,31 @@ fn below_is_uniform_by_a_chi_squared_test_with_a_fixed_seed() {
             "n = {n}: chi-squared {chi2} over {bound}: {count:?}"
         );
     }
+}
+
+#[test]
+fn a_small_seed_is_not_enough_and_sixteen_bytes_are() {
+    let seeded = |rng: &[u8], kaslr: &[u8], zkr: &[u8]| {
+        derive_key(&Inputs {
+            rng_seed: rng,
+            kaslr_seed: kaslr,
+            zkr,
+            time: 0,
+        })
+        .1
+    };
+    assert!(!seeded(&[1], &[], &[]), "one byte");
+    assert!(!seeded(&[], &[], &[7, 7]), "one 16-bit seed CSR read");
+    assert!(!seeded(&[1; 15], &[], &[]), "fifteen bytes");
+    assert!(seeded(&[1; 16], &[], &[]), "sixteen bytes");
+    assert!(seeded(&[1; 8], &[2; 8], &[]), "two sources add up");
+    assert!(
+        !seeded(&[0; 32], &[2; 8], &[]),
+        "zero bytes count for nothing"
+    );
+}
+
+#[test]
+fn below_gives_up_when_the_source_refuses() {
+    assert_eq!(below(|_| false, 7), None);
 }

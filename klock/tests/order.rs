@@ -123,7 +123,7 @@ fn more_than_eight_locks_is_a_bug() {
 
 #[test]
 fn the_class_numbers_are_the_documented_ones() {
-    // SCHED-SMP-SPEC 3.3 numbers them 1 to 14; the kernel's masks and the INVARIANTS table rely on it
+    // SCHED-SMP-SPEC 3.3 numbers them 1 to 13 and the amendment of 2026-11-20 adds ENTROPY (14) before UART (15); the kernel's masks and the INVARIANTS table rely on it
     for (i, &c) in Class::ALL.iter().enumerate() {
         assert_eq!(c as usize, i + 1, "{c:?}");
     }

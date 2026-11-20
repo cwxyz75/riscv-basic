@@ -18,7 +18,7 @@ static FIRST: AtomicU64 = AtomicU64::new(0);
 fn hart_has_zkr(nodes: &[kcore::fdt::Node], hart_id: usize) -> bool {
     nodes.iter().any(|n| {
         n.path.starts_with("/cpus/cpu")
-            && n.cells("reg").first().map(|&r| r as usize) == Some(hart_id)
+            && n.cells("reg").last().map(|&r| r as usize) == Some(hart_id)
             && kcore::isa::extensions_of(n).iter().any(|e| e == "zkr")
     })
 }
@@ -71,14 +71,19 @@ pub fn init(boot_hart_id: usize) {
         zkr: zkr.get(..zkr_len).unwrap_or(&[]),
         time: crate::timer::now(),
     });
-    let mut d = Drbg::new();
-    d.reseed(&key);
-    // the first output, for the boot tests (a test build reports it; a release build does not)
+    // keyed in place inside the lock (no copy of the generator is left in this frame), then the key and the CSR bytes are wiped
+    let mut key = key;
     let mut first = [0u8; 8];
-    let _ = d.fill(&mut first);
+    {
+        let mut pool = POOL.lock();
+        let d = pool.insert(Drbg::new());
+        d.reseed(&key);
+        // the first output, for the boot tests (a test build reports it; a release build does not)
+        let _ = d.fill(&mut first);
+    }
     FIRST.store(u64::from_le_bytes(first), Ordering::Relaxed);
-    *POOL.lock() = Some(d);
     SEEDED.store(seeded, Ordering::Release);
+    rngcore::drbg::wipe(&mut key);
     rngcore::drbg::wipe(&mut zkr);
     if seeded {
         if !crate::RELEASE {
@@ -114,12 +119,7 @@ pub fn fill(out: &mut [u8]) -> bool {
 pub fn below(n: u64) -> Option<u64> {
     let mut pool = POOL.lock();
     let d = pool.as_mut()?;
-    pool::below(
-        |b| {
-            let _ = d.fill(b);
-        },
-        n,
-    )
+    pool::below(|b| d.fill(b), n)
 }
 
 /// The first output after keying (test builds only).
