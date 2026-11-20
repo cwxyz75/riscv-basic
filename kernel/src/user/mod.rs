@@ -29,11 +29,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
-use kcore::ipc::{self, Kobjs, ReadError};
+use kcore::ipc::{self, ReadError};
 use kcore::job::{JobId, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::sched::Tid;
-use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
+use kcore::usercopy::copy_from_user;
 use ksys::{charge_thread, credit_thread, new_start};
 use ksys::{ProcState, Process, UserState};
 

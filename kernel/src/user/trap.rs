@@ -154,14 +154,6 @@ pub(super) fn status_ret(frame: &mut crate::trap::TrapFrame, s: Status) {
     frame.set_return(s.code() as i64 as u64, None, None);
 }
 
-pub(super) fn handle_list(args: &[u8]) -> Vec<Handle> {
-    args.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| Handle(u32::from_le_bytes(*c)))
-        .collect()
-}
-
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
