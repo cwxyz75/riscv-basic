@@ -468,7 +468,7 @@ os-fuzz-host:
 os-allocfail:
 	KALLOC_PERSIST=1 cargo test --profile release-checked -p ksys --test allocfail every -- --nocapture
 
-# On demand only, when the owner asks (not routine; CI is the check). What CI has failed a PR for. `make preflight` is the quick part, about five minutes: formatting, the docs check, clippy on the host
+# `preflight` is the quick pre-push check (fine to run routinely); `preflight-full` is on demand only, when the owner asks. What CI has failed a PR for. `make preflight` is the quick part, about five minutes: formatting, the docs check, clippy on the host
 # crates and on the kernel, and the host tests (which include the allocation-failure sweep and the fuzzer). `make preflight-full` adds the kernel-only
 # boot at four harts in the debug and the optimised build (the optimised build's stack budget, KT13, moves with every change that moves code between
 # crates): run it when `kernel/`, `ksys/` or `kcore/` changed, about fifteen more minutes. CI additionally runs one and two harts, the instruction counts,
