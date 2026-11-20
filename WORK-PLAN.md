@@ -115,7 +115,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **MM2** the buddy frame allocator (PR 307)
 - [x] **MM3** large pages in the direct map (PR 308)
 - [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
-- [ ] **PL5** discovery: console, interrupt controller, device windows, reset
+- [ ] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a, the windows: PR to follow; the console, the AIA and the reset left)
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
 - [ ] **SC1** sixty-four harts
 - [ ] **HD1** the kernel entropy pool
@@ -238,5 +238,9 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     exception kind. KERNEL-V1-SPEC 2.6, AR1.
   - Kernel address randomisation is built although Sv39 leaves it about 9 and 7 bits; the owner chose the option that
     includes it, and the entropy is stated. HD3.
+  - 2026-11-20, PL5a: the device windows are admitted by an allowlist of compatible strings, not by the item's denylist (every `reg` range
+    not driven by the kernel), because a denylist fails open: on `virt` it would have made fw-cfg (DMA into guest RAM), the flash banks
+    and the PCI ECAM window mappable. Narrower than the item, so safer; the ranges still come from the tree. Alternative: follow the
+    item's text. KERNEL-V1-SPEC 2.3 (dated amendment), `work/PL5.md`.
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

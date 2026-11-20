@@ -331,6 +331,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
             },
             harts_online: crate::smp::online() as u64,
+            windows: crate::kmem::device_windows(),
         };
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {
             return r;

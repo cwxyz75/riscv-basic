@@ -72,7 +72,7 @@ get filled in as each area is built.
 
 | # | Invariant | How checked |
 |---|---|---|
-| D1 | A physical VMO never names RAM: its range is inside a device window, so the frame database never sees its frames and no path frees or zeroes them; the kernel never reads or writes through one (`vmo_read`/`vmo_write` and every syscall copy refuse it) | `abi::layout::in_device_window`, `kcore/tests/device_vmo.rs` (mutation-checked), QEMU `device_caps_need_the_resource`, `mmio_reads_the_virtio_magic` |
+| D1 | A physical VMO never names RAM: its range is inside a device window, so the frame database never sees its frames and no path frees or zeroes them; the kernel never reads or writes through one (`vmo_read`/`vmo_write` and every syscall copy refuse it) | `kcore::devwin` (`kcore/tests/devwin.rs`: the real `virt` tree against `dtc`'s listing; an allowlist by compatible, so an unknown device is never a window; RAM, the kernel's own devices and every controller are cut; four mutants caught), QEMU's refusal probes for the finisher, the CLINT, both APLICs, both IMSIC files, fw-cfg, flash and ECAM, `kcore/tests/device_vmo.rs` (mutation-checked), QEMU `device_caps_need_the_resource`, `mmio_reads_the_virtio_magic` |
 | D2 | A physical address is learnable only through a DMA-right handle of a DMA VMO | QEMU `device_caps_need_the_resource` |
 | D3 | Device objects are minted only with the root resource, which only the kernel-started process can obtain | QEMU `device_caps_need_the_resource` |
 | D4 | DMA frames are freed exactly once, when the VMO and its last mapping go; the DMA budget and the job's page charge come back | `kcore/tests/device_vmo.rs` (random, exact frame count; mutation-checked), QEMU `device_caps_need_the_resource` |

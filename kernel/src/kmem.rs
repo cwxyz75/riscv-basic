@@ -213,6 +213,24 @@ pub fn init() {
             image_end: image_end.div_ceil(PAGE_SIZE),
         };
     }
+    // The device windows a physical VMO may name (PL5, D1): every device range the tree names minus what the kernel itself drives
+    // (the console, the test finisher and the interrupt controller's pages, still constants until the rest of PL5) and minus RAM.
+    {
+        let mut driven: alloc::vec::Vec<(u64, u64)> =
+            alloc::vec![(0x1000_0000, 0x1000), (abi::finisher::BASE as u64, 0x1000)];
+        driven.extend(crate::aia::pages().map(|p| (p, 0x1000)));
+        let windows = crate::dtb::dtb_blob()
+            .and_then(|b| kcore::fdt::parse(b).ok())
+            .map(|nodes| {
+                // RAM and everything reserved (firmware, the image, the tree) is cut from the windows
+                let ram: alloc::vec::Vec<(u64, u64)> =
+                    memory.iter().chain(reserved.iter()).copied().collect();
+                kcore::devwin::device_windows(&nodes, &driven, &ram)
+            })
+            .unwrap_or_default();
+        // SAFETY: boot code, one hart, before anything reads it.
+        unsafe { *addr_of_mut!(WINDOWS) = windows };
+    }
     let mut mm = Mm {
         db: FrameDb::with_ranges(&managed_ranges, storage).expect("room for the frame metadata"),
         mem: DirectMap,
@@ -301,6 +319,15 @@ pub struct MemStats {
     /// The kernel image's frames, first to one past the last.
     pub image_first: u64,
     pub image_end: u64,
+}
+
+/// The device windows (page-aligned `(start, end)` byte ranges) built at boot from the tree; read-only afterwards.
+static mut WINDOWS: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+
+/// The device windows a physical VMO may name.
+pub fn device_windows() -> &'static [(u64, u64)] {
+    // SAFETY: written once by `init` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { &*addr_of!(WINDOWS) }
 }
 
 /// The usable ranges `init` gave the direct map, `(first frame, count)` (read-only after boot).
