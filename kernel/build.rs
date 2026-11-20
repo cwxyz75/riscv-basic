@@ -12,6 +12,13 @@ fn main() {
     // to, or $KERNEL_LMA for the load-address boot test, `make os-boot-test-loadaddr`). Defining it on the linker's command line does not
     // work: lld evaluates the script's `AT()` addresses before it sees `--defsym`.
     let lma = std::env::var("KERNEL_LMA").unwrap_or_else(|_| "0x80200000".to_string());
+    // (the early boot code maps the image with 2 MiB pages: any other load address would stop it before there is a console to say so)
+    let value = u64::from_str_radix(lma.trim_start_matches("0x"), 16)
+        .expect("KERNEL_LMA is a hexadecimal address, like 0x80600000");
+    assert!(
+        value.is_multiple_of(2 << 20),
+        "KERNEL_LMA must be a multiple of 2 MiB"
+    );
     let template = std::fs::read_to_string(format!("{dir}/linker.ld")).expect("read linker.ld");
     let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     std::fs::write(

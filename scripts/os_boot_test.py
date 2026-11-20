@@ -1016,8 +1016,29 @@ def rr_args():
     return ["-icount", f"{shift},rr=record,rrfile={LAST_RECORD[0]}"]
 
 
+def elf_load_address(kernel: str) -> int:
+    """The physical address the kernel ELF asks to be loaded at: `p_paddr` of its first PT_LOAD segment. The kernel is told this (`load=`
+    on its line) and must find itself there (PL4c); a build that ignores the address it was meant for (an earlier version of the
+    load-address test did) is caught because this is read from the ELF, not from what the build was asked for."""
+    import struct
+    with open(kernel, "rb") as f:
+        head = f.read(64)
+        phoff, = struct.unpack_from("<Q", head, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            ph = f.read(phentsize)
+            ptype, = struct.unpack_from("<I", ph, 0)
+            if ptype == 1:
+                paddr, = struct.unpack_from("<Q", ph, 24)
+                return paddr
+    raise SystemExit(f"{kernel}: no PT_LOAD segment")
+
+
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
+    if os.environ.get("OS_LOAD") and int(os.environ["OS_LOAD"], 16) != elf_load_address(kernel):
+        raise SystemExit(f"{kernel} is linked to load at {elf_load_address(kernel):#x}, not at OS_LOAD={os.environ['OS_LOAD']}: the load-address build did not take")
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
         "-m", os.environ.get("OS_RAM", "256M"), "-display", "none", "-serial", "stdio", "-monitor", "none",
@@ -1049,7 +1070,7 @@ def run(kernel: str, extra=()):
                                            f"shard={SHARD}" if SHARD else "",
                                            "kfast" if SHARD == "k" and KFAST else "",
                                            f"ram={os.environ.get('OS_RAM', '256M')}",
-                                           f"load={os.environ['OS_LOAD']}" if os.environ.get("OS_LOAD") else "",
+                                           f"load={elf_load_address(kernel):#x}",
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
           ),

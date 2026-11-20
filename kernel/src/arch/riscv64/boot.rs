@@ -61,12 +61,23 @@ _start:
     la   t2, EARLY_ROOT
     li   t3, 0xC7                # V R W A D
     sd   t3, 0(t2)               # root[0] = phys 0, RW (the devices, until `kmem::init`)
-    # identity: the gigabyte the image runs from, RWX (keeps these instructions running across `satp`)
-    srli t4, t0, 30              # its gigabyte number
+    # identity: the gigabytes the image runs from (its first and its last byte may be in different ones), RWX (keeps these instructions
+    # running across `satp`, and lets a secondary hart read what it needs). An image that starts at 64 GiB or beyond is refused (`9:`).
+    srli a4, t0, 36
+    bnez a4, 9f
+    la   a5, __kernel_end
+    addi a5, a5, -1              # the image's last byte
+    srli a5, a5, 30              # its gigabyte number
+    srli t4, t0, 30              # the first byte's gigabyte number
     slli t5, t4, 3
     add  t5, t2, t5              # &root[number]
     slli t3, t4, 28              # (number << 18) << 10: the frame number of that gigabyte in the entry
     ori  t3, t3, 0xCF            # V R W X A D
+    sd   t3, 0(t5)
+    slli t5, a5, 3
+    add  t5, t2, t5              # (the same slot again when the image sits in one gigabyte)
+    slli t3, a5, 28
+    ori  t3, t3, 0xCF
     sd   t3, 0(t5)
     # PL4: the direct map reaches every gigabyte of physical space the kernel supports (`DIRECT_MAP_PHYS_LIMIT`, 64 GiB), so that
     # `kmem::init` can write page tables into frames wherever the device tree puts RAM: root[256 + i] = phys i GiB, RW, for i = 0 to 63
@@ -96,6 +107,8 @@ _start:
     li   t6, 0x1fffff
     add  t4, t4, t6
     srli t4, t4, 21              # the number of 2 MiB pages
+    li   t6, 511
+    bgtu t4, t6, 9f              # an image that does not fit EARLY_L1 (over 1022 MiB) is refused
     slli a4, t0, 43              # a misaligned image (low 21 bits set) cannot be mapped: stop here (no console yet)
     bnez a4, 9f
     srli a4, t0, 21              # the first page's frame, in 2 MiB units

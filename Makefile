@@ -382,13 +382,17 @@ os-serial-test: os-interactive
 	@if python3 scripts/uv7_detach_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the detach test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
-# The reference CPU of the OS track (OD47).
-# PL4c: the image loaded at another physical address (6 MiB above the default; any multiple of 2 MiB works) boots the kernel-only shard.
-# The link address does not change; the early boot code works out the difference.
+# PL4c: the image loaded at other physical addresses boots the kernel-only shard: 6 MiB above the default (the same gigabyte, a different
+# 2 MiB page) and at 3 GiB + 2 MiB on a 2 GiB machine (another gigabyte, so the early table's identity slot is not the default one). The
+# link address does not change; the early boot code works out the difference. The harness reads each ELF's load address itself and refuses
+# a build that did not take the address it was asked for.
 os-boot-test-loadaddr: os-user
 	cd kernel && KERNEL_LMA=0x80600000 cargo build --target-dir ../target/os-loadaddr
 	OS_LOAD=0x80600000 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr/riscv64gc-unknown-none-elf/debug/kernel
+	cd kernel && KERNEL_LMA=0xc0200000 cargo build --target-dir ../target/os-loadaddr2
+	OS_LOAD=0xc0200000 OS_RAM=2G OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr2/riscv64gc-unknown-none-elf/debug/kernel
 
+# The reference CPU of the OS track (OD47).
 # PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
 os-boot-test-cpu-neg: kernel
 	OS_CPU=rv64 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "missing extension" $(OS_ELF)

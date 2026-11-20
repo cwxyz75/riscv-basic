@@ -127,14 +127,18 @@ pub fn init() {
     let (memory, mut reserved) =
         crate::dtb::memory_map().expect("a device tree below 64 GiB that describes the machine's memory (T180: RAM above 64 GiB is not supported yet)");
     reserved.push((image_start, image_end - image_start));
-    // Firmware keeps its footprint below the load address. The tree normally says so (OpenSBI adds `/reserved-memory`), but a tree that
-    // does not must not make the firmware's own memory the first thing handed out (and the frame metadata's home): everything below the
-    // image in the range that holds it stays reserved, as it was when the layout was a constant.
+    // Firmware keeps its footprint just below the load address. The tree normally says so (OpenSBI adds `/reserved-memory`), but a tree
+    // that does not must not make the firmware's own memory the first thing handed out (and the frame metadata's home): the 2 MiB below the
+    // image (where OpenSBI's own region ends at the default load address) stays reserved when it lies in the same RAM range. Nothing more:
+    // the cost is a fixed 2 MiB wherever the image is.
     if let Some(&(base, _)) = memory
         .iter()
         .find(|&&(b, s)| b <= image_start && image_start < b.saturating_add(s))
     {
-        reserved.push((base, image_start - base));
+        reserved.push((
+            base.max(image_start.saturating_sub(2 << 20)),
+            image_start - base.max(image_start.saturating_sub(2 << 20)),
+        ));
     }
     // Only the physical space the direct map reaches is used (`DIRECT_MAP_PHYS_LIMIT`): RAM above it is left alone, loudly.
     let limit = abi::layout::DIRECT_MAP_PHYS_LIMIT;
@@ -179,7 +183,7 @@ pub fn init() {
         let at =
             (DIRECT_BASE + usable.get(host).expect("the host range").0 * PAGE_SIZE) as *mut Meta;
         // SAFETY: the first `meta_frames` frames of a usable range are RAM that nothing else uses and the database will not hand out;
-        // the early boot table direct-maps all physical space below 128 GiB; `managed` entries fit in `meta_frames` frames (sized from
+        // the early boot table direct-maps all physical space below 64 GiB; `managed` entries fit in `meta_frames` frames (sized from
         // the larger `usable_total`); an all-zero `Meta` is a valid value and the slice is cleared before it is formed; it is the only
         // reference to that memory.
         unsafe {

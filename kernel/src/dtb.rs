@@ -114,7 +114,6 @@ pub fn boot_arg_present(arg: &str) -> bool {
 }
 
 /// The value of the `name` word of the kernel command line, for words like `chaos=17` (`name` is `"chaos="`): the text after it.
-#[cfg_attr(not(feature = "chaos"), allow(dead_code))]
 pub fn boot_arg_value(name: &str) -> Option<alloc::string::String> {
     let blob = dtb_blob()?;
     let nodes = kcore::fdt::parse(blob).ok()?;

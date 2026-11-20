@@ -98,6 +98,7 @@ fn low_half_is_empty() -> Outcome {
         0x8000_0000,
         0x8020_0000,
         0x8800_0000,
+        kmem::stats().image_first << 12, // wherever the image actually is
     ] {
         ensure(
             k.aspace.table().translate(&k.mm, va).is_none(),
@@ -293,7 +294,12 @@ fn the_image_is_where_the_loader_put_it() -> Outcome {
         "the image is loaded at a multiple of 2 MiB",
     )?;
     let Some(want) = crate::dtb::boot_arg_value("load=") else {
-        return Ok(());
+        // a boot without the harness (the interactive targets) says nothing; the harness always does (`ram=` is its mark)
+        return if crate::dtb::boot_arg_value("ram=").is_some() {
+            Err("the harness did not say where it loaded the image (load=)".into())
+        } else {
+            Ok(())
+        };
     };
     let want =
         u64::from_str_radix(want.trim_start_matches("0x"), 16).map_err(|_| "load= is not hex")?;
