@@ -81,6 +81,12 @@ pub mod fp {
     pub fn first_use(frame: &mut TrapFrame) -> bool {
         unimplemented!()
     }
+    pub fn init_boot_hart() {
+        unimplemented!()
+    }
+    pub fn check_hart() {
+        unimplemented!()
+    }
     pub fn thread_gone(tid: u32) {
         unimplemented!()
     }
