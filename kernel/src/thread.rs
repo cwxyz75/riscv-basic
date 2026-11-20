@@ -1098,7 +1098,7 @@ pub fn wake_stat(which: u64) -> u64 {
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
         3..=5 => crate::aia::stat(which),
-        // 6: the `time` counter (10 MHz on QEMU `virt`), so a benchmark need not depend on user-mode counter access
+        // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),
         // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
@@ -1131,6 +1131,8 @@ pub fn wake_stat(which: u64) -> u64 {
         102 => crate::kmem::stats().memory_frames,
         103 => crate::kmem::stats().managed_frames,
         104 => crate::kmem::stats().image_first << 12,
+        // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
+        105 => crate::timer::timebase(),
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
         // 16 + h: how often hart h took the big kernel lock from free

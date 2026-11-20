@@ -114,7 +114,7 @@ AR1 goes first so that everything after it is written on the right side of the b
 - [x] **PL1** RVA23 in the gate, the boot-time extension check (PR 306; the AIA-node check waits for PL6)
 - [x] **MM2** the buddy frame allocator (PR 307)
 - [x] **MM3** large pages in the direct map (PR 308)
-- [ ] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a, memory: PR to follow; PL4b timebase and PL4c load address left)
+- [ ] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a memory: PRs 310; PL4b timebase: PR to follow; PL4c load address left)
 - [ ] **PL5** discovery: console, interrupt controller, device windows, reset
 - [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
 - [ ] **SC1** sixty-four harts

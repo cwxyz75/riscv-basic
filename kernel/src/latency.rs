@@ -225,21 +225,21 @@ pub use off::*;
 /// A test section of known length is reported within 20% (and at the right place): the trace can see what it claims to.
 #[cfg(feature = "latency-trace")]
 pub fn the_latency_trace_can_see_a_long_section() -> Result<(), alloc::string::String> {
-    const LEN: u64 = 50_000; // 5 ms of the 10 MHz counter
+    let len = crate::timer::cycles_from_ns(5_000_000); // 5 ms of the counter
     reset();
     // (this hart's maximum: another hart waiting for the big lock with interrupts off can record a longer span of its
     // own between the reset and the read, which says nothing about this section)
     let h = crate::irq::without(|| {
         let start = crate::timer::now();
-        while crate::timer::now() < start + LEN {
+        while crate::timer::now() < start + len {
             core::hint::spin_loop();
         }
         this_hart()
     });
     let (cycles, site) = irq_off_max_on(h);
-    if !(LEN..=LEN + LEN / 5).contains(&cycles) {
+    if !(len..=len + len / 5).contains(&cycles) {
         return Err(alloc::format!(
-            "a {LEN}-cycle interrupts-off section was reported as {cycles} cycles"
+            "a {len}-cycle interrupts-off section was reported as {cycles} cycles"
         ));
     }
     match site {

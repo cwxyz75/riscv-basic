@@ -312,7 +312,7 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
         crate::irq::without(smp::racy_increment);
     }
     for i in 1..n {
-        if smp::wait_work(i, 5 * 10_000_000) != Some(M) {
+        if smp::wait_work(i, 5 * crate::timer::timebase()) != Some(M) {
             return Err(format!("hart {i} did not finish its increments"));
         }
     }

@@ -111,6 +111,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     heap::init();
     trap::init();
     dtb::locate(dtb); // (the extent of the tree, read once the trap vector can report a fault: `kmem::init` needs it)
+    dtb::init_timebase(); // (the clock's rate: before anything reads the time)
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
@@ -148,7 +149,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     bkl::enforce();
     // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {
-        let deadline = timer::now() + 2 * 10_000_000;
+        let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000);
         while thread::joined() < smp::started() && timer::now() < deadline {
             core::hint::spin_loop();
         }

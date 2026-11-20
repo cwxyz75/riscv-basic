@@ -48,6 +48,7 @@ pub mod sched_smp;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;
+pub mod timebase;
 pub mod usercopy;
 pub mod wait;
 

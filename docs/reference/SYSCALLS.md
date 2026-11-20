@@ -236,7 +236,7 @@ were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart 
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 
-`which` 100 to 104 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, and the physical address where the kernel image starts. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals.
+`which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals.
 
 ### debug_write(ptr, len) -> status
 

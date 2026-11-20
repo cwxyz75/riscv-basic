@@ -184,7 +184,7 @@ ATOMICS = {
     "kernel/src/smp.rs": (7, "hart bring-up and IPI flags"),
     "kernel/src/arch/riscv64/aia.rs": (12, "interrupt controller statistics and masks"),
     "kernel/src/thread.rs": (30, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender as one word and its name as two, the exempt thread)"),
-    "kernel/src/arch/riscv64/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
+    "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot)"),
     "kernel/src/user/trap.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch)"),
