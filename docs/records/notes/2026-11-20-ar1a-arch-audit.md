@@ -42,7 +42,7 @@ canonical-address rule) and doc comments naming `sfence.vma` or `sstatus.FS` (`a
 | `abi/src/lib.rs` 387 to 450 | kernel address layout "(Sv39, upper half)" and its test | AR1d: `abi::arch` holds the user range, stack arena and thread-state layouts; the upper-half test stays with the Sv39 format |
 | `ksys` | nothing | check added in AR1 acceptance (1) keeps it so |
 | `rt/src/lib.rs` | the `ecall` stub, `global_asm!` start code | becomes `libsys/src/arch/riscv64.rs` (the one `ecall` sequence); `rt` keeps the call table |
-| `libc/src/{thread,stdio,spawn,setjmp,posix2,wchar}.rs` | `asm!`/`global_asm!` (thread start, setjmp/longjmp, syscall stubs, one `csr`) | per-architecture directory in libc (`libc/src/arch/riscv64/`); the check covers `kernel/src`, `kcore`, `ksys` only, `libsys` and `libc/src/arch` are exempt |
+| `libc/src/{thread,stdio,spawn,setjmp,posix2}.rs` | `asm!`/`global_asm!` (thread start, setjmp/longjmp, syscall stubs) | per-architecture directory in libc (`libc/src/arch/riscv64/`); the check covers `kernel/src`, `kcore`, `ksys` only, `libsys` and `libc/src/arch` are exempt |
 
 ## Facts the audit found that change the plan
 
@@ -51,5 +51,5 @@ canonical-address rule) and doc comments naming `sfence.vma` or `sstatus.FS` (`a
 2. `PerHart` has a `satp` cache and its doc names `sscratch`: the field becomes an opaque `AspaceToken`.
 3. The four test files above assert raw cause numbers (13, 15). They are rewritten against `Fault` kinds in AR1b, not left behind the check.
 4. The SBI is used only from `smp.rs`; there is no console SBI call outside the boot path.
-5. `libc` has six files of inline assembly. AR1's check does not cover `libc` (it is user-side, built per architecture from the same
+5. `libc` has five files of inline assembly. AR1's check does not cover `libc` (it is user-side, built per architecture from the same
    source tree), but the same rule applies: new assembly goes in `libc/src/arch/`.
