@@ -278,14 +278,17 @@ pub fn init() {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
             .expect("device tree map");
     }
-    // the devices the kernel drives, found in the tree: the console, the test device, the interrupt controller's pages
-    for device in crate::console::base()
+    // the devices the kernel drives, found in the tree: the console, the test device, the interrupt controller's pages. Each page once (the
+    // console and the test device may share one, and a page may not be mapped twice).
+    let mut pages: alloc::vec::Vec<u64> = crate::console::base()
         .into_iter()
-        .chain(crate::finisher::base())
+        .chain(crate::finisher::base().filter(|_| !crate::RELEASE))
         .chain(crate::aia::pages())
-    {
-        // (the page the device's registers are in)
-        let page = device & !(PAGE_SIZE - 1);
+        .map(|d| d & !(PAGE_SIZE - 1))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    for page in pages {
         pt.map(&mut mm, DIRECT_BASE + page, page / PAGE_SIZE, Perms::RW)
             .expect("device page");
     }

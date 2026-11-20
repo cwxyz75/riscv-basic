@@ -202,3 +202,171 @@ fn a_tree_without_the_test_device_has_none() {
     );
     assert_eq!(test_finisher_base(&[]), None);
 }
+
+/// A console tree with extra properties on the UART node and a number of other aliases (the wanted one comes last).
+fn tree_with(
+    extra: &[(&str, Vec<u8>)],
+    uart_compat: &[u8],
+    aliases: usize,
+    name: &str,
+    bootargs: &str,
+) -> Vec<u8> {
+    let mut d = Dt::new();
+    d.begin("");
+    d.u32s("#address-cells", &[1]);
+    d.u32s("#size-cells", &[1]);
+    d.begin("chosen");
+    d.prop("stdout-path", b"serial0:115200\0");
+    if !bootargs.is_empty() {
+        let mut b = bootargs.as_bytes().to_vec();
+        b.push(0);
+        d.prop("bootargs", &b);
+    }
+    d.end();
+    d.begin("aliases");
+    for i in 0..aliases {
+        d.prop(&format!("ethernet{i}"), b"/soc/eth@9000\0");
+    }
+    d.prop("serial0", format!("/soc/{name}\0").as_bytes());
+    d.end();
+    d.begin("other"); // a node with the same name elsewhere, before the real one
+    d.begin("uart@2000");
+    d.u32s("reg", &[0x9999, 0x100]);
+    d.prop("compatible", b"ns16550a\0");
+    d.end();
+    d.end();
+    d.begin("soc");
+    d.u32s("#address-cells", &[1]);
+    d.u32s("#size-cells", &[1]);
+    d.begin("uart@2000");
+    d.u32s("reg", &[0x2000, 0x100]);
+    d.prop("compatible", uart_compat);
+    for (k, v) in extra {
+        d.prop(k, v);
+    }
+    d.end();
+    d.end();
+    d.end();
+    d.finish()
+}
+
+#[test]
+fn many_aliases_the_second_compatible_and_a_same_named_node_elsewhere() {
+    // fifty aliases, the wanted one last: no fixed table to overflow
+    let t = tree_with(&[], b"ns16550a\0", 50, "uart@2000", "");
+    assert_eq!(console_base(&t), Some(0x2000));
+    // the 16550 compatible is the second of two
+    let t = tree_with(&[], b"acme,uart\0ns16550a\0", 0, "uart@2000", "");
+    assert_eq!(console_base(&t), Some(0x2000));
+    // the path matches the node at /soc, not the same-named one under /other (which comes first and has another address)
+    assert_ne!(console_base(&t), Some(0x9999));
+}
+
+#[test]
+fn a_path_without_the_unit_address_names_the_node_that_has_one() {
+    let t = tree_with(&[], b"ns16550a\0", 0, "uart", "");
+    assert_eq!(console_base(&t), Some(0x2000), "/soc/uart names uart@2000");
+    let t = tree_with(&[], b"ns16550a\0", 0, "uart@2001", "");
+    assert_eq!(
+        console_base(&t),
+        None,
+        "a unit address that differs is a different node"
+    );
+}
+
+#[test]
+fn a_uart_the_kernel_cannot_drive_is_not_the_console() {
+    let be = |v: u32| v.to_be_bytes().to_vec();
+    assert_eq!(
+        console_base(&tree_with(
+            &[("status", b"disabled\0".to_vec())],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        None,
+        "disabled"
+    );
+    assert_eq!(
+        console_base(&tree_with(
+            &[("status", b"okay\0".to_vec())],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        Some(0x2000),
+        "okay"
+    );
+    assert_eq!(
+        console_base(&tree_with(
+            &[("reg-shift", be(2))],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        None,
+        "registers four bytes apart"
+    );
+    assert_eq!(
+        console_base(&tree_with(
+            &[("reg-shift", be(0))],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        Some(0x2000),
+        "shift 0 is the plain kind"
+    );
+    assert_eq!(
+        console_base(&tree_with(
+            &[("reg-io-width", be(4))],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        None,
+        "word-wide registers"
+    );
+    assert_eq!(
+        console_base(&tree_with(
+            &[("reg-io-width", be(1))],
+            b"ns16550a\0",
+            0,
+            "uart@2000",
+            ""
+        )),
+        Some(0x2000)
+    );
+}
+
+#[test]
+fn boot_words_are_found_without_allocating() {
+    use kcore::fdt::bootarg_present;
+    let t = tree_with(
+        &[],
+        b"ns16550a\0",
+        0,
+        "uart@2000",
+        "shard=k console=sbi ram=256M",
+    );
+    assert!(bootarg_present(&t, "console=sbi"));
+    assert!(bootarg_present(&t, "shard=k"));
+    assert!(
+        !bootarg_present(&t, "console=s"),
+        "a prefix is not the word"
+    );
+    assert!(!bootarg_present(&t, "sbi"));
+    assert!(
+        !bootarg_present(
+            &tree_with(&[], b"ns16550a\0", 0, "uart@2000", ""),
+            "console=sbi"
+        ),
+        "no bootargs at all"
+    );
+    assert!(!bootarg_present(&[], "console=sbi"));
+}

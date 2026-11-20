@@ -35,7 +35,10 @@ pub fn try_read() -> Option<u8> {
 /// Find the console in the device tree (allocation-free: the first thing `kmain` does, before the heap exists): the UART `/chosen/stdout-path`
 /// names. Returns its physical address, or `None` (then output goes through the firmware's debug console).
 pub fn init_from_tree() -> Option<u64> {
-    let pa = crate::dtb::dtb_blob().and_then(kcore::fdt::console_base)?;
+    let pa = crate::dtb::dtb_blob()
+        .and_then(kcore::fdt::console_base)
+        // (an address the early table does not map would fault with no handler: a tree naming one has no usable console)
+        .filter(|&pa| pa != 0 && pa.saturating_add(0x1000) <= abi::layout::DIRECT_MAP_PHYS_LIMIT)?;
     UART_BASE.store(
         (DIRECT_BASE + pa) as usize,
         core::sync::atomic::Ordering::Relaxed,

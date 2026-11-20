@@ -62,14 +62,19 @@ fn scan(blob: &[u8], name: &str) -> Option<bool> {
 // ---- the early devices (PL5b): allocation-free, because the console is needed before the heap exists ----
 
 /// Deepest nesting the allocation-free walker follows (the same bound as the whole-tree parse).
-const WALK_DEPTH: usize = MAX_DEPTH_EARLY;
-const MAX_DEPTH_EARLY: usize = 16;
+const WALK_DEPTH: usize = MAX_DEPTH;
+const MAX_DEPTH_EARLY: usize = MAX_DEPTH;
 
 /// What `walk_props` calls for each property: the node's path components, its parent's cell counts, the property name and value.
 type PropVisitor<'a, 'f> = dyn FnMut(&[&'a str], (u32, u32), &'a str, &'a [u8]) + 'f;
 
-/// A node's `reg` (the first range) and `compatible` value, as `node_at` collects them.
-type NodeFacts<'a> = (Option<(u64, u64)>, Option<&'a [u8]>);
+/// What `node_at` collects about a node: its `reg` (the first range), `compatible`, and whether anything about it makes it unusable as a
+/// plain byte-register device (a disabled `status`, a `reg-shift` other than 0, a `reg-io-width` other than 1).
+struct NodeFacts<'a> {
+    reg: Option<(u64, u64)>,
+    compat: Option<&'a [u8]>,
+    unusable: bool,
+}
 
 /// Walk every property of the tree without allocating: `f(path, cells, name, value)` is called for each, where `path` is the node's name
 /// components from the root (`["soc", "serial@10000000"]`; the root itself is `[]`) and `cells` is the pair `(#address-cells,
@@ -113,6 +118,9 @@ fn walk_props<'a>(blob: &'a [u8], f: &mut PropVisitor<'a, '_>) -> Option<()> {
                 at += 4;
             }
             3 => {
+                if depth == 0 {
+                    return None; // a property outside any node
+                }
                 let len = be32(structure, at + 4)? as usize;
                 let nameoff = be32(structure, at + 8)? as usize;
                 let value = structure.get(at + 12..at.checked_add(12)?.checked_add(len)?)?;
@@ -154,70 +162,101 @@ fn first_reg(v: &[u8], (a, s): (u32, u32)) -> Option<(u64, u64)> {
     Some((cell(0, a)?, cell(4 * a as usize, s)?))
 }
 
-/// Does `path` (a node's name components from the root) equal the absolute path string `want` (`/soc/serial@10000000`)? No wildcards.
+/// Does one node name match one component of a path string? A component written without a unit address (`serial`) names the node
+/// `serial@10000000` (the specification's rule); one written with it must match exactly.
+fn component_is(name: &str, want: &str) -> bool {
+    name == want
+        || (!want.contains('@') && name.contains('@') && name.split('@').next() == Some(want))
+}
+
+/// Does `path` (a node's name components from the root) equal the absolute path string `want` (`/soc/serial@10000000`, or `/soc/serial`)?
+/// No wildcards.
 fn path_is(path: &[&str], want: &str) -> bool {
     let Some(rest) = want.strip_prefix('/') else {
         return false;
     };
     let mut parts = rest.split('/').filter(|p| !p.is_empty());
     for c in path {
-        if parts.next() != Some(*c) {
-            return false;
+        match parts.next() {
+            Some(p) if component_is(c, p) => {}
+            _ => return false,
         }
     }
     parts.next().is_none()
 }
 
-/// The `reg` and `compatible` of the node at an absolute path (collected by walking the whole tree: properties arrive node by node).
+/// The facts about the node at an absolute path (collected by walking the whole tree: properties arrive node by node).
 fn node_at<'a>(blob: &'a [u8], want: &str) -> Option<NodeFacts<'a>> {
-    let (mut reg, mut compat): (Option<(u64, u64)>, Option<&[u8]>) = (None, None);
+    let mut f = NodeFacts {
+        reg: None,
+        compat: None,
+        unusable: false,
+    };
     walk_props(blob, &mut |path, cells, name, value| {
         if path_is(path, want) {
             match name {
-                "reg" => reg = first_reg(value, cells),
-                "compatible" => compat = Some(value),
+                "reg" => f.reg = first_reg(value, cells),
+                "compatible" => f.compat = Some(value),
+                "status" => {
+                    let st = value.split(|&b| b == 0).next().unwrap_or(&[]);
+                    f.unusable |= st != b"okay" && st != b"ok";
+                }
+                "reg-shift" => f.unusable |= be32(value, 0) != Some(0),
+                "reg-io-width" => f.unusable |= be32(value, 0) != Some(1),
                 _ => {}
             }
         }
     })?;
-    Some((reg, compat))
+    Some(f)
 }
 
 /// The base address of the console UART the tree names: `/chosen/stdout-path` (an absolute path or an alias from `/aliases`, either with
-/// `:options` after it) naming a node whose `compatible` is an NS16550 and whose `reg` gives the base. `None` when the tree names no
-/// console, names one that is not a 16550 or is malformed: the caller falls back to the firmware's console.
+/// `:options` after it) naming a node whose `compatible` is an NS16550, whose `status` is not disabled, whose registers are the plain
+/// byte-wide, stride-one kind the kernel drives (`reg-shift` and `reg-io-width` absent or 0 and 1), and whose `reg` gives the base. `None`
+/// when the tree names no console, names one the kernel cannot drive or is malformed: the caller falls back to the firmware's console.
 pub fn console_base(blob: &[u8]) -> Option<u64> {
     let mut stdout: Option<&str> = None;
-    let mut aliases: [(&str, &str); 8] = [("", ""); 8];
-    let mut n_alias = 0usize;
     walk_props(blob, &mut |path, _, name, value| {
-        let text = core::str::from_utf8(value.split(|&b| b == 0).next().unwrap_or(&[])).ok();
-        match (path, name) {
-            (["chosen"], "stdout-path") => stdout = text,
-            (["aliases"], k) => {
-                if let (Some(t), Some(slot)) = (text, aliases.get_mut(n_alias)) {
-                    *slot = (k, t);
-                    n_alias = n_alias.saturating_add(1);
-                }
-            }
-            _ => {}
+        if path == ["chosen"] && name == "stdout-path" {
+            stdout = core::str::from_utf8(value.split(|&b| b == 0).next().unwrap_or(&[])).ok();
         }
     })?;
     let want = stdout?.split(':').next()?;
     let want = if want.starts_with('/') {
         want
     } else {
-        aliases.iter().take(n_alias).find(|a| a.0 == want)?.1
+        // an alias: its value is the path (no table of aliases: one more walk for this one key)
+        let mut target: Option<&str> = None;
+        walk_props(blob, &mut |path, _, name, value| {
+            if path == ["aliases"] && name == want {
+                target = core::str::from_utf8(value.split(|&b| b == 0).next().unwrap_or(&[])).ok();
+            }
+        })?;
+        target?
     };
-    let (reg, compat) = node_at(blob, want)?;
-    let is_16550 = compat?
+    let f = node_at(blob, want)?;
+    let is_16550 = f
+        .compat?
         .split(|&b| b == 0)
         .any(|c| c == b"ns16550a" || c == b"ns16550");
-    if is_16550 {
-        reg.map(|r| r.0)
+    if is_16550 && !f.unusable {
+        f.reg.map(|r| r.0)
     } else {
         None
     }
+}
+
+/// Is `word` one of the space-separated words of `/chosen/bootargs`? Allocation-free (the boot words that must act before the heap exists).
+pub fn bootarg_present(blob: &[u8], word: &str) -> bool {
+    let mut found = false;
+    let _ = walk_props(blob, &mut |path, _, name, value| {
+        if path == ["chosen"] && name == "bootargs" {
+            found |= value
+                .split(|&b| b == 0 || b == b' ')
+                .any(|w| w == word.as_bytes());
+        }
+    });
+    found
 }
 
 /// The base address of the test finisher, a SiFive test device (`sifive,test1` or `sifive,test0`): the way a headless test run says pass or

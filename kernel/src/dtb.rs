@@ -17,7 +17,7 @@ pub fn locate(dtb: usize) -> Option<(u64, usize)> {
         return None;
     }
     let head = (abi::layout::DIRECT_BASE + dtb as u64) as *const u8;
-    // SAFETY: the early table maps physical addresses below 128 GiB through the direct map; a firmware pointer is a physical address inside
+    // SAFETY: the early table maps physical addresses below 64 GiB through the direct map; a firmware pointer is a physical address inside
     // RAM, so the 8 header bytes are readable. The length is bounded before anything else reads further.
     let (magic, total) = unsafe {
         (
