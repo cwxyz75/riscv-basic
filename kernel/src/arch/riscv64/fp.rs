@@ -27,6 +27,17 @@ struct Cell(UnsafeCell<Option<FpState>>);
 unsafe impl Sync for Cell {}
 static STATE: Cell = Cell(UnsafeCell::new(None));
 
+/// Build the FP bookkeeping once into `slot` (its per-hart array is MAX_HARTS entries: out of line, so `state` has a small frame).
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, once, at the first use of the FP state
+fn init_state(slot: &mut Option<FpState>) {
+    *slot = Some(FpState {
+        tokens: Tokens::new(),
+        threads: BTreeMap::new(),
+        harts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
+    });
+}
+
 fn state() -> &'static mut FpState {
     debug_assert!(
         crate::bkl::held(),
@@ -34,11 +45,14 @@ fn state() -> &'static mut FpState {
     );
     // SAFETY: the big kernel lock is held, and no caller keeps the reference across a context switch.
     unsafe {
-        (*STATE.0.get()).get_or_insert_with(|| FpState {
-            tokens: Tokens::new(),
-            threads: BTreeMap::new(),
-            harts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
-        })
+        let cell = &mut *STATE.0.get();
+        if cell.is_none() {
+            init_state(cell);
+        }
+        match cell {
+            Some(s) => s,
+            None => unreachable!(),
+        }
     }
 }
 

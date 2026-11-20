@@ -158,7 +158,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     bkl::enforce();
     // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {
-        let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000);
+        let deadline = timer::now()
+            + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * smp::started() as u64);
         while thread::joined() < smp::started() && timer::now() < deadline {
             core::hint::spin_loop();
         }

@@ -92,16 +92,29 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
         }
     }
     let entry_phys = secondary_entry as *const () as usize - crate::arch::kernel_delta() as usize;
+    // the harts the tree lists (any ids, any order; the boot hart is index 0): a hart's index is its place in this list
+    let ids: alloc::vec::Vec<u32> = crate::dtb::dtb_blob()
+        .and_then(|b| kcore::fdt::parse(b).ok())
+        .and_then(|nodes| kcore::harts::hart_ids(&nodes, boot_hart_id as u32))
+        .unwrap_or_else(|| {
+            let _ = writeln!(
+                Console,
+                "the tree does not list the boot hart {boot_hart_id}: one hart"
+            );
+            alloc::vec![boot_hart_id as u32]
+        });
     let mut next = 1;
-    for id in 0..MAX_HARTS {
-        if id == boot_hart_id {
-            continue;
-        }
+    for &id in ids.iter().skip(1) {
+        let id = id as usize;
         let r = sbi(EID_HSM, FID_HART_GET_STATUS, id, 0, 0);
         if r.error != 0 {
             continue; // no such hart
         }
         if next >= MAX_HARTS {
+            let _ = writeln!(
+                Console,
+                "more than {MAX_HARTS} harts: the rest are left stopped"
+            );
             break;
         }
         if r.value != HSM_STOPPED {
@@ -131,7 +144,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
     }
     STARTED.store(next, Ordering::SeqCst);
     // wait (bounded) for every started hart
-    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000); // 2 s
+    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * next as u64); // 2 s and 0.1 s per hart (emulated harts start slowly)
     for i in 1..next {
         while !percpu::hart(i).online.load(Ordering::Acquire) {
             if timer::now() > deadline {
@@ -243,19 +256,22 @@ pub fn shootdown() {
         return; // negative control: the test that guards this must fail
     }
     let me = percpu::this().index.load(Ordering::Relaxed);
+    // every other online hart, as the (mask, base) groups the firmware wants: one call per group of 64 ids, not per hart
+    let mut ids = [0usize; MAX_HARTS];
+    let mut n = 0;
     for i in 0..started() {
-        if i == me || !percpu::hart(i).online.load(Ordering::Acquire) {
-            continue;
+        if i != me && percpu::hart(i).online.load(Ordering::Acquire) {
+            if let Some(slot) = ids.get_mut(n) {
+                *slot = percpu::hart(i).hart_id.load(Ordering::Relaxed);
+                n += 1;
+            }
         }
-        let id = percpu::hart(i).hart_id.load(Ordering::Relaxed);
-        // a whole-address-space flush (start = 0, size = 0) of every ASID on that hart
-        let r = sbi5(
-            EID_RFENCE,
-            FID_REMOTE_SFENCE_VMA,
-            [1usize << (id % 64), id - id % 64, 0, 0, 0],
-        );
-        assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
     }
+    kcore::harts::for_each_hart_mask(ids.get_mut(..n).unwrap_or(&mut []), |mask, base| {
+        // a whole-address-space flush (start = 0, size = 0) of every ASID on those harts
+        let r = sbi5(EID_RFENCE, FID_REMOTE_SFENCE_VMA, [mask, base, 0, 0, 0]);
+        assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
+    });
 }
 
 /// Tell every other hart that is part of the scheduler to look at its run state (a kill, for

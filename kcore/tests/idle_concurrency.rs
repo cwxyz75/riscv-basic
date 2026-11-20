@@ -39,7 +39,7 @@ struct World {
 }
 
 /// What `send_pokes` does in the kernel: an IPI to every poked hart that is up.
-fn send_pokes(w: &World, mut pokes: u32, me: usize) {
+fn send_pokes(w: &World, mut pokes: u64, me: usize) {
     pokes &= !(1 << me);
     while pokes != 0 {
         let i = pokes.trailing_zeros() as usize;

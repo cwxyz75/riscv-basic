@@ -34,6 +34,7 @@ pub mod fp;
 pub mod frame;
 pub mod futex;
 pub mod handle;
+pub mod harts;
 pub mod ipc;
 pub mod isa;
 pub mod job;
