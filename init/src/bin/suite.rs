@@ -9627,8 +9627,8 @@ fn device_caps_need_the_resource() -> Outcome {
     sys::handle_close(dvmo);
     // device windows only: never RAM, never off-window, never misaligned or empty
     for (pa, len, what) in [
-        (0x8000_0000u64, 4096u64, "RAM"),
-        (0x8020_0000, 4096, "the kernel image"),
+        (sys::debug_stat(100), 4096u64, "RAM"),
+        (sys::debug_stat(104), 4096, "the kernel image"),
         (0x1000_0000, 4096, "just below the window"),
         (0x1000_9000, 4096, "just above the window"),
         (0x1000_8000, 8192, "straddling the end"),
@@ -9690,7 +9690,7 @@ fn device_caps_need_the_resource() -> Outcome {
     let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
     ensure!(
         pa.is_multiple_of(4096)
-            && (sys::debug_stat(24)..sys::debug_stat(25)).contains(&(pa as u64)),
+            && (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
         "a RAM address: {pa:#x}"
     );
     ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
@@ -10606,7 +10606,7 @@ fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
         let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
         ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
         ensure!(
-            (sys::debug_stat(24)..sys::debug_stat(25)).contains(&(pa as u64)),
+            (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
             "inside RAM: {pa:#x}"
         );
         sys::handle_close(v);

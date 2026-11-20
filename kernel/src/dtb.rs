@@ -7,16 +7,13 @@ pub static DTB: AtomicUsize = AtomicUsize::new(0);
 /// Its length in bytes, from its header (0 until `locate` has read it).
 static DTB_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// The most a device tree may be and still be trusted: firmware trees are a few tens of kilobytes; this bounds what a hostile header can
-/// make the kernel read and map.
-const MAX_DTB_BYTES: usize = 2 * 1024 * 1024;
-
 /// Read the tree's header through the early boot table's direct map (which reaches all physical space the kernel supports, `boot.rs`) and
 /// remember the extent: `kmem::init` keeps the tree's frames out of the allocator and maps them read-only. Returns `(address, length)`, or
 /// `None` for no tree or one that does not look like a tree.
 pub fn locate(dtb: usize) -> Option<(u64, usize)> {
     DTB.store(dtb, Ordering::Relaxed);
-    if dtb == 0 {
+    // (a pointer the early table does not map would fault: refuse it with a message instead; 8 bytes of header must lie below the limit)
+    if dtb == 0 || (dtb as u64).saturating_add(8) > abi::layout::DIRECT_MAP_PHYS_LIMIT {
         return None;
     }
     let head = (abi::layout::DIRECT_BASE + dtb as u64) as *const u8;
@@ -28,8 +25,11 @@ pub fn locate(dtb: usize) -> Option<(u64, usize)> {
             u32::from_be_bytes([*head.add(4), *head.add(5), *head.add(6), *head.add(7)]) as usize,
         )
     };
-    if magic != 0xd00d_feed || !(40..=MAX_DTB_BYTES).contains(&total) {
+    if magic != 0xd00d_feed || !(40..=abi::limits::MAX_DTB_BYTES).contains(&total) {
         return None;
+    }
+    if (dtb as u64).saturating_add(total as u64) > abi::layout::DIRECT_MAP_PHYS_LIMIT {
+        return None; // the tree would run past the span the early table maps
     }
     DTB_LEN.store(total, Ordering::Relaxed);
     Some((dtb as u64, total))

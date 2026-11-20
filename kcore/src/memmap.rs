@@ -10,7 +10,7 @@ pub type FrameRange = (Pfn, usize);
 
 /// The frames fully inside the byte range `(address, size)`: the first frame at or after the start and the last whole one before the end.
 fn inward(addr: u64, size: u64) -> Option<(u64, u64)> {
-    let end = addr.checked_add(size)?;
+    let end = addr.saturating_add(size); // a range that runs past the top of the address space is cut there, like `outward`
     let first = addr.div_ceil(PAGE_SIZE);
     let last = end / PAGE_SIZE; // exclusive
     (first < last).then_some((first, last))

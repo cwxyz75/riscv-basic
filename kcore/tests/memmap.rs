@@ -50,6 +50,17 @@ impl Dt {
         let b: Vec<u8> = v.iter().flat_map(|x| x.to_be_bytes()).collect();
         self.prop(name, &b);
     }
+    /// `reg` of one (address, size) pair in one-cell form.
+    fn reg_1cell(&mut self, a: u32, s: u32) {
+        let mut b = vec![];
+        b.extend(a.to_be_bytes());
+        b.extend(s.to_be_bytes());
+        self.prop("reg", &b);
+    }
+    /// `reg` bytes as given.
+    fn raw_reg(&mut self, b: &[u8]) {
+        self.prop("reg", b);
+    }
     /// `reg` of (address, size) pairs in two-cell form.
     fn reg(&mut self, ranges: &[(u64, u64)]) {
         let mut b = vec![];
@@ -260,4 +271,89 @@ fn the_real_qemu_tree_gives_the_ram_and_the_timebase() {
     assert_eq!(fdt::timebase_frequency(&nodes), Some(10_000_000));
     assert_eq!(fdt::reserved_ranges(&nodes), vec![]);
     assert_eq!(usable_frames(&mem, &[]), vec![(0x80000, 0x8000)]);
+}
+
+/// A machine written by hand with the odd shapes real trees have: one-cell addresses and sizes, several pairs in one `reg`, a node that
+/// looks like memory but has no `device_type`, a reserved node with no `reg`, grandchildren of `/reserved-memory`, an eight-byte timebase.
+#[test]
+fn odd_tree_shapes_are_read_as_the_specification_says() {
+    let mut d = Dt::new();
+    d.rsv = vec![(0x4010_0000, 0x1000)];
+    d.begin("");
+    d.u32s("#address-cells", &[1]);
+    d.u32s("#size-cells", &[1]);
+    d.begin("cpus");
+    d.prop("timebase-frequency", &24_000_000u64.to_be_bytes()); // two cells
+    d.end();
+    d.begin("memory@40000000"); // two banks in one node, one-cell form
+    d.prop("device_type", b"memory\0");
+    let mut reg = vec![];
+    for x in [0x4000_0000u32, 0x0080_0000, 0x5000_0000, 0x0010_0000] {
+        reg.extend(x.to_be_bytes());
+    }
+    d.raw_reg(&reg);
+    d.end();
+    d.begin("memory@60000000"); // no device_type: not memory
+    d.reg_1cell(0x6000_0000, 0x1000_0000);
+    d.end();
+    d.begin("reserved-memory");
+    d.u32s("#address-cells", &[1]);
+    d.u32s("#size-cells", &[1]);
+    d.prop("ranges", &[]);
+    d.begin("dynamic"); // a request with no reg: nothing to name
+    d.prop("size", &[0, 0, 0x10, 0]);
+    d.end();
+    d.begin("fw@40400000");
+    d.reg_1cell(0x4040_0000, 0x0010_0000);
+    d.end();
+    d.end();
+    d.end();
+    let blob = d.finish();
+    let nodes = fdt::parse(&blob).unwrap();
+    assert_eq!(
+        fdt::memory_ranges(&nodes),
+        vec![(0x4000_0000, 0x80_0000), (0x5000_0000, 0x10_0000)]
+    );
+    assert_eq!(fdt::reserved_ranges(&nodes), vec![(0x4040_0000, 0x10_0000)]);
+    assert_eq!(fdt::timebase_frequency(&nodes), Some(24_000_000));
+    let mut reserved = fdt::reserved_ranges(&nodes);
+    reserved.extend(fdt::reservation_block(&blob));
+    // bank one 0x40000..0x40800 minus the reservation block's frame 0x40100 and the firmware's 0x40400..0x40500; bank two 0x50000..0x50100
+    assert_eq!(
+        usable_frames(&fdt::memory_ranges(&nodes), &reserved),
+        vec![
+            (0x40000, 0x100),
+            (0x40101, 0x2ff),
+            (0x40500, 0x300),
+            (0x50000, 0x100)
+        ]
+    );
+}
+
+#[test]
+fn ranges_at_the_top_of_the_address_space_are_cut_there_not_dropped_or_wrapped() {
+    // memory running past u64::MAX is cut at it (the same rule the reserved side already had), not discarded
+    let top = !0xfffu64;
+    let got = usable_frames(&[(top - 0x3000, 0x10_0000)], &[]);
+    assert_eq!(got, vec![((top - 0x3000) / 4096, 3)]);
+    assert_eq!(
+        usable_frames(&[(0, 0x4000)], &[(u64::MAX - 8, 100)]),
+        vec![(0, 4)]
+    );
+}
+
+#[test]
+fn a_reservation_block_without_a_terminator_or_with_too_many_entries_is_bounded() {
+    let mut d = Dt::new();
+    d.rsv = (0..100).map(|i| (0x1000 * (i + 1), 0x1000)).collect();
+    d.begin("");
+    d.end();
+    let blob = d.finish();
+    let got = fdt::reservation_block(&blob);
+    assert_eq!(got.len(), 64, "capped");
+    assert_eq!(got[0], (0x1000, 0x1000));
+    // a header whose block starts outside the blob gives nothing
+    let mut bad = blob.clone();
+    bad[16..20].copy_from_slice(&0x7fff_0000u32.to_be_bytes());
+    assert_eq!(fdt::reservation_block(&bad), vec![]);
 }

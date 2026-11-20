@@ -395,6 +395,9 @@ pub mod layout {
     /// Start of the direct map: physical address `pa` is at `DIRECT_BASE + pa`
     /// (RAM outside the kernel image, plus the device pages the kernel uses).
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
+    /// The direct map reaches physical addresses below this (64 GiB: top-level slots 256 to 319); the slots above it belong to other
+    /// kernel windows (the self-test region at 320, the stacks at 384, the heap at 416, the image at 510). RAM above it is not used.
+    pub const DIRECT_MAP_PHYS_LIMIT: u64 = 64 << 30;
     /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots, and the goldfish real-time clock
     /// (one page, `0x101000`: the wall clock, FS-SPEC section 7; the device manager hands clients a read-only VMO of it).
     pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
@@ -452,6 +455,8 @@ mod tests {
         assert_eq!(slot(DIRECT_BASE), 256);
         assert_eq!(slot(KERNEL_PHYS + KERNEL_OFFSET), 510);
         assert_eq!(slot(LAZY_TEST_BASE), 320);
+        // the direct map's span ends where the next window begins, and the early table's loop (`boot.rs`) maps exactly that span
+        assert_eq!(DIRECT_BASE + DIRECT_MAP_PHYS_LIMIT, LAZY_TEST_BASE);
         assert_eq!(slot(KSTACK_WINDOW_BASE), 384);
         assert_eq!(slot(HEAP_WINDOW_BASE), 416);
         assert_eq!((HEAP_WINDOW_BASE as i64) >> 38, -1);

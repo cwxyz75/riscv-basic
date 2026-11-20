@@ -119,8 +119,32 @@ pub fn init() {
     let image_start = s.text.0 - KERNEL_OFFSET;
     let image_end = s.data.1 - KERNEL_OFFSET;
     let (memory, mut reserved) =
-        crate::dtb::memory_map().expect("a device tree that describes the machine's memory");
+        crate::dtb::memory_map().expect("a device tree below 64 GiB that describes the machine's memory (T180: RAM above 64 GiB is not supported yet)");
     reserved.push((image_start, image_end - image_start));
+    // Firmware keeps its footprint below the load address. The tree normally says so (OpenSBI adds `/reserved-memory`), but a tree that
+    // does not must not make the firmware's own memory the first thing handed out (and the frame metadata's home): everything below the
+    // image in the range that holds it stays reserved, as it was when the layout was a constant.
+    if let Some(&(base, _)) = memory
+        .iter()
+        .find(|&&(b, s)| b <= image_start && image_start < b.saturating_add(s))
+    {
+        reserved.push((base, image_start - base));
+    }
+    // Only the physical space the direct map reaches is used (`DIRECT_MAP_PHYS_LIMIT`): RAM above it is left alone, loudly.
+    let limit = abi::layout::DIRECT_MAP_PHYS_LIMIT;
+    if memory.iter().any(|&(b, s)| b.saturating_add(s) > limit) {
+        use core::fmt::Write;
+        let _ = writeln!(
+            crate::console::Console,
+            "kernel: RAM above {} GiB is not used (the direct map ends there)",
+            limit >> 30
+        );
+    }
+    let memory: alloc::vec::Vec<(u64, u64)> = memory
+        .iter()
+        .filter(|&&(b, _)| b < limit)
+        .map(|&(b, s)| (b, s.min(limit - b)))
+        .collect();
     let usable = kcore::memmap::usable_frames(&memory, &reserved);
     let usable_total: usize = usable.iter().map(|r| r.1).sum();
     // The frame metadata (MM2): one `Meta` per managed frame, carved from the start of the first usable range that can hold it, before any
@@ -143,6 +167,8 @@ pub fn init() {
         })
         .collect();
     let managed: usize = managed_ranges.iter().map(|r| r.1).sum();
+    // SAFETY: boot code, one hart, before anything reads it.
+    unsafe { *addr_of_mut!(USABLE) = usable.clone() };
     let storage: &'static mut [Meta] = {
         let at =
             (DIRECT_BASE + usable.get(host).expect("the host range").0 * PAGE_SIZE) as *mut Meta;
@@ -202,11 +228,24 @@ pub fn init() {
         }
     }
     // The device tree's own frames (not usable memory: reserved above) are mapped read-only (the interrupt controller probe reads them).
+    // Only frames inside the RAM the tree describes are mapped, and a tree that overlaps the image is refused (the image is never
+    // reachable through the direct map, readable or not).
     let tree = crate::dtb::dtb_blob().map_or(0..0, |b| {
         let pa = crate::dtb::DTB.load(core::sync::atomic::Ordering::Relaxed) as u64;
         pa / PAGE_SIZE..(pa + b.len() as u64).div_ceil(PAGE_SIZE)
     });
-    for pfn in tree {
+    assert!(
+        tree.is_empty()
+            || tree.end <= image_start / PAGE_SIZE
+            || tree.start >= image_end.div_ceil(PAGE_SIZE),
+        "the device tree overlaps the kernel image"
+    );
+    let in_ram = |pfn: u64| {
+        memory
+            .iter()
+            .any(|&(b, s)| pfn * PAGE_SIZE >= b && (pfn + 1) * PAGE_SIZE <= b.saturating_add(s))
+    };
+    for pfn in tree.filter(|&p| in_ram(p)) {
         pt.map(&mut mm, DIRECT_BASE + pfn * PAGE_SIZE, pfn, Perms::R)
             .expect("device tree map");
     }
@@ -252,6 +291,15 @@ pub struct MemStats {
     /// The kernel image's frames, first to one past the last.
     pub image_first: u64,
     pub image_end: u64,
+}
+
+/// The usable ranges `init` gave the direct map, `(first frame, count)` (read-only after boot).
+static mut USABLE: alloc::vec::Vec<(u64, usize)> = alloc::vec::Vec::new();
+
+/// The usable ranges (read-only after boot).
+pub fn usable_ranges() -> &'static [(u64, usize)] {
+    // SAFETY: written once by `init` at boot, before any other hart or thread runs; read-only afterwards.
+    unsafe { &*addr_of!(USABLE) }
 }
 
 static mut STATS: MemStats = MemStats {

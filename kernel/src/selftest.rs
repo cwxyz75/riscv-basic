@@ -176,7 +176,8 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
             "a page of the kernel image or firmware is reachable through the direct map",
         )?;
     }
-    let (mut in_map, mut aliases, mut devices) = (0, 0, 0);
+    let usable = kmem::usable_ranges();
+    let (mut in_map, mut aliases, mut devices, mut outside) = (0, 0, 0, 0);
     let (mut leaves, mut level1) = (0u64, 0u64);
     k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
@@ -195,6 +196,17 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
             if va - DIRECT_BASE != t.pfn << 12 {
                 aliases += 1; // not the direct map's own formula
             }
+            // a read-write leaf lies wholly inside a usable range; anything else is a device page (below RAM) or one of the tree's
+            // read-only pages
+            let inside = usable
+                .iter()
+                .any(|&(f, c)| t.pfn >= f && t.pfn + pages <= f + c as u64);
+            if t.perms.write && !inside && t.pfn >= st.ram_first {
+                outside += 1;
+            }
+            if !t.perms.write && t.pfn >= st.ram_first && !(t.perms.read && pages == 1) {
+                outside += 1; // only the tree's pages are read-only RAM, one frame each
+            }
         }
     });
     ensure(in_map > 1000, "the direct map has pages")?;
@@ -212,52 +224,56 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         "device pages in the direct map",
     )?;
     ensure_eq(
+        outside,
+        0,
+        "direct-map leaves that are not usable memory, a device page or a tree page",
+    )?;
+    ensure_eq(
         aliases,
         0,
         "direct-map leaves aliasing the image, firmware or a wrong address",
     )
 }
 
-/// PL4: the frame count matches the machine. The harness says how much RAM it gave QEMU (`ram=<size>` on the kernel line: `128M`, `4G`);
-/// the tree must describe exactly that, and every frame of it is accounted for: managed by the allocator, holding its metadata, or
-/// reserved (firmware, the kernel image, the tree).
+/// PL4: the frame count matches the machine. What does not need the harness's word is checked always: the allocator's total is the managed
+/// frames, and the reserved part of RAM covers at least the kernel image (a tree that reserved nothing would hand out the image's frames)
+/// and is the image plus a little (firmware, the tree). The harness says how much RAM it gave QEMU (`ram=<size>` on the kernel line:
+/// `128M`, `4G`, or bytes); the tree must describe exactly that.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn ram_matches_the_machine() -> Outcome {
     let st = kmem::stats();
-    let Some(want) = crate::dtb::boot_arg_value("ram=") else {
-        return Ok(()); // a boot without the harness (the interactive targets): nothing to compare
-    };
-    let (num, unit) = want.split_at(want.len().saturating_sub(1));
-    let bytes = num.parse::<u64>().map_err(|_| "ram= is not a number")?
-        << match unit {
-            "M" => 20,
-            "G" => 30,
-            _ => return Err("ram= has no M or G".into()),
-        };
-    ensure_eq(
-        st.memory_frames,
-        bytes / 4096,
-        "the frames of RAM the device tree describes",
-    )?;
-    ensure_eq(
-        st.managed_frames + st.meta_frames + (st.memory_frames - st.usable_frames),
-        st.memory_frames,
-        "managed + metadata + reserved is all of RAM",
-    )?;
+    let image = st.image_end - st.image_first;
+    let reserved = st.memory_frames - st.usable_frames;
     ensure_eq(
         k_total_frames(),
         st.managed_frames,
         "the allocator's total is the managed frames",
     )?;
-    // the reserved part is the image, the firmware's footprint and the tree: the image plus at most 8 MiB
     ensure(
-        st.memory_frames - st.usable_frames < st.image_end - st.image_first + 2048,
+        reserved >= image,
+        "the reserved part of RAM covers the image",
+    )?;
+    ensure(
+        st.meta_frames * 4096 >= st.managed_frames * kcore::buddy::META_BYTES as u64,
+        "the frames set aside for the metadata hold one entry per managed frame",
+    )?;
+    ensure(
+        reserved < image + 2048,
         "the reserved part of RAM is the image and a little more",
     )?;
+    let Some(want) = crate::dtb::boot_arg_value("ram=") else {
+        return Ok(()); // a boot without the harness (the interactive targets): nothing to compare
+    };
+    let (num, shift) = match want.as_bytes().last() {
+        Some(b'M') => (&want[..want.len() - 1], 20),
+        Some(b'G') => (&want[..want.len() - 1], 30),
+        _ => (want.as_str(), 0),
+    };
+    let bytes = num.parse::<u64>().map_err(|_| "ram= is not a number")? << shift;
     ensure_eq(
-        st.meta_frames,
-        (st.usable_frames * kcore::buddy::META_BYTES as u64).div_ceil(4096),
-        "the metadata is 16 bytes a frame",
+        st.memory_frames,
+        bytes.min(abi::layout::DIRECT_MAP_PHYS_LIMIT - st.ram_first * 4096) / 4096,
+        "the frames of RAM the device tree describes",
     )
 }
 

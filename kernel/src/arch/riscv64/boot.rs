@@ -13,7 +13,7 @@
 //!                                                       running across `satp`)
 //!   root[256]  phys 0                  RW   direct map base
 //!   root[258]  phys 0x8000_0000        RW   direct map of RAM
-//!   root[259..384] phys 3 GiB ..       RW   direct map of the rest of the physical space (PL4: RAM is wherever the tree says)
+//!   root[257..320] phys 1 GiB ..       RW   direct map of the physical space below 64 GiB (PL4: RAM is wherever the tree says)
 //!   root[510]  phys 0x8000_0000        RWX  the kernel image's upper-half address
 
 use core::arch::global_asm;
@@ -54,10 +54,11 @@ _start:
     sd   t3, 16(t5)              # root[258] = phys 0x8000_0000, RW
     li   t3, 0x200000CF
     sd   t3, 2032(t5)            # root[510] = phys 0x8000_0000, RWX
-    # PL4: the direct map reaches every gigabyte of physical space the kernel supports (127 GiB, Sv39's 128 minus the first), so that
-    # `kmem::init` can write page tables into frames wherever the device tree puts RAM: root[256 + i] = phys i GiB, RW, for i = 3 to 127
-    li   t6, 3
-    li   a2, 128
+    # PL4: the direct map reaches every gigabyte of physical space the kernel supports (`DIRECT_MAP_PHYS_LIMIT`, 64 GiB), so that
+    # `kmem::init` can write page tables into frames wherever the device tree puts RAM: root[256 + i] = phys i GiB, RW, for i = 1 to 63
+    # (0 and 2 are set above; rewriting 2 with the same value is harmless)
+    li   t6, 1
+    li   a2, 64
 5:
     bgeu t6, a2, 6f
     slli t3, t6, 28              # (i << 18) << 10: the frame number of i GiB in the entry
