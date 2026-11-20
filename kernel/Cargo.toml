@@ -40,6 +40,8 @@ latency-trace = []
 # Boot with the plain round-robin scheduling class instead of fixed-priority (OD32).
 # The priority-specific self-tests are skipped; the generic ones must still pass.
 sched-round-robin = []
+# (KT7) schedule perturbation: seeded random delays at lock, IPI, switch and user-return points (boot argument `chaos=<seed>`); no code without it.
+chaos = []
 # Negative controls for the SMP tests (S5d): each disables one safety mechanism, and the test
 # that guards it must then fail (the harness runs these builds and requires that).
 fault-skip-shootdown = []

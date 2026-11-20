@@ -559,6 +559,7 @@ pub fn preempt_point() {
 /// Interrupts must be off.
 #[allow(clippy::expect_used)] // INVARIANT: the running and the next thread are threads the scheduler knows and the kernel table holds (every scheduler thread has a KThread: the same insert)
 fn reschedule() {
+    crate::chaos::point(crate::chaos::Point::Schedule);
     crate::percpu::this()
         .need_resched
         .store(false, Ordering::Relaxed);

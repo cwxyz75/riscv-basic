@@ -756,10 +756,15 @@ pub fn user_return_is_quiet() -> bool {
 }
 
 /// A trap from user mode (called from the trap handler with interrupts off).
+pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
+    user_trap_inner(frame);
+    crate::chaos::point(crate::chaos::Point::ReturnToUser);
+}
+
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: sepc + 4 steps past an ecall; the process of a trapping thread exists; -1000 - cause is a small negative number (cause < 64)
-pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
+fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     let cause = frame.scause;
     match cause {
         8 => {
