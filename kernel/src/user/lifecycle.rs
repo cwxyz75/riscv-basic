@@ -26,6 +26,7 @@ pub(super) fn user_thread_main(token: usize) {
             .procs
             .get_mut(&ts.pid)
             .expect("a process lives while one of its threads does");
+        p.live_tids.insert(thread::current());
         if let Some(o) = ts.obj {
             p.thread_objs.insert(thread::current(), o);
         }
@@ -124,11 +125,17 @@ pub(super) fn teardown(pid: u64) -> i32 {
 pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
     irq::without(|| {
         let s = state();
-        s.thread_pid.retain(|_, p| *p != pid);
+        // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
+        let process = s.procs.remove(&pid);
+        if let Some(p) = process.as_ref() {
+            for tid in &p.live_tids {
+                s.thread_pid.remove(tid);
+            }
+        }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
         // already; this is the backstop)
         s.futexes.forget_process(pid);
-        s.procs.remove(&pid)
+        process
     })
 }
 
@@ -216,6 +223,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
+        p.live_tids.remove(&tid);
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
         if let Some(o) = p.thread_objs.remove(&tid) {

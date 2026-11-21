@@ -36,6 +36,7 @@ fn world() -> W {
         .map_region(&mut vmos, MEM, 4, v, 0, Perms::RW.user())
         .unwrap();
     let p = Process {
+        live_tids: Default::default(),
         aspace,
         handles: HandleTable::new(64),
         asid: 1,

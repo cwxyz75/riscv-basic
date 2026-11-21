@@ -45,6 +45,7 @@ fn world(frames: usize) -> W {
 
 fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process {
     ksys::Process {
+        live_tids: Default::default(),
         aspace: kcore::aspace::AddressSpace::new(
             PageTable::new_with_kernel_half(mm, kernel).unwrap(),
         ),
