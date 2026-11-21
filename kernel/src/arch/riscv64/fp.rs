@@ -675,14 +675,15 @@ fn drop_claim(tid: u64, fp: bool) {
         } else {
             (&p.vs_claim, &p.vs_buf)
         };
+        // (only if the hart still holds this thread: another thread's load there has replaced the claim already)
         if cell.load(core::sync::atomic::Ordering::Acquire) == tid {
             cell.store(0, core::sync::atomic::Ordering::Release);
             buf.store(0, core::sync::atomic::Ordering::Release);
-        }
-        if fp {
-            s.harts[h].forget();
-        } else {
-            s.vharts[h].forget();
+            if fp {
+                s.harts[h].forget();
+            } else {
+                s.vharts[h].forget();
+            }
         }
     }
 }
@@ -691,7 +692,7 @@ fn drop_claim(tid: u64, fp: bool) {
 /// charged to its job. `frame` is the thread's saved user frame if it has run (its `sstatus.FS` is set so the return to user mode loads the
 /// state); a thread that has not run gets it at its first entry (`mark_present`). False when the job cannot be charged.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the register image is built on the stack and moved into its box); T172 shrinks them
-pub fn write_fp(tid: u64, w: &[u64; 33], frame: Option<&mut TrapFrame>) -> bool {
+pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
     let s = state();
     if !charge_state(
         &mut s.fp_charge,
@@ -711,18 +712,16 @@ pub fn write_fp(tid: u64, w: &[u64; 33], frame: Option<&mut TrapFrame>) -> bool 
         tokens, threads, ..
     } = s;
     threads.entry(tid).or_default().replace_regs(tokens, regs);
-    if let Some(fr) = frame {
-        fr.sstatus = (fr.sstatus & !FS_MASK) | (1 << 13);
-    }
     true
 }
 
 /// The thread's vector state in the layout of `abi::thread_state::VECTOR`: vtype, vl, vstart, vcsr, then v0 to v31 (`vlenb` bytes each).
-pub fn read_vec(tid: u64) -> alloc::vec::Vec<u8> {
+pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
     let s = state();
     let n = vlenb();
     let mut out = alloc::vec::Vec::new();
-    let _ = out.try_reserve_exact(32 + n.saturating_mul(32));
+    out.try_reserve_exact(32usize.saturating_add(n.saturating_mul(32)))
+        .ok()?;
     match s.vthreads.get(&tid).and_then(|t| t.regs()) {
         Some(r) => {
             for w in [r.vtype, r.vl, r.vstart, r.vcsr] {
@@ -730,13 +729,13 @@ pub fn read_vec(tid: u64) -> alloc::vec::Vec<u8> {
             }
             out.extend_from_slice(&r.v);
         }
-        None => out.resize(32 + n.saturating_mul(32), 0),
+        None => out.resize(32usize.saturating_add(n.saturating_mul(32)), 0),
     }
-    out
+    Some(out)
 }
 
 /// Write the thread's vector state (`bytes` in the layout of `read_vec`, of exactly `32 + 32 * vlenb` bytes). As `write_fp`.
-pub fn write_vec(tid: u64, bytes: &[u8], frame: Option<&mut TrapFrame>) -> bool {
+pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
     let n = vlenb();
     let s = state();
     if !charge_state(
@@ -763,10 +762,19 @@ pub fn write_vec(tid: u64, bytes: &[u8], frame: Option<&mut TrapFrame>) -> bool 
         vtokens, vthreads, ..
     } = s;
     vthreads.entry(tid).or_default().replace_regs(vtokens, regs);
-    if let Some(fr) = frame {
-        fr.sstatus = (fr.sstatus & !VS_MASK) | (1 << 9);
-    }
     true
+}
+
+/// A thread's FP or vector state was written while it was parked: its frame says Initial so the return to user mode loads it (the thread does
+/// this to its own frame when it wakes).
+pub fn apply_written(tid: u64, frame: &mut TrapFrame, fp: bool, vec: bool) {
+    let _ = tid;
+    if fp {
+        frame.sstatus = (frame.sstatus & !FS_MASK) | (1 << 13);
+    }
+    if vec {
+        frame.sstatus = (frame.sstatus & !VS_MASK) | (1 << 9);
+    }
 }
 
 /// A thread is about to run for the first time from a register image: if state was written for it beforehand, the units are to be loaded.

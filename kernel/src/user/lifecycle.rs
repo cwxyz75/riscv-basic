@@ -25,6 +25,9 @@ pub(super) fn user_thread_main(token: usize) {
         // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
         // SUSPENDED thread's spawner has made it already
         let tid = thread::current();
+        // (a resume may have come before this thread ever ran: the image the spawner made is the sign that it registered the stopped state, and
+        // then it is not made again)
+        let spawner_done = s.initial_regs.contains_key(&tid);
         s.initial_regs.entry(tid).or_insert_with(|| {
             ksys::initial_general(
                 ts.entry,
@@ -34,7 +37,7 @@ pub(super) fn user_thread_main(token: usize) {
                 if ts.spawned { tid } else { 0 },
             )
         });
-        if ts.suspended {
+        if ts.suspended && !spawner_done {
             ksys::thread_start_suspended(s, tid);
             sync_suspends(s);
         }
@@ -73,9 +76,15 @@ pub(super) fn user_thread_main(token: usize) {
     }
     // A thread created in a stopped process waits here: it runs no user code before `process_resume` (or dies with the
     // process).
-    park_while_stopped();
-    // (the return to user mode is a defined point for a switch a wake asked for: X7)
-    thread::preempt_point();
+    // (the return to user mode is a defined point for a switch a wake asked for, X7: and a suspend, a stop or a kill can land while this thread
+    // is switched out there, so look again until a pass finds nothing)
+    loop {
+        park_while_stopped();
+        thread::preempt_point();
+        if irq::without(|| killed_now().is_none() && !stopped_now() && !suspended_now()) {
+            break;
+        }
+    }
     // The marks above were read before `preempt_point`, which can switch and let a kill or stop land (and another thread on this hart
     // record the new epoch) before this thread resumes: its first trap takes the full path, which looks again (PR 267 review)
     crate::percpu::this()
@@ -396,12 +405,6 @@ pub(super) fn park_while_stopped() {
         }
         let (stopped, suspended) = irq::without(|| (stopped_now(), suspended_now()));
         if !stopped && !suspended {
-            if irq::without(|| !state().suspends.is_empty()) {
-                irq::without(|| {
-                    let s = state();
-                    ksys::thread_unparked(s, thread::current());
-                });
-            }
             return;
         }
         if suspended {
@@ -414,10 +417,16 @@ pub(super) fn park_while_stopped() {
             });
         }
         commit_wake(); // (wakes this trap made are committed before this thread sleeps, as at every blocking site)
+        irq::without(|| {
+            state().parked_tids.insert(thread::current());
+        });
         thread::wait_deadline_private(
             || killed_now().is_some() || (!stopped_now() && !suspended_now()),
             u64::MAX,
         );
+        irq::without(|| {
+            state().parked_tids.remove(&thread::current());
+        });
     }
 }
 

@@ -28,7 +28,7 @@ extern "C" {
     /// Interrupts are off until the drop; nothing returns.
     ///
     /// # Safety
-    /// `frame` points at a valid `TrapFrame` that does not overlap the top 288 bytes of the stack (it is on the heap); `token` names a live
+    /// `frame` points at a valid `TrapFrame` that does not overlap the top 288 bytes of the stack (it is in a per-hart static); `token` names a live
     /// process root whose upper half is the kernel's; `tp` holds this hart's `PerHart`; `kernel_top` is the calling thread's own kernel stack
     /// top, 16-aligned; the caller holds no lock.
     #[link_name = "enter_user_frame"]

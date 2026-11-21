@@ -430,12 +430,13 @@ pub fn thread_suspend(
     let (tid, pid) = crate::thread_target(&us.objs, &us.procs, me, current, h, Rights::MANAGE)?;
     let obj = thread_obj(us, pid, tid)?;
     let blocked = blocked(tid);
-    let raise = us
-        .suspends
-        .entry(tid)
-        .or_default()
-        .suspend(blocked)
-        .ok_or(Status::NoMemory)?;
+    let parked = us.parked_tids.contains(&tid);
+    let entry = us.suspends.entry(tid).or_default();
+    let raise = entry.suspend(blocked).ok_or(Status::NoMemory)?;
+    if parked {
+        // asleep in the park at the return to user mode (a stopped process): it is parked, not blocked in a call
+        let _ = entry.return_to_user();
+    }
     if raise {
         ipc::thread_set_suspended(&mut us.objs, obj, true);
     }
@@ -535,6 +536,8 @@ pub fn thread_state_target(
 pub fn thread_suspend_forget(us: &mut UserState, tid: kcore::sched::Tid) {
     us.suspends.remove(&tid);
     us.initial_regs.remove(&tid);
+    us.pending_regs.remove(&tid);
+    us.parked_tids.remove(&tid);
 }
 
 /// A thread made with the SUSPENDED flag: stopped before it ever runs.
@@ -568,5 +571,17 @@ pub fn thread_spawned_suspended(us: &mut UserState, tid: kcore::sched::Tid, sp: 
     }
     if let Some(o) = sp.obj {
         ipc::thread_set_suspended(&mut us.objs, o, true);
+    }
+}
+
+/// The spawner's registration of any new thread, once it has the tid (EX1): the thread is known to `thread_suspend` and the rest from the moment
+/// `thread_spawn` returns, not only after it first runs. The thread registers itself too (idempotent).
+pub fn thread_registered_by_spawner(us: &mut UserState, tid: kcore::sched::Tid, sp: &Spawn) {
+    us.thread_pid.insert(tid, sp.pid);
+    if let Some(p) = us.procs.get_mut(&sp.pid) {
+        p.live_tids.insert(tid);
+        if let Some(o) = sp.obj {
+            p.thread_objs.insert(tid, o);
+        }
     }
 }

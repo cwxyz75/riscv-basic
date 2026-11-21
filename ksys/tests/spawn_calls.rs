@@ -469,3 +469,43 @@ fn a_suspended_thread_is_made_with_its_object_stopped_and_a_register_image() {
         "not suspended any more"
     );
 }
+
+#[test]
+fn a_resume_before_a_suspended_thread_first_runs_is_not_lost() {
+    let mut w = world();
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED) << 32;
+    let s = w.spawn(r).unwrap();
+    // the spawner's half, and a resume at once (the fork-child sequence with no pause)
+    ksys::thread_registered_by_spawner(&mut w.us, 77, &s);
+    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    let (tid, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert_eq!((tid, wake), (77, true));
+    // the thread's own registration, when it first runs: the image the spawner made says that the stopped state was registered, and a resume
+    // has used it up, so the thread does not make it again (the kernel's `user_thread_main` tests this)
+    assert!(w.us.initial_regs.contains_key(&77));
+    assert!(!w.us.suspends.contains_key(&77), "not suspended again");
+}
+
+#[test]
+fn a_thread_asleep_in_the_park_at_the_return_counts_as_parked_not_blocked_in_a_call() {
+    let mut w = world();
+    let s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 88, &s);
+    // the thread is asleep in the park of a stopped process (the scheduler says "blocked"): a suspend finds it there
+    w.us.parked_tids.insert(88);
+    ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| true).unwrap();
+    assert!(
+        ksys::thread_state_target(&w.us, 1, 5, s.handle, true).is_ok(),
+        "its registers can be written: it is parked at the return to user mode"
+    );
+    // a thread that is blocked in a call and not parked there: a read, no write
+    let s2 = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 89, &s2);
+    ksys::thread_suspend(&mut w.us, 1, 5, s2.handle, |_| true).unwrap();
+    assert!(ksys::thread_state_target(&w.us, 1, 5, s2.handle, false).is_ok());
+    assert_eq!(
+        ksys::thread_state_target(&w.us, 1, 5, s2.handle, true),
+        Err(Status::BadState)
+    );
+}

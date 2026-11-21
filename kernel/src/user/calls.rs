@@ -192,16 +192,19 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         let k = kmem::get();
         ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
     })?;
-    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
+    // Spawned after the state borrow is gone. The call runs under the big lock with interrupts off and the new thread's first act is to take that
+    // lock, so what follows (the spawner's half of the registration) happens before the thread runs a line of `user_thread_main`.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    if spawn.suspended {
-        // (EX1) the spawner's half: the thread is stopped and its register image exists before this call returns the handle that can resume it
-        irq::without(|| {
-            let s = state();
+    irq::without(|| {
+        let s = state();
+        // (EX1) the thread is known to `thread_suspend` and the rest from the moment this call returns; a SUSPENDED one is stopped, with its
+        // register image, before the handle that can resume it is handed back
+        ksys::thread_registered_by_spawner(s, tid, &spawn);
+        if spawn.suspended {
             ksys::thread_spawned_suspended(s, tid, &spawn);
             sync_suspends(s);
-        });
-    }
+        }
+    });
     Ok((Some(spawn.handle), Some(tid)))
 }
 
@@ -253,6 +256,8 @@ pub(super) fn thread_resume_call(a: [u64; 6]) -> Reply {
 }
 
 /// The user registers of a stopped thread, in the GENERAL layout: its starting image if it has not run, else its saved frame.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a register image on the stack (T172 shrinks them)
 fn general_of(
     s: &UserState,
     tid: Tid,
@@ -260,6 +265,10 @@ fn general_of(
 ) -> Option<[u64; 32]> {
     if let Some(image) = s.initial_regs.get(&tid) {
         return Some(*image);
+    }
+    // (a write the thread has not applied yet is what it will have)
+    if let Some(g) = s.pending_regs.get(&tid).and_then(|p| p.general) {
+        return Some(g);
     }
     // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers;
     // the big kernel lock is held, as for every other access to it.
@@ -327,13 +336,16 @@ fn state_write(
         kcore::usercopy::copy_from_user(&mut caller.aspace, k.mm, k.vmos, k.jobs, buf, len)
             .map_err(|e| (e, None, None))?
     };
-    let w = le_words(&data);
-    // (the thread's frame, if it has run: its FP and vector state is switched on there)
-    let frame = frame_ptr
-        .filter(|_| !s.initial_regs.contains_key(&tid))
-        // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved
-        // registers; the big kernel lock is held, as for every other access to it.
-        .map(|p| unsafe { &mut *p });
+    // (the two fixed layouts become words; the vector layout is written as bytes: it can be large and its allocation was the copy's)
+    let w = if kind == ts::VECTOR {
+        alloc::vec::Vec::new()
+    } else {
+        le_words(&data)
+    };
+    // A thread that has not run is written through its starting image. One that has is parked at the return to user mode holding a `&mut` to its
+    // own frame, so nobody else writes the frame: the write is left for it (`pending_regs`) and it applies it itself when it wakes.
+    let ran = !s.initial_regs.contains_key(&tid);
+    let _ = frame_ptr;
     match kind {
         ts::GENERAL => {
             let mut g = [0u64; 32];
@@ -344,22 +356,26 @@ fn state_write(
             }
             if let Some(image) = s.initial_regs.get_mut(&tid) {
                 *image = g;
-            } else if let Some(f) = frame {
-                f.set_general(&g);
             } else {
-                return bad(Status::BadState);
+                s.pending_regs.entry(tid).or_default().general = Some(g);
             }
         }
         ts::FP => {
             let mut g = [0u64; 33];
             g.copy_from_slice(&w);
-            if !crate::fp::write_fp(tid, &g, frame) {
+            if !crate::fp::write_fp(tid, &g) {
                 return bad(Status::NoMemory);
+            }
+            if ran {
+                s.pending_regs.entry(tid).or_default().fp = true;
             }
         }
         _ => {
-            if !crate::fp::write_vec(tid, &data, frame) {
+            if !crate::fp::write_vec(tid, &data) {
                 return bad(Status::NoMemory);
+            }
+            if ran {
+                s.pending_regs.entry(tid).or_default().vec = true;
             }
         }
     }
@@ -386,7 +402,7 @@ fn state_read(
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect(),
-        _ => crate::fp::read_vec(tid),
+        _ => crate::fp::read_vec(tid).ok_or((Status::NoMemory, None, None))?,
     };
     let k = kmem::get();
     let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;

@@ -21,11 +21,33 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
     aspace_token_of(p)
 }
 
+/// Register writes (`thread_write_state`) that were left for this thread while it was parked: applied here, by the thread to its own frame (the
+/// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
+fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
+    let pending = irq::without(|| {
+        let s = state();
+        if s.pending_regs.is_empty() {
+            return None;
+        }
+        s.pending_regs.remove(&thread::current())
+    });
+    let Some(p) = pending else {
+        return;
+    };
+    if !frame.is_from_user() {
+        return; // (a kernel frame: nothing was written for it)
+    }
+    if let Some(g) = p.general {
+        frame.set_general(&g);
+    }
+    crate::fp::apply_written(thread::current(), frame, p.fp, p.vec);
+}
+
 /// Make the calling thread's process the current address space, just before returning to
 /// user mode. Needed because the hart's address space belongs to whichever user thread last ran:
 /// threads of different processes are switched between, and the kernel half is shared so
 /// kernel code runs under any of them, but returning to user mode must use *this* one.
-pub fn activate_current() {
+pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // (the epoch first, then the marks: a kill that lands after this load moves the epoch and is seen at the next trap)
     crate::percpu::this()
         .attention_seen
@@ -33,6 +55,7 @@ pub fn activate_current() {
     // A process that was killed while its thread was not running dies here, at the point
     // where it would otherwise return to user mode.
     park_while_stopped();
+    apply_pending_regs(frame);
     let token = irq::without(|| {
         let s = state();
         let UserState {

@@ -3252,6 +3252,18 @@ fn ex1_pause(ticks: u64) -> Result<(), Detail> {
     Ok(())
 }
 
+/// Poll `cond` (every tick) until it holds or `ticks` have passed.
+fn ex1_until(ticks: u64, cond: impl Fn() -> bool) -> bool {
+    let end = sys::clock_get() + ticks;
+    while sys::clock_get() < end {
+        if cond() {
+            return true;
+        }
+        let _ = ex1_pause(1);
+    }
+    cond()
+}
+
 fn ex1_signals(t: u64) -> u32 {
     sys::object_signals(t).a1 as u32
 }
@@ -3334,8 +3346,12 @@ fn a_stopped_thread_can_be_sent_to_a_handler_and_back() -> Outcome {
     g[31] = ex1_handler as *const () as usize as u64;
     ensure_eq!(ex1_write(t, &g), Some(S::Ok), "point the pc at the handler");
     ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
-    ex1_pause(3)?;
-    ensure_eq!(EX1_HITS.load(Ordering::SeqCst), 1, "the handler ran once");
+    ensure!(
+        ex1_until(100, || EX1_HITS.load(Ordering::SeqCst) == 1),
+        "the handler ran"
+    );
+    ex1_pause(2)?;
+    ensure_eq!(EX1_HITS.load(Ordering::SeqCst), 1, "and only once");
     ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "stop it again");
     ensure_eq!(
         sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
@@ -3432,6 +3448,44 @@ fn a_thread_started_suspended_runs_only_after_resume_with_registers_written_firs
         sys::thread_info(t).a1,
         77,
         "from the registers that were written"
+    );
+    Ok(())
+}
+
+/// The fork-child sequence with no pause at all: the spawner writes the child's registers and resumes it at once.
+fn a_thread_started_suspended_and_resumed_at_once_runs() -> Outcome {
+    for _ in 0..8 {
+        let (t, _) = ex1_spawn(ex1_spin_a1, rt::abi::spawn::SUSPENDED)?;
+        let mut g = ex1_read(t)?;
+        g[10] = EX1_MAGIC;
+        ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write at once");
+        ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume at once");
+        ensure_eq!(
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+            0,
+            "it runs"
+        );
+        ensure_eq!(
+            sys::thread_info(t).a1,
+            77,
+            "from the registers that were written"
+        );
+    }
+    // a thread that is not suspended can be suspended at once too: it is known from the moment the spawn returns
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend at once");
+    ensure!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status == 0,
+        "it stops"
+    );
+    let mut g = ex1_read(t)?;
+    g[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
     );
     Ok(())
 }
@@ -3718,6 +3772,54 @@ fn fp_and_vector_state_round_trip_through_thread_state() -> Outcome {
         "it ran and ended"
     );
     ensure_eq!(sys::thread_info(t).a1, 66, "having seen f1");
+    // a thread that has run (it uses the FP unit: its first FP instruction turned it on) gets FP state written while it is stopped: the unit is
+    // loaded from the new state when it runs again
+    let (u, _) = ex1_spawn(ex1_spin_f1, 0)?;
+    ex1_pause(3)?;
+    ensure_eq!(
+        st(sys::thread_suspend(u)),
+        Some(S::Ok),
+        "suspend a running thread that uses FP"
+    );
+    ensure_eq!(
+        sys::object_wait(u, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut z = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            u,
+            FPK,
+            z.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read its FP state"
+    );
+    ensure_eq!(
+        z[1],
+        0,
+        "f1 is still zero: the thread is waiting for the pattern"
+    );
+    z[1] = 0x123_4567;
+    ensure_eq!(
+        st(sys::thread_write_state(
+            u,
+            FPK,
+            z.as_ptr() as *const u8,
+            264
+        )),
+        Some(S::Ok),
+        "write f1"
+    );
+    ensure_eq!(st(sys::thread_resume(u)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(u, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it sees the new f1 and ends"
+    );
+    ensure_eq!(sys::thread_info(u).a1, 66, "its exit code says it did");
     Ok(())
 }
 
@@ -13497,6 +13599,10 @@ pub fn app_main() -> i32 {
         (
             "a_thread_started_suspended_runs_only_after_resume_with_registers_written_first",
             a_thread_started_suspended_runs_only_after_resume_with_registers_written_first,
+        ),
+        (
+            "a_thread_started_suspended_and_resumed_at_once_runs",
+            a_thread_started_suspended_and_resumed_at_once_runs,
         ),
         (
             "suspend_and_state_calls_check_their_arguments_and_rights",

@@ -17,6 +17,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, FaultError};
 use kcore::testlog;
 
+/// Bytes of a saved trap frame: where a thread's frame sits below its kernel stack's top (`trap_entry`, `enter_user_frame`).
+pub const FRAME_BYTES: u64 = 288;
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == FRAME_BYTES as usize);
+
 /// Saved registers: x0 is unused (slot kept so the index is the register number),
 /// then the trap CSRs.
 #[repr(C)]
@@ -37,6 +41,12 @@ impl TrapFrame {
         stval: 0,
         sstatus: 0,
     };
+
+    /// Was this frame saved by a trap from user mode?
+    #[inline(always)]
+    pub fn is_from_user(&self) -> bool {
+        self.sstatus & (1 << 8) == 0
+    }
 
     /// Is this trap from user mode a system call? (The hot path: cheaper than building the whole decoded trap.)
     #[inline(always)]
@@ -88,7 +98,7 @@ impl TrapFrame {
             sepc: words[31],
             scause: 0,
             stval: 0,
-            sstatus: 1 << 5, // SPIE
+            sstatus: (1 << 5) | (2 << 32), // SPIE, and UXL 64-bit (a trap's own frame has it: a WARL field written as it reads)
         };
         f.x[1..].copy_from_slice(&words[..31]);
         f
@@ -430,7 +440,7 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
             crate::thread::switch_if_designated();
             crate::user::commit_wake();
             crate::thread::preempt_point();
-            crate::user::activate_current();
+            crate::user::activate_current(frame);
             crate::heap::service();
             crate::bkl::unlock();
         }
@@ -485,7 +495,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
                 crate::thread::switch_if_designated();
                 crate::user::commit_wake();
                 crate::thread::preempt_point();
-                crate::user::activate_current();
+                crate::user::activate_current(frame);
                 crate::heap::service();
                 crate::bkl::unlock();
             }
@@ -496,7 +506,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             crate::thread::switch_if_designated();
             crate::user::commit_wake();
             crate::thread::preempt_point();
-            crate::user::activate_current();
+            crate::user::activate_current(frame);
             crate::heap::service();
             crate::bkl::unlock();
         } else if crate::thread::timer_interrupt() {
@@ -519,7 +529,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             // the return to user mode is a defined point for the switch a wake asked for (X7)
             crate::thread::preempt_point();
             // (a switch away and back: load this thread's address space again, as every other path through `trap_body` does)
-            crate::user::activate_current();
+            crate::user::activate_current(frame);
         }
         crate::heap::service(); // (a safe point: headroom for the next allocations, see heap.rs)
         crate::bkl::unlock();
@@ -550,7 +560,7 @@ fn ipi_trap(frame: &mut TrapFrame) {
             crate::fp::trap_entry(frame);
             crate::thread::reschedule_this_hart();
             crate::thread::preempt_point();
-            crate::user::activate_current();
+            crate::user::activate_current(frame);
             crate::bkl::unlock();
         } else if crate::thread::reschedule_fast() {
             // interrupted kernel code and the hart must switch: only now the big kernel lock
@@ -591,7 +601,7 @@ fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     if from_user {
         crate::user::commit_wake();
         crate::thread::preempt_point();
-        crate::user::activate_current();
+        crate::user::activate_current(frame);
     }
     crate::heap::service();
     crate::bkl::unlock();
@@ -612,7 +622,7 @@ fn trap_body(frame: &mut TrapFrame) {
     if frame.sstatus & (1 << 8) == 0 {
         // SPP = 0: the trap came from user mode.
         crate::user::user_trap(frame);
-        crate::user::activate_current();
+        crate::user::activate_current(frame);
         return;
     }
     let access = match cause {

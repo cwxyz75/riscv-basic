@@ -1011,6 +1011,10 @@ pub fn wait_deadline_registered(
             if now_ns() >= deadline {
                 return Some(false);
             }
+            // (EX1, MM8) a thread that was suspended after it entered the call has stopped where it is, and the translations a copy made stale
+            // are dropped before it sleeps (both are one load when nothing is pending)
+            crate::user::suspend_blocks();
+            crate::user::cow_sync();
             // (prepared before registering: the order of 3.7 — under the big lock nothing can interleave, but the
             // protocol is the one the later locks need)
             let _ = sched().prepare_block_on(hart());
@@ -1267,7 +1271,7 @@ pub fn user_frame_ptr(tid: Tid) -> Option<*mut crate::trap::TrapFrame> {
     irq::without(|| {
         let k = kernel();
         let top = (k.threads.get(&tid)?.stack.as_ref()?.top() & !15) as u64;
-        Some((top - 288) as *mut crate::trap::TrapFrame)
+        Some((top - crate::trap::FRAME_BYTES) as *mut crate::trap::TrapFrame)
     })
 }
 

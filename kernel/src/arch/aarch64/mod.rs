@@ -99,13 +99,16 @@ pub mod fp {
     pub fn read_fp(tid: u64) -> [u64; 33] {
         unimplemented!()
     }
-    pub fn write_fp(tid: u64, w: &[u64; 33], frame: Option<&mut TrapFrame>) -> bool {
+    pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
         unimplemented!()
     }
-    pub fn read_vec(tid: u64) -> alloc::vec::Vec<u8> {
+    pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
         unimplemented!()
     }
-    pub fn write_vec(tid: u64, bytes: &[u8], frame: Option<&mut TrapFrame>) -> bool {
+    pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+        unimplemented!()
+    }
+    pub fn apply_written(tid: u64, frame: &mut TrapFrame, fp: bool, vec: bool) {
         unimplemented!()
     }
     pub fn mark_present(tid: u64, frame: &mut TrapFrame) {
@@ -165,10 +168,14 @@ pub mod trap {
     use crate::arch::UserTrap;
     use kcore::aspace::{Access, FaultError};
 
+    pub const FRAME_BYTES: u64 = 288;
     pub struct TrapFrame;
 
     impl TrapFrame {
         pub const ZERO: TrapFrame = TrapFrame;
+        pub fn is_from_user(&self) -> bool {
+            unimplemented!()
+        }
         pub fn is_syscall(&self) -> bool {
             unimplemented!()
         }
