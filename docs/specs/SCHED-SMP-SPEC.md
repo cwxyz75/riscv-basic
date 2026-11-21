@@ -1458,3 +1458,7 @@ What this amendment replaces; everything else in this document stands.
 ## Amendment 2026-11-20: the kernel entropy pool (HD1)
 
 Section 3.3: one lock class is added, `ENTROPY` (the kernel entropy generator's lock, taken for a draw and never across a call out), between `HEAP` (13) and `UART`, which becomes 15.
+
+## Amendment 2026-11-21: the per-hart frame cache (L16 part c)
+
+Section 3.10, Frames: a cached frame **stays allocated in the database with reference count 1**, held by the cache, instead of having reference count zero. The leak oracles still count it as free (`free_frames_accounted` adds the caches' lengths); the database never lists it free, so no other hart can take it, and the cache's drain checks that each frame it returns still has exactly its one reference. Only a frame whose sole reference the caller holds goes back to a cache (`free_sole`): the kernel's own frames; user pages stay on the database. Zeroing at allocation is left out of the cache: no consumer of it needs zeroed frames (the slab pool does not), and a frame that does is zeroed by its taker. The model of the cache's refill and drain is a **shuttle** model (`kcore/tests/fcache_concurrency.rs`), not loom: the repository's concurrency models of this kind (`rq_concurrency`) are shuttle, and the property (no frame held twice, none lost) needs random schedules over a locked database, not exhaustive ones.

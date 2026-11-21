@@ -12,7 +12,7 @@ use common::*;
 /// A handle to the root job with `rights`.
 fn root_handle(w: &mut World, rights: Rights) -> u64 {
     let mut q = Quota {
-        jobs: &mut w.vmos.jobs,
+        jobs: &mut w.jobs,
         job: Some(JobId::ROOT),
     };
 
@@ -94,7 +94,6 @@ fn job_create_rows() {
 fn job_create_failure_leaks_no_job() {
     let mut w = world();
     let tiny = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -108,13 +107,13 @@ fn job_create_failure_leaks_no_job() {
     let root = root_handle(&mut w, Rights::JOB);
     w.poke(BASE, &limits([NONE; 6]));
     // the caller's job may hold no object at all: the new job's handle cannot be charged
-    let live = w.vmos.jobs.live();
+    let live = w.jobs.live();
     assert_eq!(
         w.err(nr::JOB_CREATE, [root, BASE, 0, 0, 0, 0]),
         Status::NoMemory
     );
     assert_eq!(
-        w.vmos.jobs.live(),
+        w.jobs.live(),
         live,
         "the job made for the refused call is released again"
     );
@@ -166,7 +165,7 @@ fn job_info_rows() {
         Status::AccessDenied
     );
     assert_eq!(
-        w.err(nr::JOB_INFO, [root, 8, 0, 0, 0, 0]),
+        w.err(nr::JOB_INFO, [root, 9, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
     // the usage counts what was made: a channel is two objects, charged to the job

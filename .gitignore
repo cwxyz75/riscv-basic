@@ -5,3 +5,7 @@
 # Third-party downloads (make fetch-third-party) are never committed; vendored sources live elsewhere in third_party/.
 /third_party/fetched/
 .claude/worktrees/
+
+# cargo-mutants output (a run leaves it in the directory it was started in; the scripts put theirs under target/)
+/mutants.out
+/mutants.out.old

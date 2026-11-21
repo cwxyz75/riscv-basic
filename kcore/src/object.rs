@@ -70,6 +70,10 @@ struct Slot<T> {
     job: Option<JobId>,
 }
 
+/// Bytes of bookkeeping the registry keeps around each object (its slot: generation, koid, count, the job the object is charged to), for the
+/// kernel-byte charge of an object (MM5).
+pub const SLOT_OVERHEAD: usize = core::mem::size_of::<Slot<()>>();
+
 pub struct Registry<T: Object> {
     slots: Vec<Slot<T>>,
     /// The koid the next object gets (a counter from 1; test builds start it high, `fast_forward_koid`).

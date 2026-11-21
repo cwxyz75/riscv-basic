@@ -22,6 +22,7 @@ const REC: u64 = 0x50_0000;
 
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
+        live_tids: Default::default(),
         aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
         handles: HandleTable::new(64),
         asid: 1,
@@ -49,6 +50,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
 struct W {
     us: UserState,
     vmos: Vmos,
+    jobs: kcore::job::Jobs,
     mm: Mm<FakeMem>,
     /// A handle in process 1 to process 2, with every right.
     ph: u64,
@@ -67,26 +69,27 @@ fn world() -> W {
     us.procs
         .insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
     let mut vmos = Vmos::new();
-    let code = vmos.create(1);
+    let mut jobs = kcore::job::Jobs::new();
+    let code = vmos.create(&mut jobs, 1);
     us.procs
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE, 1, code, 0, Perms::RX.user())
+        .map_region(&mut vmos, CODE, 1, code, 0, Perms::RX.user())
         .unwrap();
-    let data = vmos.create(1);
+    let data = vmos.create(&mut jobs, 1);
     us.procs
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
+        .map_region(&mut vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
         .unwrap();
-    let rec = vmos.create(1);
+    let rec = vmos.create(&mut jobs, 1);
     us.procs
         .get_mut(&1)
         .unwrap()
         .aspace
-        .map_region(&vmos, REC, 1, rec, 0, Perms::RW.user())
+        .map_region(&mut vmos, REC, 1, rec, 0, Perms::RW.user())
         .unwrap();
     let p = us.procs.get_mut(&1).unwrap();
     let (h, _) = ipc::process_object_create_in(
@@ -95,7 +98,7 @@ fn world() -> W {
         2,
         false,
         &mut Quota {
-            jobs: &mut vmos.jobs,
+            jobs: &mut jobs,
             job: Some(JobId::ROOT),
         },
     )
@@ -103,6 +106,7 @@ fn world() -> W {
     W {
         us,
         vmos,
+        jobs,
         mm,
         ph: h.0,
     }
@@ -112,8 +116,15 @@ impl W {
     fn record(&mut self, w: [u64; 8]) {
         let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
         let p = self.us.procs.get_mut(&1).unwrap();
-        kcore::usercopy::copy_to_user(&mut p.aspace, &mut self.mm, &mut self.vmos, REC, &bytes)
-            .unwrap();
+        kcore::usercopy::copy_to_user(
+            &mut p.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            REC,
+            &bytes,
+        )
+        .unwrap();
     }
     /// A record: entry, arg, tp, stack bytes, guard bytes, prio | flags << 32, caller sp, reserved.
     fn spawn(&mut self, rec: [u64; 8]) -> Result<ksys::Spawn, Status> {
@@ -122,6 +133,7 @@ impl W {
             &mut self.us,
             &mut self.mm,
             &mut self.vmos,
+            &mut self.jobs,
             1,
             10,
             [self.ph, REC, 0, 0, 0, 0],
@@ -131,10 +143,10 @@ impl W {
         [CODE, 7, 0x1234, 0, 0, 0, 0, 0]
     }
     fn pages_used(&self, job: JobId) -> u64 {
-        self.vmos.jobs.usage(job).unwrap().get(Resource::Pages)
+        self.jobs.usage(job).unwrap().get(Resource::Pages)
     }
     fn threads_charged(&self, job: JobId) -> u64 {
-        self.vmos.jobs.usage(job).unwrap().get(Resource::Threads)
+        self.jobs.usage(job).unwrap().get(Resource::Threads)
     }
 }
 
@@ -207,6 +219,7 @@ fn the_error_rows_in_order() {
             &mut w.us,
             &mut w.mm,
             &mut w.vmos,
+            &mut w.jobs,
             1,
             10,
             [0x999, 0x10, 0, 0, 0, 0]
@@ -218,6 +231,7 @@ fn the_error_rows_in_order() {
             &mut w.us,
             &mut w.mm,
             &mut w.vmos,
+            &mut w.jobs,
             1,
             10,
             [0x999, REC, 0, 0, 0, 0]
@@ -237,6 +251,7 @@ fn the_error_rows_in_order() {
             &mut w.us,
             &mut w.mm,
             &mut w.vmos,
+            &mut w.jobs,
             1,
             10,
             [weak.0, REC, 0, 0, 0, 0]
@@ -244,14 +259,13 @@ fn the_error_rows_in_order() {
         Err(Status::AccessDenied)
     );
     // a priority above the job's maximum is refused, not clamped
-    let low = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    w.vmos
-        .jobs
+    let low = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.jobs
         .set_sched(
             low,
             SchedLimits {
                 max_prio: 4,
-                ..w.vmos.jobs.sched(low).unwrap()
+                ..w.jobs.sched(low).unwrap()
             },
         )
         .unwrap();
@@ -303,7 +317,6 @@ fn every_failure_after_the_checks_gives_back_what_it_took() {
     let (threads, pages) = (w.threads_charged(JobId::ROOT), w.pages_used(JobId::ROOT));
     // the table pages of the stack do not fit
     let tight = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -323,7 +336,6 @@ fn every_failure_after_the_checks_gives_back_what_it_took() {
     // the caller's job has no room for the thread's object
     w.us.procs.get_mut(&2).unwrap().job = JobId::ROOT;
     let none = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -351,14 +363,13 @@ fn every_failure_after_the_checks_gives_back_what_it_took() {
 fn the_priority_is_inherited_clamped_to_the_job_and_at_least_one() {
     // (moved from the retired `thread_create` tests, AB5: with priority 0 in the record the thread takes its creator's base priority)
     let mut w = world();
-    let low = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    w.vmos
-        .jobs
+    let low = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.jobs
         .set_sched(
             low,
             SchedLimits {
                 max_prio: 4,
-                ..w.vmos.jobs.sched(low).unwrap()
+                ..w.jobs.sched(low).unwrap()
             },
         )
         .unwrap();
@@ -370,6 +381,7 @@ fn the_priority_is_inherited_clamped_to_the_job_and_at_least_one() {
             &mut w.us,
             &mut w.mm,
             &mut w.vmos,
+            &mut w.jobs,
             1,
             creator,
             [w.ph, REC, 0, 0, 0, 0],
@@ -381,8 +393,8 @@ fn the_priority_is_inherited_clamped_to_the_job_and_at_least_one() {
     assert_eq!(prio_of(2), 2, "inherited below the maximum");
     assert_eq!(prio_of(0), 1, "never the idle priority");
     assert_eq!(
-        ksys::clamp_prio(&w.vmos.jobs, JobId::ROOT, 200),
-        63.min(w.vmos.jobs.sched(JobId::ROOT).unwrap().max_prio)
+        ksys::clamp_prio(&w.jobs, JobId::ROOT, 200),
+        63.min(w.jobs.sched(JobId::ROOT).unwrap().max_prio)
     );
 }
 

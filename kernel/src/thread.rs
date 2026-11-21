@@ -906,9 +906,23 @@ pub fn exit() -> ! {
             // switch, or the mark would stay set with no flag and no poke owed (PR 263 review)
             sc.reschedule_on(h);
         }
-        // negative control (L11d): the stack is freed while this thread still runs on it
+        // negative control (L11d): the stack is freed while this thread still runs on it. The bug only bites if another thread takes the
+        // freed slot before this one has switched away, which is a race; the control makes it certain: the slot is taken at once and its
+        // new owner writes to it (soak, 2026-11-21: the race alone no longer lost often enough for `teardown_with_threads_on_other_harts`
+        // to notice)
         #[cfg(feature = "fault-early-reap")]
-        reap_if_dead(running_here());
+        {
+            // (`reap_if_dead` itself refuses a thread that is in transit, which is the guard this control removes: reap directly)
+            let me = running_here();
+            if kernel().threads.get(&me).is_some_and(|t| t.detached) && sched().reap(me).is_ok() {
+                if let Some(t) = kernel().threads.remove(&me) {
+                    note_stack_use(me, &t);
+                }
+                if let Some(mut stolen) = crate::kstack::alloc() {
+                    stolen.fill(0xdead_dead_dead_dead);
+                }
+            }
+        }
         reschedule();
     });
     unreachable!("an exited thread was scheduled again");
@@ -1141,6 +1155,9 @@ pub fn wake_stat(which: u64) -> u64 {
         }
         // 100 and 101: the lowest byte address of RAM and the address after the highest (from the device tree, PL4); 102 and 103: the
         // frames of RAM the tree describes and the frames the allocator manages; 104: where the kernel image starts
+        // 109: the kernel heap's leak oracle (`heap::leak_oracle`, wrapping): taken before and after something, `before - after` is the heap
+        // bytes it kept (MM5's acceptance test: what a confined program holds against what its job was charged)
+        109 => heap_free() as u64,
         100 => crate::kmem::stats().ram_first << 12,
         101 => crate::kmem::stats().ram_end << 12,
         102 => crate::kmem::stats().memory_frames,
@@ -1178,10 +1195,9 @@ pub fn fp_off() -> bool {
     crate::arch::lazy_units_are_off()
 }
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the heap's total free bytes are at least its grown bytes
+/// The leak tests' oracle: equal before and after when nothing was kept (see `heap::leak_oracle`).
 pub fn heap_free() -> usize {
-    // (growth at a safe point adds free bytes that are not a leak)
-    heap::free_bytes() - heap::grown_bytes()
+    heap::leak_oracle()
 }
 
 pub fn thread_count() -> usize {

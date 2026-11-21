@@ -84,7 +84,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         let p = state().procs.get_mut(&pid).expect("process exists");
                         let r = p
                             .aspace
-                            .handle_fault_mapped(&mut k.mm, &mut k.vmos, va, access);
+                            .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
                             kmem::flush_pages(m.first, m.last, p.asid);
                         }
@@ -158,6 +158,7 @@ pub(super) fn status_ret(frame: &mut crate::trap::TrapFrame, s: Status) {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
+    let growth_at_entry = kcore::handle::growth_events();
     let (n, a) = (
         frame.arg(17) as usize,
         [
@@ -262,6 +263,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     if n == nr::THREAD_YIELD {
         // status already set above
     }
+    // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
+    settle_handle_table(growth_at_entry);
 }
 
 pub(super) fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
@@ -292,7 +295,6 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let Some(&pid) = s.thread_pid.get(&tid) else {
         return fail(Status::BadState);
     };
-    let k = kmem::get();
     // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
     if matches!(
         n,
@@ -324,13 +326,17 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         return fail(status);
     }
     {
+        // (the memory locks are held only inside this block and in the two calls below that need them: every other call may take the
+        // big kernel lock, which comes before them in the order)
+        let k = kmem::get();
         let mut ctx = ksys::Ctx {
             objs: &mut *objs,
             handles: &mut p.handles,
             job: p.job,
             aspace: &mut p.aspace,
-            mm: &mut k.mm,
-            vmos: &mut k.vmos,
+            mm: k.mm,
+            vmos: k.vmos,
+            jobs: k.jobs,
             faults: ksys::Faults {
                 skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
             },
@@ -353,8 +359,11 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if len > MAX_DEBUG_WRITE {
                 return fail(Status::TooBig);
             }
-            let bytes = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, ptr, len)
-                .map_err(|e| (e, None, None))?;
+            let bytes = {
+                let k = kmem::get();
+                copy_from_user(&mut p.aspace, k.mm, k.vmos, k.jobs, ptr, len)
+            }
+            .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);
             Ok((None, None))
         }
@@ -366,10 +375,11 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 return fail(Status::NotSupported);
             };
             let pages = (blob.len() as u64).div_ceil(4096);
+            let k = kmem::get();
             if k.vmos.reserve_one().is_err() {
                 return fail(Status::NoMemory);
             }
-            let id = k.vmos.create_in(pages, p.job);
+            let id = k.vmos.create_in(k.jobs, pages, p.job);
             // the firmware's seeds are the kernel's (HD1): the copy the device manager sees has them zeroed
             // (scrubbed in a heap copy first, so no frame of the VMO ever holds them)
             let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
@@ -379,16 +389,25 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                     range.fill(0);
                 }
             }
-            if k.vmos.write(&mut k.mm, id, 0, &copy).is_err() {
-                let _ = k.vmos.destroy(&mut k.mm, id);
+            if k.vmos.write(k.mm, k.jobs, id, 0, &copy).is_err() {
+                let _ = k.vmos.release(k.mm, k.jobs, id);
                 return fail(Status::NoMemory);
             }
             let rights =
                 Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
-            match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
+            match ipc::vmo_object_create_with(
+                objs,
+                &mut p.handles,
+                id,
+                rights,
+                &mut ipc::Quota {
+                    jobs: &mut *k.jobs,
+                    job: Some(p.job),
+                },
+            ) {
                 Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
                 Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    let _ = k.vmos.release(k.mm, k.jobs, id);
                     fail(e)
                 }
             }

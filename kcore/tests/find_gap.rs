@@ -18,10 +18,11 @@ fn find_gap_agrees_with_a_scan() {
             mem: FakeMem::default(),
         };
         let mut vmos = Vmos::new();
+        let mut jobs = kcore::job::Jobs::new();
         let mut a = AddressSpace::new(PageTable::new(&mut mm).unwrap());
         let hi = LO + PAGES * 4096;
         let mut used = [false; PAGES as usize];
-        let v = vmos.create(8);
+        let v = vmos.create(&mut jobs, 8);
         let perms = Perms {
             read: true,
             write: true,
@@ -35,7 +36,7 @@ fn find_gap_agrees_with_a_scan() {
                 let first = rng.below(PAGES);
                 let n = 1 + rng.below(8).min(PAGES - first - 1);
                 let free = (first..first + n).all(|p| !used[p as usize]);
-                let r = a.map_region(&vmos, LO + first * 4096, n, v, 0, perms);
+                let r = a.map_region(&mut vmos, LO + first * 4096, n, v, 0, perms);
                 assert_eq!(r.is_ok(), free, "seed {seed}: mapping {first}+{n}");
                 if r.is_ok() {
                     for p in first..first + n {
@@ -45,7 +46,9 @@ fn find_gap_agrees_with_a_scan() {
             } else {
                 // unmap one region at random
                 let start = rng.below(PAGES);
-                if a.unmap_region(&mut mm, LO + start * 4096).is_ok() {
+                if a.unmap_region(&mut mm, &mut vmos, &mut jobs, LO + start * 4096)
+                    .is_ok()
+                {
                     // find its extent in the model: pages from `start` while used and not the start of another
                     // region is not recoverable from `used`, so rebuild the model from the address space instead
                     for p in 0..PAGES {

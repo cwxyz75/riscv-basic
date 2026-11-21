@@ -143,6 +143,16 @@ fn channel_write_errors() {
         w.err(nr::CHANNEL_WRITE, [0x999, BASE, 4, BASE, 0, 0]),
         Status::BadHandle
     );
+    // T171: a bad channel handle is BAD_HANDLE even when the buffers are bad too (the channel is looked at before anything is copied)
+    assert_eq!(
+        w.err(nr::CHANNEL_WRITE, [0x999, 0x10, 4, 0x10, 1, 0]),
+        Status::BadHandle,
+        "bad handle, bad bytes pointer and bad handle-list pointer: the handle is named first"
+    );
+    assert_eq!(
+        w.err(nr::CHANNEL_WRITE, [0x999, 0x10, 4, BASE, 0, 0]),
+        Status::BadHandle
+    );
     w.poke(BASE, &0x777u32.to_le_bytes());
     assert_eq!(
         w.err(nr::CHANNEL_WRITE, [x, BASE, 0, BASE, 1, 0]),
@@ -782,7 +792,6 @@ fn ports_bind_rearm_unbind_rows() {
 fn job_quota_refuses_creation_with_no_memory() {
     let mut w = world();
     let job = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -808,7 +817,6 @@ fn job_quota_refuses_creation_with_no_memory() {
 fn queued_bytes_are_charged_to_the_job() {
     let mut w = world();
     let job = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,

@@ -40,6 +40,44 @@ pub enum FaultError {
     MapFailed(MapError),
 }
 
+/// What a fault's first step found (`AddressSpace::fault_lookup`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// The page is already mapped and allows the access: nothing to do.
+    Mapped(MappedPages),
+    /// The page to fetch from the VMO and map.
+    Plan(FaultPlan),
+}
+
+/// The region and page a fault is about, with the region's generation: enough to fetch the page without holding the address space and to
+/// notice afterwards that the region went away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultPlan {
+    start: u64,
+    page: u64,
+    page_va: u64,
+    vmo: u64,
+    vmo_page: u64,
+    perms: Perms,
+    pages: u64,
+    gen: u64,
+}
+
+impl FaultPlan {
+    /// The VMO and the page in it the fault needs.
+    pub fn vmo_page(&self) -> (u64, u64) {
+        (self.vmo, self.vmo_page.saturating_add(self.page))
+    }
+}
+
+/// Why `AddressSpace::fault_map` did not map.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FaultMapError {
+    /// The region was unmapped (or replaced) since the lookup: look the fault up again.
+    Stale,
+    Fault(FaultError),
+}
+
 /// The largest region (1 GiB), so that unmapping one is bounded work.
 pub const MAX_REGION_PAGES: u64 = 1 << 18;
 
@@ -88,6 +126,9 @@ struct Vmo {
     /// The job charged for this VMO's committed pages (it holds one use of it).
     job: JobId,
     pages: u64,
+    /// Holders of the VMO: its creator (the object a handle names, or the kernel for its own) and every region that maps it (L15). The VMO is
+    /// freed when the last is gone.
+    refs: u32,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
     committed: PageMap,
 }
@@ -105,9 +146,6 @@ pub struct Vmos {
     slots: alloc::vec::Vec<VmoSlot>,
     free: alloc::vec::Vec<u32>,
     live: usize,
-    /// The job ledger lives here because memory is charged at the moment a page is committed,
-    /// which happens in this store (`page_for`) and nowhere else.
-    pub jobs: Jobs,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
 }
@@ -185,18 +223,19 @@ impl Vmos {
 
     /// A new lazily committed VMO of `pages` pages (nothing allocated yet), charged to the
     /// root job (the kernel's own VMOs).
-    pub fn create(&mut self, pages: u64) -> u64 {
-        self.create_in(pages, JobId::ROOT)
+    pub fn create(&mut self, jobs: &mut Jobs, pages: u64) -> u64 {
+        self.create_in(jobs, pages, JobId::ROOT)
     }
 
     /// A new lazily committed VMO whose pages are charged to `job` as they are committed.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter is a u64 that starts at 1 and gains one per VMO, bounded by the object quota
-    pub fn create_in(&mut self, pages: u64, job: JobId) -> u64 {
-        self.jobs.retain(job);
+    pub fn create_in(&mut self, jobs: &mut Jobs, pages: u64, job: JobId) -> u64 {
+        jobs.retain(job);
         self.place(Vmo {
             kind: VmoKind::Plain,
             job,
             pages,
+            refs: 1,
             committed: PageMap::new(),
         })
     }
@@ -204,12 +243,13 @@ impl Vmos {
     /// A VMO over device memory starting at frame `first` (the caller has checked the range is
     /// inside an allowed device window). Holds one use of the root job.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter as above; `first + i` for i < pages: the caller passed the device-window check (a range inside one window, so no overflow)
-    pub fn create_physical(&mut self, first: Pfn, pages: u64) -> u64 {
-        self.jobs.retain(JobId::ROOT);
+    pub fn create_physical(&mut self, jobs: &mut Jobs, first: Pfn, pages: u64) -> u64 {
+        jobs.retain(JobId::ROOT);
         self.place(Vmo {
             kind: VmoKind::Device,
             job: JobId::ROOT,
             pages,
+            refs: 1,
             committed: PageMap::from_run(pages, first),
         })
     }
@@ -220,6 +260,7 @@ impl Vmos {
     pub fn create_dma<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         pages: u64,
         job: JobId,
     ) -> Result<u64, VmoError> {
@@ -227,22 +268,22 @@ impl Vmos {
         if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > MAX_DMA_TOTAL_PAGES {
             return Err(VmoError::OutOfRange);
         }
-        self.jobs
-            .charge(job, Resource::Pages, pages)
+        jobs.charge(job, Resource::Pages, pages)
             .map_err(|_| VmoError::NoMemory)?;
         let Some(first) = mm.db.alloc_contiguous(pages as usize) else {
-            self.jobs.credit(job, Resource::Pages, pages);
+            jobs.credit(job, Resource::Pages, pages);
             return Err(VmoError::NoMemory);
         };
         for i in 0..pages {
             mm.mem.zero_frame(first + i);
         }
-        self.jobs.retain(job);
+        jobs.retain(job);
         self.dma_pages += pages;
         Ok(self.place(Vmo {
             kind: VmoKind::Dma,
             job,
             pages,
+            refs: 1,
             committed: PageMap::from_run(pages, first),
         }))
     }
@@ -275,21 +316,45 @@ impl Vmos {
         self.vmo(id)?.committed.get(page)
     }
 
-    /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
-    pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
+    /// Take one more reference on a VMO (a region maps it). `Err` if the id is not a live VMO.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a VMO has one reference per region plus its creator's: bounded by the region and object limits, far below u32::MAX
+    pub fn retain(&mut self, id: u64) -> Result<(), VmoGone> {
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
+        v.refs += 1;
+        Ok(())
+    }
+
+    /// How many holders a live VMO has (its creator and the regions that map it).
+    pub fn refs(&self, id: u64) -> Option<u32> {
+        self.vmo(id).map(|v| v.refs)
+    }
+
+    /// Drop one reference on a VMO; the last one frees it: its pages go back and its job is credited. The creator's reference is dropped when the
+    /// object a handle names is destroyed (or by the kernel for its own VMOs), a mapping's when the region goes (L15: no scan for VMOs that
+    /// nothing maps any more). Frames still mapped somewhere hold references of their own.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: refs >= 1 for a live VMO; dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
+    pub fn release<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+    ) -> Result<(), VmoGone> {
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
+        v.refs -= 1;
+        if v.refs > 0 {
+            return Ok(());
+        }
         let vmo = self.take(id).ok_or(VmoGone)?;
         if vmo.kind == VmoKind::Device {
             // device frames are not ours: nothing was charged and nothing is freed
-            self.jobs.release(vmo.job);
+            jobs.release(vmo.job);
             return Ok(());
         }
         if vmo.kind == VmoKind::Dma {
             self.dma_pages -= vmo.pages;
         }
-        self.jobs
-            .credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
-        self.jobs.release(vmo.job);
+        jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
+        jobs.release(vmo.job);
         let mut committed = vmo.committed;
         committed.drain_pfns(|pfn| {
             let dropped = mm.db.dec(pfn);
@@ -308,11 +373,12 @@ impl Vmos {
     pub fn write<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         offset: u64,
         data: &[u8],
     ) -> Result<(), VmoError> {
-        self.access(mm, id, offset, data.len(), |mm, pa, range| {
+        self.access(mm, jobs, id, offset, data.len(), |mm, pa, range| {
             mm.mem.write_bytes(pa, &data[range])
         })
     }
@@ -359,6 +425,7 @@ impl Vmos {
     fn access<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         offset: u64,
         len: usize,
@@ -376,7 +443,7 @@ impl Vmos {
         // Commit everything first so a failure part-way leaves no half-written data.
         let mut at = offset;
         while at < end {
-            self.page_for(mm, id, at / PAGE_SIZE)
+            self.page_for(mm, jobs, None, id, at / PAGE_SIZE)
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
@@ -402,6 +469,7 @@ impl Vmos {
     pub fn commit<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         first: u64,
         pages: u64,
@@ -417,7 +485,7 @@ impl Vmos {
         // Refuse at once what cannot fit (no frames taken and given back for nothing): count the pages
         // this call would commit and compare with the job's room and the free frames.
         let needed = (first..end).filter(|p| !vmo.committed.contains(*p)).count() as u64;
-        if needed > self.jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
+        if needed > jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
             return Err(VmoError::NoMemory);
         }
         // (the list of this call's commits, for undoing them, is allocated before the first frame is taken: KT9)
@@ -428,7 +496,7 @@ impl Vmos {
             if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
-            match self.page_for(mm, id, page) {
+            match self.page_for(mm, jobs, None, id, page) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
@@ -436,7 +504,7 @@ impl Vmos {
                     for p in done {
                         if let Some(pfn) = vmo.committed.remove(p) {
                             let _ = mm.db.dec(pfn);
-                            self.jobs.credit(vmo.job, Resource::Pages, 1);
+                            jobs.credit(vmo.job, Resource::Pages, 1);
                         }
                     }
                     return Err(VmoError::NoMemory);
@@ -461,6 +529,11 @@ impl Vmos {
         vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains(p))
     }
 
+    /// Pages of VMO `id` that have a frame now (committed by a fault, a write or `commit`).
+    pub fn committed_pages(&self, id: u64) -> Option<u64> {
+        self.vmo(id).map(|v| v.committed.len() as u64)
+    }
+
     /// The job a VMO's pages are charged to.
     pub fn job_of(&self, id: u64) -> Option<JobId> {
         self.vmo(id).map(|v| v.job)
@@ -471,6 +544,8 @@ impl Vmos {
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        mut reserve: Option<&mut Reservation>,
         id: u64,
         page: u64,
     ) -> Result<Pfn, FaultError> {
@@ -478,19 +553,31 @@ impl Vmos {
         if let Some(pfn) = vmo.committed.get(page) {
             return Ok(pfn);
         }
-        // The job's limit first (a full job is "out of memory" for its own programs only),
-        // then the frame; a frame that cannot be had gives the charge back.
-        self.jobs
-            .charge(vmo.job, Resource::Pages, 1)
-            .map_err(|_| FaultError::NoMemory)?;
+        // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
+        // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
+        let prepaid = match reserve.as_deref_mut() {
+            Some(r) => r.take(jobs, vmo.job).map_err(|_| FaultError::NoMemory)?,
+            None => {
+                jobs.charge(vmo.job, Resource::Pages, 1)
+                    .map_err(|_| FaultError::NoMemory)?;
+                false
+            }
+        };
+        let vmo_job = vmo.job;
+        let give_back = |jobs: &mut Jobs, reserve: &mut Option<&mut Reservation>| match reserve
+            .as_deref_mut()
+        {
+            Some(r) if prepaid => r.put_back(jobs, vmo_job),
+            _ => jobs.credit(vmo_job, Resource::Pages, 1),
+        };
         let Some(pfn) = mm.db.alloc() else {
-            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
         };
         // (the bookkeeping first: if it cannot be had, the frame and the charge go back and nothing was committed)
         if vmo.committed.insert(page, pfn).is_err() {
             let _ = mm.db.dec(pfn);
-            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
         }
         mm.mem.zero_frame(pfn);
@@ -513,12 +600,95 @@ struct Region {
     vmo: u64,
     vmo_page: u64,
     perms: Perms,
+    /// Which incarnation of the region this is: a number from the address space's counter, never reused, so a fault that looked the region up
+    /// and later finds a region with another number (or none) at that start knows it was unmapped (and maybe replaced) meanwhile.
+    gen: u64,
+}
+
+/// Pages an address space prepays from a job at a time (KERNEL-V1-SPEC 4.7): the fault path takes a page from the reservation and
+/// asks the ledger only to refill it, so the ledger is consulted once per batch, not once per fault.
+pub const RESERVATION_PAGES: u64 = 64;
+/// A refill takes at most `room / RESERVATION_ROOM_DIVISOR` pages (and at least one).
+pub const RESERVATION_ROOM_DIVISOR: u64 = 8;
+
+/// Pages charged to a job (they count as its usage, J1) but not yet committed to any VMO: an address space's prepaid pool. A reservation
+/// is for one job at a time; a fault on a VMO of another job gives the remainder back and prepays from that one.
+#[derive(Debug, Default)]
+pub struct Reservation {
+    job: Option<JobId>,
+    pages: u64,
+}
+
+impl Reservation {
+    /// Prepaid pages left.
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+
+    /// Spend one page of `job`'s allowance. `Ok(true)`: it came from the prepaid pool (a refill charged the ledger by up to
+    /// [`RESERVATION_PAGES`], an eighth of the job's room at most, one page at least, when the pool was empty or belonged to another job);
+    /// `Ok(false)`: it was charged to the ledger now (a job with no limit has nothing to prepay against: a prepayment would only make its
+    /// usage drift from what its VMOs hold). `Err` when the job has no room for even one page.
+    pub fn take(&mut self, jobs: &mut Jobs, job: JobId) -> Result<bool, crate::job::JobError> {
+        if self.job == Some(job) && self.pages > 0 {
+            self.pages = self.pages.saturating_sub(1);
+            if self.pages == 0 {
+                // (nothing prepaid is left: stop holding the job)
+                self.job = None;
+                jobs.release(job);
+            }
+            return Ok(true);
+        }
+        let room = jobs.room(job, Resource::Pages);
+        if room == 0 {
+            self.release(jobs);
+            return Err(crate::job::JobError::Exceeded);
+        }
+        if room == crate::job::UNLIMITED {
+            jobs.charge(job, Resource::Pages, 1)?;
+            return Ok(false);
+        }
+        self.release(jobs);
+        // (an eighth of the room at most, so that a prepayment near a job's limit cannot starve the job's other users: a 64-page job
+        // prepays 8 pages at a time, not all 64)
+        let n = (room / RESERVATION_ROOM_DIVISOR).clamp(1, RESERVATION_PAGES);
+        jobs.charge(job, Resource::Pages, n)?;
+        if n > 1 {
+            jobs.retain(job); // (the prepaid pages are charged to the job: it must outlive them)
+            self.job = Some(job);
+            self.pages = n.saturating_sub(1); // (one is spent now)
+        }
+        Ok(true)
+    }
+
+    /// Take back a page `take` spent from the pool that was not committed after all (the frame could not be had): it stays prepaid if the
+    /// pool is still the job's, else it goes back to the ledger.
+    pub fn put_back(&mut self, jobs: &mut Jobs, job: JobId) {
+        if self.job == Some(job) {
+            self.pages = self.pages.saturating_add(1);
+        } else {
+            jobs.credit(job, Resource::Pages, 1);
+        }
+    }
+
+    /// Give every prepaid page back to the job (teardown; an idle address space).
+    pub fn release(&mut self, jobs: &mut Jobs) {
+        if let Some(job) = self.job.take() {
+            jobs.credit(job, Resource::Pages, self.pages);
+            jobs.release(job);
+        }
+        self.pages = 0;
+    }
 }
 
 /// A page table plus the regions that say what its holes mean.
 pub struct AddressSpace<F: PageTableFormat = Sv39> {
     table: PageTable<F>,
     regions: BTreeMap<u64, Region>,
+    /// The prepaid pages the fault path spends (L16).
+    reserve: Reservation,
+    /// The generation the next region gets (see `Region::gen`).
+    next_gen: u64,
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
@@ -526,7 +696,19 @@ impl<F: PageTableFormat> AddressSpace<F> {
         AddressSpace {
             table,
             regions: BTreeMap::new(),
+            reserve: Reservation::default(),
+            next_gen: 1,
         }
+    }
+
+    /// The prepaid pages this address space holds (they count as its job's usage).
+    pub fn reserved_pages(&self) -> u64 {
+        self.reserve.pages()
+    }
+
+    /// Give the prepaid pages back to their job (a quiet address space; teardown does it itself).
+    pub fn release_reservation(&mut self, jobs: &mut Jobs) {
+        self.reserve.release(jobs);
     }
 
     pub fn table(&self) -> &PageTable<F> {
@@ -538,7 +720,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add and canonical-ness first; pages <= MAX_REGION_PAGES keeps the products small; `end - 1` cannot underflow because len > 0
     pub fn map_region(
         &mut self,
-        vmos: &Vmos,
+        vmos: &mut Vmos,
         start: u64,
         pages: u64,
         vmo: u64,
@@ -579,6 +761,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if self.regions.range(start..end).next().is_some() {
             return Err(RegionError::Overlap);
         }
+        // (the region holds a reference on its VMO until it goes: L15)
+        vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
         self.regions.insert(
             start,
             Region {
@@ -586,8 +770,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 vmo,
                 vmo_page,
                 perms,
+                gen: self.next_gen,
             },
         );
+        self.next_gen = self.next_gen.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
         Ok(())
     }
 
@@ -616,16 +802,6 @@ impl<F: PageTableFormat> AddressSpace<F> {
         (at.checked_add(bytes)? <= hi).then_some(at)
     }
 
-    /// Add the ids of every VMO this address space maps to `out`.
-    pub fn collect_vmos(&self, out: &mut alloc::collections::BTreeSet<u64>) {
-        out.extend(self.regions.values().map(|r| r.vmo));
-    }
-
-    /// Does any region of this address space map VMO `vmo`?
-    pub fn maps_vmo(&self, vmo: u64) -> bool {
-        self.regions.values().any(|r| r.vmo == vmo)
-    }
-
     /// The permissions of the region covering `va`, if there is one (mapped yet or not).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
@@ -640,6 +816,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
     pub fn unmap_region<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
         start: u64,
     ) -> Result<(), RegionError> {
         let region = self.regions.remove(&start).ok_or(RegionError::NoRegion)?;
@@ -655,6 +833,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 );
             }
         }
+        // the region's reference on its VMO goes last (the VMO may be freed by it: the frames the mapping held are already dropped)
+        let _ = vmos.release(mm, jobs, region.vmo);
         Ok(())
     }
 
@@ -665,10 +845,12 @@ impl<F: PageTableFormat> AddressSpace<F> {
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
+        jobs: &mut Jobs,
         va: u64,
         access: Access,
     ) -> Result<(), FaultError> {
-        self.handle_fault_mapped(mm, vmos, va, access).map(|_| ())
+        self.handle_fault_mapped(mm, vmos, jobs, va, access)
+            .map(|_| ())
     }
 
     /// `handle_fault`, saying which pages it mapped: the faulting page and, in the same 64 KiB aligned window and the same region,
@@ -676,14 +858,40 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// caller flushes `first..=last` (page by page) before returning to the faulting instruction: a mapping that was absent may
     /// still be cached as absent unless the implementation has Svvptc, and a stale entry is harmless but a fault. A neighbour that
     /// cannot be mapped (no memory for a table) is simply left for its own fault. Device memory is not mapped around.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums; the window arithmetic is on page-aligned addresses inside the region
     pub fn handle_fault_mapped<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
+        jobs: &mut Jobs,
         va: u64,
         access: Access,
     ) -> Result<MappedPages, FaultError> {
+        // (the three steps run back to back here, under one hold of the address space; a caller that releases it between the steps, as
+        // a pager wait must (MM9, KERNEL-V1-SPEC 4.5), asks `fault_map` whether the region is still the one it looked up)
+        loop {
+            let plan = match self.fault_lookup(mm, va, access)? {
+                Lookup::Mapped(m) => return Ok(m),
+                Lookup::Plan(plan) => plan,
+            };
+            let (fetch_vmo, fetch_page) = plan.vmo_page();
+            let pfn = vmos.page_for(mm, jobs, Some(&mut self.reserve), fetch_vmo, fetch_page)?;
+            match self.fault_map(mm, vmos, &plan, pfn) {
+                Ok(m) => return Ok(m),
+                Err(FaultMapError::Stale) => continue,
+                Err(FaultMapError::Fault(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// First step of a fault: find the region and check the access. `Mapped` when the page is already mapped and allows it (a spurious
+    /// fault); otherwise the plan for the page to fetch.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums
+    pub fn fault_lookup<M: PhysMem>(
+        &self,
+        mm: &Mm<M>,
+        va: u64,
+        access: Access,
+    ) -> Result<Lookup, FaultError> {
         let (&start, region) = self
             .regions
             .range(..=va)
@@ -712,20 +920,54 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 Access::Exec => existing.perms.exec,
             };
             return if ok {
-                Ok(MappedPages {
+                Ok(Lookup::Mapped(MappedPages {
                     first: page_va,
                     last: page_va,
-                })
+                }))
             } else {
                 Err(FaultError::Denied)
             };
         }
-        let (vmo, perms, region_pages, vmo_page0) =
-            (region.vmo, region.perms, region.pages, region.vmo_page);
-        let pfn = vmos.page_for(mm, vmo, vmo_page0 + page)?;
+        Ok(Lookup::Plan(FaultPlan {
+            start,
+            page,
+            page_va,
+            vmo: region.vmo,
+            vmo_page: region.vmo_page,
+            perms: region.perms,
+            pages: region.pages,
+            gen: region.gen,
+        }))
+    }
+
+    /// Last step of a fault: map the page `pfn` the VMO gave for `plan` (and the committed neighbours, fault-around). `Stale` when the
+    /// region the plan came from is gone or was replaced since the lookup (an unmap in between): nothing is mapped, and the caller looks
+    /// the fault up again.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the window arithmetic is on page-aligned addresses inside the region
+    pub fn fault_map<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        plan: &FaultPlan,
+        pfn: Pfn,
+    ) -> Result<MappedPages, FaultMapError> {
+        match self.regions.get(&plan.start) {
+            Some(r) if r.gen == plan.gen => {}
+            _ => return Err(FaultMapError::Stale),
+        }
+        let (start, page_va, vmo, perms, vmo_page0, region_pages) = (
+            plan.start,
+            plan.page_va,
+            plan.vmo,
+            plan.perms,
+            plan.vmo_page,
+            plan.pages,
+        );
         let managed = mm.db.is_managed(pfn);
         if managed {
-            mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
+            mm.db
+                .inc(pfn)
+                .map_err(|_| FaultMapError::Fault(FaultError::NoMemory))?;
         }
         if let Err(e) = self.table.map(mm, page_va, pfn, perms) {
             if managed {
@@ -735,10 +977,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
                     "the reference just taken must be droppable"
                 );
             }
-            return Err(match e {
+            return Err(FaultMapError::Fault(match e {
                 MapError::NoMemory => FaultError::NoMemory,
                 other => FaultError::MapFailed(other),
-            });
+            }));
         }
         let mut out = MappedPages {
             first: page_va,
@@ -779,20 +1021,22 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// Unmap everything and free the tables of a process whose table shares the kernel's
     /// upper half (`PageTable::new_with_kernel_half`): the shared half is left alone.
-    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>) {
+    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos, jobs: &mut Jobs) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, start);
+            let _ = self.unmap_region(mm, vmos, jobs, start);
         }
+        self.reserve.release(jobs);
         self.table.destroy_user(mm);
     }
 
     /// Unmap everything and free the tables.
-    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>) {
+    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos, jobs: &mut Jobs) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, start);
+            let _ = self.unmap_region(mm, vmos, jobs, start);
         }
+        self.reserve.release(jobs);
         self.table.destroy(mm);
     }
 }

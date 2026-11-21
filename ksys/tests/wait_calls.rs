@@ -20,6 +20,7 @@ const MEM: u64 = 0x50_0000;
 struct W {
     us: UserState,
     vmos: Vmos,
+    jobs: kcore::job::Jobs,
     mm: Mm<FakeMem>,
 }
 
@@ -30,12 +31,14 @@ fn world() -> W {
     };
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let mut aspace = AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap());
-    let v = vmos.create(4);
+    let v = vmos.create(&mut jobs, 4);
     aspace
-        .map_region(&vmos, MEM, 4, v, 0, Perms::RW.user())
+        .map_region(&mut vmos, MEM, 4, v, 0, Perms::RW.user())
         .unwrap();
     let p = Process {
+        live_tids: Default::default(),
         aspace,
         handles: HandleTable::new(64),
         asid: 1,
@@ -60,13 +63,13 @@ fn world() -> W {
     };
     let mut us = UserState::new();
     us.procs.insert(1, Box::new(p));
-    W { us, vmos, mm }
+    W { us, vmos, jobs, mm }
 }
 
 impl W {
-    fn q(vmos: &mut Vmos) -> Quota<'_> {
+    fn q(jobs: &mut kcore::job::Jobs) -> Quota<'_> {
         Quota {
-            jobs: &mut vmos.jobs,
+            jobs,
             job: Some(JobId::ROOT),
         }
     }
@@ -76,7 +79,7 @@ impl W {
         ipc::event_create_in(
             &mut self.us.objs,
             &mut p.handles,
-            &mut Self::q(&mut self.vmos),
+            &mut Self::q(&mut self.jobs),
         )
         .unwrap()
         .0
@@ -86,18 +89,34 @@ impl W {
         let (a, b) = ipc::channel_create_in(
             &mut self.us.objs,
             &mut p.handles,
-            &mut Self::q(&mut self.vmos),
+            &mut Self::q(&mut self.jobs),
         )
         .unwrap();
         (a.0, b.0)
     }
     fn poke(&mut self, at: u64, d: &[u8]) {
         let p = self.us.procs.get_mut(&1).unwrap();
-        kcore::usercopy::copy_to_user(&mut p.aspace, &mut self.mm, &mut self.vmos, at, d).unwrap();
+        kcore::usercopy::copy_to_user(
+            &mut p.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            at,
+            d,
+        )
+        .unwrap();
     }
     fn peek(&mut self, at: u64, n: usize) -> Vec<u8> {
         let p = self.us.procs.get_mut(&1).unwrap();
-        kcore::usercopy::copy_from_user(&mut p.aspace, &mut self.mm, &mut self.vmos, at, n).unwrap()
+        kcore::usercopy::copy_from_user(
+            &mut p.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            at,
+            n,
+        )
+        .unwrap()
     }
 }
 
@@ -219,7 +238,7 @@ fn port_wait_takes_a_full_register_handle_and_reports() {
 fn a_port_poll_finds_a_ready_binding() {
     let mut w = world();
     let p = w.us.procs.get_mut(&1).unwrap();
-    let port = ipc::port_create_in(&mut w.us.objs, &mut p.handles, &mut W::q(&mut w.vmos)).unwrap();
+    let port = ipc::port_create_in(&mut w.us.objs, &mut p.handles, &mut W::q(&mut w.jobs)).unwrap();
     let e = w.event();
     let p = w.us.procs.get(&1).unwrap();
     ipc::port_bind_in(
@@ -229,10 +248,10 @@ fn a_port_poll_finds_a_ready_binding() {
         abi::Handle(e),
         1 << 24,
         77,
-        &mut w.vmos.jobs,
+        &mut w.jobs,
     )
     .unwrap();
-    assert_eq!(ksys::port_poll(&mut w.us, &mut w.vmos, 1, port), Ok(None));
+    assert_eq!(ksys::port_poll(&mut w.us, &mut w.jobs, 1, port), Ok(None));
     ipc::event_signal(
         &mut w.us.objs,
         &w.us.procs[&1].handles,
@@ -242,11 +261,11 @@ fn a_port_poll_finds_a_ready_binding() {
     )
     .unwrap();
     assert_eq!(
-        ksys::port_poll(&mut w.us, &mut w.vmos, 1, port).unwrap(),
+        ksys::port_poll(&mut w.us, &mut w.jobs, 1, port).unwrap(),
         Some((77, 1 << 24))
     );
     assert_eq!(
-        ksys::port_poll(&mut w.us, &mut w.vmos, 1, abi::Handle(0x999)),
+        ksys::port_poll(&mut w.us, &mut w.jobs, 1, abi::Handle(0x999)),
         Err(Status::BadHandle)
     );
 }
@@ -263,6 +282,7 @@ fn futex_wait_compares_polls_and_enqueues() {
             &mut w.us,
             &mut w.mm,
             &mut w.vmos,
+            &mut w.jobs,
             1,
             who,
             [addr, expected, deadline, 0, 0, 0],
@@ -339,6 +359,7 @@ fn futex_wake_checks_the_address_and_counts() {
                 &mut w.us,
                 &mut w.mm,
                 &mut w.vmos,
+                &mut w.jobs,
                 1,
                 who,
                 [MEM, 5, 9, 0, 0, 0]
@@ -384,7 +405,9 @@ fn call_record(w: &mut W, ch: u64, nbytes: u32, deadline: u64) -> [u64; 6] {
 }
 
 fn send(w: &mut W, a: [u64; 6], interrupted: bool) -> Result<ksys::Call, Status> {
-    ksys::channel_call_send(&mut w.us, &mut w.mm, &mut w.vmos, 1, a, || interrupted)
+    ksys::channel_call_send(&mut w.us, &mut w.mm, &mut w.vmos, &mut w.jobs, 1, a, || {
+        interrupted
+    })
 }
 
 #[test]
@@ -427,7 +450,7 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
         abi::Handle(server),
         &other,
         &[],
-        &mut w.vmos.jobs,
+        &mut w.jobs,
     )
     .unwrap();
     assert!(!ksys::channel_call_ready(&w.us, 1, &call, false));
@@ -439,11 +462,19 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
         abi::Handle(server),
         &mine,
         &[],
-        &mut w.vmos.jobs,
+        &mut w.jobs,
     )
     .unwrap();
     assert!(ksys::channel_call_ready(&w.us, 1, &call, false));
-    let r = ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &call, || false);
+    let r = ksys::channel_call_reply(
+        &mut w.us,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        1,
+        &call,
+        || false,
+    );
     assert_eq!(r, Ok((Some(7), Some(0))));
     assert_eq!(w.peek(MEM + 0x400, 7), mine);
 }
@@ -503,11 +534,27 @@ fn the_reply_half_reports_by_what_is_there() {
     let call = send(&mut w, a, false).unwrap();
     // nothing came: TIMED_OUT, or INTERRUPTED when an interrupt ended the wait (the request stays queued)
     assert_eq!(
-        ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &call, || false),
+        ksys::channel_call_reply(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            1,
+            &call,
+            || false
+        ),
         Err((Status::TimedOut, None, None))
     );
     assert_eq!(
-        ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &call, || true),
+        ksys::channel_call_reply(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            1,
+            &call,
+            || true
+        ),
         Err((Status::Interrupted, None, None))
     );
     // a reply too big for the buffer: the sizes come back, the message stays
@@ -519,11 +566,19 @@ fn the_reply_half_reports_by_what_is_there() {
         abi::Handle(server),
         &big,
         &[],
-        &mut w.vmos.jobs,
+        &mut w.jobs,
     )
     .unwrap();
     assert_eq!(
-        ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &call, || false),
+        ksys::channel_call_reply(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            1,
+            &call,
+            || false
+        ),
         Err((Status::BufferTooSmall, Some(104), Some(0)))
     );
     // a bad reply buffer loses nothing: the checks come before the message is taken
@@ -533,12 +588,28 @@ fn the_reply_half_reports_by_what_is_there() {
     };
     c2.rd_max_bytes = 200;
     assert_eq!(
-        ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &c2, || false),
+        ksys::channel_call_reply(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            1,
+            &c2,
+            || false
+        ),
         Err((Status::InvalidArgs, None, None))
     );
     c2.rd_bytes = MEM + 0x400;
     assert_eq!(
-        ksys::channel_call_reply(&mut w.us, &mut w.mm, &mut w.vmos, 1, &c2, || false),
+        ksys::channel_call_reply(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            1,
+            &c2,
+            || false
+        ),
         Ok((Some(104), Some(0))),
         "the message was still there"
     );

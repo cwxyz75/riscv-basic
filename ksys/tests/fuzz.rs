@@ -68,7 +68,7 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
     // a handle to the root job, to give the job calls something to act on (the generator never closes it or sets limits on it)
     let jh = {
         let mut q = Quota {
-            jobs: &mut w.vmos.jobs,
+            jobs: &mut w.jobs,
             job: Some(JobId::ROOT),
         };
 
@@ -111,8 +111,14 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
         for (p, bytes) in &call.pokes {
             if *p >= BASE && p + bytes.len() as u64 <= BASE + 0x10000 {
                 // (the pokes can fail once the fake machine is out of frames: the call then runs on whatever the buffer held)
-                let _ =
-                    kcore::usercopy::copy_to_user(&mut w.aspace, &mut w.mm, &mut w.vmos, *p, bytes);
+                let _ = kcore::usercopy::copy_to_user(
+                    &mut w.aspace,
+                    &mut w.mm,
+                    &mut w.vmos,
+                    &mut w.jobs,
+                    *p,
+                    bytes,
+                );
             }
         }
         at.set(("call", i));
@@ -149,6 +155,7 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                     &mut w.aspace,
                     &mut w.mm,
                     &mut w.vmos,
+                    &mut w.jobs,
                     list,
                     n * 4,
                 ) {

@@ -351,6 +351,14 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
         // the planned classes, through the same checker (the pure table is in `klock/tests/order.rs`)
         (Class::Heap, Class::Frame, true),
         (Class::Frame, Class::Heap, false),
+        // the memory locks (L16 part b): none may be held when the big lock is taken, nor taken in the wrong order
+        (Class::Vmo, Class::Legacy, true),
+        (Class::Jobs, Class::Legacy, true),
+        (Class::Frame, Class::Legacy, true),
+        (Class::Jobs, Class::Vmo, true),
+        (Class::Frame, Class::Jobs, true),
+        (Class::Vmo, Class::Jobs, false),
+        (Class::Jobs, Class::Frame, false),
         (Class::Obj, Class::Futex, false),
         (Class::Futex, Class::Obj, true),
     ] {
@@ -523,7 +531,7 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     if !wait_for(2000, || user::process_count() == 0) {
         return Err(String::from("processes are left"));
     }
-    if user::job_ledger() != (1, 0, 0, 0, 0) {
+    if user::job_ledger() != (1, 0, 0, 0, 0, 0) {
         return Err(format!(
             "the job ledger is not back to the root: {:?}",
             user::job_ledger()
@@ -728,7 +736,7 @@ fn smp_churn_stress() -> Result<(), String> {
         return Err(String::from("processes are left"));
     }
     thread::sleep_ticks(5);
-    if user::job_ledger() != (1, 0, 0, 0, 0) {
+    if user::job_ledger() != (1, 0, 0, 0, 0, 0) {
         return Err(format!("job ledger {:?}", user::job_ledger()));
     }
     if thread::thread_count() > threads_before {

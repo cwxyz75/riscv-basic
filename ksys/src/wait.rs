@@ -12,6 +12,7 @@ use abi::Handle;
 use alloc::vec::Vec;
 use kcore::aspace::Vmos;
 use kcore::ipc::{self, ReadError};
+use kcore::job::Jobs;
 use kcore::pagetable::PhysMem;
 use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
 use kcore::Mm;
@@ -80,13 +81,13 @@ pub fn port_wait_check(a: [u64; 6]) -> Result<(Handle, u64), Status> {
 /// One poll of the port: the key and observed signals of a ready binding, or `None`.
 pub fn port_poll(
     us: &mut UserState,
-    vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     h: Handle,
 ) -> Result<Option<(u64, u32)>, Status> {
     let UserState { objs, procs, .. } = us;
     let p = procs.get(&me).ok_or(Status::BadState)?;
-    ipc::port_poll_in(objs, &p.handles, h, &mut vmos.jobs)
+    ipc::port_poll_in(objs, &p.handles, h, jobs)
 }
 
 /// How `port_wait` reports: the binding it found, else INTERRUPTED if the interrupt flag was taken, else TIMED_OUT.
@@ -119,6 +120,7 @@ pub fn port_poll_many<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     h: Handle,
     buf: u64,
@@ -127,8 +129,8 @@ pub fn port_poll_many<M: PhysMem>(
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let len = cap * abi::limits::PORT_PACKET_BYTES;
-    verify_writable(&mut p.aspace, mm, vmos, buf, len).map_err(|_| Status::InvalidArgs)?;
-    let got = ipc::port_poll_many_in(objs, &p.handles, h, &mut vmos.jobs, cap)?;
+    verify_writable(&mut p.aspace, mm, vmos, jobs, buf, len).map_err(|_| Status::InvalidArgs)?;
+    let got = ipc::port_poll_many_in(objs, &p.handles, h, jobs, cap)?;
     let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
     for &(key, observed) in &got {
         bytes.extend_from_slice(&key.to_le_bytes());
@@ -171,6 +173,7 @@ pub fn futex_wait_check<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     who: u64,
     a: [u64; 6],
@@ -181,7 +184,7 @@ pub fn futex_wait_check<M: PhysMem>(
     }
     let UserState { procs, futexes, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
-    let word = kcore::usercopy::read_user_u32(&mut p.aspace, mm, vmos, addr)?;
+    let word = kcore::usercopy::read_user_u32(&mut p.aspace, mm, vmos, jobs, addr)?;
     if u64::from(word) != expected {
         return Ok(FutexCheck::Done(Status::ShouldWait)); // the word changed: do not sleep
     }
@@ -255,6 +258,7 @@ pub fn channel_call_send<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
@@ -262,7 +266,14 @@ pub fn channel_call_send<M: PhysMem>(
     let ch = Handle(a[0]);
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
-    let rec = copy_from_user(&mut p.aspace, mm, vmos, a[1], abi::CHANNEL_CALL_ARGS_BYTES)?;
+    let rec = copy_from_user(
+        &mut p.aspace,
+        mm,
+        vmos,
+        jobs,
+        a[1],
+        abi::CHANNEL_CALL_ARGS_BYTES,
+    )?;
     let (req_bytes, req_handles) = (le64(&rec, 0), le64(&rec, 8));
     let (nbytes, nhandles) = (le32(&rec, 16) as usize, le32(&rec, 20) as usize);
     let (rd_bytes, rd_handles) = (le64(&rec, 24), le64(&rec, 32));
@@ -290,15 +301,15 @@ pub fn channel_call_send<M: PhysMem>(
         }
         return Err(Status::AccessDenied);
     }
-    let data = copy_from_user(&mut p.aspace, mm, vmos, req_bytes, nbytes)?;
-    let raw = copy_from_user(&mut p.aspace, mm, vmos, req_handles, nhandles * 8)?;
+    let data = copy_from_user(&mut p.aspace, mm, vmos, jobs, req_bytes, nbytes)?;
+    let raw = copy_from_user(&mut p.aspace, mm, vmos, jobs, req_handles, nhandles * 8)?;
     ipc::channel_write_in(
         objs,
         &mut p.handles,
         ch,
         &data,
         &crate::handle_list(&raw)?,
-        &mut vmos.jobs,
+        jobs,
     )?;
     Ok(Call {
         ch,
@@ -341,6 +352,7 @@ pub fn channel_call_reply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     c: &Call,
     take_interrupt: impl FnOnce() -> bool,
@@ -356,9 +368,9 @@ pub fn channel_call_reply<M: PhysMem>(
         c.rd_max_handles,
     ) {
         Ok((nb, nh)) => (|| {
-            verify_writable(&mut p.aspace, mm, vmos, c.rd_bytes, nb)
+            verify_writable(&mut p.aspace, mm, vmos, jobs, c.rd_bytes, nb)
                 .map_err(|e| (e, None, None))?;
-            verify_writable(&mut p.aspace, mm, vmos, c.rd_handles, nh * 8)
+            verify_writable(&mut p.aspace, mm, vmos, jobs, c.rd_handles, nh * 8)
                 .map_err(|e| (e, None, None))?;
             let got = ipc::channel_read_txid_in(
                 objs,
@@ -367,7 +379,7 @@ pub fn channel_call_reply<M: PhysMem>(
                 c.txid,
                 c.rd_max_bytes,
                 c.rd_max_handles,
-                &mut vmos.jobs,
+                jobs,
             )
             .map_err(|_| (Status::BadState, None, None))?;
             copy_to_user_verified(&mut p.aspace, mm, c.rd_bytes, &got.data)

@@ -182,4 +182,22 @@ mod tests {
         assert!(t.unlock(0, &d)); // the incoming thread's depth was 1
         assert!(t.is_free());
     }
+
+    #[test]
+    fn the_depth_counts_nested_takes() {
+        // (KT10: the mutant "Depth::get gives 1" survived the first mutation run)
+        let t = Ticket::new();
+        let d = Depth::new();
+        assert_eq!(d.get(), 0, "a new depth is zero");
+        t.lock(0, &d, || {});
+        assert_eq!(d.get(), 1);
+        t.lock(0, &d, || {});
+        t.lock(0, &d, || {});
+        assert_eq!(d.get(), 3, "each nested take deepens it");
+        assert!(!t.unlock(0, &d));
+        assert_eq!(d.get(), 2);
+        assert!(!t.unlock(0, &d));
+        assert!(t.unlock(0, &d), "the last release frees the lock");
+        assert_eq!(d.get(), 0);
+    }
 }

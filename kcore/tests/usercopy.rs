@@ -19,6 +19,7 @@ const KERNEL_LAST_SLOT: u64 = 0xffff_ffff_c000_0000; // slot 511
 struct World {
     mm: Mm<FakeMem>,
     vmos: Vmos,
+    jobs: kcore::job::Jobs,
     kernel: PageTable,
     proc: AddressSpace,
     baseline: usize,
@@ -46,6 +47,7 @@ fn world() -> World {
     World {
         mm,
         vmos: Vmos::new(),
+        jobs: kcore::job::Jobs::new(),
         kernel,
         proc,
         baseline,
@@ -53,30 +55,47 @@ fn world() -> World {
 }
 
 fn region(w: &mut World, start: u64, pages: u64, perms: Perms) -> u64 {
-    let id = w.vmos.create(pages);
+    let id = w.vmos.create(&mut w.jobs, pages);
     w.proc
-        .map_region(&w.vmos, start, pages, id, 0, perms)
+        .map_region(&mut w.vmos, start, pages, id, 0, perms)
         .unwrap();
     id
 }
 
 impl World {
     fn read(&mut self, va: u64, len: usize) -> Result<Vec<u8>, Status> {
-        copy_from_user(&mut self.proc, &mut self.mm, &mut self.vmos, va, len)
+        copy_from_user(
+            &mut self.proc,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            va,
+            len,
+        )
     }
     fn write(&mut self, va: u64, data: &[u8]) -> Result<(), Status> {
-        copy_to_user(&mut self.proc, &mut self.mm, &mut self.vmos, va, data)
+        copy_to_user(
+            &mut self.proc,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            va,
+            data,
+        )
     }
     fn teardown(mut self) {
         let starts: Vec<u64> = vec![0x1_0000, 0x2_0000, 0x3_0000, STACK_TOP - STACK_PAGES * 4096];
         for s in starts {
-            let _ = self.proc.unmap_region(&mut self.mm, s);
+            let _ = self
+                .proc
+                .unmap_region(&mut self.mm, &mut self.vmos, &mut self.jobs, s);
         }
         let ids: Vec<u64> = (1..=8).collect();
         for id in ids {
-            let _ = self.vmos.destroy(&mut self.mm, id);
+            let _ = self.vmos.release(&mut self.mm, &mut self.jobs, id);
         }
-        self.proc.destroy_user(&mut self.mm);
+        self.proc
+            .destroy_user(&mut self.mm, &mut self.vmos, &mut self.jobs);
         self.kernel.destroy(&mut self.mm);
         assert_eq!(
             self.mm.db.free_count(),
@@ -184,9 +203,11 @@ fn a_process_table_shares_the_kernel_half_and_frees_only_its_own() {
     region(&mut w, 0x1_0000, 1, Perms::RW.user());
     w.write(0x1_0000, &[1]).unwrap();
     // ...and tearing the process down leaves the kernel's tables alone
-    w.proc.unmap_region(&mut w.mm, 0x1_0000).unwrap();
-    w.vmos.destroy(&mut w.mm, 1).unwrap();
-    w.proc.destroy_user(&mut w.mm);
+    w.proc
+        .unmap_region(&mut w.mm, &mut w.vmos, &mut w.jobs, 0x1_0000)
+        .unwrap();
+    w.vmos.release(&mut w.mm, &mut w.jobs, 1).unwrap();
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos, &mut w.jobs);
     assert_eq!(
         w.kernel.translate(&w.mm, KERNEL_VA).unwrap().pfn,
         3399,
@@ -228,9 +249,11 @@ fn a_stack_region_commits_lazily_and_a_guard_below_it_is_refused() {
 #[test]
 fn vmo_write_and_read_back_with_bounds() {
     let mut w = world();
-    let id = w.vmos.create(3);
+    let id = w.vmos.create(&mut w.jobs, 3);
     let data: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
-    w.vmos.write(&mut w.mm, id, 4000, &data).unwrap(); // crosses a page boundary
+    w.vmos
+        .write(&mut w.mm, &mut w.jobs, id, 4000, &data)
+        .unwrap(); // crosses a page boundary
     let mut out = vec![0u8; 5000];
     w.vmos.read(&mut w.mm, id, 4000, &mut out).unwrap();
     assert_eq!(out, data);
@@ -238,15 +261,19 @@ fn vmo_write_and_read_back_with_bounds() {
     w.vmos.read(&mut w.mm, id, 0, &mut head).unwrap();
     assert_eq!(head, [0; 16], "bytes before the written range are zero");
     assert_eq!(
-        w.vmos.write(&mut w.mm, id, 3 * 4096 - 1, &[1, 2]),
+        w.vmos
+            .write(&mut w.mm, &mut w.jobs, id, 3 * 4096 - 1, &[1, 2]),
         Err(VmoError::OutOfRange)
     );
     assert_eq!(
-        w.vmos.write(&mut w.mm, id, u64::MAX, &[1]),
+        w.vmos.write(&mut w.mm, &mut w.jobs, id, u64::MAX, &[1]),
         Err(VmoError::OutOfRange),
         "offset overflow"
     );
-    assert_eq!(w.vmos.write(&mut w.mm, 99, 0, &[1]), Err(VmoError::Gone));
+    assert_eq!(
+        w.vmos.write(&mut w.mm, &mut w.jobs, 99, 0, &[1]),
+        Err(VmoError::Gone)
+    );
     let mut empty = [0u8; 0];
     assert_eq!(
         w.vmos.read(&mut w.mm, id, 3 * 4096, &mut empty),
@@ -254,7 +281,7 @@ fn vmo_write_and_read_back_with_bounds() {
         "an empty read at the end is fine"
     );
     // reading an uncommitted page does not commit it
-    let fresh = w.vmos.create(2);
+    let fresh = w.vmos.create(&mut w.jobs, 2);
     let free = w.mm.db.free_count();
     let mut page = vec![1u8; 4096];
     w.vmos.read(&mut w.mm, fresh, 0, &mut page).unwrap();
@@ -264,9 +291,9 @@ fn vmo_write_and_read_back_with_bounds() {
         free,
         "a read of uncommitted memory allocates nothing"
     );
-    w.vmos.destroy(&mut w.mm, id).unwrap();
-    w.vmos.destroy(&mut w.mm, fresh).unwrap();
-    w.proc.destroy_user(&mut w.mm);
+    w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+    w.vmos.release(&mut w.mm, &mut w.jobs, fresh).unwrap();
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos, &mut w.jobs);
     w.kernel.destroy(&mut w.mm);
     assert_eq!(w.mm.db.free_count(), w.baseline);
 }
@@ -320,13 +347,15 @@ fn a_region_outside_the_user_half_is_still_refused_by_the_copy_checks() {
         w.write(0xffff_ffe0_0000_0000, &[1]).err(),
         Some(Status::InvalidArgs)
     );
-    let _ = w.proc.unmap_region(&mut w.mm, 0);
-    let _ = w.proc.unmap_region(&mut w.mm, 0xffff_ffe0_0000_0000);
+    let _ = w.proc.unmap_region(&mut w.mm, &mut w.vmos, &mut w.jobs, 0);
+    let _ = w
+        .proc
+        .unmap_region(&mut w.mm, &mut w.vmos, &mut w.jobs, 0xffff_ffe0_0000_0000);
     let ids: Vec<u64> = vec![1, 2];
     for id in ids {
-        let _ = w.vmos.destroy(&mut w.mm, id);
+        let _ = w.vmos.release(&mut w.mm, &mut w.jobs, id);
     }
-    w.proc.destroy_user(&mut w.mm);
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos, &mut w.jobs);
     w.kernel.destroy(&mut w.mm);
     assert_eq!(w.mm.db.free_count(), w.baseline);
 }
@@ -367,6 +396,7 @@ fn a_verified_copy_needs_no_allocation_and_refuses_pages_that_are_not_there() {
         &mut w.proc,
         &mut w.mm,
         &mut w.vmos,
+        &mut w.jobs,
         0x1_0000 + 50,
         data.len(),
     )
@@ -402,7 +432,8 @@ fn read_user_u32_reads_both_halves_of_a_word_whole() {
     w.write(0x1_0004, &0x2222_2222u32.to_le_bytes()).unwrap();
     w.write(0x1_0008, &0x3333_3333u32.to_le_bytes()).unwrap();
     w.write(0x1_000c, &0x4444_4444u32.to_le_bytes()).unwrap();
-    let rd = |w: &mut World, va| read_user_u32(&mut w.proc, &mut w.mm, &mut w.vmos, va);
+    let rd =
+        |w: &mut World, va| read_user_u32(&mut w.proc, &mut w.mm, &mut w.vmos, &mut w.jobs, va);
     assert_eq!(
         rd(&mut w, 0x1_0000),
         Ok(0x1111_1111),

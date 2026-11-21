@@ -244,3 +244,16 @@ fn cycles_and_over_long_chains_are_refused() {
     assert_eq!(d.donate(1, 3).err(), Some(DonateError::AlreadyDonating));
     assert_eq!(d.donate(99, 1).err(), Some(DonateError::NoThread));
 }
+
+#[test]
+fn a_change_list_says_whether_it_is_empty() {
+    // (KT10: the mutant "Changes::is_empty gives true" survived the first mutation run)
+    let mut d = Donations::new();
+    d.add_thread(1, 10);
+    let none = d.set_base(1, 10);
+    assert!(none.is_empty(), "no thread's effective priority changed");
+    assert!(none.as_slice().is_empty());
+    let some = d.set_base(1, 20);
+    assert!(!some.is_empty(), "thread 1's effective priority changed");
+    assert_eq!(some.as_slice().len(), 1);
+}

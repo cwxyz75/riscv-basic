@@ -35,11 +35,28 @@ pub fn kernel_delta() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(KERNEL_DELTA)) }
 }
 
+/// Where `early_trap` ends the run in a test build: QEMU's `virt` test finisher, at its fixed address (the tree is not read this early). A release
+/// build writes nothing there and ends through the firmware.
+const EARLY_FINISHER: u64 = if cfg!(feature = "release") {
+    0
+} else {
+    0x10_0000
+};
+
+/// The failure code `early_trap` writes to the test finisher (`abi::finisher::fail(1)`).
+const EARLY_FAIL: u64 = abi::finisher::fail(1) as u64;
+
 global_asm!(
-    r#"
+    r##"
     .section .text.init
     .globl _start
 _start:
+    # Before anything else: a trap handler of our own. This kernel is built for the RVA23 profile, so the compiler may use an extension
+    # in any function, the device-tree reader included; on a CPU without the profile the first such instruction traps, long before
+    # `dtb::require_extensions` could say so. `early_trap` (base ISA only) says it. It runs at its physical address, which the early table
+    # identity-maps; `trap::init` replaces it.
+    la   t0, early_trap
+    csrw stvec, t0
     mv   s0, a0                  # hart id
     mv   s1, a1                  # device tree pointer
     # zero .bss (these are physical addresses: PC-relative `la`)
@@ -147,5 +164,76 @@ _start:
 4:
     wfi
     j    4b
-"#
+
+    # The early trap handler: base ISA only (no extension may be assumed), no stack, no memory but the messages. Prints one line through the
+    # firmware's console (SBI legacy putchar), then ends the run: failure through the test finisher in a test build, then the firmware's
+    # system reset, then a stop.
+    .balign 4
+early_trap:
+    csrr s3, scause
+    csrr s4, sepc
+    la   t0, 91f                 # the missing-extension line for an illegal instruction, the early-trap line otherwise
+    li   t1, 2
+    beq  s3, t1, 81f
+    la   t0, 92f
+81:
+    jal  t6, 70f                 # print the string at t0
+    mv   t2, s3
+    jal  t6, 72f                 # scause
+    la   t0, 93f
+    jal  t6, 70f
+    mv   t2, s4
+    jal  t6, 72f                 # sepc
+    la   t0, 94f
+    jal  t6, 70f
+    li   t0, {finisher}
+    beqz t0, 85f
+    li   t1, {fail}
+    sw   t1, 0(t0)               # the test finisher: the run ends here with a failing exit status
+85:
+    li   a7, 0x53525354          # SBI SRST: shutdown, reason system failure
+    li   a6, 0
+    li   a0, 0
+    li   a1, 1
+    ecall
+86:
+    wfi
+    j    86b
+70:                              # print the NUL-terminated string at t0, return through t6
+    lbu  a0, 0(t0)
+    beqz a0, 71f
+    li   a7, 1                   # SBI legacy console putchar
+    ecall
+    addi t0, t0, 1
+    j    70b
+71:
+    jr   t6
+72:                              # print t2 as 16 hex digits, return through t6
+    li   t3, 60
+73:
+    srl  t4, t2, t3
+    andi t4, t4, 15
+    li   t5, 10
+    bltu t4, t5, 74f
+    addi a0, t4, 87              # 'a' - 10
+    j    75f
+74:
+    addi a0, t4, 48              # '0'
+75:
+    li   a7, 1
+    ecall
+    addi t3, t3, -4
+    bgez t3, 73b
+    jr   t6
+91:
+    .asciz "\n##PANIC missing extension: an instruction this CPU lacks ran before the profile check (RVA23S64 and the AIA, OD127); scause 0x"
+92:
+    .asciz "\n##PANIC early trap before the kernel's own handler; scause 0x"
+93:
+    .asciz ", sepc 0x"
+94:
+    .asciz "\n"
+"##,
+    finisher = const EARLY_FINISHER,
+    fail = const EARLY_FAIL,
 );

@@ -37,6 +37,23 @@ struct Slot {
     entry: Option<Entry>,
 }
 
+/// How many times any handle table has grown a slot (MM5): a counter the kernel compares with what a hart last saw, so a syscall that
+/// grew nothing anywhere costs two loads, not a look at the process.
+// (`core`'s atomics, not `crate::sync`'s: the model checkers' atomics cannot be built in a static, and these counters are no part of a modelled protocol)
+static GROWTH_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How many tables are clamped by `settle_growth` now (their job could not pay): while any is, every settle looks again.
+static CLAMPED_TABLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Slot growths so far, in all tables.
+pub fn growth_events() -> u64 {
+    GROWTH_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tables that are clamped now.
+pub fn clamped_tables() -> u64 {
+    CLAMPED_TABLES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct HandleTable {
     slots: Vec<Slot>,
     free: Vec<u32>,
@@ -46,6 +63,20 @@ pub struct HandleTable {
     first_gen: u64,
     /// The most slots the table may have (`MAX_SLOTS`; a test lowers it to fill the table cheaply).
     slot_cap: usize,
+    /// The handle limit the table was made with: `limit` goes down to the slots it has while its job cannot pay for more (MM5).
+    full_limit: usize,
+    /// Bytes of the table's growth charged to its job's kernel bytes (MM5): what `settle_growth` has charged so far.
+    charged: u64,
+    /// Whether `settle_growth` has clamped `limit` (counted in `CLAMPED_TABLES`).
+    clamped: bool,
+}
+
+impl Drop for HandleTable {
+    fn drop(&mut self) {
+        if self.clamped {
+            CLAMPED_TABLES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl HandleTable {
@@ -55,6 +86,9 @@ impl HandleTable {
             slots: Vec::new(),
             free: Vec::new(),
             limit: limit.min(MAX_SLOTS),
+            full_limit: limit.min(MAX_SLOTS),
+            charged: 0,
+            clamped: false,
             live: 0,
             first_gen: 0,
             slot_cap: MAX_SLOTS,
@@ -94,6 +128,46 @@ impl HandleTable {
             .try_reserve(self.slots.len() + fresh - self.free.len())
             .map_err(|_| Status::NoMemory)?;
         Ok(())
+    }
+
+    /// The memory the table's two vectors hold, in bytes: their capacity, not their length (they grow by doubling, and the memory is held
+    /// whether or not it is used).
+    pub fn slot_bytes(&self) -> u64 {
+        const SLOT: u64 = core::mem::size_of::<Slot>() as u64;
+        const FREE: u64 = core::mem::size_of::<u32>() as u64;
+        (self.slots.capacity() as u64)
+            .saturating_mul(SLOT)
+            .saturating_add((self.free.capacity() as u64).saturating_mul(FREE))
+    }
+
+    /// Bytes of growth charged so far.
+    pub fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// Settle the table's growth with its job (MM5): `charge(n)` asks the ledger for `n` more bytes and says whether it was granted. A
+    /// refusal keeps the table from growing further (its handle limit drops to the slots it has: the free slots stay usable, a new one
+    /// is NO_MEMORY) until a later call is granted; the growth that already happened stays pending, so the overshoot is bounded by one
+    /// call's insertions (per thread: threads of one process that each have an unsettled call add up, bounded by the thread limit). Called after the calls that can insert, never in the middle of one.
+    pub fn settle_growth(&mut self, charge: impl FnOnce(u64) -> bool) {
+        let have = self.slot_bytes();
+        let pending = have.saturating_sub(self.charged);
+        if pending == 0 || charge(pending) {
+            if pending > 0 {
+                self.charged = have;
+            }
+            self.limit = self.full_limit;
+            if self.clamped {
+                self.clamped = false;
+                CLAMPED_TABLES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.limit = self.slots.len().max(self.live).min(self.full_limit);
+            if !self.clamped {
+                self.clamped = true;
+                CLAMPED_TABLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -157,6 +231,7 @@ impl HandleTable {
                     return Err(Status::NoMemory);
                 }
                 self.reserve(1)?;
+                GROWTH_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 self.slots.push(Slot {
                     gen: self.first_gen,
                     entry,

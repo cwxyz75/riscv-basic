@@ -50,6 +50,7 @@ pub struct World {
     pub handles: HandleTable,
     pub mm: Mm<FakeMem>,
     pub vmos: Vmos,
+    pub jobs: kcore::job::Jobs,
     pub aspace: AddressSpace,
     pub job: JobId,
     pub faults: Faults,
@@ -63,19 +64,21 @@ pub fn world_with(handles: usize) -> World {
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut aspace = AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap());
     let mut vmos = Vmos::new();
-    let rw = vmos.create(16);
+    let mut jobs = kcore::job::Jobs::new();
+    let rw = vmos.create(&mut jobs, 16);
     aspace
-        .map_region(&vmos, BASE, 16, rw, 0, Perms::RW.user())
+        .map_region(&mut vmos, BASE, 16, rw, 0, Perms::RW.user())
         .unwrap();
-    let ro = vmos.create(1);
+    let ro = vmos.create(&mut jobs, 1);
     aspace
-        .map_region(&vmos, RO, 1, ro, 0, Perms::R.user())
+        .map_region(&mut vmos, RO, 1, ro, 0, Perms::R.user())
         .unwrap();
     World {
         objs: Kobjs::new(),
         handles: HandleTable::new(handles),
         mm,
         vmos,
+        jobs,
         aspace,
         job: JobId::ROOT,
         faults: Faults::default(),
@@ -98,6 +101,7 @@ impl World {
             aspace: &mut self.aspace,
             mm: &mut self.mm,
             vmos: &mut self.vmos,
+            jobs: &mut self.jobs,
             faults: self.faults,
             harts_online: 4,
             windows: &WINDOWS,
@@ -117,12 +121,26 @@ impl World {
         (x.unwrap(), y.unwrap())
     }
     pub fn poke(&mut self, at: u64, d: &[u8]) {
-        kcore::usercopy::copy_to_user(&mut self.aspace, &mut self.mm, &mut self.vmos, at, d)
-            .unwrap();
+        kcore::usercopy::copy_to_user(
+            &mut self.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            at,
+            d,
+        )
+        .unwrap();
     }
     pub fn peek(&mut self, at: u64, n: usize) -> Vec<u8> {
-        kcore::usercopy::copy_from_user(&mut self.aspace, &mut self.mm, &mut self.vmos, at, n)
-            .unwrap()
+        kcore::usercopy::copy_from_user(
+            &mut self.aspace,
+            &mut self.mm,
+            &mut self.vmos,
+            &mut self.jobs,
+            at,
+            n,
+        )
+        .unwrap()
     }
     /// A duplicate of `h` with exactly `rights`.
     pub fn narrow(&mut self, h: u64, rights: Rights) -> u64 {
@@ -144,9 +162,9 @@ pub fn cleanup(w: &mut World) {
         for o in dead.drain(..) {
             match o {
                 KObj::Vmo(id) => {
-                    let _ = w.vmos.destroy(&mut w.mm, id);
+                    let _ = w.vmos.release(&mut w.mm, &mut w.jobs, id);
                 }
-                KObj::Job(id) => w.vmos.jobs.release(id),
+                KObj::Job(id) => w.jobs.release(id),
                 _ => {}
             }
         }
@@ -208,7 +226,7 @@ pub fn audit(w: &mut World) -> Result<(), String> {
         }
     }
     // the ledger: after the credits of destroyed objects are applied, a job's usage is exactly what live objects charged to it or below hold
-    ipc::settle(&mut w.objs, &mut w.vmos.jobs);
+    ipc::settle(&mut w.objs, &mut w.jobs);
     let mut charged: Vec<(JobId, usize)> = Vec::new();
     let mut jobs = vec![JobId::ROOT, w.job];
     for &id in &ids {
@@ -224,14 +242,14 @@ pub fn audit(w: &mut World) -> Result<(), String> {
     jobs.sort_by_key(|j| format!("{j:?}"));
     jobs.dedup();
     for j in jobs {
-        let below = |c: &&(JobId, usize)| w.vmos.jobs.is_within(c.0, j);
+        let below = |c: &&(JobId, usize)| w.jobs.is_within(c.0, j);
         let held = charged.iter().filter(below).count() as u64;
         let bytes = charged
             .iter()
             .filter(below)
             .map(|c| c.1 as u64)
             .sum::<u64>();
-        let u = w.vmos.jobs.usage(j);
+        let u = w.jobs.usage(j);
         let (used, used_bytes) = u.map_or((0, 0), |u| {
             (u.get(Resource::Objects), u.get(Resource::IpcBytes))
         });
@@ -253,7 +271,7 @@ pub fn baseline(w: &mut World) -> Result<(), String> {
     cleanup(w);
     w.objs.sweep(&[]);
     cleanup(w);
-    ipc::settle(&mut w.objs, &mut w.vmos.jobs);
+    ipc::settle(&mut w.objs, &mut w.jobs);
     if w.objs.live() != 0 {
         return Err(format!(
             "{} objects alive after every handle was closed and the sweep ran",
@@ -261,7 +279,7 @@ pub fn baseline(w: &mut World) -> Result<(), String> {
         ));
     }
     for r in [Resource::Objects, Resource::IpcBytes] {
-        let used = w.vmos.jobs.usage(JobId::ROOT).map_or(0, |u| u.get(r));
+        let used = w.jobs.usage(JobId::ROOT).map_or(0, |u| u.get(r));
         if used != 0 {
             return Err(format!(
                 "the root job still holds {used} of {r:?} after everything was closed"

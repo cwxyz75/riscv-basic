@@ -146,6 +146,7 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test rq_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test fcache_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test park_concurrency --target-dir target/shuttle
 
 # Miri needs a nightly toolchain with the miri component (rustup toolchain install
@@ -158,7 +159,8 @@ os-models:
 # so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
-	cargo +nightly miri test -p ksys --target-dir target/miri
+	# (the allocation-failure sweep starts child processes of itself, which Miri cannot do; the host run and `os-allocfail` cover it)
+	cargo +nightly miri test -p ksys --target-dir target/miri -- --skip every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean
 	cargo +nightly miri test -p klock --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal
@@ -498,8 +500,9 @@ else
 endif
 
 # KT11: line and region coverage of the pure kernel crates and the syscall layer (needs `rustup component add llvm-tools-preview` and
-# `cargo install cargo-llvm-cov --locked --version 0.6.16`). The summary goes to the job summary, the HTML report to target/cov/html (an
-# artifact in CI). Not a gate.
+# `cargo install cargo-llvm-cov --locked --version 0.9.2`). The summary goes to the job summary, the HTML report to target/cov/html (an
+# artifact in CI). Not a gate. (0.6.16 cannot read the coverage data of rustc 1.100 and reports 0 percent everywhere: found by the first overnight
+# run, 2026-11-21; with 0.9.2 the host tests of the four crates cover 90.4 percent of regions and 91.3 percent of lines.)
 os-coverage:
 	cargo llvm-cov -p kcore -p klock -p abi -p ksys --summary-only
 	cargo llvm-cov report --html --output-dir target/cov

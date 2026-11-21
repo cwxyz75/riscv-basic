@@ -26,6 +26,7 @@ pub(super) fn user_thread_main(token: usize) {
             .procs
             .get_mut(&ts.pid)
             .expect("a process lives while one of its threads does");
+        p.live_tids.insert(thread::current());
         if let Some(o) = ts.obj {
             p.thread_objs.insert(thread::current(), o);
         }
@@ -38,8 +39,7 @@ pub(super) fn user_thread_main(token: usize) {
         let token = aspace_token_of(p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
-        let max = kmem::get()
-            .vmos
+        let max = kmem::jobs()
             .jobs
             .sched(p.job)
             .map_or(63, |j| j.max_prio)
@@ -114,7 +114,6 @@ pub(super) fn teardown(pid: u64) -> i32 {
     teardown_objects(&mut process, code);
     teardown_memory(process);
     kmem::flush_tlb();
-    REAP_DIRTY.store(true, Ordering::SeqCst); // its mappings are gone: pending VMOs may go
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
 }
@@ -125,11 +124,17 @@ pub(super) fn teardown(pid: u64) -> i32 {
 pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
     irq::without(|| {
         let s = state();
-        s.thread_pid.retain(|_, p| *p != pid);
+        // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
+        let process = s.procs.remove(&pid);
+        if let Some(p) = process.as_ref() {
+            for tid in &p.live_tids {
+                s.thread_pid.remove(tid);
+            }
+        }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
         // already; this is the backstop)
         s.futexes.forget_process(pid);
-        s.procs.remove(&pid)
+        process
     })
 }
 
@@ -156,25 +161,32 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
     });
 }
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
 pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
         let k = kmem::get();
         let mut process = process;
-        process.aspace.destroy_user(&mut k.mm);
+        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
         for id in core::mem::take(&mut process.vmos) {
-            let _ = k.vmos.destroy(&mut k.mm, id);
+            let _ = k.vmos.release(k.mm, k.jobs, id);
         }
         // the stacks `thread_spawn` mapped for threads that were still alive (their mappings went with the address space)
         for st in process.stacks.values() {
-            let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+            let _ = k.vmos.release(k.mm, k.jobs, st.vmo);
         }
         let tables: u64 = process.table_charge.values().sum();
         // the address space and its page tables are gone: no hart may keep translations through them
         crate::smp::shootdown();
-        k.vmos.jobs.credit(process.job, Resource::Pages, tables);
-        k.vmos.jobs.credit(process.job, Resource::Processes, 1);
-        k.vmos.jobs.release(process.job);
+        k.jobs.credit(process.job, Resource::Pages, tables);
+        k.jobs.credit(
+            process.job,
+            Resource::KernelBytes,
+            process.handles.charged(),
+        );
+        k.jobs.credit(process.job, Resource::Processes, 1);
+        k.jobs.release(process.job);
     });
 }
 
@@ -185,14 +197,14 @@ pub(super) fn free_spawn_stack(p: &mut Process, tid: Tid) {
         return;
     };
     let k = kmem::get();
-    let _ = p.aspace.unmap_region(&mut k.mm, st.region);
+    let _ = p.aspace.unmap_region(k.mm, k.vmos, k.jobs, st.region);
     if let Some(tables) = p.table_charge.remove(&st.region) {
-        k.vmos.jobs.credit(p.job, Resource::Pages, tables);
+        k.jobs.credit(p.job, Resource::Pages, tables);
     }
     // other harts may cache translations of the stack: they go before the frames can be reused
     crate::smp::shootdown();
     kmem::flush_tlb();
-    let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+    let _ = k.vmos.release(k.mm, k.jobs, st.vmo);
 }
 
 pub(super) fn exit_process(code: i32) -> ! {
@@ -217,13 +229,14 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
+        p.live_tids.remove(&tid);
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
         if let Some(o) = p.thread_objs.remove(&tid) {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;
-        credit_thread(&mut kmem::get().vmos.jobs, p.job);
+        credit_thread(kmem::jobs().jobs, p.job);
         if !whole {
             // (a whole-process exit leaves the stacks to the teardown)
             free_spawn_stack(p, tid);
@@ -269,6 +282,48 @@ pub(super) fn interrupted_now() -> bool {
 /// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
 pub(super) fn take_interrupt() -> bool {
     irq::without(|| state().interrupts.remove(&thread::current()))
+}
+
+/// The job the user thread `tid` belongs to (`None` for a kernel thread): who pays for the register state the kernel keeps for it (MM5).
+/// Needs the big kernel lock.
+pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
+    let s = state();
+    let pid = s.thread_pid.get(&tid)?;
+    Some(s.procs.get(pid)?.job)
+}
+
+/// Charge the growth of the calling thread's handle table to its process's job (MM5; `HandleTable::settle_growth`): a job that cannot pay
+/// leaves the table unable to grow, so the calls that insert handles say NO_MEMORY.
+pub(super) fn settle_handle_table(growth_at_entry: u64) {
+    // (the usual syscall grew no table anywhere while it ran: two loads and out, before the big lock is touched. `growth_at_entry` is the
+    // count when this call began, kept by the call itself, so a thread that was switched to another hart meanwhile still compares its own)
+    if kcore::handle::growth_events() == growth_at_entry && kcore::handle::clamped_tables() == 0 {
+        return;
+    }
+    irq::without(|| {
+        let s = state();
+        let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+            return;
+        };
+        let Some(p) = s.procs.get_mut(&pid) else {
+            return;
+        };
+        if p.handles.slot_bytes() == p.handles.charged() {
+            return; // (the usual case: no growth, nothing to take)
+        }
+        let job = p.job;
+        let j = kmem::jobs();
+        p.handles.settle_growth(|n| {
+            j.jobs
+                .charge(job, kcore::job::Resource::KernelBytes, n)
+                .is_ok()
+        });
+    });
+}
+
+/// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
+pub(super) fn take_interrupt_held() -> bool {
+    state().interrupts.remove(&thread::current())
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.

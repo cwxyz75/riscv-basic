@@ -34,16 +34,29 @@ fn rw() -> Perms {
 fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
     let mut mm = mm(100);
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let mut a = AddressSpace::new(PageTable::new(&mut mm).unwrap());
     let free_before = mm.db.free_count();
-    let v = vmos.create_physical(MMIO_PFN, 2);
+    let v = vmos.create_physical(&mut jobs, MMIO_PFN, 2);
     assert_eq!(vmos.kind(v), Some(VmoKind::Device));
     assert_eq!(vmos.phys_addr(v), None, "D2: only DMA VMOs have an address");
-    a.map_region(&vmos, BASE, 2, v, 0, rw()).unwrap();
-    a.handle_fault(&mut mm, &mut vmos, BASE, kcore::aspace::Access::Write)
-        .unwrap();
-    a.handle_fault(&mut mm, &mut vmos, BASE + 4096, kcore::aspace::Access::Read)
-        .unwrap();
+    a.map_region(&mut vmos, BASE, 2, v, 0, rw()).unwrap();
+    a.handle_fault(
+        &mut mm,
+        &mut vmos,
+        &mut jobs,
+        BASE,
+        kcore::aspace::Access::Write,
+    )
+    .unwrap();
+    a.handle_fault(
+        &mut mm,
+        &mut vmos,
+        &mut jobs,
+        BASE + 4096,
+        kcore::aspace::Access::Read,
+    )
+    .unwrap();
     let t = a.table().translate(&mm, BASE).unwrap();
     assert_eq!(t.pfn, MMIO_PFN);
     assert_eq!(
@@ -56,10 +69,13 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
     // the kernel never reads or writes it (D1)
     let mut b = [0u8; 4];
     assert_eq!(vmos.read(&mut mm, v, 0, &mut b), Err(VmoError::Device));
-    assert_eq!(vmos.write(&mut mm, v, 0, &b), Err(VmoError::Device));
-    vmos.destroy(&mut mm, v).unwrap();
-    a.unmap_region(&mut mm, BASE).unwrap();
-    a.destroy(&mut mm);
+    assert_eq!(
+        vmos.write(&mut mm, &mut jobs, v, 0, &b),
+        Err(VmoError::Device)
+    );
+    vmos.release(&mut mm, &mut jobs, v).unwrap();
+    a.unmap_region(&mut mm, &mut vmos, &mut jobs, BASE).unwrap();
+    a.destroy(&mut mm, &mut vmos, &mut jobs);
     assert_eq!(
         mm.db.free_count(),
         free_before + 1,
@@ -72,11 +88,12 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
 fn a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly() {
     let mut mm = mm(200);
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let free = mm.db.free_count();
     // fragment the free list so contiguity is not an accident
     let hold: Vec<u64> = (0..7).map(|_| mm.db.alloc().unwrap()).collect();
     mm.db.dec(hold[3]).unwrap();
-    let v = vmos.create_dma(&mut mm, 8, JobId::ROOT).unwrap();
+    let v = vmos.create_dma(&mut mm, &mut jobs, 8, JobId::ROOT).unwrap();
     assert_eq!(vmos.kind(v), Some(VmoKind::Dma));
     let pa = vmos.phys_addr(v).unwrap();
     for i in 0..8 {
@@ -89,7 +106,7 @@ fn a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly() {
         "the hole of one frame is too small"
     );
     assert_eq!(mm.db.free_count(), free - 7 + 1 - 8);
-    vmos.destroy(&mut mm, v).unwrap();
+    vmos.release(&mut mm, &mut jobs, v).unwrap();
     assert_eq!(
         mm.db.free_count(),
         free - 7 + 1,
@@ -111,29 +128,31 @@ fn a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly() {
 fn dma_limits_and_failure_leave_nothing_behind() {
     let mut mm = mm(2000);
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     assert_eq!(
-        vmos.create_dma(&mut mm, 0, JobId::ROOT),
+        vmos.create_dma(&mut mm, &mut jobs, 0, JobId::ROOT),
         Err(VmoError::OutOfRange)
     );
     assert_eq!(
-        vmos.create_dma(&mut mm, MAX_DMA_PAGES + 1, JobId::ROOT),
+        vmos.create_dma(&mut mm, &mut jobs, MAX_DMA_PAGES + 1, JobId::ROOT),
         Err(VmoError::OutOfRange)
     );
     let mut ids = vec![];
     for _ in 0..MAX_DMA_TOTAL_PAGES / MAX_DMA_PAGES {
         ids.push(
-            vmos.create_dma(&mut mm, MAX_DMA_PAGES, JobId::ROOT)
+            vmos.create_dma(&mut mm, &mut jobs, MAX_DMA_PAGES, JobId::ROOT)
                 .unwrap(),
         );
     }
     assert_eq!(
-        vmos.create_dma(&mut mm, 1, JobId::ROOT),
+        vmos.create_dma(&mut mm, &mut jobs, 1, JobId::ROOT),
         Err(VmoError::OutOfRange),
         "the system-wide DMA budget"
     );
-    vmos.destroy(&mut mm, ids.pop().unwrap()).unwrap();
+    vmos.release(&mut mm, &mut jobs, ids.pop().unwrap())
+        .unwrap();
     assert!(
-        vmos.create_dma(&mut mm, 1, JobId::ROOT).is_ok(),
+        vmos.create_dma(&mut mm, &mut jobs, 1, JobId::ROOT).is_ok(),
         "budget comes back"
     );
     // no contiguous run left: NoMemory, and the job is not left charged
@@ -146,7 +165,7 @@ fn dma_limits_and_failure_leave_nothing_behind() {
     }
     let mut v2 = Vmos::new();
     assert_eq!(
-        v2.create_dma(&mut small, 2, JobId::ROOT),
+        v2.create_dma(&mut small, &mut jobs, 2, JobId::ROOT),
         Err(VmoError::NoMemory)
     );
     assert_eq!(small.db.free_count(), 5);
@@ -158,8 +177,8 @@ fn the_jobs_page_charge_follows_dma_exactly() {
     use kcore::job::{Limits, Resource};
     let mut mm = mm(200);
     let mut vmos = Vmos::new();
-    let job = vmos
-        .jobs
+    let mut jobs = kcore::job::Jobs::new();
+    let job = jobs
         .create(
             JobId::ROOT,
             Limits {
@@ -168,20 +187,23 @@ fn the_jobs_page_charge_follows_dma_exactly() {
             },
         )
         .unwrap();
-    let used = |v: &Vmos| v.jobs.usage(job).unwrap().get(Resource::Pages);
+    let used = |j: &kcore::job::Jobs| j.usage(job).unwrap().get(Resource::Pages);
     assert_eq!(
-        vmos.create_dma(&mut mm, 7, job),
+        vmos.create_dma(&mut mm, &mut jobs, 7, job),
         Err(VmoError::NoMemory),
         "over the job limit"
     );
-    assert_eq!(used(&vmos), 0, "a refused creation charges nothing");
+    assert_eq!(used(&jobs), 0, "a refused creation charges nothing");
     assert_eq!(mm.db.free_count(), 200, "and takes no frames");
-    let a = vmos.create_dma(&mut mm, 4, job).unwrap();
-    assert_eq!(used(&vmos), 4);
-    assert_eq!(vmos.create_dma(&mut mm, 3, job), Err(VmoError::NoMemory));
-    assert_eq!(used(&vmos), 4);
-    vmos.destroy(&mut mm, a).unwrap();
-    assert_eq!(used(&vmos), 0, "destroy credits exactly");
+    let a = vmos.create_dma(&mut mm, &mut jobs, 4, job).unwrap();
+    assert_eq!(used(&jobs), 4);
+    assert_eq!(
+        vmos.create_dma(&mut mm, &mut jobs, 3, job),
+        Err(VmoError::NoMemory)
+    );
+    assert_eq!(used(&jobs), 4);
+    vmos.release(&mut mm, &mut jobs, a).unwrap();
+    assert_eq!(used(&jobs), 0, "destroy credits exactly");
     assert_eq!(mm.db.free_count(), 200);
 }
 
@@ -192,6 +214,7 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
         let mut mm = mm(400);
         let base_free = mm.db.free_count();
         let mut vmos = Vmos::new();
+        let mut jobs = kcore::job::Jobs::new();
         let mut a = AddressSpace::new(PageTable::new(&mut mm).unwrap());
         let after_root = mm.db.free_count();
         let mut live: Vec<(u64, VmoKind, u64)> = vec![]; // (id, kind, pages)
@@ -201,23 +224,28 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
             match rng.below(5) {
                 0 => {
                     let n = 1 + rng.below(4);
-                    if let Ok(id) = vmos.create_dma(&mut mm, n, JobId::ROOT) {
+                    if let Ok(id) = vmos.create_dma(&mut mm, &mut jobs, n, JobId::ROOT) {
                         live.push((id, VmoKind::Dma, n));
                     }
                 }
                 1 => {
                     let n = 1 + rng.below(3);
-                    live.push((vmos.create_physical(MMIO_PFN, n), VmoKind::Device, n));
+                    live.push((
+                        vmos.create_physical(&mut jobs, MMIO_PFN, n),
+                        VmoKind::Device,
+                        n,
+                    ));
                 }
                 2 if !live.is_empty() => {
                     let (id, _, pages) = live[rng.below(live.len() as u64) as usize];
                     let va = BASE + next_slot * (1 << 21);
                     next_slot += 1;
-                    if a.map_region(&vmos, va, pages, id, 0, rw()).is_ok() {
+                    if a.map_region(&mut vmos, va, pages, id, 0, rw()).is_ok() {
                         for p in 0..pages {
                             let _ = a.handle_fault(
                                 &mut mm,
                                 &mut vmos,
+                                &mut jobs,
                                 va + p * 4096,
                                 kcore::aspace::Access::Write,
                             );
@@ -227,25 +255,25 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
                 }
                 3 if !mapped.is_empty() => {
                     let (va, _) = mapped.swap_remove(rng.below(mapped.len() as u64) as usize);
-                    a.unmap_region(&mut mm, va).unwrap();
+                    a.unmap_region(&mut mm, &mut vmos, &mut jobs, va).unwrap();
                 }
                 4 if !live.is_empty() => {
                     let (id, _, _) = live.swap_remove(rng.below(live.len() as u64) as usize);
-                    vmos.destroy(&mut mm, id).unwrap();
+                    vmos.release(&mut mm, &mut jobs, id).unwrap();
                 }
                 _ => {}
             }
             mm.db.audit().unwrap();
         }
         for (id, _, _) in live.drain(..) {
-            vmos.destroy(&mut mm, id).unwrap();
+            vmos.release(&mut mm, &mut jobs, id).unwrap();
         }
         for (va, _) in mapped.drain(..) {
-            a.unmap_region(&mut mm, va).unwrap();
+            a.unmap_region(&mut mm, &mut vmos, &mut jobs, va).unwrap();
         }
         // everything but the address space's own tables is back
         assert!(mm.db.free_count() >= after_root, "seed {seed}: frames lost");
-        a.destroy(&mut mm);
+        a.destroy(&mut mm, &mut vmos, &mut jobs);
         assert_eq!(mm.db.free_count(), base_free, "seed {seed}: exact");
         assert_eq!(vmos.count(), 0);
     }

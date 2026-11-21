@@ -20,6 +20,7 @@ const CODE: u64 = 0x40_0000;
 
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
+        live_tids: Default::default(),
         aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
         handles: HandleTable::new(64),
         asid: 1,
@@ -46,7 +47,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
 
 struct W {
     us: UserState,
-    vmos: Vmos,
+    jobs: kcore::job::Jobs,
     /// A handle in process 1 to process 2, with every right.
     ph: u64,
 }
@@ -64,19 +65,20 @@ fn world() -> W {
     us.procs
         .insert(2, Box::new(process(&mut mm, &kernel, JobId::ROOT)));
     let mut vmos = Vmos::new();
-    let code = vmos.create(1);
+    let mut jobs = kcore::job::Jobs::new();
+    let code = vmos.create(&mut jobs, 1);
     us.procs
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE, 1, code, 0, Perms::RX.user())
+        .map_region(&mut vmos, CODE, 1, code, 0, Perms::RX.user())
         .unwrap();
-    let data = vmos.create(1);
+    let data = vmos.create(&mut jobs, 1);
     us.procs
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
+        .map_region(&mut vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
         .unwrap();
     let p = us.procs.get_mut(&1).unwrap();
     let (h, _) = ipc::process_object_create_in(
@@ -85,13 +87,13 @@ fn world() -> W {
         2,
         false,
         &mut Quota {
-            jobs: &mut vmos.jobs,
+            jobs: &mut jobs,
             job: Some(JobId::ROOT),
         },
     )
     .unwrap();
     us.procs.get_mut(&2).unwrap().state = ProcState::Created;
-    W { us, vmos, ph: h.0 }
+    W { us, jobs, ph: h.0 }
 }
 
 impl W {
@@ -102,7 +104,7 @@ impl W {
             &mut self.us.objs,
             &mut p.handles,
             &mut Quota {
-                jobs: &mut self.vmos.jobs,
+                jobs: &mut self.jobs,
                 job: Some(JobId::ROOT),
             },
         )
@@ -117,15 +119,10 @@ impl W {
         bh: u64,
         arg: u64,
     ) -> Result<(usize, u8), Status> {
-        ksys::process_start(
-            &mut self.us,
-            &mut self.vmos.jobs,
-            1,
-            [ph, entry, sp, bh, arg, 0],
-        )
+        ksys::process_start(&mut self.us, &mut self.jobs, 1, [ph, entry, sp, bh, arg, 0])
     }
     fn threads(&self, job: JobId) -> u64 {
-        self.vmos.jobs.usage(job).unwrap().get(Resource::Threads)
+        self.jobs.usage(job).unwrap().get(Resource::Threads)
     }
 }
 
@@ -230,7 +227,6 @@ fn every_refusal_changes_nothing() {
     let before = snapshot(&w);
     // the job's thread limit
     let tight = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,

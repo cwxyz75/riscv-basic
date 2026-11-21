@@ -2,7 +2,7 @@
 //! its hart until `switched`, so no other hart may run it (a wake that queued it, then a settle on another hart) and nothing may
 //! reap it before then. Each case is deterministic: the switch of hart 0 is left unfinished while hart 1 acts.
 use kcore::sched::State;
-use kcore::sched2::{FixedPrio, SchedAttr, MS};
+use kcore::sched2::{Error, FixedPrio, SchedAttr, MS};
 use kcore::sched_smp::Sched2;
 
 fn two_harts() -> (Sched2<FixedPrio>, u64) {
@@ -72,4 +72,30 @@ fn a_thread_that_exited_is_not_reaped_before_its_switch_is_done() {
     s.switched(0);
     assert!(!s.is_in_transit(a));
     s.reap(a).unwrap();
+}
+
+#[test]
+fn reap_frees_an_exited_thread_and_refuses_anything_else() {
+    // (KT10: the mutant "reap gives Ok(())" survived the first mutation run)
+    let (s, a) = two_harts();
+    assert_eq!(
+        s.reap(a),
+        Err(Error::NotExited),
+        "a running thread is not reaped"
+    );
+    assert_eq!(
+        s.reap(9_999),
+        Err(Error::NoSuchThread),
+        "a thread that never was"
+    );
+    assert!(s.state(a).is_some());
+    s.exit_on(0).unwrap();
+    assert_eq!(s.state(a), Some(State::Exited));
+    assert_eq!(s.reap(a), Ok(()), "an exited thread is reaped");
+    assert_eq!(s.state(a), None, "and is gone");
+    assert_eq!(
+        s.reap(a),
+        Err(Error::NoSuchThread),
+        "a second reap finds nothing"
+    );
 }

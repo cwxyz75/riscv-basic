@@ -236,6 +236,8 @@ were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart 
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 
+`which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
+
 `which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
 
 ### debug_write(ptr, len) -> status
@@ -566,8 +568,12 @@ read). The rights are checked before the pointer is touched.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet); `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
+
+**Kernel bytes (`which` 8)** are charged for object bodies (every call that creates an object: `channel_create`, `event_create`, `socket_create`, `port_create`, `vmo_create`, `thread_spawn`, `process_create`, `job_create`, ... returns NO_MEMORY when the job or an ancestor would pass its kernel-byte limit) and for the growth of a process's handle table (charged when the call that grew it returns: a job that cannot pay leaves the table unable to grow, so the calls that insert a handle return NO_MEMORY, while closing and reusing handles still work; the table stays unable to grow until the next call the process makes after its job has room again, so the first insert after room returns can still be refused once) and for a thread's floating-point and vector register state, charged at the thread's first use of the unit. A job at its limit that makes a thread use floating point or vector instructions for the first time ends the process with the illegal-instruction exit code: the instruction faults like any illegal one (a program built for RVA23 whose start-up code is vectorised dies this way in a job whose kernel-byte limit is too small to run a single thread's register state).
+
+**Pages (`which` 2) count the pages a job's address spaces have prepaid** for their faults as well as the pages its VMOs hold: in a job with a limit, an address space prepays up to 64 pages at a time (an eighth of the job's room at most, one at least) and gives the rest back when it ends, so `used` can read a little above the committed pages while a process of the job runs. A job with no limit prepays nothing.
 
 ### job_set_sched(job, max_prio, rt_budget_ns, cpu_weight) -> status
 
@@ -814,8 +820,9 @@ Effects: the handles are removed from the caller's table *only if the whole call
 succeeds*; the message holds one reference to each handle's object.
 Blocking: never.
 Errors, checked in this order: TOO_BIG (over MAX_MSG_BYTES or MAX_MSG_HANDLES; first,
-because it bounds the work of every later check); BAD_HANDLE (the channel, then each
-listed handle); WRONG_TYPE (not a channel); ACCESS_DENIED (no WRITE on the channel, then
+because it bounds the work of every later check); BAD_HANDLE (the channel, before
+any user memory is read); INVALID_ARGS (`bytes` or the handle list is not readable user
+memory); BAD_HANDLE (each listed handle); WRONG_TYPE (not a channel); ACCESS_DENIED (no WRITE on the channel, then
 a listed handle without TRANSFER); INVALID_ARGS (a handle listed twice); NOT_SUPPORTED
 (either endpoint *of this channel*, by object identity, is in the list: that would put
 an endpoint in its own queue); PEER_CLOSED; SHOULD_WAIT (the peer's queue holds
