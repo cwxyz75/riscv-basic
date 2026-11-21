@@ -491,12 +491,12 @@ impl Vmos {
         vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains(p))
     }
 
-    /// The job a VMO's pages are charged to.
     /// Pages of VMO `id` that have a frame now (committed by a fault, a write or `commit`).
     pub fn committed_pages(&self, id: u64) -> Option<u64> {
         self.vmo(id).map(|v| v.committed.len() as u64)
     }
 
+    /// The job a VMO's pages are charged to.
     pub fn job_of(&self, id: u64) -> Option<JobId> {
         self.vmo(id).map(|v| v.job)
     }
@@ -517,18 +517,20 @@ impl Vmos {
         }
         // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
         // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
-        match reserve.as_deref_mut() {
+        let prepaid = match reserve.as_deref_mut() {
             Some(r) => r.take(jobs, vmo.job).map_err(|_| FaultError::NoMemory)?,
-            None => jobs
-                .charge(vmo.job, Resource::Pages, 1)
-                .map_err(|_| FaultError::NoMemory)?,
-        }
+            None => {
+                jobs.charge(vmo.job, Resource::Pages, 1)
+                    .map_err(|_| FaultError::NoMemory)?;
+                false
+            }
+        };
         let vmo_job = vmo.job;
         let give_back = |jobs: &mut Jobs, reserve: &mut Option<&mut Reservation>| match reserve
             .as_deref_mut()
         {
-            Some(r) => r.put_back(),
-            None => jobs.credit(vmo_job, Resource::Pages, 1),
+            Some(r) if prepaid => r.put_back(jobs, vmo_job),
+            _ => jobs.credit(vmo_job, Resource::Pages, 1),
         };
         let Some(pfn) = mm.db.alloc() else {
             give_back(jobs, &mut reserve);
@@ -582,36 +584,57 @@ impl Reservation {
         self.pages
     }
 
-    /// Spend one prepaid page of `job`, refilling by up to [`RESERVATION_PAGES`] (an eighth of the job's room at most, one page at
-    /// least) when the pool is empty or belongs to another job. `Err` when the job has no room for even one page.
-    pub fn take(&mut self, jobs: &mut Jobs, job: JobId) -> Result<(), crate::job::JobError> {
+    /// Spend one page of `job`'s allowance. `Ok(true)`: it came from the prepaid pool (a refill charged the ledger by up to
+    /// [`RESERVATION_PAGES`], an eighth of the job's room at most, one page at least, when the pool was empty or belonged to another job);
+    /// `Ok(false)`: it was charged to the ledger now (a job with no limit has nothing to prepay against: a prepayment would only make its
+    /// usage drift from what its VMOs hold). `Err` when the job has no room for even one page.
+    pub fn take(&mut self, jobs: &mut Jobs, job: JobId) -> Result<bool, crate::job::JobError> {
         if self.job == Some(job) && self.pages > 0 {
             self.pages = self.pages.saturating_sub(1);
-            return Ok(());
+            if self.pages == 0 {
+                // (nothing prepaid is left: stop holding the job)
+                self.job = None;
+                jobs.release(job);
+            }
+            return Ok(true);
+        }
+        let room = jobs.room(job, Resource::Pages);
+        if room == 0 {
+            self.release(jobs);
+            return Err(crate::job::JobError::Exceeded);
+        }
+        if room == crate::job::UNLIMITED {
+            jobs.charge(job, Resource::Pages, 1)?;
+            return Ok(false);
         }
         self.release(jobs);
         // (an eighth of the room at most, so that a prepayment near a job's limit cannot starve the job's other users: a 64-page job
         // prepays 8 pages at a time, not all 64)
-        let n = (jobs.room(job, Resource::Pages) / RESERVATION_ROOM_DIVISOR)
-            .clamp(1, RESERVATION_PAGES);
-        if jobs.room(job, Resource::Pages) == 0 {
-            return Err(crate::job::JobError::Exceeded);
-        }
+        let n = (room / RESERVATION_ROOM_DIVISOR).clamp(1, RESERVATION_PAGES);
         jobs.charge(job, Resource::Pages, n)?;
-        self.job = Some(job);
-        self.pages = n.saturating_sub(1); // (one is spent now)
-        Ok(())
+        if n > 1 {
+            jobs.retain(job); // (the prepaid pages are charged to the job: it must outlive them)
+            self.job = Some(job);
+            self.pages = n.saturating_sub(1); // (one is spent now)
+        }
+        Ok(true)
     }
 
-    /// Take back a page `take` spent that was not committed after all (the frame could not be had): it stays prepaid.
-    pub fn put_back(&mut self) {
-        self.pages = self.pages.saturating_add(1);
+    /// Take back a page `take` spent from the pool that was not committed after all (the frame could not be had): it stays prepaid if the
+    /// pool is still the job's, else it goes back to the ledger.
+    pub fn put_back(&mut self, jobs: &mut Jobs, job: JobId) {
+        if self.job == Some(job) {
+            self.pages = self.pages.saturating_add(1);
+        } else {
+            jobs.credit(job, Resource::Pages, 1);
+        }
     }
 
     /// Give every prepaid page back to the job (teardown; an idle address space).
     pub fn release(&mut self, jobs: &mut Jobs) {
         if let Some(job) = self.job.take() {
             jobs.credit(job, Resource::Pages, self.pages);
+            jobs.release(job);
         }
         self.pages = 0;
     }

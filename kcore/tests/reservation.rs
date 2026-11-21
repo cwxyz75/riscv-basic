@@ -167,3 +167,52 @@ fn a_frame_that_cannot_be_had_keeps_the_page_prepaid_and_charges_nothing_more() 
     vmos.release(&mut mm, &mut jobs, id).unwrap();
     assert_eq!(pages_of(&jobs, j), 0);
 }
+
+#[test]
+fn an_unlimited_job_is_charged_page_by_page_with_nothing_prepaid() {
+    let (mut mm, mut vmos, mut jobs, mut a) = setup(300);
+    let id = vmos.create(&mut jobs, 40); // the root job: no limit
+    a.map_region(&mut vmos, BASE, 40, id, 0, Perms::RW).unwrap();
+    for p in 0..40u64 {
+        a.handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + p * 4096,
+            Access::Write,
+        )
+        .unwrap();
+        assert_eq!(a.reserved_pages(), 0);
+        assert_eq!(
+            pages_of(&jobs, kcore::job::JobId::ROOT),
+            vmos.committed_pages(id).unwrap(),
+            "usage is exactly what the VMO holds"
+        );
+    }
+    a.destroy_user(&mut mm, &mut vmos, &mut jobs);
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
+    assert_eq!(pages_of(&jobs, kcore::job::JobId::ROOT), 0);
+}
+
+#[test]
+fn a_reservation_keeps_its_job_alive_until_it_is_given_back() {
+    let (mut mm, mut vmos, mut jobs, mut a) = setup(300);
+    let j = limited(&mut jobs, 400);
+    let id = vmos.create_in(&mut jobs, 8, j);
+    a.map_region(&mut vmos, BASE, 8, id, 0, Perms::RW).unwrap();
+    a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Write)
+        .unwrap();
+    assert!(a.reserved_pages() > 0, "a limited job prepays");
+    // the creator lets go of the VMO and the job: only the mapping and the prepaid pages hold them
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
+    jobs.release(j);
+    assert!(
+        jobs.exists(j),
+        "the mapping and the reservation hold the job"
+    );
+    a.destroy_user(&mut mm, &mut vmos, &mut jobs);
+    assert!(
+        !jobs.exists(j),
+        "the last holder was the reservation: the job is freed with no usage left"
+    );
+}
