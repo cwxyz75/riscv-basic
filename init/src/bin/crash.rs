@@ -237,6 +237,26 @@ pub fn app_main() -> i32 {
                 }
             }
         }
+        101 => {
+            // MM7: a guard page: protect the second of two pages read-only, then write it: a clean fault ends the process
+            let me = rt::sys::process_self().a1 as u64;
+            let v = rt::sys::vmo_create(2);
+            if v.status != 0 {
+                return -1;
+            }
+            const BASE: usize = 0x560_0000;
+            if rt::sys::process_map(me, v.a1 as u64, BASE as u64, 0, 2 * 4096, 3).status != 0 {
+                return -2;
+            }
+            // SAFETY: both pages are mapped read-write in this process.
+            unsafe { core::ptr::write_volatile((BASE + 4096) as *mut u8, 1) };
+            if rt::sys::process_protect(me, (BASE + 4096) as u64, 4096, 1).status != 0 {
+                return -3;
+            }
+            // SAFETY: deliberately a write to a page that is read-only now: the kernel must refuse and end this process.
+            unsafe { core::ptr::write_volatile((BASE + 4096) as *mut u8, 2) };
+            return 0;
+        }
         100 => {
             // MM6: shrink a resizable VMO under a mapping, then touch the part that went: a clean fault, the process ends
             let me = rt::sys::process_self().a1 as u64;

@@ -419,6 +419,44 @@ pub mod sys {
             [process as usize, vaddr as usize, 0, 0, 0, 0],
         )
     }
+    /// Unmap every page of `[vaddr, vaddr + len)`: holes are fine and mappings are split at the edges (MM7).
+    pub fn process_unmap_range(process: u64, vaddr: u64, len: u64) -> Ret {
+        syscall(
+            PROCESS_UNMAP,
+            [process as usize, vaddr as usize, len as usize, 0, 0, 0],
+        )
+    }
+    /// Change the permissions of a fully mapped range (`flags`: R 1, W 2, X 4; MM7).
+    pub fn process_protect(process: u64, vaddr: u64, len: u64, flags: u64) -> Ret {
+        syscall(
+            PROCESS_PROTECT,
+            [
+                process as usize,
+                vaddr as usize,
+                len as usize,
+                flags as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Map `length` bytes of `vmo` where the kernel chooses; the address is in `a1` (MM7).
+    pub fn process_map_anywhere(
+        process: u64,
+        vmo: u64,
+        vmo_offset: u64,
+        length: u64,
+        flags: u64,
+    ) -> Ret {
+        process_map(process, vmo, 0, vmo_offset, length, flags)
+    }
+    /// The mapping at or after `vaddr`: six words in `buf` (base, length, permissions, ceiling, VMO id, VMO offset); `a1` is the next base or 0 (MM7).
+    pub fn process_map_info(process: u64, vaddr: u64, buf: *mut u64) -> Ret {
+        syscall(
+            PROCESS_MAP_INFO,
+            [process as usize, vaddr as usize, buf as usize, 0, 0, 0],
+        )
+    }
     pub fn process_start(process: u64, entry: u64, sp: u64, bootstrap: u64, arg: u64) -> Ret {
         syscall(
             PROCESS_START,

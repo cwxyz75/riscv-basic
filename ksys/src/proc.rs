@@ -29,6 +29,12 @@ pub trait Machine {
     fn shootdown(&mut self);
     /// Drop this hart's own cached translations.
     fn flush_tlb(&mut self);
+    /// `pages` executable pages were just made visible (PL7): make every hart's instruction fetches agree with memory.
+    fn icache_sync(&mut self, _pages: u64) {}
+    /// A number below `n` from the kernel's entropy pool (HD1), for the placement of a mapping that asked for ANYWHERE; 0 where there is no pool.
+    fn random_below(&mut self, _n: u64) -> u64 {
+        0
+    }
 }
 
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
@@ -86,6 +92,10 @@ pub struct Process {
     /// when the region goes or the process ends. Table frames are not VMO pages, so without this
     /// a program could spend memory the page limit never sees.
     pub table_charge: BTreeMap<u64, u64>,
+    /// Where each `process_map` charge in `table_charge` ends (its key is where it starts): the charge is credited when no region is left in
+    /// that span, not when the region that started there goes (a range unmap or a protect can split a mapping: the tables of what stays
+    /// must stay charged, MM7).
+    pub charge_end: BTreeMap<u64, u64>,
     /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process).
     pub stacks: BTreeMap<Tid, SpawnStack>,
     /// Where the next stack search in the arena starts (just above the last stack handed out).
@@ -119,13 +129,39 @@ fn e(s: Status) -> (Status, Option<u64>, Option<u64>) {
 
 /// Resolve a process handle and a VMO handle of the caller, checking them in the order SYSCALLS.md lists (BAD_HANDLE, WRONG_TYPE,
 /// ACCESS_DENIED). Returns the target pid and the VMO id.
+/// Is `[vaddr, vaddr + length)` a non-empty range inside the user half? (The range calls act only on regions, and regions are in the user half;
+/// this keeps it so if a kernel-half region ever exists.)
+fn in_user_range(vaddr: u64, length: u64) -> bool {
+    length > 0
+        && vaddr >= abi::user::BASE
+        && vaddr
+            .checked_add(length)
+            .is_some_and(|end| end <= abi::user::TOP)
+}
+
+/// Where an ANYWHERE mapping of `bytes` goes (MM7): the mapping arena `[0x1_0000_0000, the stack arena)`, at a place chosen uniformly among
+/// the page-aligned starts, taking the first gap that fits from there and wrapping to the start of the arena; `None` when nothing fits.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the arena bounds are constants below the canonical limit; the chosen start is below `span`
+fn place_anywhere<X: Machine>(machine: &mut X, aspace: &AddressSpace, bytes: u64) -> Option<u64> {
+    const LO: u64 = 0x1_0000_0000;
+    let hi = abi::user::STACK_ARENA_BASE;
+    if bytes > hi - LO {
+        return None;
+    }
+    let slots = (hi - LO - bytes) / 4096 + 1;
+    let from = LO + machine.random_below(slots) * 4096;
+    aspace
+        .find_gap(LO, hi, bytes, from)
+        .or_else(|| aspace.find_gap(LO, hi, bytes, LO))
+}
+
 fn resolve_map_args(
     objs: &Kobjs,
     caller: &Process,
     ph: Handle,
     vh: Handle,
     flags: u64,
-) -> Result<(u64, u64), Status> {
+) -> Result<(u64, u64, Perms), Status> {
     let pe = caller.handles.get(ph)?;
     let ve = caller.handles.get(vh)?;
     let tpid = match objs.get(pe.obj) {
@@ -146,7 +182,14 @@ fn resolve_map_args(
     if !pe.rights.contains(Rights::MANAGE) || !ve.rights.contains(need) {
         return Err(Status::AccessDenied);
     }
-    Ok((tpid, vid))
+    // what the mapping may later be raised to: read always, write and execute as the VMO handle's rights allow
+    let max = Perms {
+        read: true,
+        write: ve.rights.contains(Rights::WRITE),
+        exec: ve.rights.contains(Rights::EXECUTE),
+        user: true,
+    };
+    Ok((tpid, vid, max))
 }
 
 /// `None`: `n` is not one of these calls.
@@ -171,22 +214,27 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let (ph, vh) = (Handle(a[0]), Handle(a[1]));
             let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
-            let (tpid, vid) = resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
+            let (tpid, vid, max_perms) =
+                resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
             let caller_job = caller.job;
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
             }
             let aligned = |x: u64| x.is_multiple_of(4096);
-            let in_user = vaddr >= abi::user::BASE
-                && vaddr
+            // ANYWHERE (MM7): `vaddr` 0 asks the kernel to choose a free place, at random among those that fit in the mapping arena. Every
+            // other argument is checked first (with the arena's start standing in for the address), so a refused call costs no entropy.
+            let anywhere = vaddr == 0;
+            let probe = if anywhere { abi::user::BASE } else { vaddr };
+            let in_user = probe >= abi::user::BASE
+                && probe
                     .checked_add(length)
                     .is_some_and(|end| end <= abi::user::TOP);
             let vmo_pages = vmos.pages(vid).ok_or(e(Status::BadHandle))?;
             let inside_vmo = offset
                 .checked_add(length)
                 .is_some_and(|end| end <= vmo_pages * 4096);
-            if !aligned(vaddr)
+            if !aligned(probe)
                 || !aligned(offset)
                 || !aligned(length)
                 || length == 0
@@ -197,6 +245,14 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             {
                 return bad(Status::InvalidArgs);
             }
+            let vaddr = if anywhere {
+                match place_anywhere(&mut **machine, &target.aspace, length) {
+                    Some(at) => at,
+                    None => return bad(Status::NoMemory),
+                }
+            } else {
+                vaddr
+            };
             // A VMO charged to a job that is neither the caller's nor the address space owner's must already be committed over the
             // range (slice V, INVARIANTS V1): its pages are paid for, so a touch can neither fail nor charge a stranger, and a
             // process cannot be killed by a VMO it was handed. A parent mapping its own VMO, or one charged to the child's job,
@@ -219,19 +275,31 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let tables = length / 4096 / 512 + 4;
             jobs.charge(target.job, Resource::Pages, tables)
                 .map_err(|x| e(crate::job_status(x)))?;
-            if let Err(x) =
-                target
-                    .aspace
-                    .map_region(vmos, vaddr, length / 4096, vid, offset / 4096, perms)
-            {
+            if let Err(x) = target.aspace.map_region_max(
+                vmos,
+                vaddr,
+                length / 4096,
+                vid,
+                offset / 4096,
+                perms,
+                max_perms,
+            ) {
                 jobs.credit(target.job, Resource::Pages, tables);
                 return Err(match x {
                     kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
                     _ => e(Status::InvalidArgs),
                 });
             }
-            target.table_charge.insert(vaddr, tables);
-            Ok((None, None))
+            // (a key that is already there is a mapping that was split and whose start has been mapped again: its charge stays, and this one adds)
+            *target.table_charge.entry(vaddr).or_default() += tables;
+            let end = vaddr + length;
+            let extent = target.charge_end.entry(vaddr).or_insert(end);
+            *extent = (*extent).max(end);
+            // a mapping that touches one of the same VMO with the same permissions becomes part of it (fewer regions)
+            target
+                .aspace
+                .merge_near(mm, vmos, jobs, vaddr, vaddr + length);
+            Ok((anywhere.then_some(vaddr), None))
         })(),
         nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => (|| {
             // Both take pages away from a VMO, so both first unmap them from every address space that maps them, then have every hart drop
@@ -304,25 +372,129 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
         })(),
         nr::PROCESS_UNMAP => (|| {
-            let ph = Handle(a[0]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (_, tpid, _, _) =
-                ipc::process_of(objs, &caller.handles, ph, Rights::MANAGE).map_err(e)?;
+                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
             }
-            target
-                .aspace
-                .unmap_region(mm, vmos, jobs, a[1])
-                .map_err(|_| e(Status::InvalidArgs))?;
+            // length 0: the region that starts at `vaddr`, whole (the original call). Otherwise (MM7) every page of `[vaddr, vaddr + length)`:
+            // holes are fine, regions are split at the edges.
+            if a[2] == 0 {
+                target
+                    .aspace
+                    .unmap_region(mm, vmos, jobs, a[1])
+                    .map_err(|_| e(Status::InvalidArgs))?;
+            } else {
+                if !in_user_range(a[1], a[2]) {
+                    return bad(Status::InvalidArgs);
+                }
+                target
+                    .aspace
+                    .unmap_range(mm, vmos, jobs, a[1], a[2])
+                    .map_err(|x| match x {
+                        kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
+                        _ => e(Status::InvalidArgs),
+                    })?;
+            }
             // other harts may still cache the translations of what was just unmapped
             machine.shootdown();
-            if let Some(tables) = target.table_charge.remove(&a[1]) {
-                jobs.credit(target.job, Resource::Pages, tables);
+            // the page-table charge of a `process_map` is credited when no region is left in the span it covered (a mapping that was split
+            // keeps the charge for what stays: its tables are still there)
+            let gone: alloc::vec::Vec<u64> = target
+                .charge_end
+                .iter()
+                .filter(|&(&k, &end)| !target.aspace.has_region_in(k, end))
+                .map(|(&k, _)| k)
+                .collect();
+            for k in gone {
+                target.charge_end.remove(&k);
+                if let Some(tables) = target.table_charge.remove(&k) {
+                    jobs.credit(target.job, Resource::Pages, tables);
+                }
             }
             machine.flush_tlb();
             Ok((None, None))
+        })(),
+        nr::PROCESS_PROTECT => (|| {
+            let (vaddr, length, flags) = (a[1], a[2], a[3]);
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let (_, tpid, _, _) =
+                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
+            if flags & !(PF_R | PF_W | PF_X) != 0
+                || flags & PF_W != 0 && flags & PF_X != 0
+                || !in_user_range(vaddr, length)
+            {
+                return bad(Status::InvalidArgs);
+            }
+            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            if target.exit_code.is_some() || target.killed.is_some() {
+                return bad(Status::BadState);
+            }
+            let perms = Perms {
+                read: true,
+                write: flags & PF_W != 0,
+                exec: flags & PF_X != 0,
+                user: true,
+            };
+            let stats = target
+                .aspace
+                .protect_range(mm, vmos, jobs, vaddr, length, perms)
+                .map_err(|x| match x {
+                    kcore::aspace::ProtectError::Denied => e(Status::AccessDenied),
+                    kcore::aspace::ProtectError::TooMany => e(Status::NoMemory),
+                    _ => e(Status::InvalidArgs),
+                })?;
+            // a permission taken away may still be cached by every hart; code made visible must reach every instruction fetch
+            if stats.downgraded {
+                machine.shootdown();
+                machine.flush_tlb();
+            }
+            if stats.exec_pages > 0 {
+                machine.icache_sync(stats.exec_pages);
+            }
+            Ok((None, None))
+        })(),
+        nr::PROCESS_MAP_INFO => (|| {
+            let (vaddr, buf) = (a[1], a[2]);
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let (_, tpid, _, _) =
+                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
+            let target = procs.get(&tpid).ok_or(e(Status::BadState))?;
+            let bits =
+                |p: Perms| u64::from(p.read) | u64::from(p.write) << 1 | u64::from(p.exec) << 2;
+            // the region at or after `vaddr`; none: a zeroed record and 0
+            let (record, next) = match target.aspace.region_at_or_after(vaddr) {
+                Some(r) => {
+                    let len = r.pages * 4096;
+                    let next = target
+                        .aspace
+                        .region_at_or_after(r.start + len)
+                        .map_or(0, |n| n.start);
+                    (
+                        [
+                            r.start,
+                            len,
+                            bits(r.perms),
+                            bits(r.max_perms),
+                            r.vmo,
+                            r.vmo_page * 4096,
+                        ],
+                        next,
+                    )
+                }
+                None => ([0; 6], 0),
+            };
+            let mut words = [[0u8; 8]; 6];
+            for (out, w) in words.iter_mut().zip(record.iter()) {
+                *out = w.to_le_bytes();
+            }
+            let bytes: [u8; 48] = words.concat().try_into().unwrap_or([0; 48]);
+            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
+            kcore::usercopy::copy_to_user(&mut caller.aspace, mm, vmos, jobs, buf, &bytes)
+                .map_err(|_| e(Status::InvalidArgs))?;
+            Ok((Some(next), None))
         })(),
         nr::PROCESS_INFO => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
