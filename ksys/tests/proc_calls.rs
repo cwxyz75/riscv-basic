@@ -23,6 +23,7 @@ mod alloc_free {
     pub const R: u64 = 1;
     pub const W: u64 = 2;
     pub const X: u64 = 4;
+    pub const ANY: u64 = abi::map_flags::ANYWHERE;
 }
 
 #[derive(Default)]
@@ -310,8 +311,8 @@ fn process_map_argument_errors() {
         ("unknown flag", [ph, v, VA, 0, 4096, 8]),
         ("write and execute", [ph, v, VA, 0, 4096, W | X]),
         // (address 0 is no longer "below the user range": it asks for ANYWHERE, MM7)
-        ("zero length anywhere", [ph, v, 0, 0, 0, R]),
-        ("unaligned length anywhere", [ph, v, 0, 0, 100, R]),
+        ("zero length anywhere", [ph, v, 0, 0, 0, R | ANY]),
+        ("unaligned length anywhere", [ph, v, 0, 0, 100, R | ANY]),
         ("above the user range", [ph, v, TOP, 0, 4096, R]),
         ("wrapping range", [ph, v, u64::MAX - 4095, 0, 8192, R]),
         (
@@ -878,11 +879,11 @@ fn process_map_anywhere_picks_free_places_that_do_not_overlap_and_returns_them()
     let (mut w, ph) = world();
     let v = w.vmo(4, JobId::ROOT);
     let first = w
-        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, W | R])
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, W | R | ANY])
         .0
         .expect("the address comes back");
     let second = w
-        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, R])
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, R | ANY])
         .0
         .expect("and again");
     for at in [first, second] {
@@ -1150,11 +1151,13 @@ fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first
     // ANYWHERE: a bad flag, W with X, an unaligned offset, past the VMO's end: all InvalidArgs, and none takes entropy or a place
     let spent = w.tlb.randoms;
     for (name, a) in [
-        ("bad flag", [ph, v, 0, 0, 4096, 8]),
-        ("write with execute", [ph, v, 0, 0, 4096, W | X]),
-        ("unaligned offset", [ph, v, 0, 1, 4096, R]),
-        ("past the VMO", [ph, v, 0, 0, 3 * 4096, R]),
-        ("bigger than the arena", [ph, v, 0, 0, 1 << 40, R]),
+        ("bad flag", [ph, v, 0, 0, 4096, 16 | ANY]),
+        ("ANYWHERE with an address", [ph, v, VA, 0, 4096, R | ANY]),
+        ("address 0 without the flag", [ph, v, 0, 0, 4096, R]),
+        ("write with execute", [ph, v, 0, 0, 4096, W | X | ANY]),
+        ("unaligned offset", [ph, v, 0, 1, 4096, R | ANY]),
+        ("past the VMO", [ph, v, 0, 0, 3 * 4096, R | ANY]),
+        ("bigger than the arena", [ph, v, 0, 0, 1 << 40, R | ANY]),
     ] {
         assert_eq!(
             w.err(nr::PROCESS_MAP, a),
@@ -1372,4 +1375,122 @@ fn process_clone_region_shares_or_snapshots_a_region_into_another_process() {
     // everything goes back: the processes' regions, then the VMOs
     w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
     w.ok(nr::PROCESS_UNMAP, [ph1, VA, 0, 0, 0, 0]);
+}
+
+// ---- the memory calls under random sequences (KT8's job for the calls on the process table) ----
+
+/// A deterministic sequence of random memory calls (map, unmap, protect, decommit, resize, children, clones, touches) over two processes:
+/// none may panic, the frame database and the families keep their audits after every call, and every translation of every process maps
+/// what its VMO shows.
+#[test]
+fn random_memory_calls_never_panic_and_keep_their_audits() {
+    // (how many calls of each kind succeeded over all seeds: the sequences must do real work)
+    let mut succeeded = std::collections::BTreeMap::<usize, u32>::new();
+    for seed in 1..=25u64 {
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut w, ph) = world();
+        let ph1 = w.handle_to(1);
+        let procs = [ph1, ph];
+        let mut vmo_handles: Vec<u64> = (0..3)
+            .map(|_| {
+                let (h, id) = w.vmo_and_id(8, JobId::ROOT);
+                w.vmos.set_resizable(id);
+                h
+            })
+            .collect();
+        for step in 0..400 {
+            let p = procs[rnd(2) as usize];
+            let v = vmo_handles[rnd(vmo_handles.len() as u64) as usize];
+            let va = VA + rnd(6) * 0x10_0000 + rnd(4) * 4096;
+            let len = (1 + rnd(6)) * 4096;
+            let off = rnd(4) * 4096;
+            let flags = [R, R | W, R | X, W, R | W | X][rnd(5) as usize];
+            let call = match rnd(11) {
+                0 | 1 => (nr::PROCESS_MAP, [p, v, va, off, len, flags]),
+                2 => (nr::PROCESS_UNMAP, [p, va, len, 0, 0, 0]),
+                3 => (nr::PROCESS_PROTECT, [p, va, len, flags, 0, 0]),
+                4 => (nr::VMO_DECOMMIT, [v, off, len, 0, 0, 0]),
+                5 => (nr::VMO_SET_SIZE, [v, (1 + rnd(10)) * 4096, 0, 0, 0, 0]),
+                6 => (
+                    nr::VMO_CREATE_CHILD,
+                    [
+                        v,
+                        off,
+                        len,
+                        0,
+                        [abi::child_flags::SNAPSHOT, abi::child_flags::PRIVATE][rnd(2) as usize],
+                        0,
+                    ],
+                ),
+                7 => (
+                    nr::PROCESS_CLONE_REGION,
+                    [
+                        procs[rnd(2) as usize],
+                        p,
+                        va,
+                        [abi::clone_mode::SHARE, abi::clone_mode::SNAPSHOT][rnd(2) as usize],
+                        0,
+                        0,
+                    ],
+                ),
+                8 | 9 => {
+                    // a touch: a write or a read through the process's address space, wherever it is mapped
+                    let pid = if p == ph1 { 1 } else { 2 };
+                    let t = w.procs.get_mut(&pid).unwrap();
+                    let _ = copy_to_user(
+                        &mut t.aspace,
+                        &mut w.mm,
+                        &mut w.vmos,
+                        &mut w.jobs,
+                        va,
+                        &[step as u8],
+                    );
+                    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+                    continue;
+                }
+                _ => {
+                    // a new VMO, so that children and clones have more to work on
+                    if vmo_handles.len() < 8 {
+                        vmo_handles.push(w.vmo(4, JobId::ROOT));
+                    }
+                    continue;
+                }
+            };
+            let r = w.call(call.0, call.1);
+            if r.is_ok() {
+                *succeeded.entry(call.0).or_default() += 1;
+            }
+            if let Ok((Some(h), _)) = r {
+                if call.0 == nr::VMO_CREATE_CHILD && vmo_handles.len() < 12 {
+                    vmo_handles.push(h);
+                }
+            }
+            w.mm.db
+                .audit()
+                .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            w.vmos
+                .audit_families(true)
+                .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+        }
+    }
+    for n in [
+        nr::PROCESS_MAP,
+        nr::PROCESS_UNMAP,
+        nr::PROCESS_PROTECT,
+        nr::VMO_DECOMMIT,
+        nr::VMO_SET_SIZE,
+        nr::VMO_CREATE_CHILD,
+        nr::PROCESS_CLONE_REGION,
+    ] {
+        assert!(
+            succeeded.get(&n).copied().unwrap_or(0) > 5,
+            "call {n} never did anything: {succeeded:?}"
+        );
+    }
 }

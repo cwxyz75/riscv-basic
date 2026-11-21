@@ -48,6 +48,9 @@ chaos = []
 fault-skip-shootdown = []
 # MM8: a SNAPSHOT leaves the source's writable translations as they were; a write through them then reaches the child's pages
 fault-skip-cow-protect = []
+# MM6/MM7: a decommit, or a protect that takes a permission away, leaves the other harts' translations alone; the sibling-thread tests must then fail
+fault-decommit-no-shootdown = []
+fault-protect-no-shootdown = []
 fault-skip-kernel-satp = []
 # L18 negative control: a hart installs a newer generation's address space without the flush it owes, and the ASID field counts as one bit
 # (one ASID per generation: every new process turns the generation). The harm is a stale translation under a reused ASID; QEMU drops its

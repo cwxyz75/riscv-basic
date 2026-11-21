@@ -355,7 +355,9 @@ impl Gen {
                 } else {
                     0
                 };
-                c.args = [pages, job, 0, 0, 0, 0];
+                // (sizes are bytes; one in four makes the VMO resizable)
+                let flags = u64::from(self.below(4) == 0);
+                c.args = [pages * 4096, job, flags, 0, 0, 0];
             }
             nr::CHANNEL_WRITE => {
                 let len = self.below(65);
@@ -490,7 +492,7 @@ impl Gen {
         let _ = m;
         let mut args = [0u64; 6];
         if n == nr::VMO_CREATE {
-            args[0] = 1 + self.below(8);
+            args[0] = (1 + self.below(8)) * 4096;
         }
         Call {
             nr: n,

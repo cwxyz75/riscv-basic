@@ -49,6 +49,10 @@ impl ksys::Machine for KernelMachine {
     fn icache_sync(&mut self, pages: u64) {
         crate::smp::icache_sync(pages);
     }
+    fn skip_shootdown(&self, call: usize) -> bool {
+        (call == nr::VMO_DECOMMIT && cfg!(feature = "fault-decommit-no-shootdown"))
+            || (call == nr::PROCESS_PROTECT && cfg!(feature = "fault-protect-no-shootdown"))
+    }
     fn skip_cow_protect(&self) -> bool {
         cfg!(feature = "fault-skip-cow-protect")
     }

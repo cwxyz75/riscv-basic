@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -243,6 +244,33 @@ int posix2_test(void) {
         CHECK(sem_post(&t_sem) == 0 && sem_timedwait(&t_sem, &soon) == 0, "and succeeds after a post");
         CHECK(sem_open("/x", 0) == SEM_FAILED && errno == ENOSYS, "named semaphores are not supported");
         CHECK(mtx_trylock(&t_mtx) == thrd_success && mtx_trylock(&t_mtx) == thrd_busy && mtx_unlock(&t_mtx) == thrd_success, "mtx_trylock");
+    }
+    {
+        /* mmap, munmap and mprotect over the kernel's mappings (MM7) */
+        size_t len = 8 * 4096;
+        unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(m != MAP_FAILED && ((unsigned long)m % 4096) == 0, "mmap anywhere gives page-aligned memory");
+        int zero = 1;
+        for (size_t i = 0; i < len; i += 512) if (m[i]) zero = 0;
+        CHECK(zero, "and it is zeroed");
+        for (size_t i = 0; i < len; i += 4096) m[i] = (unsigned char)(i / 4096 + 1);
+        CHECK(mprotect(m, len, PROT_READ) == 0 && m[4096] == 2, "mprotect to read-only keeps the contents");
+        CHECK(mprotect(m, len, PROT_READ | PROT_WRITE | PROT_EXEC) == -1 && errno == EINVAL, "writable with executable is EINVAL");
+        CHECK(mprotect(m, len, PROT_READ | PROT_WRITE) == 0, "and back to read-write");
+        CHECK(munmap(m + 2 * 4096, 2 * 4096) == 0, "munmap of the middle pages");
+        CHECK(m[0] == 1 && m[4096] == 2 && m[4 * 4096] == 5 && m[7 * 4096] == 8, "leaves the rest as it was");
+        CHECK(munmap(m + 2 * 4096, 2 * 4096) == 0, "unmapping a hole is not an error");
+        CHECK(mprotect(m, len, PROT_READ) == -1 && errno == ENOMEM, "a protect over the hole is ENOMEM");
+        CHECK(munmap(m, 2 * 4096) == 0 && munmap(m + 4 * 4096, 4 * 4096) == 0, "the rest goes");
+        unsigned char *f = mmap((void *)0x600000000UL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        CHECK(f == (unsigned char *)0x600000000UL, "MAP_FIXED maps where it is told");
+        f[0] = 7;
+        unsigned char *g = mmap(f, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        CHECK(g == f && g[0] == 0, "and replaces what was there");
+        munmap(f, 4096);
+        CHECK(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3, 0) == MAP_FAILED && errno == ENOSYS, "a file mapping is not supported");
+        CHECK(mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == ENOSYS, "PROT_NONE is not supported");
+        CHECK(mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL, "a zero length is EINVAL");
     }
     printf("posix2: %d failures\n", failures);
     return failures;

@@ -169,6 +169,11 @@ pub const TESTS: &[Test] = &[
     ),
     ("unmap_while_siblings_touch", unmap_while_siblings_touch),
     (
+        "decommit_while_siblings_touch",
+        decommit_while_siblings_touch,
+    ),
+    ("protect_while_siblings_write", protect_while_siblings_write),
+    (
         "kill_a_spinner_on_another_hart",
         kill_a_spinner_on_another_hart,
     ),
@@ -508,6 +513,31 @@ fn unmap_while_siblings_touch() -> Result<(), String> {
     let code = user::finish(pid, tid);
     if code != 0 {
         return Err(format!("the process ended with {code}: a worker saw stale data (round {code}) or the protocol broke (9xx)"));
+    }
+    Ok(())
+}
+
+/// MM6: the same for `vmo_decommit`: two sibling threads read a page whose frame the main thread decommits and gives to another VMO;
+/// through a stale translation a worker would read that VMO's bytes where the decommitted page reads zeros.
+fn decommit_while_siblings_touch() -> Result<(), String> {
+    use crate::user;
+    let (pid, tid) = user::start(user::CRASH_ELF, 102).map_err(|e| format!("{e:?}"))?;
+    let code = user::finish(pid, tid);
+    if code != 0 {
+        return Err(format!("the process ended with {code}: a worker read through a stale translation (round {code}) or the protocol broke (9xx)"));
+    }
+    Ok(())
+}
+
+/// MM7: a protect that takes write permission away reaches the other harts: a worker that has written the page (so its hart caches a
+/// writable translation) and writes it again after the protect must fault, and a fault ends the process (-1001). Through a stale
+/// translation the write would go through and the process would end normally.
+fn protect_while_siblings_write() -> Result<(), String> {
+    use crate::user;
+    let (pid, tid) = user::start(user::CRASH_ELF, 103).map_err(|e| format!("{e:?}"))?;
+    let code = user::finish(pid, tid);
+    if code != -1001 {
+        return Err(format!("the process ended with {code}, not -1001: a worker wrote through a stale writable translation (0), or the protocol broke (9xx)"));
     }
     Ok(())
 }

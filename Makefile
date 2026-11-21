@@ -97,6 +97,8 @@ OS_RR_ELF   := target/os-rr/$(KERNEL_TARGET)/debug/kernel
 OS_NOSHOOT_ELF := target/os-fault-shootdown/$(KERNEL_TARGET)/debug/kernel
 OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 OS_NOCOWPROT_ELF := target/os-fault-cowprot/$(KERNEL_TARGET)/debug/kernel
+OS_NODECOMMIT_ELF := target/os-fault-decommit/$(KERNEL_TARGET)/debug/kernel
+OS_NOPROTSHOOT_ELF := target/os-fault-protshoot/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
@@ -269,9 +271,13 @@ os-boot-test-smp-neg: kernel os-interactive
 	cd kernel && cargo build --features fault-skip-shootdown --target-dir ../target/os-fault-shootdown
 	cd kernel && cargo build --features fault-skip-kernel-satp --target-dir ../target/os-fault-satp
 	cd kernel && cargo build --features fault-skip-cow-protect --target-dir ../target/os-fault-cowprot
+	cd kernel && cargo build --features fault-decommit-no-shootdown --target-dir ../target/os-fault-decommit
+	cd kernel && cargo build --features fault-protect-no-shootdown --target-dir ../target/os-fault-protshoot
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSHOOT_ELF) unmap_while_siblings_touch
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOSATP_ELF) teardown_with_threads_on_other_harts
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOCOWPROT_ELF) copy_on_write_children_from_user_mode
+	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NODECOMMIT_ELF) decommit_while_siblings_touch
+	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOPROTSHOOT_ELF) protect_while_siblings_write
 	cd kernel && cargo build --features fault-skip-kill-ipi --target-dir ../target/os-fault-killipi
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave

@@ -1472,7 +1472,7 @@ fn process_map_argument_checks() -> Outcome {
         Some(S::InvalidArgs),
         "writable and executable"
     );
-    // (address 0 is ANYWHERE since MM7, not page zero: the kernel never maps page zero, and the two calls below are refused as before)
+    // (address 0 is not mappable: ANYWHERE is a flag since MM7, and these two calls are refused as before)
     ensure_eq!(
         map(0, 0, 0, PF_R),
         Some(S::InvalidArgs),

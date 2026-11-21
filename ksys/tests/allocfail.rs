@@ -120,7 +120,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "vmo_create",
-            run: |w, go| vec![go(w, nr::VMO_CREATE, [4, 0, 0, 0, 0, 0])],
+            run: |w, go| vec![go(w, nr::VMO_CREATE, [4 * 4096, 0, 0, 0, 0, 0])],
         },
         Scenario {
             name: "handle_duplicate_and_replace",
@@ -196,7 +196,7 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "vmo_write_read_commit",
             run: |w, go| {
-                let v = w.ok(nr::VMO_CREATE, [4, 0, 0, 0, 0, 0]).0.unwrap();
+                let v = w.ok(nr::VMO_CREATE, [4 * 4096, 0, 0, 0, 0, 0]).0.unwrap();
                 w.poke(BASE, b"data");
                 vec![
                     go(w, nr::VMO_WRITE, [v, 100, BASE, 4, 0, 0]),
@@ -240,7 +240,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "thirty_vmo_creates",
             run: |w, go| {
                 (0..30)
-                    .map(|_| go(w, nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]))
+                    .map(|_| go(w, nr::VMO_CREATE, [4096, 0, 0, 0, 0, 0]))
                     .collect()
             },
         },
@@ -275,7 +275,7 @@ fn scenarios() -> Vec<Scenario> {
             name: "closing_thirty_vmo_handles",
             run: |w, go| {
                 let vs: Vec<u64> = (0..30)
-                    .map(|_| w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap())
+                    .map(|_| w.ok(nr::VMO_CREATE, [4096, 0, 0, 0, 0, 0]).0.unwrap())
                     .collect();
                 vs.iter()
                     .map(|&v| go(w, nr::HANDLE_CLOSE, [v, 0, 0, 0, 0, 0]))
@@ -287,7 +287,7 @@ fn scenarios() -> Vec<Scenario> {
             run: |w, go| {
                 let (x, y) = w.pair(nr::CHANNEL_CREATE);
                 for _ in 0..8 {
-                    let v = w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap();
+                    let v = w.ok(nr::VMO_CREATE, [4096, 0, 0, 0, 0, 0]).0.unwrap();
                     w.poke(BASE + 0x100, &v.to_le_bytes());
                     w.ok(nr::CHANNEL_WRITE, [x, BASE, 0, BASE + 0x100, 1, 0]);
                 }

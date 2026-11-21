@@ -210,6 +210,12 @@ pub mod child_flags {
     pub const PRIVATE: u64 = 2;
 }
 
+/// Flags of `process_map` beyond the permissions (R 1, W 2, X 4): MM7.
+pub mod map_flags {
+    /// The kernel picks a free place at random (`vaddr` must be 0); the address is returned in `a1`.
+    pub const ANYWHERE: u64 = 8;
+}
+
 /// Modes of `process_clone_region` (its fourth argument, MM8).
 pub mod clone_mode {
     /// The target maps the same VMO with the same permissions.

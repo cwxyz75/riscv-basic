@@ -18,17 +18,20 @@ fn vmo_create_rows() {
         Status::InvalidArgs
     );
     assert_eq!(
-        w.err(nr::VMO_CREATE, [MAX_VMO_PAGES + 1, 0, 0, 0, 0, 0]),
+        w.err(nr::VMO_CREATE, [(MAX_VMO_PAGES + 1) * 4096, 0, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
-    let v = w.ok(nr::VMO_CREATE, [4, 0, 0, 0, 0, 0]).0.unwrap();
+    let v = w.ok(nr::VMO_CREATE, [4 * 4096, 0, 0, 0, 0, 0]).0.unwrap();
     assert_eq!(w.ok(nr::VMO_GET_SIZE, [v, 0, 0, 0, 0, 0]).0, Some(4 * 4096));
     // a job argument that is not a job handle
     assert_eq!(
-        w.err(nr::VMO_CREATE, [1, 0x999, 0, 0, 0, 0]),
+        w.err(nr::VMO_CREATE, [4096, 0x999, 0, 0, 0, 0]),
         Status::BadHandle
     );
-    assert_eq!(w.err(nr::VMO_CREATE, [1, v, 0, 0, 0, 0]), Status::WrongType);
+    assert_eq!(
+        w.err(nr::VMO_CREATE, [4096, v, 0, 0, 0, 0]),
+        Status::WrongType
+    );
 }
 
 #[test]
@@ -45,10 +48,10 @@ fn vmo_create_is_charged_to_the_job_and_a_failure_frees_the_vmo() {
         )
         .unwrap();
     w.job = job;
-    w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]);
+    w.ok(nr::VMO_CREATE, [4096, 0, 0, 0, 0, 0]);
     let before = w.mm.db.free_count();
     assert_eq!(
-        w.err(nr::VMO_CREATE, [8, 0, 0, 0, 0, 0]),
+        w.err(nr::VMO_CREATE, [8 * 4096, 0, 0, 0, 0, 0]),
         Status::NoMemory,
         "no object left in the job"
     );
@@ -62,7 +65,7 @@ fn vmo_create_is_charged_to_the_job_and_a_failure_frees_the_vmo() {
 #[test]
 fn vmo_size_read_write_rows() {
     let mut w = world();
-    let v = w.ok(nr::VMO_CREATE, [2, 0, 0, 0, 0, 0]).0.unwrap();
+    let v = w.ok(nr::VMO_CREATE, [2 * 4096, 0, 0, 0, 0, 0]).0.unwrap();
     assert_eq!(
         w.err(nr::VMO_GET_SIZE, [0x999, 0, 0, 0, 0, 0]),
         Status::BadHandle
@@ -122,7 +125,7 @@ fn vmo_size_read_write_rows() {
 #[test]
 fn vmo_commit_rows() {
     let mut w = world();
-    let v = w.ok(nr::VMO_CREATE, [8, 0, 0, 0, 0, 0]).0.unwrap();
+    let v = w.ok(nr::VMO_CREATE, [8 * 4096, 0, 0, 0, 0, 0]).0.unwrap();
     let before = w.mm.db.free_count();
     w.ok(nr::VMO_COMMIT, [v, 0, 4 * 4096, 0, 0, 0]);
     assert_eq!(
@@ -165,7 +168,10 @@ fn vmo_commit_rows() {
     let pages = MAX_COMMIT_PAGES.min(MAX_VMO_PAGES);
     let mut st = None;
     for _ in 0..200 {
-        let more = w.ok(nr::VMO_CREATE, [pages, 0, 0, 0, 0, 0]).0.unwrap();
+        let more = w
+            .ok(nr::VMO_CREATE, [pages * 4096, 0, 0, 0, 0, 0])
+            .0
+            .unwrap();
         if let Err((s, _, _)) = w
             .call(nr::VMO_COMMIT, [more, 0, pages * 4096, 0, 0, 0])
             .unwrap()
@@ -185,7 +191,7 @@ fn physical_and_dma_creation_need_the_resource_and_a_valid_window() {
         w.err(nr::VMO_CREATE_PHYSICAL, [0x999, 0x1000_0000, 4096, 0, 0, 0]),
         Status::BadHandle
     );
-    let v = w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap();
+    let v = w.ok(nr::VMO_CREATE, [4096, 0, 0, 0, 0, 0]).0.unwrap();
     assert_eq!(
         w.err(nr::VMO_CREATE_PHYSICAL, [v, 0x1000_0000, 4096, 0, 0, 0]),
         Status::WrongType
@@ -204,4 +210,24 @@ fn physical_and_dma_creation_need_the_resource_and_a_valid_window() {
         Status::BadHandle
     );
     let _ = SAME;
+}
+
+#[test]
+fn vmo_create_takes_bytes_and_rounds_up_to_pages() {
+    let mut w = world();
+    let v = w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap();
+    assert_eq!(
+        w.ok(nr::VMO_GET_SIZE, [v, 0, 0, 0, 0, 0]).0,
+        Some(4096),
+        "one byte is a page"
+    );
+    let v = w.ok(nr::VMO_CREATE, [4097, 0, 0, 0, 0, 0]).0.unwrap();
+    assert_eq!(w.ok(nr::VMO_GET_SIZE, [v, 0, 0, 0, 0, 0]).0, Some(8192));
+    let top = MAX_VMO_PAGES * 4096;
+    assert!(w.ok(nr::VMO_CREATE, [top, 0, 0, 0, 0, 0]).0.is_some());
+    assert_eq!(
+        w.err(nr::VMO_CREATE, [top + 1, 0, 0, 0, 0, 0]),
+        Status::InvalidArgs,
+        "a byte over the limit is a page over"
+    );
 }
