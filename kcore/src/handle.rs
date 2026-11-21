@@ -39,18 +39,19 @@ struct Slot {
 
 /// How many times any handle table has grown a slot (MM5): a counter the kernel compares with what a hart last saw, so a syscall that
 /// grew nothing anywhere costs two loads, not a look at the process.
-static GROWTH_EVENTS: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
+// (`core`'s atomics, not `crate::sync`'s: the model checkers' atomics cannot be built in a static, and these counters are no part of a modelled protocol)
+static GROWTH_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// How many tables are clamped by `settle_growth` now (their job could not pay): while any is, every settle looks again.
-static CLAMPED_TABLES: crate::sync::AtomicU64 = crate::sync::AtomicU64::new(0);
+static CLAMPED_TABLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Slot growths so far, in all tables.
 pub fn growth_events() -> u64 {
-    GROWTH_EVENTS.load(crate::sync::Ordering::Relaxed)
+    GROWTH_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Tables that are clamped now.
 pub fn clamped_tables() -> u64 {
-    CLAMPED_TABLES.load(crate::sync::Ordering::Relaxed)
+    CLAMPED_TABLES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct HandleTable {
@@ -73,7 +74,7 @@ pub struct HandleTable {
 impl Drop for HandleTable {
     fn drop(&mut self) {
         if self.clamped {
-            CLAMPED_TABLES.fetch_sub(1, crate::sync::Ordering::Relaxed);
+            CLAMPED_TABLES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -158,13 +159,13 @@ impl HandleTable {
             self.limit = self.full_limit;
             if self.clamped {
                 self.clamped = false;
-                CLAMPED_TABLES.fetch_sub(1, crate::sync::Ordering::Relaxed);
+                CLAMPED_TABLES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             }
         } else {
             self.limit = self.slots.len().max(self.live).min(self.full_limit);
             if !self.clamped {
                 self.clamped = true;
-                CLAMPED_TABLES.fetch_add(1, crate::sync::Ordering::Relaxed);
+                CLAMPED_TABLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -230,7 +231,7 @@ impl HandleTable {
                     return Err(Status::NoMemory);
                 }
                 self.reserve(1)?;
-                GROWTH_EVENTS.fetch_add(1, crate::sync::Ordering::Relaxed);
+                GROWTH_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 self.slots.push(Slot {
                     gen: self.first_gen,
                     entry,
