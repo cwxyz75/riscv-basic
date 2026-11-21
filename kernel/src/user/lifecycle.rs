@@ -244,7 +244,12 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
     match me {
         Some((pid, _, alive)) if alive > 0 => {
             notify(); // waiters on this thread
-            wake_threads_of(pid); // siblings (a futex sleeper is on no queue)
+                      // siblings: only when the whole process is going (a futex sleeper is on no queue, and a kill must reach it). A plain `thread_exit`
+                      // changes nothing a sibling waits on, and waking all of them on every exit is quadratic in the thread count: 2047 exits took
+                      // minutes at four harts
+            if whole {
+                wake_threads_of(pid);
+            }
         }
         Some((pid, true, _)) => {
             teardown(pid);
