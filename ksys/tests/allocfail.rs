@@ -212,7 +212,7 @@ fn scenarios() -> Vec<Scenario> {
                 use kcore::job::JobId;
                 let jh = {
                     let mut q = Quota {
-                        jobs: &mut w.vmos.jobs,
+                        jobs: &mut w.jobs,
                         job: Some(JobId::ROOT),
                     };
 
@@ -324,9 +324,9 @@ fn armed_cleanup(w: &mut World) {
     for o in dead.drain(..) {
         match o {
             kcore::ipc::KObj::Vmo(id) => {
-                let _ = w.vmos.release(&mut w.mm, id);
+                let _ = w.vmos.release(&mut w.mm, &mut w.jobs, id);
             }
-            kcore::ipc::KObj::Job(id) => w.vmos.jobs.release(id),
+            kcore::ipc::KObj::Job(id) => w.jobs.release(id),
             _ => {}
         }
     }

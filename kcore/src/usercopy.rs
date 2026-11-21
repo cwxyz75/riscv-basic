@@ -7,6 +7,7 @@
 
 use crate::aspace::{Access, AddressSpace, Vmos};
 use crate::frame::PAGE_SIZE;
+use crate::job::Jobs;
 use crate::pagetable::PhysMem;
 use crate::Mm;
 use abi::status::Status;
@@ -19,6 +20,7 @@ fn resolve<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     va: u64,
     access: Access,
 ) -> Result<u64, Status> {
@@ -26,7 +28,7 @@ fn resolve<M: PhysMem>(
     let mut t = aspace.table().translate(mm, page);
     if t.is_none() {
         aspace
-            .handle_fault(mm, vmos, page, access)
+            .handle_fault(mm, vmos, jobs, page, access)
             .map_err(|_| Status::InvalidArgs)?;
         t = aspace.table().translate(mm, page);
     }
@@ -61,13 +63,14 @@ pub fn read_user_u32<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     va: u64,
 ) -> Result<u32, Status> {
     if va & 3 != 0 {
         return Err(Status::InvalidArgs);
     }
     check_range(va, 4)?;
-    let pa = resolve(aspace, mm, vmos, va, Access::Read)?;
+    let pa = resolve(aspace, mm, vmos, jobs, va, Access::Read)?;
     let word = mm.mem.read_u64(pa & !7);
     Ok((word >> ((pa & 4) * 8)) as u32)
 }
@@ -78,6 +81,7 @@ pub fn copy_from_user<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     va: u64,
     len: usize,
 ) -> Result<Vec<u8>, Status> {
@@ -92,7 +96,7 @@ pub fn copy_from_user<M: PhysMem>(
     while done < len {
         let at = va + done as u64;
         let n = ((PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize).min(len - done);
-        let pa = resolve(aspace, mm, vmos, at, Access::Read)?;
+        let pa = resolve(aspace, mm, vmos, jobs, at, Access::Read)?;
         mm.mem.read_bytes(pa, &mut out[done..done + n]);
         done += n;
     }
@@ -106,6 +110,7 @@ pub fn copy_to_user<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     va: u64,
     data: &[u8],
 ) -> Result<(), Status> {
@@ -121,7 +126,7 @@ pub fn copy_to_user<M: PhysMem>(
     while done < data.len() {
         let at = va + done as u64;
         let n = ((PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize).min(data.len() - done);
-        pages.push((resolve(aspace, mm, vmos, at, Access::Write)?, n));
+        pages.push((resolve(aspace, mm, vmos, jobs, at, Access::Write)?, n));
         done += n;
     }
     let mut at = 0;
@@ -141,6 +146,7 @@ pub fn verify_writable<M: PhysMem>(
     aspace: &mut AddressSpace,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     va: u64,
     len: usize,
 ) -> Result<(), Status> {
@@ -151,7 +157,7 @@ pub fn verify_writable<M: PhysMem>(
     let mut done = 0;
     while done < len {
         let at = va + done as u64;
-        resolve(aspace, mm, vmos, at, Access::Write)?;
+        resolve(aspace, mm, vmos, jobs, at, Access::Write)?;
         done += ((PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize).min(len - done);
     }
     Ok(())

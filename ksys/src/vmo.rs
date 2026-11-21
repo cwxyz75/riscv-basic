@@ -33,6 +33,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         aspace,
         mm,
         vmos,
+        jobs,
         windows,
         ..
     } = c;
@@ -51,19 +52,19 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 ipc::job_of(objs, handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
             };
             vmos.reserve_one().map_err(|e| (e, None, None))?;
-            let id = vmos.create_in(a[0], job);
+            let id = vmos.create_in(jobs, a[0], job);
             match ipc::vmo_object_create_in(
                 objs,
                 handles,
                 id,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.release(mm, id);
+                    let _ = vmos.release(mm, jobs, id);
                     fail(e)
                 }
             }
@@ -75,7 +76,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 return fail(Status::InvalidArgs);
             }
             vmos.reserve_one().map_err(|e| (e, None, None))?;
-            let id = vmos.create_physical(pa >> 12, bytes >> 12);
+            let id = vmos.create_physical(jobs, pa >> 12, bytes >> 12);
             let rights = Rights(
                 Rights::READ.0
                     | Rights::WRITE.0
@@ -89,13 +90,13 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 id,
                 rights,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.release(mm, id);
+                    let _ = vmos.release(mm, jobs, id);
                     fail(e)
                 }
             }
@@ -103,7 +104,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::VMO_CREATE_DMA => {
             ipc::resource_of(objs, handles, h(0)).map_err(|e| (e, None, None))?;
             vmos.reserve_one().map_err(|e| (e, None, None))?;
-            let id = match vmos.create_dma(mm, a[1], job) {
+            let id = match vmos.create_dma(mm, jobs, a[1], job) {
                 Ok(id) => id,
                 Err(kcore::aspace::VmoError::OutOfRange) => return fail(Status::InvalidArgs),
                 Err(_) => return fail(Status::NoMemory),
@@ -123,13 +124,13 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 id,
                 rights,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.release(mm, id);
+                    let _ = vmos.release(mm, jobs, id);
                     fail(e)
                 }
             }
@@ -153,7 +154,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
                 return fail(Status::TooBig);
             }
-            match vmos.commit(mm, id, offset / 4096, len / 4096) {
+            match vmos.commit(mm, jobs, id, offset / 4096, len / 4096) {
                 Ok(()) => Ok((None, None)),
                 Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
                 Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
@@ -183,12 +184,12 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 return fail(Status::InvalidArgs);
             }
             if writing {
-                let data =
-                    copy_from_user(aspace, mm, vmos, buf, len).map_err(|e| (e, None, None))?;
-                vmos.write(mm, id, offset, &data)
+                let data = copy_from_user(aspace, mm, vmos, jobs, buf, len)
+                    .map_err(|e| (e, None, None))?;
+                vmos.write(mm, jobs, id, offset, &data)
                     .map_err(|_| (Status::NoMemory, None, None))?;
             } else {
-                verify_writable(aspace, mm, vmos, buf, len).map_err(|e| (e, None, None))?;
+                verify_writable(aspace, mm, vmos, jobs, buf, len).map_err(|e| (e, None, None))?;
                 let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                 data.try_reserve_exact(len)
                     .map_err(|_| (Status::NoMemory, None, None))?;

@@ -34,17 +34,17 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     let built = (|| -> Result<(), LoadError> {
         for seg in &parsed.segments {
             let (first, end) = seg.pages();
-            let id = k.vmos.create(end - first);
+            let id = k.vmos.create(&mut k.jobs, end - first);
             vmo_ids.push(id);
             let bytes = &image[seg.offset as usize..(seg.offset + seg.filesz) as usize];
             k.vmos
-                .write(&mut k.mm, id, seg.vaddr % 4096, bytes)
+                .write(&mut k.mm, &mut k.jobs, id, seg.vaddr % 4096, bytes)
                 .map_err(|_| LoadError::NoMemory)?;
             aspace
                 .map_region(&mut k.vmos, first * 4096, end - first, id, 0, seg.perms)
                 .map_err(|_| LoadError::NoMemory)?;
         }
-        let stack = k.vmos.create(STACK_PAGES);
+        let stack = k.vmos.create(&mut k.jobs, STACK_PAGES);
         vmo_ids.push(stack);
         aspace
             .map_region(
@@ -68,9 +68,9 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
     if let Err(e) = built {
-        aspace.destroy_user(&mut k.mm, &mut k.vmos);
+        aspace.destroy_user(&mut k.mm, &mut k.vmos, &mut k.jobs);
         for id in vmo_ids {
-            let _ = k.vmos.release(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
         }
         return Err(e);
     }
@@ -126,9 +126,11 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         true
     });
     if !made {
-        process.aspace.destroy_user(&mut k.mm, &mut k.vmos);
+        process
+            .aspace
+            .destroy_user(&mut k.mm, &mut k.vmos, &mut k.jobs);
         for id in process.vmos {
-            let _ = k.vmos.release(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
         }
         return Err(LoadError::NoMemory);
     }
@@ -136,7 +138,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         let s = state();
         let (entry, arg) = (process.entry, process.arg);
         // (the root job has no limits: these charges only keep its usage honest)
-        let jobs = &mut kmem::get().vmos.jobs;
+        let jobs = &mut kmem::get().jobs;
         let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
         let _ = charge_thread(jobs, JobId::ROOT);
         s.procs.insert(pid, Box::new(process));

@@ -41,6 +41,8 @@ impl PhysMem for DirectMap {
 pub struct Kmem {
     pub mm: Mm<DirectMap>,
     pub vmos: Vmos,
+    /// The job ledger (L16): not part of the VMO store.
+    pub jobs: kcore::job::Jobs,
     pub aspace: AddressSpace,
 }
 
@@ -298,6 +300,7 @@ pub fn init() {
         *addr_of_mut!(KMEM) = Some(Kmem {
             mm,
             vmos: Vmos::new(),
+            jobs: kcore::job::Jobs::new(),
             aspace,
         })
     };

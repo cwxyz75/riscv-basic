@@ -73,7 +73,9 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
 pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let who = thread::current() as u64;
     let deadline = a[2];
-    match in_process(|s, k, me| ksys::futex_wait_check(s, &mut k.mm, &mut k.vmos, me, who, a))? {
+    match in_process(|s, k, me| {
+        ksys::futex_wait_check(s, &mut k.mm, &mut k.vmos, &mut k.jobs, me, who, a)
+    })? {
         ksys::FutexCheck::Done(status) => return fail(status),
         ksys::FutexCheck::Sleep => {}
     }
@@ -99,7 +101,7 @@ pub(super) fn futex_wake(a: [u64; 6]) -> (Reply, Vec<u64>) {
 /// then report one in turn.
 pub(super) fn port_wait(a: [u64; 6]) -> Reply {
     let (h, deadline) = ksys::port_wait_check(a).map_err(|e| (e, None, None))?;
-    let poll = || in_process(|s, k, me| ksys::port_poll(s, &mut k.vmos, me, h));
+    let poll = || in_process(|s, k, me| ksys::port_poll(s, &mut k.jobs, me, h));
     // Poll, and while nothing is ready and the deadline has not passed, sleep until the port
     // is READABLE and poll again (the readiness seen by the sleep check can be gone by the time
     // we poll, so one wait is not enough).
@@ -136,8 +138,11 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
 /// `buffer` and their count in `a1`.
 pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
     let (h, buf, cap, deadline) = ksys::port_wait_many_check(a).map_err(|e| (e, None, None))?;
-    let poll =
-        || in_process(|s, k, me| ksys::port_poll_many(s, &mut k.mm, &mut k.vmos, me, h, buf, cap));
+    let poll = || {
+        in_process(|s, k, me| {
+            ksys::port_poll_many(s, &mut k.mm, &mut k.vmos, &mut k.jobs, me, h, buf, cap)
+        })
+    };
     let mut got = poll()?;
     while got == 0
         && deadline != 0
@@ -167,7 +172,15 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
-        ksys::channel_call_send(s, &mut k.mm, &mut k.vmos, me, a, take_interrupt)
+        ksys::channel_call_send(
+            s,
+            &mut k.mm,
+            &mut k.vmos,
+            &mut k.jobs,
+            me,
+            a,
+            take_interrupt,
+        )
     })?;
     notify();
     // Wait for the reply with that transaction id (or the peer closing, or the deadline).
@@ -198,9 +211,15 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
         let s = state();
         let k = kmem::get();
         match caller_pid(s) {
-            Ok(pid) => {
-                ksys::channel_call_reply(s, &mut k.mm, &mut k.vmos, pid, &call, take_interrupt)
-            }
+            Ok(pid) => ksys::channel_call_reply(
+                s,
+                &mut k.mm,
+                &mut k.vmos,
+                &mut k.jobs,
+                pid,
+                &call,
+                take_interrupt,
+            ),
             Err(e) => Err((e, None, None)),
         }
     })

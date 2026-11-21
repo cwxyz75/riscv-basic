@@ -53,7 +53,7 @@ pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.el
 /// kernel's own objects).
 fn quota(job: JobId) -> ipc::Quota<'static> {
     ipc::Quota {
-        jobs: &mut kmem::get().vmos.jobs,
+        jobs: &mut kmem::get().jobs,
         job: Some(job),
     }
 }
@@ -102,8 +102,8 @@ pub fn reported() -> (u32, u32) {
 /// J2). Applies the credits of destroyed objects first.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64) {
     irq::without(|| {
-        ipc::settle(&mut state().objs, &mut kmem::get().vmos.jobs);
-        let jobs = &kmem::get().vmos.jobs;
+        ipc::settle(&mut state().objs, &mut kmem::get().jobs);
+        let jobs = &kmem::get().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
         (jobs.live(), u.processes, u.threads, u.objects, u.ipc_bytes)
     })

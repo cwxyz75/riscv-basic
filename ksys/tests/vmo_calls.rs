@@ -35,7 +35,6 @@ fn vmo_create_rows() {
 fn vmo_create_is_charged_to_the_job_and_a_failure_frees_the_vmo() {
     let mut w = world();
     let job = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
