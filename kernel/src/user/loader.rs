@@ -75,6 +75,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(e);
     }
     let process = Process {
+        live_tids: Default::default(),
         aspace,
         handles: HandleTable::new(MAX_HANDLES),
         asid,

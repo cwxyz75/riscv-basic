@@ -22,6 +22,7 @@ const REC: u64 = 0x50_0000;
 
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
+        live_tids: Default::default(),
         aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
         handles: HandleTable::new(64),
         asid: 1,

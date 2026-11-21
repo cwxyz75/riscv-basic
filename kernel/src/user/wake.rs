@@ -143,13 +143,13 @@ pub fn end_process(pid: u64, code: i32) {
 /// Wake every blocked thread of process `pid` by id (a kill must reach sleepers that are on no
 /// queue: futex sleepers).
 pub(super) fn wake_threads_of(pid: u64) {
+    // (the process's own set of live threads: not a walk of every thread in the system, T191)
     let tids: Vec<Tid> = irq::without(|| {
         state()
-            .thread_pid
-            .iter()
-            .filter(|(_, p)| **p == pid)
-            .map(|(t, _)| *t)
-            .collect()
+            .procs
+            .get(&pid)
+            .map(|p| p.live_tids.iter().copied().collect())
+            .unwrap_or_default()
     });
     thread::wake_many(&tids);
 }

@@ -92,6 +92,7 @@ pub fn process_create<M: PhysMem>(
     procs.insert(
         pid,
         Box::new(Process {
+            live_tids: Default::default(),
             aspace: AddressSpace::new(table),
             handles: HandleTable::new(MAX_HANDLES),
             asid: (pid & 0xffff) as u16,

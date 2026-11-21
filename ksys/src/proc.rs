@@ -43,6 +43,10 @@ pub struct PCtx<'a, M: PhysMem, X: Machine> {
 }
 
 pub struct Process {
+    /// The user threads of this process that have started and not ended (T191): what a kill, a suspend or a teardown walks, instead of every thread
+    /// in the system. Kept in step with `UserState::thread_pid` (the same threads, keyed the other way): a thread is added when it registers
+    /// itself on its first run and removed when it ends or its process is torn down.
+    pub live_tids: alloc::collections::BTreeSet<Tid>,
     pub aspace: AddressSpace,
     pub handles: HandleTable,
     pub asid: u16,
