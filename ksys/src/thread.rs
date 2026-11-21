@@ -432,10 +432,13 @@ pub fn thread_suspend(
     let blocked = blocked(tid);
     let parked = us.parked_tids.contains(&tid);
     let entry = us.suspends.entry(tid).or_default();
-    let raise = entry.suspend(blocked).ok_or(Status::NoMemory)?;
+    let mut raise = entry.suspend(blocked).ok_or(Status::NoMemory)?;
     if parked {
-        // asleep in the park at the return to user mode (a stopped process): it is parked, not blocked in a call
-        let _ = entry.return_to_user();
+        // asleep in the park at the return to user mode (a stopped process, or a thread that was resumed and has not run yet to leave it): it is
+        // parked, not blocked in a call, and SUSPENDED rises now if it was not up
+        if let AtReturn::Park { raise: r } = entry.return_to_user() {
+            raise |= r;
+        }
     }
     if raise {
         ipc::thread_set_suspended(&mut us.objs, obj, true);
@@ -498,6 +501,14 @@ pub fn thread_blocks(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) -> bo
 /// Is the thread suspended (its count is above 0)?
 pub fn thread_is_suspended(us: &UserState, tid: kcore::sched::Tid) -> bool {
     us.suspends.get(&tid).is_some_and(|s| s.active())
+}
+
+/// Is the thread suspended with SUSPENDED not up (a resume and a new suspend came before the woken thread ran)? A parked thread that finds this
+/// leaves its sleep and parks again, which raises the signal.
+pub fn thread_stop_pending(us: &UserState, tid: kcore::sched::Tid) -> bool {
+    us.suspends
+        .get(&tid)
+        .is_some_and(|s| s.active() && !s.stopped())
 }
 
 /// A thread that was parked leaves the return to user mode (woken with a count of 0, or killed).

@@ -4396,7 +4396,7 @@ fn pager_calls_check_their_arguments() -> Outcome {
         Some(S::WrongType),
         "a VMO is not a pager"
     );
-    let weak = weaker(pager, Rights::WAIT.0)?;
+    let weak = weaker(pager, Rights::DUPLICATE.0)?;
     ensure_eq!(
         st(sys::pager_create_vmo(weak, 1, 4096)),
         Some(S::AccessDenied),

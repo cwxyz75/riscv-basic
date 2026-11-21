@@ -42,8 +42,8 @@ pub use thread::{
     charge_thread, clamp_prio, credit_thread, initial_general, new_start, process_start,
     thread_at_return, thread_blocks, thread_is_suspended, thread_registered_by_spawner,
     thread_resume, thread_spawn, thread_spawned_suspended, thread_start_suspended,
-    thread_state_target, thread_suspend, thread_suspend_forget, thread_unparked, total_threads,
-    Spawn, KSTACK_PAGES,
+    thread_state_target, thread_stop_pending, thread_suspend, thread_suspend_forget,
+    thread_unparked, total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::vmo_call;
 pub use wait::{

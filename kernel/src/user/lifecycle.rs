@@ -426,7 +426,12 @@ pub(super) fn park_while_stopped() {
             state().parked_tids.insert(thread::current());
         });
         thread::wait_deadline_private(
-            || killed_now().is_some() || (!stopped_now() && !suspended_now()),
+            || {
+                killed_now().is_some()
+                || (!stopped_now() && !suspended_now())
+                // (resumed and suspended again before this thread ran: it parks afresh, which raises SUSPENDED)
+                || (suspended_now() && ksys::thread_stop_pending(state(), thread::current()))
+            },
             u64::MAX,
         );
         irq::without(|| {
