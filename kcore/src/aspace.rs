@@ -405,7 +405,7 @@ impl Vmos {
         // Commit everything first so a failure part-way leaves no half-written data.
         let mut at = offset;
         while at < end {
-            self.page_for(mm, jobs, id, at / PAGE_SIZE)
+            self.page_for(mm, jobs, None, id, at / PAGE_SIZE)
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
@@ -458,7 +458,7 @@ impl Vmos {
             if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
-            match self.page_for(mm, jobs, id, page) {
+            match self.page_for(mm, jobs, None, id, page) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
@@ -492,6 +492,11 @@ impl Vmos {
     }
 
     /// The job a VMO's pages are charged to.
+    /// Pages of VMO `id` that have a frame now (committed by a fault, a write or `commit`).
+    pub fn committed_pages(&self, id: u64) -> Option<u64> {
+        self.vmo(id).map(|v| v.committed.len() as u64)
+    }
+
     pub fn job_of(&self, id: u64) -> Option<JobId> {
         self.vmo(id).map(|v| v.job)
     }
@@ -502,6 +507,7 @@ impl Vmos {
         &mut self,
         mm: &mut Mm<M>,
         jobs: &mut Jobs,
+        mut reserve: Option<&mut Reservation>,
         id: u64,
         page: u64,
     ) -> Result<Pfn, FaultError> {
@@ -509,18 +515,29 @@ impl Vmos {
         if let Some(pfn) = vmo.committed.get(page) {
             return Ok(pfn);
         }
-        // The job's limit first (a full job is "out of memory" for its own programs only),
-        // then the frame; a frame that cannot be had gives the charge back.
-        jobs.charge(vmo.job, Resource::Pages, 1)
-            .map_err(|_| FaultError::NoMemory)?;
+        // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
+        // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
+        match reserve.as_deref_mut() {
+            Some(r) => r.take(jobs, vmo.job).map_err(|_| FaultError::NoMemory)?,
+            None => jobs
+                .charge(vmo.job, Resource::Pages, 1)
+                .map_err(|_| FaultError::NoMemory)?,
+        }
+        let vmo_job = vmo.job;
+        let give_back = |jobs: &mut Jobs, reserve: &mut Option<&mut Reservation>| match reserve
+            .as_deref_mut()
+        {
+            Some(r) => r.put_back(),
+            None => jobs.credit(vmo_job, Resource::Pages, 1),
+        };
         let Some(pfn) = mm.db.alloc() else {
-            jobs.credit(vmo.job, Resource::Pages, 1);
+            give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
         };
         // (the bookkeeping first: if it cannot be had, the frame and the charge go back and nothing was committed)
         if vmo.committed.insert(page, pfn).is_err() {
             let _ = mm.db.dec(pfn);
-            jobs.credit(vmo.job, Resource::Pages, 1);
+            give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
         }
         mm.mem.zero_frame(pfn);
@@ -545,10 +562,67 @@ struct Region {
     perms: Perms,
 }
 
+/// Pages an address space prepays from a job at a time (KERNEL-V1-SPEC 4.7): the fault path takes a page from the reservation and
+/// asks the ledger only to refill it, so the ledger is consulted once per batch, not once per fault.
+pub const RESERVATION_PAGES: u64 = 64;
+/// A refill takes at most `room / RESERVATION_ROOM_DIVISOR` pages (and at least one).
+pub const RESERVATION_ROOM_DIVISOR: u64 = 8;
+
+/// Pages charged to a job (they count as its usage, J1) but not yet committed to any VMO: an address space's prepaid pool. A reservation
+/// is for one job at a time; a fault on a VMO of another job gives the remainder back and prepays from that one.
+#[derive(Debug, Default)]
+pub struct Reservation {
+    job: Option<JobId>,
+    pages: u64,
+}
+
+impl Reservation {
+    /// Prepaid pages left.
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+
+    /// Spend one prepaid page of `job`, refilling by up to [`RESERVATION_PAGES`] (an eighth of the job's room at most, one page at
+    /// least) when the pool is empty or belongs to another job. `Err` when the job has no room for even one page.
+    pub fn take(&mut self, jobs: &mut Jobs, job: JobId) -> Result<(), crate::job::JobError> {
+        if self.job == Some(job) && self.pages > 0 {
+            self.pages = self.pages.saturating_sub(1);
+            return Ok(());
+        }
+        self.release(jobs);
+        // (an eighth of the room at most, so that a prepayment near a job's limit cannot starve the job's other users: a 64-page job
+        // prepays 8 pages at a time, not all 64)
+        let n = (jobs.room(job, Resource::Pages) / RESERVATION_ROOM_DIVISOR)
+            .clamp(1, RESERVATION_PAGES);
+        if jobs.room(job, Resource::Pages) == 0 {
+            return Err(crate::job::JobError::Exceeded);
+        }
+        jobs.charge(job, Resource::Pages, n)?;
+        self.job = Some(job);
+        self.pages = n.saturating_sub(1); // (one is spent now)
+        Ok(())
+    }
+
+    /// Take back a page `take` spent that was not committed after all (the frame could not be had): it stays prepaid.
+    pub fn put_back(&mut self) {
+        self.pages = self.pages.saturating_add(1);
+    }
+
+    /// Give every prepaid page back to the job (teardown; an idle address space).
+    pub fn release(&mut self, jobs: &mut Jobs) {
+        if let Some(job) = self.job.take() {
+            jobs.credit(job, Resource::Pages, self.pages);
+        }
+        self.pages = 0;
+    }
+}
+
 /// A page table plus the regions that say what its holes mean.
 pub struct AddressSpace<F: PageTableFormat = Sv39> {
     table: PageTable<F>,
     regions: BTreeMap<u64, Region>,
+    /// The prepaid pages the fault path spends (L16).
+    reserve: Reservation,
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
@@ -556,7 +630,18 @@ impl<F: PageTableFormat> AddressSpace<F> {
         AddressSpace {
             table,
             regions: BTreeMap::new(),
+            reserve: Reservation::default(),
         }
+    }
+
+    /// The prepaid pages this address space holds (they count as its job's usage).
+    pub fn reserved_pages(&self) -> u64 {
+        self.reserve.pages()
+    }
+
+    /// Give the prepaid pages back to their job (a quiet address space; teardown does it itself).
+    pub fn release_reservation(&mut self, jobs: &mut Jobs) {
+        self.reserve.release(jobs);
     }
 
     pub fn table(&self) -> &PageTable<F> {
@@ -751,7 +836,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         let (vmo, perms, region_pages, vmo_page0) =
             (region.vmo, region.perms, region.pages, region.vmo_page);
-        let pfn = vmos.page_for(mm, jobs, vmo, vmo_page0 + page)?;
+        let pfn = vmos.page_for(mm, jobs, Some(&mut self.reserve), vmo, vmo_page0 + page)?;
         let managed = mm.db.is_managed(pfn);
         if managed {
             mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
@@ -813,6 +898,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         for start in starts {
             let _ = self.unmap_region(mm, vmos, jobs, start);
         }
+        self.reserve.release(jobs);
         self.table.destroy_user(mm);
     }
 
@@ -822,6 +908,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         for start in starts {
             let _ = self.unmap_region(mm, vmos, jobs, start);
         }
+        self.reserve.release(jobs);
         self.table.destroy(mm);
     }
 }
