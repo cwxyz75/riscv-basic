@@ -88,6 +88,15 @@ pub(crate) fn cow_sync() {
     }
     irq::without(|| {
         let s = state();
+        // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB
+        let replaced = caller_pid(s)
+            .ok()
+            .and_then(|pid| s.procs.get_mut(&pid))
+            .is_some_and(|p| p.aspace.take_replaced() > 0);
+        if replaced {
+            crate::smp::shootdown();
+            kmem::flush_tlb();
+        }
         let k = kmem::get();
         ksys::cow_sync(&mut s.procs, k.mm, k.vmos, &mut KernelMachine);
     });
