@@ -57,6 +57,7 @@ fn world() -> W {
         thread_objs: Default::default(),
         job: JobId::ROOT,
         table_charge: Default::default(),
+        charge_end: Default::default(),
         stacks: Default::default(),
         stack_hint: 0,
         privileged: false,

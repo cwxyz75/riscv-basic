@@ -31,6 +31,8 @@ struct Tlb {
     flushes: u32,
     /// Executable pages the instruction caches were synchronised for (PL7).
     icache_pages: u64,
+    /// Draws from the entropy pool (ANYWHERE).
+    randoms: u32,
 }
 impl Machine for Tlb {
     fn shootdown(&mut self) {
@@ -41,6 +43,10 @@ impl Machine for Tlb {
     }
     fn icache_sync(&mut self, pages: u64) {
         self.icache_pages += pages;
+    }
+    fn random_below(&mut self, _n: u64) -> u64 {
+        self.randoms += 1;
+        0
     }
 }
 
@@ -74,6 +80,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         thread_objs: BTreeMap::new(),
         job,
         table_charge: BTreeMap::new(),
+        charge_end: BTreeMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
@@ -1083,4 +1090,80 @@ fn map_info_walks_the_regions_and_a_protect_splits_and_merges_them() {
     // an address in a hole reports the next region; past the last, nothing
     let (c, _) = info(&mut w, buf, ph, VA + 8 * 4096);
     assert_eq!(c[1], 0, "no region at or after");
+}
+
+#[test]
+fn the_tables_of_a_split_mapping_stay_charged_until_no_region_is_left_in_their_span() {
+    let (mut w, ph) = world();
+    let v = w.vmo(2, JobId::ROOT);
+    let pages = |w: &W| w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let base = pages(&w);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R | W]);
+    let charged = pages(&w) - base;
+    assert!(charged > 0);
+    // the first page goes: the second stays, and so does the whole charge (its tables are still there)
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 4096, 0, 0, 0]);
+    assert_eq!(
+        pages(&w) - base,
+        charged,
+        "nothing is credited while a page of the mapping stays"
+    );
+    // a mapping folded into its neighbour keeps its own charge too
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4096, R | W]);
+    let both = pages(&w) - base;
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 4096, 4096, 0, 0, 0]);
+    assert!(
+        pages(&w) - base > 0,
+        "the charge of the mapping that stayed is still there: {both}"
+    );
+    // the last page goes: everything comes back
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 4096, 0, 0, 0]);
+    assert_eq!(
+        pages(&w),
+        base,
+        "no region left: the tables' charge is credited"
+    );
+}
+
+#[test]
+fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first() {
+    let (mut w, ph) = world();
+    let v = w.vmo(2, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R | W]);
+    for (name, at, len) in [
+        ("below the user range", 0u64, 4096u64),
+        ("the kernel half", 0xffff_ffc0_0000_0000, 4096),
+        ("over the top", TOP - 4096, 8192),
+        ("wrapping", u64::MAX - 4095, 8192),
+    ] {
+        assert_eq!(
+            w.err(nr::PROCESS_UNMAP, [ph, at, len, 0, 0, 0]),
+            Status::InvalidArgs,
+            "unmap {name}"
+        );
+        assert_eq!(
+            w.err(nr::PROCESS_PROTECT, [ph, at, len, R, 0, 0]),
+            Status::InvalidArgs,
+            "protect {name}"
+        );
+    }
+    // ANYWHERE: a bad flag, W with X, an unaligned offset, past the VMO's end: all InvalidArgs, and none takes entropy or a place
+    let spent = w.tlb.randoms;
+    for (name, a) in [
+        ("bad flag", [ph, v, 0, 0, 4096, 8]),
+        ("write with execute", [ph, v, 0, 0, 4096, W | X]),
+        ("unaligned offset", [ph, v, 0, 1, 4096, R]),
+        ("past the VMO", [ph, v, 0, 0, 3 * 4096, R]),
+        ("bigger than the arena", [ph, v, 0, 0, 1 << 40, R]),
+    ] {
+        assert_eq!(
+            w.err(nr::PROCESS_MAP, a),
+            Status::InvalidArgs,
+            "anywhere {name}"
+        );
+    }
+    assert_eq!(
+        w.tlb.randoms, spent,
+        "a refused ANYWHERE does not draw from the pool"
+    );
 }

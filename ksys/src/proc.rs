@@ -92,6 +92,10 @@ pub struct Process {
     /// when the region goes or the process ends. Table frames are not VMO pages, so without this
     /// a program could spend memory the page limit never sees.
     pub table_charge: BTreeMap<u64, u64>,
+    /// Where each `process_map` charge in `table_charge` ends (its key is where it starts): the charge is credited when no region is left in
+    /// that span, not when the region that started there goes (a range unmap or a protect can split a mapping: the tables of what stays
+    /// must stay charged, MM7).
+    pub charge_end: BTreeMap<u64, u64>,
     /// The stacks `thread_spawn` provisioned, by thread: freed when the thread ends (or with the process).
     pub stacks: BTreeMap<Tid, SpawnStack>,
     /// Where the next stack search in the arena starts (just above the last stack handed out).
@@ -125,6 +129,16 @@ fn e(s: Status) -> (Status, Option<u64>, Option<u64>) {
 
 /// Resolve a process handle and a VMO handle of the caller, checking them in the order SYSCALLS.md lists (BAD_HANDLE, WRONG_TYPE,
 /// ACCESS_DENIED). Returns the target pid and the VMO id.
+/// Is `[vaddr, vaddr + length)` a non-empty range inside the user half? (The range calls act only on regions, and regions are in the user half;
+/// this keeps it so if a kernel-half region ever exists.)
+fn in_user_range(vaddr: u64, length: u64) -> bool {
+    length > 0
+        && vaddr >= abi::user::BASE
+        && vaddr
+            .checked_add(length)
+            .is_some_and(|end| end <= abi::user::TOP)
+}
+
 /// Where an ANYWHERE mapping of `bytes` goes (MM7): the mapping arena `[0x1_0000_0000, the stack arena)`, at a place chosen uniformly among
 /// the page-aligned starts, taking the first gap that fits from there and wrapping to the start of the arena; `None` when nothing fits.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the arena bounds are constants below the canonical limit; the chosen start is below `span`
@@ -208,25 +222,19 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::BadState);
             }
             let aligned = |x: u64| x.is_multiple_of(4096);
-            // ANYWHERE (MM7): `vaddr` 0 asks the kernel to choose a free place, at random among those that fit in the mapping arena
+            // ANYWHERE (MM7): `vaddr` 0 asks the kernel to choose a free place, at random among those that fit in the mapping arena. Every
+            // other argument is checked first (with the arena's start standing in for the address), so a refused call costs no entropy.
             let anywhere = vaddr == 0;
-            let vaddr = if anywhere && aligned(length) && length > 0 {
-                match place_anywhere(&mut **machine, &target.aspace, length) {
-                    Some(at) => at,
-                    None => return bad(Status::NoMemory),
-                }
-            } else {
-                vaddr
-            };
-            let in_user = vaddr >= abi::user::BASE
-                && vaddr
+            let probe = if anywhere { abi::user::BASE } else { vaddr };
+            let in_user = probe >= abi::user::BASE
+                && probe
                     .checked_add(length)
                     .is_some_and(|end| end <= abi::user::TOP);
             let vmo_pages = vmos.pages(vid).ok_or(e(Status::BadHandle))?;
             let inside_vmo = offset
                 .checked_add(length)
                 .is_some_and(|end| end <= vmo_pages * 4096);
-            if !aligned(vaddr)
+            if !aligned(probe)
                 || !aligned(offset)
                 || !aligned(length)
                 || length == 0
@@ -237,6 +245,14 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             {
                 return bad(Status::InvalidArgs);
             }
+            let vaddr = if anywhere {
+                match place_anywhere(&mut **machine, &target.aspace, length) {
+                    Some(at) => at,
+                    None => return bad(Status::NoMemory),
+                }
+            } else {
+                vaddr
+            };
             // A VMO charged to a job that is neither the caller's nor the address space owner's must already be committed over the
             // range (slice V, INVARIANTS V1): its pages are paid for, so a touch can neither fail nor charge a stranger, and a
             // process cannot be killed by a VMO it was handed. A parent mapping its own VMO, or one charged to the child's job,
@@ -274,7 +290,11 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     _ => e(Status::InvalidArgs),
                 });
             }
-            target.table_charge.insert(vaddr, tables);
+            // (a key that is already there is a mapping that was split and whose start has been mapped again: its charge stays, and this one adds)
+            *target.table_charge.entry(vaddr).or_default() += tables;
+            let end = vaddr + length;
+            let extent = target.charge_end.entry(vaddr).or_insert(end);
+            *extent = (*extent).max(end);
             // a mapping that touches one of the same VMO with the same permissions becomes part of it (fewer regions)
             target
                 .aspace
@@ -367,6 +387,9 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     .unmap_region(mm, vmos, jobs, a[1])
                     .map_err(|_| e(Status::InvalidArgs))?;
             } else {
+                if !in_user_range(a[1], a[2]) {
+                    return bad(Status::InvalidArgs);
+                }
                 target
                     .aspace
                     .unmap_range(mm, vmos, jobs, a[1], a[2])
@@ -377,14 +400,16 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
             // other harts may still cache the translations of what was just unmapped
             machine.shootdown();
-            // the page-table charge of a region that is gone is credited (a split region keeps its original charge until its first part goes)
+            // the page-table charge of a `process_map` is credited when no region is left in the span it covered (a mapping that was split
+            // keeps the charge for what stays: its tables are still there)
             let gone: alloc::vec::Vec<u64> = target
-                .table_charge
-                .keys()
-                .copied()
-                .filter(|&k| k != u64::MAX && !target.aspace.has_region_at(k))
+                .charge_end
+                .iter()
+                .filter(|&(&k, &end)| !target.aspace.has_region_in(k, end))
+                .map(|(&k, _)| k)
                 .collect();
             for k in gone {
+                target.charge_end.remove(&k);
                 if let Some(tables) = target.table_charge.remove(&k) {
                     jobs.credit(target.job, Resource::Pages, tables);
                 }
@@ -397,7 +422,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (_, tpid, _, _) =
                 ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
-            if flags & !(PF_R | PF_W | PF_X) != 0 || flags & PF_W != 0 && flags & PF_X != 0 {
+            if flags & !(PF_R | PF_W | PF_X) != 0
+                || flags & PF_W != 0 && flags & PF_X != 0
+                || !in_user_range(vaddr, length)
+            {
                 return bad(Status::InvalidArgs);
             }
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;

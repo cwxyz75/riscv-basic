@@ -980,6 +980,29 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
     }
 
+    /// Does any region overlap `[lo, hi)`?
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
+    pub fn has_region_in(&self, lo: u64, hi: u64) -> bool {
+        if let Some((&s, r)) = self.regions.range(..lo).next_back() {
+            if s + r.pages * PAGE_SIZE > lo {
+                return true;
+            }
+        }
+        self.regions.range(lo..hi).next().is_some()
+    }
+
+    /// How many regions splitting at `start` and at `end` would add (0, 1 or 2): the room a range operation needs before it changes anything.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
+    fn splits_needed(&self, start: u64, end: u64) -> usize {
+        let inside = |va: u64| {
+            self.regions
+                .range(..=va)
+                .next_back()
+                .is_some_and(|(&s, r)| s != va && va < s + r.pages * PAGE_SIZE)
+        };
+        usize::from(inside(start)) + usize::from(inside(end))
+    }
+
     /// Is there a region that starts exactly at `va`?
     pub fn has_region_at(&self, va: u64) -> bool {
         self.regions.contains_key(&va)
@@ -1049,16 +1072,14 @@ impl<F: PageTableFormat> AddressSpace<F> {
         len: u64,
     ) -> Result<u64, RegionError> {
         let end = Self::range_end(start, len)?;
-        if self.regions.len().saturating_add(2) > abi::limits::MAX_REGIONS {
-            // (room for the two splits: a range inside one region needs both)
-            let inside_one = self
-                .regions
-                .range(..=start)
-                .next_back()
-                .is_some_and(|(&s, r)| s + r.pages * PAGE_SIZE >= end);
-            if inside_one {
-                return Err(RegionError::TooMany);
-            }
+        // (room for the splits this range needs, before anything changes: none at all for a range on region boundaries)
+        if self
+            .regions
+            .len()
+            .saturating_add(self.splits_needed(start, end))
+            > abi::limits::MAX_REGIONS
+        {
+            return Err(RegionError::TooMany);
         }
         self.split_at(vmos, start)?;
         self.split_at(vmos, end)?;
@@ -1121,7 +1142,12 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if denied {
             return Err(ProtectError::Denied);
         }
-        if self.regions.len().saturating_add(2) > abi::limits::MAX_REGIONS {
+        if self
+            .regions
+            .len()
+            .saturating_add(self.splits_needed(start, end))
+            > abi::limits::MAX_REGIONS
+        {
             return Err(ProtectError::TooMany);
         }
         self.split_at(vmos, start)

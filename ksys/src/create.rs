@@ -111,6 +111,7 @@ pub fn process_create<M: PhysMem>(
             thread_objs: BTreeMap::new(),
             job,
             table_charge: BTreeMap::from([(u64::MAX, 1)]),
+            charge_end: BTreeMap::new(),
             stacks: BTreeMap::new(),
             stack_hint: abi::user::STACK_ARENA_BASE,
             privileged: false,

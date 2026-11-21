@@ -67,6 +67,7 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
         thread_objs: Default::default(),
         job,
         table_charge: Default::default(),
+        charge_end: Default::default(),
         stacks: Default::default(),
         stack_hint: 0,
         privileged: false,

@@ -264,3 +264,119 @@ fn range_unmap_protect_split_and_merge_agree_with_a_per_page_model() {
         mm.db.audit().unwrap();
     }
 }
+
+/// The region limit (MM7 review): a range operation that needs no split works at the limit, and one that needs a split it cannot make fails
+/// before it changes anything (no half-done split, no new generations).
+#[test]
+fn range_operations_at_the_region_limit_need_exactly_the_room_they_use() {
+    use abi::limits::MAX_REGIONS;
+    let mut mm = Mm {
+        db: FrameDb::new(2000, 50),
+        mem: FakeMem::default(),
+    };
+    let mut vmos = Vmos::new();
+    let mut jobs = Jobs::new();
+    let mut a = AddressSpace::new(PageTable::new(&mut mm).unwrap());
+    let id = vmos.create(&mut jobs, 2);
+    // regions of two pages every four pages: each has an interior boundary and the gaps between them are holes
+    let at = |i: usize| BASE + (i as u64) * 4 * PAGE;
+    for i in 0..MAX_REGIONS - 1 {
+        a.map_region(&mut vmos, at(i), 2, id, 0, pm(true, true, false))
+            .unwrap();
+    }
+    let before = a.regions_info();
+    // a range from inside one region to inside the next needs two splits, and there is room for one
+    assert_eq!(
+        a.unmap_range(&mut mm, &mut vmos, &mut jobs, at(3) + PAGE, 4 * PAGE),
+        Err(RegionError::TooMany)
+    );
+    assert_eq!(
+        a.protect_range(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            at(3) + PAGE,
+            4 * PAGE,
+            pm(true, false, false)
+        )
+        .unwrap_err(),
+        ProtectError::NotMapped,
+        "(the hole between them is checked first)"
+    );
+    // a protect that is covered but needs two splits: one region, an inner range
+    assert_eq!(
+        a.protect_range(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            at(5),
+            PAGE,
+            pm(true, false, false)
+        )
+        .map(|_| ()),
+        Ok(()),
+        "one split is room enough"
+    );
+    // (that used the last slot: put it back)
+    a.protect_range(
+        &mut mm,
+        &mut vmos,
+        &mut jobs,
+        at(5),
+        PAGE,
+        pm(true, true, false),
+    )
+    .unwrap();
+    assert_eq!(
+        a.regions_info(),
+        before,
+        "protect and back merges to what was there"
+    );
+    assert_eq!(a.region_count(), MAX_REGIONS - 1);
+    // a failed range operation changed nothing
+    let _ = a.unmap_range(&mut mm, &mut vmos, &mut jobs, at(3) + PAGE, 4 * PAGE);
+    assert_eq!(
+        a.regions_info(),
+        before,
+        "TooMany leaves every region as it was"
+    );
+    // at the limit itself, a range that lands on region boundaries needs no split and frees a slot
+    a.map_region(
+        &mut vmos,
+        at(MAX_REGIONS - 1),
+        2,
+        id,
+        0,
+        pm(true, true, false),
+    )
+    .unwrap();
+    assert_eq!(a.region_count(), MAX_REGIONS);
+    assert_eq!(
+        a.unmap_range(&mut mm, &mut vmos, &mut jobs, at(7), 2 * PAGE),
+        Ok(1),
+        "a whole region at the limit"
+    );
+    assert_eq!(
+        a.protect_range(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            at(9),
+            2 * PAGE,
+            pm(true, false, false)
+        )
+        .map(|s| s.downgraded),
+        Ok(false),
+        "protecting exactly one region at the limit (nothing mapped: no downgrade to shoot down)"
+    );
+    assert_eq!(a.region_count(), MAX_REGIONS - 1);
+    // and a range that needs a split at the limit is refused
+    a.map_region(&mut vmos, at(7), 2, id, 0, pm(true, true, false))
+        .unwrap();
+    assert_eq!(a.region_count(), MAX_REGIONS);
+    assert_eq!(
+        a.unmap_range(&mut mm, &mut vmos, &mut jobs, at(11) + PAGE, PAGE),
+        Err(RegionError::TooMany),
+        "a tail trim that needs a split with no room left (end at the region's own end needs none, so this is a head split)"
+    );
+}
