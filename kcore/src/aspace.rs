@@ -271,6 +271,10 @@ pub struct Vmos {
 pub static COPY_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Set when `Vmos::need` holds a page a pager must supply: the kernel looks here after every call, so the common case costs one load and no lock.
+pub static PAGER_NEED_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 impl Vmos {
     pub fn new() -> Vmos {
         Vmos::default()
@@ -533,6 +537,7 @@ impl Vmos {
 
     /// The page a pager must supply that the last failed access needed (taken: the kernel asks for it once).
     pub fn take_need(&mut self) -> Option<PagerNeed> {
+        PAGER_NEED_PENDING.store(false, core::sync::atomic::Ordering::Release);
         self.need.take()
     }
 
@@ -1270,6 +1275,7 @@ impl Vmos {
                 if self.lookup_hit(id, page).is_none() {
                     if let Some(need) = self.pager_need(id, page) {
                         self.need = Some(need);
+                        PAGER_NEED_PENDING.store(true, core::sync::atomic::Ordering::Release);
                         return Err(VmoError::NeedPager);
                     }
                 }
@@ -1592,6 +1598,7 @@ impl Vmos {
         if hit.is_none() {
             if let Some(need) = self.pager_need(id, page) {
                 self.need = Some(need);
+                PAGER_NEED_PENDING.store(true, core::sync::atomic::Ordering::Release);
                 return Err(FaultError::NeedPager(need));
             }
         }
