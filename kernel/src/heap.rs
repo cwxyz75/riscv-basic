@@ -434,14 +434,14 @@ fn service_pool() {
     rebalance_pool();
 }
 
-/// Bring the pool to `POOL_TARGET`: stock it from the frame database, or give the surplus back.
+/// Bring the pool to `POOL_TARGET`: stock it from this hart's frame cache, or give the surplus back to it.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a frame number is below 2^52, so its address in the direct map (a kernel virtual address) does not overflow, and a pool frame is a direct-map address, so subtracting the base cannot underflow
 fn rebalance_pool() {
     debug_assert!(crate::bkl::held());
-    let k = crate::kmem::frames();
+    // (frames come from this hart's cache, which takes `FRAME` only to refill or drain a batch)
     let count = || with_heaps(|h| h.pool_count);
     while count() < POOL_TARGET {
-        let Some(pfn) = k.mm.db.alloc() else {
+        let Some(pfn) = crate::kmem::frame_alloc() else {
             POOL_STARVED.store(true, Ordering::Relaxed);
             break;
         };
@@ -467,7 +467,7 @@ fn rebalance_pool() {
         });
         let Some(frame) = frame else { break };
         let pfn = (frame as u64 - DIRECT_BASE) >> 12;
-        let _ = k.mm.db.dec(pfn);
+        crate::kmem::frame_free_sole(pfn);
     }
 }
 

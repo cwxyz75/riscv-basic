@@ -627,6 +627,58 @@ fn heap_grows_at_a_safe_point() -> Outcome {
     Ok(())
 }
 
+/// L16: this hart's frame cache hands out frames with one reference, refills in batches (the database's free count drops by whole
+/// batches, not per frame), takes frames back without the database, and the leak oracle counts what it holds as free.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn frame_cache_serves_and_accounts() -> Outcome {
+    use alloc::vec::Vec;
+    irq_service();
+    let accounted = kmem::free_frames_accounted();
+    let db_free = || kmem::get().mm.db.free_count();
+    let db_before = db_free();
+    let mut got: Vec<u64> = Vec::new();
+    for _ in 0..40 {
+        got.push(kmem::frame_alloc().ok_or("a frame")?);
+    }
+    let mut sorted = got.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    ensure_eq(sorted.len(), 40, "forty different frames")?;
+    ensure_eq(
+        kmem::free_frames_accounted(),
+        accounted - 40,
+        "forty frames are out",
+    )?;
+    let taken = db_before - db_free();
+    ensure(
+        taken % kcore::fcache::BATCH == 0 && taken <= 40 + kcore::fcache::BATCH,
+        "the database was asked in batches",
+    )?;
+    {
+        let k = kmem::get();
+        for &p in &got {
+            ensure_eq(k.mm.db.refs(p), Some(1), "one reference each")?;
+        }
+    }
+    for &p in &got {
+        kmem::frame_free_sole(p);
+    }
+    ensure_eq(
+        kmem::free_frames_accounted(),
+        accounted,
+        "the frames are back (the cache counts as free)",
+    )?;
+    ensure(
+        kmem::cached_frames() > 0,
+        "the cache keeps frames for the next allocation",
+    )?;
+    kmem::get()
+        .mm
+        .db
+        .audit()
+        .map_err(|e| format!("frame database audit: {e}"))
+}
+
 /// MM4: small objects come from the slabs (in the direct map, aligned to their class), keep what is written, and when they are all freed the
 /// frames and bytes the heap holds are back where they were: the churn test of T-SPEC section 8 for the slab path.
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
@@ -708,6 +760,10 @@ fn irq_service() {
 
 pub const TESTS: &[Test] = &[
     ("heap_grows_at_a_safe_point", heap_grows_at_a_safe_point),
+    (
+        "frame_cache_serves_and_accounts",
+        frame_cache_serves_and_accounts,
+    ),
     (
         "slab_serves_small_objects_and_everything_comes_back",
         slab_serves_small_objects_and_everything_comes_back,

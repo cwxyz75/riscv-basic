@@ -103,6 +103,44 @@ pub struct PerHart {
     pub last_class: AtomicU32,
     /// This hart's magazines of free slab objects, one per size class (MM4): touched only by this hart with interrupts off.
     pub magazines: Magazines,
+    /// This hart's cache of free frames (L16): touched only by this hart with interrupts off.
+    pub frame_cache: FrameCacheCell,
+}
+
+/// One hart's frame cache (`kcore::fcache`, L16). The cache itself is touched by the owning hart alone with interrupts off; its length is
+/// mirrored in an atomic so the leak oracle on another hart can count the frames it holds.
+pub struct FrameCacheCell {
+    cache: core::cell::UnsafeCell<kcore::fcache::FrameCache>,
+    len: AtomicUsize,
+}
+
+// SAFETY: `cache` is reached only through `with`, whose contract is that the owning hart calls it with interrupts off; `len` is atomic.
+unsafe impl Sync for FrameCacheCell {}
+
+impl FrameCacheCell {
+    const fn new() -> FrameCacheCell {
+        FrameCacheCell {
+            cache: core::cell::UnsafeCell::new(kcore::fcache::FrameCache::new()),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Frames cached now (any hart may read it).
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Run `f` on the cache.
+    ///
+    /// # Safety
+    /// The calling hart must be the owner of this record, with interrupts off.
+    pub unsafe fn with<R>(&self, f: impl FnOnce(&mut kcore::fcache::FrameCache) -> R) -> R {
+        // SAFETY: the caller owns the cache with interrupts off, so nothing else touches it.
+        let c = unsafe { &mut *self.cache.get() };
+        let r = f(c);
+        self.len.store(c.len(), Ordering::Relaxed);
+        r
+    }
 }
 
 /// Free objects a hart keeps per size class (MM4): the common allocation and free take no shared lock.
@@ -222,6 +260,7 @@ impl PerHart {
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
             magazines: Magazines::new(),
+            frame_cache: FrameCacheCell::new(),
         }
     }
 }

@@ -62,6 +62,53 @@ pub struct Kmem {
     _vmos: Held<'static, Vmos>,
 }
 
+/// The shared side of the per-hart frame caches: each call is one take of `FRAME`.
+struct SharedFrames;
+
+impl kcore::fcache::Shared for SharedFrames {
+    fn refill(&mut self, out: &mut [u64]) -> usize {
+        frames().mm.db.refill(out)
+    }
+    fn drain(&mut self, frames_back: &[u64]) {
+        frames().mm.db.drain(frames_back);
+    }
+}
+
+/// A frame (reference count 1) from this hart's cache, which refills from the database in batches under `FRAME` (L16). Not to be called
+/// with a memory lock held (a refill takes `FRAME`).
+#[track_caller]
+pub fn frame_alloc() -> Option<u64> {
+    let was = crate::irq::save_and_disable();
+    // SAFETY: interrupts are off, and this is the calling hart's own record.
+    let r = unsafe {
+        crate::percpu::this()
+            .frame_cache
+            .with(|c| c.alloc(&mut SharedFrames))
+    };
+    crate::irq::restore(was);
+    r
+}
+
+/// Give a frame back to this hart's cache; the caller holds its only reference (a kernel-owned frame: a slab, the pool, a stack).
+#[track_caller]
+pub fn frame_free_sole(pfn: u64) {
+    let was = crate::irq::save_and_disable();
+    // SAFETY: as in `frame_alloc`.
+    unsafe {
+        crate::percpu::this()
+            .frame_cache
+            .with(|c| c.free_sole(pfn, &mut SharedFrames))
+    };
+    crate::irq::restore(was);
+}
+
+/// Frames the harts' caches hold (free for the leak oracles).
+pub fn cached_frames() -> usize {
+    (0..crate::percpu::MAX_HARTS)
+        .map(|i| crate::percpu::hart(i).frame_cache.len())
+        .sum()
+}
+
 /// The frame database alone (`FRAME`), for the code that needs only frames: the heap's pool (the kernel stacks also need the address space, so they use `get`).
 pub struct Frames {
     pub mm: &'static mut Mm<DirectMap>,
@@ -515,5 +562,5 @@ pub fn kernel_half_unchanged() -> bool {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a sum of three frame counts, each at most the number of frames
 pub fn free_frames_accounted() -> usize {
     let free = get().mm.db.free_count(); // (the locks are released before the two calls below)
-    free + crate::kstack::frames_held() + crate::heap::frames_held()
+    free + cached_frames() + crate::kstack::frames_held() + crate::heap::frames_held()
 }
