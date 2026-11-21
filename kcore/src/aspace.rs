@@ -40,6 +40,44 @@ pub enum FaultError {
     MapFailed(MapError),
 }
 
+/// What a fault's first step found (`AddressSpace::fault_lookup`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// The page is already mapped and allows the access: nothing to do.
+    Mapped(MappedPages),
+    /// The page to fetch from the VMO and map.
+    Plan(FaultPlan),
+}
+
+/// The region and page a fault is about, with the region's generation: enough to fetch the page without holding the address space and to
+/// notice afterwards that the region went away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultPlan {
+    start: u64,
+    page: u64,
+    page_va: u64,
+    vmo: u64,
+    vmo_page: u64,
+    perms: Perms,
+    pages: u64,
+    gen: u64,
+}
+
+impl FaultPlan {
+    /// The VMO and the page in it the fault needs.
+    pub fn vmo_page(&self) -> (u64, u64) {
+        (self.vmo, self.vmo_page.saturating_add(self.page))
+    }
+}
+
+/// Why `AddressSpace::fault_map` did not map.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FaultMapError {
+    /// The region was unmapped (or replaced) since the lookup: look the fault up again.
+    Stale,
+    Fault(FaultError),
+}
+
 /// The largest region (1 GiB), so that unmapping one is bounded work.
 pub const MAX_REGION_PAGES: u64 = 1 << 18;
 
@@ -562,6 +600,9 @@ struct Region {
     vmo: u64,
     vmo_page: u64,
     perms: Perms,
+    /// Which incarnation of the region this is: a number from the address space's counter, never reused, so a fault that looked the region up
+    /// and later finds a region with another number (or none) at that start knows it was unmapped (and maybe replaced) meanwhile.
+    gen: u64,
 }
 
 /// Pages an address space prepays from a job at a time (KERNEL-V1-SPEC 4.7): the fault path takes a page from the reservation and
@@ -646,6 +687,8 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
     regions: BTreeMap<u64, Region>,
     /// The prepaid pages the fault path spends (L16).
     reserve: Reservation,
+    /// The generation the next region gets (see `Region::gen`).
+    next_gen: u64,
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
@@ -654,6 +697,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
             table,
             regions: BTreeMap::new(),
             reserve: Reservation::default(),
+            next_gen: 1,
         }
     }
 
@@ -726,8 +770,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 vmo,
                 vmo_page,
                 perms,
+                gen: self.next_gen,
             },
         );
+        self.next_gen = self.next_gen.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
         Ok(())
     }
 
@@ -812,7 +858,6 @@ impl<F: PageTableFormat> AddressSpace<F> {
     /// caller flushes `first..=last` (page by page) before returning to the faulting instruction: a mapping that was absent may
     /// still be cached as absent unless the implementation has Svvptc, and a stale entry is harmless but a fault. A neighbour that
     /// cannot be mapped (no memory for a table) is simply left for its own fault. Device memory is not mapped around.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums; the window arithmetic is on page-aligned addresses inside the region
     pub fn handle_fault_mapped<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -821,6 +866,32 @@ impl<F: PageTableFormat> AddressSpace<F> {
         va: u64,
         access: Access,
     ) -> Result<MappedPages, FaultError> {
+        // (the three steps run back to back here, under one hold of the address space; a caller that releases it between the steps, as
+        // a pager wait must (MM9, KERNEL-V1-SPEC 4.5), asks `fault_map` whether the region is still the one it looked up)
+        loop {
+            let plan = match self.fault_lookup(mm, va, access)? {
+                Lookup::Mapped(m) => return Ok(m),
+                Lookup::Plan(plan) => plan,
+            };
+            let (fetch_vmo, fetch_page) = plan.vmo_page();
+            let pfn = vmos.page_for(mm, jobs, Some(&mut self.reserve), fetch_vmo, fetch_page)?;
+            match self.fault_map(mm, vmos, &plan, pfn) {
+                Ok(m) => return Ok(m),
+                Err(FaultMapError::Stale) => continue,
+                Err(FaultMapError::Fault(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// First step of a fault: find the region and check the access. `Mapped` when the page is already mapped and allows it (a spurious
+    /// fault); otherwise the plan for the page to fetch.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the region was found with start <= va, so va - start does not underflow; page < region.pages bounds the sums
+    pub fn fault_lookup<M: PhysMem>(
+        &self,
+        mm: &Mm<M>,
+        va: u64,
+        access: Access,
+    ) -> Result<Lookup, FaultError> {
         let (&start, region) = self
             .regions
             .range(..=va)
@@ -849,20 +920,54 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 Access::Exec => existing.perms.exec,
             };
             return if ok {
-                Ok(MappedPages {
+                Ok(Lookup::Mapped(MappedPages {
                     first: page_va,
                     last: page_va,
-                })
+                }))
             } else {
                 Err(FaultError::Denied)
             };
         }
-        let (vmo, perms, region_pages, vmo_page0) =
-            (region.vmo, region.perms, region.pages, region.vmo_page);
-        let pfn = vmos.page_for(mm, jobs, Some(&mut self.reserve), vmo, vmo_page0 + page)?;
+        Ok(Lookup::Plan(FaultPlan {
+            start,
+            page,
+            page_va,
+            vmo: region.vmo,
+            vmo_page: region.vmo_page,
+            perms: region.perms,
+            pages: region.pages,
+            gen: region.gen,
+        }))
+    }
+
+    /// Last step of a fault: map the page `pfn` the VMO gave for `plan` (and the committed neighbours, fault-around). `Stale` when the
+    /// region the plan came from is gone or was replaced since the lookup (an unmap in between): nothing is mapped, and the caller looks
+    /// the fault up again.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the window arithmetic is on page-aligned addresses inside the region
+    pub fn fault_map<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        plan: &FaultPlan,
+        pfn: Pfn,
+    ) -> Result<MappedPages, FaultMapError> {
+        match self.regions.get(&plan.start) {
+            Some(r) if r.gen == plan.gen => {}
+            _ => return Err(FaultMapError::Stale),
+        }
+        let (start, page_va, vmo, perms, vmo_page0, region_pages) = (
+            plan.start,
+            plan.page_va,
+            plan.vmo,
+            plan.perms,
+            plan.vmo_page,
+            plan.pages,
+        );
         let managed = mm.db.is_managed(pfn);
         if managed {
-            mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
+            mm.db
+                .inc(pfn)
+                .map_err(|_| FaultMapError::Fault(FaultError::NoMemory))?;
         }
         if let Err(e) = self.table.map(mm, page_va, pfn, perms) {
             if managed {
@@ -872,10 +977,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
                     "the reference just taken must be droppable"
                 );
             }
-            return Err(match e {
+            return Err(FaultMapError::Fault(match e {
                 MapError::NoMemory => FaultError::NoMemory,
                 other => FaultError::MapFailed(other),
-            });
+            }));
         }
         let mut out = MappedPages {
             first: page_va,
