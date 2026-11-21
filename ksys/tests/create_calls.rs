@@ -134,7 +134,7 @@ fn a_process_is_made_in_the_created_state_and_charged() {
 }
 
 #[test]
-fn pids_are_never_reused_while_live_and_wrap_without_overflow() {
+fn pids_are_never_reused_while_live_and_never_wrap() {
     let mut w = world(400);
     w.create(true, [0; 6]).unwrap();
     w.create(true, [0; 6]).unwrap();

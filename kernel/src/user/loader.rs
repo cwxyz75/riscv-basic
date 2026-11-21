@@ -17,7 +17,7 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     clippy::expect_used,
     clippy::indexing_slicing
 )]
-// INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); pids are a counter far below u32::MAX
+// INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); a pid is a u64 counter that never wraps (a start at its end is refused)
 pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);
@@ -61,9 +61,12 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     let (pid, asid, first_gen) = irq::without(|| {
         let s = state();
         let pid = s.next_pid;
-        s.next_pid = pid.saturating_add(1);
-        (pid, (pid & 0xffff) as u16, s.first_handle_gen)
+        // (CNT1: the counter never wraps or repeats: at its end no process is started)
+        let ok = pid.checked_add(1).map(|n| s.next_pid = n).is_some();
+        (ok.then_some(pid), (pid & 0xffff) as u16, s.first_handle_gen)
     });
+    let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
+    let pid = pid.unwrap_or(0);
     if let Err(e) = built {
         aspace.destroy_user(&mut k.mm);
         for id in vmo_ids {

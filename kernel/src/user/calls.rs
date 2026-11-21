@@ -95,6 +95,9 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
 }
 
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -147,6 +150,9 @@ pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
 }
 
 pub(super) fn thread_create(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -161,6 +167,9 @@ pub(super) fn thread_create(a: [u64; 6]) -> Reply {
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;

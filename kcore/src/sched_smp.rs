@@ -242,6 +242,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
     }
 
+    /// Is there room for at least `margin` more thread ids? A caller that cannot undo a spawn after the fact asks this first (CNT1: user
+    /// thread creation is refused, never a panic, when the ids run out); the margin covers the creations racing between the check and the spawn.
+    pub fn tid_headroom(&self, margin: u64) -> bool {
+        self.next_tid
+            .load(Ordering::Relaxed)
+            .checked_add(margin)
+            .is_some()
+    }
+
     /// For test builds (`ff=tid:<n>`): the next thread gets id `n`, so a counter boundary is crossed in a few creations.
     pub fn fast_forward_tid(&self, n: Tid) {
         self.next_tid.store(n.max(1), Ordering::Relaxed);

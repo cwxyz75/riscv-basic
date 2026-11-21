@@ -14,7 +14,7 @@ use kcore::sched::Tid;
 use kcore::sched2::{FixedPrio, HartRq, SchedAttr, MS};
 use kcore::sched_smp::{Rqs, Sched2, Table};
 use shuttle::rand::Rng;
-use shuttle::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use shuttle::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use shuttle::sync::{Arc, Mutex, MutexGuard};
 use shuttle::thread;
 
@@ -44,7 +44,7 @@ struct World {
     /// The model big kernel lock: held by every path but the tick and the IPI, until the hart has switched.
     bkl: Mutex<()>,
     /// The thread each hart is executing (0: none yet).
-    exec: Vec<AtomicU32>,
+    exec: Vec<AtomicU64>,
     /// Threads that exist (spawned and not yet reaped), and those that have exited and wait to be reaped.
     tids: Mutex<Vec<Tid>>,
     dead: Mutex<Vec<Tid>>,
@@ -249,7 +249,7 @@ fn model(steps: usize, deferred: bool, g4: bool) {
     let w = Arc::new(World {
         s: Sched2::over(rqs),
         bkl: Mutex::new(()),
-        exec: (0..HARTS).map(|_| AtomicU32::new(0)).collect(),
+        exec: (0..HARTS).map(|_| AtomicU64::new(0)).collect(),
         tids: Mutex::new(Vec::new()),
         dead: Mutex::new(Vec::new()),
         ipi: (0..HARTS).map(|_| AtomicBool::new(false)).collect(),

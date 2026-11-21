@@ -351,6 +351,12 @@ fn default_affinity() -> Option<usize> {
     (a != usize::MAX).then_some(a)
 }
 
+/// Is there room to create a user thread (CNT1)? Checked before the creation commits anything; the margin is far above the number of
+/// creations that can be in flight between the check and the spawn (one per hart).
+pub fn user_thread_ids_left() -> bool {
+    sched().tid_headroom(4096)
+}
+
 /// Like `spawn_detached`, free to run on any hart.
 pub fn spawn_free_detached(name: &'static str, prio: Prio, entry: fn(usize), arg: usize) -> Tid {
     spawn_with_affinity(name, prio, entry, arg, true, None)
@@ -1308,7 +1314,10 @@ fn note_stack_use(tid: Tid, t: &KThread) {
             for (slot, w) in OVER_BUDGET_NAME.iter().zip(words) {
                 slot.store(w, core::sync::atomic::Ordering::SeqCst);
             }
-            OVER_BUDGET_TID.store(tid, core::sync::atomic::Ordering::SeqCst);
+            if OVER_BUDGET.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                OVER_BUDGET_TID.store(tid, core::sync::atomic::Ordering::SeqCst);
+                // (a later offender does not overwrite the first's id)
+            }
             let _ = OVER_BUDGET.compare_exchange(
                 0,
                 used as u64,

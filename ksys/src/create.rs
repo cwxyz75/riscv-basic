@@ -59,8 +59,13 @@ pub fn process_create<M: PhysMem>(
         return Err(Status::NoMemory);
     };
     // (CNT1: a process id is never reused and the counter never wraps; at its limit the creation is refused)
-    let pid = us.next_pid;
+    // (a pid in use is skipped: the boot-time loader and the test worlds place processes without moving the counter)
+    let mut pid = us.next_pid;
+    while us.procs.contains_key(&pid) {
+        pid = pid.saturating_add(1);
+    }
     let Some(next) = pid.checked_add(1) else {
+        PageTable::destroy_user(table, mm);
         give_back(vmos);
         return Err(Status::NoMemory);
     };
