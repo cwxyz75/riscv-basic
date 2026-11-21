@@ -112,21 +112,20 @@ impl W {
             &mut Self::q(&mut self.vmos),
         )
         .unwrap();
-        u64::from(h.0)
+        h.0
     }
     fn vmo(&mut self, pages: u64, job: JobId) -> u64 {
         let id = self.vmos.create_in(pages, job);
         let p = self.procs.get_mut(&1).unwrap();
-        u64::from(
-            ipc::vmo_object_create_in(
-                &mut self.objs,
-                &mut p.handles,
-                id,
-                &mut Self::q(&mut self.vmos),
-            )
-            .unwrap()
-            .0,
+
+        ipc::vmo_object_create_in(
+            &mut self.objs,
+            &mut p.handles,
+            id,
+            &mut Self::q(&mut self.vmos),
         )
+        .unwrap()
+        .0
     }
     fn call(&mut self, n: usize, a: [u64; 6]) -> Reply {
         let mut c = PCtx {
@@ -210,12 +209,11 @@ fn process_map_rows_in_order() {
     // rights: MANAGE on the process; MAP|READ (+WRITE, +EXECUTE for those flags) on the VMO
     let no_manage = {
         let p = w.procs.get_mut(&1).unwrap();
-        u64::from(
-            p.handles
-                .duplicate(&mut w.objs, abi::Handle(ph as u32), Rights::WAIT)
-                .unwrap()
-                .0,
-        )
+
+        p.handles
+            .duplicate(&mut w.objs, abi::Handle(ph), Rights::WAIT)
+            .unwrap()
+            .0
     };
     assert_eq!(
         w.err(nr::PROCESS_MAP, ok_args(no_manage, v)),
@@ -223,16 +221,15 @@ fn process_map_rows_in_order() {
     );
     let ro = {
         let p = w.procs.get_mut(&1).unwrap();
-        u64::from(
-            p.handles
-                .duplicate(
-                    &mut w.objs,
-                    abi::Handle(v as u32),
-                    Rights(Rights::MAP.0 | Rights::READ.0),
-                )
-                .unwrap()
-                .0,
-        )
+
+        p.handles
+            .duplicate(
+                &mut w.objs,
+                abi::Handle(v),
+                Rights(Rights::MAP.0 | Rights::READ.0),
+            )
+            .unwrap()
+            .0
     };
     w.ok(nr::PROCESS_MAP, [ph, ro, VA, 0, 4096, R]);
     assert_eq!(
@@ -293,7 +290,7 @@ fn process_map_of_a_stranger_vmo_must_be_committed_and_a_dead_target_is_refused(
     );
     let id = match w
         .objs
-        .get(w.procs[&1].handles.get(abi::Handle(v as u32)).unwrap().obj)
+        .get(w.procs[&1].handles.get(abi::Handle(v)).unwrap().obj)
     {
         Some(ipc::KObj::Vmo(id)) => *id,
         _ => unreachable!(),
@@ -388,7 +385,7 @@ fn process_and_thread_info_report_the_exit_code_only_when_ended() {
     let (obj, ..) = ipc::process_of(
         &w.objs,
         &w.procs[&1].handles,
-        abi::Handle(ph as u32),
+        abi::Handle(ph),
         Rights::INSPECT,
     )
     .unwrap();
@@ -399,12 +396,11 @@ fn process_and_thread_info_report_the_exit_code_only_when_ended() {
     );
     let manage_only = {
         let p = w.procs.get_mut(&1).unwrap();
-        u64::from(
-            p.handles
-                .duplicate(&mut w.objs, abi::Handle(ph as u32), Rights::MANAGE)
-                .unwrap()
-                .0,
-        )
+
+        p.handles
+            .duplicate(&mut w.objs, abi::Handle(ph), Rights::MANAGE)
+            .unwrap()
+            .0
     };
     assert_eq!(
         w.err(nr::PROCESS_INFO, [manage_only, 0, 0, 0, 0, 0]),
@@ -435,16 +431,12 @@ fn process_and_thread_info_report_the_exit_code_only_when_ended() {
     };
     let (thandle, tobj) = th;
     assert_eq!(
-        w.err(nr::THREAD_INFO, [u64::from(thandle.0), 0, 0, 0, 0, 0]),
+        w.err(nr::THREAD_INFO, [thandle.0, 0, 0, 0, 0, 0]),
         Status::BadState,
         "still running"
     );
     ipc::thread_mark_terminated(&mut w.objs, tobj, 3);
-    assert_eq!(
-        w.ok(nr::THREAD_INFO, [u64::from(thandle.0), 0, 0, 0, 0, 0])
-            .0,
-        Some(3)
-    );
+    assert_eq!(w.ok(nr::THREAD_INFO, [thandle.0, 0, 0, 0, 0, 0]).0, Some(3));
 }
 
 #[test]
@@ -456,13 +448,7 @@ fn the_root_handles_are_for_privileged_processes_only() {
     w.procs.get_mut(&1).unwrap().privileged = true;
     let h = w.ok(nr::JOB_ROOT, [0; 6]).0.unwrap();
     assert_eq!(
-        ipc::job_of(
-            &w.objs,
-            &w.procs[&1].handles,
-            abi::Handle(h as u32),
-            Rights::JOB
-        )
-        .unwrap(),
+        ipc::job_of(&w.objs, &w.procs[&1].handles, abi::Handle(h), Rights::JOB).unwrap(),
         JobId::ROOT
     );
     assert!(w.ok(nr::RESOURCE_ROOT, [0; 6]).0.is_some());
@@ -475,7 +461,7 @@ fn process_self_gives_views_that_cannot_be_sent_away() {
     let h2 = w.ok(nr::PROCESS_SELF, [0; 6]).0.unwrap();
     assert_ne!(h1, h2);
     for h in [h1, h2] {
-        let e = w.procs[&1].handles.get(abi::Handle(h as u32)).unwrap();
+        let e = w.procs[&1].handles.get(abi::Handle(h)).unwrap();
         assert!(e.rights.contains(Rights::INSPECT) && e.rights.contains(Rights::MANAGE));
         assert!(
             !e.rights.contains(Rights::TRANSFER),
@@ -497,37 +483,34 @@ fn process_self_gives_views_that_cannot_be_sent_away() {
 
 fn narrow(w: &mut W, h: u64, r: Rights) -> abi::Handle {
     let p = w.procs.get_mut(&1).unwrap();
-    p.handles
-        .duplicate(&mut w.objs, abi::Handle(h as u32), r)
-        .unwrap()
+    p.handles.duplicate(&mut w.objs, abi::Handle(h), r).unwrap()
 }
 
 fn job_handle(w: &mut W, job: JobId) -> u64 {
     let p = w.procs.get_mut(&1).unwrap();
-    u64::from(
-        ipc::job_object_create(
-            &mut w.objs,
-            &mut p.handles,
-            job,
-            Rights::JOB,
-            &mut W::q(&mut w.vmos),
-        )
-        .unwrap()
-        .0,
+
+    ipc::job_object_create(
+        &mut w.objs,
+        &mut p.handles,
+        job,
+        Rights::JOB,
+        &mut W::q(&mut w.vmos),
     )
+    .unwrap()
+    .0
 }
 
 #[test]
 fn kill_and_stop_name_their_target_and_refuse_the_ended() {
     let (mut w, ph) = world();
-    let h = abi::Handle(ph as u32);
+    let h = abi::Handle(ph);
     assert_eq!(
         ksys::kill_target(&w.objs, &w.procs, 1, abi::Handle(0x999)),
         Err(Status::BadHandle)
     );
     let v = w.vmo(1, JobId::ROOT);
     assert_eq!(
-        ksys::kill_target(&w.objs, &w.procs, 1, abi::Handle(v as u32)),
+        ksys::kill_target(&w.objs, &w.procs, 1, abi::Handle(v)),
         Err(Status::WrongType)
     );
     let no_kill = narrow(&mut w, ph, Rights::INSPECT);
@@ -582,14 +565,8 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     w.procs.get_mut(&2).unwrap().job = deeper;
     let jh = job_handle(&mut w, sub);
     // the caller (1) is outside the job: it is not a victim and not inside
-    let (v, inside) = ksys::job_kill_victims(
-        &w.objs,
-        &w.procs,
-        &mut w.vmos.jobs,
-        1,
-        abi::Handle(jh as u32),
-    )
-    .unwrap();
+    let (v, inside) =
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(jh)).unwrap();
     assert_eq!(
         (v, inside),
         (vec![2], false),
@@ -603,14 +580,8 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     );
     // the caller inside: ends last, not named
     w.procs.get_mut(&1).unwrap().job = sub;
-    let (v, inside) = ksys::job_kill_victims(
-        &w.objs,
-        &w.procs,
-        &mut w.vmos.jobs,
-        1,
-        abi::Handle(jh as u32),
-    )
-    .unwrap();
+    let (v, inside) =
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(jh)).unwrap();
     assert_eq!((v, inside), (vec![2], true));
     let weak = narrow(&mut w, jh, Rights::MANAGE);
     assert_eq!(
@@ -648,43 +619,22 @@ fn thread_target_and_set_sched_rows() {
             .unwrap()
     };
     assert_eq!(
-        ksys::thread_target(
-            &w.objs,
-            &w.procs,
-            1,
-            me_tid,
-            u64::from(th.0),
-            Rights::MANAGE
-        ),
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, th.0, Rights::MANAGE),
         Err(Status::BadState),
         "never started"
     );
     w.procs.get_mut(&2).unwrap().thread_objs.insert(other, tobj);
     assert_eq!(
-        ksys::thread_target(
-            &w.objs,
-            &w.procs,
-            1,
-            me_tid,
-            u64::from(th.0),
-            Rights::MANAGE
-        ),
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, th.0, Rights::MANAGE),
         Ok((other, 2))
     );
-    let weak = narrow(&mut w, u64::from(th.0), Rights::INSPECT);
+    let weak = narrow(&mut w, th.0, Rights::INSPECT);
     assert_eq!(
-        ksys::thread_target(
-            &w.objs,
-            &w.procs,
-            1,
-            me_tid,
-            u64::from(weak.0),
-            Rights::MANAGE
-        ),
+        ksys::thread_target(&w.objs, &w.procs, 1, me_tid, weak.0, Rights::MANAGE),
         Err(Status::AccessDenied)
     );
     // set_sched: range of the priority and flags, then the job's maximum
-    let a = |prio, flags| [u64::from(th.0), prio, flags, 0, 0, 0];
+    let a = |prio, flags| [th.0, prio, flags, 0, 0, 0];
     let jobs = &w.vmos.jobs;
     assert_eq!(
         ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(0, 0)),
@@ -748,7 +698,7 @@ fn job_set_sched_rows() {
         "a zero weight is not a weight"
     );
     assert_eq!(call(&mut w, 0x999, 5, 0, 1), Err(Status::BadHandle));
-    let weak = u64::from(narrow(&mut w, jh, Rights::MANAGE).0);
+    let weak = narrow(&mut w, jh, Rights::MANAGE).0;
     assert_eq!(
         call(&mut w, weak, 5, 0, 1),
         Err(Status::AccessDenied),

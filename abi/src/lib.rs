@@ -83,7 +83,7 @@ pub mod status {
 
 /// A handle value as userland sees it (SYSCALLS.md, "ABI").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Handle(pub u32);
+pub struct Handle(pub u64);
 
 impl Handle {
     pub const INVALID: Handle = Handle(0);
@@ -234,7 +234,6 @@ pub const CHANNEL_CALL_ARGS_BYTES: usize = 56;
 
 /// Limits (SYSCALLS.md, "Limits").
 pub mod limits {
-    pub const MAX_HANDLES: usize = 4096;
     pub const MAX_MSG_BYTES: usize = 65536;
     pub const MAX_MSG_HANDLES: usize = 64;
     pub const MAX_QUEUED_MSGS: usize = 128;

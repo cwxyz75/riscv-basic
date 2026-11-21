@@ -29,7 +29,7 @@ pub fn app_main() -> i32 {
         return c;
     }
     // threads on stacks from the heap, until one is refused
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     let mut stacks: Vec<Vec<u8>> = Vec::new();
     let mut started = 0;
     let mut last = 0;

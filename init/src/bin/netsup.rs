@@ -32,12 +32,12 @@ use netshm::Shm;
 const PF_RW: u64 = 3;
 const RING_VA: u64 = 0x510_0000;
 
-fn dup(h: u32, rights: Rights) -> Option<u32> {
+fn dup(h: u64, rights: Rights) -> Option<u64> {
     let r = sys::handle_duplicate(h, rights.0);
-    (r.status == 0).then_some(r.a1 as u32)
+    (r.status == 0).then_some(r.a1 as u64)
 }
 
-fn read_bin(bi: u32, name: &[u8]) -> Option<Vec<u8>> {
+fn read_bin(bi: u64, name: &[u8]) -> Option<Vec<u8>> {
     let total = sys::vmo_get_size(bi).a1;
     let prefix = rt::spawn::read_image(bi, 0, (total as u64).min(128 * 1024))?;
     let entries = bootimg::parse_prefix(&prefix, total).ok()?;
@@ -47,17 +47,17 @@ fn read_bin(bi: u32, name: &[u8]) -> Option<Vec<u8>> {
 
 /// Everything held across child lifetimes.
 struct Held {
-    mmio: u32,
-    rx: u32,
-    tx: u32,
-    q: u32,
-    irq: Option<u32>,
-    ring: u32,
+    mmio: u64,
+    rx: u64,
+    tx: u64,
+    q: u64,
+    irq: Option<u64>,
+    ring: u64,
     /// The doorbell events: the driver signals `to_stack`, the stack signals `to_driver`.
-    to_stack: u32,
-    to_driver: u32,
+    to_stack: u64,
+    to_driver: u64,
     /// The configuration blob (one page): netd's interface half and dhcpc's lease half.
-    blob: u32,
+    blob: u64,
     /// The next driver generation (the supervisor gives it; the driver never takes one from shared memory).
     next_gen: core::cell::Cell<u64>,
     /// A deliberate fault for the negative-control tests (`FAULT=name` in our own environment), passed to the children.
@@ -71,7 +71,7 @@ struct Held {
 
 /// A running child: its process handle.
 struct Child {
-    proc: Option<u32>,
+    proc: Option<u64>,
     /// Which incarnation: the port key of its exit event carries it, so a late event of a killed predecessor is ignored.
     seq: u64,
     name: &'static str,
@@ -79,7 +79,7 @@ struct Child {
     last_exit: i32,
 }
 
-fn claim(chan: u32) -> Result<(Vec<u32>, devmgr::NetClaim), i32> {
+fn claim(chan: u64) -> Result<(Vec<u64>, devmgr::NetClaim), i32> {
     let req = devmgr::encode_claim_net(1, 0);
     if sys::channel_write(chan, req.as_ptr(), req.len(), core::ptr::null(), 0).status != 0 {
         return Err(10);
@@ -89,12 +89,12 @@ fn claim(chan: u32) -> Result<(Vec<u32>, devmgr::NetClaim), i32> {
         return Err(11);
     }
     let mut buf = [0u8; 64];
-    let mut hs = [0u32; 8];
+    let mut hs = [0u64; 8];
     let r = sys::channel_read(chan, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
     if r.status != 0 {
         return Err(12);
     }
-    let handles: Vec<u32> = hs[..r.a2].to_vec();
+    let handles: Vec<u64> = hs[..r.a2].to_vec();
     match devmgr::decode_claim_net_reply(&buf[..r.a1]) {
         Some((_, DStatus::Ok, Some(c))) if handles.len() >= devmgr::NET_CLAIM_HANDLES => {
             Ok((handles, c))
@@ -106,16 +106,16 @@ fn claim(chan: u32) -> Result<(Vec<u32>, devmgr::NetClaim), i32> {
 }
 
 /// Start the driver on a fresh control channel; returns its process handle and the stack's end of the channel.
-fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u32, u32), i32> {
+fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u64, u64), i32> {
     let pair = sys::channel_create();
     if pair.status != 0 {
         return Err(20);
     }
-    let (drv_end, stack_end) = (pair.a1 as u32, pair.a2 as u32);
+    let (drv_end, stack_end) = (pair.a1 as u64, pair.a2 as u64);
     let sig_wait = Rights::SIGNAL.union(Rights::WAIT).union(Rights::TRANSFER);
-    let mut handles: Vec<u32> = Vec::new();
+    let mut handles: Vec<u64> = Vec::new();
     let mut roles: Vec<(Role, u32)> = Vec::new();
-    let mut add = |role: Role, v: Option<u32>, handles: &mut Vec<u32>| -> bool {
+    let mut add = |role: Role, v: Option<u64>, handles: &mut Vec<u64>| -> bool {
         match v {
             Some(x) => {
                 roles.push((role, handles.len() as u32));
@@ -187,7 +187,7 @@ fn spawn_driver(h: &Held, image: &[u8]) -> Result<(u32, u32), i32> {
 }
 
 /// The stack-side handles, in the order `[ring, rx pool (read-only), tx pool, to_stack (wait), to_driver (signal), ctl]`.
-fn stack_handles(h: &Held, ctl_end: u32) -> Option<Vec<u32>> {
+fn stack_handles(h: &Held, ctl_end: u64) -> Option<Vec<u64>> {
     let ro = Rights::READ.union(Rights::MAP).union(Rights::TRANSFER);
     let rw = ro.union(Rights::WRITE);
     Some(alloc::vec![
@@ -239,11 +239,11 @@ pub fn app_main() -> i32 {
     let irq = (c.flags & devmgr::NET_FLAG_IRQ != 0).then(|| hs[4]);
     // the ring VMO: committed up front, so mapping it in another job is allowed (OD81)
     let ring = sys::vmo_create(2);
-    if ring.status != 0 || sys::vmo_commit(ring.a1 as u32, 0, 2 * 4096).status != 0 {
+    if ring.status != 0 || sys::vmo_commit(ring.a1 as u64, 0, 2 * 4096).status != 0 {
         return 16;
     }
-    let ring = ring.a1 as u32;
-    let me = sys::process_self().a1 as u32;
+    let ring = ring.a1 as u64;
+    let me = sys::process_self().a1 as u64;
     if sys::process_map(me, ring, RING_VA, 0, 2 * 4096, PF_RW).status != 0 {
         return 17;
     }
@@ -262,7 +262,7 @@ pub fn app_main() -> i32 {
         return 18;
     }
     let blob = sys::vmo_create(1);
-    if blob.status != 0 || sys::vmo_commit(blob.a1 as u32, 0, 4096).status != 0 {
+    if blob.status != 0 || sys::vmo_commit(blob.a1 as u64, 0, 4096).status != 0 {
         return 28;
     }
     let held = Held {
@@ -273,15 +273,15 @@ pub fn app_main() -> i32 {
         } else {
             secret_env(env.handle(Role::ServiceRegistry))
         },
-        blob: blob.a1 as u32,
+        blob: blob.a1 as u64,
         mmio: hs[0],
         rx: hs[1],
         tx: hs[2],
         q: hs[3],
         irq,
         ring,
-        to_stack: e1.a1 as u32,
-        to_driver: e2.a1 as u32,
+        to_stack: e1.a1 as u64,
+        to_driver: e2.a1 as u64,
         shm,
     };
     let Some(drv_image) = read_bin(bi, b"bin/netdrv") else {
@@ -336,7 +336,7 @@ pub fn app_main() -> i32 {
     if pair.status != 0 {
         return 27;
     }
-    let (mut sup_end, netd_sup_end) = (pair.a1 as u32, pair.a2 as u32);
+    let (mut sup_end, netd_sup_end) = (pair.a1 as u64, pair.a2 as u64);
     let mut dhcpc = Child {
         proc: None,
         seq: 0,
@@ -355,7 +355,7 @@ pub fn app_main() -> i32 {
         Ok(p) => netd.proc = Some(p),
         Err(code) => return code,
     }
-    let port = sys::port_create().a1 as u32;
+    let port = sys::port_create().a1 as u64;
     let _ = sys::port_bind(
         port,
         ctl_parent,
@@ -363,7 +363,7 @@ pub fn app_main() -> i32 {
         8,
     );
     // exit events: key = (incarnation << 4) | child index + 1 (children: 0 driver, 1 stack)
-    let bind = |p: u32, c: &mut Child, idx: u64| {
+    let bind = |p: u64, c: &mut Child, idx: u64| {
         c.seq += 1;
         let _ = sys::port_bind_flags(
             port,
@@ -614,10 +614,10 @@ pub fn app_main() -> i32 {
 fn spawn_netd(
     h: &Held,
     image: &[u8],
-    ctl_end: u32,
-    registry: u32,
-    sup_end: u32,
-) -> Result<u32, i32> {
+    ctl_end: u64,
+    registry: u64,
+    sup_end: u64,
+) -> Result<u64, i32> {
     let Some(mut hs) = stack_handles(h, ctl_end) else {
         return Err(24);
     };
@@ -668,7 +668,7 @@ fn spawn_netd(
 /// (`/svc/random`, seeded by the entropy device). Without it (no entropy device, or `rngd` not running) a stand-in is used
 /// and said so in the entry `SECRET_SRC=standin`: a hash of the clock, which an observer of the boot could guess
 /// (work item T99); the debt is loud on purpose. The stack keeps the secret across its own restarts because `netsup` holds it.
-fn secret_env(registry: Option<u32>) -> Vec<Vec<u8>> {
+fn secret_env(registry: Option<u64>) -> Vec<Vec<u8>> {
     let mut seed = [0u8; 32];
     let mut from_rngd = false;
     if let Some(reg) = registry {
@@ -725,7 +725,7 @@ fn fault_env(h: &Held) -> Vec<Vec<u8>> {
 }
 
 /// Start the DHCP client with a view of `/svc` holding only the two names it needs.
-fn spawn_dhcpc(h: &Held, image: &[u8], registry: u32) -> Result<u32, i32> {
+fn spawn_dhcpc(h: &Held, image: &[u8], registry: u64) -> Result<u64, i32> {
     let mut reg = rt::fs::Fs::new(registry);
     let Ok(view) = reg.view(&[b"net-priv", b"net-config"], proto::file::rights::READ) else {
         return Err(25);
@@ -759,9 +759,9 @@ fn restart_both(
     netd_image: &[u8],
     drv: &mut Child,
     netd: &mut Child,
-    registry: u32,
-    bind: &dyn Fn(u32, &mut Child, u64),
-) -> Option<u32> {
+    registry: u64,
+    bind: &dyn Fn(u64, &mut Child, u64),
+) -> Option<u64> {
     let Ok((dp, ctl_end)) = spawn_driver(held, drv_image) else {
         return None;
     };
@@ -772,12 +772,12 @@ fn restart_both(
         return None;
     }
     // (a fresh supervisor channel for the new stack; the old one died with it)
-    match spawn_netd(held, netd_image, ctl_end, registry, pair.a2 as u32) {
+    match spawn_netd(held, netd_image, ctl_end, registry, pair.a2 as u64) {
         Ok(p) => {
             netd.proc = Some(p);
             bind(p, netd, 1);
             // our end of the new supervisor channel: the caller keeps it (the next driver restart sends the new control channel there)
-            Some(pair.a1 as u32)
+            Some(pair.a1 as u64)
         }
         Err(_) => None,
     }

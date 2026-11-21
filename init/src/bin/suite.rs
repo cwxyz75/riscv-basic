@@ -20,7 +20,7 @@ use rt::{ensure, ensure_eq, println, report, sys, Detail, Ret};
 type Outcome = Result<(), Detail>;
 type Test = (&'static str, fn() -> Outcome);
 
-const BAD: u32 = 0x7777_0001; // a handle value nobody was ever given
+const BAD: u64 = 0x7777_0001; // a handle value nobody was ever given
 const KERNEL_ADDR: usize = 0xffff_ffff_8020_0000;
 
 fn st(r: Ret) -> Option<S> {
@@ -37,13 +37,13 @@ fn ok(r: Ret, what: &str) -> Result<Ret, Detail> {
     }
 }
 
-fn channel() -> Result<(u32, u32), Detail> {
+fn channel() -> Result<(u64, u64), Detail> {
     let r = ok(sys::channel_create(), "channel_create")?;
-    Ok((r.a1 as u32, r.a2 as u32))
+    Ok((r.a1 as u64, r.a2 as u64))
 }
 
-fn event() -> Result<u32, Detail> {
-    Ok(ok(sys::event_create(), "event_create")?.a1 as u32)
+fn event() -> Result<u64, Detail> {
+    Ok(ok(sys::event_create(), "event_create")?.a1 as u64)
 }
 
 fn user_mode_runs_and_prints() -> Outcome {
@@ -138,8 +138,60 @@ fn abi_debug() -> usize {
     rt::abi::syscall::DEBUG_WRITE
 }
 
+/// AB1: a handle is 64 bits and the table grows on demand: one process holds twenty thousand handles (duplicates of one event: a handle is not an
+/// object), slot numbers pass the old 13-bit limit, every one works, a closed one is refused, and a value with the generation bits changed names nothing.
+fn a_process_holds_twenty_thousand_handles() -> Outcome {
+    let e = event()?;
+    let mut hs: Vec<u64> = Vec::new();
+    hs.try_reserve(20_000).map_err(|_| msg_at(line!()))?;
+    for _ in 0..20_000 {
+        let d = sys::handle_duplicate(e, Rights::SAME.0);
+        ensure_eq!(d.status, 0, "a duplicate");
+        hs.push(d.a1 as u64);
+    }
+    let slot = |h: u64| h & 0xff_ffff;
+    ensure!(
+        hs.iter().any(|&h| slot(h) > 8191),
+        "slot numbers above the old 13-bit limit are in use"
+    );
+    let mut sorted = hs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    ensure_eq!(sorted.len(), 20_000, "every handle value is different");
+    for &h in hs.iter().step_by(997) {
+        ensure_eq!(st(sys::object_signals(h)), Some(S::Ok), "a handle works");
+    }
+    // a value that differs from a live one only in its generation names nothing (and is not truncated to a live one)
+    let forged = hs[5] ^ (1 << 40);
+    ensure_eq!(
+        st(sys::object_signals(forged)),
+        Some(S::BadHandle),
+        "a wrong generation"
+    );
+    let victim = hs.pop().ok_or_else(|| msg_at(line!()))?;
+    ensure_eq!(st(sys::handle_close(victim)), Some(S::Ok), "close one");
+    ensure_eq!(
+        st(sys::object_signals(victim)),
+        Some(S::BadHandle),
+        "a closed handle is refused"
+    );
+    for h in hs {
+        sys::handle_close(h);
+    }
+    sys::handle_close(e);
+    Ok(())
+}
+
 fn handle_syscalls_reject_bad_values() -> Outcome {
-    for h in [0u32, 0x0002_0001, BAD, u32::MAX, 0x0001_0000] {
+    for h in [
+        0u64,
+        0x0002_0001,
+        BAD,
+        u64::MAX,
+        0x0001_0000,
+        1 << 40 | 1,
+        1 << 32,
+    ] {
         ensure_eq!(st(sys::handle_close(h)), Some(S::BadHandle), "close {h:#x}");
         ensure_eq!(
             st(sys::handle_duplicate(h, Rights::SAME.0)),
@@ -210,7 +262,7 @@ fn event_syscalls() -> Outcome {
         Some(S::WrongType),
         "a channel is not an event"
     );
-    let weak = ok(sys::handle_replace(e, Rights::WAIT.0), "replace")?.a1 as u32;
+    let weak = ok(sys::handle_replace(e, Rights::WAIT.0), "replace")?.a1 as u64;
     ensure_eq!(
         st(sys::event_signal(weak, 0, 1 << 24)),
         Some(S::AccessDenied),
@@ -313,7 +365,7 @@ fn channel_sends_handles() -> Outcome {
         "the sent handle left this table"
     );
     let mut buf = [0u8; 8];
-    let mut got = [0u32; 4];
+    let mut got = [0u64; 4];
     let r = sys::channel_read(b, buf.as_mut_ptr(), 8, got.as_mut_ptr(), 4);
     ensure_eq!(
         (r.status, r.a1, r.a2),
@@ -337,9 +389,9 @@ fn channel_sends_handles() -> Outcome {
 fn channel_syscall_errors() -> Outcome {
     let (a, b) = channel()?;
     let e = event()?;
-    let e_no_transfer = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u32;
+    let e_no_transfer = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u64;
     let none8 = core::ptr::null::<u8>();
-    let none32 = core::ptr::null::<u32>();
+    let none32 = core::ptr::null::<u64>();
     // order: TOO_BIG first (before any pointer or handle is looked at)
     ensure_eq!(
         st(sys::channel_write(
@@ -357,7 +409,7 @@ fn channel_syscall_errors() -> Outcome {
             BAD,
             none8,
             0,
-            0x10 as *const u32,
+            0x10 as *const u64,
             MAX_MSG_HANDLES + 1
         )),
         Some(S::TooBig),
@@ -382,12 +434,12 @@ fn channel_syscall_errors() -> Outcome {
     );
     let read_only = ok(
         sys::handle_replace(
-            ok(sys::handle_duplicate(a, Rights::SAME.0), "dup")?.a1 as u32,
+            ok(sys::handle_duplicate(a, Rights::SAME.0), "dup")?.a1 as u64,
             Rights::READ.0,
         ),
         "replace",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::channel_write(read_only, none8, 0, none32, 0)),
         Some(S::AccessDenied),
@@ -446,7 +498,7 @@ fn channel_syscall_errors() -> Outcome {
         "kernel data pointer"
     );
     ensure_eq!(
-        st(sys::channel_write(a, none8, 0, 0x10 as *const u32, 1)),
+        st(sys::channel_write(a, none8, 0, 0x10 as *const u64, 1)),
         Some(S::InvalidArgs),
         "bad handles pointer"
     );
@@ -476,12 +528,12 @@ fn channel_syscall_errors() -> Outcome {
     );
     let write_only = ok(
         sys::handle_replace(
-            ok(sys::handle_duplicate(b, Rights::SAME.0), "dup")?.a1 as u32,
+            ok(sys::handle_duplicate(b, Rights::SAME.0), "dup")?.a1 as u64,
             Rights::WRITE.0,
         ),
         "replace",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::channel_read(
             write_only,
@@ -512,7 +564,7 @@ fn channel_buffer_too_small_keeps_message() -> Outcome {
         "write"
     );
     let mut buf = [0u8; 8];
-    let mut hs = [0u32; 2];
+    let mut hs = [0u64; 2];
     let r = sys::channel_read(b, buf.as_mut_ptr(), 4, hs.as_mut_ptr(), 2);
     ensure_eq!(
         (r.status, r.a1, r.a2),
@@ -710,7 +762,7 @@ fn call(req: &[u8], reply: &mut [u8], deadline: u64) -> Ret {
 
 fn wait_arguments_are_checked() -> Outcome {
     let e = event()?;
-    let weak = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u32;
+    let weak = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u64;
     ensure_eq!(
         st(sys::object_wait(BAD, 1, 0)),
         Some(S::BadHandle),
@@ -1002,12 +1054,12 @@ fn channel_call_argument_errors() -> Outcome {
     );
     let read_only = ok(
         sys::handle_replace(
-            ok(sys::handle_duplicate(BOOTSTRAP, Rights::SAME.0), "dup")?.a1 as u32,
+            ok(sys::handle_duplicate(BOOTSTRAP, Rights::SAME.0), "dup")?.a1 as u64,
             Rights::READ.0,
         ),
         "replace",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::channel_call(
             read_only,
@@ -1020,12 +1072,12 @@ fn channel_call_argument_errors() -> Outcome {
     // helper would answer and the channel would become readable.)
     let write_only = ok(
         sys::handle_replace(
-            ok(sys::handle_duplicate(BOOTSTRAP, Rights::SAME.0), "dup")?.a1 as u32,
+            ok(sys::handle_duplicate(BOOTSTRAP, Rights::SAME.0), "dup")?.a1 as u64,
             Rights::WRITE.0,
         ),
         "replace",
     )?
-    .a1 as u32;
+    .a1 as u64;
     let (e, en) = request(8, b'E', b"w");
     let r = sys::channel_call(write_only, &args(&e[..en], reply.as_mut_ptr() as u64));
     ensure_eq!(st(r), Some(S::AccessDenied), "no READ");
@@ -1073,23 +1125,33 @@ fn channel_call_argument_errors() -> Outcome {
 
 fn wait_and_call_argument_edges() -> Outcome {
     let e = event()?;
-    let wide = 1usize << 32;
+    let wide = 1usize << 40; // flips a generation bit: a value that names nothing
     use rt::abi::syscall as nr;
     ensure_eq!(
         st(rt::syscall(
             nr::OBJECT_WAIT,
-            [wide | e as usize, 1 << 24, 0, 0, 0, 0]
+            [e as usize ^ wide, 1 << 24, 0, 0, 0, 0]
         )),
         Some(S::BadHandle),
         "object_wait with a wide handle"
     );
+    // (a valid request record, so the handle is what is refused)
+    let msg = [0u8; 4];
+    let args = rt::CallArgs {
+        req_bytes: msg.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: 4,
+        req_nhandles: 0,
+        rep_bytes: 0,
+        rep_handles: 0,
+        rep_max_bytes: 0,
+        rep_max_handles: 0,
+        deadline: 0,
+    };
     ensure_eq!(
-        st(rt::syscall(
-            nr::CHANNEL_CALL,
-            [wide | BOOTSTRAP as usize, 0, 0, 0, 0, 0]
-        )),
+        st(sys::channel_call(BOOTSTRAP ^ wide as u64, &args)),
         Some(S::BadHandle),
-        "channel_call with a wide handle"
+        "channel_call with a value that names nothing"
     );
     // a deadline that has already passed (but is not 0): no waiting, TIMED_OUT
     let t0 = sys::clock_get();
@@ -1159,7 +1221,7 @@ fn channel_call_carries_handles() -> Outcome {
         "the handle left this table with the request"
     );
     // a request handle without TRANSFER is refused and stays put
-    let weak = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u32;
+    let weak = ok(sys::handle_replace(event()?, Rights::SIGNAL.0), "replace")?.a1 as u64;
     let handles = [weak];
     let args = CallArgs {
         req_handles: handles.as_ptr() as u64,
@@ -1182,7 +1244,7 @@ fn kernel_ends_survive_a_sweep() -> Outcome {
     // More than 256 live objects makes the kernel sweep garbage before it creates the next
     // one. The kernel's end of the bootstrap channel is reachable from no process handle:
     // it must not be swept with the garbage, or the channel would look closed.
-    let mut events = [0u32; 300];
+    let mut events = [0u64; 300];
     for slot in events.iter_mut() {
         *slot = event()?;
     }
@@ -1249,7 +1311,7 @@ fn wait_is_woken_by_the_peer_closing() -> Outcome {
 
 // --- VMOs, processes and the user-level launcher (S3c-2a) ---------------------------------
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const PF_R: u64 = 1;
 const PF_W: u64 = 2;
@@ -1257,21 +1319,21 @@ const PF_X: u64 = 4;
 const TOP: u64 = 0x40_0000_0000;
 
 /// The handle of the program image VMO the kernel-side helper sent us (0 until fetched).
-static IMAGE: AtomicU32 = AtomicU32::new(0);
+static IMAGE: AtomicU64 = AtomicU64::new(0);
 /// The `hello` program image (S4a runtime tests).
-static HELLO_IMAGE: AtomicU32 = AtomicU32::new(0);
+static HELLO_IMAGE: AtomicU64 = AtomicU64::new(0);
 
-fn vmo(pages: u64) -> Result<u32, Detail> {
-    Ok(ok(sys::vmo_create(pages), "vmo_create")?.a1 as u32)
+fn vmo(pages: u64) -> Result<u64, Detail> {
+    Ok(ok(sys::vmo_create(pages), "vmo_create")?.a1 as u64)
 }
 
-fn proc_create() -> Result<u32, Detail> {
-    Ok(ok(sys::process_create(), "process_create")?.a1 as u32)
+fn proc_create() -> Result<u64, Detail> {
+    Ok(ok(sys::process_create(), "process_create")?.a1 as u64)
 }
 
-fn weaker(h: u32, rights: u32) -> Result<u32, Detail> {
-    let d = ok(sys::handle_duplicate(h, Rights::SAME.0), "duplicate")?.a1 as u32;
-    Ok(ok(sys::handle_replace(d, rights), "replace")?.a1 as u32)
+fn weaker(h: u64, rights: u32) -> Result<u64, Detail> {
+    let d = ok(sys::handle_duplicate(h, Rights::SAME.0), "duplicate")?.a1 as u64;
+    Ok(ok(sys::handle_replace(d, rights), "replace")?.a1 as u64)
 }
 
 fn vmo_basics() -> Outcome {
@@ -1364,13 +1426,13 @@ fn vmo_basics() -> Outcome {
     ensure_eq!(
         st(rt::syscall(
             rt::abi::syscall::VMO_GET_SIZE,
-            [(1usize << 32) | v as usize, 0, 0, 0, 0, 0]
+            [v as usize ^ (1usize << 40), 0, 0, 0, 0, 0]
         )),
         Some(S::BadHandle),
         "a wide handle"
     );
     // two handles, one VMO: a write through one shows through the other
-    let dup = ok(sys::handle_duplicate(v, Rights::SAME.0), "dup")?.a1 as u32;
+    let dup = ok(sys::handle_duplicate(v, Rights::SAME.0), "dup")?.a1 as u64;
     sys::vmo_write(dup, 100, b"shared".as_ptr(), 6);
     let mut s = [0u8; 6];
     sys::vmo_read(v, 100, s.as_mut_ptr(), 6);
@@ -1505,7 +1567,7 @@ fn process_map_argument_checks() -> Outcome {
         st(rt::syscall(
             rt::abi::syscall::PROCESS_MAP,
             [
-                (1usize << 32) | p as usize,
+                p as usize ^ (1usize << 40),
                 v as usize,
                 0x9_0000,
                 0,
@@ -1556,7 +1618,7 @@ fn process_start_argument_checks() -> Outcome {
         "and some data"
     );
     let (mine, theirs) = channel()?;
-    let go = |entry: u64, sp: u64, bs: u32| st(sys::process_start(p, entry, sp, bs, 0));
+    let go = |entry: u64, sp: u64, bs: u64| st(sys::process_start(p, entry, sp, bs, 0));
     ensure_eq!(
         go(0x3_0000, 0x4_1000, theirs),
         Some(S::InvalidArgs),
@@ -1648,7 +1710,7 @@ fn process_start_argument_checks() -> Outcome {
 fn fetch_the_program_image() -> Outcome {
     let (m, n) = request(21, b'I', b"");
     let mut reply = [0u8; 16];
-    let mut got = [0u32; 2];
+    let mut got = [0u64; 2];
     let args = CallArgs {
         req_bytes: m.as_ptr() as u64,
         req_handles: 0,
@@ -1688,18 +1750,18 @@ fn le(b: &[u8], at: usize, n: usize) -> u64 {
 /// per PT_LOAD segment, plus a stack), and start it with start argument `arg`. Returns our
 /// handle to the process and our end of its bootstrap channel. This is what a real launcher
 /// does (OS-ARCHITECTURE 9): the kernel never parses an executable for it.
-fn launch(arg: u64) -> Result<(u32, u32), Detail> {
+fn launch(arg: u64) -> Result<(u64, u64), Detail> {
     launch_image(IMAGE.load(Ordering::Relaxed), arg)
 }
 
-fn launch_image(image: u32, arg: u64) -> Result<(u32, u32), Detail> {
+fn launch_image(image: u64, arg: u64) -> Result<(u64, u64), Detail> {
     launch_image_in(image, arg, 0)
 }
 
 /// Build and start a child from `image` charged to `job` (a handle with MANAGE; 0: our own job).
 /// With a job, our handles to the child's memory are closed after mapping, so that the job's
 /// usage can be seen going back to zero when the child ends.
-fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail> {
+fn launch_image_in(image: u64, arg: u64, job: u64) -> Result<(u64, u64), Detail> {
     ensure!(image != 0, "no image was fetched");
     let mut eh = [0u8; 64];
     ok(
@@ -1716,7 +1778,7 @@ fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail>
     let proc = if job == 0 {
         proc_create()?
     } else {
-        ok(sys::process_create_in(job), "process_create_in")?.a1 as u32
+        ok(sys::process_create_in(job), "process_create_in")?.a1 as u64
     };
     for i in 0..phnum {
         let h = &ph[i * 56..(i + 1) * 56];
@@ -1735,7 +1797,7 @@ fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail>
         let seg = if job == 0 {
             vmo(pages)?
         } else {
-            ok(sys::vmo_create_in(pages, job), "vmo_create_in")?.a1 as u32
+            ok(sys::vmo_create_in(pages, job), "vmo_create_in")?.a1 as u64
         };
         let mut done = 0u64;
         let mut chunk = [0u8; 2048];
@@ -1764,7 +1826,7 @@ fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail>
     let stack = if job == 0 {
         vmo(16)?
     } else {
-        ok(sys::vmo_create_in(16, job), "vmo_create_in")?.a1 as u32
+        ok(sys::vmo_create_in(16, job), "vmo_create_in")?.a1 as u64
     };
     ok(
         sys::process_map(proc, stack, 0x10_0000_0000, 0, 16 * 4096, PF_R | PF_W),
@@ -1781,7 +1843,7 @@ fn launch_image_in(image: u32, arg: u64, job: u32) -> Result<(u32, u32), Detail>
     Ok((proc, mine))
 }
 
-fn wait_ended(proc: u32, ticks: u64) -> Result<(), Detail> {
+fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
     ensure_eq!(r.status, 0, "the process ended");
     ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
@@ -1927,7 +1989,7 @@ const TARGETED_WAKE: bool = true;
 
 /// A bystander: blocked on an event nobody signals until the test ends it.
 extern "C" fn bystander(arg: usize) -> ! {
-    sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + 60_000);
+    sys::object_wait(arg as u64, 1 << 24, sys::clock_get() + 60_000);
     sys::thread_exit(0)
 }
 
@@ -1935,12 +1997,12 @@ extern "C" fn bystander(arg: usize) -> ! {
 extern "C" fn pong(arg: usize) -> ! {
     let mut buf = [0u8; 8];
     for _ in 0..ROUND_TRIPS {
-        sys::object_wait(arg as u32, sig::READABLE, sys::clock_get() + 60_000);
-        let r = sys::channel_read(arg as u32, buf.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
+        sys::object_wait(arg as u64, sig::READABLE, sys::clock_get() + 60_000);
+        let r = sys::channel_read(arg as u64, buf.as_mut_ptr(), 8, core::ptr::null_mut(), 0);
         if r.status != 0 {
             break;
         }
-        sys::channel_write(arg as u32, buf.as_ptr(), 8, core::ptr::null(), 0);
+        sys::channel_write(arg as u64, buf.as_ptr(), 8, core::ptr::null(), 0);
     }
     sys::thread_exit(0)
 }
@@ -2103,7 +2165,7 @@ fn futex_sleepers_are_not_woken_by_unrelated_syscalls() -> Outcome {
 
 /// A port bystander: blocked in `port_wait` on a port nobody binds.
 extern "C" fn port_bystander(arg: usize) -> ! {
-    sys::port_wait(arg as u32, sys::clock_get() + 60_000);
+    sys::port_wait(arg as u64, sys::clock_get() + 60_000);
     sys::thread_exit(0)
 }
 
@@ -2209,7 +2271,7 @@ fn kill_a_spinning_child() -> Outcome {
 // ---- process_suspend and process_resume (SIG2) ----
 
 /// Read and drop every message waiting on `ch`; how many there were.
-fn drain_reports(ch: u32) -> usize {
+fn drain_reports(ch: u64) -> usize {
     let mut n = 0;
     let mut buf = [0u8; 64];
     while sys::channel_read(ch, buf.as_mut_ptr(), 64, core::ptr::null_mut(), 0).status == 0 {
@@ -2219,12 +2281,12 @@ fn drain_reports(ch: u32) -> usize {
 }
 
 /// Reports from a counting child (`crash` mode 71) arrive within `ticks`.
-fn reports_arrive(ch: u32, ticks: u64) -> bool {
+fn reports_arrive(ch: u64, ticks: u64) -> bool {
     sys::object_wait(ch, sig::READABLE, sys::clock_get() + ticks).status == 0
 }
 
 /// The child is silent: nothing arrives for `ticks`, after the reports in flight were dropped.
-fn child_is_silent(ch: u32, ticks: u64) -> Outcome {
+fn child_is_silent(ch: u64, ticks: u64) -> Outcome {
     nap(8)?; // time to park (a thread on another hart is kicked at once, a tick at the latest)
     drain_reports(ch);
     nap(ticks)?;
@@ -2279,7 +2341,7 @@ fn process_suspend_stops_a_spinner_and_resume_restarts_it() -> Outcome {
 fn process_suspend_stops_every_thread_on_every_hart() -> Outcome {
     let (p, mine) = launch(71)?;
     // three more counting threads (they share the bootstrap channel), so with several harts some run elsewhere
-    let mut ts = [0u32; 3];
+    let mut ts = [0u64; 3];
     for (i, t) in ts.iter_mut().enumerate() {
         *t = child_thread(p, i as u64, 71)?;
     }
@@ -2500,7 +2562,7 @@ fn a_process_that_never_started_can_be_killed() -> Outcome {
 }
 
 fn process_self_and_mapping_into_ourselves() -> Outcome {
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     ensure_eq!(
         st(sys::process_info(me)),
         Some(S::BadState),
@@ -2543,7 +2605,7 @@ fn process_self_and_mapping_into_ourselves() -> Outcome {
         "and a write to the VMO is visible through the mapping"
     );
     ensure_eq!(st(sys::process_unmap(me, 0x400_0000)), Some(S::Ok), "unmap");
-    let again = ok(sys::process_self(), "a second self handle")?.a1 as u32;
+    let again = ok(sys::process_self(), "a second self handle")?.a1 as u64;
     ensure_eq!(
         st(sys::handle_close(again)),
         Some(S::Ok),
@@ -2560,7 +2622,7 @@ fn process_self_and_mapping_into_ourselves() -> Outcome {
 fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     // SYSCALLS.md: closing the last handle to a VMO frees it "once nothing maps it". A
     // mapping must keep the VMO alive, including pages not yet touched.
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     let v = vmo(2)?;
     sys::vmo_write(v, 0, 0xfeed_f00du32.to_le_bytes().as_ptr(), 4);
     ensure_eq!(
@@ -2609,16 +2671,14 @@ fn many_children_do_not_leak() -> Outcome {
 
 // --- Threads (S3c-2b) -----------------------------------------------------------------------
 
-use core::sync::atomic::AtomicU64;
-
 // (below the stack arena, which `thread_spawn` hands out: 0x30_0000_0000 and up)
 static NEXT_STACK: AtomicU64 = AtomicU64::new(0x28_0000_0000);
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static WOKEN_AT: AtomicU64 = AtomicU64::new(0);
 static WOKEN_STATUS: AtomicU32 = AtomicU32::new(99);
 
-fn me() -> Result<u32, Detail> {
-    Ok(ok(sys::process_self(), "process_self")?.a1 as u32)
+fn me() -> Result<u64, Detail> {
+    Ok(ok(sys::process_self(), "process_self")?.a1 as u64)
 }
 
 /// Map a fresh 4-page stack into our own address space; returns its top.
@@ -2632,13 +2692,13 @@ fn own_stack() -> Result<u64, Detail> {
     Ok(base + 4 * 4096)
 }
 
-fn new_thread(f: extern "C" fn(usize) -> !, arg: usize) -> Result<u32, Detail> {
+fn new_thread(f: extern "C" fn(usize) -> !, arg: usize) -> Result<u64, Detail> {
     let top = own_stack()?;
     Ok(ok(
         sys::thread_create(me()?, f as *const () as usize as u64, top, arg as u64),
         "thread_create",
     )?
-    .a1 as u32)
+    .a1 as u64)
 }
 
 extern "C" fn worker_set(arg: usize) -> ! {
@@ -2652,7 +2712,7 @@ extern "C" fn worker_set(arg: usize) -> ! {
 const SLOW_MS: u64 = 120_000;
 
 extern "C" fn worker_wait_event(arg: usize) -> ! {
-    let r = sys::object_wait(arg as u32, 1 << 24, sys::clock_get() + SLOW_MS);
+    let r = sys::object_wait(arg as u64, 1 << 24, sys::clock_get() + SLOW_MS);
     WOKEN_AT.store(sys::clock_get(), Ordering::SeqCst);
     WOKEN_STATUS.store(r.status as u32, Ordering::SeqCst);
     sys::thread_exit(if r.status == 0 { 0 } else { 1 })
@@ -2662,7 +2722,7 @@ fn thread_create_argument_checks() -> Outcome {
     let top = own_stack()?;
     let me = me()?;
     let entry = worker_set as *const () as usize as u64;
-    let go = |p: u32, entry: u64, sp: u64| st(sys::thread_create(p, entry, sp, 0));
+    let go = |p: u64, entry: u64, sp: u64| st(sys::thread_create(p, entry, sp, 0));
     ensure_eq!(go(BAD, entry, top), Some(S::BadHandle), "bad handle");
     let ev = event()?;
     ensure_eq!(
@@ -2698,7 +2758,7 @@ fn thread_create_argument_checks() -> Outcome {
         st(rt::syscall(
             rt::abi::syscall::THREAD_CREATE,
             [
-                (1usize << 32) | me as usize,
+                me as usize ^ (1usize << 40),
                 entry as usize,
                 top as usize,
                 0,
@@ -2798,8 +2858,8 @@ fn a_user_signal_wakes_a_blocked_thread() -> Outcome {
 // returns INTERRUPTED (-14); the flag is set whether or not the thread is blocked, and is taken by the blocking call that sees
 // it (never by a poll, never by a call whose condition already holds).
 
-static INTR_H: AtomicU32 = AtomicU32::new(0);
-static INTR_H2: AtomicU32 = AtomicU32::new(0);
+static INTR_H: AtomicU64 = AtomicU64::new(0);
+static INTR_H2: AtomicU64 = AtomicU64::new(0);
 static INTR_WORD: AtomicU32 = AtomicU32::new(0);
 static INTR_GO: AtomicU32 = AtomicU32::new(0);
 static INTR_STARTED: AtomicU32 = AtomicU32::new(0);
@@ -2946,7 +3006,7 @@ fn thread_interrupt_ends_an_object_wait() -> Outcome {
 }
 
 fn thread_interrupt_ends_a_port_wait() -> Outcome {
-    let p = ok(sys::port_create(), "port_create")?.a1 as u32;
+    let p = ok(sys::port_create(), "port_create")?.a1 as u64;
     let e = event()?;
     ok(sys::port_bind(p, e, 1 << 24, 5), "bind")?;
     INTR_H.store(p, Ordering::SeqCst);
@@ -3028,7 +3088,7 @@ fn thread_interrupt_waits_for_a_wait_that_would_block() -> Outcome {
 }
 
 fn thread_interrupt_polls_leave_the_flag_on_every_wait() -> Outcome {
-    let p = ok(sys::port_create(), "port_create")?.a1 as u32;
+    let p = ok(sys::port_create(), "port_create")?.a1 as u64;
     let e = event()?;
     ok(sys::port_bind(p, e, 1 << 24, 5), "bind")?;
     INTR_H.store(p, Ordering::SeqCst);
@@ -3106,7 +3166,7 @@ fn thread_interrupt_argument_errors() -> Outcome {
         sys::handle_duplicate(t, Rights::INSPECT.0),
         "a thread handle without MANAGE",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::thread_interrupt(weak)),
         Some(S::AccessDenied),
@@ -3217,7 +3277,7 @@ fn thread_priority_is_bounded_by_the_job() -> Outcome {
         sys::handle_duplicate(g, Rights::INSPECT.0),
         "a job handle without SET_LIMITS",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::job_set_sched(weak, 5, 0, 1024)),
         Some(S::AccessDenied),
@@ -3304,15 +3364,10 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
         ),
         "map the shared stacks",
     )?;
-    let mut ts: Vec<u32> = Vec::new();
+    let mut ts: Vec<u64> = Vec::new();
     loop {
         let top = base + (ts.len() as u64 + 1) * STACK_PAGES * 4096;
-        let r = sys::thread_create(
-            me,
-            worker_wait_event as *const () as usize as u64,
-            top,
-            ev as u64,
-        );
+        let r = sys::thread_create(me, worker_wait_event as *const () as usize as u64, top, ev);
         if r.status != 0 {
             ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
             break;
@@ -3321,7 +3376,7 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
             ts.len() < LIMIT,
             "more than the limit of threads was allowed"
         );
-        ts.push(r.a1 as u32);
+        ts.push(r.a1 as u64);
     }
     // this thread plus the others: the limit is `MAX_THREADS_PER_PROCESS` in all
     ensure_eq!(
@@ -3439,39 +3494,6 @@ fn kill_a_process_that_is_creating_threads() -> Outcome {
     Ok(())
 }
 
-fn thread_create_with_a_full_handle_table() -> Outcome {
-    let me = me()?;
-    let top = own_stack()?;
-    let entry = worker_set as *const () as usize as u64;
-    static HS: [AtomicU32; 4200] = [const { AtomicU32::new(0) }; 4200];
-    let mut n = 0;
-    while n < HS.len() {
-        let r = sys::event_create();
-        if r.status != 0 {
-            break;
-        }
-        HS[n].store(r.a1 as u32, Ordering::Relaxed);
-        n += 1;
-    }
-    ensure_eq!(
-        st(sys::thread_create(me, entry, top, 0)),
-        Some(S::NoMemory),
-        "table full"
-    );
-    for h in &HS[..n] {
-        sys::handle_close(h.load(Ordering::Relaxed));
-    }
-    for _ in 0..3 {
-        let t = new_thread(worker_set, 1)?;
-        ensure_eq!(
-            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
-            0,
-            "threads work again"
-        );
-    }
-    Ok(())
-}
-
 fn a_thread_handle_closed_early_is_harmless() -> Outcome {
     let ev = event()?;
     let t = new_thread(worker_wait_event, ev as usize)?;
@@ -3497,7 +3519,7 @@ fn a_thread_handle_closed_early_is_harmless() -> Outcome {
 /// Many children each trying to start seven threads: the system-wide limit must turn into
 /// NO_MEMORY for the children, never a kernel out-of-memory panic.
 fn a_thread_hog_cannot_exhaust_the_kernel() -> Outcome {
-    let mut ps = [0u32; 40];
+    let mut ps = [0u64; 40];
     let mut n = 0;
     while n < ps.len() {
         // once the system-wide thread limit is reached a start is refused with NO_MEMORY
@@ -3530,7 +3552,7 @@ fn child_entry() -> Result<u64, Detail> {
 }
 
 /// Another thread in child `p` at the program entry with start arg `arg`, on its own stack.
-fn child_thread(p: u32, slot: u64, arg: u64) -> Result<u32, Detail> {
+fn child_thread(p: u64, slot: u64, arg: u64) -> Result<u64, Detail> {
     let base = 0x20_0000_0000 + slot * 0x10_0000;
     let v = vmo(4)?;
     ok(
@@ -3542,10 +3564,10 @@ fn child_thread(p: u32, slot: u64, arg: u64) -> Result<u32, Detail> {
         sys::thread_create(p, child_entry()?, base + 4 * 4096, arg),
         "thread_create in a child",
     )?
-    .a1 as u32)
+    .a1 as u64)
 }
 
-fn thread_ended_with(t: u32, code: i64) -> Outcome {
+fn thread_ended_with(t: u64, code: i64) -> Outcome {
     ensure_eq!(
         sys::object_signals(t).a1 as u32 & sig::TERMINATED,
         sig::TERMINATED,
@@ -3570,7 +3592,7 @@ extern "C" fn worker_spin(_: usize) -> ! {
 }
 
 extern "C" fn worker_block_forever(arg: usize) -> ! {
-    sys::object_wait(arg as u32, 1 << 24, u64::MAX);
+    sys::object_wait(arg as u64, 1 << 24, u64::MAX);
     sys::thread_exit(1)
 }
 
@@ -3613,7 +3635,7 @@ fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
     for _ in 0..3 {
         sys::thread_yield();
     }
-    let _ev2 = ok(sys::handle_replace(ev, Rights::SAME.0), "replace")?.a1 as u32;
+    let _ev2 = ok(sys::handle_replace(ev, Rights::SAME.0), "replace")?.a1 as u64;
     let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 100);
     let prompt = r.status == 0;
     sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 3000); // leave nothing behind
@@ -3626,7 +3648,7 @@ fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
     Ok(())
 }
 
-fn child_with_a_ready_exit_thread() -> Result<(u32, u32, u32), Detail> {
+fn child_with_a_ready_exit_thread() -> Result<(u64, u64, u64), Detail> {
     let (p, m) = launch(25)?;
     let base = 0x20_0000_0000u64;
     let v = vmo(4)?;
@@ -3640,7 +3662,7 @@ fn child_with_a_ready_exit_thread() -> Result<(u32, u32, u32), Detail> {
         sys::thread_create(p, child_entry()?, base + 4 * 4096, 8),
         "thread_create",
     )?
-    .a1 as u32;
+    .a1 as u64;
     Ok((p, m, t))
 }
 
@@ -3658,7 +3680,7 @@ fn a_thread_killed_before_it_ran_runs_no_user_code() -> Outcome {
 
 fn kill_a_child_whose_threads_never_ran() -> Outcome {
     let (p, _m) = launch(15)?;
-    let mut ts = [0u32; 7];
+    let mut ts = [0u64; 7];
     for (i, t) in ts.iter_mut().enumerate() {
         *t = child_thread(p, i as u64, 15)?;
     }
@@ -3676,7 +3698,7 @@ fn kill_a_child_whose_threads_never_ran() -> Outcome {
 fn kill_a_child_with_blocked_and_spinning_threads() -> Outcome {
     let (p, _m) = launch(16)?;
     nap(3)?;
-    let mut ts = [0u32; 6];
+    let mut ts = [0u64; 6];
     for (i, t) in ts.iter_mut().enumerate().take(3) {
         *t = child_thread(p, i as u64, 16)?;
     }
@@ -3697,7 +3719,7 @@ fn kill_a_child_with_blocked_and_spinning_threads() -> Outcome {
 
 fn closing_handles_early_and_kill_on_close() -> Outcome {
     let (p, mine) = launch(15)?;
-    let mut ts = [0u32; 7];
+    let mut ts = [0u64; 7];
     for (i, t) in ts.iter_mut().enumerate() {
         *t = child_thread(p, i as u64, 15)?;
     }
@@ -3778,29 +3800,29 @@ fn threads_left_behind_when_init_exits() -> Outcome {
 
 const SOCKET_BUFFER: usize = 65536;
 
-fn socket() -> Result<(u32, u32), Detail> {
+fn socket() -> Result<(u64, u64), Detail> {
     let r = ok(sys::socket_create(), "socket_create")?;
-    Ok((r.a1 as u32, r.a2 as u32))
+    Ok((r.a1 as u64, r.a2 as u64))
 }
 
-fn port() -> Result<u32, Detail> {
-    Ok(ok(sys::port_create(), "port_create")?.a1 as u32)
+fn port() -> Result<u64, Detail> {
+    Ok(ok(sys::port_create(), "port_create")?.a1 as u64)
 }
 
 fn sleep_in_thread(ticks: u64) {
-    let gate = sys::event_create().a1 as u32;
+    let gate = sys::event_create().a1 as u64;
     sys::object_wait(gate, 1 << 24, sys::clock_get() + ticks);
     sys::handle_close(gate);
 }
 
 extern "C" fn worker_signal_later(arg: usize) -> ! {
     sleep_in_thread(6);
-    sys::event_signal(arg as u32, 0, 1 << 24);
+    sys::event_signal(arg as u64, 0, 1 << 24);
     sys::thread_exit(0)
 }
 
 extern "C" fn worker_port_wait_then_report(arg: usize) -> ! {
-    let r = sys::port_wait(arg as u32, sys::clock_get() + 1000);
+    let r = sys::port_wait(arg as u64, sys::clock_get() + 1000);
     sys::thread_exit(if r.status == 0 { 0 } else { 1 })
 }
 
@@ -3811,7 +3833,7 @@ extern "C" fn worker_write_later(arg: usize) -> ! {
     for _ in 0..3 {
         sys::thread_yield();
     }
-    let r = sys::socket_write(arg as u32, b"ping".as_ptr(), 4);
+    let r = sys::socket_write(arg as u64, b"ping".as_ptr(), 4);
     // Linger without making any syscall that wakes waiters, so that only the write's own
     // wake-up can end a waiter's sleep (an exit would wake everyone and hide a missing one).
     // (400 ms: the readers' bound is the slack of `within`, 250 ms above the expected time, and a wake by the exit must fall outside it.)
@@ -3824,11 +3846,11 @@ extern "C" fn worker_write_later(arg: usize) -> ! {
 
 /// Wait (up to 2000 ticks) until the socket can take a write, then write 3 bytes.
 extern "C" fn worker_write_when_writable(arg: usize) -> ! {
-    let r = sys::object_wait(arg as u32, sig::WRITABLE, sys::clock_get() + 2000);
+    let r = sys::object_wait(arg as u64, sig::WRITABLE, sys::clock_get() + 2000);
     if r.status != 0 {
         sys::thread_exit(1);
     }
-    let w = sys::socket_write(arg as u32, b"abc".as_ptr(), 3);
+    let w = sys::socket_write(arg as u64, b"abc".as_ptr(), 3);
     sys::thread_exit(if w.status == 0 { w.a1 as i32 } else { 2 })
 }
 
@@ -3935,7 +3957,7 @@ fn socket_syscalls() -> Outcome {
         st(rt::syscall(
             rt::abi::syscall::SOCKET_WRITE,
             [
-                (1usize << 32) | a as usize,
+                a as usize ^ (1usize << 40),
                 big.as_ptr() as usize,
                 1,
                 0,
@@ -4034,7 +4056,7 @@ fn socket_half_close() -> Outcome {
         Some(S::WrongType),
         "a channel is not a socket"
     );
-    let ro = ok(sys::handle_duplicate(b, Rights::READ.0), "dup read-only")?.a1 as u32;
+    let ro = ok(sys::handle_duplicate(b, Rights::READ.0), "dup read-only")?.a1 as u64;
     ensure_eq!(
         st(sys::socket_shutdown(ro)),
         Some(S::AccessDenied),
@@ -4105,7 +4127,7 @@ fn socket_ends_travel_over_channels() -> Outcome {
         Some(S::Ok),
         "send a socket end"
     );
-    let mut hb = [0u32; 1];
+    let mut hb = [0u64; 1];
     let mut mb = [0u8; 4];
     let r = sys::channel_read(d, mb.as_mut_ptr(), 4, hb.as_mut_ptr(), 1);
     ensure_eq!((r.status, r.a2), (0, 1), "received it");
@@ -4243,7 +4265,7 @@ fn port_argument_checks() -> Outcome {
     ensure_eq!(
         st(rt::syscall(
             rt::abi::syscall::PORT_BIND,
-            [(1usize << 32) | p as usize, e as usize, m as usize, 1, 0, 0]
+            [p as usize ^ (1usize << 40), e as usize, m as usize, 1, 0, 0]
         )),
         Some(S::BadHandle),
         "a wide port handle"
@@ -4292,7 +4314,7 @@ fn port_argument_checks() -> Outcome {
     ensure_eq!(
         st(rt::syscall(
             rt::abi::syscall::PORT_WAIT,
-            [(1usize << 32) | p as usize, 0, 0, 0, 0, 0]
+            [p as usize ^ (1usize << 40), 0, 0, 0, 0, 0]
         )),
         Some(S::BadHandle),
         "wide handle"
@@ -4479,7 +4501,7 @@ fn kill_a_child_blocked_in_port_wait() -> Outcome {
 
 fn socket_memory_is_bounded() -> Outcome {
     let chunk = [7u8; SOCKET_BUFFER];
-    let mut pairs = [(0u32, 0u32); 64];
+    let mut pairs = [(0u64, 0u64); 64];
     let mut n = 0;
     let mut hit_the_limit = false;
     while n < pairs.len() {
@@ -4554,7 +4576,7 @@ fn dead_port_bindings_vanish_at_once() -> Outcome {
 /// Park events 64 at a time in channel messages until something refuses: the refusal must be
 /// NO_MEMORY, and everything must work again once the channels are closed.
 fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
-    let mut chans = [0u32; 10];
+    let mut chans = [0u64; 10];
     for i in 0..5 {
         let (a, b) = channel()?;
         chans[2 * i] = a;
@@ -4564,7 +4586,7 @@ fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
     let mut refused = None;
     'outer: for &ch in chans.iter() {
         for _ in 0..128 {
-            let mut hs = [0u32; 64];
+            let mut hs = [0u64; 64];
             let mut got = 0;
             for h in hs.iter_mut() {
                 let r = sys::event_create();
@@ -4572,7 +4594,7 @@ fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
                     refused = st(r);
                     break;
                 }
-                *h = r.a1 as u32;
+                *h = r.a1 as u64;
                 got += 1;
                 made += 1;
             }
@@ -4641,7 +4663,7 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     let e = event()?;
     let mut sent = 0u32;
     let mut refused = None;
-    let mut chans = [0u32; 40];
+    let mut chans = [0u64; 40];
     let mut nch = 0;
     'outer: for _ in 0..20 {
         let (a, b) = channel()?;
@@ -4650,14 +4672,14 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
         nch += 2;
         for side in [a, b] {
             for _ in 0..128 {
-                let mut hs = [0u32; 64];
+                let mut hs = [0u64; 64];
                 for h in hs.iter_mut() {
                     let r = sys::handle_duplicate(e, Rights::SAME.0);
                     if r.status != 0 {
                         refused = st(r);
                         break 'outer;
                     }
-                    *h = r.a1 as u32;
+                    *h = r.a1 as u64;
                 }
                 let w = sys::channel_write(side, core::ptr::null(), 0, hs.as_ptr(), 64);
                 if w.status != 0 {
@@ -4733,7 +4755,7 @@ fn kill_needs_the_kill_right_and_nothing_else() -> Outcome {
         Some(S::Ok),
         "a KILL|WAIT|TRANSFER handle can be sent"
     );
-    let mut hb = [0u32; 1];
+    let mut hb = [0u64; 1];
     let mut mb = [0u8; 4];
     let r = sys::channel_read(b, mb.as_mut_ptr(), 4, hb.as_mut_ptr(), 1);
     ensure_eq!((r.status, r.a2), (0, 1), "received it");
@@ -4766,7 +4788,7 @@ use proto::startup::{Role, Startup};
 fn fetch_the_hello_image() -> Outcome {
     let (m, n) = request(22, b'H', b"");
     let mut reply = [0u8; 16];
-    let mut got = [0u32; 2];
+    let mut got = [0u64; 2];
     let args = CallArgs {
         req_bytes: m.as_ptr() as u64,
         req_handles: 0,
@@ -4784,7 +4806,7 @@ fn fetch_the_hello_image() -> Outcome {
     Ok(())
 }
 
-fn send_startup(mine: u32, s: &Startup, handles: &[u32]) -> Outcome {
+fn send_startup(mine: u64, s: &Startup, handles: &[u64]) -> Outcome {
     let bytes = s.encode().map_err(|e| {
         let mut d = Detail::new();
         let _ = core::fmt::Write::write_fmt(&mut d, format_args!("encode: {e:?}"));
@@ -4806,7 +4828,7 @@ fn send_startup(mine: u32, s: &Startup, handles: &[u32]) -> Outcome {
 
 /// Start `hello` with `args`, a stdin pipe and a stdout pipe; returns (process, our write end of
 /// stdin, our read end of stdout).
-fn start_hello(args: &[&[u8]]) -> Result<(u32, u32, u32), Detail> {
+fn start_hello(args: &[&[u8]]) -> Result<(u64, u64, u64), Detail> {
     let (p, mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
     let (in_w, in_r) = socket()?;
     let (out_r, out_w) = socket()?;
@@ -4827,7 +4849,7 @@ fn start_hello(args: &[&[u8]]) -> Result<(u32, u32, u32), Detail> {
 }
 
 /// Read a socket to the end of the stream.
-fn read_to_end(h: u32) -> Result<Vec<u8>, Detail> {
+fn read_to_end(h: u64) -> Result<Vec<u8>, Detail> {
     let mut out = Vec::new();
     let mut buf = [0u8; 64];
     loop {
@@ -4960,7 +4982,7 @@ extern "C" fn drain_for_big_write(arg: usize) -> ! {
     let mut total = 0usize;
     let mut buf = [0u8; 4096];
     while total < 70_000 {
-        match rt::io::read(arg as u32, &mut buf) {
+        match rt::io::read(arg as u64, &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => total += n,
         }
@@ -4998,8 +5020,8 @@ use proto::launch;
 /// The boot image VMO, fetched once: the kernel makes a fresh copy of the whole image (about a
 /// thousand pages) for every request, so asking in every test left a dozen copies behind and
 /// the suite ran the machine out of memory on a runner whose image was a little larger.
-fn boot_image_vmo() -> Result<u32, Detail> {
-    static CACHED: AtomicU32 = AtomicU32::new(0);
+fn boot_image_vmo() -> Result<u64, Detail> {
+    static CACHED: AtomicU64 = AtomicU64::new(0);
     let have = CACHED.load(Ordering::Relaxed);
     if have != 0 {
         return Ok(have);
@@ -5009,10 +5031,10 @@ fn boot_image_vmo() -> Result<u32, Detail> {
     Ok(h)
 }
 
-fn fetch_boot_image_vmo() -> Result<u32, Detail> {
+fn fetch_boot_image_vmo() -> Result<u64, Detail> {
     let (m, n) = request(23, b'B', b"");
     let mut reply = [0u8; 16];
-    let mut got = [0u32; 2];
+    let mut got = [0u64; 2];
     let args = CallArgs {
         req_bytes: m.as_ptr() as u64,
         req_handles: 0,
@@ -5030,7 +5052,7 @@ fn fetch_boot_image_vmo() -> Result<u32, Detail> {
 }
 
 /// (offset, length) of a boot image entry.
-fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
+fn image_entry(vmo: u64, name: &[u8]) -> Result<(u64, u64), Detail> {
     // only the table at the front is needed, not the whole image (which is megabytes)
     let size = sys::vmo_get_size(vmo).a1;
     let prefix = rt::spawn::read_image(vmo, 0, (size as u64).min(128 * 1024)).ok_or_else(|| {
@@ -5054,7 +5076,7 @@ fn image_entry(vmo: u32, name: &[u8]) -> Result<(u64, u64), Detail> {
 
 /// Start the launcher from the boot image through `rt::spawn`: (its process handle, our end of
 /// its service channel, the boot image VMO).
-fn start_launcher() -> Result<(u32, u32, u32), Detail> {
+fn start_launcher() -> Result<(u64, u64, u64), Detail> {
     let bi = boot_image_vmo()?;
     let (off, len) = image_entry(bi, b"bin/launcher")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -5076,15 +5098,15 @@ fn start_launcher() -> Result<(u32, u32, u32), Detail> {
 /// Ask the launcher to spawn the image at (offset, len) of `bi`, with `startup` and `forward`
 /// handles. Returns (status, process handle if any).
 fn ask_launcher(
-    ch: u32,
-    bi: u32,
+    ch: u64,
+    bi: u64,
     txid: u32,
     off: u64,
     len: u64,
     startup: &[u8],
-    forward: &[u32],
-) -> Result<(i32, Option<u32>), Detail> {
-    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    forward: &[u64],
+) -> Result<(i32, Option<u64>), Detail> {
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     // Built by hand: the encoder refuses the invalid extents some tests need to send.
     let mut req = Vec::new();
     req.extend_from_slice(&txid.to_le_bytes());
@@ -5114,7 +5136,7 @@ fn ask_launcher(
     );
     ensure_eq!(w.status, 0, "the launcher answered");
     let mut buf = [0u8; 16];
-    let mut h = [0u32; 1];
+    let mut h = [0u64; 1];
     let r = sys::channel_read(ch, buf.as_mut_ptr(), 16, h.as_mut_ptr(), 1);
     ensure_eq!(r.status, 0, "read the reply");
     let (id, status) = launch::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
@@ -5122,7 +5144,7 @@ fn ask_launcher(
     Ok((status, if r.a2 == 1 { Some(h[0]) } else { None }))
 }
 
-fn hello_startup(args: &[&[u8]]) -> Result<(Vec<u8>, u32, u32, u32, u32), Detail> {
+fn hello_startup(args: &[&[u8]]) -> Result<(Vec<u8>, u64, u64, u64, u64), Detail> {
     // returns (startup bytes, in_w (ours), in_r_child, out_r (ours), out_w_child)
     let (in_w, in_r) = socket()?;
     let (out_r, out_w) = socket()?;
@@ -5239,7 +5261,7 @@ fn the_launcher_refuses_bad_images_and_requests_without_leaks() -> Outcome {
         "an unreferenced handle"
     );
     // garbage bytes
-    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u32;
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u64;
     ensure_eq!(
         st(sys::channel_write(
             ch,
@@ -5323,12 +5345,12 @@ fn code<T>(r: Result<T, i32>) -> Option<i32> {
 
 /// Start memfsd from the boot image: (process handle, a root connection with every right, the
 /// boot image VMO).
-fn start_memfsd() -> Result<(u32, Fs, u32), Detail> {
+fn start_memfsd() -> Result<(u64, Fs, u64), Detail> {
     let bi = boot_image_vmo()?;
     let (off, len) = image_entry(bi, b"bin/memfsd")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (mine, theirs) = channel()?;
-    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u32;
+    let image_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup")?.a1 as u64;
     let s = Startup {
         args: vec![b"memfsd".to_vec()],
         roles: vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
@@ -5908,7 +5930,7 @@ fn memfsd_rights_only_shrink() -> Outcome {
     Ok(())
 }
 
-fn raw_request(ch: u32, bytes: &[u8], handles: &[u32]) -> Outcome {
+fn raw_request(ch: u64, bytes: &[u8], handles: &[u64]) -> Outcome {
     ensure_eq!(
         st(sys::channel_write(
             ch,
@@ -5923,7 +5945,7 @@ fn raw_request(ch: u32, bytes: &[u8], handles: &[u32]) -> Outcome {
     Ok(())
 }
 
-fn reply_status(ch: u32) -> Result<i32, Detail> {
+fn reply_status(ch: u64) -> Result<i32, Detail> {
     let w = sys::object_wait(
         ch,
         sig::READABLE | sig::PEER_CLOSED,
@@ -6046,7 +6068,7 @@ fn memfsd_protocol_violations() -> Outcome {
 /// tighter than its parent, and what it uses counts against the parent too); and an account's room comes back
 /// when its connections close.
 /// Start the service registry (slice SD): the connection to it is the full directory connection.
-fn start_registry() -> Result<(u32, Fs), Detail> {
+fn start_registry() -> Result<(u64, Fs), Detail> {
     let bi = boot_image_vmo()?;
     let (off, len) = image_entry(bi, b"bin/registryd")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -6067,11 +6089,11 @@ fn start_registry() -> Result<(u32, Fs), Detail> {
 
 /// Take the connection the registry forwarded to a listener (an `Open` frame carrying the client's endpoint)
 /// and answer on it, as a service would: `reply` is written to the client.
-fn serve_one_forwarded(listener: u32, reply: &[u8]) -> Outcome {
+fn serve_one_forwarded(listener: u64, reply: &[u8]) -> Outcome {
     let w = sys::object_wait(listener, sig::READABLE, sys::clock_get() + 2000);
     ensure_eq!(st(w), Some(S::Ok), "the registry forwarded the connection");
     let mut buf = [0u8; 64];
-    let mut hs = [0u32; 2];
+    let mut hs = [0u64; 2];
     let r = sys::channel_read(listener, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), 2);
     ensure_eq!(st(r), Some(S::Ok), "read the forwarded open");
     ensure_eq!(r.a2, 1, "it carries the client's endpoint");
@@ -6543,7 +6565,7 @@ fn memfsd_survives_memory_pressure_from_quota_legal_clients() -> Outcome {
         }
     }
     // fill the shared IPC budget with our own junk, so no reply can be queued
-    let mut junk: Vec<(u32, u32)> = Vec::new();
+    let mut junk: Vec<(u64, u64)> = Vec::new();
     'fill: loop {
         let (m, t) = channel()?;
         junk.push((m, t));
@@ -6845,7 +6867,7 @@ fn syscalls_stay_fast_with_many_live_processes() -> Outcome {
     // took about 3000 ticks then, 150 to 700 now (a fast machine, a loaded CI runner): the bound
     // sits between. (A bound relative to a run "without" the processes does not work: earlier
     // tests leave processes alive, which slows both runs the same.)
-    let mut kids = [0u32; 12];
+    let mut kids = [0u64; 12];
     for k in kids.iter_mut() {
         let (p, _mine) = launch_image(HELLO_IMAGE.load(Ordering::Relaxed), 0)?;
         *k = p;
@@ -6876,7 +6898,7 @@ fn object_info_names_objects_and_peers() -> Outcome {
     );
     ensure_eq!(ia.a2, ib.a1, "a's peer is b");
     ensure_eq!(ib.a2, ia.a1, "b's peer is a");
-    let dup = ok(sys::handle_duplicate(a, Rights::SAME.0), "dup")?.a1 as u32;
+    let dup = ok(sys::handle_duplicate(a, Rights::SAME.0), "dup")?.a1 as u64;
     ensure_eq!(
         ok(sys::object_info(dup), "info dup")?.a1,
         ia.a1,
@@ -6895,7 +6917,7 @@ fn object_info_names_objects_and_peers() -> Outcome {
     ensure_eq!(
         st(rt::syscall(
             rt::abi::syscall::OBJECT_INFO,
-            [(1usize << 32) | a as usize, 0, 0, 0, 0, 0]
+            [a as usize ^ (1usize << 40), 0, 0, 0, 0, 0]
         )),
         Some(S::BadHandle),
         "a wide handle"
@@ -6960,7 +6982,7 @@ fn registers_survive_a_syscall() -> Outcome {
 
 fn wide_arguments_are_not_truncated() -> Outcome {
     let e = event()?;
-    let wide = |h: u32| (1usize << 32) | h as usize; // a valid handle with a high bit added
+    let wide = |h: u64| h as usize ^ (1usize << 40); // a valid handle with a high bit added
     let st = |n: usize, a: [usize; 6]| st(rt::syscall(n, a));
     use rt::abi::syscall as nr;
     ensure_eq!(
@@ -7081,7 +7103,7 @@ fn rights_cannot_be_widened() -> Outcome {
         sys::handle_duplicate(e, Rights::SIGNAL.0),
         "duplicate with fewer rights",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::handle_duplicate(dup, Rights::SAME.0)),
         Some(S::AccessDenied),
@@ -7114,7 +7136,7 @@ fn rights_cannot_be_widened() -> Outcome {
         sys::handle_replace(dup, Rights::NONE.0),
         "replace with no rights",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::event_signal(dup, 0, 0)),
         Some(S::BadHandle),
@@ -7209,16 +7231,16 @@ fn cycles_do_not_grow_memory() -> Outcome {
 /// device), the DMA buffer (kept across driver lifetimes: killing a driver must not free memory the
 /// device may still write to, T42) and the interrupt object when the machine has a PLIC.
 struct BlkRig {
-    res: u32,
+    res: u64,
     dev: Blk,
-    dma: u32,
-    irq: Option<u32>,
-    bi: u32,
-    job: u32,
+    dma: u64,
+    irq: Option<u64>,
+    bi: u64,
+    job: u64,
 }
 
 fn blk_rig() -> Result<Option<BlkRig>, Detail> {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let Some(dev) = find_blk(res)? else {
         return Ok(None);
     };
@@ -7228,8 +7250,8 @@ fn blk_rig() -> Result<Option<BlkRig>, Detail> {
         "interrupt_create: {:?}",
         st(made)
     );
-    let irq = (st(made) == Some(S::Ok)).then_some(made.a1 as u32);
-    let dma = ok(sys::vmo_create_dma(res, 4), "the DMA buffer")?.a1 as u32;
+    let irq = (st(made) == Some(S::Ok)).then_some(made.a1 as u64);
+    let dma = ok(sys::vmo_create_dma(res, 4), "the DMA buffer")?.a1 as u64;
     let root = root_job()?;
     let job = job(root, u64::MAX, u64::MAX, u64::MAX)?;
     sys::handle_close(root);
@@ -7245,7 +7267,7 @@ fn blk_rig() -> Result<Option<BlkRig>, Detail> {
 
 impl BlkRig {
     /// Start a driver in the rig's job: (its process, our end of its service channel).
-    fn spawn(&self) -> Result<(u32, u32), Detail> {
+    fn spawn(&self) -> Result<(u64, u64), Detail> {
         let (off, len) = image_entry(self.bi, b"bin/blkd")?;
         let image = rt::spawn::read_image(self.bi, off, len).ok_or_else(|| msg_at(line!()))?;
         let slot = u64::from(self.dev.irq - 1);
@@ -7253,12 +7275,12 @@ impl BlkRig {
             sys::vmo_create_physical(self.res, 0x1000_1000 + slot * 4096, 4096),
             "the slot's MMIO VMO",
         )?
-        .a1 as u32;
+        .a1 as u64;
         let dma = ok(
             sys::handle_duplicate(self.dma, Rights::SAME.0),
             "dup the DMA buffer",
         )?
-        .a1 as u32;
+        .a1 as u64;
         let (mine, theirs) = channel()?;
         let mut handles = vec![mmio, dma, theirs];
         let mut roles = vec![(Role::BlkMmio, 0), (Role::BlkDma, 1), (Role::ServiceBlk, 2)];
@@ -7267,7 +7289,7 @@ impl BlkRig {
                 sys::handle_duplicate(irq, Rights::SAME.0),
                 "dup the interrupt",
             )?
-            .a1 as u32;
+            .a1 as u64;
             handles.push(d);
             roles.push((Role::BlkIrq, 3));
         }
@@ -7295,7 +7317,7 @@ impl BlkRig {
 impl Drop for BlkRig {
     fn drop(&mut self) {
         self.reset();
-        let me = sys::process_self().a1 as u32;
+        let me = sys::process_self().a1 as u64;
         sys::process_unmap(me, MMIO_VA);
         sys::handle_close(me);
         for h in [self.dma, self.job, self.res] {
@@ -7308,7 +7330,7 @@ impl Drop for BlkRig {
 }
 
 /// One raw request/reply exchange on the block service channel.
-fn blk_raw(ch: u32, bytes: &[u8]) -> Result<Vec<u8>, Detail> {
+fn blk_raw(ch: u64, bytes: &[u8]) -> Result<Vec<u8>, Detail> {
     ensure_eq!(
         st(sys::channel_write(
             ch,
@@ -7329,7 +7351,7 @@ fn blk_raw(ch: u32, bytes: &[u8]) -> Result<Vec<u8>, Detail> {
     Ok(buf)
 }
 
-fn blk_call(ch: u32, txid: u32, op: blk::Op<'_>) -> Result<(blk::Status, Vec<u8>), Detail> {
+fn blk_call(ch: u64, txid: u32, op: blk::Op<'_>) -> Result<(blk::Status, Vec<u8>), Detail> {
     let reply = blk_raw(ch, &blk::Request { txid, op }.encode())?;
     let (t, status, body) = blk::decode_reply(&reply).ok_or_else(|| msg_at(line!()))?;
     ensure_eq!(t, txid, "the reply answers this transaction");
@@ -7340,7 +7362,7 @@ fn pattern(sector: u64, i: usize) -> u8 {
     (sector as usize * 31 + i * 7 + 5) as u8
 }
 
-fn write_pattern(ch: u32, first: u64, sectors: u64) -> Outcome {
+fn write_pattern(ch: u64, first: u64, sectors: u64) -> Outcome {
     let mut s = 0;
     while s < sectors {
         let n = (sectors - s).min(16);
@@ -7363,7 +7385,7 @@ fn write_pattern(ch: u32, first: u64, sectors: u64) -> Outcome {
     Ok(())
 }
 
-fn check_pattern(ch: u32, first: u64, sectors: u64) -> Outcome {
+fn check_pattern(ch: u64, first: u64, sectors: u64) -> Outcome {
     let mut s = 0;
     let mut sum = 0u64;
     while s < sectors {
@@ -7773,7 +7795,7 @@ fn futex_times_out_not_early() -> Outcome {
 
 /// Start `n` sleepers one after the other (so their arrival order is known) and let each reach the
 /// kernel's table.
-fn start_sleepers(n: u32) -> Result<Vec<u32>, Detail> {
+fn start_sleepers(n: u32) -> Result<Vec<u64>, Detail> {
     FW.store(0, Ordering::SeqCst);
     ARRIVED.store(0, Ordering::SeqCst);
     WOKEN_N.store(0, Ordering::SeqCst);
@@ -7920,7 +7942,7 @@ extern "C" fn mutex_worker(_: usize) -> ! {
 fn mutex_excludes_across_harts() -> Outcome {
     *LOCK.lock() = 0;
     DONE.store(0, Ordering::SeqCst);
-    let mut ts = [0u32; 3];
+    let mut ts = [0u64; 3];
     for t in &mut ts {
         *t = new_thread(mutex_worker, 0)?;
     }
@@ -8157,7 +8179,7 @@ fn lua_script_matches_the_host_build() -> Outcome {
     let (off, len) = image_entry(bi, b"bin/lua")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (out_mine, out_theirs) = socket()?;
-    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u32;
+    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u64;
     let (_fsd, mut root, _bi) = start_memfsd()?;
     let slash = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
     let dot = root
@@ -8236,7 +8258,7 @@ fn run_lua_upstream(file: &str) -> Outcome {
     let (off, len) = image_entry(bi, b"bin/lua")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (out_mine, out_theirs) = socket()?;
-    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u32;
+    let err_theirs = ok(sys::handle_duplicate(out_theirs, Rights::SAME.0), "dup")?.a1 as u64;
     let (_fsd, mut root, _bi) = start_memfsd()?;
     let slash = root.clone_conn(RO_DIR).map_err(|e| msg_e(e, line!()))?;
     let dot = root
@@ -8434,16 +8456,16 @@ fn basic_golden_corpus_on_the_target() -> Outcome {
 // --- The device manager (S6c) -----------------------------------------------------------------
 
 /// One OpenBlock exchange: the status and the block channel that came with an Ok.
-fn devmgr_open(ch: u32, txid: u32) -> Result<(proto::devmgr::Status, Option<u32>), Detail> {
+fn devmgr_open(ch: u64, txid: u32) -> Result<(proto::devmgr::Status, Option<u64>), Detail> {
     devmgr_open_at(ch, txid, 0)
 }
 
 /// OpenBlock for the device `index` (in device-tree order).
 fn devmgr_open_at(
-    ch: u32,
+    ch: u64,
     txid: u32,
     index: u16,
-) -> Result<(proto::devmgr::Status, Option<u32>), Detail> {
+) -> Result<(proto::devmgr::Status, Option<u64>), Detail> {
     let req = proto::devmgr::encode_open_block_at(txid, index);
     ensure_eq!(
         st(sys::channel_write(
@@ -8459,7 +8481,7 @@ fn devmgr_open_at(
     let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000);
     ensure_eq!(st(w), Some(S::Ok), "the manager answers");
     let mut buf = [0u8; 64];
-    let mut hs = [0u32; 2];
+    let mut hs = [0u64; 2];
     let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
     ensure_eq!(st(r), Some(S::Ok), "read the reply");
     let (t, status) = proto::devmgr::decode_reply(&buf[..r.a1]).ok_or_else(|| msg_at(line!()))?;
@@ -8474,10 +8496,10 @@ fn devmgr_open_at(
 
 fn devmgr_starts_blkd_for_the_disk() -> Outcome {
     use proto::devmgr::Status as D;
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let have_disk = match find_blk(res)? {
         Some(_) => {
-            let me = sys::process_self().a1 as u32;
+            let me = sys::process_self().a1 as u64;
             sys::process_unmap(me, MMIO_VA);
             sys::handle_close(me);
             true
@@ -8493,8 +8515,8 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
         sys::handle_duplicate(res, Rights::SAME.0),
         "dup the resource",
     )?
-    .a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    .a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     let s = Startup {
         args: vec![b"devmgr".to_vec()],
         roles: vec![
@@ -8689,7 +8711,7 @@ fn devmgr_starts_blkd_for_the_disk() -> Outcome {
 const FSD_UUID: [u8; 16] = *b"fsd-suite-volume";
 
 /// `devmgr` in a job of its own: (our channel to it, its process, its job).
-fn start_devmgr_in_job(res: u32) -> Result<(u32, u32, u32), Detail> {
+fn start_devmgr_in_job(res: u64) -> Result<(u64, u64, u64), Detail> {
     let bi = boot_image_vmo()?;
     let (off, len) = image_entry(bi, b"bin/devmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -8698,8 +8720,8 @@ fn start_devmgr_in_job(res: u32) -> Result<(u32, u32, u32), Detail> {
         sys::handle_duplicate(res, Rights::SAME.0),
         "dup the resource",
     )?
-    .a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    .a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     let s = Startup {
         args: vec![b"devmgr".to_vec()],
         roles: vec![
@@ -8722,7 +8744,7 @@ fn start_devmgr_in_job(res: u32) -> Result<(u32, u32, u32), Detail> {
 }
 
 /// The block channel of device `index`, retrying while the previous driver for it winds down.
-fn open_disk(mgr_ch: u32, mut txid: u32, index: u16) -> Result<u32, Detail> {
+fn open_disk(mgr_ch: u64, mut txid: u32, index: u16) -> Result<u64, Detail> {
     use proto::devmgr::Status as D;
     let until = sys::clock_get() + 5000;
     loop {
@@ -8738,7 +8760,7 @@ fn open_disk(mgr_ch: u32, mut txid: u32, index: u16) -> Result<u32, Detail> {
 }
 
 /// Start `fsd` on the block channel (it takes the channel): (its process, a root connection).
-fn spawn_fsd(blk_ch: u32) -> Result<(u32, Fs), Detail> {
+fn spawn_fsd(blk_ch: u64) -> Result<(u64, Fs), Detail> {
     let bi = boot_image_vmo()?;
     let (off, len) = image_entry(bi, b"bin/fsd")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
@@ -8762,10 +8784,10 @@ fn fsd_pattern(n: usize) -> Vec<u8> {
 }
 
 fn fsd_keeps_files_across_a_restart() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let have_disk = match find_blk(res)? {
         Some(_) => {
-            let me = sys::process_self().a1 as u32;
+            let me = sys::process_self().a1 as u64;
             sys::process_unmap(me, MMIO_VA);
             sys::handle_close(me);
             true
@@ -8959,7 +8981,7 @@ fn fsd_keeps_files_across_a_restart() -> Outcome {
 const RTC_BASE_NS: u64 = 1_907_755_200 * 1_000_000_000;
 
 /// A registry, a connection that can publish, and a clock service on `devmgr_ch`: (the view of `clock`, the processes).
-fn start_clockd(bi: u32, job_h: u32, devmgr_ch: u32) -> Result<(Fs, Vec<u32>), Detail> {
+fn start_clockd(bi: u64, job_h: u64, devmgr_ch: u64) -> Result<(Fs, Vec<u64>), Detail> {
     let (off, len) = image_entry(bi, b"bin/registryd")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let (reg_mine, reg_theirs) = channel()?;
@@ -9001,7 +9023,7 @@ fn start_clockd(bi: u32, job_h: u32, devmgr_ch: u32) -> Result<(Fs, Vec<u32>), D
 fn clock_service_reports_the_rtc() -> Outcome {
     use proto::clock::quality;
     use rt::clock::Clock;
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let bi = boot_image_vmo()?;
     let root_j = root_job()?;
     let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
@@ -9013,8 +9035,8 @@ fn clock_service_reports_the_rtc() -> Outcome {
         sys::handle_duplicate(res, Rights::SAME.0),
         "dup the resource",
     )?
-    .a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    .a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     let (off, len) = image_entry(bi, b"bin/devmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let s = Startup {
@@ -9110,7 +9132,7 @@ fn clock_service_reports_the_rtc() -> Outcome {
 // --- The volume manager (FS-SPEC steps 5d and 5e) ---------------------------------------------
 
 /// The device manager, a registry and the volume manager in one job: (a connection to the registry, the job).
-fn start_volmgr_rig(res: u32, bi: u32) -> Result<(Fs, u32), Detail> {
+fn start_volmgr_rig(res: u64, bi: u64) -> Result<(Fs, u64), Detail> {
     let root_j = root_job()?;
     let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
     sys::handle_close(root_j);
@@ -9119,8 +9141,8 @@ fn start_volmgr_rig(res: u32, bi: u32) -> Result<(Fs, u32), Detail> {
         sys::handle_duplicate(res, Rights::SAME.0),
         "dup the resource",
     )?
-    .a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    .a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     let (off, len) = image_entry(bi, b"bin/devmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let s = Startup {
@@ -9196,7 +9218,7 @@ fn start_volmgr_rig(res: u32, bi: u32) -> Result<(Fs, u32), Detail> {
         mj,
     )
     .map_err(|_| msg_at(line!()))?;
-    let bi_dup2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u32;
+    let bi_dup2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup the image")?.a1 as u64;
     let (off, len) = image_entry(bi, b"bin/volmgr")?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let s = Startup {
@@ -9238,7 +9260,7 @@ fn open_volume(root: &mut Fs, name: &[u8], rights: u32) -> Result<Fs, Detail> {
 
 /// Kills a job when it goes out of scope, so a test that fails part way does not leave services running on the disk for the
 /// next test (a failure then cascades).
-struct KillOnDrop(u32);
+struct KillOnDrop(u64);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -9249,10 +9271,10 @@ impl Drop for KillOnDrop {
 }
 
 fn volmgr_serves_volumes_by_the_table() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let have_disk = match find_blk(res)? {
         Some(_) => {
-            let me = sys::process_self().a1 as u32;
+            let me = sys::process_self().a1 as u64;
             sys::process_unmap(me, MMIO_VA);
             sys::handle_close(me);
             true
@@ -9387,10 +9409,10 @@ fn volmgr_serves_volumes_by_the_table() -> Outcome {
 /// says how much of the path it consumed and what the target is; `pathres` resolves the target lexically and tries again.
 fn symlinks_are_followed_by_the_client_not_the_server() -> Outcome {
     use rt::fs::Stopped;
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let have_disk = match find_blk(res)? {
         Some(_) => {
-            let me = sys::process_self().a1 as u32;
+            let me = sys::process_self().a1 as u64;
             sys::process_unmap(me, MMIO_VA);
             sys::handle_close(me);
             true
@@ -9603,7 +9625,7 @@ fn devd_serves_null_and_zero() -> Outcome {
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
 fn device_caps_need_the_resource() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let ev = event()?;
     let plain = vmo(1)?;
     // no resource, no device objects
@@ -9622,7 +9644,7 @@ fn device_caps_need_the_resource() -> Outcome {
         Some(S::WrongType),
         "dma: an event is no resource"
     );
-    let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u32;
+    let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u64;
     ensure_eq!(
         st(sys::vmo_create_physical(weak, 0x1000_1000, 4096)),
         Some(S::AccessDenied),
@@ -9650,7 +9672,7 @@ fn device_caps_need_the_resource() -> Outcome {
         "dtb: no MANAGE"
     );
     let dtb = ok(sys::resource_dtb(res), "resource_dtb")?;
-    let (dvmo, dlen) = (dtb.a1 as u32, dtb.a2);
+    let (dvmo, dlen) = (dtb.a1 as u64, dtb.a2);
     ensure!(
         (40..=256 * 1024).contains(&dlen),
         "a plausible length: {dlen}"
@@ -9716,14 +9738,14 @@ fn device_caps_need_the_resource() -> Outcome {
         sys::vmo_create_physical(res, 0x10_1000, 4096),
         "the RTC page",
     )?
-    .a1 as u32;
+    .a1 as u64;
     sys::handle_close(rtc);
     // a good one; the kernel will not copy through it
     let dev = ok(
         sys::vmo_create_physical(res, 0x1000_1000, 4096),
         "an MMIO VMO",
     )?
-    .a1 as u32;
+    .a1 as u64;
     let mut b = [0u8; 4];
     ensure_eq!(
         st(sys::vmo_read(dev, 0, b.as_mut_ptr(), 4)),
@@ -9758,7 +9780,7 @@ fn device_caps_need_the_resource() -> Outcome {
     );
     let root = root_job()?;
     let before = job_use(root, 2)?.0;
-    let dma = ok(sys::vmo_create_dma(res, 4), "a DMA VMO")?.a1 as u32;
+    let dma = ok(sys::vmo_create_dma(res, 4), "a DMA VMO")?.a1 as u64;
     let after = job_use(root, 2)?.0;
     ensure_eq!(
         after - before,
@@ -9776,7 +9798,7 @@ fn device_caps_need_the_resource() -> Outcome {
         sys::handle_duplicate(dma, Rights::READ.0 | Rights::WRITE.0 | Rights::MAP.0),
         "dup without DMA",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::vmo_phys_addr(lesser)),
         Some(S::AccessDenied),
@@ -9835,13 +9857,13 @@ fn wr(b: &Blk, off: usize, v: u32) {
 }
 
 /// Map the virtio-mmio window and find a block device (None when the machine has no disk).
-fn find_blk(res: u32) -> Result<Option<Blk>, Detail> {
+fn find_blk(res: u64) -> Result<Option<Blk>, Detail> {
     let dev = ok(
         sys::vmo_create_physical(res, 0x1000_1000, 8 * 4096),
         "the MMIO window",
     )?
-    .a1 as u32;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    .a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     ensure_eq!(
         st(sys::process_map(me, dev, MMIO_VA, 0, 8 * 4096, PF_R | PF_W)),
         Some(S::Ok),
@@ -9932,7 +9954,7 @@ fn blk_read_sector0(b: &Blk, pa: u64, n: u16) {
 }
 
 fn interrupt_object_fires_and_masks() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     // argument checks that hold on every machine
     ensure_eq!(
         st(sys::interrupt_create(res, 0)),
@@ -9962,20 +9984,20 @@ fn interrupt_object_fires_and_masks() -> Outcome {
     if st(probe) == Some(S::NotSupported) {
         // no interrupt controller (plain `virt`): drivers poll; the harness checks which machine this is
         // (the window stays mapped otherwise, and the next test that looks for the disk cannot map it)
-        let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+        let me = ok(sys::process_self(), "process_self")?.a1 as u64;
         sys::process_unmap(me, MMIO_VA);
         return Ok(());
     }
-    let irq = ok(probe, "interrupt_create")?.a1 as u32;
+    let irq = ok(probe, "interrupt_create")?.a1 as u64;
     ensure_eq!(
         st(sys::interrupt_create(res, b.irq)),
         Some(S::BadState),
         "one object per source"
     );
     // a DMA buffer for the queue and one request
-    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u32;
+    let dma = ok(sys::vmo_create_dma(res, 4), "DMA")?.a1 as u64;
     let pa = ok(sys::vmo_phys_addr(dma), "phys")?.a1 as u64;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     ensure_eq!(
         st(sys::process_map(me, dma, DMA_VA, 0, 4 * 4096, PF_R | PF_W)),
         Some(S::Ok),
@@ -10098,7 +10120,7 @@ fn interrupt_object_fires_and_masks() -> Outcome {
         sys::interrupt_create(res, b.irq),
         "the source is free again after close",
     )?
-    .a1 as u32;
+    .a1 as u64;
     sys::handle_close(again);
     for h in [dma, me, res, ev] {
         sys::handle_close(h);
@@ -10126,13 +10148,13 @@ fn device_interrupts_arrive_where_asked() -> Outcome {
 }
 
 fn mmio_reads_the_virtio_magic() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let dev = ok(
         sys::vmo_create_physical(res, 0x1000_1000, 4096),
         "an MMIO VMO",
     )?
-    .a1 as u32;
-    let me = ok(sys::process_self(), "process_self")?.a1 as u32;
+    .a1 as u64;
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
     ensure_eq!(
         st(sys::process_map(me, dev, 0x400_0000, 0, 4096, PF_R | PF_W)),
         Some(S::Ok),
@@ -10178,11 +10200,11 @@ fn mmio_reads_the_virtio_magic() -> Outcome {
     Ok(())
 }
 
-fn root_job() -> Result<u32, Detail> {
-    Ok(ok(sys::job_root(), "job_root")?.a1 as u32)
+fn root_job() -> Result<u64, Detail> {
+    Ok(ok(sys::job_root(), "job_root")?.a1 as u64)
 }
 
-fn job(parent: u32, procs: u64, threads: u64, pages: u64) -> Result<u32, Detail> {
+fn job(parent: u64, procs: u64, threads: u64, pages: u64) -> Result<u64, Detail> {
     Ok(ok(
         sys::job_create(
             parent,
@@ -10190,17 +10212,17 @@ fn job(parent: u32, procs: u64, threads: u64, pages: u64) -> Result<u32, Detail>
         ),
         "job_create",
     )?
-    .a1 as u32)
+    .a1 as u64)
 }
 
 /// (used, limit) of a job's resource: 0 processes, 1 threads, 2 pages.
-fn job_use(j: u32, which: u64) -> Result<(u64, u64), Detail> {
+fn job_use(j: u64, which: u64) -> Result<(u64, u64), Detail> {
     let r = ok(sys::job_info(j, which), "job_info")?;
     Ok((r.a1 as u64, r.a2 as u64))
 }
 
 /// Wait (up to `ticks`) for a job's usage of `which` to reach `want`.
-fn job_use_settles(j: u32, which: u64, want: u64, ticks: u64) -> Outcome {
+fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
     let until = sys::clock_get() + ticks;
     loop {
         let (used, _) = job_use(j, which)?;
@@ -10218,7 +10240,7 @@ fn job_use_settles(j: u32, which: u64, want: u64, ticks: u64) -> Outcome {
 fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     let root = root_job()?;
     // a job is a job: the other kinds of handle are the wrong type
-    let ev = ok(sys::event_create(), "event")?.a1 as u32;
+    let ev = ok(sys::event_create(), "event")?.a1 as u64;
     ensure_eq!(
         st(sys::job_create(
             ev,
@@ -10272,8 +10294,8 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "the resource after the last"
     );
     // each operation needs its own right
-    let only = |r: Rights| -> Result<u32, Detail> {
-        Ok(ok(sys::handle_duplicate(root, r.0), "duplicate")?.a1 as u32)
+    let only = |r: Rights| -> Result<u64, Detail> {
+        Ok(ok(sys::handle_duplicate(root, r.0), "duplicate")?.a1 as u64)
     };
     let inspect = only(Rights::INSPECT)?;
     let manage = only(Rights::MANAGE)?;
@@ -10387,8 +10409,8 @@ fn job_limits_stop_a_process_bomb_and_usage_comes_back() -> Outcome {
         sys::job_set_limits(j, &[2, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
         "raise",
     )?;
-    let a = ok(sys::process_create_in(j), "first")?.a1 as u32;
-    let b = ok(sys::process_create_in(j), "second")?.a1 as u32;
+    let a = ok(sys::process_create_in(j), "first")?.a1 as u64;
+    let b = ok(sys::process_create_in(j), "second")?.a1 as u64;
     ensure_eq!(
         st(sys::process_create_in(j)),
         Some(S::NoMemory),
@@ -10442,8 +10464,8 @@ fn job_limits_stop_a_thread_bomb() -> Outcome {
     Ok(())
 }
 
-fn proc_create_in(job: u32) -> Result<u32, Detail> {
-    Ok(ok(sys::process_create_in(job), "process_create_in")?.a1 as u32)
+fn proc_create_in(job: u64) -> Result<u64, Detail> {
+    Ok(ok(sys::process_create_in(job), "process_create_in")?.a1 as u64)
 }
 
 fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
@@ -10477,7 +10499,7 @@ fn vmo_commit_charges_up_front_and_foreign_maps_need_it() -> Outcome {
         sys::vmo_create_in(8, j),
         "a VMO of 8 pages in a six-page job",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(job_use(j, 2)?.0, 0, "creation is lazy");
     ensure_eq!(
         st(sys::vmo_commit(v, 0, 4 * 4096)),
@@ -10506,7 +10528,7 @@ fn vmo_commit_charges_up_front_and_foreign_maps_need_it() -> Outcome {
         sys::handle_duplicate(v, (Rights::VMO.0 & !Rights::COMMIT.0) & !Rights::SAME.0),
         "a duplicate without COMMIT",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         st(sys::vmo_commit(weak, 4 * 4096, 4096)),
         Some(S::AccessDenied),
@@ -10566,7 +10588,7 @@ fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
     let parent = job(root, u64::MAX, u64::MAX, 8)?;
     let a = job(parent, u64::MAX, u64::MAX, u64::MAX)?; // its own limit allows everything
     let b = job(parent, u64::MAX, u64::MAX, u64::MAX)?;
-    let big = ok(sys::vmo_create_in(100, a), "a VMO in a")?.a1 as u32;
+    let big = ok(sys::vmo_create_in(100, a), "a VMO in a")?.a1 as u64;
     let page = [7u8; 4096];
     let mut got = 0;
     while sys::vmo_write(big, got * 4096, page.as_ptr(), 4096).status == 0 {
@@ -10577,7 +10599,7 @@ fn a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling() -> Outcome {
     ensure_eq!(job_use(parent, 2)?.0, 8, "the parent sees them");
     ensure_eq!(job_use(a, 2)?.0, 8, "and so does the child");
     // the sibling shares the same 8 pages: none left
-    let other = ok(sys::vmo_create_in(4, b), "a VMO in b")?.a1 as u32;
+    let other = ok(sys::vmo_create_in(4, b), "a VMO in b")?.a1 as u64;
     ensure_eq!(
         st(sys::vmo_write(other, 0, page.as_ptr(), 4096)),
         Some(S::NoMemory),
@@ -10662,7 +10684,7 @@ fn jobs_do_not_leak() -> Outcome {
             d
         })?;
         let p = proc_create_in(j)?;
-        let v = ok(sys::vmo_create_in(2, j), "vmo")?.a1 as u32;
+        let v = ok(sys::vmo_create_in(2, j), "vmo")?.a1 as u64;
         ok(sys::vmo_write(v, 0, b"x".as_ptr(), 1), "commit a page")?;
         for h in [v, p, j] {
             sys::handle_close(h);
@@ -10678,9 +10700,9 @@ fn jobs_do_not_leak() -> Outcome {
 /// live at once (each at its own address, all in RAM, none overlapping), and runs of an odd length round up and give the tail back.
 /// The kernel's final audit says nothing leaked and the free lists merged back.
 fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     for round in 0..40u32 {
-        let v = ok(sys::vmo_create_dma(res, 64), "a 64-page DMA run")?.a1 as u32;
+        let v = ok(sys::vmo_create_dma(res, 64), "a 64-page DMA run")?.a1 as u64;
         let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
         ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
         ensure!(
@@ -10692,7 +10714,7 @@ fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
     // several at once: no two overlap (sixteen runs of 64 pages is the whole 1024-page allowance)
     let mut live = alloc::vec::Vec::new();
     for _ in 0..16 {
-        let v = ok(sys::vmo_create_dma(res, 64), "sixteen runs live at once")?.a1 as u32;
+        let v = ok(sys::vmo_create_dma(res, 64), "sixteen runs live at once")?.a1 as u64;
         live.push((v, ok(sys::vmo_phys_addr(v), "address")?.a1));
     }
     for (i, (_, a)) in live.iter().enumerate() {
@@ -10708,7 +10730,7 @@ fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
     }
     // an odd length, repeatedly: the rounded-up tail must come back each time
     for _ in 0..40 {
-        let v = ok(sys::vmo_create_dma(res, 37), "a 37-page DMA run")?.a1 as u32;
+        let v = ok(sys::vmo_create_dma(res, 37), "a 37-page DMA run")?.a1 as u64;
         sys::handle_close(v);
     }
     sys::handle_close(res);
@@ -10721,7 +10743,7 @@ fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
     let root = root_job()?;
     let j = job(root, u64::MAX, 0, u64::MAX)?; // no threads at all
     let p = proc_create_in(j)?;
-    let seg = ok(sys::vmo_create_in(1, j), "segment")?.a1 as u32;
+    let seg = ok(sys::vmo_create_in(1, j), "segment")?.a1 as u64;
     // one instruction, `jal x0, 0`: a jump to itself. (An empty page is an illegal instruction: the
     // child would fault and end at once, and "one thread running" below would race with its exit.)
     ok(
@@ -10809,7 +10831,7 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         sys::thread_create(p, entry, base + 4 * 4096, 16),
         "the thread now fits",
     )?
-    .a1 as u32;
+    .a1 as u64;
     ensure_eq!(
         job_use(j, 2)?.0,
         used + 4,
@@ -10910,7 +10932,7 @@ fn thread_spawn_starts_with_the_documented_state() -> Outcome {
         ..spawn_rec(spawn_probe)
     };
     let r = ok(sys::thread_spawn(me, &rec), "thread_spawn")?;
-    let (h, tid) = (r.a1 as u32, r.a2 as u64);
+    let (h, tid) = (r.a1 as u64, r.a2 as u64);
     ensure!(h != 0 && tid != 0, "a handle and a tid");
     let w = sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 1000);
     ensure_eq!(w.status, 0, "the thread ended");
@@ -10965,7 +10987,7 @@ fn thread_spawn_starts_with_the_documented_state() -> Outcome {
         ..spawn_rec(spawn_probe)
     };
     let r = ok(sys::thread_spawn(me, &c), "a caller stack")?;
-    let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 1000);
+    let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 1000);
     SPAWN_DIG.store(40, Ordering::SeqCst);
     ensure_eq!(w.status, 0, "it ended");
     let sp = SPAWN_SEEN[3].load(Ordering::SeqCst);
@@ -10973,13 +10995,13 @@ fn thread_spawn_starts_with_the_documented_state() -> Outcome {
         sp <= top && sp > top - 4 * 4096,
         "it ran on the caller's stack ({sp:#x})"
     );
-    sys::handle_close(r.a1 as u32);
+    sys::handle_close(r.a1 as u64);
     Ok(())
 }
 
 fn thread_spawn_error_cases() -> Outcome {
     let me = me()?;
-    let go = |p: u32, rec: &rt::SpawnArgs| st(sys::thread_spawn(p, rec));
+    let go = |p: u64, rec: &rt::SpawnArgs| st(sys::thread_spawn(p, rec));
     let good = spawn_rec(spawn_probe);
     ensure_eq!(
         st(rt::syscall(abi_nr_spawn(), [me as usize, 8, 0, 0, 0, 0])),
@@ -11079,8 +11101,8 @@ fn thread_spawn_error_cases() -> Outcome {
         sys::thread_spawn(me, &good),
         "a valid spawn after the errors",
     )?;
-    sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 1000);
-    sys::handle_close(r.a1 as u32);
+    sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 1000);
+    sys::handle_close(r.a1 as u64);
     Ok(())
 }
 
@@ -11096,9 +11118,9 @@ fn thread_spawn_gives_every_stack_back() -> Outcome {
     for round in 0..200u32 {
         let rec = spawn_rec(spawn_probe);
         let r = ok(sys::thread_spawn(me, &rec), "thread_spawn")?;
-        let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 500);
+        let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 500);
         ensure!(w.status == 0, "a thread ended (round {round})");
-        sys::handle_close(r.a1 as u32);
+        sys::handle_close(r.a1 as u64);
     }
     for _ in 0..50 {
         let rec = rt::SpawnArgs {
@@ -11121,18 +11143,18 @@ fn thread_spawn_arena_is_bounded_and_reused() -> Outcome {
     let me = me()?;
     let ev = event()?;
     let big = rt::SpawnArgs {
-        arg: u64::from(ev),
+        arg: ev,
         stack_bytes: 64 * 1024 * 1024,
         ..spawn_rec(spawn_wait_event)
     };
-    let mut ts: Vec<u32> = Vec::new();
+    let mut ts: Vec<u64> = Vec::new();
     loop {
         let r = sys::thread_spawn(me, &big);
         if r.status != 0 {
             ensure_eq!(st(r), Some(S::NoMemory), "a full arena is NO_MEMORY");
             break;
         }
-        ts.push(r.a1 as u32);
+        ts.push(r.a1 as u64);
         ensure!(ts.len() <= 512, "more stacks than the arena can hold");
     }
     ensure!(ts.len() >= 400, "{} 64 MiB stacks fit the arena", ts.len());
@@ -11152,8 +11174,8 @@ fn thread_spawn_arena_is_bounded_and_reused() -> Outcome {
         "after they ended there is room again",
     )?;
     sys::event_signal(ev, 0, 1 << 24);
-    sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 2000);
-    sys::handle_close(r.a1 as u32);
+    sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 2000);
+    sys::handle_close(r.a1 as u64);
     sys::handle_close(ev);
     Ok(())
 }
@@ -11163,11 +11185,11 @@ fn two_thousand_threads_live() -> Outcome {
     let me = me()?;
     let ev = event()?;
     let rec = rt::SpawnArgs {
-        arg: u64::from(ev),
+        arg: ev,
         ..spawn_rec(spawn_wait_event)
     };
     let started = sys::clock_get();
-    let mut ts: Vec<u32> = Vec::new();
+    let mut ts: Vec<u64> = Vec::new();
     for _ in 0..2000 {
         let r = sys::thread_spawn(me, &rec);
         ensure!(
@@ -11176,7 +11198,7 @@ fn two_thousand_threads_live() -> Outcome {
             r.status,
             ts.len()
         );
-        ts.push(r.a1 as u32);
+        ts.push(r.a1 as u64);
     }
     ensure_eq!(
         st(sys::event_signal(ev, 0, 1 << 24)),
@@ -11212,9 +11234,9 @@ fn ten_thousand_threads_leak_nothing() -> Outcome {
             "thread_spawn: status {} in round {round}",
             r.status
         );
-        let w = sys::object_wait(r.a1 as u32, sig::TERMINATED, sys::clock_get() + 500);
+        let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 500);
         ensure_eq!(w.status, 0, "a thread ended");
-        sys::handle_close(r.a1 as u32);
+        sys::handle_close(r.a1 as u64);
     }
     job_use_settles(root, 2, base, 1000)?;
     sys::handle_close(root);
@@ -11235,7 +11257,7 @@ fn thousands_of_threads_come_and_go() -> Outcome {
             "thread_create: status {} in round {round}",
             r.status
         );
-        let t = r.a1 as u32;
+        let t = r.a1 as u64;
         let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(t);
@@ -11251,7 +11273,7 @@ fn page_tables_are_charged_to_the_job() -> Outcome {
     let p = proc_create_in(j)?;
     let (base, _) = job_use(j, 2)?;
     ensure!(base >= 1, "the process's root table is charged ({base})");
-    let v = ok(sys::vmo_create_in(1, j), "a VMO")?.a1 as u32;
+    let v = ok(sys::vmo_create_in(1, j), "a VMO")?.a1 as u64;
     let mut mapped = 0u64;
     loop {
         let r = sys::process_map(p, v, 0x1_0000_0000 + mapped * 0x20_0000, 0, 4096, PF_R);
@@ -11296,7 +11318,7 @@ fn a_job_limits_how_many_jobs_may_exist_below_it() -> Outcome {
         sys::job_create(root, &[u64::MAX, u64::MAX, u64::MAX, 3, u64::MAX, u64::MAX]),
         "top",
     )?
-    .a1 as u32;
+    .a1 as u64;
     let a = job(top, u64::MAX, u64::MAX, u64::MAX)?;
     let b = job(a, u64::MAX, u64::MAX, u64::MAX)?; // a grandchild counts against top too
     let c = job(top, u64::MAX, u64::MAX, u64::MAX)?;
@@ -11329,7 +11351,7 @@ fn job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back() -> Outco
         ),
         "a job with 11 objects",
     )?
-    .a1 as u32;
+    .a1 as u64;
     let (p, _m) = launch_image_in(image, 35, j)?;
     wait_ended(p, 2000)?;
     ensure_eq!(
@@ -11354,7 +11376,7 @@ fn job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back() -> Outco
     // meanwhile this program (in the root job) was never short: the shared budget is not the
     // hog's to use up
     let (a, b) =
-        ok(sys::socket_create(), "a socket in the root job").map(|r| (r.a1 as u32, r.a2 as u32))?;
+        ok(sys::socket_create(), "a socket in the root job").map(|r| (r.a1 as u64, r.a2 as u64))?;
     ok(
         sys::socket_write(a, [1u8; 4096].as_ptr(), 4096),
         "write while the hog is dead",
@@ -11378,13 +11400,13 @@ fn job_create_sees_the_credit_of_a_job_closed_just_before() -> Outcome {
         sys::job_create(root, &[u64::MAX, u64::MAX, u64::MAX, 1, u64::MAX, u64::MAX]),
         "top",
     )?
-    .a1 as u32;
+    .a1 as u64;
     for round in 0..5 {
         let c = job(top, u64::MAX, u64::MAX, u64::MAX).map_err(|mut d| {
             let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" in round {round}"));
             d
         })?;
-        let v = ok(sys::vmo_create_in(1, c), "a VMO in the child")?.a1 as u32;
+        let v = ok(sys::vmo_create_in(1, c), "a VMO in the child")?.a1 as u64;
         sys::handle_close(v);
         sys::handle_close(c);
     }
@@ -11412,8 +11434,8 @@ fn bench_line(name: &str, cycles: u64, ops: u64) -> u64 {
 
 static BENCH_ITERS: AtomicU32 = AtomicU32::new(0);
 // (handle values carry a generation in their high bits: too wide to pack into a thread argument)
-static BENCH_A: AtomicU32 = AtomicU32::new(0);
-static BENCH_B: AtomicU32 = AtomicU32::new(0);
+static BENCH_A: AtomicU64 = AtomicU64::new(0);
+static BENCH_B: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn bench_exit(_: usize) -> ! {
     sys::thread_exit(0)
@@ -11432,7 +11454,7 @@ fn bench_thread_create_join(n: u32) -> Result<u64, Detail> {
             "thread_create: status {} in round {round}",
             r.status
         );
-        let t = r.a1 as u32;
+        let t = r.a1 as u64;
         let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(t);
@@ -11482,7 +11504,7 @@ fn bench_wake_latency_event(n: u32) -> Result<u64, Detail> {
 
 /// The server of the call benchmark: echo every request (the first four bytes are the transaction id).
 extern "C" fn bench_call_server(arg: usize) -> ! {
-    let ch = arg as u32;
+    let ch = arg as u64;
     let mut buf = [0u8; 16];
     loop {
         let w = sys::object_wait(ch, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
@@ -11499,7 +11521,7 @@ extern "C" fn bench_call_server(arg: usize) -> ! {
 }
 
 extern "C" fn bench_bystander(arg: usize) -> ! {
-    sys::object_wait(arg as u32, 1 << 25, u64::MAX); // never raised until the end
+    sys::object_wait(arg as u64, 1 << 25, u64::MAX); // never raised until the end
     sys::thread_exit(0)
 }
 
@@ -11639,7 +11661,7 @@ fn instruction_counts_report() -> Outcome {
     // handle_duplicate + handle_close
     let ev = event()?;
     counted("handle_dup_close", n, || {
-        let d = ok(sys::handle_duplicate(ev, Rights::SAME.0), "dup")?.a1 as u32;
+        let d = ok(sys::handle_duplicate(ev, Rights::SAME.0), "dup")?.a1 as u64;
         ok(sys::handle_close(d), "close")?;
         Ok(())
     })?;
@@ -11685,7 +11707,7 @@ fn instruction_counts_report() -> Outcome {
     let me = me()?;
     let entry = bench_exit as *const () as usize as u64;
     counted("thread_create_join", n, || {
-        let t = ok(sys::thread_create(me, entry, top, 0), "thread_create")?.a1 as u32;
+        let t = ok(sys::thread_create(me, entry, top, 0), "thread_create")?.a1 as u64;
         let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(t);
@@ -11712,6 +11734,10 @@ pub fn app_main() -> i32 {
         (
             "handle_syscalls_reject_bad_values",
             handle_syscalls_reject_bad_values,
+        ),
+        (
+            "a_process_holds_twenty_thousand_handles",
+            a_process_holds_twenty_thousand_handles,
         ),
         ("event_syscalls", event_syscalls),
         ("channel_round_trip", channel_round_trip),
@@ -11865,10 +11891,6 @@ pub fn app_main() -> i32 {
         (
             "kill_a_process_that_is_creating_threads",
             kill_a_process_that_is_creating_threads,
-        ),
-        (
-            "thread_create_with_a_full_handle_table",
-            thread_create_with_a_full_handle_table,
         ),
         (
             "a_thread_handle_closed_early_is_harmless",

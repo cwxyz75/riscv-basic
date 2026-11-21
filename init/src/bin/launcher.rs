@@ -34,7 +34,7 @@ const PROGRAM_IPC_BYTES: u64 = 192 * 1024;
 const MAX_REQ_BYTES: usize = launch::HEADER + proto::startup::MAX_BYTES;
 const MAX_REQ_HANDLES: usize = launch::MAX_HANDLES;
 
-fn close_all(hs: &[u32]) {
+fn close_all(hs: &[u64]) {
     for &h in hs {
         sys::handle_close(h);
     }
@@ -52,7 +52,7 @@ const HOLD_TIMEOUT: u64 = 30_000;
 
 struct Launcher {
     core: Core<()>,
-    jobs: Option<u32>,
+    jobs: Option<u64>,
 }
 
 impl Service for Launcher {
@@ -62,7 +62,7 @@ impl Service for Launcher {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         self.spawn_for(key, msg, hs);
     }
 
@@ -70,7 +70,7 @@ impl Service for Launcher {
 }
 
 impl Launcher {
-    fn reply(&mut self, key: u64, txid: u32, status: i32, handle: Option<u32>) {
+    fn reply(&mut self, key: u64, txid: u32, status: i32, handle: Option<u64>) {
         let _ = self
             .core
             .send(key, launch::encode_reply(txid, status), handle);
@@ -78,7 +78,7 @@ impl Launcher {
 
     /// Handle one request. The handles are ours to close or forward; a malformed request is answered with
     /// BAD_REQUEST (the runtime already ended a connection whose message did not even fit the buffers).
-    fn spawn_for(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn spawn_for(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         let txid = proto::file::peek_txid(msg).unwrap_or(0);
         let req = match launch::decode_spawn(msg) {
             Ok(q) => q,
@@ -125,7 +125,7 @@ impl Launcher {
                     drop(image);
                     return self.reply(key, txid, j.status, None);
                 }
-                let job = j.a1 as u32;
+                let job = j.a1 as u64;
                 // Policy (SCHED-SMP-SPEC 4.9): a program runs in the normal band and may raise itself only to 20, with no
                 // real-time budget. (Without this every job inherits the root's 63.)
                 let _ = sys::job_set_sched(job, PROGRAM_MAX_PRIO, 0, 1024);
@@ -170,7 +170,7 @@ pub fn app_main() -> i32 {
     }
     let mut launcher = Launcher {
         core: Core::new(
-            p.a1 as u32,
+            p.a1 as u64,
             POOL,
             MAX_REQ_BYTES,
             MAX_REQ_HANDLES,

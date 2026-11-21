@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 pub struct Held {
     pub bytes: Vec<u8>,
     /// A handle travelling with the reply (the runtime closes it if the reply is dropped).
-    pub handle: Option<u32>,
+    pub handle: Option<u64>,
     /// When it was first held (the runtime's clock), for the timeout.
     pub since: u64,
 }
@@ -109,7 +109,7 @@ impl<C> ConnTable<C> {
         accounts: &mut Accounts,
         key: u64,
         bytes: Vec<u8>,
-        handle: Option<u32>,
+        handle: Option<u64>,
         now: u64,
     ) -> Result<(), Refuse> {
         let c = self.map.get_mut(&key).ok_or(Refuse::NoSuchConn)?;

@@ -62,7 +62,7 @@ struct World {
 }
 
 fn pick(rng: &mut Rng, t: &HandleTable) -> Option<Handle> {
-    let objs: Vec<_> = (1..=8191u32)
+    let objs: Vec<_> = (1..=8191u64)
         .map(Handle)
         .filter(|h| t.get(*h).is_ok())
         .take(64)

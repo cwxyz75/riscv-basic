@@ -10,43 +10,28 @@ pub(super) fn bad(s: Status) -> Reply {
     Err((s, None, None))
 }
 
-#[allow(clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and `wide(i)` is called with constants below 6
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
-    // Handles are 32 bits wide everywhere (SYSCALLS.md); no truncation.
-    let wide = |i: usize| a[i] > u64::from(u32::MAX);
     match n {
-        nr::PROCESS_CREATE if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_CREATE => process_create(a),
-        nr::JOB_KILL | nr::JOB_SET_SCHED if wide(0) => bad(Status::BadHandle),
         nr::JOB_SET_SCHED => job_set_sched(a),
-        nr::THREAD_SET_SCHED | nr::THREAD_GET_SCHED if wide(0) => bad(Status::BadHandle),
         nr::THREAD_SET_SCHED => thread_set_sched(a),
         nr::THREAD_GET_SCHED => thread_get_sched(a),
         nr::JOB_KILL => job_kill(a),
         nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::PROCESS_SELF => process_table_call(n, a),
-        nr::PROCESS_MAP if wide(0) || wide(1) => bad(Status::BadHandle),
         nr::PROCESS_MAP => process_table_call(n, a),
-        nr::PROCESS_UNMAP if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_UNMAP => process_table_call(n, a).inspect(|_| {
             REAP_DIRTY.store(true, Ordering::SeqCst);
             reap_vmos();
         }),
-        nr::PROCESS_START if wide(0) || wide(3) => bad(Status::BadHandle),
         nr::PROCESS_START => process_start(a),
-        nr::PROCESS_KILL | nr::PROCESS_INFO if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_KILL => process_kill(a),
-        nr::PROCESS_SUSPEND | nr::PROCESS_RESUME if wide(0) => bad(Status::BadHandle),
         nr::PROCESS_SUSPEND => process_stop(a, true),
         nr::PROCESS_RESUME => process_stop(a, false),
         nr::PROCESS_INFO => process_table_call(n, a),
-        nr::THREAD_CREATE if wide(0) => bad(Status::BadHandle),
         nr::THREAD_CREATE => thread_create(a),
-        nr::THREAD_SPAWN if wide(0) => bad(Status::BadHandle),
         nr::THREAD_SPAWN => thread_spawn(a),
-        nr::THREAD_INFO if wide(0) => bad(Status::BadHandle),
         nr::THREAD_INFO => process_table_call(n, a),
-        nr::THREAD_INTERRUPT if wide(0) => bad(Status::BadHandle),
         nr::THREAD_INTERRUPT => thread_interrupt(a),
         _ => bad(Status::BadSyscall),
     }
@@ -105,7 +90,7 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
             a,
         )
         .map_err(|e| (e, None, None))?;
-        Ok((Some(u64::from(handle)), None))
+        Ok((Some(handle), None))
     })
 }
 
@@ -122,7 +107,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
 }
 
 pub(super) fn process_kill(a: [u64; 6]) -> Reply {
-    let ph = Handle(a[0] as u32);
+    let ph = Handle(a[0]);
     let code = a[1] as i32;
     let (tpid, me) = irq::without(|| -> Result<(u32, u32), ReplyErr> {
         let s = state();
@@ -141,7 +126,7 @@ pub(super) fn process_kill(a: [u64; 6]) -> Reply {
 /// KILL on the handle (the right to end a process is the right to stop it), are idempotent, and refuse an ended process
 /// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
 pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
-    let ph = Handle(a[0] as u32);
+    let ph = Handle(a[0]);
     let tpid = irq::without(|| -> Result<u32, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -171,7 +156,7 @@ pub(super) fn thread_create(a: [u64; 6]) -> Reply {
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    Ok((Some(u64::from(spawn.handle)), None))
+    Ok((Some(spawn.handle), None))
 }
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
@@ -185,7 +170,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    Ok((Some(u64::from(spawn.handle)), Some(u64::from(tid))))
+    Ok((Some(spawn.handle), Some(u64::from(tid))))
 }
 
 /// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
@@ -193,9 +178,6 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
 /// INTERRUPTED and takes the flag; one that is satisfied, or a poll, leaves it. It ends waits, not running code.
 /// Needs MANAGE on a thread handle; a thread that has ended is BAD_STATE.
 pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
-    if a[0] > u64::from(u32::MAX) {
-        return fail(Status::BadHandle);
-    }
     let tid = irq::without(|| -> Result<Tid, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -305,7 +287,7 @@ pub(super) fn job_kill(a: [u64; 6]) -> Reply {
             &s.procs,
             &mut kmem::get().vmos.jobs,
             me,
-            Handle(a[0] as u32),
+            Handle(a[0]),
         )
         .map_err(|e| (e, None, None))?;
         Ok((victims, me_inside, me))

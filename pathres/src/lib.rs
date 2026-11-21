@@ -83,16 +83,16 @@ pub fn parse_abs(path: &[u8]) -> Comps {
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     /// (prefix components, handle): `/` is the empty prefix. Any absolute prefix (`/mnt/store`, `/svc`) may appear.
-    pub mounts: Vec<(Comps, u32)>,
+    pub mounts: Vec<(Comps, u64)>,
     /// The cwd: its absolute components (if known) and its handle (if the process has one).
     pub cwd: Option<Comps>,
-    pub cwd_handle: Option<u32>,
+    pub cwd_handle: Option<u64>,
 }
 
 /// Where to open something: the handle and the path relative to it (components).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
-    pub handle: u32,
+    pub handle: u64,
     pub rel: Comps,
     /// The absolute components of the directory `handle` stands for (the prefix, or the cwd): what a link found below it is
     /// resolved against.
@@ -102,7 +102,7 @@ pub struct Place {
 impl Table {
     /// The mount whose prefix is the longest one covering `abs`.
     pub fn locate(&self, abs: &[Vec<u8>]) -> Option<Place> {
-        let mut best: Option<(&Comps, u32)> = None;
+        let mut best: Option<(&Comps, u64)> = None;
         for (p, h) in &self.mounts {
             if abs.len() >= p.len()
                 && abs[..p.len()] == p[..]
@@ -180,7 +180,7 @@ pub enum Fail {
 pub fn open_following<T>(
     table: &Table,
     path: &[u8],
-    mut open: impl FnMut(u32, &[u8]) -> Result<T, Stop>,
+    mut open: impl FnMut(u64, &[u8]) -> Result<T, Stop>,
 ) -> Result<(T, Comps), Fail> {
     // POSIX: the empty path names nothing (`open("")` is ENOENT, not the cwd)
     if path.is_empty() {

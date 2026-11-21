@@ -41,8 +41,8 @@ const KILLED: i32 = -130;
 
 /// What a `Stream` the shell hands to `ish` stands for (0, 1 and 2 are the terminal).
 enum Obj {
-    PipeR(u32),
-    PipeW(u32),
+    PipeR(u64),
+    PipeW(u64),
     FileR {
         data: Vec<u8>,
         pos: usize,
@@ -59,7 +59,7 @@ enum Obj {
 /// A program's standard output redirected to a file: the shell holds the read end of a socket the program writes to and stores
 /// what arrives when the program (every writer) is gone (UV8 follow-up, T126 item 2).
 struct PumpOut {
-    rd: u32,
+    rd: u64,
     path: String,
     append: bool,
     buf: Vec<u8>,
@@ -67,7 +67,7 @@ struct PumpOut {
 
 /// A program's standard input from a file: the shell feeds the write end of a socket and closes it at the end of the data.
 struct PumpIn {
-    wr: u32,
+    wr: u64,
     data: Vec<u8>,
     pos: usize,
 }
@@ -76,13 +76,13 @@ struct PumpIn {
 struct Os {
     pumps_out: Vec<PumpOut>,
     pumps_in: Vec<PumpIn>,
-    tty: u32,
+    tty: u64,
     root: Fs,
     cwd: Fs,
     cwd_path: Vec<u8>,
-    launch: u32,
-    ctl: u32,
-    init_ch: u32,
+    launch: u64,
+    ctl: u64,
+    init_ch: u64,
     trusted: Vec<Trust>,
     /// A read connection to the service registry (volumes are opened as `vol-<name>`), if the session has one.
     registry: Option<Fs>,
@@ -92,8 +92,8 @@ struct Os {
     dev: Option<Fs>,
     /// `/proc` (UV6): a connection to `procd`'s root, and the channel the shell tells it about its programs on.
     proc_root: Option<Fs>,
-    proc_ctl: Option<u32>,
-    jobs: u32,
+    proc_ctl: Option<u64>,
+    jobs: u64,
     /// The private directory just made for the program being started (taken by `spawn`).
     new_tmp: Option<Vec<u8>>,
     /// Each running program's private directory, removed when it is reaped.
@@ -102,7 +102,7 @@ struct Os {
     inbuf: Vec<u8>,
     objs: BTreeMap<u32, Obj>,
     next_stream: u32,
-    procs: BTreeMap<u32, u32>,
+    procs: BTreeMap<u32, u64>,
     next_pid: u32,
     /// What each started program was run as (argv joined), for the job table.
     cmdlines: BTreeMap<u32, String>,
@@ -159,7 +159,7 @@ struct Trust {
 #[derive(Clone, Copy)]
 enum Stdio {
     Streams(ProcIo),
-    Handles([u32; 3]),
+    Handles([u64; 3]),
 }
 
 /// A spawn request's handles go away with a start that fails before it uses them.
@@ -180,14 +180,14 @@ struct Broker {
     pid: u32,
     /// The program the shell's command line started, the root of this chain.
     root: u32,
-    ch: u32,
+    ch: u64,
     depth: u8,
     cwd: Fs,
     cwd_path: Vec<u8>,
     /// Each mount in the program's namespace, whether it is writable and what it is made from.
     mounts: Vec<Held>,
     /// The shell's end of the channel the program receives signals on (S11, OD119).
-    sig: u32,
+    sig: u64,
     /// The `confine` grants the program was started under: what its children are confined to, not the shell's present block.
     confined: Option<Vec<(String, String)>>,
     /// The private `/tmp` directory of this chain (its root's: what a program starts, it shares it, so a script's files are
@@ -199,18 +199,18 @@ struct Broker {
 
 /// A program a program started (the shell holds its process handle too: it reaps it and ends it with its chain's root).
 struct Desc {
-    h: u32,
+    h: u64,
     root: u32,
 }
 
 /// Add a namespace entry unless the asking program does not hold it; record it for the new program's own spawn grant.
 fn ns_push(
     startup: &mut Startup,
-    forward: &mut Vec<u32>,
+    forward: &mut Vec<u64>,
     mounts: &mut Vec<Held>,
     allow: Option<&[Held]>,
     (name, source): (&[u8], &[u8]),
-    ch: u32,
+    ch: u64,
     writable: bool,
 ) {
     if !may_pass_on(allow, name, source, writable) {
@@ -286,17 +286,17 @@ fn remove_tree(parent: &mut Fs, name: &[u8], depth: u32) {
     let _ = parent.unlink(name);
 }
 
-fn say(tty: u32, bytes: &[u8]) {
+fn say(tty: u64, bytes: &[u8]) {
     let _ = io::write_all(tty, bytes);
 }
 
 /// Duplicate with fewer rights (the original stays).
-fn dup(h: u32, rights: u32) -> Option<u32> {
+fn dup(h: u64, rights: u32) -> Option<u64> {
     let d = sys::handle_duplicate(h, rights);
-    (d.status == 0).then_some(d.a1 as u32)
+    (d.status == 0).then_some(d.a1 as u64)
 }
 
-fn close_all(hs: &[u32]) {
+fn close_all(hs: &[u64]) {
     for &h in hs {
         sys::handle_close(h);
     }
@@ -446,13 +446,13 @@ impl Os {
     /// The programs of the foreground job that do not handle SIGINT: what the console server may end on Ctrl-C.
     fn register_foreground(&mut self) -> bool {
         let job_rights = Rights::KILL.0 | Rights::WAIT.0 | Rights::TRANSFER.0;
-        let hs: Vec<u32> = self
+        let hs: Vec<u64> = self
             .fg_pids
             .iter()
             .filter(|&&pid| !self.brokers.iter().any(|b| b.pid == pid && b.handles_int))
             .filter_map(|pid| self.procs.get(pid).copied())
             .collect();
-        let dups: Vec<u32> = hs.iter().filter_map(|&p| dup(p, job_rights)).collect();
+        let dups: Vec<u64> = hs.iter().filter_map(|&p| dup(p, job_rights)).collect();
         if dups.len() != hs.len() {
             close_all(&dups);
             return false;
@@ -472,7 +472,7 @@ impl Os {
             // is read and dropped so that it does not keep the channel readable)
             for _ in 0..8 {
                 let mut m = [0u8; 64];
-                let mut hs = [0u32; 8];
+                let mut hs = [0u64; 8];
                 let r =
                     sys::channel_read(b.sig, m.as_mut_ptr(), m.len(), hs.as_mut_ptr(), hs.len());
                 if r.status != 0 {
@@ -578,7 +578,7 @@ impl Os {
         }
     }
 
-    fn control(&mut self, what: Control, handles: &[u32]) -> bool {
+    fn control(&mut self, what: Control, handles: &[u64]) -> bool {
         self.txid = self.txid.wrapping_add(1);
         let msg = ctl::encode(self.txid, what);
         let w = sys::channel_write(
@@ -670,7 +670,7 @@ impl Os {
     }
 
     /// Tell `procd` about a program (it gets an INSPECT-only duplicate of the process handle).
-    fn proc_announce(&mut self, pid: u32, h: u32, argv: &[Vec<u8>]) {
+    fn proc_announce(&mut self, pid: u32, h: u64, argv: &[Vec<u8>]) {
         let Some(ctl) = self.proc_ctl else {
             return;
         };
@@ -712,7 +712,7 @@ impl Os {
     }
 
     /// A program has ended: its exit code, its handle closed and its `/tmp` removed.
-    fn reap(&mut self, pid: u32, h: u32) -> i32 {
+    fn reap(&mut self, pid: u32, h: u64) -> i32 {
         let code = if sys::object_wait(h, signals::TERMINATED, 0).status == 0 {
             sys::process_info(h).a1 as i64 as i32
         } else {
@@ -799,7 +799,7 @@ impl Os {
             let mut served = 0;
             let mut keep = true;
             while served < 4 {
-                let mut hs = [0u32; proto::spawn::HANDLES + 1];
+                let mut hs = [0u64; proto::spawn::HANDLES + 1];
                 let ch = self.brokers[i].ch;
                 let r =
                     sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
@@ -852,7 +852,7 @@ impl Os {
     /// Watch what the shell serves on `port`: every program's spawn channel, every program a program started, every output pump.
     /// (A port's keys are unique: each binding gets its own, from 1000 up; a repeated key is refused, and the object is not
     /// watched.)
-    fn bind_served(&self, port: u32) {
+    fn bind_served(&self, port: u64) {
         let mut key = 1000;
         for b in &self.brokers {
             sys::port_bind(port, b.ch, signals::READABLE | signals::PEER_CLOSED, key);
@@ -872,13 +872,13 @@ impl Os {
 
     /// Wait on `h` for `mask` (or a few milliseconds) while serving; the shell never sits in a blocking read or write while a
     /// program of its own is waiting for it.
-    fn serve_wait(&mut self, h: u32, mask: u32) {
+    fn serve_wait(&mut self, h: u64, mask: u32) {
         let p = sys::port_create();
         if p.status != 0 {
             io::nap(2);
             return;
         }
-        let port = p.a1 as u32;
+        let port = p.a1 as u64;
         sys::port_bind(port, h, mask, 0);
         self.bind_served(port);
         sys::port_wait(port, sys::clock_get() + 20);
@@ -886,12 +886,12 @@ impl Os {
         self.serve();
     }
 
-    fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u32]) -> bool {
+    fn answer_spawn(&mut self, i: usize, msg: &[u8], hs: &[u64]) -> bool {
         let ch = self.brokers[i].ch;
         let txid = proto::file::peek_txid(msg).unwrap_or(0);
-        let reply = |status: i32, pid: u32, h: Option<u32>| {
+        let reply = |status: i32, pid: u32, h: Option<u64>| {
             let m = proto::spawn::encode_reply(txid, status, pid);
-            let hv: &[u32] = match &h {
+            let hv: &[u64] = match &h {
                 Some(x) => core::slice::from_ref(x),
                 None => &[],
             };
@@ -1093,14 +1093,14 @@ impl Os {
 
     /// Sleep until something the shell serves happens: a program ends (`extra`, and the ones programs started), a program
     /// sends a spawn request, or `deadline` (capped, so the output pumps are looked at too).
-    fn idle(&mut self, extra: &[u32], deadline: u64) {
+    fn idle(&mut self, extra: &[u64], deadline: u64) {
         let until = deadline.min(sys::clock_get() + if self.has_pumps() { 10 } else { 100 });
         let p = sys::port_create();
         if p.status != 0 {
             io::nap(2);
             return;
         }
-        let port = p.a1 as u32;
+        let port = p.a1 as u64;
         for (i, &h) in extra.iter().enumerate() {
             sys::port_bind(port, h, signals::TERMINATED, i as u64);
         }
@@ -1117,7 +1117,7 @@ impl Os {
     }
 
     /// The handle to forward to a program for one of its standard streams.
-    fn forward_stream(&mut self, s: Stream, input: bool) -> Option<u32> {
+    fn forward_stream(&mut self, s: Stream, input: bool) -> Option<u64> {
         let (h, want) = match s.0 {
             0 if input => (
                 self.tty,
@@ -1145,12 +1145,12 @@ impl Os {
     }
 
     /// A redirected output file for a program: a socket pair, the write end for the program, the read end drained by the shell.
-    fn pump_out(&mut self, id: u32) -> Option<u32> {
+    fn pump_out(&mut self, id: u32) -> Option<u64> {
         let s = sys::socket_create();
         if s.status != 0 {
             return None;
         }
-        let (rd, wr) = (s.a1 as u32, s.a2 as u32);
+        let (rd, wr) = (s.a1 as u64, s.a2 as u64);
         let fwd = dup(
             wr,
             Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
@@ -1179,12 +1179,12 @@ impl Os {
     }
 
     /// A redirected input file for a program: a socket pair, the read end for the program, the write end fed by the shell.
-    fn pump_in(&mut self, id: u32) -> Option<u32> {
+    fn pump_in(&mut self, id: u32) -> Option<u64> {
         let s = sys::socket_create();
         if s.status != 0 {
             return None;
         }
-        let (rd, wr) = (s.a1 as u32, s.a2 as u32);
+        let (rd, wr) = (s.a1 as u64, s.a2 as u64);
         let fwd = dup(
             rd,
             Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
@@ -1281,7 +1281,7 @@ impl Os {
         argv: &[String],
         env: &[(String, String)],
         io: ProcIo,
-    ) -> Result<u32, HostError> {
+    ) -> Result<u64, HostError> {
         let bytes: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
         let envb: Vec<(Vec<u8>, Vec<u8>)> = env
             .iter()
@@ -1300,7 +1300,7 @@ impl Os {
         env: &[(Vec<u8>, Vec<u8>)],
         stdio: Stdio,
         mut parent: Option<&mut Broker>,
-    ) -> Result<u32, HostError> {
+    ) -> Result<u64, HostError> {
         let allow: Option<Vec<Held>> = parent.as_ref().map(|p| p.mounts.clone());
         let mut mounts: Vec<Held> = Vec::new();
         let name = prog;
@@ -1357,7 +1357,7 @@ impl Os {
         } else {
             None
         };
-        let mut forward: Vec<u32> = alloc::vec![stdin, stdout, stderr];
+        let mut forward: Vec<u64> = alloc::vec![stdin, stdout, stderr];
         let mut startup = Startup {
             args: if argv.is_empty() {
                 alloc::vec![prog.to_vec()]
@@ -1605,7 +1605,7 @@ impl Os {
         if self.spawn_grant && depth <= SPAWN_DEPTH {
             let c = sys::channel_create();
             if c.status == 0 {
-                let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+                let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
                 let cw = match parent {
                     Some(p) => p.cwd.clone_conn(rights::READ | rights::ENUMERATE),
                     None => self.cwd.clone_conn(rights::READ | rights::ENUMERATE),
@@ -1620,9 +1620,9 @@ impl Os {
                         startup
                             .roles
                             .push((Role::SignalChannel, forward.len() as u32));
-                        forward.push(sg.a2 as u32);
+                        forward.push(sg.a2 as u64);
                         self.pending_broker = Some(Broker {
-                            sig: sg.a1 as u32,
+                            sig: sg.a1 as u64,
                             pid: 0,
                             root: 0,
                             ch: mine,
@@ -1642,7 +1642,7 @@ impl Os {
                     Err(_) => {
                         close_all(&[mine, theirs]);
                         if sg.status == 0 {
-                            close_all(&[sg.a1 as u32, sg.a2 as u32]);
+                            close_all(&[sg.a1 as u64, sg.a2 as u64]);
                         }
                     }
                 }
@@ -1786,7 +1786,7 @@ impl Host for Os {
         if s.status != 0 {
             return Err(HostError::Other(String::from("could not make a pipe")));
         }
-        let (a, b) = (s.a1 as u32, s.a2 as u32);
+        let (a, b) = (s.a1 as u64, s.a2 as u64);
         let w = dup(
             a,
             Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0 | Rights::DUPLICATE.0,
@@ -1840,7 +1840,7 @@ impl Host for Os {
         streams: &[Stream],
         buf: &mut [u8],
     ) -> Result<(usize, usize), HostError> {
-        let handles: Vec<Option<u32>> = streams
+        let handles: Vec<Option<u64>> = streams
             .iter()
             .map(|s| match self.objs.get(&s.0) {
                 Some(Obj::PipeR(h)) => Some(*h),
@@ -1861,7 +1861,7 @@ impl Host for Os {
             if p.status != 0 {
                 return Err(HostError::Other(String::from("no port")));
             }
-            let port = p.a1 as u32;
+            let port = p.a1 as u64;
             for (i, h) in handles.iter().enumerate() {
                 if let Some(h) = h {
                     sys::port_bind(port, *h, signals::READABLE | signals::PEER_CLOSED, i as u64);
@@ -2030,7 +2030,7 @@ impl Host for Os {
             if p.status != 0 {
                 return TermIn::Gone;
             }
-            let port = p.a1 as u32;
+            let port = p.a1 as u64;
             sys::port_bind(port, self.tty, signals::READABLE | signals::PEER_CLOSED, 1);
             sys::port_bind(port, self.ctl, signals::READABLE | signals::PEER_CLOSED, 2);
             // a background job may ask for a program, or write a redirected file, while the shell waits for a key
@@ -2115,7 +2115,7 @@ impl Host for Os {
             return true; // no console server: nothing to register with
         }
         // register the job (duplicates with only KILL|WAIT|TRANSFER; not the programs that handle SIGINT)
-        let hs: Vec<u32> = pids
+        let hs: Vec<u64> = pids
             .iter()
             .filter_map(|p| self.procs.get(&p.0).copied())
             .collect();
@@ -2477,8 +2477,8 @@ pub fn app_main() -> i32 {
         cwd,
         cwd_path: b"/home".to_vec(),
         launch,
-        ctl: ctl_ch.unwrap_or(u32::MAX),
-        init_ch: init_ch.unwrap_or(u32::MAX),
+        ctl: ctl_ch.unwrap_or(u64::MAX),
+        init_ch: init_ch.unwrap_or(u64::MAX),
         trusted: Vec::new(),
         registry: env.handle(Role::ServiceRegistry).map(Fs::new),
         tmp: env.handle(Role::TmpDir).map(Fs::new),

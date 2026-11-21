@@ -2,7 +2,6 @@
 //! machine facts, whether the kernel half of its own table still matches the snapshot and the kernel table itself, are passed in.
 
 use crate::{ProcState, Process, UserState};
-use abi::limits::MAX_HANDLES;
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
@@ -11,6 +10,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::handle::HandleTable;
+use kcore::handle::MAX_SLOTS as MAX_HANDLES;
 use kcore::ipc::{self, Quota};
 use kcore::job::Resource;
 use kcore::pagetable::{PageTable, PhysMem};
@@ -29,7 +29,7 @@ pub fn process_create<M: PhysMem>(
     kernel_half_ok: bool,
     me: u32,
     a: [u64; 6],
-) -> Result<u32, Status> {
+) -> Result<u64, Status> {
     if us.procs.len() >= abi::limits::MAX_PROCESSES || !kernel_half_ok {
         return Err(Status::NoMemory);
     }
@@ -38,12 +38,7 @@ pub fn process_create<M: PhysMem>(
     let job = if a[0] == 0 {
         creator.job
     } else {
-        ipc::job_of(
-            &us.objs,
-            &creator.handles,
-            Handle(a[0] as u32),
-            Rights::MANAGE,
-        )?
+        ipc::job_of(&us.objs, &creator.handles, Handle(a[0]), Rights::MANAGE)?
     };
     vmos.jobs
         .charge(job, Resource::Processes, 1)

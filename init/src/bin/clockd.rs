@@ -88,7 +88,7 @@ impl Service for Clockd {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         if matches!(self.core.conn(key), Some(Conn::Listener)) {
             // a forwarded Open: the client's endpoint becomes a connection in an account of its own
             let ok = proto::file::decode_request(msg)
@@ -181,7 +181,7 @@ pub fn app_main() -> i32 {
         );
         if w.status == 0 {
             let mut b = [0u8; 16];
-            let mut hs = [0u32; 2];
+            let mut hs = [0u64; 2];
             let r = sys::channel_read(
                 devmgr_ch,
                 b.as_mut_ptr(),
@@ -191,7 +191,7 @@ pub fn app_main() -> i32 {
             );
             if r.status == 0 && r.a2 == 1 {
                 if let Some((_, devmgr::Status::Ok)) = devmgr::decode_reply(&b[..r.a1]) {
-                    let me = sys::process_self().a1 as u32;
+                    let me = sys::process_self().a1 as u64;
                     rtc = sys::process_map(me, hs[0], RTC_VA, 0, 4096, PF_R).status == 0;
                 }
             }
@@ -209,7 +209,7 @@ pub fn app_main() -> i32 {
     };
     let mut d = Clockd {
         core: Core::new(
-            p.a1 as u32,
+            p.a1 as u64,
             pool,
             rt::abi::limits::MAX_MSG_BYTES,
             rt::abi::limits::MAX_MSG_HANDLES,
@@ -226,7 +226,7 @@ pub fn app_main() -> i32 {
     if c.status != 0 {
         return 6;
     }
-    let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+    let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
     if fs.publish(b"clock", theirs).is_err() {
         return 7;
     }

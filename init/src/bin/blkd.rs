@@ -78,7 +78,7 @@ const TIMEOUT: u64 = 2000;
 
 struct Dev {
     pa: u64,
-    irq: u32,
+    irq: u64,
     avail_idx: u16,
     last_used: u16,
     sectors: u64,
@@ -303,7 +303,7 @@ impl Dev {
     }
 }
 
-fn map(process: u32, vmo: u32, va: u64, pages: u64) -> bool {
+fn map(process: u64, vmo: u64, va: u64, pages: u64) -> bool {
     sys::process_map(process, vmo, va, 0, pages * 4096, PF_RW).status() == Some(Sys::Ok)
 }
 
@@ -322,7 +322,7 @@ pub fn app_main() -> i32 {
     ) else {
         return 3;
     };
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     if !map(me, mmio, MMIO_VA, 1) || !map(me, dma, DMA_VA, DMA_PAGES) {
         return 4;
     }
@@ -350,7 +350,7 @@ pub fn app_main() -> i32 {
     }
     let mut server = BlkServer {
         core: Core::new(
-            p.a1 as u32,
+            p.a1 as u64,
             POOL,
             abi_max_msg(),
             rt::abi::limits::MAX_MSG_HANDLES,
@@ -386,7 +386,7 @@ impl Service for BlkServer {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         // a request carries no handles: close whatever came (authority we did not ask for)
         for &h in hs {
             sys::handle_close(h);

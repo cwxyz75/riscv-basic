@@ -72,15 +72,14 @@ impl W {
     }
     fn event(&mut self) -> u64 {
         let p = self.us.procs.get_mut(&1).unwrap();
-        u64::from(
-            ipc::event_create_in(
-                &mut self.us.objs,
-                &mut p.handles,
-                &mut Self::q(&mut self.vmos),
-            )
-            .unwrap()
-            .0,
+
+        ipc::event_create_in(
+            &mut self.us.objs,
+            &mut p.handles,
+            &mut Self::q(&mut self.vmos),
         )
+        .unwrap()
+        .0
     }
     fn channel(&mut self) -> (u64, u64) {
         let p = self.us.procs.get_mut(&1).unwrap();
@@ -90,7 +89,7 @@ impl W {
             &mut Self::q(&mut self.vmos),
         )
         .unwrap();
-        (u64::from(a.0), u64::from(b.0))
+        (a.0, b.0)
     }
     fn poke(&mut self, at: u64, d: &[u8]) {
         let p = self.us.procs.get_mut(&1).unwrap();
@@ -123,10 +122,10 @@ fn object_wait_checks_in_order_and_reports_by_what_was_seen() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(e as u32), Rights::SIGNAL)
+            .duplicate(&mut w.us.objs, abi::Handle(e), Rights::SIGNAL)
             .unwrap();
     assert_eq!(
-        ksys::object_wait_check(&w.us, 1, [u64::from(no_wait.0), 1 << 24, 5, 0, 0, 0]),
+        ksys::object_wait_check(&w.us, 1, [no_wait.0, 1 << 24, 5, 0, 0, 0]),
         Err(Status::AccessDenied)
     );
     for mask in [0u64, 1 << 32, 1 << 8] {
@@ -188,10 +187,10 @@ fn object_wait_checks_in_order_and_reports_by_what_was_seen() {
 // ---- port_wait ----
 
 #[test]
-fn port_wait_checks_the_handle_width_and_reports() {
+fn port_wait_takes_a_full_register_handle_and_reports() {
     assert_eq!(
         ksys::port_wait_check([1 << 32, 7, 0, 0, 0, 0]),
-        Err(Status::BadHandle)
+        Ok((abi::Handle(1 << 32), 7))
     );
     assert_eq!(
         ksys::port_wait_check([3, 7, 0, 0, 0, 0]),
@@ -227,7 +226,7 @@ fn a_port_poll_finds_a_ready_binding() {
         &mut w.us.objs,
         &p.handles,
         port,
-        abi::Handle(e as u32),
+        abi::Handle(e),
         1 << 24,
         77,
         &mut w.vmos.jobs,
@@ -237,7 +236,7 @@ fn a_port_poll_finds_a_ready_binding() {
     ipc::event_signal(
         &mut w.us.objs,
         &w.us.procs[&1].handles,
-        abi::Handle(e as u32),
+        abi::Handle(e),
         0,
         1 << 24,
     )
@@ -417,7 +416,7 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
             .get(&1)
             .unwrap()
             .handles
-            .get(abi::Handle(server as u32))
+            .get(abi::Handle(server))
             .unwrap();
     let _ = ph;
     let mut other = vec![8u8, 0, 0, 0];
@@ -425,7 +424,7 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
     ipc::channel_write_in(
         &mut w.us.objs,
         &mut w.us.procs.get_mut(&1).unwrap().handles,
-        abi::Handle(server as u32),
+        abi::Handle(server),
         &other,
         &[],
         &mut w.vmos.jobs,
@@ -437,7 +436,7 @@ fn a_call_sends_waits_for_its_transaction_id_and_takes_the_reply() {
     ipc::channel_write_in(
         &mut w.us.objs,
         &mut w.us.procs.get_mut(&1).unwrap().handles,
-        abi::Handle(server as u32),
+        abi::Handle(server),
         &mine,
         &[],
         &mut w.vmos.jobs,
@@ -489,9 +488,9 @@ fn the_request_half_checks_in_order() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(client as u32), Rights::READ)
+            .duplicate(&mut w.us.objs, abi::Handle(client), Rights::READ)
             .unwrap();
-    let a = call_record(&mut w, u64::from(ro.0), 8, 9);
+    let a = call_record(&mut w, ro.0, 8, 9);
     assert_eq!(send(&mut w, a, false), Err(Status::AccessDenied));
     let _ = good;
 }
@@ -517,7 +516,7 @@ fn the_reply_half_reports_by_what_is_there() {
     ipc::channel_write_in(
         &mut w.us.objs,
         &mut w.us.procs.get_mut(&1).unwrap().handles,
-        abi::Handle(server as u32),
+        abi::Handle(server),
         &big,
         &[],
         &mut w.vmos.jobs,

@@ -13,7 +13,7 @@ use proto::startup::{Role, Startup, StartupError, MAX_BYTES, MAX_HANDLES};
 pub struct Env {
     pub startup: Startup,
     /// The handles that arrived with the message; the startup message's indices refer here.
-    pub handles: Vec<u32>,
+    pub handles: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub const EXIT_NO_STARTUP: i32 = -2002;
 
 impl Env {
     /// The handle with `role`.
-    pub fn handle(&self, role: Role) -> Option<u32> {
+    pub fn handle(&self, role: Role) -> Option<u64> {
         let i = self.startup.handle_of(role)?;
         self.handles.get(i as usize).copied()
     }
@@ -46,7 +46,7 @@ impl Env {
     }
 
     /// The handle of the namespace entry with this prefix (`b"."`, `b"/"`, or an absolute path such as `b"/svc"`).
-    pub fn namespace(&self, prefix: &[u8]) -> Option<u32> {
+    pub fn namespace(&self, prefix: &[u8]) -> Option<u64> {
         let (_, i) = self.startup.namespace.iter().find(|(p, _)| p == prefix)?;
         self.handles.get(*i as usize).copied()
     }
@@ -57,7 +57,7 @@ impl Env {
 pub fn read() -> Result<Env, EnvError> {
     loop {
         let mut bytes = alloc::vec![0u8; MAX_BYTES];
-        let mut handles = [0u32; MAX_HANDLES];
+        let mut handles = [0u64; MAX_HANDLES];
         let r = sys::channel_read(
             BOOTSTRAP,
             bytes.as_mut_ptr(),
@@ -67,7 +67,7 @@ pub fn read() -> Result<Env, EnvError> {
         );
         if r.status == 0 {
             let (nb, nh) = (r.a1, r.a2);
-            let hs: Vec<u32> = handles[..nh].to_vec();
+            let hs: Vec<u64> = handles[..nh].to_vec();
             return match Startup::decode(&bytes[..nb], nh) {
                 Ok(startup) => Ok(Env {
                     startup,

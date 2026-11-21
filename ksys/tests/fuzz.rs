@@ -47,7 +47,7 @@ fn replay(seed: u64, calls: usize) -> String {
 
 /// The kind the model should give a handle the process just received.
 fn kind_of(w: &World, h: u64) -> Kind {
-    let Ok(e) = w.handles.get(Handle(h as u32)) else {
+    let Ok(e) = w.handles.get(Handle(h)) else {
         return Kind::Any;
     };
     match w.objs.get(e.obj) {
@@ -71,17 +71,16 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
             jobs: &mut w.vmos.jobs,
             job: Some(JobId::ROOT),
         };
-        u64::from(
-            ipc::job_object_create(
-                &mut w.objs,
-                &mut w.handles,
-                JobId::ROOT,
-                Rights::JOB,
-                &mut q,
-            )
-            .map_err(|e| format!("{e:?}"))?
-            .0,
+
+        ipc::job_object_create(
+            &mut w.objs,
+            &mut w.handles,
+            JobId::ROOT,
+            Rights::JOB,
+            &mut q,
         )
+        .map_err(|e| format!("{e:?}"))?
+        .0
     };
     let mut model = Model::with(&[(jh, Kind::Job)]);
     model.pin(jh);
@@ -105,9 +104,7 @@ fn run_seed(seed: u64, calls: usize, at: &Cell<(&'static str, usize)>) -> Result
                 .collect();
             w.job = jobs
                 .get(i / 40 % (jobs.len() + 1))
-                .and_then(|&h| {
-                    ipc::job_of(&w.objs, &w.handles, Handle(h as u32), Rights::MANAGE).ok()
-                })
+                .and_then(|&h| ipc::job_of(&w.objs, &w.handles, Handle(h), Rights::MANAGE).ok())
                 .unwrap_or(JobId::ROOT);
         }
         at.set(("poke", i));

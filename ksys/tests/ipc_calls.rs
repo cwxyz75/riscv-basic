@@ -19,17 +19,14 @@ fn calls_that_are_not_these_are_left_to_the_kernel() {
 }
 
 #[test]
-fn wide_arguments_are_refused_not_truncated() {
+fn wide_arguments_are_refused_not_truncated_but_handles_are_full_registers() {
+    // AB1: a handle is 64 bits, so a handle argument has no width rule; rights, signals and masks are 32 bits and a wider value is refused
     let big = 1u64 << 32;
     let a = |i: usize| {
         let mut a = [0u64; 6];
         a[i] = big;
         a
     };
-    assert_eq!(
-        wide_argument_error(nr::HANDLE_CLOSE, &a(0)),
-        Some(Status::BadHandle)
-    );
     assert_eq!(
         wide_argument_error(nr::HANDLE_DUPLICATE, &a(1)),
         Some(Status::AccessDenied)
@@ -43,21 +40,29 @@ fn wide_arguments_are_refused_not_truncated() {
         Some(Status::InvalidArgs)
     );
     assert_eq!(
-        wide_argument_error(nr::PORT_BIND, &a(1)),
-        Some(Status::BadHandle)
-    );
-    assert_eq!(
-        wide_argument_error(nr::VMO_CREATE, &a(1)),
-        Some(Status::BadHandle)
-    );
-    assert_eq!(
         wide_argument_error(nr::CHANNEL_READ_TXID, &a(1)),
         Some(Status::InvalidArgs)
     );
-    assert_eq!(
-        wide_argument_error(nr::HANDLE_CLOSE, &[u64::from(u32::MAX), 0, 0, 0, 0, 0]),
-        None
-    );
+    // handle arguments: nothing refused by width (the table says BAD_HANDLE for a value that names nothing)
+    for (n, i) in [
+        (nr::HANDLE_CLOSE, 0),
+        (nr::HANDLE_DUPLICATE, 0),
+        (nr::CHANNEL_WRITE, 0),
+        (nr::PORT_BIND, 0),
+        (nr::PORT_BIND, 1),
+        (nr::VMO_CREATE, 1),
+        (nr::EVENT_SIGNAL, 0),
+    ] {
+        assert_eq!(wide_argument_error(n, &a(i)), None, "call {n} argument {i}");
+        assert_eq!(
+            wide_argument_error(n, &{
+                let mut x = [0u64; 6];
+                x[i] = u64::MAX;
+                x
+            }),
+            None
+        );
+    }
     assert_eq!(wide_argument_error(nr::CHANNEL_CREATE, &[big; 6]), None);
 }
 
@@ -94,7 +99,7 @@ fn channel_round_trip_with_a_handle() {
     let (x, y) = w.pair(nr::CHANNEL_CREATE);
     let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
     w.poke(BASE, b"hello");
-    w.poke(BASE + 0x100, &(e as u32).to_le_bytes());
+    w.poke(BASE + 0x100, &e.to_le_bytes());
     w.ok(nr::CHANNEL_WRITE, [x, BASE, 5, BASE + 0x100, 1, 0]);
     assert_eq!(
         w.err(nr::HANDLE_CLOSE, [e, 0, 0, 0, 0, 0]),
@@ -300,36 +305,9 @@ const SIG0: u64 = 1 << 24;
 fn every_wide_argument_is_refused_table_driven() {
     // (call, argument index, status): the whole table of `wide_argument_error`, probed one entry at a time, and a clean value passes.
     let table: &[(usize, usize, Status)] = &[
-        (nr::HANDLE_CLOSE, 0, Status::BadHandle),
-        (nr::OBJECT_SIGNALS, 0, Status::BadHandle),
-        (nr::OBJECT_INFO, 0, Status::BadHandle),
-        (nr::CHANNEL_WRITE, 0, Status::BadHandle),
-        (nr::CHANNEL_READ, 0, Status::BadHandle),
-        (nr::CHANNEL_READ_TXID, 0, Status::BadHandle),
         (nr::CHANNEL_READ_TXID, 1, Status::InvalidArgs),
-        (nr::VMO_READ, 0, Status::BadHandle),
-        (nr::VMO_WRITE, 0, Status::BadHandle),
-        (nr::VMO_GET_SIZE, 0, Status::BadHandle),
-        (nr::VMO_PHYS_ADDR, 0, Status::BadHandle),
-        (nr::VMO_COMMIT, 0, Status::BadHandle),
-        (nr::VMO_CREATE_PHYSICAL, 0, Status::BadHandle),
-        (nr::VMO_CREATE_DMA, 0, Status::BadHandle),
-        (nr::RESOURCE_DTB, 0, Status::BadHandle),
-        (nr::INTERRUPT_CREATE, 0, Status::BadHandle),
-        (nr::INTERRUPT_ACK, 0, Status::BadHandle),
-        (nr::VMO_CREATE, 1, Status::BadHandle),
-        (nr::SOCKET_WRITE, 0, Status::BadHandle),
-        (nr::SOCKET_READ, 0, Status::BadHandle),
-        (nr::SOCKET_SHUTDOWN, 0, Status::BadHandle),
-        (nr::PORT_UNBIND, 0, Status::BadHandle),
-        (nr::PORT_REARM, 0, Status::BadHandle),
-        (nr::PORT_BIND, 0, Status::BadHandle),
-        (nr::PORT_BIND, 1, Status::BadHandle),
-        (nr::HANDLE_DUPLICATE, 0, Status::BadHandle),
-        (nr::HANDLE_REPLACE, 0, Status::BadHandle),
         (nr::HANDLE_DUPLICATE, 1, Status::AccessDenied),
         (nr::HANDLE_REPLACE, 1, Status::AccessDenied),
-        (nr::EVENT_SIGNAL, 0, Status::BadHandle),
         (nr::EVENT_SIGNAL, 1, Status::InvalidArgs),
         (nr::EVENT_SIGNAL, 2, Status::InvalidArgs),
     ];
@@ -427,21 +405,21 @@ fn channel_write_rights_and_handle_list_rules() {
     );
     // a listed handle without TRANSFER
     let no_xfer = w.narrow(ev, Rights::SIGNAL);
-    w.poke(BASE, &(no_xfer as u32).to_le_bytes());
+    w.poke(BASE, &no_xfer.to_le_bytes());
     assert_eq!(
         w.err(nr::CHANNEL_WRITE, [x, BASE, 0, BASE, 1, 0]),
         Status::AccessDenied
     );
     // a handle listed twice
-    let mut two = (c as u32).to_le_bytes().to_vec();
-    two.extend_from_slice(&(c as u32).to_le_bytes());
+    let mut two = c.to_le_bytes().to_vec();
+    two.extend_from_slice(&c.to_le_bytes());
     w.poke(BASE, &two);
     assert_eq!(
         w.err(nr::CHANNEL_WRITE, [x, BASE, 0, BASE, 2, 0]),
         Status::InvalidArgs
     );
     // the channel's own endpoint in the list
-    w.poke(BASE, &(x as u32).to_le_bytes());
+    w.poke(BASE, &x.to_le_bytes());
     assert_eq!(
         w.err(nr::CHANNEL_WRITE, [x, BASE, 0, BASE, 1, 0]),
         Status::NotSupported
@@ -501,7 +479,7 @@ fn channel_read_rights_handle_room_and_error_ordering() {
     );
     // send a message carrying one handle
     w.poke(BASE, b"msg!");
-    w.poke(BASE + 0x100, &(ev as u32).to_le_bytes());
+    w.poke(BASE + 0x100, &ev.to_le_bytes());
     w.ok(nr::CHANNEL_WRITE, [x, BASE, 4, BASE + 0x100, 1, 0]);
     // too small for the handle, reported with both sizes, and that wins over a bad pointer
     let e = w

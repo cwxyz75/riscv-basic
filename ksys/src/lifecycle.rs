@@ -88,7 +88,7 @@ pub fn thread_target(
         return Ok((current, me));
     }
     let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let handle = Handle(h as u32);
+    let handle = Handle(h);
     ipc::thread_of(objs, &caller.handles, handle, need)?;
     let obj = caller.handles.get(handle)?.obj;
     let pid = match objs.get(obj) {
@@ -143,12 +143,7 @@ pub fn job_set_sched(
         return Err(Status::InvalidArgs);
     }
     let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let job = ipc::job_of(
-        objs,
-        &caller.handles,
-        Handle(a[0] as u32),
-        Rights::SET_LIMITS,
-    )?;
+    let job = ipc::job_of(objs, &caller.handles, Handle(a[0]), Rights::SET_LIMITS)?;
     let limits = SchedLimits {
         max_prio: a[1] as u8,
         rt_budget: a[2],

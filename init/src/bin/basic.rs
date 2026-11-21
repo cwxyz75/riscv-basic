@@ -29,8 +29,8 @@ use rt::io;
 
 /// The console behind the program's stdin and stdout.
 struct StdioIo {
-    stdin: Option<u32>,
-    stdout: Option<u32>,
+    stdin: Option<u64>,
+    stdout: Option<u64>,
     /// Bytes read from stdin and not yet turned into a line.
     pending: Vec<u8>,
     memory: BTreeMap<u64, u8>,
@@ -108,7 +108,7 @@ impl Io for StdioIo {
 }
 
 /// Read a file under the root connection (`/etc/basic/<path>`); `None` if it cannot be read.
-fn read_under_home(root: u32, path: &str) -> Option<String> {
+fn read_under_home(root: u64, path: &str) -> Option<String> {
     let mut dir = Fs::new(root); // the connection belongs to the program: never closed here
     let mut full = String::from("etc/basic/");
     full.push_str(path);

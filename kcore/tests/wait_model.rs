@@ -19,7 +19,7 @@ fn is_port(reg: &Kobjs, id: ObjId) -> bool {
 }
 
 fn pick(rng: &mut Rng, t: &HandleTable) -> Option<Handle> {
-    let hs: Vec<_> = (1..=8191u32)
+    let hs: Vec<_> = (1..=8191u64)
         .map(Handle)
         .filter(|h| t.get(*h).is_ok())
         .take(64)

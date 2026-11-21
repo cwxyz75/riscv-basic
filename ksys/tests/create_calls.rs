@@ -72,7 +72,7 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
 }
 
 impl W {
-    fn create(&mut self, ok: bool, a: [u64; 6]) -> Result<u32, Status> {
+    fn create(&mut self, ok: bool, a: [u64; 6]) -> Result<u64, Status> {
         ksys::process_create(
             &mut self.us,
             &mut self.mm,
@@ -88,20 +88,19 @@ impl W {
     }
     fn job_handle(&mut self, job: JobId, rights: Rights) -> u64 {
         let p = self.us.procs.get_mut(&1).unwrap();
-        u64::from(
-            ipc::job_object_create(
-                &mut self.us.objs,
-                &mut p.handles,
-                job,
-                rights,
-                &mut Quota {
-                    jobs: &mut self.vmos.jobs,
-                    job: Some(JobId::ROOT),
-                },
-            )
-            .unwrap()
-            .0,
+
+        ipc::job_object_create(
+            &mut self.us.objs,
+            &mut p.handles,
+            job,
+            rights,
+            &mut Quota {
+                jobs: &mut self.vmos.jobs,
+                job: Some(JobId::ROOT),
+            },
         )
+        .unwrap()
+        .0
     }
 }
 
@@ -167,10 +166,7 @@ fn the_job_handle_is_checked_and_the_new_process_is_charged_to_that_job() {
         },
     )
     .unwrap();
-    assert_eq!(
-        w.create(true, [u64::from(e.0), 0, 0, 0, 0, 0]),
-        Err(Status::WrongType)
-    );
+    assert_eq!(w.create(true, [e.0, 0, 0, 0, 0, 0]), Err(Status::WrongType));
     let weak = w.job_handle(JobId::ROOT, Rights::INSPECT);
     assert_eq!(
         w.create(true, [weak, 0, 0, 0, 0, 0]),

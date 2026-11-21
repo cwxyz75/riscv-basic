@@ -11,14 +11,14 @@
 use crate::errno;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void, CStr};
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use proto::file::status as ps;
 use rt::abi::rights::Rights;
 use rt::abi::signals;
 use rt::sync::Mutex;
 use rt::sys;
 
-static SPAWN_CH: AtomicU32 = AtomicU32::new(0);
+static SPAWN_CH: AtomicU64 = AtomicU64::new(0);
 /// Requests and replies on the spawn channel are one exchange at a time.
 static EXCHANGE: Mutex<()> = Mutex::new(());
 /// Transaction numbers for requests, and pids for the children that ended before they began (a failed `exec` in a `vfork`
@@ -27,7 +27,7 @@ static NEXT_TX: AtomicU32 = AtomicU32::new(1);
 static NEXT_PSEUDO: AtomicU32 = AtomicU32::new(1_000_000);
 
 /// Install the spawn channel (start-up); 0 means the program holds no grant.
-pub fn init(ch: u32) {
+pub fn init(ch: u64) {
     SPAWN_CH.store(ch, Ordering::Relaxed);
 }
 
@@ -36,7 +36,7 @@ struct Child {
     notified: bool,
     pid: c_int,
     /// The process handle, or 0 for a child that ended before it began (a `vfork` child whose `exec` failed).
-    h: u32,
+    h: u64,
     done: Option<i32>,
     /// A stop was reported to `waitpid(WUNTRACED)` (so a continue can be reported to `WCONTINUED`).
     stop_seen: bool,
@@ -46,7 +46,7 @@ struct Child {
 
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
-fn register(pid: c_int, h: u32, done: Option<i32>) -> c_int {
+fn register(pid: c_int, h: u64, done: Option<i32>) -> c_int {
     let pid = if pid != 0 {
         pid
     } else {
@@ -104,7 +104,7 @@ pub fn stop_self() {
 }
 
 /// The process handles of the children that have not ended yet, for a wait that a child's end should wake.
-pub fn live_child_handles() -> Vec<u32> {
+pub fn live_child_handles() -> Vec<u64> {
     CHILDREN
         .lock()
         .iter()
@@ -135,16 +135,16 @@ fn wait_status(code: i32) -> c_int {
 
 /// A handle for a child's standard stream from our descriptor `fd`: a duplicate, or a stand-in when `fd` is closed (an input
 /// at its end, an output nobody reads).
-fn std_handle(fd: c_int, input: bool) -> Option<u32> {
+fn std_handle(fd: c_int, input: bool) -> Option<u64> {
     if let Some(h) = crate::fd::stream_handle(fd) {
         let d = sys::handle_duplicate(h, Rights::SAME.0);
-        return (d.status == 0).then_some(d.a1 as u32);
+        return (d.status == 0).then_some(d.a1 as u64);
     }
     let s = sys::socket_create();
     if s.status != 0 {
         return None;
     }
-    let (a, b) = (s.a1 as u32, s.a2 as u32);
+    let (a, b) = (s.a1 as u64, s.a2 as u64);
     // the end the child holds; ours is closed, so the child sees the end of input or a closed output
     let (keep, drop_) = if input { (a, b) } else { (b, a) };
     sys::handle_close(drop_);
@@ -166,7 +166,7 @@ fn start(
     argv: &[Vec<u8>],
     env: &[Vec<u8>],
     fds: [c_int; 3],
-) -> Result<(u32, c_int), c_int> {
+) -> Result<(u64, c_int), c_int> {
     let ch = SPAWN_CH.load(Ordering::Relaxed);
     if ch == 0 {
         return Err(38);
@@ -183,7 +183,7 @@ fn start(
         })
         .cloned()
         .collect();
-    let mut hs = [0u32; 3];
+    let mut hs = [0u64; 3];
     for (i, fd) in fds.iter().enumerate() {
         let got = match crate::fd::stdio_for_child(*fd) {
             Some((h, marker)) => {
@@ -235,7 +235,7 @@ fn start(
             return Err(110); // ETIMEDOUT
         }
         let mut buf = [0u8; 16];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
         if r.status != 0 {
             return Err(5);
@@ -276,7 +276,7 @@ fn signal_via_shell(pid: c_int, sig: c_int) -> Result<(), c_int> {
             return Err(110);
         }
         let mut buf = [0u8; 16];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
         if r.status != 0 {
             return Err(5);
@@ -380,7 +380,7 @@ pub fn term_via_shell(what: u16, value: u32) -> Result<u32, c_int> {
             return Err(110);
         }
         let mut buf = [0u8; 16];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
         if r.status != 0 {
             return Err(5);
@@ -507,7 +507,7 @@ extern "C" {
 }
 
 /// The `vfork` child is done (it started a program or ended): back to the caller of `vfork`, with the child's pid.
-fn vfork_return(spid: c_int, h: u32, done: Option<i32>) -> ! {
+fn vfork_return(spid: c_int, h: u64, done: Option<i32>) -> ! {
     VFORK_ACTIVE.store(0, Ordering::Relaxed);
     crate::sig::vfork_restore();
     crate::fd::vfork_leave();
@@ -530,7 +530,7 @@ unsafe fn exec_start(
     file: *const c_char,
     argv: *const *const c_char,
     envp: Option<*const *const c_char>,
-) -> Result<(u32, c_int), c_int> {
+) -> Result<(u64, c_int), c_int> {
     if file.is_null() || argv.is_null() {
         return Err(14);
     }
@@ -724,7 +724,7 @@ const WCONTINUED: c_int = 8;
 #[no_mangle]
 pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
     loop {
-        let handles: Vec<u32> = {
+        let handles: Vec<u64> = {
             let mut g = CHILDREN.lock();
             let mut any = false;
             let mut found = None;
@@ -792,7 +792,7 @@ pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int)
         // (a child that is stopped and already reported does not wake the wait: the level signal would spin it)
         let want_stop = options & WUNTRACED != 0;
         let mut watching_continue = false;
-        let items: Vec<(u32, u32)> = {
+        let items: Vec<(u64, u32)> = {
             let g = CHILDREN.lock();
             handles
                 .iter()
@@ -856,7 +856,7 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
 // ---- system and popen: the command goes to the compat shell (BusyBox `hush`, work item T139) ----
 
 /// Start `busybox hush -c cmd` with the standard streams from `fds`.
-unsafe fn start_shell(cmd: *const c_char, fds: [c_int; 3]) -> Result<(u32, c_int), c_int> {
+unsafe fn start_shell(cmd: *const c_char, fds: [c_int; 3]) -> Result<(u64, c_int), c_int> {
     let line = CStr::from_ptr(cmd).to_bytes().to_vec();
     let argv: Vec<Vec<u8>> =
         alloc::vec![b"busybox".to_vec(), b"hush".to_vec(), b"-c".to_vec(), line];

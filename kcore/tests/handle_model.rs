@@ -147,7 +147,7 @@ fn random_operations_agree_with_the_model() {
             }
             // Adversarial values never resolve unless live.
             for _ in 0..4 {
-                let v = Handle(rng.next() as u32);
+                let v = Handle(rng.next());
                 assert_eq!(
                     table.get(v).is_ok(),
                     live.contains_key(&v),
@@ -279,12 +279,12 @@ fn handle_values_encode_slot_and_generation() {
     let mut reg = Kobjs::new();
     let mut t = HandleTable::new(16);
     let h1 = event_create(&mut reg, &mut t).unwrap();
-    assert_eq!(h1.0, 1, "first slot, generation 0: value 0x0000_0001");
+    assert_eq!(h1.0, 1, "first slot, generation 0: value 0x1");
     t.close(&mut reg, h1).unwrap();
     let h2 = event_create(&mut reg, &mut t).unwrap();
     assert_eq!(
-        h2.0, 0x0000_2001,
-        "same slot, generation 1 (shifted past the 13 slot bits)"
+        h2.0, 0x0000_0000_0100_0001,
+        "same slot, generation 1 (shifted past the 24 slot bits)"
     );
     assert_eq!(
         t.get(h1),
@@ -294,7 +294,7 @@ fn handle_values_encode_slot_and_generation() {
     let h3 = event_create(&mut reg, &mut t).unwrap();
     assert_eq!(h3.0, 2, "second slot");
     assert_eq!(
-        t.get(Handle(0x0000_1fff)),
+        t.get(Handle(0x00ff_ffff)),
         Err(Status::BadHandle),
         "slot far beyond the table"
     );
@@ -306,16 +306,17 @@ fn a_slot_whose_generation_would_wrap_is_retired_so_no_stale_value_comes_back() 
     // One slot used over and over: the generation counts up, and at the end of its range the
     // slot is taken out of service instead of wrapping to a value an old handle still holds.
     let mut reg = Kobjs::new();
-    let mut t = HandleTable::new(4);
+    // (the generation fast-forwarded to 2^40 - 2: the slot has two uses left, instead of 2^40)
+    let mut t = HandleTable::starting_at_generation(4, (1 << 40) - 2);
     let first = event_create(&mut reg, &mut t).unwrap();
     t.close(&mut reg, first).unwrap();
     let mut seen_slot0 = 1u64;
     let mut last_slot0 = first;
     loop {
         let h = event_create(&mut reg, &mut t).unwrap();
-        if h.0 & 0x1fff != 1 {
+        if h.0 & 0xff_ffff != 1 {
             // slot 0 was retired: the next handle came from another slot
-            assert_eq!(h.0 & 0x1fff, 2, "the replacement slot");
+            assert_eq!(h.0 & 0xff_ffff, 2, "the replacement slot");
             t.close(&mut reg, h).unwrap();
             break;
         }
@@ -323,13 +324,9 @@ fn a_slot_whose_generation_would_wrap_is_retired_so_no_stale_value_comes_back() 
         seen_slot0 += 1;
         last_slot0 = h;
         t.close(&mut reg, h).unwrap();
-        assert!(seen_slot0 <= 1 << 19, "the slot was never retired");
+        assert!(seen_slot0 <= 4, "the slot was never retired");
     }
-    assert_eq!(
-        seen_slot0,
-        1 << 19,
-        "every generation of the slot was used once"
-    );
+    assert_eq!(seen_slot0, 2, "every generation of the slot was used once");
     assert_eq!(t.get(last_slot0), Err(Status::BadHandle));
     assert_eq!(t.get(first), Err(Status::BadHandle));
     // the table still holds its full limit of live handles (it just uses a fresh slot)
@@ -339,6 +336,63 @@ fn a_slot_whose_generation_would_wrap_is_retired_so_no_stale_value_comes_back() 
     assert!(
         event_create(&mut reg, &mut t).is_err(),
         "the limit is still 4"
+    );
+    t.drain(&mut reg);
+}
+
+#[test]
+fn a_table_grows_to_a_hundred_thousand_live_handles_and_slot_numbers_pass_8191() {
+    // AB1: 24 slot bits; the table grows on demand (nothing is sized for the limit)
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(kcore::handle::MAX_SLOTS);
+    // (the registry holds at most MAX_OBJECTS objects, so the handles are duplicates of one event: a handle is not an object)
+    let first = event_create(&mut reg, &mut t).unwrap();
+    let mut hs = vec![first];
+    for _ in 1..100_000 {
+        hs.push(t.duplicate(&mut reg, first, Rights::SAME).unwrap());
+    }
+    assert_eq!(reg.live(), 1);
+    assert_eq!(t.len(), 100_000);
+    let mut distinct: Vec<u64> = hs.iter().map(|h| h.0).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 100_000, "every handle value differs");
+    assert!(
+        hs.iter().any(|h| h.0 & 0xff_ffff > 8191),
+        "slot numbers above the old 13-bit limit are in use"
+    );
+    assert!(hs.iter().all(|h| t.get(*h).is_ok()));
+    // closing and reusing: the old values die, the new ones differ in generation
+    let victim = hs[99_999];
+    t.close(&mut reg, victim).unwrap();
+    assert_eq!(t.get(victim), Err(Status::BadHandle));
+    let again = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(
+        again.0 & 0xff_ffff,
+        victim.0 & 0xff_ffff,
+        "the slot is reused"
+    );
+    assert_ne!(again, victim, "with a new generation");
+    assert_eq!(again.0 >> 24, 1);
+    t.drain(&mut reg);
+    assert_eq!(reg.live(), 0);
+}
+
+#[test]
+fn a_handle_value_keeps_its_forty_bit_generation_in_the_high_bits() {
+    let mut reg = Kobjs::new();
+    // a slot one use from retirement: its last handle carries generation 2^40 - 1 in bits 24 to 63
+    let mut t = HandleTable::starting_at_generation(4, (1 << 40) - 1);
+    let h = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(h.0 >> 24, (1 << 40) - 1);
+    assert_eq!(h.0 & 0xff_ffff, 1);
+    t.close(&mut reg, h).unwrap();
+    assert_eq!(t.get(h), Err(Status::BadHandle));
+    let next = event_create(&mut reg, &mut t).unwrap();
+    assert_eq!(
+        next.0 & 0xff_ffff,
+        2,
+        "the exhausted slot is retired, not wrapped"
     );
     t.drain(&mut reg);
 }

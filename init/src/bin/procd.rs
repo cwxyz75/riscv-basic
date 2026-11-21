@@ -87,7 +87,7 @@ const SYS_FILES: [(&[u8], SysFile); 4] = [
 struct Entry {
     pid: u32,
     args: Vec<u8>,
-    handle: u32,
+    handle: u64,
 }
 
 struct Conn {
@@ -97,8 +97,8 @@ struct Conn {
 
 struct Procd {
     core: Core<Conn>,
-    job: Option<u32>,
-    ctl: u32,
+    job: Option<u64>,
+    ctl: u64,
     entries: Vec<Entry>,
 }
 
@@ -296,7 +296,7 @@ impl Procd {
     fn control(&mut self) {
         loop {
             let mut buf = [0u8; 600];
-            let mut hs = [0u32; 1];
+            let mut hs = [0u64; 1];
             let r = sys::channel_read(self.ctl, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), 1);
             if r.status != 0 {
                 return;
@@ -355,11 +355,11 @@ impl Service for Procd {
         }
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u64]) {
         // take what the shell has told us first: a program may ask before the port reported the shell's message
         self.control();
         let ep = handles.first().copied();
-        let close_ep = |h: Option<u32>| {
+        let close_ep = |h: Option<u64>| {
             if let Some(h) = h {
                 sys::handle_close(h);
             }
@@ -529,7 +529,7 @@ pub fn app_main() -> i32 {
     if p.status != 0 {
         return 4;
     }
-    let port = p.a1 as u32;
+    let port = p.a1 as u64;
     let mut d = Procd {
         core: Core::new(port, POOL, file::MAX_MESSAGE, 1, 30_000),
         job: env.handle(Role::Job),

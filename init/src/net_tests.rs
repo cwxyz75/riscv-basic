@@ -16,39 +16,39 @@ const OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 /// The stack side of a running driver, as the tests play it.
 struct Net {
     shm: Shm,
-    ring: u32,
-    rx: u32,
-    tx: u32,
-    to_stack: u32,
-    to_driver: u32,
-    ctl: u32,
+    ring: u64,
+    rx: u64,
+    tx: u64,
+    to_stack: u64,
+    to_driver: u64,
+    ctl: u64,
     /// `netsup`, the device manager and the channel that keeps the manager's connection.
-    sup: u32,
-    mgr: u32,
-    mgr_chan: u32,
-    jobs: [u32; 2],
+    sup: u64,
+    mgr: u64,
+    mgr_chan: u64,
+    jobs: [u64; 2],
 }
 
 fn spawn_prog(
-    bi: u32,
+    bi: u64,
     name: &[u8],
     args: &[&[u8]],
     roles: Vec<(Role, u32)>,
-    handles: &[u32],
-    job: u32,
-) -> Result<u32, Detail> {
+    handles: &[u64],
+    job: u64,
+) -> Result<u64, Detail> {
     spawn_prog_env(bi, name, args, roles, Vec::new(), handles, job)
 }
 
 fn spawn_prog_env(
-    bi: u32,
+    bi: u64,
     name: &[u8],
     args: &[&[u8]],
     roles: Vec<(Role, u32)>,
     env: Vec<Vec<u8>>,
-    handles: &[u32],
-    job: u32,
-) -> Result<u32, Detail> {
+    handles: &[u64],
+    job: u64,
+) -> Result<u64, Detail> {
     let (off, len) = image_entry(bi, name)?;
     let image = rt::spawn::read_image(bi, off, len).ok_or_else(|| msg_at(line!()))?;
     let s = Startup {
@@ -67,7 +67,7 @@ fn spawn_prog_env(
 
 /// Start the device manager and `netsup` (stackless: the test is the stack). `Ok(None)`: no network device on this machine.
 fn start_stack() -> Result<Option<Net>, Detail> {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let bi = boot_image_vmo()?;
     let root = root_job()?;
     let mj = job(root, u64::MAX, u64::MAX, u64::MAX)?;
@@ -75,8 +75,8 @@ fn start_stack() -> Result<Option<Net>, Detail> {
     sys::handle_close(root);
     // the device manager, and a second connection for `netsup` (a claim lives as long as its connection)
     let (mine, theirs) = channel()?;
-    let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let mgr = spawn_prog(
         bi,
         b"bin/devmgr",
@@ -107,7 +107,7 @@ fn start_stack() -> Result<Option<Net>, Detail> {
     let mut rb = [0u8; 16];
     sys::channel_read(mine, rb.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
     let (parent, parent_theirs) = channel()?;
-    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let sup = spawn_prog(
         bi,
         b"bin/netsup",
@@ -128,7 +128,7 @@ fn start_stack() -> Result<Option<Net>, Detail> {
     );
     ensure_eq!(st(w), Some(S::Ok), "netsup answers");
     let mut b = [0u8; 16];
-    let mut hs = [0u32; 8];
+    let mut hs = [0u64; 8];
     let r = sys::channel_read(parent, b.as_mut_ptr(), 16, hs.as_mut_ptr(), 8);
     if r.status != 0 {
         // netsup ended without handing anything over: no device (exit code 13)
@@ -254,7 +254,7 @@ fn arp_request_frame(target: [u8; 4]) -> Vec<u8> {
     f
 }
 
-fn read_ctl(ch: u32) -> Option<(u32, msg::Msg)> {
+fn read_ctl(ch: u64) -> Option<(u32, msg::Msg)> {
     let w = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 5000);
     if w.status != 0 {
         return None;
@@ -441,17 +441,17 @@ pub fn net_driver_attaches_and_exchanges_a_frame() -> Outcome {
 
 /// A running full stack as the tests see it.
 struct Full {
-    mgr: u32,
-    mgr_chan: u32,
-    sup: u32,
+    mgr: u64,
+    mgr_chan: u64,
+    sup: u64,
     /// The channel to `netsup` (Status, Restart).
-    ctl: u32,
-    reg: u32,
+    ctl: u64,
+    reg: u64,
     /// The random service (`rngd`).
-    rng: u32,
+    rng: u64,
     /// The registry's root connection (it can publish, view).
     root: Fs,
-    jobs: [u32; 3],
+    jobs: [u64; 3],
 }
 
 fn start_full() -> Result<Option<Full>, Detail> {
@@ -465,7 +465,7 @@ fn start_full_with(dhcp: bool) -> Result<Option<Full>, Detail> {
 
 /// `fault`: a deliberate fault for the children to run (`FAULT=name`; the negative controls of NET-SPEC 12.4).
 fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Detail> {
-    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let bi = boot_image_vmo()?;
     let root_j = root_job()?;
     let mj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
@@ -473,8 +473,8 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
     let rj = job(root_j, u64::MAX, u64::MAX, u64::MAX)?;
     sys::handle_close(root_j);
     let (mine, theirs) = channel()?;
-    let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u32;
-    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let res_dup = ok(sys::handle_duplicate(res, Rights::SAME.0), "dup resource")?.a1 as u64;
+    let bi_dup = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let mgr = spawn_prog(
         bi,
         b"bin/devmgr",
@@ -563,7 +563,7 @@ fn start_full_opts(dhcp: bool, fault: Option<&[u8]>) -> Result<Option<Full>, Det
         sj,
     )?;
     let (ctl, ctl_theirs) = channel()?;
-    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u32;
+    let bi2 = ok(sys::handle_duplicate(bi, Rights::SAME.0), "dup image")?.a1 as u64;
     let fault_env: Vec<Vec<u8>> = fault
         .map(|f| vec![[&b"FAULT="[..], f].concat()])
         .unwrap_or_default();
@@ -1120,8 +1120,8 @@ pub fn net_clients_are_confined() -> Outcome {
             for _ in 0..n_handles {
                 let c = sys::channel_create();
                 ensure_eq!(c.status, 0, "channel_create");
-                mine.push(c.a1 as u32);
-                theirs.push(c.a2 as u32);
+                mine.push(c.a1 as u64);
+                theirs.push(c.a2 as u64);
             }
             let req = proto::net::Request::Open {
                 kind,
@@ -1763,10 +1763,10 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
         let _lb = server
             .listen_stream(7102, 2, 0, t(3000))
             .map_err(|_| msg_at(line!()))?;
-        let open_raw = |net: &mut rt::net::Net| -> Result<u32, Detail> {
+        let open_raw = |net: &mut rt::net::Net| -> Result<u64, Detail> {
             let c = sys::channel_create();
             ensure_eq!(c.status, 0, "an endpoint channel");
-            let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+            let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
             let req = proto::net::Request::Open {
                 kind: 3,
                 local_port: 0,
@@ -1780,7 +1780,7 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
             Ok(mine)
         };
         // sends Connect with `h` and returns what the stack answered first: Ok(true) Connected, Ok(false) failed with `status`
-        let try_connect = |mine: u32, h: u32| -> Result<Result<(), i32>, Detail> {
+        let try_connect = |mine: u64, h: u64| -> Result<Result<(), i32>, Detail> {
             let msg = proto::net::encode_connect(1, [10, 0, 2, 15], 7102, 0, 0);
             let w = sys::channel_write(mine, msg.as_ptr(), msg.len(), [h].as_ptr(), 1);
             ensure_eq!(w.status, 0, "the connect request was sent");
@@ -1814,14 +1814,14 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
         ensure_eq!(chan.status, 0, "a channel to pass by mistake");
         let e1 = open_raw(&mut client)?;
         ensure_eq!(
-            try_connect(e1, chan.a2 as u32)?,
+            try_connect(e1, chan.a2 as u64)?,
             Err(bad),
             "a channel instead of a socket"
         );
         // one socket used twice
         let pr = sys::socket_create();
         ensure_eq!(pr.status, 0, "a socket pair");
-        let (pa, pb) = (pr.a1 as u32, pr.a2 as u32);
+        let (pa, pb) = (pr.a1 as u64, pr.a2 as u64);
         let dup = sys::handle_duplicate(pa, 1 << 31);
         ensure_eq!(dup.status, 0, "a duplicate of the same socket");
         let e2 = open_raw(&mut client)?;
@@ -1832,7 +1832,7 @@ pub fn net_stream_quotas_and_bad_handles() -> Outcome {
         );
         let e3 = open_raw(&mut client)?;
         ensure_eq!(
-            try_connect(e3, dup.a1 as u32)?,
+            try_connect(e3, dup.a1 as u64)?,
             Err(bad),
             "the same socket again"
         );
@@ -2307,7 +2307,7 @@ fn run_with_svc(
     f: &mut Full,
     name: &[u8],
     args: &[&[u8]],
-    extra_ns: Vec<(Vec<u8>, u32)>,
+    extra_ns: Vec<(Vec<u8>, u64)>,
     limit: u64,
 ) -> Result<(i64, Vec<u8>), Detail> {
     let bi = boot_image_vmo()?;

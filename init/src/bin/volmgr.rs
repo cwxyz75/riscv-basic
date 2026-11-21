@@ -47,12 +47,12 @@ struct Volume {
     name: Option<String>,
     readonly: bool,
     sub: Option<String>,
-    proc: Option<u32>,
+    proc: Option<u64>,
     restarts: u32,
 }
 
 /// One OpenBlock exchange: the status and the block channel.
-fn open_block(dm: u32, txid: u32, index: u16) -> Option<(devmgr::Status, Option<u32>)> {
+fn open_block(dm: u64, txid: u32, index: u16) -> Option<(devmgr::Status, Option<u64>)> {
     let req = devmgr::encode_open_block_at(txid, index);
     if sys::channel_write(dm, req.as_ptr(), req.len(), core::ptr::null(), 0).status != 0 {
         return None;
@@ -61,7 +61,7 @@ fn open_block(dm: u32, txid: u32, index: u16) -> Option<(devmgr::Status, Option<
         return None;
     }
     let mut buf = [0u8; 64];
-    let mut hs = [0u32; 2];
+    let mut hs = [0u64; 2];
     let r = sys::channel_read(dm, buf.as_mut_ptr(), buf.len(), hs.as_mut_ptr(), hs.len());
     if r.status != 0 {
         return None;
@@ -74,7 +74,7 @@ fn open_block(dm: u32, txid: u32, index: u16) -> Option<(devmgr::Status, Option<
 }
 
 /// OpenBlock, retrying while the previous driver for the device winds down.
-fn open_block_retry(dm: u32, txid: &mut u32, index: u16) -> Option<(devmgr::Status, Option<u32>)> {
+fn open_block_retry(dm: u64, txid: &mut u32, index: u16) -> Option<(devmgr::Status, Option<u64>)> {
     let until = sys::clock_get() + 5000;
     loop {
         *txid += 1;
@@ -86,7 +86,7 @@ fn open_block_retry(dm: u32, txid: &mut u32, index: u16) -> Option<(devmgr::Stat
     }
 }
 
-fn image_file(bi: u32, name: &[u8]) -> Option<Vec<u8>> {
+fn image_file(bi: u64, name: &[u8]) -> Option<Vec<u8>> {
     let total = sys::vmo_get_size(bi).a1;
     let prefix = rt::spawn::read_image(bi, 0, (total as u64).min(128 * 1024))?;
     let entries = bootimg::parse_prefix(&prefix, total).ok()?;
@@ -97,7 +97,7 @@ fn image_file(bi: u32, name: &[u8]) -> Option<Vec<u8>> {
 /// Start the volume server for `v` on block channel `blk`, and publish its names.
 fn start(
     v: &mut Volume,
-    blk: u32,
+    blk: u64,
     image: &[u8],
     reg: &mut rt::fs::Fs,
     clock_view: &mut Option<rt::fs::Fs>,
@@ -116,13 +116,13 @@ fn start(
     if let Some(n) = &v.name {
         names.push(format!("vol-{n}"));
     }
-    let mut published: Vec<(String, u32)> = Vec::new();
+    let mut published: Vec<(String, u64)> = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let c = sys::channel_create();
         if c.status != 0 {
             return false;
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         handles.push(mine);
         roles.push((
             if i == 0 {
@@ -139,7 +139,7 @@ fn start(
     if rc.status != 0 {
         return false;
     }
-    let (ready_mine, ready_theirs) = (rc.a1 as u32, rc.a2 as u32);
+    let (ready_mine, ready_theirs) = (rc.a1 as u64, rc.a2 as u64);
     handles.push(ready_theirs);
     roles.push((Role::Ready, handles.len() as u32 - 1));
     let mut args: Vec<Vec<u8>> = alloc::vec![b"fsd".to_vec()];
@@ -233,7 +233,7 @@ pub fn app_main() -> i32 {
     // ---- discovery
     let mut txid = 0u32;
     let mut found: Vec<Found> = Vec::new();
-    let mut chans: Vec<u32> = Vec::new();
+    let mut chans: Vec<u64> = Vec::new();
     for index in 0..MAX_DEVICES {
         let Some((st, h)) = open_block_retry(dm, &mut txid, index) else {
             break;
@@ -306,7 +306,7 @@ pub fn app_main() -> i32 {
     if p.status != 0 {
         return 5;
     }
-    let port = p.a1 as u32;
+    let port = p.a1 as u64;
     for (i, v) in volumes.iter().enumerate() {
         if let Some(pr) = v.proc {
             sys::port_bind(port, pr, signals::TERMINATED, i as u64);
