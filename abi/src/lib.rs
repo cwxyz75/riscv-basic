@@ -241,6 +241,9 @@ pub mod signals {
     pub const INTERRUPT: u32 = 1 << 5;
     /// A process is stopped by `process_suspend` (level: cleared by `process_resume`; never set with TERMINATED).
     pub const STOPPED: u32 = 1 << 6;
+    /// A thread has stopped because of `thread_suspend` (level: cleared when its suspend count falls to 0; never set with TERMINATED; EX1). A
+    /// thread blocked in a call has stopped where it is.
+    pub const SUSPENDED: u32 = 1 << 7;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
     /// Every signal a wait or a port binding may name.
@@ -251,6 +254,7 @@ pub mod signals {
         | WRITE_CLOSED
         | INTERRUPT
         | STOPPED
+        | SUSPENDED
         | USER_MASK;
 }
 
@@ -370,6 +374,14 @@ pub mod syscall {
     pub const VMO_CREATE_CHILD: usize = 68;
     /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
     pub const PROCESS_CLONE_REGION: usize = 69;
+    /// Raise a thread's suspend count: it stops at its next return to user mode (EX1).
+    pub const THREAD_SUSPEND: usize = 74;
+    /// Lower it; at 0 the thread runs again.
+    pub const THREAD_RESUME: usize = 75;
+    /// Read a stopped thread's registers.
+    pub const THREAD_READ_STATE: usize = 76;
+    /// Write a stopped thread's registers.
+    pub const THREAD_WRITE_STATE: usize = 77;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -430,6 +442,24 @@ pub mod spawn {
     pub const DETACHED: u32 = 2;
     /// Flag: the stack is the caller's (`sp` at offset 48); the kernel provisions nothing.
     pub const CALLER_STACK: u32 = 4;
+    /// Flag: the thread exists but does not run until `thread_resume` (EX1): its registers can be written first.
+    pub const SUSPENDED: u32 = 8;
+}
+
+/// `thread_read_state` / `thread_write_state` (EX1): the kinds and, for RISC-V, the layouts (per architecture: `abi::arch`).
+pub mod thread_state {
+    /// x1 to x31, then pc: 32 words.
+    pub const GENERAL: u64 = 1;
+    /// f0 to f31, then fcsr: 33 words.
+    pub const FP: u64 = 2;
+    /// vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each.
+    pub const VECTOR: u64 = 3;
+    /// Words of the GENERAL layout.
+    pub const GENERAL_WORDS: usize = 32;
+    /// Words of the FP layout.
+    pub const FP_WORDS: usize = 33;
+    /// Words before the vector registers in the VECTOR layout.
+    pub const VECTOR_HEADER_WORDS: usize = 4;
 }
 
 /// The kernel's address-space layout (Sv39, kernel in the upper half).

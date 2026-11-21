@@ -285,7 +285,7 @@ fn the_error_rows_in_order() {
         ("entry not executable", (0usize, CODE + 0x10_000)),
         ("reserved", (7, 1)),
         ("priority over 63", (5, 64)),
-        ("unknown flag", (5, 8u64 << 32)),
+        ("unknown flag", (5, 16u64 << 32)),
         ("stack too big", (3, sp::MAX_STACK + 1)),
         ("guard too big", (4, sp::MAX_STACK + 1)),
         ("a stack pointer without CALLER_STACK", (6, 16)),
@@ -420,4 +420,52 @@ fn a_full_handle_table_refuses_with_no_memory_and_charges_nothing() {
     let p = procs.get_mut(&1).unwrap();
     p.handles.close(objs, held.pop().unwrap()).unwrap();
     assert!(w.spawn(plain).is_ok());
+}
+
+#[test]
+fn a_suspended_thread_is_made_with_its_object_stopped_and_a_register_image() {
+    use abi::signals;
+    let mut w = world();
+    // SUSPENDED with DETACHED could never be resumed
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED | sp::DETACHED) << 32;
+    assert_eq!(w.spawn(r), Err(Status::InvalidArgs));
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED) << 32;
+    let s = w.spawn(r).unwrap();
+    assert!(s.suspended);
+    // the object says SUSPENDED from the start, and the image is the entry, the stack and the argument (a1 is filled with the tid later)
+    let obj = s.obj.unwrap();
+    assert_eq!(
+        ipc::signals_of_object(&w.us.objs, obj).unwrap() & signals::SUSPENDED,
+        signals::SUSPENDED
+    );
+    let image = s.image.as_ref().unwrap();
+    assert_eq!(image[31], CODE, "the pc is the entry");
+    assert_eq!(image[9], 7, "a0 is the argument");
+    assert_eq!(image[3], 0x1234, "tp");
+    // the spawner records the stopped state once it has the tid; suspend, resume and state then work on it
+    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    assert!(w
+        .us
+        .suspends
+        .get(&77)
+        .is_some_and(|x| x.stopped() && x.parked()));
+    assert_eq!(
+        w.us.initial_regs.get(&77).map(|g| g[10]),
+        Some(77),
+        "a1 is the tid"
+    );
+    // a resume lowers it to 0: SUSPENDED falls and the parked thread is to be woken
+    let (tid, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert_eq!((tid, wake), (77, true));
+    assert_eq!(
+        ipc::signals_of_object(&w.us.objs, obj).unwrap() & signals::SUSPENDED,
+        0
+    );
+    assert_eq!(
+        ksys::thread_resume(&mut w.us, 1, 5, s.handle),
+        Err(Status::BadState),
+        "not suspended any more"
+    );
 }

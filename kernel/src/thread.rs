@@ -802,6 +802,8 @@ pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn block() {
+    // (EX1) a thread that was suspended after it entered the call has stopped where it is
+    crate::user::suspend_blocks();
     // (MM8) a page the call made visible or replaced may be shown stale through other mappings until the call ends; a thread that sleeps
     // inside it would leave them so for as long as it sleeps
     crate::user::cow_sync();
@@ -1254,6 +1256,18 @@ pub fn current_stack_top() -> u64 {
             .as_ref()
             .expect("a user thread has its own kernel stack");
         (stack.top() & !15) as u64
+    })
+}
+
+/// Where the registers of a user thread's last trap from user mode are: the frame at the top of its kernel stack (EX1). `None` for a thread
+/// that has no kernel stack of its own. The frame is meaningful while the thread is in the kernel after a trap from user mode (blocked in a
+/// call, or parked at the return to user mode); the caller holds the big kernel lock, which every other access to it holds too.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a kernel stack is far larger than the 288-byte frame
+pub fn user_frame_ptr(tid: Tid) -> Option<*mut crate::trap::TrapFrame> {
+    irq::without(|| {
+        let k = kernel();
+        let top = (k.threads.get(&tid)?.stack.as_ref()?.top() & !15) as u64;
+        Some((top - 288) as *mut crate::trap::TrapFrame)
     })
 }
 

@@ -37,8 +37,10 @@ pub use lifecycle::{
 pub use proc::{cow_sync, proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
 pub use state::{ThreadStart, UserState};
 pub use thread::{
-    charge_thread, clamp_prio, credit_thread, new_start, process_start, thread_spawn,
-    total_threads, Spawn, KSTACK_PAGES,
+    charge_thread, clamp_prio, credit_thread, initial_general, new_start, process_start,
+    thread_at_return, thread_blocks, thread_is_suspended, thread_resume, thread_spawn,
+    thread_spawned_suspended, thread_start_suspended, thread_state_target, thread_suspend,
+    thread_suspend_forget, thread_unparked, total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::vmo_call;
 pub use wait::{

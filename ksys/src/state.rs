@@ -22,6 +22,8 @@ pub struct ThreadStart {
     pub stack: Option<SpawnStack>,
     pub rr: bool,
     pub spawned: bool,
+    /// Made with `spawn::SUSPENDED` (EX1): the spawner builds its first register image and it runs only after `thread_resume`.
+    pub suspended: bool,
 }
 
 /// Everything the syscall layer keeps about user mode: the kernel objects, the processes and threads, the wait tables, and the kernel's own handles.
@@ -39,6 +41,11 @@ pub struct UserState {
     /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
     /// hart skip the cleanup while one cleaner was preempted).
     pub cleaning: BTreeSet<Tid>,
+    /// The suspend state of every thread with a suspend count above 0 (EX1): present exactly while a thread is suspended or stopped by it.
+    pub suspends: BTreeMap<Tid, kcore::suspend::Suspend>,
+    /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
+    /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
+    pub initial_regs: BTreeMap<Tid, [u64; 32]>,
     /// Threads with a pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
     pub interrupts: BTreeSet<Tid>,
     /// Thread starts waiting for their thread to run, by token.
@@ -92,6 +99,8 @@ impl UserState {
             asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
             cleaning: BTreeSet::new(),
+            suspends: BTreeMap::new(),
+            initial_regs: BTreeMap::new(),
             interrupts: BTreeSet::new(),
             starts: BTreeMap::new(),
             next_token: 1,

@@ -260,7 +260,11 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_INFO
         | nr::THREAD_SPAWN
         | nr::THREAD_INFO
-        | nr::THREAD_INTERRUPT => {
+        | nr::THREAD_INTERRUPT
+        | nr::THREAD_SUSPEND
+        | nr::THREAD_RESUME
+        | nr::THREAD_READ_STATE
+        | nr::THREAD_WRITE_STATE => {
             let r = process_call(n, a);
             notify();
             reply(frame, r);

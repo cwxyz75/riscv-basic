@@ -32,6 +32,10 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::THREAD_SPAWN => thread_spawn(a),
         nr::THREAD_INFO => process_table_call(n, a),
         nr::THREAD_INTERRUPT => thread_interrupt(a),
+        nr::THREAD_SUSPEND => thread_suspend_call(a),
+        nr::THREAD_RESUME => thread_resume_call(a),
+        nr::THREAD_READ_STATE => thread_state_call(a, false),
+        nr::THREAD_WRITE_STATE => thread_state_call(a, true),
         _ => bad(Status::BadSyscall),
     }
 }
@@ -190,6 +194,14 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
+    if spawn.suspended {
+        // (EX1) the spawner's half: the thread is stopped and its register image exists before this call returns the handle that can resume it
+        irq::without(|| {
+            let s = state();
+            ksys::thread_spawned_suspended(s, tid, &spawn);
+            sync_suspends(s);
+        });
+    }
     Ok((Some(spawn.handle), Some(tid)))
 }
 
@@ -207,6 +219,179 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     })?;
     // (after the state closure has ended: a wake can switch threads)
     thread::wake(tid);
+    Ok((None, None))
+}
+
+/// `thread_suspend(thread)` (EX1): raise the thread's suspend count. It stops at its next return to user mode (a thread running user code on
+/// another hart is reached by the same kick as a kill), or where it is if it is blocked in a call.
+pub(super) fn thread_suspend_call(a: [u64; 6]) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        ksys::thread_suspend(s, me, thread::current(), a[0], thread::is_blocked)
+            .map_err(|e| (e, None, None))?;
+        sync_suspends(s);
+        bump_attention();
+        crate::smp::kick_others();
+        Ok((None, None))
+    })
+}
+
+/// `thread_resume(thread)` (EX1): lower the count; at 0 the thread runs again (a parked one is woken).
+pub(super) fn thread_resume_call(a: [u64; 6]) -> Reply {
+    let (tid, wake) = irq::without(|| -> Result<(Tid, bool), ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let r = ksys::thread_resume(s, me, thread::current(), a[0]).map_err(|e| (e, None, None));
+        sync_suspends(s);
+        r
+    })?;
+    if wake {
+        thread::wake(tid);
+    }
+    Ok((None, None))
+}
+
+/// The user registers of a stopped thread, in the GENERAL layout: its starting image if it has not run, else its saved frame.
+fn general_of(
+    s: &UserState,
+    tid: Tid,
+    frame: Option<*mut crate::trap::TrapFrame>,
+) -> Option<[u64; 32]> {
+    if let Some(image) = s.initial_regs.get(&tid) {
+        return Some(*image);
+    }
+    // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers;
+    // the big kernel lock is held, as for every other access to it.
+    Some(unsafe { (*frame?).general() })
+}
+
+/// `thread_read_state(thread, kind, buffer, length)` and `thread_write_state(...)` (EX1): the registers of a thread that has stopped. The
+/// layouts are in `abi::thread_state`; `length` must be exactly the layout's size (VECTOR: 32 + 32 `vlenb` bytes).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: vlenb is a small power of two (at most 8 KiB), so the layout's size is far below u64::MAX
+pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
+    use abi::thread_state as ts;
+    let (kind, buf, len) = (a[1], a[2], a[3]);
+    let want = match kind {
+        ts::GENERAL => (ts::GENERAL_WORDS * 8) as u64,
+        ts::FP => (ts::FP_WORDS * 8) as u64,
+        ts::VECTOR => match crate::fp::vector_vlenb() {
+            Some(n) => (ts::VECTOR_HEADER_WORDS * 8 + 32 * n) as u64,
+            None => return bad(Status::NotSupported),
+        },
+        _ => return bad(Status::InvalidArgs),
+    };
+    if len != want {
+        return bad(Status::InvalidArgs);
+    }
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (tid, _) = ksys::thread_state_target(s, me, thread::current(), a[0], write)
+            .map_err(|e| (e, None, None))?;
+        // (before the memory locks: the frame lookup takes the big lock, which must not be taken under a later lock)
+        let frame_ptr = thread::user_frame_ptr(tid);
+        if write {
+            state_write(s, me, tid, kind, buf, len as usize, frame_ptr)
+        } else {
+            state_read(s, me, tid, kind, buf, frame_ptr)
+        }
+    })
+}
+
+/// The little-endian words of `b` (a layout of whole words).
+fn le_words(b: &[u8]) -> alloc::vec::Vec<u64> {
+    b.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect()
+}
+
+#[inline(never)]
+#[allow(clippy::large_stack_frames, clippy::indexing_slicing)] // KT13: audited, a register image on the stack (T172 shrinks them); INVARIANT: each layout was checked to have its exact size, so the word counts are 32 and 33
+fn state_write(
+    s: &mut UserState,
+    me: u64,
+    tid: Tid,
+    kind: u64,
+    buf: u64,
+    len: usize,
+    frame_ptr: Option<*mut crate::trap::TrapFrame>,
+) -> Reply {
+    use abi::thread_state as ts;
+    // (the memory locks are held for the copy only: writing FP or vector state charges the job, which takes them itself)
+    let data = {
+        let k = kmem::get();
+        let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+        kcore::usercopy::copy_from_user(&mut caller.aspace, k.mm, k.vmos, k.jobs, buf, len)
+            .map_err(|e| (e, None, None))?
+    };
+    let w = le_words(&data);
+    // (the thread's frame, if it has run: its FP and vector state is switched on there)
+    let frame = frame_ptr
+        .filter(|_| !s.initial_regs.contains_key(&tid))
+        // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved
+        // registers; the big kernel lock is held, as for every other access to it.
+        .map(|p| unsafe { &mut *p });
+    match kind {
+        ts::GENERAL => {
+            let mut g = [0u64; 32];
+            g.copy_from_slice(&w);
+            // the pc is a user address, on a 2-byte boundary
+            if !(abi::user::BASE..abi::user::TOP).contains(&g[31]) || g[31] & 1 != 0 {
+                return bad(Status::InvalidArgs);
+            }
+            if let Some(image) = s.initial_regs.get_mut(&tid) {
+                *image = g;
+            } else if let Some(f) = frame {
+                f.set_general(&g);
+            } else {
+                return bad(Status::BadState);
+            }
+        }
+        ts::FP => {
+            let mut g = [0u64; 33];
+            g.copy_from_slice(&w);
+            if !crate::fp::write_fp(tid, &g, frame) {
+                return bad(Status::NoMemory);
+            }
+        }
+        _ => {
+            if !crate::fp::write_vec(tid, &data, frame) {
+                return bad(Status::NoMemory);
+            }
+        }
+    }
+    Ok((None, None))
+}
+
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a register image on the stack (T172 shrinks them)
+fn state_read(
+    s: &mut UserState,
+    me: u64,
+    tid: Tid,
+    kind: u64,
+    buf: u64,
+    frame_ptr: Option<*mut crate::trap::TrapFrame>,
+) -> Reply {
+    use abi::thread_state as ts;
+    let bytes: alloc::vec::Vec<u8> = match kind {
+        ts::GENERAL => {
+            let g = general_of(s, tid, frame_ptr).ok_or((Status::BadState, None, None))?;
+            g.iter().flat_map(|w| w.to_le_bytes()).collect()
+        }
+        ts::FP => crate::fp::read_fp(tid)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+        _ => crate::fp::read_vec(tid),
+    };
+    let k = kmem::get();
+    let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
+    kcore::usercopy::copy_to_user(&mut caller.aspace, k.mm, k.vmos, k.jobs, buf, &bytes)
+        .map_err(|e| (e, None, None))?;
     Ok((None, None))
 }
 

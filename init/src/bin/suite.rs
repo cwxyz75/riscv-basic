@@ -784,7 +784,7 @@ fn wait_arguments_are_checked() -> Outcome {
         "an empty mask"
     );
     ensure_eq!(
-        st(sys::object_wait(e, 1 << 7, 0)),
+        st(sys::object_wait(e, 1 << 8, 0)),
         Some(S::InvalidArgs),
         "a bit that is no signal"
     );
@@ -3174,6 +3174,550 @@ fn copy_on_write_children_from_user_mode() -> Outcome {
         ensure_eq!(st(sys::process_unmap(me, va)), Some(S::Ok), "unmap");
         sys::handle_close(h);
     }
+    Ok(())
+}
+
+// ---- EX1: thread_suspend, thread_resume, thread_read_state, thread_write_state, thread_spawn SUSPENDED ----
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .globl ex1_spin_a1
+    .balign 4
+ex1_spin_a1:                    # spins until a1 holds 0x5a5a5a, then ends with exit code 77
+    li   t1, 0x5a5a5a
+1:  beq  a1, t1, 2f
+    j    1b
+2:  li   a0, 77
+    li   a7, 61
+    ecall
+    .globl ex1_exit_55
+    .balign 4
+ex1_exit_55:                    # ends with exit code 55
+    li   a0, 55
+    li   a7, 61
+    ecall
+    .globl ex1_handler
+    .balign 4
+ex1_handler:                    # a "signal handler": counts a hit, returns to the address the debugger left in t6
+    li   t5, 1
+    la   t4, EX1_HITS
+    amoadd.w zero, t5, (t4)
+    jr   t6
+    .globl ex1_spin_f1
+    .balign 4
+ex1_spin_f1:                    # spins until f1 holds 0x1234567, then ends with exit code 66
+1:  fmv.x.d t0, f1
+    li   t1, 0x1234567
+    beq  t0, t1, 2f
+    j    1b
+2:  li   a0, 66
+    li   a7, 61
+    ecall
+"#
+);
+
+extern "C" {
+    fn ex1_spin_a1();
+    fn ex1_exit_55();
+    fn ex1_handler();
+    fn ex1_spin_f1();
+}
+
+#[no_mangle]
+static EX1_HITS: AtomicU32 = AtomicU32::new(0);
+
+const EX1_MAGIC: u64 = 0x5a5a5a;
+const GENERAL: u64 = rt::abi::thread_state::GENERAL;
+const FPK: u64 = rt::abi::thread_state::FP;
+const VECK: u64 = rt::abi::thread_state::VECTOR;
+
+/// Start a thread at `entry` on a stack of its own; `flags` are extra `thread_spawn` flags. Returns (handle, tid).
+fn ex1_spawn(entry: unsafe extern "C" fn(), flags: u32) -> Result<(u64, u64), Detail> {
+    let top = own_stack()?;
+    let rec = rt::SpawnArgs {
+        entry: entry as usize as u64,
+        flags: rt::abi::spawn::CALLER_STACK | flags,
+        sp: top,
+        ..rt::SpawnArgs::default()
+    };
+    let r = ok(sys::thread_spawn(me()?, &rec), "thread_spawn")?;
+    Ok((r.a1 as u64, r.a2 as u64))
+}
+
+fn ex1_pause(ticks: u64) -> Result<(), Detail> {
+    let gate = event()?;
+    let _ = sys::object_wait(gate, 1 << 24, sys::clock_get() + ticks);
+    sys::handle_close(gate);
+    Ok(())
+}
+
+fn ex1_signals(t: u64) -> u32 {
+    sys::object_signals(t).a1 as u32
+}
+
+fn ex1_read(t: u64) -> Result<[u64; 32], Detail> {
+    let mut g = [0u64; 32];
+    ok(
+        sys::thread_read_state(t, GENERAL, g.as_mut_ptr() as *mut u8, 256),
+        "thread_read_state",
+    )?;
+    Ok(g)
+}
+
+fn ex1_write(t: u64, g: &[u64; 32]) -> Option<S> {
+    st(sys::thread_write_state(
+        t,
+        GENERAL,
+        g.as_ptr() as *const u8,
+        256,
+    ))
+}
+
+/// A running thread is suspended (it stops, its object says SUSPENDED), its registers are read twice (the same) and one is written: after
+/// the resume the thread sees the value. The resume of a thread that is not suspended is BAD_STATE.
+fn thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written() -> Outcome {
+    let (t, tid) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(3)?;
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        0,
+        "a running thread is not SUSPENDED"
+    );
+    ensure_eq!(
+        st(sys::thread_resume(t)),
+        Some(S::BadState),
+        "resume of a thread that is not suspended"
+    );
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    let r = sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "SUSPENDED rises");
+    let (g1, g2) = (ex1_read(t)?, ex1_read(t)?);
+    ensure_eq!(g1, g2, "a stopped thread's registers do not change");
+    let entry = ex1_spin_a1 as *const () as usize as u64;
+    ensure!(
+        g1[31] >= entry && g1[31] < entry + 16,
+        "the pc {:#x} is in the spin loop at {entry:#x}",
+        g1[31]
+    );
+    ensure_eq!(g1[10], tid, "a1 is the tid a spawned thread starts with");
+    let mut w = g1;
+    w[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &w), Some(S::Ok), "write a1");
+    ensure_eq!(ex1_read(t)?, w, "what was written reads back");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "the thread saw the new a1 and ended");
+    ensure_eq!(
+        sys::thread_info(t).a1,
+        77,
+        "its exit code says it saw the value"
+    );
+    Ok(())
+}
+
+/// The signal-injection sequence: stop a thread, point its pc at a handler (leaving the old pc where the handler returns to), let it run the
+/// handler, and see it continue where it was.
+fn a_stopped_thread_can_be_sent_to_a_handler_and_back() -> Outcome {
+    EX1_HITS.store(0, Ordering::SeqCst);
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut g = ex1_read(t)?;
+    let old_pc = g[31];
+    g[30] = old_pc; // t6 (x31) is word 30
+    g[31] = ex1_handler as *const () as usize as u64;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "point the pc at the handler");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ex1_pause(3)?;
+    ensure_eq!(EX1_HITS.load(Ordering::SeqCst), 1, "the handler ran once");
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "stop it again");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped again"
+    );
+    let mut g = ex1_read(t)?;
+    ensure!(
+        g[31] >= ex1_spin_a1 as *const () as usize as u64
+            && g[31] < ex1_spin_a1 as *const () as usize as u64 + 16,
+        "back in the loop at {:#x}",
+        g[31]
+    );
+    g[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "set a1");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 77, "having gone back to its loop");
+    // (another thread redirected to a function of its own)
+    let (u, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    ensure_eq!(st(sys::thread_suspend(u)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(u, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut g = ex1_read(u)?;
+    g[31] = ex1_exit_55 as *const () as usize as u64;
+    ensure_eq!(ex1_write(u, &g), Some(S::Ok), "redirect the pc");
+    ensure_eq!(st(sys::thread_resume(u)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(u, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(sys::thread_info(u).a1, 55, "at the new pc");
+    Ok(())
+}
+
+/// A thread started SUSPENDED runs only after `thread_resume`, with the registers written beforehand (the `fork` child sequence).
+fn a_thread_started_suspended_runs_only_after_resume_with_registers_written_first() -> Outcome {
+    let top = own_stack()?;
+    let rec = |flags: u32| rt::SpawnArgs {
+        entry: ex1_spin_a1 as *const () as usize as u64,
+        flags: rt::abi::spawn::CALLER_STACK | flags,
+        sp: top,
+        ..rt::SpawnArgs::default()
+    };
+    ensure_eq!(
+        st(sys::thread_spawn(
+            me()?,
+            &rec(rt::abi::spawn::SUSPENDED | rt::abi::spawn::DETACHED)
+        )),
+        Some(S::InvalidArgs),
+        "SUSPENDED with DETACHED could never be resumed"
+    );
+    let r = ok(
+        sys::thread_spawn(me()?, &rec(rt::abi::spawn::SUSPENDED)),
+        "spawn SUSPENDED",
+    )?;
+    let (t, tid) = (r.a1 as u64, r.a2 as u64);
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        sig::SUSPENDED,
+        "SUSPENDED is up at once"
+    );
+    ex1_pause(4)?;
+    ensure_eq!(ex1_signals(t) & sig::TERMINATED, 0, "it has not run");
+    let mut g = ex1_read(t)?;
+    ensure_eq!(
+        g[31],
+        ex1_spin_a1 as *const () as usize as u64,
+        "it starts at its entry"
+    );
+    ensure_eq!(g[1], top, "with its stack");
+    ensure_eq!(g[10], tid, "and its tid in a1");
+    g[10] = EX1_MAGIC; // as a forked child is given its parent's registers with a return value changed
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write before it ever ran");
+    ex1_pause(3)?;
+    ensure_eq!(ex1_signals(t) & sig::TERMINATED, 0, "still not running");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(ex1_signals(t) & sig::SUSPENDED, 0, "SUSPENDED falls");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it runs and ends"
+    );
+    ensure_eq!(
+        sys::thread_info(t).a1,
+        77,
+        "from the registers that were written"
+    );
+    Ok(())
+}
+
+/// The refusals, nesting, and a thread blocked in a call.
+fn suspend_and_state_calls_check_their_arguments_and_rights() -> Outcome {
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::BadState),
+        "read of a running thread"
+    );
+    ensure_eq!(
+        ex1_write(t, &g),
+        Some(S::BadState),
+        "write to a running thread"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            0,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::BadState),
+        "a thread cannot read its own registers"
+    );
+    let weak = weaker(t, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::thread_suspend(weak)),
+        Some(S::AccessDenied),
+        "suspend needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::thread_resume(weak)),
+        Some(S::AccessDenied),
+        "resume needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::thread_suspend(BAD)),
+        Some(S::BadHandle),
+        "suspend: bad handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::thread_suspend(ev)),
+        Some(S::WrongType),
+        "suspend: an event"
+    );
+    // nesting: two suspends, one resume leaves it suspended
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "and again");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "one resume");
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        sig::SUSPENDED,
+        "still suspended"
+    );
+    // the argument checks on a stopped thread
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            248
+        )),
+        Some(S::InvalidArgs),
+        "a length that is not the layout's"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            99,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::InvalidArgs),
+        "an unknown kind"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(t, GENERAL, 8 as *mut u8, 256)),
+        Some(S::InvalidArgs),
+        "a bad buffer"
+    );
+    let mut w = ex1_read(t)?;
+    let pc = w[31];
+    w[31] = rt::abi::user::TOP;
+    ensure_eq!(
+        ex1_write(t, &w),
+        Some(S::InvalidArgs),
+        "a pc that is not a user address"
+    );
+    w[31] = pc | 1;
+    ensure_eq!(
+        ex1_write(t, &w),
+        Some(S::InvalidArgs),
+        "a pc that is not 2-aligned"
+    );
+    w[31] = pc;
+    ensure_eq!(ex1_read(t)?[31], pc, "nothing changed");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "the second resume");
+    ensure_eq!(ex1_signals(t) & sig::SUSPENDED, 0, "SUSPENDED falls at 0");
+    ensure_eq!(
+        st(sys::thread_resume(t)),
+        Some(S::BadState),
+        "a third resume"
+    );
+    w[10] = EX1_MAGIC;
+    // (end it: suspend, set a1, resume)
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(ex1_write(t, &w), Some(S::Ok), "set a1");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(
+        st(sys::thread_suspend(t)),
+        Some(S::BadState),
+        "suspend of an ended thread"
+    );
+    // a thread blocked in a call has stopped where it is: SUSPENDED rises at once, its registers can be read, not written
+    let gate = event()?;
+    let b = new_thread(worker_wait_event, gate as usize)?;
+    ex1_pause(4)?;
+    ensure_eq!(
+        st(sys::thread_suspend(b)),
+        Some(S::Ok),
+        "suspend a blocked thread"
+    );
+    ensure_eq!(
+        sys::object_wait(b, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "SUSPENDED rises while it is blocked"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            b,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read it"
+    );
+    ensure_eq!(
+        ex1_write(b, &g),
+        Some(S::BadState),
+        "write is refused inside a blocking call"
+    );
+    ensure_eq!(st(sys::thread_resume(b)), Some(S::Ok), "resume it");
+    ensure_eq!(ex1_signals(b) & sig::SUSPENDED, 0, "SUSPENDED falls");
+    ensure_eq!(ex1_signals(b) & sig::TERMINATED, 0, "it goes on waiting");
+    // a suspend that arrives while it is blocked and a wake that ends the wait: it parks instead of returning
+    ensure_eq!(st(sys::thread_suspend(b)), Some(S::Ok), "suspend again");
+    ensure_eq!(
+        sys::object_wait(b, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(
+        st(sys::event_signal(gate, 0, 1 << 24)),
+        Some(S::Ok),
+        "end its wait"
+    );
+    ex1_pause(3)?;
+    ensure_eq!(
+        ex1_signals(b) & sig::TERMINATED,
+        0,
+        "it has not returned from its call: it is parked"
+    );
+    ensure_eq!(st(sys::thread_resume(b)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(b, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "now it returns and ends"
+    );
+    ensure_eq!(
+        WOKEN_STATUS.load(Ordering::SeqCst),
+        0,
+        "its wait had succeeded"
+    );
+    Ok(())
+}
+
+/// FP and vector state round-trip, and a thread started with FP state written for it uses it.
+fn fp_and_vector_state_round_trip_through_thread_state() -> Outcome {
+    let (t, _) = ex1_spawn(ex1_spin_f1, rt::abi::spawn::SUSPENDED)?;
+    let mut f = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            FPK,
+            f.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read FP of a thread that never used it"
+    );
+    ensure_eq!(f, [0u64; 33], "zeros");
+    f[1] = 0x123_4567;
+    f[10] = 0xdead_beef_0000_0001;
+    f[32] = 0x61; // fcsr: frm 3, fflags 1
+    ensure_eq!(
+        st(sys::thread_write_state(
+            t,
+            FPK,
+            f.as_ptr() as *const u8,
+            264
+        )),
+        Some(S::Ok),
+        "write FP"
+    );
+    let mut back = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            FPK,
+            back.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read FP"
+    );
+    ensure_eq!(back, f, "FP state round-trips");
+    // the vector unit, if there is one: find the register length by the size the call accepts
+    let mut vlen = 0;
+    for vlenb in [16usize, 32, 64, 128, 256] {
+        let n = 32 + 32 * vlenb;
+        let mut v = vec![0u8; n];
+        if st(sys::thread_read_state(t, VECK, v.as_mut_ptr(), n)) == Some(S::Ok) {
+            vlen = n;
+            ensure!(
+                v.iter().all(|&b| b == 0),
+                "a thread that never used the vector unit reads zeros"
+            );
+            for (i, b) in v.iter_mut().enumerate().skip(32) {
+                *b = (i % 251) as u8;
+            }
+            ensure_eq!(
+                st(sys::thread_write_state(t, VECK, v.as_ptr(), n)),
+                Some(S::Ok),
+                "write the vector state"
+            );
+            let mut w = vec![0u8; n];
+            ensure_eq!(
+                st(sys::thread_read_state(t, VECK, w.as_mut_ptr(), n)),
+                Some(S::Ok),
+                "read it back"
+            );
+            ensure!(v == w, "vector state round-trips");
+            break;
+        }
+    }
+    ensure!(
+        vlen != 0
+            || st(sys::thread_read_state(t, VECK, [0u8; 8].as_mut_ptr(), 8))
+                == Some(S::NotSupported),
+        "a machine without a vector unit says NOT_SUPPORTED"
+    );
+    // the thread starts with the FP state written for it: f1 holds the pattern it waits for
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ran and ended"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 66, "having seen f1");
     Ok(())
 }
 
@@ -11774,7 +12318,7 @@ fn thread_spawn_error_cases() -> Outcome {
                 ..good
             },
         ),
-        ("a reserved flag", rt::SpawnArgs { flags: 8, ..good }),
+        ("a reserved flag", rt::SpawnArgs { flags: 16, ..good }),
         (
             "the reserved word",
             rt::SpawnArgs {
@@ -12941,6 +13485,26 @@ pub fn app_main() -> i32 {
         (
             "copy_on_write_children_from_user_mode",
             copy_on_write_children_from_user_mode,
+        ),
+        (
+            "thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written",
+            thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written,
+        ),
+        (
+            "a_stopped_thread_can_be_sent_to_a_handler_and_back",
+            a_stopped_thread_can_be_sent_to_a_handler_and_back,
+        ),
+        (
+            "a_thread_started_suspended_runs_only_after_resume_with_registers_written_first",
+            a_thread_started_suspended_runs_only_after_resume_with_registers_written_first,
+        ),
+        (
+            "suspend_and_state_calls_check_their_arguments_and_rights",
+            suspend_and_state_calls_check_their_arguments_and_rights,
+        ),
+        (
+            "fp_and_vector_state_round_trip_through_thread_state",
+            fp_and_vector_state_round_trip_through_thread_state,
         ),
         (
             "touching_past_a_shrunk_vmo_ends_the_process_cleanly",

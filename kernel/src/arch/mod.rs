@@ -21,7 +21,7 @@ pub use aarch64::*;
 //   cpu.rs      aspace_token, aspace_token_asid, aspace_current, aspace_install, aspace_install_noflush, aspace_current_asid, icache_flush_local, asid_bits, tlb_flush_all, tlb_flush_page, cpu_idle,
 //               thread_pointer, set_thread_pointer, lazy_units_off, lazy_units_are_off, seed_csr_read, vlenb_read, enable_cache_block_ops
 //   switch.rs   Context (new), switch
-//   usermode.rs enter_user
+//   usermode.rs enter_user_frame
 //   trap.rs     TrapFrame (arg, set_return, decode_user, skip_trap_instruction), Fault, FaultKind, UserTrap
 //   sbi.rs      firmware calls and the secondary harts' entry
 //   boot, timer, irq, fp, aia, finisher: the boot path, the one-shot timer, interrupt masking, the lazily switched FP unit,

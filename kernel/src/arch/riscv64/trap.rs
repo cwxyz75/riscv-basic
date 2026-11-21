@@ -29,6 +29,15 @@ pub struct TrapFrame {
 }
 
 impl TrapFrame {
+    /// An all-zero frame (a hart's scratch frame, before it is filled).
+    pub const ZERO: TrapFrame = TrapFrame {
+        x: [0; 32],
+        sepc: 0,
+        scause: 0,
+        stval: 0,
+        sstatus: 0,
+    };
+
     /// Is this trap from user mode a system call? (The hot path: cheaper than building the whole decoded trap.)
     #[inline(always)]
     pub fn is_syscall(&self) -> bool {
@@ -68,6 +77,35 @@ impl TrapFrame {
     #[allow(clippy::indexing_slicing)] // INVARIANT: n < 32, the register count of the trap frame (callers pass constants)
     pub fn arg(&self, n: usize) -> u64 {
         self.x[n]
+    }
+
+    /// The registers of a thread that has not run yet (or of a frame being built for one): the GENERAL layout of `abi::thread_state` (x1 to x31,
+    /// then pc), user mode with interrupts on at the `sret`, the FP and vector units off.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the layout has 32 words; word 31 is the pc, words 0 to 30 are x1 to x31 (x has 32 slots)
+    pub fn from_general(words: &[u64; 32]) -> TrapFrame {
+        let mut f = TrapFrame {
+            x: [0; 32],
+            sepc: words[31],
+            scause: 0,
+            stval: 0,
+            sstatus: 1 << 5, // SPIE
+        };
+        f.x[1..].copy_from_slice(&words[..31]);
+        f
+    }
+
+    /// The user's registers in the GENERAL layout (x1 to x31, then pc).
+    pub fn general(&self) -> [u64; 32] {
+        let mut w = [0u64; 32];
+        w[..31].copy_from_slice(&self.x[1..]);
+        w[31] = self.sepc;
+        w
+    }
+
+    /// Replace the user's registers with the GENERAL layout (the caller has checked the pc).
+    pub fn set_general(&mut self, words: &[u64; 32]) {
+        self.x[1..].copy_from_slice(&words[..31]);
+        self.sepc = words[31];
     }
 
     /// Put syscall results in a0 (and a1, a2 when given).
@@ -204,6 +242,8 @@ trap_entry:
     sd   t0, 280(sp)
     mv   a0, sp
     call trap_handler
+    .globl trap_epilogue
+trap_epilogue:                   # a frame at sp (also entered by `enter_user_frame`): restore it and return
     ld   t0, 256(sp)
     csrw sepc, t0
     ld   t0, 280(sp)
