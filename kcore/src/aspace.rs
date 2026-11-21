@@ -470,6 +470,37 @@ impl Vmos {
         }
     }
 
+    /// Can the VMO take over the frame it inherits at `page` instead of copying it (KERNEL-V1-SPEC 4.3: "moves it, when no other leaf can see
+    /// it")? Only from a hidden node it hangs under directly, charged to the same job, when every other child of that node already holds
+    /// its own entry for the page or does not reach it: nothing else can then see the frame, and handing it over changes no one's contents
+    /// and no one's charge. Returns the node and the page in it.
+    fn takeover_source(&self, id: u64, page: u64) -> Option<(u64, u64)> {
+        let v = self.vmo(id)?;
+        let l = v.parent?;
+        if page >= v.inherit {
+            return None;
+        }
+        let op = page.checked_add(l.offset)?;
+        let o = self.vmo(l.id)?;
+        if !o.hidden || o.job != v.job || !matches!(o.committed.entry(op), Entry::Frame(_)) {
+            return None;
+        }
+        for &c in &o.children {
+            if c == id {
+                continue;
+            }
+            let cv = self.vmo(c)?;
+            let cl = cv.parent?;
+            // (a child that reaches the page and does not shadow it sees it: the node exists, so something reads through it)
+            if let Some(q) = op.checked_sub(cl.offset) {
+                if q < cv.inherit && cv.committed.entry(q) == Entry::None {
+                    return None;
+                }
+            }
+        }
+        Some((l.id, op))
+    }
+
     /// Does the VMO inherit pages from another (it is a child or the source of a SNAPSHOT)?
     pub fn has_parent(&self, id: u64) -> bool {
         self.vmo(id).is_some_and(|v| v.parent.is_some())
@@ -1311,6 +1342,20 @@ impl Vmos {
         // parent is seen)
         if !write && (inherits || hit == Some(Hit::Zero)) {
             return Ok((self.zero_frame(mm)?, false));
+        }
+        // No other node can see the inherited frame: take it over (nothing is allocated or charged; the writer's job already pays for it
+        // as part of the hidden node's pages, and the node and the writer are charged to the same job)
+        if let Some(Hit::Frame(pfn, false)) = hit {
+            if let Some((node, op)) = self.takeover_source(id, page) {
+                let inserted = Self::vmo_in(&mut self.slots, id)
+                    .is_some_and(|v| v.committed.insert(page, pfn).is_ok());
+                if inserted {
+                    if let Some(o) = Self::vmo_in(&mut self.slots, node) {
+                        o.committed.remove(op);
+                    }
+                    return Ok((pfn, true));
+                }
+            }
         }
         let copy_from = match hit {
             Some(Hit::Frame(pfn, _)) => Some(pfn),

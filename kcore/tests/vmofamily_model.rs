@@ -705,3 +705,48 @@ fn a_chain_of_children_is_at_most_64_deep_and_a_refusal_changes_nothing() {
         "no frame left, the zero frame included"
     );
 }
+
+#[test]
+fn a_write_takes_over_the_frame_when_no_other_leaf_can_see_it_and_copies_otherwise() {
+    let mut mm = Mm {
+        db: FrameDb::new(400, 100),
+        mem: FakeMem::default(),
+    };
+    let free0 = mm.db.free_count();
+    let mut vmos = Vmos::new();
+    let mut jobs = Jobs::new();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let src = vmos.create_in(&mut jobs, 2, job);
+    vmos.write(&mut mm, &mut jobs, src, 0, &[7]).unwrap();
+    vmos.write(&mut mm, &mut jobs, src, 4096, &[8]).unwrap();
+    vmos.reserve_n(2).unwrap();
+    let c = vmos
+        .child_prepare(&mut jobs, src, 0, 2, job, ChildMode::Snapshot)
+        .unwrap();
+    vmos.child_attach(&mut jobs, c, src, 0, 2, ChildMode::Snapshot);
+    assert_eq!(vmos.frames_held(), 2, "the hidden node holds the two pages");
+    // the source writes page 0: the child still sees it, so it is copied
+    vmos.write(&mut mm, &mut jobs, src, 0, &[70]).unwrap();
+    assert_eq!(vmos.frames_held(), 3, "a copy");
+    // the child writes page 0: the source holds its own, nothing else sees the old frame, so the child takes it over
+    let used = mm.db.free_count();
+    vmos.write(&mut mm, &mut jobs, c, 0, &[71]).unwrap();
+    assert_eq!(vmos.frames_held(), 3, "taken over, not copied");
+    assert_eq!(mm.db.free_count(), used, "no frame was taken");
+    // page 1 is still seen by both: the first writer copies, the second takes over
+    vmos.write(&mut mm, &mut jobs, c, 4096, &[81]).unwrap();
+    assert_eq!(vmos.frames_held(), 4, "a copy");
+    vmos.write(&mut mm, &mut jobs, src, 4096, &[80]).unwrap();
+    assert_eq!(vmos.frames_held(), 4, "taken over");
+    let mut b = [0u8; 1];
+    for (id, page, want) in [(src, 0, 70), (c, 0, 71), (src, 1, 80), (c, 1, 81)] {
+        vmos.read(&mut mm, id, page * 4096, &mut b).unwrap();
+        assert_eq!(b[0], want, "vmo {id} page {page}");
+    }
+    vmos.audit_families().unwrap();
+    for id in [src, c] {
+        vmos.release(&mut mm, &mut jobs, id).unwrap();
+    }
+    assert_eq!(vmos.count(), 0);
+    assert_eq!(mm.db.free_count(), free0);
+}
