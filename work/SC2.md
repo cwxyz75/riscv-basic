@@ -4,7 +4,7 @@ kind: slice
 title: Placement without visiting every hart; scaling measured at 16 and 32 harts
 area: sched
 horizon: long
-blocked_by: [SC1, L20]
+blocked_by: [L20]
 refs: [KERNEL-V1-SPEC, SCHED-SMP-SPEC]
 ---
 
