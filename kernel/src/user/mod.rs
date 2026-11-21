@@ -157,6 +157,16 @@ pub fn futex_sleepers() -> usize {
     irq::without(|| state().futexes.len())
 }
 
+/// Threads waiting for a pager and pagers still alive (for leak checks, PG1).
+pub fn pager_leftovers() -> usize {
+    irq::without(|| {
+        state()
+            .pagers
+            .waits()
+            .saturating_add(state().pager_ends.len())
+    })
+}
+
 /// The number of live kernel objects (for leak checks).
 pub fn live_objects() -> usize {
     irq::without(|| state().objs.live())

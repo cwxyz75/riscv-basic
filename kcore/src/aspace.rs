@@ -38,6 +38,17 @@ pub enum FaultError {
     /// The page table refused the mapping for a reason other than memory (for
     /// example something is already mapped there with other permissions).
     MapFailed(MapError),
+    /// The page is absent and its VMO is backed by a pager (MM9): the caller asks the pager and waits.
+    NeedPager(PagerNeed),
+}
+
+/// A page of a pager's VMO that nobody has supplied (MM9): which pager to ask, the VMO it made (the root of the family the access went through)
+/// and the page in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerNeed {
+    pub pager: u64,
+    pub vmo: u64,
+    pub page: u64,
 }
 
 /// What a fault's first step found (`AddressSpace::fault_lookup`).
@@ -154,6 +165,10 @@ pub enum VmoError {
     JobMismatch,
     /// A VMO with children cannot change size (KERNEL-V1-SPEC 3.5).
     HasChildren,
+    /// The access needs a page of a pager's VMO that has not been supplied (MM9; `Vmos::take_need` says which).
+    NeedPager,
+    /// Not a pager VMO, or the pages are not the source's own to give.
+    NotSuppliable,
     /// Make the child of a device or DMA VMO: their frames are fixed.
     NotCopyable,
 }
@@ -221,6 +236,8 @@ struct Vmo {
     hidden: bool,
     /// The VMO has had a parent (it may hold translations of the shared zero frame even after a merge made it a root).
     had_parent: bool,
+    /// Made by `pager_create_vmo` (MM9): the pager and the key its requests carry. A page nobody has supplied is not zero: it is asked for.
+    pager: Option<(u64, u64)>,
 }
 
 struct VmoSlot {
@@ -246,6 +263,8 @@ pub struct Vmos {
     zero: Option<Pfn>,
     /// The zero frame was made by `ensure_zero` (the kernel, at boot): it stays when the last VMO goes. A lazily made one goes with it.
     zero_pinned: bool,
+    /// The last page a pager must supply that an access found absent (set by `page_for`; the kernel takes it after a call that failed with it).
+    need: Option<PagerNeed>,
 }
 
 /// Set when `Vmos::copy_log` has entries: the kernel looks here after every call and fault, so the common case costs one load.
@@ -350,6 +369,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            pager: None,
             inherit: 0,
         })
     }
@@ -370,6 +390,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            pager: None,
             inherit: 0,
         })
     }
@@ -410,6 +431,7 @@ impl Vmos {
             children: alloc::vec::Vec::new(),
             hidden: false,
             had_parent: false,
+            pager: None,
             inherit: 0,
         }))
     }
@@ -466,6 +488,195 @@ impl Vmos {
             own = false;
         }
         None
+    }
+
+    /// The pager page a lookup of `page` in `id` that found nothing needs (MM9): the first node on the way up that has a pager, with the page
+    /// in it. `None` when the page reads as zeros (it is past what a child inherits) or no node has a pager.
+    fn pager_need(&self, id: u64, page: u64) -> Option<PagerNeed> {
+        let (mut cur, mut page) = (id, page);
+        for _ in 0..=MAX_FAMILY_DEPTH {
+            let v = self.vmo(cur)?;
+            if let Some((pager, _)) = v.pager {
+                return Some(PagerNeed {
+                    pager,
+                    vmo: cur,
+                    page,
+                });
+            }
+            let link = v.parent?;
+            if page >= v.inherit {
+                return None;
+            }
+            page = page.checked_add(link.offset)?;
+            cur = link.id;
+        }
+        None
+    }
+
+    /// Does some node above `id` (inclusive) have a pager?
+    fn pager_in_chain(&self, id: u64) -> bool {
+        let mut cur = id;
+        for _ in 0..=MAX_FAMILY_DEPTH {
+            let Some(v) = self.vmo(cur) else {
+                return false;
+            };
+            if v.pager.is_some() {
+                return true;
+            }
+            match v.parent {
+                Some(l) => cur = l.id,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// The page a pager must supply that the last failed access needed (taken: the kernel asks for it once).
+    pub fn take_need(&mut self) -> Option<PagerNeed> {
+        self.need.take()
+    }
+
+    /// A VMO whose pages come from `pager` (MM9): nothing is committed; an access to a page nobody has supplied is a `NeedPager`. The key is what
+    /// the pager's requests for it carry.
+    pub fn create_pager_in(
+        &mut self,
+        jobs: &mut Jobs,
+        pages: u64,
+        job: JobId,
+        pager: u64,
+        key: u64,
+    ) -> u64 {
+        let id = self.create_in(jobs, pages, job);
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.pager = Some((pager, key));
+        }
+        id
+    }
+
+    /// The pager and key of a VMO made by `create_pager_in`.
+    pub fn pager_of(&self, id: u64) -> Option<(u64, u64)> {
+        self.vmo(id).and_then(|v| v.pager)
+    }
+
+    /// Give pages `spage ..` of `src` to pages `dpage .. dpage + count` of the pager VMO `dst` (MM9 `pager_supply`): the frames **move**, nothing
+    /// is copied, and the charge moves with them from the source's job to the destination's. The source must be a plain VMO of its own (no
+    /// parent, no children, no pager) with every page of the range committed, and **the caller has already unmapped those pages from every
+    /// address space** (a frame a mapping still holds is `NotSuppliable`). A destination page that has a frame already is left as it is, and the
+    /// source keeps its page. On `Err((moved, e))` the first `moved` pages did move.
+    /// Everything `supply` checks about its arguments except that no mapping holds a source frame: the caller runs this **before** it unmaps
+    /// the source, so a call that is going to be refused takes no translation away.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `supply`
+    pub fn supply_check(
+        &self,
+        dst: u64,
+        dpage: u64,
+        count: u64,
+        src: u64,
+        spage: u64,
+    ) -> Result<(), VmoError> {
+        let d = self.vmo(dst).ok_or(VmoError::Gone)?;
+        if d.pager.is_none() || d.kind != VmoKind::Plain {
+            return Err(VmoError::NotSuppliable);
+        }
+        let s = self.vmo(src).ok_or(VmoError::Gone)?;
+        if s.kind != VmoKind::Plain
+            || s.pager.is_some()
+            || s.parent.is_some()
+            || !s.children.is_empty()
+            || s.hidden
+        {
+            return Err(VmoError::NotSuppliable);
+        }
+        let dend = dpage.checked_add(count).ok_or(VmoError::OutOfRange)?;
+        let send = spage.checked_add(count).ok_or(VmoError::OutOfRange)?;
+        if dend > d.pages || send > s.pages {
+            return Err(VmoError::OutOfRange);
+        }
+        if (0..count).any(|i| !s.committed.contains(spage + i)) {
+            return Err(VmoError::NotSuppliable);
+        }
+        Ok(())
+    }
+
+    /// Does the page of a pager's VMO still have to be supplied (the VMO is there and has no frame for it)?
+    pub fn still_needed(&self, need: PagerNeed) -> bool {
+        self.vmo(need.vmo).is_some_and(|v| {
+            v.pager.is_some() && v.pages > need.page && !v.committed.contains(need.page)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: the ranges were checked against both sizes first, so the sums are bounded by the VMO sizes
+    pub fn supply<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        dst: u64,
+        dpage: u64,
+        count: u64,
+        src: u64,
+        spage: u64,
+    ) -> Result<u64, (u64, VmoError)> {
+        let d = self.vmo(dst).ok_or((0, VmoError::Gone))?;
+        if d.pager.is_none() || d.kind != VmoKind::Plain {
+            return Err((0, VmoError::NotSuppliable));
+        }
+        let s = self.vmo(src).ok_or((0, VmoError::Gone))?;
+        if s.kind != VmoKind::Plain
+            || s.pager.is_some()
+            || s.parent.is_some()
+            || !s.children.is_empty()
+            || s.hidden
+        {
+            return Err((0, VmoError::NotSuppliable));
+        }
+        let dend = dpage.checked_add(count).ok_or((0, VmoError::OutOfRange))?;
+        let send = spage.checked_add(count).ok_or((0, VmoError::OutOfRange))?;
+        if dend > d.pages || send > s.pages {
+            return Err((0, VmoError::OutOfRange));
+        }
+        let (djob, sjob) = (d.job, s.job);
+        // every source page must be there and held by nothing but the VMO (nothing maps it any more)
+        for i in 0..count {
+            match s.committed.get(spage + i) {
+                Some(pfn) if mm.db.refs(pfn) == Some(1) => {}
+                _ => return Err((0, VmoError::NotSuppliable)),
+            }
+        }
+        let mut moved = 0u64;
+        for i in 0..count {
+            let have = self
+                .vmo(dst)
+                .is_some_and(|v| v.committed.contains(dpage + i));
+            if have {
+                moved += 1; // (already supplied: the waiter is served as well)
+                continue;
+            }
+            if djob != sjob && jobs.charge(djob, Resource::Pages, 1).is_err() {
+                return Err((moved, VmoError::NoMemory));
+            }
+            let Some(pfn) =
+                Self::vmo_in(&mut self.slots, src).and_then(|v| v.committed.remove(spage + i))
+            else {
+                return Err((moved, VmoError::NotSuppliable));
+            };
+            let inserted = Self::vmo_in(&mut self.slots, dst)
+                .is_some_and(|v| v.committed.insert(dpage + i, pfn).is_ok());
+            if !inserted {
+                // (put it back where it was: the slot was just emptied, so this cannot need a new node)
+                if let Some(v) = Self::vmo_in(&mut self.slots, src) {
+                    let _ = v.committed.insert(spage + i, pfn);
+                }
+                if djob != sjob {
+                    jobs.credit(djob, Resource::Pages, 1);
+                }
+                return Err((moved, VmoError::NoMemory));
+            }
+            if djob != sjob {
+                jobs.credit(sjob, Resource::Pages, 1);
+            }
+            moved += 1;
+        }
+        Ok(moved)
     }
 
     /// `lookup_hit`, for the callers that want a frame (a hole, like nothing, has none).
@@ -621,6 +832,11 @@ impl Vmos {
         if mode == ChildMode::Snapshot && src.job != job {
             return Err(VmoError::JobMismatch);
         }
+        // (a SNAPSHOT would move the pager VMO's pages into a hidden node the pager cannot reach: only a PRIVATE child, which asks the parent's
+        // pager for what it inherits)
+        if mode == ChildMode::Snapshot && (src.pager.is_some() || self.pager_in_chain(source)) {
+            return Err(VmoError::NotCopyable);
+        }
         // (the longest chain after the call: a SNAPSHOT puts a node above the source and everything below it, a PRIVATE child is one
         // below the source; the walk of a lookup stops at `MAX_FAMILY_DEPTH` links, so no chain may pass that)
         let up = self.depth(source);
@@ -670,6 +886,7 @@ impl Vmos {
             children: stash,
             hidden: false,
             had_parent: false,
+            pager: None,
             inherit: 0,
         }))
     }
@@ -737,6 +954,7 @@ impl Vmos {
                         children: kids,
                         hidden: true,
                         had_parent: old_parent.is_some(),
+                        pager: None,
                         inherit: old_inherit,
                     });
                     if let Some(l) = old_parent {
@@ -1045,6 +1263,19 @@ impl Vmos {
         if end > vmo.pages * PAGE_SIZE {
             return Err(VmoError::OutOfRange);
         }
+        // (MM9) a page of a pager's VMO that nobody has supplied is asked for, not read as zeros; nothing is copied until every page is there
+        if len > 0 {
+            let mut page = offset / PAGE_SIZE;
+            while page * PAGE_SIZE < end {
+                if self.lookup_hit(id, page).is_none() {
+                    if let Some(need) = self.pager_need(id, page) {
+                        self.need = Some(need);
+                        return Err(VmoError::NeedPager);
+                    }
+                }
+                page += 1;
+            }
+        }
         let mut done = 0;
         while done < len {
             let at = offset + done as u64;
@@ -1088,7 +1319,10 @@ impl Vmos {
         let mut at = offset;
         while at < end {
             self.page_for(mm, jobs, None, id, at / PAGE_SIZE, true, true)
-                .map_err(|_| VmoError::NoMemory)?;
+                .map_err(|e| match e {
+                    FaultError::NeedPager(_) => VmoError::NeedPager,
+                    _ => VmoError::NoMemory,
+                })?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
         let vmo = self.vmo(id).expect("exists");
@@ -1142,7 +1376,7 @@ impl Vmos {
             }
             match self.page_for(mm, jobs, None, id, page, true, false) {
                 Ok(_) => done.push(page),
-                Err(_) => {
+                Err(e) => {
                     // undo this call's commits: frames back, charges back
                     let vmo = Self::vmo_in(&mut self.slots, id).expect("checked above");
                     for p in done {
@@ -1151,7 +1385,10 @@ impl Vmos {
                             jobs.credit(vmo.job, Resource::Pages, 1);
                         }
                     }
-                    return Err(VmoError::NoMemory);
+                    return Err(match e {
+                        FaultError::NeedPager(_) => VmoError::NeedPager,
+                        _ => VmoError::NoMemory,
+                    });
                 }
             }
         }
@@ -1349,6 +1586,13 @@ impl Vmos {
         if let Some(Hit::Frame(pfn, own)) = hit {
             if own || !write {
                 return Ok((pfn, own));
+            }
+        }
+        // (MM9) a page nobody has, in a family that has a pager: it is asked for, not zero
+        if hit.is_none() {
+            if let Some(need) = self.pager_need(id, page) {
+                self.need = Some(need);
+                return Err(FaultError::NeedPager(need));
             }
         }
         // (a hole, or nothing in a VMO that inherits: a read maps the shared zero frame and commits nothing, so that a later change by the

@@ -4090,6 +4090,389 @@ fn a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_
     Ok(())
 }
 
+// ---- MM9: pagers ----
+
+static PG_PAGER: AtomicU64 = AtomicU64::new(0);
+static PG_CH: AtomicU64 = AtomicU64::new(0);
+static PG_VMO: AtomicU64 = AtomicU64::new(0);
+static PG_STOP: AtomicU32 = AtomicU32::new(0);
+static PG_SERVED: AtomicU32 = AtomicU32::new(0);
+static PG_BAD: AtomicU32 = AtomicU32::new(0);
+static PG_SEEN: AtomicU32 = AtomicU32::new(0);
+const PG_KEY: u64 = 0x5eed;
+const PG_PAGES: u64 = 16;
+const PG_MAP: u64 = 0x5c0_0000;
+
+/// A pager thread: serves each request on the channel by filling a page with `page + 1` and moving it in with `pager_supply`.
+extern "C" fn pg_server(_arg: usize) -> ! {
+    while PG_STOP.load(Ordering::SeqCst) == 0 {
+        let ch = PG_CH.load(Ordering::SeqCst);
+        if sys::object_wait(ch, sig::READABLE, sys::clock_get() + 20).status != 0 {
+            continue;
+        }
+        let mut b = [0u8; 40];
+        let r = sys::channel_read(ch, b.as_mut_ptr(), 40, core::ptr::null_mut(), 0);
+        if r.status != 0 || r.a1 != 40 {
+            continue;
+        }
+        let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        let (key, off, len, kind) = (w(0), w(1), w(2), w(3));
+        if key != PG_KEY || kind != rt::abi::pager::READ || len != 4096 || off % 4096 != 0 {
+            PG_BAD.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+        let src = sys::vmo_create(1).a1 as u64;
+        let fill = [(off / 4096 + 1) as u8; 4096];
+        sys::vmo_write(src, 0, fill.as_ptr(), 4096);
+        let r = sys::pager_supply(
+            PG_PAGER.load(Ordering::SeqCst),
+            PG_VMO.load(Ordering::SeqCst),
+            off,
+            4096,
+            src,
+            0,
+        );
+        sys::handle_close(src);
+        if r.status == 0 {
+            PG_SERVED.fetch_add(1, Ordering::SeqCst);
+        } else {
+            PG_BAD.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    sys::thread_exit(0)
+}
+
+/// A pager, the channel its requests arrive on, and a VMO of `PG_PAGES` pages of it.
+fn pager_vmo() -> Result<(u64, u64, u64), Detail> {
+    let r = ok(sys::pager_create(), "pager_create")?;
+    let (pager, ch) = (r.a1 as u64, r.a2 as u64);
+    let v = ok(
+        sys::pager_create_vmo(pager, PG_KEY, PG_PAGES * 4096),
+        "pager_create_vmo",
+    )?
+    .a1 as u64;
+    Ok((pager, ch, v))
+}
+
+/// Read one request from `ch`: (key, offset, length, kind).
+fn pager_request(ch: u64) -> Result<(u64, u64, u64, u64), Detail> {
+    let r = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 1000);
+    ensure_eq!(r.status, 0, "a request arrives");
+    let mut b = [0u8; 40];
+    let r = ok(
+        sys::channel_read(ch, b.as_mut_ptr(), 40, core::ptr::null_mut(), 0),
+        "read the request",
+    )?;
+    ensure_eq!(r.a1, 40, "40 bytes");
+    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    Ok((w(0), w(1), w(2), w(3)))
+}
+
+/// Start a child (`launch(110)`) that reads page 3 of `v` (a copy of the handle is sent to it).
+fn pager_reader(v: u64) -> Result<(u64, u64), Detail> {
+    let (p, m) = launch(110)?;
+    let dup = ok(
+        sys::handle_duplicate(v, Rights::SAME.0),
+        "duplicate the VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::channel_write(m, b"v".as_ptr(), 1, &dup, 1)),
+        Some(S::Ok),
+        "send the VMO"
+    );
+    Ok((p, m))
+}
+
+/// MM9: a pager thread serves a 16-page VMO; a reader in another process and a kernel copy in this one both see the pattern.
+fn a_pager_serves_a_vmo_to_a_reader_in_another_process() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, PG_PAGES * 4096, "its size");
+    ensure_eq!(
+        st(sys::vmo_commit(v, 0, 4096)),
+        Some(S::AccessDenied),
+        "no COMMIT: it would put zeros where the pager's data belongs"
+    );
+    let mine = ok(sys::handle_duplicate(v, Rights::SAME.0), "duplicate")?.a1 as u64;
+    PG_PAGER.store(pager, Ordering::SeqCst);
+    PG_CH.store(ch, Ordering::SeqCst);
+    PG_VMO.store(mine, Ordering::SeqCst);
+    PG_STOP.store(0, Ordering::SeqCst);
+    PG_SERVED.store(0, Ordering::SeqCst);
+    PG_BAD.store(0, Ordering::SeqCst);
+    let server = new_thread(pg_server, 0)?;
+    // a kernel copy of an absent page asks the pager and waits; the call then says "try again", and the page is there
+    let mut b = [0u8; 8];
+    let mut tries = 0;
+    loop {
+        let r = sys::vmo_read(v, 5 * 4096 + 8, b.as_mut_ptr(), 8);
+        if r.status == 0 {
+            break;
+        }
+        ensure_eq!(
+            st(r),
+            Some(S::ShouldWait),
+            "a kernel copy waits for the pager"
+        );
+        tries += 1;
+        ensure!(tries < 10, "the page never arrived");
+    }
+    ensure_eq!(b, [6u8; 8], "page 5 holds 5 + 1");
+    // another process reads page 3 through its own mapping
+    let (p, _m) = pager_reader(v)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        4,
+        "it saw page 3 hold 3 + 1"
+    );
+    PG_STOP.store(1, Ordering::SeqCst);
+    ensure_eq!(
+        sys::object_wait(server, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the pager thread ends"
+    );
+    ensure_eq!(
+        PG_BAD.load(Ordering::SeqCst),
+        0,
+        "every request was well formed"
+    );
+    ensure!(
+        PG_SERVED.load(Ordering::SeqCst) >= 2,
+        "it served both pages"
+    );
+    for h in [v, mine, pager, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM9 (PG1): a reader killed while it waits for a pager leaves nothing behind, and a slow pager stops nobody else.
+fn killing_a_reader_waiting_for_a_pager_leaks_nothing() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    let (p, _m) = pager_reader(v)?;
+    let (key, off, len, kind) = pager_request(ch)?;
+    ensure_eq!(
+        (key, off, len, kind),
+        (PG_KEY, 3 * 4096, 4096, rt::abi::pager::READ),
+        "it asked for page 3, with the VMO's key"
+    );
+    // the pager does nothing: the reader waits, and everyone else goes on
+    let (q, _mq) = launch(8)?;
+    wait_ended(q, 500)?;
+    ensure_eq!(
+        st(sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 4)),
+        Some(S::TimedOut),
+        "the reader is still waiting"
+    );
+    ensure_eq!(st(sys::process_kill(p, -5)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -5, "its exit code");
+    // (the kernel checks after init that no waiter or pager is left)
+    for h in [v, pager, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM9: a pager that goes away fails the reader waiting for it with a PAGER fault.
+fn a_pager_that_dies_fails_the_reader_with_a_pager_fault() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    let (p, _m) = pager_reader(v)?;
+    pager_request(ch)?;
+    ensure_eq!(
+        st(sys::handle_close(pager)),
+        Some(S::Ok),
+        "the pager's last handle goes"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        i64::from(rt::abi::arch::fault::exit_code(rt::abi::arch::fault::PAGER)),
+        "the reader ended with a PAGER fault"
+    );
+    for h in [v, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+extern "C" fn pg_reader(_arg: usize) -> ! {
+    // SAFETY: PG_MAP is the test's read-write mapping of the pager's VMO; the read waits for page 2.
+    let b = unsafe { core::ptr::read_volatile((PG_MAP + 2 * 4096) as *const u8) };
+    PG_SEEN.store(u32::from(b), Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// MM9: `pager_fail` makes the waiting thread take a PAGER exception with the status as its cause; the handler supplies the page and RETRYs.
+fn a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry() -> Outcome {
+    let me = me()?;
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(
+        st(sys::process_map(
+            me,
+            v,
+            PG_MAP,
+            0,
+            PG_PAGES * 4096,
+            PF_R | PF_W
+        )),
+        Some(S::Ok),
+        "map the pager's VMO"
+    );
+    let ech = ok(sys::process_exception_channel(me), "the channel")?.a1 as u64;
+    PG_SEEN.store(0, Ordering::SeqCst);
+    let t = new_thread(pg_reader, 0)?;
+    let (_, off, _, _) = pager_request(ch)?;
+    ensure_eq!(off, 2 * 4096, "it asked for page 2");
+    ensure_eq!(
+        st(sys::pager_fail(
+            pager,
+            v,
+            2 * 4096,
+            4096,
+            S::TimedOut.code()
+        )),
+        Some(S::Ok),
+        "fail it"
+    );
+    let (kind, _tid, _pc, addr, cause, th, eh) = ex2_message(ech)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::PAGER),
+        "a PAGER fault"
+    );
+    ensure_eq!(addr, PG_MAP + 2 * 4096, "at the page");
+    ensure_eq!(
+        cause,
+        S::TimedOut.code() as i64 as u64,
+        "with the pager's status as the cause"
+    );
+    // the handler supplies the page after all and retries
+    let src = vmo(1)?;
+    let fill = [0x77u8; 4096];
+    ensure_eq!(
+        st(sys::vmo_write(src, 0, fill.as_ptr(), 4096)),
+        Some(S::Ok),
+        "fill a page"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 2 * 4096, 4096, src, 0)),
+        Some(S::Ok),
+        "supply it"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::Ok),
+        "RETRY"
+    );
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the reader goes on"
+    );
+    ensure_eq!(
+        PG_SEEN.load(Ordering::SeqCst),
+        0x77,
+        "and reads the page the handler supplied"
+    );
+    for h in [eh, th, ech, src, v, pager, ch] {
+        sys::handle_close(h);
+    }
+    ensure_eq!(st(sys::process_unmap(me, PG_MAP)), Some(S::Ok), "unmap");
+    Ok(())
+}
+
+/// MM9: the argument rows of the pager calls, the reserved dirty-tracking names, and PRIVATE children of a pager's VMO.
+fn pager_calls_check_their_arguments() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(
+        st(sys::pager_create_vmo(BAD, 1, 4096)),
+        Some(S::BadHandle),
+        "bad pager handle"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(v, 1, 4096)),
+        Some(S::WrongType),
+        "a VMO is not a pager"
+    );
+    let weak = weaker(pager, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::pager_create_vmo(weak, 1, 4096)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(pager, 1, 0)),
+        Some(S::InvalidArgs),
+        "zero bytes"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(pager, 1, 100)),
+        Some(S::InvalidArgs),
+        "not a whole page"
+    );
+    let src = vmo(1)?;
+    let plain = vmo(1)?;
+    let ro = weaker(src, Rights::READ.0)?;
+    ensure_eq!(
+        st(sys::pager_supply(pager, plain, 0, 4096, src, 0)),
+        Some(S::InvalidArgs),
+        "not a pager's VMO"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 1, 4096, src, 0)),
+        Some(S::InvalidArgs),
+        "offset not aligned"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 0, 4096, ro, 0)),
+        Some(S::AccessDenied),
+        "the source needs WRITE"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 0, 4096, src, 0)),
+        Some(S::BadState),
+        "nothing committed in the source"
+    );
+    ensure_eq!(
+        st(sys::pager_fail(pager, v, 0, 4096, 0)),
+        Some(S::InvalidArgs),
+        "OK is not a failure"
+    );
+    ensure_eq!(
+        st(sys::pager_query_dirty()),
+        Some(S::NotSupported),
+        "dirty tracking is reserved"
+    );
+    ensure_eq!(
+        st(sys::pager_writeback_done()),
+        Some(S::NotSupported),
+        "writeback is reserved"
+    );
+    // a SNAPSHOT of a pager's VMO is refused; a PRIVATE child is made (it asks the parent's pager for what it inherits)
+    ensure_eq!(
+        st(sys::vmo_create_child(
+            v,
+            0,
+            4096,
+            0,
+            rt::abi::child_flags::SNAPSHOT
+        )),
+        Some(S::NotSupported),
+        "no SNAPSHOT of a pager's VMO"
+    );
+    let c = ok(
+        sys::vmo_create_child(v, 0, 4096, 0, rt::abi::child_flags::PRIVATE),
+        "a PRIVATE child",
+    )?
+    .a1 as u64;
+    for h in [c, ro, plain, src, weak, v, pager, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 /// MM6: a mapping that outlives a shrink: touching the part of it past the VMO's new end ends the process with a page fault.
 fn touching_past_a_shrunk_vmo_ends_the_process_cleanly() -> Outcome {
     let (p, _m) = launch(100)?;
@@ -13886,6 +14269,26 @@ pub fn app_main() -> i32 {
         (
             "a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped",
             a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped,
+        ),
+        (
+            "a_pager_serves_a_vmo_to_a_reader_in_another_process",
+            a_pager_serves_a_vmo_to_a_reader_in_another_process,
+        ),
+        (
+            "killing_a_reader_waiting_for_a_pager_leaks_nothing",
+            killing_a_reader_waiting_for_a_pager_leaks_nothing,
+        ),
+        (
+            "a_pager_that_dies_fails_the_reader_with_a_pager_fault",
+            a_pager_that_dies_fails_the_reader_with_a_pager_fault,
+        ),
+        (
+            "a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry",
+            a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry,
+        ),
+        (
+            "pager_calls_check_their_arguments",
+            pager_calls_check_their_arguments,
         ),
         (
             "suspend_and_state_calls_check_their_arguments_and_rights",

@@ -5,7 +5,7 @@
 //! bytes then move through the direct map. Anything else is `INVALID_ARGS`, and a call
 //! that fails changes no user memory.
 
-use crate::aspace::{Access, AddressSpace, Vmos};
+use crate::aspace::{Access, AddressSpace, FaultError, Vmos};
 use crate::frame::PAGE_SIZE;
 use crate::job::Jobs;
 use crate::pagetable::PhysMem;
@@ -31,7 +31,11 @@ fn resolve<M: PhysMem>(
     if t.is_none() || cow {
         aspace
             .handle_fault(mm, vmos, jobs, page, access)
-            .map_err(|_| Status::InvalidArgs)?;
+            .map_err(|e| match e {
+                // (MM9) the page is not supplied yet: the kernel asks the pager, waits, and the call answers "try again"
+                FaultError::NeedPager(_) => Status::ShouldWait,
+                _ => Status::InvalidArgs,
+            })?;
         t = aspace.table().translate(mm, page);
     }
     let t = t.ok_or(Status::InvalidArgs)?;

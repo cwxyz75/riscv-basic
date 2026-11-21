@@ -23,6 +23,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             | nr::VMO_GET_SIZE
             | nr::VMO_READ
             | nr::VMO_WRITE
+            | nr::PAGER_CREATE_VMO
     ) {
         return None;
     }
@@ -65,6 +66,32 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 id,
+                &mut ipc::Quota {
+                    jobs,
+                    job: Some(job),
+                },
+            ) {
+                Ok(h) => Ok((Some(h.0), None)),
+                Err(e) => {
+                    let _ = vmos.release(mm, jobs, id);
+                    fail(e)
+                }
+            }
+        }
+        nr::PAGER_CREATE_VMO => {
+            // (pager, key, bytes): a VMO whose pages the pager supplies (MM9); the memory is charged to the caller's job
+            let pager =
+                ipc::pager_of(objs, handles, h(0), Rights::MANAGE).map_err(|e| (e, None, None))?;
+            if a[2] == 0 || !a[2].is_multiple_of(4096) || a[2] / 4096 > abi::limits::MAX_VMO_PAGES {
+                return fail(Status::InvalidArgs);
+            }
+            vmos.reserve_one().map_err(|e| (e, None, None))?;
+            let id = vmos.create_pager_in(jobs, a[2] / 4096, job, pager, a[1]);
+            match ipc::vmo_object_create_with(
+                objs,
+                handles,
+                id,
+                Rights::PAGER_VMO,
                 &mut ipc::Quota {
                     jobs,
                     job: Some(job),
@@ -166,6 +193,8 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 Ok(()) => Ok((None, None)),
                 Err(kcore::aspace::VmoError::Gone) => fail(Status::BadHandle),
                 Err(kcore::aspace::VmoError::NoMemory) => fail(Status::NoMemory),
+                // (MM9) a page of a pager's VMO that is not there: the kernel asks the pager and waits, then the call says "try again"
+                Err(kcore::aspace::VmoError::NeedPager) => fail(Status::ShouldWait),
                 Err(_) => fail(Status::InvalidArgs),
             }
         }
@@ -195,15 +224,20 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 let data = copy_from_user(aspace, mm, vmos, jobs, buf, len)
                     .map_err(|e| (e, None, None))?;
                 vmos.write(mm, jobs, id, offset, &data)
-                    .map_err(|_| (Status::NoMemory, None, None))?;
+                    .map_err(|e| match e {
+                        kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
+                        _ => (Status::NoMemory, None, None),
+                    })?;
             } else {
                 verify_writable(aspace, mm, vmos, jobs, buf, len).map_err(|e| (e, None, None))?;
                 let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                 data.try_reserve_exact(len)
                     .map_err(|_| (Status::NoMemory, None, None))?;
                 data.resize(len, 0);
-                vmos.read(mm, id, offset, &mut data)
-                    .map_err(|_| (Status::InvalidArgs, None, None))?;
+                vmos.read(mm, id, offset, &mut data).map_err(|e| match e {
+                    kcore::aspace::VmoError::NeedPager => (Status::ShouldWait, None, None),
+                    _ => (Status::InvalidArgs, None, None),
+                })?;
                 copy_to_user_verified(aspace, mm, buf, &data).map_err(|e| (e, None, None))?;
             }
             Ok((None, None))

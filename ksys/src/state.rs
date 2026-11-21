@@ -57,6 +57,14 @@ pub struct UserState {
     /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
     /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
     pub initial_regs: BTreeMap<Tid, [u64; 32]>,
+    /// Pagers and the threads waiting for their pages (MM9).
+    pub pagers: kcore::pager::Pagers,
+    /// The kernel's end (a handle in `ktable`) of each pager's request channel, by pager id.
+    pub pager_ends: BTreeMap<u64, abi::Handle>,
+    /// The next pager id.
+    pub next_pager: u64,
+    /// Threads a call that failed has to wake anyway (a partly done supply): the kernel takes them after the call.
+    pub pending_wake: Vec<Tid>,
     /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
     pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
     /// The exception each stopped thread waits for, by its serial (EX2); a decision about any other (an older one, a resolved one) does nothing.
@@ -125,6 +133,10 @@ impl UserState {
             suspends: BTreeMap::new(),
             initial_regs: BTreeMap::new(),
             job_exc: BTreeMap::new(),
+            pagers: kcore::pager::Pagers::new(),
+            pager_ends: BTreeMap::new(),
+            next_pager: 1,
+            pending_wake: Vec::new(),
             exc_pending: BTreeMap::new(),
             next_exc: 1,
             pending_regs: BTreeMap::new(),

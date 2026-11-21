@@ -119,6 +119,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     if frame.is_syscall() {
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
+        // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held
+        pager_after_call(frame);
         // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
         super::calls::cow_sync();
         return;
@@ -129,7 +131,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             let cause = fault.code;
             let access = fault.access.unwrap_or(Access::Read);
             let va = fault.address;
-            let resolved = {
+            let mut pager_need = None;
+            let mut resolved = {
                 let pid = state().thread_pid.get(&thread::current()).copied();
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
@@ -146,6 +149,11 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
                             // thread still runs under the old one)
                             kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
+                        }
+                        if let Err(kcore::aspace::FaultError::NeedPager(n)) = &r {
+                            pager_need = Some(*n);
+                            // (the fault has the need in its error: the slot a kernel copy reads must not keep it for another thread's call)
+                            let _ = k.vmos.take_need();
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {
@@ -180,6 +188,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                     }
                 }
             };
+            // (MM9) the page is a pager's and was not supplied: wait for it with no lock held (PG1); on a supply the access is tried again, and
+            // a pager that failed or died raises a PAGER exception
+            let mut pager_status = None;
+            if let Some(need) = pager_need {
+                match pager_wait(need, false) {
+                    Ok(()) => resolved = true,
+                    Err(status) => pager_status = Some(status),
+                }
+            }
             // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
             super::calls::cow_sync();
             if resolved {
@@ -198,7 +215,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         ),
                     );
                 }
-                fault_or_exit(&fault);
+                match pager_status {
+                    Some(status) => raise_fault(ksys::exception::Fault {
+                        kind: abi::arch::fault::PAGER,
+                        pc: fault.pc,
+                        address: fault.address,
+                        cause: i64::from(status.code()) as u64,
+                    }),
+                    None => fault_or_exit(&fault),
+                }
             }
         }
         UserTrap::Fault(fault)
@@ -216,12 +241,16 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
 /// handler resolves it (RETRY comes back here and returns to user mode to try the instruction again). With no handler anywhere the process ends,
 /// as it always did, with `-1000 - kind`.
 fn fault_or_exit(fault: &crate::arch::Fault) {
-    let f = ksys::exception::Fault {
+    raise_fault(ksys::exception::Fault {
         kind: fault.kind.abi_kind(),
         pc: fault.pc,
         address: fault.address,
         cause: fault.code,
-    };
+    });
+}
+
+/// `fault_or_exit` for a fault already described (a PAGER fault, MM9, has the pager's status as its cause).
+fn raise_fault(f: ksys::exception::Fault) {
     let delivered = irq::without(|| {
         let s = state();
         let tid = thread::current();
@@ -322,7 +351,12 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::EXCEPTION_RESUME
         | nr::THREAD_RESUME
         | nr::THREAD_READ_STATE
-        | nr::THREAD_WRITE_STATE => {
+        | nr::THREAD_WRITE_STATE
+        | nr::PAGER_CREATE
+        | nr::PAGER_SUPPLY
+        | nr::PAGER_FAIL
+        | nr::PAGER_QUERY_DIRTY
+        | nr::PAGER_WRITEBACK_DONE => {
             let r = process_call(n, a);
             notify();
             reply(frame, r);

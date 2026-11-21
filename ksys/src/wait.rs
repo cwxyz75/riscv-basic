@@ -129,7 +129,11 @@ pub fn port_poll_many<M: PhysMem>(
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let len = cap * abi::limits::PORT_PACKET_BYTES;
-    verify_writable(&mut p.aspace, mm, vmos, jobs, buf, len).map_err(|_| Status::InvalidArgs)?;
+    verify_writable(&mut p.aspace, mm, vmos, jobs, buf, len).map_err(|e| match e {
+        // (MM9) a page of a pager's VMO that is not there: the kernel waits for it and the call says "try again"
+        Status::ShouldWait => Status::ShouldWait,
+        _ => Status::InvalidArgs,
+    })?;
     let got = ipc::port_poll_many_in(objs, &p.handles, h, jobs, cap)?;
     let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
     for &(key, observed) in &got {
