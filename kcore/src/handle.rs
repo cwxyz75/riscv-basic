@@ -102,10 +102,14 @@ impl HandleTable {
         Ok(())
     }
 
-    /// The memory the table's slots hold, in bytes (a slot and its place in the free list).
+    /// The memory the table's two vectors hold, in bytes: their capacity, not their length (they grow by doubling, and the memory is held
+    /// whether or not it is used).
     pub fn slot_bytes(&self) -> u64 {
-        const PER_SLOT: u64 = (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>()) as u64;
-        (self.slots.len() as u64).saturating_mul(PER_SLOT)
+        const SLOT: u64 = core::mem::size_of::<Slot>() as u64;
+        const FREE: u64 = core::mem::size_of::<u32>() as u64;
+        (self.slots.capacity() as u64)
+            .saturating_mul(SLOT)
+            .saturating_add((self.free.capacity() as u64).saturating_mul(FREE))
     }
 
     /// Bytes of growth charged so far.
@@ -116,7 +120,7 @@ impl HandleTable {
     /// Settle the table's growth with its job (MM5): `charge(n)` asks the ledger for `n` more bytes and says whether it was granted. A
     /// refusal keeps the table from growing further (its handle limit drops to the slots it has: the free slots stay usable, a new one
     /// is NO_MEMORY) until a later call is granted; the growth that already happened stays pending, so the overshoot is bounded by one
-    /// call's insertions. Called after the calls that can insert, never in the middle of one.
+    /// call's insertions (per thread: threads of one process that each have an unsettled call add up, bounded by the thread limit). Called after the calls that can insert, never in the middle of one.
     pub fn settle_growth(&mut self, charge: impl FnOnce(u64) -> bool) {
         let have = self.slot_bytes();
         let pending = have.saturating_sub(self.charged);
