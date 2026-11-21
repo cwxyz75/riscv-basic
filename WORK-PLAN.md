@@ -133,11 +133,19 @@ Each rebuilds all of user space; they are grouped so the churn happens once.
 
 ### Phase 6: kernel memory and the remaining lock peels
 
-- [ ] **MM4** the slab allocator (in progress, 2026-11-21: `kcore::slab` and the kernel half are merged, small objects up to 2048 bytes come from slabs behind per-hart magazines with a frame pool; what is left is T196: the `FRAME` lock, inline frame runs, and `linked_list_allocator` leaving the kernel)
+Cut in two epics (2026-11-21, a decision below): **6a**, `epic/phase-6`, is the memory work that is whole on its own; **6b** (`epic/phase-6b`, cut from `main` after 6a merges) is the lock peels that depend on each other.
+
+Phase 6a (`epic/phase-6`):
+
+- [ ] **MM4** the slab allocator (in progress, 2026-11-21: `kcore::slab` and the kernel half are merged, small objects up to 2048 bytes come from slabs behind per-hart magazines with a frame pool; what is left is T196: inline frame runs and `linked_list_allocator` leaving the kernel, which wait for the allocator to run without the big lock: phase 6b)
 - [x] **L15** mappings hold a VMO reference (`Vmos::retain`/`release`, regions hold a reference, `reap_vmos` and `pending_vmos` deleted)
-- [x] **L16** `JOBS`, per-family `VMO`, `FRAME`; page reservations (in progress: part a is merged, the job ledger is out of the VMO store; part b is the three locks as real locks nested inside the big lock (`kmem::get()` takes `VMO`, `JOBS`, `FRAME` in that order; the order checker sees them); part c is merged: `kcore::fcache`, the per-hart frame caches, used by the slab pool (T200 lists the other users); part d is merged: an address space prepays pages from its job for the fault path (T201: the 100 ms idle return waits for L17); T199 records the one-lock-per-store stand-in)
-- [x] **MM5** all kernel memory charged to jobs (PRs 353 to 355 and this part: the kernel-bytes resource, object bodies, thread FP and vector state, handle tables, and the QEMU acceptance test `a_confined_program_cannot_hold_much_uncharged_kernel_memory`; port bindings were already charged (`BINDING_COST`, to IPC bytes) and a wait registration is one per waiting thread, covered by the thread's own charge; kernel stacks and page tables stay on `Pages` (T202); heap growth frames, T81, are not charged)
-- [ ] **L17** per-process address-space locks, with the fault path shaped for pagers
+- [x] **L16** `JOBS`, `VMO`, `FRAME` as real locks nested inside the big lock (PR 350), per-hart frame caches (PR 351), page reservations (PR 352); T199, T200, T201 list the stand-ins
+- [x] **MM5** all kernel memory charged to jobs (PRs 353 to 356: the kernel-bytes resource, object bodies, thread FP and vector state, handle tables, the QEMU acceptance test `a_confined_program_cannot_hold_much_uncharged_kernel_memory`; port bindings were already charged (`BINDING_COST`, to IPC bytes) and a wait registration is one per waiting thread, covered by the thread's own charge; kernel stacks and page tables stay on `Pages` (T202); heap growth frames, T81, are not charged (T203))
+- [ ] **L17** per-process address-space locks, with the fault path shaped for pagers (part a is merged, PR 357: a fault is three steps and regions carry a generation; the per-process lock and the fault path leaving the big lock are phase 6b)
+
+Phase 6b (`epic/phase-6b`):
+
+- [ ] **L17** (parts b and c) the per-process `AS` lock, page faults and user copies leave the big lock
 - [ ] **L18** the ASID allocator with generations; batched shootdown
 - [ ] **PL7** instruction-cache flush on executable mappings
 - [ ] **L14** futex bucket locks
@@ -272,3 +280,4 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     spec's end state waits for it (`work/T196.md`). Alternative: do L16's frame lock first (a much larger change, with the allocator's rewrite
     on top). MM4 is not ticked.
   - 2026-11-21, MM5: kernel stacks and page tables stay charged to a job's `Pages` (they were already charged, and the existing job-limit tests count them there); the new `KernelBytes` resource (limit: an eighth of the page limit in bytes, derived, so the limits record is unchanged) takes what nothing charged: object bodies, thread FP and vector state (a job at its limit gets an illegal-instruction fault on the first FP use, not a kernel panic), then handle tables, wait registrations and port bindings. MM5's text says to restate stacks and tables in bytes; that move waits for the suite to be changed with it (`work/T202.md`). Alternative: move them now and rewrite the job tests blind.
+  - 2026-11-21, phase 6: cut into two epics. 6a (MM4's two parts, L15, L16, MM5, L17 part a) is whole and, with the QEMU acceptance test of MM5, merges into `main` on the epic gate; 6b holds the items that peel the big lock (L17 parts b and c, L18, PL7, L14, L19, MM10, L21, L20, PL8) and MM4's end state (T196). Reason: L17 b and c need a lock primitive that `ksys` (pure) can take on a process's address space (about 25 sites in `ksys` reach it through the process table) with the order checker and a negative control, a design of its own that is best done with L18 (ASIDs) and L19 (the process table) in view; and the epic has accumulated MM4, L15, L16 and MM5 that only a green epic gate can vouch for, so merging them first keeps a bisect short. Alternative: finish all of phase 6 first. `TESTING.md` allows a long phase to be cut.
