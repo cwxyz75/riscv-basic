@@ -213,12 +213,20 @@ impl HandleTable {
         Ok(self.slots[slot].entry.expect("decoded slot is occupied"))
     }
 
-    /// Add a handle that takes over the caller's reference to `obj`.
+    /// Add a handle that takes over the caller's reference to `obj`. The registry is a parameter so that the sweep's write barrier cannot be
+    /// forgotten (MM10): while a sweep runs, a new handle shades its object, or a handle moved out of a queued message could hide the
+    /// object from the marker.
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: s is a free slot index or the new last slot; live is at most the table's limit
-    pub fn insert(&mut self, obj: ObjId, rights: Rights) -> Result<Handle, Status> {
+    pub fn insert<T: Object>(
+        &mut self,
+        reg: &mut Registry<T>,
+        obj: ObjId,
+        rights: Rights,
+    ) -> Result<Handle, Status> {
         if self.live >= self.limit {
             return Err(Status::NoMemory);
         }
+        reg.shade(obj);
         let entry = Some(Entry { obj, rights });
         let slot = match self.free.pop() {
             Some(s) => {
@@ -301,7 +309,7 @@ impl HandleTable {
         if !reg.retain(entry.obj) {
             return Err(Status::BadHandle); // cannot happen: a live handle owns a reference
         }
-        self.insert(entry.obj, rights)
+        self.insert(reg, entry.obj, rights)
     }
 
     /// Swap a handle for one with fewer rights; the old value stops working. On an
@@ -331,7 +339,7 @@ impl HandleTable {
         // the old value stops working: waiters on it must re-validate (a forced touch)
         reg.touch_forced(entry.obj);
         Ok(self
-            .insert(entry.obj, rights)
+            .insert(reg, entry.obj, rights)
             .expect("a slot was just freed"))
     }
 
@@ -370,6 +378,15 @@ impl HandleTable {
     /// Every object this table refers to (the roots for `Registry::sweep`).
     pub fn objects(&self) -> impl Iterator<Item = ObjId> + '_ {
         self.slots.iter().filter_map(|s| s.entry.map(|e| e.obj))
+    }
+
+    /// Every live handle value in this table (for tests and audits).
+    pub fn handle_values(&self) -> impl Iterator<Item = Handle> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.entry.is_some())
+            .map(|(i, s)| Self::encode(i, s.gen))
     }
 
     /// Close everything (process death).
