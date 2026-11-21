@@ -17,8 +17,7 @@ system, so stopping between phases loses nothing.
 **Start.** The plan starts when the owner says so. From then on every item in it, the lock-peel tasks included, has the
 owner's go-ahead: the sentences in older `L` items about waiting for one are superseded (each carries a note).
 
-**Paused, 2026-11-20.** The owner stopped the plan after AR1 to change how work is branched and tested (OD144, below). It
-resumes at PL1, on the phase 4 epic, **when the owner says so**; until then no plan item is started.
+**Where the plan stands (2026-11-21).** Phases 1 to 5 are merged into `main`. Phase 6 was cut in two: 6a (PR 359, merge commit `a153f9e`: the slab allocator, L15, L16, MM5, L17 part a) and 6b (PR 368, `c8fc2c6`: L18, PL7, MM10) are merged; the items that peel the big lock (L17 parts b and c, L14, L19, L21, L20) and PL8 are a phase 6c that runs after phase 8. Phase 7 is in progress on `epic/phase-7` (MM6 in part: PR 369; MM7: PR 370; next MM8). The owner started the plan again on 2026-11-21 and asked for it to run without input until it is done; the earlier pause (2026-11-20, to change how work is branched and tested: OD144) is over.
 
 **Epics (OD144, 2026-11-20).** From phase 4 on, each phase is an epic branch, `epic/phase-<n>`, cut from `main`. Every item is a
 feature branch off the epic and a pull request into it, merged on the feature gate (build and host tests, no QEMU). When the
@@ -59,9 +58,10 @@ code-touching tidy items ride on the open epic. The rules are in `docs/reference
 - **Track CI yourself; merge green PRs.** A feature PR is squash-merged into its epic (delete the branch); an epic is merged
   into `main` with a merge commit, so its commits survive. Never force-push and never `git reset --hard`; merge `main` into
   an epic instead. Feature PRs target the epic, never another feature branch.
-- **One item (or one named part of an item) per feature PR.** `main` always builds and boots; an epic always builds and passes
-  its host tests. A flag-day item (AB1, AB2, AB3) is one
-  PR by nature; everything else is cut as small as its acceptance check allows.
+- **One item per feature PR from phase 6b on** (its parts together, one Fable review of the finished PR); a change that makes the kernel
+  rely on a lock or removes a flush (L18's no-flush, L17's fault path leaving the big lock, the L19 and L20 peels) is its own PR so a
+  failure has one suspect. `main` always builds and boots; an epic always builds and passes its host tests. A flag-day item (AB1, AB2,
+  AB3) is one PR by nature.
 - The rules of `CLAUDE.md` apply throughout: shortcuts as tidy items in the same PR, decisions as OD rows, specs changed
   only by dated amendments, reference documents changed with the code. An item's box is ticked here when its feature merges;
   `work.py done` runs in the epic's closing commit, so an item is closed only with its epic's green smoke behind it.
@@ -163,8 +163,8 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 7: the memory model programs need
 
-- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit` (in progress: `vmo_create` flags (RESIZABLE), `vmo_decommit`, `vmo_set_size` are built; byte sizes, the cap and the mapping lists are T207)
-- [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info` (built: the four calls, split and merge, `max_perms`; left, T208: the C library's mmap, the protect-versus-sibling negative control, per-job region counts)
+- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit` (in part, PR 369: `vmo_create` flags (RESIZABLE), `vmo_decommit`, `vmo_set_size`; a decommit or shrink is refused (BAD_STATE) over a range a process of another job maps: V4; left, T207: byte sizes, the caps (they need chunked unmap: phase 6c), the per-VMO mapping lists, the 2 GiB acceptance, the decommit-versus-touch negative control)
+- [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info` (in part, PR 370: the four calls, split and merge, `max_perms`, the JIT flip runs on the target; left, T208: the C library's mmap, the protect-versus-sibling negative control, per-job region counts)
 - [ ] **MM8** copy-on-write children, `process_clone_region`
 
 ### Phase 8: threads, exceptions, pagers
@@ -229,6 +229,7 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   profile ends in `##PANIC missing extension`), `os-boot-test-loadaddr` (the image at two other load addresses) and
   `os-boot-test-sbi-console` (output through the firmware's debug console). A red result is a work item that day (OD140), ahead of the
   next plan item.
+- **Measurements and hardware checks nobody has made** (phases 6 and 7; each is in its work item): the sweep's worst interrupts-off section with 16,000 live objects (T206); the ASID-reuse control, the instruction-cache synchronisation and the shootdown negative controls, which QEMU cannot show and which need real hardware or an emulator that models them (T205, PL7, T193); a 2 GiB VMO sparsely touched at `-m 4G` and the decommit-versus-touch race (T207); `os-miri` over the new code (`kcore::asid`, `fcache`, the sweep, the region operations).
 
 ## Decisions taken without the owner
 
@@ -287,3 +288,6 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   - 2026-11-21, phase 6a epic gate: the instruction-count baseline (`bench/counts.tsv`) was re-recorded from CI's numbers after the L16 locks and MM5's charging (futex_wake_no_waiter +19 percent, handle_dup_close +17, event_signal_wait +15, page_fault_fresh_page +13; thread_create_join -10), once the avoidable part (a charging pass on every syscall, PR 361) was removed. The cost is three real locks in every `kmem::get()` (`work/T204.md` lists the fix: take only the locks a call needs). Alternative: hold the 5 percent rule and block the epic until `kmem::get()` is cheaper, which would mean reworking `ksys::Ctx` first.
   - 2026-11-21, working agreement (suggested by the owner): from phase 6b a feature PR is one work item, its parts together, and a Fable review is per item on the finished PR; a change that makes the kernel rely on a lock or removes a flush (L18's no-flush, L17's BKL-less fault path, the L19 and L20 peels) is its own PR so a failure has one suspect. `TESTING.md` rule 1 and the plan's "one item or one named part of one" allow it.
   - 2026-11-21, phase 6b: closed with L18, PL7 and MM10 (the items that stood alone) and merged on its epic gate; the rest of the old 6b (L17 parts b and c, L14, L19, L21, L20) and PL8 move to a **phase 6c** that runs after phase 8. Reason: they peel the big lock and depend on each other (a lock `ksys` can take on an address space, the process and thread tables as real locks, the wait and futex tables), PL8 needs the object registry rebuilt (it preallocates for its cap, and a RAM-derived cap at 4 GiB would preallocate 100 MB), and none of them changes what a program can do, where phases 7 and 8 (the memory model, threads and exceptions, pagers) do; the freeze (FZ1) still waits for all of them. `MM6`'s and `MM7`'s block on L17 is lifted for the same reason (L17 part a, the fault in three steps, is what the memory model needs). Alternative: keep the plan's order and do the peels now.
+  - 2026-11-21, MM6: built in part (`vmo_create` flags, `vmo_decommit`, `vmo_set_size`; PR 369). Byte-sized VMOs and the removal of `MAX_VMO_PAGES` and `MAX_REGION_PAGES` wait for chunked, preemptible unmap (a 2 GiB region cleared inside one big-lock section is not acceptable), which is L19 in phase 6c; `vmo_decommit` finds mappings by walking every process's regions, not the spec's per-VMO list. Alternative: do L19 first. `work/T207.md`.
+  - 2026-11-21, MM6 (security): a decommit or a shrinking `vmo_set_size` is refused with BAD_STATE over a range that a process of **another job than the VMO's** maps, so INVARIANTS V1 (a stranger's touch never charges the VMO's job and a stranger is never ended by a VMO it was handed) holds for the new calls (INVARIANTS V4). Found by the Fable review: without it a WRITE holder could end a server that had mapped its VMO. Alternatives: a no-resize seal on the VMO, or rewording V1; the refusal is the smallest change that keeps the invariant.
+  - 2026-11-21, MM7: built in part (PR 370). Deviations from KERNEL-V1-SPEC 3.5, all in `work/T208.md`: ANYWHERE is `vaddr` 0 alone (no flag), placed at a uniformly random start and the first gap from there (not eight random tries); `process_map_info` writes six words and the VMO store id (not a seventh `flags` word and a koid); a mapping is merged into a neighbour of the same VMO with the same permissions when it is made, so `process_unmap(vaddr, 0)` removes a merged mapping whole; the page-table charge of a `process_map` is kept with its extent and credited when no region is left in it (the first version credited it early, which would have let a job shed table charges: found by review). The C library's `mmap` family waits.
