@@ -4,7 +4,7 @@ kind: slice
 title: Asynchronous signals and fault handlers in the C library, over exception channels and thread state (follow-on)
 area: signals
 horizon: long
-blocked_by: [EX2, FZ1]
+blocked_by: [FZ1]
 refs: [KERNEL-V1-SPEC, OD137]
 ---
 
