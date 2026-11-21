@@ -492,6 +492,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
 }
 
 /// An inter-hart interrupt on its own (no device message came with it): the quiet paths of L12b, the lock only when the hart has scheduling to do.
+#[inline(never)] // (a frame of its own: folded into `trap_handler_inner` it deepens every kernel path that starts with a trap, KT13)
 fn ipi_trap(frame: &mut TrapFrame) {
     let reasons = crate::smp::ipi_interrupt();
     if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
@@ -522,6 +523,7 @@ fn ipi_trap(frame: &mut TrapFrame) {
 
 /// A supervisor external interrupt: take every message in this hart's IMSIC file. The inter-hart interrupt (message 1) is the hot one and needs
 /// no lock unless the hart must switch; a device message goes to its interrupt object under the big lock (S6a-2).
+#[inline(never)] // (as `ipi_trap`)
 fn external_trap(frame: &mut TrapFrame, from_user: bool) {
     let ids = crate::aia::claim();
     let devices = ids & !crate::aia::IPI_BIT;

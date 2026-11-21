@@ -117,7 +117,7 @@ code is right.
 **Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0`, where the
 guest's retired-instruction counter is deterministic, and compares the suite's `##BENCH count_<name> <n> instr` lines
 with `bench/counts.tsv`. A rise of more than 5 % fails; a fall of more than 5 % is printed with a request to record it
-(`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot).
+(`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot). The file holds the numbers of the CI run (2026-11-20: PL1 moved the test CPU to `rva23s64` and the kernel's code generation to the profile's extensions, and the epic gate's numbers then differed from a laptop's by up to 12 % in either direction, so the recorded values came from the gate's own log): a local `make os-count` is a reproduction, not the check.
 
 **Benchmarks.** The suite prints `##BENCH <name> <ns> ns` lines (a malformed one fails the boot). Every boot runs the
 benchmarks at a tenth of the iterations with sanity assertions only, so they cannot rot. `make os-bench` (soak) runs

@@ -110,6 +110,12 @@ impl StateUnit for HartUnit {
     type Regs = FpRegs;
     fn save(&mut self) -> FpRegs {
         let mut r = FpRegs::ZERO;
+        self.save_into(&mut r);
+        r
+    }
+
+    /// In place: the trap paths save into the thread's own copy and build no 264-byte temporary (the kernel's stack budget, KT13).
+    fn save_into(&mut self, r: &mut FpRegs) {
         let (f, fcsr) = (r.f.as_mut_ptr(), &mut r.fcsr as *mut u32);
         // SAFETY: the unit is switched on for exactly these instructions; `f` points at 32 u64s.
         unsafe {
@@ -134,7 +140,6 @@ impl StateUnit for HartUnit {
                 options(nostack),
             );
         }
-        r
     }
 
     fn load(&mut self, r: &FpRegs) {
@@ -355,6 +360,13 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
 pub fn trap_entry(frame: &mut TrapFrame) {
     if frame.sstatus & (1 << 8) != 0 {
         return; // from the kernel
+    }
+    // The cheap way first (no table lookup, no new token): the hart's claim names the running thread, so its dirty state is saved in place.
+    // Only what that cannot do (no claim yet: the first save of a thread, or the state came from another hart) takes the slow way below.
+    if light_save(frame) {
+        // SAFETY: clears sstatus.FS and sstatus.VS only: the kernel runs with the FP and vector units off.
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) FS_MASK | VS_MASK) };
+        return;
     }
     let dirty = frame.sstatus & FS_MASK == FS_DIRTY;
     let vdirty = frame.sstatus & VS_MASK == VS_DIRTY;

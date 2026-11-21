@@ -1056,30 +1056,6 @@ fn vlenb() -> usize {
     v
 }
 
-/// Store `v0`-`v31` to `p` (32 * vlenb bytes).
-fn vec_store(p: *mut u8, vlenb: usize) {
-    // SAFETY: writes `32 * vlenb` bytes at `p` (the caller's buffer) and reads the vector registers.
-    unsafe {
-        asm!(
-            ".option push", ".option arch, +v",
-            "vs8r.v v0, ({p})", "add {p}, {p}, {s}",
-            "vs8r.v v8, ({p})", "add {p}, {p}, {s}",
-            "vs8r.v v16, ({p})", "add {p}, {p}, {s}",
-            "vs8r.v v24, ({p})",
-            ".option pop",
-            p = inout(reg) p => _,
-            s = in(reg) vlenb * 8,
-        );
-    }
-}
-
-fn vec_csr() -> u64 {
-    let v: u64;
-    // SAFETY: reads `vcsr`.
-    unsafe { asm!("csrr {v}, 0x00f", v = out(reg) v) };
-    v
-}
-
 fn vec_pattern(buf: &mut [u8], seed: u64) {
     for (i, b) in buf.iter_mut().enumerate() {
         *b = (seed
@@ -1195,38 +1171,92 @@ fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
     0
 }
 
-fn read_vl() -> u64 {
-    let v: u64;
-    // SAFETY: reads `vl`.
-    unsafe { asm!("csrr {v}, 0xc20", v = out(reg) v) };
-    v
-}
-
-fn read_vtype() -> u64 {
-    let v: u64;
-    // SAFETY: reads `vtype`.
-    unsafe { asm!("csrr {v}, 0xc21", v = out(reg) v) };
-    v
-}
-
-/// First vector use: every register, `vcsr`, `vl` and `vtype` must read as zero.
+/// First vector use: every register, `vcsr`, `vl` and `vtype` must read as zero. Run on a thread whose entry is assembly that executes a vector
+/// instruction first: compiled code (the user build is RVA23U64) may already have used the vector unit in this process, and a thread of its
+/// own starts with the unit off. The thread stores what it saw in `VFRESH` and signals through its last word.
 fn vec_fresh() -> i32 {
-    let n = vlenb(); // (the first vector instruction: the kernel enables the unit here, from zeros)
-    if n == 0 || n > VMAX {
-        return 800;
-    }
-    // SAFETY: only the address of the last buffer is taken.
-    let got = unsafe {
-        core::slice::from_raw_parts_mut(
+    let me = rt::sys::process_self().a1 as u32;
+    // SAFETY: only addresses of statics are taken; the thread writes `VFRESH` and its buffer, and this thread reads them after the done flag.
+    let (res, buf) = unsafe {
+        (
+            core::ptr::addr_of_mut!(VFRESH) as *mut u64,
             (core::ptr::addr_of_mut!(VBUFS.0) as *mut u8).add(5 * 32 * VMAX),
-            32 * n,
         )
     };
-    vec_store(got.as_mut_ptr(), n);
+    // SAFETY: as above.
+    unsafe {
+        res.write_volatile(buf as u64);
+        for k in 1..6 {
+            res.add(k).write_volatile(0);
+        }
+    }
+    // SAFETY: only the address of the static stack is taken (the thread's entry uses no stack).
+    let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[0]) } as u64 + 8192;
+    let t = rt::sys::thread_create(
+        me,
+        vec_fresh_thread as *const () as usize as u64,
+        top,
+        res as u64,
+    );
+    if t.status != 0 {
+        return 900;
+    }
+    for _ in 0..1_000_000u32 {
+        // SAFETY: reads the done flag the thread writes last.
+        if unsafe { res.add(5).read_volatile() } == 1 {
+            break;
+        }
+        rt::sys::thread_yield();
+    }
+    // SAFETY: as above.
+    let r: [u64; 6] = unsafe { core::array::from_fn(|k| res.add(k).read_volatile()) };
+    let n = r[1] as usize;
+    if r[5] != 1 || n == 0 || n > VMAX {
+        return 800;
+    }
+    // SAFETY: the buffer the thread stored into, `32 * n` bytes of it.
+    let got = unsafe { core::slice::from_raw_parts(buf, 32 * n) };
     let nonzero = got.iter().filter(|&&b| b != 0).count() as i32;
-    let csrs = (vec_csr() | read_vl() | read_vtype()) != 0;
-    nonzero + if csrs { 10_000 } else { 0 }
+    nonzero + if r[2] | r[3] | r[4] != 0 { 10_000 } else { 0 }
 }
+
+/// [buffer address, vlenb, vcsr, vl, vtype, done] as the fresh thread leaves them.
+static mut VFRESH: [u64; 6] = [0; 6];
+
+extern "C" {
+    fn vec_fresh_thread(arg: usize) -> !;
+}
+
+core::arch::global_asm!(
+    ".section .text.vec_fresh_thread,\"ax\",@progbits",
+    ".globl vec_fresh_thread",
+    "vec_fresh_thread:",
+    "csrr t0, vlenb", // the first vector instruction this thread executes: the kernel enables the unit here, from zeros
+    "ld t1, 0(a0)",
+    "slli t2, t0, 3",
+    "mv t3, t1",
+    "vs8r.v v0, (t3)",
+    "add t3, t3, t2",
+    "vs8r.v v8, (t3)",
+    "add t3, t3, t2",
+    "vs8r.v v16, (t3)",
+    "add t3, t3, t2",
+    "vs8r.v v24, (t3)",
+    "csrr t4, vcsr",
+    "sd t4, 16(a0)",
+    "csrr t4, vl",
+    "sd t4, 24(a0)",
+    "csrr t4, vtype",
+    "sd t4, 32(a0)",
+    "sd t0, 8(a0)",
+    "fence w, w",
+    "li t4, 1",
+    "sd t4, 40(a0)",
+    "li a7, {exit}",
+    "li a0, 0",
+    "ecall",
+    exit = const rt::abi::syscall::THREAD_EXIT,
+);
 
 /// Edge states: the first vector instruction is a `vsetvli` (not a CSR read); an illegal `vtype` (`vill`) and a non-zero `vstart` survive a trap
 /// (a yield). Each is one assembly block, with the system call inside it: compiled code in between could use the vector unit and change the
