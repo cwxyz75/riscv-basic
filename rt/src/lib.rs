@@ -632,6 +632,29 @@ pub mod sys {
             ],
         )
     }
+    /// Raise a thread's suspend count (EX1; needs MANAGE): it stops at its next return to user mode, or where it is if it is blocked in a call.
+    /// Its object then raises SUSPENDED.
+    pub fn thread_suspend(thread: u64) -> Ret {
+        syscall(THREAD_SUSPEND, [thread as usize, 0, 0, 0, 0, 0])
+    }
+    /// Lower a thread's suspend count (EX1); at 0 it runs again. BAD_STATE when it is not suspended.
+    pub fn thread_resume(thread: u64) -> Ret {
+        syscall(THREAD_RESUME, [thread as usize, 0, 0, 0, 0, 0])
+    }
+    /// Read a stopped thread's registers into `buf` (EX1): `kind` is `abi::thread_state::GENERAL`, `FP` or `VECTOR`; `len` is exactly the layout's size.
+    pub fn thread_read_state(thread: u64, kind: u64, buf: *mut u8, len: usize) -> Ret {
+        syscall(
+            THREAD_READ_STATE,
+            [thread as usize, kind as usize, buf as usize, len, 0, 0],
+        )
+    }
+    /// Write a stopped thread's registers from `buf` (EX1); refused while the thread is inside a blocking call.
+    pub fn thread_write_state(thread: u64, kind: u64, buf: *const u8, len: usize) -> Ret {
+        syscall(
+            THREAD_WRITE_STATE,
+            [thread as usize, kind as usize, buf as usize, len, 0, 0],
+        )
+    }
     /// Reserved (T56): always NOT_SUPPORTED for a valid thread handle.
     pub fn thread_interrupt(thread: u64) -> Ret {
         syscall(THREAD_INTERRUPT, [thread as usize, 0, 0, 0, 0, 0])

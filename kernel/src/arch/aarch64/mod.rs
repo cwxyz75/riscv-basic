@@ -93,6 +93,27 @@ pub mod fp {
     pub fn thread_gone(tid: u64) {
         unimplemented!()
     }
+    pub fn vector_vlenb() -> Option<usize> {
+        unimplemented!()
+    }
+    pub fn read_fp(tid: u64) -> [u64; 33] {
+        unimplemented!()
+    }
+    pub fn write_fp(tid: u64, w: &[u64; 33]) -> bool {
+        unimplemented!()
+    }
+    pub fn read_vec(tid: u64) -> Option<alloc::vec::Vec<u8>> {
+        unimplemented!()
+    }
+    pub fn write_vec(tid: u64, bytes: &[u8]) -> bool {
+        unimplemented!()
+    }
+    pub fn apply_written(tid: u64, frame: &mut TrapFrame, fp: bool, vec: bool) {
+        unimplemented!()
+    }
+    pub fn mark_present(tid: u64, frame: &mut TrapFrame) {
+        unimplemented!()
+    }
     pub fn entry_count() -> usize {
         unimplemented!()
     }
@@ -147,9 +168,14 @@ pub mod trap {
     use crate::arch::UserTrap;
     use kcore::aspace::{Access, FaultError};
 
+    pub const FRAME_BYTES: u64 = 288;
     pub struct TrapFrame;
 
     impl TrapFrame {
+        pub const ZERO: TrapFrame = TrapFrame;
+        pub fn is_from_user(&self) -> bool {
+            unimplemented!()
+        }
         pub fn is_syscall(&self) -> bool {
             unimplemented!()
         }
@@ -160,6 +186,15 @@ pub mod trap {
             unimplemented!()
         }
         pub fn arg(&self, n: usize) -> u64 {
+            unimplemented!()
+        }
+        pub fn from_general(words: &[u64; 32]) -> TrapFrame {
+            unimplemented!()
+        }
+        pub fn general(&self) -> [u64; 32] {
+            unimplemented!()
+        }
+        pub fn set_general(&mut self, words: &[u64; 32]) {
             unimplemented!()
         }
         pub fn set_return(&mut self, a0: u64, a1: Option<u64>, a2: Option<u64>) {
@@ -232,7 +267,7 @@ pub fn kernel_delta() -> u64 {
     unimplemented!()
 }
 pub use switch::{switch, Context};
-pub use usermode::enter_user_raw as enter_user;
+pub use usermode::enter_user_frame_raw as enter_user_frame;
 
 pub mod cpu {
     pub fn aspace_token(root: u64) -> u64 {
@@ -305,14 +340,10 @@ pub mod switch {
 }
 
 pub mod usermode {
-    pub unsafe fn enter_user_raw(
-        entry: u64,
-        sp: u64,
-        arg: u64,
+    pub unsafe fn enter_user_frame_raw(
+        frame: *const super::trap::TrapFrame,
         token: u64,
         kernel_top: u64,
-        tp: u64,
-        a1: u64,
     ) -> ! {
         unimplemented!()
     }

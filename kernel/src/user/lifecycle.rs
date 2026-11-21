@@ -22,6 +22,25 @@ pub(super) fn user_thread_main(token: usize) {
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
         s.thread_pid.insert(thread::current(), ts.pid);
+        // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
+        // SUSPENDED thread's spawner has made it already
+        let tid = thread::current();
+        // (a resume may have come before this thread ever ran: the image the spawner made is the sign that it registered the stopped state, and
+        // then it is not made again)
+        let spawner_done = s.initial_regs.contains_key(&tid);
+        s.initial_regs.entry(tid).or_insert_with(|| {
+            ksys::initial_general(
+                ts.entry,
+                ts.sp,
+                ts.arg,
+                ts.tp,
+                if ts.spawned { tid } else { 0 },
+            )
+        });
+        if ts.suspended && !spawner_done {
+            ksys::thread_start_suspended(s, tid);
+            sync_suspends(s);
+        }
         let p = s
             .procs
             .get_mut(&ts.pid)
@@ -57,9 +76,15 @@ pub(super) fn user_thread_main(token: usize) {
     }
     // A thread created in a stopped process waits here: it runs no user code before `process_resume` (or dies with the
     // process).
-    park_while_stopped();
-    // (the return to user mode is a defined point for a switch a wake asked for: X7)
-    thread::preempt_point();
+    // (the return to user mode is a defined point for a switch a wake asked for, X7: and a suspend, a stop or a kill can land while this thread
+    // is switched out there, so look again until a pass finds nothing)
+    loop {
+        park_while_stopped();
+        thread::preempt_point();
+        if irq::without(|| killed_now().is_none() && !stopped_now() && !suspended_now()) {
+            break;
+        }
+    }
     // The marks above were read before `preempt_point`, which can switch and let a kill or stop land (and another thread on this hart
     // record the new epoch) before this thread resumes: its first trap takes the full path, which looks again (PR 267 review)
     crate::percpu::this()
@@ -80,22 +105,44 @@ pub(super) fn user_thread_main(token: usize) {
         .store(token, Ordering::SeqCst);
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
+    // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
+    // vector state loaded if a write gave it any, in this hart's entry frame
+    let entry_frame = {
+        let image = state().initial_regs.remove(&thread::current());
+        let image = image.unwrap_or_else(|| {
+            ksys::initial_general(
+                ts.entry,
+                ts.sp,
+                ts.arg,
+                ts.tp,
+                if ts.spawned { thread::current() } else { 0 },
+            )
+        });
+        let mut frame = crate::trap::TrapFrame::from_general(&image);
+        crate::fp::mark_present(thread::current(), &mut frame);
+        crate::fp::return_to_user(&mut frame);
+        let hart = crate::percpu::this().index.load(Ordering::Relaxed);
+        // SAFETY: interrupts are off and the big lock is held; this hart's element is used by this hart only.
+        let slot = unsafe { (*ENTRY_FRAMES.0.get()).get_mut(hart) }
+            .expect("an entry frame for every hart");
+        *slot = frame;
+        slot as *const crate::trap::TrapFrame
+    };
     crate::bkl::unlock();
     user_mode_entered();
-    // SAFETY: `enter_user` switches to the process's address space and drops to U-mode at
-    // its entry point with the stack and argument chosen above; it never returns.
-    unsafe {
-        crate::arch::enter_user(
-            ts.entry,
-            ts.sp,
-            ts.arg,
-            token,
-            top,
-            ts.tp,
-            if ts.spawned { thread::current() } else { 0 },
-        )
-    }
+    // SAFETY: `enter_user_frame` switches to the process's address space and drops to U-mode from the register image prepared above (in this hart's
+    // entry frame, which only this hart uses and only with interrupts off); it never returns.
+    unsafe { crate::arch::enter_user_frame(entry_frame, token, top) }
 }
+
+/// A hart's frame for the drop to user mode: the register image a new thread starts from is built here (not on the stack the assembly then
+/// copies it onto), used by this hart alone with interrupts off between the fill and the jump.
+struct EntryFrames(core::cell::UnsafeCell<[crate::trap::TrapFrame; crate::percpu::MAX_HARTS]>);
+// SAFETY: each hart touches only its own element, with interrupts off.
+unsafe impl Sync for EntryFrames {}
+static ENTRY_FRAMES: EntryFrames = EntryFrames(core::cell::UnsafeCell::new(
+    [const { crate::trap::TrapFrame::ZERO }; crate::percpu::MAX_HARTS],
+));
 
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.
 pub fn finish(pid: u64, tid: Tid) -> i32 {
@@ -238,6 +285,8 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         crate::fp::thread_gone(tid);
         s.sched_flags.remove(&tid);
         s.interrupts.remove(&tid);
+        ksys::thread_suspend_forget(s, tid);
+        sync_suspends(s);
         let pid = s.thread_pid.remove(&tid)?;
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
@@ -345,21 +394,75 @@ pub(super) fn killed_now() -> Option<i32> {
     s.procs.get(pid)?.killed
 }
 
-/// Where a stopped process stops and a killed one dies: the calling thread's return to user mode. A thread of a process
-/// that `process_suspend` stopped sleeps here (woken by id, like a futex sleeper) until `process_resume` or a kill; a
-/// killed process ends here too. Nothing is held across the sleep but the big lock, which follows the thread as it does
-/// in every blocking call.
+/// Where a stopped process stops, a suspended thread stops (`thread_suspend`, EX1) and a killed one dies: the calling thread's return to user
+/// mode. A thread of a process that `process_suspend` stopped, or whose own suspend count is above 0, sleeps here (woken by id, like a
+/// futex sleeper) until `process_resume`, `thread_resume` or a kill; a killed process ends here too. SUSPENDED rises when the thread parks.
+/// Nothing is held across the sleep but the big lock, which follows the thread as it does in every blocking call.
 pub(super) fn park_while_stopped() {
     loop {
         if let Some(code) = irq::without(killed_now) {
             exit_process(code);
         }
-        if !irq::without(stopped_now) {
+        let (stopped, suspended) = irq::without(|| (stopped_now(), suspended_now()));
+        if !stopped && !suspended {
             return;
         }
+        if suspended {
+            // (the signal rises, once: the thread has stopped)
+            irq::without(|| {
+                let s = state();
+                if let Some(&pid) = s.thread_pid.get(&thread::current()) {
+                    ksys::thread_at_return(s, pid, thread::current());
+                }
+            });
+        }
         commit_wake(); // (wakes this trap made are committed before this thread sleeps, as at every blocking site)
-        thread::wait_deadline_private(|| killed_now().is_some() || !stopped_now(), u64::MAX);
+        irq::without(|| {
+            state().parked_tids.insert(thread::current());
+        });
+        thread::wait_deadline_private(
+            || killed_now().is_some() || (!stopped_now() && !suspended_now()),
+            u64::MAX,
+        );
+        irq::without(|| {
+            state().parked_tids.remove(&thread::current());
+        });
     }
+}
+
+/// Is the calling thread suspended (`thread_suspend`: its count is above 0)? One comparison when nothing is.
+pub(super) fn suspended_now() -> bool {
+    let s = state();
+    !s.suspends.is_empty() && ksys::thread_is_suspended(s, thread::current())
+}
+
+/// How many threads have suspend state (a copy of `UserState::suspends.len()`, kept by `sync_suspends`): `thread::block` looks here, with no lock,
+/// so that the common case costs one load and takes no lock (a kernel thread may block holding a lock the big lock must not be taken under).
+static SUSPEND_STATES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Record the size of the suspend table after a change (under the big lock).
+pub(super) fn sync_suspends(s: &UserState) {
+    SUSPEND_STATES.store(s.suspends.len(), Ordering::Release);
+}
+
+/// Called before a thread blocks in a call: a thread that was suspended after it entered the call has stopped where it is (SUSPENDED rises).
+pub(crate) fn suspend_blocks() {
+    if SUSPEND_STATES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    irq::without(|| {
+        let s = state();
+        if s.suspends.is_empty() {
+            return;
+        }
+        let tid = thread::current();
+        let Some(&pid) = s.thread_pid.get(&tid) else {
+            return;
+        };
+        if ksys::thread_blocks(s, pid, tid) {
+            commit_wake();
+        }
+    });
 }
 
 /// Is the calling thread's process stopped (`process_suspend`)?

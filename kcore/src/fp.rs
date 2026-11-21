@@ -197,6 +197,15 @@ impl<R> UnitThread<R> {
     }
 }
 
+impl<R> UnitThread<R> {
+    /// Replace the saved registers (a debugger's write, EX1): the thread has state from now on, under a new token (so every hart that holds the
+    /// old copy reloads) and with no holder.
+    pub fn replace_regs(&mut self, tokens: &mut Tokens, regs: R) {
+        self.state = Some((Box::new(regs), tokens.next()));
+        self.holder = None;
+    }
+}
+
 impl UnitThread<FpRegs> {
     /// The first FP use: start from a zeroed register file.
     pub fn enable(&mut self, tokens: &mut Tokens) -> bool {

@@ -1,73 +1,40 @@
-//! Entering user mode for the first time (the assembly of a new thread's first `sret`).
+//! Entering user mode for the first time (the assembly of a new thread's first `sret`): from a register image (EX1).
 
 core::arch::global_asm!(
     r#"
     .section .text
-    .globl enter_user
+    .globl enter_user_frame
     .balign 4
-enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 address-space token, a4 kernel stack top, a5 tp, a6 a1 for the thread
+enter_user_frame:                # a0 a TrapFrame to start from, a1 address-space token, a2 kernel stack top (16-aligned)
     csrci sstatus, 2             # interrupts off until we are in U-mode
-    csrw  satp, a3               # no flush: the token's ASID is unique and this hart flushed for its generation (L18)
-    csrw  sepc, a0
-    sd    a4, 0(tp)              # PerHart.kstack_top: where the next trap from user mode lands
-    csrw  sscratch, tp           # from now on a trap is a trap from user mode
-    li    t0, 256
-    csrc  sstatus, t0            # SPP = 0: sret goes to U-mode
-    li    t0, 32
-    csrs  sstatus, t0            # SPIE = 1: interrupts on in U-mode
-    li    t0, 0x6600
-    csrc  sstatus, t0            # FP and vector units off: a new thread has no FP state
-    mv    sp, a1
-    mv    a0, a2
-    li x1, 0
-    li x3, 0
-    mv x4, a5
-    li x5, 0
-    li x6, 0
-    li x7, 0
-    li x8, 0
-    li x9, 0
-    mv x11, a6
-    li x12, 0
-    li x13, 0
-    li x14, 0
-    li x15, 0
-    li x16, 0
-    li x17, 0
-    li x18, 0
-    li x19, 0
-    li x20, 0
-    li x21, 0
-    li x22, 0
-    li x23, 0
-    li x24, 0
-    li x25, 0
-    li x26, 0
-    li x27, 0
-    li x28, 0
-    li x29, 0
-    li x30, 0
-    li x31, 0
-    sret
+    csrw  satp, a1               # no flush: the token's ASID is unique and this hart flushed for its generation (L18)
+    addi  sp, a2, -288           # the frame goes where a trap from user mode puts one: the top of this thread's kernel stack
+    li    t0, 36
+    mv    t1, a0
+    mv    t2, sp
+1:  ld    t3, 0(t1)
+    sd    t3, 0(t2)
+    addi  t1, t1, 8
+    addi  t2, t2, 8
+    addi  t0, t0, -1
+    bnez  t0, 1b
+    j     trap_epilogue          # restores the registers, sets PerHart.kstack_top from sp, and srets (tp is this hart's PerHart)
 "#
 );
 
 extern "C" {
-    /// Switch to the address space `token`, make `kernel_top` the trap stack of this hart, and drop to U-mode at `entry`
-    /// with stack `sp`, first argument `arg` and `a1` in the second argument register; `tp` is the user thread pointer.
+    /// Drop to U-mode from the register image `frame` (the thread's first run, or its first run after being written before it started): switch
+    /// to the address space `token` and copy the image to the top of the kernel stack `kernel_top`, from where the trap exit restores it.
     /// Interrupts are off until the drop; nothing returns.
     ///
     /// # Safety
-    /// `token` names a live process root whose upper half is the kernel's; `tp` holds this hart's `PerHart`, whose first word receives
-    /// `kernel_top` (the calling thread's own kernel stack top); the caller holds no lock and interrupts are off.
-    #[link_name = "enter_user"]
-    pub fn enter_user_raw(
-        entry: u64,
-        sp: u64,
-        arg: u64,
+    /// `frame` points at a valid `TrapFrame` that does not overlap the top 288 bytes of the stack (it is in a per-hart static); `token` names a live
+    /// process root whose upper half is the kernel's; `tp` holds this hart's `PerHart`; `kernel_top` is the calling thread's own kernel stack
+    /// top, 16-aligned; the caller holds no lock.
+    #[link_name = "enter_user_frame"]
+    pub fn enter_user_frame_raw(
+        frame: *const crate::trap::TrapFrame,
         token: u64,
         kernel_top: u64,
-        tp: u64,
-        a1: u64,
     ) -> !;
 }

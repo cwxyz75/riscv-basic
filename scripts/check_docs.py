@@ -183,6 +183,7 @@ ATOMICS = {
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
+    "kernel/src/user/lifecycle.rs": (2, "the number of threads with suspend state (EX1): a copy of the table's size, read with no lock by `thread::block` so that a kernel thread that blocks holding a lock the big lock must not be taken under pays one load; the table itself is under the big lock"),
     "kernel/src/smp.rs": (12, "hart bring-up and IPI flags, and the two counters of instruction-cache synchronisations (PL7)"),
     "kernel/src/arch/riscv64/aia.rs": (14, "interrupt controller statistics and masks, and the per-source aimed-hart table sized at boot (PL5c)"),
     "kernel/src/thread.rs": (32, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread)"),

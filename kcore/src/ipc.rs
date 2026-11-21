@@ -70,6 +70,8 @@ pub struct ProcessObj {
 pub struct ThreadObj {
     pub pid: u64,
     pub terminated: bool,
+    /// Stopped by `thread_suspend` (EX1): raises SUSPENDED.
+    pub suspended: bool,
     pub exit_code: i32,
 }
 
@@ -690,6 +692,8 @@ fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
         KObj::Thread(t) => {
             if t.terminated {
                 signals::TERMINATED
+            } else if t.suspended {
+                signals::SUSPENDED
             } else {
                 0
             }
@@ -1460,6 +1464,13 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
     }
 }
 
+/// Record that the thread behind `obj` has stopped for `thread_suspend` or runs again (raises or clears SUSPENDED).
+pub fn thread_set_suspended(reg: &mut Kobjs, obj: ObjId, suspended: bool) {
+    if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
+        t.suspended = suspended && !t.terminated;
+    }
+}
+
 /// A thread object for a user thread of `pid`, with a handle in `table` (default thread rights).
 #[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
 pub fn thread_object_create_in(
@@ -1476,6 +1487,7 @@ pub fn thread_object_create_in(
         KObj::Thread(ThreadObj {
             pid,
             terminated: false,
+            suspended: false,
             exit_code: 0,
         }),
         q.job,

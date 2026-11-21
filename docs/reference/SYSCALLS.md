@@ -190,6 +190,10 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
+| 74 | thread_suspend | `a0` thread (MANAGE) | |
+| 75 | thread_resume | `a0` thread (MANAGE) | |
+| 76 | thread_read_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length | |
+| 77 | thread_write_state | `a0` thread (MANAGE), `a1` kind, `a2` buffer, `a3` length | |
 | 65 | thread_set_sched | `a0` thread (0: the caller), `a1` priority 1-63, `a2` flags | |
 | 66 | thread_get_sched | `a0` thread (0: the caller) | `a1` packed priorities, `a2` tid |
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
@@ -987,7 +991,7 @@ Create and start a thread in a running process, with its stack. `args` points to
 | 24 | `u64` stack bytes (0: 256 KiB; rounded up to a page; at most 64 MiB) |
 | 32 | `u64` guard bytes (0: one page; rounded up to a page) |
 | 40 | `u32` priority (0: the creator's base priority, clamped to the new thread's job) |
-| 44 | `u32` flags: bit 0 round robin; bit 1 detached (no handle is returned); bit 2 caller stack (use offset 48, provision nothing) |
+| 44 | `u32` flags: bit 0 round robin; bit 1 detached (no handle is returned); bit 2 caller stack (use offset 48, provision nothing); bit 3 SUSPENDED (EX1: the thread exists, with its registers as below, but does not run until `thread_resume`; with detached it is INVALID_ARGS, since nothing could resume it) |
 | 48 | `u64` stack pointer (caller stack only; otherwise 0) |
 | 56 | `u64` reserved, 0 |
 
@@ -1026,6 +1030,14 @@ ACCESS_DENIED.
 ### thread_suspend(thread) / thread_resume(thread) -> status
 
 **Reserved.** Validate the handle (MANAGE) and answer NOT_SUPPORTED.
+
+### thread_suspend(thread) -> status, thread_resume(thread) -> status
+
+(EX1, KERNEL-V1-SPEC 3.6.) A thread has a **suspend count**. `thread_suspend` (MANAGE) raises it and returns at once: the thread stops at its next return to user mode (a thread running user code on another hart is reached by the same inter-hart interrupt a kill uses), or where it is if it is **blocked in a call** (a thread that enters a blocking call after the suspend stops there too). A thread whose count is above 0 never returns to user mode: it parks as it would return. When it has stopped its object raises the signal **SUSPENDED** (bit 7; waitable; a level: it falls when the count returns to 0; never set with TERMINATED). `thread_resume` (MANAGE) lowers the count; at 0 the thread runs again (a parked one is woken, one still inside its call just goes on). A thread may suspend itself (it parks as the call returns). Suspending is independent of `process_suspend`. The count is at most 2^20 (NO_MEMORY beyond). Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (MANAGE); BAD_STATE (the thread has ended; for `thread_resume` also: its count is 0). A kill of a process ends a parked thread as it does any other. Tests: `thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written`, `suspend_and_state_calls_check_their_arguments_and_rights`, `kcore/tests/suspend_model.rs` (the count against a model: no lost wake, the signal exactly when stopped; mutation-checked).
+
+### thread_read_state(thread, kind, buffer, length) -> status, thread_write_state(thread, kind, buffer, length) -> status
+
+(EX1.) Read or write the user registers of a thread that has **stopped**: SUSPENDED is up (parked at the return to user mode or blocked in a call), or it was made SUSPENDED and has not run. Rights: MANAGE on a thread handle (0, the caller itself, is BAD_STATE: it is running). `kind` and the layouts (RISC-V; `abi::thread_state`): GENERAL (1) is 32 little-endian words, x1 to x31 then pc (256 bytes); FP (2) is f0 to f31 then fcsr (264 bytes; fcsr's 8 defined bits); VECTOR (3) is vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each (`32 + 32 * vlenb` bytes; NOT_SUPPORTED on a machine without a vector unit). `length` must be exactly the layout's size (INVALID_ARGS). A thread that never used the FP or vector unit reads zeros; a write gives it the state (charged to its job's kernel bytes, NO_MEMORY at the limit) and it runs with the unit on. A write to a thread that has run is **left for the thread to apply to its own frame when it wakes** (a read in between shows the pending value); the layout of every kind is applied before the thread runs another instruction. A write is refused (BAD_STATE) while the thread is **inside a blocking call** (a read is allowed: its user registers are as they were when it entered); a write to a GENERAL pc that is not a user address, or not 2-aligned, is INVALID_ARGS and changes nothing. Errors, in order: INVALID_ARGS (kind, length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not stopped; a write inside a blocking call; the thread itself); INVALID_ARGS (a bad buffer; the pc). Tests: `a_stopped_thread_can_be_sent_to_a_handler_and_back` (the signal-injection sequence), `a_thread_started_suspended_runs_only_after_resume_with_registers_written_first` (the `fork` child sequence), `fp_and_vector_state_round_trip_through_thread_state`.
 
 ### thread_interrupt(thread) -> status   (replaces the reserved entry at task 26)
 
