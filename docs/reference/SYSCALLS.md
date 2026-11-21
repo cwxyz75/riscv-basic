@@ -180,6 +180,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 82 | port_unbind | `a0` port, `a1` key | |
 | 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
 | 84 | port_rearm | `a0` port, `a1` key | |
+| 85 | port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
@@ -733,6 +734,16 @@ Wait until some binding is ready or the absolute time `deadline` (nanoseconds) p
 mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
 Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;
 ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once.
+
+### port_wait_many(port, buffer, capacity, deadline) -> status, count
+
+`port_wait` for a batch (AB4). `capacity` is 1 to 64; each record in `buffer` is 16 bytes: `key` (`u64`), `observed` (`u32`, `signals & mask`) and four bytes of zero. Waits as `port_wait` does (`deadline` in nanoseconds, 0: do not
+block, `u64::MAX`: none) until at least one binding is ready, then takes every ready binding up to `capacity`, each at most once, in the order that many
+successive `port_wait` calls would have given them (the port's rotation moves past the last one taken, and a delivered one-shot binding disarms exactly as it
+does for `port_wait`). `count` is how many records were written. Rights: WAIT. Errors: INVALID_ARGS (`capacity` 0 or above 64, or `buffer` not writable user
+memory for `capacity` records; checked before anything is taken, and again in the step that takes the packets, so a packet is never taken and lost); BAD_HANDLE
+(also if the handle stops naming anything while waiting); WRONG_TYPE; ACCESS_DENIED; INTERRUPTED (as `port_wait`); TIMED_OUT. `port_wait` stays until the system
+library wraps it (AB7). Tests: `port_wait_many_*`; `a_batch_wait_equals_that_many_single_waits` (host model).
 
 ## Entry template
 

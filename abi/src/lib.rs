@@ -234,6 +234,10 @@ pub const CHANNEL_CALL_ARGS_BYTES: usize = 56;
 
 /// Limits (SYSCALLS.md, "Limits").
 pub mod limits {
+    /// Most packets one `port_wait_many` returns (AB4).
+    pub const PORT_PACKETS_MAX: usize = 64;
+    /// Bytes in one `port_wait_many` record: `key: u64`, `observed: u32`, four bytes of zero.
+    pub const PORT_PACKET_BYTES: usize = 16;
     pub const MAX_MSG_BYTES: usize = 65536;
     pub const MAX_MSG_HANDLES: usize = 64;
     pub const MAX_QUEUED_MSGS: usize = 128;
@@ -335,6 +339,8 @@ pub mod syscall {
     pub const PORT_UNBIND: usize = 82;
     pub const PORT_WAIT: usize = 83;
     pub const PORT_REARM: usize = 84;
+    /// Up to `PORT_PACKETS_MAX` ready bindings in one call (AB4).
+    pub const PORT_WAIT_MANY: usize = 85;
     pub const JOB_CREATE: usize = 90;
     pub const JOB_SET_LIMITS: usize = 91;
     pub const JOB_INFO: usize = 92;

@@ -1097,6 +1097,47 @@ pub fn port_poll_in(
     Ok(observed)
 }
 
+/// Up to `max` ready bindings at once (`port_wait_many`, AB4): each ready binding at most once, in the order `max` successive
+/// `port_poll_in` calls would give them, with the same effects (the cursor moves past the last one given, a delivered one-shot binding
+/// disarms). Empty if nothing is ready. Needs WAIT on the port.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: n is the binding count and is non-zero in the loop; next < n
+pub fn port_poll_many_in(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    jobs: &mut Jobs,
+    max: usize,
+) -> Result<Vec<(u64, u32)>, Status> {
+    let port_obj = port_of(reg, table, port, Rights::WAIT)?;
+    prune_port(reg, jobs, port_obj);
+    let picked: Vec<(usize, u64, u32, ObjId)> = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => {
+            let n = p.bindings.len();
+            (0..n)
+                .map(|i| (p.next + i) % n)
+                .filter(|&i| binding_ready(reg, &p.bindings[i]))
+                .take(max)
+                .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj))
+                .collect()
+        }
+        _ => return Err(Status::BadHandle),
+    };
+    let observed: Vec<(u64, u32)> = picked
+        .iter()
+        .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask)))
+        .collect();
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    for &(i, ..) in &picked {
+        p.next = i + 1;
+        if p.bindings[i].oneshot {
+            p.bindings[i].armed = false;
+        }
+    }
+    Ok(observed)
+}
+
 /// Arm binding `key` again (a one-shot binding that was delivered; harmless on one that is armed): it
 /// is ready at once if its object's signals match now. Rights: MANAGE on the port.
 pub fn port_rearm_in(
@@ -1605,6 +1646,14 @@ pub fn port_unbind(
     key: u64,
 ) -> Result<(), Status> {
     port_unbind_in(reg, table, port, key, &mut Jobs::new())
+}
+pub fn port_poll_many(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    max: usize,
+) -> Result<Vec<(u64, u32)>, Status> {
+    port_poll_many_in(reg, table, port, &mut Jobs::new(), max)
 }
 pub fn port_poll(
     reg: &mut Kobjs,

@@ -102,6 +102,58 @@ pub fn port_wait_report(
     }
 }
 
+/// `port_wait_many(port, buffer, capacity, deadline)` (AB4): the handle and deadline, after the capacity (1 to `PORT_PACKETS_MAX`) is checked.
+pub fn port_wait_many_check(a: [u64; 6]) -> Result<(Handle, u64, usize, u64), Status> {
+    let cap = usize::try_from(a[2]).map_err(|_| Status::InvalidArgs)?;
+    if cap == 0 || cap > abi::limits::PORT_PACKETS_MAX {
+        return Err(Status::InvalidArgs);
+    }
+    Ok((Handle(a[0]), a[1], cap, a[3]))
+}
+
+/// One poll of the port for up to `cap` ready bindings, written as records at `buf` (`key: u64`, `observed: u32`, four zero bytes). The buffer
+/// is verified writable before anything is dequeued (INVALID_ARGS, nothing changes), and the records are written in the same locked step that
+/// dequeues them, so a packet is never taken and then lost. The number of records written (0: nothing ready).
+#[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: cap is at most PORT_PACKETS_MAX (checked by `port_wait_many_check`)
+pub fn port_poll_many<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    me: u64,
+    h: Handle,
+    buf: u64,
+    cap: usize,
+) -> Result<usize, Status> {
+    let UserState { objs, procs, .. } = us;
+    let p = procs.get_mut(&me).ok_or(Status::BadState)?;
+    let len = cap * abi::limits::PORT_PACKET_BYTES;
+    verify_writable(&mut p.aspace, mm, vmos, buf, len).map_err(|_| Status::InvalidArgs)?;
+    let got = ipc::port_poll_many_in(objs, &p.handles, h, &mut vmos.jobs, cap)?;
+    let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
+    for &(key, observed) in &got {
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&observed.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+    }
+    copy_to_user_verified(&mut p.aspace, mm, buf, &bytes)?;
+    Ok(got.len())
+}
+
+/// How `port_wait_many` reports: the count, else INTERRUPTED if the interrupt flag was taken, else TIMED_OUT.
+pub fn port_wait_many_report(
+    count: usize,
+    deadline: u64,
+    take_interrupt: impl FnOnce() -> bool,
+) -> Reply {
+    if count > 0 {
+        return Ok((Some(count as u64), None));
+    }
+    if deadline != 0 && take_interrupt() {
+        return fail(Status::Interrupted);
+    }
+    fail(Status::TimedOut)
+}
+
 // ---- futex_wait and futex_wake ----
 
 /// What `futex_wait` decided before sleeping.

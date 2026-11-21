@@ -185,6 +185,11 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             commit_wake();
             reply(frame, r);
         }
+        nr::PORT_WAIT_MANY => {
+            let r = port_wait_many(a);
+            commit_wake();
+            reply(frame, r);
+        }
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
         nr::FUTEX_WAKE => {
             let (r, woken) = futex_wake(a);
