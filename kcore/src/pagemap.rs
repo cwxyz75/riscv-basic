@@ -7,6 +7,18 @@ use alloc::vec::Vec;
 
 const CHUNK: u64 = 64;
 const NONE: u64 = u64::MAX;
+/// A page that is explicitly empty: it reads as zeros whatever an ancestor holds, and has no frame (MM8: a decommit in a VMO that inherits).
+const HOLE: u64 = u64::MAX - 1;
+
+/// What the map says about a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// Nothing: an ancestor may show a page.
+    None,
+    /// Explicitly zero, no frame, shadows the ancestors.
+    Hole,
+    Frame(Pfn),
+}
 
 #[derive(Debug, Default)]
 pub struct PageMap {
@@ -58,7 +70,28 @@ impl PageMap {
     pub fn get(&self, page: u64) -> Option<Pfn> {
         let chunk = self.chunks.get((page / CHUNK) as usize)?.as_ref()?;
         let v = chunk[(page % CHUNK) as usize];
-        (v != NONE).then_some(v)
+        (v != NONE && v != HOLE).then_some(v)
+    }
+
+    /// What the map says about `page`.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK, the chunk's length
+    pub fn entry(&self, page: u64) -> Entry {
+        match self
+            .chunks
+            .get((page / CHUNK) as usize)
+            .and_then(|c| c.as_ref())
+        {
+            Some(chunk) => Self::decode(chunk[(page % CHUNK) as usize]),
+            None => Entry::None,
+        }
+    }
+
+    fn decode(v: u64) -> Entry {
+        match v {
+            NONE => Entry::None,
+            HOLE => Entry::Hole,
+            pfn => Entry::Frame(pfn),
+        }
     }
 
     pub fn contains(&self, page: u64) -> bool {
@@ -66,8 +99,31 @@ impl PageMap {
     }
 
     /// Record that `page` is backed by `pfn`. `Err` if the memory for the bookkeeping cannot be had (nothing changed).
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() after the reservation, and the slot index is below CHUNK
     pub fn insert(&mut self, page: u64, pfn: Pfn) -> Result<(), abi::status::Status> {
+        self.put(page, pfn)
+    }
+
+    /// Record that `page` is explicitly empty (a frame it had is the caller's to free: `remove` or `get` it first). `Err` as `insert`.
+    pub fn insert_hole(&mut self, page: u64) -> Result<(), abi::status::Status> {
+        self.put(page, HOLE)
+    }
+
+    /// Turn a page that has a slot already (a frame or a hole) into a hole. Cannot fail; returns the frame it had.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a frame is replaced
+    pub fn make_hole(&mut self, page: u64) -> Option<Pfn> {
+        let chunk = self.chunks.get_mut((page / CHUNK) as usize)?.as_mut()?;
+        let old = core::mem::replace(&mut chunk[(page % CHUNK) as usize], HOLE);
+        match Self::decode(old) {
+            Entry::Frame(pfn) => {
+                self.len -= 1;
+                Some(pfn)
+            }
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() after the reservation, and the slot index is below CHUNK; len counts frames
+    fn put(&mut self, page: u64, raw: u64) -> Result<(), abi::status::Status> {
         let c = (page / CHUNK) as usize;
         if self.chunks.len() <= c {
             self.chunks
@@ -83,19 +139,44 @@ impl PageMap {
             self.chunks[c] = Some(v);
         }
         if let Some(chunk) = self.chunks[c].as_mut() {
-            if chunk[(page % CHUNK) as usize] == NONE {
+            let slot = &mut chunk[(page % CHUNK) as usize];
+            let was_frame = matches!(Self::decode(*slot), Entry::Frame(_));
+            let is_frame = matches!(Self::decode(raw), Entry::Frame(_));
+            *slot = raw;
+            if is_frame && !was_frame {
                 self.len += 1;
+            } else if was_frame && !is_frame {
+                self.len -= 1;
             }
-            chunk[(page % CHUNK) as usize] = pfn;
         }
         Ok(())
+    }
+
+    /// The first page at or after `from` with an entry (a frame or a hole), and what it is (an allocation-free walk over the map).
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the chunk index is below chunks.len() and the slot index below CHUNK
+    pub fn next_entry_at_or_after(&self, from: u64) -> Option<(u64, Entry)> {
+        let mut c = (from / CHUNK) as usize;
+        let mut slot = (from % CHUNK) as usize;
+        while c < self.chunks.len() {
+            if let Some(chunk) = self.chunks[c].as_ref() {
+                while slot < CHUNK as usize {
+                    if chunk[slot] != NONE {
+                        return Some((c as u64 * CHUNK + slot as u64, Self::decode(chunk[slot])));
+                    }
+                    slot += 1;
+                }
+            }
+            c += 1;
+            slot = 0;
+        }
+        None
     }
 
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the slot index is below CHUNK; len is at least 1 when a slot is occupied
     pub fn remove(&mut self, page: u64) -> Option<Pfn> {
         let chunk = self.chunks.get_mut((page / CHUNK) as usize)?.as_mut()?;
         let v = core::mem::replace(&mut chunk[(page % CHUNK) as usize], NONE);
-        if v == NONE {
+        if v == NONE || v == HOLE {
             return None;
         }
         self.len -= 1;
@@ -106,7 +187,7 @@ impl PageMap {
     pub fn drain_pfns(&mut self, mut f: impl FnMut(Pfn)) {
         for chunk in self.chunks.drain(..).flatten() {
             for v in chunk {
-                if v != NONE {
+                if v != NONE && v != HOLE {
                     f(v);
                 }
             }

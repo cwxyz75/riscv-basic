@@ -802,6 +802,9 @@ pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn block() {
+    // (MM8) a page the call made visible or replaced may be shown stale through other mappings until the call ends; a thread that sleeps
+    // inside it would leave them so for as long as it sleeps
+    crate::user::cow_sync();
     irq::without(|| {
         if sched().block_on(hart()).expect("running thread") {
             reschedule();

@@ -1167,3 +1167,209 @@ fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first
         "a refused ANYWHERE does not draw from the pool"
     );
 }
+
+// ---- MM8: vmo_create_child and process_clone_region ----
+
+fn byte(w: &mut W, pid: u64, va: u64) -> u8 {
+    let t = w.procs.get_mut(&pid).unwrap();
+    let b = copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, 1).unwrap()[0];
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+    b
+}
+
+fn put(w: &mut W, pid: u64, va: u64, b: u8) {
+    let t = w.procs.get_mut(&pid).unwrap();
+    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, &[b]).unwrap();
+    // (what the kernel does after every call and fault)
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+}
+
+#[test]
+fn a_snapshot_child_keeps_the_contents_as_they_were_and_the_source_write_protects_and_copies() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    put(&mut w, 1, VA, 7);
+    put(&mut w, 1, VA + 4096, 8);
+    let shoot = w.tlb.shootdowns;
+    let (child, _) = w.ok(
+        nr::VMO_CREATE_CHILD,
+        [v, 0, 4 * 4096, 0, abi::child_flags::SNAPSHOT, 0],
+    );
+    let child = child.unwrap();
+    assert_eq!(
+        w.tlb.shootdowns,
+        shoot + 1,
+        "the source's writable translations are shot down"
+    );
+    assert!(
+        !w.procs[&1]
+            .aspace
+            .table()
+            .translate(&w.mm, VA)
+            .unwrap()
+            .perms
+            .write,
+        "and no longer writable"
+    );
+    assert_eq!(
+        w.vmos.committed_pages(id),
+        Some(0),
+        "the pages moved to the hidden node"
+    );
+    // the child, mapped in the other process, sees the old bytes; a write through the source does not reach it
+    w.ok(nr::PROCESS_MAP, [ph, child, VA, 0, 4 * 4096, W | R]);
+    assert_eq!(byte(&mut w, 2, VA), 7);
+    put(&mut w, 1, VA, 70);
+    assert_eq!(byte(&mut w, 1, VA), 70, "the source sees its own write");
+    assert_eq!(byte(&mut w, 2, VA), 7, "the child still sees the old page");
+    // and a write through the child does not reach the source
+    put(&mut w, 2, VA + 4096, 80);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 80);
+    assert_eq!(byte(&mut w, 1, VA + 4096), 8);
+    // a member gives a page back: it reads zero afterwards (and the other side is untouched); the source can too
+    w.ok(nr::VMO_DECOMMIT, [child, 4096, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 0, "the child's page is gone");
+    assert_eq!(
+        byte(&mut w, 1, VA + 4096),
+        8,
+        "the source still has its own"
+    );
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 1, VA), 0);
+    assert_eq!(
+        byte(&mut w, 2, VA),
+        7,
+        "and the child still has what the snapshot showed"
+    );
+    // a page nobody wrote reads zero in both, and the charge is exact: frames in use are the jobs' pages (no tables charged to the job's pages here)
+    assert_eq!(byte(&mut w, 1, VA + 3 * 4096), 0);
+    assert_eq!(byte(&mut w, 2, VA + 3 * 4096), 0);
+}
+
+#[test]
+fn a_child_is_refused_when_it_would_break_a_rule() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    let snap = abi::child_flags::SNAPSHOT;
+    let private = abi::child_flags::PRIVATE;
+    for bad_flags in [0, snap | private, 4] {
+        assert_eq!(
+            w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, bad_flags, 0]),
+            Status::InvalidArgs,
+            "exactly one of SNAPSHOT or PRIVATE"
+        );
+    }
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 1, 4096, 0, private, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 3 * 4096, 2 * 4096, 0, private, 0]),
+        Status::InvalidArgs,
+        "past the end"
+    );
+    // a job handle other than the source's job: a SNAPSHOT is refused, a PRIVATE child may be charged elsewhere
+    let jh = {
+        let p = w.procs.get_mut(&1).unwrap();
+        let obj = w.objs.create(ipc::KObj::Job(other));
+        p.handles.insert(&mut w.objs, obj, Rights::ALL).unwrap().0
+    };
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, jh, snap, 0]),
+        Status::AccessDenied,
+        "COW2: the pages never change payer"
+    );
+    w.ok(nr::VMO_CREATE_CHILD, [v, 0, 4096, jh, private, 0]);
+    // V1: a SNAPSHOT is refused while a process of another job maps the source, and nothing changes
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    let stranger = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = stranger;
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0],
+    );
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
+        Status::BadState,
+        "the stranger's mapping is promised that a write never charges the VMO's job"
+    );
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.procs.get_mut(&2).unwrap().job = JobId::ROOT;
+    // a call that fails for want of a handle slot changes nothing (no hidden node, the source stays as it was)
+    let vmos_before = w.vmos.count();
+    let full = {
+        let p = w.procs.get_mut(&1).unwrap();
+        let mut n = 0;
+        while p.handles.room() > 0 {
+            let obj = w.objs.create(ipc::KObj::Job(JobId::ROOT));
+            p.handles.insert(&mut w.objs, obj, Rights::ALL).unwrap();
+            n += 1;
+        }
+        n
+    };
+    assert!(full > 0);
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
+        Status::NoMemory
+    );
+    assert_eq!(w.vmos.count(), vmos_before, "no VMO was made");
+    assert!(!w.vmos.has_parent(id), "the source was not restructured");
+    w.vmos.audit_families(true).unwrap();
+}
+
+#[test]
+fn process_clone_region_shares_or_snapshots_a_region_into_another_process() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, _) = w.vmo_and_id(4, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    put(&mut w, 1, VA, 5);
+    // SHARE: the same VMO, both see each other's writes
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0],
+    );
+    assert_eq!(byte(&mut w, 2, VA), 5);
+    put(&mut w, 2, VA, 6);
+    assert_eq!(byte(&mut w, 1, VA), 6);
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    // SNAPSHOT: each has its own from here
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SNAPSHOT, 0, 0],
+    );
+    assert_eq!(byte(&mut w, 2, VA), 6);
+    put(&mut w, 1, VA, 9);
+    put(&mut w, 2, VA + 4096, 10);
+    assert_eq!(byte(&mut w, 1, VA), 9);
+    assert_eq!(byte(&mut w, 2, VA), 6, "the child kept the old page");
+    assert_eq!(byte(&mut w, 1, VA + 4096), 0);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 10);
+    // refusals: nothing at the address; the target already has a mapping there; a bad mode
+    assert_eq!(
+        w.err(
+            nr::PROCESS_CLONE_REGION,
+            [ph1, ph, VA + 0x10_0000, abi::clone_mode::SHARE, 0, 0]
+        ),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(
+            nr::PROCESS_CLONE_REGION,
+            [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0]
+        ),
+        Status::InvalidArgs,
+        "the target has a region there"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_CLONE_REGION, [ph1, ph, VA, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    // everything goes back: the processes' regions, then the VMOs
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.ok(nr::PROCESS_UNMAP, [ph1, VA, 0, 0, 0, 0]);
+}

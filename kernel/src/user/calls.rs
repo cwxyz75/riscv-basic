@@ -23,6 +23,7 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_UNMAP => process_table_call(n, a),
         nr::PROCESS_PROTECT | nr::PROCESS_MAP_INFO => process_table_call(n, a),
         nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => process_table_call(n, a),
+        nr::VMO_CREATE_CHILD | nr::PROCESS_CLONE_REGION => process_table_call(n, a),
         nr::PROCESS_START => process_start(a),
         nr::PROCESS_KILL => process_kill(a),
         nr::PROCESS_SUSPEND => process_stop(a, true),
@@ -48,6 +49,9 @@ impl ksys::Machine for KernelMachine {
     fn icache_sync(&mut self, pages: u64) {
         crate::smp::icache_sync(pages);
     }
+    fn skip_cow_protect(&self) -> bool {
+        cfg!(feature = "fault-skip-cow-protect")
+    }
     fn random_below(&mut self, n: u64) -> u64 {
         // (a pool that is not seeded yet gives nothing: the placement is then the first fit, which is still a valid place)
         crate::entropy::below(n).unwrap_or(0)
@@ -71,6 +75,18 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
         };
         ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
     })
+}
+
+/// After a call or a fault: drop what the copy log made stale in every address space (COW1). A load when nothing is pending.
+pub(crate) fn cow_sync() {
+    if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    irq::without(|| {
+        let s = state();
+        let k = kmem::get();
+        ksys::cow_sync(&mut s.procs, k.mm, k.vmos, &mut KernelMachine);
+    });
 }
 
 pub(super) fn caller_pid(s: &UserState) -> Result<u64, Status> {

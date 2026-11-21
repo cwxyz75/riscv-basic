@@ -26,7 +26,9 @@ fn resolve<M: PhysMem>(
 ) -> Result<u64, Status> {
     let page = va & !(PAGE_SIZE - 1);
     let mut t = aspace.table().translate(mm, page);
-    if t.is_none() {
+    // a page mapped read-only under a writable region is shared copy-on-write (MM8): the fault path makes the writer's own copy
+    let cow = access == Access::Write && t.is_some_and(|t| !t.perms.write);
+    if t.is_none() || cow {
         aspace
             .handle_fault(mm, vmos, jobs, page, access)
             .map_err(|_| Status::InvalidArgs)?;

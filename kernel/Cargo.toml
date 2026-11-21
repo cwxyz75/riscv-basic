@@ -46,6 +46,8 @@ chaos = []
 # Negative controls for the SMP tests (S5d): each disables one safety mechanism, and the test
 # that guards it must then fail (the harness runs these builds and requires that).
 fault-skip-shootdown = []
+# MM8: a SNAPSHOT leaves the source's writable translations as they were; a write through them then reaches the child's pages
+fault-skip-cow-protect = []
 fault-skip-kernel-satp = []
 # L18 negative control: a hart installs a newer generation's address space without the flush it owes, and the ASID field counts as one bit
 # (one ASID per generation: every new process turns the generation). The harm is a stale translation under a reused ASID; QEMU drops its

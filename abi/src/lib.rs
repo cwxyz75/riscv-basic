@@ -202,6 +202,22 @@ pub mod vmo_flags {
     pub const RESIZABLE: u64 = 1;
 }
 
+/// Flags for `vmo_create_child` (its fifth argument, MM8): exactly one.
+pub mod child_flags {
+    /// The source and the child each see the source's contents as they were; later writes are private to the writer. The child is charged to the source's job.
+    pub const SNAPSHOT: u64 = 1;
+    /// The child sees the source's pages, including later changes to those it has not written; its writes are private to it.
+    pub const PRIVATE: u64 = 2;
+}
+
+/// Modes of `process_clone_region` (its fourth argument, MM8).
+pub mod clone_mode {
+    /// The target maps the same VMO with the same permissions.
+    pub const SHARE: u64 = 1;
+    /// The target maps a SNAPSHOT child of the source's VMO.
+    pub const SNAPSHOT: u64 = 2;
+}
+
 pub mod port_flags {
     /// The binding disarms itself when `port_wait` reports it, until `port_rearm`.
     pub const ONESHOT: u64 = 1;
@@ -344,6 +360,10 @@ pub mod syscall {
     pub const THREAD_GET_SCHED: usize = 66;
     /// Describe the region of a process at or after an address (MM7).
     pub const PROCESS_MAP_INFO: usize = 67;
+    /// Make a copy-on-write child of a range of a VMO (MM8): SNAPSHOT or PRIVATE.
+    pub const VMO_CREATE_CHILD: usize = 68;
+    /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
+    pub const PROCESS_CLONE_REGION: usize = 69;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;

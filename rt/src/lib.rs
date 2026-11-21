@@ -261,6 +261,20 @@ pub mod sys {
     pub fn vmo_set_size(vmo: u64, bytes: u64) -> Ret {
         syscall(VMO_SET_SIZE, [vmo as usize, bytes as usize, 0, 0, 0, 0])
     }
+    /// A copy-on-write child of `bytes` bytes of `vmo` from `offset`, charged to `job` (0: the caller's own): `flags` is `child_flags::SNAPSHOT` or `PRIVATE` (MM8). Returns the handle.
+    pub fn vmo_create_child(vmo: u64, offset: u64, bytes: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE_CHILD,
+            [
+                vmo as usize,
+                offset as usize,
+                bytes as usize,
+                job as usize,
+                flags as usize,
+                0,
+            ],
+        )
+    }
     pub fn vmo_read(vmo: u64, offset: u64, buf: *mut u8, len: usize) -> Ret {
         syscall(
             VMO_READ,
@@ -455,6 +469,20 @@ pub mod sys {
         syscall(
             PROCESS_MAP_INFO,
             [process as usize, vaddr as usize, buf as usize, 0, 0, 0],
+        )
+    }
+    /// Map the region of `source` that starts at `vaddr` into `target` at the same address: `clone_mode::SHARE` or `SNAPSHOT` (MM8).
+    pub fn process_clone_region(source: u64, target: u64, vaddr: u64, mode: u64) -> Ret {
+        syscall(
+            PROCESS_CLONE_REGION,
+            [
+                source as usize,
+                target as usize,
+                vaddr as usize,
+                mode as usize,
+                0,
+                0,
+            ],
         )
     }
     pub fn process_start(process: u64, entry: u64, sp: u64, bootstrap: u64, arg: u64) -> Ret {
