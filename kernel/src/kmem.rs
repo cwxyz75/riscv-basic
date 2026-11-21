@@ -502,9 +502,10 @@ pub fn use_kernel_table_if_needed() {
     }
     let want = KERNEL_ASPACE.load(core::sync::atomic::Ordering::Relaxed);
     if crate::arch::aspace_current() != want {
-        // SAFETY: the kernel table maps everything the kernel runs from and touches; installing it
-        // drops the translations of the table being left.
-        unsafe { crate::arch::aspace_install(want) };
+        // SAFETY: the kernel table maps everything the kernel runs from and touches. No flush (L18): the user entries of the space being
+        // left stay cached under its ASID, which nothing runs under until its owner does (a hart flushes before it takes a newer
+        // generation's ASID, and teardown's shootdown reaches every hart before the table's frames are reused).
+        unsafe { crate::arch::aspace_install_noflush(want) };
     }
 }
 
