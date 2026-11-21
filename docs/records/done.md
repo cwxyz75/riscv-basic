@@ -86,3 +86,8 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-20 | PL2 | Per-thread vector state | per-thread vector state: kcore::fp as one model with two instances (PR 319) |
 | 2026-11-20 | PL3 | User code built for RVA23U64; cache-block instructions enabled for user mode | user code built for RVA23U64; cache-block instructions enabled for user mode (PR 320) |
 | 2026-11-20 | T166 | A user thread that has used floating point still takes the big lock at every trap return (fp::return_to_user) | a thread that has used a unit returns to user mode with no big lock: per-hart claims and the lock-free save (fixed by PL3) (PR 320) |
+| 2026-11-20 | AB1 | Handles become 64 bits (24 slot bits, 40 generation bits): one flag-day change | 64-bit handles: 24 slot bits, 40 generation bits, growing table, 8-byte handle arrays (PR 324) |
+| 2026-11-20 | AB3 | Identifiers that are never reused become 64 bits; no counter wraps (CNT1); counter fast-forward tests | u64 thread ids, pids, koids, object generations; no counter wraps; ff= fast-forward boot (PR 325) |
+| 2026-11-20 | AB5 | Remove `thread_create`; `thread_spawn` is the only way to make a thread | thread_create removed, syscall 60 retired (PR 326) |
+| 2026-11-20 | AB4 | `port_wait_many`: up to 64 packets in one call | port_wait_many, syscall 85 (PR 327) |
+| 2026-11-20 | T8 | Handle tables are sized for the worst case | handle tables grow on demand (fixed by AB1) (PR 324) |
