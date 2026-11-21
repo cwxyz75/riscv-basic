@@ -158,7 +158,8 @@ os-models:
 # so Miri has little to find in them (the fake memory in the tests is safe code too).
 os-miri:
 	cargo +nightly miri test -p abi -p kcore --lib --test frame_model --target-dir target/miri
-	cargo +nightly miri test -p ksys --target-dir target/miri
+	# (the allocation-failure sweep starts child processes of itself, which Miri cannot do; the host run and `os-allocfail` cover it)
+	cargo +nightly miri test -p ksys --target-dir target/miri -- --skip every_failing_allocation_is_reported_as_no_memory_and_leaves_the_state_clean
 	cargo +nightly miri test -p klock --target-dir target/miri
 
 # Tier 1 (smoke, OD83): the whole suite once, on the default (AIA) machine at four harts. The normal

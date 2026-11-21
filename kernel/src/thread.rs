@@ -1195,7 +1195,7 @@ pub fn fp_off() -> bool {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the heap's total free bytes are at least its grown bytes
 pub fn heap_free() -> usize {
     // (growth at a safe point adds free bytes that are not a leak)
-    heap::free_bytes() - heap::grown_bytes()
+    heap::free_bytes() - heap::grown_bytes() - heap::small_bytes_in_use()
 }
 
 pub fn thread_count() -> usize {

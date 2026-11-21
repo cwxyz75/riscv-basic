@@ -91,8 +91,9 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             unlock();
         }
         Class::Heap => {
-            // the heap's own path: `alloc` notes the class around the allocator
-            let b = alloc::vec![0u8; 64];
+            // the heap's own path: `alloc` notes the class around the allocator. A large block, since a small one is served from the
+            // hart's magazine with no lock (MM4)
+            let b = alloc::vec![0u8; 4096];
             core::hint::black_box(&b);
             drop(b);
         }
