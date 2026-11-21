@@ -210,7 +210,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 One standing line (OD144). The per-item list that stood here until 2026-11-20 is in git history (this file as of PR 304).
 
 - **One soak run and one overnight run are owed, at the owner's choosing** (`gh workflow run soak.yml`,
-  `gh workflow run overnight.yml`). Neither tier has run since OD142; between them they cover everything merged since
+  `gh workflow run overnight.yml`). The owner asked for a local run of both tiers on 2026-11-21 (see "Decisions taken without the owner": tier 2 in full, tier 3 reduced); until the full overnight sweeps are run, neither tier has run in full since OD142; between them they cover everything merged since
   (the first peel and the scheduler's exit from the big lock, nanosecond time and the tickless timer, the move behind
   `arch/`, and the first runs of the checks phase 3 built: chaos, mutants, the checked release kernel, the long fuzz run,
   the persistent allocation-failure sweep, coverage, Miri over `ksys`). The mutation job is red until its first survivors
@@ -256,3 +256,19 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     stops if a bit does not stick. Alternative: a target specification (nightly only).
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.
+  - 2026-11-21, at the owner's request (a full soak, then the overnight tier, `os-miri` and a full local gate, while the owner slept): tier 2 was run
+    on a Mac (QEMU 11.1.3; CI has 10.2.1) first three boots at a time, then each failing target alone. Failures that were load or shared host ports
+    (T195) were not fixed; the three real ones were: `cpu-neg` (an early trap handler in `_start`: the kernel hung silently on a CPU without the
+    profile), the `fault-early-reap` control (made deterministic), and the `fault-shootdown` control (passes on QEMU 11.1.3: T193, not fixed). Tier 3
+    ran in a reduced form (chaos seeds 1 to 50 at two jobs, ten `overnight-repeat-smp` boots instead of twenty, `make check` in place of the retired
+    `preflight`, mutants over `klock` then `kcore`), because the full sweeps would have taken longer than the night and the machine also had to
+    build phase 6; the full ones are still the owner's to run. Chaos failures consisting only of `realtime_thread_stays_responsive_under_load`
+    (T178: it fails under host load) are not counted. `make os-miri` skips the `ksys` allocation-failure sweep, which starts child processes of
+    itself, which Miri cannot do.
+  - 2026-11-21, MM4: the slab allocator is built in two parts. The kernel half serves requests up to 2048 bytes from slabs behind per-hart magazines,
+    with slab frames from a small pool that `heap::service` stocks at the existing safe points (under the big lock); a request the pool cannot
+    serve, every large request and early boot stay on the free-list heaps, and `dealloc` tells them apart by address. KERNEL-V1-SPEC 4.2 has the
+    allocator take frames inline under a `FRAME` lock and drop `linked_list_allocator`; that lock is L16's, which comes after MM4 in the plan, so the
+    spec's end state waits for it (`work/T196.md`). Alternative: do L16's frame lock first (a much larger change, with the allocator's rewrite
+    on top). MM4 is not ticked.
+
