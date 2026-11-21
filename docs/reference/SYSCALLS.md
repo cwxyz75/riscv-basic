@@ -566,7 +566,7 @@ read). The rights are checked before the pointer is touched.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet); `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 **Pages (`which` 2) count the pages a job's address spaces have prepaid** for their faults as well as the pages its VMOs hold: in a job with a limit, an address space prepays up to 64 pages at a time (an eighth of the job's room at most, one at least) and gives the rest back when it ends, so `used` can read a little above the committed pages while a process of the job runs. A job with no limit prepays nothing.
