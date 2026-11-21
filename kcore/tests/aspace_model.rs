@@ -649,7 +649,11 @@ fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
         .unmap_region(&mut mm, &mut vmos, &mut jobs, BASE)
         .unwrap();
     assert_eq!(jobs.usage(job).unwrap().pages, 0);
-    assert_eq!(jobs.usage(JobId::ROOT).unwrap().pages, 1);
+    // (the root job has no limit: the address space prepaid a batch from it, which counts as usage until it is released)
+    assert_eq!(
+        jobs.usage(JobId::ROOT).unwrap().pages,
+        1 + aspace.reserved_pages()
+    );
     assert_eq!(
         aspace.handle_fault(
             &mut mm,
@@ -699,8 +703,14 @@ fn running_out_of_frames_gives_the_page_charge_back() {
     assert!(ok < 64, "the frames ran out");
     assert_eq!(
         jobs.usage(job).unwrap().pages,
+        ok + aspace.reserved_pages(),
+        "a refused page is not charged: the committed pages and the prepaid ones are all there is"
+    );
+    aspace.release_reservation(&mut jobs);
+    assert_eq!(
+        jobs.usage(job).unwrap().pages,
         ok,
-        "a refused page is not charged"
+        "and the prepaid remainder goes back"
     );
 }
 
