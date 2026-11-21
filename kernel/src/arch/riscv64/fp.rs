@@ -356,6 +356,13 @@ pub fn trap_entry(frame: &mut TrapFrame) {
     if frame.sstatus & (1 << 8) != 0 {
         return; // from the kernel
     }
+    // The cheap way first (no table lookup, no new token): the hart's claim names the running thread, so its dirty state is saved in place.
+    // Only what that cannot do (no claim yet: the first save of a thread, or the state came from another hart) takes the slow way below.
+    if light_save(frame) {
+        // SAFETY: clears sstatus.FS and sstatus.VS only: the kernel runs with the FP and vector units off.
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) FS_MASK | VS_MASK) };
+        return;
+    }
     let dirty = frame.sstatus & FS_MASK == FS_DIRTY;
     let vdirty = frame.sstatus & VS_MASK == VS_DIRTY;
     // (the negative-control kernel forgets to save: the test that guards the save must then fail)

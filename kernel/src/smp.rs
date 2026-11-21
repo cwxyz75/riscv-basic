@@ -258,22 +258,28 @@ pub fn shootdown() {
         return; // negative control: the test that guards this must fail
     }
     let me = percpu::this().index.load(Ordering::Relaxed);
-    // every other online hart, as the (mask, base) groups the firmware wants: one call per group of 64 ids, not per hart
-    let mut ids = [0usize; MAX_HARTS];
-    let mut n = 0;
+    // every other online hart, as the (mask, base) groups the firmware wants: one call per group of 64 ids, not per hart. No array: the first
+    // hart of a group makes the call for the whole group (this runs on the deepest kernel path, the reap on a fresh thread: T173)
+    let id_of = |i: usize| percpu::hart(i).hart_id.load(Ordering::Relaxed);
+    let online = |i: usize| i != me && percpu::hart(i).online.load(Ordering::Acquire);
     for i in 0..started() {
-        if i != me && percpu::hart(i).online.load(Ordering::Acquire) {
-            if let Some(slot) = ids.get_mut(n) {
-                *slot = percpu::hart(i).hart_id.load(Ordering::Relaxed);
-                n += 1;
+        if !online(i) {
+            continue;
+        }
+        let base = id_of(i) & !63usize;
+        if (0..i).any(|j| online(j) && id_of(j) & !63usize == base) {
+            continue;
+        }
+        let mut mask = 0usize;
+        for j in i..started() {
+            if online(j) && id_of(j) & !63usize == base {
+                mask |= 1usize << (id_of(j) & 63);
             }
         }
-    }
-    kcore::harts::for_each_hart_mask(ids.get_mut(..n).unwrap_or(&mut []), |mask, base| {
         // a whole-address-space flush (start = 0, size = 0) of every ASID on those harts
         let r = sbi5(EID_RFENCE, FID_REMOTE_SFENCE_VMA, [mask, base, 0, 0, 0]);
         assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
-    });
+    }
 }
 
 /// Tell every other hart that is part of the scheduler to look at its run state (a kill, for
