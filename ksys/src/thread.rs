@@ -95,6 +95,7 @@ pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
+    jobs: &mut Jobs,
     me: u64,
     creator_prio: u8,
     a: [u64; 6],
@@ -104,7 +105,7 @@ pub fn thread_spawn<M: PhysMem>(
     // the record first (a bad pointer is the first error), then the handle
     let raw = {
         let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
-        copy_from_user(&mut c.aspace, mm, vmos, a[1], sp::ARGS_BYTES)?
+        copy_from_user(&mut c.aspace, mm, vmos, jobs, a[1], sp::ARGS_BYTES)?
     };
     let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
     let (entry, arg, tp, stack_bytes, guard_bytes) = (w(0), w(1), w(2), w(3), w(4));
@@ -116,7 +117,7 @@ pub fn thread_spawn<M: PhysMem>(
     let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
     let tjob = target.job;
     // a priority above the job's maximum is refused (ACCESS_DENIED), not clamped: the program asked for it
-    let max = vmos.jobs.sched(tjob).map_or(10, |j| j.max_prio);
+    let max = jobs.sched(tjob).map_or(10, |j| j.max_prio);
     if (1..=63).contains(&prio_req) && prio_req as u8 > max {
         return Err(Status::AccessDenied);
     }
@@ -178,12 +179,12 @@ pub fn thread_spawn<M: PhysMem>(
         }
     };
     let prio = if prio_req == 0 {
-        clamp_prio(&vmos.jobs, tjob, creator_prio)
+        clamp_prio(jobs, tjob, creator_prio)
     } else {
         prio_req as u8
     };
     let detached = flags & sp::DETACHED != 0;
-    charge_thread(&mut vmos.jobs, tjob).map_err(crate::job_status)?;
+    charge_thread(jobs, tjob).map_err(crate::job_status)?;
     let UserState { objs, procs, .. } = us;
     // the thread's object and handle (not for a detached thread)
     let made = if detached {
@@ -196,13 +197,13 @@ pub fn thread_spawn<M: PhysMem>(
             &mut caller.handles,
             tpid,
             &mut Quota {
-                jobs: &mut vmos.jobs,
+                jobs,
                 job: Some(job),
             },
         ) {
             Ok(x) => Some(x),
             Err(e) => {
-                credit_thread(&mut vmos.jobs, tjob);
+                credit_thread(jobs, tjob);
                 return Err(e);
             }
         }
@@ -224,16 +225,16 @@ pub fn thread_spawn<M: PhysMem>(
                 }
                 credit_thread(jobs, tjob);
             };
-        if let Err(e) = vmos.jobs.charge(tjob, Resource::Pages, tables) {
-            undo(made, procs, objs, &mut vmos.jobs);
+        if let Err(e) = jobs.charge(tjob, Resource::Pages, tables) {
+            undo(made, procs, objs, jobs);
             return Err(crate::job_status(e));
         }
         if let Err(e) = vmos.reserve_one() {
-            undo(made, procs, objs, &mut vmos.jobs);
-            vmos.jobs.credit(tjob, Resource::Pages, tables);
+            undo(made, procs, objs, jobs);
+            jobs.credit(tjob, Resource::Pages, tables);
             return Err(e);
         }
-        let vmo = vmos.create_in(stack_len / 4096, tjob);
+        let vmo = vmos.create_in(jobs, stack_len / 4096, tjob);
         let perms = Perms {
             read: true,
             write: true,
@@ -245,9 +246,9 @@ pub fn thread_spawn<M: PhysMem>(
             .aspace
             .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
         {
-            let _ = vmos.release(mm, vmo);
-            vmos.jobs.credit(tjob, Resource::Pages, tables);
-            undo(made, procs, objs, &mut vmos.jobs);
+            let _ = vmos.release(mm, jobs, vmo);
+            jobs.credit(tjob, Resource::Pages, tables);
+            undo(made, procs, objs, jobs);
             return Err(match e {
                 kcore::aspace::RegionError::TooMany => Status::NoMemory,
                 _ => Status::InvalidArgs,

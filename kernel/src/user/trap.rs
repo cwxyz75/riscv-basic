@@ -82,9 +82,13 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                     Some(pid) if va < abi::user::TOP => {
                         let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
-                        let r = p
-                            .aspace
-                            .handle_fault_mapped(&mut k.mm, &mut k.vmos, va, access);
+                        let r = p.aspace.handle_fault_mapped(
+                            &mut k.mm,
+                            &mut k.vmos,
+                            &mut k.jobs,
+                            va,
+                            access,
+                        );
                         if let Ok(m) = &r {
                             kmem::flush_pages(m.first, m.last, p.asid);
                         }
@@ -331,6 +335,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             aspace: &mut p.aspace,
             mm: &mut k.mm,
             vmos: &mut k.vmos,
+            jobs: &mut k.jobs,
             faults: ksys::Faults {
                 skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
             },
@@ -353,8 +358,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if len > MAX_DEBUG_WRITE {
                 return fail(Status::TooBig);
             }
-            let bytes = copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, ptr, len)
-                .map_err(|e| (e, None, None))?;
+            let bytes =
+                copy_from_user(&mut p.aspace, &mut k.mm, &mut k.vmos, &mut k.jobs, ptr, len)
+                    .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);
             Ok((None, None))
         }
@@ -369,7 +375,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             if k.vmos.reserve_one().is_err() {
                 return fail(Status::NoMemory);
             }
-            let id = k.vmos.create_in(pages, p.job);
+            let id = k.vmos.create_in(&mut k.jobs, pages, p.job);
             // the firmware's seeds are the kernel's (HD1): the copy the device manager sees has them zeroed
             // (scrubbed in a heap copy first, so no frame of the VMO ever holds them)
             let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
@@ -379,8 +385,8 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                     range.fill(0);
                 }
             }
-            if k.vmos.write(&mut k.mm, id, 0, &copy).is_err() {
-                let _ = k.vmos.release(&mut k.mm, id);
+            if k.vmos.write(&mut k.mm, &mut k.jobs, id, 0, &copy).is_err() {
+                let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
                 return fail(Status::NoMemory);
             }
             let rights =
@@ -388,7 +394,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
                 Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
                 Err(e) => {
-                    let _ = k.vmos.release(&mut k.mm, id);
+                    let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
                     fail(e)
                 }
             }

@@ -57,6 +57,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
             me,
             mm: &mut k.mm,
             vmos: &mut k.vmos,
+            jobs: &mut k.jobs,
             machine: &mut KernelMachine,
         };
         ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
@@ -79,7 +80,7 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
         let handle = ksys::process_create(
             s,
             &mut k.mm,
-            &mut k.vmos,
+            &mut k.jobs,
             k.aspace.table(),
             kernel_half_ok,
             me,
@@ -97,7 +98,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        ksys::process_start(s, &mut kmem::get().vmos.jobs, me, a).map_err(|e| (e, None, None))
+        ksys::process_start(s, &mut kmem::get().jobs, me, a).map_err(|e| (e, None, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
@@ -155,7 +156,8 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let creator = creator_prio(s);
         let k = kmem::get();
-        ksys::thread_spawn(s, &mut k.mm, &mut k.vmos, me, creator, a).map_err(|e| (e, None, None))
+        ksys::thread_spawn(s, &mut k.mm, &mut k.vmos, &mut k.jobs, me, creator, a)
+            .map_err(|e| (e, None, None))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
@@ -213,7 +215,7 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
         let (tid, prio, flags) = ksys::thread_set_sched_target(
             &s.objs,
             &s.procs,
-            &kmem::get().vmos.jobs,
+            &kmem::get().jobs,
             me,
             thread::current(),
             a,
@@ -244,7 +246,7 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let jobs = &mut kmem::get().vmos.jobs;
+        let jobs = &mut kmem::get().jobs;
         let job =
             ksys::job_set_sched(&s.objs, &s.procs, jobs, me, a).map_err(|e| (e, None, None))?;
         // PR1: clamp the threads of the job and everything below it
@@ -271,14 +273,9 @@ pub(super) fn job_kill(a: [u64; 6]) -> Reply {
     let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u64>, bool, u64), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let (victims, me_inside) = ksys::job_kill_victims(
-            &s.objs,
-            &s.procs,
-            &mut kmem::get().vmos.jobs,
-            me,
-            Handle(a[0]),
-        )
-        .map_err(|e| (e, None, None))?;
+        let (victims, me_inside) =
+            ksys::job_kill_victims(&s.objs, &s.procs, &mut kmem::get().jobs, me, Handle(a[0]))
+                .map_err(|e| (e, None, None))?;
         Ok((victims, me_inside, me))
     })?;
     for pid in victims {

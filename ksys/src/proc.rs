@@ -14,7 +14,7 @@ use kcore::aspace::AddressSpace;
 use kcore::aspace::Vmos;
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs};
-use kcore::job::{JobId, Resource};
+use kcore::job::{JobId, Jobs, Resource};
 use kcore::pagetable::{Perms, PhysMem};
 use kcore::sched::Tid;
 use kcore::Mm;
@@ -39,6 +39,7 @@ pub struct PCtx<'a, M: PhysMem, X: Machine> {
     pub me: u64,
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
+    pub jobs: &'a mut Jobs,
     pub machine: &'a mut X,
 }
 
@@ -160,6 +161,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
         me,
         mm,
         vmos,
+        jobs,
         machine,
     } = c;
     let me = *me;
@@ -214,15 +216,14 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             // Page tables for this region, worst case: one leaf table per 512 pages it spans (plus one for each end not aligned to
             // them) and two interior ones.
             let tables = length / 4096 / 512 + 4;
-            vmos.jobs
-                .charge(target.job, Resource::Pages, tables)
+            jobs.charge(target.job, Resource::Pages, tables)
                 .map_err(|x| e(crate::job_status(x)))?;
             if let Err(x) =
                 target
                     .aspace
                     .map_region(vmos, vaddr, length / 4096, vid, offset / 4096, perms)
             {
-                vmos.jobs.credit(target.job, Resource::Pages, tables);
+                jobs.credit(target.job, Resource::Pages, tables);
                 return Err(match x {
                     kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
                     _ => e(Status::InvalidArgs),
@@ -242,12 +243,12 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
             target
                 .aspace
-                .unmap_region(mm, vmos, a[1])
+                .unmap_region(mm, vmos, jobs, a[1])
                 .map_err(|_| e(Status::InvalidArgs))?;
             // other harts may still cache the translations of what was just unmapped
             machine.shootdown();
             if let Some(tables) = target.table_charge.remove(&a[1]) {
-                vmos.jobs.credit(target.job, Resource::Pages, tables);
+                jobs.credit(target.job, Resource::Pages, tables);
             }
             machine.flush_tlb();
             Ok((None, None))
@@ -280,7 +281,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 objs,
                 &mut caller.handles,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             ) {
@@ -294,20 +295,20 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::AccessDenied);
             }
             let job = caller.job;
-            vmos.jobs.retain(JobId::ROOT);
+            jobs.retain(JobId::ROOT);
             match ipc::job_object_create(
                 objs,
                 &mut caller.handles,
                 JobId::ROOT,
                 Rights::JOB,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(x) => {
-                    vmos.jobs.release(JobId::ROOT);
+                    jobs.release(JobId::ROOT);
                     Err(e(x))
                 }
             }
@@ -339,7 +340,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                         me,
                         false,
                         &mut ipc::Quota {
-                            jobs: &mut vmos.jobs,
+                            jobs,
                             job: Some(job),
                         },
                     )

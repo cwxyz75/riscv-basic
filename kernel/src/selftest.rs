@@ -402,7 +402,7 @@ fn frame_database_is_sane() -> Outcome {
 /// Create a VMO of `pages` pages and one region over all of it at `va`.
 fn region(va: u64, pages: u64, perms: Perms) -> u64 {
     let k = kmem::get();
-    let id = k.vmos.create(pages);
+    let id = k.vmos.create(&mut k.jobs, pages);
     k.aspace
         .map_region(&mut k.vmos, va, pages, id, 0, perms)
         .expect("map_region");
@@ -413,11 +413,13 @@ fn teardown(vmo: u64, starts: &[u64]) {
     let k = kmem::get();
     for &s in starts {
         k.aspace
-            .unmap_region(&mut k.mm, &mut k.vmos, s)
+            .unmap_region(&mut k.mm, &mut k.vmos, &mut k.jobs, s)
             .expect("unmap_region");
     }
     trap::flush_tlb();
-    k.vmos.release(&mut k.mm, vmo).expect("destroy vmo");
+    k.vmos
+        .release(&mut k.mm, &mut k.jobs, vmo)
+        .expect("destroy vmo");
 }
 
 fn free() -> usize {

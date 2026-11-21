@@ -8,11 +8,11 @@ use abi::Handle;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use kcore::aspace::{AddressSpace, Vmos};
+use kcore::aspace::AddressSpace;
 use kcore::handle::HandleTable;
 use kcore::handle::MAX_SLOTS as MAX_HANDLES;
 use kcore::ipc::{self, Quota};
-use kcore::job::Resource;
+use kcore::job::{Jobs, Resource};
 use kcore::pagetable::{PageTable, PhysMem};
 use kcore::Mm;
 
@@ -24,7 +24,7 @@ use kcore::Mm;
 pub fn process_create<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
-    vmos: &mut Vmos,
+    jobs: &mut Jobs,
     kernel: &PageTable,
     kernel_half_ok: bool,
     me: u64,
@@ -40,22 +40,21 @@ pub fn process_create<M: PhysMem>(
     } else {
         ipc::job_of(&us.objs, &creator.handles, Handle(a[0]), Rights::MANAGE)?
     };
-    vmos.jobs
-        .charge(job, Resource::Processes, 1)
+    jobs.charge(job, Resource::Processes, 1)
         .map_err(crate::job_status)?;
     // the process's root page table is charged to its job too (one page)
-    if let Err(e) = vmos.jobs.charge(job, Resource::Pages, 1) {
-        vmos.jobs.credit(job, Resource::Processes, 1);
+    if let Err(e) = jobs.charge(job, Resource::Pages, 1) {
+        jobs.credit(job, Resource::Processes, 1);
         return Err(crate::job_status(e));
     }
-    vmos.jobs.retain(job);
-    let give_back = |vmos: &mut Vmos| {
-        vmos.jobs.credit(job, Resource::Pages, 1);
-        vmos.jobs.credit(job, Resource::Processes, 1);
-        vmos.jobs.release(job);
+    jobs.retain(job);
+    let give_back = |jobs: &mut Jobs| {
+        jobs.credit(job, Resource::Pages, 1);
+        jobs.credit(job, Resource::Processes, 1);
+        jobs.release(job);
     };
     let Some(table) = PageTable::new_with_kernel_half(mm, kernel) else {
-        give_back(vmos);
+        give_back(jobs);
         return Err(Status::NoMemory);
     };
     // (CNT1: a process id is never reused and the counter never wraps; at its limit the creation is refused)
@@ -66,7 +65,7 @@ pub fn process_create<M: PhysMem>(
     }
     let Some(next) = pid.checked_add(1) else {
         PageTable::destroy_user(table, mm);
-        give_back(vmos);
+        give_back(jobs);
         return Err(Status::NoMemory);
     };
     us.next_pid = next;
@@ -78,14 +77,14 @@ pub fn process_create<M: PhysMem>(
         pid,
         true,
         &mut Quota {
-            jobs: &mut vmos.jobs,
+            jobs,
             job: Some(job),
         },
     ) {
         Ok(x) => x,
         Err(e) => {
             PageTable::destroy_user(table, mm);
-            give_back(vmos);
+            give_back(jobs);
             return Err(e);
         }
     };

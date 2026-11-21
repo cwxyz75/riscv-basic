@@ -15,7 +15,7 @@ use common::FakeMem;
 
 struct W {
     us: UserState,
-    vmos: Vmos,
+    jobs: kcore::job::Jobs,
     mm: Mm<FakeMem>,
     kernel: PageTable,
 }
@@ -29,15 +29,16 @@ fn world(frames: usize) -> W {
     let kernel = PageTable::new(&mut mm).unwrap();
     let mut us = UserState::new();
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let _ = &mut vmos;
-    let first = ksys::process_create(&mut us, &mut mm, &mut vmos, &kernel, true, 0, [0; 6]);
+    let first = ksys::process_create(&mut us, &mut mm, &mut jobs, &kernel, true, 0, [0; 6]);
     // (no creator yet: process 0 does not exist)
     assert_eq!(first, Err(Status::BadState));
     us.procs
         .insert(1, Box::new(blank(&mut mm, &kernel, JobId::ROOT)));
     W {
         us,
-        vmos,
+        jobs,
         mm,
         kernel,
     }
@@ -77,7 +78,7 @@ impl W {
         ksys::process_create(
             &mut self.us,
             &mut self.mm,
-            &mut self.vmos,
+            &mut self.jobs,
             &self.kernel,
             ok,
             1,
@@ -85,7 +86,7 @@ impl W {
         )
     }
     fn used(&self, job: JobId, r: Resource) -> u64 {
-        self.vmos.jobs.usage(job).unwrap().get(r)
+        self.jobs.usage(job).unwrap().get(r)
     }
     fn job_handle(&mut self, job: JobId, rights: Rights) -> u64 {
         let p = self.us.procs.get_mut(&1).unwrap();
@@ -96,7 +97,7 @@ impl W {
             job,
             rights,
             &mut Quota {
-                jobs: &mut self.vmos.jobs,
+                jobs: &mut self.jobs,
                 job: Some(JobId::ROOT),
             },
         )
@@ -171,7 +172,7 @@ fn the_job_handle_is_checked_and_the_new_process_is_charged_to_that_job() {
         &mut w.us.objs,
         &mut ev.handles,
         &mut Quota {
-            jobs: &mut w.vmos.jobs,
+            jobs: &mut w.jobs,
             job: Some(JobId::ROOT),
         },
     )
@@ -183,7 +184,7 @@ fn the_job_handle_is_checked_and_the_new_process_is_charged_to_that_job() {
         Err(Status::AccessDenied),
         "MANAGE is needed"
     );
-    let child = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let child = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
     let ch = w.job_handle(child, Rights::JOB);
     w.create(true, [ch, 0, 0, 0, 0, 0]).unwrap();
     assert_eq!(
@@ -211,7 +212,6 @@ fn every_failure_gives_back_what_it_took() {
     assert_eq!(w.create(false, [0; 6]), Err(Status::NoMemory));
     // the job's process limit, then its page limit (the second charge: the first is given back)
     let procs = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -225,7 +225,6 @@ fn every_failure_gives_back_what_it_took() {
     let before2 = snapshot(&w);
     assert_eq!(w.create(true, [ph, 0, 0, 0, 0, 0]), Err(Status::NoMemory));
     let pages = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -247,7 +246,6 @@ fn every_failure_gives_back_what_it_took() {
     );
     // no object may be charged to the creator's job: the page table is freed again, the charges given back
     let none = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,

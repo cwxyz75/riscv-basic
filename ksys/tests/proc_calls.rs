@@ -44,6 +44,7 @@ struct W {
     procs: BTreeMap<u64, Box<Process>>,
     mm: Mm<FakeMem>,
     vmos: Vmos,
+    jobs: kcore::job::Jobs,
     tlb: Tlb,
 }
 
@@ -89,6 +90,7 @@ fn world() -> (W, u64) {
         procs,
         mm,
         vmos: Vmos::new(),
+        jobs: kcore::job::Jobs::new(),
         tlb: Tlb::default(),
     };
     let ph = w.handle_to(2);
@@ -96,9 +98,9 @@ fn world() -> (W, u64) {
 }
 
 impl W {
-    fn q(vmos: &mut Vmos) -> Quota<'_> {
+    fn q(jobs: &mut kcore::job::Jobs) -> Quota<'_> {
         Quota {
-            jobs: &mut vmos.jobs,
+            jobs,
             job: Some(JobId::ROOT),
         }
     }
@@ -110,20 +112,20 @@ impl W {
             &mut p.handles,
             pid,
             false,
-            &mut Self::q(&mut self.vmos),
+            &mut Self::q(&mut self.jobs),
         )
         .unwrap();
         h.0
     }
     fn vmo(&mut self, pages: u64, job: JobId) -> u64 {
-        let id = self.vmos.create_in(pages, job);
+        let id = self.vmos.create_in(&mut self.jobs, pages, job);
         let p = self.procs.get_mut(&1).unwrap();
 
         ipc::vmo_object_create_in(
             &mut self.objs,
             &mut p.handles,
             id,
-            &mut Self::q(&mut self.vmos),
+            &mut Self::q(&mut self.jobs),
         )
         .unwrap()
         .0
@@ -135,6 +137,7 @@ impl W {
             me: 1,
             mm: &mut self.mm,
             vmos: &mut self.vmos,
+            jobs: &mut self.jobs,
             machine: &mut self.tlb,
         };
         proc_call(n, a, &mut c).expect("handled")
@@ -158,6 +161,7 @@ fn calls_that_are_not_these_are_left_to_the_kernel() {
         me: 1,
         mm: &mut w.mm,
         vmos: &mut w.vmos,
+        jobs: &mut w.jobs,
         machine: &mut w.tlb,
     };
     assert!(proc_call(nr::PROCESS_CREATE, [0; 6], &mut c).is_none());
@@ -167,9 +171,9 @@ fn calls_that_are_not_these_are_left_to_the_kernel() {
 fn process_map_maps_into_the_target_and_charges_its_tables() {
     let (mut w, ph) = world();
     let v = w.vmo(4, JobId::ROOT);
-    let pages_before = w.vmos.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let pages_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
-    let used = w.vmos.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let used = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
     assert_eq!(
         used - pages_before,
         4,
@@ -177,13 +181,37 @@ fn process_map_maps_into_the_target_and_charges_its_tables() {
     );
     // the target's memory shows it, the caller's does not
     let t = w.procs.get_mut(&2).unwrap();
-    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, VA + 8, b"hi").unwrap();
+    copy_to_user(
+        &mut t.aspace,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        VA + 8,
+        b"hi",
+    )
+    .unwrap();
     assert_eq!(
-        copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, VA + 8, 2).unwrap(),
+        copy_from_user(
+            &mut t.aspace,
+            &mut w.mm,
+            &mut w.vmos,
+            &mut w.jobs,
+            VA + 8,
+            2
+        )
+        .unwrap(),
         b"hi"
     );
     let me = w.procs.get_mut(&1).unwrap();
-    assert!(copy_from_user(&mut me.aspace, &mut w.mm, &mut w.vmos, VA + 8, 2).is_err());
+    assert!(copy_from_user(
+        &mut me.aspace,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        VA + 8,
+        2
+    )
+    .is_err());
 }
 
 #[test]
@@ -281,7 +309,7 @@ fn process_map_argument_errors() {
 #[test]
 fn process_map_of_a_stranger_vmo_must_be_committed_and_a_dead_target_is_refused() {
     let (mut w, ph) = world();
-    let other = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
     let v = w.vmo(2, other);
     // charged to a job that is neither the caller's nor the target's: it must already be committed
     assert_eq!(
@@ -295,7 +323,7 @@ fn process_map_of_a_stranger_vmo_must_be_committed_and_a_dead_target_is_refused(
         Some(ipc::KObj::Vmo(id)) => *id,
         _ => unreachable!(),
     };
-    w.vmos.commit(&mut w.mm, id, 0, 2).unwrap();
+    w.vmos.commit(&mut w.mm, &mut w.jobs, id, 0, 2).unwrap();
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R]);
     // a target that has ended, or been killed
     w.procs.get_mut(&2).unwrap().exit_code = Some(0);
@@ -320,7 +348,6 @@ fn process_map_of_a_stranger_vmo_must_be_committed_and_a_dead_target_is_refused(
 fn process_map_over_the_page_limit_charges_nothing() {
     let (mut w, ph) = world();
     let tight = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -337,7 +364,7 @@ fn process_map_over_the_page_limit_charges_nothing() {
         Status::NoMemory,
         "four table pages do not fit in three"
     );
-    assert_eq!(w.vmos.jobs.usage(tight).unwrap().get(Resource::Pages), 0);
+    assert_eq!(w.jobs.usage(tight).unwrap().get(Resource::Pages), 0);
     assert!(w.procs[&2].table_charge.is_empty());
 }
 
@@ -345,7 +372,7 @@ fn process_map_over_the_page_limit_charges_nothing() {
 fn process_unmap_credits_the_tables_and_asks_for_the_shootdown() {
     let (mut w, ph) = world();
     let v = w.vmo(2, JobId::ROOT);
-    let before = w.vmos.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R]);
     assert_eq!(
         w.err(nr::PROCESS_UNMAP, [ph, VA + 4096, 0, 0, 0, 0]),
@@ -360,7 +387,7 @@ fn process_unmap_credits_the_tables_and_asks_for_the_shootdown() {
     w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
     assert_eq!((w.tlb.shootdowns, w.tlb.flushes), (1, 1));
     assert_eq!(
-        w.vmos.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
+        w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
         before,
         "the table charge came back"
     );
@@ -426,7 +453,7 @@ fn process_and_thread_info_report_the_exit_code_only_when_ended() {
     );
     let th = {
         let p = w.procs.get_mut(&1).unwrap();
-        ipc::thread_object_create_in(&mut w.objs, &mut p.handles, 2, &mut W::q(&mut w.vmos))
+        ipc::thread_object_create_in(&mut w.objs, &mut p.handles, 2, &mut W::q(&mut w.jobs))
             .unwrap()
     };
     let (thandle, tobj) = th;
@@ -494,7 +521,7 @@ fn job_handle(w: &mut W, job: JobId) -> u64 {
         &mut p.handles,
         job,
         Rights::JOB,
-        &mut W::q(&mut w.vmos),
+        &mut W::q(&mut w.jobs),
     )
     .unwrap()
     .0
@@ -560,19 +587,19 @@ fn kill_and_stop_name_their_target_and_refuse_the_ended() {
 #[test]
 fn job_kill_closes_the_job_and_names_the_victims() {
     let (mut w, _) = world();
-    let sub = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    let deeper = w.vmos.jobs.create(sub, Limits::UNLIMITED).unwrap();
+    let sub = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let deeper = w.jobs.create(sub, Limits::UNLIMITED).unwrap();
     w.procs.get_mut(&2).unwrap().job = deeper;
     let jh = job_handle(&mut w, sub);
     // the caller (1) is outside the job: it is not a victim and not inside
     let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(jh)).unwrap();
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
     assert_eq!(
         (v, inside),
         (vec![2], false),
         "a process in a descendant job is a victim"
     );
-    let l = w.vmos.jobs.limits(sub).unwrap();
+    let l = w.jobs.limits(sub).unwrap();
     assert_eq!(
         (l.processes, l.threads),
         (0, 0),
@@ -581,15 +608,15 @@ fn job_kill_closes_the_job_and_names_the_victims() {
     // the caller inside: ends last, not named
     w.procs.get_mut(&1).unwrap().job = sub;
     let (v, inside) =
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(jh)).unwrap();
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(jh)).unwrap();
     assert_eq!((v, inside), (vec![2], true));
     let weak = narrow(&mut w, jh, Rights::MANAGE);
     assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, weak),
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, weak),
         Err(Status::AccessDenied)
     );
     assert_eq!(
-        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.vmos.jobs, 1, abi::Handle(0x999)),
+        ksys::job_kill_victims(&w.objs, &w.procs, &mut w.jobs, 1, abi::Handle(0x999)),
         Err(Status::BadHandle)
     );
 }
@@ -615,7 +642,7 @@ fn thread_target_and_set_sched_rows() {
     // a thread object of process 2 that has a live kernel thread, and one that has ended
     let (th, tobj) = {
         let p = w.procs.get_mut(&1).unwrap();
-        ipc::thread_object_create_in(&mut w.objs, &mut p.handles, 2, &mut W::q(&mut w.vmos))
+        ipc::thread_object_create_in(&mut w.objs, &mut p.handles, 2, &mut W::q(&mut w.jobs))
             .unwrap()
     };
     assert_eq!(
@@ -635,7 +662,7 @@ fn thread_target_and_set_sched_rows() {
     );
     // set_sched: range of the priority and flags, then the job's maximum
     let a = |prio, flags| [th.0, prio, flags, 0, 0, 0];
-    let jobs = &w.vmos.jobs;
+    let jobs = &w.jobs;
     assert_eq!(
         ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(0, 0)),
         Err(Status::InvalidArgs)
@@ -652,19 +679,18 @@ fn thread_target_and_set_sched_rows() {
         ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(5, 1)),
         Ok((other, 5, 1))
     );
-    let low = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    w.vmos
-        .jobs
+    let low = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.jobs
         .set_sched(
             low,
             kcore::job::SchedLimits {
                 max_prio: 5,
-                ..w.vmos.jobs.sched(low).unwrap()
+                ..w.jobs.sched(low).unwrap()
             },
         )
         .unwrap();
     w.procs.get_mut(&2).unwrap().job = low;
-    let jobs = &w.vmos.jobs;
+    let jobs = &w.jobs;
     assert_eq!(
         ksys::thread_set_sched_target(&w.objs, &w.procs, jobs, 1, me_tid, a(6, 0)),
         Err(Status::AccessDenied),
@@ -679,16 +705,10 @@ fn thread_target_and_set_sched_rows() {
 #[test]
 fn job_set_sched_rows() {
     let (mut w, _) = world();
-    let sub = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let sub = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
     let jh = job_handle(&mut w, sub);
     let call = |w: &mut W, h: u64, a1: u64, a2: u64, a3: u64| {
-        ksys::job_set_sched(
-            &w.objs,
-            &w.procs,
-            &mut w.vmos.jobs,
-            1,
-            [h, a1, a2, a3, 0, 0],
-        )
+        ksys::job_set_sched(&w.objs, &w.procs, &mut w.jobs, 1, [h, a1, a2, a3, 0, 0])
     };
     assert_eq!(call(&mut w, jh, 64, 0, 1), Err(Status::InvalidArgs));
     assert_eq!(call(&mut w, jh, 5, 0, 65537), Err(Status::InvalidArgs));
@@ -705,9 +725,9 @@ fn job_set_sched_rows() {
         "SET_LIMITS is needed"
     );
     assert_eq!(call(&mut w, jh, 5, 0, 100), Ok(sub));
-    assert_eq!(w.vmos.jobs.sched(sub).unwrap().max_prio, 5);
+    assert_eq!(w.jobs.sched(sub).unwrap().max_prio, 5);
     // a child cannot exceed its parent
-    let child = w.vmos.jobs.create(sub, Limits::UNLIMITED).unwrap();
+    let child = w.jobs.create(sub, Limits::UNLIMITED).unwrap();
     let ch = job_handle(&mut w, child);
     assert_eq!(call(&mut w, ch, 6, 0, 1), Err(Status::AccessDenied));
     assert_eq!(

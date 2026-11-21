@@ -81,6 +81,7 @@ fn random_model<F: PageTableFormat>() {
         };
         let baseline = mm.db.free_count();
         let mut vmos = Vmos::new();
+        let mut jobs = kcore::job::Jobs::new();
         let mut aspace = AddressSpace::new(PageTable::<F>::create(&mut mm).unwrap());
         let mut model_regions: BTreeMap<u64, ModelRegion> = BTreeMap::new(); // by slot
         let mut model_vmos: BTreeMap<u64, u64> = BTreeMap::new(); // vmo id -> pages (the VMOs in the store: held by their creator or a region)
@@ -93,7 +94,7 @@ fn random_model<F: PageTableFormat>() {
             match rng.below(8) {
                 0 => {
                     let pages = 1 + rng.below(SLOT_PAGES * 2);
-                    let id = vmos.create(pages);
+                    let id = vmos.create(&mut jobs, pages);
                     model_vmos.insert(id, pages);
                     creator.insert(id);
                 }
@@ -138,7 +139,7 @@ fn random_model<F: PageTableFormat>() {
                     let page = rng.below(SLOT_PAGES + 2);
                     let va = slot_va(slot) + page * 4096 + rng.below(4096);
                     let access = [Access::Read, Access::Write, Access::Exec][rng.below(3) as usize];
-                    let result = aspace.handle_fault(&mut mm, &mut vmos, va, access);
+                    let result = aspace.handle_fault(&mut mm, &mut vmos, &mut jobs, va, access);
                     let region = model_regions.get(&slot).filter(|r| page < r.pages);
                     match region {
                         None => assert_eq!(
@@ -204,7 +205,7 @@ fn random_model<F: PageTableFormat>() {
                 5 => {
                     // unmap a region
                     let slot = rng.below(REGION_SLOTS);
-                    let result = aspace.unmap_region(&mut mm, &mut vmos, slot_va(slot));
+                    let result = aspace.unmap_region(&mut mm, &mut vmos, &mut jobs, slot_va(slot));
                     match model_regions.remove(&slot) {
                         Some(r) => {
                             assert_eq!(result, Ok(()), "{ctx}");
@@ -237,7 +238,7 @@ fn random_model<F: PageTableFormat>() {
                     else {
                         continue;
                     };
-                    vmos.release(&mut mm, id).unwrap();
+                    vmos.release(&mut mm, &mut jobs, id).unwrap();
                     creator.remove(&id);
                     free_unheld(
                         &mut model_vmos,
@@ -276,13 +277,13 @@ fn random_model<F: PageTableFormat>() {
         }
         // Tear everything down: back to baseline.
         for slot in 0..REGION_SLOTS {
-            let _ = aspace.unmap_region(&mut mm, &mut vmos, slot_va(slot));
+            let _ = aspace.unmap_region(&mut mm, &mut vmos, &mut jobs, slot_va(slot));
         }
         for id in creator.iter().copied().collect::<Vec<_>>() {
-            vmos.release(&mut mm, id).unwrap();
+            vmos.release(&mut mm, &mut jobs, id).unwrap();
         }
         assert_eq!(vmos.count(), 0, "seed {seed}: a VMO is left");
-        aspace.destroy(&mut mm, &mut vmos);
+        aspace.destroy(&mut mm, &mut vmos, &mut jobs);
         assert_eq!(
             mm.db.free_count(),
             baseline,
@@ -298,8 +299,9 @@ fn a_lazy_page_is_zero_and_faults_in_exactly_once() {
         mem: FakeMem::default(),
     };
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let mut aspace = AddressSpace::new(PageTable::new(&mut mm).unwrap());
-    let id = vmos.create(4);
+    let id = vmos.create(&mut jobs, 4);
     aspace
         .map_region(&mut vmos, BASE, 4, id, 0, Perms::RW)
         .unwrap();
@@ -310,7 +312,7 @@ fn a_lazy_page_is_zero_and_faults_in_exactly_once() {
         "nothing is mapped until touched"
     );
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 8, Access::Read)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE + 8, Access::Read)
         .unwrap();
     let t = aspace.table().translate(&mm, BASE).unwrap();
     for word in 0..512 {
@@ -323,7 +325,7 @@ fn a_lazy_page_is_zero_and_faults_in_exactly_once() {
     let after_first = mm.db.free_count();
     assert!(after_first < before, "the fault allocated");
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 16, Access::Write)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE + 16, Access::Write)
         .unwrap();
     assert_eq!(
         mm.db.free_count(),
@@ -340,15 +342,16 @@ fn a_mapping_keeps_its_vmo_and_frames_alive_after_the_creator_goes() {
     };
     let baseline = mm.db.free_count();
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let mut aspace = AddressSpace::new(PageTable::new(&mut mm).unwrap());
-    let id = vmos.create(1);
+    let id = vmos.create(&mut jobs, 1);
     assert_eq!(vmos.refs(id), Some(1), "the creator's reference");
     aspace
         .map_region(&mut vmos, BASE, 1, id, 0, Perms::R)
         .unwrap();
     assert_eq!(vmos.refs(id), Some(2), "and the region's");
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE, Access::Read)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Read)
         .unwrap();
     let pfn = aspace.table().translate(&mm, BASE).unwrap().pfn;
     assert_eq!(
@@ -356,14 +359,16 @@ fn a_mapping_keeps_its_vmo_and_frames_alive_after_the_creator_goes() {
         Some(2),
         "one reference for the VMO, one for the mapping"
     );
-    vmos.release(&mut mm, id).unwrap();
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
     assert!(vmos.exists(id), "the region still holds the VMO");
     assert_eq!(mm.db.refs(pfn), Some(2), "and the VMO its page");
     // a page nobody has touched yet can still be faulted in: the VMO is there
-    aspace.unmap_region(&mut mm, &mut vmos, BASE).unwrap();
+    aspace
+        .unmap_region(&mut mm, &mut vmos, &mut jobs, BASE)
+        .unwrap();
     assert!(!vmos.exists(id), "the last holder went: the VMO is freed");
     assert_eq!(mm.db.refs(pfn), None, "and so is its frame");
-    aspace.destroy(&mut mm, &mut vmos);
+    aspace.destroy(&mut mm, &mut vmos, &mut jobs);
     assert_eq!(mm.db.free_count(), baseline);
 }
 
@@ -375,16 +380,17 @@ fn a_vmo_closed_before_a_region_of_it_faults_still_serves_the_fault() {
     };
     let baseline = mm.db.free_count();
     let mut vmos = Vmos::new();
+    let mut jobs = kcore::job::Jobs::new();
     let mut aspace = AddressSpace::new(PageTable::new(&mut mm).unwrap());
-    let id = vmos.create(2);
+    let id = vmos.create(&mut jobs, 2);
     aspace
         .map_region(&mut vmos, BASE, 2, id, 0, Perms::RW)
         .unwrap();
-    vmos.release(&mut mm, id).unwrap(); // the handle is closed with nothing faulted in yet
+    vmos.release(&mut mm, &mut jobs, id).unwrap(); // the handle is closed with nothing faulted in yet
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 4096, Access::Write)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE + 4096, Access::Write)
         .unwrap();
-    aspace.destroy(&mut mm, &mut vmos);
+    aspace.destroy(&mut mm, &mut vmos, &mut jobs);
     assert!(!vmos.exists(id));
     assert_eq!(mm.db.free_count(), baseline);
 }
@@ -403,7 +409,8 @@ fn setup(frames: usize) -> (Mm<FakeMem>, Vmos, AddressSpace) {
 fn region_arguments_are_checked_with_specific_errors() {
     use kcore::aspace::{RegionError, MAX_REGION_PAGES};
     let (mut mm, mut vmos, mut a) = setup(40);
-    let id = vmos.create(8);
+    let mut jobs = kcore::job::Jobs::new();
+    let id = vmos.create(&mut jobs, 8);
     let mut r = |a: &mut AddressSpace, start, pages, vmo, off, p| {
         a.map_region(&mut vmos, start, pages, vmo, off, p)
     };
@@ -488,30 +495,31 @@ fn region_arguments_are_checked_with_specific_errors() {
         "touching is not overlapping"
     );
     assert_eq!(r(&mut a, BASE + 8 * 4096, 1, id, 0, Perms::R), Ok(()));
-    a.destroy(&mut mm, &mut vmos);
+    a.destroy(&mut mm, &mut vmos, &mut jobs);
 }
 
 #[test]
 fn a_fault_the_existing_mapping_cannot_satisfy_is_refused_not_retried_forever() {
     let (mut mm, mut vmos, mut a) = setup(40);
-    let id = vmos.create(2);
+    let mut jobs = kcore::job::Jobs::new();
+    let id = vmos.create(&mut jobs, 2);
     // The region says RW, but the page tables already hold a read-only mapping there
     // (as if some other code had mapped it).
     a.map_region(&mut vmos, BASE, 2, id, 0, Perms::RW).unwrap();
     let mut pt2 = PageTable::from_root(a.table().root());
     pt2.map(&mut mm, BASE, 3000, Perms::R).unwrap();
     assert_eq!(
-        a.handle_fault(&mut mm, &mut vmos, BASE, Access::Read),
+        a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Read),
         Ok(()),
         "spurious read: fine"
     );
     assert_eq!(
-        a.handle_fault(&mut mm, &mut vmos, BASE, Access::Write),
+        a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Write),
         Err(FaultError::Denied),
         "a write the mapping cannot do must not 'succeed' and re-fault forever"
     );
     pt2.unmap(&mut mm, BASE);
-    a.destroy(&mut mm, &mut vmos);
+    a.destroy(&mut mm, &mut vmos, &mut jobs);
 }
 
 #[test]
@@ -519,11 +527,12 @@ fn running_out_of_frames_changes_nothing_and_leaks_nothing() {
     // Root (1) + two tables + one data page = 4 frames; give it 3 so the first
     // fault runs out part-way, and check every kind of state after each attempt.
     let (mut mm, mut vmos, mut a) = setup(3);
-    let id = vmos.create(4);
+    let mut jobs = kcore::job::Jobs::new();
+    let id = vmos.create(&mut jobs, 4);
     a.map_region(&mut vmos, BASE, 4, id, 0, Perms::RW).unwrap();
     let free = mm.db.free_count();
     for _ in 0..3 {
-        let result = a.handle_fault(&mut mm, &mut vmos, BASE, Access::Write);
+        let result = a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Write);
         assert_eq!(result, Err(FaultError::NoMemory));
         mm.db.audit().unwrap();
         assert!(
@@ -535,15 +544,15 @@ fn running_out_of_frames_changes_nothing_and_leaks_nothing() {
         assert!(mm.db.free_count() <= free);
     }
     let stable = mm.db.free_count();
-    let _ = a.handle_fault(&mut mm, &mut vmos, BASE, Access::Write);
+    let _ = a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Write);
     assert_eq!(
         mm.db.free_count(),
         stable,
         "retrying a failing fault does not leak"
     );
-    a.unmap_region(&mut mm, &mut vmos, BASE).unwrap();
-    vmos.release(&mut mm, id).unwrap();
-    a.destroy(&mut mm, &mut vmos);
+    a.unmap_region(&mut mm, &mut vmos, &mut jobs, BASE).unwrap();
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
+    a.destroy(&mut mm, &mut vmos, &mut jobs);
     assert_eq!(mm.db.free_count(), 3, "everything came back");
 }
 
@@ -551,8 +560,8 @@ fn running_out_of_frames_changes_nothing_and_leaks_nothing() {
 fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
     use kcore::job::{JobId, Limits, Resource, UNLIMITED};
     let (mut mm, mut vmos, mut aspace) = setup(200);
-    let job = vmos
-        .jobs
+    let mut jobs = kcore::job::Jobs::new();
+    let job = jobs
         .create(
             JobId::ROOT,
             Limits {
@@ -564,7 +573,7 @@ fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
             },
         )
         .unwrap();
-    let id = vmos.create_in(8, job);
+    let id = vmos.create_in(&mut jobs, 8, job);
     aspace
         .map_region(&mut vmos, BASE, 8, id, 0, Perms::RW)
         .unwrap();
@@ -572,75 +581,114 @@ fn committed_pages_are_charged_to_the_vmos_job_and_credited_back() {
     // three pages fit; the fourth fault is refused, allocates nothing and charges nothing
     for page in 0..3 {
         aspace
-            .handle_fault(&mut mm, &mut vmos, BASE + page * 4096, Access::Write)
+            .handle_fault(
+                &mut mm,
+                &mut vmos,
+                &mut jobs,
+                BASE + page * 4096,
+                Access::Write,
+            )
             .unwrap();
     }
-    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 3);
+    assert_eq!(jobs.usage(job).unwrap().pages, 3);
     let free_full = mm.db.free_count();
     assert_eq!(
-        aspace.handle_fault(&mut mm, &mut vmos, BASE + 3 * 4096, Access::Write),
+        aspace.handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + 3 * 4096,
+            Access::Write
+        ),
         Err(FaultError::NoMemory)
     );
-    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 3);
+    assert_eq!(jobs.usage(job).unwrap().pages, 3);
     assert_eq!(mm.db.free_count(), free_full);
     // a page that is already committed is not charged again, and the root sees the same total
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 8, Access::Read)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE + 8, Access::Read)
         .unwrap();
-    assert_eq!(vmos.jobs.usage(JobId::ROOT).unwrap().pages, 3);
+    assert_eq!(jobs.usage(JobId::ROOT).unwrap().pages, 3);
     // another VMO in the same job shares the allowance; one in the root job does not
-    let other = vmos.create_in(2, job);
+    let other = vmos.create_in(&mut jobs, 2, job);
     aspace
         .map_region(&mut vmos, BASE + 16 * 4096, 2, other, 0, Perms::RW)
         .unwrap();
     assert_eq!(
-        aspace.handle_fault(&mut mm, &mut vmos, BASE + 16 * 4096, Access::Write),
+        aspace.handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + 16 * 4096,
+            Access::Write
+        ),
         Err(FaultError::NoMemory)
     );
-    let free_root = vmos.create(1);
+    let free_root = vmos.create(&mut jobs, 1);
     aspace
         .map_region(&mut vmos, BASE + 32 * 4096, 1, free_root, 0, Perms::RW)
         .unwrap();
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 32 * 4096, Access::Write)
+        .handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + 32 * 4096,
+            Access::Write,
+        )
         .unwrap();
     // a VMO is freed, crediting what it committed and letting go of the job, when its last holder goes: the creator, and (L15) the region that
     // maps it
-    vmos.release(&mut mm, id).unwrap();
+    vmos.release(&mut mm, &mut jobs, id).unwrap();
     assert_eq!(
-        vmos.jobs.usage(job).unwrap().pages,
+        jobs.usage(job).unwrap().pages,
         3,
         "the creator let go, the region still holds the VMO"
     );
-    aspace.unmap_region(&mut mm, &mut vmos, BASE).unwrap();
-    assert_eq!(vmos.jobs.usage(job).unwrap().pages, 0);
-    assert_eq!(vmos.jobs.usage(JobId::ROOT).unwrap().pages, 1);
+    aspace
+        .unmap_region(&mut mm, &mut vmos, &mut jobs, BASE)
+        .unwrap();
+    assert_eq!(jobs.usage(job).unwrap().pages, 0);
+    assert_eq!(jobs.usage(JobId::ROOT).unwrap().pages, 1);
     assert_eq!(
-        aspace.handle_fault(&mut mm, &mut vmos, BASE + 16 * 4096, Access::Write),
+        aspace.handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + 16 * 4096,
+            Access::Write
+        ),
         Ok(()),
         "room again after the first VMO went"
     );
     let _ = (free_before, Resource::Pages);
     aspace
-        .unmap_region(&mut mm, &mut vmos, BASE + 16 * 4096)
+        .unmap_region(&mut mm, &mut vmos, &mut jobs, BASE + 16 * 4096)
         .unwrap(); // (the region held `other` too)
-    vmos.release(&mut mm, other).unwrap();
-    vmos.jobs.release(job);
-    assert!(!vmos.jobs.exists(job), "the last use was the creator's");
+    vmos.release(&mut mm, &mut jobs, other).unwrap();
+    jobs.release(job);
+    assert!(!jobs.exists(job), "the last use was the creator's");
 }
 
 #[test]
 fn running_out_of_frames_gives_the_page_charge_back() {
     use kcore::job::{JobId, Limits};
     let (mut mm, mut vmos, mut aspace) = setup(7); // enough for the tables, almost nothing else
-    let job = vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    let id = vmos.create_in(64, job);
+    let mut jobs = kcore::job::Jobs::new();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let id = vmos.create_in(&mut jobs, 64, job);
     aspace
         .map_region(&mut vmos, BASE, 64, id, 0, Perms::RW)
         .unwrap();
     let mut ok = 0;
     for page in 0..64 {
-        match aspace.handle_fault(&mut mm, &mut vmos, BASE + page * 4096, Access::Write) {
+        match aspace.handle_fault(
+            &mut mm,
+            &mut vmos,
+            &mut jobs,
+            BASE + page * 4096,
+            Access::Write,
+        ) {
             Ok(()) => ok += 1,
             Err(e) => {
                 assert_eq!(e, FaultError::NoMemory);
@@ -650,7 +698,7 @@ fn running_out_of_frames_gives_the_page_charge_back() {
     }
     assert!(ok < 64, "the frames ran out");
     assert_eq!(
-        vmos.jobs.usage(job).unwrap().pages,
+        jobs.usage(job).unwrap().pages,
         ok,
         "a refused page is not charged"
     );
@@ -660,9 +708,10 @@ fn running_out_of_frames_gives_the_page_charge_back() {
 /// and touching uncommitted pages takes one fault each (a fault never commits a page for its neighbours).
 fn touch_in_order(committed_first: bool) -> usize {
     let (mut mm, mut vmos, mut aspace) = setup(400);
-    let id = vmos.create(64);
+    let mut jobs = kcore::job::Jobs::new();
+    let id = vmos.create(&mut jobs, 64);
     if committed_first {
-        vmos.commit(&mut mm, id, 0, 64).unwrap();
+        vmos.commit(&mut mm, &mut jobs, id, 0, 64).unwrap();
     }
     aspace
         .map_region(&mut vmos, BASE, 64, id, 0, Perms::RW)
@@ -673,7 +722,7 @@ fn touch_in_order(committed_first: bool) -> usize {
         if aspace.table().translate(&mm, va).is_none() {
             faults += 1;
             aspace
-                .handle_fault(&mut mm, &mut vmos, va, Access::Write)
+                .handle_fault(&mut mm, &mut vmos, &mut jobs, va, Access::Write)
                 .unwrap();
         }
     }
@@ -697,14 +746,15 @@ fn fault_around_maps_committed_neighbours_and_never_commits_one() {
 #[test]
 fn fault_around_stays_inside_the_region_and_the_window() {
     let (mut mm, mut vmos, mut aspace) = setup(400);
-    let id = vmos.create(64);
-    vmos.commit(&mut mm, id, 0, 64).unwrap();
+    let mut jobs = kcore::job::Jobs::new();
+    let id = vmos.create(&mut jobs, 64);
+    vmos.commit(&mut mm, &mut jobs, id, 0, 64).unwrap();
     // a region of 5 pages that starts 3 pages into a 64 KiB window and runs to the window's end: BASE is 64 KiB aligned
     aspace
         .map_region(&mut vmos, BASE + 3 * 4096, 5, id, 10, Perms::RW)
         .unwrap();
     aspace
-        .handle_fault(&mut mm, &mut vmos, BASE + 5 * 4096, Access::Read)
+        .handle_fault(&mut mm, &mut vmos, &mut jobs, BASE + 5 * 4096, Access::Read)
         .unwrap();
     for page in 0..16u64 {
         let mapped = aspace.table().translate(&mm, BASE + page * 4096).is_some();

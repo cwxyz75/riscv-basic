@@ -57,7 +57,7 @@ use alloc::vec::Vec;
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::handle::HandleTable;
 use kcore::ipc::{self, Kobjs, ReadError};
-use kcore::job::JobId;
+use kcore::job::{JobId, Jobs};
 use kcore::pagetable::PhysMem;
 use kcore::usercopy::{copy_from_user, copy_to_user_verified, verify_writable};
 use kcore::Mm;
@@ -80,11 +80,12 @@ pub struct Faults {
 pub struct Ctx<'a, M: PhysMem> {
     pub objs: &'a mut Kobjs,
     pub handles: &'a mut HandleTable,
-    /// The job the process's new objects are charged to (the ledger is `vmos.jobs`).
+    /// The job the process's new objects are charged to (the ledger is `jobs`).
     pub job: JobId,
     pub aspace: &'a mut AddressSpace,
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
+    pub jobs: &'a mut Jobs,
     pub faults: Faults,
     /// The processors that are online (`job_info` 7).
     pub harts_online: u64,
@@ -134,6 +135,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         aspace,
         mm,
         vmos,
+        jobs,
         faults,
         ..
     } = c;
@@ -190,7 +192,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             )
@@ -202,7 +204,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             )
@@ -212,8 +214,9 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::SOCKET_WRITE => {
             let len = a[2] as usize;
             ipc::socket_write_check(objs, handles, h(0), len).map_err(|e| (e, None, None))?;
-            let data = copy_from_user(aspace, mm, vmos, a[1], len).map_err(|e| (e, None, None))?;
-            ipc::socket_write_in(objs, handles, h(0), &data, &mut vmos.jobs)
+            let data =
+                copy_from_user(aspace, mm, vmos, jobs, a[1], len).map_err(|e| (e, None, None))?;
+            ipc::socket_write_in(objs, handles, h(0), &data, jobs)
                 .map(|n| (Some(n as u64), None))
                 .map_err(|e| (e, None, None))
         }
@@ -222,9 +225,9 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             // What a read would deliver, checked against the destination before anything is
             // removed, so a bad pointer never loses data.
             let n = ipc::socket_peek(objs, handles, h(0), max).map_err(|e| (e, None, None))?;
-            verify_writable(aspace, mm, vmos, a[1], n).map_err(|e| (e, None, None))?;
-            let data = ipc::socket_read_in(objs, handles, h(0), max, &mut vmos.jobs)
-                .map_err(|e| (e, None, None))?;
+            verify_writable(aspace, mm, vmos, jobs, a[1], n).map_err(|e| (e, None, None))?;
+            let data =
+                ipc::socket_read_in(objs, handles, h(0), max, jobs).map_err(|e| (e, None, None))?;
             copy_to_user_verified(aspace, mm, a[1], &data).map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
@@ -236,22 +239,20 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             )
             .map_err(|e| (e, None, None))?;
             Ok((Some(port.0), None))
         }
-        nr::PORT_BIND => {
-            ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], &mut vmos.jobs)
-                .map(|_| (None, None))
-                .map_err(|e| (e, None, None))
-        }
-        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(0), a[1], &mut vmos.jobs)
+        nr::PORT_BIND => ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
-        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(0), a[1], &mut vmos.jobs)
+        nr::PORT_REARM => ipc::port_rearm_in(objs, handles, h(0), a[1], jobs)
+            .map(|_| (None, None))
+            .map_err(|e| (e, None, None)),
+        nr::PORT_UNBIND => ipc::port_unbind_in(objs, handles, h(0), a[1], jobs)
             .map(|_| (None, None))
             .map_err(|e| (e, None, None)),
         nr::EVENT_CREATE => {
@@ -259,7 +260,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 objs,
                 handles,
                 &mut ipc::Quota {
-                    jobs: &mut vmos.jobs,
+                    jobs,
                     job: Some(job),
                 },
             )
@@ -281,9 +282,9 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
                 return fail(Status::TooBig);
             }
-            let data =
-                copy_from_user(aspace, mm, vmos, a[1], nbytes).map_err(|e| (e, None, None))?;
-            let raw = copy_from_user(aspace, mm, vmos, a[3], nhandles * 8)
+            let data = copy_from_user(aspace, mm, vmos, jobs, a[1], nbytes)
+                .map_err(|e| (e, None, None))?;
+            let raw = copy_from_user(aspace, mm, vmos, jobs, a[3], nhandles * 8)
                 .map_err(|e| (e, None, None))?;
             ipc::channel_write_in(
                 objs,
@@ -291,7 +292,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 h(0),
                 &data,
                 &handle_list(&raw).map_err(|e| (e, None, None))?,
-                &mut vmos.jobs,
+                jobs,
             )
             .map(|_| (None, None))
             .map_err(|e| (e, None, None))
@@ -322,14 +323,13 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 }
                 Err(ReadError::Status(st)) => return fail(st),
             };
-            verify_writable(aspace, mm, vmos, bytes_at, nbytes).map_err(|e| (e, None, None))?;
-            verify_writable(aspace, mm, vmos, handles_at, nhandles * 8)
+            verify_writable(aspace, mm, vmos, jobs, bytes_at, nbytes)
+                .map_err(|e| (e, None, None))?;
+            verify_writable(aspace, mm, vmos, jobs, handles_at, nhandles * 8)
                 .map_err(|e| (e, None, None))?;
             let got = match txid {
-                None => ipc::channel_read_in(objs, handles, h(0), mb, mh, &mut vmos.jobs),
-                Some(t) => {
-                    ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, &mut vmos.jobs)
-                }
+                None => ipc::channel_read_in(objs, handles, h(0), mb, mh, jobs),
+                Some(t) => ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, jobs),
             };
             match got {
                 Ok(r) => {

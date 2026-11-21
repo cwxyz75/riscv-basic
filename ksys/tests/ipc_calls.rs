@@ -782,7 +782,6 @@ fn ports_bind_rearm_unbind_rows() {
 fn job_quota_refuses_creation_with_no_memory() {
     let mut w = world();
     let job = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,
@@ -808,7 +807,6 @@ fn job_quota_refuses_creation_with_no_memory() {
 fn queued_bytes_are_charged_to_the_job() {
     let mut w = world();
     let job = w
-        .vmos
         .jobs
         .create(
             JobId::ROOT,

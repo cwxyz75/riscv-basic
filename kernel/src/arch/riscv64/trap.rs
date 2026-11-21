@@ -584,7 +584,7 @@ fn trap_body(frame: &mut TrapFrame) {
     let k = kmem::get();
     match k
         .aspace
-        .handle_fault_mapped(&mut k.mm, &mut k.vmos, frame.stval, access)
+        .handle_fault_mapped(&mut k.mm, &mut k.vmos, &mut k.jobs, frame.stval, access)
     {
         // (the kernel's own table: every ASID, the pages the fault mapped)
         Ok(m) => {

@@ -28,7 +28,7 @@ pub fn job_status(e: JobError) -> Status {
     clippy::indexing_slicing
 )] // INVARIANT: the record is six words (48 bytes, copied in whole), read at word indices 0 to 5, so the slices are inside it and `try_into` of eight bytes cannot fail
 fn read_limits<M: PhysMem>(c: &mut Ctx<'_, M>, ptr: u64) -> Result<Limits, Status> {
-    let raw = copy_from_user(c.aspace, c.mm, c.vmos, ptr, 48)?;
+    let raw = copy_from_user(c.aspace, c.mm, c.vmos, c.jobs, ptr, 48)?;
     let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
     Ok(Limits {
         processes: w(0),
@@ -50,10 +50,10 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::JOB_CREATE => (|| {
             // credits of objects destroyed since the last charge come first: a job that has just closed its children must be able
             // to make another at once
-            ipc::settle(c.objs, &mut c.vmos.jobs);
+            ipc::settle(c.objs, c.jobs);
             let parent = ipc::job_of(c.objs, c.handles, h, Rights::MANAGE).map_err(e)?;
             let limits = read_limits(c, a[1]).map_err(e)?;
-            let jobs = &mut c.vmos.jobs;
+            let jobs = &mut c.jobs;
             let id = jobs.create(parent, limits).map_err(|x| e(job_status(x)))?;
             match ipc::job_object_create(
                 c.objs,
@@ -61,13 +61,13 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 id,
                 Rights::JOB,
                 &mut ipc::Quota {
-                    jobs: &mut c.vmos.jobs,
+                    jobs: c.jobs,
                     job: Some(c.job),
                 },
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(x) => {
-                    c.vmos.jobs.release(id);
+                    c.jobs.release(id);
                     Err(e(x))
                 }
             }
@@ -77,8 +77,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::JOB_SET_LIMITS => (|| {
             let job = ipc::job_of(c.objs, c.handles, h, Rights::SET_LIMITS).map_err(e)?;
             let limits = read_limits(c, a[1]).map_err(e)?;
-            c.vmos
-                .jobs
+            c.jobs
                 .set_limits(job, limits)
                 .map_err(|x| e(job_status(x)))?;
             Ok((None, None))
@@ -96,7 +95,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 5 => Resource::IpcBytes,
                 // 6: the job's scheduling limits: `max_prio` and `rt_budget` (nanoseconds per 100 ms window)
                 6 => {
-                    let s = c.vmos.jobs.sched(job).ok_or(e(Status::BadState))?;
+                    let s = c.jobs.sched(job).ok_or(e(Status::BadState))?;
                     return Ok((Some(u64::from(s.max_prio)), Some(s.rt_budget)));
                 }
                 // 7: the processors a job's threads may run on: every hart that is online (there is no affinity yet), the count
@@ -104,7 +103,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 7 => return Ok((Some(c.harts_online), Some(c.harts_online))),
                 _ => return fail(Status::InvalidArgs),
             };
-            let jobs = &c.vmos.jobs;
+            let jobs = &c.jobs;
             let used = jobs.usage(job).ok_or(e(Status::BadState))?.get(res);
             let limits = jobs.limits(job).ok_or(e(Status::BadState))?;
             let limit = match res {

@@ -41,7 +41,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 &[],
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             )
         });
         notify();
@@ -58,7 +58,7 @@ impl KernelEnd {
                 self.handle,
                 MAX_MSG_BYTES,
                 MAX_MSG_HANDLES,
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             );
             match got {
                 Ok(msg) => {
@@ -82,9 +82,9 @@ impl KernelEnd {
             let s = state();
             let k = kmem::get();
             let pages = (image.len() as u64).div_ceil(4096).max(1);
-            let id = k.vmos.create(pages);
-            if k.vmos.write(&mut k.mm, id, 0, image).is_err() {
-                let _ = k.vmos.release(&mut k.mm, id);
+            let id = k.vmos.create(&mut k.jobs, pages);
+            if k.vmos.write(&mut k.mm, &mut k.jobs, id, 0, image).is_err() {
+                let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
                 return Err(Status::NoMemory);
             }
             let h = match ipc::vmo_object_create_in(
@@ -95,7 +95,7 @@ impl KernelEnd {
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    let _ = k.vmos.release(&mut k.mm, id);
+                    let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
                     return Err(e);
                 }
             };
@@ -105,7 +105,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 &[h],
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             );
             if r.is_err() {
                 let _ = s.ktable.close(&mut s.objs, h);
@@ -127,7 +127,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 handles,
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             )
         });
         notify();
@@ -212,9 +212,9 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         let s = state();
         let k = kmem::get();
         let pages = (bytes.len() as u64).div_ceil(4096).max(1);
-        let id = k.vmos.create(pages);
-        if k.vmos.write(&mut k.mm, id, 0, bytes).is_err() {
-            let _ = k.vmos.release(&mut k.mm, id);
+        let id = k.vmos.create(&mut k.jobs, pages);
+        if k.vmos.write(&mut k.mm, &mut k.jobs, id, 0, bytes).is_err() {
+            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
             return Err(Status::NoMemory);
         }
         let h = match ipc::vmo_object_create_in(
@@ -225,7 +225,7 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         ) {
             Ok(h) => h,
             Err(e) => {
-                let _ = k.vmos.release(&mut k.mm, id);
+                let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
                 return Err(e);
             }
         };
@@ -252,7 +252,7 @@ impl KernelSocket {
                 &s.ktable,
                 self.handle,
                 max,
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             )
         });
         notify();
@@ -268,7 +268,7 @@ impl KernelSocket {
                 &s.ktable,
                 self.handle,
                 data,
-                &mut kmem::get().vmos.jobs,
+                &mut kmem::get().jobs,
             )
         });
         notify();

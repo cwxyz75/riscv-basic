@@ -108,9 +108,6 @@ pub struct Vmos {
     slots: alloc::vec::Vec<VmoSlot>,
     free: alloc::vec::Vec<u32>,
     live: usize,
-    /// The job ledger lives here because memory is charged at the moment a page is committed,
-    /// which happens in this store (`page_for`) and nowhere else.
-    pub jobs: Jobs,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
 }
@@ -188,14 +185,14 @@ impl Vmos {
 
     /// A new lazily committed VMO of `pages` pages (nothing allocated yet), charged to the
     /// root job (the kernel's own VMOs).
-    pub fn create(&mut self, pages: u64) -> u64 {
-        self.create_in(pages, JobId::ROOT)
+    pub fn create(&mut self, jobs: &mut Jobs, pages: u64) -> u64 {
+        self.create_in(jobs, pages, JobId::ROOT)
     }
 
     /// A new lazily committed VMO whose pages are charged to `job` as they are committed.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter is a u64 that starts at 1 and gains one per VMO, bounded by the object quota
-    pub fn create_in(&mut self, pages: u64, job: JobId) -> u64 {
-        self.jobs.retain(job);
+    pub fn create_in(&mut self, jobs: &mut Jobs, pages: u64, job: JobId) -> u64 {
+        jobs.retain(job);
         self.place(Vmo {
             kind: VmoKind::Plain,
             job,
@@ -208,8 +205,8 @@ impl Vmos {
     /// A VMO over device memory starting at frame `first` (the caller has checked the range is
     /// inside an allowed device window). Holds one use of the root job.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the id counter as above; `first + i` for i < pages: the caller passed the device-window check (a range inside one window, so no overflow)
-    pub fn create_physical(&mut self, first: Pfn, pages: u64) -> u64 {
-        self.jobs.retain(JobId::ROOT);
+    pub fn create_physical(&mut self, jobs: &mut Jobs, first: Pfn, pages: u64) -> u64 {
+        jobs.retain(JobId::ROOT);
         self.place(Vmo {
             kind: VmoKind::Device,
             job: JobId::ROOT,
@@ -225,6 +222,7 @@ impl Vmos {
     pub fn create_dma<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         pages: u64,
         job: JobId,
     ) -> Result<u64, VmoError> {
@@ -232,17 +230,16 @@ impl Vmos {
         if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > MAX_DMA_TOTAL_PAGES {
             return Err(VmoError::OutOfRange);
         }
-        self.jobs
-            .charge(job, Resource::Pages, pages)
+        jobs.charge(job, Resource::Pages, pages)
             .map_err(|_| VmoError::NoMemory)?;
         let Some(first) = mm.db.alloc_contiguous(pages as usize) else {
-            self.jobs.credit(job, Resource::Pages, pages);
+            jobs.credit(job, Resource::Pages, pages);
             return Err(VmoError::NoMemory);
         };
         for i in 0..pages {
             mm.mem.zero_frame(first + i);
         }
-        self.jobs.retain(job);
+        jobs.retain(job);
         self.dma_pages += pages;
         Ok(self.place(Vmo {
             kind: VmoKind::Dma,
@@ -298,7 +295,12 @@ impl Vmos {
     /// object a handle names is destroyed (or by the kernel for its own VMOs), a mapping's when the region goes (L15: no scan for VMOs that
     /// nothing maps any more). Frames still mapped somewhere hold references of their own.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: refs >= 1 for a live VMO; dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
-    pub fn release<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
+    pub fn release<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+    ) -> Result<(), VmoGone> {
         let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
         v.refs -= 1;
         if v.refs > 0 {
@@ -307,15 +309,14 @@ impl Vmos {
         let vmo = self.take(id).ok_or(VmoGone)?;
         if vmo.kind == VmoKind::Device {
             // device frames are not ours: nothing was charged and nothing is freed
-            self.jobs.release(vmo.job);
+            jobs.release(vmo.job);
             return Ok(());
         }
         if vmo.kind == VmoKind::Dma {
             self.dma_pages -= vmo.pages;
         }
-        self.jobs
-            .credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
-        self.jobs.release(vmo.job);
+        jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
+        jobs.release(vmo.job);
         let mut committed = vmo.committed;
         committed.drain_pfns(|pfn| {
             let dropped = mm.db.dec(pfn);
@@ -334,11 +335,12 @@ impl Vmos {
     pub fn write<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         offset: u64,
         data: &[u8],
     ) -> Result<(), VmoError> {
-        self.access(mm, id, offset, data.len(), |mm, pa, range| {
+        self.access(mm, jobs, id, offset, data.len(), |mm, pa, range| {
             mm.mem.write_bytes(pa, &data[range])
         })
     }
@@ -385,6 +387,7 @@ impl Vmos {
     fn access<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         offset: u64,
         len: usize,
@@ -402,7 +405,7 @@ impl Vmos {
         // Commit everything first so a failure part-way leaves no half-written data.
         let mut at = offset;
         while at < end {
-            self.page_for(mm, id, at / PAGE_SIZE)
+            self.page_for(mm, jobs, id, at / PAGE_SIZE)
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
@@ -428,6 +431,7 @@ impl Vmos {
     pub fn commit<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         first: u64,
         pages: u64,
@@ -443,7 +447,7 @@ impl Vmos {
         // Refuse at once what cannot fit (no frames taken and given back for nothing): count the pages
         // this call would commit and compare with the job's room and the free frames.
         let needed = (first..end).filter(|p| !vmo.committed.contains(*p)).count() as u64;
-        if needed > self.jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
+        if needed > jobs.room(vmo.job, Resource::Pages) || needed > mm.db.free_count() as u64 {
             return Err(VmoError::NoMemory);
         }
         // (the list of this call's commits, for undoing them, is allocated before the first frame is taken: KT9)
@@ -454,7 +458,7 @@ impl Vmos {
             if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
-            match self.page_for(mm, id, page) {
+            match self.page_for(mm, jobs, id, page) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
@@ -462,7 +466,7 @@ impl Vmos {
                     for p in done {
                         if let Some(pfn) = vmo.committed.remove(p) {
                             let _ = mm.db.dec(pfn);
-                            self.jobs.credit(vmo.job, Resource::Pages, 1);
+                            jobs.credit(vmo.job, Resource::Pages, 1);
                         }
                     }
                     return Err(VmoError::NoMemory);
@@ -497,6 +501,7 @@ impl Vmos {
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        jobs: &mut Jobs,
         id: u64,
         page: u64,
     ) -> Result<Pfn, FaultError> {
@@ -506,17 +511,16 @@ impl Vmos {
         }
         // The job's limit first (a full job is "out of memory" for its own programs only),
         // then the frame; a frame that cannot be had gives the charge back.
-        self.jobs
-            .charge(vmo.job, Resource::Pages, 1)
+        jobs.charge(vmo.job, Resource::Pages, 1)
             .map_err(|_| FaultError::NoMemory)?;
         let Some(pfn) = mm.db.alloc() else {
-            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            jobs.credit(vmo.job, Resource::Pages, 1);
             return Err(FaultError::NoMemory);
         };
         // (the bookkeeping first: if it cannot be had, the frame and the charge go back and nothing was committed)
         if vmo.committed.insert(page, pfn).is_err() {
             let _ = mm.db.dec(pfn);
-            self.jobs.credit(vmo.job, Resource::Pages, 1);
+            jobs.credit(vmo.job, Resource::Pages, 1);
             return Err(FaultError::NoMemory);
         }
         mm.mem.zero_frame(pfn);
@@ -659,6 +663,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
+        jobs: &mut Jobs,
         start: u64,
     ) -> Result<(), RegionError> {
         let region = self.regions.remove(&start).ok_or(RegionError::NoRegion)?;
@@ -675,7 +680,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
             }
         }
         // the region's reference on its VMO goes last (the VMO may be freed by it: the frames the mapping held are already dropped)
-        let _ = vmos.release(mm, region.vmo);
+        let _ = vmos.release(mm, jobs, region.vmo);
         Ok(())
     }
 
@@ -686,10 +691,12 @@ impl<F: PageTableFormat> AddressSpace<F> {
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
+        jobs: &mut Jobs,
         va: u64,
         access: Access,
     ) -> Result<(), FaultError> {
-        self.handle_fault_mapped(mm, vmos, va, access).map(|_| ())
+        self.handle_fault_mapped(mm, vmos, jobs, va, access)
+            .map(|_| ())
     }
 
     /// `handle_fault`, saying which pages it mapped: the faulting page and, in the same 64 KiB aligned window and the same region,
@@ -702,6 +709,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         &mut self,
         mm: &mut Mm<M>,
         vmos: &mut Vmos,
+        jobs: &mut Jobs,
         va: u64,
         access: Access,
     ) -> Result<MappedPages, FaultError> {
@@ -743,7 +751,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         }
         let (vmo, perms, region_pages, vmo_page0) =
             (region.vmo, region.perms, region.pages, region.vmo_page);
-        let pfn = vmos.page_for(mm, vmo, vmo_page0 + page)?;
+        let pfn = vmos.page_for(mm, jobs, vmo, vmo_page0 + page)?;
         let managed = mm.db.is_managed(pfn);
         if managed {
             mm.db.inc(pfn).map_err(|_| FaultError::NoMemory)?;
@@ -800,19 +808,19 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// Unmap everything and free the tables of a process whose table shares the kernel's
     /// upper half (`PageTable::new_with_kernel_half`): the shared half is left alone.
-    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos) {
+    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos, jobs: &mut Jobs) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, vmos, start);
+            let _ = self.unmap_region(mm, vmos, jobs, start);
         }
         self.table.destroy_user(mm);
     }
 
     /// Unmap everything and free the tables.
-    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos) {
+    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos, jobs: &mut Jobs) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, vmos, start);
+            let _ = self.unmap_region(mm, vmos, jobs, start);
         }
         self.table.destroy(mm);
     }
