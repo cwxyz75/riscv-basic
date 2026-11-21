@@ -48,6 +48,7 @@ pub mod park;
 pub mod sched;
 pub mod sched2;
 pub mod sched_smp;
+pub mod slab;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;
