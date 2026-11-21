@@ -233,6 +233,60 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             target.table_charge.insert(vaddr, tables);
             Ok((None, None))
         })(),
+        nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => (|| {
+            // Both take pages away from a VMO, so both first unmap them from every address space that maps them, then have every hart drop
+            // its translations, and only then let the VMO give the frames back (TLB2).
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::WRITE).map_err(e)?;
+            let size = vmos.pages(id).ok_or(e(Status::BadHandle))?;
+            let (first, count, new_size) = if n == nr::VMO_DECOMMIT {
+                let (offset, len) = (a[1], a[2]);
+                if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || len == 0 {
+                    return Err(e(Status::InvalidArgs));
+                }
+                let first = offset / 4096;
+                let count = len / 4096;
+                if first.checked_add(count).is_none_or(|end| end > size) {
+                    return Err(e(Status::InvalidArgs));
+                }
+                (first, count, None)
+            } else {
+                let bytes = a[1];
+                if bytes == 0
+                    || !bytes.is_multiple_of(4096)
+                    || bytes / 4096 > abi::limits::MAX_VMO_PAGES
+                {
+                    return Err(e(Status::InvalidArgs));
+                }
+                let new = bytes / 4096;
+                if !vmos.is_resizable(id) {
+                    return Err(e(Status::AccessDenied));
+                }
+                // growing takes nothing away; shrinking takes the tail
+                (new.min(size), size.saturating_sub(new), Some(new))
+            };
+            if vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
+                return Err(e(Status::NotSupported));
+            }
+            if count > 0 {
+                for p in procs.values_mut() {
+                    p.aspace.unmap_vmo_pages(mm, id, first, count);
+                }
+                // other harts may still cache the translations of what was just unmapped: before any frame is freed
+                machine.shootdown();
+                machine.flush_tlb();
+            }
+            let r = match new_size {
+                None => vmos.decommit(mm, jobs, id, first, count).map(|_| ()),
+                Some(new) => vmos.set_size(mm, jobs, id, new),
+            };
+            match r {
+                Ok(()) => Ok((None, None)),
+                Err(kcore::aspace::VmoError::Gone) => Err(e(Status::BadHandle)),
+                Err(kcore::aspace::VmoError::NotResizable) => Err(e(Status::AccessDenied)),
+                Err(_) => Err(e(Status::InvalidArgs)),
+            }
+        })(),
         nr::PROCESS_UNMAP => (|| {
             let ph = Handle(a[0]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;

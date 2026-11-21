@@ -107,6 +107,10 @@ pub enum VmoError {
     NoMemory,
     /// Device memory is never read or written through the kernel.
     Device,
+    /// The VMO's memory is fixed (DMA frames are committed for good).
+    Fixed,
+    /// The VMO was not made resizable.
+    NotResizable,
 }
 
 /// What backs a VMO.
@@ -131,6 +135,8 @@ struct Vmo {
     refs: u32,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
     committed: PageMap,
+    /// Made with the RESIZABLE flag: `set_size` may change `pages` (MM6).
+    resizable: bool,
 }
 
 struct VmoSlot {
@@ -237,6 +243,7 @@ impl Vmos {
             pages,
             refs: 1,
             committed: PageMap::new(),
+            resizable: false,
         })
     }
 
@@ -251,6 +258,7 @@ impl Vmos {
             pages,
             refs: 1,
             committed: PageMap::from_run(pages, first),
+            resizable: false,
         })
     }
 
@@ -285,6 +293,7 @@ impl Vmos {
             pages,
             refs: 1,
             committed: PageMap::from_run(pages, first),
+            resizable: false,
         }))
     }
 
@@ -534,6 +543,83 @@ impl Vmos {
         self.vmo(id).map(|v| v.committed.len() as u64)
     }
 
+    /// Mark a new VMO resizable (`vmo_create` with the RESIZABLE flag, MM6): `set_size` may then change its size. Plain VMOs only.
+    pub fn set_resizable(&mut self, id: u64) {
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            if v.kind == VmoKind::Plain {
+                v.resizable = true;
+            }
+        }
+    }
+
+    /// Was the VMO made resizable?
+    pub fn is_resizable(&self, id: u64) -> bool {
+        self.vmo(id).is_some_and(|v| v.resizable)
+    }
+
+    /// Give back the committed pages of `first .. first + pages` (MM6): the VMO drops its reference on each frame and its job is credited.
+    /// **The caller has already unmapped the range from every address space** (`AddressSpace::unmap_vmo_pages`) and shot the other harts'
+    /// translations down: a frame a mapping still holds would otherwise stay readable and survive. The pages read as zeros afterwards (a
+    /// fresh page is committed on the next touch). Returns how many pages were freed. Plain VMOs only (device memory and DMA frames are
+    /// fixed).
+    pub fn decommit<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+        first: u64,
+        pages: u64,
+    ) -> Result<u64, VmoError> {
+        let vmo = Self::vmo_in(&mut self.slots, id).ok_or(VmoError::Gone)?;
+        match vmo.kind {
+            VmoKind::Device => return Err(VmoError::Device),
+            VmoKind::Dma => return Err(VmoError::Fixed),
+            VmoKind::Plain => {}
+        }
+        let end = first.checked_add(pages).ok_or(VmoError::OutOfRange)?;
+        if end > vmo.pages {
+            return Err(VmoError::OutOfRange);
+        }
+        let mut freed = 0u64;
+        for page in first..end {
+            if let Some(pfn) = vmo.committed.remove(page) {
+                let _ = mm.db.dec(pfn);
+                freed = freed.saturating_add(1);
+            }
+        }
+        jobs.credit(vmo.job, Resource::Pages, freed);
+        Ok(freed)
+    }
+
+    /// Change the size of a resizable VMO to `pages` (MM6). Growing changes the size only (nothing is committed). Shrinking gives back the
+    /// committed pages past the new end (the caller has unmapped that range, as for `decommit`); a mapping that reaches past the new end
+    /// keeps its length, and a touch beyond it is refused at the fault. Not for VMOs with a mapped range the caller did not clear.
+    pub fn set_size<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        jobs: &mut Jobs,
+        id: u64,
+        pages: u64,
+    ) -> Result<(), VmoError> {
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
+        match vmo.kind {
+            VmoKind::Device => return Err(VmoError::Device),
+            VmoKind::Dma => return Err(VmoError::Fixed),
+            VmoKind::Plain => {}
+        }
+        if !vmo.resizable {
+            return Err(VmoError::NotResizable);
+        }
+        let old = vmo.pages;
+        if pages < old {
+            self.decommit(mm, jobs, id, pages, old.saturating_sub(pages))?;
+        }
+        if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            v.pages = pages;
+        }
+        Ok(())
+    }
+
     /// The job a VMO's pages are charged to.
     pub fn job_of(&self, id: u64) -> Option<JobId> {
         self.vmo(id).map(|v| v.job)
@@ -552,6 +638,10 @@ impl Vmos {
         let vmo = Self::vmo_in(&mut self.slots, id).ok_or(FaultError::VmoGone)?;
         if let Some(pfn) = vmo.committed.get(page) {
             return Ok(pfn);
+        }
+        // (a VMO that was shrunk under a mapping: the page is past its end, the access is refused like one outside any region)
+        if page >= vmo.pages {
+            return Err(FaultError::NoRegion);
         }
         // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
         // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
@@ -811,6 +901,41 @@ impl<F: PageTableFormat> AddressSpace<F> {
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
         let (&start, r) = self.regions.range(..=va).next_back()?;
         (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
+    }
+
+    /// Unmap, in this address space, every mapped page of VMO `vmo` among its pages `first .. first + pages` (MM6: before the VMO gives the
+    /// pages back). Drops each mapping's reference on its frame; regions stay. Returns how many pages were unmapped. **The caller must flush
+    /// the TLBs (every hart) before the VMO's own references on those frames are dropped.**
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted; the page numbers are bounded by the region's length
+    pub fn unmap_vmo_pages<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmo: u64,
+        first: u64,
+        pages: u64,
+    ) -> u64 {
+        let end = first.saturating_add(pages);
+        let mut cleared = 0u64;
+        for (&start, r) in self.regions.iter() {
+            if r.vmo != vmo {
+                continue;
+            }
+            // the region maps the VMO's pages `r.vmo_page .. r.vmo_page + r.pages`
+            let lo = first.max(r.vmo_page);
+            let hi = end.min(r.vmo_page + r.pages);
+            let mut p = lo;
+            while p < hi {
+                let va = start + (p - r.vmo_page) * PAGE_SIZE;
+                if let Some((pfn, _)) = self.table.unmap(mm, va) {
+                    if mm.db.is_managed(pfn) {
+                        let _ = mm.db.dec(pfn);
+                    }
+                    cleared += 1;
+                }
+                p += 1;
+            }
+        }
+        cleared
     }
 
     /// Remove the region starting at `start`, unmapping its pages and dropping the

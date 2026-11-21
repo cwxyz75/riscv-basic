@@ -243,6 +243,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
         | nr::PROCESS_UNMAP
+        | nr::VMO_DECOMMIT
+        | nr::VMO_SET_SIZE
         | nr::PROCESS_START
         | nr::PROCESS_KILL
         | nr::PROCESS_SUSPEND

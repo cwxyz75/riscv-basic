@@ -163,6 +163,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 45 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
 | 46 | vmo_phys_addr | `a0` vmo | `a1` physical address |
 | 47 | vmo_commit | `a0` vmo, `a1` offset, `a2` length | |
+| 48 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length | |
+| 49 | vmo_set_size | `a0` vmo, `a1` bytes | |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
 | 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
@@ -345,10 +347,10 @@ the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle t
 kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
 closing the last handle to a VMO frees it once nothing maps it.
 
-### vmo_create(pages, job) -> status, handle
+### vmo_create(pages, job, flags) -> status, handle
 
 New zero-filled VMO whose pages are charged to a job as they are first touched (S4.5): `job` is
-a job handle with MANAGE, or 0 for the caller's own job. Errors: INVALID_ARGS (`pages` is 0 or
+a job handle with MANAGE, or 0 for the caller's own job. `flags` (MM6): bit 0 `RESIZABLE` makes the VMO's size changeable (`vmo_set_size`); any other bit is INVALID_ARGS. Errors: INVALID_ARGS (`pages` is 0 or
 over the limit); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
 memory). A page that cannot be charged is refused when it is first touched, with NO_MEMORY from
 `vmo_write`, or as a fault that ends the process. Tests: `vmo_*` in `init`.
@@ -360,6 +362,14 @@ WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (a bad user pointer, or the range does n
 inside the VMO: `offset + length` wraps or exceeds its size; a zero `length` is allowed
 anywhere inside or at the end). `length` is limited to `MAX_MSG_BYTES` per call (TOO_BIG).
 Nothing is written on an error.
+
+### vmo_decommit(vmo, offset, length) -> status
+
+Give back the pages `[offset, offset + length)` of a VMO (MM6): every mapping of them, in every address space, goes and every hart drops its translations **before** any frame is freed, then the VMO drops its references, the frames return to the allocator and the VMO's creating job is credited. The range reads as zeros afterwards, through a mapping (the page faults in again as a fresh zero page, charged then) and through `vmo_read`. Pages that were never committed cost nothing. Rights: WRITE. `offset` and `length` must be page aligned and `length` not 0 (INVALID_ARGS), the range inside the VMO (INVALID_ARGS). Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS; NOT_SUPPORTED (a device or DMA VMO: their frames are fixed). The mappings stay (the regions keep their length); only the pages go. Tests: `vmo_decommit_and_resize_from_user_mode`, `kcore/tests/vmo_ops_model.rs`.
+
+### vmo_set_size(vmo, bytes) -> status
+
+Change the size of a VMO made with `RESIZABLE` (MM6); `bytes` must be a whole number of pages, not 0, and at most the VMO limit (INVALID_ARGS). Growing changes the size and nothing else (no page is committed). Shrinking decommits the pages past the new end exactly as `vmo_decommit` does (mappings and translations first, then the frames) and the size follows; a mapping that reaches past the new end keeps its length, and **touching its part past the end is a page fault that ends the process** (the address is in no backed region). Rights: WRITE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no WRITE, or the VMO was not made RESIZABLE); INVALID_ARGS; NOT_SUPPORTED (a device or DMA VMO). Sizes are whole pages until the byte-sized VMOs of MM6's full text (work/T207.md). Tests: `vmo_decommit_and_resize_from_user_mode`, `touching_past_a_shrunk_vmo_ends_the_process_cleanly`.
 
 ### vmo_commit(vmo, offset, length) -> status
 

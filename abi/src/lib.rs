@@ -196,6 +196,12 @@ pub mod rights {
 
 /// Signal bits (SYSCALLS.md, "Signals").
 /// Flags for `port_bind` (its fifth argument).
+/// Flags for `vmo_create` (its third argument, MM6).
+pub mod vmo_flags {
+    /// The VMO's size may change (`vmo_set_size`).
+    pub const RESIZABLE: u64 = 1;
+}
+
 pub mod port_flags {
     /// The binding disarms itself when `port_wait` reports it, until `port_rearm`.
     pub const ONESHOT: u64 = 1;
@@ -309,6 +315,10 @@ pub mod syscall {
     pub const VMO_CREATE_DMA: usize = 45;
     pub const VMO_PHYS_ADDR: usize = 46;
     pub const VMO_COMMIT: usize = 47;
+    /// Give back the committed pages of a range of a VMO (MM6): they read as zeros afterwards.
+    pub const VMO_DECOMMIT: usize = 48;
+    /// Change the size of a resizable VMO (MM6).
+    pub const VMO_SET_SIZE: usize = 49;
     pub const PROCESS_CREATE: usize = 50;
     pub const PROCESS_SELF: usize = 51;
     pub const PROCESS_MAP: usize = 52;
