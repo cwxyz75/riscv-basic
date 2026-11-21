@@ -168,7 +168,7 @@ fn run() {
         h.join().unwrap();
     }
     let mut w = Arc::try_unwrap(world).ok().unwrap().into_inner().unwrap();
-    w.vmos.audit_families().unwrap();
+    w.vmos.audit_families(true).unwrap();
     let ids: Vec<(u64, usize, u64)> = w.members.clone();
     for (id, si, base) in ids {
         w.spaces[si]

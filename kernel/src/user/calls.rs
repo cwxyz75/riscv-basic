@@ -78,7 +78,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
 }
 
 /// After a call or a fault: drop what the copy log made stale in every address space (COW1). A load when nothing is pending.
-pub(super) fn cow_sync() {
+pub(crate) fn cow_sync() {
     if !kcore::aspace::COPY_PENDING.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }

@@ -219,6 +219,8 @@ struct Vmo {
     inherit: u64,
     /// Made by a SNAPSHOT: holds the source's pages for the source and the child, has no handle and is never mapped or written.
     hidden: bool,
+    /// The VMO has had a parent (it may hold translations of the shared zero frame even after a merge made it a root).
+    had_parent: bool,
 }
 
 struct VmoSlot {
@@ -236,9 +238,10 @@ pub struct Vmos {
     live: usize,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
-    /// Pages that became visible, or were replaced, in a VMO that other mappings may reach through a family (`page_for`): (node, page). The
+    /// Pages that became visible, or were replaced, in a VMO that other mappings may reach through a family (`page_for`): (node, first page,
+    /// count), neighbouring pages coalesced (a `vmo_commit` of a large VMO is one entry). The
     /// caller drains it with `invalidate_copies` (every address space drops what the new page makes stale) before the faulting thread runs on.
-    copy_log: alloc::vec::Vec<(u64, u64)>,
+    copy_log: alloc::vec::Vec<(u64, u64, u64)>,
     /// The frame a read of a page nobody has committed maps, read-only, in a VMO that inherits (nothing is committed for such a read).
     zero: Option<Pfn>,
     /// The zero frame was made by `ensure_zero` (the kernel, at boot): it stays when the last VMO goes. A lazily made one goes with it.
@@ -346,6 +349,7 @@ impl Vmos {
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
+            had_parent: false,
             inherit: 0,
         })
     }
@@ -365,6 +369,7 @@ impl Vmos {
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
+            had_parent: false,
             inherit: 0,
         })
     }
@@ -404,6 +409,7 @@ impl Vmos {
             parent: None,
             children: alloc::vec::Vec::new(),
             hidden: false,
+            had_parent: false,
             inherit: 0,
         }))
     }
@@ -663,6 +669,7 @@ impl Vmos {
             parent: None,
             children: stash,
             hidden: false,
+            had_parent: false,
             inherit: 0,
         }))
     }
@@ -729,6 +736,7 @@ impl Vmos {
                         parent: old_parent,
                         children: kids,
                         hidden: true,
+                        had_parent: old_parent.is_some(),
                         inherit: old_inherit,
                     });
                     if let Some(l) = old_parent {
@@ -743,6 +751,7 @@ impl Vmos {
                             id: hidden,
                             offset: 0,
                         });
+                        v.had_parent = true;
                         v.inherit = src_pages;
                     }
                     Link { id: hidden, offset }
@@ -751,6 +760,7 @@ impl Vmos {
         };
         if let Some(c) = Self::vmo_in(&mut self.slots, child) {
             c.parent = Some(link);
+            c.had_parent = true;
             c.inherit = pages;
         }
     }
@@ -876,27 +886,28 @@ impl Vmos {
     }
 
     /// Take the log of pages that became visible or were replaced in a VMO other mappings may reach (see `invalidate_copies`).
-    pub fn take_copy_log(&mut self) -> alloc::vec::Vec<(u64, u64)> {
+    pub fn take_copy_log(&mut self) -> alloc::vec::Vec<(u64, u64, u64)> {
         core::mem::take(&mut self.copy_log)
     }
 
     /// Give the (emptied) log back, with its capacity.
-    pub fn restore_copy_log(&mut self, mut log: alloc::vec::Vec<(u64, u64)>) {
+    pub fn restore_copy_log(&mut self, mut log: alloc::vec::Vec<(u64, u64, u64)>) {
         log.clear();
         if self.copy_log.is_empty() {
             self.copy_log = log;
         }
     }
 
-    /// Check the shape of every family: children lists and parent links agree, a hidden node has two or more children, nothing is deeper than
+    /// Check the shape of every family: children lists and parent links agree, a hidden node has two or more children (`strict`; one
+    /// is tolerated otherwise: a merge that could not get memory is retried at the next release), nothing is deeper than
     /// `MAX_FAMILY_DEPTH`, a node's references cover its handle-less holders (tests and audits).
-    pub fn audit_families(&self) -> Result<(), &'static str> {
+    pub fn audit_families(&self, strict: bool) -> Result<(), &'static str> {
         for (i, slot) in self.slots.iter().enumerate() {
             let Some(v) = slot.vmo.as_ref() else {
                 continue;
             };
             let id = (u64::from(slot.gen) << 32) | (i as u64).saturating_add(1);
-            if v.hidden && v.children.len() < 2 {
+            if v.hidden && v.children.len() < if strict { 2 } else { 1 } {
                 return Err("a hidden node has fewer than two children");
             }
             for &c in &v.children {
@@ -1076,7 +1087,7 @@ impl Vmos {
         // Commit everything first so a failure part-way leaves no half-written data.
         let mut at = offset;
         while at < end {
-            self.page_for(mm, jobs, None, id, at / PAGE_SIZE, true)
+            self.page_for(mm, jobs, None, id, at / PAGE_SIZE, true, true)
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
@@ -1129,7 +1140,7 @@ impl Vmos {
             if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
-            match self.page_for(mm, jobs, None, id, page, true) {
+            match self.page_for(mm, jobs, None, id, page, true, false) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
@@ -1317,6 +1328,7 @@ impl Vmos {
     /// later change by the parent is seen). A page only inherited is returned as it is for a read; for a write (`write`) it is copied into a
     /// new frame of this VMO, charged to its job (MM8). The VMO keeps its own reference on the frames it owns. A page that becomes visible
     /// to mappings of other VMOs of the family is logged (`invalidate_copies`).
+    #[allow(clippy::too_many_arguments)] // INVARIANT: one private function with every input of a page request: the store, the ledger, the reservation, the page, and the two flags
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -1325,6 +1337,7 @@ impl Vmos {
         id: u64,
         page: u64,
         write: bool,
+        may_take: bool,
     ) -> Result<(Pfn, bool), FaultError> {
         let v = self.vmo(id).ok_or(FaultError::VmoGone)?;
         // (a VMO that was shrunk under a mapping: the page is past its end, the access is refused like one outside any region)
@@ -1345,7 +1358,11 @@ impl Vmos {
         }
         // No other node can see the inherited frame: take it over (nothing is allocated or charged; the writer's job already pays for it
         // as part of the hidden node's pages, and the node and the writer are charged to the same job)
-        if let Some(Hit::Frame(pfn, false)) = hit {
+        // (not while translations of an older version are still to be dropped: the kernel would write into a frame another address space
+        // still reads through; not for `commit`, whose undo frees what it made)
+        if let (true, true, Some(Hit::Frame(pfn, false))) =
+            (may_take, self.copy_log.is_empty(), hit)
+        {
             if let Some((node, op)) = self.takeover_source(id, page) {
                 let inserted = Self::vmo_in(&mut self.slots, id)
                     .is_some_and(|v| v.committed.insert(page, pfn).is_ok());
@@ -1397,13 +1414,18 @@ impl Vmos {
         // to make it) and those of the VMOs below it, in every address space. Nothing else can hold such a translation when the VMO has a
         // single holder and no children.
         // (a page nobody had, in a VMO that inherits nothing, can have no translation of an older version: only what is below it can)
-        let stale_possible = if hit.is_none() && !inherits {
+        let stale_possible = if hit.is_none() && !inherits && !vmo.had_parent {
             !vmo.children.is_empty()
         } else {
             vmo.refs > 1 || !vmo.children.is_empty()
         };
         if stale_possible {
-            self.copy_log.push((id, page));
+            match self.copy_log.last_mut() {
+                Some(l) if l.0 == id && l.1.saturating_add(l.2) == page => {
+                    l.2 = l.2.saturating_add(1);
+                }
+                _ => self.copy_log.push((id, page, 1)),
+            }
             COPY_PENDING.store(true, core::sync::atomic::Ordering::Release);
         }
         match copy_from {
@@ -2111,6 +2133,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 fetch_vmo,
                 fetch_page,
                 plan.write,
+                true,
             )?;
             // a write to a page that is mapped read-only (the VMO now owns its own copy, or the source's mappings were write-protected
             // by a SNAPSHOT): every mapping of the page in this address space goes, the fault maps the right frame afresh
@@ -2332,10 +2355,14 @@ pub fn invalidate_copies<'a, F: PageTableFormat + 'a, M: PhysMem>(
     let mut cleared = 0u64;
     if !log.is_empty() {
         for space in spaces {
-            for &(node, page) in &log {
+            for &(node, first, count) in &log {
+                let end = first.saturating_add(count);
                 vmos.for_each_below(node, 0, &mut |d, base| {
-                    if let Some(p) = page.checked_sub(base) {
-                        cleared = cleared.saturating_add(space.unmap_vmo_pages(mm, d, p, 1));
+                    // (the part of the range that lies inside the descendant's pages)
+                    let lo = first.saturating_sub(base);
+                    if end > base {
+                        let n = end.saturating_sub(base).saturating_sub(lo);
+                        cleared = cleared.saturating_add(space.unmap_vmo_pages(mm, d, lo, n));
                     }
                 });
             }

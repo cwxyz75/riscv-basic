@@ -29,8 +29,10 @@ struct Node {
     job: usize,
     /// the real VMO, for the members a program can reach; hidden nodes have none
     id: Option<u64>,
-    /// a member whose handle is still open
+    /// a member that exists for the test: its handle is open or a region of it is still mapped
     alive: bool,
+    /// its handle (the creator's reference) has not been closed yet
+    open: bool,
     resizable: bool,
 }
 
@@ -221,14 +223,14 @@ impl World {
             "{ctx}: every frame is charged to exactly one job"
         );
         self.vmos
-            .audit_families()
+            .audit_families(true)
             .unwrap_or_else(|e| panic!("{ctx}: {e}"));
     }
 }
 
 #[test]
 fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_stale() {
-    for seed in 1..=60u64 {
+    for seed in 1..=400u64 {
         let mut rng = Rng::new(seed);
         let mut mm = Mm {
             db: FrameDb::new(20000, 500),
@@ -236,9 +238,13 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
         };
         let total = mm.db.free_count();
         let mut jobs = Jobs::new();
-        let job_ids: Vec<JobId> = (0..2)
-            .map(|_| jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap())
-            .collect();
+        // (job 1 has a page limit, so that its address spaces prepay from it)
+        let mut limited = Limits::UNLIMITED;
+        limited.pages = 100_000;
+        let job_ids: Vec<JobId> = vec![
+            jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap(),
+            jobs.create(JobId::ROOT, limited).unwrap(),
+        ];
         let spaces: Vec<AddressSpace> = (0..2)
             .map(|_| AddressSpace::new(PageTable::new(&mut mm).unwrap()))
             .collect();
@@ -262,6 +268,7 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                 job: j,
                 id: Some(id),
                 alive: true,
+                open: true,
                 resizable: true,
             });
         }
@@ -280,7 +287,7 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                     alive[rng.below(alive.len() as u64) as usize]
                 }
             };
-            let op = rng.below(14);
+            let op = rng.below(16);
             if std::env::var("FAMTRACE").is_ok() {
                 eprintln!("{ctx}: op {op} alive {alive:?}");
             }
@@ -428,6 +435,7 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                                 job,
                                 id: None,
                                 alive: false, // (a hidden node exists while something below it does)
+                                open: false,
                                 resizable: false,
                             });
                             w.m.nodes[i].parent = Some((h, 0));
@@ -441,6 +449,7 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                             job,
                             id: Some(child),
                             alive: true,
+                            open: true,
                             resizable: false,
                         });
                     }
@@ -465,6 +474,7 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                             job,
                             id: Some(child),
                             alive: true,
+                            open: true,
                             resizable: false,
                         });
                     }
@@ -585,6 +595,31 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                     w.vmos.release(&mut w.mm, &mut w.jobs, c).unwrap();
                     assert_eq!(w.vmos.count(), before, "{ctx}: nothing was made");
                 }
+                12 => {
+                    // `vmo_commit` of a range: every page of it is the member's own afterwards (copied, or a zero page)
+                    let i = pick(&mut rng);
+                    let id = w.m.nodes[i].id.unwrap();
+                    let pages = w.m.nodes[i].own.len() as u64;
+                    let first = rng.below(pages);
+                    let n = 1 + rng.below(pages - first);
+                    let seen: Vec<u8> = (first..first + n).map(|p| w.m.read(i, p)).collect();
+                    w.vmos.commit(&mut w.mm, &mut w.jobs, id, first, n).unwrap();
+                    w.sync();
+                    for (k, p) in (first..first + n).enumerate() {
+                        if w.m.nodes[i].own[p as usize].is_none() {
+                            w.m.nodes[i].own[p as usize] = Some(seen[k]);
+                        }
+                    }
+                }
+                13 => {
+                    // the handle closes while the regions stay: the VMO lives on through them
+                    let i = pick(&mut rng);
+                    if w.m.nodes[i].open {
+                        let id = w.m.nodes[i].id.unwrap();
+                        w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+                        w.m.nodes[i].open = false;
+                    }
+                }
                 _ => {
                     // a member goes away: its regions, then its handle
                     if alive.len() > 2 {
@@ -596,9 +631,12 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                                 .unmap_region(&mut w.mm, &mut w.vmos, &mut w.jobs, base)
                                 .unwrap();
                         }
-                        w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+                        if w.m.nodes[i].open {
+                            w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+                        }
                         w.sync();
                         w.m.nodes[i].alive = false;
+                        w.m.nodes[i].open = false;
                     }
                 }
             }
@@ -614,7 +652,9 @@ fn families_agree_with_the_reference_through_every_path_and_no_translation_goes_
                             .unmap_region(&mut w.mm, &mut w.vmos, &mut w.jobs, base)
                             .unwrap();
                     }
-                    w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+                    if w.m.nodes[i].open {
+                        w.vmos.release(&mut w.mm, &mut w.jobs, id).unwrap();
+                    }
                 }
             }
         }
@@ -743,10 +783,51 @@ fn a_write_takes_over_the_frame_when_no_other_leaf_can_see_it_and_copies_otherwi
         vmos.read(&mut mm, id, page * 4096, &mut b).unwrap();
         assert_eq!(b[0], want, "vmo {id} page {page}");
     }
-    vmos.audit_families().unwrap();
+    vmos.audit_families(true).unwrap();
     for id in [src, c] {
         vmos.release(&mut mm, &mut jobs, id).unwrap();
     }
     assert_eq!(vmos.count(), 0);
     assert_eq!(mm.db.free_count(), free0);
+}
+
+#[test]
+fn two_buffers_that_alias_one_inherited_page_both_verify_and_copy() {
+    use kcore::usercopy::{copy_to_user_verified, verify_writable};
+    let mut mm = Mm {
+        db: FrameDb::new(400, 100),
+        mem: FakeMem::default(),
+    };
+    let mut vmos = Vmos::new();
+    let mut jobs = Jobs::new();
+    let job = jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let mut space = AddressSpace::new(PageTable::new(&mut mm).unwrap());
+    let src = vmos.create_in(&mut jobs, 1, job);
+    vmos.write(&mut mm, &mut jobs, src, 0, &[5]).unwrap();
+    vmos.reserve_n(2).unwrap();
+    let c = vmos
+        .child_prepare(&mut jobs, src, 0, 1, job, ChildMode::Snapshot)
+        .unwrap();
+    vmos.child_attach(&mut jobs, c, src, 0, 1, ChildMode::Snapshot);
+    let user_rw = Perms {
+        user: true,
+        ..Perms::RW
+    };
+    // the child mapped twice in one space (two aliases of the same inherited page), both read first (read-only translations)
+    let (a1, a2) = (0x40_0000u64, 0x50_0000u64);
+    space.map_region(&mut vmos, a1, 1, c, 0, user_rw).unwrap();
+    space.map_region(&mut vmos, a2, 1, c, 0, user_rw).unwrap();
+    for va in [a1, a2] {
+        space
+            .handle_fault(&mut mm, &mut vmos, &mut jobs, va, Access::Read)
+            .unwrap();
+    }
+    verify_writable(&mut space, &mut mm, &mut vmos, &mut jobs, a1, 8).unwrap();
+    verify_writable(&mut space, &mut mm, &mut vmos, &mut jobs, a2 + 8, 8).unwrap();
+    copy_to_user_verified(&mut space, &mut mm, a1, &[1; 8]).expect("the first buffer");
+    copy_to_user_verified(&mut space, &mut mm, a2 + 8, &[2; 8]).expect("the second buffer");
+    invalidate_copies(std::iter::once(&mut space), &mut mm, &mut vmos);
+    space.destroy(&mut mm, &mut vmos, &mut jobs);
+    vmos.release(&mut mm, &mut jobs, c).unwrap();
+    vmos.release(&mut mm, &mut jobs, src).unwrap();
 }

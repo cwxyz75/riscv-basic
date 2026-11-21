@@ -1318,7 +1318,7 @@ fn a_child_is_refused_when_it_would_break_a_rule() {
     );
     assert_eq!(w.vmos.count(), vmos_before, "no VMO was made");
     assert!(!w.vmos.has_parent(id), "the source was not restructured");
-    w.vmos.audit_families().unwrap();
+    w.vmos.audit_families(true).unwrap();
 }
 
 #[test]
