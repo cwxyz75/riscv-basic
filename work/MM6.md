@@ -4,7 +4,6 @@ kind: slice
 title: VMOs by byte size with no cap; a VMO knows its mappings; `vmo_set_size`, `vmo_decommit`
 area: kernel
 horizon: long
-blocked_by: [L17]
 refs: [KERNEL-V1-SPEC, OD133]
 ---
 
