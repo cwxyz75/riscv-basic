@@ -10418,7 +10418,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 8)),
+        st(sys::job_info(root, 9)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -10613,6 +10613,60 @@ fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
     job_use_settles(j, 2, 0, 1000)?;
     // (the root job's own page count is not stable: this program's heap and stack grow too)
     sys::handle_close(p);
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
+/// MM5: a confined program that makes objects and handles until the job refuses cannot hold much kernel memory the job was not charged
+/// for. The child (crash mode 99) makes events and duplicates a handle until a call says no, then waits; the kernel heap bytes it holds
+/// (the heap leak oracle, `debug_stat` 109, before against after) may exceed what its job was charged (`job_info` 8) by at most 64 KiB.
+fn a_confined_program_cannot_hold_much_uncharged_kernel_memory() -> Outcome {
+    const SLACK: i64 = 64 * 1024;
+    let root = root_job()?;
+    let j = job(root, u64::MAX, u64::MAX, 128)?; // 128 pages: 64 KiB of kernel bytes
+    let before = sys::debug_stat(109);
+    let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 99, j)?;
+    // wait until its kernel-byte use stops growing
+    let (mut last, mut steady) = (0u64, 0);
+    for _ in 0..300 {
+        nap(10)?;
+        let used = job_use(j, 8)?.0;
+        steady = if used == last && used > 0 {
+            steady + 1
+        } else {
+            0
+        };
+        last = used;
+        if steady >= 10 {
+            break;
+        }
+    }
+    let (used, limit) = job_use(j, 8)?;
+    ensure_eq!(
+        limit,
+        128 * 512,
+        "the limit is an eighth of the pages, in bytes"
+    );
+    ensure!(
+        steady >= 10,
+        "the child stopped asking for kernel memory (used {used})"
+    );
+    ensure!(
+        used > limit / 2,
+        "the child got close to its limit ({used} of {limit})"
+    );
+    ensure!(used <= limit + 4096, "and not past it ({used} of {limit})");
+    let held = before.wrapping_sub(sys::debug_stat(109)) as i64;
+    ensure!(
+        held <= used as i64 + SLACK,
+        "the child holds {held} heap bytes for {used} charged: more than {SLACK} uncharged"
+    );
+    sys::process_kill(p, 1);
+    wait_ended(p, 3000)?;
+    sys::handle_close(p);
+    // everything the child had comes back
+    job_use_settles(j, 8, 0, 2000)?;
     sys::handle_close(j);
     sys::handle_close(root);
     Ok(())
@@ -12339,6 +12393,10 @@ pub fn app_main() -> i32 {
         (
             "job_memory_limits_stop_a_hog_and_are_credited_back",
             job_memory_limits_stop_a_hog_and_are_credited_back,
+        ),
+        (
+            "a_confined_program_cannot_hold_much_uncharged_kernel_memory",
+            a_confined_program_cannot_hold_much_uncharged_kernel_memory,
         ),
         (
             "vmo_commit_charges_up_front_and_foreign_maps_need_it",

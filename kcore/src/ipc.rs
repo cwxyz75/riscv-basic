@@ -195,10 +195,11 @@ impl Object for KObj {
 
 pub type Kobjs = Registry<KObj>;
 
-/// The kernel memory one object body holds, in bytes (MM5): the size of the object (`KObj`) rounded up to a power of two (the slot around it
-/// in the registry adds a few words that are not counted), charged to the creating job's kernel bytes with the object and credited when the object is destroyed. Queued data has its own
+/// The kernel memory one object body holds, in bytes (MM5): the size of the object (`KObj`) and the registry slot around it, rounded up to a
+/// power of two (the doubling of the registry's vector is not counted), charged to the creating job's kernel bytes with the object and credited when the object is destroyed. Queued data has its own
 /// charge (`IpcBytes`); handle tables, thread state and the rest are charged where they grow.
-pub const OBJECT_BYTES: u64 = (core::mem::size_of::<KObj>() as u64).next_power_of_two();
+pub const OBJECT_BYTES: u64 =
+    ((core::mem::size_of::<KObj>() + crate::object::SLOT_OVERHEAD) as u64).next_power_of_two();
 
 /// Who is charged for a new object: the job of the creating process, and the ledger.
 pub struct Quota<'a> {
