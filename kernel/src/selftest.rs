@@ -676,7 +676,7 @@ fn slab_serves_small_objects_and_everything_comes_back() -> Outcome {
         "a large block is not a slab object",
     )?;
     ensure(
-        crate::thread::heap_free() < bytes_before,
+        crate::thread::heap_free() != bytes_before,
         "the live objects show in the leak oracle",
     )?;
     drop(big);
@@ -696,6 +696,11 @@ fn slab_serves_small_objects_and_everything_comes_back() -> Outcome {
         crate::thread::heap_free(),
         bytes_before,
         "the heap holds the same bytes once everything is freed",
+    )?;
+    ensure_eq(
+        crate::heap::slab_violations(),
+        0,
+        "the slab refused no free",
     )?;
     ensure(
         crate::kmem::free_frames_accounted() == frames_before,

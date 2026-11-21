@@ -50,8 +50,11 @@ pub const GROW_STEP: usize = 2 * 1024 * 1024;
 pub const POOL_TARGET: usize = 64;
 const POOL_LOW: usize = 16;
 const POOL_HIGH: usize = 192;
-/// Objects a magazine moves to or from the slabs at a time.
-const MAGAZINE_BATCH: usize = 16;
+/// Objects a magazine moves to or from the slabs at a time: 16, fewer for the classes whose slab holds fewer (a 2048-byte object is half a
+/// frame).
+fn magazine_batch(class: usize) -> usize {
+    slab::objects_per_slab(class).min(16)
+}
 
 struct Heaps {
     boot: Heap,
@@ -140,15 +143,30 @@ fn with_heaps<R>(f: impl FnOnce(&mut Heaps) -> R) -> R {
 /// safe points cost one load when the heap is healthy.
 static LOW: AtomicBool = AtomicBool::new(false);
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: free() of both heaps is at most their sizes (a few MiB)
 /// Set once the frame database exists (`init_window`): before it the pool cannot be stocked, and its being empty is no reason to ask for a
 /// safe point.
 static POOL_READY: AtomicBool = AtomicBool::new(false);
 
+/// The pool's size, mirrored from the heap lock so a safe point can look without taking it (`service` runs at the tail of every trap).
+static POOL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set when a safe point found the frame database empty and could not stock the pool: the pool being low is then no reason to ask for another
+/// safe point until a frame comes back to it.
+static POOL_STARVED: AtomicBool = AtomicBool::new(false);
+
+/// Frees the slab refused: a double free, a stray address, a misaligned one (each is a kernel bug; counted so a test can say so).
+static SLAB_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
+
 fn note_free(h: &Heaps) {
+    POOL_COUNT.store(h.pool_count, Ordering::Relaxed);
+    if h.pool_count >= POOL_LOW {
+        POOL_STARVED.store(false, Ordering::Relaxed);
+    }
     LOW.store(
         h.boot.free().saturating_add(h.grown.free()) < LOW_WATER
-            || (h.pool_count < POOL_LOW && POOL_READY.load(Ordering::Relaxed)),
+            || (h.pool_count < POOL_LOW
+                && POOL_READY.load(Ordering::Relaxed)
+                && !POOL_STARVED.load(Ordering::Relaxed)),
         Ordering::Relaxed,
     );
 }
@@ -163,6 +181,7 @@ struct IrqSafeHeap;
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the batch is at most MAGAZINE_SIZE
 fn small_alloc(class: usize) -> Option<*mut u8> {
     let was = irq::save_and_disable();
+    crate::bkl::check_use(klock::Class::Heap); // (the order checker sees every allocation, not only the ones that reach the lock)
     let mag = &crate::percpu::this().magazines;
     // SAFETY: this hart's own magazines, interrupts off (the allocator is reached from interrupt handlers too, and they are masked here).
     let mut got = unsafe { mag.pop(class) };
@@ -180,7 +199,7 @@ fn small_alloc(class: usize) -> Option<*mut u8> {
                 head: pool_head,
                 count: pool_count,
             };
-            for i in 0..MAGAZINE_BATCH {
+            for i in 0..magazine_batch(class) {
                 let Some(a) = slab.alloc(&mut DirectMem, &mut pool, class) else {
                     break;
                 };
@@ -206,10 +225,12 @@ fn small_alloc(class: usize) -> Option<*mut u8> {
 /// Return a small object: into this hart's magazine, draining half of it to the slabs when it is full.
 fn small_free(addr: usize) {
     let was = irq::save_and_disable();
+    crate::bkl::check_use(klock::Class::Heap);
     let mag = &crate::percpu::this().magazines;
     let class = slab::class_of_addr(&DirectMem, addr as u64);
     let Some(class) = class else {
-        // (not a slab object: a stray free; the heap cannot do better than leak it)
+        // (not a slab object: a stray free; the heap cannot do better than leak it, and says so)
+        SLAB_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
         irq::restore(was);
         return;
     };
@@ -227,14 +248,18 @@ fn small_free(addr: usize) {
                 count: pool_count,
             };
             // drain a batch, and the object being freed with it
-            for _ in 0..MAGAZINE_BATCH {
+            for _ in 0..magazine_batch(class) {
                 // SAFETY: as above.
                 let Some(a) = (unsafe { mag.pop(class) }) else {
                     break;
                 };
-                let _ = slab.free(&mut DirectMem, &mut pool, a as u64);
+                if slab.free(&mut DirectMem, &mut pool, a as u64).is_err() {
+                    SLAB_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            let _ = slab.free(&mut DirectMem, &mut pool, addr as u64);
+            if slab.free(&mut DirectMem, &mut pool, addr as u64).is_err() {
+                SLAB_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            }
             note_free(h);
         });
     }
@@ -332,24 +357,6 @@ pub fn frames_held() -> usize {
     grown + irq::without(|| with_heaps(|h| h.slab.frames() + h.pool_count))
 }
 
-/// Bytes of small objects in use: the slabs' objects less those sitting in the harts' magazines (free, but cached). The leak oracles subtract
-/// this too, so a small object that is never freed shows as a leak as the free-list heap's blocks do.
-#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: class < CLASSES; the magazines hold only objects the slabs counted as in use, so the difference does not underflow; the sums are bounded by the memory the slabs hold
-pub fn small_bytes_in_use() -> usize {
-    irq::without(|| {
-        with_heaps(|h| {
-            let mut bytes = 0usize;
-            for class in 0..slab::CLASSES {
-                let cached: usize = (0..crate::percpu::MAX_HARTS)
-                    .map(|i| crate::percpu::hart(i).magazines.len(class))
-                    .sum();
-                bytes += h.slab.objects_of(class).saturating_sub(cached) * slab::CLASS_SIZES[class];
-            }
-            bytes
-        })
-    })
-}
-
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
 /// of the window, extend the heap. Needs the big kernel lock (frames and the kernel page table). Returns how many
 /// bytes were added (0 when the window is full or no frames are left; nothing is left half done).
@@ -416,16 +423,29 @@ pub fn service() {
 
 /// Stock the slabs' frame pool to `POOL_TARGET` frames from the frame database, and give frames back above `POOL_HIGH`. Needs the big kernel
 /// lock (the frame database's).
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a frame number is below 2^52, so its address in the direct map (a kernel virtual address) does not overflow, and a pool frame is a direct-map address, so subtracting the base cannot underflow
 fn service_pool() {
     if !POOL_READY.load(Ordering::Relaxed) {
         return;
     }
+    // (one load when the pool is between its marks: the safe points are on every trap's tail)
+    let c = POOL_COUNT.load(Ordering::Relaxed);
+    if (POOL_LOW..=POOL_HIGH).contains(&c) {
+        return;
+    }
+    rebalance_pool();
+}
+
+/// Bring the pool to `POOL_TARGET`: stock it from the frame database, or give the surplus back.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a frame number is below 2^52, so its address in the direct map (a kernel virtual address) does not overflow, and a pool frame is a direct-map address, so subtracting the base cannot underflow
+fn rebalance_pool() {
     debug_assert!(crate::bkl::held());
     let k = crate::kmem::get();
     let count = || irq::without(|| with_heaps(|h| h.pool_count));
     while count() < POOL_TARGET {
-        let Some(pfn) = k.mm.db.alloc() else { break };
+        let Some(pfn) = k.mm.db.alloc() else {
+            POOL_STARVED.store(true, Ordering::Relaxed);
+            break;
+        };
         let frame = (DIRECT_BASE + (pfn << 12)) as usize;
         irq::without(|| {
             with_heaps(|h| {
@@ -438,7 +458,7 @@ fn service_pool() {
             })
         });
     }
-    while count() > POOL_HIGH {
+    while count() > POOL_TARGET {
         let frame = irq::without(|| {
             with_heaps(|h| {
                 let f = Pool {
@@ -463,6 +483,34 @@ pub fn init_window() {
         let added = grow(GROW_STEP);
         assert!(added > 0, "memory for the first heap growth");
         POOL_READY.store(true, Ordering::Relaxed);
-        service_pool(); // (the slabs' first frames)
+        rebalance_pool(); // (the slabs' first frames)
     });
+}
+
+/// The leak oracle in one take of the heap lock: the free-list heaps' free bytes, less the grown heap's size (growth at a safe point adds free
+/// bytes that are not a leak), less the small objects in use. Wrapping, so the value is only for comparing with another taken at a quiet time
+/// (an equal pair means nothing was kept).
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: class < CLASSES; the sums are bounded by the memory the heaps hold, and the arithmetic that could wrap is wrapping on purpose
+pub fn leak_oracle() -> usize {
+    irq::without(|| {
+        with_heaps(|h| {
+            let mut small = 0usize;
+            for class in 0..slab::CLASSES {
+                let cached: usize = (0..crate::percpu::MAX_HARTS)
+                    .map(|i| crate::percpu::hart(i).magazines.len(class))
+                    .sum();
+                small += h.slab.objects_of(class).saturating_sub(cached) * slab::CLASS_SIZES[class];
+            }
+            h.boot
+                .free()
+                .wrapping_add(h.grown.free())
+                .wrapping_sub(GROWN_BYTES.load(Ordering::Relaxed))
+                .wrapping_sub(small)
+        })
+    })
+}
+
+/// How many frees the slab refused so far (a double free, a stray or misaligned address): zero unless the kernel has a bug.
+pub fn slab_violations() -> usize {
+    SLAB_VIOLATIONS.load(Ordering::Relaxed)
 }

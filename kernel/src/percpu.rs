@@ -110,6 +110,16 @@ pub const MAGAZINE_SIZE: usize = 32;
 /// Size classes of the slab (`kcore::slab::CLASSES`).
 const MAGAZINE_CLASSES: usize = kcore::slab::CLASSES;
 
+/// Objects a magazine of `class` holds at most: 32, but only 4 for the big classes (1024 and 2048 bytes), whose objects take a quarter to a whole
+/// frame each, so an idle hart does not pin dozens of frames.
+pub fn magazine_limit(class: usize) -> usize {
+    if class >= 6 {
+        4
+    } else {
+        MAGAZINE_SIZE
+    }
+}
+
 /// One hart's magazines. The object addresses are touched by the owning hart alone, with interrupts off (so a timer interrupt cannot
 /// re-enter); the counts are atomics so a leak check on another hart can read them.
 pub struct Magazines {
@@ -156,7 +166,7 @@ impl Magazines {
     /// As for [`Magazines::pop`].
     pub unsafe fn push(&self, class: usize, object: usize) -> bool {
         let n = self.len(class);
-        if n >= MAGAZINE_SIZE {
+        if n >= magazine_limit(class) {
             return false;
         }
         // SAFETY: as in `pop`.

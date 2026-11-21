@@ -189,7 +189,7 @@ ATOMICS = {
     "kernel/src/user/mod.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot)"),
     "kernel/src/user/trap.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch)"),
     "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
-    "kernel/src/heap.rs": (8, "heap statistics, the growth guard and the frame pool's readiness flag"),
+    "kernel/src/heap.rs": (14, "heap statistics, the growth guard, and the frame pool's readiness, size mirror, starvation flag and the refused-free counter"),
     "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),

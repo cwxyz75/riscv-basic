@@ -1192,10 +1192,9 @@ pub fn fp_off() -> bool {
     crate::arch::lazy_units_are_off()
 }
 
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: the heap's total free bytes are at least its grown bytes
+/// The leak tests' oracle: equal before and after when nothing was kept (see `heap::leak_oracle`).
 pub fn heap_free() -> usize {
-    // (growth at a safe point adds free bytes that are not a leak)
-    heap::free_bytes() - heap::grown_bytes() - heap::small_bytes_in_use()
+    heap::leak_oracle()
 }
 
 pub fn thread_count() -> usize {
