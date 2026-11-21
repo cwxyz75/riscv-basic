@@ -4,7 +4,6 @@ kind: slice
 title: A slab kernel allocator with per-hart magazines; `linked_list_allocator` retired
 area: kernel
 horizon: long
-blocked_by: [MM3]
 refs: [KERNEL-V1-SPEC, OD138]
 ---
 

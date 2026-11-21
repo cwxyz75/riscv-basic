@@ -4,7 +4,7 @@ kind: slice
 title: Regions split: `process_unmap` and `process_protect` over ranges, `process_map` ANYWHERE, `process_map_info`
 area: kernel
 horizon: long
-blocked_by: [MM6, HD1]
+blocked_by: [MM6]
 refs: [KERNEL-V1-SPEC, OD133]
 ---
 

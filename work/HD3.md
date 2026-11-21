@@ -4,7 +4,6 @@ kind: slice
 title: Address randomisation for the kernel
 area: security
 horizon: long
-blocked_by: [HD1, MM3]
 refs: [KERNEL-V1-SPEC, OD139]
 ---
 

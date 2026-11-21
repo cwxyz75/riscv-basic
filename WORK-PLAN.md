@@ -244,7 +244,7 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   - 2026-11-20, PL5a: the device windows are admitted by an allowlist of compatible strings, not by the item's denylist (every `reg` range
     not driven by the kernel), because a denylist fails open: on `virt` it would have made fw-cfg (DMA into guest RAM), the flash banks
     and the PCI ECAM window mappable. Narrower than the item, so safer; the ranges still come from the tree. Alternative: follow the
-    item's text. KERNEL-V1-SPEC 2.3 (dated amendment), `work/PL5.md`.
+    item's text. KERNEL-V1-SPEC 2.3 (dated amendment), the PL5 entry of `docs/records/done.md`.
   - 2026-11-20, SC1: the per-hart records, boot stacks and emergency stacks are static arrays sized for 64 harts (about 2.6 MiB of `.bss`),
     not allocated at boot for the harts found as KERNEL-V1-SPEC 2.3 says; the rest of the item (ids from the tree, the hart-mask builder,
     64-bit masks) is done. The first hart's record must exist before the heap does, and the saving is memory only. Alternative: allocate.
