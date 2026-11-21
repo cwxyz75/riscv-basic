@@ -147,7 +147,7 @@ pub fn run() -> crate::user_tests::Report {
         "interactive_nothing_survives_init".into(),
         if user::process_count() == 0
             && user::live_objects() == 0
-            && user::job_ledger() == (1, 0, 0, 0, 0)
+            && user::job_ledger() == (1, 0, 0, 0, 0, 0)
         {
             Ok(())
         } else {

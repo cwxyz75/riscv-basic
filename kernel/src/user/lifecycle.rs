@@ -277,6 +277,14 @@ pub(super) fn take_interrupt() -> bool {
     irq::without(|| state().interrupts.remove(&thread::current()))
 }
 
+/// The job the user thread `tid` belongs to (`None` for a kernel thread): who pays for the register state the kernel keeps for it (MM5).
+/// Needs the big kernel lock.
+pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
+    let s = state();
+    let pid = s.thread_pid.get(&tid)?;
+    Some(s.procs.get(pid)?.job)
+}
+
 /// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
 pub(super) fn take_interrupt_held() -> bool {
     state().interrupts.remove(&thread::current())

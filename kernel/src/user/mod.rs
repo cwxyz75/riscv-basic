@@ -123,15 +123,22 @@ pub fn reported() -> (u32, u32) {
 }
 
 /// How many processes exist right now (a leak counter for tests).
-/// (jobs alive including the root, and the root job's live processes, threads, objects and queued
-/// IPC bytes): `(1, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
+/// (jobs alive including the root, and the root job's live processes, threads, objects, queued
+/// IPC bytes and kernel bytes): `(1, 0, 0, 0, 0, 0)` when nothing is left (a leak oracle for the ledger, INVARIANTS
 /// J2). Applies the credits of destroyed objects first.
-pub fn job_ledger() -> (usize, u64, u64, u64, u64) {
+pub fn job_ledger() -> (usize, u64, u64, u64, u64, u64) {
     irq::without(|| {
         ipc::settle(&mut state().objs, kmem::jobs().jobs);
         let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
-        (jobs.live(), u.processes, u.threads, u.objects, u.ipc_bytes)
+        (
+            jobs.live(),
+            u.processes,
+            u.threads,
+            u.objects,
+            u.ipc_bytes,
+            u.kernel_bytes,
+        )
     })
 }
 
