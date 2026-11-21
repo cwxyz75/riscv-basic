@@ -29,9 +29,8 @@ fn world() -> (Kobjs, HandleTable) {
 }
 
 fn weaker(reg: &mut Kobjs, t: &mut HandleTable, h: Handle, rights: Rights) -> Handle {
-    let _ = reg;
     let e = t.get(h).unwrap();
-    t.insert(e.obj, rights).unwrap()
+    t.insert(reg, e.obj, rights).unwrap()
 }
 
 #[test]

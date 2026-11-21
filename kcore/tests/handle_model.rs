@@ -133,7 +133,7 @@ fn random_operations_agree_with_the_model() {
                             assert_eq!(entry.rights, have, "{ctx}");
                             live.remove(&h);
                             closed.push(h);
-                            let nh = table.insert(entry.obj, entry.rights).unwrap();
+                            let nh = table.insert(&mut reg, entry.obj, entry.rights).unwrap();
                             live.insert(nh, (o, have));
                         }
                         Err(e) => {

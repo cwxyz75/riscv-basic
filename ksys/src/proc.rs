@@ -330,7 +330,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 Some(obj) => {
                     // another view of the same process object
                     objs.retain(obj);
-                    let h = p.handles.insert(obj, rights).expect("room was checked");
+                    let h = p
+                        .handles
+                        .insert(objs, obj, rights)
+                        .expect("room was checked");
                     Ok((Some(h.0), None))
                 }
                 None => {

@@ -121,7 +121,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             .expect("a fresh handle can be transferred");
         let first = process
             .handles
-            .insert(entry.obj, entry.rights)
+            .insert(&mut s.objs, entry.obj, entry.rights)
             .expect("an empty table has room");
         assert_eq!(
             first,

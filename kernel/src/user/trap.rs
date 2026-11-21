@@ -68,6 +68,10 @@ pub fn activate_current() {
 /// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
 pub(super) static ATTENTION: AtomicU64 = AtomicU64::new(1);
 
+/// How much of the reachability sweep one creating call does (MM10): up to this many slices of this many marked objects or slots each.
+const SWEEP_SLICES_PER_CALL: usize = 4;
+const SWEEP_SLICE_BUDGET: usize = 256;
+
 pub(super) fn bump_attention() {
     ATTENTION.fetch_add(1, Ordering::SeqCst);
 }
@@ -333,10 +337,25 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             | nr::SOCKET_CREATE
             | nr::PORT_CREATE
             | nr::INTERRUPT_CREATE
-    ) && s.objs.needs_sweep()
+    ) && (s.objs.sweep_active() || s.objs.needs_sweep())
     {
-        let roots = s.roots();
-        s.objs.sweep(&roots);
+        // (MM10) the sweep runs in slices: this call starts one if garbage cycles have piled up, and runs a few slices of it; the next
+        // creating call carries on. The worst interrupts-off span of a sweep is a slice, not the whole object graph.
+        if !s.objs.sweep_active() {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots);
+        }
+        let mut slices = 0;
+        while s.objs.sweep_active() && slices < SWEEP_SLICES_PER_CALL {
+            s.objs.sweep_step(SWEEP_SLICE_BUDGET);
+            slices += 1;
+        }
+        // near the cap a creation would be refused while garbage that the sweep is about to free fills the registry: finish it now
+        if s.objs.sweep_active() && s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
+            while s.objs.sweep_active() {
+                s.objs.sweep_step(SWEEP_SLICE_BUDGET);
+            }
+        }
     }
     let UserState {
         objs,

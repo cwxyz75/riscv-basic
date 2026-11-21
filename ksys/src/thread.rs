@@ -343,7 +343,7 @@ pub fn process_start(
     let target = procs.get_mut(&tpid).expect("target exists");
     let first = target
         .handles
-        .insert(moved.obj, moved.rights)
+        .insert(objs, moved.obj, moved.rights)
         .expect("an empty table has room, and its memory was reserved");
     assert_eq!(
         first,
