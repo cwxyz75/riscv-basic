@@ -161,6 +161,10 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
 /// After a call that failed with SHOULD_WAIT because a page of a pager's VMO was not there (MM9): wait for the page, and make the call's answer
 /// what the wait came to: SHOULD_WAIT again (the page is there now, try again) or the pager's failure status.
 pub(super) fn pager_after_call(frame: &mut crate::trap::TrapFrame) {
+    // (one load when no pager page was missing: the common case takes no lock)
+    if !kcore::aspace::PAGER_NEED_PENDING.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let need = irq::without(|| kmem::get().vmos.take_need());
     let Some(need) = need else {
         return;
