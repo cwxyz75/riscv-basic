@@ -45,6 +45,7 @@ pub mod linestate;
 pub mod memmap;
 pub mod object;
 pub mod pagemap;
+pub mod pager;
 pub mod pagetable;
 pub mod park;
 pub mod sched;

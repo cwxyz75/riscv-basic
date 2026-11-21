@@ -23,6 +23,7 @@ extern crate alloc;
 mod create;
 mod job;
 mod lifecycle;
+pub mod pager;
 mod proc;
 mod state;
 mod thread;

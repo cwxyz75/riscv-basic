@@ -373,6 +373,8 @@ fn error_code(e: FaultError) -> u64 {
         FaultError::VmoGone => 2,
         FaultError::NoMemory => 3,
         FaultError::MapFailed(_) => 4,
+        // (the kernel's own table has no pagers)
+        FaultError::NeedPager(_) => 5,
     }
 }
 

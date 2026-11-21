@@ -145,6 +145,8 @@ pub enum KObj {
     Thread(ThreadObj),
     /// A thread's fault, offered to a handler (EX2).
     Exception(ExceptionObj),
+    /// A pager (MM9): the id of its state in `kcore::pager::Pagers`.
+    Pager(u64),
     Socket(SocketEnd),
     Port(PortObj),
     /// A job (S4.5): the ledger id; the object holds one use of it.
@@ -187,6 +189,7 @@ impl Object for KObj {
                 | KObj::Job(_)
                 | KObj::Interrupt(_)
                 | KObj::Exception(_)
+                | KObj::Pager(_)
         )
     }
 
@@ -702,7 +705,7 @@ pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
-        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource | KObj::Exception(_) => 0,
+        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource | KObj::Exception(_) | KObj::Pager(_) => 0,
         KObj::Interrupt(i) => {
             if i.fired {
                 signals::INTERRUPT
@@ -1400,6 +1403,42 @@ pub fn job_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
     let entry = table.get(h)?;
     match reg.get(entry.obj) {
         Some(KObj::Job(id)) => {
+            if entry.rights.contains(need) {
+                Ok(*id)
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// A pager object (MM9) with a handle in `table`, charged to `q`.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn pager_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    id: u64,
+    rights: Rights,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Pager(id), q.job);
+    Ok((
+        table.insert(reg, obj, rights).expect("room was checked"),
+        obj,
+    ))
+}
+
+/// The pager id behind a pager handle that carries `need`.
+pub fn pager_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<u64, Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Pager(id)) => {
             if entry.rights.contains(need) {
                 Ok(*id)
             } else {

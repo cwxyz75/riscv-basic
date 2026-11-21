@@ -35,6 +35,11 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_EXCEPTION_CHANNEL => exception_channel_call(a, false),
         nr::JOB_EXCEPTION_CHANNEL => exception_channel_call(a, true),
         nr::EXCEPTION_RESUME => exception_resume_call(a),
+        nr::PAGER_CREATE => pager_create_call(),
+        nr::PAGER_SUPPLY => pager_supply_call(a),
+        nr::PAGER_FAIL => pager_fail_call(a),
+        // (dirty tracking is reserved: the names exist, the calls answer NOT_SUPPORTED, MM9)
+        nr::PAGER_QUERY_DIRTY | nr::PAGER_WRITEBACK_DONE => bad(Status::NotSupported),
         nr::THREAD_SUSPEND => thread_suspend_call(a),
         nr::THREAD_RESUME => thread_resume_call(a),
         nr::THREAD_READ_STATE => thread_state_call(a, false),
@@ -225,6 +230,56 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     })?;
     // (after the state closure has ended: a wake can switch threads)
     thread::wake(tid);
+    Ok((None, None))
+}
+
+/// `pager_create() -> (pager, channel)` (MM9).
+pub(super) fn pager_create_call() -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let (p, c) =
+            ksys::pager::pager_create(s, kmem::jobs().jobs, me).map_err(|e| (e, None, None))?;
+        Ok((Some(p), Some(c)))
+    })
+}
+
+/// Wake the threads whose wait a pager call ended (the answer of the call is what it is: a partly done supply still wakes the pages it moved).
+fn wake_pager_waiters(mut woken: Vec<Tid>) {
+    woken.extend(irq::without(|| core::mem::take(&mut state().pending_wake)));
+    thread::wake_many(&woken);
+}
+
+/// `pager_supply(pager, vmo, offset, length, source, source_offset)` (MM9).
+pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
+    let r = irq::without(|| -> Result<Vec<Tid>, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        ksys::pager::pager_supply(s, k.mm, k.vmos, k.jobs, &mut KernelMachine, me, a)
+            .map_err(|e| (e, None, None))
+    });
+    match r {
+        Ok(woken) => {
+            wake_pager_waiters(woken);
+            Ok((None, None))
+        }
+        Err(e) => {
+            wake_pager_waiters(Vec::new());
+            Err(e)
+        }
+    }
+}
+
+/// `pager_fail(pager, vmo, offset, length, status)` (MM9).
+pub(super) fn pager_fail_call(a: [u64; 6]) -> Reply {
+    let woken = irq::without(|| -> Result<Vec<Tid>, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let k = kmem::get();
+        ksys::pager::pager_fail(s, k.vmos, me, a).map_err(|e| (e, None, None))
+    })?;
+    wake_pager_waiters(woken);
     Ok((None, None))
 }
 

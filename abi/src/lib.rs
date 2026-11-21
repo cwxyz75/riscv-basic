@@ -153,6 +153,10 @@ pub mod rights {
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::WAIT.0);
         /// An exception (EX2): resolve it (`exception_resume`), pass it on, hand it to another thread.
         pub const EXCEPTION: Rights = Rights(Self::TRANSFER.0 | Self::MANAGE.0);
+        /// A pager (MM9): create its VMOs, supply and fail their pages (MANAGE).
+        pub const PAGER: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
+        /// The VMO of a pager: every right of a VMO but COMMIT (committing would put zeros where the pager's data belongs).
+        pub const PAGER_VMO: Rights = Rights(Self::VMO.0 & !Self::COMMIT.0);
         pub const THREAD: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
@@ -390,6 +394,18 @@ pub mod syscall {
     pub const JOB_EXCEPTION_CHANNEL: usize = 79;
     /// Say what becomes of a thread that took an exception: RETRY, NEXT or KILL.
     pub const EXCEPTION_RESUME: usize = 97;
+    /// `pager_create() -> (pager, channel)` (MM9).
+    pub const PAGER_CREATE: usize = 103;
+    /// `pager_create_vmo(pager, key, bytes) -> vmo`.
+    pub const PAGER_CREATE_VMO: usize = 104;
+    /// `pager_supply(pager, vmo, offset, length, source, source_offset)`.
+    pub const PAGER_SUPPLY: usize = 105;
+    /// `pager_fail(pager, vmo, offset, length, status)`.
+    pub const PAGER_FAIL: usize = 106;
+    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+    pub const PAGER_QUERY_DIRTY: usize = 107;
+    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+    pub const PAGER_WRITEBACK_DONE: usize = 108;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -414,6 +430,16 @@ pub mod syscall {
     pub const FUTEX_WAKE: usize = 111;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
+}
+
+/// Pagers (MM9, KERNEL-V1-SPEC 4.4): the request message on a pager's channel.
+pub mod pager {
+    /// A request: five little-endian words (key, byte offset, byte length, kind, reserved 0).
+    pub const REQUEST_BYTES: usize = 40;
+    /// Read: supply these pages.
+    pub const READ: u64 = 1;
+    /// Reserved for dirty tracking: write these pages back (not produced).
+    pub const WRITEBACK: u64 = 2;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").
