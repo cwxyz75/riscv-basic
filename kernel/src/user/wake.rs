@@ -80,6 +80,11 @@ pub(super) fn cleanup_dead() {
                     request_kill(p.pid, -2000)
                 }
                 ipc::KObj::Job(id) => irq::without(|| kmem::jobs().jobs.release(id)),
+                // the last handle to an exception was closed without a decision: it is NEXT (EX2)
+                ipc::KObj::Exception(e) => act_on_resolution(irq::without(|| {
+                    let s = state();
+                    ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
+                })),
                 ipc::KObj::Interrupt(i) => irq::without(|| {
                     // mask the source unless a newer object already owns it
                     let s = state();

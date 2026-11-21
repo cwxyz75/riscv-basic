@@ -205,6 +205,11 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
         if let Some(end) = process.kernel_end.take() {
             let _ = s.ktable.close(&mut s.objs, end);
         }
+        if let Some(end) = process.exc_channel.take() {
+            let _ = s.ktable.close(&mut s.objs, end);
+        }
+        // (the process's handles were drained above: a job exception channel it held the user end of is reaped now)
+        ksys::exception::reap_closed_job_channels(s);
         // Anything still alive that nothing can reach (reference cycles). The roots are
         // computed here, in the same interrupts-off step as the sweep, and include the
         // kernel's own handles.

@@ -31,6 +31,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         arg: 0,
         exit_code: None,
         kernel_end: None,
+        exc_channel: None,
         start_sp: 0,
         obj: None,
         state: ProcState::Running,

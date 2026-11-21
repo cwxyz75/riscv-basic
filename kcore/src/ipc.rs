@@ -75,6 +75,30 @@ pub struct ThreadObj {
     pub exit_code: i32,
 }
 
+/// Which level an exception was offered at (EX2): the process's own channel, then the job's and each ancestor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcLevel {
+    Process,
+    Job(JobId),
+}
+
+/// A thread's exception, as a kernel object: what the exception handle names. The thread stays stopped until it is resolved: retried, passed to the
+/// next level, or ended with its process; closing the last handle passes it on.
+pub struct ExceptionObj {
+    pub pid: u64,
+    pub tid: u64,
+    /// `abi::arch::fault` kind, the pc, the faulting address and the architecture's raw cause.
+    pub kind: u32,
+    pub pc: u64,
+    pub address: u64,
+    pub cause: u64,
+    pub level: ExcLevel,
+    /// Which exception of its thread this is (a counter the kernel keeps): a decision counts only for the one the thread is stopped for.
+    pub serial: u64,
+    /// `exception_resume` has acted on it (or the process ended): closing the handle then does nothing.
+    pub resolved: bool,
+}
+
 /// One end of a byte-stream socket: what it holds is what its *peer* wrote.
 pub struct SocketEnd {
     peer: Option<ObjId>,
@@ -119,6 +143,8 @@ pub enum KObj {
     Vmo(u64),
     Process(ProcessObj),
     Thread(ThreadObj),
+    /// A thread's fault, offered to a handler (EX2).
+    Exception(ExceptionObj),
     Socket(SocketEnd),
     Port(PortObj),
     /// A job (S4.5): the ledger id; the object holds one use of it.
@@ -156,7 +182,11 @@ impl Object for KObj {
     fn needs_cleanup(&self) -> bool {
         matches!(
             self,
-            KObj::Vmo(_) | KObj::Process(_) | KObj::Job(_) | KObj::Interrupt(_)
+            KObj::Vmo(_)
+                | KObj::Process(_)
+                | KObj::Job(_)
+                | KObj::Interrupt(_)
+                | KObj::Exception(_)
         )
     }
 
@@ -672,7 +702,7 @@ pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
-        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource => 0,
+        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource | KObj::Exception(_) => 0,
         KObj::Interrupt(i) => {
             if i.fired {
                 signals::INTERRUPT
@@ -1468,6 +1498,76 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 pub fn thread_set_suspended(reg: &mut Kobjs, obj: ObjId, suspended: bool) {
     if let Some(KObj::Thread(t)) = reg.get_mut(obj) {
         t.suspended = suspended && !t.terminated;
+    }
+}
+
+/// An exception object, with a handle in `table` (the kernel's own table, from which the handle travels in the message), charged to `q`.
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn exception_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    e: ExceptionObj,
+    q: &mut Quota,
+) -> Result<(Handle, ObjId), Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Exception(e), q.job);
+    Ok((
+        table
+            .insert(reg, obj, Rights::EXCEPTION)
+            .expect("room was checked"),
+        obj,
+    ))
+}
+
+/// The exception behind a handle that carries `need`: a copy of what it says and whether it is resolved.
+pub fn exception_of(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, ExceptionObj), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Exception(e)) => {
+            if entry.rights.contains(need) {
+                Ok((
+                    entry.obj,
+                    ExceptionObj {
+                        pid: e.pid,
+                        tid: e.tid,
+                        kind: e.kind,
+                        pc: e.pc,
+                        address: e.address,
+                        cause: e.cause,
+                        level: e.level,
+                        serial: e.serial,
+                        resolved: e.resolved,
+                    },
+                ))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// Mark the exception object resolved (it is acted on once).
+/// Has the peer of channel end `h` (a handle in `table`) closed its end?
+pub fn channel_peer_closed(reg: &Kobjs, table: &HandleTable, h: Handle) -> bool {
+    match table.get(h).ok().and_then(|e| reg.get(e.obj)) {
+        Some(KObj::Channel(c)) => c.peer_closed,
+        _ => true,
+    }
+}
+
+pub fn exception_set_resolved(reg: &mut Kobjs, obj: ObjId) {
+    if let Some(KObj::Exception(e)) = reg.get_mut(obj) {
+        e.resolved = true;
     }
 }
 

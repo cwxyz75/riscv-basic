@@ -87,6 +87,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         arg,
         exit_code: None,
         kernel_end: None,
+        exc_channel: None,
         start_sp: 0,
         obj: None,
         state: ProcState::Running,

@@ -151,6 +151,8 @@ pub mod rights {
         );
         pub const PORT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::WAIT.0);
+        /// An exception (EX2): resolve it (`exception_resume`), pass it on, hand it to another thread.
+        pub const EXCEPTION: Rights = Rights(Self::TRANSFER.0 | Self::MANAGE.0);
         pub const THREAD: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
@@ -382,6 +384,12 @@ pub mod syscall {
     pub const THREAD_READ_STATE: usize = 76;
     /// Write a stopped thread's registers.
     pub const THREAD_WRITE_STATE: usize = 77;
+    /// The user end of the channel exceptions of a process's threads are delivered on (EX2).
+    pub const PROCESS_EXCEPTION_CHANNEL: usize = 78;
+    /// The same for the processes of a job that have no handler of their own.
+    pub const JOB_EXCEPTION_CHANNEL: usize = 79;
+    /// Say what becomes of a thread that took an exception: RETRY, NEXT or KILL.
+    pub const EXCEPTION_RESUME: usize = 97;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -444,6 +452,22 @@ pub mod spawn {
     pub const CALLER_STACK: u32 = 4;
     /// Flag: the thread exists but does not run until `thread_resume` (EX1): its registers can be written first.
     pub const SUSPENDED: u32 = 8;
+}
+
+/// Exceptions (EX2, KERNEL-V1-SPEC 3.6): the message the kernel writes to an exception channel and what a handler may do about it.
+pub mod exception {
+    /// Bytes of the message: five little-endian words, `kind` (`abi::arch::fault`), `tid`, `pc`, `address`, `cause` (the architecture's raw cause: on
+    /// RISC-V 12, 13 and 15 for a page fault on an instruction fetch, a load and a store). Two handles come with it: the thread (INSPECT,
+    /// MANAGE, WAIT) and the exception.
+    pub const MESSAGE_BYTES: usize = 40;
+    /// Handles in the message.
+    pub const MESSAGE_HANDLES: usize = 2;
+    /// `exception_resume`: the thread goes on from its state (which the handler may have changed).
+    pub const RETRY: u64 = 1;
+    /// Offer the exception to the next level (the job, then each ancestor job); with none left the process ends as it always did.
+    pub const NEXT: u64 = 2;
+    /// End the process with the usual fault exit code.
+    pub const KILL: u64 = 3;
 }
 
 /// `thread_read_state` / `thread_write_state` (EX1): the kinds and, for RISC-V, the layouts (per architecture: `abi::arch`).

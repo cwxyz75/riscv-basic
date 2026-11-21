@@ -29,6 +29,7 @@ mod thread;
 mod vmo;
 mod wait;
 pub use create::process_create;
+pub mod exception;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
     job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,

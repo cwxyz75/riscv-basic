@@ -198,7 +198,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         ),
                     );
                 }
-                exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind()));
+                fault_or_exit(&fault);
             }
         }
         UserTrap::Fault(fault)
@@ -208,7 +208,39 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             // for it, from zeros; the instruction is retried. (A real illegal instruction traps again
             // with the unit on and ends the process below.)
         }
-        UserTrap::Fault(fault) => exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind())),
+        UserTrap::Fault(fault) => fault_or_exit(&fault),
+    }
+}
+
+/// A fault the kernel cannot resolve (EX2): offered to the process's exception channel, then its job's and each ancestor's; the thread stops until a
+/// handler resolves it (RETRY comes back here and returns to user mode to try the instruction again). With no handler anywhere the process ends,
+/// as it always did, with `-1000 - kind`.
+fn fault_or_exit(fault: &crate::arch::Fault) {
+    let f = ksys::exception::Fault {
+        kind: fault.kind.abi_kind(),
+        pc: fault.pc,
+        address: fault.address,
+        cause: fault.code,
+    };
+    let delivered = irq::without(|| {
+        let s = state();
+        let tid = thread::current();
+        let Some(&pid) = s.thread_pid.get(&tid) else {
+            return false;
+        };
+        if !ksys::exception::deliver(s, kmem::jobs().jobs, pid, tid, &f, None) {
+            return false;
+        }
+        // (the thread is stopped before anyone can read the message: the big lock is held throughout)
+        ksys::exception::stop_thread(s, tid);
+        sync_suspends(s);
+        true
+    });
+    if delivered {
+        commit_wake(); // the channel is readable now
+        park_while_stopped();
+    } else {
+        exit_process(abi::arch::fault::exit_code(f.kind));
     }
 }
 
@@ -285,6 +317,9 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::THREAD_INFO
         | nr::THREAD_INTERRUPT
         | nr::THREAD_SUSPEND
+        | nr::PROCESS_EXCEPTION_CHANNEL
+        | nr::JOB_EXCEPTION_CHANNEL
+        | nr::EXCEPTION_RESUME
         | nr::THREAD_RESUME
         | nr::THREAD_READ_STATE
         | nr::THREAD_WRITE_STATE => {
@@ -323,6 +358,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::PORT_UNBIND
                     | nr::PORT_REARM
             ) {
+                if n == nr::HANDLE_CLOSE {
+                    // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
+                    irq::without(|| ksys::exception::reap_closed_job_channels(state()));
+                }
                 notify();
             }
             // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed

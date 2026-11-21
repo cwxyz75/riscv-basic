@@ -32,6 +32,9 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::THREAD_SPAWN => thread_spawn(a),
         nr::THREAD_INFO => process_table_call(n, a),
         nr::THREAD_INTERRUPT => thread_interrupt(a),
+        nr::PROCESS_EXCEPTION_CHANNEL => exception_channel_call(a, false),
+        nr::JOB_EXCEPTION_CHANNEL => exception_channel_call(a, true),
+        nr::EXCEPTION_RESUME => exception_resume_call(a),
         nr::THREAD_SUSPEND => thread_suspend_call(a),
         nr::THREAD_RESUME => thread_resume_call(a),
         nr::THREAD_READ_STATE => thread_state_call(a, false),
@@ -222,6 +225,50 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
     })?;
     // (after the state closure has ended: a wake can switch threads)
     thread::wake(tid);
+    Ok((None, None))
+}
+
+/// `process_exception_channel(process) -> channel` and `job_exception_channel(job) -> channel` (EX2): the user end of the channel the kernel writes
+/// the exceptions of that process's threads (or of the processes below that job) on.
+pub(super) fn exception_channel_call(a: [u64; 6], job: bool) -> Reply {
+    irq::without(|| -> Reply {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let target = if job {
+            ksys::exception::Target::Job(a[0])
+        } else {
+            ksys::exception::Target::Process(a[0])
+        };
+        let h = ksys::exception::exception_channel(s, kmem::jobs().jobs, me, target)
+            .map_err(|e| (e, None, None))?;
+        Ok((Some(h), None))
+    })
+}
+
+/// Do what a decision about an exception comes to: wake a retried thread, end a process.
+pub(super) fn act_on_resolution(r: Option<ksys::exception::Resolved>) {
+    use ksys::exception::Resolved;
+    match r {
+        Some(Resolved::Retry { tid, wake }) => {
+            irq::without(|| sync_suspends(state()));
+            if wake {
+                thread::wake(tid);
+            }
+        }
+        Some(Resolved::Kill { pid, code }) => request_kill(pid, code),
+        Some(Resolved::Passed) | None => {}
+    }
+}
+
+/// `exception_resume(exception, how)` (EX2): RETRY, NEXT or KILL.
+pub(super) fn exception_resume_call(a: [u64; 6]) -> Reply {
+    let r = irq::without(|| -> Result<ksys::exception::Resolved, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        ksys::exception::exception_resume(s, kmem::jobs().jobs, me, a[0], a[1])
+            .map_err(|e| (e, None, None))
+    })?;
+    act_on_resolution(Some(r));
     Ok((None, None))
 }
 

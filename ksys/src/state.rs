@@ -57,6 +57,12 @@ pub struct UserState {
     /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
     /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
     pub initial_regs: BTreeMap<Tid, [u64; 32]>,
+    /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
+    pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
+    /// The exception each stopped thread waits for, by its serial (EX2); a decision about any other (an older one, a resolved one) does nothing.
+    pub exc_pending: BTreeMap<Tid, u64>,
+    /// The next exception serial.
+    pub next_exc: u64,
     /// Register writes for threads parked at the return to user mode, applied by the thread itself to its own frame when it wakes (EX1: nobody
     /// else writes a frame its owner holds a `&mut` to).
     pub pending_regs: BTreeMap<Tid, PendingRegs>,
@@ -118,12 +124,17 @@ impl UserState {
             cleaning: BTreeSet::new(),
             suspends: BTreeMap::new(),
             initial_regs: BTreeMap::new(),
+            job_exc: BTreeMap::new(),
+            exc_pending: BTreeMap::new(),
+            next_exc: 1,
             pending_regs: BTreeMap::new(),
             parked_tids: BTreeSet::new(),
             interrupts: BTreeSet::new(),
             starts: BTreeMap::new(),
             next_token: 1,
-            ktable: HandleTable::new(256),
+            // (one end of each process's and job's exception channel lives here, and the creators' ends of bootstrap channels: bounded by the
+            // object cap, whose charges the objects themselves carry)
+            ktable: HandleTable::new(abi::limits::MAX_OBJECTS),
             futexes: kcore::futex::Futexes::new(),
             waits: kcore::wait::WaitTable::new(),
             irq_objs: alloc::vec::Vec::new(),

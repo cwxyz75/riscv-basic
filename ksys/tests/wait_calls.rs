@@ -47,6 +47,7 @@ fn world() -> W {
         arg: 0,
         exit_code: None,
         kernel_end: None,
+        exc_channel: None,
         start_sp: 0,
         obj: None,
         state: ProcState::Running,

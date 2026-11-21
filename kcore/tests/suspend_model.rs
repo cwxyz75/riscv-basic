@@ -27,7 +27,7 @@ fn the_suspend_count_never_loses_a_wake_and_raises_the_signal_exactly_when_stopp
         let mut signal = false;
         for step in 0..300 {
             let ctx = format!("seed {seed} step {step} at {at:?}");
-            match rng.below(7) {
+            match rng.below(9) {
                 0 | 1 => {
                     // thread_suspend: a thread blocked in a call has stopped at once
                     let blocked = at == Where::Blocked;
@@ -39,7 +39,7 @@ fn the_suspend_count_never_loses_a_wake_and_raises_the_signal_exactly_when_stopp
                 }
                 2 | 3 => match s.resume() {
                     None => assert_eq!(s.count(), 0, "{ctx}: a resume with a count"),
-                    Some(Resumed::Still) => assert!(s.count() > 0),
+                    Some(Resumed::Still) => assert!(s.active()),
                     Some(Resumed::Running { clear, wake }) => {
                         assert_eq!(s.count(), 0);
                         if clear {
@@ -92,6 +92,39 @@ fn the_suspend_count_never_loses_a_wake_and_raises_the_signal_exactly_when_stopp
                     },
                     Where::Parked => {}
                 },
+                7 => {
+                    // an exception stops the thread (only a thread that is running user code, or in a call, takes one)
+                    if !s.has_exception() && matches!(at, Where::User | Where::InCall) {
+                        if s.stop_for_exception(false) {
+                            panic!("{ctx}: raised by a thread that is not blocked");
+                        }
+                        // the faulting thread parks as it returns
+                        match s.return_to_user() {
+                            AtReturn::Run => panic!("{ctx}: an exception must park"),
+                            AtReturn::Park { raise } => {
+                                if raise {
+                                    signal = true;
+                                }
+                                at = Where::Parked;
+                            }
+                        }
+                    }
+                }
+                8 => match s.release_exception() {
+                    None => assert!(!s.has_exception(), "{ctx}"),
+                    Some(Resumed::Still) => assert!(s.active(), "{ctx}"),
+                    Some(Resumed::Running { clear, wake }) => {
+                        assert!(!s.active(), "{ctx}");
+                        if clear {
+                            assert!(signal, "{ctx}");
+                            signal = false;
+                        }
+                        if wake {
+                            assert_eq!(at, Where::Parked, "{ctx}");
+                            at = Where::User;
+                        }
+                    }
+                },
                 _ => {
                     // killed while parked or blocked: it leaves without a wake
                     if at == Where::Parked && rng.below(8) == 0 {
@@ -109,22 +142,25 @@ fn the_suspend_count_never_loses_a_wake_and_raises_the_signal_exactly_when_stopp
                 "{ctx}: the signal is the stopped state"
             );
             if signal {
-                assert!(s.count() > 0, "{ctx}: stopped with a count of 0");
+                assert!(
+                    s.active(),
+                    "{ctx}: stopped while not suspended or in an exception"
+                );
             }
             if at == Where::Parked {
                 assert!(
-                    s.count() > 0 && s.parked() && signal,
-                    "{ctx}: parked without a count"
+                    s.active() && s.parked() && signal,
+                    "{ctx}: parked without a reason"
                 );
             }
-            if s.count() == 0 {
+            if !s.active() {
                 assert!(
                     at != Where::Parked,
                     "{ctx}: a thread with count 0 is parked: a lost wake"
                 );
                 assert!(!signal);
             }
-            if at == Where::Blocked && s.count() > 0 {
+            if at == Where::Blocked && s.active() {
                 // (a blocked thread with a suspend counts as stopped: it was either raised by the suspend or by `blocks`)
                 assert!(signal, "{ctx}: blocked with a count and not stopped");
             }

@@ -497,7 +497,7 @@ pub fn thread_blocks(us: &mut UserState, pid: u64, tid: kcore::sched::Tid) -> bo
 
 /// Is the thread suspended (its count is above 0)?
 pub fn thread_is_suspended(us: &UserState, tid: kcore::sched::Tid) -> bool {
-    us.suspends.get(&tid).is_some_and(|s| s.count() > 0)
+    us.suspends.get(&tid).is_some_and(|s| s.active())
 }
 
 /// A thread that was parked leaves the return to user mode (woken with a count of 0, or killed).
@@ -538,6 +538,7 @@ pub fn thread_suspend_forget(us: &mut UserState, tid: kcore::sched::Tid) {
     us.initial_regs.remove(&tid);
     us.pending_regs.remove(&tid);
     us.parked_tids.remove(&tid);
+    us.exc_pending.remove(&tid);
 }
 
 /// A thread made with the SUSPENDED flag: stopped before it ever runs.
