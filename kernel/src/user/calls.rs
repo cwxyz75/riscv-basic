@@ -29,7 +29,6 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::PROCESS_SUSPEND => process_stop(a, true),
         nr::PROCESS_RESUME => process_stop(a, false),
         nr::PROCESS_INFO => process_table_call(n, a),
-        nr::THREAD_CREATE => thread_create(a),
         nr::THREAD_SPAWN => thread_spawn(a),
         nr::THREAD_INFO => process_table_call(n, a),
         nr::THREAD_INTERRUPT => thread_interrupt(a),
@@ -147,22 +146,6 @@ pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
         wake_threads_of(tpid);
     }
     Ok((None, None))
-}
-
-pub(super) fn thread_create(a: [u64; 6]) -> Reply {
-    if !thread::user_thread_ids_left() {
-        return bad(Status::NoMemory);
-    }
-    let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
-        let s = state();
-        let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let creator = creator_prio(s);
-        ksys::thread_create(s, &mut kmem::get().vmos.jobs, me, creator, a)
-            .map_err(|e| (e, None, None))
-    })?;
-    // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
-    thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    Ok((Some(spawn.handle), None))
 }
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.

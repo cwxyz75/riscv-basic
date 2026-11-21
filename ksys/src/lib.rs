@@ -37,8 +37,8 @@ pub use lifecycle::{
 pub use proc::{proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
 pub use state::{ThreadStart, UserState};
 pub use thread::{
-    charge_thread, clamp_prio, credit_thread, new_start, process_start, thread_create,
-    thread_spawn, total_threads, Spawn, KSTACK_PAGES,
+    charge_thread, clamp_prio, credit_thread, new_start, process_start, thread_spawn,
+    total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::vmo_call;
 pub use wait::{

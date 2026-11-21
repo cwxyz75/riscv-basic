@@ -315,7 +315,7 @@ pub mod syscall {
     /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
     pub const PROCESS_SUSPEND: usize = 57;
     pub const PROCESS_RESUME: usize = 58;
-    pub const THREAD_CREATE: usize = 60;
+    // 60 was `thread_create`: retired, not reused (AB5)
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
     /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then

@@ -180,7 +180,6 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 82 | port_unbind | `a0` port, `a1` key | |
 | 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
 | 84 | port_rearm | `a0` port, `a1` key | |
-| 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
@@ -537,7 +536,7 @@ is no call that returns the caller's own job, and `job_root` is for the process 
 started. Limits are exhausted with NO_MEMORY.
 
 What is charged: a process from `process_create` to its teardown; a thread from the moment it is
-created (`process_start` or `thread_create`) until it ends; a VMO page from the moment it is first
+created (`process_start` or `thread_spawn`) until it ends; a VMO page from the moment it is first
 committed (a write, a read through a mapping, a fault) until the VMO is freed; **page tables** as
 a worst-case estimate: one page for a process's root table and, per mapped region, one page per
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
@@ -605,11 +604,19 @@ does (a caller inside the job ends too, last). Errors: BAD_HANDLE; WRONG_TYPE; A
 A handle with every job right to the root job. Only a process started by the kernel may ask
 (`init`); everything else gets ACCESS_DENIED. Tests: `job_*` in `init`.
 
+### Retired numbers
+
+A retired number is never reused: a call to it is BAD_SYSCALL.
+
+| number | was | retired |
+|---|---|---|
+| 60 | `thread_create` (replaced by `thread_spawn` with CALLER_STACK) | AB5 |
+
 ## Threads (S3c-2b)
 
 A process runs one or more user threads, all sharing its address space and handle table.
 The first thread starts at `process_start` (or at load, for a kernel-started process); more
-are made with `thread_spawn` (the kernel provisions the stack) or `thread_create` (the caller's). A thread is a kernel object (kind THREAD): a handle to it can
+are made with `thread_spawn` (the kernel provisions the stack, or the caller brings one: CALLER_STACK). A thread is a kernel object (kind THREAD): a handle to it can
 be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
 INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (2048) live threads per process. A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
 
@@ -620,21 +627,6 @@ process had already been given one (`process_exit`, `process_kill`, a fault). `p
 stops at its next return to user mode (a blocked one is woken to die), and the process object
 is TERMINATED only after the last of its threads has gone and its memory is freed. A thread
 that was killed before it ever ran never runs user code.
-
-### thread_create(process, entry, sp, arg) -> status, handle
-
-(The older call: the stack is the caller's, and a thread that used a mapped stack never frees it. New code uses `thread_spawn`, below in this file and in `SCHED-SMP-SPEC.md` 5.3.)
-
-Start a new thread in a running process: it begins at `entry` in U-mode with `a0 = arg`, the
-stack pointer `sp`, and every other register zero. The new thread's stack is the caller's to
-provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order: BAD_HANDLE;
-WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
-dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
-aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
-threads, the system already has `MAX_USER_THREADS` (4096; each thread costs a kernel stack), the
-caller's handle table is full, the system-wide object cap `MAX_OBJECTS` is reached, or the process's
-job or an ancestor is at its thread limit, or has fewer than four pages of its page limit left for the stack). The process handle may be the caller's
-`process_self` handle. On error nothing changes. Tests: `thread_create_*`.
 
 ### thread_exit(code) -> does not return
 
@@ -902,7 +894,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | process_suspend, process_resume | specified and implemented (SIG2) |
-| thread_create, thread_exit, thread_info | specified (S3c-2b) |
+| thread_spawn, thread_exit, thread_info | specified (S3c-2b) |
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
 | socket_shutdown | specified and implemented (tidy-up, T17) |
@@ -1026,7 +1018,7 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
 * **Memory:** `vmo_create` by bytes with RESIZABLE, `vmo_set_size`, `vmo_decommit`, `vmo_create_child` (SNAPSHOT,
   PRIVATE), `process_map` with ANYWHERE returning the address, `process_unmap` and `process_protect` over ranges,
   `process_map_info`, `process_clone_region`, and the pager calls.
-* **Threads and exceptions:** `thread_create` is removed; `thread_spawn` gains SUSPENDED; `thread_suspend`,
+* **Threads and exceptions:** `thread_spawn` is the only way to make a thread; it gains SUSPENDED; `thread_suspend`,
   `thread_resume`, `thread_read_state`, `thread_write_state`; `process_exception_channel`, `job_exception_channel`,
   `exception_resume`.
 * **Waiting:** `port_wait_many`.

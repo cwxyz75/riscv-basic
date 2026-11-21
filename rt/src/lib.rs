@@ -464,18 +464,17 @@ pub mod sys {
     pub fn port_wait_ns(port: u64, deadline: u64) -> Ret {
         syscall(PORT_WAIT, [port as usize, deadline as usize, 0, 0, 0, 0])
     }
-    pub fn thread_create(process: u64, entry: u64, sp: u64, arg: u64) -> Ret {
-        syscall(
-            THREAD_CREATE,
-            [
-                process as usize,
-                entry as usize,
-                sp as usize,
-                arg as usize,
-                0,
-                0,
-            ],
-        )
+    /// A thread on a stack the caller provides (`thread_spawn` with CALLER_STACK; the call `thread_create` is retired, AB5): it starts at
+    /// `entry` with `a0 = arg` and `sp` as given. `a1` of the result is its handle, `a2` its tid.
+    pub fn thread_on_stack(process: u64, entry: u64, sp: u64, arg: u64) -> Ret {
+        let rec = SpawnArgs {
+            entry,
+            arg,
+            flags: abi::spawn::CALLER_STACK,
+            sp,
+            ..SpawnArgs::default()
+        };
+        thread_spawn(process, &rec)
     }
     /// Create and start a thread (SYSCALLS.md `thread_spawn`): `a1` is its handle (0 if detached), `a2` its tid.
     pub fn thread_spawn(process: u64, rec: &SpawnArgs) -> Ret {

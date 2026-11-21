@@ -128,7 +128,7 @@ Each rebuilds all of user space; they are grouped so the churn happens once.
 
 - [x] **AB1** 64-bit handles (PR below: `abi::Handle(u64)`, 24 slot and 40 generation bits, the table grows on demand, handle arrays 8 bytes; T8 is fixed by it; the C and Lua transcripts and BusyBox are the epic gate's)
 - [ ] **AB3** 64-bit identifiers, no counter wraps, the fast-forward tests
-- [ ] **AB5** remove `thread_create`
+- [x] **AB5** remove `thread_create`
 - [ ] **AB4** `port_wait_many`
 
 ### Phase 6: kernel memory and the remaining lock peels

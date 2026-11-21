@@ -36,7 +36,7 @@ pub fn app_main() -> i32 {
     for _ in 0..200 {
         let mut stack = alloc::vec![0u8; 8192];
         let top = (stack.as_mut_ptr() as u64 + 8192) & !15;
-        let t = sys::thread_create(me, idle as *const () as usize as u64, top, 0);
+        let t = sys::thread_on_stack(me, idle as *const () as usize as u64, top, 0);
         stacks.push(stack);
         if t.status == 0 {
             started += 1;
