@@ -110,6 +110,12 @@ impl StateUnit for HartUnit {
     type Regs = FpRegs;
     fn save(&mut self) -> FpRegs {
         let mut r = FpRegs::ZERO;
+        self.save_into(&mut r);
+        r
+    }
+
+    /// In place: the trap paths save into the thread's own copy and build no 264-byte temporary (the kernel's stack budget, KT13).
+    fn save_into(&mut self, r: &mut FpRegs) {
         let (f, fcsr) = (r.f.as_mut_ptr(), &mut r.fcsr as *mut u32);
         // SAFETY: the unit is switched on for exactly these instructions; `f` points at 32 u64s.
         unsafe {
@@ -134,7 +140,6 @@ impl StateUnit for HartUnit {
                 options(nostack),
             );
         }
-        r
     }
 
     fn load(&mut self, r: &FpRegs) {
