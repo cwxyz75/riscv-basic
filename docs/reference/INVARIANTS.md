@@ -181,7 +181,7 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. Ro
 | PR1-PR2 | A thread's base priority never exceeds its job's maximum; a job's maximum and RT budget never exceed its parent's | job model; QEMU probe from a confined program |
 | NM1 | When RT budgets are enforced, the normal band gets at least 20% of every window on a hart where it has work throughout | simulated-clock property test; QEMU runaway test |
 | AC1 | CPU time is conserved: per hart, thread time plus idle time equals elapsed time | model; QEMU within tolerance |
-| TLB1 | Live address spaces have distinct ASIDs; an ASID is reused only after it was flushed on every hart that ran its last owner | allocator model; `fault-asid-reuse-no-flush` |
+| TLB1 | Live address spaces of one generation have distinct ASIDs (never 0, the kernel's); an ASID is reused only in a newer generation, and a hart flushes everything before it installs a tag of a newer generation (`kcore::asid`, `user::install_token_of`); a stale tag is replaced before its space is installed. The allocator is built (L18 part a); the flush at every switch stays until part b removes it, so today this rests on that flush as well | `kcore/tests/asid_model.rs` (a model of each hart's TLB across generation changes, with its negative control); `fault-asid-reuse-no-flush` comes with part b |
 | TLB2 | A frame that was mapped is freed only after every hart in the address space's `ran_on` mask has been flushed for that page (replaces SMP5). **Platform requirement:** SBI remote fence calls return after the target harts have flushed | `unmap_while_siblings_touch`, the negative controls |
 
 ### Planned invariants of the v1 kernel (KERNEL-V1-SPEC; OD126 to OD141)

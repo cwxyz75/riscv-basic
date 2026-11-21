@@ -146,7 +146,7 @@ Phase 6a (`epic/phase-6`):
 Phase 6b (`epic/phase-6b`):
 
 - [ ] **L17** (parts b and c) the per-process `AS` lock, page faults and user copies leave the big lock
-- [ ] **L18** the ASID allocator with generations; batched shootdown
+- [ ] **L18** the ASID allocator with generations; batched shootdown (part a is merged when this line says so: the allocator `kcore::asid`, ASIDs from it instead of the pid, the stale-tag refresh and the hart's generation flush; left: no flush at every switch, `ran_on`, batched shootdown, `fault-asid-reuse-no-flush`, TLB1 and TLB2 checks)
 - [ ] **PL7** instruction-cache flush on executable mappings
 - [ ] **L14** futex bucket locks
 - [ ] **L19** `PROCS` and `TT`; teardown out of the big lock

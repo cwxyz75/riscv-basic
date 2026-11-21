@@ -3,7 +3,20 @@
 use super::*;
 
 pub(super) fn aspace_token_of(p: &Process) -> u64 {
-    crate::arch::aspace_token_asid(p.aspace.table().root(), p.asid)
+    crate::arch::aspace_token_asid(p.aspace.table().root(), p.tag.asid)
+}
+
+/// The token to install for `p` on this hart (interrupts off, big lock held): a tag of an older generation names an ASID that may be
+/// another space's now, so the space takes a fresh one first, and this hart flushes everything if it has not since the generation turned
+/// (TLB1 per generation, L18).
+pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) -> u64 {
+    asids.refresh(&mut p.tag);
+    let me = crate::percpu::this();
+    if p.tag.gen > me.asid_seen.load(Ordering::Relaxed) {
+        crate::arch::tlb_flush_all();
+        me.asid_seen.store(p.tag.gen, Ordering::Relaxed);
+    }
+    aspace_token_of(p)
 }
 
 /// Make the calling thread's process the current address space, just before returning to
@@ -20,10 +33,18 @@ pub fn activate_current() {
     park_while_stopped();
     let token = irq::without(|| {
         let s = state();
-        s.thread_pid
+        let UserState {
+            asids,
+            procs,
+            thread_pid,
+            ..
+        } = s;
+        let p = thread_pid
             .get(&thread::current())
-            .and_then(|pid| s.procs.get(pid))
-            .map(|p| aspace_token_of(p))
+            .and_then(|pid| procs.get_mut(pid))?;
+        // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
+        // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
+        Some(install_token_of(asids, p))
     });
     if let Some(token) = token {
         if crate::percpu::this()
@@ -86,7 +107,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             .aspace
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
-                            kmem::flush_pages(m.first, m.last, p.asid);
+                            kmem::flush_pages(m.first, m.last, p.tag.asid);
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {

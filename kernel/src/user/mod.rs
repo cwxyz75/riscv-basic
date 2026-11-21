@@ -99,6 +99,8 @@ fn state() -> &'static mut UserState {
         let slot = &mut *addr_of_mut!(USER);
         slot.get_or_insert_with(|| {
             let mut s = UserState::with_irq_slots(crate::aia::slots());
+            // the ASID field the harts implement (L18): the allocator hands out ASIDs from it and turns the generation when they are used up
+            s.asids = kcore::asid::Asids::new(crate::arch::asid_bits());
             // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
             if let Some(n) = crate::dtb::ff_value("koid") {
                 s.objs.fast_forward_koid(n);

@@ -69,6 +69,7 @@ pub fn process_create<M: PhysMem>(
         return Err(Status::NoMemory);
     };
     us.next_pid = next;
+    let tag = us.asids.alloc();
     let UserState { objs, procs, .. } = us;
     let creator = procs.get_mut(&me).ok_or(Status::BadState)?;
     let (handle, obj) = match ipc::process_object_create_in(
@@ -94,7 +95,7 @@ pub fn process_create<M: PhysMem>(
             live_tids: Default::default(),
             aspace: AddressSpace::new(table),
             handles: HandleTable::new(MAX_HANDLES),
-            asid: (pid & 0xffff) as u16,
+            tag,
             vmos: Vec::new(),
             entry: 0,
             arg: 0,

@@ -29,6 +29,21 @@ pub unsafe fn aspace_install(token: u64) {
     unsafe { asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) token) };
 }
 
+/// How many bits of ASID this hart implements (1 to 16), probed by writing ones to `satp`'s ASID field and reading it back (L18). Writes the
+/// current table back with the field unchanged; call it with interrupts off, on a hart that has a page table installed.
+pub fn asid_bits() -> u32 {
+    let old: u64;
+    let back: u64;
+    // SAFETY: reads `satp`, writes the same mode and table with every ASID bit set, reads it back and restores the old value: the table is
+    // the one already installed, so nothing the hart executes from or touches changes; the flush drops entries cached under the probe.
+    unsafe {
+        asm!("csrr {old}, satp", old = out(reg) old);
+        let probe = old | (0xffffu64 << 44);
+        asm!("csrw satp, {p}", "csrr {b}, satp", "csrw satp, {o}", "sfence.vma zero, zero", p = in(reg) probe, b = out(reg) back, o = in(reg) old);
+    }
+    ((back >> 44) & 0xffff).count_ones().clamp(1, 16)
+}
+
 /// Flush the whole TLB of this hart.
 #[inline(always)]
 pub fn tlb_flush_all() {

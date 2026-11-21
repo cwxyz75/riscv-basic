@@ -53,7 +53,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         live_tids: Default::default(),
         aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
         handles: HandleTable::new(64),
-        asid: 1,
+        tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
         entry: 0,
         arg: 0,
