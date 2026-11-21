@@ -531,7 +531,7 @@ fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     if !wait_for(2000, || user::process_count() == 0) {
         return Err(String::from("processes are left"));
     }
-    if user::job_ledger() != (1, 0, 0, 0, 0) {
+    if user::job_ledger() != (1, 0, 0, 0, 0, 0) {
         return Err(format!(
             "the job ledger is not back to the root: {:?}",
             user::job_ledger()
@@ -736,7 +736,7 @@ fn smp_churn_stress() -> Result<(), String> {
         return Err(String::from("processes are left"));
     }
     thread::sleep_ticks(5);
-    if user::job_ledger() != (1, 0, 0, 0, 0) {
+    if user::job_ledger() != (1, 0, 0, 0, 0, 0) {
         return Err(format!("job ledger {:?}", user::job_ledger()));
     }
     if thread::thread_count() > threads_before {

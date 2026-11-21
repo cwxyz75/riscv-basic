@@ -514,9 +514,12 @@ pub fn return_to_user(frame: &mut TrapFrame) {
 pub fn first_use(frame: &mut TrapFrame) -> bool {
     if kcore::fp::is_vector_insn(frame.stval) {
         // (a vector-FP instruction such as `vfadd.vv` is a vector instruction that is also the thread's first FP use, with the vector unit already on)
-        return vec_first_use(frame) || fp_first_use(frame);
+        return match vec_first_use(frame) {
+            Some(on) => on || fp_first_use(frame),
+            None => false, // (the job is at its kernel-memory limit: the instruction faults; the FP unit is not tried)
+        };
     }
-    fp_first_use(frame) || (frame.stval == 0 && vec_first_use(frame))
+    fp_first_use(frame) || (frame.stval == 0 && vec_first_use(frame).unwrap_or(false))
 }
 
 fn fp_first_use(frame: &mut TrapFrame) -> bool {
@@ -529,7 +532,7 @@ fn fp_first_use(frame: &mut TrapFrame) -> bool {
     if !charge_state(
         &mut s.fp_charge,
         tid,
-        core::mem::size_of::<FpThread>() as u64,
+        (core::mem::size_of::<FpThread>() + core::mem::size_of::<FpRegs>()) as u64,
     ) {
         return false;
     }
@@ -544,15 +547,17 @@ fn fp_first_use(frame: &mut TrapFrame) -> bool {
     enabled
 }
 
-fn vec_first_use(frame: &mut TrapFrame) -> bool {
+/// `Some(enabled)`, or `None` when the job could not be charged for the state.
+fn vec_first_use(frame: &mut TrapFrame) -> Option<bool> {
     if frame.sstatus & VS_MASK != 0 {
-        return false;
+        return Some(false);
     }
     let s = state();
     let tid = crate::thread::current();
-    let bytes = (core::mem::size_of::<VecThread>() + crate::arch::vlenb_read() * 32) as u64;
+    let bytes =
+        (core::mem::size_of::<VecThread>() + core::mem::size_of::<VecRegs>() + vlenb() * 32) as u64;
     if !charge_state(&mut s.vec_charge, tid, bytes) {
-        return false;
+        return None;
     }
     let FpState {
         vtokens, vthreads, ..
@@ -564,7 +569,7 @@ fn vec_first_use(frame: &mut TrapFrame) -> bool {
     if enabled {
         frame.sstatus |= 1 << 9; // Initial: the return path loads the zero state and sets Clean
     }
-    enabled
+    Some(enabled)
 }
 
 /// Charge `bytes` of register state to the job of user thread `tid`, once (a second call for a thread already charged is free); `false`

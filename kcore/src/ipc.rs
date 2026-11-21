@@ -195,8 +195,8 @@ impl Object for KObj {
 
 pub type Kobjs = Registry<KObj>;
 
-/// The kernel memory one object body holds, in bytes (MM5): the size of a registry entry rounded up to a power of two (a slab class when it
-/// fits one), charged to the creating job's kernel bytes with the object and credited when the object is destroyed. Queued data has its own
+/// The kernel memory one object body holds, in bytes (MM5): the size of the object (`KObj`) rounded up to a power of two (the slot around it
+/// in the registry adds a few words that are not counted), charged to the creating job's kernel bytes with the object and credited when the object is destroyed. Queued data has its own
 /// charge (`IpcBytes`); handle tables, thread state and the rest are charged where they grow.
 pub const OBJECT_BYTES: u64 = (core::mem::size_of::<KObj>() as u64).next_power_of_two();
 
