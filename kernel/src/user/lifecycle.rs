@@ -39,7 +39,7 @@ pub(super) fn user_thread_main(token: usize) {
         let token = aspace_token_of(p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
-        let max = kmem::get()
+        let max = kmem::jobs()
             .jobs
             .sched(p.job)
             .map_or(63, |j| j.max_prio)
@@ -166,15 +166,13 @@ pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
         let k = kmem::get();
         let mut process = process;
-        process
-            .aspace
-            .destroy_user(&mut k.mm, &mut k.vmos, &mut k.jobs);
+        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
         for id in core::mem::take(&mut process.vmos) {
-            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+            let _ = k.vmos.release(k.mm, k.jobs, id);
         }
         // the stacks `thread_spawn` mapped for threads that were still alive (their mappings went with the address space)
         for st in process.stacks.values() {
-            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, st.vmo);
+            let _ = k.vmos.release(k.mm, k.jobs, st.vmo);
         }
         let tables: u64 = process.table_charge.values().sum();
         // the address space and its page tables are gone: no hart may keep translations through them
@@ -192,16 +190,14 @@ pub(super) fn free_spawn_stack(p: &mut Process, tid: Tid) {
         return;
     };
     let k = kmem::get();
-    let _ = p
-        .aspace
-        .unmap_region(&mut k.mm, &mut k.vmos, &mut k.jobs, st.region);
+    let _ = p.aspace.unmap_region(k.mm, k.vmos, k.jobs, st.region);
     if let Some(tables) = p.table_charge.remove(&st.region) {
         k.jobs.credit(p.job, Resource::Pages, tables);
     }
     // other harts may cache translations of the stack: they go before the frames can be reused
     crate::smp::shootdown();
     kmem::flush_tlb();
-    let _ = k.vmos.release(&mut k.mm, &mut k.jobs, st.vmo);
+    let _ = k.vmos.release(k.mm, k.jobs, st.vmo);
 }
 
 pub(super) fn exit_process(code: i32) -> ! {
@@ -233,7 +229,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;
-        credit_thread(&mut kmem::get().jobs, p.job);
+        credit_thread(kmem::jobs().jobs, p.job);
         if !whole {
             // (a whole-process exit leaves the stacks to the teardown)
             free_spawn_stack(p, tid);
@@ -279,6 +275,11 @@ pub(super) fn interrupted_now() -> bool {
 /// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
 pub(super) fn take_interrupt() -> bool {
     irq::without(|| state().interrupts.remove(&thread::current()))
+}
+
+/// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
+pub(super) fn take_interrupt_held() -> bool {
+    state().interrupts.remove(&thread::current())
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.

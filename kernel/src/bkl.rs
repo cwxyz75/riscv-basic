@@ -60,6 +60,7 @@ pub fn check_use(class: Class) {
     }
 }
 
+#[track_caller]
 fn note_acquire(class: Class, instance: u32) {
     let bad = percpu::this().held.with(|h| {
         let bad = h.check(class, instance);
@@ -117,7 +118,7 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             let _ = write!(crate::console::Console, "");
             crate::console::with_uart_for_test();
         }
-        // (the other classes have no lock in the kernel yet: the pure pair table covers them, `klock/tests/order.rs`)
+        // (the other classes are probed by pretending to hold them; the pure pair table is in `klock/tests/order.rs`)
         other => note_acquire(other, 0),
     }
     let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;
@@ -139,6 +140,7 @@ fn who() -> u32 {
     percpu::this().index.load(Ordering::Relaxed) as u32
 }
 
+#[track_caller]
 /// Take the BKL. Interrupts must already be off (a handler taking it while the interrupted code
 /// spun for it with interrupts on would deadlock the hart). Reentrant.
 pub fn lock() {
@@ -267,6 +269,7 @@ impl klock::Machine for Machine {
         spin_watchdog(&mut n, "a spin lock");
         percpu::this().spins.store(n, Ordering::Relaxed);
     }
+    #[track_caller]
     fn acquired(class: Class, instance: u32) {
         percpu::this()
             .last_class

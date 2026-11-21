@@ -101,7 +101,7 @@ fn low_half_is_empty() -> Outcome {
         kmem::stats().image_first << 12, // wherever the image actually is
     ] {
         ensure(
-            k.aspace.table().translate(&k.mm, va).is_none(),
+            k.aspace.table().translate(k.mm, va).is_none(),
             &format!("{va:#x} must not be mapped (the boot identity map is gone)"),
         )?;
     }
@@ -111,7 +111,7 @@ fn low_half_is_empty() -> Outcome {
 fn kernel_mappings_are_w_xor_x() -> Outcome {
     let k = kmem::get();
     let (mut leaves, mut bad) = (0, 0);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
+    k.aspace.table().for_each_leaf(k.mm, &mut |va, t, level| {
         leaves += 1;
         // a large leaf is legal only in the direct map (MM3) and only as plain data: read-write, never executable, never user
         let large_ok = level == 0
@@ -139,7 +139,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
             let t = k
                 .aspace
                 .table()
-                .translate(&k.mm, va)
+                .translate(k.mm, va)
                 .ok_or_else(|| format!("{name} page {va:#x} is unmapped"))?;
             ensure_eq(t.perms, want, &format!("{name} page {va:#x}"))?;
             ensure_eq(
@@ -152,7 +152,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
     }
     // Executable pages exist only in the text section.
     let mut stray = 0;
-    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, _| {
+    k.aspace.table().for_each_leaf(k.mm, &mut |va, t, _| {
         if t.perms.exec && !(s.text.0..s.text.1).contains(&va) {
             stray += 1;
         }
@@ -172,7 +172,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
         ensure(
             k.aspace
                 .table()
-                .translate(&k.mm, DIRECT_BASE + (pfn << 12))
+                .translate(k.mm, DIRECT_BASE + (pfn << 12))
                 .is_none(),
             "a page of the kernel image or firmware is reachable through the direct map",
         )?;
@@ -180,7 +180,7 @@ fn direct_map_does_not_alias_the_image() -> Outcome {
     let usable = kmem::usable_ranges();
     let (mut in_map, mut aliases, mut devices, mut outside) = (0, 0, 0, 0);
     let (mut leaves, mut level1) = (0u64, 0u64);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
+    k.aspace.table().for_each_leaf(k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
             let pages = 1u64 << (9 * level);
             in_map += pages; // pages, whatever the leaf's size
@@ -402,9 +402,9 @@ fn frame_database_is_sane() -> Outcome {
 /// Create a VMO of `pages` pages and one region over all of it at `va`.
 fn region(va: u64, pages: u64, perms: Perms) -> u64 {
     let k = kmem::get();
-    let id = k.vmos.create(&mut k.jobs, pages);
+    let id = k.vmos.create(k.jobs, pages);
     k.aspace
-        .map_region(&mut k.vmos, va, pages, id, 0, perms)
+        .map_region(k.vmos, va, pages, id, 0, perms)
         .expect("map_region");
     id
 }
@@ -413,13 +413,11 @@ fn teardown(vmo: u64, starts: &[u64]) {
     let k = kmem::get();
     for &s in starts {
         k.aspace
-            .unmap_region(&mut k.mm, &mut k.vmos, &mut k.jobs, s)
+            .unmap_region(k.mm, k.vmos, k.jobs, s)
             .expect("unmap_region");
     }
     trap::flush_tlb();
-    k.vmos
-        .release(&mut k.mm, &mut k.jobs, vmo)
-        .expect("destroy vmo");
+    k.vmos.release(k.mm, k.jobs, vmo).expect("destroy vmo");
 }
 
 fn free() -> usize {
@@ -467,11 +465,11 @@ fn unmapped_region_is_gone() -> Outcome {
         let vmo = region(LAZY_TEST_BASE, 2, Perms::RW);
         write(LAZY_TEST_BASE, 1);
         teardown(vmo, &[LAZY_TEST_BASE]);
-        let k = kmem::get();
-        ensure(
-            k.aspace.table().translate(&k.mm, LAZY_TEST_BASE).is_none(),
-            "the page is unmapped",
-        )?;
+        let unmapped = {
+            let k = kmem::get(); // (dropped before the access below: the fault handler takes the same locks)
+            k.aspace.table().translate(k.mm, LAZY_TEST_BASE).is_none()
+        };
+        ensure(unmapped, "the page is unmapped")?;
         let refused = trap::expect_refused(|| {
             read(LAZY_TEST_BASE);
         });
@@ -529,7 +527,7 @@ fn shared_vmo_is_one_memory() -> Outcome {
         {
             let k = kmem::get();
             k.aspace
-                .map_region(&mut k.vmos, b, 2, vmo, 0, Perms::R)
+                .map_region(k.vmos, b, 2, vmo, 0, Perms::R)
                 .map_err(|e| format!("map_region b: {e:?}"))?;
         }
         write(a + 8, 0xfeed_f00d);
@@ -538,27 +536,20 @@ fn shared_vmo_is_one_memory() -> Outcome {
             0xfeed_f00d,
             "the write is visible through the other mapping",
         )?;
-        let k = kmem::get();
-        let pfn = k
-            .aspace
-            .table()
-            .translate(&k.mm, a)
-            .ok_or("a unmapped")?
-            .pfn;
-        ensure_eq(
-            k.mm.db.refs(pfn),
-            Some(3),
-            "one reference for the VMO and one per mapping",
-        )?;
-        ensure_eq(
-            k.aspace
-                .table()
-                .translate(&k.mm, b)
-                .ok_or("b unmapped")?
-                .pfn,
-            pfn,
-            "same frame",
-        )?;
+        {
+            let k = kmem::get(); // (dropped before `teardown`, which takes the locks again)
+            let pfn = k.aspace.table().translate(k.mm, a).ok_or("a unmapped")?.pfn;
+            ensure_eq(
+                k.mm.db.refs(pfn),
+                Some(3),
+                "one reference for the VMO and one per mapping",
+            )?;
+            ensure_eq(
+                k.aspace.table().translate(k.mm, b).ok_or("b unmapped")?.pfn,
+                pfn,
+                "same frame",
+            )?;
+        }
         teardown(vmo, &[a, b]);
         Ok(())
     })

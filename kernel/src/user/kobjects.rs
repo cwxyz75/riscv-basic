@@ -41,7 +41,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 &[],
-                &mut kmem::get().jobs,
+                kmem::jobs().jobs,
             )
         });
         notify();
@@ -58,7 +58,7 @@ impl KernelEnd {
                 self.handle,
                 MAX_MSG_BYTES,
                 MAX_MSG_HANDLES,
-                &mut kmem::get().jobs,
+                kmem::jobs().jobs,
             );
             match got {
                 Ok(msg) => {
@@ -82,20 +82,23 @@ impl KernelEnd {
             let s = state();
             let k = kmem::get();
             let pages = (image.len() as u64).div_ceil(4096).max(1);
-            let id = k.vmos.create(&mut k.jobs, pages);
-            if k.vmos.write(&mut k.mm, &mut k.jobs, id, 0, image).is_err() {
-                let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+            let id = k.vmos.create(k.jobs, pages);
+            if k.vmos.write(k.mm, k.jobs, id, 0, image).is_err() {
+                let _ = k.vmos.release(k.mm, k.jobs, id);
                 return Err(Status::NoMemory);
             }
             let h = match ipc::vmo_object_create_in(
                 &mut s.objs,
                 &mut s.ktable,
                 id,
-                &mut quota(JobId::ROOT),
+                &mut ipc::Quota {
+                    jobs: &mut *k.jobs,
+                    job: Some(JobId::ROOT),
+                },
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+                    let _ = k.vmos.release(k.mm, k.jobs, id);
                     return Err(e);
                 }
             };
@@ -105,7 +108,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 &[h],
-                &mut kmem::get().jobs,
+                &mut *k.jobs,
             );
             if r.is_err() {
                 let _ = s.ktable.close(&mut s.objs, h);
@@ -127,7 +130,7 @@ impl KernelEnd {
                 self.handle,
                 data,
                 handles,
-                &mut kmem::get().jobs,
+                kmem::jobs().jobs,
             )
         });
         notify();
@@ -212,20 +215,23 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         let s = state();
         let k = kmem::get();
         let pages = (bytes.len() as u64).div_ceil(4096).max(1);
-        let id = k.vmos.create(&mut k.jobs, pages);
-        if k.vmos.write(&mut k.mm, &mut k.jobs, id, 0, bytes).is_err() {
-            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+        let id = k.vmos.create(k.jobs, pages);
+        if k.vmos.write(k.mm, k.jobs, id, 0, bytes).is_err() {
+            let _ = k.vmos.release(k.mm, k.jobs, id);
             return Err(Status::NoMemory);
         }
         let h = match ipc::vmo_object_create_in(
             &mut s.objs,
             &mut s.ktable,
             id,
-            &mut quota(JobId::ROOT),
+            &mut ipc::Quota {
+                jobs: &mut *k.jobs,
+                job: Some(JobId::ROOT),
+            },
         ) {
             Ok(h) => h,
             Err(e) => {
-                let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+                let _ = k.vmos.release(k.mm, k.jobs, id);
                 return Err(e);
             }
         };
@@ -247,13 +253,7 @@ impl KernelSocket {
     pub fn read(&self, max: usize) -> Result<Vec<u8>, Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::socket_read_in(
-                &mut s.objs,
-                &s.ktable,
-                self.handle,
-                max,
-                &mut kmem::get().jobs,
-            )
+            ipc::socket_read_in(&mut s.objs, &s.ktable, self.handle, max, kmem::jobs().jobs)
         });
         notify();
         r
@@ -263,13 +263,7 @@ impl KernelSocket {
     pub fn write(&self, data: &[u8]) -> Result<usize, Status> {
         let r = irq::without(|| {
             let s = state();
-            ipc::socket_write_in(
-                &mut s.objs,
-                &s.ktable,
-                self.handle,
-                data,
-                &mut kmem::get().jobs,
-            )
+            ipc::socket_write_in(&mut s.objs, &s.ktable, self.handle, data, kmem::jobs().jobs)
         });
         notify();
         r

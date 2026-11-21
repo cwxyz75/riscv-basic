@@ -351,6 +351,14 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
         // the planned classes, through the same checker (the pure table is in `klock/tests/order.rs`)
         (Class::Heap, Class::Frame, true),
         (Class::Frame, Class::Heap, false),
+        // the memory locks (L16 part b): none may be held when the big lock is taken, nor taken in the wrong order
+        (Class::Vmo, Class::Legacy, true),
+        (Class::Jobs, Class::Legacy, true),
+        (Class::Frame, Class::Legacy, true),
+        (Class::Jobs, Class::Vmo, true),
+        (Class::Frame, Class::Jobs, true),
+        (Class::Vmo, Class::Jobs, false),
+        (Class::Jobs, Class::Frame, false),
         (Class::Obj, Class::Futex, false),
         (Class::Futex, Class::Obj, true),
     ] {
