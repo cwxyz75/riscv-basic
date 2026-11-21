@@ -34,6 +34,8 @@ pub enum AtReturn {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Suspend {
     count: u32,
+    /// Stopped for an exception (EX2), apart from the count: `thread_resume` does not release it, only the exception's resolution does.
+    exc: bool,
     /// SUSPENDED is up: the thread has stopped (parked, or blocked in a call).
     stopped: bool,
     /// The thread is parked at the return to user mode (and must be woken to leave it).
@@ -44,9 +46,15 @@ impl Suspend {
     pub const fn new() -> Suspend {
         Suspend {
             count: 0,
+            exc: false,
             stopped: false,
             parked: false,
         }
+    }
+
+    /// Is the thread to stay stopped: its count is above 0 or it has an exception pending?
+    pub fn active(&self) -> bool {
+        self.count > 0 || self.exc
     }
 
     /// The suspend count.
@@ -84,7 +92,7 @@ impl Suspend {
             return None;
         }
         self.count = self.count.saturating_sub(1);
-        if self.count > 0 {
+        if self.active() {
             return Some(Resumed::Still);
         }
         let (clear, wake) = (self.stopped, self.parked);
@@ -96,7 +104,7 @@ impl Suspend {
     /// The thread is about to block in a call while its count is above 0 and SUSPENDED is not up yet (it entered the call after the suspend):
     /// it counts as stopped where it is. Returns whether SUSPENDED rises now.
     pub fn blocks(&mut self) -> bool {
-        if self.count > 0 && !self.stopped {
+        if self.active() && !self.stopped {
             self.stopped = true;
             return true;
         }
@@ -105,13 +113,44 @@ impl Suspend {
 
     /// The thread reached the return to user mode.
     pub fn return_to_user(&mut self) -> AtReturn {
-        if self.count == 0 {
+        if !self.active() {
             return AtReturn::Run;
         }
         let raise = !self.stopped;
         self.stopped = true;
         self.parked = true;
         AtReturn::Park { raise }
+    }
+
+    /// The thread took an exception (EX2): it stays stopped until `release_exception`, whatever `thread_suspend` and `thread_resume` do. Returns
+    /// whether SUSPENDED rises now (a thread blocked in a call is stopped where it is; the faulting thread parks and raises it itself).
+    pub fn stop_for_exception(&mut self, blocked: bool) -> bool {
+        self.exc = true;
+        let raise = blocked && !self.stopped;
+        if raise {
+            self.stopped = true;
+        }
+        raise
+    }
+
+    /// The exception was resolved with RETRY. `None` when there was none; otherwise as `resume`.
+    pub fn release_exception(&mut self) -> Option<Resumed> {
+        if !self.exc {
+            return None;
+        }
+        self.exc = false;
+        if self.active() {
+            return Some(Resumed::Still);
+        }
+        let (clear, wake) = (self.stopped, self.parked);
+        self.stopped = false;
+        self.parked = false;
+        Some(Resumed::Running { clear, wake })
+    }
+
+    /// Has the thread an exception pending?
+    pub fn has_exception(&self) -> bool {
+        self.exc
     }
 
     /// A parked thread was woken and found the count 0 (or was killed): it leaves the return to user mode.

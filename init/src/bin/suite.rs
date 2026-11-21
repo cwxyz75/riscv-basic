@@ -3947,6 +3947,10 @@ fn a_handler_thread_can_make_a_faulting_store_succeed_and_retry() -> Outcome {
         0xe2e2,
         "the value is there"
     );
+    // (this process's own channel goes: a later accidental fault in the suite ends it with a code instead of waiting for a handler nobody runs)
+    for h in [eh, th, ch, t] {
+        sys::handle_close(h);
+    }
     Ok(())
 }
 

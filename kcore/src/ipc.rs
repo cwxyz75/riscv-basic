@@ -93,6 +93,8 @@ pub struct ExceptionObj {
     pub address: u64,
     pub cause: u64,
     pub level: ExcLevel,
+    /// Which exception of its thread this is (a counter the kernel keeps): a decision counts only for the one the thread is stopped for.
+    pub serial: u64,
     /// `exception_resume` has acted on it (or the process ended): closing the handle then does nothing.
     pub resolved: bool,
 }
@@ -1541,6 +1543,7 @@ pub fn exception_of(
                         address: e.address,
                         cause: e.cause,
                         level: e.level,
+                        serial: e.serial,
                         resolved: e.resolved,
                     },
                 ))

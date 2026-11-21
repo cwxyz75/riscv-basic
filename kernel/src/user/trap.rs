@@ -358,6 +358,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::PORT_UNBIND
                     | nr::PORT_REARM
             ) {
+                if n == nr::HANDLE_CLOSE {
+                    // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
+                    irq::without(|| ksys::exception::reap_closed_job_channels(state()));
+                }
                 notify();
             }
             // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed

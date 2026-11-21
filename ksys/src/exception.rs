@@ -75,6 +75,7 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
     let Some(job) = us.procs.get(&pid).map(|p| p.job) else {
         return false;
     };
+    let serial = us.next_exc;
     let UserState {
         objs,
         ktable,
@@ -88,14 +89,19 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
         jobs,
         job: Some(job),
     };
-    // the thread: its object if it has one, else one made now (a thread started by `process_start` has none)
+    // the thread: its object if it has one (the handle takes a reference of its own, so closing it never destroys the spawner's object), else one
+    // made now (a thread started by `process_start` has none, or its object is gone)
     let existing = procs
         .get(&pid)
-        .and_then(|p| p.thread_objs.get(&tid).copied());
+        .and_then(|p| p.thread_objs.get(&tid).copied())
+        .filter(|&obj| objs.retain(obj));
     let (th, tobj) = match existing {
         Some(obj) => match ktable.insert(objs, obj, Rights::THREAD) {
             Ok(h) => (h, obj),
-            Err(_) => return false,
+            Err(_) => {
+                objs.release(obj);
+                return false;
+            }
         },
         None => match ipc::thread_object_create_in(objs, ktable, pid, &mut q) {
             Ok(x) => x,
@@ -111,10 +117,11 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
         address: f.address,
         cause: f.cause,
         level: l,
+        serial,
         resolved: false,
     };
-    let eh = match ipc::exception_object_create_in(objs, ktable, e, &mut q) {
-        Ok((h, _)) => h,
+    let (eh, eobj) = match ipc::exception_object_create_in(objs, ktable, e, &mut q) {
+        Ok(x) => x,
         Err(_) => {
             let _ = ktable.close(objs, th);
             return false;
@@ -132,10 +139,14 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
                     p.thread_objs.insert(tid, tobj);
                 }
             }
+            us.next_exc = serial.saturating_add(1);
+            us.exc_pending.insert(tid, serial);
             true
         }
         Err(_) => {
-            // (the handles are still ours: they and their objects go)
+            // (the handles are still ours: they and their objects go; the exception object is resolved first, so that its death is not taken
+            // for a close by a handler)
+            ipc::exception_set_resolved(objs, eobj);
             let _ = ktable.close(objs, th);
             let _ = ktable.close(objs, eh);
             false
@@ -146,15 +157,20 @@ fn offer(us: &mut UserState, jobs: &mut Jobs, pid: u64, tid: Tid, f: &Fault, l: 
 /// The thread of an exception is stopped (its suspend count goes up and SUSPENDED is raised when it parks): the faulting thread calls this
 /// after `deliver` took the exception.
 pub fn stop_thread(us: &mut UserState, tid: Tid) {
-    let _ = us.suspends.entry(tid).or_default().suspend(false);
+    let _ = us
+        .suspends
+        .entry(tid)
+        .or_default()
+        .stop_for_exception(false);
 }
 
 /// Let the thread of a retried exception go: its suspend count falls; returns whether it is parked and to be woken.
 fn release_thread(us: &mut UserState, pid: u64, tid: Tid) -> bool {
+    us.exc_pending.remove(&tid);
     let Some(s) = us.suspends.get_mut(&tid) else {
         return false;
     };
-    match s.resume() {
+    match s.release_exception() {
         Some(kcore::suspend::Resumed::Running { clear, wake }) => {
             us.suspends.remove(&tid);
             if clear {
@@ -174,6 +190,11 @@ fn release_thread(us: &mut UserState, pid: u64, tid: Tid) -> bool {
 
 fn alive(p: Option<&Process>) -> bool {
     p.is_some_and(|p| p.exit_code.is_none() && p.killed.is_none())
+}
+
+/// Is `e` the exception its thread is stopped for, in a process that lives?
+fn current(us: &UserState, e: &ExceptionObj) -> bool {
+    alive(us.procs.get(&e.pid).map(|p| &**p)) && us.exc_pending.get(&e.tid) == Some(&e.serial)
 }
 
 /// Act on a decision for exception `e` (not yet resolved, its process alive).
@@ -221,7 +242,7 @@ pub fn exception_resume(
     }
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let (obj, e) = ipc::exception_of(&us.objs, &caller.handles, Handle(h), Rights::MANAGE)?;
-    if e.resolved || !alive(us.procs.get(&e.pid).map(|p| &**p)) {
+    if e.resolved || !current(us, &e) {
         return Err(Status::BadState);
     }
     ipc::exception_set_resolved(&mut us.objs, obj);
@@ -234,7 +255,7 @@ pub fn exception_dropped(
     jobs: &mut Jobs,
     e: &ExceptionObj,
 ) -> Option<Resolved> {
-    if e.resolved || !alive(us.procs.get(&e.pid).map(|p| &**p)) {
+    if e.resolved || !current(us, e) {
         return None;
     }
     Some(resolve(us, jobs, e, abi::exception::NEXT))
@@ -278,6 +299,13 @@ pub fn exception_channel(
             return Err(Status::BadState);
         }
     }
+    // (room for the handle is made first, so that the insert below cannot fail and strand the user end)
+    us.procs
+        .get_mut(&me)
+        .ok_or(Status::BadState)?
+        .handles
+        .reserve(1)
+        .map_err(|_| Status::NoMemory)?;
     let UserState {
         objs,
         ktable,
@@ -329,11 +357,6 @@ pub fn is_exception(us: &UserState, obj: ObjId) -> bool {
     matches!(us.objs.get(obj), Some(KObj::Exception(_)))
 }
 
-/// An ended thread's stop state and a stopped process's exceptions: nothing to keep once a thread is gone.
-pub fn forget_thread(us: &mut UserState, tid: Tid) {
-    us.suspends.remove(&tid);
-}
-
 /// The kernel ends of job exception channels whose user end has closed: closed, so the channel and the job it is charged to can go (the kernel
 /// calls this when objects have been destroyed). A process's own channel goes with the process.
 pub fn reap_closed_job_channels(us: &mut UserState) {
@@ -355,13 +378,5 @@ pub fn reap_closed_job_channels(us: &mut UserState) {
         if let Some(h) = job_exc.remove(&j) {
             let _ = ktable.close(objs, h);
         }
-    }
-}
-
-/// A job that is no longer there: its channel's kernel end closes.
-pub fn forget_job(us: &mut UserState, job: JobId) {
-    if let Some(h) = us.job_exc.remove(&job) {
-        let UserState { objs, ktable, .. } = us;
-        let _ = ktable.close(objs, h);
     }
 }

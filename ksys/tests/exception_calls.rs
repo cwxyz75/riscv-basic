@@ -350,3 +350,172 @@ fn a_job_channel_whose_user_end_closed_is_reaped_so_nothing_is_left() {
         "and the kernel's end with it"
     );
 }
+
+#[test]
+fn the_thread_handle_in_a_message_takes_its_own_reference_and_closing_it_leaves_the_spawners() {
+    let mut w = world();
+    let ch =
+        exception::exception_channel(&mut w.us, &mut w.jobs, 1, Target::Process(w.ph)).unwrap();
+    // thread 5 of process 2 has an object and a handle of its own in process 2's table (what `thread_spawn` made)
+    let (own, tobj) = {
+        let p2 = w.us.procs.get_mut(&2).unwrap();
+        let mut q = Quota {
+            jobs: &mut w.jobs,
+            job: Some(JobId::ROOT),
+        };
+        ipc::thread_object_create_in(&mut w.us.objs, &mut p2.handles, 2, &mut q).unwrap()
+    };
+    w.us.procs.get_mut(&2).unwrap().thread_objs.insert(5, tobj);
+    assert!(exception::deliver(
+        &mut w.us,
+        &mut w.jobs,
+        2,
+        5,
+        &FAULT,
+        None
+    ));
+    let (_, h) = w.read(ch);
+    // the handler closes its copy of the thread: the spawner's handle and object are still there
+    w.us.procs
+        .get_mut(&1)
+        .unwrap()
+        .handles
+        .close(&mut w.us.objs, h[0])
+        .unwrap();
+    assert!(
+        ipc::thread_of(&w.us.objs, &w.us.procs[&2].handles, own, Rights::NONE).is_ok(),
+        "the thread's own handle still names a live object"
+    );
+    // a second fault of the thread (after the handler resolved the first) reaches the handler with a live thread handle too
+    exception::stop_thread(&mut w.us, 5);
+    assert!(matches!(
+        exception::exception_resume(&mut w.us, &mut w.jobs, 1, h[1].0, abi::exception::RETRY),
+        Ok(Resolved::Retry { .. })
+    ));
+    assert!(exception::deliver(
+        &mut w.us,
+        &mut w.jobs,
+        2,
+        5,
+        &FAULT,
+        None
+    ));
+    let (_, h2) = w.read(ch);
+    assert!(ipc::thread_of(&w.us.objs, &w.us.procs[&1].handles, h2[0], Rights::MANAGE).is_ok());
+}
+
+#[test]
+fn a_level_whose_queue_is_full_is_skipped_and_the_exception_is_not_delivered_twice() {
+    let mut w = world();
+    let _pch =
+        exception::exception_channel(&mut w.us, &mut w.jobs, 1, Target::Process(w.ph)).unwrap();
+    // fill the process channel (nobody reads it): with no other level, a full queue means "not delivered"
+    let mut tid = 100;
+    while exception::deliver(&mut w.us, &mut w.jobs, 2, tid, &FAULT, None) {
+        tid += 1;
+        assert!(tid < 1000, "the queue never filled");
+    }
+    // a job channel now: the next fault goes there, once
+    let jch = exception::exception_channel(&mut w.us, &mut w.jobs, 1, Target::Job(w.jh)).unwrap();
+    assert!(exception::deliver(
+        &mut w.us,
+        &mut w.jobs,
+        2,
+        7,
+        &FAULT,
+        None
+    ));
+    // the objects the refused offer left dead are resolved: cleaning them up passes nothing on
+    for obj in w.us.objs.drain_dead() {
+        if let ipc::KObj::Exception(e) = obj {
+            assert!(
+                exception::exception_dropped(&mut w.us, &mut w.jobs, &e).is_none(),
+                "a refused offer is not a decision"
+            );
+        }
+    }
+    assert_eq!(
+        w.read_count(jch),
+        1,
+        "the job's channel holds one message for the one fault"
+    );
+}
+
+#[test]
+fn thread_resume_does_not_release_a_thread_stopped_for_an_exception() {
+    let mut w = world();
+    let ch =
+        exception::exception_channel(&mut w.us, &mut w.jobs, 1, Target::Process(w.ph)).unwrap();
+    assert!(exception::deliver(
+        &mut w.us,
+        &mut w.jobs,
+        2,
+        5,
+        &FAULT,
+        None
+    ));
+    exception::stop_thread(&mut w.us, 5);
+    let _ = w.us.suspends.get_mut(&5).unwrap().return_to_user();
+    let (_, h) = w.read(ch);
+    // `thread_resume` from the handler: the thread is not suspended (BAD_STATE) and stays stopped
+    assert_eq!(
+        ksys::thread_resume(&mut w.us, 1, 7, h[0].0),
+        Err(Status::BadState)
+    );
+    assert!(ksys::thread_is_suspended(&w.us, 5));
+    // a `thread_suspend` on top, then RETRY: still stopped until the suspend is resumed
+    ksys::thread_suspend(&mut w.us, 1, 7, h[0].0, |_| false).unwrap();
+    assert_eq!(
+        exception::exception_resume(&mut w.us, &mut w.jobs, 1, h[1].0, abi::exception::RETRY),
+        Ok(Resolved::Retry {
+            tid: 5,
+            wake: false
+        }),
+        "stopped by the suspend still"
+    );
+    assert_eq!(ksys::thread_resume(&mut w.us, 1, 7, h[0].0), Ok((5, true)));
+    // an exception that is not the one the thread is stopped for does nothing: a later fault, then the old (resolved) one's drop
+    assert!(exception::deliver(
+        &mut w.us,
+        &mut w.jobs,
+        2,
+        5,
+        &FAULT,
+        None
+    ));
+    exception::stop_thread(&mut w.us, 5);
+    let (_, e) =
+        ipc::exception_of(&w.us.objs, &w.us.procs[&1].handles, h[1], Rights::MANAGE).unwrap();
+    assert_eq!(
+        exception::exception_dropped(&mut w.us, &mut w.jobs, &e),
+        None,
+        "the old one is resolved"
+    );
+}
+
+impl W {
+    /// How many messages wait on the user end `ch` (read and counted).
+    fn read_count(&mut self, ch: u64) -> usize {
+        let mut n = 0;
+        loop {
+            let p1 = self.us.procs.get_mut(&1).unwrap();
+            match ipc::channel_read_in(
+                &mut self.us.objs,
+                &mut p1.handles,
+                Handle(ch),
+                64,
+                4,
+                &mut self.jobs,
+            ) {
+                Ok(r) => {
+                    n += 1;
+                    for h in r.handles {
+                        let p1 = self.us.procs.get_mut(&1).unwrap();
+                        let _ = p1.handles.close(&mut self.us.objs, h);
+                    }
+                }
+                Err(_) => return n,
+            }
+        }
+    }
+}
