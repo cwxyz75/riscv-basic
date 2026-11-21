@@ -42,7 +42,7 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 v
             };
             let pick = |rng: &mut Rng| handles[rng.below(handles.len() as u64) as usize];
-            match rng.below(12) {
+            match rng.below(14) {
                 0 => {
                     let _ = event_create(&mut reg, &mut tables[ti]);
                 }
@@ -74,6 +74,19 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                         tables[1 - ti]
                             .insert(&mut reg, e.obj, e.rights)
                             .expect("room");
+                    }
+                }
+                10 => {
+                    // a process dies: its table is drained (every handle closed at once)
+                    if rng.below(8) == 0 {
+                        tables[ti].drain(&mut reg);
+                    }
+                }
+                11 => {
+                    // the teardown's whole sweep, in the middle of a sliced one (it finishes that one first)
+                    if rng.below(4) == 0 {
+                        let roots: Vec<_> = tables.iter().flat_map(|t| t.objects()).collect();
+                        reg.sweep(&roots);
                     }
                 }
                 _ => {
@@ -109,4 +122,21 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
             "seed {seed}: every unreachable object is freed"
         );
     }
+}
+
+#[test]
+fn an_object_made_while_a_sweep_runs_is_born_marked() {
+    use kcore::ipc::KObj;
+    let mut reg = Kobjs::new();
+    assert!(reg.sweep_begin(&[]));
+    // made during marking, with no handle at all: only the birth mark keeps it from being freed as unreachable
+    let id = reg.create(KObj::Vmo(0));
+    while let SweepStep::More = reg.sweep_step(1) {}
+    assert!(
+        reg.get(id).is_some(),
+        "an object made during a sweep survives that sweep"
+    );
+    // the next sweep, started after its birth, finds it unreachable
+    assert_eq!(reg.sweep(&[]), 1);
+    assert!(reg.get(id).is_none());
 }

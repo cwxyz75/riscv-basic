@@ -350,11 +350,11 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             s.objs.sweep_step(SWEEP_SLICE_BUDGET);
             slices += 1;
         }
-        // near the cap a creation would be refused while garbage that the sweep is about to free fills the registry: finish it now
-        if s.objs.sweep_active() && s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
-            while s.objs.sweep_active() {
-                s.objs.sweep_step(SWEEP_SLICE_BUDGET);
-            }
+        // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
+        // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
+        if s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
+            let roots = s.roots();
+            s.objs.sweep(&roots);
         }
     }
     let UserState {

@@ -134,7 +134,8 @@ pub enum SweepStep {
     /// The sweep is not finished: call `sweep_step` again (between slices the owner may do anything, including mutate the graph: the
     /// barrier, `Registry::shade`, keeps what is reachable marked).
     More,
-    /// The sweep is finished; this many objects were freed.
+    /// The sweep is finished; this many objects were freed (at least this many: an object that dies through the release cascade of an
+    /// earlier slice's victim is not counted; `sweep`, which frees in one slice, counts exactly).
     Done(usize),
 }
 
