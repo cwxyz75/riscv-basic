@@ -146,11 +146,11 @@ Phase 6a (`epic/phase-6`):
 Phase 6b (`epic/phase-6b`):
 
 - [ ] **L17** (parts b and c) the per-process `AS` lock, page faults and user copies leave the big lock
-- [ ] **L18** the ASID allocator with generations; batched shootdown (the allocator `kcore::asid`, ASIDs from it instead of the pid, the stale-tag refresh and the hart's generation flush, and no flush at a switch to or from a user space; `ran_on` and batched shootdowns are T205)
-- [ ] **PL7** instruction-cache flush on executable mappings (`smp::icache_sync` after a fault that maps code; `process_protect` waits for MM7)
+- [x] **L18** the ASID allocator with generations; batched shootdown (PRs 363 and 364: the allocator `kcore::asid`, ASIDs from it instead of the pid, the stale-tag refresh and the hart's generation flush, and no flush at a switch to or from a user space; `ran_on` and batched shootdowns are T205)
+- [x] **PL7** instruction-cache flush on executable mappings (PR 365: `smp::icache_sync` after a fault that maps code; `process_protect` waits for MM7)
 - [ ] **L14** futex bucket locks
 - [ ] **L19** `PROCS` and `TT`; teardown out of the big lock
-- [ ] **MM10** the sweep in slices (`Registry::sweep_begin`/`sweep_step`/`shade`; `HandleTable::insert` takes the registry and shades; a creating syscall runs up to four slices of 256, and all of it near the object cap; the roots of a sweep are still collected whole at its start, T206)
+- [x] **MM10** the sweep in slices (PR 366: `Registry::sweep_begin`/`sweep_step`/`shade`; `HandleTable::insert` takes the registry and shades; a creating syscall runs up to four slices of 256, and all of it near the object cap; the roots of a sweep are still collected whole at its start, T206)
 - [ ] **L21** the W remainder (exact ready set, wake-one)
 - [ ] **L20** the end of the big kernel lock; the `&'static mut` accessors deleted
 - [ ] **PL8** limits derived from RAM; per-process ceilings as quotas
