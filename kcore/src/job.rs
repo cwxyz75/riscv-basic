@@ -45,6 +45,9 @@ pub enum Resource {
     Objects,
     /// Bytes queued in the channels, sockets and ports created by this job's processes.
     IpcBytes,
+    /// Kernel memory the job causes beyond pages it maps (MM5, KERNEL-V1-SPEC 4.7): stacks, page tables, object bodies, handle tables,
+    /// register state, queued data, in bytes. Its limit is not set separately: it is an eighth of the page limit in bytes.
+    KernelBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +78,23 @@ impl Limits {
             Resource::Jobs => self.jobs,
             Resource::Objects => self.objects,
             Resource::IpcBytes => self.ipc_bytes,
+            // an eighth of the pages the job may hold, in bytes (no limit on pages, no limit here)
+            Resource::KernelBytes => match self.pages {
+                UNLIMITED => UNLIMITED,
+                p => p.saturating_mul(PAGE_BYTES / KERNEL_BYTES_FRACTION),
+            },
         }
     }
+
+    /// The limit that applies to `r`: the stored one, or for `KernelBytes` the one derived from the page limit.
+    pub fn effective(&self, r: Resource) -> u64 {
+        self.get(r)
+    }
 }
+
+/// Bytes in a page, and the fraction of a job's page limit its kernel-memory limit is (one eighth).
+const PAGE_BYTES: u64 = 4096;
+const KERNEL_BYTES_FRACTION: u64 = 8;
 
 /// What a job (and everything below it) uses now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +105,7 @@ pub struct Usage {
     pub jobs: u64,
     pub objects: u64,
     pub ipc_bytes: u64,
+    pub kernel_bytes: u64,
 }
 
 impl Usage {
@@ -99,6 +117,7 @@ impl Usage {
             Resource::Jobs => &mut self.jobs,
             Resource::Objects => &mut self.objects,
             Resource::IpcBytes => &mut self.ipc_bytes,
+            Resource::KernelBytes => &mut self.kernel_bytes,
         }
     }
 
@@ -110,6 +129,7 @@ impl Usage {
             Resource::Jobs => self.jobs,
             Resource::Objects => self.objects,
             Resource::IpcBytes => self.ipc_bytes,
+            Resource::KernelBytes => self.kernel_bytes,
         }
     }
 }

@@ -83,7 +83,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             Ok((None, None))
         })(),
         // `job_info(job, which) -> used, limit` for `which` 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes
-        // (everything in the job and below it), 6 the scheduling limits, 7 the processors. Needs INSPECT.
+        // (everything in the job and below it), 6 the scheduling limits, 7 the processors, 8 kernel bytes. Needs INSPECT.
         nr::JOB_INFO => (|| {
             let job = ipc::job_of(c.objs, c.handles, h, Rights::INSPECT).map_err(e)?;
             let res = match a[1] {
@@ -101,6 +101,8 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 // 7: the processors a job's threads may run on: every hart that is online (there is no affinity yet), the count
                 // in both `a1` and `a2` (UV6: what `/proc/cpuinfo` and `nproc` report)
                 7 => return Ok((Some(c.harts_online), Some(c.harts_online))),
+                // 8: kernel memory in bytes (MM5), its limit an eighth of the page limit
+                8 => Resource::KernelBytes,
                 _ => return fail(Status::InvalidArgs),
             };
             let jobs = &c.jobs;
@@ -113,6 +115,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 Resource::Jobs => limits.jobs,
                 Resource::Objects => limits.objects,
                 Resource::IpcBytes => limits.ipc_bytes,
+                Resource::KernelBytes => limits.effective(Resource::KernelBytes),
             };
             Ok((Some(used), Some(limit)))
         })(),
