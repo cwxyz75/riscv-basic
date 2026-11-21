@@ -169,13 +169,16 @@ impl Vmos {
         s.vmo.as_mut()
     }
 
-    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; the generation wraps (a slot used 2^32 times)
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the index came from `slot_index`; a slot whose generation is exhausted is retired
     fn take(&mut self, id: u64) -> Option<Vmo> {
         let i = self.slot_index(id)?;
         let slot = &mut self.slots[i];
         let v = slot.vmo.take();
-        slot.gen = slot.gen.wrapping_add(1);
-        self.free.push(i as u32);
+        // (CNT1: a slot whose 32-bit generation is exhausted is retired, not wrapped: its ids stay invalid for ever)
+        if slot.gen < u32::MAX {
+            slot.gen += 1;
+            self.free.push(i as u32);
+        }
         self.live -= 1;
         v
     }

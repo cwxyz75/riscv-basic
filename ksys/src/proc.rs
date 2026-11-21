@@ -34,9 +34,9 @@ pub trait Machine {
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
 pub struct PCtx<'a, M: PhysMem, X: Machine> {
     pub objs: &'a mut Kobjs,
-    pub procs: &'a mut BTreeMap<u32, Box<Process>>,
+    pub procs: &'a mut BTreeMap<u64, Box<Process>>,
     /// The calling process.
-    pub me: u32,
+    pub me: u64,
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
     pub machine: &'a mut X,
@@ -119,7 +119,7 @@ fn resolve_map_args(
     ph: Handle,
     vh: Handle,
     flags: u64,
-) -> Result<(u32, u64), Status> {
+) -> Result<(u64, u64), Status> {
     let pe = caller.handles.get(ph)?;
     let ve = caller.handles.get(vh)?;
     let tpid = match objs.get(pe.obj) {

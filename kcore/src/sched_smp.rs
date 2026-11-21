@@ -19,7 +19,7 @@
 
 use crate::sched::{State, Tid, PRIO_MAX};
 use crate::sched2::{Class, Enq, Error, HartRq, Home, Prio, SchedAttr, ThreadSched, Time};
-use crate::sync::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -154,7 +154,7 @@ impl<N: Class, R: Rqs<N>> Drop for Hq<'_, N, R> {
 /// form the model tests drive.
 pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     rqs: R,
-    next_tid: AtomicU32,
+    next_tid: AtomicU64,
     /// `resched_pending[h]`: set by whoever owes hart `h` one poke (compare-and-swap clear to set).
     pending: Vec<AtomicBool>,
     /// Harts that are part of the scheduler: only they are chosen to run or hold threads (a hart that has not joined
@@ -165,7 +165,7 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// whose context the kernel has not finished saving. It is not available to any other hart (no pull, no balance, no
     /// push) until `switched(h)`: the spec's "the switch completes under the lock" (3.7), for kernels whose lock is not held
     /// across the switch.
-    transit: Vec<AtomicU32>,
+    transit: Vec<AtomicU64>,
     /// Deferred mode (SCHED-SMP-SPEC X7: a wake never switches): a wake, a spawn or a priority change that would make the caller's own
     /// hart look at its queues marks it (`pending`) instead of settling at once, so `current_on` stays the thread that is running
     /// until the hart's next defined point calls `reschedule_on`. The kernel sets it; the pure models run both ways.
@@ -200,11 +200,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         assert!((1..=MAX_HARTS).contains(&harts), "1 to 64 harts");
         let s = Sched2 {
             rqs,
-            next_tid: AtomicU32::new(1),
+            next_tid: AtomicU64::new(1),
             pending: (0..harts).map(|_| AtomicBool::new(false)).collect(),
             online: (0..harts).map(|_| AtomicBool::new(true)).collect(),
             hint: (0..harts).map(|_| Hint::new()).collect(),
-            transit: (0..harts).map(|_| AtomicU32::new(0)).collect(),
+            transit: (0..harts).map(|_| AtomicU64::new(0)).collect(),
             deferred: AtomicBool::new(false),
             clock: None,
             pokes: AtomicU64::new(0),
@@ -214,7 +214,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             _n: core::marker::PhantomData,
         };
         for h in 0..harts {
-            let tid = s.alloc_tid();
+            let tid = s.alloc_tid().expect("a counter that starts at 1");
             let home = {
                 let mut q = s.lq(h);
                 q.adopt_idle_as(tid, h as u8);
@@ -225,8 +225,35 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         s
     }
 
-    fn alloc_tid(&self) -> Tid {
-        self.next_tid.fetch_add(1, Ordering::Relaxed)
+    /// The next thread id (a counter from 1 that never wraps: at its limit the creation is refused).
+    fn alloc_tid(&self) -> Result<Tid, Error> {
+        let mut cur = self.next_tid.load(Ordering::Relaxed);
+        loop {
+            let next = cur.checked_add(1).ok_or(Error::Exhausted)?;
+            match self.next_tid.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(cur),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Is there room for at least `margin` more thread ids? A caller that cannot undo a spawn after the fact asks this first (CNT1: user
+    /// thread creation is refused, never a panic, when the ids run out); the margin covers the creations racing between the check and the spawn.
+    pub fn tid_headroom(&self, margin: u64) -> bool {
+        self.next_tid
+            .load(Ordering::Relaxed)
+            .checked_add(margin)
+            .is_some()
+    }
+
+    /// For test builds (`ff=tid:<n>`): the next thread gets id `n`, so a counter boundary is crossed in a few creations.
+    pub fn fast_forward_tid(&self, n: Tid) {
+        self.next_tid.store(n.max(1), Ordering::Relaxed);
     }
 
     /// Take hart `x`'s run-queue lock (it publishes the hart's hints when released after a change).
@@ -720,7 +747,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         attr: SchedAttr,
         affinity: Option<usize>,
     ) -> Result<Tid, Error> {
-        let tid = self.alloc_tid();
+        let tid = self.alloc_tid()?;
         let home = {
             let mut q = self.lq(hart);
             q.adopt_current_as(tid, attr, affinity.map(|a| a as u8), hart as u8)?;
@@ -744,7 +771,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if affinity.is_some_and(|a| a >= self.harts()) {
             return Err(Error::NoSuchThread);
         }
-        let tid = self.alloc_tid();
+        let tid = self.alloc_tid()?;
         let probe = ThreadSched {
             home: Arc::new(Home::new(0)),
             tid,

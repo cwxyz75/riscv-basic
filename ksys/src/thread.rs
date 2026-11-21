@@ -56,7 +56,7 @@ pub fn clamp_prio(jobs: &Jobs, job: JobId, want: u8) -> u8 {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread start
 pub fn new_start(
     us: &mut UserState,
-    pid: u32,
+    pid: u64,
     entry: u64,
     sp: u64,
     arg: u64,
@@ -87,7 +87,7 @@ pub fn new_start(
 pub fn thread_create(
     us: &mut UserState,
     jobs: &mut Jobs,
-    me: u32,
+    me: u64,
     creator_prio: u8,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
@@ -157,7 +157,7 @@ pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     creator_prio: u8,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
@@ -276,7 +276,7 @@ pub fn thread_spawn<M: PhysMem>(
         let tables = stack_len / 4096 / 512 + 4;
         let undo =
             |made: Option<(Handle, ObjId)>,
-             procs: &mut alloc::collections::BTreeMap<u32, alloc::boxed::Box<crate::Process>>,
+             procs: &mut alloc::collections::BTreeMap<u64, alloc::boxed::Box<crate::Process>>,
              objs: &mut kcore::ipc::Kobjs,
              jobs: &mut Jobs| {
                 if let Some((h, _)) = made {
@@ -342,7 +342,7 @@ pub fn thread_spawn<M: PhysMem>(
 pub fn process_start(
     us: &mut UserState,
     jobs: &mut Jobs,
-    me: u32,
+    me: u64,
     a: [u64; 6],
 ) -> Result<(usize, u8), Status> {
     let (ph, bh) = (Handle(a[0]), Handle(a[3]));
@@ -391,6 +391,7 @@ pub fn process_start(
         return Err(e);
     }
     // Commit: the channel end moves into the new process as its handle 1.
+    let first_gen = us.first_handle_gen;
     let UserState { procs, objs, .. } = us;
     let caller = procs.get_mut(&me).expect("caller exists");
     let moved = match caller.handles.remove_for_transfer(objs, bh) {
@@ -410,6 +411,8 @@ pub fn process_start(
         abi::BOOTSTRAP_HANDLE,
         "the bootstrap channel must be handle 1"
     );
+    // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
+    target.handles.set_first_generation(first_gen);
     target.entry = entry;
     target.arg = arg;
     target.start_sp = sp;

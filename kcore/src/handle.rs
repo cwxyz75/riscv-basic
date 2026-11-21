@@ -65,8 +65,13 @@ impl HandleTable {
     /// few reuses of a slot instead of 2^40.
     pub fn starting_at_generation(limit: usize, gen: u64) -> HandleTable {
         let mut t = HandleTable::new(limit);
-        t.first_gen = gen.min(GENERATIONS);
+        t.first_gen = gen.min(GENERATIONS - 1);
         t
+    }
+
+    /// For tests: slots made from now on start at generation `gen` (the boot loader makes the bootstrap handle, value 1, first, then calls this).
+    pub fn set_first_generation(&mut self, gen: u64) {
+        self.first_gen = gen.min(GENERATIONS - 1);
     }
 
     /// For tests: lower the most slots the table may have (so a full table of retired slots is cheap to build).

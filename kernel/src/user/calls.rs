@@ -67,7 +67,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
     })
 }
 
-pub(super) fn caller_pid(s: &UserState) -> Result<u32, Status> {
+pub(super) fn caller_pid(s: &UserState) -> Result<u64, Status> {
     s.thread_pid
         .get(&thread::current())
         .copied()
@@ -95,6 +95,9 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
 }
 
 pub(super) fn process_start(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -109,7 +112,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
 pub(super) fn process_kill(a: [u64; 6]) -> Reply {
     let ph = Handle(a[0]);
     let code = a[1] as i32;
-    let (tpid, me) = irq::without(|| -> Result<(u32, u32), ReplyErr> {
+    let (tpid, me) = irq::without(|| -> Result<(u64, u64), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let tpid = ksys::kill_target(&s.objs, &s.procs, me, ph).map_err(|e| (e, None, None))?;
@@ -127,7 +130,7 @@ pub(super) fn process_kill(a: [u64; 6]) -> Reply {
 /// (BAD_STATE). A process may stop itself: its calling thread parks as it returns.
 pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
     let ph = Handle(a[0]);
-    let tpid = irq::without(|| -> Result<u32, ReplyErr> {
+    let tpid = irq::without(|| -> Result<u64, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let tpid = ksys::stop_target(&mut s.objs, &mut s.procs, me, ph, stop)
@@ -147,6 +150,9 @@ pub(super) fn process_stop(a: [u64; 6], stop: bool) -> Reply {
 }
 
 pub(super) fn thread_create(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -161,6 +167,9 @@ pub(super) fn thread_create(a: [u64; 6]) -> Reply {
 
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread (`ksys::thread_spawn`), then spawn it.
 pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
+    if !thread::user_thread_ids_left() {
+        return bad(Status::NoMemory);
+    }
     let spawn = irq::without(|| -> Result<ksys::Spawn, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
@@ -170,7 +179,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
-    Ok((Some(spawn.handle), Some(u64::from(tid))))
+    Ok((Some(spawn.handle), Some(tid)))
 }
 
 /// `thread_interrupt(thread)` (T56, SCHED-SMP-SPEC task 26): set the thread's interrupt flag and wake it. The next blocking
@@ -206,10 +215,10 @@ pub(super) fn creator_prio(s: &UserState) -> u8 {
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to.
 pub(super) fn thread_target(
     s: &UserState,
-    me: u32,
+    me: u64,
     h: u64,
     need: Rights,
-) -> Result<(Tid, u32), ReplyErr> {
+) -> Result<(Tid, u64), ReplyErr> {
     ksys::thread_target(&s.objs, &s.procs, me, thread::current(), h, need)
         .map_err(|e| (e, None, None))
 }
@@ -245,7 +254,7 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
         let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
         let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
         let flags = u64::from(s.sched_flags.get(&tid).copied().unwrap_or(0));
-        Ok((Some(prio | flags << 8 | prio << 16), Some(u64::from(tid))))
+        Ok((Some(prio | flags << 8 | prio << 16), Some(tid)))
     })
 }
 
@@ -279,7 +288,7 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
 /// caller inside the job ends too, last.
 pub(super) fn job_kill(a: [u64; 6]) -> Reply {
     let code = a[1] as i32;
-    let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u32>, bool, u32), ReplyErr> {
+    let (victims, me_inside, me) = irq::without(|| -> Result<(Vec<u64>, bool, u64), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (victims, me_inside) = ksys::job_kill_victims(

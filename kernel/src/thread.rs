@@ -178,6 +178,9 @@ pub fn init(boot_prio: Prio) {
             Some(0),
         )
         .expect("boot thread");
+    if let Some(n) = crate::dtb::ff_value("tid") {
+        sched.fast_forward_tid(n); // (AB3, test builds)
+    }
     let idle0 = sched.idle(0);
     let mut threads = BTreeMap::new();
     threads.insert(
@@ -346,6 +349,12 @@ pub static DEFAULT_AFFINITY: core::sync::atomic::AtomicUsize =
 fn default_affinity() -> Option<usize> {
     let a = DEFAULT_AFFINITY.load(Ordering::Relaxed);
     (a != usize::MAX).then_some(a)
+}
+
+/// Is there room to create a user thread (CNT1)? Checked before the creation commits anything; the margin is far above the number of
+/// creations that can be in flight between the check and the spawn (one per hart).
+pub fn user_thread_ids_left() -> bool {
+    sched().tid_headroom(4096)
 }
 
 /// Like `spawn_detached`, free to run on any hart.
@@ -631,10 +640,13 @@ pub fn reschedule_fast() -> bool {
     clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::indexing_slicing
-)] // INVARIANT: h is a hart index below MAX_HARTS; the panic is the detector's report
+)]
+// INVARIANT: h is a hart index below MAX_HARTS; the panic is the detector's report
+// KT13: audited, a frame over 1 KiB on a path that ends in a panic (the report holds a thread record)
+#[allow(clippy::large_stack_frames)]
 fn starvation_watchdog(h: usize, now: u64) {
-    static LAST: [core::sync::atomic::AtomicU32; crate::percpu::MAX_HARTS] =
-        [const { core::sync::atomic::AtomicU32::new(0) }; crate::percpu::MAX_HARTS];
+    static LAST: [core::sync::atomic::AtomicU64; crate::percpu::MAX_HARTS] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_HARTS];
     static REPEATS: [core::sync::atomic::AtomicU32; crate::percpu::MAX_HARTS] =
         [const { core::sync::atomic::AtomicU32::new(0) }; crate::percpu::MAX_HARTS];
     if now.saturating_sub(WD_AT[h % crate::percpu::MAX_HARTS].load(Ordering::Relaxed))
@@ -1238,9 +1250,11 @@ pub const STACK_BUDGET: usize = 8 * 1024;
 #[cfg(kernel_optimized)]
 pub const STACK_BUDGET: usize = 12 * 1024;
 
-/// The first thread seen over the budget: `(use << 32) | tid`, or 0 while none is. (One word, so the check at a thread's exit is
-/// lock-free.)
+/// The first thread seen over the budget: its stack use, or 0 while none is (the thread's id is in `OVER_BUDGET_TID`; atomics only, so the
+/// check at a thread's exit is lock-free).
 static OVER_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// That thread's id (a u64 since AB3; written with the name, before `OVER_BUDGET`).
+static OVER_BUDGET_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The first 16 bytes of that thread's name, as two words (written before `OVER_BUDGET`, read after it).
 static OVER_BUDGET_NAME: [core::sync::atomic::AtomicU64; 2] = [
     core::sync::atomic::AtomicU64::new(0),
@@ -1276,7 +1290,10 @@ pub fn current_stack_use() -> usize {
 
 /// Exempt the calling thread from the budget check when it ends (the test that recurses on purpose).
 pub fn exempt_from_stack_budget() {
-    EXEMPT.store(current() as u64 + 1, core::sync::atomic::Ordering::SeqCst);
+    EXEMPT.store(
+        current().saturating_add(1),
+        core::sync::atomic::Ordering::SeqCst,
+    );
 }
 static EXEMPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -1285,7 +1302,8 @@ fn note_stack_use(tid: Tid, t: &KThread) {
     if let Some(stack) = t.stack.as_ref() {
         let used = stack_used(stack);
         STACK_HIGH_WATER.fetch_max(used, core::sync::atomic::Ordering::Relaxed);
-        if over_budget(used) && EXEMPT.load(core::sync::atomic::Ordering::SeqCst) != tid as u64 + 1
+        if over_budget(used)
+            && EXEMPT.load(core::sync::atomic::Ordering::SeqCst) != tid.saturating_add(1)
         {
             let mut words = [0u64; 2];
             for (i, b) in t.name.bytes().take(16).enumerate() {
@@ -1296,9 +1314,13 @@ fn note_stack_use(tid: Tid, t: &KThread) {
             for (slot, w) in OVER_BUDGET_NAME.iter().zip(words) {
                 slot.store(w, core::sync::atomic::Ordering::SeqCst);
             }
+            if OVER_BUDGET.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                OVER_BUDGET_TID.store(tid, core::sync::atomic::Ordering::SeqCst);
+                // (a later offender does not overwrite the first's id)
+            }
             let _ = OVER_BUDGET.compare_exchange(
                 0,
-                ((used as u64) << 32) | u64::from(tid),
+                used as u64,
                 core::sync::atomic::Ordering::SeqCst,
                 core::sync::atomic::Ordering::SeqCst,
             );
@@ -1325,8 +1347,8 @@ pub fn stack_budget_violation() -> Option<(alloc::string::String, Tid, usize)> {
         .collect();
     Some((
         alloc::string::String::from_utf8_lossy(&bytes).into_owned(),
-        (v & 0xffff_ffff) as Tid,
-        (v >> 32) as usize,
+        OVER_BUDGET_TID.load(core::sync::atomic::Ordering::SeqCst),
+        v as usize,
     ))
 }
 

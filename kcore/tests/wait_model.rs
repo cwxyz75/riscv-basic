@@ -36,7 +36,7 @@ fn run(seed: u64) {
     let mut reg = Kobjs::new();
     let mut tables = [HandleTable::new(64), HandleTable::new(64)];
     let mut waits = WaitTable::new();
-    let mut masks: BTreeMap<u32, (ObjId, u32)> = BTreeMap::new(); // what each registered thread waits for
+    let mut masks: BTreeMap<u64, (ObjId, u32)> = BTreeMap::new(); // what each registered thread waits for
     for step in 0..STEPS {
         let ti = rng.below(2) as usize;
         let mut what = String::new();
@@ -157,7 +157,7 @@ fn run(seed: u64) {
         }
         waits.audit(|id| reg.is_alive(id)).unwrap();
         // some threads start waiting (only when their predicate is false, as the kernel does)
-        for t in 1..=6u32 {
+        for t in 1..=6u64 {
             if !masks.contains_key(&t) && rng.chance(30) {
                 let ids = reg.live_ids();
                 if ids.is_empty() {

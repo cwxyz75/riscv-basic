@@ -9,7 +9,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 /// A futex: a process and an address in its address space.
-pub type Key = (u32, u64);
+pub type Key = (u64, u64);
 /// A sleeper (a kernel thread id).
 pub type Waiter = u64;
 
@@ -65,7 +65,7 @@ impl Futexes {
     }
 
     /// Everyone sleeping in process `pid` leaves (the process is gone); returns them.
-    pub fn forget_process(&mut self, pid: u32) -> Vec<Waiter> {
+    pub fn forget_process(&mut self, pid: u64) -> Vec<Waiter> {
         let gone: Vec<Waiter> = self
             .sleeping_on
             .iter()

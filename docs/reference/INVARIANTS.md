@@ -188,7 +188,7 @@ Each becomes a row above, with its check, in the change that builds its mechanis
 
 | # | Invariant | Where specified |
 |---|---|---|
-| CNT1 | No kernel counter wraps: a counter retires what it counts or refuses with NO_MEMORY at its limit | KERNEL-V1-SPEC 3.3 |
+| CNT1 | No kernel counter wraps: a counter retires what it counts or refuses at its limit (thread ids `Error::Exhausted`, process ids NO_MEMORY, object and handle slots are retired at their last generation; koids, FP/vector tokens and the entropy and scheduler tick counters are u64 and saturate or are unreachable). Ticket-lock counters wrap by design (modular compare, bounded distance) | `kcore/tests/counters_cnt1.rs`, `handle_model`, `create_calls` (the pid limit), and the kernel-only boot with every counter started 16 below 2^32 (`ff=` boot arguments, test builds only; `os-ktest-small`) |
 | ABI1 | A program enters the kernel only through the system library; an `ecall` from anywhere else is an exception | 3.1 |
 | COW1 | A write through one member of a VMO family is never visible through another member entitled to the old contents | 4.3 |
 | COW2 | Every page of a family is charged to exactly one job; a charge moves only with its page and within one job | 4.3 |
