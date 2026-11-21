@@ -163,8 +163,8 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 7: the memory model programs need
 
-- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit` (in part, PR 369: `vmo_create` flags (RESIZABLE), `vmo_decommit`, `vmo_set_size`; a decommit or shrink is refused (BAD_STATE) over a range a process of another job maps: V4; left, T207: byte sizes, the caps (they need chunked unmap: phase 6c), the per-VMO mapping lists, the 2 GiB acceptance, the decommit-versus-touch negative control)
-- [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info` (in part, PR 370: the four calls, split and merge, `max_perms`, the JIT flip runs on the target; left, T208: the C library's mmap, the protect-versus-sibling negative control, per-job region counts)
+- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit` (PR 369 and the epic's follow-up: `vmo_create` by bytes with RESIZABLE, `vmo_decommit`, `vmo_set_size`, V4, the sibling-thread decommit test with its negative control `fault-decommit-no-shootdown`, the walk that skips absent tables; left, T207, each waiting for phase 6c or MM9 or a decision: the caps, the per-VMO mapping lists, the 2 GiB acceptance, the allocator returning memory)
+- [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info` (PR 370 and the epic's follow-up: the four calls, split and merge, `max_perms`, the ANYWHERE flag with eight random tries, the JIT flip, the C library's `mmap`/`munmap`/`mprotect` over them, the sibling-thread protect test with its negative control `fault-protect-no-shootdown`; left, T208: the per-job region count (PL8) and small deviations)
 - [x] **MM8** copy-on-write children, `process_clone_region` (PR 372: SNAPSHOT and PRIVATE children, hidden-node merge, `process_clone_region`, family-wide coherence of translations, decommit and resize of members; the model test, a shuttle test and the QEMU test with its negative control; `work.py done` waits for the epic's smoke)
 
 ### Phase 8: threads, exceptions, pagers

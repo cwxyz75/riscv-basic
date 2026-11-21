@@ -39,6 +39,11 @@ pub trait Machine {
     fn skip_cow_protect(&self) -> bool {
         false
     }
+    /// Negative control: leave out the shootdown that call number `call` (`VMO_DECOMMIT` or `PROCESS_PROTECT`) owes the other harts before a
+    /// frame is freed or a permission is taken away. Never true in a real kernel.
+    fn skip_shootdown(&self, _call: usize) -> bool {
+        false
+    }
 }
 
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
@@ -143,16 +148,23 @@ fn in_user_range(vaddr: u64, length: u64) -> bool {
             .is_some_and(|end| end <= abi::user::TOP)
 }
 
-/// Where an ANYWHERE mapping of `bytes` goes (MM7): the mapping arena `[0x1_0000_0000, the stack arena)`, at a place chosen uniformly among
-/// the page-aligned starts, taking the first gap that fits from there and wrapping to the start of the arena; `None` when nothing fits.
+/// Where an ANYWHERE mapping of `bytes` goes (MM7): the mapping arena `[MAP_ARENA_BASE, the stack arena)`, at a random page-aligned place: eight
+/// random positions are tried, then the first gap that fits from a random start, wrapping once; `None` when nothing fits.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the arena bounds are constants below the canonical limit; the chosen start is below `span`
 fn place_anywhere<X: Machine>(machine: &mut X, aspace: &AddressSpace, bytes: u64) -> Option<u64> {
-    const LO: u64 = 0x1_0000_0000;
+    const LO: u64 = abi::user::MAP_ARENA_BASE;
     let hi = abi::user::STACK_ARENA_BASE;
     if bytes > hi - LO {
         return None;
     }
     let slots = (hi - LO - bytes) / 4096 + 1;
+    // eight random positions first; then the first gap that fits from a random start, wrapping once
+    for _ in 0..8 {
+        let at = LO + machine.random_below(slots) * 4096;
+        if !aspace.has_region_in(at, at + bytes) {
+            return Some(at);
+        }
+    }
     let from = LO + machine.random_below(slots) * 4096;
     aspace
         .find_gap(LO, hi, bytes, from)
@@ -266,9 +278,14 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 return bad(Status::BadState);
             }
             let aligned = |x: u64| x.is_multiple_of(4096);
-            // ANYWHERE (MM7): `vaddr` 0 asks the kernel to choose a free place, at random among those that fit in the mapping arena. Every
-            // other argument is checked first (with the arena's start standing in for the address), so a refused call costs no entropy.
-            let anywhere = vaddr == 0;
+            // ANYWHERE (MM7): the flag asks the kernel to choose a free place (`vaddr` must be 0), at random among those that fit in the
+            // mapping arena. Every other argument is checked first (with the arena's start standing in for the address), so a refused
+            // call costs no entropy.
+            let anywhere = flags & abi::map_flags::ANYWHERE != 0;
+            let flags = flags & !abi::map_flags::ANYWHERE;
+            if anywhere && vaddr != 0 {
+                return bad(Status::InvalidArgs);
+            }
             let probe = if anywhere { abi::user::BASE } else { vaddr };
             let in_user = probe >= abi::user::BASE
                 && probe
@@ -412,7 +429,9 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 // other harts may still cache the translations of what was just unmapped: before any frame is freed. (When nothing was
                 // mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.)
                 if cleared > 0 {
-                    machine.shootdown();
+                    if !machine.skip_shootdown(n) {
+                        machine.shootdown();
+                    }
                     machine.flush_tlb();
                 }
             }
@@ -704,7 +723,9 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 })?;
             // a permission taken away may still be cached by every hart; code made visible must reach every instruction fetch
             if stats.downgraded {
-                machine.shootdown();
+                if !machine.skip_shootdown(n) {
+                    machine.shootdown();
+                }
                 machine.flush_tlb();
             }
             if stats.exec_pages > 0 {

@@ -470,43 +470,145 @@ pub unsafe extern "C" fn fseeko(f: *mut c_void, off: i64, whence: c_int) -> c_in
     fseek(f, off, whence)
 }
 
-/// Anonymous private memory only (`MAP_ANONYMOUS | MAP_PRIVATE`, as programs use for big page-aligned buffers): zeroed memory from the
-/// heap, page aligned, remembered so that `munmap` of exactly that region gives it back. A file mapping, `MAP_FIXED` or `MAP_SHARED`
-/// gets `MAP_FAILED` and `ENOSYS`. (No `mprotect`, no partial unmap.)
-static ANON_MAPS: rt::sync::Mutex<alloc::vec::Vec<(usize, usize)>> =
-    rt::sync::Mutex::new(alloc::vec::Vec::new());
+/// `mmap`, `munmap` and `mprotect` for anonymous memory (MM7), over `process_map` (ANYWHERE or the address of `MAP_FIXED`),
+/// `process_unmap` and `process_protect`: real mappings of a fresh VMO, zeroed, page aligned, unmapped or re-protected in whole pages
+/// or in part. `MAP_PRIVATE` and `MAP_SHARED` anonymous memory are the same thing here (one process); a file mapping gets `MAP_FAILED`
+/// and `ENOSYS` (S11-MMAP). `PROT_NONE` is not available (the kernel's mappings always read; guard pages: ENOSYS), nor is writable
+/// with executable (`EINVAL`: M2). Memory is committed lazily, as on Linux (a touch can fail when the job's page limit is reached, which
+/// ends the program: use the heap for memory that must not), and a partial `munmap` frees the pages only when the whole mapping has gone
+/// (the VMO is not kept). A mapping is at most `MAX_VMO_PAGES` pages (64 MiB) until the caps go (PL8): larger is `ENOMEM`. `MAP_FIXED`
+/// unmaps what is in the range before it maps, so a mapping that then fails for want of memory has lost the range (POSIX allows that for
+/// errors other than `EINVAL`); every argument error is found before anything is unmapped.
 const PAGE: usize = 4096;
+
+/// The process's own handle, fetched once (every `process_self` call makes a new handle).
+fn my_process() -> Option<u64> {
+    static ME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let known = ME.load(core::sync::atomic::Ordering::Acquire);
+    if known != 0 {
+        return Some(known);
+    }
+    let r = rt::sys::process_self();
+    if r.status != 0 {
+        return None;
+    }
+    // (two threads that race each keep a handle; the loser's is closed)
+    match ME.compare_exchange(
+        0,
+        r.a1 as u64,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Some(r.a1 as u64),
+        Err(winner) => {
+            rt::sys::handle_close(r.a1 as u64);
+            Some(winner)
+        }
+    }
+}
+
+/// The `process_map` flags of a POSIX `prot`: `None` when it asks for something the kernel does not do.
+fn map_flags(prot: c_int) -> Option<u64> {
+    if prot & !7 != 0 || prot == 0 {
+        return None;
+    }
+    Some(1 | u64::from(prot & 2 != 0) << 1 | u64::from(prot & 4 != 0) << 2)
+}
+
+/// The errno of a failed memory call.
+fn mem_errno(status: i32) -> c_int {
+    use rt::abi::status::Status;
+    match Status::from_code(status) {
+        Some(Status::NoMemory) | Some(Status::TooBig) => 12,
+        Some(Status::AccessDenied) => 13,
+        Some(Status::InvalidArgs) => 22,
+        _ => 12,
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn mmap(
     addr: *mut c_void,
     len: usize,
-    _prot: c_int,
+    prot: c_int,
     flags: c_int,
     _fd: c_int,
     _off: i64,
 ) -> *mut c_void {
     let failed = usize::MAX as *mut c_void;
-    if flags & 0x20 == 0 || flags & 0x2 == 0 || flags & 0x10 != 0 || !addr.is_null() || len == 0 {
+    // (anonymous, and exactly one of private and shared)
+    if flags & 0x3 == 0x3 || flags & 0x3 == 0 {
+        crate::errno::set(22);
+        return failed;
+    }
+    if flags & 0x20 == 0 {
         crate::errno::set(38);
+        return failed;
+    }
+    if len == 0 {
+        crate::errno::set(22);
+        return failed;
+    }
+    let Some(pf) = map_flags(prot) else {
+        crate::errno::set(if prot == 0 { 38 } else { 22 });
+        return failed;
+    };
+    if pf & 6 == 6 {
+        crate::errno::set(22); // (writable and executable: M2; found before anything is unmapped)
         return failed;
     }
     let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
         crate::errno::set(12);
         return failed;
     };
-    let Ok(layout) = alloc::alloc::Layout::from_size_align(size, PAGE) else {
+    let fixed = flags & 0x10 != 0;
+    if fixed && !(addr as usize).is_multiple_of(PAGE) {
+        crate::errno::set(22);
+        return failed;
+    }
+    let Some(me) = my_process() else {
         crate::errno::set(12);
         return failed;
     };
-    // SAFETY: a non-zero-size layout.
-    let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    if p.is_null() {
+    let v = rt::sys::vmo_create_bytes(size as u64, 0, 0);
+    if v.status != 0 {
+        // (including a size over the cap: what callers expect is ENOMEM)
         crate::errno::set(12);
         return failed;
     }
-    ANON_MAPS.lock().push((p as usize, size));
-    p as *mut c_void
+    let vmo = v.a1 as u64;
+    if fixed {
+        // (a fixed mapping replaces what is there)
+        let r = rt::sys::process_unmap_range(me, addr as u64, size as u64);
+        if r.status != 0 {
+            rt::sys::handle_close(vmo);
+            crate::errno::set(mem_errno(r.status));
+            return failed;
+        }
+    }
+    let r = rt::sys::process_map(
+        me,
+        vmo,
+        if fixed { addr as u64 } else { 0 },
+        0,
+        size as u64,
+        if fixed {
+            pf
+        } else {
+            pf | rt::abi::map_flags::ANYWHERE
+        },
+    );
+    // (the mapping holds the VMO: the handle is not needed)
+    rt::sys::handle_close(vmo);
+    if r.status != 0 {
+        crate::errno::set(mem_errno(r.status));
+        return failed;
+    }
+    if fixed {
+        addr
+    } else {
+        r.a1 as usize as *mut c_void
+    }
 }
 
 #[no_mangle]
@@ -515,27 +617,55 @@ pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
         crate::errno::set(22);
         return -1;
     };
-    let mut maps = ANON_MAPS.lock();
-    match maps
-        .iter()
-        .position(|&(a, n)| a == addr as usize && n == size)
-    {
-        Some(i) => {
-            maps.swap_remove(i);
-            // SAFETY: the block came from `alloc_zeroed` with this layout in `mmap` and was recorded exactly once.
-            unsafe {
-                alloc::alloc::dealloc(
-                    addr as *mut u8,
-                    alloc::alloc::Layout::from_size_align_unchecked(size, PAGE),
-                )
-            };
-            0
-        }
-        None => {
-            crate::errno::set(22);
-            -1
-        }
+    if len == 0 || !(addr as usize).is_multiple_of(PAGE) {
+        crate::errno::set(22);
+        return -1;
     }
+    let Some(me) = my_process() else {
+        crate::errno::set(12);
+        return -1;
+    };
+    let r = rt::sys::process_unmap_range(me, addr as u64, size as u64);
+    if r.status != 0 {
+        crate::errno::set(mem_errno(r.status));
+        return -1;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int {
+    let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
+        crate::errno::set(22);
+        return -1;
+    };
+    if len == 0 || !(addr as usize).is_multiple_of(PAGE) {
+        crate::errno::set(22);
+        return -1;
+    }
+    let Some(pf) = map_flags(prot) else {
+        crate::errno::set(if prot == 0 { 38 } else { 22 });
+        return -1;
+    };
+    if pf & 6 == 6 {
+        crate::errno::set(22); // (writable and executable: M2)
+        return -1;
+    }
+    let Some(me) = my_process() else {
+        crate::errno::set(12);
+        return -1;
+    };
+    let r = rt::sys::process_protect(me, addr as u64, size as u64, pf);
+    if r.status != 0 {
+        // (the range is not all mapped: POSIX says ENOMEM; the other refusals are the kernel's own codes)
+        crate::errno::set(if r.status == -4 {
+            12
+        } else {
+            mem_errno(r.status)
+        });
+        return -1;
+    }
+    0
 }
 /// No call that sets file times (the file protocol has none yet: work item T134).
 #[no_mangle]

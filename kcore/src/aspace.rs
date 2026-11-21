@@ -2046,16 +2046,21 @@ impl<F: PageTableFormat> AddressSpace<F> {
             // the region maps the VMO's pages `r.vmo_page .. r.vmo_page + r.pages`
             let lo = first.max(r.vmo_page);
             let hi = end.min(r.vmo_page + r.pages);
-            let mut p = lo;
-            while p < hi {
-                let va = start + (p - r.vmo_page) * PAGE_SIZE;
-                if let Some((pfn, _)) = self.table.unmap(mm, va) {
+            if hi <= lo {
+                continue;
+            }
+            let first_va = start + (lo - r.vmo_page) * PAGE_SIZE;
+            let end_va = start + (hi - r.vmo_page) * PAGE_SIZE;
+            // (only what is mapped: the walk skips the spans whose tables are absent)
+            let mut va = first_va;
+            while let Some(at) = self.table.next_mapped(mm, va, end_va) {
+                if let Some((pfn, _)) = self.table.unmap(mm, at) {
                     if mm.db.is_managed(pfn) {
                         let _ = mm.db.dec(pfn);
                     }
                     cleared += 1;
                 }
-                p += 1;
+                va = at + PAGE_SIZE;
             }
         }
         cleared

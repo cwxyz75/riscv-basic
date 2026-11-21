@@ -237,17 +237,44 @@ pub mod sys {
         syscall(OBJECT_INFO, [h as usize, 0, 0, 0, 0, 0])
     }
     pub fn vmo_create(pages: u64) -> Ret {
-        syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
+        syscall(
+            VMO_CREATE,
+            [pages.saturating_mul(4096) as usize, 0, 0, 0, 0, 0],
+        )
+    }
+    /// A VMO of `bytes` bytes (rounded up to whole pages), charged to `job` (0: the caller's own), with `flags` (`abi::vmo_flags`).
+    pub fn vmo_create_bytes(bytes: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE,
+            [bytes as usize, job as usize, flags as usize, 0, 0, 0],
+        )
     }
     /// A VMO whose pages are charged to `job` (a handle with MANAGE) instead of the caller's own.
     pub fn vmo_create_in(pages: u64, job: u64) -> Ret {
-        syscall(VMO_CREATE, [pages as usize, job as usize, 0, 0, 0, 0])
+        syscall(
+            VMO_CREATE,
+            [
+                pages.saturating_mul(4096) as usize,
+                job as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
     }
     /// A VMO with `flags` (`abi::vmo_flags`: RESIZABLE), charged to `job` (0: the caller's own).
     pub fn vmo_create_flags(pages: u64, job: u64, flags: u64) -> Ret {
         syscall(
             VMO_CREATE,
-            [pages as usize, job as usize, flags as usize, 0, 0, 0],
+            [
+                pages.saturating_mul(4096) as usize,
+                job as usize,
+                flags as usize,
+                0,
+                0,
+                0,
+            ],
         )
     }
     /// Give back the committed pages of `[offset, offset + len)` of a VMO (needs WRITE; page aligned): every mapping of them goes, and they read as zeros.
@@ -462,7 +489,14 @@ pub mod sys {
         length: u64,
         flags: u64,
     ) -> Ret {
-        process_map(process, vmo, 0, vmo_offset, length, flags)
+        process_map(
+            process,
+            vmo,
+            0,
+            vmo_offset,
+            length,
+            flags | abi::map_flags::ANYWHERE,
+        )
     }
     /// The mapping at or after `vaddr`: six words in `buf` (base, length, permissions, ceiling, VMO id, VMO offset); `a1` is the next base or 0 (MM7).
     pub fn process_map_info(process: u64, vaddr: u64, buf: *mut u64) -> Ret {

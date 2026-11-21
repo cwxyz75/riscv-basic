@@ -155,7 +155,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 32 | object_signals | `a0` handle | `a1` the signal word |
 | 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
 | 34 | object_info | `a0` handle | `a1` koid, `a2` peer koid |
-| 40 | vmo_create | `a0` pages | `a1` handle |
+| 40 | vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
 | 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 43 | vmo_get_size | `a0` vmo | `a1` bytes |
@@ -167,7 +167,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 49 | vmo_set_size | `a0` vmo, `a1` bytes | |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
-| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr (0: ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags | `a1` the address, for ANYWHERE |
+| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr (0 with ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags (R 1, W 2, X 4, ANYWHERE 8) | `a1` the address, for ANYWHERE |
 | 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
@@ -351,10 +351,10 @@ the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle t
 kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
 closing the last handle to a VMO frees it once nothing maps it.
 
-### vmo_create(pages, job, flags) -> status, handle
+### vmo_create(bytes, job, flags) -> status, handle
 
 New zero-filled VMO whose pages are charged to a job as they are first touched (S4.5): `job` is
-a job handle with MANAGE, or 0 for the caller's own job. `flags` (MM6): bit 0 `RESIZABLE` makes the VMO's size changeable (`vmo_set_size`); any other bit is INVALID_ARGS. Errors: INVALID_ARGS (`pages` is 0 or
+a job handle with MANAGE, or 0 for the caller's own job. `flags` (MM6): bit 0 `RESIZABLE` makes the VMO's size changeable (`vmo_set_size`); any other bit is INVALID_ARGS. The size is in bytes, rounded up to whole pages (`vmo_get_size` returns the rounded size). Errors: INVALID_ARGS (`bytes` is 0 or
 over the limit); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
 memory). A page that cannot be charged is refused when it is first touched, with NO_MEMORY from
 `vmo_write`, or as a fault that ends the process. Tests: `vmo_*` in `init`.
@@ -499,11 +499,11 @@ otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger ch
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
 process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
-`length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 itself is ANYWHERE) or outside the
+`length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 is refused unless the flag ANYWHERE is set) or outside the
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
 
-**ANYWHERE (MM7):** `vaddr` 0 asks the kernel to choose (every other argument is checked first, so a refused call draws nothing from the entropy pool): a page-aligned place in the mapping arena (`0x1_0000_0000` up to the stack arena), picked at random (the kernel entropy pool: HD1) among the places a mapping of `length` bytes fits, the first fit from there, wrapping to the start of the arena; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
+**ANYWHERE (MM7):** the flag `ANYWHERE` (8; `vaddr` must be 0, else INVALID_ARGS) asks the kernel to choose (every argument error is found first, so a call refused for its arguments draws nothing from the entropy pool; one that fails later, for V1 or for want of memory, has drawn up to nine values): a page-aligned place in the mapping arena (`0x9_0000_0000`, above the runtime heap's range, up to the stack arena), picked at random (the kernel entropy pool: HD1): eight random positions are tried, then the first fit from a random start, wrapping once; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
 Tests: `process_map_*` in `init`.
 
 ### process_unmap(process, vaddr, length) -> status
@@ -579,7 +579,7 @@ a worst-case estimate: one page for a process's root table and, per mapped regio
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
 when it is unmapped or the process ends (the kernel's own objects are bounded by the global caps,
 not charged). **Objects** are charged to the job they are created for: the creating process's job, except that a
-process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(pages, job)`)
+process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(bytes, job)`)
 are charged to that job (a channel or socket pair counts two) and credited when they are destroyed. **Queued data** is charged to the job
 that created the *endpoint holding the queue* (so the creator of a conversation pays for both
 buffers, whoever writes into them), credited when read or when the endpoint is destroyed; a

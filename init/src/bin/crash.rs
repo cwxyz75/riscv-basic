@@ -442,6 +442,8 @@ pub fn app_main() -> i32 {
         // status, the end's signals); 'R' drain the kept end (reply: bytes read); 'X' exit.
         70 => return socket_hand(),
         40 => return unmap_while_siblings_touch(),
+        102 => return decommit_while_siblings_touch(),
+        103 => return protect_while_siblings_write(),
         n if n & 0xff == 42 => return churn((n >> 8) as u64),
         // slice A (OD76): floating-point state. 60: keep a private FP pattern across preemption and
         // yields (mode in bits 8-15, seed above); 61: read every FP register at first use (all zero
@@ -814,6 +816,180 @@ extern "C" fn reader(_id: usize) -> ! {
         }
         core::hint::spin_loop();
     }
+}
+
+// ---- MM6/MM7: decommit and protect against sibling threads ----
+
+const D_READ: u64 = 1;
+const D_ZERO: u64 = 3;
+static D_PHASE: AtomicU64 = AtomicU64::new(0);
+static D_READ_ACKS: AtomicU64 = AtomicU64::new(0);
+static D_ZERO_ACKS: AtomicU64 = AtomicU64::new(0);
+static D_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// A worker: for each round, reads the page the main thread maps and expects the round's pattern; then, after the main thread has
+/// decommitted it and given the frame to another VMO, expects zeros. A stale translation shows the frame's new owner's bytes.
+extern "C" fn decommit_reader(_id: usize) -> ! {
+    let (mut read_round, mut zero_round) = (0u64, 0u64);
+    loop {
+        let ph = D_PHASE.load(Ordering::Acquire);
+        let (round, state) = (ph >> 2, ph & 3);
+        if state == D_READ && round > read_round {
+            for _ in 0..40 {
+                // SAFETY: X is mapped (read-only) by the main thread for the round.
+                let got = unsafe { core::ptr::read_volatile(X as *const u64) };
+                if got != pattern(round) {
+                    let _ = D_FAIL.compare_exchange(0, round, Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+            read_round = round;
+            D_READ_ACKS.fetch_add(1, Ordering::AcqRel);
+        } else if state == D_ZERO && round > zero_round {
+            for _ in 0..40 {
+                // SAFETY: as above (a decommitted page of a mapping faults in again as zeros).
+                let got = unsafe { core::ptr::read_volatile(X as *const u64) };
+                if got != 0 {
+                    let _ = D_FAIL.compare_exchange(0, round, Ordering::AcqRel, Ordering::Acquire);
+                }
+            }
+            zero_round = round;
+            D_ZERO_ACKS.fetch_add(1, Ordering::AcqRel);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn spin_until(acks: &AtomicU64, want: u64) -> bool {
+    let mut spins = 0u64;
+    while acks.load(Ordering::Acquire) < want {
+        spins += 1;
+        if spins > 400_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// Two sibling threads read a page that the main thread decommits and whose frame it hands to another VMO, round after round. Exit code
+/// 0, or the first failing round.
+fn decommit_while_siblings_touch() -> i32 {
+    let me = rt::sys::process_self().a1 as u64;
+    #[allow(clippy::needless_range_loop)]
+    for k in 0..2 {
+        // SAFETY: only the address of the static stack is taken; each worker owns its own.
+        let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+        let t = rt::sys::thread_on_stack(
+            me,
+            decommit_reader as *const () as usize as u64,
+            top,
+            k as u64,
+        );
+        if t.status != 0 {
+            return 900 + (-(t.status as i64)) as i32;
+        }
+    }
+    for round in 1..=ROUNDS {
+        let v = rt::sys::vmo_create(1);
+        if v.status != 0 {
+            return 910;
+        }
+        let vmo = v.a1 as u64;
+        if rt::sys::vmo_write(vmo, 0, pattern(round).to_le_bytes().as_ptr(), 8).status != 0 {
+            return 911;
+        }
+        if rt::sys::process_map(me, vmo, X, 0, 4096, 1).status != 0 {
+            return 912;
+        }
+        D_PHASE.store((round << 2) | D_READ, Ordering::Release);
+        if !spin_until(&D_READ_ACKS, 2 * round) {
+            return 920;
+        }
+        // the frame goes back, and another VMO is handed it (the freed frame is the next one this hart's cache gives)
+        if rt::sys::vmo_decommit(vmo, 0, 4096).status != 0 {
+            return 913;
+        }
+        let junk = rt::sys::vmo_create(1).a1 as u64;
+        let _ = rt::sys::vmo_write(junk, 0, [0xee; 8].as_ptr(), 8);
+        D_PHASE.store((round << 2) | D_ZERO, Ordering::Release);
+        if !spin_until(&D_ZERO_ACKS, 2 * round) {
+            return 921;
+        }
+        if rt::sys::process_unmap(me, X).status != 0 {
+            return 914;
+        }
+        rt::sys::handle_close(vmo);
+        rt::sys::handle_close(junk);
+        if D_FAIL.load(Ordering::Acquire) != 0 {
+            return D_FAIL.load(Ordering::Acquire) as i32;
+        }
+    }
+    D_FAIL.load(Ordering::Acquire) as i32
+}
+
+const P_WRITE1: u64 = 1;
+const P_WRITE2: u64 = 2;
+static P_PHASE: AtomicU64 = AtomicU64::new(0);
+static P_ACKS1: AtomicU64 = AtomicU64::new(0);
+static P_ACKS2: AtomicU64 = AtomicU64::new(0);
+
+/// A worker: writes its own word of the page when told (so its hart caches a writable translation), and again after the main thread
+/// has taken write permission away. Once the protect has reached its hart the second write faults and ends the process.
+extern "C" fn protect_writer(id: usize) -> ! {
+    let mut done1 = false;
+    let mut done2 = false;
+    loop {
+        let ph = P_PHASE.load(Ordering::Acquire);
+        let word = (X + 8 * id as u64) as *mut u64;
+        if ph == P_WRITE1 && !done1 {
+            // SAFETY: X is mapped read-write by the main thread for this phase; each worker has its own word.
+            unsafe { core::ptr::write_volatile(word, 0x11 + id as u64) };
+            done1 = true;
+            P_ACKS1.fetch_add(1, Ordering::AcqRel);
+        } else if ph == P_WRITE2 && !done2 {
+            // SAFETY: the page is read-only now: with the translation dropped this write faults, which is the test.
+            unsafe { core::ptr::write_volatile(word, 0x22 + id as u64) };
+            done2 = true;
+            P_ACKS2.fetch_add(1, Ordering::AcqRel);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Exit code: -1001 from the kernel when a worker's write faulted (as it must), 0 if the writes went through, 9xx if the protocol broke.
+fn protect_while_siblings_write() -> i32 {
+    let me = rt::sys::process_self().a1 as u64;
+    #[allow(clippy::needless_range_loop)]
+    for k in 0..2 {
+        // SAFETY: only the address of the static stack is taken; each worker owns its own.
+        let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
+        let t = rt::sys::thread_on_stack(
+            me,
+            protect_writer as *const () as usize as u64,
+            top,
+            k as u64,
+        );
+        if t.status != 0 {
+            return 900 + (-(t.status as i64)) as i32;
+        }
+    }
+    let vmo = rt::sys::vmo_create(1).a1 as u64;
+    if rt::sys::process_map(me, vmo, X, 0, 4096, 3).status != 0 {
+        return 912;
+    }
+    P_PHASE.store(P_WRITE1, Ordering::Release);
+    if !spin_until(&P_ACKS1, 2) {
+        return 920;
+    }
+    if rt::sys::process_protect(me, X, 4096, 1).status != 0 {
+        return 913;
+    }
+    P_PHASE.store(P_WRITE2, Ordering::Release);
+    // (with the shootdown done, a worker faults here and the kernel ends the process)
+    if !spin_until(&P_ACKS2, 2) {
+        return 921;
+    }
+    0
 }
 
 // ---- S5e: churn ----
