@@ -634,12 +634,91 @@ fn heap_grows_at_a_safe_point() -> Outcome {
     Ok(())
 }
 
+/// MM4: small objects come from the slabs (in the direct map, aligned to their class), keep what is written, and when they are all freed the
+/// frames and bytes the heap holds are back where they were: the churn test of T-SPEC section 8 for the slab path.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn slab_serves_small_objects_and_everything_comes_back() -> Outcome {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    irq_service(); // (the pool stocked, the magazines settled)
+    let frames_before = crate::kmem::free_frames_accounted();
+    let bytes_before = crate::thread::heap_free();
+    let direct = abi::layout::DIRECT_BASE as usize
+        ..(abi::layout::DIRECT_BASE + abi::layout::DIRECT_MAP_PHYS_LIMIT) as usize;
+    // many objects of every size class, written with a pattern
+    let mut held: Vec<(Box<[u8]>, u8)> = Vec::new();
+    for round in 0..6000usize {
+        let size = [8usize, 16, 24, 48, 100, 200, 400, 1000, 2000][round % 9];
+        let pattern = (round % 251) as u8;
+        if round % 40 == 0 {
+            irq_service(); // (a safe point: the pool is stocked again; a burst without one falls back to the free-list heap, which is allowed)
+        }
+        let b: Box<[u8]> = alloc::vec![pattern; size].into_boxed_slice();
+        let addr = b.as_ptr() as usize;
+        ensure(
+            direct.contains(&addr),
+            "a small object lives in the direct map",
+        )?;
+        ensure(
+            addr.is_multiple_of(16),
+            "and is aligned to its class (at least 16)",
+        )?;
+        held.push((b, pattern));
+    }
+    ensure(
+        held.iter().all(|(b, p)| b.iter().all(|x| x == p)),
+        "every object holds what was written",
+    )?;
+    // something big goes to the free-list heaps, not the slabs
+    let big: Vec<u8> = alloc::vec![3u8; 8192];
+    ensure(
+        !direct.contains(&(big.as_ptr() as usize)),
+        "a large block is not a slab object",
+    )?;
+    ensure(
+        crate::thread::heap_free() != bytes_before,
+        "the live objects show in the leak oracle",
+    )?;
+    drop(big);
+    // free in a different order than allocated (every other one first), so slabs go from full to partial to empty
+    let mut later = Vec::new();
+    for (i, o) in held.drain(..).enumerate() {
+        if i % 2 == 0 {
+            drop(o);
+        } else {
+            later.push(o);
+        }
+    }
+    drop(later);
+    drop(held); // (the vector's own buffer is heap too)
+    irq_service(); // (the pool above its high-water mark goes back to the frame database)
+    ensure_eq(
+        crate::thread::heap_free(),
+        bytes_before,
+        "the heap holds the same bytes once everything is freed",
+    )?;
+    ensure_eq(
+        crate::heap::slab_violations(),
+        0,
+        "the slab refused no free",
+    )?;
+    ensure(
+        crate::kmem::free_frames_accounted() == frames_before,
+        "and the frames are all accounted for",
+    )?;
+    Ok(())
+}
+
 fn irq_service() {
     crate::irq::without(crate::heap::service);
 }
 
 pub const TESTS: &[Test] = &[
     ("heap_grows_at_a_safe_point", heap_grows_at_a_safe_point),
+    (
+        "slab_serves_small_objects_and_everything_comes_back",
+        slab_serves_small_objects_and_everything_comes_back,
+    ),
     ("paging_enabled", paging_enabled),
     ("runs_in_the_upper_half", runs_in_the_upper_half),
     ("low_half_is_empty", low_half_is_empty),

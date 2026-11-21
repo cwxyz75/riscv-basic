@@ -88,6 +88,14 @@ pub fn run_order(size: usize, align: usize) -> Option<usize> {
     (order <= 30).then_some(order)
 }
 
+/// The class of the slab whose frame holds `addr`, if that frame is a live slab: the header's tag, which only the slab's own frees change.
+/// It reads one word and needs no lock for an object the caller owns (the slab cannot be released while it holds a live object).
+pub fn class_of_addr<M: SlabMem>(mem: &M, addr: u64) -> Option<usize> {
+    let tag = mem.read((addr & !(PAGE_SIZE - 1)) + W_CLASS);
+    (tag >> 32 == MAGIC && ((tag & 0xffff_ffff) as usize) < CLASSES)
+        .then_some((tag & 0xffff_ffff) as usize)
+}
+
 /// Header slots a class reserves (the slots the header overlaps).
 fn reserved_slots(class: usize) -> usize {
     let size = CLASS_SIZES.get(class).copied().unwrap_or(FRAME);
@@ -229,11 +237,9 @@ impl Slab {
         Ok(())
     }
 
-    /// The class of the slab holding `addr`, if it is a slab object address (for `dealloc`, which must tell a slab object from a frame run).
+    /// The class of the slab holding `addr`, if it is a slab object address (see [`class_of_addr`]).
     pub fn class_of<M: SlabMem>(&self, mem: &M, addr: u64) -> Option<usize> {
-        let tag = mem.read((addr & !(PAGE_SIZE - 1)) + W_CLASS);
-        (tag >> 32 == MAGIC && ((tag & 0xffff_ffff) as usize) < CLASSES)
-            .then_some((tag & 0xffff_ffff) as usize)
+        class_of_addr(mem, addr)
     }
 
     /// Start a slab of `class` in `frame` and put it on the class's list.

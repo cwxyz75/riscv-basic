@@ -45,6 +45,21 @@ pub fn violates(class: Class) -> bool {
     percpu::this().held.with(|h| h.check(class, 0).is_err())
 }
 
+/// Check that using `class` now would not break the order, for a path that takes no lock but is part of the order all the same (the heap's
+/// magazine fast path, MM4): a violation is counted, or a panic, exactly as `note_acquire` does it, so the checker sees every allocation and not
+/// just the ones that reach the lock.
+pub fn check_use(class: Class) {
+    if let Err(v) = percpu::this().held.with(|h| h.check(class, 0)) {
+        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+        if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
+            panic!(
+                "lock order violation: taking {:?} while holding {:?}",
+                v.taking, v.held
+            );
+        }
+    }
+}
+
 fn note_acquire(class: Class, instance: u32) {
     let bad = percpu::this().held.with(|h| {
         let bad = h.check(class, instance);
@@ -91,7 +106,8 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             unlock();
         }
         Class::Heap => {
-            // the heap's own path: `alloc` notes the class around the allocator
+            // the heap's own path: `alloc` notes the class around the allocator (a small block is served from the hart's magazine with
+            // no lock, and `check_use` tells the checker all the same: MM4)
             let b = alloc::vec![0u8; 64];
             core::hint::black_box(&b);
             drop(b);

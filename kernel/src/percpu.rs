@@ -4,7 +4,7 @@
 //! read only with interrupts off (or by its own hart in the trap path), so a thread that
 //! migrates between harts never sees another hart's record through a stale pointer.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Most harts the kernel manages (QEMU `-smp` up to this).
 pub const MAX_HARTS: usize = 64;
@@ -101,9 +101,89 @@ pub struct PerHart {
     pub spins: AtomicU64,
     /// The lock class this hart last asked for (diagnostics for the deadlock detector).
     pub last_class: AtomicU32,
+    /// This hart's magazines of free slab objects, one per size class (MM4): touched only by this hart with interrupts off.
+    pub magazines: Magazines,
+}
+
+/// Free objects a hart keeps per size class (MM4): the common allocation and free take no shared lock.
+pub const MAGAZINE_SIZE: usize = 32;
+/// Size classes of the slab (`kcore::slab::CLASSES`).
+const MAGAZINE_CLASSES: usize = kcore::slab::CLASSES;
+
+/// Objects a magazine of `class` holds at most: 32, but only 4 for the big classes (1024 and 2048 bytes), whose objects take a quarter to a whole
+/// frame each, so an idle hart does not pin dozens of frames.
+pub fn magazine_limit(class: usize) -> usize {
+    if class >= 6 {
+        4
+    } else {
+        MAGAZINE_SIZE
+    }
+}
+
+/// One hart's magazines. The object addresses are touched by the owning hart alone, with interrupts off (so a timer interrupt cannot
+/// re-enter); the counts are atomics so a leak check on another hart can read them.
+pub struct Magazines {
+    objects: core::cell::UnsafeCell<[[usize; MAGAZINE_SIZE]; MAGAZINE_CLASSES]>,
+    len: [AtomicU8; MAGAZINE_CLASSES],
+}
+
+// SAFETY: `objects` is accessed only through the `unsafe` methods below, whose contract is that the owning hart calls them with interrupts
+// off; `len` is atomic.
+unsafe impl Sync for Magazines {}
+
+impl Magazines {
+    #[allow(clippy::large_stack_frames)] // KT13: a const fn that builds a static at compile time; no run-time frame
+    const fn new() -> Magazines {
+        Magazines {
+            objects: core::cell::UnsafeCell::new([[0; MAGAZINE_SIZE]; MAGAZINE_CLASSES]),
+            len: [const { AtomicU8::new(0) }; MAGAZINE_CLASSES],
+        }
+    }
+
+    /// Objects in the magazine of `class` (any hart may read it).
+    pub fn len(&self, class: usize) -> usize {
+        self.len
+            .get(class)
+            .map_or(0, |l| usize::from(l.load(Ordering::Relaxed)))
+    }
+
+    /// Take the most recently freed object of `class`.
+    ///
+    /// # Safety
+    /// The calling hart must be the owner of this record, with interrupts off.
+    pub unsafe fn pop(&self, class: usize) -> Option<usize> {
+        let n = self.len(class).checked_sub(1)?;
+        // SAFETY: the caller owns the magazines with interrupts off, so nothing else touches `objects`.
+        let objects = unsafe { &mut *self.objects.get() };
+        let p = *objects.get(class)?.get(n)?;
+        self.len.get(class)?.store(n as u8, Ordering::Relaxed);
+        Some(p)
+    }
+
+    /// Put a freed object in the magazine of `class`; `false` if it is full.
+    ///
+    /// # Safety
+    /// As for [`Magazines::pop`].
+    pub unsafe fn push(&self, class: usize, object: usize) -> bool {
+        let n = self.len(class);
+        if n >= magazine_limit(class) {
+            return false;
+        }
+        // SAFETY: as in `pop`.
+        let objects = unsafe { &mut *self.objects.get() };
+        let Some(slot) = objects.get_mut(class).and_then(|m| m.get_mut(n)) else {
+            return false;
+        };
+        *slot = object;
+        if let Some(l) = self.len.get(class) {
+            l.store((n + 1) as u8, Ordering::Relaxed);
+        }
+        true
+    }
 }
 
 impl PerHart {
+    #[allow(clippy::large_stack_frames)] // KT13: a const fn that builds a static at compile time; no run-time frame
     const fn new() -> PerHart {
         PerHart {
             kstack_top: AtomicU64::new(0),
@@ -141,6 +221,7 @@ impl PerHart {
             vs_buf: AtomicUsize::new(0),
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
+            magazines: Magazines::new(),
         }
     }
 }
