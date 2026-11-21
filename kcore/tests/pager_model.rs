@@ -22,8 +22,6 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
         let mut waiting: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
         let mut requested: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
         let mut woken_once: BTreeMap<u64, Result<(), Status>> = BTreeMap::new();
-        let mut sent_requests = 0usize;
-        let mut model_requests = 0usize;
         for step in 0..200 {
             let ctx = format!("seed {seed} step {step}");
             match rng.below(6) {
@@ -42,9 +40,7 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
                     }
                     waiting.insert(tid, (pager, vmo, page));
                     let first = requested.insert((pager, vmo, page));
-                    model_requests += usize::from(first);
                     assert_eq!(r.unwrap().is_some(), first, "{ctx}: one request per page");
-                    sent_requests += usize::from(first);
                 }
                 3 | 4 => {
                     // the pager supplies or fails a range
@@ -103,7 +99,11 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
                                     None,
                                     "{ctx}: a cancelled wait has no result"
                                 );
-                                waiting.remove(&t);
+                                let key = waiting.remove(&t).unwrap();
+                                // the last waiter for a page takes its request with it
+                                if !waiting.values().any(|k| *k == key) {
+                                    requested.remove(&key);
+                                }
                             }
                         }
                         _ => {
@@ -134,8 +134,12 @@ fn requests_are_made_once_and_every_waiter_is_woken_exactly_once() {
                 assert!(p.waiting(t), "{ctx}: a waiter is still registered");
             }
             assert_eq!(p.waits(), waiting.len() + woken_once.len(), "{ctx}");
+            assert_eq!(
+                p.pending_requests(),
+                requested.len(),
+                "{ctx}: no request outlives its waiters"
+            );
         }
-        assert_eq!(sent_requests, model_requests, "seed {seed}");
         // everything taken: nothing is left registered
         for t in woken_once
             .keys()

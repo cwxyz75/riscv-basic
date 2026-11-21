@@ -175,7 +175,33 @@ impl Pagers {
     /// The thread's wait is over (it took the result, or it was killed or interrupted): forget it. A request nobody waits for any more stays
     /// pending until the pager answers it.
     pub fn cancel(&mut self, tid: Tid) -> Option<Outcome> {
-        self.waits.remove(&tid).and_then(|w| w.result)
+        let w = self.waits.remove(&tid)?;
+        if w.result.is_none() {
+            // abandoned (killed or interrupted): when nobody else waits for the page, its request goes too, so that nothing a dead waiter
+            // asked for stays in the kernel's heap until the pager answers (a pager that never does would hold it for ever)
+            let others = self.waits.values().any(|o| {
+                o.result.is_none() && (o.pager, o.vmo, o.page) == (w.pager, w.vmo, w.page)
+            });
+            if !others {
+                if let Some(p) = self.pagers.get_mut(&w.pager) {
+                    p.requested.remove(&(w.vmo, w.page));
+                    p.unsent.retain(|r| !(r.vmo == w.vmo && r.page == w.page));
+                }
+            }
+        }
+        w.result
+    }
+
+    /// How many requests are pending in all (a leak check).
+    pub fn pending_requests(&self) -> usize {
+        self.pagers.values().map(|p| p.requested.len()).sum()
+    }
+
+    /// Is the pager's channel backed up (it has requests not written yet)?
+    pub fn has_unsent(&self, pager: u64) -> bool {
+        self.pagers
+            .get(&pager)
+            .is_some_and(|p| !p.unsent.is_empty())
     }
 
     /// Is the thread waiting (registered, with no result yet)?

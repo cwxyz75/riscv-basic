@@ -563,6 +563,48 @@ impl Vmos {
     /// parent, no children, no pager) with every page of the range committed, and **the caller has already unmapped those pages from every
     /// address space** (a frame a mapping still holds is `NotSuppliable`). A destination page that has a frame already is left as it is, and the
     /// source keeps its page. On `Err((moved, e))` the first `moved` pages did move.
+    /// Everything `supply` checks about its arguments except that no mapping holds a source frame: the caller runs this **before** it unmaps
+    /// the source, so a call that is going to be refused takes no translation away.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `supply`
+    pub fn supply_check(
+        &self,
+        dst: u64,
+        dpage: u64,
+        count: u64,
+        src: u64,
+        spage: u64,
+    ) -> Result<(), VmoError> {
+        let d = self.vmo(dst).ok_or(VmoError::Gone)?;
+        if d.pager.is_none() || d.kind != VmoKind::Plain {
+            return Err(VmoError::NotSuppliable);
+        }
+        let s = self.vmo(src).ok_or(VmoError::Gone)?;
+        if s.kind != VmoKind::Plain
+            || s.pager.is_some()
+            || s.parent.is_some()
+            || !s.children.is_empty()
+            || s.hidden
+        {
+            return Err(VmoError::NotSuppliable);
+        }
+        let dend = dpage.checked_add(count).ok_or(VmoError::OutOfRange)?;
+        let send = spage.checked_add(count).ok_or(VmoError::OutOfRange)?;
+        if dend > d.pages || send > s.pages {
+            return Err(VmoError::OutOfRange);
+        }
+        if (0..count).any(|i| !s.committed.contains(spage + i)) {
+            return Err(VmoError::NotSuppliable);
+        }
+        Ok(())
+    }
+
+    /// Does the page of a pager's VMO still have to be supplied (the VMO is there and has no frame for it)?
+    pub fn still_needed(&self, need: PagerNeed) -> bool {
+        self.vmo(need.vmo).is_some_and(|v| {
+            v.pager.is_some() && v.pages > need.page && !v.committed.contains(need.page)
+        })
+    }
+
     #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: the ranges were checked against both sizes first, so the sums are bounded by the VMO sizes
     pub fn supply<M: PhysMem>(
         &mut self,

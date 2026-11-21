@@ -44,6 +44,11 @@ pub fn commit_wake() {
 /// global wait queue that used to be woken here, OD43, is gone).
 pub fn notify() {
     cleanup_dead();
+    // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
+    let woken = irq::without(|| ksys::pager::reap_closed_channels(state()));
+    if !woken.is_empty() {
+        thread::wake_many(&woken);
+    }
     commit_wake();
     // the safe point where the kernel heap may grow (heap.rs)
     irq::without(crate::heap::service);

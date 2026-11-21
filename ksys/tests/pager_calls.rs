@@ -258,11 +258,58 @@ fn a_closed_channel_fails_the_waiters_and_a_full_one_keeps_the_request_pending()
     // the pager closes its end of the channel: the next flush fails everything
     let p = w.us.procs.get_mut(&1).unwrap();
     p.handles.close(&mut w.us.objs, Handle(w.chan)).unwrap();
-    let woken = w.begin(1, vmo, 1000).unwrap();
-    assert!(woken.contains(&1), "the new waiter is woken with the rest");
-    assert!(woken.contains(&100), "and the old ones");
-    assert_eq!(w.us.pagers.result(1), Some(Err(Status::PeerClosed)));
+    assert_eq!(w.begin(1, vmo, 1000), Err(Status::PeerClosed));
     assert!(!w.us.pagers.exists(1));
+    assert!(
+        !w.us.pending_wake.is_empty(),
+        "the old waiters are woken through pending_wake"
+    );
+}
+
+#[test]
+fn a_channel_closed_after_the_request_was_sent_kills_the_pager_for_waiters_and_newcomers() {
+    let mut w = world();
+    let (vmo, _) = w.pager_vmo(1, 4);
+    w.begin(10, vmo, 0).unwrap();
+    w.requests();
+    assert!(!w.us.pagers.any_unsent(), "the request was written");
+    let p = w.us.procs.get_mut(&1).unwrap();
+    p.handles.close(&mut w.us.objs, Handle(w.chan)).unwrap();
+    assert_eq!(
+        reap_closed_channels(&mut w.us),
+        vec![10],
+        "the waiter fails"
+    );
+    assert_eq!(pager_wait_end(&mut w.us, 10), Some(Err(Status::PeerClosed)));
+    assert_eq!(w.begin(11, vmo, 0), Err(Status::PeerClosed));
+}
+
+#[test]
+fn a_cancelled_wait_takes_its_request_and_a_supplied_page_is_not_waited_for() {
+    let mut w = world();
+    let (vmo, vh) = w.pager_vmo(1, 4);
+    w.begin(10, vmo, 0).unwrap();
+    w.begin(11, vmo, 0).unwrap();
+    assert_eq!(w.us.pagers.pending_requests(), 1);
+    assert_eq!(pager_wait_end(&mut w.us, 10), None);
+    assert_eq!(
+        w.us.pagers.pending_requests(),
+        1,
+        "another thread still waits"
+    );
+    assert_eq!(pager_wait_end(&mut w.us, 11), None);
+    assert_eq!(
+        w.us.pagers.pending_requests(),
+        0,
+        "nobody waits: nothing stays pending"
+    );
+    let (_, sh) = w.source(1, 3);
+    w.supply(vh, 0, 4096, sh, 0).unwrap();
+    assert_eq!(w.begin(12, vmo, 0), Ok(vec![]));
+    assert!(
+        !w.us.pagers.waiting(12),
+        "the page is there: nothing registered"
+    );
 }
 
 #[test]

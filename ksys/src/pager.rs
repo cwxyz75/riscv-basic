@@ -138,6 +138,9 @@ pub fn pager_supply<M: PhysMem>(
     {
         return Err(Status::BadState);
     }
+    // (refused for what is wrong with the VMOs before any mapping is touched)
+    vmos.supply_check(vmo, first, count, src, sfirst)
+        .map_err(map_vmo_error)?;
     // the source's pages leave every address space that maps them, and every hart drops its translation, before the frames change owner
     let mut cleared = 0u64;
     for p in us.procs.values_mut() {
@@ -172,10 +175,11 @@ pub fn pager_fail(
     a: [u64; 6],
 ) -> Result<Vec<Tid>, Status> {
     let (pager, vmo, first, count) = range(us, vmos, me, &a)?;
+    // (a failure the reader can act on: not OK, and not one of the codes that mean "try again" or "stopped by the caller")
     let status = i32::try_from(a[4] as i64)
         .ok()
         .and_then(Status::from_code)
-        .filter(|s| *s != Status::Ok)
+        .filter(|s| !matches!(s, Status::Ok | Status::ShouldWait | Status::Interrupted))
         .ok_or(Status::InvalidArgs)?;
     Ok(us.pagers.fail(pager, vmo, first, count, status))
 }
@@ -234,8 +238,45 @@ pub fn pager_wait_begin(
     tid: Tid,
     need: PagerNeed,
 ) -> Result<Vec<Tid>, Status> {
+    // (a page supplied since the call found it missing, or a VMO that is gone, is nothing to wait for)
+    if !vmos.still_needed(need) {
+        return Ok(Vec::new());
+    }
+    // a pager whose channel has no reader is dead, whether or not it has anything to write
+    if let Some(&end) = us.pager_ends.get(&need.pager) {
+        if ipc::channel_peer_closed(&us.objs, &us.ktable, end) {
+            let woken = us.pagers.destroy(need.pager);
+            us.pending_wake.extend(woken);
+            return Err(Status::PeerClosed);
+        }
+    }
     us.pagers.wait(tid, need.pager, need.vmo, need.page)?;
     Ok(pager_flush(us, vmos, jobs, need.pager))
+}
+
+/// The request channel of a pager lost its reader (its user end's last handle went): the pager is dead and every wait for its pages fails.
+/// The kernel calls this after objects were destroyed; an empty table costs one test.
+pub fn reap_closed_channels(us: &mut UserState) -> Vec<Tid> {
+    if us.pager_ends.is_empty() {
+        return Vec::new();
+    }
+    let UserState {
+        objs,
+        ktable,
+        pager_ends,
+        pagers,
+        ..
+    } = us;
+    let dead: Vec<u64> = pager_ends
+        .iter()
+        .filter(|(p, h)| pagers.exists(**p) && ipc::channel_peer_closed(objs, ktable, **h))
+        .map(|(p, _)| *p)
+        .collect();
+    let mut woken = Vec::new();
+    for p in dead {
+        woken.extend(pagers.destroy(p));
+    }
+    woken
 }
 
 /// The thread's wait is over (or abandoned): forget it. `None`: it ended without a result (killed or interrupted).

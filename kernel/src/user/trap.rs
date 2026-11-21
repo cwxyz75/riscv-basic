@@ -152,6 +152,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         }
                         if let Err(kcore::aspace::FaultError::NeedPager(n)) = &r {
                             pager_need = Some(*n);
+                            // (the fault has the need in its error: the slot a kernel copy reads must not keep it for another thread's call)
+                            let _ = k.vmos.take_need();
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {
@@ -190,7 +192,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             // a pager that failed or died raises a PAGER exception
             let mut pager_status = None;
             if let Some(need) = pager_need {
-                match pager_wait(need) {
+                match pager_wait(need, false) {
                     Ok(()) => resolved = true,
                     Err(status) => pager_status = Some(status),
                 }
