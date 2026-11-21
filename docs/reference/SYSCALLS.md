@@ -569,6 +569,8 @@ read). The rights are checked before the pointer is touched.
 Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
+**Pages (`which` 2) count the pages a job's address spaces have prepaid** for their faults as well as the pages its VMOs hold: in a job with a limit, an address space prepays up to 64 pages at a time (an eighth of the job's room at most, one at least) and gives the rest back when it ends, so `used` can read a little above the committed pages while a process of the job runs. A job with no limit prepays nothing.
+
 ### job_set_sched(job, max_prio, rt_budget_ns, cpu_weight) -> status
 
 Set a job's scheduling limits (slice SC, SCHED-SMP-SPEC 4.9). Needs SET_LIMITS. `max_prio` (0 to 63) is the highest **base**
