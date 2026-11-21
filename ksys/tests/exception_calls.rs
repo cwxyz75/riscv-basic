@@ -326,3 +326,27 @@ fn closing_the_last_exception_handle_is_next_and_a_dead_process_discards_its_exc
         "an ended process takes no channel"
     );
 }
+
+#[test]
+fn a_job_channel_whose_user_end_closed_is_reaped_so_nothing_is_left() {
+    let mut w = world();
+    let before = w.us.ktable.objects().count();
+    let jch = exception::exception_channel(&mut w.us, &mut w.jobs, 1, Target::Job(w.jh)).unwrap();
+    assert_eq!(w.us.job_exc.len(), 1);
+    // the user end is open: nothing to reap
+    exception::reap_closed_job_channels(&mut w.us);
+    assert_eq!(w.us.job_exc.len(), 1);
+    w.us.procs
+        .get_mut(&1)
+        .unwrap()
+        .handles
+        .close(&mut w.us.objs, Handle(jch))
+        .unwrap();
+    exception::reap_closed_job_channels(&mut w.us);
+    assert!(w.us.job_exc.is_empty(), "the entry goes");
+    assert_eq!(
+        w.us.ktable.objects().count(),
+        before,
+        "and the kernel's end with it"
+    );
+}

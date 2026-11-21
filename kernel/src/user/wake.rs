@@ -100,6 +100,8 @@ pub(super) fn cleanup_dead() {
                 _ => {}
             }
         }
+        // (EX2) a job exception channel whose user end has just been destroyed: its kernel end is let go
+        irq::without(|| ksys::exception::reap_closed_job_channels(state()));
         irq::without(|| state().objs.recycle(dead)); // (the emptied vector goes back, so the next destruction does not allocate: KT9)
     }
 }

@@ -334,6 +334,30 @@ pub fn forget_thread(us: &mut UserState, tid: Tid) {
     us.suspends.remove(&tid);
 }
 
+/// The kernel ends of job exception channels whose user end has closed: closed, so the channel and the job it is charged to can go (the kernel
+/// calls this when objects have been destroyed). A process's own channel goes with the process.
+pub fn reap_closed_job_channels(us: &mut UserState) {
+    if us.job_exc.is_empty() {
+        return;
+    }
+    let UserState {
+        objs,
+        ktable,
+        job_exc,
+        ..
+    } = us;
+    let closed: alloc::vec::Vec<JobId> = job_exc
+        .iter()
+        .filter(|(_, h)| ipc::channel_peer_closed(objs, ktable, **h))
+        .map(|(j, _)| *j)
+        .collect();
+    for j in closed {
+        if let Some(h) = job_exc.remove(&j) {
+            let _ = ktable.close(objs, h);
+        }
+    }
+}
+
 /// A job that is no longer there: its channel's kernel end closes.
 pub fn forget_job(us: &mut UserState, job: JobId) {
     if let Some(h) = us.job_exc.remove(&job) {
