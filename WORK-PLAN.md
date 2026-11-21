@@ -143,17 +143,20 @@ Phase 6a (`epic/phase-6`):
 - [x] **MM5** all kernel memory charged to jobs (PRs 353 to 356: the kernel-bytes resource, object bodies, thread FP and vector state, handle tables, the QEMU acceptance test `a_confined_program_cannot_hold_much_uncharged_kernel_memory`; port bindings were already charged (`BINDING_COST`, to IPC bytes) and a wait registration is one per waiting thread, covered by the thread's own charge; kernel stacks and page tables stay on `Pages` (T202); heap growth frames, T81, are not charged (T203))
 - [ ] **L17** per-process address-space locks, with the fault path shaped for pagers (part a is merged, PR 357: a fault is three steps and regions carry a generation; the per-process lock and the fault path leaving the big lock are phase 6b)
 
-Phase 6b (`epic/phase-6b`):
+Phase 6b (`epic/phase-6b`, merged into `main` on its epic gate):
+
+- [x] **L18** the ASID allocator with generations; no flush at a switch to or from a user space (PRs 363 and 364; shootdowns stay whole-TLB, T205)
+- [x] **PL7** instruction-cache flush on executable mappings (PR 365; `process_protect` waits for MM7)
+- [x] **MM10** the sweep in slices (PR 366; teardown's and the near-cap sweep are still whole: T206, T76 stays open)
+
+Phase 6c, **the end of the big lock** (an epic of its own, after phase 8; a decision below): the items that peel the big kernel lock and the one that needs the registry reworked.
 
 - [ ] **L17** (parts b and c) the per-process `AS` lock, page faults and user copies leave the big lock
-- [x] **L18** the ASID allocator with generations; batched shootdown (PRs 363 and 364: the allocator `kcore::asid`, ASIDs from it instead of the pid, the stale-tag refresh and the hart's generation flush, and no flush at a switch to or from a user space; `ran_on` and batched shootdowns are T205)
-- [x] **PL7** instruction-cache flush on executable mappings (PR 365: `smp::icache_sync` after a fault that maps code; `process_protect` waits for MM7)
 - [ ] **L14** futex bucket locks
-- [ ] **L19** `PROCS` and `TT`; teardown out of the big lock
-- [x] **MM10** the sweep in slices (PR 366: `Registry::sweep_begin`/`sweep_step`/`shade`; `HandleTable::insert` takes the registry and shades; a creating syscall runs up to four slices of 256, and all of it near the object cap; the roots of a sweep are still collected whole at its start, T206)
+- [ ] **L19** `PROCS` and `TT`; teardown out of the big lock (and teardown's sweep in slices: T206)
 - [ ] **L21** the W remainder (exact ready set, wake-one)
 - [ ] **L20** the end of the big kernel lock; the `&'static mut` accessors deleted
-- [ ] **PL8** limits derived from RAM; per-process ceilings as quotas
+- [ ] **PL8** limits derived from RAM; per-process ceilings as quotas (needs the object registry reworked: it preallocates its cap, T196)
 
 The order of L14 to L19 is the default of SCHED-SMP-SPEC 7.2. If the lock profile after L12 says another class of syscalls
 holds the big lock longest, reorder on that evidence and record it below.
@@ -283,3 +286,4 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   - 2026-11-21, phase 6: cut into two epics. 6a (MM4's two parts, L15, L16, MM5, L17 part a) is whole and, with the QEMU acceptance test of MM5, merges into `main` on the epic gate; 6b holds the items that peel the big lock (L17 parts b and c, L18, PL7, L14, L19, MM10, L21, L20, PL8) and MM4's end state (T196). Reason: L17 b and c need a lock primitive that `ksys` (pure) can take on a process's address space (about 25 sites in `ksys` reach it through the process table) with the order checker and a negative control, a design of its own that is best done with L18 (ASIDs) and L19 (the process table) in view; and the epic has accumulated MM4, L15, L16 and MM5 that only a green epic gate can vouch for, so merging them first keeps a bisect short. Alternative: finish all of phase 6 first. `TESTING.md` allows a long phase to be cut.
   - 2026-11-21, phase 6a epic gate: the instruction-count baseline (`bench/counts.tsv`) was re-recorded from CI's numbers after the L16 locks and MM5's charging (futex_wake_no_waiter +19 percent, handle_dup_close +17, event_signal_wait +15, page_fault_fresh_page +13; thread_create_join -10), once the avoidable part (a charging pass on every syscall, PR 361) was removed. The cost is three real locks in every `kmem::get()` (`work/T204.md` lists the fix: take only the locks a call needs). Alternative: hold the 5 percent rule and block the epic until `kmem::get()` is cheaper, which would mean reworking `ksys::Ctx` first.
   - 2026-11-21, working agreement (suggested by the owner): from phase 6b a feature PR is one work item, its parts together, and a Fable review is per item on the finished PR; a change that makes the kernel rely on a lock or removes a flush (L18's no-flush, L17's BKL-less fault path, the L19 and L20 peels) is its own PR so a failure has one suspect. `TESTING.md` rule 1 and the plan's "one item or one named part of one" allow it.
+  - 2026-11-21, phase 6b: closed with L18, PL7 and MM10 (the items that stood alone) and merged on its epic gate; the rest of the old 6b (L17 parts b and c, L14, L19, L21, L20) and PL8 move to a **phase 6c** that runs after phase 8. Reason: they peel the big lock and depend on each other (a lock `ksys` can take on an address space, the process and thread tables as real locks, the wait and futex tables), PL8 needs the object registry rebuilt (it preallocates for its cap, and a RAM-derived cap at 4 GiB would preallocate 100 MB), and none of them changes what a program can do, where phases 7 and 8 (the memory model, threads and exceptions, pagers) do; the freeze (FZ1) still waits for all of them. `MM6`'s and `MM7`'s block on L17 is lifted for the same reason (L17 part a, the fault in three steps, is what the memory model needs). Alternative: keep the plan's order and do the peels now.
