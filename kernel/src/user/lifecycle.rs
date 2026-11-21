@@ -114,7 +114,6 @@ pub(super) fn teardown(pid: u64) -> i32 {
     teardown_objects(&mut process, code);
     teardown_memory(process);
     kmem::flush_tlb();
-    REAP_DIRTY.store(true, Ordering::SeqCst); // its mappings are gone: pending VMOs may go
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
 }
@@ -161,13 +160,13 @@ pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
         let k = kmem::get();
         let mut process = process;
-        process.aspace.destroy_user(&mut k.mm);
+        process.aspace.destroy_user(&mut k.mm, &mut k.vmos);
         for id in core::mem::take(&mut process.vmos) {
-            let _ = k.vmos.destroy(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, id);
         }
         // the stacks `thread_spawn` mapped for threads that were still alive (their mappings went with the address space)
         for st in process.stacks.values() {
-            let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+            let _ = k.vmos.release(&mut k.mm, st.vmo);
         }
         let tables: u64 = process.table_charge.values().sum();
         // the address space and its page tables are gone: no hart may keep translations through them
@@ -185,14 +184,14 @@ pub(super) fn free_spawn_stack(p: &mut Process, tid: Tid) {
         return;
     };
     let k = kmem::get();
-    let _ = p.aspace.unmap_region(&mut k.mm, st.region);
+    let _ = p.aspace.unmap_region(&mut k.mm, &mut k.vmos, st.region);
     if let Some(tables) = p.table_charge.remove(&st.region) {
         k.vmos.jobs.credit(p.job, Resource::Pages, tables);
     }
     // other harts may cache translations of the stack: they go before the frames can be reused
     crate::smp::shootdown();
     kmem::flush_tlb();
-    let _ = k.vmos.destroy(&mut k.mm, st.vmo);
+    let _ = k.vmos.release(&mut k.mm, st.vmo);
 }
 
 pub(super) fn exit_process(code: i32) -> ! {

@@ -55,7 +55,7 @@ fn world() -> World {
 fn region(w: &mut World, start: u64, pages: u64, perms: Perms) -> u64 {
     let id = w.vmos.create(pages);
     w.proc
-        .map_region(&w.vmos, start, pages, id, 0, perms)
+        .map_region(&mut w.vmos, start, pages, id, 0, perms)
         .unwrap();
     id
 }
@@ -70,13 +70,13 @@ impl World {
     fn teardown(mut self) {
         let starts: Vec<u64> = vec![0x1_0000, 0x2_0000, 0x3_0000, STACK_TOP - STACK_PAGES * 4096];
         for s in starts {
-            let _ = self.proc.unmap_region(&mut self.mm, s);
+            let _ = self.proc.unmap_region(&mut self.mm, &mut self.vmos, s);
         }
         let ids: Vec<u64> = (1..=8).collect();
         for id in ids {
-            let _ = self.vmos.destroy(&mut self.mm, id);
+            let _ = self.vmos.release(&mut self.mm, id);
         }
-        self.proc.destroy_user(&mut self.mm);
+        self.proc.destroy_user(&mut self.mm, &mut self.vmos);
         self.kernel.destroy(&mut self.mm);
         assert_eq!(
             self.mm.db.free_count(),
@@ -184,9 +184,11 @@ fn a_process_table_shares_the_kernel_half_and_frees_only_its_own() {
     region(&mut w, 0x1_0000, 1, Perms::RW.user());
     w.write(0x1_0000, &[1]).unwrap();
     // ...and tearing the process down leaves the kernel's tables alone
-    w.proc.unmap_region(&mut w.mm, 0x1_0000).unwrap();
-    w.vmos.destroy(&mut w.mm, 1).unwrap();
-    w.proc.destroy_user(&mut w.mm);
+    w.proc
+        .unmap_region(&mut w.mm, &mut w.vmos, 0x1_0000)
+        .unwrap();
+    w.vmos.release(&mut w.mm, 1).unwrap();
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos);
     assert_eq!(
         w.kernel.translate(&w.mm, KERNEL_VA).unwrap().pfn,
         3399,
@@ -264,9 +266,9 @@ fn vmo_write_and_read_back_with_bounds() {
         free,
         "a read of uncommitted memory allocates nothing"
     );
-    w.vmos.destroy(&mut w.mm, id).unwrap();
-    w.vmos.destroy(&mut w.mm, fresh).unwrap();
-    w.proc.destroy_user(&mut w.mm);
+    w.vmos.release(&mut w.mm, id).unwrap();
+    w.vmos.release(&mut w.mm, fresh).unwrap();
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos);
     w.kernel.destroy(&mut w.mm);
     assert_eq!(w.mm.db.free_count(), w.baseline);
 }
@@ -320,13 +322,15 @@ fn a_region_outside_the_user_half_is_still_refused_by_the_copy_checks() {
         w.write(0xffff_ffe0_0000_0000, &[1]).err(),
         Some(Status::InvalidArgs)
     );
-    let _ = w.proc.unmap_region(&mut w.mm, 0);
-    let _ = w.proc.unmap_region(&mut w.mm, 0xffff_ffe0_0000_0000);
+    let _ = w.proc.unmap_region(&mut w.mm, &mut w.vmos, 0);
+    let _ = w
+        .proc
+        .unmap_region(&mut w.mm, &mut w.vmos, 0xffff_ffe0_0000_0000);
     let ids: Vec<u64> = vec![1, 2];
     for id in ids {
-        let _ = w.vmos.destroy(&mut w.mm, id);
+        let _ = w.vmos.release(&mut w.mm, id);
     }
-    w.proc.destroy_user(&mut w.mm);
+    w.proc.destroy_user(&mut w.mm, &mut w.vmos);
     w.kernel.destroy(&mut w.mm);
     assert_eq!(w.mm.db.free_count(), w.baseline);
 }

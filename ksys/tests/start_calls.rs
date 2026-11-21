@@ -69,14 +69,14 @@ fn world() -> W {
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE, 1, code, 0, Perms::RX.user())
+        .map_region(&mut vmos, CODE, 1, code, 0, Perms::RX.user())
         .unwrap();
     let data = vmos.create(1);
     us.procs
         .get_mut(&2)
         .unwrap()
         .aspace
-        .map_region(&vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
+        .map_region(&mut vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
         .unwrap();
     let p = us.procs.get_mut(&1).unwrap();
     let (h, _) = ipc::process_object_create_in(

@@ -44,7 +44,6 @@ pub fn commit_wake() {
 /// global wait queue that used to be woken here, OD43, is gone).
 pub fn notify() {
     cleanup_dead();
-    reap_vmos();
     commit_wake();
     // the safe point where the kernel heap may grow (heap.rs)
     irq::without(crate::heap::service);
@@ -72,10 +71,11 @@ pub(super) fn cleanup_dead() {
         }
         for obj in dead.drain(..) {
             match obj {
-                ipc::KObj::Vmo(id) => {
-                    irq::without(|| state().pending_vmos.push(id));
-                    REAP_DIRTY.store(true, Ordering::SeqCst);
-                }
+                // the object's reference on its VMO goes; a region that still maps it keeps it alive (L15)
+                ipc::KObj::Vmo(id) => irq::without(|| {
+                    let k = kmem::get();
+                    let _ = k.vmos.release(&mut k.mm, id);
+                }),
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
                     request_kill(p.pid, -2000)
                 }
@@ -96,43 +96,7 @@ pub(super) fn cleanup_dead() {
             }
         }
         irq::without(|| state().objs.recycle(dead)); // (the emptied vector goes back, so the next destruction does not allocate: KT9)
-                                                     // One scan for everything that died in this round (not one per VMO).
-        reap_vmos();
     }
-}
-
-/// Set whenever something happened that could let a pending VMO go: one was queued, a mapping
-/// was removed, or a process was torn down. `reap_vmos` runs only then: it scans every region of
-/// every process, and every VMO a process closes after mapping it stays pending until the
-/// process dies, so scanning on every wake-up cost about a millisecond per syscall once a
-/// dozen service processes were alive.
-pub(super) static REAP_DIRTY: AtomicBool = AtomicBool::new(false);
-
-/// Free the VMOs whose last handle is gone and that no address space maps any more.
-pub(super) fn reap_vmos() {
-    if !REAP_DIRTY.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    irq::without(|| {
-        let s = state();
-        let k = kmem::get();
-        if s.pending_vmos.is_empty() {
-            return;
-        }
-        // One pass over all regions, not one per pending VMO.
-        let mut mapped: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
-        for p in s.procs.values() {
-            p.aspace.collect_vmos(&mut mapped);
-        }
-        let pending = core::mem::take(&mut s.pending_vmos);
-        for id in pending {
-            if mapped.contains(&id) {
-                s.pending_vmos.push(id);
-            } else {
-                let _ = k.vmos.destroy(&mut k.mm, id);
-            }
-        }
-    });
 }
 
 /// End process `pid` with `code`, from any other thread: a process with no thread yet is

@@ -84,7 +84,7 @@ impl KernelEnd {
             let pages = (image.len() as u64).div_ceil(4096).max(1);
             let id = k.vmos.create(pages);
             if k.vmos.write(&mut k.mm, id, 0, image).is_err() {
-                let _ = k.vmos.destroy(&mut k.mm, id);
+                let _ = k.vmos.release(&mut k.mm, id);
                 return Err(Status::NoMemory);
             }
             let h = match ipc::vmo_object_create_in(
@@ -95,7 +95,7 @@ impl KernelEnd {
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    let _ = k.vmos.release(&mut k.mm, id);
                     return Err(e);
                 }
             };
@@ -214,7 +214,7 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         let pages = (bytes.len() as u64).div_ceil(4096).max(1);
         let id = k.vmos.create(pages);
         if k.vmos.write(&mut k.mm, id, 0, bytes).is_err() {
-            let _ = k.vmos.destroy(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, id);
             return Err(Status::NoMemory);
         }
         let h = match ipc::vmo_object_create_in(
@@ -225,7 +225,7 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
         ) {
             Ok(h) => h,
             Err(e) => {
-                let _ = k.vmos.destroy(&mut k.mm, id);
+                let _ = k.vmos.release(&mut k.mm, id);
                 return Err(e);
             }
         };

@@ -34,9 +34,6 @@ pub struct UserState {
     pub next_pid: u64,
     /// The generation new handle tables start their slots at (0; `ff=handlegen:` in test builds).
     pub first_handle_gen: u64,
-    /// VMOs whose last handle is gone but that some address space still maps: freed when the
-    /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
-    pub pending_vmos: Vec<u64>,
     /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
     /// hart skip the cleanup while one cleaner was preempted).
     pub cleaning: BTreeSet<Tid>,
@@ -91,7 +88,6 @@ impl UserState {
             sched_flags: BTreeMap::new(),
             next_pid: 1,
             first_handle_gen: 0,
-            pending_vmos: Vec::new(),
             cleaning: BTreeSet::new(),
             interrupts: BTreeSet::new(),
             starts: BTreeMap::new(),

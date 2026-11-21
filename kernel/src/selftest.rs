@@ -404,7 +404,7 @@ fn region(va: u64, pages: u64, perms: Perms) -> u64 {
     let k = kmem::get();
     let id = k.vmos.create(pages);
     k.aspace
-        .map_region(&k.vmos, va, pages, id, 0, perms)
+        .map_region(&mut k.vmos, va, pages, id, 0, perms)
         .expect("map_region");
     id
 }
@@ -412,10 +412,12 @@ fn region(va: u64, pages: u64, perms: Perms) -> u64 {
 fn teardown(vmo: u64, starts: &[u64]) {
     let k = kmem::get();
     for &s in starts {
-        k.aspace.unmap_region(&mut k.mm, s).expect("unmap_region");
+        k.aspace
+            .unmap_region(&mut k.mm, &mut k.vmos, s)
+            .expect("unmap_region");
     }
     trap::flush_tlb();
-    k.vmos.destroy(&mut k.mm, vmo).expect("destroy vmo");
+    k.vmos.release(&mut k.mm, vmo).expect("destroy vmo");
 }
 
 fn free() -> usize {
@@ -525,7 +527,7 @@ fn shared_vmo_is_one_memory() -> Outcome {
         {
             let k = kmem::get();
             k.aspace
-                .map_region(&k.vmos, b, 2, vmo, 0, Perms::R)
+                .map_region(&mut k.vmos, b, 2, vmo, 0, Perms::R)
                 .map_err(|e| format!("map_region b: {e:?}"))?;
         }
         write(a + 8, 0xfeed_f00d);

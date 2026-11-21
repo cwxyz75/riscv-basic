@@ -58,7 +58,7 @@ fn a_commit_charges_now_and_a_later_touch_charges_nothing() {
     // a touch of a committed page through a mapping charges nothing and cannot fail
     let mut a = AddressSpace::new(PageTable::new(&mut mm).unwrap());
     let va = 0xffff_ffd0_0000_0000u64;
-    a.map_region(&vmos, va, 8, id, 0, Perms::RW).unwrap();
+    a.map_region(&mut vmos, va, 8, id, 0, Perms::RW).unwrap();
     let before = (used(&vmos, j), mm.db.free_count());
     a.handle_fault(&mut mm, &mut vmos, va + 3 * 4096, Access::Write)
         .unwrap();
@@ -135,7 +135,7 @@ fn destroying_credits_exactly_what_was_committed() {
     let id = vmos.create_in(8, j);
     vmos.commit(&mut mm, id, 0, 5).unwrap();
     assert_eq!(used(&vmos, j), 5);
-    vmos.destroy(&mut mm, id).unwrap();
+    vmos.release(&mut mm, id).unwrap();
     assert_eq!(used(&vmos, j), 0, "credited back");
     assert_eq!(mm.db.free_count(), free, "frames back");
 }
@@ -156,7 +156,7 @@ fn a_failed_commit_over_already_committed_pages_keeps_them_and_double_credits_no
     );
     assert!(vmos.is_committed(id, 0, 3));
     let free = mm.db.free_count();
-    vmos.destroy(&mut mm, id).unwrap();
+    vmos.release(&mut mm, id).unwrap();
     assert_eq!(used(&vmos, j), 0);
     assert_eq!(mm.db.free_count(), free + 3);
 }
