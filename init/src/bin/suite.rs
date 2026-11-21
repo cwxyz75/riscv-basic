@@ -4323,6 +4323,116 @@ fn port_argument_checks() -> Outcome {
     Ok(())
 }
 
+fn port_wait_many_takes_a_batch_in_order() -> Outcome {
+    use rt::PortPacket;
+    let p = port()?;
+    let m = 1u32 << 24;
+    let mut events = Vec::new();
+    for key in 1..=64u64 {
+        let e = event()?;
+        ensure_eq!(st(sys::port_bind(p, e, m, key)), Some(S::Ok), "bind");
+        events.push(e);
+    }
+    let mut buf = [PortPacket::default(); 64];
+    ensure_eq!(
+        st(sys::port_wait_many(p, &mut buf, 0)),
+        Some(S::TimedOut),
+        "nothing ready, no wait"
+    );
+    for &e in &events {
+        sys::event_signal(e, 0, m);
+    }
+    let r = sys::port_wait_many(p, &mut buf, 0);
+    ensure_eq!((r.status, r.a1), (0, 64), "64 ready bindings in one call");
+    for (i, rec) in buf.iter().enumerate() {
+        ensure_eq!(
+            (rec.key, rec.observed, rec.zero),
+            (i as u64 + 1, m, 0),
+            "record {i}"
+        );
+    }
+    // a smaller batch continues the rotation where port_wait would: 8 now, the next 8 after them
+    let r = sys::port_wait_many(p, &mut buf[..8], 0);
+    ensure_eq!((r.status, r.a1), (0, 8), "a batch of 8");
+    ensure_eq!(buf[0].key, 1, "the cursor wrapped to the first");
+    let r = sys::port_wait_many(p, &mut buf[..8], 0);
+    ensure_eq!((r.status, r.a1, buf[0].key), (0, 8, 9), "the next 8");
+    let single = sys::port_wait(p, 0);
+    ensure_eq!(
+        (single.status, single.a1),
+        (0, 17),
+        "port_wait goes on from there"
+    );
+    // argument checks: capacity, buffer (both before anything is taken), handle
+    let call = |h: u64, buf: usize, cap: usize| {
+        st(rt::syscall(
+            rt::abi::syscall::PORT_WAIT_MANY,
+            [h as usize, buf, cap, 0, 0, 0],
+        ))
+    };
+    let at = buf.as_mut_ptr() as usize;
+    ensure_eq!(call(p, at, 0), Some(S::InvalidArgs), "capacity 0");
+    ensure_eq!(call(p, at, 65), Some(S::InvalidArgs), "capacity 65");
+    ensure_eq!(call(p, 0x10, 4), Some(S::InvalidArgs), "an unmapped buffer");
+    ensure_eq!(
+        call(p, 0x10, 0),
+        Some(S::InvalidArgs),
+        "capacity 0 and no buffer"
+    );
+    ensure_eq!(call(BAD, at, 4), Some(S::BadHandle), "bad handle");
+    ensure_eq!(call(events[0], at, 4), Some(S::WrongType), "not a port");
+    let nowait = weaker(p, Rights::MANAGE.0)?;
+    ensure_eq!(call(nowait, at, 4), Some(S::AccessDenied), "needs WAIT");
+    ensure_eq!(
+        call(p ^ (1u64 << 40), at, 4),
+        Some(S::BadHandle),
+        "a wide handle"
+    );
+    Ok(())
+}
+
+fn port_wait_many_leaves_everything_on_a_bad_buffer() -> Outcome {
+    use rt::PortPacket;
+    let p = port()?;
+    let ev = event()?;
+    let m = 1u32 << 24;
+    ensure_eq!(
+        st(sys::port_bind_flags(
+            p,
+            ev,
+            m,
+            5,
+            rt::abi::port_flags::ONESHOT
+        )),
+        Some(S::Ok),
+        "a one-shot binding"
+    );
+    sys::event_signal(ev, 0, m);
+    let r = st(rt::syscall(
+        rt::abi::syscall::PORT_WAIT_MANY,
+        [p as usize, 0x10, 4, 0, 0, 0],
+    ));
+    ensure_eq!(r, Some(S::InvalidArgs), "a bad buffer");
+    // the one-shot packet was not taken: a good call still gets it, once
+    let mut buf = [PortPacket::default(); 4];
+    let r = sys::port_wait_many(p, &mut buf, 0);
+    ensure_eq!((r.status, r.a1, buf[0].key), (0, 1, 5), "still there");
+    ensure_eq!(
+        st(sys::port_wait_many(p, &mut buf, 0)),
+        Some(S::TimedOut),
+        "delivered once"
+    );
+    // it blocks until something is ready, and a deadline ends the wait
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        st(sys::port_wait_many(p, &mut buf, t0 + 20)),
+        Some(S::TimedOut),
+        "a deadline with nothing ready"
+    );
+    ensure!(sys::clock_get() >= t0 + 20, "not early");
+    Ok(())
+}
+
 fn port_wait_levels_timeouts_and_fairness() -> Outcome {
     let p = port()?;
     let (e1, e2) = (event()?, event()?);
@@ -11465,6 +11575,24 @@ fn bench_thread_create_join(n: u32) -> Result<u64, Detail> {
     ))
 }
 
+/// Drain a port with 64 ready bindings in one `port_wait_many`, `n` times: ns per call (AB4).
+fn bench_port_drain_64(n: u32) -> Result<u64, Detail> {
+    let p = port()?;
+    let m = 1u32 << 24;
+    for key in 1..=64u64 {
+        let e = event()?;
+        ensure_eq!(st(sys::port_bind(p, e, m, key)), Some(S::Ok), "bind");
+        sys::event_signal(e, 0, m);
+    }
+    let mut buf = [rt::PortPacket::default(); 64];
+    let t0 = cycles();
+    for _ in 0..n {
+        let r = sys::port_wait_many(p, &mut buf, 0);
+        ensure_eq!((r.status, r.a1), (0, 64), "a full batch");
+    }
+    Ok(bench_line("port_drain_64", cycles() - t0, u64::from(n)))
+}
+
 /// The partner of the event ping-pong: wait for A, clear it, raise B; `BENCH_ITERS` times.
 extern "C" fn bench_event_partner(_: usize) -> ! {
     let (a, b) = (
@@ -11576,12 +11704,14 @@ fn benchmarks() -> Outcome {
     let w = bench_wake_latency_event(200 * k)?;
     let c0 = bench_channel_call("channel_call_rt", 1000 * k, 0)?;
     let c100 = bench_channel_call("channel_call_rt_100_bystanders", 1000 * k, 100)?;
+    let d = bench_port_drain_64(1000 * k)?;
     // sanity only (the numbers are for the baseline): every operation took some time, and was not absurd
     for (what, ns) in [
         ("thread", t),
         ("wake", w),
         ("call", c0),
         ("call with bystanders", c100),
+        ("port drain", d),
     ] {
         ensure!(
             ns > 0 && ns < 1_000_000_000,
@@ -12021,6 +12151,14 @@ pub fn app_main() -> i32 {
             dead_port_bindings_vanish_at_once,
         ),
         ("port_argument_checks", port_argument_checks),
+        (
+            "port_wait_many_takes_a_batch_in_order",
+            port_wait_many_takes_a_batch_in_order,
+        ),
+        (
+            "port_wait_many_leaves_everything_on_a_bad_buffer",
+            port_wait_many_leaves_everything_on_a_bad_buffer,
+        ),
         (
             "port_wait_levels_timeouts_and_fairness",
             port_wait_levels_timeouts_and_fairness,

@@ -132,6 +132,36 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
     ksys::port_wait_report(got, deadline, take_interrupt)
 }
 
+/// `port_wait_many(port, buffer, capacity, deadline)` (AB4): `port_wait`'s wait, returning up to `capacity` ready bindings as records in
+/// `buffer` and their count in `a1`.
+pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
+    let (h, buf, cap, deadline) = ksys::port_wait_many_check(a).map_err(|e| (e, None, None))?;
+    let poll =
+        || in_process(|s, k, me| ksys::port_poll_many(s, &mut k.mm, &mut k.vmos, me, h, buf, cap));
+    let mut got = poll()?;
+    while got == 0
+        && deadline != 0
+        && thread::now_ns() < deadline
+        && irq::without(killed_now).is_none()
+        && !irq::without(interrupted_now)
+    {
+        commit_wake();
+        let me = thread::current();
+        thread::wait_deadline_registered(
+            || {
+                killed_now().is_some()
+                    || interrupted_now()
+                    || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
+            },
+            || register_wait(me, h, abi::signals::READABLE),
+            deadline,
+        );
+        irq::without(|| state().waits.forget(me));
+        got = poll()?;
+    }
+    ksys::port_wait_many_report(got, deadline, take_interrupt)
+}
+
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {

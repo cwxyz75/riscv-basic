@@ -50,6 +50,15 @@ pub struct SpawnArgs {
     pub reserved: u64,
 }
 
+/// One record of `port_wait_many` (SYSCALLS.md): a ready binding's key and the signals observed under its mask.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortPacket {
+    pub key: u64,
+    pub observed: u32,
+    pub zero: u32,
+}
+
 /// The result of a raw syscall: the status code and the two result registers.
 #[derive(Debug, Clone, Copy)]
 pub struct Ret {
@@ -459,6 +468,21 @@ pub mod sys {
     /// Wait for a binding to be ready; `deadline` in absolute milliseconds as for `object_wait`.
     pub fn port_wait(port: u64, deadline: u64) -> Ret {
         port_wait_ns(port, deadline_ns(deadline))
+    }
+    /// Wait for bindings to be ready and take up to `buf.len()` (1 to 64) of them at once; `deadline` as for `port_wait`. `a1` of the
+    /// result is how many records were written.
+    pub fn port_wait_many(port: u64, buf: &mut [super::PortPacket], deadline: u64) -> Ret {
+        syscall(
+            PORT_WAIT_MANY,
+            [
+                port as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+                deadline_ns(deadline) as usize,
+                0,
+                0,
+            ],
+        )
     }
     /// `port_wait` with the deadline in nanoseconds.
     pub fn port_wait_ns(port: u64, deadline: u64) -> Ret {

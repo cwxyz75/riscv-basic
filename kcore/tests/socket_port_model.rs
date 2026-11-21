@@ -551,3 +551,99 @@ fn half_close_ends_the_stream_one_way_only() {
     let ro = weaker(&mut reg, &mut t, b, Rights::READ);
     assert_eq!(socket_shutdown(&mut reg, &t, ro), Err(Status::AccessDenied));
 }
+
+/// AB4: `port_poll_many` is exactly that many `port_poll`s: a random walk over two identical worlds, one drained with the batch call,
+/// the other with as many single polls as the batch gave (each binding at most once, never more than `max`).
+#[test]
+fn a_batch_wait_equals_that_many_single_waits() {
+    for seed in 0..SEEDS {
+        let mut rng = Rng::new(seed);
+        let mut worlds: Vec<(Kobjs, HandleTable, Handle, Vec<Handle>)> = (0..2)
+            .map(|_| {
+                let (mut reg, mut t) = world();
+                let port = port_create(&mut reg, &mut t).unwrap();
+                let events: Vec<Handle> = (0..6)
+                    .map(|_| event_create(&mut reg, &mut t).unwrap())
+                    .collect();
+                (reg, t, port, events)
+            })
+            .collect();
+        let mut jobs = kcore::job::Jobs::new();
+        // the same random bindings in both
+        for key in 1..=6u64 {
+            let ev = rng.below(6) as usize;
+            let flags = if rng.below(3) == 0 {
+                abi::port_flags::ONESHOT
+            } else {
+                0
+            };
+            for (reg, t, port, events) in &mut worlds {
+                port_bind_flags_in(reg, t, *port, events[ev], 1 << 24, key, flags, &mut jobs)
+                    .unwrap();
+            }
+        }
+        for _ in 0..STEPS {
+            match rng.below(4) {
+                0 | 1 => {
+                    let ev = rng.below(6) as usize;
+                    let (set, clear) = if rng.below(2) == 0 {
+                        (1 << 24, 0)
+                    } else {
+                        (0, 1 << 24)
+                    };
+                    for (reg, t, _, events) in &mut worlds {
+                        event_signal(reg, t, events[ev], clear, set).unwrap();
+                    }
+                }
+                2 => {
+                    let key = 1 + rng.below(6);
+                    for (reg, t, port, _) in &mut worlds {
+                        let _ = port_rearm_in(reg, t, *port, key, &mut jobs);
+                    }
+                }
+                _ => {
+                    let max = 1 + rng.below(8) as usize;
+                    let (reg_a, t_a, port_a, _) = &mut worlds[0];
+                    let many = port_poll_many_in(reg_a, t_a, *port_a, &mut jobs, max).unwrap();
+                    let (reg_b, t_b, port_b, _) = &mut worlds[1];
+                    // the same number of single polls (a poll to "see if the rotation came round" would move the cursor)
+                    let single: Vec<(u64, u32)> = (0..many.len())
+                        .map(|_| {
+                            port_poll_in(reg_b, t_b, *port_b, &mut jobs)
+                                .unwrap()
+                                .unwrap()
+                        })
+                        .collect();
+                    let keys: Vec<u64> = many.iter().map(|g| g.0).collect();
+                    assert!(
+                        keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k)),
+                        "each binding at most once: {keys:?}"
+                    );
+                    assert_eq!(many, single, "seed {seed}, max {max}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_batch_wait_checks_its_handle_like_a_single_one() {
+    let (mut reg, mut t) = world();
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let e = event_create(&mut reg, &mut t).unwrap();
+    let nowait = weaker(&mut reg, &mut t, port, Rights::MANAGE);
+    assert_eq!(
+        port_poll_many(&mut reg, &t, Handle(0), 4),
+        Err(Status::BadHandle)
+    );
+    assert_eq!(port_poll_many(&mut reg, &t, e, 4), Err(Status::WrongType));
+    assert_eq!(
+        port_poll_many(&mut reg, &t, nowait, 4),
+        Err(Status::AccessDenied)
+    );
+    assert_eq!(
+        port_poll_many(&mut reg, &t, port, 4),
+        Ok(vec![]),
+        "nothing ready"
+    );
+}
