@@ -12,9 +12,9 @@ on the serial port (OS-ARCHITECTURE.md, "Structured test output"):
     ##PANIC <message>
     ##DONE pass=<n> fail=<n>
 
-The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA; plain
-`virt` has no interrupt controller the kernel drives: `make os-boot-test-polling`); $OS_CPU, if set, is passed as `-cpu` (the target is RVA23: `rva23s64`, OD47). The kernel must report every test in REQUIRED, and it is booted with `-m 128M` (the
-size it assumes, `abi::layout::RAM_SIZE`). The verdict comes from the kernel's exit status (QEMU's test finisher device:
+The machine type comes from $OS_MACHINE (default `virt,aia=aplic-imsic`, the AIA, which the kernel requires: plain
+`virt` has only a PLIC and the kernel refuses to boot on it, PL6); the CPU is always `-cpu rva23s64` (the kernel refuses to boot below the profile, OD47, OD127); only `make os-boot-test-cpu-neg` sets $OS_CPU, to boot a CPU without the profile and expect the refusal. The kernel must report every test in REQUIRED, and it is booted with `-m 256M` (the
+size the harness gives it: `OS_RAM`, default 256M, and `ram=` on the kernel line says which). The verdict comes from the kernel's exit status (QEMU's test finisher device:
 0 for pass, nonzero for fail) AND the lines, which must agree with each other. If
 a second kernel is given (built with its `fail-demo` feature, which makes one test
 fail on purpose), this checks that failure is detected: nonzero exit status, a
@@ -31,8 +31,7 @@ import tempfile
 import time
 import sys
 
-# The machine the OS track runs on (OD75): AIA (APLIC + IMSIC). A plain `virt` has only a PLIC, which the
-# kernel does not drive: no interrupt controller, drivers poll (`make os-boot-test-polling`).
+# The machine the OS track runs on (OD75): AIA (APLIC + IMSIC), required since PL6 (inter-hart interrupts are IMSIC messages).
 DEFAULT_MACHINE = "virt,aia=aplic-imsic"
 # A boot is judged on progress, not on total time (T157, OD140): it fails when the guest prints nothing for STALL seconds (a hang),
 # or when it runs past TIMEOUT (a ceiling far above any healthy run, a runaway). A loaded host (a CI runner, ten busy cores) slows
@@ -47,7 +46,7 @@ REQUIRED = [
     "bss_is_zeroed", "latch_works_on_the_target", "harts_come_online", "ipi_reaches_every_hart", "bkl_is_exclusive_under_contention", "a_wake_preempts_a_lower_priority_hart", "user_threads_run_in_parallel", "teardown_with_threads_on_other_harts", "unmap_while_siblings_touch", "kill_a_spinner_on_another_hart", "smp_churn_stress", "lock_order_violations_are_detected", "bkl_is_released_on_user_entry_and_idle", "idle_harts_take_no_big_lock_for_their_ticks",
     "paging_enabled", "runs_in_the_upper_half", "low_half_is_empty",
     "kernel_mappings_are_w_xor_x", "kernel_sections_have_the_right_permissions",
-    "direct_map_does_not_alias_the_image", "heap_works", "frame_database_is_sane",
+    "direct_map_does_not_alias_the_image", "ram_matches_the_machine", "the_console_is_where_the_boot_line_says", "the_image_is_where_the_loader_put_it", "the_entropy_pool_is_seeded_as_the_tree_says", "heap_works", "frame_database_is_sane",
     "lazy_commit_on_read", "lazy_commit_on_write", "unmapped_region_is_gone",
     "fault_outside_region_is_refused", "write_to_read_only_region_is_refused",
     "shared_vmo_is_one_memory", "churn_does_not_leak",
@@ -90,7 +89,7 @@ REQUIRED = [
     "channel_call_times_out_but_the_request_was_sent", "channel_call_buffer_too_small",
     "channel_call_argument_errors", "wait_and_call_argument_edges", "channel_call_carries_handles",
     "kernel_ends_survive_a_sweep", "wait_is_woken_by_the_peer_closing",
-    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "fsd_keeps_files_across_a_restart", "clock_service_reports_the_rtc", "volmgr_serves_volumes_by_the_table", "devd_serves_null_and_zero", "symlinks_are_followed_by_the_client_not_the_server", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "user_vector_instruction_is_fatal", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_argument_errors", "thread_interrupt_ends_an_object_wait", "thread_interrupt_ends_a_port_wait", "thread_interrupt_ends_a_futex_wait", "thread_interrupt_ends_a_channel_call", "thread_interrupt_before_the_wait_is_not_lost", "thread_interrupt_is_not_taken_by_a_poll", "thread_interrupt_waits_for_a_wait_that_would_block", "thread_interrupt_polls_leave_the_flag_on_every_wait", "thread_interrupt_is_taken_once", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_tcp_churn", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
+    "vmo_basics", "process_map_argument_checks", "process_start_argument_checks", "fetch_the_program_image", "child_exit_code_and_terminated_signal", "child_faults_are_contained", "parent_and_child_talk", "kill_a_spinning_child", "kill_a_blocked_child", "closing_the_last_process_handle_kills_the_child", "a_process_that_never_started_can_be_killed", "process_self_and_mapping_into_ourselves", "many_children_do_not_leak", "vmo_closed_while_mapped_keeps_its_pages", "thread_create_argument_checks", "threads_share_memory_and_report_exit_codes", "a_user_signal_wakes_a_blocked_thread", "thread_limit_and_slots_are_reused", "second_thread_outlives_the_first", "a_thread_can_end_the_whole_process", "a_fault_in_any_thread_ends_the_process", "the_last_thread_sets_the_exit_code", "many_threaded_children_do_not_leak", "threads_created_but_not_run_when_the_process_ends", "kill_a_process_that_is_creating_threads", "thread_create_with_a_full_handle_table", "a_thread_handle_closed_early_is_harmless", "a_thread_hog_cannot_exhaust_the_kernel", "wake_baseline_bystanders_and_counters", "sending_a_waited_handle_ends_a_siblings_wait", "port_waiters_are_not_woken_by_unrelated_syscalls", "futex_sleepers_are_not_woken_by_unrelated_syscalls", "fp_state_is_private_to_each_thread_and_process", "vector_state_is_private_to_each_thread_and_process", "socket_syscalls", "socket_end_of_stream", "socket_half_close", "device_caps_need_the_resource", "port_oneshot_rearm_and_many_bindings", "benchmarks_run_and_report", "blk_round_trip", "blk_driver_restart", "c_transcript_matches_the_host", "lua_script_matches_the_host_build", "lua_upstream_calls", "lua_upstream_closure", "lua_upstream_constructs", "lua_upstream_events", "lua_upstream_goto", "lua_upstream_literals", "lua_upstream_locals", "lua_upstream_math", "lua_upstream_nextvar", "lua_upstream_pm", "lua_upstream_sort", "lua_upstream_strings", "lua_upstream_utf8", "lua_upstream_vararg", "lua_upstream_bitwise", "lua_upstream_tpack", "lua_upstream_coroutine", "lua_upstream_errors", "lua_upstream_db", "lua_upstream_gc", "lua_upstream_gengc", "lua_upstream_cstack", "lua_upstream_attrib", "lua_upstream_files", "futex_argument_errors", "futex_times_out_not_early", "futex_wake_counts_and_fifo", "kill_a_futex_waiter", "mutex_excludes_across_harts", "condvar_producer_consumer", "once_and_semaphore", "basic_golden_corpus_on_the_target", "devmgr_starts_blkd_for_the_disk", "fsd_keeps_files_across_a_restart", "clock_service_reports_the_rtc", "volmgr_serves_volumes_by_the_table", "devd_serves_null_and_zero", "symlinks_are_followed_by_the_client_not_the_server", "a_child_has_no_device_authority", "mmio_reads_the_virtio_magic", "interrupt_object_fires_and_masks", "device_interrupts_arrive_where_asked", "socket_ends_travel_over_channels", "a_child_reads_a_socket_to_the_end", "a_blocked_reader_wakes_when_data_arrives", "a_blocked_writer_wakes_when_space_appears", "port_argument_checks", "port_wait_levels_timeouts_and_fairness", "port_wait_blocks_until_an_object_is_ready", "port_wait_sees_socket_data_and_object_wait_works_on_a_port", "kill_a_child_blocked_in_port_wait", "socket_memory_is_bounded", "kill_needs_the_kill_right_and_nothing_else", "fetch_the_hello_image", "runtime_startup_heap_and_stdio", "runtime_heap_stops_at_its_cap", "runtime_refuses_a_bad_startup_message", "runtime_without_a_startup_message", "runtime_io_fails_instead_of_spinning_without_wait", "launcher_spawns_a_program_from_the_boot_image", "the_process_handle_the_launcher_returns_cannot_manage", "the_launcher_refuses_bad_images_and_requests_without_leaks", "many_launcher_spawns_do_not_leak", "memfsd_serves_the_boot_image", "memfsd_tmp_is_the_only_writable_place", "memfsd_rename", "memfsd_paths_cannot_escape_a_directory_handle", "memfsd_rights_only_shrink", "memfsd_protocol_violations", "registry_publish_open_unavailable_and_views", "memfsd_accounts_confine_a_client", "memfsd_quotas_and_connection_limit", "object_info_names_objects_and_peers", "memfsd_refuses_endpoints_it_cannot_serve_and_orphans", "memfsd_refuses_both_ends_of_one_channel", "memfsd_survives_memory_pressure_from_quota_legal_clients", "memfsd_rights_are_checked_op_by_op", "memfsd_unlinked_open_files_live_until_closed", "memfsd_hands_out_programs_the_launcher_can_run", "memfsd_listing_pages_and_a_slow_client_stalls_only_itself", "memfsd_exits_when_every_client_is_gone", "syscalls_stay_fast_with_many_live_processes", "the_object_cap_is_reached_without_a_kernel_panic", "mappings_per_process_are_bounded", "queued_handles_are_charged_to_the_budget", "dead_port_bindings_vanish_at_once", "replacing_a_handle_ends_a_siblings_wait", "a_thread_killed_before_it_ran_runs_no_user_code", "kill_a_child_whose_threads_never_ran", "kill_a_child_with_blocked_and_spinning_threads", "closing_handles_early_and_kill_on_close", "kill_on_close_holds_after_the_child_took_a_self_handle", "a_thread_made_by_the_parent_faults_or_exits", "job_syscalls_check_handles_rights_and_arguments", "job_limits_stop_a_process_bomb_and_usage_comes_back", "job_limits_stop_a_thread_bomb", "job_memory_limits_stop_a_hog_and_are_credited_back", "vmo_commit_charges_up_front_and_foreign_maps_need_it", "a_child_job_cannot_exceed_its_parent_or_borrow_from_a_sibling", "job_kill_ends_every_process_below_and_forbids_more", "jobs_do_not_leak", "dma_runs_are_allocated_and_freed_repeatedly", "a_refused_process_start_changes_nothing_and_can_be_retried", "thread_interrupt_argument_errors", "thread_interrupt_ends_an_object_wait", "thread_interrupt_ends_a_port_wait", "thread_interrupt_ends_a_futex_wait", "thread_interrupt_ends_a_channel_call", "thread_interrupt_before_the_wait_is_not_lost", "thread_interrupt_is_not_taken_by_a_poll", "thread_interrupt_waits_for_a_wait_that_would_block", "thread_interrupt_polls_leave_the_flag_on_every_wait", "thread_interrupt_is_taken_once", "thread_priority_is_bounded_by_the_job", "page_tables_are_charged_to_the_job", "thread_stacks_are_charged_to_the_job_and_credited_back", "thousands_of_threads_come_and_go", "stream_buffers_are_charged_to_the_client", "a_client_at_quota_stalls_only_itself", "one_socket_two_one_shot_bindings", "stream_pipe_numbers", "bystander_cost_of_sleeping_bindings", "a_dead_client_frees_everything", "a_bad_stream_handle_is_refused", "stream_budgets_with_the_launcher_defaults", "random_service_gives_seeded_distinct_bytes", "c_sockets_over_the_stack", "net_fetch_from_a_host_server", "net_httpd_for_the_host", "net_streams_over_loopback", "net_stream_quotas_and_bad_handles", "net_tcp_echo_for_the_host", "net_tcp_to_the_host_server", "net_tcp_churn", "net_streams_survive_a_stack_restart", "net_ping_round_trip_is_measured", "net_faults_are_survived", "net_clients_are_confined", "net_children_restart", "net_dhcp_configures_the_interface", "net_udp_echo_through_hostfwd", "net_static_config_and_ping_the_gateway", "net_driver_attaches_and_exchanges_a_frame", "a_process_ending_with_spawned_threads_leaks_nothing", "thread_spawn_starts_with_the_documented_state", "thread_spawn_error_cases", "thread_spawn_gives_every_stack_back", "thread_spawn_arena_is_bounded_and_reused", "two_thousand_threads_live", "ten_thousand_threads_leak_nothing", "a_job_limits_how_many_jobs_may_exist_below_it", "job_quotas_stop_an_object_and_an_ipc_hog_and_everything_comes_back", "job_create_sees_the_credit_of_a_job_closed_just_before", "threads_left_behind_when_init_exits", "no_kernel_thread_survives_init", "no_process_or_vmo_survives_init",
 ]
 
 # Tests that only make sense for the fixed-priority class: a kernel booted with the
@@ -282,7 +281,7 @@ def run_profiled(cmd, kernel):
     label = os.environ.get("OS_PROFILE_LABEL") or (
         f"{kernel.split('/')[1] if kernel.startswith('target/') else kernel}"
         f"|smp{os.environ.get('OS_SMP', '1')}|{os.environ.get('OS_MACHINE', DEFAULT_MACHINE)}"
-        f"|{os.environ.get('OS_CPU', 'default-cpu')}")
+        f"|{os.environ.get('OS_CPU', 'rva23s64')}")
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
     stamped = []
@@ -1016,15 +1015,38 @@ def rr_args():
     return ["-icount", f"{shift},rr=record,rrfile={LAST_RECORD[0]}"]
 
 
+def elf_load_address(kernel: str) -> int:
+    """The physical address the kernel ELF asks to be loaded at: `p_paddr` of its first PT_LOAD segment. The kernel is told this (`load=`
+    on its line) and must find itself there (PL4c); a build that ignores the address it was meant for (an earlier version of the
+    load-address test did) is caught because this is read from the ELF, not from what the build was asked for."""
+    import struct
+    with open(kernel, "rb") as f:
+        head = f.read(64)
+        phoff, = struct.unpack_from("<Q", head, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            ph = f.read(phentsize)
+            ptype, = struct.unpack_from("<I", ph, 0)
+            if ptype == 1:
+                paddr, = struct.unpack_from("<Q", ph, 24)
+                return paddr
+    raise SystemExit(f"{kernel}: no PT_LOAD segment")
+
+
 def run(kernel: str, extra=()):
     """Boot `kernel`; return (lines, exit status, timed out)."""
+    if os.environ.get("OS_LOAD") and int(os.environ["OS_LOAD"], 16) != elf_load_address(kernel):
+        raise SystemExit(f"{kernel} is linked to load at {elf_load_address(kernel):#x}, not at OS_LOAD={os.environ['OS_LOAD']}: the load-address build did not take")
     cmd = [
         "qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", DEFAULT_MACHINE), "-bios", "default",
-        "-m", "256M", "-display", "none", "-serial", "stdio", "-monitor", "none",
+        "-m", os.environ.get("OS_RAM", "256M"), "-display", "none", "-serial", "stdio", "-monitor", "none",
         # The clock (FS-SPEC section 7, step C1): the RTC starts from a known date and follows the virtual clock, so the test can
         # tell the time it is given from a made-up one.
         "-rtc", "base=2030-06-15T12:00:00,clock=vm",
-        *(["-cpu", os.environ["OS_CPU"]] if os.environ.get("OS_CPU") else []),
+        # HD1: `OS_DTB=<file>` boots with that device tree (`scripts/entropy_boot_test.py` strips the seeds from QEMU's own)
+        *(["-dtb", os.environ["OS_DTB"]] if os.environ.get("OS_DTB") else []),
+        "-cpu", os.environ.get("OS_CPU", "rva23s64"),  # PL1: the profile CPU is the only test CPU (only the negative control overrides it)
         # Harts (S5): the kernel must start and use all of them; OS_SMP=4 runs the whole suite on 4
         *(["-smp", os.environ["OS_SMP"]] if os.environ.get("OS_SMP") else []),
         # Deterministic guest time (instruction counting): the tests then do not depend on how fast
@@ -1048,9 +1070,12 @@ def run(kernel: str, extra=()):
                                            "net=lossy" if os.environ.get("OS_NET_LOSSY") else "",
                                            f"shard={SHARD}" if SHARD else "",
                                            "kfast" if SHARD == "k" and KFAST else "",
+                                           f"ram={os.environ.get('OS_RAM', '256M')}",
+                                           f"load={elf_load_address(kernel):#x}",
+                                           os.environ.get("OS_BOOT_ARGS", ""),
                                            f"chaos={os.environ['OS_CHAOS_SEED']}" if os.environ.get("OS_CHAOS_SEED") else "",
                                            f"chaospoints={os.environ['OS_CHAOS_POINTS']}" if os.environ.get("OS_CHAOS_POINTS") else "") if a)]
-          if os.environ.get("OS_BENCH_FULL") == "1" or os.environ.get("OS_NET_LOSSY") or SHARD or os.environ.get("OS_CHAOS_SEED") else []),
+          ),
         # The network (S8, NET-SPEC 3.1): one virtio-net device on QEMU's user-mode network, with the addresses set
         # explicitly so no test depends on a default, a host-forwarded UDP port to the guest's 7777, and a packet
         # capture of everything the guest and slirp exchange. OS_NET=0 leaves it off; OS_NET_PCAP names the capture;
@@ -1254,25 +1279,21 @@ def main() -> int:
             found.append(f"the kernel did not report 'harts online: {want_harts}'")
         # (the lossy mode runs only the bulk TCP tests, and the net shard only the network tests: the checks for the other tests would fail by design)
         strict = not expect_fail and not os.environ.get("OS_NET_LOSSY") and SHARD != "b"
-        # The interrupt controller the kernel found must be the one the machine has (S6a-2): a PLIC on
-        # the default board, the AIA (APLIC + IMSIC, OD75) on the aia machine. Otherwise the interrupt-object test
-        # could pass by skipping.
-        aia = "aia" in os.environ.get("OS_MACHINE", DEFAULT_MACHINE)
-        want_ic = "interrupt controller: AIA" if aia else "interrupt controller: none"
+        # The kernel must have found the AIA (APLIC + IMSIC, OD75); otherwise the interrupt-object test could pass by skipping.
+        want_ic = "interrupt controller: AIA"
         if strict and want_ic not in text.split("\n"):
             found.append(f"the kernel did not report '{want_ic}'")
         # The interrupt-object test must have run its full path (a disk, an interrupt), not skipped.
-        if (strict and os.environ.get("OS_DISK") != "0" and aia
+        if (strict and os.environ.get("OS_DISK") != "0"
                 and "s6: interrupt path exercised" not in text):
             found.append("the interrupt-object test did not reach the device interrupt")
-        # The block-driver tests must have found the disk and run (with interrupts on both machines, OD75).
+        # The block-driver tests must have found the disk and run, with interrupts.
         if (strict and os.environ.get("OS_DISK") != "0"
-                and f"s6: blkd exercised ({'interrupts' if aia else 'polling'})" not in text):
-            found.append("the block-driver tests did not run in the expected mode "
-                         f"({'interrupts' if aia else 'polling'})")
+                and "s6: blkd exercised (interrupts)" not in text):
+            found.append("the block-driver tests did not run with interrupts")
         # On the AIA, device interrupts must have been taken, none on a hart they were not aimed at, and
         # (with several harts) some on a hart other than the boot hart: delivery goes to the hart that asked.
-        if strict and aia and os.environ.get("OS_DISK") != "0":
+        if strict and os.environ.get("OS_DISK") != "0":
             m = re.search(r"s6: device interrupts taken (\d+), off the boot hart (\d+), misrouted (\d+)", text)
             if not m:
                 found.append("the kernel did not report the device interrupt counts")

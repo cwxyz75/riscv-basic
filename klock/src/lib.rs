@@ -45,12 +45,13 @@ pub enum Class {
     Kstack = 11,
     Frame = 12,
     Heap = 13,
-    Uart = 14,
+    Entropy = 14,
+    Uart = 15,
 }
 
 impl Class {
     /// Every class, in order.
-    pub const ALL: [Class; 14] = [
+    pub const ALL: [Class; 15] = [
         Class::Legacy,
         Class::As,
         Class::Obj,
@@ -64,6 +65,7 @@ impl Class {
         Class::Kstack,
         Class::Frame,
         Class::Heap,
+        Class::Entropy,
         Class::Uart,
     ];
 

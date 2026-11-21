@@ -487,3 +487,27 @@ fn equal_priority_threads_are_not_pulled_back_and_forth() {
     assert_eq!(s.pulls(), 0, "equals never migrate");
     s.audit(true).unwrap();
 }
+
+#[test]
+fn sixty_four_harts_poke_every_hart_including_the_last() {
+    // SC1: the scheduler the kernel runs keeps its pokes in a 64-bit mask; one thread per hart, spawned from hart 0
+    let mut w = World::new(64);
+    let mut poked = 0u64;
+    for _ in 0..64 {
+        let tid =
+            w.s.spawn_on(0, SchedAttr { prio: 4, rr: false }, None)
+                .unwrap();
+        w.t.insert(
+            tid,
+            Ref {
+                state: R::Runnable,
+                prio: 4,
+                pin: None,
+            },
+        );
+        poked |= w.s.take_pokes();
+        w.drain(); // (the poked hart takes the thread, so the next one goes to another idle hart)
+    }
+    assert!(poked & (1 << 63) != 0, "hart 63 was poked: {poked:#x}");
+    w.check("64 harts", 0, 0);
+}

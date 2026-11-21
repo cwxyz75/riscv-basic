@@ -50,6 +50,58 @@ pub fn cpu_idle() {
     unsafe { asm!("wfi") };
 }
 
+/// One read of the `seed` CSR (Zkr): bits 31:30 say what the low 16 bits are (00 the entropy source is still testing itself, 01 it is gathering,
+/// 10 they are 16 fresh entropy bits, 11 it has failed). Only on a hart whose ISA string has Zkr, and only if M-mode lets S-mode read it
+/// (`mseccfg.SSEED`); otherwise the read is an illegal instruction.
+pub fn seed_csr_read() -> usize {
+    let v: usize;
+    // SAFETY: `csrrw rd, seed, x0` reads the entropy source and writes nothing (rs1 = x0 makes the write an unused zero); the caller checked
+    // that the hart has Zkr.
+    unsafe { asm!("csrrw {}, 0x015, zero", out(reg) v) };
+    v
+}
+
+/// Enable the cache-block instructions for user mode on this hart (PL3): `senvcfg.CBZE` (`cbo.zero`), `CBCFE` (`cbo.clean` and `cbo.flush`) and `CBIE`
+/// = 01 (`cbo.inval` executes as a flush). Returns whether every bit stuck: M-mode has to allow them first (`menvcfg`), and a hart without the
+/// extensions keeps them zero.
+pub fn enable_cache_block_ops() -> bool {
+    const SENVCFG_CBIE_FLUSH: usize = 1 << 4;
+    const SENVCFG_CBCFE: usize = 1 << 6;
+    const SENVCFG_CBZE: usize = 1 << 7;
+    const WANT: usize = SENVCFG_CBIE_FLUSH | SENVCFG_CBCFE | SENVCFG_CBZE;
+    let v: usize;
+    // SAFETY: sets bits of `senvcfg` (0x10a), the supervisor's environment configuration for user mode, and reads it back; nothing else changes.
+    unsafe {
+        asm!(
+            "csrc 0x10a, {clear}",
+            "csrs 0x10a, {want}",
+            "csrr {v}, 0x10a",
+            clear = in(reg) WANT | (3 << 4),
+            want = in(reg) WANT,
+            v = out(reg) v,
+        )
+    };
+    v & (WANT | (3 << 4)) == WANT
+}
+
+/// This hart's vector register length in bytes (`vlenb`; the CSR is readable only with `sstatus.VS` on).
+pub fn vlenb_read() -> usize {
+    let v: usize;
+    // SAFETY: switches the vector unit on for one CSR read and off again; it changes no other state and runs with interrupts as the caller has them
+    // (boot, before any user thread), so no user state can be in the unit.
+    unsafe {
+        asm!(
+            "csrs sstatus, {on}",
+            "csrr {v}, 0xc22",
+            "csrc sstatus, {on2}",
+            v = out(reg) v,
+            on = in(reg) 1usize << 9,
+            on2 = in(reg) 3usize << 9,
+        )
+    };
+    v
+}
+
 /// The per-hart pointer register's value.
 #[inline(always)]
 pub fn thread_pointer() -> usize {
@@ -92,18 +144,4 @@ pub fn lazy_units_are_off() -> bool {
     // SAFETY: reads a CSR.
     unsafe { asm!("csrr {}, sstatus", out(reg) v) };
     v >> 13 & 3 == 0 && v >> 9 & 3 == 0
-}
-
-/// Enable the software interrupt (the inter-hart interrupt) on this hart.
-#[inline(always)]
-pub fn software_interrupt_enable() {
-    // SAFETY: sets sie.SSIE only (the supervisor software interrupt, used for IPIs).
-    unsafe { asm!("csrs sie, {}", in(reg) 1usize << 1) };
-}
-
-/// Clear this hart's pending software interrupt.
-#[inline(always)]
-pub fn software_interrupt_clear() {
-    // SAFETY: clears sip.SSIP, the pending bit of the software interrupt; nothing else.
-    unsafe { asm!("csrc sip, {}", in(reg) 1usize << 1) };
 }

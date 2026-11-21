@@ -296,6 +296,13 @@ fn ipi_reaches_every_hart() -> Result<(), String> {
             ));
         }
     }
+    // PL6: the interrupts above were messages to the harts' IMSIC files; the firmware's IPI extension was never called
+    if crate::arch::sbi::ipi_calls() != 0 {
+        return Err(format!(
+            "{} calls were made to the SBI IPI extension",
+            crate::arch::sbi::ipi_calls()
+        ));
+    }
     Ok(())
 }
 
@@ -312,7 +319,7 @@ fn bkl_is_exclusive_under_contention() -> Result<(), String> {
         crate::irq::without(smp::racy_increment);
     }
     for i in 1..n {
-        if smp::wait_work(i, 5 * 10_000_000) != Some(M) {
+        if smp::wait_work(i, 5 * crate::timer::timebase()) != Some(M) {
             return Err(format!("hart {i} did not finish its increments"));
         }
     }

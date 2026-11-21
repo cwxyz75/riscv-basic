@@ -13,6 +13,8 @@ pub mod timer;
 pub mod trap;
 pub mod usermode;
 
+pub use boot::kernel_delta;
 pub use cpu::*;
+pub use sbi::{debug_console_write_byte, system_reset};
 pub use switch::{switch, Context};
 pub use usermode::enter_user_raw as enter_user;

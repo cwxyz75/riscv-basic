@@ -12,7 +12,10 @@ exits with pass or fail. Its switches are environment variables:
 |---|---|
 | `OS_SMP` | hart count |
 | `OS_SHARD` | which part of the suite: `a`, `b`, `k` (below), empty for all |
-| `OS_CPU` | the CPU model (`rva23s64`) |
+| `OS_DTB` | boot with this device tree (`-dtb`); `scripts/entropy_boot_test.py` (`make os-boot-test-entropy`, soak) uses a copy of QEMU's own with `/chosen/rng-seed` removed |
+| `OS_LOAD` | the physical address the image was built for (`make os-boot-test-loadaddr` sets it): the kernel line carries `load=<address>` and the test `the_image_is_where_the_loader_put_it` compares it with where the early boot code found the image |
+| `OS_RAM` | the RAM QEMU is given (`-m`; default `256M`); the harness also puts `ram=<size>` on the kernel line, and the kernel test `ram_matches_the_machine` checks the frame count against it |
+| `OS_CPU` | the CPU model; always `rva23s64` (the kernel refuses to boot below the profile); only `os-boot-test-cpu-neg` sets it, to `rv64` |
 | `OS_BOOT_STALL` | seconds without output before a boot is called stalled (default 180) |
 | `OS_BOOT_TIMEOUT` | the runaway ceiling in seconds (default 1800) |
 | `OS_PROFILE=<file>` | append host seconds and guest ticks per test to a TSV |
@@ -82,6 +85,7 @@ test between tiers, and put the numbers in a dated record.
 | `make os-aarch64-check` | the kernel compiles against the AArch64 stub (the architecture boundary is complete) |
 | `make lint` | clippy with warnings denied: `lint-host` (the host crates) and `lint-target` (the home kernel, the user programs, the OS kernel with its panic-finding deny list) |
 | `make docs-check` | `scripts/check_docs.py` (documents, the decision log, the work queue, the testing tiers, the atomics allow-list, the architecture boundary, the workflows, the syscall-error table) and the self-tests of the benchmark comparison and the packet-capture checker |
+| `make build` | the OS kernel (with its user programs) and the home kernel, then `scripts/check_vector_codegen.py` (PL3): the built C code (Lua, the C tests) must hold vector instructions, so a `-march` that lost the V extension cannot pass silently |
 | `make os-miri` | the unit tests and the frame-database model under Miri (nightly toolchain; soak) |
 
 **The fuzzer of the syscall layer.** `kfuzz-gen` generates call sequences from a model of what the process holds
@@ -113,7 +117,7 @@ code is right.
 **Instruction counts.** `make os-count` boots the kernel-only shard at one hart under `-icount shift=0`, where the
 guest's retired-instruction counter is deterministic, and compares the suite's `##BENCH count_<name> <n> instr` lines
 with `bench/counts.tsv`. A rise of more than 5 % fails; a fall of more than 5 % is printed with a request to record it
-(`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot).
+(`make os-count-record`, then read the diff of the file). Record and compare in the same configuration (the `kfast` boot). The file holds the numbers of the CI run (2026-11-20: PL1 moved the test CPU to `rva23s64` and the kernel's code generation to the profile's extensions, and the epic gate's numbers then differed from a laptop's by up to 12 % in either direction, so the recorded values came from the gate's own log): a local `make os-count` is a reproduction, not the check.
 
 **Benchmarks.** The suite prints `##BENCH <name> <ns> ns` lines (a malformed one fails the boot). Every boot runs the
 benchmarks at a tenth of the iterations with sanity assertions only, so they cannot rot. `make os-bench` (soak) runs
@@ -134,8 +138,8 @@ kernel-only shard at one, two and eight on the `release-checked` profile: optimi
 overflow checks on.
 
 **The matrix and the negative controls** (soak): `os-boot-test` (the normal, fail-demo, round-robin and release
-kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`, `os-boot-test-polling` (plain `virt`),
-`os-boot-test-rva23`, `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
+kernels), `os-boot-test-smp` (two and four harts), `os-boot-test-nodisk`,
+`os-boot-test-cpu-neg` (a CPU without the profile ends in `##PANIC missing extension`), `os-boot-test-overflow`, `os-serial-test`, and the negative controls, each a kernel built with one
 mechanism disabled that the suite must then fail: `os-boot-test-smp-neg`, `os-boot-test-sched-neg`, `os-boot-test-aia`.
 
 **The network checks by tier.**

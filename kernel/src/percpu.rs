@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Most harts the kernel manages (QEMU `-smp` up to this).
-pub const MAX_HARTS: usize = 8;
+pub const MAX_HARTS: usize = 64;
 
 /// Why a hart was sent an IPI (bits of `PerHart::pending`).
 pub const IPI_RESCHED: u32 = 1;
@@ -46,7 +46,7 @@ pub struct PerHart {
     pub online: AtomicBool,
     /// Timer interrupts this hart has taken.
     pub timer_ticks: AtomicU64,
-    /// Software interrupts (IPIs) this hart has taken.
+    /// Inter-hart interrupts (IPIs) this hart has taken.
     pub ipis: AtomicU64,
     /// Is the hart in (or entering) user mode right now?
     pub in_user: AtomicBool,
@@ -89,6 +89,14 @@ pub struct PerHart {
     pub idle_wfi: AtomicU64,
     pub idle_suspend: AtomicU64,
     pub idle_ns: AtomicU64,
+    /// The thread whose latest FP (resp. vector) state this hart's register file holds, 0 for none (PL3, T166): written under the big lock by the
+    /// load and save paths of `arch::fp`, read by this hart alone on its way back to user mode, so a thread that has used a unit and is
+    /// alone on its hart returns without taking the lock. A claim is cleared when another hart saves or loads the thread's state.
+    pub fs_claim: AtomicU32,
+    pub vs_claim: AtomicU32,
+    /// Where the claimed thread's saved registers are (the address of its box), so the trap paths that take no lock can save into it.
+    pub fs_buf: AtomicUsize,
+    pub vs_buf: AtomicUsize,
     /// Spin iterations in the current wait for a lock (the deadlock detector's counter).
     pub spins: AtomicU64,
     /// The lock class this hart last asked for (diagnostics for the deadlock detector).
@@ -127,6 +135,10 @@ impl PerHart {
             idle_wfi: AtomicU64::new(0),
             idle_suspend: AtomicU64::new(0),
             idle_ns: AtomicU64::new(0),
+            fs_claim: AtomicU32::new(0),
+            vs_claim: AtomicU32::new(0),
+            fs_buf: AtomicUsize::new(0),
+            vs_buf: AtomicUsize::new(0),
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
         }

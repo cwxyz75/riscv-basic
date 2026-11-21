@@ -20,6 +20,7 @@ mod bkl;
 mod chaos;
 mod console;
 mod dtb;
+mod entropy;
 mod heap;
 #[cfg(feature = "interactive")]
 mod interactive;
@@ -75,9 +76,17 @@ impl Tally {
 #[no_mangle]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
-    dtb::DTB.store(dtb, core::sync::atomic::Ordering::Relaxed);
-    // First of all: this hart's record in `tp` (the trap entry needs it).
+    // First of all: this hart's record in `tp` (the trap entry and the console's lock need it, so a panic in what follows can still print).
     percpu::bind(0, hart_id);
+    // Then, before anything prints: where the tree is (the early table maps all physical space below 64 GiB, and the pointer is
+    // bounds-checked), the console it names, the boot word that forces the firmware's console (the fallback path, exercised on a machine
+    // that has a UART: `make os-boot-test-sbi-console`) and the test device. All allocation-free: there is no heap yet.
+    dtb::locate(dtb);
+    console::init_from_tree();
+    if dtb::dtb_blob().is_some_and(|b| kcore::fdt::bootarg_present(b, "console=sbi")) {
+        console::use_sbi();
+    }
+    finisher::init(dtb::dtb_blob().and_then(kcore::fdt::test_finisher_base));
     percpu::this()
         .online
         .store(true, core::sync::atomic::Ordering::Release);
@@ -111,16 +120,22 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
 
     heap::init();
     trap::init();
+    dtb::init_timebase(); // (the clock's rate: before anything reads the time)
+    entropy::init(hart_id); // (HD1: the pool is seeded before any address is chosen)
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
+    dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
+    fp::init_boot_hart(); // PL2: the vector register length (every other hart must agree)
+    fp::enable_cache_block_ops_or_stop(); // PL3: cbo.zero and friends for user mode
     kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
     aia::init();
+    // PL6: the AIA is required (the inter-hart interrupt is an IMSIC message, and there is no polling mode)
+    assert!(
+        aia::present(),
+        "no usable AIA (APLIC in MSI mode with an IMSIC): this kernel needs `-machine virt,aia=aplic-imsic`"
+    );
     if !RELEASE {
-        let _ = writeln!(
-            out,
-            "interrupt controller: {}",
-            if aia::present() { "AIA" } else { "none" }
-        );
+        let _ = writeln!(out, "interrupt controller: AIA");
         let _ = writeln!(
             out,
             "kernel page table active; {} frames free",
@@ -147,14 +162,14 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     bkl::enforce();
     // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {
-        let deadline = timer::now() + 2 * 10_000_000;
+        let deadline = timer::now()
+            + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * smp::started() as u64);
         while thread::joined() < smp::started() && timer::now() < deadline {
             core::hint::spin_loop();
         }
     }
     timer::start();
     irq::enable_timer_interrupt();
-    smp::enable_ipi_on_this_hart();
     irq::enable();
     let class = thread::class_name();
     if !RELEASE {

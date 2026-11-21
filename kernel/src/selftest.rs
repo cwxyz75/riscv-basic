@@ -4,7 +4,7 @@
 //! allocation counts to baseline" (the old roadmap, S1).
 
 use crate::{kmem, trap};
-use abi::layout::{DIRECT_BASE, KERNEL_OFFSET, LAZY_TEST_BASE};
+use abi::layout::{DIRECT_BASE, LAZY_TEST_BASE};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -84,7 +84,7 @@ fn runs_in_the_upper_half() -> Outcome {
         "stack address is in the Sv39 upper half",
     )?;
     ensure(
-        pc >= abi::layout::KERNEL_PHYS + KERNEL_OFFSET,
+        pc >= abi::layout::KERNEL_VIRT_BASE,
         "code is at the kernel's linked address",
     )
 }
@@ -98,6 +98,7 @@ fn low_half_is_empty() -> Outcome {
         0x8000_0000,
         0x8020_0000,
         0x8800_0000,
+        kmem::stats().image_first << 12, // wherever the image actually is
     ] {
         ensure(
             k.aspace.table().translate(&k.mm, va).is_none(),
@@ -110,9 +111,12 @@ fn low_half_is_empty() -> Outcome {
 fn kernel_mappings_are_w_xor_x() -> Outcome {
     let k = kmem::get();
     let (mut leaves, mut bad) = (0, 0);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |_va, t, level| {
+    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         leaves += 1;
-        if (t.perms.write && t.perms.exec) || level != 0 || t.perms.user {
+        // a large leaf is legal only in the direct map (MM3) and only as plain data: read-write, never executable, never user
+        let large_ok = level == 0
+            || ((DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) && t.perms == Perms::RW);
+        if (t.perms.write && t.perms.exec) || !large_ok || t.perms.user {
             bad += 1;
         }
     });
@@ -140,7 +144,7 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
             ensure_eq(t.perms, want, &format!("{name} page {va:#x}"))?;
             ensure_eq(
                 t.pfn,
-                (va - KERNEL_OFFSET) >> 12,
+                (va - crate::arch::kernel_delta()) >> 12,
                 &format!("{name} page {va:#x} maps to its physical load address"),
             )?;
             va += PAGE;
@@ -156,46 +160,218 @@ fn kernel_sections_have_the_right_permissions() -> Outcome {
     ensure_eq(stray, 0, "executable pages outside text")
 }
 
-/// Every direct-map leaf maps a frame the frame database manages (never the
-/// kernel image, whose frames sit below the first managed frame), or is one of
-/// the two device pages.
+/// Every direct-map leaf maps usable RAM (the frames the database manages and the metadata the database lives in; never the kernel image
+/// or the firmware's reserved ranges), or is one of the device pages or the tree's own frames.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn direct_map_does_not_alias_the_image() -> Outcome {
     let k = kmem::get();
-    let first = kmem::first_managed_frame();
-    let image_pa = abi::layout::KERNEL_PHYS;
-    ensure(
-        k.aspace
-            .table()
-            .translate(&k.mm, DIRECT_BASE + image_pa)
-            .is_none(),
-        "the kernel image must not be reachable through the direct map",
-    )?;
-    let (mut in_map, mut aliases, mut devices) = (0, 0, 0);
-    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, _| {
+    let st = kmem::stats();
+    // (the whole image, page by page: nothing of it is reachable through the direct map, whatever the leaf sizes. The firmware's own
+    // reservation is the tree's business; the RAM between it and the image is ordinary usable memory now)
+    for pfn in st.image_first..st.image_end {
+        ensure(
+            k.aspace
+                .table()
+                .translate(&k.mm, DIRECT_BASE + (pfn << 12))
+                .is_none(),
+            "a page of the kernel image or firmware is reachable through the direct map",
+        )?;
+    }
+    let usable = kmem::usable_ranges();
+    let (mut in_map, mut aliases, mut devices, mut outside) = (0, 0, 0, 0);
+    let (mut leaves, mut level1) = (0u64, 0u64);
+    k.aspace.table().for_each_leaf(&k.mm, &mut |va, t, level| {
         if (DIRECT_BASE..DIRECT_BASE + (1 << 36)).contains(&va) {
-            in_map += 1;
-            if t.pfn >= abi::layout::RAM_BASE >> 12 && t.pfn < first {
-                aliases += 1; // a RAM frame below the first managed one: the image or firmware
+            let pages = 1u64 << (9 * level);
+            in_map += pages; // pages, whatever the leaf's size
+            leaves += 1;
+            if level >= 1 {
+                level1 += pages; // pages covered by large leaves (2 MiB, and 1 GiB on a big machine)
             }
-            if t.pfn < abi::layout::RAM_BASE >> 12 {
+            if t.pfn < st.image_end && t.pfn + pages > st.image_first {
+                aliases += 1; // a leaf that covers part of the image
+            }
+            if t.pfn < st.ram_first {
                 devices += 1;
             }
             if va - DIRECT_BASE != t.pfn << 12 {
                 aliases += 1; // not the direct map's own formula
             }
+            // a read-write leaf lies wholly inside a usable range; anything else is a device page (below RAM) or one of the tree's
+            // read-only pages
+            let inside = usable
+                .iter()
+                .any(|&(f, c)| t.pfn >= f && t.pfn + pages <= f + c as u64);
+            if t.perms.write && !inside && t.pfn >= st.ram_first {
+                outside += 1;
+            }
+            if !t.perms.write && t.pfn >= st.ram_first && !(t.perms.read && pages == 1) {
+                outside += 1; // only the tree's pages are read-only RAM, one frame each
+            }
         }
     });
-    ensure(in_map > 1000, "the direct map has leaves")?;
+    ensure(in_map > 1000, "the direct map has pages")?;
+    // MM3: RAM is mapped with 2 MiB pages (a 256 MiB machine has about 126 of them) and 4 KiB pages only at the edges and around the
+    // tree, not tens of thousands of small leaves
+    ensure(
+        level1 >= st.usable_frames / 2,
+        "most of the direct map is large pages",
+    )?;
+    // leaves: large pages are few; the small ones are the edges and the tree's pages
+    ensure(leaves < 3000, "the direct map has few leaves")?;
     ensure_eq(
         devices,
-        2 + crate::aia::PAGE_COUNT,
+        2 + crate::aia::pages().count(),
         "device pages in the direct map",
+    )?;
+    ensure_eq(
+        outside,
+        0,
+        "direct-map leaves that are not usable memory, a device page or a tree page",
     )?;
     ensure_eq(
         aliases,
         0,
         "direct-map leaves aliasing the image, firmware or a wrong address",
     )
+}
+
+/// PL4: the frame count matches the machine. What does not need the harness's word is checked always: the allocator's total is the managed
+/// frames, and the reserved part of RAM covers at least the kernel image (a tree that reserved nothing would hand out the image's frames)
+/// and is the image plus a little (firmware, the tree). The harness says how much RAM it gave QEMU (`ram=<size>` on the kernel line:
+/// `128M`, `4G`, or bytes); the tree must describe exactly that.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn ram_matches_the_machine() -> Outcome {
+    let st = kmem::stats();
+    let image = st.image_end - st.image_first;
+    let reserved = st.memory_frames - st.usable_frames;
+    ensure_eq(
+        k_total_frames(),
+        st.managed_frames,
+        "the allocator's total is the managed frames",
+    )?;
+    ensure(
+        reserved >= image,
+        "the reserved part of RAM covers the image",
+    )?;
+    ensure(
+        st.meta_frames * 4096 >= st.managed_frames * kcore::buddy::META_BYTES as u64,
+        "the frames set aside for the metadata hold one entry per managed frame",
+    )?;
+    ensure(
+        reserved < image + 2048,
+        "the reserved part of RAM is the image and a little more",
+    )?;
+    let Some(want) = crate::dtb::boot_arg_value("ram=") else {
+        return Ok(()); // a boot without the harness (the interactive targets): nothing to compare
+    };
+    let (num, shift) = match want.as_bytes().last() {
+        Some(b'M') => (&want[..want.len() - 1], 20),
+        Some(b'G') => (&want[..want.len() - 1], 30),
+        _ => (want.as_str(), 0),
+    };
+    let bytes = num.parse::<u64>().map_err(|_| "ram= is not a number")? << shift;
+    ensure_eq(
+        st.memory_frames,
+        bytes.min(abi::layout::DIRECT_MAP_PHYS_LIMIT - st.ram_first * 4096) / 4096,
+        "the frames of RAM the device tree describes",
+    )
+}
+
+/// PL5b: the console fallback proves itself. Under the boot word `console=sbi` (`make os-boot-test-sbi-console`) output must really go through the
+/// firmware: the switch happened, bytes went that way (this test's own line included) and the firmware refused none. Without the word the
+/// kernel prints on the UART the tree named, and nothing went through the firmware.
+fn the_console_is_where_the_boot_line_says() -> Outcome {
+    let (bytes, refused) = crate::console::sbi_counts();
+    if crate::dtb::boot_arg_present("console=sbi") {
+        ensure(
+            crate::console::sbi_forced(),
+            "console=sbi switched the console",
+        )?;
+        ensure(
+            bytes > 0,
+            "output went through the firmware's debug console",
+        )?;
+        ensure_eq(refused, 0, "bytes the firmware's debug console refused")
+    } else {
+        ensure(
+            !crate::console::sbi_forced(),
+            "the console was not switched without the word",
+        )?;
+        ensure(
+            crate::console::base().is_some(),
+            "the tree named a UART and the kernel found it",
+        )?;
+        ensure_eq(bytes, 0, "bytes sent through the firmware without the word")
+    }
+}
+
+/// PL4c: the image is where the loader put it, and the kernel found out. The harness names the address it built the image for
+/// (`load=0x...` on the kernel line; only the load-address boot test does) and the image's physical start, worked out by the early boot
+/// code from its own address, must be that: a kernel that quietly ran from the default address would pass every other test.
+/// HD1: the pool is seeded exactly when the tree has a seed (a stripped tree is booted with `-dtb`), and what it produces is not constant.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn the_entropy_pool_is_seeded_as_the_tree_says() -> Outcome {
+    let blob = crate::dtb::dtb_blob().ok_or_else(|| String::from("no device tree"))?;
+    let seeds = kcore::fdt::chosen_seeds(blob).unwrap_or_default();
+    let nonzero = |r: Option<(usize, usize)>| {
+        r.and_then(|(o, l)| blob.get(o..o + l))
+            .is_some_and(|b| b.iter().any(|&x| x != 0))
+    };
+    let want = nonzero(seeds.rng_seed) || nonzero(seeds.kaslr_seed);
+    ensure_eq(
+        crate::entropy::seeded(),
+        want,
+        "seeded exactly when the tree has a non-zero seed (this machine has no Zkr)",
+    )?;
+    let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+    ensure(
+        crate::entropy::fill(&mut a) && crate::entropy::fill(&mut b),
+        "the pool fills",
+    )?;
+    ensure(a != b && a != [0; 16], "two draws differ and are not zero")?;
+    ensure(crate::entropy::below(0).is_none(), "below(0) is refused")?;
+    ensure(
+        (0..50).all(|_| crate::entropy::below(7).is_some_and(|x| x < 7)),
+        "below(7) stays below 7",
+    )?;
+    ensure(
+        crate::entropy::first_output() != 0,
+        "the first output was recorded",
+    )
+}
+
+fn the_image_is_where_the_loader_put_it() -> Outcome {
+    let st = kmem::stats();
+    let delta = crate::arch::kernel_delta();
+    ensure_eq(
+        abi::layout::KERNEL_VIRT_BASE - delta,
+        st.image_first << 12,
+        "the image's physical start is its link address minus the delta",
+    )?;
+    ensure(
+        (st.image_first << 12).is_multiple_of(2 << 20),
+        "the image is loaded at a multiple of 2 MiB",
+    )?;
+    let Some(want) = crate::dtb::boot_arg_value("load=") else {
+        // a boot without the harness (the interactive targets) says nothing; the harness always does (`ram=` is its mark)
+        return if crate::dtb::boot_arg_value("ram=").is_some() {
+            Err("the harness did not say where it loaded the image (load=)".into())
+        } else {
+            Ok(())
+        };
+    };
+    let want =
+        u64::from_str_radix(want.trim_start_matches("0x"), 16).map_err(|_| "load= is not hex")?;
+    ensure_eq(
+        st.image_first << 12,
+        want,
+        "the image's physical start is where the harness loaded it",
+    )
+}
+
+fn k_total_frames() -> u64 {
+    crate::irq::without(|| kmem::get().mm.db.total() as u64)
 }
 
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
@@ -473,6 +649,19 @@ pub const TESTS: &[Test] = &[
     (
         "direct_map_does_not_alias_the_image",
         direct_map_does_not_alias_the_image,
+    ),
+    ("ram_matches_the_machine", ram_matches_the_machine),
+    (
+        "the_console_is_where_the_boot_line_says",
+        the_console_is_where_the_boot_line_says,
+    ),
+    (
+        "the_entropy_pool_is_seeded_as_the_tree_says",
+        the_entropy_pool_is_seeded_as_the_tree_says,
+    ),
+    (
+        "the_image_is_where_the_loader_put_it",
+        the_image_is_where_the_loader_put_it,
     ),
     ("heap_works", heap_works),
     ("frame_database_is_sane", frame_database_is_sane),

@@ -22,8 +22,11 @@
 
 extern crate alloc;
 
+pub mod aiatree;
 pub mod aspace;
+pub mod buddy;
 pub mod chaos;
+pub mod devwin;
 pub mod donate;
 pub mod elf;
 pub mod fdt;
@@ -31,10 +34,13 @@ pub mod fp;
 pub mod frame;
 pub mod futex;
 pub mod handle;
+pub mod harts;
 pub mod ipc;
+pub mod isa;
 pub mod job;
 pub mod latch;
 pub mod linestate;
+pub mod memmap;
 pub mod object;
 pub mod pagemap;
 pub mod pagetable;
@@ -45,6 +51,7 @@ pub mod sched_smp;
 pub mod sync;
 pub mod testlog;
 pub mod ticket;
+pub mod timebase;
 pub mod usercopy;
 pub mod wait;
 

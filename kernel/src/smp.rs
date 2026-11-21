@@ -1,6 +1,6 @@
 //! Secondary harts (S5a, spec section 3): discovery through the SBI hart-state-management
 //! extension, the entry code they start in, and the IPI. In S5a the secondaries only idle: each
-//! takes its own timer interrupts and software interrupts and counts them; the scheduler and every
+//! takes its own timer interrupts and inter-hart interrupts and counts them; the scheduler and every
 //! piece of shared kernel state stay on the boot hart (the big kernel lock arrives in S5b).
 
 use crate::arch::sbi::*;
@@ -41,10 +41,9 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     unsafe { crate::arch::aspace_install(token) };
     timer::start();
     irq::enable_timer_interrupt();
-    enable_software_interrupt();
-    if crate::aia::present() {
-        crate::aia::init_hart();
-    }
+    crate::fp::check_hart(); // (PL2: the same vector register length as the boot hart)
+    crate::fp::enable_cache_block_ops_or_stop(); // (PL3)
+    crate::aia::init_hart(); // (the inter-hart interrupt is a message in this hart's IMSIC file)
     percpu::this().online.store(true, Ordering::Release);
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
     // shared), then this hart joins it for good.
@@ -58,19 +57,8 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     }
 }
 
-fn enable_software_interrupt() {
-    crate::arch::software_interrupt_enable();
-}
-
-/// The boot hart's share of `enable_software_interrupt`.
-pub fn enable_ipi_on_this_hart() {
-    enable_software_interrupt();
-}
-
-/// The software interrupt handler (called from the trap handler on any hart): clear the pending
-/// bit, take the reasons, count.
+/// The inter-hart interrupt handler (called from the trap handler on any hart, after the IMSIC message was claimed): take the reasons, count.
 pub fn ipi_interrupt() -> u32 {
-    crate::arch::software_interrupt_clear();
     let me = percpu::this();
     // take the reasons first, then count: whoever sees the count move sees the bits already gone
     let reasons = me.pending.swap(0, Ordering::SeqCst);
@@ -84,13 +72,12 @@ pub fn ipi_interrupt() -> u32 {
     reasons
 }
 
-/// Send `reason` to hart `index` (an IPI through SBI).
+/// Send `reason` to hart `index` (a message to its IMSIC file).
 pub fn send_ipi(index: usize, reason: u32) {
     crate::chaos::point(crate::chaos::Point::BeforeIpi);
     let target = percpu::hart(index);
     target.pending.fetch_or(reason, Ordering::SeqCst);
-    let id = target.hart_id.load(Ordering::Relaxed);
-    sbi(EID_IPI, FID_SEND_IPI, 1usize << (id % 64), id - id % 64, 0);
+    crate::aia::send_ipi(target.hart_id.load(Ordering::Relaxed));
 }
 
 /// Find the other harts and start them. Needs `kmem::init` (the kernel table) and the heap.
@@ -106,17 +93,30 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
             *((stacks + i * STACK_BYTES) as *mut u64) = CANARY;
         }
     }
-    let entry_phys = secondary_entry as *const () as usize - abi::layout::KERNEL_OFFSET as usize;
+    let entry_phys = secondary_entry as *const () as usize - crate::arch::kernel_delta() as usize;
+    // the harts the tree lists (any ids, any order; the boot hart is index 0): a hart's index is its place in this list
+    let ids: alloc::vec::Vec<u32> = crate::dtb::dtb_blob()
+        .and_then(|b| kcore::fdt::parse(b).ok())
+        .and_then(|nodes| kcore::harts::hart_ids(&nodes, boot_hart_id as u32))
+        .unwrap_or_else(|| {
+            let _ = writeln!(
+                Console,
+                "the tree does not list the boot hart {boot_hart_id}: one hart"
+            );
+            alloc::vec![boot_hart_id as u32]
+        });
     let mut next = 1;
-    for id in 0..MAX_HARTS {
-        if id == boot_hart_id {
-            continue;
-        }
+    for &id in ids.iter().skip(1) {
+        let id = id as usize;
         let r = sbi(EID_HSM, FID_HART_GET_STATUS, id, 0, 0);
         if r.error != 0 {
             continue; // no such hart
         }
         if next >= MAX_HARTS {
+            let _ = writeln!(
+                Console,
+                "more than {MAX_HARTS} harts: the rest are left stopped"
+            );
             break;
         }
         if r.value != HSM_STOPPED {
@@ -126,6 +126,11 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
                 "hart {id}: not stopped (state {}), left alone",
                 r.value
             );
+            continue;
+        }
+        if !crate::aia::lists_hart(id) {
+            // an inter-hart interrupt could never reach it (PL6): it stays stopped
+            let _ = writeln!(Console, "hart {id}: not in the IMSIC, left stopped");
             continue;
         }
         // dense index `next`; the record's ids are filled in by the hart itself, but the target
@@ -141,7 +146,7 @@ pub fn start_secondaries(boot_hart_id: usize) -> usize {
     }
     STARTED.store(next, Ordering::SeqCst);
     // wait (bounded) for every started hart
-    let deadline = timer::now() + 2 * 10_000_000; // 2 s at 10 MHz
+    let deadline = timer::now() + timer::cycles_from_ns(2_000_000_000 + 100_000_000 * next as u64); // 2 s and 0.1 s per hart (emulated harts start slowly)
     for i in 1..next {
         while !percpu::hart(i).online.load(Ordering::Acquire) {
             if timer::now() > deadline {
@@ -253,17 +258,26 @@ pub fn shootdown() {
         return; // negative control: the test that guards this must fail
     }
     let me = percpu::this().index.load(Ordering::Relaxed);
+    // every other online hart, as the (mask, base) groups the firmware wants: one call per group of 64 ids, not per hart. No array: the first
+    // hart of a group makes the call for the whole group (this runs on the deepest kernel path, the reap on a fresh thread: T173)
+    let id_of = |i: usize| percpu::hart(i).hart_id.load(Ordering::Relaxed);
+    let online = |i: usize| i != me && percpu::hart(i).online.load(Ordering::Acquire);
     for i in 0..started() {
-        if i == me || !percpu::hart(i).online.load(Ordering::Acquire) {
+        if !online(i) {
             continue;
         }
-        let id = percpu::hart(i).hart_id.load(Ordering::Relaxed);
-        // a whole-address-space flush (start = 0, size = 0) of every ASID on that hart
-        let r = sbi5(
-            EID_RFENCE,
-            FID_REMOTE_SFENCE_VMA,
-            [1usize << (id % 64), id - id % 64, 0, 0, 0],
-        );
+        let base = id_of(i) & !63usize;
+        if (0..i).any(|j| online(j) && id_of(j) & !63usize == base) {
+            continue;
+        }
+        let mut mask = 0usize;
+        for j in i..started() {
+            if online(j) && id_of(j) & !63usize == base {
+                mask |= 1usize << (id_of(j) & 63);
+            }
+        }
+        // a whole-address-space flush (start = 0, size = 0) of every ASID on those harts
+        let r = sbi5(EID_RFENCE, FID_REMOTE_SFENCE_VMA, [mask, base, 0, 0, 0]);
         assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
     }
 }

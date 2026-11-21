@@ -571,7 +571,7 @@ pub fn switch_if_designated() {
 
 /// Send a reschedule IPI to every hart in the bitmask (by dense index) except `me`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pokes is a non-zero mask of harts (the loop condition), so pokes - 1 cannot underflow
-fn send_pokes(mut pokes: u32, me: usize) {
+fn send_pokes(mut pokes: u64, me: usize) {
     #[cfg(feature = "fault-skip-poke")]
     {
         let _ = (&mut pokes, me);
@@ -631,23 +631,25 @@ pub fn reschedule_fast() -> bool {
     clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::indexing_slicing
-)] // INVARIANT: h is a hart index below 32; the panic is the detector's report
+)] // INVARIANT: h is a hart index below MAX_HARTS; the panic is the detector's report
 fn starvation_watchdog(h: usize, now: u64) {
-    static LAST: [core::sync::atomic::AtomicU32; 32] =
-        [const { core::sync::atomic::AtomicU32::new(0) }; 32];
-    static REPEATS: [core::sync::atomic::AtomicU32; 32] =
-        [const { core::sync::atomic::AtomicU32::new(0) }; 32];
-    if now.saturating_sub(WD_AT[h & 31].load(Ordering::Relaxed)) >= WATCHDOG_PERIOD {
-        WD_AT[h & 31].store(now, Ordering::Relaxed);
+    static LAST: [core::sync::atomic::AtomicU32; crate::percpu::MAX_HARTS] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; crate::percpu::MAX_HARTS];
+    static REPEATS: [core::sync::atomic::AtomicU32; crate::percpu::MAX_HARTS] =
+        [const { core::sync::atomic::AtomicU32::new(0) }; crate::percpu::MAX_HARTS];
+    if now.saturating_sub(WD_AT[h % crate::percpu::MAX_HARTS].load(Ordering::Relaxed))
+        >= WATCHDOG_PERIOD
+    {
+        WD_AT[h % crate::percpu::MAX_HARTS].store(now, Ordering::Relaxed);
         let found = sched().starved(now, 500 * MS);
         let tid = found.map_or(0, |f| f.0);
-        let before = LAST[h & 31].swap(tid, Ordering::Relaxed);
+        let before = LAST[h % crate::percpu::MAX_HARTS].swap(tid, Ordering::Relaxed);
         // (the same thread in three samples in a row: on a loaded host the emulated machine is slow, and a thread queued behind a few
         // thousand others while a hart is between two pulls would trip a shorter rule)
         let repeats = if before == tid && tid != 0 {
-            REPEATS[h & 31].fetch_add(1, Ordering::Relaxed) + 1
+            REPEATS[h % crate::percpu::MAX_HARTS].fetch_add(1, Ordering::Relaxed) + 1
         } else {
-            REPEATS[h & 31].store(0, Ordering::Relaxed);
+            REPEATS[h % crate::percpu::MAX_HARTS].store(0, Ordering::Relaxed);
             0
         };
         if let Some((t, on, idle)) = found {
@@ -673,7 +675,8 @@ fn starvation_watchdog(h: usize, now: u64) {
 #[cfg(debug_assertions)]
 const WATCHDOG_PERIOD: u64 = 100 * MS;
 #[cfg(debug_assertions)]
-static WD_AT: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+static WD_AT: [AtomicU64; crate::percpu::MAX_HARTS] =
+    [const { AtomicU64::new(0) }; crate::percpu::MAX_HARTS];
 
 /// Arm this hart's one-shot timer (L13: there is no periodic tick) for the earliest of its scheduler's next event (a sleeper's hard
 /// expiry, a slice end when an equal peer waits) and, in debug builds while the hart has queued work, the next watchdog sample. Called
@@ -686,7 +689,7 @@ pub fn program_timer() -> Option<u64> {
     #[cfg(debug_assertions)]
     if sched().queued_on(h) > 0 {
         let at = WD_AT
-            .get(h & 31)
+            .get(h % crate::percpu::MAX_HARTS)
             .map_or(0, |a| a.load(Ordering::Relaxed))
             .saturating_add(WATCHDOG_PERIOD);
         ev = Some(ev.map_or(at, |e| e.min(at)));
@@ -1098,7 +1101,7 @@ pub fn wake_stat(which: u64) -> u64 {
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
         3..=5 => crate::aia::stat(which),
-        // 6: the `time` counter (10 MHz on QEMU `virt`), so a benchmark need not depend on user-mode counter access
+        // 6: the `time` counter (its rate is selector 105), so a benchmark need not depend on user-mode counter access
         // or on the 1 ms tick; 7: 1 if the kernel command line has `bench=full` (SCHED-SMP-SPEC 6.1)
         6 => crate::timer::now(),
         // 8: the longest interrupts-off span seen (cycles; 0 unless built with `latency-trace`)
@@ -1124,6 +1127,21 @@ pub fn wake_stat(which: u64) -> u64 {
                 0
             }
         }
+        // 100 and 101: the lowest byte address of RAM and the address after the highest (from the device tree, PL4); 102 and 103: the
+        // frames of RAM the tree describes and the frames the allocator manages; 104: where the kernel image starts
+        100 => crate::kmem::stats().ram_first << 12,
+        101 => crate::kmem::stats().ram_end << 12,
+        102 => crate::kmem::stats().memory_frames,
+        103 => crate::kmem::stats().managed_frames,
+        104 => crate::kmem::stats().image_first << 12,
+        // 105: the frequency of the `time` counter (selector 6), in hertz, from the device tree
+        105 => crate::timer::timebase(),
+        // 107: the first eight bytes the entropy pool produced after it was keyed (test builds; 0 in release), different at every boot; 108: 1 if
+        // the pool had a real seed (rng-seed, kaslr-seed or Zkr), 0 if not (then the kernel does not randomise addresses)
+        107 => crate::entropy::first_output(),
+        108 => u64::from(crate::entropy::seeded()),
+        // 106: calls the kernel made to the SBI IPI extension (0: inter-hart interrupts are IMSIC messages, PL6)
+        106 => crate::arch::sbi::ipi_calls() as u64,
         // 10 to 12: scheduler statistics (pulls, settles, marks)
         10..=12 => sched_stat(which),
         // 16 + h: how often hart h took the big kernel lock from free

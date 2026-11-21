@@ -6,8 +6,29 @@
 #![allow(dead_code, unused_variables, clippy::missing_safety_doc)]
 
 pub mod aia {
-    pub const APLIC_BASE: u64 = 0;
     pub const PAGE_COUNT: usize = 0;
+    pub fn discover(nodes: &[kcore::fdt::Node], ram: &[(u64, u64)]) {
+        unimplemented!()
+    }
+    pub const IPI_BIT: u64 = 0;
+    pub fn lists_hart(hart_id: usize) -> bool {
+        unimplemented!()
+    }
+    pub fn send_ipi(hart_id: usize) {
+        unimplemented!()
+    }
+    pub fn claim() -> u64 {
+        unimplemented!()
+    }
+    pub fn deliver(mask: u64, fired: impl FnMut(u32) -> bool) -> bool {
+        unimplemented!()
+    }
+    pub fn slots() -> usize {
+        unimplemented!()
+    }
+    pub fn irq_allowed(irq: u32) -> bool {
+        unimplemented!()
+    }
     pub fn pages() -> impl Iterator<Item = u64> {
         core::iter::empty()
     }
@@ -38,7 +59,12 @@ pub mod aia {
 }
 
 pub mod finisher {
-    pub const BASE: u64 = 0;
+    pub fn init(base: Option<u64>) {
+        unimplemented!()
+    }
+    pub fn base() -> Option<u64> {
+        unimplemented!()
+    }
     pub fn exit(ok: bool) -> ! {
         unimplemented!()
     }
@@ -53,6 +79,15 @@ pub mod fp {
         unimplemented!()
     }
     pub fn first_use(frame: &mut TrapFrame) -> bool {
+        unimplemented!()
+    }
+    pub fn init_boot_hart() {
+        unimplemented!()
+    }
+    pub fn enable_cache_block_ops_or_stop() {
+        unimplemented!()
+    }
+    pub fn check_hart() {
         unimplemented!()
     }
     pub fn thread_gone(tid: u32) {
@@ -85,6 +120,12 @@ pub mod irq {
 }
 
 pub mod timer {
+    pub fn set_frequency(hz: u64) -> bool {
+        unimplemented!()
+    }
+    pub fn cycles_from_ns(ns: u64) -> u64 {
+        unimplemented!()
+    }
     pub fn timebase() -> u64 {
         unimplemented!()
     }
@@ -156,7 +197,9 @@ pub mod sbi {
     pub const EID_RFENCE: usize = 0;
     pub const FID_REMOTE_SFENCE_VMA: usize = 0;
     pub const EID_IPI: usize = 0;
-    pub const FID_SEND_IPI: usize = 0;
+    pub fn ipi_calls() -> usize {
+        unimplemented!()
+    }
     pub const HSM_STOPPED: usize = 0;
     pub struct SbiRet {
         pub error: isize,
@@ -174,6 +217,19 @@ pub mod sbi {
 }
 
 pub use cpu::*;
+
+/// The firmware's debug console and reset.
+pub fn debug_console_write_byte(byte: u8) -> bool {
+    unimplemented!()
+}
+pub fn system_reset(reboot: bool, failure: bool) {
+    unimplemented!()
+}
+
+/// Virtual minus physical for the kernel image.
+pub fn kernel_delta() -> u64 {
+    unimplemented!()
+}
 pub use switch::{switch, Context};
 pub use usermode::enter_user_raw as enter_user;
 
@@ -196,6 +252,15 @@ pub mod cpu {
     pub fn tlb_flush_page(va: u64, asid: u16) {
         unimplemented!()
     }
+    pub fn enable_cache_block_ops() -> bool {
+        unimplemented!()
+    }
+    pub fn vlenb_read() -> usize {
+        unimplemented!()
+    }
+    pub fn seed_csr_read() -> usize {
+        unimplemented!()
+    }
     pub fn cpu_idle() {
         unimplemented!()
     }
@@ -209,12 +274,6 @@ pub mod cpu {
         unimplemented!()
     }
     pub fn lazy_units_are_off() -> bool {
-        unimplemented!()
-    }
-    pub fn software_interrupt_enable() {
-        unimplemented!()
-    }
-    pub fn software_interrupt_clear() {
         unimplemented!()
     }
 }

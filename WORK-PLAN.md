@@ -111,16 +111,16 @@ be host-testable, fuzzable and covered before that starts.
 AR1 goes first so that everything after it is written on the right side of the boundary. Epic: `epic/phase-4` (from PL1 on).
 
 - [x] **AR1** (a, b, c, d) all RISC-V code behind `kernel/src/arch/`, page tables generic over a format, the AArch64 stub (PRs 301, 302, 303, 304; merged to `main` before the epic was cut)
-- [ ] **PL1** RVA23 in the gate, the boot-time extension check
-- [ ] **MM2** the buddy frame allocator
-- [ ] **MM3** large pages in the direct map
-- [ ] **PL4** discovery: memory, load address, device tree pointer, timer frequency
-- [ ] **PL5** discovery: console, interrupt controller, device windows, reset
-- [ ] **PL6** AIA only; inter-hart interrupts through the IMSIC
-- [ ] **SC1** sixty-four harts
-- [ ] **HD1** the kernel entropy pool
-- [ ] **PL2** vector state
-- [ ] **PL3** user code built for RVA23U64
+- [x] **PL1** RVA23 in the gate, the boot-time extension check (PR 306; the AIA-node check waits for PL6)
+- [x] **MM2** the buddy frame allocator (PR 307)
+- [x] **MM3** large pages in the direct map (PR 308)
+- [x] **PL4** discovery: memory, load address, device tree pointer, timer frequency (PL4a PR 310, PL4b PR 311, PL4c PR 312)
+- [x] **PL5** discovery: console, interrupt controller, device windows, reset (PL5a PR 313, PL5b PR 314, PL5c PR 315)
+- [x] **PL6** AIA only; inter-hart interrupts through the IMSIC (PR 316; the wake-latency before/after is a soak bench, `work/T184.md` has the leftovers)
+- [x] **SC1** sixty-four harts (PR 317: harts from `/cpus`, the SBI hart-mask builder, 64-bit pokes; the records and stacks stay static at 64, T185; the `-smp` 8/16/32 boots are the owner's soak)
+- [x] **HD1** the kernel entropy pool
+- [x] **PL2** vector state (PR 319: `kcore::fp` as one model with two instances; the `vlen=128` boot and one hart are the gate's and the soak's)
+- [x] **PL3** user code built for RVA23U64 (PR 320; T54 and R16 were closed before; the C and Lua transcripts and BusyBox are the epic gate's)
 
 ### Phase 5: the ABI flag days
 
@@ -214,7 +214,10 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   (the first peel and the scheduler's exit from the big lock, nanosecond time and the tickless timer, the move behind
   `arch/`, and the first runs of the checks phase 3 built: chaos, mutants, the checked release kernel, the long fuzz run,
   the persistent allocation-failure sweep, coverage, Miri over `ksys`). The mutation job is red until its first survivors
-  are triaged. A red result is a work item that day (OD140), ahead of the next plan item.
+  are triaged. The soak tier also holds four boots added in phase 4, never run by the owner: `os-boot-test-entropy` (two boots differ in the entropy pool's first output; a tree without a seed boots unseeded), `os-boot-test-cpu-neg` (a CPU without the
+  profile ends in `##PANIC missing extension`), `os-boot-test-loadaddr` (the image at two other load addresses) and
+  `os-boot-test-sbi-console` (output through the firmware's debug console). A red result is a work item that day (OD140), ahead of the
+  next plan item.
 
 ## Decisions taken without the owner
 
@@ -238,5 +241,18 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     exception kind. KERNEL-V1-SPEC 2.6, AR1.
   - Kernel address randomisation is built although Sv39 leaves it about 9 and 7 bits; the owner chose the option that
     includes it, and the entropy is stated. HD3.
+  - 2026-11-20, PL5a: the device windows are admitted by an allowlist of compatible strings, not by the item's denylist (every `reg` range
+    not driven by the kernel), because a denylist fails open: on `virt` it would have made fw-cfg (DMA into guest RAM), the flash banks
+    and the PCI ECAM window mappable. Narrower than the item, so safer; the ranges still come from the tree. Alternative: follow the
+    item's text. KERNEL-V1-SPEC 2.3 (dated amendment), the PL5 entry of `docs/records/done.md`.
+  - 2026-11-20, SC1: the per-hart records, boot stacks and emergency stacks are static arrays sized for 64 harts (about 2.6 MiB of `.bss`),
+    not allocated at boot for the harts found as KERNEL-V1-SPEC 2.3 says; the rest of the item (ids from the tree, the hart-mask builder,
+    64-bit masks) is done. The first hart's record must exist before the heap does, and the saving is memory only. Alternative: allocate.
+    `work/T185.md`.
+  - 2026-11-20, PL3: the user Rust build enables `+v,+zvbb,+zba,+zbb,+zbs,+zicond,+zcb,+zfa,+zicbom,+zicboz,+zihintpause,+zkt,+zimop,+zcmop,+zawrs` (the
+    RVA23U64 mandatory extensions rustc has features for; `init/.cargo/config.toml`), and user C is built with `-march=rva23u64` where the clang knows
+    it, else the same set spelled out, else the part LLVM 17 accepts (`init/build.rs`). `v`, `zfa` and `zvbb` are unstable features on the stable
+    toolchain and warn "will become a hard error": `work/T187.md`. `senvcfg` enables CBZE, CBCFE and CBIE (flush) on every hart and the boot
+    stops if a bit does not stick. Alternative: a target specification (nightly only).
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

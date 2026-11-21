@@ -28,7 +28,7 @@ use core::cell::{RefCell, RefMut};
 use core::ops::{Deref, DerefMut};
 
 /// The most harts (the poke set is a bitmask).
-pub const MAX_HARTS: usize = 32;
+pub const MAX_HARTS: usize = 64;
 
 /// The thread table (the spec's `TT`): each thread's `Home`.
 pub type Table = BTreeMap<Tid, Arc<Home>>;
@@ -172,7 +172,7 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     deferred: AtomicBool,
     /// The time source of a tickless kernel (L13): when set, every settle first charges the hart's running thread up to it.
     clock: Option<fn() -> Time>,
-    pokes: AtomicU32,
+    pokes: AtomicU64,
     pulls: AtomicU64,
     settles: AtomicU64,
     marks: AtomicU64,
@@ -187,7 +187,7 @@ impl<N: Class> Sched2<N, Local<N>> {
     /// `harts` run queues (1 to [`MAX_HARTS`]), each with a normal class made by `make`. Every hart starts with its idle
     /// thread running (`idle(h)` gives its id).
     pub fn new(harts: usize, make: impl Fn() -> N) -> Sched2<N, Local<N>> {
-        assert!((1..=MAX_HARTS).contains(&harts), "1 to 32 harts");
+        assert!((1..=MAX_HARTS).contains(&harts), "1 to 64 harts");
         Sched2::over(Local::new(harts, make))
     }
 }
@@ -197,7 +197,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::expect_used)] // INVARIANT: the record was just created on this hart
     pub fn over(rqs: R) -> Sched2<N, R> {
         let harts = rqs.len();
-        assert!((1..=MAX_HARTS).contains(&harts), "1 to 32 harts");
+        assert!((1..=MAX_HARTS).contains(&harts), "1 to 64 harts");
         let s = Sched2 {
             rqs,
             next_tid: AtomicU32::new(1),
@@ -207,7 +207,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             transit: (0..harts).map(|_| AtomicU32::new(0)).collect(),
             deferred: AtomicBool::new(false),
             clock: None,
-            pokes: AtomicU32::new(0),
+            pokes: AtomicU64::new(0),
             pulls: AtomicU64::new(0),
             settles: AtomicU64::new(0),
             marks: AtomicU64::new(0),
@@ -312,7 +312,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.pending[hart].load(Ordering::Acquire)
     }
     /// The harts to send a reschedule IPI to (bitmask), clearing the set.
-    pub fn take_pokes(&self) -> u32 {
+    pub fn take_pokes(&self) -> u64 {
         self.pokes.swap(0, Ordering::AcqRel)
     }
     pub fn state(&self, tid: Tid) -> Option<State> {

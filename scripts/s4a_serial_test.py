@@ -35,8 +35,7 @@ class Session:
         cmd = ["qemu-system-riscv64", "-machine", os.environ.get("OS_MACHINE", "virt,aia=aplic-imsic"),
                "-bios", "default", "-m", "256M", "-display", "none", "-serial", "stdio",
                "-monitor", "none", "-kernel", kernel]
-        if os.environ.get("OS_CPU"):
-            cmd[1:1] = ["-cpu", os.environ["OS_CPU"]]
+        cmd[1:1] = ["-cpu", os.environ.get("OS_CPU", "rva23s64")]  # PL1: the profile CPU is the only test CPU
         if os.environ.get("OS_SMP"):
             cmd[1:1] = ["-smp", os.environ["OS_SMP"]]
         cmd += self.EXTRA_ARGS

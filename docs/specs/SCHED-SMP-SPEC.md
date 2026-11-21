@@ -1454,3 +1454,7 @@ What this amendment replaces; everything else in this document stands.
 | 4.4 | Placement by push and pull over all harts | The same rule (GP1), implemented with the `online`, `idle` and `overloaded` masks so that no periodic path visits every hart; the choice of hart is a replaceable policy (KERNEL-V1-SPEC 5.2, 5.6) |
 | 5.1 | "The older `thread_create` stays"; suspend and resume reserved | `thread_create` is removed; `thread_suspend` and `thread_resume` exist; `thread_spawn` gains SUSPENDED (KERNEL-V1-SPEC 3.6) |
 | 6.1, 6.4 | Scaling measured at 4 harts | Also at 16 and 32 (KERNEL-V1-SPEC 5.2, 8) |
+
+## Amendment 2026-11-20: the kernel entropy pool (HD1)
+
+Section 3.3: one lock class is added, `ENTROPY` (the kernel entropy generator's lock, taken for a draw and never across a call out), between `HEAP` (13) and `UART`, which becomes 15.

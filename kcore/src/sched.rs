@@ -229,7 +229,7 @@ struct Thread {
 }
 
 /// The most harts the core handles (the pokes are a bitmask).
-pub const MAX_SCHED_HARTS: usize = 32;
+pub const MAX_SCHED_HARTS: usize = 64;
 
 pub struct Sched<C: SchedClass> {
     class: C,
@@ -244,7 +244,7 @@ pub struct Sched<C: SchedClass> {
     slice_left: Vec<u32>,
     resched_pending: Vec<bool>,
     /// Harts that were marked since the last [`Sched::take_pokes`].
-    pokes: u32,
+    pokes: u64,
     /// How many times the class returned something the core had to reject.
     pub bad_picks: u32,
 }
@@ -257,7 +257,7 @@ impl<C: SchedClass> Sched<C> {
 
     /// A scheduler for `harts` harts (1 to [`MAX_SCHED_HARTS`]).
     pub fn with_harts(class: C, harts: usize) -> Sched<C> {
-        assert!((1..=MAX_SCHED_HARTS).contains(&harts), "1 to 32 harts");
+        assert!((1..=MAX_SCHED_HARTS).contains(&harts), "1 to 64 harts");
         Sched {
             class,
             threads: BTreeMap::new(),
@@ -301,7 +301,7 @@ impl<C: SchedClass> Sched<C> {
         self.resched_pending[hart] = false;
     }
 
-    pub fn take_pokes(&mut self) -> u32 {
+    pub fn take_pokes(&mut self) -> u64 {
         core::mem::take(&mut self.pokes)
     }
     pub fn state(&self, tid: Tid) -> Option<State> {

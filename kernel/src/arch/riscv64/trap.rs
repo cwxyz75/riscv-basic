@@ -369,13 +369,13 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 }
 
 /// `clock_get` and `thread_yield` from user mode without the big kernel lock (L12c). False: not one of those, or the return is not
-/// quiet (a kill or stop to look for) or the FP registers are dirty: the full path.
+/// quiet (a kill or stop to look for) or dirty FP or vector registers could not be saved without the lock (`fp::light_save`): the full path.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: sepc + 4 steps past an ecall
 fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     use abi::syscall as nr;
     let n = frame.arg(17) as usize;
     if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD)
-        || user_fp_dirty(frame)
+        || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
     {
         return false;
@@ -398,12 +398,6 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     true
 }
 
-/// Are the interrupted user thread's FP registers dirty (`sstatus.FS` = 3)? Saving them needs the FP tables, so the big lock.
-fn user_fp_dirty(frame: &TrapFrame) -> bool {
-    const FS_MASK: u64 = 3 << 13;
-    frame.sstatus & FS_MASK == FS_MASK
-}
-
 fn trap_handler_inner(frame: &mut TrapFrame) {
     let from_user = frame.sstatus & (1 << 8) == 0;
     if from_user {
@@ -411,7 +405,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // The kernel runs with the FP unit off (INVARIANTS FP3) on every path, including the light
         // IPI one that saves nothing: the frame keeps the user's FS for the return.
         // SAFETY: clears sstatus.FS only.
-        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) 3usize << 13) };
+        unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are
     // off (the trap cleared SIE). The interrupted code held it only if it was in a locked region,
@@ -419,9 +413,9 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     //
     let cause = frame.scause;
     let ready = crate::thread::scheduler_ready();
-    // A software interrupt (IPI) takes the lock only when it has scheduling to do; a secondary
+    // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
-    let light = cause == (1 << 63) | 1 || (cause == (1 << 63) | 5 && !ready);
+    let light = cause == (1 << 63) | 5 && !ready;
     // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
     // (no kill or stop recorded) and the user's FP state is not dirty.
     if from_user && cause == 8 && ready && lock_free_syscall(frame) {
@@ -431,14 +425,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
         // switch threads. A tick that interrupted **user mode** takes it only when something needs it (L12b, below): the return
         // to user mode is where a killed process dies (`activate_current`), which needs the lock, so a kill moves an epoch the tick looks at.
-        // (A thread whose FP state is not Off still takes it at `fp::return_to_user`: tidy T166.)
+        // (A thread whose state is in this hart's FP or vector registers returns with no lock: `fp::return_to_user`, T166.)
         crate::percpu::this()
             .timer_ticks
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         // L12b: a tick that interrupted user mode takes the big lock only when something needs it: the user's FP registers are dirty
         // (saving them touches the FP tables), the hart must switch threads, a kill or stop was recorded since this hart last
         // returned to user mode, or the heap is low. Otherwise the thread resumes with no lock at all.
-        if from_user && !user_fp_dirty(frame) {
+        if from_user && crate::fp::light_save(frame) {
             let switch = crate::thread::timer_interrupt();
             if !switch
                 && crate::user::user_return_is_quiet()
@@ -471,6 +465,8 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
             crate::heap::service();
             crate::bkl::unlock();
         }
+    } else if cause == (1 << 63) | 9 {
+        external_trap(frame, from_user);
     } else if light {
         trap_body(frame);
     } else {
@@ -495,50 +491,75 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     }
 }
 
+/// An inter-hart interrupt on its own (no device message came with it): the quiet paths of L12b, the lock only when the hart has scheduling to do.
+#[inline(never)] // (a frame of its own: folded into `trap_handler_inner` it deepens every kernel path that starts with a trap, KT13)
+fn ipi_trap(frame: &mut TrapFrame) {
+    let reasons = crate::smp::ipi_interrupt();
+    if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
+        if frame.sstatus & (1 << 8) == 0 {
+            // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
+            // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
+            if crate::fp::light_save(frame)
+                && !crate::thread::reschedule_fast()
+                && crate::user::user_return_is_quiet()
+                && !crate::thread::need_resched_pending()
+            {
+                return;
+            }
+            crate::bkl::lock();
+            crate::fp::trap_entry(frame);
+            crate::thread::reschedule_this_hart();
+            crate::thread::preempt_point();
+            crate::user::activate_current();
+            crate::bkl::unlock();
+        } else if crate::thread::reschedule_fast() {
+            // interrupted kernel code and the hart must switch: only now the big kernel lock
+            crate::bkl::lock();
+            crate::thread::switch_if_designated();
+            crate::bkl::unlock();
+        }
+    }
+}
+
+/// A supervisor external interrupt: take every message in this hart's IMSIC file. The inter-hart interrupt (message 1) is the hot one and needs
+/// no lock unless the hart must switch; a device message goes to its interrupt object under the big lock (S6a-2).
+#[inline(never)] // (as `ipi_trap`)
+fn external_trap(frame: &mut TrapFrame, from_user: bool) {
+    let ids = crate::aia::claim();
+    let devices = ids & !crate::aia::IPI_BIT;
+    if devices == 0 {
+        if ids & crate::aia::IPI_BIT != 0 {
+            ipi_trap(frame);
+        }
+        return;
+    }
+    // (the inter-hart part first, with no lock: its test jobs probe the lock)
+    let reasons = if ids & crate::aia::IPI_BIT != 0 {
+        crate::smp::ipi_interrupt()
+    } else {
+        0
+    };
+    crate::bkl::lock();
+    crate::fp::trap_entry(frame);
+    let any = crate::aia::deliver(devices, crate::user::irq_fired);
+    if (any || reasons & crate::percpu::IPI_RESCHED != 0) && crate::thread::scheduler_ready() {
+        if any {
+            crate::user::wake_signal_waiters();
+        }
+        crate::thread::reschedule_this_hart();
+    }
+    if from_user {
+        crate::user::commit_wake();
+        crate::thread::preempt_point();
+        crate::user::activate_current();
+    }
+    crate::heap::service();
+    crate::bkl::unlock();
+}
+
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the kernel's own fault path: va steps over the pages a fault mapped; sepc plus an instruction length stays in kernel text
 fn trap_body(frame: &mut TrapFrame) {
     let cause = frame.scause;
-    if cause == (1 << 63) | 1 {
-        // Supervisor software interrupt: an IPI.
-        let reasons = crate::smp::ipi_interrupt();
-        if reasons & crate::percpu::IPI_RESCHED != 0 && crate::thread::scheduler_ready() {
-            if frame.sstatus & (1 << 8) == 0 {
-                // interrupted user mode (L12b): no big lock when the hart need not switch and no kill or stop was recorded (the
-                // kill IPI follows the epoch bump, so it takes the full path, where a killed process dies at the return to user mode)
-                if !user_fp_dirty(frame)
-                    && !crate::thread::reschedule_fast()
-                    && crate::user::user_return_is_quiet()
-                    && !crate::thread::need_resched_pending()
-                {
-                    return;
-                }
-                crate::bkl::lock();
-                crate::fp::trap_entry(frame);
-                crate::thread::reschedule_this_hart();
-                crate::thread::preempt_point();
-                crate::user::activate_current();
-                crate::bkl::unlock();
-            } else if crate::thread::reschedule_fast() {
-                // interrupted kernel code and the hart must switch: only now the big kernel lock
-                crate::bkl::lock();
-                crate::thread::switch_if_designated();
-                crate::bkl::unlock();
-            }
-        }
-        return;
-    }
-    if cause == (1 << 63) | 9 {
-        // Supervisor external interrupt (S6a-2): a device source, owned by an interrupt object.
-        let any = crate::aia::handle(crate::user::irq_fired);
-        if any && crate::thread::scheduler_ready() {
-            crate::user::wake_signal_waiters();
-            crate::thread::reschedule_this_hart();
-            if frame.sstatus & (1 << 8) == 0 {
-                crate::user::activate_current();
-            }
-        }
-        return;
-    }
     if cause == (1 << 63) | 5 && !crate::thread::scheduler_ready() {
         // A secondary hart's timer before the scheduler exists: count and re-arm.
         crate::percpu::this()

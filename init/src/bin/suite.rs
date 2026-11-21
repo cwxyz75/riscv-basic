@@ -1862,6 +1862,63 @@ fn fp_state_is_private_to_each_thread_and_process() -> Outcome {
     Ok(())
 }
 
+/// PL2: vector state is per thread (the twin of the FP test above): a first use reads zeros, patterns survive preemption and yields, three threads
+/// of one process keep their own, and a process that used the unit and then ran an illegal instruction is still just killed.
+fn vector_state_is_private_to_each_thread_and_process() -> Outcome {
+    let mut procs = Vec::new();
+    for seed in 1..=4u64 {
+        let mode = seed % 2;
+        let (p, _mine) = launch(92 | (mode << 8) | (seed << 16))?;
+        procs.push(p);
+    }
+    let (p, _m) = launch(94)?;
+    procs.push(p);
+    nap_ticks(5);
+    let (fresh, _m) = launch(93)?;
+    wait_ended(fresh, 3000)?;
+    ensure_eq!(
+        sys::process_info(fresh).a1 as i64,
+        0,
+        "a process's first vector use sees zero registers"
+    );
+    sys::handle_close(fresh);
+    for (i, p) in procs.into_iter().enumerate() {
+        wait_ended(p, 6000)?;
+        let code = sys::process_info(p).a1 as i64;
+        sys::handle_close(p);
+        ensure_eq!(code, 0, "vector process {i} kept its own registers");
+    }
+    // the edge states: a first instruction that is `vsetvli`, `vill` and `vstart` across a yield, a first instruction that is a vector load
+    for (arg, what) in [
+        (96u64, "vill and vstart survive a yield"),
+        (97, "a vector load enables the unit"),
+        (98, "a vector loop and cbo.zero work in the RVA23U64 build"),
+    ] {
+        let (e, _m) = launch(arg)?;
+        wait_ended(e, 3000)?;
+        ensure_eq!(sys::process_info(e).a1 as i64, 0, "{}", what);
+        sys::handle_close(e);
+    }
+    let (bad, _m) = launch(95)?;
+    wait_ended(bad, 3000)?;
+    ensure_eq!(
+        sys::process_info(bad).a1 as i64,
+        -1002,
+        "an illegal instruction after vector use is fatal"
+    );
+    sys::handle_close(bad);
+    // what it left in the unit is not seen by the next process
+    let (fresh, _m) = launch(93)?;
+    wait_ended(fresh, 3000)?;
+    ensure_eq!(
+        sys::process_info(fresh).a1 as i64,
+        0,
+        "a killed process's vector registers are not inherited"
+    );
+    sys::handle_close(fresh);
+    Ok(())
+}
+
 // --- The wake path: counters, the bystander baseline, a benchmark (roadmap slice W, step 0) ---------
 
 /// True since slice W step 3: `object_wait` and `channel_call` waiters are woken by id, so bystanders are
@@ -7345,11 +7402,11 @@ fn blk_round_trip() -> Outcome {
     let Some(rig) = blk_rig()? else {
         return Ok(()); // no disk attached (OS_DISK=0)
     };
-    sys::debug_write(if rig.irq.is_some() {
-        b"s6: blkd exercised (interrupts)\n"
-    } else {
-        b"s6: blkd exercised (polling)\n"
-    });
+    ensure!(
+        rig.irq.is_some(),
+        "the block device has an interrupt (the AIA is required, PL6)"
+    );
+    sys::debug_write(b"s6: blkd exercised (interrupts)\n");
     let (p, ch) = rig.spawn()?;
     let (st, body) = blk_call(ch, 1, blk::Op::Info)?;
     ensure_eq!(st, blk::Status::Ok, "info");
@@ -9627,8 +9684,8 @@ fn device_caps_need_the_resource() -> Outcome {
     sys::handle_close(dvmo);
     // device windows only: never RAM, never off-window, never misaligned or empty
     for (pa, len, what) in [
-        (0x8000_0000u64, 4096u64, "RAM"),
-        (0x8020_0000, 4096, "the kernel image"),
+        (sys::debug_stat(100), 4096u64, "RAM"),
+        (sys::debug_stat(104), 4096, "the kernel image"),
         (0x1000_0000, 4096, "just below the window"),
         (0x1000_9000, 4096, "just above the window"),
         (0x1000_8000, 8192, "straddling the end"),
@@ -9636,10 +9693,31 @@ fn device_caps_need_the_resource() -> Outcome {
         (0x1000_1000, 0, "empty"),
         (0x1000_1000, 100, "not a whole page"),
         (u64::MAX - 4095, 4096, "wrapping"),
+        // PL5a: the windows come from the device tree and fail closed. What the kernel or the firmware drives, and what nobody decided
+        // a process may touch, on the live tree, are refused: the test finisher, the CLINT, the M-level APLIC, the S-level APLIC and its
+        // upper half, both IMSIC files, fw-cfg (its DMA interface writes guest RAM), both flash banks, the PCI ECAM window
+        (0x10_0000, 4096, "the test finisher"),
+        (0x200_0000, 4096, "the CLINT"),
+        (0xc00_0000, 4096, "the M-level APLIC"),
+        (0xd00_0000, 4096, "the S-level APLIC"),
+        (0xd00_4000, 4096, "the S-level APLIC's upper half"),
+        (0x2400_0000, 4096, "the M-level IMSIC file"),
+        (0x2800_0000, 4096, "the S-level IMSIC file"),
+        (0x1010_0000, 4096, "fw-cfg"),
+        (0x2000_0000, 4096, "flash bank 0"),
+        (0x2200_0000, 4096, "flash bank 1"),
+        (0x3000_0000, 4096, "the PCI ECAM window"),
     ] {
         let r = sys::vmo_create_physical(res, pa, len);
         ensure!(st(r) == Some(S::InvalidArgs), "{what}: {:?}", st(r));
     }
+    // the RTC page is a window too (the first entry of the table the kernel built from the tree)
+    let rtc = ok(
+        sys::vmo_create_physical(res, 0x10_1000, 4096),
+        "the RTC page",
+    )?
+    .a1 as u32;
+    sys::handle_close(rtc);
     // a good one; the kernel will not copy through it
     let dev = ok(
         sys::vmo_create_physical(res, 0x1000_1000, 4096),
@@ -9689,7 +9767,8 @@ fn device_caps_need_the_resource() -> Outcome {
     );
     let pa = ok(sys::vmo_phys_addr(dma), "phys addr")?.a1 as u64;
     ensure!(
-        pa.is_multiple_of(4096) && (0x8000_0000..0x8800_0000).contains(&pa),
+        pa.is_multiple_of(4096)
+            && (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
         "a RAM address: {pa:#x}"
     );
     ensure_eq!(job_use(root, 2)?.0, after, "asking costs nothing");
@@ -10594,6 +10673,48 @@ fn jobs_do_not_leak() -> Outcome {
     Ok(())
 }
 
+/// MM2: contiguous runs come from the buddy allocator and go back to it. The most one DMA object may hold is 64 pages (`MAX_DMA_PAGES`;
+/// PL8 derives the limits from RAM later), and 1024 pages may be held in all: runs of 64 pages are made and closed many times, several
+/// live at once (each at its own address, all in RAM, none overlapping), and runs of an odd length round up and give the tail back.
+/// The kernel's final audit says nothing leaked and the free lists merged back.
+fn dma_runs_are_allocated_and_freed_repeatedly() -> Outcome {
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u32;
+    for round in 0..40u32 {
+        let v = ok(sys::vmo_create_dma(res, 64), "a 64-page DMA run")?.a1 as u32;
+        let pa = ok(sys::vmo_phys_addr(v), "its address")?.a1;
+        ensure_eq!(pa % 4096, 0, "page aligned, round {round}");
+        ensure!(
+            (sys::debug_stat(100)..sys::debug_stat(101)).contains(&(pa as u64)),
+            "inside RAM: {pa:#x}"
+        );
+        sys::handle_close(v);
+    }
+    // several at once: no two overlap (sixteen runs of 64 pages is the whole 1024-page allowance)
+    let mut live = alloc::vec::Vec::new();
+    for _ in 0..16 {
+        let v = ok(sys::vmo_create_dma(res, 64), "sixteen runs live at once")?.a1 as u32;
+        live.push((v, ok(sys::vmo_phys_addr(v), "address")?.a1));
+    }
+    for (i, (_, a)) in live.iter().enumerate() {
+        for (_, b) in live.iter().skip(i + 1) {
+            ensure!(
+                a.abs_diff(*b) >= 64 * 4096,
+                "runs {a:#x} and {b:#x} overlap"
+            );
+        }
+    }
+    for (v, _) in live {
+        sys::handle_close(v);
+    }
+    // an odd length, repeatedly: the rounded-up tail must come back each time
+    for _ in 0..40 {
+        let v = ok(sys::vmo_create_dma(res, 37), "a 37-page DMA run")?.a1 as u32;
+        sys::handle_close(v);
+    }
+    sys::handle_close(res);
+    Ok(())
+}
+
 fn a_refused_process_start_changes_nothing_and_can_be_retried() -> Outcome {
     // (found by the independent review of S4.5a: the refusal came after the bootstrap handle had
     // moved, and a second start found handle 1 taken and panicked the kernel)
@@ -11275,14 +11396,16 @@ fn job_create_sees_the_credit_of_a_job_closed_just_before() -> Outcome {
 
 // --- Benchmarks (slice B, SCHED-SMP-SPEC 6.1) ------------------------------------------------------------------
 
-/// The `time` counter (10 MHz on QEMU `virt`: one cycle is 100 ns).
+/// The `time` counter (its rate is `debug_stat(105)`, from the device tree: 10 MHz on QEMU `virt`).
 fn cycles() -> u64 {
     sys::debug_stat(6)
 }
 
 /// Report one benchmark as a structured line: ns per operation (smaller is better).
 fn bench_line(name: &str, cycles: u64, ops: u64) -> u64 {
-    let ns = cycles * 100 / ops.max(1);
+    let ns = (u128::from(cycles) * 1_000_000_000
+        / u128::from(sys::debug_stat(105).max(1))
+        / u128::from(ops.max(1))) as u64;
     println!("##BENCH {name} {ns} ns");
     ns
 }
@@ -11788,6 +11911,10 @@ pub fn app_main() -> i32 {
             fp_state_is_private_to_each_thread_and_process,
         ),
         (
+            "vector_state_is_private_to_each_thread_and_process",
+            vector_state_is_private_to_each_thread_and_process,
+        ),
+        (
             "wake_baseline_bystanders_and_counters",
             wake_baseline_bystanders_and_counters,
         ),
@@ -12050,6 +12177,10 @@ pub fn app_main() -> i32 {
             job_kill_ends_every_process_below_and_forbids_more,
         ),
         ("jobs_do_not_leak", jobs_do_not_leak),
+        (
+            "dma_runs_are_allocated_and_freed_repeatedly",
+            dma_runs_are_allocated_and_freed_repeatedly,
+        ),
         (
             "a_refused_process_start_changes_nothing_and_can_be_retried",
             a_refused_process_start_changes_nothing_and_can_be_retried,

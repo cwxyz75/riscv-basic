@@ -236,6 +236,8 @@ were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart 
 (roadmap slice W): today a bystander blocked on an unrelated object is woken and goes back to sleep after
 nearly every syscall.
 
+`which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
+
 ### debug_write(ptr, len) -> status
 
 Sends bytes to the serial console. Rights: none (a debugging aid for the boot-time
@@ -382,9 +384,12 @@ it on deliberately. A process without it cannot reach device memory.
 ### vmo_create_physical(resource, pa, bytes) -> status, handle
 
 A VMO over device memory (MMIO). `resource` needs MANAGE. The range must be page aligned,
-non-empty, a whole number of pages and inside one *device window* (`abi::layout::DEVICE_WINDOWS`:
-the eight QEMU `virt` virtio-mmio slots, `0x1000_1000..0x1000_9000`, and the one-page goldfish RTC, `0x10_1000..0x10_2000`); anything else, RAM
-included, is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
+non-empty, a whole number of pages and inside one *device window*: the kernel builds the windows at boot from the device tree (`kcore::devwin`) and the rule fails closed. A node
+contributes its `reg` ranges, widened to whole pages, only if its `compatible` is on the list of devices the system drives (`virtio,mmio`
+and `google,goldfish-rtc`), its `status` is not disabled and every bus above it passes addresses through unchanged (`ranges;`); from the
+windows are cut RAM and everything reserved, the console, and the ranges of every interrupt controller, timer, test finisher and power or
+reset node. On QEMU `virt` that is the eight virtio-mmio slots and the RTC page. Anything else, RAM and every other device included (fw-cfg,
+the flash banks, the PCI ECAM window), is INVALID_ARGS. Rights: READ, WRITE, MAP, DUPLICATE, TRANSFER (never EXECUTE, never
 DMA). The frames are not in the frame database: they are never freed, zeroed or charged as pages,
 and `vmo_read`/`vmo_write` on it are NOT_SUPPORTED. **The kernel never copies through device
 memory**: a syscall buffer pointer that lands in an MMIO mapping is INVALID_ARGS. Errors, in
@@ -396,7 +401,8 @@ quota).
 A VMO of `pages` physically contiguous, zeroed frames, committed now and charged to the caller's
 job as pages. At most `MAX_DMA_PAGES` (64) per object and `MAX_DMA_TOTAL_PAGES` (1024) in the
 system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of pages or no
-contiguous run is free. The returned handle has VMO rights without EXECUTE plus **DMA**.
+free aligned block of the size rounded up to a power of two exists (a 33-page request needs a free aligned 64-page block; the frame
+allocator is a buddy allocator, MM2). The returned handle has VMO rights without EXECUTE plus **DMA**.
 
 ### vmo_phys_addr(vmo) -> status, address
 
@@ -432,13 +438,13 @@ mapped: nobody can be sleeping on an address the sleeper could not read.)
 
 ### interrupt_create(resource, source) -> status, handle
 
-An interrupt object for AIA source `source` (1..=`MAX_IRQ`, 8: the QEMU `virt` virtio-mmio
-slots; slot *n* is source *n*+1). `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
+An interrupt object for AIA source `source`: one of the sources the admitted devices of the device tree name in `interrupts` (`kcore::aiatree`: on
+QEMU `virt` the virtio-mmio slots, sources 1 to 8, and the RTC, 11; slot *n* is source *n*+1), and at most 62 (a source is delivered as IMSIC message id source + 1; message 1 is the inter-hart interrupt); every other source, the console's
+included, is refused. `resource` needs MANAGE. Rights: DUPLICATE, TRANSFER, WAIT,
 INSPECT, MANAGE (acknowledge). The source is delivered (as an MSI to the IMSIC) to **the hart that called `interrupt_create`**, and is masked when the object is destroyed. When it fires the kernel takes the message, **masks the source** and raises INTERRUPT; waiters wake. `interrupt_ack` re-aims the source at the hart that acknowledges, so delivery follows the driver thread. A source may also be pending from before the object
 existed (a device that raised its line while nobody listened): **drivers must tolerate a spurious
 interrupt** right after `interrupt_create` and check their device's own status. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED;
-INVALID_ARGS (source 0 or above the range); NOT_SUPPORTED (a machine without an AIA, such as plain `virt`; drivers
-poll); BAD_STATE (a live object already owns the source); NO_MEMORY.
+INVALID_ARGS (source 0, not a source of an admitted device, or past 32 bits); BAD_STATE (a live object already owns the source); NO_MEMORY.
 
 ### interrupt_ack(interrupt) -> status, claims
 

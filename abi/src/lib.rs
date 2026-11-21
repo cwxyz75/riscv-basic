@@ -16,13 +16,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// QEMU `virt`'s test finisher (a SiFive test device): writing a value here ends
-/// the emulation with an exit status.
+/// The values of QEMU's test finisher (a SiFive test device; its address comes from the device tree): writing one ends the emulation with
+/// an exit status.
 pub mod arch;
 
 pub mod finisher {
-    /// Physical address of the device.
-    pub const BASE: usize = 0x10_0000;
     /// Write this to exit QEMU with status 0.
     pub const PASS: u32 = 0x5555;
     /// The value that exits QEMU with status `code` (1 to 0xffff).
@@ -388,34 +386,15 @@ pub mod spawn {
 
 /// The kernel's address-space layout (Sv39, kernel in the upper half).
 pub mod layout {
-    /// Where OpenSBI puts the kernel image in physical memory.
-    pub const KERNEL_PHYS: u64 = 0x8020_0000;
-    /// Add to a physical address inside the kernel image to get its virtual address.
-    pub const KERNEL_OFFSET: u64 = 0xffff_ffff_0000_0000;
+    /// The virtual address the kernel image is linked at (the start of its text). Where it sits in physical memory is the loader's choice,
+    /// found at boot (`arch::kernel_delta`: virtual minus physical).
+    pub const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8020_0000;
     /// Start of the direct map: physical address `pa` is at `DIRECT_BASE + pa`
     /// (RAM outside the kernel image, plus the device pages the kernel uses).
     pub const DIRECT_BASE: u64 = 0xffff_ffc0_0000_0000;
-    /// Physical RAM on QEMU's `virt` board starts here.
-    pub const RAM_BASE: u64 = 0x8000_0000;
-    /// Device windows a physical VMO may name (QEMU `virt`): the eight virtio-mmio slots, and the goldfish real-time clock
-    /// (one page, `0x101000`: the wall clock, FS-SPEC section 7; the device manager hands clients a read-only VMO of it).
-    pub const DEVICE_WINDOWS: &[(u64, u64)] = &[(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_9000)];
-    /// Is `[pa, pa + bytes)` page aligned, non-empty and inside one device window?
-    pub fn in_device_window(pa: u64, bytes: u64) -> bool {
-        let Some(end) = pa.checked_add(bytes) else {
-            return false;
-        };
-        pa.is_multiple_of(4096)
-            && bytes != 0
-            && bytes.is_multiple_of(4096)
-            && DEVICE_WINDOWS.iter().any(|&(s, e)| pa >= s && end <= e)
-    }
-    /// Highest PLIC source an interrupt object may name (QEMU `virt`: the eight virtio-mmio slots
-    /// are sources 1..=8; the UART, 10, belongs to the kernel).
-    pub const MAX_IRQ: u32 = 8;
-    /// RAM size the kernel assumes (the boot test passes `-m 128M`). Reading it
-    /// from the device tree arrives with the device manager (S6).
-    pub const RAM_SIZE: u64 = 256 * 1024 * 1024;
+    /// The direct map reaches physical addresses below this (64 GiB: top-level slots 256 to 319); the slots above it belong to other
+    /// kernel windows (the self-test region at 320, the stacks at 384, the heap at 416, the image at 510). RAM above it is not used.
+    pub const DIRECT_MAP_PHYS_LIMIT: u64 = 64 << 30;
     /// First virtual address of the region the self-tests use for lazily
     /// committed memory (an otherwise empty top-level slot in the upper half).
     pub const LAZY_TEST_BASE: u64 = 0xffff_ffd0_0000_0000;
@@ -442,10 +421,8 @@ mod tests {
     #[test]
     fn layout_is_consistent() {
         use super::layout::*;
-        // The kernel image is reachable at KERNEL_PHYS + KERNEL_OFFSET = 0xffff_ffff_8020_0000.
-        assert_eq!(KERNEL_PHYS + KERNEL_OFFSET, 0xffff_ffff_8020_0000);
         // Sv39 upper half: bit 38 and everything above set.
-        for va in [DIRECT_BASE, KERNEL_PHYS + KERNEL_OFFSET, LAZY_TEST_BASE] {
+        for va in [DIRECT_BASE, KERNEL_VIRT_BASE, LAZY_TEST_BASE] {
             assert_eq!(
                 (va as i64) >> 38,
                 -1,
@@ -455,8 +432,10 @@ mod tests {
         // The direct map and the lazy test area use top-level slots of their own.
         let slot = |va: u64| (va >> 30) & 0x1ff;
         assert_eq!(slot(DIRECT_BASE), 256);
-        assert_eq!(slot(KERNEL_PHYS + KERNEL_OFFSET), 510);
+        assert_eq!(slot(KERNEL_VIRT_BASE), 510);
         assert_eq!(slot(LAZY_TEST_BASE), 320);
+        // the direct map's span ends where the next window begins, and the early table's loop (`boot.rs`) maps exactly that span
+        assert_eq!(DIRECT_BASE + DIRECT_MAP_PHYS_LIMIT, LAZY_TEST_BASE);
         assert_eq!(slot(KSTACK_WINDOW_BASE), 384);
         assert_eq!(slot(HEAP_WINDOW_BASE), 416);
         assert_eq!((HEAP_WINDOW_BASE as i64) >> 38, -1);
@@ -466,7 +445,6 @@ mod tests {
         assert_eq!((KSTACK_WINDOW_BASE as i64) >> 30, -128);
         assert_eq!(KSTACK_WINDOW_SIZE, 1 << 30);
         assert!(KSTACK_SLOT_BYTES.is_power_of_two() && KSTACK_BYTES * 2 == KSTACK_SLOT_BYTES);
-        assert_eq!(RAM_BASE % 4096, 0);
     }
 
     #[test]

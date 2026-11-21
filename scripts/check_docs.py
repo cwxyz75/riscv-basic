@@ -177,22 +177,26 @@ ATOMICS = {
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (29, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`)"),
-    "kernel/src/percpu.rs": (62, "per-hart state, touched by its own hart or read by others: the audited per-hart layer"),
+    "kernel/src/percpu.rs": (70, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166)"),
     "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/smp.rs": (7, "hart bring-up and IPI flags"),
-    "kernel/src/arch/riscv64/aia.rs": (12, "interrupt controller statistics and masks"),
+    "kernel/src/arch/riscv64/aia.rs": (14, "interrupt controller statistics and masks, and the per-source aimed-hart table sized at boot (PL5c)"),
     "kernel/src/thread.rs": (30, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender as one word and its name as two, the exempt thread)"),
-    "kernel/src/arch/riscv64/timer.rs": (2, "the clock's zero (the counter value at the first tick), read by `now_ns`"),
+    "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
     "kernel/src/user/mod.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot)"),
     "kernel/src/user/trap.rs": (2, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch)"),
     "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (6, "heap statistics and the growth guard"),
     "kernel/src/kmem.rs": (2, "the active-table bookkeeping counters"),
-    "kernel/src/dtb.rs": (3, "boot-argument and device-tree flags set once at boot"),
-    "kernel/src/console.rs": (2, "the console's panic flag and line state"),
+    "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
+    "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),
+    "kernel/src/entropy.rs": (6, "whether the pool was keyed from a real seed, and its first output for the boot tests (HD1)"),
+    "kernel/src/arch/riscv64/sbi.rs": (4, "whether the firmware has the debug console extension, probed once; the count of calls to the IPI extension (stays 0, PL6)"),
+    "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
+    "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (47, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured)"),
     "kernel/src/smp_tests.rs": (16, "self-test flags and counters"),
@@ -270,6 +274,25 @@ def check_workflows():
                 v = m.group(1).strip()
                 if v and v[0] not in "|>'\"[{&*!%@`" and ": " in v.split(" #")[0]:
                     out.append(f"workflows/{f}:{n}: an unquoted value contains ': ' (invalid YAML: GitHub cannot read the file); quote it or use a block scalar")
+    return out
+
+
+# PL4 (KERNEL-V1-SPEC 2.3): nothing in the kernel assumes where RAM is, how big it is, or where the image was loaded; all of it comes from the
+# device tree and from the early boot code. The literals below may appear only in test code (the kernel's self-tests and `*_tests.rs`).
+RAM_LITERAL_RE = re.compile(r"\bRAM_SIZE\b|\bRAM_BASE\b|\bKERNEL_PHYS\b|\bKERNEL_OFFSET\b|0x8000_0000|0x8000_00|0x80000000|0x8020_0000|0x80200000")
+
+
+def check_ram_literals():
+    out = []
+    for top in ["kernel/src", "kcore/src", "abi/src", "ksys/src"]:
+        for dp, _, fs in os.walk(os.path.join(ROOT, top)):
+            for f in fs:
+                if not f.endswith(".rs") or f == "selftest.rs" or f.endswith("_tests.rs"):
+                    continue
+                path = os.path.join(dp, f)
+                for n, line in enumerate(open(path), 1):
+                    if RAM_LITERAL_RE.search(line.split("//", 1)[0]):
+                        out.append(f"PL4: {os.path.relpath(path, ROOT)}:{n} assumes where RAM or the image is (RAM_SIZE, 0x8000_0000, KERNEL_PHYS, ...): it comes from the device tree and the boot code")
     return out
 
 
@@ -397,7 +420,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

@@ -709,6 +709,50 @@ static int posix2_test(void) { return 0; }
 #define RUN_POSIX2(argc, argv) 0
 #endif
 
+/* PL3: the user build is RVA23U64, so a vector loop and `cbo.zero` run here when the compiler was told so (`__riscv_vector`,
+ * `__riscv_zicboz`); the host build does the same work in plain C and prints the same lines. */
+static void rva23(void) {
+    static unsigned a[100], b[100], c[100];
+    for (unsigned i = 0; i < 100; i++) { a[i] = i; b[i] = 3 * i; c[i] = 0; }
+#ifdef __riscv_vector
+    {
+        unsigned *pa = a, *pb = b, *pc = c;
+        long n = 100, vl, t;
+        __asm__ volatile(
+            "1: vsetvli %[vl], %[n], e32, m1, ta, ma\n"
+            "vle32.v v0, (%[a])\n"
+            "vle32.v v1, (%[b])\n"
+            "vadd.vv v2, v0, v1\n"
+            "vse32.v v2, (%[c])\n"
+            "slli %[t], %[vl], 2\n"
+            "add %[a], %[a], %[t]\n"
+            "add %[b], %[b], %[t]\n"
+            "add %[c], %[c], %[t]\n"
+            "sub %[n], %[n], %[vl]\n"
+            "bnez %[n], 1b\n"
+            : [a] "+r"(pa), [b] "+r"(pb), [c] "+r"(pc), [n] "+r"(n), [vl] "=&r"(vl), [t] "=&r"(t)
+            :
+            : "v0", "v1", "v2", "memory");
+    }
+#else
+    for (unsigned i = 0; i < 100; i++) c[i] = a[i] + b[i];
+#endif
+    unsigned sum = 0;
+    for (unsigned i = 0; i < 100; i++) sum += c[i];
+    printf("vector loop: sum %u\n", sum);
+    static unsigned char page[4096] __attribute__((aligned(4096)));
+    memset(page, 0xff, sizeof page);
+#ifdef __riscv_zicboz
+    __asm__ volatile("cbo.zero 0(%0)" : : "r"(page) : "memory");
+#else
+    memset(page, 0, 64);
+#endif
+    int zeros = 0, ones = 0;
+    for (int i = 0; i < 64; i++) zeros += page[i] == 0;
+    for (int i = 256; i < 4096; i++) ones += page[i] == 0xff;
+    printf("cbo.zero: block zeroed %d, rest kept %d\n", zeros == 64, ones == 4096 - 256);
+}
+
 int main(int argc, char **argv) {
     if (RUN_SOCKETS(argc, argv)) return sockets_test();
     if (RUN_MOUNT(argc, argv)) return mount_test(argv[2]);
@@ -727,6 +771,7 @@ int main(int argc, char **argv) {
     files();
     times();
     misc();
+    rva23();
     searching();
     threads();
     printf("done\n");

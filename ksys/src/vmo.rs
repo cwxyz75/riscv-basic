@@ -33,9 +33,11 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         aspace,
         mm,
         vmos,
+        windows,
         ..
     } = c;
     let job = *job;
+    let windows: &[(u64, u64)] = windows;
     let h = |i: usize| Handle(a[i] as u32);
     let r: Reply = (|| match n {
         nr::VMO_CREATE => {
@@ -69,7 +71,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::VMO_CREATE_PHYSICAL => {
             ipc::resource_of(objs, handles, h(0)).map_err(|e| (e, None, None))?;
             let (pa, bytes) = (a[1], a[2]);
-            if !abi::layout::in_device_window(pa, bytes) {
+            if !kcore::devwin::in_window(windows, pa, bytes) {
                 return fail(Status::InvalidArgs);
             }
             vmos.reserve_one().map_err(|e| (e, None, None))?;

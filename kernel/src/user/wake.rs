@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// A PLIC source fired (trap context, BKL held): hand it to the interrupt object that owns it.
+/// An interrupt source fired (trap context, BKL held): hand it to the interrupt object that owns it.
 pub fn irq_fired(irq: u32) -> bool {
     let s = state();
     let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {
@@ -83,10 +83,12 @@ pub(super) fn cleanup_dead() {
                 ipc::KObj::Interrupt(i) => irq::without(|| {
                     // mask the source unless a newer object already owns it
                     let s = state();
-                    let owned = matches!(s.irq_objs[i.irq as usize], Some(o)
-                        if matches!(s.objs.get(o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
+                    let owned = matches!(s.irq_objs.get(i.irq as usize), Some(Some(o))
+                        if matches!(s.objs.get(*o), Some(ipc::KObj::Interrupt(n)) if n.irq == i.irq));
                     if !owned {
-                        s.irq_objs[i.irq as usize] = None;
+                        if let Some(slot) = s.irq_objs.get_mut(i.irq as usize) {
+                            *slot = None;
+                        }
                         crate::aia::disable(i.irq);
                     }
                 }),

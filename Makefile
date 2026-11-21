@@ -9,8 +9,8 @@ DISK          := disk.img
 DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 
-.PHONY: os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -241,7 +241,7 @@ os-boot-test-release:
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_REL_ELF)
 
 # The same suite with several harts (S5): the secondary harts must come online, take timer and
-# software interrupts, and leave every other test as it was.
+# inter-hart interrupts, and leave every other test as it was.
 os-boot-test-smp: kernel os-interactive
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF) $(OS_FAIL_ELF) $(OS_RR_ELF)
@@ -329,9 +329,6 @@ os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
 	OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
 
-os-boot-test-polling: kernel
-	OS_MACHINE=virt python3 scripts/os_boot_test.py $(OS_ELF)
-
 os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	cd kernel && cargo build --features fault-aia-no-unmask --target-dir ../target/os-fault-unmask
@@ -350,7 +347,7 @@ os-interactive: os-user
 
 # Boot the OS to its shell in this terminal (type `basic`; Ctrl-A then X leaves QEMU).
 os-run: os-interactive
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_INTERACTIVE_ELF)
 
 # The system as it is meant to be used (T48): optimised kernel and programs, no boot self-tests, no
 # test banners. `make os-release-run` boots it in this terminal; `os-release-smoke` boots it
@@ -362,7 +359,7 @@ os-release:
 	cd kernel && OS_USER_PROFILE=release CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --features release --target-dir ../target/os-release-run
 
 os-release-run: os-release
-	qemu-system-riscv64 -machine virt,aia=aplic-imsic -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
+	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
 
 os-release-smoke: os-release
 	python3 scripts/release_smoke_test.py $(OS_RELEASE_ELF)
@@ -382,9 +379,29 @@ os-serial-test: os-interactive
 	@if python3 scripts/uv7_detach_test.py $(OS_REPL_ELF) --break-expectation >/dev/null 2>&1; then echo "the detach test passed a broken expectation"; exit 1; fi
 	@if S4_TIMEOUT=15 python3 scripts/s4e_shell_test.py $(OS_INTERACTIVE_ELF) --break-expectation >/dev/null 2>&1; then echo "the shell test passed a broken expectation"; exit 1; fi
 
+# PL4c: the image loaded at other physical addresses boots the kernel-only shard: 6 MiB above the default (the same gigabyte, a different
+# 2 MiB page) and at 3 GiB + 2 MiB on a 2 GiB machine (another gigabyte, so the early table's identity slot is not the default one). The
+# link address does not change; the early boot code works out the difference. The harness reads each ELF's load address itself and refuses
+# a build that did not take the address it was asked for.
+os-boot-test-loadaddr: os-user
+	cd kernel && KERNEL_LMA=0x80600000 cargo build --target-dir ../target/os-loadaddr
+	OS_LOAD=0x80600000 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr/riscv64gc-unknown-none-elf/debug/kernel
+	cd kernel && KERNEL_LMA=0xc0200000 cargo build --target-dir ../target/os-loadaddr2
+	OS_LOAD=0xc0200000 OS_RAM=2G OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py target/os-loadaddr2/riscv64gc-unknown-none-elf/debug/kernel
+
+# PL5b: all output through the firmware's debug console (SBI DBCN) instead of the UART the tree names: the fallback path for a machine
+# whose tree names no 16550, exercised here on one that has it.
+os-boot-test-sbi-console: kernel
+	OS_BOOT_ARGS=console=sbi OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_ELF)
+
+# HD1: the entropy pool differs at every boot; a tree without a seed boots unseeded and passes (needs dtc).
+os-boot-test-entropy: kernel
+	python3 scripts/entropy_boot_test.py $(OS_ELF)
+
 # The reference CPU of the OS track (OD47).
-os-boot-test-rva23: kernel
-	OS_CPU=rva23s64 python3 scripts/os_boot_test.py $(OS_ELF)
+# PL1 (OD47, OD127): a CPU without the profile must end the boot in `##PANIC missing extension` (QEMU's plain rv64 has no V, Zicond or Svade).
+os-boot-test-cpu-neg: kernel
+	OS_CPU=rv64 OS_BOOT_TIMEOUT=60 python3 scripts/os_boot_test.py --expect-panic "missing extension" $(OS_ELF)
 
 # Download third-party sources into third_party/fetched/ (ignored by git; checksums pinned in
 # third_party/fetch-manifest.txt). Used by the libc gap survey (UV0-GAP-SURVEY.md); nothing here builds them.
@@ -406,6 +423,7 @@ docs-check:
 # Everything that is compiled for the target, built and not run: the OS kernel with its user programs, and the home computer's kernel.
 # (The optimised build is `os-release`; CI builds it in its own job.)
 build: kernel-main home-kernel
+	python3 scripts/check_vector_codegen.py
 
 # The commit hook (scripts/hooks/pre-commit): format, the docs check and clippy, on every commit; no tests. Once per clone
 # (worktrees share the setting).
@@ -433,7 +451,7 @@ smoke: $(SMOKE_TARGETS)
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
 # owner asks for it (OD142): not nightly, not on a label, not by an agent on its own judgement. The boots are independent (each makes its own disk), so they run
 # in parallel (SOAK_JOBS, default 3; the tests follow the host clock, so do not oversubscribe a small machine).
-SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-polling os-boot-test-rva23 os-boot-test-lossy os-serial-test
+SOAK_TARGETS := os-bench os-latency os-boot-test os-boot-test-overflow os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-boot-test-loadaddr os-boot-test-sbi-console os-boot-test-entropy os-boot-test-lossy os-serial-test
 SOAK_JOBS ?= 3
 soak:
 	$(MAKE) -j$(SOAK_JOBS) $(SOAK_TARGETS)
