@@ -2149,6 +2149,10 @@ impl<F: PageTableFormat> AddressSpace<F> {
             };
             // (counted before the map: if the map fails, the translations that went are still owed a shootdown)
             self.replaced = self.replaced.saturating_add(replaced);
+            if replaced > 0 {
+                // (the kernel looks at this one flag after every call and fault, then asks the address space)
+                COPY_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            }
             match self.fault_map(mm, vmos, &plan, pfn, own) {
                 Ok(mut m) => {
                     m.replaced = replaced;
