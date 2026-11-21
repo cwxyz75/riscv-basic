@@ -267,6 +267,8 @@ int posix2_test(void) {
         f[0] = 7;
         unsigned char *g = mmap(f, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         CHECK(g == f && g[0] == 0, "and replaces what was there");
+        f[0] = 9;
+        CHECK(mmap(f, 4096, PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED && errno == EINVAL && f[0] == 9, "a refused MAP_FIXED leaves the old mapping alone");
         munmap(f, 4096);
         CHECK(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3, 0) == MAP_FAILED && errno == ENOSYS, "a file mapping is not supported");
         CHECK(mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == ENOSYS, "PROT_NONE is not supported");

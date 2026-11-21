@@ -29,7 +29,12 @@ fn next_mapped_finds_exactly_what_a_scan_finds() {
         for _ in 0..200 {
             let lo = spans[rng.below(3) as usize] - 0x10_0000 + rng.below(2048) * 4096;
             let hi = lo + 1 + rng.below(0x80_0000);
-            let expect = mapped.iter().copied().filter(|&v| v >= lo && v < hi).min();
+            let aligned = lo & !4095;
+            let expect = mapped
+                .iter()
+                .copied()
+                .filter(|&v| v >= aligned && v < hi)
+                .min();
             let aligned = lo & !4095;
             let expect = expect.filter(|&v| v >= aligned);
             assert_eq!(
@@ -39,4 +44,23 @@ fn next_mapped_finds_exactly_what_a_scan_finds() {
             );
         }
     }
+}
+
+#[test]
+fn next_mapped_stops_at_the_top_of_the_address_space_and_at_the_hole() {
+    let mut mm = Mm {
+        db: FrameDb::new(2000, 500),
+        mem: FakeMem::default(),
+    };
+    let mut pt = PageTable::new(&mut mm).unwrap();
+    pt.map(&mut mm, 0x40_0000, 1000, Perms::RW).unwrap();
+    // nothing above the one mapping, up to the top of the address space: no panic, no overflow
+    assert_eq!(pt.next_mapped(&mm, 0x40_1000, u64::MAX), None);
+    assert_eq!(pt.next_mapped(&mm, 0xffff_ffff_ffff_0000, u64::MAX), None);
+    assert_eq!(pt.next_mapped(&mm, 0x40_0000, u64::MAX), Some(0x40_0000));
+    // (a range that spans the hole between the halves is walked one half at a time)
+    assert_eq!(
+        pt.next_mapped(&mm, 0x3f_ffff_f000, 0xffff_ffc0_0000_0000),
+        None
+    );
 }

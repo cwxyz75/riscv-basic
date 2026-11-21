@@ -534,10 +534,14 @@ fn decommit_while_siblings_touch() -> Result<(), String> {
 /// translation the write would go through and the process would end normally.
 fn protect_while_siblings_write() -> Result<(), String> {
     use crate::user;
-    let (pid, tid) = user::start(user::CRASH_ELF, 103).map_err(|e| format!("{e:?}"))?;
-    let code = user::finish(pid, tid);
-    if code != -1001 {
-        return Err(format!("the process ended with {code}, not -1001: a worker wrote through a stale writable translation (0), or the protocol broke (9xx)"));
+    // (twenty processes: a worker that is switched out loses its cached translation anyway, so one round proves little; with the
+    // shootdown skipped, at least one of twenty must see the stale entry and exit 0)
+    for round in 0..20 {
+        let (pid, tid) = user::start(user::CRASH_ELF, 103).map_err(|e| format!("{e:?}"))?;
+        let code = user::finish(pid, tid);
+        if code != -1001 {
+            return Err(format!("round {round}: the process ended with {code}, not -1001: a worker wrote through a stale writable translation (0), or the protocol broke (9xx)"));
+        }
     }
     Ok(())
 }

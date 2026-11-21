@@ -534,7 +534,8 @@ impl<F: PageTableFormat> PageTable<F> {
 
     /// The first address at or after `va`, below `end`, that has a mapping (a page or a huge leaf), skipping every span whose table is absent
     /// (a 4 KiB page, 2 MiB or 1 GiB at a time, as far up as the first invalid entry): a walk over a mostly empty range costs what is
-    /// mapped, not the length of the range. `None` when nothing is mapped in `[va, end)`.
+    /// mapped, not the length of the range. `None` when nothing is mapped in `[va, end)`, or when the walk reaches a non-canonical
+    /// address (a range that spans the hole between the halves is walked one half at a time).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the spans are 1 << (12 + 9 * level) with level < 4; the next start is computed with checked arithmetic
     pub fn next_mapped<M: PhysMem>(&self, mm: &Mm<M>, mut va: u64, end: u64) -> Option<u64> {
         while va < end {

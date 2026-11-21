@@ -888,7 +888,8 @@ fn process_map_anywhere_picks_free_places_that_do_not_overlap_and_returns_them()
         .expect("and again");
     for at in [first, second] {
         assert!(
-            at.is_multiple_of(4096) && (0x1_0000_0000..abi::user::STACK_ARENA_BASE).contains(&at),
+            at.is_multiple_of(4096)
+                && (abi::user::MAP_ARENA_BASE..abi::user::STACK_ARENA_BASE).contains(&at),
             "inside the arena: {at:#x}"
         );
     }
@@ -1380,8 +1381,8 @@ fn process_clone_region_shares_or_snapshots_a_region_into_another_process() {
 // ---- the memory calls under random sequences (KT8's job for the calls on the process table) ----
 
 /// A deterministic sequence of random memory calls (map, unmap, protect, decommit, resize, children, clones, touches) over two processes:
-/// none may panic, the frame database and the families keep their audits after every call, and every translation of every process maps
-/// what its VMO shows.
+/// none may panic, the frame database and the families keep their audits after every call or touch, and every translation of every
+/// process shows what its VMO shows (the VMO's own frame, or zeros where it has none), writable only where the VMO owns the page.
 #[test]
 fn random_memory_calls_never_panic_and_keep_their_audits() {
     // (how many calls of each kind succeeded over all seeds: the sequences must do real work)
@@ -1411,9 +1412,11 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
             let len = (1 + rnd(6)) * 4096;
             let off = rnd(4) * 4096;
             let flags = [R, R | W, R | X, W, R | W | X][rnd(5) as usize];
-            let call = match rnd(11) {
+            let call = match rnd(13) {
                 0 | 1 => (nr::PROCESS_MAP, [p, v, va, off, len, flags]),
                 2 => (nr::PROCESS_UNMAP, [p, va, len, 0, 0, 0]),
+                10 => (nr::PROCESS_UNMAP, [p, va, 0, 0, 0, 0]),
+                11 => (nr::PROCESS_MAP, [p, v, 0, off, len, (flags & 3 | R) | ANY]),
                 3 => (nr::PROCESS_PROTECT, [p, va, len, flags, 0, 0]),
                 4 => (nr::VMO_DECOMMIT, [v, off, len, 0, 0, 0]),
                 5 => (nr::VMO_SET_SIZE, [v, (1 + rnd(10)) * 4096, 0, 0, 0, 0]),
@@ -1452,17 +1455,21 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
                         &[step as u8],
                     );
                     ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
-                    continue;
+                    (0, [0; 6])
                 }
                 _ => {
                     // a new VMO, so that children and clones have more to work on
                     if vmo_handles.len() < 8 {
                         vmo_handles.push(w.vmo(4, JobId::ROOT));
                     }
-                    continue;
+                    (0, [0; 6])
                 }
             };
-            let r = w.call(call.0, call.1);
+            let r = if call.0 == 0 {
+                Err((Status::BadSyscall, None, None)) // (a touch or a new VMO: no call was made)
+            } else {
+                w.call(call.0, call.1)
+            };
             if r.is_ok() {
                 *succeeded.entry(call.0).or_default() += 1;
             }
@@ -1477,6 +1484,29 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
             w.vmos
                 .audit_families(true)
                 .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            for (pid, proc) in w.procs.iter() {
+                for r in proc.aspace.regions_info() {
+                    for pg in 0..r.pages {
+                        let va = r.start + pg * 4096;
+                        let Some(t) = proc.aspace.table().translate(&w.mm, va) else {
+                            continue;
+                        };
+                        match w.vmos.frame_info(r.vmo, r.vmo_page + pg) {
+                            Some((pfn, own)) => {
+                                assert_eq!(t.pfn, pfn, "seed {seed} step {step}: process {pid} {va:#x} maps another frame than its VMO's");
+                                assert!(own || !t.perms.write, "seed {seed} step {step}: process {pid} {va:#x} is writable but not owned");
+                            }
+                            None => {
+                                // (nothing committed: only the shared zero frame can be mapped, read-only, and it reads zeros)
+                                use kcore::pagetable::PhysMem;
+                                let mut b = [0u8; 8];
+                                w.mm.mem.read_bytes(t.pfn << 12, &mut b);
+                                assert!(b == [0; 8] && !t.perms.write, "seed {seed} step {step}: process {pid} {va:#x} maps a page its VMO does not have");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     for n in [

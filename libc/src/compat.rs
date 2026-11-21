@@ -474,19 +474,45 @@ pub unsafe extern "C" fn fseeko(f: *mut c_void, off: i64, whence: c_int) -> c_in
 /// `process_unmap` and `process_protect`: real mappings of a fresh VMO, zeroed, page aligned, unmapped or re-protected in whole pages
 /// or in part. `MAP_PRIVATE` and `MAP_SHARED` anonymous memory are the same thing here (one process); a file mapping gets `MAP_FAILED`
 /// and `ENOSYS` (S11-MMAP). `PROT_NONE` is not available (the kernel's mappings always read; guard pages: ENOSYS), nor is writable
-/// with executable (`EINVAL`: M2). A mapping is at most `MAX_VMO_PAGES` pages (64 MiB) until the caps go (PL8).
+/// with executable (`EINVAL`: M2). Memory is committed lazily, as on Linux (a touch can fail when the job's page limit is reached, which
+/// ends the program: use the heap for memory that must not), and a partial `munmap` frees the pages only when the whole mapping has gone
+/// (the VMO is not kept). A mapping is at most `MAX_VMO_PAGES` pages (64 MiB) until the caps go (PL8): larger is `ENOMEM`. `MAP_FIXED`
+/// unmaps what is in the range before it maps, so a mapping that then fails for want of memory has lost the range (POSIX allows that for
+/// errors other than `EINVAL`); every argument error is found before anything is unmapped.
 const PAGE: usize = 4096;
+
+/// The process's own handle, fetched once (every `process_self` call makes a new handle).
+fn my_process() -> Option<u64> {
+    static ME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let known = ME.load(core::sync::atomic::Ordering::Acquire);
+    if known != 0 {
+        return Some(known);
+    }
+    let r = rt::sys::process_self();
+    if r.status != 0 {
+        return None;
+    }
+    // (two threads that race each keep a handle; the loser's is closed)
+    match ME.compare_exchange(
+        0,
+        r.a1 as u64,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Some(r.a1 as u64),
+        Err(winner) => {
+            rt::sys::handle_close(r.a1 as u64);
+            Some(winner)
+        }
+    }
+}
 
 /// The `process_map` flags of a POSIX `prot`: `None` when it asks for something the kernel does not do.
 fn map_flags(prot: c_int) -> Option<u64> {
     if prot & !7 != 0 || prot == 0 {
         return None;
     }
-    Some(
-        u64::from(prot & 1 != 0 || prot & 6 != 0)
-            | u64::from(prot & 2 != 0) << 1
-            | u64::from(prot & 4 != 0) << 2,
-    )
+    Some(1 | u64::from(prot & 2 != 0) << 1 | u64::from(prot & 4 != 0) << 2)
 }
 
 /// The errno of a failed memory call.
@@ -511,7 +537,11 @@ pub extern "C" fn mmap(
 ) -> *mut c_void {
     let failed = usize::MAX as *mut c_void;
     // (anonymous, and exactly one of private and shared)
-    if flags & 0x20 == 0 || (flags & 0x3 != 1 && flags & 0x3 != 2) {
+    if flags & 0x3 == 0x3 || flags & 0x3 == 0 {
+        crate::errno::set(22);
+        return failed;
+    }
+    if flags & 0x20 == 0 {
         crate::errno::set(38);
         return failed;
     }
@@ -523,6 +553,10 @@ pub extern "C" fn mmap(
         crate::errno::set(if prot == 0 { 38 } else { 22 });
         return failed;
     };
+    if pf & 6 == 6 {
+        crate::errno::set(22); // (writable and executable: M2; found before anything is unmapped)
+        return failed;
+    }
     let Some(size) = len.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE) else {
         crate::errno::set(12);
         return failed;
@@ -532,16 +566,25 @@ pub extern "C" fn mmap(
         crate::errno::set(22);
         return failed;
     }
-    let me = rt::sys::process_self().a1 as u64;
-    let v = rt::sys::vmo_create(size as u64 / PAGE as u64);
+    let Some(me) = my_process() else {
+        crate::errno::set(12);
+        return failed;
+    };
+    let v = rt::sys::vmo_create_bytes(size as u64, 0, 0);
     if v.status != 0 {
-        crate::errno::set(mem_errno(v.status));
+        // (including a size over the cap: what callers expect is ENOMEM)
+        crate::errno::set(12);
         return failed;
     }
     let vmo = v.a1 as u64;
     if fixed {
         // (a fixed mapping replaces what is there)
-        let _ = rt::sys::process_unmap_range(me, addr as u64, size as u64);
+        let r = rt::sys::process_unmap_range(me, addr as u64, size as u64);
+        if r.status != 0 {
+            rt::sys::handle_close(vmo);
+            crate::errno::set(mem_errno(r.status));
+            return failed;
+        }
     }
     let r = rt::sys::process_map(
         me,
@@ -578,7 +621,10 @@ pub extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
         crate::errno::set(22);
         return -1;
     }
-    let me = rt::sys::process_self().a1 as u64;
+    let Some(me) = my_process() else {
+        crate::errno::set(12);
+        return -1;
+    };
     let r = rt::sys::process_unmap_range(me, addr as u64, size as u64);
     if r.status != 0 {
         crate::errno::set(mem_errno(r.status));
@@ -605,7 +651,10 @@ pub extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int 
         crate::errno::set(22); // (writable and executable: M2)
         return -1;
     }
-    let me = rt::sys::process_self().a1 as u64;
+    let Some(me) = my_process() else {
+        crate::errno::set(12);
+        return -1;
+    };
     let r = rt::sys::process_protect(me, addr as u64, size as u64, pf);
     if r.status != 0 {
         // (the range is not all mapped: POSIX says ENOMEM; the other refusals are the kernel's own codes)

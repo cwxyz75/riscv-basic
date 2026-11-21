@@ -237,7 +237,10 @@ pub mod sys {
         syscall(OBJECT_INFO, [h as usize, 0, 0, 0, 0, 0])
     }
     pub fn vmo_create(pages: u64) -> Ret {
-        syscall(VMO_CREATE, [(pages * 4096) as usize, 0, 0, 0, 0, 0])
+        syscall(
+            VMO_CREATE,
+            [pages.saturating_mul(4096) as usize, 0, 0, 0, 0, 0],
+        )
     }
     /// A VMO of `bytes` bytes (rounded up to whole pages), charged to `job` (0: the caller's own), with `flags` (`abi::vmo_flags`).
     pub fn vmo_create_bytes(bytes: u64, job: u64, flags: u64) -> Ret {
@@ -250,7 +253,14 @@ pub mod sys {
     pub fn vmo_create_in(pages: u64, job: u64) -> Ret {
         syscall(
             VMO_CREATE,
-            [(pages * 4096) as usize, job as usize, 0, 0, 0, 0],
+            [
+                pages.saturating_mul(4096) as usize,
+                job as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
         )
     }
     /// A VMO with `flags` (`abi::vmo_flags`: RESIZABLE), charged to `job` (0: the caller's own).
@@ -258,7 +268,7 @@ pub mod sys {
         syscall(
             VMO_CREATE,
             [
-                (pages * 4096) as usize,
+                pages.saturating_mul(4096) as usize,
                 job as usize,
                 flags as usize,
                 0,

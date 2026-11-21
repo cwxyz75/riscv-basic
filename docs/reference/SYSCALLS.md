@@ -503,7 +503,7 @@ process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page ali
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
 
-**ANYWHERE (MM7):** the flag `ANYWHERE` (8; `vaddr` must be 0, else INVALID_ARGS) asks the kernel to choose (every other argument is checked first, so a refused call draws nothing from the entropy pool): a page-aligned place in the mapping arena (`0x1_0000_0000` up to the stack arena), picked at random (the kernel entropy pool: HD1): eight random positions are tried, then the first fit from a random start, wrapping once; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
+**ANYWHERE (MM7):** the flag `ANYWHERE` (8; `vaddr` must be 0, else INVALID_ARGS) asks the kernel to choose (every argument error is found first, so a call refused for its arguments draws nothing from the entropy pool; one that fails later, for V1 or for want of memory, has drawn up to nine values): a page-aligned place in the mapping arena (`0x9_0000_0000`, above the runtime heap's range, up to the stack arena), picked at random (the kernel entropy pool: HD1): eight random positions are tried, then the first fit from a random start, wrapping once; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
 Tests: `process_map_*` in `init`.
 
 ### process_unmap(process, vaddr, length) -> status
@@ -579,7 +579,7 @@ a worst-case estimate: one page for a process's root table and, per mapped regio
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
 when it is unmapped or the process ends (the kernel's own objects are bounded by the global caps,
 not charged). **Objects** are charged to the job they are created for: the creating process's job, except that a
-process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(pages, job)`)
+process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(bytes, job)`)
 are charged to that job (a channel or socket pair counts two) and credited when they are destroyed. **Queued data** is charged to the job
 that created the *endpoint holding the queue* (so the creator of a conversation pays for both
 buffers, whoever writes into them), credited when read or when the endpoint is destroyed; a

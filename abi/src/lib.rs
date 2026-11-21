@@ -410,6 +410,9 @@ pub mod user {
     pub const MAX_DEBUG_WRITE: usize = 4096;
     /// The stack arena: where `thread_spawn` maps the stacks it provisions (32 GiB nothing else is given).
     pub const STACK_ARENA_BASE: u64 = crate::arch::USER_STACK_ARENA_BASE;
+    /// Where the arena that ANYWHERE mappings are placed in starts: above the runtime heap's range (`rt::heap`: 128 MiB from 0x8_0000_0000),
+    /// which grows at fixed addresses and reserves nothing.
+    pub const MAP_ARENA_BASE: u64 = 0x9_0000_0000;
     pub const STACK_ARENA_END: u64 = crate::arch::USER_STACK_ARENA_END;
 }
 
