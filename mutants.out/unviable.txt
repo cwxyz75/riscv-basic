@@ -1,1 +1,5 @@
-klock/src/lib.rs:274:9: replace Spin<T, M>::try_lock -> Option<Guard<'_, T, M>> with Some(Default::default())
+kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![]
+kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 0)]
+kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 1)]
+kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 0)]
+kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 1)]

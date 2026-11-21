@@ -1,302 +1,512 @@
 [
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Held::is_empty",
-      "return_type": "-> bool",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 122,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 124,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 123,
-        "column": 9
+        "line": 93,
+        "column": 5
       },
       "end": {
-        "line": 123,
-        "column": 22
+        "line": 132,
+        "column": 8
       }
     },
-    "replacement": "true",
+    "replacement": "vec![]",
     "genre": "FnValue"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Held::is_empty",
-      "return_type": "-> bool",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 122,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 124,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 123,
-        "column": 9
+        "line": 93,
+        "column": 5
       },
       "end": {
-        "line": 123,
-        "column": 22
+        "line": 132,
+        "column": 8
       }
     },
-    "replacement": "false",
+    "replacement": "vec![(0, 0)]",
     "genre": "FnValue"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Held::is_empty",
-      "return_type": "-> bool",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 122,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 124,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 123,
-        "column": 18
+        "line": 93,
+        "column": 5
       },
       "end": {
-        "line": 123,
-        "column": 20
+        "line": 132,
+        "column": 8
       }
     },
-    "replacement": "!=",
+    "replacement": "vec![(0, 1)]",
+    "genre": "FnValue"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 93,
+        "column": 5
+      },
+      "end": {
+        "line": 132,
+        "column": 8
+      }
+    },
+    "replacement": "vec![(1, 0)]",
+    "genre": "FnValue"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 93,
+        "column": 5
+      },
+      "end": {
+        "line": 132,
+        "column": 8
+      }
+    },
+    "replacement": "vec![(1, 1)]",
+    "genre": "FnValue"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 105,
+        "column": 71
+      },
+      "end": {
+        "line": 105,
+        "column": 73
+      }
+    },
+    "replacement": "||",
     "genre": "BinaryOperator"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Spin<T, M>::try_lock",
-      "return_type": "-> Option<Guard<'_, T, M>>",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 272,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 290,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 274,
-        "column": 9
+        "line": 105,
+        "column": 55
       },
       "end": {
-        "line": 289,
-        "column": 11
+        "line": 105,
+        "column": 57
       }
     },
-    "replacement": "None",
-    "genre": "FnValue"
-  },
-  {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
-    "function": {
-      "function_name": "Spin<T, M>::try_lock",
-      "return_type": "-> Option<Guard<'_, T, M>>",
-      "span": {
-        "start": {
-          "line": 272,
-          "column": 5
-        },
-        "end": {
-          "line": 290,
-          "column": 6
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 274,
-        "column": 9
-      },
-      "end": {
-        "line": 289,
-        "column": 11
-      }
-    },
-    "replacement": "Some(Default::default())",
-    "genre": "FnValue"
-  },
-  {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
-    "function": {
-      "function_name": "Spin<T, M>::try_lock",
-      "return_type": "-> Option<Guard<'_, T, M>>",
-      "span": {
-        "start": {
-          "line": 272,
-          "column": 5
-        },
-        "end": {
-          "line": 290,
-          "column": 6
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 277,
-        "column": 36
-      },
-      "end": {
-        "line": 277,
-        "column": 38
-      }
-    },
-    "replacement": "&&",
+    "replacement": "||",
     "genre": "BinaryOperator"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Spin<T, M>::try_lock",
-      "return_type": "-> Option<Guard<'_, T, M>>",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 272,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 290,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 277,
-        "column": 39
+        "line": 105,
+        "column": 58
       },
       "end": {
-        "line": 277,
-        "column": 40
+        "line": 105,
+        "column": 59
       }
     },
     "replacement": "",
     "genre": "UnaryOperator"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Spin<T, M>::is_free",
-      "return_type": "-> bool",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 292,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 295,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 294,
-        "column": 9
+        "line": 114,
+        "column": 19
       },
       "end": {
-        "line": 294,
-        "column": 30
+        "line": 114,
+        "column": 21
       }
     },
-    "replacement": "true",
-    "genre": "FnValue"
+    "replacement": "<",
+    "genre": "BinaryOperator"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "Spin<T, M>::is_free",
-      "return_type": "-> bool",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 292,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 295,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 294,
-        "column": 9
+        "line": 117,
+        "column": 19
       },
       "end": {
-        "line": 294,
-        "column": 30
+        "line": 117,
+        "column": 21
       }
     },
-    "replacement": "false",
-    "genre": "FnValue"
+    "replacement": ">",
+    "genre": "BinaryOperator"
   },
   {
-    "package": "klock",
-    "file": "klock/src/lib.rs",
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
     "function": {
-      "function_name": "<impl Drop for Guard<'_, T, M>>::drop",
-      "return_type": "",
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
       "span": {
         "start": {
-          "line": 326,
-          "column": 5
+          "line": 84,
+          "column": 1
         },
         "end": {
-          "line": 331,
-          "column": 6
+          "line": 133,
+          "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 327,
-        "column": 9
+        "line": 120,
+        "column": 19
       },
       "end": {
-        "line": 330,
-        "column": 34
+        "line": 120,
+        "column": 20
       }
     },
-    "replacement": "()",
-    "genre": "FnValue"
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 120,
+        "column": 19
+      },
+      "end": {
+        "line": 120,
+        "column": 20
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 120,
+        "column": 19
+      },
+      "end": {
+        "line": 120,
+        "column": 20
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 124,
+        "column": 18
+      },
+      "end": {
+        "line": 124,
+        "column": 20
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 128,
+        "column": 14
+      },
+      "end": {
+        "line": 128,
+        "column": 15
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 128,
+        "column": 14
+      },
+      "end": {
+        "line": 128,
+        "column": 15
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/devwin.rs",
+    "function": {
+      "function_name": "device_windows",
+      "return_type": "-> Vec<(u64, u64)>",
+      "span": {
+        "start": {
+          "line": 84,
+          "column": 1
+        },
+        "end": {
+          "line": 133,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 128,
+        "column": 14
+      },
+      "end": {
+        "line": 128,
+        "column": 15
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
   }
 ]

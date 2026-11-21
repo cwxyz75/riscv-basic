@@ -1,0 +1,17 @@
+kcore/src/devwin.rs:105:71: replace && with || in device_windows
+kcore/src/devwin.rs:105:55: replace && with || in device_windows
+kcore/src/devwin.rs:105:58: delete ! in device_windows
+kcore/src/devwin.rs:114:19: replace >= with < in device_windows
+kcore/src/devwin.rs:117:19: replace <= with > in device_windows
+kcore/src/devwin.rs:120:19: replace > with == in device_windows
+kcore/src/devwin.rs:120:19: replace > with < in device_windows
+kcore/src/devwin.rs:120:19: replace > with >= in device_windows
+kcore/src/devwin.rs:124:18: replace >= with < in device_windows
+kcore/src/devwin.rs:128:14: replace < with == in device_windows
+kcore/src/devwin.rs:128:14: replace < with > in device_windows
+kcore/src/donate.rs:62:9: replace Changes::is_empty -> bool with true
+kcore/src/donate.rs:62:9: replace Changes::is_empty -> bool with false
+kcore/src/donate.rs:62:18: replace == with != in Changes::is_empty
+kcore/src/sched_smp.rs:1035:9: replace Sched2<N, R>::reap -> Result<(), Error> with Ok(())
+kcore/src/ticket.rs:32:9: replace Depth::get -> u32 with 0
+kcore/src/ticket.rs:32:9: replace Depth::get -> u32 with 1

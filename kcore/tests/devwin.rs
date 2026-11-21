@@ -309,3 +309,27 @@ fn a_tree_with_one_cell_addresses_and_one_with_no_devices() {
     assert_eq!(windows_of(&machine(&[]), &[]), vec![]);
     assert!(!in_window(&[], 0x1000_1000, 4096));
 }
+
+#[test]
+fn a_cut_that_starts_at_a_windows_start_leaves_no_empty_range() {
+    // (KT10: the mutant "ca > a gives ca >= a" in `device_windows` survived the first mutation run: it pushes the empty range [a, a))
+    let w = windows_of(VIRT_AIA, &[CONSOLE, (0x1000_1000, 0x1000)]);
+    assert_eq!(
+        w,
+        vec![(0x10_1000, 0x10_2000), (0x1000_2000, 0x1000_9000)],
+        "the first virtio slot is cut away from the front of its run, and nothing empty is left behind"
+    );
+    assert!(w.iter().all(|&(a, b)| a < b), "every range is non-empty");
+}
+
+#[test]
+fn a_cut_that_ends_at_a_windows_end_leaves_no_empty_range() {
+    // (KT10: the mutant "a < b gives a <= b" after the cut loop of `device_windows`: it pushes the empty range [b, b))
+    let w = windows_of(VIRT_AIA, &[CONSOLE, (0x1000_8000, 0x1000)]);
+    assert_eq!(
+        w,
+        vec![(0x10_1000, 0x10_2000), (0x1000_1000, 0x1000_8000)],
+        "the last virtio slot is cut away from the end of its run, and nothing empty is left behind"
+    );
+    assert!(w.iter().all(|&(a, b)| a < b), "every range is non-empty");
+}

@@ -1,0 +1,60 @@
+--- kcore/src/devwin.rs
++++ replace device_windows -> Vec<(u64, u64)> with vec![(0, 1)]
+@@ -85,56 +85,17 @@
+ /// drives: the console UART, and anything else the caller names), minus `ram` byte ranges (a device range that overlaps RAM or a reserved
+ /// range is not a window) and minus the ranges of the nodes the kernel or firmware drives, as sorted, non-overlapping page ranges
+ /// `(start, end)` in bytes, adjacent ones merged.
+ pub fn device_windows(
+     nodes: &[Node],
+     excluded: &[(u64, u64)],
+     ram: &[(u64, u64)],
+ ) -> Vec<(u64, u64)> {
+-    let mut want: Vec<(u64, u64)> = Vec::new();
+-    let mut cut: Vec<(u64, u64)> = excluded
+-        .iter()
+-        .chain(ram.iter())
+-        .filter_map(|&(a, s)| pages(a, s))
+-        .collect();
+-    for n in nodes {
+-        // what the kernel or firmware drives is cut from every window, wherever its range sits
+-        if NEVER.iter().any(|c| n.is_compatible(c)) {
+-            cut.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+-            continue;
+-        }
+-        if ALLOWED.iter().any(|c| n.is_compatible(c)) && !disabled(n) && physical(n, nodes) {
+-            want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+-        }
+-    }
+-    cut.sort_unstable();
+-    want.sort_unstable();
+-    let mut out: Vec<(u64, u64)> = Vec::new();
+-    for (mut a, b) in want {
+-        for &(ca, cb) in &cut {
+-            if ca >= b {
+-                break; // sorted by start: nothing further can overlap
+-            }
+-            if cb <= a {
+-                continue;
+-            }
+-            if ca > a {
+-                push(&mut out, a, ca);
+-            }
+-            a = a.max(cb);
+-            if a >= b {
+-                break;
+-            }
+-        }
+-        if a < b {
+-            push(&mut out, a, b);
+-        }
+-    }
+-    out
++    vec![(0, 1)] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Add `[a, b)` to a sorted list, merging with the last range when they touch or overlap.
+ fn push(out: &mut Vec<(u64, u64)>, a: u64, b: u64) {
+     match out.last_mut() {
+         Some(last) if a <= last.1 => last.1 = last.1.max(b),
+         _ => out.push((a, b)),
+     }
