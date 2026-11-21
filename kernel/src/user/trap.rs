@@ -96,13 +96,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     if frame.is_syscall() {
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
-        // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced a translation other harts may still cache
+        // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
         let pid = state().thread_pid.get(&thread::current()).copied();
         if let Some(p) = pid.and_then(|pid| state().procs.get_mut(&pid)) {
             if p.aspace.take_replaced() > 0 {
                 crate::smp::shootdown();
+                kmem::flush_tlb();
             }
         }
+        super::calls::cow_sync();
         return;
     }
     match frame.decode_user() {
@@ -122,8 +124,10 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
                             if p.aspace.take_replaced() > 0 {
-                                // (MM8) a read-only translation of a page the writer now owns a copy of may sit in another hart's TLB
+                                // (MM8) a read-only translation of a page the writer now owns a copy of may sit in another hart's TLB, or
+                                // in this one's under another alias of the page
                                 crate::smp::shootdown();
+                                kmem::flush_tlb();
                             }
                             if m.exec > 0 {
                                 // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
@@ -166,6 +170,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                     }
                 }
             };
+            // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
+            super::calls::cow_sync();
             if resolved {
                 // (the pages the fault mapped were flushed one by one above)
             } else {

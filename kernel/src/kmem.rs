@@ -419,7 +419,10 @@ pub fn init() {
     let aspace = AddressSpace::new(PageTable::from_root(root));
     // SAFETY: called once at boot with interrupts off, before anything calls `get`.
     unsafe { *addr_of_mut!(KASPACE) = Some(aspace) };
-    *VMOS.lock() = Some(Vmos::new());
+    // (the shared zero frame is made now, so that a count of free frames taken later has it in its baseline)
+    let mut vmos = Vmos::new();
+    vmos.ensure_zero(&mut mm);
+    *VMOS.lock() = Some(vmos);
     *JOBS.lock() = Some(kcore::job::Jobs::new());
     *FRAMES.lock() = Some(mm);
     let token = crate::arch::aspace_token(root);

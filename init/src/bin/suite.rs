@@ -3108,14 +3108,41 @@ fn copy_on_write_children_from_user_mode() -> Outcome {
     wr(B + 4096, 8_000);
     ensure_eq!(rd(B + 4096), 8_000, "the child sees its write");
     ensure_eq!(rd(A + 4096), 101, "the source does not");
+    // a loader-style protect of the source's mapping (read-only, then writable again) must not make a page it only inherits writable
+    ensure_eq!(
+        st(sys::process_protect(me, A, 4 * 4096, PF_R)),
+        Some(S::Ok),
+        "protect read-only"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, A, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "and back"
+    );
+    wr(A + 3 * 4096, 9_000);
+    ensure_eq!(rd(A + 3 * 4096), 9_000, "the source sees its write");
+    ensure_eq!(
+        rd(B + 3 * 4096),
+        103,
+        "the child does not, after a protect either"
+    );
     ensure_eq!(rd(A + 2 * 4096), 102, "an untouched page is still shared");
     ensure_eq!(rd(B + 2 * 4096), 102, "in both");
-    // the source holds inherited pages now: no page is given back from under the child
+    // a member gives a page back: it reads zero afterwards, the other side keeps what it saw
     ensure_eq!(
         st(sys::vmo_decommit(v, 0, 4096)),
-        Some(S::BadState),
+        Some(S::Ok),
         "decommit on a member of a family"
     );
+    ensure_eq!(rd(A), 0, "the source's page reads zero");
+    ensure_eq!(rd(B), 100, "the child's does not change");
+    ensure_eq!(
+        st(sys::vmo_decommit(c, 4096, 4096)),
+        Some(S::Ok),
+        "and the child's own"
+    );
+    ensure_eq!(rd(B + 4096), 0, "reads zero");
+    ensure_eq!(rd(A + 4096), 101, "the source keeps its page");
     // a PRIVATE child of a fresh VMO sees the source's later changes, and its own writes stay its own
     let u = vmo(2)?;
     let um = 0x5f0_0000;

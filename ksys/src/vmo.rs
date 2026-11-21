@@ -156,10 +156,6 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
                 return fail(Status::InvalidArgs);
             }
-            // (a VMO that inherits pages copies one on a write, which could leave a read-only translation of the old page in a mapping)
-            if vmos.has_parent(id) {
-                return fail(Status::BadState);
-            }
             // (bounded: the call zeroes every frame it takes with the big lock held)
             if len / 4096 > abi::limits::MAX_COMMIT_PAGES {
                 return fail(Status::TooBig);
@@ -192,10 +188,6 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             let size = vmos.pages(id).ok_or((Status::BadHandle, None, None))? * 4096;
             if offset.checked_add(len as u64).is_none_or(|end| end > size) {
                 return fail(Status::InvalidArgs);
-            }
-            if writing && vmos.has_parent(id) {
-                // (as `vmo_commit`: write through a mapping instead)
-                return fail(Status::BadState);
             }
             if writing {
                 let data = copy_from_user(aspace, mm, vmos, jobs, buf, len)

@@ -13,7 +13,7 @@
 
 use crate::frame::{Pfn, PAGE_SIZE};
 use crate::job::{JobId, Jobs, Resource};
-use crate::pagemap::PageMap;
+use crate::pagemap::{Entry, PageMap};
 use crate::pagetable::{MapError, PageTable, PageTableFormat, Perms, PhysMem, Sv39};
 use crate::Mm;
 use alloc::collections::BTreeMap;
@@ -152,8 +152,8 @@ pub enum VmoError {
     TooDeep,
     /// A SNAPSHOT child must be charged to the source's job (the pages never change payer).
     JobMismatch,
-    /// A VMO that is part of a family (it has a parent or children) cannot give pages back: a child would see the hole.
-    InFamily,
+    /// A VMO with children cannot change size (KERNEL-V1-SPEC 3.5).
+    HasChildren,
     /// Make the child of a device or DMA VMO: their frames are fixed.
     NotCopyable,
 }
@@ -161,7 +161,16 @@ pub enum VmoError {
 /// A chain of children is at most this deep (KERNEL-V1-SPEC 4.3).
 pub const MAX_FAMILY_DEPTH: usize = 64;
 
-/// How a child sees its source (`Vmos::create_child`).
+/// What a walk through a family found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    /// A frame, and whether the VMO the walk began at owns it.
+    Frame(Pfn, bool),
+    /// An explicit hole: the page reads as zeros.
+    Zero,
+}
+
+/// How a child sees its source (`Vmos::child_prepare`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildMode {
     /// The source and the child each see the source's contents as they were, and each one's later writes are private to it.
@@ -203,8 +212,11 @@ struct Vmo {
     resizable: bool,
     /// The node this one inherits from (MM8): a page it has not committed itself is found there, window `offset`.
     parent: Option<Link>,
-    /// Nodes that have this one as their parent. A VMO with children cannot give pages back or change size.
-    children: u32,
+    /// Nodes that have this one as their parent (a hidden node has two or more: with one left it is merged into it).
+    children: alloc::vec::Vec<u64>,
+    /// Pages `0 .. inherit` that this node has not committed are found in the parent; the rest read as zeros (a child that was shrunk and
+    /// grown again, or decommitted past what its parent shows).
+    inherit: u64,
     /// Made by a SNAPSHOT: holds the source's pages for the source and the child, has no handle and is never mapped or written.
     hidden: bool,
 }
@@ -224,7 +236,18 @@ pub struct Vmos {
     live: usize,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
+    /// Pages that became visible, or were replaced, in a VMO that other mappings may reach through a family (`page_for`): (node, page). The
+    /// caller drains it with `invalidate_copies` (every address space drops what the new page makes stale) before the faulting thread runs on.
+    copy_log: alloc::vec::Vec<(u64, u64)>,
+    /// The frame a read of a page nobody has committed maps, read-only, in a VMO that inherits (nothing is committed for such a read).
+    zero: Option<Pfn>,
+    /// The zero frame was made by `ensure_zero` (the kernel, at boot): it stays when the last VMO goes. A lazily made one goes with it.
+    zero_pinned: bool,
 }
+
+/// Set when `Vmos::copy_log` has entries: the kernel looks here after every call and fault, so the common case costs one load.
+pub static COPY_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 impl Vmos {
     pub fn new() -> Vmos {
@@ -321,8 +344,9 @@ impl Vmos {
             committed: PageMap::new(),
             resizable: false,
             parent: None,
-            children: 0,
+            children: alloc::vec::Vec::new(),
             hidden: false,
+            inherit: 0,
         })
     }
 
@@ -339,8 +363,9 @@ impl Vmos {
             committed: PageMap::from_run(pages, first),
             resizable: false,
             parent: None,
-            children: 0,
+            children: alloc::vec::Vec::new(),
             hidden: false,
+            inherit: 0,
         })
     }
 
@@ -377,8 +402,9 @@ impl Vmos {
             committed: PageMap::from_run(pages, first),
             resizable: false,
             parent: None,
-            children: 0,
+            children: alloc::vec::Vec::new(),
             hidden: false,
+            inherit: 0,
         }))
     }
 
@@ -415,15 +441,20 @@ impl Vmos {
         self.lookup(id, page)
     }
 
-    /// Walk from the VMO towards the root of its family: the first node with the page committed.
-    fn lookup(&self, id: u64, page: u64) -> Option<(Pfn, bool)> {
+    /// Walk from the VMO towards the root of its family: the first node that says something about the page (a frame, or an explicit hole).
+    fn lookup_hit(&self, id: u64, page: u64) -> Option<Hit> {
         let (mut cur, mut page, mut own) = (id, page, true);
         for _ in 0..=MAX_FAMILY_DEPTH {
             let v = self.vmo(cur)?;
-            if let Some(pfn) = v.committed.get(page) {
-                return Some((pfn, own));
+            match v.committed.entry(page) {
+                Entry::Frame(pfn) => return Some(Hit::Frame(pfn, own)),
+                Entry::Hole => return Some(Hit::Zero),
+                Entry::None => {}
             }
             let link = v.parent?;
+            if page >= v.inherit {
+                return None;
+            }
             page = page.checked_add(link.offset)?;
             cur = link.id;
             own = false;
@@ -431,15 +462,28 @@ impl Vmos {
         None
     }
 
+    /// `lookup_hit`, for the callers that want a frame (a hole, like nothing, has none).
+    fn lookup(&self, id: u64, page: u64) -> Option<(Pfn, bool)> {
+        match self.lookup_hit(id, page) {
+            Some(Hit::Frame(pfn, own)) => Some((pfn, own)),
+            _ => None,
+        }
+    }
+
     /// Does the VMO inherit pages from another (it is a child or the source of a SNAPSHOT)?
     pub fn has_parent(&self, id: u64) -> bool {
         self.vmo(id).is_some_and(|v| v.parent.is_some())
     }
 
+    /// Does the VMO have children (PRIVATE children under it, or the children of a SNAPSHOT are under its hidden node, not it)?
+    pub fn has_children(&self, id: u64) -> bool {
+        self.vmo(id).is_some_and(|v| !v.children.is_empty())
+    }
+
     /// Does the VMO belong to a family: a parent or children?
     pub fn in_family(&self, id: u64) -> bool {
         self.vmo(id)
-            .is_some_and(|v| v.parent.is_some() || v.children > 0)
+            .is_some_and(|v| v.parent.is_some() || !v.children.is_empty())
     }
 
     /// How many links lie between the VMO and the root of its family.
@@ -455,12 +499,72 @@ impl Vmos {
         n
     }
 
-    /// Make a child of `source`'s pages `offset .. offset + pages` charged to `job` (MM8). SNAPSHOT: `job` must be the source's job; the
-    /// source's committed pages move to a new hidden node that source and child hang under, so each sees the contents as they were and
-    /// writes after that are private to the writer (the caller write-protects the source's mappings and shoots the translations down
-    /// before anything runs). PRIVATE: the child hangs under the source, which stays as it is. Room for two VMOs must have been made
-    /// (`reserve_n`). Returns the child; `Gone`, `OutOfRange`, `NotCopyable`, `JobMismatch` or `TooDeep` change nothing.
-    pub fn create_child(
+    /// How many links lie between the VMO and its deepest descendant (bounded: no family is deeper than `MAX_FAMILY_DEPTH`).
+    fn height(&self, id: u64, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        self.vmo(id).map_or(0, |v| {
+            v.children
+                .iter()
+                .map(|&c| self.height(c, budget.saturating_sub(1)).saturating_add(1))
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Call `f(node, base)` for the VMO and every descendant: a page `p` of the VMO is page `p - base` of the node (when `p >= base`). Walks
+    /// the children lists, so it allocates nothing.
+    pub fn for_each_below(&self, id: u64, base: u64, f: &mut dyn FnMut(u64, u64)) {
+        self.below(id, base, MAX_FAMILY_DEPTH.saturating_add(1), f);
+    }
+
+    fn below(&self, id: u64, base: u64, budget: usize, f: &mut dyn FnMut(u64, u64)) {
+        let Some(v) = self.vmo(id) else {
+            return;
+        };
+        f(id, base);
+        if budget == 0 {
+            return;
+        }
+        for &c in &v.children {
+            if let Some(l) = self.vmo(c).and_then(|cv| cv.parent) {
+                self.below(
+                    c,
+                    base.saturating_add(l.offset),
+                    budget.saturating_sub(1),
+                    f,
+                );
+            }
+        }
+    }
+
+    /// The hidden node a SNAPSHOT of `offset .. offset + pages` of `source` can hang its child under without making a new one: the source's
+    /// parent, when the source holds no page of its own (nothing was written through it since that node was made) and the window is
+    /// inside what it inherits. Returns the link the child gets. This is what keeps a `fork` that clones every region of one VMO from
+    /// making one layer per region.
+    fn snapshot_reuse(&self, source: u64, offset: u64, pages: u64) -> Option<Link> {
+        let v = self.vmo(source)?;
+        let l = v.parent?;
+        let end = offset.checked_add(pages)?;
+        // (no entry of its own, holes included: a hole shadows what the node it hangs under shows)
+        if v.committed.next_entry_at_or_after(0).is_some()
+            || end > v.inherit
+            || !self.vmo(l.id)?.hidden
+        {
+            return None;
+        }
+        Some(Link {
+            id: l.id,
+            offset: l.offset.checked_add(offset)?,
+        })
+    }
+
+    /// Step one of making a child of `source`'s pages `offset .. offset + pages` charged to `job` (MM8): check everything, reserve every
+    /// byte of bookkeeping `child_attach` needs, and make the child, **not yet part of the family**. Nothing about the source changes, so a
+    /// caller whose next step fails (no room for a handle) just releases the child. SNAPSHOT: `job` must be the source's job. Room for two
+    /// VMOs must have been made (`reserve_n`). `Gone`, `OutOfRange`, `NotCopyable`, `JobMismatch`, `TooDeep` and `NoMemory` change nothing.
+    pub fn child_prepare(
         &mut self,
         jobs: &mut Jobs,
         source: u64,
@@ -480,51 +584,43 @@ impl Vmos {
         if mode == ChildMode::Snapshot && src.job != job {
             return Err(VmoError::JobMismatch);
         }
-        // (a SNAPSHOT puts one node between the source and its old parent, a PRIVATE child one below the source)
-        if self.depth(source).saturating_add(1) >= MAX_FAMILY_DEPTH {
+        // (the longest chain after the call: a SNAPSHOT puts a node above the source and everything below it, a PRIVATE child is one
+        // below the source; the walk of a lookup stops at `MAX_FAMILY_DEPTH` links, so no chain may pass that)
+        let up = self.depth(source);
+        let reuse =
+            mode == ChildMode::Snapshot && self.snapshot_reuse(source, offset, pages).is_some();
+        let longest = match mode {
+            ChildMode::Private => up.saturating_add(1),
+            ChildMode::Snapshot if reuse => up,
+            ChildMode::Snapshot => up
+                .saturating_add(1)
+                .saturating_add(self.height(source, MAX_FAMILY_DEPTH.saturating_add(1)))
+                .max(up.saturating_add(2)),
+        };
+        if longest > MAX_FAMILY_DEPTH {
             return Err(VmoError::TooDeep);
         }
-        let src_job = src.job;
-        let src_pages = src.pages;
-        let child_parent = match mode {
+        let no_memory = |_| VmoError::NoMemory;
+        // the lists the attach will push to, and the one a new hidden node will own (kept in the child until then)
+        let mut stash: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        match mode {
             ChildMode::Private => {
-                if let Some(v) = Self::vmo_in(&mut self.slots, source) {
-                    v.children = v.children.saturating_add(1);
-                    v.refs = v.refs.saturating_add(1);
-                }
-                Link { id: source, offset }
+                let v = Self::vmo_in(&mut self.slots, source).ok_or(VmoError::Gone)?;
+                v.children.try_reserve(1).map_err(no_memory)?;
+            }
+            ChildMode::Snapshot if reuse => {
+                let h = self
+                    .vmo(source)
+                    .and_then(|v| v.parent)
+                    .ok_or(VmoError::Gone)?;
+                let hv = Self::vmo_in(&mut self.slots, h.id).ok_or(VmoError::Gone)?;
+                hv.children.try_reserve(1).map_err(no_memory)?;
             }
             ChildMode::Snapshot => {
-                jobs.retain(src_job);
-                let (old_parent, committed) = {
-                    let v = Self::vmo_in(&mut self.slots, source).ok_or(VmoError::Gone)?;
-                    (
-                        v.parent,
-                        core::mem::replace(&mut v.committed, PageMap::new()),
-                    )
-                };
-                // the hidden node takes the source's pages and the source's place under its old parent (that link keeps its count and
-                // its reference); the source and the child each hold one reference on it
-                let hidden = self.place(Vmo {
-                    kind: VmoKind::Plain,
-                    job: src_job,
-                    pages: src_pages,
-                    refs: 2,
-                    committed,
-                    resizable: false,
-                    parent: old_parent,
-                    children: 2,
-                    hidden: true,
-                });
-                if let Some(v) = Self::vmo_in(&mut self.slots, source) {
-                    v.parent = Some(Link {
-                        id: hidden,
-                        offset: 0,
-                    });
-                }
-                Link { id: hidden, offset }
+                stash.try_reserve_exact(2).map_err(no_memory)?;
+                // (the old parent's list has the source in it, which the hidden node replaces: no growth)
             }
-        };
+        }
         jobs.retain(job);
         Ok(self.place(Vmo {
             kind: VmoKind::Plain,
@@ -533,10 +629,266 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
-            parent: Some(child_parent),
-            children: 0,
+            parent: None,
+            children: stash,
             hidden: false,
+            inherit: 0,
         }))
+    }
+
+    /// Step two: make `child` (from `child_prepare` with the same arguments) part of the family. Cannot fail. SNAPSHOT: the source's
+    /// committed pages move to a hidden node that the source and the child hang under (or the source's parent is used, see
+    /// `snapshot_reuse`), so each sees the contents as they were and writes after that are private to the writer; the caller write-protects
+    /// the source's mappings and shoots the translations down before anything runs. PRIVATE: the child hangs under the source, which
+    /// stays as it is.
+    pub fn child_attach(
+        &mut self,
+        jobs: &mut Jobs,
+        child: u64,
+        source: u64,
+        offset: u64,
+        pages: u64,
+        mode: ChildMode,
+    ) {
+        let link = match mode {
+            ChildMode::Private => {
+                if let Some(v) = Self::vmo_in(&mut self.slots, source) {
+                    // (room was reserved by `child_prepare`: the push does not allocate)
+                    v.children.push(child);
+                    v.refs = v.refs.saturating_add(1);
+                }
+                Link { id: source, offset }
+            }
+            ChildMode::Snapshot => {
+                if let Some(l) = self.snapshot_reuse(source, offset, pages) {
+                    if let Some(h) = Self::vmo_in(&mut self.slots, l.id) {
+                        h.children.push(child);
+                        h.refs = h.refs.saturating_add(1);
+                    }
+                    l
+                } else {
+                    let taken = Self::vmo_in(&mut self.slots, source).map(|v| {
+                        (
+                            v.job,
+                            v.pages,
+                            v.parent,
+                            v.inherit,
+                            core::mem::replace(&mut v.committed, PageMap::new()),
+                        )
+                    });
+                    let Some((src_job, src_pages, old_parent, old_inherit, committed)) = taken
+                    else {
+                        return;
+                    };
+                    jobs.retain(src_job);
+                    let mut kids = Self::vmo_in(&mut self.slots, child)
+                        .map(|c| core::mem::take(&mut c.children))
+                        .unwrap_or_default();
+                    kids.push(source);
+                    kids.push(child);
+                    // the hidden node takes the source's pages and the source's place under its old parent (that link keeps its
+                    // reference); the source and the child each hold one reference on it
+                    let hidden = self.place(Vmo {
+                        kind: VmoKind::Plain,
+                        job: src_job,
+                        pages: src_pages,
+                        refs: 2,
+                        committed,
+                        resizable: false,
+                        parent: old_parent,
+                        children: kids,
+                        hidden: true,
+                        inherit: old_inherit,
+                    });
+                    if let Some(l) = old_parent {
+                        if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
+                            for c in p.children.iter_mut().filter(|c| **c == source) {
+                                *c = hidden;
+                            }
+                        }
+                    }
+                    if let Some(v) = Self::vmo_in(&mut self.slots, source) {
+                        v.parent = Some(Link {
+                            id: hidden,
+                            offset: 0,
+                        });
+                        v.inherit = src_pages;
+                    }
+                    Link { id: hidden, offset }
+                }
+            }
+        };
+        if let Some(c) = Self::vmo_in(&mut self.slots, child) {
+            c.parent = Some(link);
+            c.inherit = pages;
+        }
+    }
+
+    /// Pages of a hidden node's last child: when a hidden node has one child left, the node is merged into it: its pages move to the child
+    /// (the child's own win; what the child cannot see is freed), the child takes the node's place under the node's parent, and the node
+    /// goes. Nothing changes if the bookkeeping for a move cannot be had (the node stays and the next release tries again).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: page numbers are below the VMO limit and offsets were checked when the links were made
+    fn try_merge<M: PhysMem>(&mut self, mm: &mut Mm<M>, jobs: &mut Jobs, p: u64) {
+        let Some(pv) = self.vmo(p) else {
+            return;
+        };
+        if !pv.hidden || pv.children.len() != 1 {
+            return;
+        }
+        let Some(&c) = pv.children.first() else {
+            return;
+        };
+        let (pjob, pparent, pinherit) = (pv.job, pv.parent, pv.inherit);
+        let Some(cv) = self.vmo(c) else {
+            return;
+        };
+        let Some(link) = cv.parent else {
+            return;
+        };
+        if link.id != p || cv.job != pjob {
+            return;
+        }
+        let (off_c, c_inherit) = (link.offset, cv.inherit);
+        let mut at = 0u64;
+        while let Some((pg, entry)) = self
+            .vmo(p)
+            .and_then(|v| v.committed.next_entry_at_or_after(at))
+        {
+            at = pg + 1;
+            let q = pg.checked_sub(off_c).filter(|&q| q < c_inherit);
+            let drop_frame = |mm: &mut Mm<M>, jobs: &mut Jobs| {
+                if let Entry::Frame(pfn) = entry {
+                    mm.db.dec(pfn).ok();
+                    jobs.credit(pjob, Resource::Pages, 1);
+                }
+            };
+            match q {
+                Some(q) => {
+                    let Some(cvm) = Self::vmo_in(&mut self.slots, c) else {
+                        return;
+                    };
+                    if cvm.committed.entry(q) != Entry::None {
+                        // (shadowed by the child's own page or hole)
+                        drop_frame(mm, jobs);
+                    } else {
+                        let moved = match entry {
+                            Entry::Frame(pfn) => cvm.committed.insert(q, pfn),
+                            _ => cvm.committed.insert_hole(q),
+                        };
+                        if moved.is_err() {
+                            return;
+                        }
+                    }
+                }
+                None => drop_frame(mm, jobs),
+            }
+            if let Some(pvm) = Self::vmo_in(&mut self.slots, p) {
+                pvm.committed.remove(pg);
+            }
+        }
+        let new_parent = pparent.map(|l| Link {
+            id: l.id,
+            offset: l.offset.saturating_add(off_c),
+        });
+        if let Some(cvm) = Self::vmo_in(&mut self.slots, c) {
+            cvm.parent = new_parent;
+            if pparent.is_some() {
+                cvm.inherit = c_inherit.min(pinherit.saturating_sub(off_c));
+            }
+        }
+        if let Some(l) = pparent {
+            if let Some(pp) = Self::vmo_in(&mut self.slots, l.id) {
+                for x in pp.children.iter_mut().filter(|x| **x == p) {
+                    *x = c;
+                }
+            }
+        }
+        // the node's reference on its parent passes to the child with the link; its job use goes
+        if self.take(p).is_some() {
+            jobs.release(pjob);
+        }
+        if self.live == 0 {
+            self.free_zero(mm);
+        }
+    }
+
+    fn free_zero<M: PhysMem>(&mut self, mm: &mut Mm<M>) {
+        if self.zero_pinned {
+            return;
+        }
+        if let Some(z) = self.zero.take() {
+            let _ = mm.db.dec(z);
+        }
+    }
+
+    /// The frame a read of a page nobody has committed maps read-only in a VMO that inherits (allocated on first use, freed with the last VMO).
+    fn zero_frame<M: PhysMem>(&mut self, mm: &mut Mm<M>) -> Result<Pfn, FaultError> {
+        if let Some(z) = self.zero {
+            return Ok(z);
+        }
+        let pfn = mm.db.alloc().ok_or(FaultError::NoMemory)?;
+        mm.mem.zero_frame(pfn);
+        self.zero = Some(pfn);
+        Ok(pfn)
+    }
+
+    /// Frames the store holds outside any VMO's pages (the shared zero frame): 0 or 1.
+    pub fn zero_frames(&self) -> u64 {
+        u64::from(self.zero.is_some())
+    }
+
+    /// The shared zero frame, made now (the kernel does it at boot so that a leak check that counts frames sees it in its baseline).
+    pub fn ensure_zero<M: PhysMem>(&mut self, mm: &mut Mm<M>) {
+        if self.zero_frame(mm).is_ok() {
+            self.zero_pinned = true;
+        }
+    }
+
+    /// Take the log of pages that became visible or were replaced in a VMO other mappings may reach (see `invalidate_copies`).
+    pub fn take_copy_log(&mut self) -> alloc::vec::Vec<(u64, u64)> {
+        core::mem::take(&mut self.copy_log)
+    }
+
+    /// Give the (emptied) log back, with its capacity.
+    pub fn restore_copy_log(&mut self, mut log: alloc::vec::Vec<(u64, u64)>) {
+        log.clear();
+        if self.copy_log.is_empty() {
+            self.copy_log = log;
+        }
+    }
+
+    /// Check the shape of every family: children lists and parent links agree, a hidden node has two or more children, nothing is deeper than
+    /// `MAX_FAMILY_DEPTH`, a node's references cover its handle-less holders (tests and audits).
+    pub fn audit_families(&self) -> Result<(), &'static str> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(v) = slot.vmo.as_ref() else {
+                continue;
+            };
+            let id = (u64::from(slot.gen) << 32) | (i as u64).saturating_add(1);
+            if v.hidden && v.children.len() < 2 {
+                return Err("a hidden node has fewer than two children");
+            }
+            for &c in &v.children {
+                let cv = self.vmo(c).ok_or("a child that does not exist")?;
+                if cv.parent.map(|l| l.id) != Some(id) {
+                    return Err("a child that does not name its parent");
+                }
+            }
+            if let Some(l) = v.parent {
+                let pv = self.vmo(l.id).ok_or("a parent that does not exist")?;
+                if !pv.children.contains(&id) {
+                    return Err("a parent that does not list its child");
+                }
+            }
+            if self.depth(id) > MAX_FAMILY_DEPTH {
+                return Err("a chain deeper than the limit");
+            }
+            let holders = u32::try_from(v.children.len()).unwrap_or(u32::MAX);
+            if v.refs < holders {
+                return Err("fewer references than children");
+            }
+        }
+        Ok(())
     }
 
     /// Take one more reference on a VMO (a region maps it). `Err` if the id is not a live VMO.
@@ -571,12 +923,19 @@ impl Vmos {
             };
             v.refs -= 1;
             if v.refs > 0 {
+                if !first {
+                    // a hidden node whose other child went has one left: fold it into that child
+                    self.try_merge(mm, jobs, cur);
+                }
                 return Ok(());
             }
             let Some(vmo) = self.take(cur) else {
                 return if first { Err(VmoGone) } else { Ok(()) };
             };
             first = false;
+            if self.live == 0 {
+                self.free_zero(mm);
+            }
             if vmo.kind == VmoKind::Device {
                 // device frames are not ours: nothing was charged and nothing is freed
                 jobs.release(vmo.job);
@@ -598,7 +957,9 @@ impl Vmos {
             match vmo.parent {
                 Some(l) => {
                     if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
-                        p.children = p.children.saturating_sub(1);
+                        if let Some(i) = p.children.iter().position(|&c| c == cur) {
+                            p.children.swap_remove(i);
+                        }
                     }
                     cur = l.id;
                 }
@@ -770,6 +1131,16 @@ impl Vmos {
         vmo.kind == VmoKind::Device || (first..end).all(|p| vmo.committed.contains(p))
     }
 
+    /// Frames held by the pages of every live VMO, hidden nodes included (tests and audits): what the jobs' page usage must add up to.
+    pub fn frames_held(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|s| s.vmo.as_ref())
+            .filter(|v| v.kind == VmoKind::Plain)
+            .map(|v| v.committed.len() as u64)
+            .sum()
+    }
+
     /// Pages of VMO `id` that have a frame now (committed by a fault, a write or `commit`).
     pub fn committed_pages(&self, id: u64) -> Option<u64> {
         self.vmo(id).map(|v| v.committed.len() as u64)
@@ -802,7 +1173,7 @@ impl Vmos {
         first: u64,
         pages: u64,
     ) -> Result<u64, VmoError> {
-        let vmo = Self::vmo_in(&mut self.slots, id).ok_or(VmoError::Gone)?;
+        let vmo = self.vmo(id).ok_or(VmoError::Gone)?;
         match vmo.kind {
             VmoKind::Device => return Err(VmoError::Device),
             VmoKind::Dma => return Err(VmoError::Fixed),
@@ -812,24 +1183,59 @@ impl Vmos {
         if end > vmo.pages {
             return Err(VmoError::OutOfRange);
         }
-        // (a page given back would show the family's older page through: T209 lets a member give back what it owns)
-        if vmo.parent.is_some() || vmo.children > 0 {
-            return Err(VmoError::InFamily);
+        let (job, has_parent, inherit) = (vmo.job, vmo.parent.is_some(), vmo.inherit);
+        // A page of a VMO that inherits, inside the window it inherits, becomes an explicit hole: it reads zeros whatever the parent
+        // shows now or later (and costs nothing). Any other page just goes. Holes that need a new slot are made first, so that the
+        // call is all or nothing.
+        let in_window = |p: u64| has_parent && p < inherit;
+        let mut made: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        if has_parent {
+            let needed = (first..end.min(inherit))
+                .filter(|&p| {
+                    self.vmo(id)
+                        .is_some_and(|v| v.committed.entry(p) == Entry::None)
+                })
+                .count();
+            made.try_reserve_exact(needed)
+                .map_err(|_| VmoError::NoMemory)?;
+            for page in first..end.min(inherit) {
+                let Some(v) = Self::vmo_in(&mut self.slots, id) else {
+                    return Err(VmoError::Gone);
+                };
+                if v.committed.entry(page) == Entry::None {
+                    if v.committed.insert_hole(page).is_err() {
+                        for p in made {
+                            v.committed.remove(p);
+                        }
+                        return Err(VmoError::NoMemory);
+                    }
+                    made.push(page);
+                }
+            }
         }
         let mut freed = 0u64;
+        let Some(vmo) = Self::vmo_in(&mut self.slots, id) else {
+            return Err(VmoError::Gone);
+        };
         for page in first..end {
-            if let Some(pfn) = vmo.committed.remove(page) {
+            let frame = if in_window(page) {
+                vmo.committed.make_hole(page)
+            } else {
+                vmo.committed.remove(page)
+            };
+            if let Some(pfn) = frame {
                 let _ = mm.db.dec(pfn);
                 freed = freed.saturating_add(1);
             }
         }
-        jobs.credit(vmo.job, Resource::Pages, freed);
+        jobs.credit(job, Resource::Pages, freed);
         Ok(freed)
     }
 
-    /// Change the size of a resizable VMO to `pages` (MM6). Growing changes the size only (nothing is committed). Shrinking gives back the
-    /// committed pages past the new end (the caller has unmapped that range, as for `decommit`); a mapping that reaches past the new end
-    /// keeps its length, and a touch beyond it is refused at the fault. Not for VMOs with a mapped range the caller did not clear.
+    /// Change the size of a resizable VMO to `pages` (MM6). Growing changes the size only (nothing is committed; what a grown child can
+    /// see of its parent stays what it saw). Shrinking gives back the committed pages past the new end (the caller has unmapped that
+    /// range, as for `decommit`); a mapping that reaches past the new end keeps its length, and a touch beyond it is refused at the
+    /// fault. Refused for a VMO with children (`HasChildren`), as the spec says.
     pub fn set_size<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -846,16 +1252,27 @@ impl Vmos {
         if !vmo.resizable {
             return Err(VmoError::NotResizable);
         }
-        if vmo.parent.is_some() || vmo.children > 0 {
-            return Err(VmoError::InFamily);
+        if !vmo.children.is_empty() {
+            return Err(VmoError::HasChildren);
         }
-        let old = vmo.pages;
-        if pages < old {
-            self.decommit(mm, jobs, id, pages, old.saturating_sub(pages))?;
-        }
+        let (job, old) = (vmo.job, vmo.pages);
+        let mut freed = 0u64;
         if let Some(v) = Self::vmo_in(&mut self.slots, id) {
+            let mut at = pages;
+            while at < old {
+                let Some((pg, _)) = v.committed.next_entry_at_or_after(at) else {
+                    break;
+                };
+                if let Some(pfn) = v.committed.remove(pg) {
+                    let _ = mm.db.dec(pfn);
+                    freed = freed.saturating_add(1);
+                }
+                at = pg.saturating_add(1);
+            }
             v.pages = pages;
+            v.inherit = v.inherit.min(pages);
         }
+        jobs.credit(job, Resource::Pages, freed);
         Ok(())
     }
 
@@ -865,8 +1282,10 @@ impl Vmos {
     }
 
     /// "Give me a page for this offset": the frame the VMO sees there, with `true` when the VMO owns it. A page nobody in the family has is
-    /// allocated zeroed on first touch. A page only inherited is returned as it is for a read; for a write (`write`) it is copied into a
-    /// new frame of this VMO, charged to its job (MM8). The VMO keeps its own reference on the frames it owns.
+    /// allocated zeroed on first touch (for a read in a VMO that inherits: the shared zero frame, read-only, nothing committed, so that a
+    /// later change by the parent is seen). A page only inherited is returned as it is for a read; for a write (`write`) it is copied into a
+    /// new frame of this VMO, charged to its job (MM8). The VMO keeps its own reference on the frames it owns. A page that becomes visible
+    /// to mappings of other VMOs of the family is logged (`invalidate_copies`).
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -876,17 +1295,31 @@ impl Vmos {
         page: u64,
         write: bool,
     ) -> Result<(Pfn, bool), FaultError> {
+        let v = self.vmo(id).ok_or(FaultError::VmoGone)?;
         // (a VMO that was shrunk under a mapping: the page is past its end, the access is refused like one outside any region)
-        if page >= self.vmo(id).ok_or(FaultError::VmoGone)?.pages {
+        if page >= v.pages {
             return Err(FaultError::NoRegion);
         }
-        let found = self.lookup(id, page);
-        if let Some((pfn, own)) = found {
+        let inherits = v.parent.is_some();
+        let hit = self.lookup_hit(id, page);
+        if let Some(Hit::Frame(pfn, own)) = hit {
             if own || !write {
                 return Ok((pfn, own));
             }
         }
-        let copy_from = found.map(|(pfn, _)| pfn);
+        // (a hole, or nothing in a VMO that inherits: a read maps the shared zero frame and commits nothing, so that a later change by the
+        // parent is seen)
+        if !write && (inherits || hit == Some(Hit::Zero)) {
+            return Ok((self.zero_frame(mm)?, false));
+        }
+        let copy_from = match hit {
+            Some(Hit::Frame(pfn, _)) => Some(pfn),
+            _ => None,
+        };
+        // (room for the log entry before anything is taken)
+        self.copy_log
+            .try_reserve(1)
+            .map_err(|_| FaultError::NoMemory)?;
         let vmo = Self::vmo_in(&mut self.slots, id).ok_or(FaultError::VmoGone)?;
         // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
         // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
@@ -914,6 +1347,19 @@ impl Vmos {
             let _ = mm.db.dec(pfn);
             give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
+        }
+        // Other mappings may still show what was here before (the older page, or the zero frame): the VMO's own mapping (a fault is about
+        // to make it) and those of the VMOs below it, in every address space. Nothing else can hold such a translation when the VMO has a
+        // single holder and no children.
+        // (a page nobody had, in a VMO that inherits nothing, can have no translation of an older version: only what is below it can)
+        let stale_possible = if hit.is_none() && !inherits {
+            !vmo.children.is_empty()
+        } else {
+            vmo.refs > 1 || !vmo.children.is_empty()
+        };
+        if stale_possible {
+            self.copy_log.push((id, page));
+            COPY_PENDING.store(true, core::sync::atomic::Ordering::Release);
         }
         match copy_from {
             Some(from) => copy_frame(mm, from, pfn),
@@ -1404,8 +1850,15 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 ..perms
             };
             r.gen = gen;
-            let (pages, new) = (r.pages, r.perms);
+            let (pages, new, rvmo, rpage) = (r.pages, r.perms, r.vmo, r.vmo_page);
             for p in 0..pages {
+                // a page the VMO only inherits (or maps as the shared zero frame) stays read-only whatever the region allows: a write
+                // to it must fault and copy (COW1), not reach a frame other members see
+                let own = vmos.frame_info(rvmo, rpage + p).is_some_and(|(_, own)| own);
+                let new = Perms {
+                    write: new.write && own,
+                    ..new
+                };
                 if let Some(old) = self.table.protect(mm, s + p * PAGE_SIZE, new) {
                     if old.read && !new.read || old.write && !new.write || old.exec && !new.exec {
                         stats.downgraded = true;
@@ -1621,10 +2074,11 @@ impl<F: PageTableFormat> AddressSpace<F> {
             } else {
                 0
             };
+            // (counted before the map: if the map fails, the translations that went are still owed a shootdown)
+            self.replaced = self.replaced.saturating_add(replaced);
             match self.fault_map(mm, vmos, &plan, pfn, own) {
                 Ok(mut m) => {
                     m.replaced = replaced;
-                    self.replaced = self.replaced.saturating_add(replaced);
                     return Ok(m);
                 }
                 Err(FaultMapError::Stale) => continue,
@@ -1817,4 +2271,31 @@ impl<F: PageTableFormat> AddressSpace<F> {
         self.reserve.release(jobs);
         self.table.destroy(mm);
     }
+}
+
+/// Drop, in every address space of `spaces`, the translations that pages logged by `Vmos` (a page that became visible or was replaced in a
+/// VMO that other mappings may reach through a family, MM8) make stale: a mapping of that page in the VMO or in any VMO below it, which
+/// showed the page's older contents or the shared zero frame. Returns how many translations went; **the caller flushes every hart's TLB when
+/// it is not 0**, before the thread that took the fault, or made the call, runs on. Clears `COPY_PENDING`.
+pub fn invalidate_copies<'a, F: PageTableFormat + 'a, M: PhysMem>(
+    spaces: impl Iterator<Item = &'a mut AddressSpace<F>>,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+) -> u64 {
+    COPY_PENDING.store(false, core::sync::atomic::Ordering::Release);
+    let log = vmos.take_copy_log();
+    let mut cleared = 0u64;
+    if !log.is_empty() {
+        for space in spaces {
+            for &(node, page) in &log {
+                vmos.for_each_below(node, 0, &mut |d, base| {
+                    if let Some(p) = page.checked_sub(base) {
+                        cleared = cleared.saturating_add(space.unmap_vmo_pages(mm, d, p, 1));
+                    }
+                });
+            }
+        }
+    }
+    vmos.restore_copy_log(log);
+    cleared
 }

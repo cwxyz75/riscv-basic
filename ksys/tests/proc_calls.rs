@@ -1172,12 +1172,16 @@ fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first
 
 fn byte(w: &mut W, pid: u64, va: u64) -> u8 {
     let t = w.procs.get_mut(&pid).unwrap();
-    copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, 1).unwrap()[0]
+    let b = copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, 1).unwrap()[0];
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+    b
 }
 
 fn put(w: &mut W, pid: u64, va: u64, b: u8) {
     let t = w.procs.get_mut(&pid).unwrap();
     copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, &[b]).unwrap();
+    // (what the kernel does after every call and fault)
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
 }
 
 #[test]
@@ -1224,6 +1228,21 @@ fn a_snapshot_child_keeps_the_contents_as_they_were_and_the_source_write_protect
     put(&mut w, 2, VA + 4096, 80);
     assert_eq!(byte(&mut w, 2, VA + 4096), 80);
     assert_eq!(byte(&mut w, 1, VA + 4096), 8);
+    // a member gives a page back: it reads zero afterwards (and the other side is untouched); the source can too
+    w.ok(nr::VMO_DECOMMIT, [child, 4096, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 0, "the child's page is gone");
+    assert_eq!(
+        byte(&mut w, 1, VA + 4096),
+        8,
+        "the source still has its own"
+    );
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 1, VA), 0);
+    assert_eq!(
+        byte(&mut w, 2, VA),
+        7,
+        "and the child still has what the snapshot showed"
+    );
     // a page nobody wrote reads zero in both, and the charge is exact: frames in use are the jobs' pages (no tables charged to the job's pages here)
     assert_eq!(byte(&mut w, 1, VA + 3 * 4096), 0);
     assert_eq!(byte(&mut w, 2, VA + 3 * 4096), 0);
@@ -1234,7 +1253,7 @@ fn a_child_is_refused_when_it_would_break_a_rule() {
     let (mut w, ph) = world();
     let ph1 = w.handle_to(1);
     let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
-    let (v, _) = w.vmo_and_id(4, JobId::ROOT);
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
     let snap = abi::child_flags::SNAPSHOT;
     let private = abi::child_flags::PRIVATE;
     for bad_flags in [0, snap | private, 4] {
@@ -1265,26 +1284,41 @@ fn a_child_is_refused_when_it_would_break_a_rule() {
         "COW2: the pages never change payer"
     );
     w.ok(nr::VMO_CREATE_CHILD, [v, 0, 4096, jh, private, 0]);
-    // mapped in two address spaces: a SNAPSHOT is refused (COW1)
+    // V1: a SNAPSHOT is refused while a process of another job maps the source, and nothing changes
     w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
-    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
+    let stranger = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = stranger;
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0],
+    );
     assert_eq!(
         w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
-        Status::BadState
-    );
-    // after one unmaps it, it works, and then the VMO may not be mapped elsewhere any more
-    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
-    w.ok(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]);
-    assert_eq!(
-        w.err(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, R]),
         Status::BadState,
-        "a VMO that inherits pages stays in one address space"
+        "the stranger's mapping is promised that a write never charges the VMO's job"
     );
-    // decommit is refused on it (a page given back would show the family's older one through)
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.procs.get_mut(&2).unwrap().job = JobId::ROOT;
+    // a call that fails for want of a handle slot changes nothing (no hidden node, the source stays as it was)
+    let vmos_before = w.vmos.count();
+    let full = {
+        let p = w.procs.get_mut(&1).unwrap();
+        let mut n = 0;
+        while p.handles.room() > 0 {
+            let obj = w.objs.create(ipc::KObj::Job(JobId::ROOT));
+            p.handles.insert(&mut w.objs, obj, Rights::ALL).unwrap();
+            n += 1;
+        }
+        n
+    };
+    assert!(full > 0);
     assert_eq!(
-        w.err(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]),
-        Status::BadState
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
+        Status::NoMemory
     );
+    assert_eq!(w.vmos.count(), vmos_before, "no VMO was made");
+    assert!(!w.vmos.has_parent(id), "the source was not restructured");
+    w.vmos.audit_families().unwrap();
 }
 
 #[test]
