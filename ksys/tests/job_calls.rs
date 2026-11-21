@@ -165,7 +165,7 @@ fn job_info_rows() {
         Status::AccessDenied
     );
     assert_eq!(
-        w.err(nr::JOB_INFO, [root, 8, 0, 0, 0, 0]),
+        w.err(nr::JOB_INFO, [root, 9, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
     // the usage counts what was made: a channel is two objects, charged to the job
