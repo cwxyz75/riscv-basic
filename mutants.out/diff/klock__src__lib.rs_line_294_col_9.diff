@@ -1,0 +1,21 @@
+--- klock/src/lib.rs
++++ replace Spin<T, M>::is_free -> bool with true
+@@ -286,17 +286,17 @@
+             depth,
+             was,
+             _not_send: PhantomData,
+         })
+     }
+ 
+     /// Is nobody holding or waiting for the lock?
+     pub fn is_free(&self) -> bool {
+-        self.ticket.is_free()
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// The lock is held while this exists.
+ pub struct Guard<'a, T, M: Machine> {
+     lock: &'a Spin<T, M>,
+     depth: Depth,
+     was: bool,

@@ -1,0 +1,9 @@
+klock/src/lib.rs:123:9: replace Held::is_empty -> bool with true
+klock/src/lib.rs:123:9: replace Held::is_empty -> bool with false
+klock/src/lib.rs:123:18: replace == with != in Held::is_empty
+klock/src/lib.rs:274:9: replace Spin<T, M>::try_lock -> Option<Guard<'_, T, M>> with None
+klock/src/lib.rs:277:36: replace || with && in Spin<T, M>::try_lock
+klock/src/lib.rs:277:39: delete ! in Spin<T, M>::try_lock
+klock/src/lib.rs:294:9: replace Spin<T, M>::is_free -> bool with true
+klock/src/lib.rs:294:9: replace Spin<T, M>::is_free -> bool with false
+klock/src/lib.rs:327:9: replace <impl Drop for Guard<'_, T, M>>::drop with ()
