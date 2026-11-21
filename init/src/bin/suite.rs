@@ -2783,6 +2783,67 @@ fn vmo_decommit_and_resize_from_user_mode() -> Outcome {
         "(page 4 was decommitted before: it reads zero)"
     );
     ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    // V1: a process of another job that maps the range stops a decommit and a shrink (nothing changes), until it unmaps
+    {
+        let root = root_job()?;
+        let j = job(root, u64::MAX, u64::MAX, 256)?;
+        let stranger = ok(sys::process_create_in(j), "a process in another job")?.a1 as u64;
+        let shared = ok(
+            sys::vmo_create_flags(4, 0, rt::abi::vmo_flags::RESIZABLE),
+            "a resizable VMO of our own job",
+        )?
+        .a1 as u64;
+        ensure_eq!(
+            st(sys::vmo_commit(shared, 0, 4 * 4096)),
+            Some(S::Ok),
+            "committed, so that a stranger may map it"
+        );
+        ensure_eq!(
+            st(sys::process_map(
+                stranger,
+                shared,
+                0x60_0000,
+                0,
+                4 * 4096,
+                PF_R
+            )),
+            Some(S::Ok),
+            "the stranger maps it"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::BadState),
+            "a decommit under a stranger's mapping"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 2 * 4096)),
+            Some(S::BadState),
+            "a shrink under a stranger's mapping"
+        );
+        ensure_eq!(
+            sys::vmo_get_size(shared).a1 as u64,
+            4 * 4096,
+            "nothing changed"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 8 * 4096)),
+            Some(S::Ok),
+            "growing is allowed"
+        );
+        ensure_eq!(
+            st(sys::process_unmap(stranger, 0x60_0000)),
+            Some(S::Ok),
+            "the stranger lets go"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::Ok),
+            "now the pages can go"
+        );
+        for h in [shared, stranger, j, root] {
+            sys::handle_close(h);
+        }
+    }
     for h in [weak, fixed, v] {
         sys::handle_close(h);
     }

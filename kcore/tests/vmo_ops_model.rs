@@ -7,7 +7,7 @@ mod common;
 use common::{FakeMem, Rng};
 use kcore::aspace::{Access, AddressSpace, FaultError, Vmos};
 use kcore::frame::FrameDb;
-use kcore::job::{JobId, Jobs, Resource};
+use kcore::job::{JobId, Jobs, Limits, Resource};
 use kcore::pagetable::{PageTable, Perms};
 use kcore::Mm;
 
@@ -41,20 +41,34 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
         let total = mm.db.free_count();
         let mut vmos = Vmos::new();
         let mut jobs = Jobs::new();
+        // a job with a page limit: faults spend the address spaces' prepaid pages (L16d), so the ledger is committed plus prepaid
+        let mut lim = Limits::UNLIMITED;
+        lim.pages = 400;
+        let job = jobs.create(JobId::ROOT, lim).unwrap();
         let mut asp: Vec<AddressSpace> = (0..2)
             .map(|_| AddressSpace::new(PageTable::new(&mut mm).unwrap()))
             .collect();
         let tables = total - mm.db.free_count();
         let mut ids = vec![];
+        // (vmo index, base, pages) of the offset mappings in space 0, each starting at VMO page 1
+        let mut offset_maps: Vec<(usize, u64, u64)> = vec![];
         let mut models: Vec<Model> = vec![];
         for (slot, &base) in BASES.iter().enumerate() {
             let pages = 2 + rng.below(MAXP - 2);
-            let id = vmos.create(&mut jobs, pages);
+            let id = vmos.create_in(&mut jobs, pages, job);
             vmos.set_resizable(id);
             assert!(vmos.is_resizable(id));
             for a in asp.iter_mut() {
                 a.map_region(&mut vmos, base, pages, id, 0, Perms::RW)
                     .unwrap();
+            }
+            // and the same VMO again in the first space, from page 1, right after the first region (so a range that is not clipped to its own
+            // region would reach into this one): an offset mapping and a double mapping
+            if pages > 2 {
+                asp[0]
+                    .map_region(&mut vmos, base + pages * PAGE, pages - 1, id, 1, Perms::RW)
+                    .unwrap();
+                offset_maps.push((slot, base + pages * PAGE, pages - 1));
             }
             ids.push(id);
             models.push(Model {
@@ -81,15 +95,18 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
                 }
                 2 => {
                     // touch through an address space: the fault commits and maps a zero page
-                    let p = rng.below(size.min(reglen[v]));
-                    let ai = rng.below(2) as usize;
-                    let r = asp[ai].handle_fault(
-                        &mut mm,
-                        &mut vmos,
-                        &mut jobs,
-                        base + p * PAGE,
-                        Access::Read,
-                    );
+                    let mut p = rng.below(size.min(reglen[v]));
+                    let mut ai = rng.below(2) as usize;
+                    let mut va = base + p * PAGE;
+                    // sometimes through the offset mapping (space 0, VMO page 1 and up)
+                    if let Some(&(_, ob, on)) = offset_maps.iter().find(|m| m.0 == v) {
+                        if rng.below(2) == 0 && size > 1 && on > 0 {
+                            p = 1 + rng.below((size - 1).min(on));
+                            ai = 0;
+                            va = ob + (p - 1) * PAGE;
+                        }
+                    }
+                    let r = asp[ai].handle_fault(&mut mm, &mut vmos, &mut jobs, va, Access::Read);
                     assert!(r.is_ok(), "{ctx}: touch {r:?}");
                     if models[v].pages[p as usize].is_none() {
                         models[v].pages[p as usize] = Some(0); // committed, reads zero
@@ -105,7 +122,8 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
                     vmos.decommit(&mut mm, &mut jobs, id, first, n).unwrap();
                     for p in first..first + n {
                         models[v].pages[p as usize] = None;
-                        for a in asp.iter() {
+                        // (only inside the base region: past its end the address belongs to the offset mapping, checked below)
+                        for a in asp.iter().filter(|_| p < reglen[v]) {
                             assert!(
                                 a.table().translate(&mm, base + p * PAGE).is_none(),
                                 "{ctx}: a decommitted page is still mapped"
@@ -168,13 +186,57 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
                     "{ctx}"
                 );
             }
+            let prepaid: u64 = asp.iter().map(|a| a.reserved_pages()).sum();
             assert_eq!(
-                jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
-                committed,
-                "{ctx}: the ledger is exactly the committed pages"
+                jobs.usage(job).unwrap().get(Resource::Pages),
+                committed + prepaid,
+                "{ctx}: the ledger is the committed pages plus the prepaid ones"
             );
+            // every translation is the VMO's own frame (no stale mapping), and each frame's count is the VMO's reference plus its mappings
+            let mut mappers: std::collections::BTreeMap<u64, u64> = Default::default();
+            for (ai, a) in asp.iter().enumerate() {
+                for (i, &base) in BASES.iter().enumerate() {
+                    for p in 0..reglen[i] {
+                        if let Some(t) = a.table().translate(&mm, base + p * PAGE) {
+                            assert_eq!(
+                                Some(t.pfn),
+                                vmos.frame(ids[i], p),
+                                "{ctx}: space {ai} vmo {i} page {p} maps a frame the VMO does not hold"
+                            );
+                            *mappers.entry(t.pfn).or_default() += 1;
+                        }
+                    }
+                }
+                if ai == 0 {
+                    for &(i, base, n) in &offset_maps {
+                        for p in 0..n {
+                            if let Some(t) = a.table().translate(&mm, base + p * PAGE) {
+                                assert_eq!(
+                                    Some(t.pfn),
+                                    vmos.frame(ids[i], p + 1),
+                                    "{ctx}: the offset mapping of vmo {i} page {}",
+                                    p + 1
+                                );
+                                *mappers.entry(t.pfn).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            for (&pfn, &n) in &mappers {
+                assert_eq!(
+                    mm.db.refs(pfn),
+                    Some(1 + n as u32),
+                    "{ctx}: frame {pfn}: the VMO's reference plus {n} mappings"
+                );
+            }
         }
         // everything back
+        for &(_, base, _) in &offset_maps {
+            asp[0]
+                .unmap_region(&mut mm, &mut vmos, &mut jobs, base)
+                .unwrap();
+        }
         for (v, &base) in BASES.iter().enumerate() {
             for a in asp.iter_mut() {
                 a.unmap_region(&mut mm, &mut vmos, &mut jobs, base).unwrap();
@@ -189,7 +251,11 @@ fn decommit_and_resize_agree_with_a_byte_level_model_and_the_ledger_is_exact() {
             total,
             "seed {seed}: no frame lost (tables were {tables})"
         );
-        assert_eq!(jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages), 0);
+        assert_eq!(
+            jobs.usage(job).unwrap().get(Resource::Pages),
+            0,
+            "seed {seed}: the prepaid pages went back too"
+        );
         mm.db.audit().unwrap();
     }
 }

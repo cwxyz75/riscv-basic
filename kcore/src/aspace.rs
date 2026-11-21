@@ -903,6 +903,15 @@ impl<F: PageTableFormat> AddressSpace<F> {
         (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
     }
 
+    /// Does a region of this address space map any of the pages `first .. first + pages` of VMO `vmo`?
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's page range was checked when it was inserted
+    pub fn maps_vmo_range(&self, vmo: u64, first: u64, pages: u64) -> bool {
+        let end = first.saturating_add(pages);
+        self.regions
+            .values()
+            .any(|r| r.vmo == vmo && first < r.vmo_page + r.pages && r.vmo_page < end)
+    }
+
     /// Unmap, in this address space, every mapped page of VMO `vmo` among its pages `first .. first + pages` (MM6: before the VMO gives the
     /// pages back). Drops each mapping's reference on its frame; regions stay. Returns how many pages were unmapped. **The caller must flush
     /// the TLBs (every hart) before the VMO's own references on those frames are dropped.**
