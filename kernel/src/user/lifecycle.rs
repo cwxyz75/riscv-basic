@@ -405,10 +405,20 @@ pub(super) fn killed_now() -> Option<i32> {
 /// Nothing is held across the sleep but the big lock, which follows the thread as it does in every blocking call.
 pub(super) fn park_while_stopped() {
     loop {
-        if let Some(code) = irq::without(killed_now) {
+        // (one lookup of the process for all three questions: this runs on every return to user mode)
+        let (killed, stopped, suspended) = irq::without(|| {
+            let s = state();
+            let tid = thread::current();
+            let p = s.thread_pid.get(&tid).and_then(|pid| s.procs.get(pid));
+            (
+                p.and_then(|p| p.killed),
+                p.is_some_and(|p| p.stopped),
+                !s.suspends.is_empty() && ksys::thread_is_suspended(s, tid),
+            )
+        });
+        if let Some(code) = killed {
             exit_process(code);
         }
-        let (stopped, suspended) = irq::without(|| (stopped_now(), suspended_now()));
         if !stopped && !suspended {
             return;
         }
