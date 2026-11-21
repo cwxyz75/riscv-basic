@@ -510,3 +510,22 @@ fn a_thread_asleep_in_the_park_at_the_return_counts_as_parked_not_blocked_in_a_c
         Err(Status::BadState)
     );
 }
+
+#[test]
+fn a_suspend_that_finds_a_thread_still_asleep_in_the_park_raises_suspended() {
+    // (resume, then suspend again before the woken thread has run to leave the park: the signal the resume dropped must rise again)
+    let mut w = world();
+    let s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 90, &s);
+    w.us.parked_tids.insert(90);
+    let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
+    assert!(raised, "parked at the return: stopped, SUSPENDED up");
+    let (_, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert!(wake);
+    // the thread has not run: it is still in `parked_tids`
+    let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
+    assert!(
+        raised,
+        "suspended again while still in the park: SUSPENDED rises again"
+    );
+}
