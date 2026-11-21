@@ -15,7 +15,7 @@ fn attr(prio: u8) -> SchedAttr {
 
 /// Two harts; hart 0 runs the boot thread; a thread pinned to hart 1 is spawned from hart 0, which marks hart 1 (one poke owed).
 /// Nobody delivers it (the lost IPI): hart 1 idles with the thread queued.
-fn lost_poke() -> (Sched2<FixedPrio>, u32) {
+fn lost_poke() -> (Sched2<FixedPrio>, u64) {
     let s = Sched2::new(2, FixedPrio::new);
     s.adopt_current_on(0, attr(20), None).unwrap();
     let t = s.spawn_on(0, attr(10), Some(1)).unwrap();

@@ -69,6 +69,11 @@ impl HandleTable {
         t
     }
 
+    /// For tests: slots made from now on start at generation `gen` (the boot loader makes the bootstrap handle, value 1, first, then calls this).
+    pub fn set_first_generation(&mut self, gen: u64) {
+        self.first_gen = gen.min(GENERATIONS);
+    }
+
     /// For tests: lower the most slots the table may have (so a full table of retired slots is cheap to build).
     pub fn with_slot_cap(mut self, cap: usize) -> HandleTable {
         self.slot_cap = cap.min(MAX_SLOTS);

@@ -18,7 +18,7 @@ fn a_periodic_high_priority_waker_does_not_starve_equal_peers() {
     let b = rq.spawn(attr(10)).unwrap();
     let waker = rq.spawn(attr(20)).unwrap();
     let mut now = 0u64;
-    let mut ran: HashMap<u32, u32> = HashMap::new();
+    let mut ran: HashMap<u64, u32> = HashMap::new();
     for _ in 0..200 {
         // the waker runs briefly and sleeps until the next tick
         if rq.current() == Some(waker) {

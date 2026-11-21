@@ -172,13 +172,13 @@ pub fn reset_user_mode_high_water() {
 pub static LAST_EXIT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// End process `pid` with `code` from kernel code (the tests).
-pub fn end_process(pid: u32, code: i32) {
+pub fn end_process(pid: u64, code: i32) {
     request_kill(pid, code);
 }
 
 /// Wake every blocked thread of process `pid` by id (a kill must reach sleepers that are on no
 /// queue: futex sleepers).
-pub(super) fn wake_threads_of(pid: u32) {
+pub(super) fn wake_threads_of(pid: u64) {
     let tids: Vec<Tid> = irq::without(|| {
         state()
             .thread_pid
@@ -190,7 +190,7 @@ pub(super) fn wake_threads_of(pid: u32) {
     thread::wake_many(&tids);
 }
 
-pub(super) fn request_kill(pid: u32, code: i32) {
+pub(super) fn request_kill(pid: u64, code: i32) {
     let direct = irq::without(|| {
         let s = state();
         let r = match s.procs.get_mut(&pid) {

@@ -126,3 +126,23 @@ pub fn boot_arg_value(name: &str) -> Option<alloc::string::String> {
         .find_map(|w| w.strip_prefix(name))
         .map(alloc::string::String::from)
 }
+
+/// Test builds only (`ff=<name>:<value>,...` on the kernel line, AB3): the value a counter starts at, so a boundary is crossed in a few steps.
+/// Names: `tid`, `koid`, `objgen`, `handlegen`, `fptoken`. Values are decimal or `0x` hex, with `_` allowed.
+pub fn ff_value(name: &str) -> Option<u64> {
+    if crate::RELEASE {
+        return None;
+    }
+    let list = boot_arg_value("ff=")?;
+    list.split(',').find_map(|kv| {
+        let (k, v) = kv.split_once(':')?;
+        if k != name {
+            return None;
+        }
+        let v: alloc::string::String = v.chars().filter(|&c| c != '_').collect();
+        match v.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16).ok(),
+            None => v.parse().ok(),
+        }
+    })
+}

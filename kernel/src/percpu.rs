@@ -75,10 +75,10 @@ pub struct PerHart {
     /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
     pub bkl_takes: AtomicU64,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
-    pub running: AtomicU32,
+    pub running: AtomicU64,
     /// The thread this hart is switching away from (set just before the switch, taken by the `finish_switch` that completes it; 0:
     /// none): the thread that resumes here finds out whether the one it replaced has exited and must be reaped (SCHED-SMP-SPEC 3.6).
-    pub prev: AtomicU32,
+    pub prev: AtomicU64,
     /// A wake or priority change on this hart designated another thread to run here: the switch happens at the next defined point
     /// (`thread::preempt_point`), never inside the wake (SCHED-SMP-SPEC X7). Written and read by this hart only, interrupts off.
     pub need_resched: AtomicBool,
@@ -92,8 +92,8 @@ pub struct PerHart {
     /// The thread whose latest FP (resp. vector) state this hart's register file holds, 0 for none (PL3, T166): written under the big lock by the
     /// load and save paths of `arch::fp`, read by this hart alone on its way back to user mode, so a thread that has used a unit and is
     /// alone on its hart returns without taking the lock. A claim is cleared when another hart saves or loads the thread's state.
-    pub fs_claim: AtomicU32,
-    pub vs_claim: AtomicU32,
+    pub fs_claim: AtomicU64,
+    pub vs_claim: AtomicU64,
     /// Where the claimed thread's saved registers are (the address of its box), so the trap paths that take no lock can save into it.
     pub fs_buf: AtomicUsize,
     pub vs_buf: AtomicUsize,
@@ -128,15 +128,15 @@ impl PerHart {
             work_done: AtomicBool::new(false),
             active_aspace: AtomicU64::new(0),
             bkl_takes: AtomicU64::new(0),
-            running: AtomicU32::new(0),
-            prev: AtomicU32::new(0),
+            running: AtomicU64::new(0),
+            prev: AtomicU64::new(0),
             need_resched: AtomicBool::new(false),
             attention_seen: AtomicU64::new(0),
             idle_wfi: AtomicU64::new(0),
             idle_suspend: AtomicU64::new(0),
             idle_ns: AtomicU64::new(0),
-            fs_claim: AtomicU32::new(0),
-            vs_claim: AtomicU32::new(0),
+            fs_claim: AtomicU64::new(0),
+            vs_claim: AtomicU64::new(0),
             fs_buf: AtomicUsize::new(0),
             vs_buf: AtomicUsize::new(0),
             spins: AtomicU64::new(0),

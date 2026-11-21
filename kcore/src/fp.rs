@@ -124,9 +124,14 @@ impl Tokens {
         Tokens::default()
     }
 
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread
+    /// For test builds (`ff=fptoken:<n>`): the next token is `n + 1`, so the counter's far end is reached in a few steps.
+    pub fn starting_at(n: u64) -> Tokens {
+        Tokens { last: n }
+    }
+
+    /// The next token (a u64 counter: 2^64 states is not reachable; at the end it would stop, never wrap).
     fn next(&mut self) -> u64 {
-        self.last += 1;
+        self.last = self.last.saturating_add(1);
         self.last
     }
 }

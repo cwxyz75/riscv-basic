@@ -19,7 +19,7 @@ use kcore::Mm;
 /// `process_create(job_handle) -> handle` (SYSCALLS.md): `a[0]` names the job the process is charged to (MANAGE), or 0 for the caller's own.
 /// `kernel_half_ok` is whether the kernel's page-table half is still as snapshotted; `kernel` its table.
 #[allow(clippy::arithmetic_side_effects)]
-// INVARIANT: pids are a counter far below u32::MAX; the new process's handle was made with room checked
+// INVARIANT: the new process's handle was made with room checked
 #[inline(never)]
 pub fn process_create<M: PhysMem>(
     us: &mut UserState,
@@ -27,7 +27,7 @@ pub fn process_create<M: PhysMem>(
     vmos: &mut Vmos,
     kernel: &PageTable,
     kernel_half_ok: bool,
-    me: u32,
+    me: u64,
     a: [u64; 6],
 ) -> Result<u64, Status> {
     if us.procs.len() >= abi::limits::MAX_PROCESSES || !kernel_half_ok {
@@ -58,18 +58,13 @@ pub fn process_create<M: PhysMem>(
         give_back(vmos);
         return Err(Status::NoMemory);
     };
-    // (pids wrap after 2^32 creations and skip the live ones: a loop of create and close must not end in an overflow)
-    let pid = loop {
-        let candidate = us.next_pid;
-        us.next_pid = if candidate == u32::MAX {
-            1
-        } else {
-            candidate + 1
-        };
-        if !us.procs.contains_key(&candidate) {
-            break candidate;
-        }
+    // (CNT1: a process id is never reused and the counter never wraps; at its limit the creation is refused)
+    let pid = us.next_pid;
+    let Some(next) = pid.checked_add(1) else {
+        give_back(vmos);
+        return Err(Status::NoMemory);
     };
+    us.next_pid = next;
     let UserState { objs, procs, .. } = us;
     let creator = procs.get_mut(&me).ok_or(Status::BadState)?;
     let (handle, obj) = match ipc::process_object_create_in(

@@ -138,7 +138,7 @@ fn idle_runs_when_nothing_else_does() -> Outcome {
 fn wake_before_block_is_not_lost() -> Outcome {
     let me = thread::current();
     // a wake that finds nobody waiting is not remembered (SCHED-SMP-SPEC 3.7)
-    thread::wake(me);
+    thread::wake(me as u64);
     ensure(
         thread::park_state(me) == Some(kcore::park::ParkState::Idle),
         "a wake with nobody waiting left something behind",
@@ -146,8 +146,8 @@ fn wake_before_block_is_not_lost() -> Outcome {
     // a thread that has prepared to wait does get the wake: its block does not happen (and wakes do not queue)
     let t0 = thread::ticks();
     thread::prepare_block();
-    thread::wake(me);
-    thread::wake(me);
+    thread::wake(me as u64);
+    thread::wake(me as u64);
     thread::block(); // consumes the notification
     ensure(
         thread::ticks() - t0 <= 1,
@@ -159,7 +159,7 @@ fn wake_before_block_is_not_lost() -> Outcome {
         NORMAL,
         |me| {
             thread::sleep_ticks(3);
-            thread::wake(me as u32);
+            thread::wake(me as u64);
         },
         me as usize,
     );
@@ -494,7 +494,7 @@ mod priority {
                 20,
                 |_| {
                     thread::wait_deadline_private(|| GO.load(SeqCst), u64::MAX);
-                    if thread::is_blocked(H2.load(SeqCst) as u32) {
+                    if thread::is_blocked(H2.load(SeqCst)) {
                         SAW_H2_BLOCKED.store(true, SeqCst);
                     }
                     RAN.fetch_add(1, SeqCst);
@@ -510,7 +510,7 @@ mod priority {
                 },
                 0,
             );
-            H2.store(u64::from(h2), SeqCst);
+            H2.store(h2, SeqCst);
             // main (priority 40) sleeps: both waiters run to their wait and block
             thread::sleep_ticks(3);
             ensure(
@@ -522,7 +522,7 @@ mod priority {
                 5,
                 |h1| {
                     GO.store(true, SeqCst);
-                    thread::wake_many(&[h1 as u32, H2.load(SeqCst) as u32]);
+                    thread::wake_many(&[h1 as u64, H2.load(SeqCst)]);
                 },
                 h1 as usize,
             );

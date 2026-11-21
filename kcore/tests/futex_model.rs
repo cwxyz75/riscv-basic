@@ -9,10 +9,10 @@ fn random_waits_wakes_and_forgets_agree_with_the_list() {
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
         let mut f = Futexes::new();
-        let mut model: Vec<((u32, u64), u64)> = vec![]; // arrival order
+        let mut model: Vec<((u64, u64), u64)> = vec![]; // arrival order
         for step in 0..STEPS {
             let ctx = format!("seed {seed} step {step}");
-            let key = (rng.below(3) as u32, rng.below(3) * 4);
+            let key = (rng.below(3), rng.below(3) * 4);
             match rng.below(5) {
                 0 | 1 => {
                     let who = rng.below(12);
@@ -39,7 +39,7 @@ fn random_waits_wakes_and_forgets_agree_with_the_list() {
                     assert_eq!(f.forget(who), had, "{ctx}");
                 }
                 _ => {
-                    let pid = rng.below(3) as u32;
+                    let pid = rng.below(3);
                     let mut want: Vec<u64> = model
                         .iter()
                         .filter(|&&((p, _), _)| p == pid)

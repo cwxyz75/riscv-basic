@@ -138,15 +138,24 @@ fn pids_are_never_reused_while_live_and_wrap_without_overflow() {
     let mut w = world(400);
     w.create(true, [0; 6]).unwrap();
     w.create(true, [0; 6]).unwrap();
-    let pids: Vec<u32> = w.us.procs.keys().copied().collect();
+    let pids: Vec<u64> = w.us.procs.keys().copied().collect();
     assert_eq!(pids.len(), 3);
-    // the counter at the top: it wraps to 1 and skips the live process 1
-    w.us.next_pid = u32::MAX;
+    // CNT1: the counter never wraps. At the top a creation is refused with NO_MEMORY and leaves nothing behind
+    w.us.next_pid = u64::MAX - 1;
     w.create(true, [0; 6]).unwrap();
-    assert!(w.us.procs.contains_key(&u32::MAX));
-    w.create(true, [0; 6]).unwrap();
-    assert_eq!(w.us.procs.len(), 5);
-    assert!(w.us.next_pid >= 2, "wrapped past the live pid 1");
+    assert!(w.us.procs.contains_key(&(u64::MAX - 1)));
+    let before = w.us.procs.len();
+    assert_eq!(w.create(true, [0; 6]), Err(Status::NoMemory));
+    assert_eq!(
+        w.us.procs.len(),
+        before,
+        "the refused creation made nothing"
+    );
+    assert_eq!(
+        w.us.next_pid,
+        u64::MAX,
+        "and the counter did not move past the end"
+    );
 }
 
 #[test]

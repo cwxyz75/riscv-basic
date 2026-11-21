@@ -80,17 +80,13 @@ pub(super) fn user_thread_main(token: usize) {
             token,
             top,
             ts.tp,
-            if ts.spawned {
-                u64::from(thread::current())
-            } else {
-                0
-            },
+            if ts.spawned { thread::current() } else { 0 },
         )
     }
 }
 
 /// Wait for a process's thread to finish, tear the process down, and return its exit code.
-pub fn finish(pid: u32, tid: Tid) -> i32 {
+pub fn finish(pid: u64, tid: Tid) -> i32 {
     thread::join(tid);
     // Other threads of the process may outlive the first one.
     while irq::without(|| state().procs.get(&pid).map_or(0, |p| p.threads_alive)) > 0 {
@@ -105,7 +101,7 @@ pub fn finish(pid: u32, tid: Tid) -> i32 {
 /// off, never holds a borrow across `notify`, and is safe to call from the dying thread
 /// itself (it first switches to the kernel page table, whose upper half every process
 /// shares).
-pub(super) fn teardown(pid: u32) -> i32 {
+pub(super) fn teardown(pid: u64) -> i32 {
     // Back to the kernel's own page table before the process's root is freed.
     kmem::use_kernel_table();
     let Some(mut process) = teardown_take(pid) else {
@@ -126,7 +122,7 @@ pub(super) fn teardown(pid: u32) -> i32 {
 // (the three steps of `teardown` are functions of their own, never merged into one frame: the optimised kernel's stack budget, KT13, T173)
 
 #[inline(never)]
-pub(super) fn teardown_take(pid: u32) -> Option<Box<Process>> {
+pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
     irq::without(|| {
         let s = state();
         s.thread_pid.retain(|_, p| *p != pid);

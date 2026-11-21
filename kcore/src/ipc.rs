@@ -56,7 +56,7 @@ pub struct Event {
 
 /// A process, as a kernel object: what a process handle names.
 pub struct ProcessObj {
-    pub pid: u32,
+    pub pid: u64,
     pub terminated: bool,
     /// Stopped by `process_suspend`: raises STOPPED.
     pub stopped: bool,
@@ -68,7 +68,7 @@ pub struct ProcessObj {
 
 /// A user thread, as a kernel object: what a thread handle names.
 pub struct ThreadObj {
-    pub pid: u32,
+    pub pid: u64,
     pub terminated: bool,
     pub exit_code: i32,
 }
@@ -1129,8 +1129,9 @@ pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, 
     let peer = obj
         .peer()
         .filter(|&p| reg.is_alive(p))
-        .map_or(0, |p| p.koid());
-    Ok((entry.obj.koid(), peer))
+        .and_then(|p| reg.koid(p))
+        .unwrap_or(0);
+    Ok((reg.koid(entry.obj).ok_or(Status::BadHandle)?, peer))
 }
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
@@ -1324,7 +1325,7 @@ pub fn vmo_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 pub fn process_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     kill_on_close: bool,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
@@ -1356,7 +1357,7 @@ pub fn process_of(
     table: &HandleTable,
     h: Handle,
     need: Rights,
-) -> Result<(ObjId, u32, bool, i32), Status> {
+) -> Result<(ObjId, u64, bool, i32), Status> {
     let entry = table.get(h)?;
     match reg.get(entry.obj) {
         Some(KObj::Process(p)) => {
@@ -1391,7 +1392,7 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 pub fn thread_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
     if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
@@ -1506,7 +1507,7 @@ pub fn vmo_object_create(
 pub fn process_object_create(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     kill_on_close: bool,
 ) -> Result<(Handle, ObjId), Status> {
     process_object_create_in(
@@ -1523,7 +1524,7 @@ pub fn process_object_create(
 pub fn thread_object_create(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
 ) -> Result<(Handle, ObjId), Status> {
     thread_object_create_in(
         reg,

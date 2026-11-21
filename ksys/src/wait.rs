@@ -31,7 +31,7 @@ pub struct ObjectWait {
 }
 
 /// `object_wait(handle, mask, deadline)`: the handle carries WAIT, and the mask is a non-empty set of waitable signals.
-pub fn object_wait_check(us: &UserState, me: u32, a: [u64; 6]) -> Result<ObjectWait, Status> {
+pub fn object_wait_check(us: &UserState, me: u64, a: [u64; 6]) -> Result<ObjectWait, Status> {
     let (handle, deadline) = (Handle(a[0]), a[2]);
     let p = us.procs.get(&me).ok_or(Status::BadState)?;
     if !p.handles.get(handle)?.rights.contains(Rights::WAIT) {
@@ -48,7 +48,7 @@ pub fn object_wait_check(us: &UserState, me: u32, a: [u64; 6]) -> Result<ObjectW
 }
 
 /// The signal word of the process's handle (the error is BAD_HANDLE, WRONG_TYPE... as `signals_of` says; a handle that names nothing).
-pub fn signals_of(us: &UserState, me: u32, h: Handle) -> Result<u32, Status> {
+pub fn signals_of(us: &UserState, me: u64, h: Handle) -> Result<u32, Status> {
     let p = us.procs.get(&me).ok_or(Status::BadState)?;
     ipc::signals_of(&us.objs, &p.handles, h)
 }
@@ -81,7 +81,7 @@ pub fn port_wait_check(a: [u64; 6]) -> Result<(Handle, u64), Status> {
 pub fn port_poll(
     us: &mut UserState,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     h: Handle,
 ) -> Result<Option<(u64, u32)>, Status> {
     let UserState { objs, procs, .. } = us;
@@ -119,7 +119,7 @@ pub fn futex_wait_check<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     who: u64,
     a: [u64; 6],
 ) -> Result<FutexCheck, Status> {
@@ -158,7 +158,7 @@ pub fn futex_wait_report(
 }
 
 /// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first. Returns the thread ids the caller must wake.
-pub fn futex_wake(us: &mut UserState, me: u32, a: [u64; 6]) -> Result<Vec<u64>, Status> {
+pub fn futex_wake(us: &mut UserState, me: u64, a: [u64; 6]) -> Result<Vec<u64>, Status> {
     let (addr, count) = (a[0], a[1]);
     if addr & 3 != 0 || addr < abi::user::BASE || addr.saturating_add(4) > abi::user::TOP {
         return Err(Status::InvalidArgs);
@@ -203,7 +203,7 @@ pub fn channel_call_send<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
 ) -> Result<Call, Status> {
@@ -261,7 +261,7 @@ pub fn channel_call_send<M: PhysMem>(
 
 /// The test that ends a call's sleep: the thread was killed or interrupted, or a reply with its transaction id (or the peer closing) is there.
 /// A thread that is not a user thread, or a process that is gone, ends it too.
-pub fn channel_call_ready(us: &UserState, me: u32, c: &Call, interrupted: bool) -> bool {
+pub fn channel_call_ready(us: &UserState, me: u64, c: &Call, interrupted: bool) -> bool {
     let Some(p) = us.procs.get(&me) else {
         return true;
     };
@@ -289,7 +289,7 @@ pub fn channel_call_reply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     c: &Call,
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {

@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// A thread id as the kernel names it.
-pub type Waiter = u32;
+pub type Waiter = u64;
 
 #[derive(Default)]
 pub struct WaitTable {

@@ -31,7 +31,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub type Tid = u32;
+pub type Tid = u64;
 pub type Prio = u8;
 
 /// The idle thread's priority; nothing else uses it.

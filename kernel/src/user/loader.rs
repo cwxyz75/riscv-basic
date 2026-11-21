@@ -6,7 +6,7 @@ use super::*;
 /// process id and the id of its thread.
 /// Build a process from `image` and start its first thread. The whole construction runs under the
 /// big kernel lock (it touches the frame database, the VMO store and the process table).
-pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
+pub fn start(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     irq::without(|| start_locked(image, arg))
 }
 
@@ -18,7 +18,7 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
     clippy::indexing_slicing
 )]
 // INVARIANT: boot-time process start: the segments were checked by `elf::parse` (offsets and sizes inside the file, addresses in the user half); pids are a counter far below u32::MAX
-pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadError> {
+pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
     if image.is_empty() {
         return Err(LoadError::NoProgram);
     }
@@ -58,11 +58,11 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadErr
             .map_err(|_| LoadError::NoMemory)?;
         Ok(())
     })();
-    let (pid, asid) = irq::without(|| {
+    let (pid, asid, first_gen) = irq::without(|| {
         let s = state();
         let pid = s.next_pid;
-        s.next_pid = pid.wrapping_add(1).max(1);
-        (pid, (pid & 0xffff) as u16)
+        s.next_pid = pid.saturating_add(1);
+        (pid, (pid & 0xffff) as u16, s.first_handle_gen)
     });
     if let Err(e) = built {
         aspace.destroy_user(&mut k.mm);
@@ -117,6 +117,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u32, Tid), LoadErr
             "the bootstrap channel must be handle 1"
         );
         process.kernel_end = Some(kernel_end);
+        // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
+        process.handles.set_first_generation(first_gen);
         true
     });
     if !made {

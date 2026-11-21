@@ -41,7 +41,7 @@ impl Machine for Tlb {
 
 struct W {
     objs: Kobjs,
-    procs: BTreeMap<u32, Box<Process>>,
+    procs: BTreeMap<u64, Box<Process>>,
     mm: Mm<FakeMem>,
     vmos: Vmos,
     tlb: Tlb,
@@ -102,7 +102,7 @@ impl W {
         }
     }
     /// A handle in process 1 to process `pid`, with all the rights a creator has.
-    fn handle_to(&mut self, pid: u32) -> u64 {
+    fn handle_to(&mut self, pid: u64) -> u64 {
         let p = self.procs.get_mut(&1).unwrap();
         let (h, _) = ipc::process_object_create_in(
             &mut self.objs,
@@ -597,7 +597,7 @@ fn job_kill_closes_the_job_and_names_the_victims() {
 #[test]
 fn thread_target_and_set_sched_rows() {
     let (mut w, _) = world();
-    let (me_tid, other) = (7u32, 9u32);
+    let (me_tid, other) = (7u64, 9u64);
     // 0 is the calling thread
     assert_eq!(
         ksys::thread_target(&w.objs, &w.procs, 1, me_tid, 0, Rights::MANAGE),

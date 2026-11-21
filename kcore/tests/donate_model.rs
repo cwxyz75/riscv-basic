@@ -9,12 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default, Clone)]
 struct Reference {
-    base: BTreeMap<u32, u8>,
-    edge: BTreeMap<u32, u32>, // from -> to
+    base: BTreeMap<u64, u8>,
+    edge: BTreeMap<u64, u64>, // from -> to
 }
 
 impl Reference {
-    fn eff(&self, t: u32) -> u8 {
+    fn eff(&self, t: u64) -> u8 {
         let mut e = self.base[&t];
         for (&d, &to) in &self.edge {
             if to == t {
@@ -23,10 +23,10 @@ impl Reference {
         }
         e
     }
-    fn effs(&self) -> BTreeMap<u32, u8> {
+    fn effs(&self) -> BTreeMap<u64, u8> {
         self.base.keys().map(|&t| (t, self.eff(t))).collect()
     }
-    fn chain_ok(&self, from: u32, to: u32) -> Result<(), DonateError> {
+    fn chain_ok(&self, from: u64, to: u64) -> Result<(), DonateError> {
         // cycle: to's chain reaches from
         let mut t = to;
         loop {
@@ -39,7 +39,7 @@ impl Reference {
             }
         }
         // depth: longest chain of donors under `from`, plus the hops above `to`
-        fn height(r: &Reference, t: u32) -> usize {
+        fn height(r: &Reference, t: u64) -> usize {
             r.edge
                 .iter()
                 .filter(|(_, &to)| to == t)
@@ -63,7 +63,7 @@ impl Reference {
 fn check(
     d: &Donations,
     r: &Reference,
-    before: &BTreeMap<u32, u8>,
+    before: &BTreeMap<u64, u8>,
     changes: &[kcore::donate::Change],
     what: &str,
 ) {
@@ -72,13 +72,13 @@ fn check(
         assert_eq!(d.eff(t), Some(e), "{what}: eff of {t}");
     }
     // the change list is exactly the threads whose effective priority changed (a removed thread is not in it)
-    let want: BTreeSet<(u32, u8)> = after
+    let want: BTreeSet<(u64, u8)> = after
         .iter()
         .filter(|(t, e)| before.get(t) != Some(e))
         .map(|(&t, &e)| (t, e))
         .filter(|(t, _)| before.contains_key(t))
         .collect();
-    let got: BTreeSet<(u32, u8)> = changes.iter().map(|c| (c.tid, c.eff)).collect();
+    let got: BTreeSet<(u64, u8)> = changes.iter().map(|c| (c.tid, c.eff)).collect();
     assert_eq!(got, want, "{what}: the change list");
     assert_eq!(changes.len(), got.len(), "{what}: no thread listed twice");
     d.audit().unwrap_or_else(|e| panic!("{what}: audit: {e}"));
@@ -90,9 +90,9 @@ fn random_walk_against_the_recomputation() {
         let mut rng = Rng::new(seed);
         let mut d = Donations::new();
         let mut r = Reference::default();
-        let mut next = 1u32;
+        let mut next = 1u64;
         for step in 0..300 {
-            let tids: Vec<u32> = r.base.keys().copied().collect();
+            let tids: Vec<u64> = r.base.keys().copied().collect();
             let pick = |rng: &mut Rng| tids[rng.next() as usize % tids.len()];
             let before = r.effs();
             let what = format!("seed {seed} step {step}");
@@ -231,15 +231,15 @@ fn cycles_and_over_long_chains_are_refused() {
     d.donate(1, 2).unwrap();
     assert_eq!(d.donate(2, 1).err(), Some(DonateError::Cycle));
     // a chain of exactly MAX_DONATION_DEPTH hops is allowed, one more is refused, and nothing changes
-    for t in 2..=MAX_DONATION_DEPTH as u32 {
+    for t in 2..=MAX_DONATION_DEPTH as u64 {
         d.donate(t, t + 1).unwrap();
     }
     assert_eq!(
-        d.donate(MAX_DONATION_DEPTH as u32 + 1, MAX_DONATION_DEPTH as u32 + 2)
+        d.donate(MAX_DONATION_DEPTH as u64 + 1, MAX_DONATION_DEPTH as u64 + 2)
             .err(),
         Some(DonateError::TooDeep)
     );
-    assert_eq!(d.target(MAX_DONATION_DEPTH as u32 + 1), None);
+    assert_eq!(d.target(MAX_DONATION_DEPTH as u64 + 1), None);
     d.audit().unwrap();
     assert_eq!(d.donate(1, 3).err(), Some(DonateError::AlreadyDonating));
     assert_eq!(d.donate(99, 1).err(), Some(DonateError::NoThread));

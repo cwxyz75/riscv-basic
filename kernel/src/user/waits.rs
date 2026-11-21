@@ -31,7 +31,7 @@ pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
 
 /// The calling process and the machine's memory, for a `ksys` function that takes them (interrupts off, lock held).
 fn in_process<R>(
-    f: impl FnOnce(&mut UserState, &mut kmem::Kmem, u32) -> Result<R, Status>,
+    f: impl FnOnce(&mut UserState, &mut kmem::Kmem, u64) -> Result<R, Status>,
 ) -> Result<R, ReplyErr> {
     irq::without(|| {
         let s = state();

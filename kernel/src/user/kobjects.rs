@@ -20,7 +20,7 @@ impl Drop for KernelEnd {
 }
 
 /// Take the kernel's end of `pid`'s bootstrap channel (once). Whoever takes it must `close` it.
-pub fn take_bootstrap(pid: u32) -> Option<KernelEnd> {
+pub fn take_bootstrap(pid: u64) -> Option<KernelEnd> {
     irq::without(|| {
         state()
             .procs
