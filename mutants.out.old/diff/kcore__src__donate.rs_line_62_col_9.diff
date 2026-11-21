@@ -1,0 +1,21 @@
+--- kcore/src/donate.rs
++++ replace Changes::is_empty -> bool with true
+@@ -54,17 +54,17 @@
+         // overflow)
+         self.items[self.len] = c;
+         self.len += 1;
+     }
+     pub fn as_slice(&self) -> &[Change] {
+         &self.items[..self.len]
+     }
+     pub fn is_empty(&self) -> bool {
+-        self.len == 0
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum DonateError {
+     NoThread,
+     /// The donation would close a cycle (a deadlock of blocked calls: their deadlines break it).
+     Cycle,

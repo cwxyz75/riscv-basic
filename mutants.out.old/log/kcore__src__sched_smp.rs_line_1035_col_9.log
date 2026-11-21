@@ -1,0 +1,651 @@
+
+*** kcore/src/sched_smp.rs:1035:9: replace Sched2<N, R>::reap -> Result<(), Error> with Ok(())
+
+*** mutation diff:
+--- kcore/src/sched_smp.rs
++++ replace Sched2<N, R>::reap -> Result<(), Error> with Ok(())
+@@ -1027,20 +1027,17 @@
+                 self.displaced(hart, &q, b);
+             }
+         }
+         self.settle(hart);
+         Ok(())
+     }
+ 
+     pub fn reap(&self, tid: Tid) -> Result<(), Error> {
+-        let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+-        self.lq(home).reap(tid)?;
+-        self.rqs.table().remove(&tid);
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Change a thread's base priority; its hart is marked (or, if it is the caller's, looks at once).
+     pub fn set_priority_on(&self, caller: usize, tid: Tid, prio: Prio) -> Result<(), Error> {
+         if prio == 0 {
+             return Err(Error::BadPriority);
+         }
+         let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+
+
+*** /Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo test --no-run --verbose --package=kcore@0.1.0
+       Fresh abi v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/abi)
+       Dirty kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/kcore): the file `kcore/src/donate.rs` has changed (1795255985.215564720s, 10s after last build at 1795255975.906718631s)
+   Compiling kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/kcore)
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=967e6e6c23e42fe7 -C extra-filename=-3d98311ccb537b13 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/3d98311ccb537b13/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --crate-type lib --emit=dep-info,metadata,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=54f81048664e775f -C extra-filename=-1df58f73b018c652 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rmeta --force-warn=unused_crate_dependencies`
+warning: unused variable: `tid`
+    --> kcore/src/sched_smp.rs:1034:24
+     |
+1034 |     pub fn reap(&self, tid: Tid) -> Result<(), Error> {
+     |                        ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kcore` (lib test) generated 1 warning (1 duplicate)
+warning: `kcore` (lib) generated 1 warning (run `cargo fix --lib -p kcore` to apply 1 suggestion)
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched_smp_model --edition=2021 kcore/tests/sched_smp_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=988670daddc7f934 -C extra-filename=-bd1cb1365a868292 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/bd1cb1365a868292/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name handle_model --edition=2021 kcore/tests/handle_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=56943dc5e2cbc6a1 -C extra-filename=-61e1a147b8cd9d9e --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61e1a147b8cd9d9e/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name ipc_model --edition=2021 kcore/tests/ipc_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=73b510a47dfd95a3 -C extra-filename=-293241e67c960cc5 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/293241e67c960cc5/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name harts --edition=2021 kcore/tests/harts.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=ecaa7a56076bf28e -C extra-filename=-9ea9c15aadf29266 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9ea9c15aadf29266/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name devwin --edition=2021 kcore/tests/devwin.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=4492eab6b1193e34 -C extra-filename=-a81a796634fcd4ac --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a81a796634fcd4ac/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name counters_cnt1 --edition=2021 kcore/tests/counters_cnt1.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=4ed70f6b2dbf44af -C extra-filename=-f1253ded9f4a17f1 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/f1253ded9f4a17f1/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name usercopy --edition=2021 kcore/tests/usercopy.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=a3f905a1c93f5397 -C extra-filename=-aa23a0fc2899a6c0 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/aa23a0fc2899a6c0/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched2_kernel_walk --edition=2021 kcore/tests/sched2_kernel_walk.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=502297004791d501 -C extra-filename=-55f803609952eec1 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/55f803609952eec1/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name aspace_model --edition=2021 kcore/tests/aspace_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=7fc8ebe3e89cc32c -C extra-filename=-47275098af5a91fb --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/47275098af5a91fb/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched_charge --edition=2021 kcore/tests/sched_charge.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=75916e1770954c08 -C extra-filename=-68c144919f5bfc3f --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/68c144919f5bfc3f/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name tick_starvation --edition=2021 kcore/tests/tick_starvation.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=3549d18aaf1c6f47 -C extra-filename=-55a898617be7d65c --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/55a898617be7d65c/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name futex_concurrency --edition=2021 kcore/tests/futex_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=45a8c2220abd429f -C extra-filename=-005e1bc3932da62f --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/005e1bc3932da62f/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name find_gap --edition=2021 kcore/tests/find_gap.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=e76753d3e48fc600 -C extra-filename=-1307af7a01cf69ef --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1307af7a01cf69ef/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name idle_concurrency --edition=2021 kcore/tests/idle_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=59bf13d72d450e1b -C extra-filename=-134896309bc54f4a --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/134896309bc54f4a/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name touch_complete --edition=2021 kcore/tests/touch_complete.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=fd9d6007c7b75f1b -C extra-filename=-353357afb8649baf --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/353357afb8649baf/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name rq_concurrency --edition=2021 kcore/tests/rq_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=02558d70e6e2b94c -C extra-filename=-aa6fdd392e871667 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/aa6fdd392e871667/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name vmo_commit --edition=2021 kcore/tests/vmo_commit.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=2729fd5ba40c5fe1 -C extra-filename=-4422b08c4bd58f1b --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/4422b08c4bd58f1b/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name job_sched --edition=2021 kcore/tests/job_sched.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=2a8d8f116065bfff -C extra-filename=-61ff8e277a0cf9c5 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61ff8e277a0cf9c5/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name timebase --edition=2021 kcore/tests/timebase.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=495fc2a313cecde5 -C extra-filename=-fabb9d49033bea41 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/fabb9d49033bea41/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name fp_model --edition=2021 kcore/tests/fp_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=a998d800afcdf0ad -C extra-filename=-b9aa884fe40c1d5a --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b9aa884fe40c1d5a/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name elf_loader --edition=2021 kcore/tests/elf_loader.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=eea039e7842755e7 -C extra-filename=-18e0c06a1b0b2be4 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/18e0c06a1b0b2be4/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name buddy_model --edition=2021 kcore/tests/buddy_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=de7d52b849d72c75 -C extra-filename=-01ac22d4f1d5664f --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/01ac22d4f1d5664f/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name pagetable_model --edition=2021 kcore/tests/pagetable_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=209352f26c2d16e4 -C extra-filename=-31c0f8b2e53fa94d --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/31c0f8b2e53fa94d/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched_transit_g4 --edition=2021 kcore/tests/sched_transit_g4.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=1de2ac1e481d3db4 -C extra-filename=-2c98db5778339994 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2c98db5778339994/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name isa_check --edition=2021 kcore/tests/isa_check.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=85b4bd4b7688c442 -C extra-filename=-9a8869e99ffcb86e --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9a8869e99ffcb86e/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name latch_concurrency --edition=2021 kcore/tests/latch_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=edb817d4703246f5 -C extra-filename=-a077da24e2f34f1e --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a077da24e2f34f1e/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched_watchdog --edition=2021 kcore/tests/sched_watchdog.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=e0bafded38fbcc64 -C extra-filename=-19f6ea2299d13ea9 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/19f6ea2299d13ea9/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name donate_model --edition=2021 kcore/tests/donate_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=e68717e0d8869270 -C extra-filename=-d2f953651c5be9a2 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/d2f953651c5be9a2/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched2_smp_model --edition=2021 kcore/tests/sched2_smp_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=b527dad2b5c4f8b3 -C extra-filename=-28ca455329911e47 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/28ca455329911e47/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name linestate --edition=2021 kcore/tests/linestate.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=8444f7fedc5b741d -C extra-filename=-92a79f58350ff9c2 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/92a79f58350ff9c2/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name two_band --edition=2021 kcore/tests/two_band.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=0396362a083233d5 -C extra-filename=-f9ee292bc425094a --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/f9ee292bc425094a/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name futex_model --edition=2021 kcore/tests/futex_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=326ea4e6573c1e70 -C extra-filename=-1846993d52bc8e04 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1846993d52bc8e04/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name interrupt_obj --edition=2021 kcore/tests/interrupt_obj.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=8f36bb4c3467ef82 -C extra-filename=-5517298ad9e4e179 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/5517298ad9e4e179/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name socket_port_model --edition=2021 kcore/tests/socket_port_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=e67d2a95bf2eb30d -C extra-filename=-d4f69c7eeb1525b0 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/d4f69c7eeb1525b0/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name device_vmo --edition=2021 kcore/tests/device_vmo.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=60be34357d31ee7f -C extra-filename=-ee1737a3e5f80f95 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/ee1737a3e5f80f95/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched2_differential --edition=2021 kcore/tests/sched2_differential.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=4ed16ba5b2e0d297 -C extra-filename=-8d565248c8449e2d --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/8d565248c8449e2d/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name large_pages --edition=2021 kcore/tests/large_pages.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=af03d113aed30136 -C extra-filename=-2d4b500fd444be53 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2d4b500fd444be53/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name aiatree --edition=2021 kcore/tests/aiatree.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=dc2046dfbd721e46 -C extra-filename=-53a2a3c483315aee --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/53a2a3c483315aee/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name frame_model --edition=2021 kcore/tests/frame_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=8a4d9e97e01118d5 -C extra-filename=-7507e0c5ab1814e6 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/7507e0c5ab1814e6/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name fdt_golden --edition=2021 kcore/tests/fdt_golden.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=c64a1d3aa44ca32f -C extra-filename=-82ec1128ed5bca15 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/82ec1128ed5bca15/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name timer_queue --edition=2021 kcore/tests/timer_queue.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=fae77e0d7aaafca8 -C extra-filename=-038706808f49f89e --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/038706808f49f89e/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name wait_model --edition=2021 kcore/tests/wait_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=2887fa953a37dc07 -C extra-filename=-18b57a5300f4161e --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/18b57a5300f4161e/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name park_concurrency --edition=2021 kcore/tests/park_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=474668862696ece3 -C extra-filename=-b2cd6cb33d59df0d --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b2cd6cb33d59df0d/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name vec_model --edition=2021 kcore/tests/vec_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=61f44037c74522ba -C extra-filename=-88c839835a7cb2ca --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/88c839835a7cb2ca/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name job_ipc_quota --edition=2021 kcore/tests/job_ipc_quota.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=f51a227b0ad6c273 -C extra-filename=-2712fce3bd16fbaf --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2712fce3bd16fbaf/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name sched_model --edition=2021 kcore/tests/sched_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=eb22674e242a14a9 -C extra-filename=-825293a9c00a7352 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/825293a9c00a7352/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name slab_model --edition=2021 kcore/tests/slab_model.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=a94e8cfcb3f1d984 -C extra-filename=-c9a0641d4b2a749f --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/c9a0641d4b2a749f/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name early_devices --edition=2021 kcore/tests/early_devices.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=40e2f65754013a77 -C extra-filename=-57f5bd0b55aa3822 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/57f5bd0b55aa3822/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name ticket_concurrency --edition=2021 kcore/tests/ticket_concurrency.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=e4d3a1a1deba3739 -C extra-filename=-2df99672f39ae8a6 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2df99672f39ae8a6/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name memmap --edition=2021 kcore/tests/memmap.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=7c7524ad161fa48d -C extra-filename=-307df1d13a53bc63 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/307df1d13a53bc63/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/incremental -L dependency=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --extern kcore=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib --force-warn=unused_crate_dependencies`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.08s
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/3d98311ccb537b13/out/kcore-3d98311ccb537b13`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/53a2a3c483315aee/out/aiatree-53a2a3c483315aee`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/47275098af5a91fb/out/aspace_model-47275098af5a91fb`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/01ac22d4f1d5664f/out/buddy_model-01ac22d4f1d5664f`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/f1253ded9f4a17f1/out/counters_cnt1-f1253ded9f4a17f1`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/ee1737a3e5f80f95/out/device_vmo-ee1737a3e5f80f95`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a81a796634fcd4ac/out/devwin-a81a796634fcd4ac`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/d2f953651c5be9a2/out/donate_model-d2f953651c5be9a2`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/57f5bd0b55aa3822/out/early_devices-57f5bd0b55aa3822`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/18e0c06a1b0b2be4/out/elf_loader-18e0c06a1b0b2be4`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/82ec1128ed5bca15/out/fdt_golden-82ec1128ed5bca15`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1307af7a01cf69ef/out/find_gap-1307af7a01cf69ef`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b9aa884fe40c1d5a/out/fp_model-b9aa884fe40c1d5a`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/7507e0c5ab1814e6/out/frame_model-7507e0c5ab1814e6`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/005e1bc3932da62f/out/futex_concurrency-005e1bc3932da62f`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1846993d52bc8e04/out/futex_model-1846993d52bc8e04`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61e1a147b8cd9d9e/out/handle_model-61e1a147b8cd9d9e`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9ea9c15aadf29266/out/harts-9ea9c15aadf29266`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/134896309bc54f4a/out/idle_concurrency-134896309bc54f4a`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/5517298ad9e4e179/out/interrupt_obj-5517298ad9e4e179`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/293241e67c960cc5/out/ipc_model-293241e67c960cc5`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9a8869e99ffcb86e/out/isa_check-9a8869e99ffcb86e`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2712fce3bd16fbaf/out/job_ipc_quota-2712fce3bd16fbaf`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61ff8e277a0cf9c5/out/job_sched-61ff8e277a0cf9c5`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2d4b500fd444be53/out/large_pages-2d4b500fd444be53`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a077da24e2f34f1e/out/latch_concurrency-a077da24e2f34f1e`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/92a79f58350ff9c2/out/linestate-92a79f58350ff9c2`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/307df1d13a53bc63/out/memmap-307df1d13a53bc63`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/31c0f8b2e53fa94d/out/pagetable_model-31c0f8b2e53fa94d`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b2cd6cb33d59df0d/out/park_concurrency-b2cd6cb33d59df0d`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/aa6fdd392e871667/out/rq_concurrency-aa6fdd392e871667`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/8d565248c8449e2d/out/sched2_differential-8d565248c8449e2d`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/55f803609952eec1/out/sched2_kernel_walk-55f803609952eec1`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/28ca455329911e47/out/sched2_smp_model-28ca455329911e47`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/68c144919f5bfc3f/out/sched_charge-68c144919f5bfc3f`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/825293a9c00a7352/out/sched_model-825293a9c00a7352`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/bd1cb1365a868292/out/sched_smp_model-bd1cb1365a868292`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2c98db5778339994/out/sched_transit_g4-2c98db5778339994`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/19f6ea2299d13ea9/out/sched_watchdog-19f6ea2299d13ea9`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/c9a0641d4b2a749f/out/slab_model-c9a0641d4b2a749f`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/d4f69c7eeb1525b0/out/socket_port_model-d4f69c7eeb1525b0`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/55a898617be7d65c/out/tick_starvation-55a898617be7d65c`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2df99672f39ae8a6/out/ticket_concurrency-2df99672f39ae8a6`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/fabb9d49033bea41/out/timebase-fabb9d49033bea41`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/038706808f49f89e/out/timer_queue-038706808f49f89e`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/353357afb8649baf/out/touch_complete-353357afb8649baf`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/f9ee292bc425094a/out/two_band-f9ee292bc425094a`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/aa23a0fc2899a6c0/out/usercopy-aa23a0fc2899a6c0`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/88c839835a7cb2ca/out/vec_model-88c839835a7cb2ca`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/4422b08c4bd58f1b/out/vmo_commit-4422b08c4bd58f1b`
+  Executable `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/18b57a5300f4161e/out/wait_model-18b57a5300f4161e`
+
+*** result: Success
+
+*** /Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo test --verbose --package=kcore@0.1.0 --lib --tests
+       Fresh abi v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/abi)
+warning: unused variable: `tid`
+    --> kcore/src/sched_smp.rs:1034:24
+     |
+1034 |     pub fn reap(&self, tid: Tid) -> Result<(), Error> {
+     |                        ^^^ help: if this is intentional, prefix it with an underscore: `_tid`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kcore` (lib) generated 1 warning (run `cargo fix --lib -p kcore` to apply 1 suggestion)
+       Fresh kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/kcore)
+warning: `kcore` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/3d98311ccb537b13/out/kcore-3d98311ccb537b13`
+
+running 36 tests
+test chaos::tests::a_resumed_generator_continues_the_same_sequence ... ok
+test chaos::tests::another_seed_or_hart_gives_another_sequence ... ok
+test chaos::tests::the_sequence_is_pinned ... ok
+test chaos::tests::the_same_seed_and_hart_give_the_same_sequence ... ok
+test futex::tests::a_thread_waits_on_one_address_at_a_time ... ok
+test futex::tests::a_process_ending_takes_its_sleepers_with_it ... ok
+test chaos::tests::the_lock_points_delay_about_one_in_sixty_four ... ok
+test fdt::tests::finds_a_compatible_string_among_several ... ok
+test fdt::tests::hostile_input_never_panics ... ok
+test futex::tests::forget_removes_exactly_one_sleeper ... ok
+test futex::tests::wake_is_fifo_counted_and_keyed ... ok
+test job::tests::a_charge_stops_at_the_limit_and_changes_nothing_when_it_fails ... ok
+test handle::tests::a_table_out_of_slots_refuses_instead_of_panicking ... ok
+test job::tests::a_child_is_bounded_by_every_ancestor ... ok
+test job::tests::a_failed_charge_touches_no_level ... ok
+test job::tests::child_jobs_are_limited_and_counted_for_every_ancestor ... ok
+test job::tests::lowering_a_limit_below_usage_blocks_new_charges_only ... ok
+test job::tests::records_live_until_their_last_use_and_free_their_parents_in_turn ... ok
+test job::tests::the_number_of_jobs_is_bounded ... ok
+test job::tests::the_root_is_unlimited_and_permanent ... ok
+test job::tests::within_follows_the_tree ... ok
+test latch::tests::set_then_take_once ... ok
+test latch::tests::wakeups_do_not_queue ... ok
+test pagemap::tests::a_run_maps_consecutive_frames ... ok
+test park::tests::a_wake_between_prepare_and_block_stops_the_block ... ok
+test park::tests::cancel_forgets_the_wait ... ok
+test park::tests::a_wake_that_finds_nobody_waiting_is_not_remembered ... ok
+test testlog::tests::a_panic_starts_on_a_fresh_line_and_stays_on_one ... ok
+test testlog::tests::lines_have_the_documented_shape ... ok
+test ticket::tests::reentrant_and_released_at_depth_zero ... ok
+test ticket::tests::swap_depth_hands_over_without_releasing ... ok
+test ticket::tests::the_depth_counts_nested_takes ... ok
+test ticket::tests::try_lock_fails_when_held_by_another ... ok
+test pagemap::tests::it_behaves_like_a_map_of_page_to_frame ... ok
+test chaos::tests::about_one_in_eight_delays_and_never_past_the_bound ... ok
+test job::tests::random_operations_agree_with_a_recomputing_model ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/53a2a3c483315aee/out/aiatree-53a2a3c483315aee`
+
+running 10 tests
+test a_device_behind_an_interrupt_nexus_does_not_inherit_the_roots_parent ... ok
+test a_controller_without_message_delivery_or_without_harts_is_not_usable ... ok
+test a_machine_with_a_plic_and_no_aplic_has_none ... ok
+test hart_ids_need_not_be_dense_or_in_order_and_the_imsic_list_is_the_hart_index ... ok
+test only_admitted_devices_on_this_aplic_and_within_its_sources_are_interrupts_a_process_may_take ... ok
+test imsic_groups_are_refused_and_a_device_that_names_its_parents_elsewhere_is_not_read ... ok
+test the_supervisor_controller_and_its_own_imsic_are_chosen_over_the_machine_level_pair ... ok
+test the_imsic_window_must_hold_a_page_per_listed_hart ... ok
+test the_real_virt_trees_give_the_supervisor_aplic_the_hart_order_and_the_device_sources ... ok
+test the_source_limits_are_exact ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/47275098af5a91fb/out/aspace_model-47275098af5a91fb`
+
+running 12 tests
+test a_lazy_page_is_zero_and_faults_in_exactly_once ... ok
+test a_vmo_closed_before_a_region_of_it_faults_still_serves_the_fault ... ok
+test a_mapping_keeps_its_vmo_and_frames_alive_after_the_creator_goes ... ok
+test region_arguments_are_checked_with_specific_errors ... ok
+test a_fault_the_existing_mapping_cannot_satisfy_is_refused_not_retried_forever ... ok
+test committed_pages_are_charged_to_the_vmos_job_and_credited_back ... ok
+test fault_around_stays_inside_the_region_and_the_window ... ok
+test running_out_of_frames_changes_nothing_and_leaks_nothing ... ok
+test running_out_of_frames_gives_the_page_charge_back ... ok
+test fault_around_maps_committed_neighbours_and_never_commits_one ... ok
+test random_faults_regions_and_teardown_agree_with_the_model_sv39 ... ok
+test random_faults_regions_and_teardown_agree_with_the_model_testfmt48 ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/01ac22d4f1d5664f/out/buddy_model-01ac22d4f1d5664f`
+
+running 6 tests
+test a_range_cut_at_unaligned_edges_uses_the_largest_blocks_that_fit ... ok
+test every_frame_of_every_range_can_be_taken_one_at_a_time_and_given_back ... ok
+test ranges_that_overlap_overflow_or_have_too_little_storage_are_refused ... ok
+test the_largest_order_and_frame_zero ... ok
+test random_blocks_never_overlap_stay_aligned_and_merge_back_completely ... ok
+test frame_db_over_two_ranges_with_partial_runs_and_shared_frames_agrees_with_a_count_map ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/f1253ded9f4a17f1/out/counters_cnt1-f1253ded9f4a17f1`
+
+running 3 tests
+test a_slot_whose_generation_is_exhausted_is_retired_not_wrapped ... ok
+test koids_cross_2_32_and_are_never_reused ... ok
+test thread_ids_pass_the_32_bit_boundary_and_stop_at_the_end ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/ee1737a3e5f80f95/out/device_vmo-ee1737a3e5f80f95`
+
+running 5 tests
+test a_physical_vmo_maps_device_frames_without_touching_the_database ... ok
+test a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly ... ok
+test the_jobs_page_charge_follows_dma_exactly ... ok
+test dma_limits_and_failure_leave_nothing_behind ... ok
+test random_creation_mapping_and_destruction_balance_the_frames ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a81a796634fcd4ac/out/devwin-a81a796634fcd4ac`
+
+running 7 tests
+test a_device_nobody_decided_on_is_never_a_window ... ok
+test a_disabled_node_and_a_bus_that_translates_or_has_no_ranges_give_nothing ... ok
+test a_cut_that_starts_at_a_windows_start_leaves_no_empty_range ... ok
+test a_tree_with_one_cell_addresses_and_one_with_no_devices ... ok
+test an_admitted_device_gets_its_pages_and_neighbours_merge ... ok
+test the_real_virt_tree_gives_the_rtc_and_the_virtio_slots_and_nothing_else ... ok
+test what_the_kernel_drives_and_ram_are_cut_from_every_window ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/d2f953651c5be9a2/out/donate_model-d2f953651c5be9a2`
+
+running 4 tests
+test a_change_list_says_whether_it_is_empty ... ok
+test a_boost_propagates_the_whole_chain_and_drops_back ... ok
+test cycles_and_over_long_chains_are_refused ... ok
+test random_walk_against_the_recomputation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/57f5bd0b55aa3822/out/early_devices-57f5bd0b55aa3822`
+
+running 10 tests
+test a_path_without_the_unit_address_names_the_node_that_has_one ... ok
+test an_absolute_path_an_alias_and_options_all_name_the_same_console ... ok
+test a_tree_without_the_test_device_has_none ... ok
+test a_uart_the_kernel_cannot_drive_is_not_the_console ... ok
+test no_console_a_console_that_is_not_a_16550_and_bad_names_give_none ... ok
+test the_real_virt_trees_name_the_uart_and_the_finisher ... ok
+test boot_words_are_found_without_allocating ... ok
+test the_seeds_in_chosen_are_found_by_offset_and_nothing_else_is_taken ... ok
+test many_aliases_the_second_compatible_and_a_same_named_node_elsewhere ... ok
+test a_hostile_tree_ends_the_walk_without_a_panic ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/18e0c06a1b0b2be4/out/elf_loader-18e0c06a1b0b2be4`
+
+running 5 tests
+test a_good_image_parses_to_exactly_these_segments ... ok
+test an_unaligned_start_within_a_page_is_allowed_when_offset_agrees ... ok
+test a_segment_may_not_touch_the_stack_or_its_guard_page ... ok
+test every_rule_has_a_rejection ... ok
+test mutated_images_never_panic_and_accepted_ones_are_safe_to_map ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/82ec1128ed5bca15/out/fdt_golden-82ec1128ed5bca15`
+
+running 7 tests
+test header_errors_are_reported ... ok
+test the_default_board_has_a_plic_and_eight_virtio_slots ... ok
+test a_long_name_cannot_multiply_into_a_huge_allocation ... ok
+test the_aia_board_has_no_plic_but_the_same_slots ... ok
+test many_properties_sharing_one_huge_name_are_refused ... ok
+test the_limits_bound_a_hostile_tree ... ok
+test every_truncation_and_corruption_is_an_error_or_a_tree_never_a_panic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1307af7a01cf69ef/out/find_gap-1307af7a01cf69ef`
+
+running 1 test
+test find_gap_agrees_with_a_scan ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b9aa884fe40c1d5a/out/fp_model-b9aa884fe40c1d5a`
+
+running 4 tests
+test a_hart_that_already_holds_the_state_does_not_reload_it ... ok
+test a_stale_hart_reloads_after_the_thread_ran_elsewhere ... ok
+test dirty_state_for_a_thread_that_never_enabled_fp_is_a_bug_and_is_reported ... ok
+test threads_keep_their_own_fp_state_across_traps_migration_and_sharing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/7507e0c5ab1814e6/out/frame_model-7507e0c5ab1814e6`
+
+running 3 tests
+test exhaustion_and_reuse ... ok
+test zero_frames_is_fine ... ok
+test random_operations_agree_with_the_model ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/005e1bc3932da62f/out/futex_concurrency-005e1bc3932da62f`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/1846993d52bc8e04/out/futex_model-1846993d52bc8e04`
+
+running 1 test
+test random_waits_wakes_and_forgets_agree_with_the_list ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61e1a147b8cd9d9e/out/handle_model-61e1a147b8cd9d9e`
+
+running 7 tests
+test a_handle_value_keeps_its_forty_bit_generation_in_the_high_bits ... ok
+test a_slot_whose_generation_would_wrap_is_retired_so_no_stale_value_comes_back ... ok
+test the_table_limit_is_enforced_and_changes_nothing ... ok
+test rights_escalation_is_refused ... ok
+test handle_values_encode_slot_and_generation ... ok
+test a_table_grows_to_a_hundred_thousand_live_handles_and_slot_numbers_pass_8191 ... ok
+test random_operations_agree_with_the_model ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9ea9c15aadf29266/out/harts-9ea9c15aadf29266`
+
+running 3 tests
+test the_hart_masks_group_ids_by_sixty_four_with_the_base_of_each_group ... ok
+test ids_need_not_be_dense_in_order_or_below_64_and_unusable_cpus_are_left_out ... ok
+test the_real_virt_tree_lists_four_harts_and_the_boot_hart_comes_first ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/134896309bc54f4a/out/idle_concurrency-134896309bc54f4a`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/5517298ad9e4e179/out/interrupt_obj-5517298ad9e4e179`
+
+running 3 tests
+test rights_and_types_are_checked ... ok
+test fire_then_ack_cycle_with_claim_counting ... ok
+test a_fire_for_another_source_or_a_dead_object_does_nothing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/293241e67c960cc5/out/ipc_model-293241e67c960cc5`
+
+running 20 tests
+test a_full_table_leaves_the_message_queued ... ok
+test a_sweep_gives_back_the_references_doomed_objects_held ... ok
+test a_txid_read_on_a_closed_channel_does_not_wait_forever ... ok
+test channel_basics ... ok
+test channel_txid ... ok
+test channel_signals ... ok
+test channel_write_checks_in_the_documented_order ... ok
+test channel_errors ... ok
+test cycles_are_swept ... ok
+test event_basics ... ok
+test destroyed_vmos_and_processes_are_handed_back_for_cleanup_exactly_once ... ok
+test peek_predicts_exactly_what_a_read_would_do ... ok
+test process_and_vmo_handles_check_type_and_rights ... ok
+test queued_handles_and_headers_count_against_the_budget ... ok
+test queued_bytes_are_capped_per_endpoint ... ok
+test the_object_count_is_capped ... ok
+test a_process_cannot_grow_kernel_memory_by_making_cycles ... ok
+test the_object_cap_applies_to_channel_pairs_too ... ok
+test deeply_nested_channels_release_without_recursion ... ok
+test random_channels_agree_with_the_model ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/9a8869e99ffcb86e/out/isa_check-9a8869e99ffcb86e`
+
+running 4 tests
+test a_plain_rv64_cpu_is_refused_and_the_missing_names_are_those_dtc_shows ... ok
+test the_isa_string_form_gives_the_same_extensions ... ok
+test the_profile_cpu_passes_on_every_hart ... ok
+test a_tree_without_harts_or_with_one_deficient_hart_is_refused ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2712fce3bd16fbaf/out/job_ipc_quota-2712fce3bd16fbaf`
+
+running 9 tests
+test a_writer_from_another_job_does_not_pay_but_cannot_exceed_the_receivers_budget ... ok
+test a_socket_write_takes_what_the_job_has_room_for ... ok
+test a_charge_sees_the_credits_of_objects_closed_just_before_without_an_explicit_settle ... ok
+test objects_are_counted_refused_at_the_limit_and_credited_when_destroyed ... ok
+test queued_channel_bytes_are_charged_to_the_endpoint_job_and_credited_on_read ... ok
+test another_jobs_objects_do_not_count_and_uncharged_objects_never_credit ... ok
+test port_bindings_are_charged_to_the_ports_job ... ok
+test swept_cycles_and_handles_in_flight_are_credited ... ok
+test random_operations_keep_the_ledger_equal_to_the_registrys_own_counts ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/61ff8e277a0cf9c5/out/job_sched-61ff8e277a0cf9c5`
+
+running 2 tests
+test lowering_a_parent_lowers_its_whole_subtree ... ok
+test random_walk_keeps_every_job_within_its_parent ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2d4b500fd444be53/out/large_pages-2d4b500fd444be53`
+
+running 3 tests
+test large_page_refusals_are_specific_and_change_nothing_in_both_formats ... ok
+test a_four_gib_direct_map_uses_large_pages_and_few_table_frames_in_both_formats ... ok
+test the_splitter_covers_each_frame_once_with_the_largest_legal_pages ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/a077da24e2f34f1e/out/latch_concurrency-a077da24e2f34f1e`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/92a79f58350ff9c2/out/linestate-92a79f58350ff9c2`
+
+running 3 tests
+test a_program_cannot_forge_a_verdict_line ... ok
+test an_unterminated_program_line_cannot_swallow_a_kernel_verdict ... ok
+test random_interleavings_keep_verdict_lines_honest ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/307df1d13a53bc63/out/memmap-307df1d13a53bc63`
+
+running 8 tests
+test a_reservation_block_without_a_terminator_or_with_too_many_entries_is_bounded ... ok
+test ram_at_0x4000_0000_with_a_reserved_range_in_the_middle_and_a_24_mhz_timebase ... ok
+test odd_tree_shapes_are_read_as_the_specification_says ... ok
+test reservations_cut_to_whole_frames_outward_and_memory_inward ... ok
+test ranges_at_the_top_of_the_address_space_are_cut_there_not_dropped_or_wrapped ... ok
+test two_banks_the_reservation_block_and_a_tree_placed_low_in_ram ... ok
+test the_real_qemu_tree_gives_the_ram_and_the_timebase ... ok
+test the_range_arithmetic_agrees_with_a_frame_bitmap ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/31c0f8b2e53fa94d/out/pagetable_model-31c0f8b2e53fa94d`
+
+running 10 tests
+test huge_leaves_translate_with_the_right_offset ... ok
+test huge_leaves_block_small_mappings_and_cannot_be_unmapped_page_by_page ... ok
+test leaf_bits_are_what_the_hardware_expects ... ok
+test leaf_walk_reports_huge_leaves_with_their_level_and_sign_extension ... ok
+test pte_encodings_for_user_and_exec_only_pages ... ok
+test running_out_of_table_frames_changes_nothing ... ok
+test write_xor_execute_and_bad_arguments_are_refused ... ok
+test testfmt48_block_entries_are_leaves_above_level_zero ... ok
+test random_map_unmap_translate_agree_with_the_model_sv39 ... ok
+test random_map_unmap_translate_agree_with_the_model_testfmt48 ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/b2cd6cb33d59df0d/out/park_concurrency-b2cd6cb33d59df0d`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/aa6fdd392e871667/out/rq_concurrency-aa6fdd392e871667`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/8d565248c8449e2d/out/sched2_differential-8d565248c8449e2d`
+
+running 4 tests
+test bands_and_queues_are_what_the_spec_says ... ok
+test an_effective_priority_moves_queued_and_running_threads ... ok
+test the_real_time_band_is_strict_fifo_and_rr_is_opt_in ... ok
+test the_new_normal_band_behaves_like_the_old_scheduler ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/55f803609952eec1/out/sched2_kernel_walk-55f803609952eec1`
+
+running 12 tests
+test a_hart_that_joins_late_starts_its_clock_at_the_join_not_at_zero ... ok
+test a_hart_that_has_not_joined_is_never_marked_and_picks_its_pinned_thread_up_when_it_joins ... ok
+test priority_zero_is_refused ... ok
+test a_tick_that_rotates_and_then_pulls_still_protects_the_thread_that_is_executing ... ok
+test a_sleeper_wakes_on_its_home_harts_tick_and_never_before_its_deadline ... ok
+test one_thread_marks_one_hart ... ok
+test a_thread_switched_away_is_not_available_to_other_harts_until_its_switch_completes ... ok
+test a_lopsided_queue_of_equals_is_shared_out_at_the_ticks_and_then_left_alone ... ok
+test round_robin_does_not_ping_pong_a_higher_priority_thread_between_harts ... ok
+test waiters_wake_in_fifo_order_and_a_stale_entry_does_not_swallow_a_wake ... ok
+test kernel_style_walk_round_robin ... ok
+test kernel_style_walk_fixed_priority ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/28ca455329911e47/out/sched2_smp_model-28ca455329911e47`
+
+running 5 tests
+test a_pinned_thread_is_never_moved ... ok
+test an_idle_hart_takes_a_new_thread_and_a_freed_hart_pulls_a_waiting_one ... ok
+test equal_priority_threads_are_not_pulled_back_and_forth ... ok
+test sixty_four_harts_poke_every_hart_including_the_last ... ok
+test gp1_and_gp2_hold_on_random_walks_over_one_to_eight_harts ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.85s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/68c144919f5bfc3f/out/sched_charge-68c144919f5bfc3f`
+
+running 2 tests
+test a_thread_that_sleeps_is_charged_for_its_own_run ... ok
+test a_thread_that_yields_is_charged_for_its_own_run ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/825293a9c00a7352/out/sched_model-825293a9c00a7352`
+
+running 19 tests
+test a_preempted_thread_resumes_before_its_peers ... ok
+test a_higher_priority_thread_preempts_at_once_and_a_lower_one_waits ... ok
+test a_wait_with_a_deadline_ends_at_the_deadline_or_at_a_wake_whichever_is_first ... ok
+test a_timed_block_keeps_a_notification_that_arrived_after_prepare ... ok
+test a_periodic_higher_priority_thread_cannot_starve_the_next_peer ... ok
+test adopt_and_reap_misuse_are_errors ... ok
+test a_wait_with_a_deadline_through_the_queue ... ok
+test a_wake_after_prepare_stops_the_block_once ... ok
+test a_prepared_thread_that_has_not_blocked_yet_is_woken_by_the_queue ... ok
+test a_wake_that_finds_nobody_waiting_is_not_remembered ... ok
+test cancelling_a_prepared_block_forgets_the_wait ... ok
+test an_early_wake_cancels_the_sleep_timer ... ok
+test equal_priority_threads_take_turns_one_slice_each ... ok
+test lowering_the_running_thread_hands_over_to_a_better_one ... ok
+test reaping_and_errors ... ok
+test sleep_wakes_on_exactly_its_deadline ... ok
+test waiters_wake_in_order_and_stale_entries_are_skipped ... ok
+test round_robin_agrees_with_the_model ... ok
+test fixed_priority_agrees_with_the_model ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/bd1cb1365a868292/out/sched_smp_model-bd1cb1365a868292`
+
+running 9 tests
+test a_pinned_thread_runs_only_on_its_hart ... ok
+test a_rotated_thread_is_offered_to_the_other_harts ... ok
+test a_wake_on_one_hart_never_changes_another_harts_current ... ok
+test equal_priority_threads_spread_over_idle_harts_and_a_thread_runs_on_one_hart_only ... ok
+test a_wake_after_prepare_is_not_lost_across_harts ... ok
+test sixty_four_harts_spread_threads_and_the_poke_mask_reaches_the_last_hart ... ok
+test random_operations_keep_every_per_hart_rule_round_robin ... ok
+test random_operations_keep_every_per_hart_rule_two_band ... ok
+test random_operations_keep_every_per_hart_rule_fixed_priority ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+
+     Running `/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-W09saW.tmp/target/debug/build/kcore/2c98db5778339994/out/sched_transit_g4-2c98db5778339994`
+
+running 4 tests
+test a_thread_that_exited_is_not_reaped_before_its_switch_is_done ... ok
+test a_thread_that_slept_is_not_run_elsewhere_before_its_switch_is_done ... ok
+test a_thread_that_blocked_is_not_run_elsewhere_before_its_switch_is_done ... ok
+test reap_frees_an_exited_thread_and_refuses_anything_else ... FAILED
+
+failures:
+
+---- reap_frees_an_exited_thread_and_refuses_anything_else stdout ----
+
+thread 'reap_frees_an_exited_thread_and_refuses_anything_else' (54398579) panicked at kcore/tests/sched_transit_g4.rs:81:5:
+assertion `left == right` failed: a running thread is not reaped
+  left: Ok(())
+ right: Err(NotExited)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    reap_frees_an_exited_thread_and_refuses_anything_else
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kcore --test sched_transit_g4`
+
+*** result: Failure(101)

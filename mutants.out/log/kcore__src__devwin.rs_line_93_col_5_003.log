@@ -1,0 +1,94 @@
+
+*** kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 0)]
+
+*** mutation diff:
+--- kcore/src/devwin.rs
++++ replace device_windows -> Vec<(u64, u64)> with vec![(1, 0)]
+@@ -85,56 +85,17 @@
+ /// drives: the console UART, and anything else the caller names), minus `ram` byte ranges (a device range that overlaps RAM or a reserved
+ /// range is not a window) and minus the ranges of the nodes the kernel or firmware drives, as sorted, non-overlapping page ranges
+ /// `(start, end)` in bytes, adjacent ones merged.
+ pub fn device_windows(
+     nodes: &[Node],
+     excluded: &[(u64, u64)],
+     ram: &[(u64, u64)],
+ ) -> Vec<(u64, u64)> {
+-    let mut want: Vec<(u64, u64)> = Vec::new();
+-    let mut cut: Vec<(u64, u64)> = excluded
+-        .iter()
+-        .chain(ram.iter())
+-        .filter_map(|&(a, s)| pages(a, s))
+-        .collect();
+-    for n in nodes {
+-        // what the kernel or firmware drives is cut from every window, wherever its range sits
+-        if NEVER.iter().any(|c| n.is_compatible(c)) {
+-            cut.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+-            continue;
+-        }
+-        if ALLOWED.iter().any(|c| n.is_compatible(c)) && !disabled(n) && physical(n, nodes) {
+-            want.extend(n.regs().iter().filter_map(|&(a, s)| pages(a, s)));
+-        }
+-    }
+-    cut.sort_unstable();
+-    want.sort_unstable();
+-    let mut out: Vec<(u64, u64)> = Vec::new();
+-    for (mut a, b) in want {
+-        for &(ca, cb) in &cut {
+-            if ca >= b {
+-                break; // sorted by start: nothing further can overlap
+-            }
+-            if cb <= a {
+-                continue;
+-            }
+-            if ca > a {
+-                push(&mut out, a, ca);
+-            }
+-            a = a.max(cb);
+-            if a >= b {
+-                break;
+-            }
+-        }
+-        if a < b {
+-            push(&mut out, a, b);
+-        }
+-    }
+-    out
++    vec![(1, 0)] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Add `[a, b)` to a sorted list, merging with the last range when they touch or overlap.
+ fn push(out: &mut Vec<(u64, u64)>, a: u64, b: u64) {
+     match out.last_mut() {
+         Some(last) if a <= last.1 => last.1 = last.1.max(b),
+         _ => out.push((a, b)),
+     }
+
+
+*** /Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo test --no-run --verbose --package=kcore@0.1.0
+       Fresh abi v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/abi)
+       Dirty kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/kcore): couldn't read metadata for file `target/debug/build/kcore/1df58f73b018c652/out/libkcore-1df58f73b018c652.rlib`
+   Compiling kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/kcore)
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --crate-type lib --emit=dep-info,metadata,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=54f81048664e775f -C extra-filename=-1df58f73b018c652 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/kcore/1df58f73b018c652/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rmeta --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=967e6e6c23e42fe7 -C extra-filename=-3d98311ccb537b13 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/kcore/3d98311ccb537b13/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --force-warn=unused_crate_dependencies`
+error: cannot find macro `vec` in this scope
+  --> kcore/src/devwin.rs:93:5
+   |
+93 |     vec![(1, 0)] /* ~ changed by cargo-mutants ~ */
+   |     ^^^
+   |
+help: consider importing this macro
+   |
+ 9 + use alloc::vec;
+   |
+
+error: could not compile `kcore` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --crate-type lib --emit=dep-info,metadata,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=54f81048664e775f -C extra-filename=-1df58f73b018c652 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/kcore/1df58f73b018c652/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rmeta --force-warn=unused_crate_dependencies` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `kcore` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=967e6e6c23e42fe7 -C extra-filename=-3d98311ccb537b13 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/kcore/3d98311ccb537b13/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-YkhB9O.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --force-warn=unused_crate_dependencies` (exit status: 1)
+
+*** result: Failure(101)
