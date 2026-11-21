@@ -58,7 +58,7 @@ pub fn activate_current() {
             // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
             // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
             // No flush: translations are tagged with the ASID (L18).
-            unsafe { crate::arch::aspace_install_tagged(token) };
+            unsafe { crate::arch::aspace_install_noflush(token) };
         }
     }
 }
@@ -110,7 +110,9 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             .aspace
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
-                            kmem::flush_pages(m.first, m.last, p.tag.asid);
+                            // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
+                            // thread still runs under the old one)
+                            kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {

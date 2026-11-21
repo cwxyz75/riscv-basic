@@ -13,7 +13,7 @@ pub(super) fn user_thread_main(token: usize) {
     // jump to user mode (nothing user-visible runs under it).
     let _ = irq::save_and_disable();
     crate::bkl::lock();
-    let (ts, token, killed) = {
+    let (ts, killed) = {
         let s = state();
         let ts = s
             .starts
@@ -36,7 +36,6 @@ pub(super) fn user_thread_main(token: usize) {
         if ts.rr {
             s.sched_flags.insert(thread::current(), 1);
         }
-        let token = install_token_of(&mut s.asids, p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
         let max = kmem::jobs()
@@ -48,7 +47,7 @@ pub(super) fn user_thread_main(token: usize) {
         if late_clamp {
             thread::set_priority(thread::current(), max);
         }
-        (ts, token, p.killed)
+        (ts, p.killed)
     };
     // Killed before it ever ran: it never runs user code.
     if let Some(code) = killed {
@@ -66,6 +65,19 @@ pub(super) fn user_thread_main(token: usize) {
     crate::percpu::this()
         .attention_seen
         .store(0, Ordering::SeqCst);
+    // The address space's token is taken last, here, with interrupts off and the lock held and nothing that can sleep or switch between
+    // this and `enter_user`: a tag taken earlier could be stale by now (the thread may have slept in a stopped process or been moved to
+    // another hart after a generation turned), and the hart's generation flush belongs to the hart that enters (L18).
+    let token = {
+        let UserState { asids, procs, .. } = state();
+        let p = procs
+            .get_mut(&ts.pid)
+            .expect("a process lives while one of its threads does");
+        install_token_of(asids, p)
+    };
+    crate::percpu::this()
+        .active_aspace
+        .store(token, Ordering::SeqCst);
     // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
     // (loads from this thread's stack and CSR writes) run before `sret`.
     crate::bkl::unlock();

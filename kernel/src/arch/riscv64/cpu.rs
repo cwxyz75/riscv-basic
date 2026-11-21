@@ -44,19 +44,26 @@ pub fn asid_bits() -> u32 {
     ((back >> 44) & 0xffff).count_ones().clamp(1, 16)
 }
 
-/// Install the address space `token` (an ASID other than 0) **without flushing** (L18, KERNEL-V1-SPEC 5.4): translations are tagged with the
-/// ASID, so the ones cached for the space being left stay out of the way, and the ones cached for another ASID are not this space's. What
-/// makes that sound is outside this function: ASIDs are unique among live spaces of a generation (`kcore::asid`), a hart flushes
-/// everything before it installs a tag of a newer generation (`user::install_token_of`), and every unmap, protection downgrade and
-/// teardown flushes the other harts before a frame is reused (`smp::shootdown`).
+/// Install the address space `token` **without flushing** (L18, KERNEL-V1-SPEC 5.4): translations are tagged with the ASID, so the ones
+/// cached for the space being left stay out of the way, and the ones cached for another ASID are not this space's. What makes that sound
+/// is outside this function: ASIDs are unique among live spaces of a generation (`kcore::asid`), a hart flushes everything before it
+/// installs a tag of a newer generation (`user::install_token_of`), and every unmap, spawn-stack free and teardown flushes the other
+/// harts before a frame is reused (`smp::shootdown`). Also the way a hart goes back to the kernel's own table (ASID 0) when it leaves a
+/// user space: the user entries stay cached under their ASID, and nothing runs under that ASID until its owner does.
 ///
 /// # Safety
-/// `token` names a live top-level table that maps everything the kernel executes from and touches, with a unique ASID of the current
-/// generation (not the kernel's 0), and the caller has done the flush the hart owes for that generation.
+/// `token` names a live top-level table that maps everything the kernel executes from and touches; for a user space its ASID is the
+/// allocator's (never 0) and of the current generation, and the caller has done the flush the hart owes for that generation.
 #[inline(always)]
-pub unsafe fn aspace_install_tagged(token: u64) {
+pub unsafe fn aspace_install_noflush(token: u64) {
     // SAFETY: the caller guarantees the table and the ASID rules above.
     unsafe { asm!("csrw satp, {}", in(reg) token) };
+}
+
+/// The ASID in this hart's `satp` right now (what a flush of one of the running space's pages must name).
+#[inline(always)]
+pub fn aspace_current_asid() -> u16 {
+    ((aspace_current() >> 44) & 0xffff) as u16
 }
 
 /// Flush the whole TLB of this hart.
