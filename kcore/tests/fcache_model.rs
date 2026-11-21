@@ -40,7 +40,9 @@ fn caches_and_database_account_for_every_frame_exactly() {
                 }
             } else if let Some(&p) = out[c].iter().next() {
                 out[c].remove(&p);
-                caches[c].free_sole(p, &mut db);
+                // (into another cache, as the kernel does: one hart stocks a frame, another gives it back)
+                let other = (rng.next() % 3) as usize;
+                caches[other].free_sole(p, &mut db);
             }
             let cached: usize = caches.iter().map(|c| c.len()).sum();
             let user: usize = out.iter().map(|s| s.len()).sum();

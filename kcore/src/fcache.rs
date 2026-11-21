@@ -2,8 +2,8 @@
 //! lock. A cache holds up to [`CACHE_MAX`] frames; an empty cache refills [`BATCH`] frames from the shared database in one take of the lock,
 //! a full one drains [`BATCH`] back in one take.
 //!
-//! A cached frame stays allocated in the database (reference count 1, held by the cache), so a stray `dec` of it is still caught and the
-//! leak oracles count it as free by adding the caches' lengths (`FrameCache::len`). Only a frame whose **sole** reference the caller holds
+//! A cached frame stays allocated in the database (reference count 1, held by the cache), so the database never counts it free (a stray `dec` of it
+//! would, so the cache's own drain checks that each frame was still held) and the leak oracles count it as free by adding the caches' lengths (`FrameCache::len`). Only a frame whose **sole** reference the caller holds
 //! may be given back to a cache (`free_sole`): the kernel's own frames (stacks, page tables, slabs, the pool), not a user page that a
 //! mapping and a VMO share.
 //!
@@ -41,7 +41,12 @@ impl Shared for FrameDb {
     }
     fn drain(&mut self, frames: &[Pfn]) {
         for &p in frames {
-            let _ = self.dec(p);
+            let r = self.dec(p);
+            // (a cached frame has exactly one reference, the cache's: anything else is a double free or a free of a shared frame)
+            debug_assert!(
+                r == Ok(true),
+                "frame {p} came back from a cache with a bad count: {r:?}"
+            );
         }
     }
 }

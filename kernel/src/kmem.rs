@@ -76,8 +76,9 @@ impl kcore::fcache::Shared for SharedFrames {
 
 /// A frame (reference count 1) from this hart's cache, which refills from the database in batches under `FRAME` (L16). Not to be called
 /// with a memory lock held (a refill takes `FRAME`).
-#[track_caller]
 pub fn frame_alloc() -> Option<u64> {
+    debug_assert!(crate::bkl::held());
+    crate::bkl::check_use(klock::Class::Frame); // (the order checker sees every call, not only the ones that refill)
     let was = crate::irq::save_and_disable();
     // SAFETY: interrupts are off, and this is the calling hart's own record.
     let r = unsafe {
@@ -90,8 +91,9 @@ pub fn frame_alloc() -> Option<u64> {
 }
 
 /// Give a frame back to this hart's cache; the caller holds its only reference (a kernel-owned frame: a slab, the pool, a stack).
-#[track_caller]
 pub fn frame_free_sole(pfn: u64) {
+    debug_assert!(crate::bkl::held());
+    crate::bkl::check_use(klock::Class::Frame);
     let was = crate::irq::save_and_disable();
     // SAFETY: as in `frame_alloc`.
     unsafe {
