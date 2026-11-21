@@ -195,6 +195,11 @@ impl Object for KObj {
 
 pub type Kobjs = Registry<KObj>;
 
+/// The kernel memory one object body holds, in bytes (MM5): the size of a registry entry rounded up to a power of two (a slab class when it
+/// fits one), charged to the creating job's kernel bytes with the object and credited when the object is destroyed. Queued data has its own
+/// charge (`IpcBytes`); handle tables, thread state and the rest are charged where they grow.
+pub const OBJECT_BYTES: u64 = (core::mem::size_of::<KObj>() as u64).next_power_of_two();
+
 /// Who is charged for a new object: the job of the creating process, and the ledger.
 pub struct Quota<'a> {
     pub jobs: &'a mut Jobs,
@@ -213,6 +218,15 @@ impl Quota<'_> {
                 self.jobs
                     .charge(job, Resource::Objects, n)
                     .map_err(|_| Status::NoMemory)?;
+                // (the bodies' memory: all or nothing with the count)
+                if self
+                    .jobs
+                    .charge(job, Resource::KernelBytes, n.saturating_mul(OBJECT_BYTES))
+                    .is_err()
+                {
+                    self.jobs.credit(job, Resource::Objects, n);
+                    return Err(Status::NoMemory);
+                }
                 // each charged object holds a use of its job until its credit is applied
                 // (`settle`), so the record cannot be freed while it still has usage
                 for _ in 0..n {
@@ -231,6 +245,7 @@ impl Quota<'_> {
 pub fn settle(reg: &mut Kobjs, jobs: &mut Jobs) {
     for (job, bytes) in reg.drain_credits() {
         jobs.credit(job, Resource::Objects, 1);
+        jobs.credit(job, Resource::KernelBytes, OBJECT_BYTES);
         jobs.credit(job, Resource::IpcBytes, bytes as u64);
         jobs.release(job); // the use the object held (see `Quota::objects`)
     }

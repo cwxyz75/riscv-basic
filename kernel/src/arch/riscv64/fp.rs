@@ -64,6 +64,9 @@ struct FpState {
     vtokens: Tokens,
     vthreads: BTreeMap<u64, VecThread>,
     vharts: [FpHart; crate::percpu::MAX_HARTS],
+    /// What each user thread's FP and vector state was charged to its job's kernel bytes (MM5): credited when the thread ends.
+    fp_charge: BTreeMap<u64, (kcore::job::JobId, u64)>,
+    vec_charge: BTreeMap<u64, (kcore::job::JobId, u64)>,
 }
 
 struct Cell(UnsafeCell<Option<FpState>>);
@@ -82,6 +85,8 @@ fn init_state(slot: &mut Option<FpState>) {
         vtokens: Tokens::starting_at(crate::dtb::ff_value("fptoken").unwrap_or(0)),
         vthreads: BTreeMap::new(),
         vharts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
+        fp_charge: BTreeMap::new(),
+        vec_charge: BTreeMap::new(),
     });
 }
 
@@ -520,6 +525,14 @@ fn fp_first_use(frame: &mut TrapFrame) -> bool {
     }
     let s = state();
     let tid = crate::thread::current();
+    // (the state is the job's kernel memory: a job at its limit cannot give a thread more; the instruction then faults like any illegal one)
+    if !charge_state(
+        &mut s.fp_charge,
+        tid,
+        core::mem::size_of::<FpThread>() as u64,
+    ) {
+        return false;
+    }
     let FpState {
         tokens, threads, ..
     } = s;
@@ -537,6 +550,10 @@ fn vec_first_use(frame: &mut TrapFrame) -> bool {
     }
     let s = state();
     let tid = crate::thread::current();
+    let bytes = (core::mem::size_of::<VecThread>() + crate::arch::vlenb_read() * 32) as u64;
+    if !charge_state(&mut s.vec_charge, tid, bytes) {
+        return false;
+    }
     let FpState {
         vtokens, vthreads, ..
     } = s;
@@ -548,6 +565,36 @@ fn vec_first_use(frame: &mut TrapFrame) -> bool {
         frame.sstatus |= 1 << 9; // Initial: the return path loads the zero state and sets Clean
     }
     enabled
+}
+
+/// Charge `bytes` of register state to the job of user thread `tid`, once (a second call for a thread already charged is free); `false`
+/// when the job is at its kernel-memory limit. Kernel threads are not charged.
+fn charge_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64, bytes: u64) -> bool {
+    if book.contains_key(&tid) {
+        return true;
+    }
+    let Some(job) = crate::user::job_of_thread(tid) else {
+        return true;
+    };
+    let j = crate::kmem::jobs();
+    if j.jobs
+        .charge(job, kcore::job::Resource::KernelBytes, bytes)
+        .is_err()
+    {
+        return false;
+    }
+    j.jobs.retain(job);
+    book.insert(tid, (job, bytes));
+    true
+}
+
+/// Give back what `charge_state` charged for `tid` in `book`.
+fn credit_state(book: &mut BTreeMap<u64, (kcore::job::JobId, u64)>, tid: u64) {
+    if let Some((job, bytes)) = book.remove(&tid) {
+        let j = crate::kmem::jobs();
+        j.jobs.credit(job, kcore::job::Resource::KernelBytes, bytes);
+        j.jobs.release(job);
+    }
 }
 
 /// A thread has ended: forget its FP and vector state.
@@ -573,6 +620,8 @@ pub fn thread_gone(tid: u64) {
     }
     s.threads.remove(&tid);
     s.vthreads.remove(&tid);
+    credit_state(&mut s.fp_charge, tid);
+    credit_state(&mut s.vec_charge, tid);
 }
 
 /// How many threads hold FP or vector state (the end-of-suite leak check: none may survive their process).
