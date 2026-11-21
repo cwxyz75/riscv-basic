@@ -3376,7 +3376,19 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
             "more than the limit of threads was allowed"
         );
         ts.push(r.a1 as u64);
+        if ts.len().is_multiple_of(256) {
+            println!(
+                "mark: thread_limit created {} at {} ms",
+                ts.len(),
+                sys::clock_get()
+            );
+        }
     }
+    println!(
+        "mark: thread_limit created all {} at {} ms",
+        ts.len(),
+        sys::clock_get()
+    );
     // this thread plus the others: the limit is `MAX_THREADS_PER_PROCESS` in all
     ensure_eq!(
         ts.len(),
@@ -3389,10 +3401,18 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
         Some(S::Ok),
         "wake them all"
     );
-    for &t in &ts {
+    println!("mark: thread_limit woken at {} ms", sys::clock_get());
+    for (n, &t) in ts.iter().enumerate() {
         let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + SLOW_MS);
         ensure_eq!(r.status, 0, "a thread ended");
         sys::handle_close(t);
+        if (n + 1).is_multiple_of(256) {
+            println!(
+                "mark: thread_limit joined {} at {} ms",
+                n + 1,
+                sys::clock_get()
+            );
+        }
     }
     ensure_eq!(
         st(sys::event_signal(ev, 1 << 24, 0)),
