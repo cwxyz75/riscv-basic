@@ -110,6 +110,10 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             .aspace
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
+                            if m.exec > 0 {
+                                // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
+                                crate::smp::icache_sync(m.exec);
+                            }
                             // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
                             // thread still runs under the old one)
                             kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());

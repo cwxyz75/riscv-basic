@@ -66,6 +66,13 @@ pub fn aspace_current_asid() -> u16 {
     ((aspace_current() >> 44) & 0xffff) as u16
 }
 
+/// Make this hart's instruction fetches see the stores it (and the kernel, through the direct map) has made to memory: `fence.i` (PL7).
+#[inline(always)]
+pub fn icache_flush_local() {
+    // SAFETY: `fence.i` synchronises the instruction stream with this hart's earlier stores; no other effect.
+    unsafe { asm!("fence.i") };
+}
+
 /// Flush the whole TLB of this hart.
 #[inline(always)]
 pub fn tlb_flush_all() {

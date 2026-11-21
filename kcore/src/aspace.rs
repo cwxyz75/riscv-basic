@@ -590,6 +590,10 @@ impl Vmos {
 pub struct MappedPages {
     pub first: u64,
     pub last: u64,
+    /// How many of the pages this fault mapped are executable (PL7): the caller must make the instruction caches of every hart agree with
+    /// memory before the thread runs them (`fence.i` here and on the other harts) when this is not 0. A page that was already mapped is not
+    /// counted: a spurious fault maps nothing.
+    pub exec: u64,
 }
 
 /// Fault-around works inside a window of this many pages (64 KiB), aligned (KERNEL-V1-SPEC 4.5): at most 15 neighbours.
@@ -923,6 +927,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 Ok(Lookup::Mapped(MappedPages {
                     first: page_va,
                     last: page_va,
+                    exec: 0,
                 }))
             } else {
                 Err(FaultError::Denied)
@@ -985,6 +990,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         let mut out = MappedPages {
             first: page_va,
             last: page_va,
+            exec: u64::from(perms.exec),
         };
         if vmos.kind(vmo) == Some(VmoKind::Device) {
             return Ok(out);
@@ -1011,6 +1017,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                         }
                         out.first = out.first.min(q);
                         out.last = out.last.max(q);
+                        out.exec = out.exec.saturating_add(u64::from(perms.exec));
                     }
                 }
             }
