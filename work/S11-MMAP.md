@@ -2,7 +2,7 @@
 id: S11-MMAP
 kind: slice
 horizon: long
-blocked_by: [MM9, MM8, FZ1]
+blocked_by: [MM9, FZ1]
 area: libc
 title: mmap of files, private and shared, in the C library and the file servers
 ---
