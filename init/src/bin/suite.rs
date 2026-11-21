@@ -3036,6 +3036,120 @@ fn a_write_to_a_protected_page_ends_the_process() -> Outcome {
     Ok(())
 }
 
+/// MM8: copy-on-write children from user mode. A SNAPSHOT child keeps the source's contents as they were and each side's later writes are
+/// private to it (the source's own writable mapping has to lose its write permission at the call: the negative control that skips that
+/// shows the child changing under a write through the source); a PRIVATE child sees what its source changes and its own writes stay
+/// its own; the argument errors; a VMO that inherits pages is not decommitted.
+fn copy_on_write_children_from_user_mode() -> Outcome {
+    const A: u64 = 0x5c0_0000;
+    const B: u64 = 0x5d0_0000;
+    const C: u64 = 0x5e0_0000;
+    let me = me()?;
+    let rd = |va: u64| -> u32 {
+        // SAFETY: the callers pass addresses inside mappings of this process.
+        unsafe { core::ptr::read_volatile(va as *const u32) }
+    };
+    let wr = |va: u64, v: u32| {
+        // SAFETY: as above, for mappings that are writable.
+        unsafe { core::ptr::write_volatile(va as *mut u32, v) }
+    };
+    let snap = rt::abi::child_flags::SNAPSHOT;
+    let private = rt::abi::child_flags::PRIVATE;
+    let v = vmo(4)?;
+    ensure_eq!(
+        st(sys::process_map(me, v, A, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the source"
+    );
+    for p in 0..4u64 {
+        wr(A + p * 4096, 100 + p as u32);
+    }
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 4 * 4096, 0, 0)),
+        Some(S::InvalidArgs),
+        "a flag is needed"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 4 * 4096, 0, snap | private)),
+        Some(S::InvalidArgs),
+        "exactly one flag"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 5 * 4096, 0, snap)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(BAD, 0, 4096, 0, snap)),
+        Some(S::BadHandle),
+        "no such VMO"
+    );
+    let c = ok(
+        sys::vmo_create_child(v, 0, 4 * 4096, 0, snap),
+        "a SNAPSHOT child",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, c, B, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the child"
+    );
+    for p in 0..4u64 {
+        ensure_eq!(
+            rd(B + p * 4096),
+            100 + p as u32,
+            "the child starts with the source's contents, page {p}"
+        );
+    }
+    // a write through the source's old writable mapping must reach neither the child nor the hidden pages
+    wr(A, 7_000);
+    ensure_eq!(rd(A), 7_000, "the source sees its write");
+    ensure_eq!(rd(B), 100, "the child does not");
+    wr(B + 4096, 8_000);
+    ensure_eq!(rd(B + 4096), 8_000, "the child sees its write");
+    ensure_eq!(rd(A + 4096), 101, "the source does not");
+    ensure_eq!(rd(A + 2 * 4096), 102, "an untouched page is still shared");
+    ensure_eq!(rd(B + 2 * 4096), 102, "in both");
+    // the source holds inherited pages now: no page is given back from under the child
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 4096)),
+        Some(S::BadState),
+        "decommit on a member of a family"
+    );
+    // a PRIVATE child of a fresh VMO sees the source's later changes, and its own writes stay its own
+    let u = vmo(2)?;
+    let um = 0x5f0_0000;
+    ensure_eq!(
+        st(sys::process_map(me, u, um, 0, 2 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map u"
+    );
+    wr(um, 1);
+    wr(um + 4096, 2);
+    let pc = ok(
+        sys::vmo_create_child(u, 0, 2 * 4096, 0, private),
+        "a PRIVATE child",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, pc, C, 0, 2 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it"
+    );
+    ensure_eq!(rd(C), 1, "it reads the source");
+    wr(um, 11);
+    ensure_eq!(rd(C), 11, "and sees what the source changes");
+    wr(C + 4096, 22);
+    ensure_eq!(rd(C + 4096), 22, "its own write");
+    ensure_eq!(rd(um + 4096), 2, "does not reach the source");
+    // everything goes
+    for (h, va) in [(c, B), (pc, C), (v, A), (u, um)] {
+        ensure_eq!(st(sys::process_unmap(me, va)), Some(S::Ok), "unmap");
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 /// MM6: a mapping that outlives a shrink: touching the part of it past the VMO's new end ends the process with a page fault.
 fn touching_past_a_shrunk_vmo_ends_the_process_cleanly() -> Outcome {
     let (p, _m) = launch(100)?;
@@ -12796,6 +12910,10 @@ pub fn app_main() -> i32 {
         (
             "vmo_decommit_and_resize_from_user_mode",
             vmo_decommit_and_resize_from_user_mode,
+        ),
+        (
+            "copy_on_write_children_from_user_mode",
+            copy_on_write_children_from_user_mode,
         ),
         (
             "touching_past_a_shrunk_vmo_ends_the_process_cleanly",

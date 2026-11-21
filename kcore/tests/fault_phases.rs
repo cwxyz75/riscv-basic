@@ -31,7 +31,7 @@ fn lookup_finds_the_page_to_fetch_and_a_mapped_page_is_a_spurious_fault() {
     assert_eq!(plan.vmo_page(), (id, 1));
     vmos.commit(&mut mm, &mut jobs, id, 1, 1).unwrap();
     let pfn = vmos.frame(id, 1).unwrap();
-    let m = a.fault_map(&mut mm, &mut vmos, &plan, pfn).unwrap();
+    let m = a.fault_map(&mut mm, &mut vmos, &plan, pfn, true).unwrap();
     assert!(m.first <= BASE + 4096 && BASE + 4096 <= m.last);
     assert!(matches!(
         a.fault_lookup(&mm, BASE + 4096, Access::Read).unwrap(),
@@ -57,7 +57,7 @@ fn a_region_unmapped_between_the_lookup_and_the_map_is_not_mapped_into() {
     a.unmap_region(&mut mm, &mut vmos, &mut jobs, BASE).unwrap();
     let before = mm.db.free_count();
     assert_eq!(
-        a.fault_map(&mut mm, &mut vmos, &plan, pfn),
+        a.fault_map(&mut mm, &mut vmos, &plan, pfn, true),
         Err(FaultMapError::Stale)
     );
     assert_eq!(mm.db.free_count(), before, "nothing was taken or mapped");
@@ -85,7 +85,7 @@ fn a_region_replaced_at_the_same_address_is_not_the_one_the_fault_looked_up() {
     a.unmap_region(&mut mm, &mut vmos, &mut jobs, BASE).unwrap();
     a.map_region(&mut vmos, BASE, 4, two, 0, Perms::RW).unwrap(); // same start, another VMO
     assert_eq!(
-        a.fault_map(&mut mm, &mut vmos, &plan, pfn),
+        a.fault_map(&mut mm, &mut vmos, &plan, pfn, true),
         Err(FaultMapError::Stale),
         "a new region at the same address is a different region"
     );

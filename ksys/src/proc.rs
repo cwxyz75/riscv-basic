@@ -35,6 +35,10 @@ pub trait Machine {
     fn random_below(&mut self, _n: u64) -> u64 {
         0
     }
+    /// Negative control (MM8): leave out the write-protection of a SNAPSHOT's source mappings. Never true in a real kernel.
+    fn skip_cow_protect(&self) -> bool {
+        false
+    }
 }
 
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
@@ -192,6 +196,27 @@ fn resolve_map_args(
     Ok((tpid, vid, max))
 }
 
+/// A SNAPSHOT moved the pages of VMO `vmo` to a node it shares with the child: take the write permission off every translation of it, and
+/// have every hart drop what it cached, before anything runs (COW1; the negative control `fault-skip-cow-protect` leaves it out).
+fn snapshot_protect<M: PhysMem, X: Machine>(
+    procs: &mut BTreeMap<u64, Box<Process>>,
+    mm: &mut Mm<M>,
+    machine: &mut X,
+    vmo: u64,
+) {
+    if machine.skip_cow_protect() {
+        return;
+    }
+    let mut changed = 0u64;
+    for p in procs.values_mut() {
+        changed = changed.saturating_add(p.aspace.write_protect_vmo(mm, vmo));
+    }
+    if changed > 0 {
+        machine.shootdown();
+        machine.flush_tlb();
+    }
+}
+
 /// `None`: `n` is not one of these calls.
 #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: vaddr + length and offset + length were checked with checked_add against the user limit and the VMO's size; the page-table estimate is length / 4096 / 512 + 4; room in the handle table was checked before the insert of another view of the process
 pub fn proc_call<M: PhysMem, X: Machine>(
@@ -217,6 +242,15 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             let (tpid, vid, max_perms) =
                 resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
             let caller_job = caller.job;
+            // a VMO that inherits pages (a child, or the source of a SNAPSHOT) is mapped in one address space only: a copy made by one mapper
+            // could not reach the stale read-only translations of another (COW1)
+            if vmos.has_parent(vid)
+                && procs
+                    .iter()
+                    .any(|(&pid, p)| pid != tpid && p.aspace.maps_vmo_range(vid, 0, u64::MAX))
+            {
+                return bad(Status::BadState);
+            }
             let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
             if target.exit_code.is_some() || target.killed.is_some() {
                 return bad(Status::BadState);
@@ -368,8 +402,195 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 Ok(()) => Ok((None, None)),
                 Err(kcore::aspace::VmoError::Gone) => Err(e(Status::BadHandle)),
                 Err(kcore::aspace::VmoError::NotResizable) => Err(e(Status::AccessDenied)),
+                Err(kcore::aspace::VmoError::InFamily) => Err(e(Status::BadState)),
                 Err(_) => Err(e(Status::InvalidArgs)),
             }
+        })(),
+        nr::VMO_CREATE_CHILD => (|| {
+            use kcore::aspace::{ChildMode, VmoError};
+            let (offset, bytes, job_handle, flags) = (a[1], a[2], a[3], a[4]);
+            let mode = match flags {
+                abi::child_flags::SNAPSHOT => ChildMode::Snapshot,
+                abi::child_flags::PRIVATE => ChildMode::Private,
+                _ => return bad(Status::InvalidArgs),
+            };
+            if !offset.is_multiple_of(4096) || !bytes.is_multiple_of(4096) || bytes == 0 {
+                return bad(Status::InvalidArgs);
+            }
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::READ).map_err(e)?;
+            let caller_job = caller.job;
+            let job = if job_handle == 0 {
+                caller_job
+            } else {
+                ipc::job_of(objs, &caller.handles, Handle(job_handle), Rights::MANAGE).map_err(e)?
+            };
+            if mode == ChildMode::Snapshot {
+                // the pages never change payer (COW2)
+                if vmos.job_of(id) != Some(job) {
+                    return bad(Status::AccessDenied);
+                }
+                // a VMO that inherits pages is mapped in one address space only (COW1: a copy made by one mapper could not reach the
+                // stale read-only translations of another's)
+                if procs
+                    .values()
+                    .filter(|p| p.aspace.maps_vmo_range(id, 0, u64::MAX))
+                    .count()
+                    > 1
+                {
+                    return bad(Status::BadState);
+                }
+            }
+            vmos.reserve_n(2).map_err(e)?;
+            let child = match vmos.create_child(jobs, id, offset / 4096, bytes / 4096, job, mode) {
+                Ok(c) => c,
+                Err(VmoError::Gone) => return bad(Status::BadHandle),
+                Err(VmoError::JobMismatch) => return bad(Status::AccessDenied),
+                Err(VmoError::TooDeep) => return bad(Status::BadState),
+                Err(VmoError::NotCopyable) => return bad(Status::NotSupported),
+                Err(_) => return bad(Status::InvalidArgs),
+            };
+            if mode == ChildMode::Snapshot {
+                snapshot_protect(procs, mm, &mut **machine, id);
+            }
+            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
+            match ipc::vmo_object_create_in(
+                objs,
+                &mut caller.handles,
+                child,
+                &mut ipc::Quota {
+                    jobs,
+                    job: Some(caller_job),
+                },
+            ) {
+                Ok(h) => Ok((Some(h.0), None)),
+                Err(x) => {
+                    let _ = vmos.release(mm, jobs, child);
+                    Err(e(x))
+                }
+            }
+        })(),
+        nr::PROCESS_CLONE_REGION => (|| {
+            use kcore::aspace::{ChildMode, VmoError};
+            let (vaddr, mode) = (a[2], a[3]);
+            if (mode != abi::clone_mode::SHARE && mode != abi::clone_mode::SNAPSHOT)
+                || !vaddr.is_multiple_of(4096)
+            {
+                return bad(Status::InvalidArgs);
+            }
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let (_, spid, _, _) =
+                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::MANAGE).map_err(e)?;
+            let (_, tpid, _, _) =
+                ipc::process_of(objs, &caller.handles, Handle(a[1]), Rights::MANAGE).map_err(e)?;
+            let caller_job = caller.job;
+            let source = procs.get(&spid).ok_or(e(Status::BadState))?;
+            let target = procs.get(&tpid).ok_or(e(Status::BadState))?;
+            if source.exit_code.is_some()
+                || source.killed.is_some()
+                || target.exit_code.is_some()
+                || target.killed.is_some()
+            {
+                return bad(Status::BadState);
+            }
+            let region = source
+                .aspace
+                .region_at_or_after(vaddr)
+                .filter(|r| r.start == vaddr)
+                .ok_or(e(Status::InvalidArgs))?;
+            let length = region.pages * 4096;
+            let end = vaddr.checked_add(length).ok_or(e(Status::InvalidArgs))?;
+            if target.aspace.has_region_in(vaddr, end) {
+                return bad(Status::InvalidArgs);
+            }
+            let target_job = target.job;
+            let vid = region.vmo;
+            let vmo_job = vmos.job_of(vid).ok_or(e(Status::BadHandle))?;
+            let snapshot = mode == abi::clone_mode::SNAPSHOT;
+            let mappers = procs
+                .values()
+                .filter(|p| p.aspace.maps_vmo_range(vid, 0, u64::MAX))
+                .count();
+            if snapshot {
+                // a fork child runs in its parent's job: the copy is charged to the source's job, which must be the target's
+                if vmo_job != target_job {
+                    return bad(Status::AccessDenied);
+                }
+                if mappers > 1 {
+                    return bad(Status::BadState);
+                }
+            } else {
+                // a VMO that inherits pages is mapped in one address space only
+                if vmos.has_parent(vid) && spid != tpid {
+                    return bad(Status::BadState);
+                }
+                // (V1, as `process_map`: a stranger's VMO must already be paid for)
+                if vmo_job != caller_job
+                    && vmo_job != target_job
+                    && !vmos.is_committed(vid, region.vmo_page, region.pages)
+                {
+                    return bad(Status::BadState);
+                }
+            }
+            let tables = region.pages / 512 + 4;
+            jobs.charge(target_job, Resource::Pages, tables)
+                .map_err(|x| e(crate::job_status(x)))?;
+            let (map_vmo, map_page, child) = if snapshot {
+                if let Err(x) = vmos.reserve_n(2) {
+                    jobs.credit(target_job, Resource::Pages, tables);
+                    return bad(x);
+                }
+                match vmos.create_child(
+                    jobs,
+                    vid,
+                    region.vmo_page,
+                    region.pages,
+                    vmo_job,
+                    ChildMode::Snapshot,
+                ) {
+                    Ok(c) => (c, 0, Some(c)),
+                    Err(x) => {
+                        jobs.credit(target_job, Resource::Pages, tables);
+                        return bad(match x {
+                            VmoError::TooDeep => Status::BadState,
+                            VmoError::JobMismatch => Status::AccessDenied,
+                            VmoError::Gone => Status::BadHandle,
+                            _ => Status::InvalidArgs,
+                        });
+                    }
+                }
+            } else {
+                (vid, region.vmo_page, None)
+            };
+            if snapshot {
+                snapshot_protect(procs, mm, &mut **machine, vid);
+            }
+            let target = procs.get_mut(&tpid).ok_or(e(Status::BadState))?;
+            let mapped = target.aspace.map_region_max(
+                vmos,
+                vaddr,
+                region.pages,
+                map_vmo,
+                map_page,
+                region.perms,
+                region.max_perms,
+            );
+            // (the region holds its own reference on the child: the creator's goes either way)
+            if let Some(c) = child {
+                let _ = vmos.release(mm, jobs, c);
+            }
+            if let Err(x) = mapped {
+                jobs.credit(target_job, Resource::Pages, tables);
+                return Err(match x {
+                    kcore::aspace::RegionError::TooMany => e(Status::NoMemory),
+                    _ => e(Status::InvalidArgs),
+                });
+            }
+            *target.table_charge.entry(vaddr).or_default() += tables;
+            let extent = target.charge_end.entry(vaddr).or_insert(end);
+            *extent = (*extent).max(end);
+            target.aspace.merge_near(mm, vmos, jobs, vaddr, end);
+            Ok((None, None))
         })(),
         nr::PROCESS_UNMAP => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;

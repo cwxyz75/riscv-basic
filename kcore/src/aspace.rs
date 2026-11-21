@@ -61,6 +61,10 @@ pub struct FaultPlan {
     perms: Perms,
     pages: u64,
     gen: u64,
+    /// The access is a write: a page the VMO only inherits is copied into it first (MM8).
+    write: bool,
+    /// The page is mapped read-only and the region allows writes: this fault replaces the mapping by one of the VMO's own page.
+    cow: bool,
 }
 
 impl FaultPlan {
@@ -144,6 +148,33 @@ pub enum VmoError {
     Fixed,
     /// The VMO was not made resizable.
     NotResizable,
+    /// A chain of children would pass `MAX_FAMILY_DEPTH`.
+    TooDeep,
+    /// A SNAPSHOT child must be charged to the source's job (the pages never change payer).
+    JobMismatch,
+    /// A VMO that is part of a family (it has a parent or children) cannot give pages back: a child would see the hole.
+    InFamily,
+    /// Make the child of a device or DMA VMO: their frames are fixed.
+    NotCopyable,
+}
+
+/// A chain of children is at most this deep (KERNEL-V1-SPEC 4.3).
+pub const MAX_FAMILY_DEPTH: usize = 64;
+
+/// How a child sees its source (`Vmos::create_child`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildMode {
+    /// The source and the child each see the source's contents as they were, and each one's later writes are private to it.
+    Snapshot,
+    /// The child sees the source's pages, including later changes to those it has not written; its writes are private to it.
+    Private,
+}
+
+/// A VMO's parent: the node it inherits unwritten pages from, and where its page 0 sits in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Link {
+    id: u64,
+    offset: u64,
 }
 
 /// What backs a VMO.
@@ -170,6 +201,12 @@ struct Vmo {
     committed: PageMap,
     /// Made with the RESIZABLE flag: `set_size` may change `pages` (MM6).
     resizable: bool,
+    /// The node this one inherits from (MM8): a page it has not committed itself is found there, window `offset`.
+    parent: Option<Link>,
+    /// Nodes that have this one as their parent. A VMO with children cannot give pages back or change size.
+    children: u32,
+    /// Made by a SNAPSHOT: holds the source's pages for the source and the child, has no handle and is never mapped or written.
+    hidden: bool,
 }
 
 struct VmoSlot {
@@ -198,10 +235,16 @@ impl Vmos {
     /// own bookkeeping, and destroying any VMO never does (KT9).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len()
     pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
+        self.reserve_n(1)
+    }
+
+    /// `reserve_one` for `n` VMOs at once (a SNAPSHOT child makes two: itself and the hidden node).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len(); n is 1 or 2
+    pub fn reserve_n(&mut self, n: usize) -> Result<(), abi::status::Status> {
         let no_memory = |_| abi::status::Status::NoMemory;
-        self.slots.try_reserve(1).map_err(no_memory)?;
+        self.slots.try_reserve(n).map_err(no_memory)?;
         self.free
-            .try_reserve(self.slots.len() + 1 - self.free.len())
+            .try_reserve(self.slots.len() + n - self.free.len())
             .map_err(no_memory)
     }
 
@@ -277,6 +320,9 @@ impl Vmos {
             refs: 1,
             committed: PageMap::new(),
             resizable: false,
+            parent: None,
+            children: 0,
+            hidden: false,
         })
     }
 
@@ -292,6 +338,9 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            parent: None,
+            children: 0,
+            hidden: false,
         })
     }
 
@@ -327,6 +376,9 @@ impl Vmos {
             refs: 1,
             committed: PageMap::from_run(pages, first),
             resizable: false,
+            parent: None,
+            children: 0,
+            hidden: false,
         }))
     }
 
@@ -353,9 +405,138 @@ impl Vmos {
         self.vmo(id).map(|v| v.pages)
     }
 
-    /// The frame backing a committed page.
+    /// The frame backing a page the VMO can see: its own committed page, else the nearest ancestor's (MM8).
     pub fn frame(&self, id: u64, page: u64) -> Option<Pfn> {
-        self.vmo(id)?.committed.get(page)
+        self.lookup(id, page).map(|(pfn, _)| pfn)
+    }
+
+    /// `frame`, and whether the VMO owns the page (committed in it, so it may be mapped writable) or only inherits it.
+    pub fn frame_info(&self, id: u64, page: u64) -> Option<(Pfn, bool)> {
+        self.lookup(id, page)
+    }
+
+    /// Walk from the VMO towards the root of its family: the first node with the page committed.
+    fn lookup(&self, id: u64, page: u64) -> Option<(Pfn, bool)> {
+        let (mut cur, mut page, mut own) = (id, page, true);
+        for _ in 0..=MAX_FAMILY_DEPTH {
+            let v = self.vmo(cur)?;
+            if let Some(pfn) = v.committed.get(page) {
+                return Some((pfn, own));
+            }
+            let link = v.parent?;
+            page = page.checked_add(link.offset)?;
+            cur = link.id;
+            own = false;
+        }
+        None
+    }
+
+    /// Does the VMO inherit pages from another (it is a child or the source of a SNAPSHOT)?
+    pub fn has_parent(&self, id: u64) -> bool {
+        self.vmo(id).is_some_and(|v| v.parent.is_some())
+    }
+
+    /// Does the VMO belong to a family: a parent or children?
+    pub fn in_family(&self, id: u64) -> bool {
+        self.vmo(id)
+            .is_some_and(|v| v.parent.is_some() || v.children > 0)
+    }
+
+    /// How many links lie between the VMO and the root of its family.
+    fn depth(&self, id: u64) -> usize {
+        let (mut cur, mut n) = (id, 0usize);
+        while let Some(l) = self.vmo(cur).and_then(|v| v.parent) {
+            cur = l.id;
+            n = n.saturating_add(1);
+            if n > MAX_FAMILY_DEPTH {
+                break;
+            }
+        }
+        n
+    }
+
+    /// Make a child of `source`'s pages `offset .. offset + pages` charged to `job` (MM8). SNAPSHOT: `job` must be the source's job; the
+    /// source's committed pages move to a new hidden node that source and child hang under, so each sees the contents as they were and
+    /// writes after that are private to the writer (the caller write-protects the source's mappings and shoots the translations down
+    /// before anything runs). PRIVATE: the child hangs under the source, which stays as it is. Room for two VMOs must have been made
+    /// (`reserve_n`). Returns the child; `Gone`, `OutOfRange`, `NotCopyable`, `JobMismatch` or `TooDeep` change nothing.
+    pub fn create_child(
+        &mut self,
+        jobs: &mut Jobs,
+        source: u64,
+        offset: u64,
+        pages: u64,
+        job: JobId,
+        mode: ChildMode,
+    ) -> Result<u64, VmoError> {
+        let src = self.vmo(source).ok_or(VmoError::Gone)?;
+        if src.kind != VmoKind::Plain || src.hidden {
+            return Err(VmoError::NotCopyable);
+        }
+        let end = offset.checked_add(pages).ok_or(VmoError::OutOfRange)?;
+        if pages == 0 || end > src.pages {
+            return Err(VmoError::OutOfRange);
+        }
+        if mode == ChildMode::Snapshot && src.job != job {
+            return Err(VmoError::JobMismatch);
+        }
+        // (a SNAPSHOT puts one node between the source and its old parent, a PRIVATE child one below the source)
+        if self.depth(source).saturating_add(1) >= MAX_FAMILY_DEPTH {
+            return Err(VmoError::TooDeep);
+        }
+        let src_job = src.job;
+        let src_pages = src.pages;
+        let child_parent = match mode {
+            ChildMode::Private => {
+                if let Some(v) = Self::vmo_in(&mut self.slots, source) {
+                    v.children = v.children.saturating_add(1);
+                    v.refs = v.refs.saturating_add(1);
+                }
+                Link { id: source, offset }
+            }
+            ChildMode::Snapshot => {
+                jobs.retain(src_job);
+                let (old_parent, committed) = {
+                    let v = Self::vmo_in(&mut self.slots, source).ok_or(VmoError::Gone)?;
+                    (
+                        v.parent,
+                        core::mem::replace(&mut v.committed, PageMap::new()),
+                    )
+                };
+                // the hidden node takes the source's pages and the source's place under its old parent (that link keeps its count and
+                // its reference); the source and the child each hold one reference on it
+                let hidden = self.place(Vmo {
+                    kind: VmoKind::Plain,
+                    job: src_job,
+                    pages: src_pages,
+                    refs: 2,
+                    committed,
+                    resizable: false,
+                    parent: old_parent,
+                    children: 2,
+                    hidden: true,
+                });
+                if let Some(v) = Self::vmo_in(&mut self.slots, source) {
+                    v.parent = Some(Link {
+                        id: hidden,
+                        offset: 0,
+                    });
+                }
+                Link { id: hidden, offset }
+            }
+        };
+        jobs.retain(job);
+        Ok(self.place(Vmo {
+            kind: VmoKind::Plain,
+            job,
+            pages,
+            refs: 1,
+            committed: PageMap::new(),
+            resizable: false,
+            parent: Some(child_parent),
+            children: 0,
+            hidden: false,
+        }))
     }
 
     /// Take one more reference on a VMO (a region maps it). `Err` if the id is not a live VMO.
@@ -381,31 +562,49 @@ impl Vmos {
         jobs: &mut Jobs,
         id: u64,
     ) -> Result<(), VmoGone> {
-        let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
-        v.refs -= 1;
-        if v.refs > 0 {
-            return Ok(());
-        }
-        let vmo = self.take(id).ok_or(VmoGone)?;
-        if vmo.kind == VmoKind::Device {
-            // device frames are not ours: nothing was charged and nothing is freed
+        // (a child holds a reference on its parent: when it goes, the parent loses one, and so on up the family, without recursion)
+        let mut cur = id;
+        let mut first = true;
+        loop {
+            let Some(v) = Self::vmo_in(&mut self.slots, cur) else {
+                return if first { Err(VmoGone) } else { Ok(()) };
+            };
+            v.refs -= 1;
+            if v.refs > 0 {
+                return Ok(());
+            }
+            let Some(vmo) = self.take(cur) else {
+                return if first { Err(VmoGone) } else { Ok(()) };
+            };
+            first = false;
+            if vmo.kind == VmoKind::Device {
+                // device frames are not ours: nothing was charged and nothing is freed
+                jobs.release(vmo.job);
+                return Ok(());
+            }
+            if vmo.kind == VmoKind::Dma {
+                self.dma_pages -= vmo.pages;
+            }
+            jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
             jobs.release(vmo.job);
-            return Ok(());
+            let mut committed = vmo.committed;
+            committed.drain_pfns(|pfn| {
+                let dropped = mm.db.dec(pfn);
+                debug_assert!(
+                    dropped.is_ok(),
+                    "a committed page holds the VMO's reference"
+                );
+            });
+            match vmo.parent {
+                Some(l) => {
+                    if let Some(p) = Self::vmo_in(&mut self.slots, l.id) {
+                        p.children = p.children.saturating_sub(1);
+                    }
+                    cur = l.id;
+                }
+                None => return Ok(()),
+            }
         }
-        if vmo.kind == VmoKind::Dma {
-            self.dma_pages -= vmo.pages;
-        }
-        jobs.credit(vmo.job, Resource::Pages, vmo.committed.len() as u64);
-        jobs.release(vmo.job);
-        let mut committed = vmo.committed;
-        committed.drain_pfns(|pfn| {
-            let dropped = mm.db.dec(pfn);
-            debug_assert!(
-                dropped.is_ok(),
-                "a committed page holds the VMO's reference"
-            );
-        });
-        Ok(())
     }
 
     /// Write bytes into a VMO at `offset`, committing pages as needed (loading a program
@@ -448,7 +647,7 @@ impl Vmos {
             let at = offset + done as u64;
             let (page, inner) = (at / PAGE_SIZE, (at % PAGE_SIZE) as usize);
             let n = (PAGE_SIZE as usize - inner).min(len - done);
-            match vmo.committed.get(page) {
+            match self.lookup(id, page).map(|(pfn, _)| pfn) {
                 Some(pfn) => mm
                     .mem
                     .read_bytes((pfn << 12) + inner as u64, &mut out[done..done + n]),
@@ -485,7 +684,7 @@ impl Vmos {
         // Commit everything first so a failure part-way leaves no half-written data.
         let mut at = offset;
         while at < end {
-            self.page_for(mm, jobs, None, id, at / PAGE_SIZE)
+            self.page_for(mm, jobs, None, id, at / PAGE_SIZE, true)
                 .map_err(|_| VmoError::NoMemory)?;
             at = (at / PAGE_SIZE + 1) * PAGE_SIZE;
         }
@@ -538,7 +737,7 @@ impl Vmos {
             if self.vmo(id).is_some_and(|v| v.committed.contains(page)) {
                 continue;
             }
-            match self.page_for(mm, jobs, None, id, page) {
+            match self.page_for(mm, jobs, None, id, page, true) {
                 Ok(_) => done.push(page),
                 Err(_) => {
                     // undo this call's commits: frames back, charges back
@@ -613,6 +812,10 @@ impl Vmos {
         if end > vmo.pages {
             return Err(VmoError::OutOfRange);
         }
+        // (a page given back would show the family's older page through: T209 lets a member give back what it owns)
+        if vmo.parent.is_some() || vmo.children > 0 {
+            return Err(VmoError::InFamily);
+        }
         let mut freed = 0u64;
         for page in first..end {
             if let Some(pfn) = vmo.committed.remove(page) {
@@ -643,6 +846,9 @@ impl Vmos {
         if !vmo.resizable {
             return Err(VmoError::NotResizable);
         }
+        if vmo.parent.is_some() || vmo.children > 0 {
+            return Err(VmoError::InFamily);
+        }
         let old = vmo.pages;
         if pages < old {
             self.decommit(mm, jobs, id, pages, old.saturating_sub(pages))?;
@@ -658,8 +864,9 @@ impl Vmos {
         self.vmo(id).map(|v| v.job)
     }
 
-    /// "Give me a page for this offset": the committed frame, allocating a zeroed
-    /// one on first touch. The VMO keeps its own reference.
+    /// "Give me a page for this offset": the frame the VMO sees there, with `true` when the VMO owns it. A page nobody in the family has is
+    /// allocated zeroed on first touch. A page only inherited is returned as it is for a read; for a write (`write`) it is copied into a
+    /// new frame of this VMO, charged to its job (MM8). The VMO keeps its own reference on the frames it owns.
     fn page_for<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
@@ -667,15 +874,20 @@ impl Vmos {
         mut reserve: Option<&mut Reservation>,
         id: u64,
         page: u64,
-    ) -> Result<Pfn, FaultError> {
-        let vmo = Self::vmo_in(&mut self.slots, id).ok_or(FaultError::VmoGone)?;
-        if let Some(pfn) = vmo.committed.get(page) {
-            return Ok(pfn);
-        }
+        write: bool,
+    ) -> Result<(Pfn, bool), FaultError> {
         // (a VMO that was shrunk under a mapping: the page is past its end, the access is refused like one outside any region)
-        if page >= vmo.pages {
+        if page >= self.vmo(id).ok_or(FaultError::VmoGone)?.pages {
             return Err(FaultError::NoRegion);
         }
+        let found = self.lookup(id, page);
+        if let Some((pfn, own)) = found {
+            if own || !write {
+                return Ok((pfn, own));
+            }
+        }
+        let copy_from = found.map(|(pfn, _)| pfn);
+        let vmo = Self::vmo_in(&mut self.slots, id).ok_or(FaultError::VmoGone)?;
         // The job's limit first (a full job is "out of memory" for its own programs only), from the address space's prepaid pages when
         // it has them (a fault), else charged now; then the frame. A frame that cannot be had gives the page back.
         let prepaid = match reserve.as_deref_mut() {
@@ -703,8 +915,20 @@ impl Vmos {
             give_back(jobs, &mut reserve);
             return Err(FaultError::NoMemory);
         }
-        mm.mem.zero_frame(pfn);
-        Ok(pfn)
+        match copy_from {
+            Some(from) => copy_frame(mm, from, pfn),
+            None => mm.mem.zero_frame(pfn),
+        }
+        Ok((pfn, true))
+    }
+}
+
+/// Copy the 4 KiB frame `from` to `to` (a write to a page the writer only inherited).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: frame numbers are below 2^52, so `pfn << 12` and the word offsets below 4096 do not overflow
+fn copy_frame<M: PhysMem>(mm: &mut Mm<M>, from: Pfn, to: Pfn) {
+    for w in 0..PAGE_SIZE / 8 {
+        let v = mm.mem.read_u64((from << 12) + w * 8);
+        mm.mem.write_u64((to << 12) + w * 8, v);
     }
 }
 
@@ -713,6 +937,9 @@ impl Vmos {
 pub struct MappedPages {
     pub first: u64,
     pub last: u64,
+    /// How many translations this fault replaced (a write to a page the VMO only inherited, MM8): another hart may still cache the
+    /// read-only one, so when this is not 0 the caller shoots them down on every hart, not only here.
+    pub replaced: u64,
     /// How many of the pages this fault mapped are executable (PL7): the caller must make the instruction caches of every hart agree with
     /// memory before the thread runs them (`fence.i` here and on the other harts) when this is not 0. A page that was already mapped is not
     /// counted: a spurious fault maps nothing.
@@ -819,6 +1046,8 @@ pub struct AddressSpace<F: PageTableFormat = Sv39> {
     reserve: Reservation,
     /// The generation the next region gets (see `Region::gen`).
     next_gen: u64,
+    /// Translations a copy-on-write fault replaced since the last `take_replaced` (MM8): other harts may still cache the old, read-only ones.
+    replaced: u64,
 }
 
 impl<F: PageTableFormat> AddressSpace<F> {
@@ -828,7 +1057,14 @@ impl<F: PageTableFormat> AddressSpace<F> {
             regions: BTreeMap::new(),
             reserve: Reservation::default(),
             next_gen: 1,
+            replaced: 0,
         }
+    }
+
+    /// How many translations copy-on-write faults replaced since the last call, and forget them: the caller shoots down every hart's TLB
+    /// when it is not 0 (a fault taken inside a kernel copy to user memory cannot do it itself).
+    pub fn take_replaced(&mut self) -> u64 {
+        core::mem::take(&mut self.replaced)
     }
 
     /// The prepaid pages this address space holds (they count as its job's usage).
@@ -1242,6 +1478,34 @@ impl<F: PageTableFormat> AddressSpace<F> {
             .any(|r| r.vmo == vmo && first < r.vmo_page + r.pages && r.vmo_page < end)
     }
 
+    /// Take the write permission off every mapped page of VMO `vmo` in this address space (a SNAPSHOT: the pages the source held are now
+    /// shared with the child, so the next write must fault and copy). Returns how many translations changed. **The caller flushes the
+    /// translations on every hart before anything runs.**
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted; p < r.pages
+    pub fn write_protect_vmo<M: PhysMem>(&mut self, mm: &mut Mm<M>, vmo: u64) -> u64 {
+        let mut changed = 0u64;
+        for (&start, r) in self.regions.iter() {
+            if r.vmo != vmo || !r.perms.write {
+                continue;
+            }
+            for p in 0..r.pages {
+                let va = start + p * PAGE_SIZE;
+                if let Some(t) = self.table.translate(mm, va) {
+                    if t.perms.write {
+                        let ro = Perms {
+                            write: false,
+                            ..t.perms
+                        };
+                        if self.table.protect(mm, va, ro).is_some() {
+                            changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Unmap, in this address space, every mapped page of VMO `vmo` among its pages `first .. first + pages` (MM6: before the VMO gives the
     /// pages back). Drops each mapping's reference on its frame; regions stay. Returns how many pages were unmapped. **The caller must flush
     /// the TLBs (every hart) before the VMO's own references on those frames are dropped.**
@@ -1342,9 +1606,27 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 Lookup::Plan(plan) => plan,
             };
             let (fetch_vmo, fetch_page) = plan.vmo_page();
-            let pfn = vmos.page_for(mm, jobs, Some(&mut self.reserve), fetch_vmo, fetch_page)?;
-            match self.fault_map(mm, vmos, &plan, pfn) {
-                Ok(m) => return Ok(m),
+            let (pfn, own) = vmos.page_for(
+                mm,
+                jobs,
+                Some(&mut self.reserve),
+                fetch_vmo,
+                fetch_page,
+                plan.write,
+            )?;
+            // a write to a page that is mapped read-only (the VMO now owns its own copy, or the source's mappings were write-protected
+            // by a SNAPSHOT): every mapping of the page in this address space goes, the fault maps the right frame afresh
+            let replaced = if plan.cow {
+                self.unmap_vmo_pages(mm, fetch_vmo, fetch_page, 1)
+            } else {
+                0
+            };
+            match self.fault_map(mm, vmos, &plan, pfn, own) {
+                Ok(mut m) => {
+                    m.replaced = replaced;
+                    self.replaced = self.replaced.saturating_add(replaced);
+                    return Ok(m);
+                }
                 Err(FaultMapError::Stale) => continue,
                 Err(FaultMapError::Fault(e)) => return Err(e),
             }
@@ -1391,7 +1673,22 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 Ok(Lookup::Mapped(MappedPages {
                     first: page_va,
                     last: page_va,
+                    replaced: 0,
                     exec: 0,
+                }))
+            } else if access == Access::Write && region.perms.write {
+                // mapped read-only under a writable region: the page is shared copy-on-write (MM8)
+                Ok(Lookup::Plan(FaultPlan {
+                    start,
+                    page,
+                    page_va,
+                    vmo: region.vmo,
+                    vmo_page: region.vmo_page,
+                    perms: region.perms,
+                    pages: region.pages,
+                    gen: region.gen,
+                    write: true,
+                    cow: true,
                 }))
             } else {
                 Err(FaultError::Denied)
@@ -1406,6 +1703,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
             perms: region.perms,
             pages: region.pages,
             gen: region.gen,
+            write: access == Access::Write,
+            cow: false,
         }))
     }
 
@@ -1419,16 +1718,22 @@ impl<F: PageTableFormat> AddressSpace<F> {
         vmos: &mut Vmos,
         plan: &FaultPlan,
         pfn: Pfn,
+        own: bool,
     ) -> Result<MappedPages, FaultMapError> {
         match self.regions.get(&plan.start) {
             Some(r) if r.gen == plan.gen => {}
             _ => return Err(FaultMapError::Stale),
         }
+        // a page the VMO only inherits is mapped read-only: a write fault copies it first
+        let own_perms = |own: bool| Perms {
+            write: plan.perms.write && own,
+            ..plan.perms
+        };
         let (start, page_va, vmo, perms, vmo_page0, region_pages) = (
             plan.start,
             plan.page_va,
             plan.vmo,
-            plan.perms,
+            own_perms(own),
             plan.vmo_page,
             plan.pages,
         );
@@ -1454,6 +1759,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
         let mut out = MappedPages {
             first: page_va,
             last: page_va,
+            replaced: 0,
             exec: u64::from(perms.exec),
         };
         if vmos.kind(vmo) == Some(VmoKind::Device) {
@@ -1467,7 +1773,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
         while q < hi {
             if q != page_va {
                 let qpage = (q - start) / PAGE_SIZE;
-                if let Some(qpfn) = vmos.frame(vmo, vmo_page0 + qpage) {
+                if let Some((qpfn, qown)) = vmos.frame_info(vmo, vmo_page0 + qpage) {
+                    let perms = own_perms(qown);
                     if self.table.translate(mm, q).is_none() {
                         let qmanaged = mm.db.is_managed(qpfn);
                         if qmanaged && mm.db.inc(qpfn).is_err() {
