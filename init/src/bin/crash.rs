@@ -237,6 +237,33 @@ pub fn app_main() -> i32 {
                 }
             }
         }
+        99 => {
+            // MM5: kernel memory until the job says no. Make events and duplicate handles (every one an object body and a handle-table slot
+            // the kernel holds for this process) until the job's kernel-byte limit refuses, then stay alive for the parent to measure.
+            let ev = rt::sys::event_create();
+            if ev.status != 0 {
+                return -1;
+            }
+            let ev = ev.a1 as u64;
+            let mut made = 0i32;
+            loop {
+                let e = rt::sys::event_create();
+                if e.status != 0 {
+                    break;
+                }
+                made += 1;
+                let d = rt::sys::handle_duplicate(ev, 1u32 << 31);
+                if d.status != 0 {
+                    break;
+                }
+            }
+            let _ = made;
+            // (the job's kernel bytes are used up: a handle table that grows on without being charged would show here, up to its 20,000 handles)
+            while rt::sys::handle_duplicate(ev, 1u32 << 31).status == 0 {}
+            loop {
+                rt::sys::thread_yield();
+            }
+        }
         30 => {
             // S4.5: a memory hog. Write one page after another (new VMOs as needed) until the
             // job's page limit says no; the exit code is how many pages it got.

@@ -1155,6 +1155,9 @@ pub fn wake_stat(which: u64) -> u64 {
         }
         // 100 and 101: the lowest byte address of RAM and the address after the highest (from the device tree, PL4); 102 and 103: the
         // frames of RAM the tree describes and the frames the allocator manages; 104: where the kernel image starts
+        // 109: the kernel heap's leak oracle (`heap::leak_oracle`, wrapping): taken before and after something, `before - after` is the heap
+        // bytes it kept (MM5's acceptance test: what a confined program holds against what its job was charged)
+        109 => heap_free() as u64,
         100 => crate::kmem::stats().ram_first << 12,
         101 => crate::kmem::stats().ram_end << 12,
         102 => crate::kmem::stats().memory_frames,
