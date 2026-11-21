@@ -262,6 +262,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     if n == nr::THREAD_YIELD {
         // status already set above
     }
+    // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
+    settle_handle_table();
 }
 
 pub(super) fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
