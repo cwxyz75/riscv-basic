@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 29.537856125,
+          "duration": 29.767766541,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -20,7 +20,7 @@
         },
         {
           "phase": "Test",
-          "duration": 27.104004583,
+          "duration": 27.577857375,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -37,42 +37,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 93,
+              "line": 1306,
               "column": 5
             },
             "end": {
-              "line": 132,
-              "column": 8
+              "line": 1311,
+              "column": 61
             }
           },
-          "replacement": "vec![]",
+          "replacement": "Ok(Default::default())",
           "genre": "FnValue"
         }
       },
       "summary": "Unviable",
-      "log_path": "log/kcore__src__devwin.rs_line_93_col_5.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_93_col_5.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_5.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.535649292,
+          "duration": 0.631854292,
           "process_status": {
             "Failure": 101
           },
@@ -90,51 +90,62 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 93,
-              "column": 5
+              "line": 1306,
+              "column": 54
             },
             "end": {
-              "line": 132,
-              "column": 8
+              "line": 1306,
+              "column": 56
             }
           },
-          "replacement": "vec![(0, 0)]",
-          "genre": "FnValue"
+          "replacement": "&&",
+          "genre": "BinaryOperator"
         }
       },
-      "summary": "Unviable",
-      "log_path": "log/kcore__src__devwin.rs_line_93_col_5_001.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_93_col_5_001.diff",
+      "summary": "MissedMutant",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_54.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_54.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.476724375,
-          "process_status": {
-            "Failure": 101
-          },
+          "duration": 4.896371417,
+          "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
             "test",
             "--no-run",
             "--verbose",
             "--package=kcore@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 27.300128167,
+          "process_status": "Success",
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=kcore@0.1.0",
+            "--lib",
+            "--tests"
           ]
         }
       ]
@@ -143,201 +154,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 93,
-              "column": 5
+              "line": 1306,
+              "column": 25
             },
             "end": {
-              "line": 132,
-              "column": 8
+              "line": 1306,
+              "column": 27
             }
           },
-          "replacement": "vec![(0, 1)]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/kcore__src__devwin.rs_line_93_col_5_002.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_93_col_5_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.518574375,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 93,
-              "column": 5
-            },
-            "end": {
-              "line": 132,
-              "column": 8
-            }
-          },
-          "replacement": "vec![(1, 0)]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/kcore__src__devwin.rs_line_93_col_5_003.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_93_col_5_003.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.472498417,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 93,
-              "column": 5
-            },
-            "end": {
-              "line": 132,
-              "column": 8
-            }
-          },
-          "replacement": "vec![(1, 1)]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/kcore__src__devwin.rs_line_93_col_5_004.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_93_col_5_004.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.527327125,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 105,
-              "column": 71
-            },
-            "end": {
-              "line": 105,
-              "column": 73
-            }
-          },
-          "replacement": "||",
+          "replacement": "&&",
           "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_105_col_71.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_105_col_71.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_25.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_25.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.800509834,
+          "duration": 4.900598708,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -349,7 +201,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.6914595,
+          "duration": 12.592861166,
           "process_status": {
             "Failure": 101
           },
@@ -368,293 +220,29 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 105,
-              "column": 55
-            },
-            "end": {
-              "line": 105,
-              "column": 57
-            }
-          },
-          "replacement": "||",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_105_col_55.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_105_col_55.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.8600238749999995,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.706072208,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 105,
-              "column": 58
-            },
-            "end": {
-              "line": 105,
-              "column": 59
-            }
-          },
-          "replacement": "",
-          "genre": "UnaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_105_col_58.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_105_col_58.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.918416833,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.1551355,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 114,
-              "column": 19
-            },
-            "end": {
-              "line": 114,
+              "line": 1306,
               "column": 21
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_114_col_19.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_114_col_19.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.952112417,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.775074875,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 117,
-              "column": 19
             },
             "end": {
-              "line": 117,
-              "column": 21
-            }
-          },
-          "replacement": ">",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_117_col_19.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_117_col_19.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.92903225,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.779976083,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 120,
-              "column": 19
-            },
-            "end": {
-              "line": 120,
-              "column": 20
+              "line": 1306,
+              "column": 22
             }
           },
           "replacement": "==",
@@ -662,12 +250,12 @@
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_120_col_19.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_120_col_19.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_21.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_21.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.829024417,
+          "duration": 4.901866625,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -679,7 +267,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.728089792,
+          "duration": 12.656008125,
           "process_status": {
             "Failure": 101
           },
@@ -698,293 +286,29 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 120,
-              "column": 19
+              "line": 1306,
+              "column": 21
             },
             "end": {
-              "line": 120,
-              "column": 20
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_120_col_19_001.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_120_col_19_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.91222225,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.932541125,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 120,
-              "column": 19
-            },
-            "end": {
-              "line": 120,
-              "column": 20
-            }
-          },
-          "replacement": ">=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_120_col_19_002.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_120_col_19_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.857280709,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.778576125,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 124,
-              "column": 18
-            },
-            "end": {
-              "line": 124,
-              "column": 20
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_124_col_18.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_124_col_18.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.938724458,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.8105963750000003,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 128,
-              "column": 14
-            },
-            "end": {
-              "line": 128,
-              "column": 15
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_128_col_14.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_128_col_14.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.895436458,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.757266,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/devwin.rs",
-          "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
-            "span": {
-              "start": {
-                "line": 84,
-                "column": 1
-              },
-              "end": {
-                "line": 133,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 128,
-              "column": 14
-            },
-            "end": {
-              "line": 128,
-              "column": 15
+              "line": 1306,
+              "column": 22
             }
           },
           "replacement": ">",
@@ -992,12 +316,12 @@
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_128_col_14_001.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_128_col_14_001.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_21_001.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_21_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.978678792,
+          "duration": 4.866923791,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1009,7 +333,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.680548417,
+          "duration": 9.903227417,
           "process_status": {
             "Failure": 101
           },
@@ -1028,106 +352,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/devwin.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "device_windows",
-            "return_type": "-> Vec<(u64, u64)>",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 84,
+                "line": 1297,
                 "column": 1
               },
               "end": {
-                "line": 133,
+                "line": 1312,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 128,
-              "column": 14
+              "line": 1306,
+              "column": 21
             },
             "end": {
-              "line": 128,
-              "column": 15
+              "line": 1306,
+              "column": 22
             }
           },
           "replacement": "<=",
           "genre": "BinaryOperator"
         }
       },
-      "summary": "MissedMutant",
-      "log_path": "log/kcore__src__devwin.rs_line_128_col_14_002.log",
-      "diff_path": "diff/kcore__src__devwin.rs_line_128_col_14_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.9711175,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 27.187639833,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/donate.rs",
-          "function": {
-            "function_name": "Changes::is_empty",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 61,
-                "column": 5
-              },
-              "end": {
-                "line": 63,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 62,
-              "column": 9
-            },
-            "end": {
-              "line": 62,
-              "column": 22
-            }
-          },
-          "replacement": "true",
-          "genre": "FnValue"
-        }
-      },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__donate.rs_line_62_col_9.log",
-      "diff_path": "diff/kcore__src__donate.rs_line_62_col_9.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_21_002.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_21_002.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.942970041,
+          "duration": 4.85272325,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1139,7 +399,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.414564875,
+          "duration": 12.630350332999999,
           "process_status": {
             "Failure": 101
           },
@@ -1158,108 +418,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/donate.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "Changes::is_empty",
-            "return_type": "-> bool",
+            "function_name": "vmo_object_create_with",
+            "return_type": "-> Result<Handle, Status>",
             "span": {
               "start": {
-                "line": 61,
-                "column": 5
+                "line": 1297,
+                "column": 1
               },
               "end": {
-                "line": 63,
-                "column": 6
+                "line": 1312,
+                "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 62,
-              "column": 9
+              "line": 1306,
+              "column": 68
             },
             "end": {
-              "line": 62,
-              "column": 22
+              "line": 1306,
+              "column": 70
             }
           },
-          "replacement": "false",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__donate.rs_line_62_col_9_001.log",
-      "diff_path": "diff/kcore__src__donate.rs_line_62_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.598436959,
-          "process_status": "Success",
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=kcore@0.1.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.538324583,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=kcore@0.1.0",
-            "--lib",
-            "--tests"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "package": "kcore",
-          "file": "kcore/src/donate.rs",
-          "function": {
-            "function_name": "Changes::is_empty",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 61,
-                "column": 5
-              },
-              "end": {
-                "line": 63,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 62,
-              "column": 18
-            },
-            "end": {
-              "line": 62,
-              "column": 20
-            }
-          },
-          "replacement": "!=",
+          "replacement": "<",
           "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__donate.rs_line_62_col_18.log",
-      "diff_path": "diff/kcore__src__donate.rs_line_62_col_18.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1306_col_68.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1306_col_68.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.600539417,
+          "duration": 4.90962475,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1271,7 +465,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.776331709,
+          "duration": 9.910401125,
           "process_status": {
             "Failure": 101
           },
@@ -1290,42 +484,95 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/sched_smp.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "Sched2<N, R>::reap",
-            "return_type": "-> Result<(), Error>",
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
             "span": {
               "start": {
-                "line": 1034,
-                "column": 5
+                "line": 1431,
+                "column": 1
               },
               "end": {
-                "line": 1039,
-                "column": 6
+                "line": 1455,
+                "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 1035,
-              "column": 9
+              "line": 1439,
+              "column": 5
             },
             "end": {
-              "line": 1038,
-              "column": 15
+              "line": 1454,
+              "column": 7
             }
           },
-          "replacement": "Ok(())",
+          "replacement": "Ok((Default::default(), Default::default()))",
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__sched_smp.rs_line_1035_col_9.log",
-      "diff_path": "diff/kcore__src__sched_smp.rs_line_1035_col_9.diff",
+      "summary": "Unviable",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_5.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 7.146915584,
+          "duration": 0.580448333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=kcore@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "kcore",
+          "file": "kcore/src/ipc.rs",
+          "function": {
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
+            "span": {
+              "start": {
+                "line": 1431,
+                "column": 1
+              },
+              "end": {
+                "line": 1455,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1439,
+              "column": 54
+            },
+            "end": {
+              "line": 1439,
+              "column": 56
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_54.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_54.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.930595167,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1337,7 +584,71 @@
         },
         {
           "phase": "Test",
-          "duration": 21.00408025,
+          "duration": 27.195211208,
+          "process_status": "Success",
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=kcore@0.1.0",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "kcore",
+          "file": "kcore/src/ipc.rs",
+          "function": {
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
+            "span": {
+              "start": {
+                "line": 1431,
+                "column": 1
+              },
+              "end": {
+                "line": 1455,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1439,
+              "column": 25
+            },
+            "end": {
+              "line": 1439,
+              "column": 27
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_25.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.847023,
+          "process_status": "Success",
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=kcore@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.789023083,
           "process_status": {
             "Failure": 101
           },
@@ -1356,42 +667,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/ticket.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "Depth::get",
-            "return_type": "-> u32",
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
             "span": {
               "start": {
-                "line": 31,
-                "column": 5
+                "line": 1431,
+                "column": 1
               },
               "end": {
-                "line": 33,
-                "column": 6
+                "line": 1455,
+                "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 32,
-              "column": 9
+              "line": 1439,
+              "column": 21
             },
             "end": {
-              "line": 32,
-              "column": 39
+              "line": 1439,
+              "column": 22
             }
           },
-          "replacement": "0",
-          "genre": "FnValue"
+          "replacement": "==",
+          "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__ticket.rs_line_32_col_9.log",
-      "diff_path": "diff/kcore__src__ticket.rs_line_32_col_9.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_21.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_21.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 6.857921125,
+          "duration": 4.894421667,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1403,7 +714,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.474391917,
+          "duration": 12.978748917,
           "process_status": {
             "Failure": 101
           },
@@ -1422,42 +733,42 @@
       "scenario": {
         "Mutant": {
           "package": "kcore",
-          "file": "kcore/src/ticket.rs",
+          "file": "kcore/src/ipc.rs",
           "function": {
-            "function_name": "Depth::get",
-            "return_type": "-> u32",
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
             "span": {
               "start": {
-                "line": 31,
-                "column": 5
+                "line": 1431,
+                "column": 1
               },
               "end": {
-                "line": 33,
-                "column": 6
+                "line": 1455,
+                "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 32,
-              "column": 9
+              "line": 1439,
+              "column": 21
             },
             "end": {
-              "line": 32,
-              "column": 39
+              "line": 1439,
+              "column": 22
             }
           },
-          "replacement": "1",
-          "genre": "FnValue"
+          "replacement": ">",
+          "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/kcore__src__ticket.rs_line_32_col_9_001.log",
-      "diff_path": "diff/kcore__src__ticket.rs_line_32_col_9_001.diff",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_21_001.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_21_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.185493667,
+          "duration": 4.909167833,
           "process_status": "Success",
           "argv": [
             "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
@@ -1469,7 +780,139 @@
         },
         {
           "phase": "Test",
-          "duration": 0.462932083,
+          "duration": 12.647049459,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=kcore@0.1.0",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "kcore",
+          "file": "kcore/src/ipc.rs",
+          "function": {
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
+            "span": {
+              "start": {
+                "line": 1431,
+                "column": 1
+              },
+              "end": {
+                "line": 1455,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1439,
+              "column": 21
+            },
+            "end": {
+              "line": 1439,
+              "column": 22
+            }
+          },
+          "replacement": "<=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_21_002.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_21_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.831443875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=kcore@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.666452084,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=kcore@0.1.0",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "kcore",
+          "file": "kcore/src/ipc.rs",
+          "function": {
+            "function_name": "thread_object_create_in",
+            "return_type": "-> Result<(Handle, ObjId), Status>",
+            "span": {
+              "start": {
+                "line": 1431,
+                "column": 1
+              },
+              "end": {
+                "line": 1455,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1439,
+              "column": 68
+            },
+            "end": {
+              "line": 1439,
+              "column": 70
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/kcore__src__ipc.rs_line_1439_col_68.log",
+      "diff_path": "diff/kcore__src__ipc.rs_line_1439_col_68.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.892956958,
+          "process_status": "Success",
+          "argv": [
+            "/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=kcore@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.740348667,
           "process_status": {
             "Failure": 101
           },
@@ -1485,10 +928,10 @@
       ]
     }
   ],
-  "total_mutants": 23,
-  "missed": 1,
-  "caught": 17,
+  "total_mutants": 14,
+  "missed": 2,
+  "caught": 10,
   "timeout": 0,
-  "unviable": 5,
+  "unviable": 2,
   "success": 0
 }

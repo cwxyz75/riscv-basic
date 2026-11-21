@@ -1,1 +1,2 @@
-kcore/src/devwin.rs:128:14: replace < with <= in device_windows
+kcore/src/ipc.rs:1306:54: replace || with && in vmo_object_create_with
+kcore/src/ipc.rs:1439:54: replace || with && in thread_object_create_in

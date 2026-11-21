@@ -1,0 +1,21 @@
+--- kcore/src/ipc.rs
++++ replace || with && in vmo_object_create_with
+@@ -1298,17 +1298,17 @@
+ #[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+ pub fn vmo_object_create_with(
+     reg: &mut Kobjs,
+     table: &mut HandleTable,
+     id: u64,
+     rights: Rights,
+     q: &mut Quota,
+ ) -> Result<Handle, Status> {
+-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
++    if table.room() < 1 || table.reserve(1).is_err() && /* ~ changed by cargo-mutants ~ */ reg.live() >= MAX_OBJECTS {
+         return Err(Status::NoMemory);
+     }
+     q.objects(reg, 1)?;
+     let obj = reg.create_charged(KObj::Vmo(id), q.job);
+     Ok(table.insert(obj, rights).expect("room was checked"))
+ }
+ 
+ /// A job object for ledger job `id` (whose use the object takes over), with a handle in

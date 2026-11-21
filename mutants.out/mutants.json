@@ -1,329 +1,119 @@
 [
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 93,
+        "line": 1306,
         "column": 5
       },
       "end": {
-        "line": 132,
-        "column": 8
+        "line": 1311,
+        "column": 61
       }
     },
-    "replacement": "vec![]",
+    "replacement": "Ok(Default::default())",
     "genre": "FnValue"
   },
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 93,
-        "column": 5
+        "line": 1306,
+        "column": 54
       },
       "end": {
-        "line": 132,
-        "column": 8
+        "line": 1306,
+        "column": 56
       }
     },
-    "replacement": "vec![(0, 0)]",
-    "genre": "FnValue"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 93,
-        "column": 5
-      },
-      "end": {
-        "line": 132,
-        "column": 8
-      }
-    },
-    "replacement": "vec![(0, 1)]",
-    "genre": "FnValue"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 93,
-        "column": 5
-      },
-      "end": {
-        "line": 132,
-        "column": 8
-      }
-    },
-    "replacement": "vec![(1, 0)]",
-    "genre": "FnValue"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 93,
-        "column": 5
-      },
-      "end": {
-        "line": 132,
-        "column": 8
-      }
-    },
-    "replacement": "vec![(1, 1)]",
-    "genre": "FnValue"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 105,
-        "column": 71
-      },
-      "end": {
-        "line": 105,
-        "column": 73
-      }
-    },
-    "replacement": "||",
+    "replacement": "&&",
     "genre": "BinaryOperator"
   },
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 105,
-        "column": 55
+        "line": 1306,
+        "column": 25
       },
       "end": {
-        "line": 105,
-        "column": 57
+        "line": 1306,
+        "column": 27
       }
     },
-    "replacement": "||",
+    "replacement": "&&",
     "genre": "BinaryOperator"
   },
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 105,
-        "column": 58
-      },
-      "end": {
-        "line": 105,
-        "column": 59
-      }
-    },
-    "replacement": "",
-    "genre": "UnaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 114,
-        "column": 19
-      },
-      "end": {
-        "line": 114,
+        "line": 1306,
         "column": 21
-      }
-    },
-    "replacement": "<",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 117,
-        "column": 19
       },
       "end": {
-        "line": 117,
-        "column": 21
-      }
-    },
-    "replacement": ">",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 120,
-        "column": 19
-      },
-      "end": {
-        "line": 120,
-        "column": 20
+        "line": 1306,
+        "column": 22
       }
     },
     "replacement": "==",
@@ -331,149 +121,29 @@
   },
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 120,
-        "column": 19
+        "line": 1306,
+        "column": 21
       },
       "end": {
-        "line": 120,
-        "column": 20
-      }
-    },
-    "replacement": "<",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 120,
-        "column": 19
-      },
-      "end": {
-        "line": 120,
-        "column": 20
-      }
-    },
-    "replacement": ">=",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 124,
-        "column": 18
-      },
-      "end": {
-        "line": 124,
-        "column": 20
-      }
-    },
-    "replacement": "<",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 128,
-        "column": 14
-      },
-      "end": {
-        "line": 128,
-        "column": 15
-      }
-    },
-    "replacement": "==",
-    "genre": "BinaryOperator"
-  },
-  {
-    "package": "kcore",
-    "file": "kcore/src/devwin.rs",
-    "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
-      "span": {
-        "start": {
-          "line": 84,
-          "column": 1
-        },
-        "end": {
-          "line": 133,
-          "column": 2
-        }
-      }
-    },
-    "span": {
-      "start": {
-        "line": 128,
-        "column": 14
-      },
-      "end": {
-        "line": 128,
-        "column": 15
+        "line": 1306,
+        "column": 22
       }
     },
     "replacement": ">",
@@ -481,32 +151,272 @@
   },
   {
     "package": "kcore",
-    "file": "kcore/src/devwin.rs",
+    "file": "kcore/src/ipc.rs",
     "function": {
-      "function_name": "device_windows",
-      "return_type": "-> Vec<(u64, u64)>",
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
       "span": {
         "start": {
-          "line": 84,
+          "line": 1297,
           "column": 1
         },
         "end": {
-          "line": 133,
+          "line": 1312,
           "column": 2
         }
       }
     },
     "span": {
       "start": {
-        "line": 128,
-        "column": 14
+        "line": 1306,
+        "column": 21
       },
       "end": {
-        "line": 128,
-        "column": 15
+        "line": 1306,
+        "column": 22
       }
     },
     "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "vmo_object_create_with",
+      "return_type": "-> Result<Handle, Status>",
+      "span": {
+        "start": {
+          "line": 1297,
+          "column": 1
+        },
+        "end": {
+          "line": 1312,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1306,
+        "column": 68
+      },
+      "end": {
+        "line": 1306,
+        "column": 70
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 5
+      },
+      "end": {
+        "line": 1454,
+        "column": 7
+      }
+    },
+    "replacement": "Ok((Default::default(), Default::default()))",
+    "genre": "FnValue"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 54
+      },
+      "end": {
+        "line": 1439,
+        "column": 56
+      }
+    },
+    "replacement": "&&",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 25
+      },
+      "end": {
+        "line": 1439,
+        "column": 27
+      }
+    },
+    "replacement": "&&",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 21
+      },
+      "end": {
+        "line": 1439,
+        "column": 22
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 21
+      },
+      "end": {
+        "line": 1439,
+        "column": 22
+      }
+    },
+    "replacement": ">",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 21
+      },
+      "end": {
+        "line": 1439,
+        "column": 22
+      }
+    },
+    "replacement": "<=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "kcore",
+    "file": "kcore/src/ipc.rs",
+    "function": {
+      "function_name": "thread_object_create_in",
+      "return_type": "-> Result<(Handle, ObjId), Status>",
+      "span": {
+        "start": {
+          "line": 1431,
+          "column": 1
+        },
+        "end": {
+          "line": 1455,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 1439,
+        "column": 68
+      },
+      "end": {
+        "line": 1439,
+        "column": 70
+      }
+    },
+    "replacement": "<",
     "genre": "BinaryOperator"
   }
 ]

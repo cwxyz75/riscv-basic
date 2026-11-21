@@ -52,3 +52,30 @@ fn a_thread_object_takes_the_last_free_slot_and_is_refused_when_there_is_none() 
     );
     assert_eq!(reg.live(), live, "a refusal makes nothing");
 }
+
+#[test]
+fn the_object_cap_refuses_both_constructors_and_makes_nothing() {
+    // (the mutants "|| gives &&" before the cap test in both: with room in the table and the registry at its cap, a creation must be refused)
+    use kcore::ipc::KObj;
+    let mut reg = Kobjs::new();
+    for i in 0..abi::limits::MAX_OBJECTS as u64 {
+        reg.create(KObj::Vmo(i));
+    }
+    assert_eq!(reg.live(), abi::limits::MAX_OBJECTS);
+    let mut t = HandleTable::new(8);
+    let mut jobs = Jobs::new();
+    let mut q = Quota {
+        jobs: &mut jobs,
+        job: None,
+    };
+    assert_eq!(
+        vmo_object_create_with(&mut reg, &mut t, 1, Rights::READ, &mut q),
+        Err(Status::NoMemory)
+    );
+    assert_eq!(
+        thread_object_create_in(&mut reg, &mut t, 1, &mut q).err(),
+        Some(Status::NoMemory)
+    );
+    assert_eq!(reg.live(), abi::limits::MAX_OBJECTS, "nothing was made");
+    assert_eq!(t.len(), 0, "and no handle either");
+}

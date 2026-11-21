@@ -1,5 +1,2 @@
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 0)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 1)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 0)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 1)]
+kcore/src/ipc.rs:1306:5: replace vmo_object_create_with -> Result<Handle, Status> with Ok(Default::default())
+kcore/src/ipc.rs:1439:5: replace thread_object_create_in -> Result<(Handle, ObjId), Status> with Ok((Default::default(), Default::default()))

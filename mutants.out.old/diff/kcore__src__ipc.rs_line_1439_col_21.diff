@@ -1,0 +1,21 @@
+--- kcore/src/ipc.rs
++++ replace < with == in thread_object_create_in
+@@ -1431,17 +1431,17 @@
+ /// A thread object for a user thread of `pid`, with a handle in `table` (default thread rights).
+ #[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+ pub fn thread_object_create_in(
+     reg: &mut Kobjs,
+     table: &mut HandleTable,
+     pid: u64,
+     q: &mut Quota,
+ ) -> Result<(Handle, ObjId), Status> {
+-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
++    if table.room() == /* ~ changed by cargo-mutants ~ */ 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+         return Err(Status::NoMemory);
+     }
+     q.objects(reg, 1)?;
+     let obj = reg.create_charged(
+         KObj::Thread(ThreadObj {
+             pid,
+             terminated: false,
+             exit_code: 0,

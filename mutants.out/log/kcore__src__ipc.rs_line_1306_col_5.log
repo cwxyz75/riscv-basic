@@ -1,0 +1,56 @@
+
+*** kcore/src/ipc.rs:1306:5: replace vmo_object_create_with -> Result<Handle, Status> with Ok(Default::default())
+
+*** mutation diff:
+--- kcore/src/ipc.rs
++++ replace vmo_object_create_with -> Result<Handle, Status> with Ok(Default::default())
+@@ -1298,22 +1298,17 @@
+ #[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+ pub fn vmo_object_create_with(
+     reg: &mut Kobjs,
+     table: &mut HandleTable,
+     id: u64,
+     rights: Rights,
+     q: &mut Quota,
+ ) -> Result<Handle, Status> {
+-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+-        return Err(Status::NoMemory);
+-    }
+-    q.objects(reg, 1)?;
+-    let obj = reg.create_charged(KObj::Vmo(id), q.job);
+-    Ok(table.insert(obj, rights).expect("room was checked"))
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// A job object for ledger job `id` (whose use the object takes over), with a handle in
+ /// `table` carrying `rights`.
+ #[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+ pub fn job_object_create(
+     reg: &mut Kobjs,
+     table: &mut HandleTable,
+
+
+*** /Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/cargo test --no-run --verbose --package=kcore@0.1.0
+       Fresh abi v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/abi)
+       Dirty kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/kcore): the file `kcore/src/ipc.rs` has changed (1795256625.765083715s, 56s after last build at 1795256569.210322281s)
+   Compiling kcore v0.1.0 (/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/kcore)
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=967e6e6c23e42fe7 -C extra-filename=-3d98311ccb537b13 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/kcore/3d98311ccb537b13/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --force-warn=unused_crate_dependencies`
+     Running `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --crate-type lib --emit=dep-info,metadata,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=54f81048664e775f -C extra-filename=-1df58f73b018c652 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/kcore/1df58f73b018c652/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rmeta --force-warn=unused_crate_dependencies`
+error[E0277]: the trait bound `Handle: Default` is not satisfied
+    --> kcore/src/ipc.rs:1306:8
+     |
+1306 |     Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     |        ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Handle`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `kcore` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --crate-type lib --emit=dep-info,metadata,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=54f81048664e775f -C extra-filename=-1df58f73b018c652 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/kcore/1df58f73b018c652/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rmeta --force-warn=unused_crate_dependencies` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `kcore` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/c.wellock/.rustup/toolchains/stable-x86_64-apple-darwin/bin/rustc --crate-name kcore --edition=2021 kcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --emit=dep-info,link -C opt-level=2 -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(loom)' --check-cfg 'cfg(shuttle)' -C debug-assertions=on --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("fault-skip-pull"))' -C metadata=967e6e6c23e42fe7 -C extra-filename=-3d98311ccb537b13 --out-dir /private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/kcore/3d98311ccb537b13/out -C incremental=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/incremental --extern abi=/private/var/folders/82/_5704bw12mq7v3prh7c63yt40000gn/T/cargo-mutants-riscv-basic-fix-4Ob9py.tmp/target/debug/build/abi/0f2925f1b13577cf/out/libabi-0f2925f1b13577cf.rlib --force-warn=unused_crate_dependencies` (exit status: 1)
+
+*** result: Failure(101)
