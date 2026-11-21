@@ -1,5 +1,0 @@
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 0)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(0, 1)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 0)]
-kcore/src/devwin.rs:93:5: replace device_windows -> Vec<(u64, u64)> with vec![(1, 1)]
