@@ -112,12 +112,12 @@ enum Node {
 /// A model server: one tree of absolute model paths; a handle is the model path of the directory it is rooted at.
 struct Model {
     nodes: BTreeMap<String, Node>,
-    roots: BTreeMap<u32, &'static str>,
+    roots: BTreeMap<u64, &'static str>,
     follow_last: bool,
 }
 
 impl Model {
-    fn open(&self, handle: u32, rel: &[u8]) -> Result<String, Stop> {
+    fn open(&self, handle: u64, rel: &[u8]) -> Result<String, Stop> {
         let root = self.roots[&handle];
         let comps: Vec<&str> = std::str::from_utf8(rel)
             .unwrap()

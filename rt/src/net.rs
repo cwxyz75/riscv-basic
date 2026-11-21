@@ -17,7 +17,7 @@ const UNAVAILABLE: i32 = -109;
 
 /// A request/reply connection to the stack.
 pub struct Net {
-    ch: u32,
+    ch: u64,
     txid: u32,
 }
 
@@ -52,11 +52,11 @@ pub enum NetError {
 
 impl Net {
     /// Wrap a connection (the channel `Fs::open` returned for the name).
-    pub fn new(ch: u32) -> Net {
+    pub fn new(ch: u64) -> Net {
         Net { ch, txid: 0 }
     }
 
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 
@@ -69,8 +69,8 @@ impl Net {
                 Err(UNAVAILABLE) if sys::clock_get() + wait < give_up => {
                     let gate = sys::event_create();
                     if gate.status == 0 {
-                        sys::object_wait(gate.a1 as u32, 1 << 24, sys::clock_get() + wait);
-                        sys::handle_close(gate.a1 as u32);
+                        sys::object_wait(gate.a1 as u64, 1 << 24, sys::clock_get() + wait);
+                        sys::handle_close(gate.a1 as u64);
                     }
                     wait = (wait * 2).min(1000);
                 }
@@ -83,7 +83,7 @@ impl Net {
     pub fn call(
         &mut self,
         r: &Request,
-        send: Option<u32>,
+        send: Option<u64>,
         deadline: u64,
     ) -> Result<(i32, Vec<u8>), NetError> {
         let hs = [send.unwrap_or(0)];
@@ -95,7 +95,7 @@ impl Net {
     pub fn call_with(
         &mut self,
         r: &Request,
-        send: &[u32],
+        send: &[u64],
         deadline: u64,
     ) -> Result<(i32, Vec<u8>), NetError> {
         self.txid = self.txid.wrapping_add(1);
@@ -143,7 +143,7 @@ impl Net {
         }
     }
 
-    fn ok(&mut self, r: &Request, send: Option<u32>, deadline: u64) -> Result<Vec<u8>, NetError> {
+    fn ok(&mut self, r: &Request, send: Option<u64>, deadline: u64) -> Result<Vec<u8>, NetError> {
         match self.call(r, send, deadline)? {
             (0, body) => Ok(body),
             (s, _) => Err(NetError::Stack(s)),
@@ -197,12 +197,12 @@ impl Net {
         addr: [u8; 4],
         oflags: u32,
         deadline: u64,
-    ) -> Result<(u32, Vec<u8>), NetError> {
+    ) -> Result<(u64, Vec<u8>), NetError> {
         let c = sys::channel_create();
         if c.status != 0 {
             return Err(NetError::Sys(c.status));
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         match self.ok(
             &Request::Open {
                 kind,
@@ -245,7 +245,7 @@ impl Drop for Net {
 }
 
 /// Read the next endpoint event, waiting until `deadline`.
-fn next_event(ch: u32, deadline: u64) -> Result<Vec<u8>, NetError> {
+fn next_event(ch: u64, deadline: u64) -> Result<Vec<u8>, NetError> {
     loop {
         let wait = sys::object_wait(ch, signals::READABLE | signals::PEER_CLOSED, deadline);
         if wait.status != 0 {
@@ -267,7 +267,7 @@ fn next_event(ch: u32, deadline: u64) -> Result<Vec<u8>, NetError> {
     }
 }
 
-fn send_msg(ch: u32, b: &[u8]) -> Result<(), NetError> {
+fn send_msg(ch: u64, b: &[u8]) -> Result<(), NetError> {
     let w = sys::channel_write(ch, b.as_ptr(), b.len(), core::ptr::null(), 0);
     match w.status {
         0 => Ok(()),
@@ -278,7 +278,7 @@ fn send_msg(ch: u32, b: &[u8]) -> Result<(), NetError> {
 
 /// A UDP endpoint.
 pub struct Udp {
-    ch: u32,
+    ch: u64,
     pub port: u16,
     cookie: u32,
 }
@@ -317,7 +317,7 @@ impl Udp {
         }
     }
 
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 }
@@ -330,7 +330,7 @@ impl Drop for Udp {
 
 /// An ICMP echo endpoint.
 pub struct Echo {
-    ch: u32,
+    ch: u64,
     cookie: u32,
 }
 
@@ -420,7 +420,7 @@ impl Net {
             sys::handle_close(ch);
             return Err(NetError::Sys(pair.status));
         }
-        let (mine, theirs) = (pair.a1 as u32, pair.a2 as u32);
+        let (mine, theirs) = (pair.a1 as u64, pair.a2 as u64);
         let msg = pn::encode_connect(1, dst, port, snd_buf, rcv_buf);
         let w = sys::channel_write(ch, msg.as_ptr(), msg.len(), [theirs].as_ptr(), 1);
         if w.status != 0 {
@@ -458,10 +458,10 @@ impl Net {
 
 /// A listening endpoint with its posted accepts.
 pub struct Listener {
-    ch: u32,
+    ch: u64,
     pub port: u16,
     /// `(cookie, the new stream's channel, its socket end)` for each accept the stack holds.
-    posted: Vec<(u32, u32, u32, u32, u32)>,
+    posted: Vec<(u32, u64, u64, u32, u32)>,
     next_cookie: u32,
 }
 
@@ -472,14 +472,14 @@ impl Listener {
         if chan.status != 0 {
             return Err(NetError::Sys(chan.status));
         }
-        let (cmine, ctheirs) = (chan.a1 as u32, chan.a2 as u32);
+        let (cmine, ctheirs) = (chan.a1 as u64, chan.a2 as u64);
         let pair = sys::socket_create();
         if pair.status != 0 {
             sys::handle_close(cmine);
             sys::handle_close(ctheirs);
             return Err(NetError::Sys(pair.status));
         }
-        let (smine, stheirs) = (pair.a1 as u32, pair.a2 as u32);
+        let (smine, stheirs) = (pair.a1 as u64, pair.a2 as u64);
         let cookie = self.next_cookie;
         self.next_cookie = self.next_cookie.wrapping_add(1).max(1);
         let msg = pn::encode_accept(cookie, snd_buf, rcv_buf);
@@ -539,7 +539,7 @@ impl Listener {
         }
     }
 
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 }
@@ -559,8 +559,8 @@ type Tuple4 = (([u8; 4], u16), ([u8; 4], u16));
 
 /// A TCP connection: its endpoint channel (control and the end-of-file rule) and its socket (the bytes).
 pub struct Stream {
-    ch: u32,
-    sock: u32,
+    ch: u64,
+    sock: u64,
     connected: Option<Tuple4>,
     connect_failed: Option<i32>,
     peer_fin: bool,
@@ -569,7 +569,7 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn new(ch: u32, sock: u32) -> Stream {
+    fn new(ch: u64, sock: u64) -> Stream {
         Stream {
             ch,
             sock,
@@ -693,10 +693,10 @@ impl Stream {
     pub fn remote(&self) -> Option<([u8; 4], u16)> {
         self.connected.map(|c| c.1)
     }
-    pub fn socket(&self) -> u32 {
+    pub fn socket(&self) -> u64 {
         self.sock
     }
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 

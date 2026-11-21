@@ -97,7 +97,7 @@ enum Phase {
 struct StreamState {
     phase: Phase,
     core: Option<ConnId>,
-    sock: Option<u32>,
+    sock: Option<u64>,
     account: AccountId,
     /// Bytes reserved against the account for this stream's buffers (S9-SPEC 6.2).
     reserved: u32,
@@ -161,9 +161,9 @@ struct Netd {
     core: Core<Conn>,
     net: Net,
     shm: Shm,
-    to_driver: u32,
-    to_stack: u32,
-    ctl: Option<u32>,
+    to_driver: u64,
+    to_stack: u64,
+    ctl: Option<u64>,
     link: Link,
     last_generation: u64,
     rx: Pool,
@@ -181,7 +181,7 @@ struct Netd {
     charged: BTreeMap<ConnId, (AccountId, u32)>,
     /// Streams whose channel closed while established: the socket is kept and read into the connection until the client's
     /// end is gone and empty (then the connection is released as an orphan), at most 20 s. `(socket, since in ticks)`.
-    draining: BTreeMap<ConnId, (u32, u64)>,
+    draining: BTreeMap<ConnId, (u64, u64)>,
     stream_rr: usize,
     more: bool,
     blob: Option<netblob::Blob>,
@@ -328,10 +328,10 @@ impl Netd {
     }
 
     /// `netsup` sends the stack end of a fresh control channel when it restarts the driver.
-    fn poll_sup(&mut self, sup: u32) {
+    fn poll_sup(&mut self, sup: u64) {
         loop {
             let mut b = [0u8; 16];
-            let mut hs = [0u32; 4];
+            let mut hs = [0u64; 4];
             let r = sys::channel_read(sup, b.as_mut_ptr(), b.len(), hs.as_mut_ptr(), hs.len());
             if r.status() != Some(Sys::Ok) {
                 return;
@@ -567,8 +567,8 @@ impl Netd {
             .send(key, pn::encode_reply(txid, status, body), None);
     }
 
-    fn open_conn(&mut self, key: u64, class: Class, msg: &[u8], hs: &[u32]) {
-        let close_all = |hs: &[u32]| {
+    fn open_conn(&mut self, key: u64, class: Class, msg: &[u8], hs: &[u64]) {
+        let close_all = |hs: &[u64]| {
             for &h in hs {
                 sys::handle_close(h);
             }
@@ -746,7 +746,7 @@ impl Netd {
         }
     }
 
-    fn endpoint_request(&mut self, key: u64, ep: EpId, msg: &[u8], hs: &[u32]) {
+    fn endpoint_request(&mut self, key: u64, ep: EpId, msg: &[u8], hs: &[u64]) {
         for &h in hs {
             sys::handle_close(h);
         }
@@ -790,14 +790,14 @@ impl Netd {
         self.more = true;
     }
 
-    fn publish_all(&mut self, registry: u32) -> bool {
+    fn publish_all(&mut self, registry: u64) -> bool {
         let mut fs = rt::fs::Fs::new(registry);
         for (name, class) in Class::NAMES {
             let c = sys::channel_create();
             if c.status != 0 {
                 return false;
             }
-            let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+            let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
             // (a stale entry from a previous incarnation is replaced; a live one is a conflict)
             if fs.publish(name, theirs).is_err() {
                 sys::handle_close(mine);
@@ -856,7 +856,7 @@ impl Netd {
 
     /// Is `h` a socket we may serve (S9-SPEC 8.3)? A channel, a socket without READ, WRITE or WAIT, a socket we already hold
     /// and the peer of one we hold are refused; an admitted socket is recorded.
-    fn admit_socket(&mut self, h: u32) -> bool {
+    fn admit_socket(&mut self, h: u64) -> bool {
         let mut b = [0u8; 1];
         for x in [
             sys::socket_read(h, b.as_mut_ptr(), 0),
@@ -871,7 +871,7 @@ impl Netd {
         if port.status != 0 {
             return false;
         }
-        let p = port.a1 as u32;
+        let p = port.a1 as u64;
         let bindable =
             sys::port_bind_flags(p, h, signals::READABLE, 0, rt::abi::port_flags::ONESHOT).status
                 == 0;
@@ -895,7 +895,7 @@ impl Netd {
         true
     }
 
-    fn forget_socket(&mut self, h: u32) {
+    fn forget_socket(&mut self, h: u64) {
         let info = sys::object_info(h);
         if info.status == 0 {
             let koid = info.a1 as u64;
@@ -914,7 +914,7 @@ impl Netd {
         local_port: u16,
         local_addr: [u8; 4],
         oflags: u32,
-        ch: u32,
+        ch: u64,
     ) {
         let account = self.account_of_key(key);
         match kind {
@@ -974,8 +974,8 @@ impl Netd {
     }
 
     /// A message on a stream's endpoint channel.
-    fn stream_request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
-        let close_all = |hs: &[u32]| {
+    fn stream_request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
+        let close_all = |hs: &[u64]| {
             for &h in hs {
                 sys::handle_close(h);
             }
@@ -1075,8 +1075,8 @@ impl Netd {
     }
 
     /// A message on a listener's endpoint channel: `Accept` posts one accept (two handles: a channel end and a socket end).
-    fn listener_request(&mut self, key: u64, lid: ListenerId, msg: &[u8], hs: &[u32]) {
-        let close_all = |hs: &[u32]| {
+    fn listener_request(&mut self, key: u64, lid: ListenerId, msg: &[u8], hs: &[u64]) {
+        let close_all = |hs: &[u64]| {
             for &h in hs {
                 sys::handle_close(h);
             }
@@ -1669,7 +1669,7 @@ impl Service for Netd {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         enum K {
             Listener(Class),
             Service(Class),
@@ -1806,7 +1806,7 @@ pub fn app_main() -> i32 {
     else {
         return 3;
     };
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     for (vmo, va, pages, perms) in [
         (ring, RING_VA, 2u64, PF_RW),
         (rxp, RX_VA, 64, PF_R),
@@ -1828,7 +1828,7 @@ pub fn app_main() -> i32 {
     };
     let mut d = Netd {
         core: Core::new(
-            p.a1 as u32,
+            p.a1 as u64,
             pool,
             rt::abi::limits::MAX_MSG_BYTES,
             rt::abi::limits::MAX_MSG_HANDLES,
@@ -1928,17 +1928,17 @@ pub fn app_main() -> i32 {
 }
 
 /// `service::run` does not know the supervisor channel: wrap it by polling `sup` from `tick` via a thin adapter.
-fn loop_with_sup(d: &mut Netd, sup: u32) -> i32 {
+fn loop_with_sup(d: &mut Netd, sup: u64) -> i32 {
     struct Wrap<'a> {
         d: &'a mut Netd,
-        sup: u32,
+        sup: u64,
     }
     impl Service for Wrap<'_> {
         type Conn = Conn;
         fn core(&mut self) -> &mut Core<Conn> {
             self.d.core()
         }
-        fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+        fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
             self.d.request(key, msg, hs)
         }
         fn closed(&mut self, conn: Conn) {

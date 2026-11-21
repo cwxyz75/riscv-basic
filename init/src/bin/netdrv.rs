@@ -119,11 +119,11 @@ fn qbase(q: usize) -> usize {
 struct Drv {
     shm: Shm,
     tx_pa: u64,
-    irq: Option<u32>,
-    ev_stack: u32,
-    ev_me: u32,
-    ctl: u32,
-    port: u32,
+    irq: Option<u64>,
+    ev_stack: u64,
+    ev_me: u64,
+    ctl: u64,
+    port: u64,
     generation: u64,
     attached: bool,
     rx_avail: u16,
@@ -447,7 +447,7 @@ pub fn app_main() -> i32 {
         return 3;
     };
     let irq = env.handle(Role::NetIrq);
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     for (vmo, va, pages) in [
         (mmio, MMIO_VA, 1u64),
         (q_dma, QUEUE_VA, 2),
@@ -512,7 +512,7 @@ pub fn app_main() -> i32 {
     if p.status != 0 {
         return 5;
     }
-    let port = p.a1 as u32;
+    let port = p.a1 as u64;
     let _ = sys::port_bind(port, ev_me, 1 << 24, 1);
     if let Some(i) = irq {
         let _ = sys::port_bind(port, i, signals::INTERRUPT, 2);

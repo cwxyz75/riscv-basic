@@ -20,7 +20,7 @@ pub const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 #[derive(Debug, PartialEq, Eq)]
 pub struct Spawn {
     pub token: usize,
-    pub handle: u32,
+    pub handle: u64,
     pub prio: u8,
 }
 
@@ -91,7 +91,7 @@ pub fn thread_create(
     creator_prio: u8,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
-    let ph = Handle(a[0] as u32);
+    let ph = Handle(a[0]);
     let (entry, sp, arg) = (a[1], a[2], a[3]);
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let (_, tpid, _, _) = ipc::process_of(&us.objs, &caller.handles, ph, Rights::MANAGE)?;
@@ -162,7 +162,7 @@ pub fn thread_spawn<M: PhysMem>(
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
     use abi::spawn as sp;
-    let ph = Handle(a[0] as u32);
+    let ph = Handle(a[0]);
     // the record first (a bad pointer is the first error), then the handle
     let raw = {
         let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
@@ -345,7 +345,7 @@ pub fn process_start(
     me: u32,
     a: [u64; 6],
 ) -> Result<(usize, u8), Status> {
-    let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
+    let (ph, bh) = (Handle(a[0]), Handle(a[3]));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let pe = caller.handles.get(ph)?;

@@ -30,12 +30,9 @@ pub struct ObjectWait {
     pub deadline: u64,
 }
 
-/// `object_wait(handle, mask, deadline)`: the handle is 32 bits, carries WAIT, and the mask is a non-empty set of waitable signals.
+/// `object_wait(handle, mask, deadline)`: the handle carries WAIT, and the mask is a non-empty set of waitable signals.
 pub fn object_wait_check(us: &UserState, me: u32, a: [u64; 6]) -> Result<ObjectWait, Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    let (handle, deadline) = (Handle(a[0] as u32), a[2]);
+    let (handle, deadline) = (Handle(a[0]), a[2]);
     let p = us.procs.get(&me).ok_or(Status::BadState)?;
     if !p.handles.get(handle)?.rights.contains(Rights::WAIT) {
         return Err(Status::AccessDenied);
@@ -75,12 +72,9 @@ pub fn object_wait_report(
 
 // ---- port_wait ----
 
-/// `port_wait(port, deadline)`: the handle must be 32 bits wide.
+/// `port_wait(port, deadline)`.
 pub fn port_wait_check(a: [u64; 6]) -> Result<(Handle, u64), Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    Ok((Handle(a[0] as u32), a[1]))
+    Ok((Handle(a[0]), a[1]))
 }
 
 /// One poll of the port: the key and observed signals of a ready binding, or `None`.
@@ -213,10 +207,7 @@ pub fn channel_call_send<M: PhysMem>(
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
 ) -> Result<Call, Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    let ch = Handle(a[0] as u32);
+    let ch = Handle(a[0]);
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let rec = copy_from_user(&mut p.aspace, mm, vmos, a[1], abi::CHANNEL_CALL_ARGS_BYTES)?;
@@ -248,7 +239,7 @@ pub fn channel_call_send<M: PhysMem>(
         return Err(Status::AccessDenied);
     }
     let data = copy_from_user(&mut p.aspace, mm, vmos, req_bytes, nbytes)?;
-    let raw = copy_from_user(&mut p.aspace, mm, vmos, req_handles, nhandles * 4)?;
+    let raw = copy_from_user(&mut p.aspace, mm, vmos, req_handles, nhandles * 8)?;
     ipc::channel_write_in(
         objs,
         &mut p.handles,
@@ -315,7 +306,7 @@ pub fn channel_call_reply<M: PhysMem>(
         Ok((nb, nh)) => (|| {
             verify_writable(&mut p.aspace, mm, vmos, c.rd_bytes, nb)
                 .map_err(|e| (e, None, None))?;
-            verify_writable(&mut p.aspace, mm, vmos, c.rd_handles, nh * 4)
+            verify_writable(&mut p.aspace, mm, vmos, c.rd_handles, nh * 8)
                 .map_err(|e| (e, None, None))?;
             let got = ipc::channel_read_txid_in(
                 objs,
@@ -334,7 +325,7 @@ pub fn channel_call_reply<M: PhysMem>(
                 copy_to_user_verified(
                     &mut p.aspace,
                     mm,
-                    c.rd_handles + (i as u64) * 4,
+                    c.rd_handles + (i as u64) * 8,
                     &h.0.to_le_bytes(),
                 )
                 .map_err(|e| (e, None, None))?;

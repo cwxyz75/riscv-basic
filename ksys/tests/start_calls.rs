@@ -91,11 +91,7 @@ fn world() -> W {
     )
     .unwrap();
     us.procs.get_mut(&2).unwrap().state = ProcState::Created;
-    W {
-        us,
-        vmos,
-        ph: u64::from(h.0),
-    }
+    W { us, vmos, ph: h.0 }
 }
 
 impl W {
@@ -111,7 +107,7 @@ impl W {
             },
         )
         .unwrap();
-        u64::from(a.0)
+        a.0
     }
     fn start(
         &mut self,
@@ -151,7 +147,7 @@ fn the_channel_end_moves_in_as_handle_one_and_the_process_runs() {
         "handle 1 of the new process"
     );
     assert!(
-        w.us.procs[&1].handles.get(abi::Handle(bh as u32)).is_err(),
+        w.us.procs[&1].handles.get(abi::Handle(bh)).is_err(),
         "the caller no longer holds the end"
     );
     let st = &w.us.starts[&token];
@@ -180,10 +176,10 @@ fn the_error_rows_in_order() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(w.ph as u32), Rights::INSPECT)
+            .duplicate(&mut w.us.objs, abi::Handle(w.ph), Rights::INSPECT)
             .unwrap();
     assert_eq!(
-        w.start(u64::from(weak_p.0), CODE, SP, bh, 0),
+        w.start(weak_p.0, CODE, SP, bh, 0),
         Err(Status::AccessDenied)
     );
     let weak_c =
@@ -191,10 +187,10 @@ fn the_error_rows_in_order() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(bh as u32), Rights::READ)
+            .duplicate(&mut w.us.objs, abi::Handle(bh), Rights::READ)
             .unwrap();
     assert_eq!(
-        w.start(w.ph, CODE, SP, u64::from(weak_c.0), 0),
+        w.start(w.ph, CODE, SP, weak_c.0, 0),
         Err(Status::AccessDenied)
     );
     // the entry and the stack

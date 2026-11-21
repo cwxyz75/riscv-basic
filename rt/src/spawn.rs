@@ -45,7 +45,7 @@ pub fn caller_rights() -> u32 {
 /// [`caller_rights`]. **The handles are consumed in every case**: they move into the child's
 /// message, or (on failure before that) are closed here. On failure everything created here is
 /// released.
-pub fn spawn(image: &[u8], startup: &[u8], handles: &[u32]) -> Result<u32, SpawnError> {
+pub fn spawn(image: &[u8], startup: &[u8], handles: &[u64]) -> Result<u64, SpawnError> {
     spawn_in(image, startup, handles, 0)
 }
 
@@ -55,10 +55,10 @@ pub fn spawn(image: &[u8], startup: &[u8], handles: &[u32]) -> Result<u32, Spawn
 pub fn spawn_in(
     image: &[u8],
     startup: &[u8],
-    handles: &[u32],
-    job: u32,
-) -> Result<u32, SpawnError> {
-    let early = |handles: &[u32], e: SpawnError| {
+    handles: &[u64],
+    job: u64,
+) -> Result<u64, SpawnError> {
+    let early = |handles: &[u64], e: SpawnError| {
         for &h in handles {
             sys::handle_close(h);
         }
@@ -85,7 +85,7 @@ pub fn spawn_in(
     if p.status != 0 {
         return early(handles, sys_err(p.status));
     }
-    let proc = p.a1 as u32;
+    let proc = p.a1 as u64;
     let mut moved = false;
     let result = build_and_start(proc, &parsed, image, startup, handles, job, &mut moved);
     match result {
@@ -98,7 +98,7 @@ pub fn spawn_in(
                 sys::handle_close(proc);
                 return Err(sys_err(r.status));
             }
-            Ok(r.a1 as u32)
+            Ok(r.a1 as u64)
         }
         Err(e) => {
             // Closing the last handle to a process that never ran frees it with everything
@@ -115,12 +115,12 @@ pub fn spawn_in(
 }
 
 fn build_and_start(
-    proc: u32,
+    proc: u64,
     parsed: &elf::Image,
     image: &[u8],
     startup: &[u8],
-    handles: &[u32],
-    job: u32,
+    handles: &[u64],
+    job: u64,
     moved: &mut bool,
 ) -> Result<(), SpawnError> {
     for seg in &parsed.segments {
@@ -130,7 +130,7 @@ fn build_and_start(
         if v.status != 0 {
             return Err(sys_err(v.status));
         }
-        let vmo = v.a1 as u32;
+        let vmo = v.a1 as u64;
         let lead = seg.vaddr % 4096;
         let Some(bytes) = image.get(seg.offset as usize..(seg.offset + seg.filesz) as usize) else {
             sys::handle_close(vmo);
@@ -163,7 +163,7 @@ fn build_and_start(
     if s.status != 0 {
         return Err(sys_err(s.status));
     }
-    let stack = s.a1 as u32;
+    let stack = s.a1 as u64;
     let m = sys::process_map(
         proc,
         stack,
@@ -180,7 +180,7 @@ fn build_and_start(
     if c.status != 0 {
         return Err(sys_err(c.status));
     }
-    let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+    let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
     // The startup message goes in before the child runs; then our end is closed (the message
     // stays readable, and the child cannot park budget on a channel we still hold).
     let w = sys::channel_write(
@@ -206,7 +206,7 @@ fn build_and_start(
 
 /// Read `len` bytes at `offset` from a VMO into memory (for an image). `None` if the extent is
 /// outside the VMO or too large.
-pub fn read_image(vmo: u32, offset: u64, len: u64) -> Option<Vec<u8>> {
+pub fn read_image(vmo: u64, offset: u64, len: u64) -> Option<Vec<u8>> {
     if len == 0 || len > MAX_IMAGE as u64 {
         return None;
     }

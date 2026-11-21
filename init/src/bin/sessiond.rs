@@ -17,7 +17,7 @@ use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 #[path = "../session.rs"]
 mod session;
 
-fn read_image(vmo: u32) -> Option<alloc::vec::Vec<u8>> {
+fn read_image(vmo: u64) -> Option<alloc::vec::Vec<u8>> {
     let size = rt::sys::vmo_get_size(vmo);
     if size.status != 0 {
         return None;

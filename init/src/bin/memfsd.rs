@@ -56,7 +56,7 @@ struct Conn {
 struct Server {
     fs: Fs,
     core: Core<Conn>,
-    image_vmo: u32,
+    image_vmo: u64,
     /// A walk met a symlink: (components consumed, target text) for the reply (`status::SYMLINK`).
     link_stop: Option<(usize, Vec<u8>)>,
 }
@@ -97,7 +97,7 @@ impl Service for Server {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u64]) {
         // (the runtime reads at most one handle: more is a protocol violation it has already ended)
         self.handle_request(key, msg, handles.first().copied());
     }
@@ -146,7 +146,7 @@ impl Server {
     fn add_conn(
         &mut self,
         account: svc::AccountId,
-        ch: u32,
+        ch: u64,
         node: NodeId,
         rights: u32,
         is_dir: bool,
@@ -185,7 +185,7 @@ impl Server {
         status: i32,
         a: u64,
         payload: &[u8],
-        handle: Option<u32>,
+        handle: Option<u64>,
     ) {
         let Some(bytes) = encode_reply(txid, status, a, payload) else {
             // out of memory (or a payload that cannot be a reply): drop the connection
@@ -200,8 +200,8 @@ impl Server {
         }
     }
 
-    fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u32>) {
-        let close_ep = |ep: Option<u32>| {
+    fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u64>) {
+        let close_ep = |ep: Option<u64>| {
             if let Some(h) = ep {
                 sys::handle_close(h);
             }
@@ -562,7 +562,7 @@ impl Server {
                         if d.status != 0 {
                             return self.send(key, txid, d.status, 0, &[], None);
                         }
-                        self.send(key, txid, 0, off, &len.to_le_bytes(), Some(d.a1 as u32));
+                        self.send(key, txid, 0, off, &len.to_le_bytes(), Some(d.a1 as u64));
                     }
                     Err(_) => self.send(key, txid, status::BAD_REQUEST, 0, &[], None),
                 }
@@ -612,7 +612,7 @@ impl Server {
         path: &[u8],
         fl: u16,
         want: u32,
-        endpoint: u32,
+        endpoint: u64,
     ) -> Result<u8, i32> {
         let denied = Status::AccessDenied.code();
         // The connection limit comes first: nothing may be created or truncated for an open that
@@ -821,7 +821,7 @@ pub fn app_main() -> i32 {
     }
     let mut server = Server {
         fs,
-        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
+        core: Core::new(p.a1 as u64, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         image_vmo,
         link_stop: None,
     };

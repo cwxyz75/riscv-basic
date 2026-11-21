@@ -1,8 +1,8 @@
 //! A process's handle table (OS-ARCHITECTURE.md, 5.1; SYSCALLS.md, "Handles").
 //!
-//! A handle value is `generation << 13 | (slot + 1)`: the slot plus one (13 bits, so up to 8191
-//! slots) so that 0 is never valid, and a 19-bit generation that changes each time the slot is
-//! freed so a stale value fails instead of naming whatever reuses the slot (INVARIANTS H2). A
+//! A handle value is 64 bits, `generation << 24 | (slot + 1)` (KERNEL-V1-SPEC 3.2, AB1): the slot plus one (24 bits, so up to 2^24 - 1
+//! slots) so that 0 is never valid, and a 40-bit generation that changes each time the slot is
+//! freed so a stale value fails instead of naming whatever reuses the slot (INVARIANTS H2). The table grows on demand. A
 //! slot whose generation has used its whole range is retired, never reused, so a stale value
 //! cannot become valid again by wrap-around. The table
 //! maps a handle to an object id and a rights mask; rights only ever shrink (H3).
@@ -24,32 +24,55 @@ pub struct Entry {
 }
 
 /// Bits of a handle value that hold the slot number plus one.
-const SLOT_BITS: u32 = 13;
-const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
-/// The generations a slot goes through before it is retired.
-const GENERATIONS: u32 = 1 << (32 - SLOT_BITS);
+const SLOT_BITS: u32 = 24;
+const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+/// The generations a slot goes through before it is retired (40 bits).
+const GENERATIONS: u64 = 1 << (64 - SLOT_BITS);
+
+/// The most handles a table can name.
+pub const MAX_SLOTS: usize = SLOT_MASK as usize;
 
 struct Slot {
-    gen: u32,
+    gen: u64,
     entry: Option<Entry>,
 }
 
 pub struct HandleTable {
     slots: Vec<Slot>,
-    free: Vec<u16>,
+    free: Vec<u32>,
     limit: usize,
     live: usize,
+    /// The generation a new slot starts at (0; a test fast-forwards it to reach retirement without 2^40 reuses).
+    first_gen: u64,
+    /// The most slots the table may have (`MAX_SLOTS`; a test lowers it to fill the table cheaply).
+    slot_cap: usize,
 }
 
 impl HandleTable {
-    /// A table that holds at most `limit` handles (capped at 8191 by the encoding).
+    /// A table that holds at most `limit` handles (capped at 2^24 - 1 by the encoding). It grows on demand: nothing is sized for the limit.
     pub fn new(limit: usize) -> HandleTable {
         HandleTable {
             slots: Vec::new(),
             free: Vec::new(),
-            limit: limit.min(SLOT_MASK as usize),
+            limit: limit.min(MAX_SLOTS),
             live: 0,
+            first_gen: 0,
+            slot_cap: MAX_SLOTS,
         }
+    }
+
+    /// For tests: a table whose new slots start at generation `gen`, so that retirement (the generation reaching 2^40) can be reached in a
+    /// few reuses of a slot instead of 2^40.
+    pub fn starting_at_generation(limit: usize, gen: u64) -> HandleTable {
+        let mut t = HandleTable::new(limit);
+        t.first_gen = gen.min(GENERATIONS);
+        t
+    }
+
+    /// For tests: lower the most slots the table may have (so a full table of retired slots is cheap to build).
+    pub fn with_slot_cap(mut self, cap: usize) -> HandleTable {
+        self.slot_cap = cap.min(MAX_SLOTS);
+        self
     }
 
     /// Make room, in memory, for `n` more handles: the slots they may need and the free list that gives them back, so that neither growing nor
@@ -88,7 +111,7 @@ impl HandleTable {
     /// Slots that can still be handed out (free ones and unused ones).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the free list and the slot table are both at most SLOT_MASK long
     fn slots_left(&self) -> usize {
-        self.free.len() + (SLOT_MASK as usize).saturating_sub(self.slots.len())
+        self.free.len() + self.slot_cap.saturating_sub(self.slots.len())
     }
 
     fn decode(&self, h: Handle) -> Option<usize> {
@@ -99,9 +122,9 @@ impl HandleTable {
         (s.gen == gen && s.entry.is_some()).then_some(slot)
     }
 
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: gen < GENERATIONS and slot < SLOT_MASK, so the encoded value fits in 32 bits
-    fn encode(slot: usize, gen: u32) -> Handle {
-        Handle((gen << SLOT_BITS) | (slot as u32 + 1))
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: gen < GENERATIONS and slot < SLOT_MASK, so the encoded value fits in 64 bits
+    fn encode(slot: usize, gen: u64) -> Handle {
+        Handle((gen << SLOT_BITS) | (slot as u64 + 1))
     }
 
     /// Look up a handle.
@@ -125,11 +148,14 @@ impl HandleTable {
             }
             None => {
                 // (retired slots stay in the vector, so the slot numbers must still fit)
-                if self.slots.len() >= SLOT_MASK as usize {
+                if self.slots.len() >= self.slot_cap {
                     return Err(Status::NoMemory);
                 }
                 self.reserve(1)?;
-                self.slots.push(Slot { gen: 0, entry });
+                self.slots.push(Slot {
+                    gen: self.first_gen,
+                    entry,
+                });
                 self.slots.len() - 1
             }
         };
@@ -150,7 +176,7 @@ impl HandleTable {
         // A slot that has gone through every generation is retired: reusing it would wrap the
         // generation round to values stale handles still hold.
         if s.gen < GENERATIONS {
-            self.free.push(slot as u16);
+            self.free.push(slot as u32);
         }
         self.live -= 1;
         entry
@@ -290,14 +316,14 @@ mod tests {
     #[test]
     fn a_table_out_of_slots_refuses_instead_of_panicking() {
         let mut reg = Kobjs::new();
-        let mut t = HandleTable::new(64);
+        let mut t = HandleTable::new(64).with_slot_cap(8);
         // slot 0 is free but on its last generation; every other slot is retired
         t.slots.push(Slot {
             gen: GENERATIONS - 1,
             entry: None,
         });
         t.free.push(0);
-        for _ in 1..SLOT_MASK as usize {
+        for _ in 1..8 {
             t.slots.push(Slot {
                 gen: GENERATIONS,
                 entry: None,

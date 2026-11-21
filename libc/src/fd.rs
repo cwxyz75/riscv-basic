@@ -7,7 +7,7 @@
 use crate::errno;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_long, c_void};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use proto::file::{flags as pf, rights, status as ps};
 use rt::fs::Fs;
 use rt::sync::Mutex;
@@ -37,7 +37,7 @@ pub struct OpenFile {
 enum Entry {
     /// A stream: the handle of a socket, and whether this table owns it (a `pipe` end or a `dup`: closed with the descriptor;
     /// the startup message's own streams are not).
-    Stream(u32, bool, bool),
+    Stream(u64, bool, bool),
     File(OpenFile),
     /// A socket (S9 step 6): shared, so a blocking call does not hold the descriptor table.
     Socket(crate::socket::SockRef),
@@ -59,7 +59,7 @@ static TABLE: Mutex<pathres::Table> = Mutex::new(pathres::Table {
     cwd_handle: None,
 });
 /// A cwd handle `chdir` opened (closed when the next `chdir` replaces it); 0 if the cwd is still the startup message's.
-static OWN_CWD: AtomicU32 = AtomicU32::new(0);
+static OWN_CWD: AtomicU64 = AtomicU64::new(0);
 
 /// Install the namespace table (start-up).
 pub fn set_table(t: pathres::Table) {
@@ -70,7 +70,7 @@ pub fn set_table(t: pathres::Table) {
 const LOOP: i32 = -999;
 
 /// Install the three standard streams (handles 0 = absent).
-pub fn init_std(stdin: u32, stdout: u32, stderr: u32, tty_in: bool, tty_out: bool) {
+pub fn init_std(stdin: u64, stdout: u64, stderr: u64, tty_in: bool, tty_out: bool) {
     let mut t = FDS.lock();
     for (i, h) in [stdin, stdout, stderr].into_iter().enumerate() {
         if h != 0 {
@@ -83,7 +83,7 @@ pub fn init_std(stdin: u32, stdout: u32, stderr: u32, tty_in: bool, tty_out: boo
 }
 
 /// The handle of a standard stream (descriptors 0-2 and what `dup` made of them), if `fd` is one.
-pub fn stream_handle(fd: c_int) -> Option<u32> {
+pub fn stream_handle(fd: c_int) -> Option<u64> {
     match FDS.lock().fds.get(usize::try_from(fd).ok()?)?.as_ref()? {
         Entry::Stream(h, _, _) => Some(*h),
         _ => None,
@@ -147,7 +147,7 @@ pub fn dup_stream(from: c_int, to: c_int) -> c_int {
     if let Some(Entry::Stream(old, true, _)) = t.fds[to as usize].take() {
         rt::sys::handle_close(old);
     }
-    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u32, true, tty));
+    t.fds[to as usize] = Some(Entry::Stream(d.a1 as u64, true, tty));
     to
 }
 
@@ -188,7 +188,7 @@ fn fail(status: i32) -> c_int {
 /// A txid range per view of a shared directory connection (see `Fs::new_at`).
 static TXIDS: AtomicU32 = AtomicU32::new(1);
 
-fn dir_view(h: u32) -> Fs {
+fn dir_view(h: u64) -> Fs {
     Fs::new_at(h, TXIDS.fetch_add(1 << 12, Ordering::Relaxed))
 }
 
@@ -618,7 +618,7 @@ pub fn dir_entries(path: &[u8]) -> Result<Vec<(Vec<u8>, bool, bool)>, c_int> {
 /// (`STDIN`, `STDOUT` or `STDERR`): `tty` for the terminal the program was started on, `file:<mode>:<offset>` for a file (the
 /// program gets a connection of its own to it: mode bit 1 readable, 2 writable, 3 append), nothing for a socket. A file that is
 /// shared this way is written at its end from then on, by both sides: a writer's position is not shared, and an append is.
-pub fn stdio_for_child(fd: c_int) -> Option<(u32, Option<alloc::string::String>)> {
+pub fn stdio_for_child(fd: c_int) -> Option<(u64, Option<alloc::string::String>)> {
     let mut t = FDS.lock();
     let entry = t.fds.get_mut(usize::try_from(fd).ok()?)?.as_mut()?;
     match entry {
@@ -627,7 +627,7 @@ pub fn stdio_for_child(fd: c_int) -> Option<(u32, Option<alloc::string::String>)
             if d.status != 0 {
                 return None;
             }
-            Some((d.a1 as u32, tty.then(|| alloc::string::String::from("tty"))))
+            Some((d.a1 as u64, tty.then(|| alloc::string::String::from("tty"))))
         }
         Entry::File(f) => {
             let want = (if f.readable { rights::READ } else { 0 })
@@ -646,7 +646,7 @@ pub fn stdio_for_child(fd: c_int) -> Option<(u32, Option<alloc::string::String>)
 }
 
 /// A started program's standard stream that is a file: replace the socket entry `init_std` made.
-pub fn init_file_std(fd: c_int, handle: u32, mode: u8, off: u64) {
+pub fn init_file_std(fd: c_int, handle: u64, mode: u8, off: u64) {
     let Some(slot) = usize::try_from(fd).ok().filter(|&i| i < 3) else {
         return;
     };
@@ -709,7 +709,7 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
         errno::set(24);
         return -1;
     }
-    let (a, b) = (c.a1 as u32, c.a2 as u32);
+    let (a, b) = (c.a1 as u64, c.a2 as u64);
     let mut t = FDS.lock();
     let mut free = (0..MAX_FDS).filter(|&i| t.fds[i].is_none());
     let (Some(r), Some(w)) = (free.next(), free.next()) else {
@@ -741,7 +741,7 @@ pub fn vfork_enter() {
             Some(Entry::Stream(h, _, tty)) => {
                 let d = rt::sys::handle_duplicate(*h, rt::abi::rights::Rights::SAME.0);
                 if d.status == 0 {
-                    child.fds[i] = Some(Entry::Stream(d.a1 as u32, true, *tty));
+                    child.fds[i] = Some(Entry::Stream(d.a1 as u64, true, *tty));
                 }
             }
             // an open file: a connection of its own (the child redirects, and starts programs with it as a standard stream)
@@ -1041,7 +1041,7 @@ unsafe fn stat_path(path: *const c_char, out: *mut Stat, nofollow: bool) -> c_in
     .map_err(status_of);
     match r {
         Ok(((s, h), abs)) => {
-            fill_stat(out, &s.info, u64::from(h), &abs);
+            fill_stat(out, &s.info, h, &abs);
             0
         }
         Err(e) => fail(e),
@@ -1299,7 +1299,7 @@ static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Read from a standard stream. On a terminal the end of input is the byte `0x04`, delivered in the
 /// stream like any other: the bytes before it come out first, then a read returns 0 (end of input),
 /// and what follows is kept for the read after that.
-unsafe fn read_stream(fd: c_int, h: u32, buf: *mut u8, n: usize) -> isize {
+unsafe fn read_stream(fd: c_int, h: u64, buf: *mut u8, n: usize) -> isize {
     let tty = fd == 0 && is_tty(0);
     let mut data: Vec<u8> = if tty {
         core::mem::take(&mut *PENDING.lock())

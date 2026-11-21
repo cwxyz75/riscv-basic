@@ -18,14 +18,14 @@ const ANSWER_TIMEOUT: u64 = 30_000;
 /// Returns the process handle (rights: WAIT, INSPECT, KILL, DUPLICATE, TRANSFER), or the
 /// launcher's status (negative; a kernel status or a `proto::file::status` value).
 pub fn spawn_via(
-    ch: u32,
-    image_vmo: u32,
+    ch: u64,
+    image_vmo: u64,
     offset: u64,
     len: u64,
     startup: &Startup,
-    forward: &[u32],
+    forward: &[u64],
     txid: u32,
-) -> Result<u32, i32> {
+) -> Result<u64, i32> {
     let startup_bytes = startup.encode().map_err(|_| -4)?;
     let req = launch::Spawn {
         txid,
@@ -40,12 +40,12 @@ pub fn spawn_via(
     if d.status != 0 {
         return Err(d.status);
     }
-    let mut hs: Vec<u32> = Vec::with_capacity(1 + forward.len());
-    hs.push(d.a1 as u32);
+    let mut hs: Vec<u64> = Vec::with_capacity(1 + forward.len());
+    hs.push(d.a1 as u64);
     hs.extend_from_slice(forward);
     let w = sys::channel_write(ch, req.as_ptr(), req.len(), hs.as_ptr(), hs.len());
     if w.status != 0 {
-        sys::handle_close(d.a1 as u32);
+        sys::handle_close(d.a1 as u64);
         return Err(w.status);
     }
     // A reply to an earlier request (one that arrived after its caller gave up) is discarded, with
@@ -57,7 +57,7 @@ pub fn spawn_via(
             return Err(wait.status);
         }
         let mut buf = [0u8; 16];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), h.len());
         if r.status != 0 {
             return Err(r.status);

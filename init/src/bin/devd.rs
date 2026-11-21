@@ -77,9 +77,9 @@ impl Service for Devd {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u64]) {
         let ep = handles.first().copied();
-        let close_ep = |h: Option<u32>| {
+        let close_ep = |h: Option<u64>| {
             if let Some(h) = h {
                 sys::handle_close(h);
             }
@@ -305,7 +305,7 @@ pub fn app_main() -> i32 {
         return 4;
     }
     let mut d = Devd {
-        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, 30_000),
+        core: Core::new(p.a1 as u64, POOL, file::MAX_MESSAGE, 1, 30_000),
         random,
     };
     if d.core

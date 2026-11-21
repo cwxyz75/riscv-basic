@@ -312,7 +312,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         ..
     } = s;
     let p = procs.get_mut(&pid).expect("process exists");
-    let h = |i: usize| Handle(a[i] as u32);
+    let h = |i: usize| Handle(a[i]);
     // The syscall layer that needs no machine is in the `ksys` crate (TS3): the width check of the 32-bit arguments first, then the calls
     // on handles, events, channels, sockets and ports, over this machine's memory.
     let bad_args = ksys::wide_argument_error(n, &a);
@@ -382,7 +382,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             let rights =
                 Rights(Rights::READ.0 | Rights::MAP.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
             match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
-                Ok(hd) => Ok((Some(u64::from(hd.0)), Some(blob.len() as u64))),
+                Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
                 Err(e) => {
                     let _ = k.vmos.destroy(&mut k.mm, id);
                     fail(e)
@@ -413,7 +413,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                         *s = Some(obj);
                     }
                     crate::aia::enable(irq as u32);
-                    Ok((Some(u64::from(hd.0)), None))
+                    Ok((Some(hd.0), None))
                 }
                 Err(e) => fail(e),
             }

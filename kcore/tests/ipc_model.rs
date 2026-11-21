@@ -12,7 +12,7 @@ use kcore::ipc::*;
 use std::collections::{HashMap, VecDeque};
 
 fn world() -> (Kobjs, HandleTable) {
-    (Kobjs::new(), HandleTable::new(abi::limits::MAX_HANDLES))
+    (Kobjs::new(), HandleTable::new(kcore::handle::MAX_SLOTS))
 }
 
 #[test]
@@ -605,7 +605,7 @@ fn random_channels_agree_with_the_model() {
                         let mut list: Vec<Handle> =
                             (0..rng.below(4)).map(|_| any(&mut rng)).collect();
                         if rng.chance(4) {
-                            list.push(Handle(rng.next() as u32)); // a forged one
+                            list.push(Handle(rng.next())); // a forged one
                         }
                         if rng.chance(3) {
                             list = handles

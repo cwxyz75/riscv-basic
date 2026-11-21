@@ -15,11 +15,10 @@ fn root_handle(w: &mut World, rights: Rights) -> u64 {
         jobs: &mut w.vmos.jobs,
         job: Some(JobId::ROOT),
     };
-    u64::from(
-        ipc::job_object_create(&mut w.objs, &mut w.handles, JobId::ROOT, rights, &mut q)
-            .unwrap()
-            .0,
-    )
+
+    ipc::job_object_create(&mut w.objs, &mut w.handles, JobId::ROOT, rights, &mut q)
+        .unwrap()
+        .0
 }
 
 fn limits(l: [u64; 6]) -> Vec<u8> {
@@ -180,11 +179,11 @@ fn job_info_rows() {
 }
 
 #[test]
-fn the_wide_job_handles_are_refused() {
+fn a_job_handle_is_a_full_register_and_a_value_that_names_nothing_is_bad_handle() {
+    let mut w = world();
     for n in [nr::JOB_CREATE, nr::JOB_SET_LIMITS, nr::JOB_INFO] {
-        assert_eq!(
-            wide_argument_error(n, &[1 << 32, 0, 0, 0, 0, 0]),
-            Some(Status::BadHandle)
-        );
+        // (AB1: no width rule on a handle; the table refuses what it does not hold)
+        assert_eq!(wide_argument_error(n, &[1 << 32, 0, 0, 0, 0, 0]), None);
+        assert_eq!(w.err(n, [1 << 40 | 1, 0, 0, 0, 0, 0]), Status::BadHandle);
     }
 }

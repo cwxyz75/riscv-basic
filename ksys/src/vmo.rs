@@ -38,7 +38,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     } = c;
     let job = *job;
     let windows: &[(u64, u64)] = windows;
-    let h = |i: usize| Handle(a[i] as u32);
+    let h = |i: usize| Handle(a[i]);
     let r: Reply = (|| match n {
         nr::VMO_CREATE => {
             if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {
@@ -61,7 +61,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     job: Some(job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
                     let _ = vmos.destroy(mm, id);
                     fail(e)
@@ -93,7 +93,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     job: Some(job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
                     let _ = vmos.destroy(mm, id);
                     fail(e)
@@ -127,7 +127,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     job: Some(job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
                     let _ = vmos.destroy(mm, id);
                     fail(e)

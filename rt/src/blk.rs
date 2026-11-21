@@ -17,7 +17,7 @@ const REPLY_TIMEOUT: u64 = 10_000;
 const PER_BLOCK: u32 = (BLOCK / SECTOR) as u32;
 
 pub struct BlkDevice {
-    ch: u32,
+    ch: u64,
     txid: u32,
     blocks: u64,
     read_only: bool,
@@ -25,7 +25,7 @@ pub struct BlkDevice {
 
 impl BlkDevice {
     /// Ask the driver on `ch` for its size and take the device over (the channel is the caller's no longer).
-    pub fn open(ch: u32) -> Option<BlkDevice> {
+    pub fn open(ch: u64) -> Option<BlkDevice> {
         let mut d = BlkDevice {
             ch,
             txid: 0,
@@ -50,7 +50,7 @@ impl BlkDevice {
     }
 
     /// The channel, to hand the device back (or close it).
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 

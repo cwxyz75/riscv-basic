@@ -94,7 +94,7 @@ fn world() -> W {
         us,
         vmos,
         mm,
-        ph: u64::from(h.0),
+        ph: h.0,
     }
 }
 
@@ -150,7 +150,7 @@ fn the_error_rows_in_order() {
     )
     .unwrap();
     let mut a = w.ok_args();
-    a[0] = u64::from(vh.0);
+    a[0] = vh.0;
     assert_eq!(w.create(a), Err(Status::WrongType));
     // no MANAGE
     let weak =
@@ -158,10 +158,10 @@ fn the_error_rows_in_order() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(w.ph as u32), Rights::INSPECT)
+            .duplicate(&mut w.us.objs, abi::Handle(w.ph), Rights::INSPECT)
             .unwrap();
     let mut a = w.ok_args();
-    a[0] = u64::from(weak.0);
+    a[0] = weak.0;
     assert_eq!(w.create(a), Err(Status::AccessDenied));
     // the entry must be executable, the stack aligned and inside the user range
     let mut a = w.ok_args();
@@ -328,4 +328,27 @@ fn the_priority_is_inherited_clamped_to_the_job_and_at_least_one() {
         ksys::clamp_prio(&w.vmos.jobs, JobId::ROOT, 200),
         63.min(w.vmos.jobs.sched(JobId::ROOT).unwrap().max_prio)
     );
+}
+
+#[test]
+fn thread_create_with_a_full_handle_table() {
+    // (AB1: a process's table has no fixed size any more, so the guest cannot fill it: the host table has a limit of 64)
+    let mut w = world();
+    let mut held = Vec::new();
+    {
+        let ksys::UserState { objs, procs, .. } = &mut w.us;
+        let p = procs.get_mut(&1).unwrap();
+        while let Ok(h) = ipc::event_create(objs, &mut p.handles) {
+            held.push(h);
+        }
+        assert!(held.len() >= 50, "the table filled up");
+    }
+    assert_eq!(w.create(w.ok_args()), Err(Status::NoMemory), "table full");
+    assert_eq!(w.us.procs[&2].threads_alive, 0, "nothing was started");
+    assert_eq!(w.threads_charged(JobId::ROOT), 0, "nothing was charged");
+    // a slot given back and the call succeeds
+    let ksys::UserState { objs, procs, .. } = &mut w.us;
+    let p = procs.get_mut(&1).unwrap();
+    p.handles.close(objs, held.pop().unwrap()).unwrap();
+    assert!(w.create(w.ok_args()).is_ok());
 }

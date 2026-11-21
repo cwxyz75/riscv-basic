@@ -95,45 +95,14 @@ pub(crate) fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
-/// Handles are 32 bits wide everywhere (SYSCALLS.md): a handle or 32-bit argument with high bits set names nothing and grants nothing,
-/// instead of being silently truncated. `Some(status)`: the call is refused before it runs.
+/// A 32-bit argument that is not a handle (rights, masks, flags) with high bits set names nothing and grants nothing, instead of being
+/// silently truncated. Handles are 64 bits (AB1): a handle argument has no width rule, and a value that names nothing is BAD_HANDLE from the
+/// table. `Some(status)`: the call is refused before it runs.
 #[allow(clippy::indexing_slicing)] // INVARIANT: a is [u64; 6] and `over(i)` is called with constants below 6
 pub fn wide_argument_error(n: usize, a: &[u64; 6]) -> Option<Status> {
     let over = |i: usize| a[i] > u64::from(u32::MAX);
     match n {
-        nr::HANDLE_CLOSE | nr::OBJECT_SIGNALS | nr::OBJECT_INFO | nr::CHANNEL_WRITE if over(0) => {
-            Some(Status::BadHandle)
-        }
-        nr::CHANNEL_READ | nr::CHANNEL_READ_TXID if over(0) => Some(Status::BadHandle),
-        nr::VMO_READ | nr::VMO_WRITE | nr::VMO_GET_SIZE | nr::VMO_PHYS_ADDR | nr::VMO_COMMIT
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::VMO_CREATE_PHYSICAL
-        | nr::VMO_CREATE_DMA
-        | nr::RESOURCE_DTB
-        | nr::INTERRUPT_CREATE
-        | nr::INTERRUPT_ACK
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::JOB_CREATE | nr::JOB_SET_LIMITS | nr::JOB_INFO if over(0) => Some(Status::BadHandle),
-        nr::VMO_CREATE if over(1) => Some(Status::BadHandle),
-        nr::SOCKET_WRITE
-        | nr::SOCKET_READ
-        | nr::SOCKET_SHUTDOWN
-        | nr::PORT_UNBIND
-        | nr::PORT_REARM
-            if over(0) =>
-        {
-            Some(Status::BadHandle)
-        }
-        nr::PORT_BIND if over(0) || over(1) => Some(Status::BadHandle),
-        nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(0) => Some(Status::BadHandle),
         nr::HANDLE_DUPLICATE | nr::HANDLE_REPLACE if over(1) => Some(Status::AccessDenied),
-        nr::EVENT_SIGNAL if over(0) => Some(Status::BadHandle),
         nr::EVENT_SIGNAL if over(1) || over(2) => Some(Status::InvalidArgs),
         nr::CHANNEL_READ_TXID if over(1) => Some(Status::InvalidArgs),
         _ => None,
@@ -142,13 +111,13 @@ pub fn wide_argument_error(n: usize, a: &[u64; 6]) -> Option<Status> {
 
 pub(crate) fn handle_list(args: &[u8]) -> Result<Vec<Handle>, Status> {
     let mut v = Vec::new();
-    v.try_reserve_exact(args.len() / 4)
+    v.try_reserve_exact(args.len() / 8)
         .map_err(|_| Status::NoMemory)?;
     v.extend(
-        args.as_chunks::<4>()
+        args.as_chunks::<8>()
             .0
             .iter()
-            .map(|c| Handle(u32::from_le_bytes(*c))),
+            .map(|c| Handle(u64::from_le_bytes(*c))),
     );
     Ok(v)
 }
@@ -192,7 +161,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     ) {
         return None;
     }
-    let h = |i: usize| Handle(a[i] as u32);
+    let h = |i: usize| Handle(a[i]);
     let r: Reply = (|| match n {
         nr::HANDLE_CLOSE => handles
             .close(objs, h(0))
@@ -202,7 +171,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             let nh = handles
                 .duplicate(objs, h(0), Rights(a[1] as u32))
                 .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(nh.0)), None))
+            Ok((Some(nh.0), None))
         }
         nr::HANDLE_REPLACE => {
             let nh = handles
@@ -213,7 +182,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if skip_forced_touch {
                 objs.take_dirty();
             }
-            Ok((Some(u64::from(nh.0)), None))
+            Ok((Some(nh.0), None))
         }
         nr::CHANNEL_CREATE => {
             let (x, y) = ipc::channel_create_in(
@@ -225,7 +194,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 },
             )
             .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
+            Ok((Some(x.0), Some(y.0)))
         }
         nr::SOCKET_CREATE => {
             let (x, y) = ipc::socket_create_in(
@@ -237,7 +206,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 },
             )
             .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(x.0)), Some(u64::from(y.0))))
+            Ok((Some(x.0), Some(y.0)))
         }
         nr::SOCKET_WRITE => {
             let len = a[2] as usize;
@@ -271,7 +240,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 },
             )
             .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(port.0)), None))
+            Ok((Some(port.0), None))
         }
         nr::PORT_BIND => {
             ipc::port_bind_flags_in(objs, handles, h(0), h(1), a[2], a[3], a[4], &mut vmos.jobs)
@@ -294,7 +263,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 },
             )
             .map_err(|e| (e, None, None))?;
-            Ok((Some(u64::from(e.0)), None))
+            Ok((Some(e.0), None))
         }
         nr::EVENT_SIGNAL => ipc::event_signal(objs, handles, h(0), a[1] as u32, a[2] as u32)
             .map(|_| (None, None))
@@ -313,7 +282,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             }
             let data =
                 copy_from_user(aspace, mm, vmos, a[1], nbytes).map_err(|e| (e, None, None))?;
-            let raw = copy_from_user(aspace, mm, vmos, a[3], nhandles * 4)
+            let raw = copy_from_user(aspace, mm, vmos, a[3], nhandles * 8)
                 .map_err(|e| (e, None, None))?;
             ipc::channel_write_in(
                 objs,
@@ -353,7 +322,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 Err(ReadError::Status(st)) => return fail(st),
             };
             verify_writable(aspace, mm, vmos, bytes_at, nbytes).map_err(|e| (e, None, None))?;
-            verify_writable(aspace, mm, vmos, handles_at, nhandles * 4)
+            verify_writable(aspace, mm, vmos, handles_at, nhandles * 8)
                 .map_err(|e| (e, None, None))?;
             let got = match txid {
                 None => ipc::channel_read_in(objs, handles, h(0), mb, mh, &mut vmos.jobs),
@@ -371,7 +340,7 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                         copy_to_user_verified(
                             aspace,
                             mm,
-                            handles_at + (i as u64) * 4,
+                            handles_at + (i as u64) * 8,
                             &h.0.to_le_bytes(),
                         )
                         .map_err(|e| (e, None, None))?;

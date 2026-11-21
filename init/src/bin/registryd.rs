@@ -31,6 +31,8 @@ const HOLD_TIMEOUT: u64 = 30_000;
 /// Port keys with this bit set are listeners the registry watches (the runtime's connection keys count up
 /// from 1 and never reach it).
 const LISTENER_KEY: u64 = 1 << 63;
+// (A listener's port key is the tag OR the listener's handle: a 64-bit handle has bit 63 clear until its slot has been reused 2^39 times, about 17 years
+// at a million reuses a second (KERNEL-V1-SPEC 3.2), so the two do not meet.)
 
 struct Conn {
     view: View,
@@ -40,7 +42,7 @@ struct Conn {
 struct Registry {
     core: Core<Conn>,
     /// name -> the listener channel handle
-    dir: Directory<u32>,
+    dir: Directory<u64>,
 }
 
 fn encode_reply(txid: u32, status: i32, a: u64, payload: &[u8]) -> Option<Vec<u8>> {
@@ -64,14 +66,14 @@ impl Registry {
         }
     }
 
-    fn drop_listener(&self, h: u32) {
-        sys::port_unbind(self.core.port(), LISTENER_KEY | u64::from(h));
+    fn drop_listener(&self, h: u64) {
+        sys::port_unbind(self.core.port(), LISTENER_KEY | h);
         sys::handle_close(h);
     }
 
     /// A new connection to this registry for `endpoint`, with `view` and `rights`, charged to the account of
     /// `from`. `None` if the runtime refuses it (not a channel, pool full): the handle stays the caller's.
-    fn add(&mut self, from: u64, endpoint: u32, view: View, rights: u32) -> Option<u64> {
+    fn add(&mut self, from: u64, endpoint: u64, view: View, rights: u32) -> Option<u64> {
         let account = self.core.account_of(from)?;
         self.core.add_conn(endpoint, account, Conn { view, rights })
     }
@@ -91,7 +93,7 @@ impl Service for Registry {
         if key & LISTENER_KEY == 0 || observed & signals::PEER_CLOSED == 0 {
             return;
         }
-        let h = (key & !LISTENER_KEY) as u32;
+        let h = key & !LISTENER_KEY;
         let names: Vec<Vec<u8>> = self
             .dir
             .listeners()
@@ -105,8 +107,8 @@ impl Service for Registry {
         sys::port_unbind(self.core.port(), key);
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
-        let close_all = |hs: &[u32]| {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
+        let close_all = |hs: &[u64]| {
             for &h in hs {
                 sys::handle_close(h);
             }
@@ -266,7 +268,7 @@ impl Service for Registry {
                     self.core.port(),
                     ep,
                     signals::PEER_CLOSED,
-                    LISTENER_KEY | u64::from(ep),
+                    LISTENER_KEY | ep,
                 )
                 .status
                     != 0
@@ -282,7 +284,7 @@ impl Service for Registry {
                         self.send(key, txid, 0, 0, &[]);
                     }
                     Err(e) => {
-                        sys::port_unbind(self.core.port(), LISTENER_KEY | u64::from(ep));
+                        sys::port_unbind(self.core.port(), LISTENER_KEY | ep);
                         sys::handle_close(ep);
                         let st = match e {
                             svc::Refuse::Quota => status::QUOTA,
@@ -327,7 +329,7 @@ pub fn app_main() -> i32 {
         return 7;
     }
     let mut reg = Registry {
-        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
+        core: Core::new(p.a1 as u64, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         dir: Directory::new(),
     };
     // the service channel is the full directory connection, with every right

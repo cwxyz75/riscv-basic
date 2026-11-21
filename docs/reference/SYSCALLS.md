@@ -15,9 +15,9 @@ entries before their implementation (S3b, S3c).
   `a0` to `a5`; nothing else is read. On return `a0` is a **status** (0 or a negative
   code, below) and `a1` onwards carry results where an entry says so. All other
   registers are preserved.
-- A **handle** is a 32-bit value. 0 is never valid. The low 13 bits are the table slot
-  plus 1 (at most 8191 slots); the high 19 bits are a generation that changes every time the slot is freed,
-  so a stale value fails (INVARIANTS H2). Values are meaningful only in the process
+- A **handle** is a 64-bit value (AB1). 0 is never valid. The low 24 bits are the table slot
+  plus 1 (at most 2^24 - 1 slots; the table grows on demand); the high 40 bits are a generation that changes every time the slot is freed,
+  so a stale value fails (INVARIANTS H2). A slot that has used all 2^40 generations is retired. Values are meaningful only in the process
   that holds them.
 - **Pointers** are user virtual addresses; the kernel validates them (inside the
   caller's own address space, mapped with the needed permission) and copies. It never
@@ -91,7 +91,7 @@ change.
 
 ## Limits
 
-`MAX_HANDLES` 4096 per process (the handle encoding allows 65535); `MAX_MSG_BYTES`
+A process holds as many handles as its job's object quota and memory allow (up to 2^24 - 1; there is no fixed `MAX_HANDLES`); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
 `MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
 alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
@@ -200,7 +200,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 111 | futex_wake | `a0` address, `a1` count | `a1` woken |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 
-A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
+A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
 ### Execution model of a syscall (S3b)
 
@@ -212,9 +212,9 @@ kernel never keeps a reference to shared state across such a point). That keeps 
 it with locks, and long syscalls (a 64 KiB message copy, the object sweep) are a latency
 cost the real-time band will feel. The kernel does not touch the user's `sp`, `gp` or `tp`
 (it has its own stack and uses no thread pointer); S5 must reload `gp`/`tp` on entry.
-Arguments declared 32-bit (handles, rights, signal masks, `txid`) must fit in 32 bits: a
-value with higher bits set is BAD_HANDLE (a handle), ACCESS_DENIED (rights) or INVALID_ARGS
-(a signal mask or `txid`), never silently truncated.
+Handles are full 64-bit registers (a value that names nothing is BAD_HANDLE from the table). Arguments declared 32-bit (rights, signal masks,
+`txid`) must fit in 32 bits: a value with higher bits set is ACCESS_DENIED (rights) or INVALID_ARGS (a signal mask or `txid`), never
+silently truncated.
 
 ### Copying from and to user memory
 
@@ -265,7 +265,7 @@ The identity of the object a handle names (`koid`: unique among live objects, ne
 of its peer (`peer_koid`; 0 for an object with no peer, or whose peer is gone). No right is
 needed. It lets a server see that two handles it holds are the two ends of one channel (a client
 can hand a server both ends of a channel it made, so that neither end ever sees PEER_CLOSED).
-Errors: BAD_HANDLE (also a handle value wider than 32 bits). Tests: `object_info_names_objects_and_peers`.
+Errors: BAD_HANDLE. Tests: `object_info_names_objects_and_peers`.
 
 ### object_wait(handle, mask, deadline) -> status, observed
 
@@ -306,8 +306,8 @@ Rights: WRITE and READ on `channel`; TRANSFER on the request handles.
 Effects: as `channel_write` then `channel_read_txid` with the request's transaction id.
 Messages with other transaction ids stay queued, for other readers or later reads.
 Blocking: until the reply arrives, the peer closes, or the deadline.
-Errors before anything is sent, in order: INVALID_ARGS (a bad `args` pointer); BAD_HANDLE
-(also: any `a0` over 32 bits); TOO_BIG (request over the limits); INVALID_ARGS (a request under
+Errors before anything is sent, in order: INVALID_ARGS (a bad `args` pointer); BAD_HANDLE;
+TOO_BIG (request over the limits); INVALID_ARGS (a request under
 4 bytes); WRONG_TYPE, then ACCESS_DENIED (no READ or no WRITE on the channel); INVALID_ARGS
 (a bad request pointer); then those of `channel_write` for the request (BAD_HANDLE for a listed
 handle, ACCESS_DENIED for one without TRANSFER, INVALID_ARGS for a duplicate, NOT_SUPPORTED,
@@ -1020,7 +1020,7 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
 
 * **The boundary moves.** Programs call the functions of the system library the kernel maps into every process
   (`sys_<name>`); syscall numbers and registers become private, and this file becomes the reference of that library.
-* **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle.
+* **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle. (Built: AB1.)
 * **Times are nanoseconds**; `clock_get` is computed in user mode by the system library.
 * **Identifiers** (koid, thread id) are 64-bit and never reused; no counter wraps.
 * **Memory:** `vmo_create` by bytes with RESIZABLE, `vmo_set_size`, `vmo_decommit`, `vmo_create_child` (SNAPSHOT,

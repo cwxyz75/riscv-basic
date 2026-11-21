@@ -25,7 +25,7 @@ pub struct Now {
 }
 
 pub struct Clock {
-    ch: u32,
+    ch: u64,
     txid: u32,
 }
 
@@ -47,11 +47,11 @@ impl Clock {
     }
 
     /// The channel (for a test that sends a malformed request).
-    pub fn channel(&self) -> u32 {
+    pub fn channel(&self) -> u64 {
         self.ch
     }
 
-    pub fn new(ch: u32) -> Clock {
+    pub fn new(ch: u64) -> Clock {
         Clock { ch, txid: 0 }
     }
 

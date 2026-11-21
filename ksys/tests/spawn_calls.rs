@@ -104,7 +104,7 @@ fn world() -> W {
         us,
         vmos,
         mm,
-        ph: u64::from(h.0),
+        ph: h.0,
     }
 }
 
@@ -229,7 +229,7 @@ fn the_error_rows_in_order() {
             .get_mut(&1)
             .unwrap()
             .handles
-            .duplicate(&mut w.us.objs, abi::Handle(w.ph as u32), Rights::INSPECT)
+            .duplicate(&mut w.us.objs, abi::Handle(w.ph), Rights::INSPECT)
             .unwrap();
     w.record(r);
     assert_eq!(
@@ -239,7 +239,7 @@ fn the_error_rows_in_order() {
             &mut w.vmos,
             1,
             10,
-            [u64::from(weak.0), REC, 0, 0, 0, 0]
+            [weak.0, REC, 0, 0, 0, 0]
         ),
         Err(Status::AccessDenied)
     );

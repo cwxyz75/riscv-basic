@@ -13,8 +13,8 @@ pub const EXIT_PIPE: i32 = 141;
 
 pub struct Prog {
     pub env: Env,
-    pub stdin: Option<u32>,
-    pub stdout: Option<u32>,
+    pub stdin: Option<u64>,
+    pub stdout: Option<u64>,
 }
 
 /// Read the startup message; `Err` is the exit code to return.
@@ -93,10 +93,10 @@ impl Prog {
     /// The connection a path is relative to: `/` for absolute paths when the program was given a
     /// root, else the working directory `.`. Returns the connection handle and the path to open
     /// there (an absolute path loses its leading slashes). `None`: nothing to resolve against.
-    pub fn base_for<'a>(&self, path: &'a [u8]) -> Option<(u32, &'a [u8])> {
+    pub fn base_for<'a>(&self, path: &'a [u8]) -> Option<(u64, &'a [u8])> {
         if path.first() == Some(&b'/') {
             // a path inside a granted volume (`/mnt/store/x`) is relative to that volume's connection
-            let mut best: Option<(usize, u32)> = None;
+            let mut best: Option<(usize, u64)> = None;
             for (prefix, i) in &self.env.startup.namespace {
                 let pre = prefix.as_slice();
                 if pre == b"/" || pre == b"." || pre == b"/svc" {

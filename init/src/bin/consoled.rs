@@ -50,22 +50,22 @@ const K_TERM: u64 = 6;
 const SCROLL_CAP: usize = 8 * 1024;
 
 struct Console {
-    port: u32,
+    port: u64,
     /// The backend's socket: the serial line, or what a provider attached. `None` while detached.
-    serial: Option<u32>,
+    serial: Option<u64>,
     /// A backend that closes is a detach, not the end (UV7): the terminal keeps its job and its recent output.
     detachable: bool,
-    term_ch: Option<u32>,
+    term_ch: Option<u64>,
     scroll: Vec<u8>,
-    tty_sock: u32,
-    ctl_ch: Option<u32>,
+    tty_sock: u64,
+    ctl_ch: Option<u64>,
     tty: Tty,
     /// Bytes taken from `tty` that the serial socket has not accepted yet.
     serial_buf: Vec<u8>,
     /// Lines (and 0x03/0x04) waiting for the client's socket.
     deliver: Vec<u8>,
     lost_input: u64,
-    jobs: Vec<u32>,
+    jobs: Vec<u64>,
     /// A foreground job is declared (`SetForeground` or `HoldForeground`): Ctrl-C is reported to the owner as `JobInterrupt`.
     fg_active: bool,
     serial_w_bound: bool,
@@ -77,7 +77,7 @@ struct Console {
 }
 
 impl Console {
-    fn bind(&self, key: u64, obj: u32, mask: u32) {
+    fn bind(&self, key: u64, obj: u64, mask: u32) {
         sys::port_bind(self.port, obj, mask, key);
     }
 
@@ -182,7 +182,7 @@ impl Console {
     }
 
     /// A new backend: the old one is closed, the new one is shown what the terminal last displayed.
-    fn attach(&mut self, socket: u32) {
+    fn attach(&mut self, socket: u64) {
         self.detach();
         self.serial = Some(socket);
         self.bind(K_SERIAL, socket, signals::READABLE | signals::PEER_CLOSED);
@@ -321,13 +321,13 @@ impl Console {
         }
     }
 
-    fn reply(&self, ch: u32, txid: u32, status: i32) {
+    fn reply(&self, ch: u64, txid: u32, status: i32) {
         let bytes = ctl::encode_reply(txid, status);
         // (a full or dead channel loses the reply; the client's call then fails: its problem)
         sys::channel_write(ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
     }
 
-    fn reply_value(&self, ch: u32, txid: u32, value: u32) {
+    fn reply_value(&self, ch: u64, txid: u32, value: u32) {
         let bytes = ctl::encode_reply_value(txid, 0, value);
         sys::channel_write(ch, bytes.as_ptr(), bytes.len(), core::ptr::null(), 0);
     }
@@ -335,7 +335,7 @@ impl Console {
     fn on_ctl(&mut self) {
         let Some(ch) = self.ctl_ch else { return };
         let mut bytes = [0u8; 16];
-        let mut handles = [0u32; ctl::MAX_JOBS + 1];
+        let mut handles = [0u64; ctl::MAX_JOBS + 1];
         let r = sys::channel_read(
             ch,
             bytes.as_mut_ptr(),
@@ -405,7 +405,7 @@ impl Console {
             return true;
         };
         let mut bytes = [0u8; 16];
-        let mut handles = [0u32; 2];
+        let mut handles = [0u64; 2];
         let r = sys::channel_read(
             ch,
             bytes.as_mut_ptr(),
@@ -506,7 +506,7 @@ pub fn app_main() -> i32 {
         return 4;
     }
     let mut c = Console {
-        port: p.a1 as u32,
+        port: p.a1 as u64,
         serial: Some(serial),
         detachable: env.var(b"DETACHABLE") == Some(b"1"),
         term_ch: env.handle(Role::ServiceTerm),

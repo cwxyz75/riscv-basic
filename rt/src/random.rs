@@ -19,7 +19,7 @@ pub enum RandomError {
 }
 
 pub struct Random {
-    ch: u32,
+    ch: u64,
     txid: u32,
 }
 
@@ -41,7 +41,7 @@ impl Random {
         }
     }
 
-    pub fn new(ch: u32) -> Random {
+    pub fn new(ch: u64) -> Random {
         Random { ch, txid: 0 }
     }
 

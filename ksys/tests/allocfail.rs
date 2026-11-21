@@ -138,7 +138,7 @@ fn scenarios() -> Vec<Scenario> {
                 let (x, _y) = w.pair(nr::CHANNEL_CREATE);
                 let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
                 w.poke(BASE, b"hello");
-                w.poke(BASE + 0x100, &(e as u32).to_le_bytes());
+                w.poke(BASE + 0x100, &e.to_le_bytes());
                 vec![go(w, nr::CHANNEL_WRITE, [x, BASE, 5, BASE + 0x100, 1, 0])]
             },
         },
@@ -148,7 +148,7 @@ fn scenarios() -> Vec<Scenario> {
                 let (x, y) = w.pair(nr::CHANNEL_CREATE);
                 let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
                 w.poke(BASE, b"hello");
-                w.poke(BASE + 0x100, &(e as u32).to_le_bytes());
+                w.poke(BASE + 0x100, &e.to_le_bytes());
                 w.ok(nr::CHANNEL_WRITE, [x, BASE, 5, BASE + 0x100, 1, 0]);
                 vec![go(
                     w,
@@ -215,17 +215,16 @@ fn scenarios() -> Vec<Scenario> {
                         jobs: &mut w.vmos.jobs,
                         job: Some(JobId::ROOT),
                     };
-                    u64::from(
-                        kcore::ipc::job_object_create(
-                            &mut w.objs,
-                            &mut w.handles,
-                            JobId::ROOT,
-                            abi::rights::Rights::JOB,
-                            &mut q,
-                        )
-                        .unwrap()
-                        .0,
+
+                    kcore::ipc::job_object_create(
+                        &mut w.objs,
+                        &mut w.handles,
+                        JobId::ROOT,
+                        abi::rights::Rights::JOB,
+                        &mut q,
                     )
+                    .unwrap()
+                    .0
                 };
                 let limits: Vec<u8> = [u64::MAX; 6].iter().flat_map(|v| v.to_le_bytes()).collect();
                 w.poke(BASE, &limits);
@@ -289,7 +288,7 @@ fn scenarios() -> Vec<Scenario> {
                 let (x, y) = w.pair(nr::CHANNEL_CREATE);
                 for _ in 0..8 {
                     let v = w.ok(nr::VMO_CREATE, [1, 0, 0, 0, 0, 0]).0.unwrap();
-                    w.poke(BASE + 0x100, &(v as u32).to_le_bytes());
+                    w.poke(BASE + 0x100, &v.to_le_bytes());
                     w.ok(nr::CHANNEL_WRITE, [x, BASE, 0, BASE + 0x100, 1, 0]);
                 }
                 vec![go(w, nr::HANDLE_CLOSE, [y, 0, 0, 0, 0, 0])]
@@ -300,7 +299,7 @@ fn scenarios() -> Vec<Scenario> {
             run: |w, go| {
                 let (x, y) = w.pair(nr::CHANNEL_CREATE);
                 let e = w.ok(nr::EVENT_CREATE, [0; 6]).0.unwrap();
-                w.poke(BASE + 0x100, &(e as u32).to_le_bytes());
+                w.poke(BASE + 0x100, &e.to_le_bytes());
                 w.ok(nr::CHANNEL_WRITE, [x, BASE, 0, BASE + 0x100, 1, 0]);
                 vec![
                     go(w, nr::HANDLE_CLOSE, [y, 0, 0, 0, 0, 0]),

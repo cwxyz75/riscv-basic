@@ -44,7 +44,7 @@ pub struct Answer {
     pub status: i32,
     pub a: u64,
     pub payload: Vec<u8>,
-    pub handle: Option<u32>,
+    pub handle: Option<u64>,
 }
 
 /// A reply with the transaction id it answers.
@@ -78,19 +78,19 @@ impl Stopped {
 }
 
 pub struct Fs {
-    pub ch: u32,
+    pub ch: u64,
     txid: u32,
 }
 
 impl Fs {
     /// Wrap a connection (the channel end the server bound to a node).
-    pub fn new(ch: u32) -> Fs {
+    pub fn new(ch: u64) -> Fs {
         Fs { ch, txid: 0 }
     }
 
     /// Wrap a connection, numbering requests from `txid`: several short-lived views of one shared
     /// connection must not reuse numbers, or a late reply to one would pass for the answer to the next.
-    pub fn new_at(ch: u32, txid: u32) -> Fs {
+    pub fn new_at(ch: u64, txid: u32) -> Fs {
         Fs { ch, txid }
     }
 
@@ -104,7 +104,7 @@ impl Fs {
         a: u64,
         b: u64,
         payload: &[u8],
-        send: Option<u32>,
+        send: Option<u64>,
     ) -> Result<Answer, i32> {
         self.txid = self.txid.wrapping_add(1);
         let req = Request {
@@ -164,7 +164,7 @@ impl Fs {
             return Err(wait.status);
         }
         let mut buf = alloc::vec![0u8; file::MAX_MESSAGE];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(self.ch, buf.as_mut_ptr(), buf.len(), h.as_mut_ptr(), 1);
         if r.status != 0 {
             return Err(r.status);
@@ -234,7 +234,7 @@ impl Fs {
         if c.status != 0 {
             return Err(Stopped::Status(c.status));
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         // the endpoint travels with the request; the server closes it if it refuses
         let r = self.call(file::op::OPEN, flags, rights, 0, 0, path, Some(theirs));
         match r {
@@ -256,7 +256,7 @@ impl Fs {
         if c.status != 0 {
             return Err(c.status);
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         match self.call(file::op::CLONE, 0, rights, 0, 0, &[], Some(theirs)) {
             Ok(a) if a.status == 0 => Ok(Fs::new(mine)),
             Ok(a) => {
@@ -284,7 +284,7 @@ impl Fs {
         if c.status != 0 {
             return Err(c.status);
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         let a = u64::from(conns) | (u64::from(inflight) << 32);
         match self.call(
             file::op::ACCOUNT,
@@ -309,7 +309,7 @@ impl Fs {
 
     /// Registry: publish `name`, handing the registry `listener` (the end of a channel the service listens
     /// on). The registry owns it once the call succeeds; on failure it is still the caller's.
-    pub fn publish(&mut self, name: &[u8], listener: u32) -> Result<(), i32> {
+    pub fn publish(&mut self, name: &[u8], listener: u64) -> Result<(), i32> {
         match self.call(file::op::PUBLISH, 0, 0, 0, 0, name, Some(listener)) {
             Ok(r) if r.status == 0 => Ok(()),
             Ok(r) => Err(r.status),
@@ -328,7 +328,7 @@ impl Fs {
         if c.status != 0 {
             return Err(c.status);
         }
-        let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+        let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
         let mut payload = Vec::new();
         for (i, n) in names.iter().enumerate() {
             if i > 0 {
@@ -541,7 +541,7 @@ impl Fs {
     }
 
     /// The boot image VMO (read-only) and the `(offset, length)` of this file in it.
-    pub fn get_vmo(&mut self) -> Result<(u32, u64, u64), i32> {
+    pub fn get_vmo(&mut self) -> Result<(u64, u64, u64), i32> {
         let a = self.call(file::op::GETVMO, 0, 0, 0, 0, &[], None)?;
         if a.status != 0 {
             if let Some(h) = a.handle {
