@@ -146,3 +146,36 @@ pub fn ff_value(name: &str) -> Option<u64> {
         }
     })
 }
+
+/// The names `ff_value` knows.
+const FF_NAMES: [&str; 5] = ["tid", "koid", "objgen", "handlegen", "fptoken"];
+
+/// Test builds only: a line saying what `ff=` asked for and what the kernel understood, so a run that was meant to start counters near their end
+/// cannot pass vacuously on a typo or a dropped boot argument (T189): `##FF tid=0x... koid=0x...` for the values it parsed, `##FF error ...` for
+/// a name it does not know or a value it cannot read. `None` when there is no `ff=` (or in a release build).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB in a test-only boot diagnostic (the formatter's frames), called once from `kmain`
+pub fn ff_report() -> Option<alloc::string::String> {
+    use core::fmt::Write;
+    if crate::RELEASE {
+        return None;
+    }
+    let list = boot_arg_value("ff=")?;
+    let mut out = alloc::string::String::from("##FF");
+    let mut bad = false;
+    for kv in list.split(',') {
+        let name = kv.split_once(':').map(|(k, _)| k).unwrap_or(kv);
+        if !FF_NAMES.contains(&name) {
+            let _ = write!(out, " error unknown name {name:?}");
+            bad = true;
+        } else if let Some(v) = ff_value(name) {
+            let _ = write!(out, " {name}={v:#x}");
+        } else {
+            let _ = write!(out, " error unreadable value for {name}");
+            bad = true;
+        }
+    }
+    if bad {
+        out.push_str(" (the counters did not start where the run asked)");
+    }
+    Some(out)
+}
