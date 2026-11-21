@@ -282,6 +282,11 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if nbytes > MAX_MSG_BYTES || nhandles > MAX_MSG_HANDLES {
                 return fail(Status::TooBig);
             }
+            // The channel handle next (BAD_HANDLE is the first error after the sizes, SYSCALLS.md): before anything is copied, so a probe with a bad
+            // handle and a bad buffer reads BAD_HANDLE (T171). The type and the rights are checked with the rest, after the copies.
+            if let Err(e) = handles.get(h(0)) {
+                return fail(e);
+            }
             let data = copy_from_user(aspace, mm, vmos, jobs, a[1], nbytes)
                 .map_err(|e| (e, None, None))?;
             let raw = copy_from_user(aspace, mm, vmos, jobs, a[3], nhandles * 8)
