@@ -243,6 +243,24 @@ pub mod sys {
     pub fn vmo_create_in(pages: u64, job: u64) -> Ret {
         syscall(VMO_CREATE, [pages as usize, job as usize, 0, 0, 0, 0])
     }
+    /// A VMO with `flags` (`abi::vmo_flags`: RESIZABLE), charged to `job` (0: the caller's own).
+    pub fn vmo_create_flags(pages: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE,
+            [pages as usize, job as usize, flags as usize, 0, 0, 0],
+        )
+    }
+    /// Give back the committed pages of `[offset, offset + len)` of a VMO (needs WRITE; page aligned): every mapping of them goes, and they read as zeros.
+    pub fn vmo_decommit(vmo: u64, offset: u64, len: u64) -> Ret {
+        syscall(
+            VMO_DECOMMIT,
+            [vmo as usize, offset as usize, len as usize, 0, 0, 0],
+        )
+    }
+    /// Change the size of a resizable VMO to `bytes` (a multiple of the page size; needs WRITE).
+    pub fn vmo_set_size(vmo: u64, bytes: u64) -> Ret {
+        syscall(VMO_SET_SIZE, [vmo as usize, bytes as usize, 0, 0, 0, 0])
+    }
     pub fn vmo_read(vmo: u64, offset: u64, buf: *mut u8, len: usize) -> Ret {
         syscall(
             VMO_READ,

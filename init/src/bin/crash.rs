@@ -237,6 +237,27 @@ pub fn app_main() -> i32 {
                 }
             }
         }
+        100 => {
+            // MM6: shrink a resizable VMO under a mapping, then touch the part that went: a clean fault, the process ends
+            let me = rt::sys::process_self().a1 as u64;
+            let v = rt::sys::vmo_create_flags(8, 0, 1);
+            if v.status != 0 {
+                return -1;
+            }
+            let v = v.a1 as u64;
+            const BASE: usize = 0x540_0000;
+            if rt::sys::process_map(me, v, BASE as u64, 0, 8 * 4096, 3).status != 0 {
+                return -2;
+            }
+            // SAFETY: the pages are mapped read-write in this process.
+            unsafe { core::ptr::write_volatile((BASE + 6 * 4096) as *mut u8, 1) };
+            if rt::sys::vmo_set_size(v, 4 * 4096).status != 0 {
+                return -3;
+            }
+            // SAFETY: deliberately past the shrunk VMO's end: the kernel must refuse and end this process.
+            unsafe { core::ptr::write_volatile((BASE + 6 * 4096) as *mut u8, 2) };
+            return 0;
+        }
         99 => {
             // MM5: kernel memory until the job says no. Make events and duplicate handles (every one an object body and a handle-table slot
             // the kernel holds for this process) until the job's kernel-byte limit refuses, then stay alive for the parent to measure.

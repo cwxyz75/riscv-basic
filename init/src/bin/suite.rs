@@ -2650,6 +2650,215 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     Ok(())
 }
 
+/// MM6: `vmo_decommit` and `vmo_set_size` from user mode. A resizable VMO is mapped and written; a decommitted range reads zero through
+/// the mapping (its translations are gone) and through the VMO, the rest keeps its data; the argument and rights errors; a resize changes
+/// `vmo_get_size`, a shrink takes the tail's data with it.
+fn vmo_decommit_and_resize_from_user_mode() -> Outcome {
+    const BASE: u64 = 0x540_0000;
+    let me = me()?;
+    let v = ok(
+        sys::vmo_create_flags(8, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a resizable VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, 8 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it"
+    );
+    let word = |p: u64| (p as u32 + 1) * 0x1111;
+    for p in 0..8u64 {
+        // SAFETY: BASE..BASE + 8 pages is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + p * 4096) as *mut u32, word(p)) };
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 2 * 4096, 3 * 4096)),
+        Some(S::Ok),
+        "decommit pages 2 to 4"
+    );
+    for p in 0..8u64 {
+        // SAFETY: as above (a decommitted page faults in again, as zeros).
+        let got = unsafe { core::ptr::read_volatile((BASE + p * 4096) as *const u32) };
+        let want = if (2..5).contains(&p) { 0 } else { word(p) };
+        ensure_eq!(got, want, "page {p} through the mapping");
+        let mut b = [0u8; 4];
+        ensure_eq!(
+            st(sys::vmo_read(v, p * 4096, b.as_mut_ptr(), 4)),
+            Some(S::Ok),
+            "read through the VMO"
+        );
+        ensure_eq!(u32::from_le_bytes(b), want, "page {p} through the VMO");
+    }
+    // the errors
+    let ev = event()?;
+    for (what, call) in [
+        ("decommit", sys::vmo_decommit(BAD, 0, 4096)),
+        ("set_size", sys::vmo_set_size(BAD, 4096)),
+    ] {
+        ensure_eq!(
+            st(call),
+            Some(S::BadHandle),
+            "{what} on a handle that is not one"
+        );
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(ev, 0, 4096)),
+        Some(S::WrongType),
+        "decommit on an event"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(ev, 4096)),
+        Some(S::WrongType),
+        "set_size on an event"
+    );
+    sys::handle_close(ev);
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 100, 4096)),
+        Some(S::InvalidArgs),
+        "unaligned offset"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 100)),
+        Some(S::InvalidArgs),
+        "unaligned length"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 0)),
+        Some(S::InvalidArgs),
+        "no length"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 4 * 4096, 5 * 4096)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    let weak = ok(
+        sys::handle_duplicate(v, Rights::READ.0 | Rights::MAP.0),
+        "a duplicate without WRITE",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::vmo_decommit(weak, 0, 4096)),
+        Some(S::AccessDenied),
+        "decommit needs WRITE"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(weak, 4096)),
+        Some(S::AccessDenied),
+        "set_size needs WRITE"
+    );
+    let fixed = vmo(2)?;
+    ensure_eq!(
+        st(sys::vmo_set_size(fixed, 4 * 4096)),
+        Some(S::AccessDenied),
+        "a VMO that is not resizable"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(v, 100)),
+        Some(S::InvalidArgs),
+        "a size that is not whole pages"
+    );
+    ensure_eq!(st(sys::vmo_set_size(v, 0)), Some(S::InvalidArgs), "no size");
+    // resizing
+    ensure_eq!(st(sys::vmo_set_size(v, 12 * 4096)), Some(S::Ok), "grow");
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, 12 * 4096, "the new size");
+    ensure_eq!(st(sys::vmo_set_size(v, 5 * 4096)), Some(S::Ok), "shrink");
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, 5 * 4096, "the shrunk size");
+    ensure_eq!(st(sys::vmo_set_size(v, 8 * 4096)), Some(S::Ok), "grow back");
+    let mut b = [0xffu8; 4];
+    ensure_eq!(
+        st(sys::vmo_read(v, 6 * 4096, b.as_mut_ptr(), 4)),
+        Some(S::Ok),
+        "read a page that was cut off"
+    );
+    ensure_eq!(u32::from_le_bytes(b), 0, "what the shrink took is gone");
+    ensure_eq!(
+        st(sys::vmo_read(v, 4 * 4096, b.as_mut_ptr(), 4)),
+        Some(S::Ok),
+        "read the last page that stayed"
+    );
+    ensure_eq!(
+        u32::from_le_bytes(b),
+        0,
+        "(page 4 was decommitted before: it reads zero)"
+    );
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    // V1: a process of another job that maps the range stops a decommit and a shrink (nothing changes), until it unmaps
+    {
+        let root = root_job()?;
+        let j = job(root, u64::MAX, u64::MAX, 256)?;
+        let stranger = ok(sys::process_create_in(j), "a process in another job")?.a1 as u64;
+        let shared = ok(
+            sys::vmo_create_flags(4, 0, rt::abi::vmo_flags::RESIZABLE),
+            "a resizable VMO of our own job",
+        )?
+        .a1 as u64;
+        ensure_eq!(
+            st(sys::vmo_commit(shared, 0, 4 * 4096)),
+            Some(S::Ok),
+            "committed, so that a stranger may map it"
+        );
+        ensure_eq!(
+            st(sys::process_map(
+                stranger,
+                shared,
+                0x60_0000,
+                0,
+                4 * 4096,
+                PF_R
+            )),
+            Some(S::Ok),
+            "the stranger maps it"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::BadState),
+            "a decommit under a stranger's mapping"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 2 * 4096)),
+            Some(S::BadState),
+            "a shrink under a stranger's mapping"
+        );
+        ensure_eq!(
+            sys::vmo_get_size(shared).a1 as u64,
+            4 * 4096,
+            "nothing changed"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 8 * 4096)),
+            Some(S::Ok),
+            "growing is allowed"
+        );
+        ensure_eq!(
+            st(sys::process_unmap(stranger, 0x60_0000)),
+            Some(S::Ok),
+            "the stranger lets go"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::Ok),
+            "now the pages can go"
+        );
+        for h in [shared, stranger, j, root] {
+            sys::handle_close(h);
+        }
+    }
+    for h in [weak, fixed, v] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM6: a mapping that outlives a shrink: touching the part of it past the VMO's new end ends the process with a page fault.
+fn touching_past_a_shrunk_vmo_ends_the_process_cleanly() -> Outcome {
+    let (p, _m) = launch(100)?;
+    wait_ended(p, 1000)?;
+    let r = sys::process_info(p);
+    ensure_eq!((r.status, r.a1 as i64), (0, -1001), "a page fault ended it");
+    Ok(())
+}
+
 fn many_children_do_not_leak() -> Outcome {
     // The kernel checks after we exit that no process, VMO, object or frame is left.
     for _ in 0..6 {
@@ -12389,6 +12598,14 @@ pub fn app_main() -> i32 {
         (
             "job_limits_stop_a_thread_bomb",
             job_limits_stop_a_thread_bomb,
+        ),
+        (
+            "vmo_decommit_and_resize_from_user_mode",
+            vmo_decommit_and_resize_from_user_mode,
+        ),
+        (
+            "touching_past_a_shrunk_vmo_ends_the_process_cleanly",
+            touching_past_a_shrunk_vmo_ends_the_process_cleanly,
         ),
         (
             "job_memory_limits_stop_a_hog_and_are_credited_back",

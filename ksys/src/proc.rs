@@ -233,6 +233,76 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             target.table_charge.insert(vaddr, tables);
             Ok((None, None))
         })(),
+        nr::VMO_DECOMMIT | nr::VMO_SET_SIZE => (|| {
+            // Both take pages away from a VMO, so both first unmap them from every address space that maps them, then have every hart drop
+            // its translations, and only then let the VMO give the frames back (TLB2).
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let id = ipc::vmo_of(objs, &caller.handles, Handle(a[0]), Rights::WRITE).map_err(e)?;
+            let size = vmos.pages(id).ok_or(e(Status::BadHandle))?;
+            let (first, count, new_size) = if n == nr::VMO_DECOMMIT {
+                if vmos.kind(id) != Some(kcore::aspace::VmoKind::Plain) {
+                    return Err(e(Status::NotSupported));
+                }
+                let (offset, len) = (a[1], a[2]);
+                if !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || len == 0 {
+                    return Err(e(Status::InvalidArgs));
+                }
+                let first = offset / 4096;
+                let count = len / 4096;
+                if first.checked_add(count).is_none_or(|end| end > size) {
+                    return Err(e(Status::InvalidArgs));
+                }
+                (first, count, None)
+            } else {
+                // (a VMO that is not resizable, which every device and DMA VMO is, is refused before the size is looked at)
+                if !vmos.is_resizable(id) {
+                    return Err(e(Status::AccessDenied));
+                }
+                let bytes = a[1];
+                if bytes == 0
+                    || !bytes.is_multiple_of(4096)
+                    || bytes / 4096 > abi::limits::MAX_VMO_PAGES
+                {
+                    return Err(e(Status::InvalidArgs));
+                }
+                let new = bytes / 4096;
+                // growing takes nothing away; shrinking takes the tail
+                (new.min(size), size.saturating_sub(new), Some(new))
+            };
+            if count > 0 {
+                // V1 (INVARIANTS): a process of another job than the VMO's holds its mapping on the promise that touching it never fails on the
+                // VMO's job and never ends it; taking pages from under such a mapping would break that (a touch would charge the VMO's job, or
+                // fault past a new end). The holder's own job may take pages back; a stranger's mapping stops the call.
+                let vmo_job = vmos.job_of(id).ok_or(e(Status::BadHandle))?;
+                if procs
+                    .values()
+                    .any(|p| p.job != vmo_job && p.aspace.maps_vmo_range(id, first, count))
+                {
+                    return Err(e(Status::BadState));
+                }
+                let mut cleared = 0u64;
+                for p in procs.values_mut() {
+                    cleared =
+                        cleared.saturating_add(p.aspace.unmap_vmo_pages(mm, id, first, count));
+                }
+                // other harts may still cache the translations of what was just unmapped: before any frame is freed. (When nothing was
+                // mapped there is nothing to drop: every earlier removal of a translation was shot down when it was made.)
+                if cleared > 0 {
+                    machine.shootdown();
+                    machine.flush_tlb();
+                }
+            }
+            let r = match new_size {
+                None => vmos.decommit(mm, jobs, id, first, count).map(|_| ()),
+                Some(new) => vmos.set_size(mm, jobs, id, new),
+            };
+            match r {
+                Ok(()) => Ok((None, None)),
+                Err(kcore::aspace::VmoError::Gone) => Err(e(Status::BadHandle)),
+                Err(kcore::aspace::VmoError::NotResizable) => Err(e(Status::AccessDenied)),
+                Err(_) => Err(e(Status::InvalidArgs)),
+            }
+        })(),
         nr::PROCESS_UNMAP => (|| {
             let ph = Handle(a[0]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;

@@ -163,7 +163,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 7: the memory model programs need
 
-- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit`
+- [ ] **MM6** VMOs by size with no cap, `vmo_set_size`, `vmo_decommit` (in progress: `vmo_create` flags (RESIZABLE), `vmo_decommit`, `vmo_set_size` are built; byte sizes, the cap and the mapping lists are T207)
 - [ ] **MM7** range unmap, `process_protect`, ANYWHERE, `process_map_info`
 - [ ] **MM8** copy-on-write children, `process_clone_region`
 

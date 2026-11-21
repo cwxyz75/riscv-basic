@@ -130,6 +130,20 @@ impl W {
         .unwrap()
         .0
     }
+    /// Like `vmo`, with the VMO's id too (the tests that look inside the store).
+    fn vmo_and_id(&mut self, pages: u64, job: JobId) -> (u64, u64) {
+        let id = self.vmos.create_in(&mut self.jobs, pages, job);
+        let p = self.procs.get_mut(&1).unwrap();
+        let h = ipc::vmo_object_create_in(
+            &mut self.objs,
+            &mut p.handles,
+            id,
+            &mut Self::q(&mut self.jobs),
+        )
+        .unwrap()
+        .0;
+        (h, id)
+    }
     fn call(&mut self, n: usize, a: [u64; 6]) -> Reply {
         let mut c = PCtx {
             objs: &mut self.objs,
@@ -734,5 +748,116 @@ fn job_set_sched_rows() {
         call(&mut w, jh, 5, 200_000_000, 1),
         Err(Status::InvalidArgs),
         "a budget over the 100 ms window"
+    );
+}
+
+// ---- MM6: vmo_decommit and vmo_set_size ----
+
+/// Fault a page of process `pid` in (a write through its address space maps it).
+fn touch(w: &mut W, pid: u64, va: u64) {
+    let t = w.procs.get_mut(&pid).unwrap();
+    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, b"x").unwrap();
+}
+
+#[test]
+fn decommit_takes_the_pages_from_every_mapping_and_asks_for_the_shootdown_only_when_something_was_mapped(
+) {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    // committed but mapped nowhere: nothing to drop, no shootdown
+    w.vmos.commit(&mut w.mm, &mut w.jobs, id, 0, 4).unwrap();
+    let before = w.mm.db.free_count();
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 2 * 4096, 0, 0, 0]);
+    assert_eq!(w.mm.db.free_count(), before + 2, "two frames came back");
+    assert_eq!(
+        (w.tlb.shootdowns, w.tlb.flushes),
+        (0, 0),
+        "no translation existed: no shootdown"
+    );
+    // mapped and touched in two processes of the VMO's own job: both lose the pages, one shootdown
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
+    touch(&mut w, 1, VA + 2 * 4096);
+    touch(&mut w, 2, VA + 3 * 4096);
+    let jobs_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    w.ok(nr::VMO_DECOMMIT, [v, 2 * 4096, 2 * 4096, 0, 0, 0]);
+    assert_eq!(w.tlb.shootdowns, 1);
+    assert_eq!(w.tlb.flushes, 1);
+    for pid in [1, 2] {
+        let a = &w.procs[&pid].aspace;
+        assert!(a.table().translate(&w.mm, VA + 2 * 4096).is_none());
+        assert!(a.table().translate(&w.mm, VA + 3 * 4096).is_none());
+    }
+    assert_eq!(
+        jobs_before - w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
+        2,
+        "the VMO's job is credited for the two pages that were committed"
+    );
+}
+
+#[test]
+fn a_mapping_in_another_job_stops_a_decommit_and_a_shrink_but_not_a_grow() {
+    let (mut w, ph) = world();
+    // process 2 lives in another job than the VMO's
+    let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = other;
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    w.vmos.set_resizable(id);
+    w.vmos.commit(&mut w.mm, &mut w.jobs, id, 0, 4).unwrap();
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, R]);
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]),
+        Status::BadState,
+        "V1: a stranger's mapping"
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 2 * 4096, 0, 0, 0, 0]),
+        Status::BadState,
+        "a shrink under it"
+    );
+    assert_eq!(w.vmos.pages(id), Some(4), "nothing changed");
+    assert_eq!(w.vmos.committed_pages(id), Some(4));
+    w.ok(nr::VMO_SET_SIZE, [v, 8 * 4096, 0, 0, 0, 0]); // growing takes nothing
+    assert_eq!(w.vmos.pages(id), Some(8));
+    // a range the stranger does not map is fine
+    w.ok(nr::VMO_DECOMMIT, [v, 5 * 4096, 4096, 0, 0, 0]);
+    // once the stranger has unmapped, the pages can go
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 4 * 4096, 0, 0, 0]);
+    assert_eq!(w.vmos.committed_pages(id), Some(0));
+}
+
+#[test]
+fn set_size_checks_resizability_before_the_size() {
+    let (mut w, _) = world();
+    let fixed = w.vmo(2, JobId::ROOT);
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [fixed, 100, 0, 0, 0, 0]),
+        Status::AccessDenied,
+        "not resizable, whatever the size"
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [fixed, 0, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    let (v, id) = w.vmo_and_id(2, JobId::ROOT);
+    w.vmos.set_resizable(id);
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 100, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 0, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 0, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 4096, 2 * 4096, 0, 0, 0]),
+        Status::InvalidArgs,
+        "past the end"
     );
 }
