@@ -502,6 +502,36 @@ impl<F: PageTableFormat> PageTable<F> {
         None
     }
 
+    /// Change the permissions of the 4 KiB leaf at `va` in place (the frame stays): returns the old permissions, or `None` if nothing is
+    /// mapped there (or a huge page is: not ours to change one page at a time). The caller flushes the translations that a
+    /// permission it took away may still be cached under, on every hart.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the slot is a table frame plus index * 8 with index < 512, as in `translate`
+    pub fn protect<M: PhysMem>(&mut self, mm: &mut Mm<M>, va: u64, perms: Perms) -> Option<Perms> {
+        if !va.is_multiple_of(PAGE_SIZE) || !F::is_canonical(va) {
+            return None;
+        }
+        let mut table = self.root;
+        for level in (0..F::LEVELS).rev() {
+            let slot = (table << 12) + index(va, level) * 8;
+            let pte = mm.mem.read_u64(slot);
+            if !F::is_valid(pte) {
+                return None;
+            }
+            if F::is_leaf(pte, level) {
+                if level != 0 {
+                    return None;
+                }
+                mm.mem.write_u64(slot, F::leaf_entry(F::pfn_of(pte), perms));
+                return Some(F::perms_of(pte));
+            }
+            if level == 0 {
+                return None;
+            }
+            table = F::pfn_of(pte);
+        }
+        None
+    }
+
     /// Translate `va` (any byte of a page). Huge leaves translate too.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level < 4; a leaf's pfn plus an in-span page offset stays a frame number
     pub fn translate<M: PhysMem>(&self, mm: &Mm<M>, va: u64) -> Option<Translation> {

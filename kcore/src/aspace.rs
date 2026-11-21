@@ -81,6 +81,39 @@ pub enum FaultMapError {
 /// The largest region (1 GiB), so that unmapping one is bounded work.
 pub const MAX_REGION_PAGES: u64 = 1 << 18;
 
+/// What a protect changed (MM7): the caller owes the other harts a shootdown after a downgrade and an instruction-cache sync for new code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProtectStats {
+    /// Some page lost a permission it had (a downgrade): every hart must drop its translations of the range.
+    pub downgraded: bool,
+    /// Pages that became executable (PL7).
+    pub exec_pages: u64,
+}
+
+/// Why `protect_range` refused (nothing changed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectError {
+    /// Not page aligned, empty, or outside the address space.
+    BadRange,
+    /// Part of the range is not mapped.
+    NotMapped,
+    /// A permission asked for is beyond what the mapping may be raised to, or write and execute together.
+    Denied,
+    /// Splitting at the edges would pass `MAX_REGIONS`.
+    TooMany,
+}
+
+/// A region as `process_map_info` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionInfo {
+    pub start: u64,
+    pub pages: u64,
+    pub vmo: u64,
+    pub vmo_page: u64,
+    pub perms: Perms,
+    pub max_perms: Perms,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionError {
     Misaligned,
@@ -694,6 +727,9 @@ struct Region {
     vmo: u64,
     vmo_page: u64,
     perms: Perms,
+    /// What the mapping may be raised to (`process_protect`): read, write if the VMO handle had WRITE when it was mapped, execute if it had
+    /// EXECUTE (MM7). Never more than the rights the mapper held.
+    max_perms: Perms,
     /// Which incarnation of the region this is: a number from the address space's counter, never reused, so a fault that looked the region up
     /// and later finds a region with another number (or none) at that start knows it was unmapped (and maybe replaced) meanwhile.
     gen: u64,
@@ -821,6 +857,21 @@ impl<F: PageTableFormat> AddressSpace<F> {
         vmo_page: u64,
         perms: Perms,
     ) -> Result<(), RegionError> {
+        self.map_region_max(vmos, start, pages, vmo, vmo_page, perms, perms)
+    }
+
+    /// `map_region` with the permissions the mapping may later be raised to (`max_perms`, at least `perms`).
+    #[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: as `map_region`
+    pub fn map_region_max(
+        &mut self,
+        vmos: &mut Vmos,
+        start: u64,
+        pages: u64,
+        vmo: u64,
+        vmo_page: u64,
+        perms: Perms,
+        max_perms: Perms,
+    ) -> Result<(), RegionError> {
         if !start.is_multiple_of(PAGE_SIZE) {
             return Err(RegionError::Misaligned);
         }
@@ -864,6 +915,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 vmo,
                 vmo_page,
                 perms,
+                max_perms,
                 gen: self.next_gen,
             },
         );
@@ -901,6 +953,258 @@ impl<F: PageTableFormat> AddressSpace<F> {
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
         let (&start, r) = self.regions.range(..=va).next_back()?;
         (va < start + r.pages * PAGE_SIZE).then_some(r.perms)
+    }
+
+    /// The region that contains `va`, or the first one above it (`process_map_info`'s walk), with its start.
+    pub fn region_at_or_after(&self, va: u64) -> Option<RegionInfo> {
+        let below = self.regions.range(..=va).next_back();
+        if let Some((&s, r)) = below {
+            if va < s.saturating_add(r.pages.saturating_mul(PAGE_SIZE)) {
+                return Some(Self::info(s, r));
+            }
+        }
+        self.regions
+            .range(va..)
+            .next()
+            .map(|(&s, r)| Self::info(s, r))
+    }
+
+    fn info(start: u64, r: &Region) -> RegionInfo {
+        RegionInfo {
+            start,
+            pages: r.pages,
+            vmo: r.vmo,
+            vmo_page: r.vmo_page,
+            perms: r.perms,
+            max_perms: r.max_perms,
+        }
+    }
+
+    /// Is there a region that starts exactly at `va`?
+    pub fn has_region_at(&self, va: u64) -> bool {
+        self.regions.contains_key(&va)
+    }
+
+    /// How many regions the address space has.
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Every region, in address order (tests and audits).
+    pub fn regions_info(&self) -> alloc::vec::Vec<RegionInfo> {
+        self.regions
+            .iter()
+            .map(|(&s, r)| Self::info(s, r))
+            .collect()
+    }
+
+    /// Split the region that contains `va` in two at `va` (page aligned): both halves hold a reference on the VMO, keep the permissions and
+    /// take fresh generations (a fault looked up before the split must look again). Nothing happens when `va` is at a region's start or
+    /// in no region. `Err(TooMany)` when the table of regions is full.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: va lies strictly inside the region, so the halves' page counts are positive and their sum is the old count
+    pub fn split_at(&mut self, vmos: &mut Vmos, va: u64) -> Result<(), RegionError> {
+        let Some((&start, r)) = self.regions.range(..=va).next_back() else {
+            return Ok(());
+        };
+        if va == start || va >= start + r.pages * PAGE_SIZE {
+            return Ok(());
+        }
+        if self.regions.len() >= abi::limits::MAX_REGIONS {
+            return Err(RegionError::TooMany);
+        }
+        let lower_pages = (va - start) / PAGE_SIZE;
+        let (vmo, vmo_page, perms, max_perms, pages) =
+            (r.vmo, r.vmo_page, r.perms, r.max_perms, r.pages);
+        vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
+        let (lower_gen, upper_gen) = (self.next_gen, self.next_gen.saturating_add(1));
+        self.next_gen = self.next_gen.saturating_add(2);
+        if let Some(low) = self.regions.get_mut(&start) {
+            low.pages = lower_pages;
+            low.gen = lower_gen;
+        }
+        self.regions.insert(
+            va,
+            Region {
+                pages: pages - lower_pages,
+                vmo,
+                vmo_page: vmo_page + lower_pages,
+                perms,
+                max_perms,
+                gen: upper_gen,
+            },
+        );
+        Ok(())
+    }
+
+    /// Unmap `[start, start + len)` (page aligned; holes are fine): regions are split at the edges and the ones inside go, with their
+    /// mapped pages (MM7). Returns how many regions were removed. **The caller must flush every hart's TLB before a freed frame can be
+    /// reused.** Nothing changes on `Err`.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add; the walk is over keys inside the range
+    pub fn unmap_range<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        start: u64,
+        len: u64,
+    ) -> Result<u64, RegionError> {
+        let end = Self::range_end(start, len)?;
+        if self.regions.len().saturating_add(2) > abi::limits::MAX_REGIONS {
+            // (room for the two splits: a range inside one region needs both)
+            let inside_one = self
+                .regions
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(&s, r)| s + r.pages * PAGE_SIZE >= end);
+            if inside_one {
+                return Err(RegionError::TooMany);
+            }
+        }
+        self.split_at(vmos, start)?;
+        self.split_at(vmos, end)?;
+        let starts: alloc::vec::Vec<u64> =
+            self.regions.range(start..end).map(|(&s, _)| s).collect();
+        let n = starts.len() as u64;
+        for s in starts {
+            let _ = self.unmap_region(mm, vmos, jobs, s);
+        }
+        Ok(n)
+    }
+
+    /// `start + len` for a page-aligned, non-empty range inside the address space.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: `end - 1` cannot underflow: `len` is not 0 and `end = start + len` was checked
+    fn range_end(start: u64, len: u64) -> Result<u64, RegionError> {
+        if !start.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) || len == 0 {
+            return Err(RegionError::Misaligned);
+        }
+        let end = start.checked_add(len).ok_or(RegionError::BadRange)?;
+        if !F::is_canonical(start)
+            || !F::is_canonical(end - 1)
+            || (start as i64) < 0 && (end - 1) as i64 >= 0
+        {
+            return Err(RegionError::BadRange);
+        }
+        Ok(end)
+    }
+
+    /// Change the permissions of `[start, start + len)` to `perms` (MM7): the whole range must be mapped (regions that touch each other
+    /// count as one), `perms` must be within each region's `max_perms` and never write with execute; regions are split at the edges, the
+    /// page-table entries change in place, and neighbours that now agree merge. Nothing changes on `Err`. The caller owes the harts a
+    /// shootdown if `downgraded`, and an instruction-cache sync if `exec_pages` is not 0.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked; region page counts bound every sum
+    pub fn protect_range<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        start: u64,
+        len: u64,
+        perms: Perms,
+    ) -> Result<ProtectStats, ProtectError> {
+        let end = Self::range_end(start, len).map_err(|_| ProtectError::BadRange)?;
+        if perms.write && perms.exec || perms.validate().is_err() {
+            return Err(ProtectError::Denied);
+        }
+        // coverage first (INVALID_ARGS), then the ceiling (ACCESS_DENIED), both before anything changes
+        let mut at = start;
+        let mut denied = false;
+        while at < end {
+            let (&s, r) = self
+                .regions
+                .range(..=at)
+                .next_back()
+                .filter(|(&s, r)| at < s + r.pages * PAGE_SIZE)
+                .ok_or(ProtectError::NotMapped)?;
+            denied |= perms.write && !r.max_perms.write || perms.exec && !r.max_perms.exec;
+            at = s + r.pages * PAGE_SIZE;
+        }
+        if denied {
+            return Err(ProtectError::Denied);
+        }
+        if self.regions.len().saturating_add(2) > abi::limits::MAX_REGIONS {
+            return Err(ProtectError::TooMany);
+        }
+        self.split_at(vmos, start)
+            .map_err(|_| ProtectError::TooMany)?;
+        self.split_at(vmos, end)
+            .map_err(|_| ProtectError::TooMany)?;
+        let mut stats = ProtectStats::default();
+        let starts: alloc::vec::Vec<u64> =
+            self.regions.range(start..end).map(|(&s, _)| s).collect();
+        for s in starts {
+            let gen = self.next_gen;
+            self.next_gen = self.next_gen.saturating_add(1);
+            let Some(r) = self.regions.get_mut(&s) else {
+                continue;
+            };
+            r.perms = Perms {
+                user: r.perms.user,
+                ..perms
+            };
+            r.gen = gen;
+            let (pages, new) = (r.pages, r.perms);
+            for p in 0..pages {
+                if let Some(old) = self.table.protect(mm, s + p * PAGE_SIZE, new) {
+                    if old.read && !new.read || old.write && !new.write || old.exec && !new.exec {
+                        stats.downgraded = true;
+                    }
+                    if !old.exec && new.exec {
+                        stats.exec_pages += 1;
+                    }
+                }
+            }
+        }
+        self.merge_near(mm, vmos, jobs, start, end);
+        Ok(stats)
+    }
+
+    /// Merge regions that touch, map the same VMO at contiguous offsets and agree on permissions, from the one before `lo` to the one at
+    /// `hi` (the keys of the regions an operation changed). Each merge releases the VMO reference of the region that goes.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: region page counts bound the sums
+    pub fn merge_near<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        lo: u64,
+        hi: u64,
+    ) {
+        let first = self
+            .regions
+            .range(..lo)
+            .next_back()
+            .map(|(&s, _)| s)
+            .unwrap_or(lo);
+        let keys: alloc::vec::Vec<u64> = self.regions.range(first..=hi).map(|(&s, _)| s).collect();
+        let Some((&first_key, rest)) = keys.split_first() else {
+            return;
+        };
+        let mut cur = first_key;
+        for &next in rest {
+            let mergeable = match (self.regions.get(&cur), self.regions.get(&next)) {
+                (Some(x), Some(y)) => {
+                    cur + x.pages * PAGE_SIZE == next
+                        && x.vmo == y.vmo
+                        && x.vmo_page + x.pages == y.vmo_page
+                        && x.perms == y.perms
+                        && x.max_perms == y.max_perms
+                }
+                _ => false,
+            };
+            if !mergeable {
+                cur = next;
+                continue;
+            }
+            if let Some(y) = self.regions.remove(&next) {
+                let gen = self.next_gen;
+                self.next_gen = self.next_gen.saturating_add(1);
+                if let Some(x) = self.regions.get_mut(&cur) {
+                    x.pages += y.pages;
+                    x.gen = gen;
+                }
+                let _ = vmos.release(mm, jobs, y.vmo);
+            }
+        }
     }
 
     /// Does a region of this address space map any of the pages `first .. first + pages` of VMO `vmo`?

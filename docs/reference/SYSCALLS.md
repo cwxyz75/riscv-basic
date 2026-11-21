@@ -167,13 +167,15 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 49 | vmo_set_size | `a0` vmo, `a1` bytes | |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
-| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
-| 53 | process_unmap | `a0` process, `a1` vaddr | |
+| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr (0: ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags | `a1` the address, for ANYWHERE |
+| 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
 | 57 | process_suspend | `a0` process | |
+| 59 | process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags | |
 | 58 | process_resume | `a0` process | |
+| 67 | process_map_info | `a0` process, `a1` vaddr, `a2` buffer | `a1` the next region's base, or 0 |
 | 70 | socket_create | | `a1`, `a2` the two handles |
 | 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
 | 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
@@ -487,15 +489,25 @@ otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger ch
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
 process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
-`length` 0; unknown flag bits; W with X; the range outside the user half (or including page zero) or outside the
+`length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 itself is ANYWHERE) or outside the
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
+
+**ANYWHERE (MM7):** `vaddr` 0 asks the kernel to choose: a page-aligned place in the mapping arena (`0x1_0000_0000` up to the stack arena), picked at random (the kernel entropy pool: HD1) among the places a mapping of `length` bytes fits, the first fit from there, wrapping to the start of the arena; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
 Tests: `process_map_*` in `init`.
 
-### process_unmap(process, vaddr) -> status
+### process_unmap(process, vaddr, length) -> status
 
-Remove the mapping that starts at `vaddr`. Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE;
-ACCESS_DENIED; BAD_STATE; INVALID_ARGS (no mapping starts there).
+With `length` 0 (the original call): remove the mapping that starts at `vaddr`, whole. With a `length` (MM7): remove every page of `[vaddr, vaddr + length)`; holes are fine, and a mapping that reaches past either edge is split there and the rest stays. Every hart drops its translations before a freed frame can be reused (TLB2). Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; BAD_STATE; INVALID_ARGS (`length` 0: no mapping starts there; otherwise `vaddr` or `length` not page aligned, or the range wraps or leaves the address space); NO_MEMORY (the split would pass the region limit).
+
+### process_protect(process, vaddr, length, flags) -> status
+
+Change the permissions of `[vaddr, vaddr + length)` to `flags` (R = 1, W = 2, X = 4; read is always implied; MM7). The **whole range must be mapped** (mappings that touch count as one), and `flags` must be within what each mapping may be raised to (read; write if the VMO handle that mapped it had WRITE; execute if it had EXECUTE), and never W with X. Mappings are split at the edges, the page-table entries change in place (no frame moves), and neighbours that now agree merge. A permission taken away is dropped by every hart before the call returns; pages that became executable are synchronised for instruction fetch on every hart (PL7). Rights: MANAGE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (MANAGE; or `flags` beyond the ceiling of part of the range, checked after the range is known to be mapped); INVALID_ARGS (unknown flag bits or W with X; `vaddr` or `length` not page aligned, `length` 0, or the range outside the address space; part of the range not mapped); BAD_STATE (the process has ended); NO_MEMORY (the split would pass the region limit). Nothing changes on an error. Tests: `process_protect_*` in `init`, `kcore/tests/region_ops_model.rs`.
+
+### process_map_info(process, vaddr, buffer) -> status, next
+
+Describe the mapping that contains `vaddr`, or the first one above it (MM7): six 64-bit words are written to `buffer` in the caller's memory: base, length in bytes, permissions, the permissions it may be raised to (bit 0 read, bit 1 write, bit 2 execute), the VMO's id, and the byte offset into the VMO. `a1` is the base of the next mapping above this one, or 0. With no mapping at or above `vaddr` the record is all zeros and `a1` is 0. Rights: INSPECT on `process`. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE; INVALID_ARGS (a bad buffer). Tests: `process_protect_*` in `init`.
 
 ### process_start(process, entry, sp, bootstrap, arg) -> status
 
@@ -921,7 +933,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
 | vmo_create, vmo_read, vmo_write, vmo_get_size | specified (S3c-2a) |
 | vmo_set_size, vmo_create_child | planned, later |
-| process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
+| process_map, process_unmap, process_protect, process_map_info | specified (S3c-2a, MM7) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | process_suspend, process_resume | specified and implemented (SIG2) |
 | thread_spawn, thread_exit, thread_info | specified (S3c-2b) |

@@ -29,6 +29,8 @@ mod alloc_free {
 struct Tlb {
     shootdowns: u32,
     flushes: u32,
+    /// Executable pages the instruction caches were synchronised for (PL7).
+    icache_pages: u64,
 }
 impl Machine for Tlb {
     fn shootdown(&mut self) {
@@ -36,6 +38,9 @@ impl Machine for Tlb {
     }
     fn flush_tlb(&mut self) {
         self.flushes += 1;
+    }
+    fn icache_sync(&mut self, pages: u64) {
+        self.icache_pages += pages;
     }
 }
 
@@ -297,10 +302,9 @@ fn process_map_argument_errors() {
         ("zero length", [ph, v, VA, 0, 0, R]),
         ("unknown flag", [ph, v, VA, 0, 4096, 8]),
         ("write and execute", [ph, v, VA, 0, 4096, W | X]),
-        (
-            "below the user range",
-            [ph, v, USER_BASE - 4096, 0, 4096, R],
-        ),
+        // (address 0 is no longer "below the user range": it asks for ANYWHERE, MM7)
+        ("zero length anywhere", [ph, v, 0, 0, 0, R]),
+        ("unaligned length anywhere", [ph, v, 0, 0, 100, R]),
         ("above the user range", [ph, v, TOP, 0, 4096, R]),
         ("wrapping range", [ph, v, u64::MAX - 4095, 0, 8192, R]),
         (
@@ -860,4 +864,223 @@ fn set_size_checks_resizability_before_the_size() {
         Status::InvalidArgs,
         "past the end"
     );
+}
+
+#[test]
+fn process_map_anywhere_picks_free_places_that_do_not_overlap_and_returns_them() {
+    let (mut w, ph) = world();
+    let v = w.vmo(4, JobId::ROOT);
+    let first = w
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, W | R])
+        .0
+        .expect("the address comes back");
+    let second = w
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, R])
+        .0
+        .expect("and again");
+    for at in [first, second] {
+        assert!(
+            at.is_multiple_of(4096) && (0x1_0000_0000..abi::user::STACK_ARENA_BASE).contains(&at),
+            "inside the arena: {at:#x}"
+        );
+    }
+    assert!(
+        first.abs_diff(second) >= 2 * 4096,
+        "two mappings do not overlap"
+    );
+    // the mappings are there (touching them works), and an explicit address still returns nothing
+    touch(&mut w, 2, first);
+    assert_eq!(w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4096, R]).0, None);
+    let _ = USER_BASE;
+}
+
+// ---- MM7: ranges, protect, info ----
+
+/// A handle in process 1 to the same VMO as `h` with only `rights`.
+fn weaker(w: &mut W, h: u64, rights: Rights) -> u64 {
+    let p = w.procs.get_mut(&1).unwrap();
+    p.handles
+        .duplicate(&mut w.objs, abi::Handle(h), rights)
+        .unwrap()
+        .0
+}
+
+/// A page of process 1's own memory for the info records.
+fn info_buffer(w: &mut W) -> u64 {
+    let me = w.handle_to(1);
+    let own = w.vmo(1, JobId::ROOT);
+    let buf = 0x70_0000u64;
+    w.ok(nr::PROCESS_MAP, [me, own, buf, 0, 4096, W | R]);
+    buf
+}
+
+fn info(w: &mut W, buf: u64, ph: u64, at: u64) -> ([u64; 6], u64) {
+    let next = w
+        .ok(nr::PROCESS_MAP_INFO, [ph, at, buf, 0, 0, 0])
+        .0
+        .unwrap();
+    let mut rec = [0u64; 6];
+    let t = w.procs.get_mut(&1).unwrap();
+    let bytes =
+        copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, buf, 48).unwrap();
+    for (i, r) in rec.iter_mut().enumerate() {
+        *r = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    (rec, next)
+}
+
+#[test]
+fn unmap_with_a_length_splits_regions_credits_and_asks_for_the_shootdown() {
+    let (mut w, ph) = world();
+    let v = w.vmo(8, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 8 * 4096, W | R]);
+    touch(&mut w, 2, VA + 3 * 4096);
+    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    // the middle: two regions are left, the hole is a hole
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 4 * 4096, 0, 0, 0]);
+    assert_eq!(w.procs[&2].aspace.region_count(), 2);
+    assert!(
+        w.procs[&2]
+            .aspace
+            .table()
+            .translate(&w.mm, VA + 3 * 4096)
+            .is_none(),
+        "the touched page went"
+    );
+    assert_eq!(w.tlb.shootdowns, 1);
+    // a range that is all hole, and one that overlaps a hole and a region, are fine
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 2 * 4096, 0, 0, 0]);
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 7 * 4096, 4 * 4096, 0, 0, 0]);
+    assert_eq!(
+        w.procs[&2].aspace.region_count(),
+        2,
+        "the tail went, the head stayed: {:?}",
+        w.procs[&2].aspace.regions_info()
+    );
+    // errors: unaligned, wrapping
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, VA + 1, 4096, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, VA, 100, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, u64::MAX - 4095, 8192, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    // the original form still removes the region that starts at the address, whole
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    assert_eq!(
+        w.procs[&2].aspace.region_count(),
+        1,
+        "the head went, the one page of the tail stayed"
+    );
+}
+
+#[test]
+fn protect_changes_rights_in_place_within_the_ceiling_and_pays_for_what_it_must() {
+    let (mut w, ph) = world();
+    let v = w.vmo(4, JobId::ROOT);
+    let ro = weaker(&mut w, v, Rights(Rights::READ.0 | Rights::MAP.0));
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, R | W]);
+    touch(&mut w, 2, VA);
+    // a downgrade: write goes, the other harts are told
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 4 * 4096, R, 0, 0]);
+    assert_eq!(
+        (w.tlb.shootdowns, w.tlb.flushes),
+        (1, 1),
+        "a downgrade is shot down"
+    );
+    let pte = w.procs[&2]
+        .aspace
+        .table()
+        .translate(&w.mm, VA)
+        .unwrap()
+        .perms;
+    assert!(pte.read && !pte.write, "the page table says read-only");
+    // an upgrade within the ceiling needs no shootdown
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 4 * 4096, R | W, 0, 0]);
+    assert_eq!(w.tlb.shootdowns, 1);
+    // execute needs EXECUTE on the VMO handle that mapped it (the full-rights handle has it), and makes the pages visible to fetch
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 2 * 4096, R | X, 0, 0]);
+    assert_eq!(
+        w.tlb.icache_pages, 1,
+        "one mapped page became executable (the others fault in later)"
+    );
+    // errors
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 4096, W | X, 0, 0]),
+        Status::InvalidArgs,
+        "write with execute"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 4096, 8, 0, 0]),
+        Status::InvalidArgs,
+        "an unknown flag"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA + 1, 4096, R, 0, 0]),
+        Status::InvalidArgs,
+        "unaligned"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 8 * 4096, R, 0, 0]),
+        Status::InvalidArgs,
+        "past the mapping: a hole in the range"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 0, R, 0, 0]),
+        Status::InvalidArgs,
+        "no length"
+    );
+    // the ceiling: a mapping made through a handle without WRITE can never become writable
+    w.ok(nr::PROCESS_MAP, [ph, ro, VA + 16 * 4096, 0, 4 * 4096, R]);
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA + 16 * 4096, 4096, R | W, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [999, VA, 4096, R, 0, 0]),
+        Status::BadHandle
+    );
+}
+
+#[test]
+fn map_info_walks_the_regions_and_a_protect_splits_and_merges_them() {
+    let (mut w, ph) = world();
+    let buf = info_buffer(&mut w);
+    let v = w.vmo(8, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 8 * 4096, R | W]);
+    let (rec, next) = info(&mut w, buf, ph, 0);
+    assert_eq!(rec[0], VA);
+    assert_eq!(rec[1], 8 * 4096);
+    assert_eq!(
+        (rec[2], rec[3]),
+        (0b011, 0b111),
+        "perms as bits (read, write) and the ceiling (the VMO handle had every right)"
+    );
+    assert_eq!(rec[5], 0, "the VMO offset");
+    assert_eq!(next, 0, "no region after it");
+    // protect the middle: three regions, the pieces know their offsets
+    w.ok(nr::PROCESS_PROTECT, [ph, VA + 2 * 4096, 3 * 4096, R, 0, 0]);
+    let (a, n1) = info(&mut w, buf, ph, VA);
+    assert_eq!((a[0], a[1], a[2]), (VA, 2 * 4096, 0b011));
+    assert_eq!(n1, VA + 2 * 4096);
+    let (b, n2) = info(&mut w, buf, ph, n1);
+    assert_eq!(
+        (b[0], b[1], b[2], b[5]),
+        (VA + 2 * 4096, 3 * 4096, 0b001, 2 * 4096)
+    );
+    assert_eq!(n2, VA + 5 * 4096);
+    // protect it back: the three merge into one again
+    w.ok(
+        nr::PROCESS_PROTECT,
+        [ph, VA + 2 * 4096, 3 * 4096, R | W, 0, 0],
+    );
+    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    // an address in a hole reports the next region; past the last, nothing
+    let (c, _) = info(&mut w, buf, ph, VA + 8 * 4096);
+    assert_eq!(c[1], 0, "no region at or after");
 }

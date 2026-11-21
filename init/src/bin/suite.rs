@@ -1472,7 +1472,22 @@ fn process_map_argument_checks() -> Outcome {
         Some(S::InvalidArgs),
         "writable and executable"
     );
-    ensure_eq!(map(0, 0, 4096, PF_R), Some(S::InvalidArgs), "page zero");
+    // (address 0 is ANYWHERE since MM7, not page zero: the kernel never maps page zero, and the two calls below are refused as before)
+    ensure_eq!(
+        map(0, 0, 0, PF_R),
+        Some(S::InvalidArgs),
+        "ANYWHERE with no length"
+    );
+    ensure_eq!(
+        map(0, 0, 100, PF_R),
+        Some(S::InvalidArgs),
+        "ANYWHERE with an unaligned length"
+    );
+    ensure_eq!(
+        map(0x800, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "inside page zero"
+    );
     ensure_eq!(
         map(TOP - 4096, 0, 8192, PF_R),
         Some(S::InvalidArgs),
@@ -2847,6 +2862,177 @@ fn vmo_decommit_and_resize_from_user_mode() -> Outcome {
     for h in [weak, fixed, v] {
         sys::handle_close(h);
     }
+    Ok(())
+}
+
+/// MM7: ranges, protect and info from user mode: the "map twice the size and trim" idiom, ANYWHERE, a JIT-style flip from writable to
+/// executable that then runs (and write with execute refused), the error rows, and `process_map_info`'s record.
+fn process_protect_and_range_unmap_from_user_mode() -> Outcome {
+    let me = me()?;
+    // two ANYWHERE mappings differ and do not overlap
+    let v = vmo(8)?;
+    let a = ok(
+        sys::process_map_anywhere(me, v, 0, 8 * 4096, PF_R | PF_W),
+        "ANYWHERE",
+    )?
+    .a1 as u64;
+    let b = ok(
+        sys::process_map_anywhere(me, v, 0, 8 * 4096, PF_R),
+        "ANYWHERE again",
+    )?
+    .a1 as u64;
+    ensure!(
+        a.is_multiple_of(4096) && b.is_multiple_of(4096) && a != b,
+        "distinct page-aligned places: {a:#x} {b:#x}"
+    );
+    ensure!(a.abs_diff(b) >= 8 * 4096, "no overlap");
+    ensure_eq!(
+        st(sys::process_unmap(me, b)),
+        Some(S::Ok),
+        "unmap the second"
+    );
+    // trim: keep the middle four pages
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 2 * 4096)),
+        Some(S::Ok),
+        "trim the head"
+    );
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a + 6 * 4096, 2 * 4096)),
+        Some(S::Ok),
+        "trim the tail"
+    );
+    // SAFETY: pages 2 to 5 of the mapping stay mapped read-write.
+    unsafe {
+        core::ptr::write_volatile((a + 2 * 4096) as *mut u32, 0xabcd);
+        core::ptr::write_volatile((a + 5 * 4096) as *mut u32, 0xef01);
+    }
+    let mut rec = [0u64; 6];
+    let next = ok(sys::process_map_info(me, a, rec.as_mut_ptr()), "map_info")?.a1 as u64;
+    ensure_eq!(
+        (rec[0], rec[1], rec[2], rec[5]),
+        (a + 2 * 4096, 4 * 4096, 0b011, 2 * 4096),
+        "the record of what is left"
+    );
+    ensure!(next == 0 || next > a, "the next base");
+    // holes are fine
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 8 * 4096)),
+        Some(S::Ok),
+        "unmap over holes"
+    );
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 4096)),
+        Some(S::Ok),
+        "unmap only hole"
+    );
+    // the JIT flip: write code, make it executable, run it
+    const CODE: u64 = 0x5a0_0000;
+    let c = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(me, c, CODE, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map for writing"
+    );
+    // addi a0, zero, 42 ; ret
+    let code: [u32; 2] = [0x02a0_0513, 0x0000_8067];
+    // SAFETY: the page is mapped read-write.
+    unsafe {
+        core::ptr::write_volatile(CODE as *mut u32, code[0]);
+        core::ptr::write_volatile((CODE + 4) as *mut u32, code[1]);
+    }
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_W | PF_X)),
+        Some(S::InvalidArgs),
+        "write with execute"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_R | PF_X)),
+        Some(S::Ok),
+        "flip to executable"
+    );
+    // SAFETY: the page holds the two instructions written above and is executable now; `fence.i` synchronises this hart's fetch.
+    let got = unsafe {
+        core::arch::asm!("fence.i");
+        let f: extern "C" fn() -> u64 = core::mem::transmute(CODE as usize);
+        f()
+    };
+    ensure_eq!(got, 42, "the code ran");
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "and back to writable"
+    );
+    // errors
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 2 * 4096, PF_R)),
+        Some(S::InvalidArgs),
+        "a hole in the range"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE + 1, 4096, PF_R)),
+        Some(S::InvalidArgs),
+        "unaligned"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 0, PF_R)),
+        Some(S::InvalidArgs),
+        "no length"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, 8)),
+        Some(S::InvalidArgs),
+        "unknown flag"
+    );
+    ensure_eq!(
+        st(sys::process_protect(BAD, CODE, 4096, PF_R)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::process_protect(ev, CODE, 4096, PF_R)),
+        Some(S::WrongType),
+        "not a process"
+    );
+    sys::handle_close(ev);
+    // the ceiling: a mapping made through a handle without WRITE can never be made writable
+    let ro = ok(
+        sys::handle_duplicate(c, Rights::READ.0 | Rights::MAP.0),
+        "a read-only handle",
+    )?
+    .a1 as u64;
+    const RO: u64 = 0x5b0_0000;
+    ensure_eq!(
+        st(sys::process_map(me, ro, RO, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "map read-only"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, RO, 4096, PF_R | PF_W)),
+        Some(S::AccessDenied),
+        "beyond the ceiling"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, RO, 4096, PF_R | PF_X)),
+        Some(S::AccessDenied),
+        "execute without the right"
+    );
+    for at in [CODE, RO] {
+        ensure_eq!(st(sys::process_unmap(me, at)), Some(S::Ok), "unmap");
+    }
+    for h in [v, c, ro] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM7: a page made read-only by `process_protect` faults on a write and ends the process.
+fn a_write_to_a_protected_page_ends_the_process() -> Outcome {
+    let (p, _m) = launch(101)?;
+    wait_ended(p, 1000)?;
+    let r = sys::process_info(p);
+    ensure_eq!((r.status, r.a1 as i64), (0, -1001), "a page fault ended it");
     Ok(())
 }
 
@@ -12598,6 +12784,14 @@ pub fn app_main() -> i32 {
         (
             "job_limits_stop_a_thread_bomb",
             job_limits_stop_a_thread_bomb,
+        ),
+        (
+            "process_protect_and_range_unmap_from_user_mode",
+            process_protect_and_range_unmap_from_user_mode,
+        ),
+        (
+            "a_write_to_a_protected_page_ends_the_process",
+            a_write_to_a_protected_page_ends_the_process,
         ),
         (
             "vmo_decommit_and_resize_from_user_mode",

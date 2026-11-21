@@ -329,6 +329,8 @@ pub mod syscall {
     /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
     pub const PROCESS_SUSPEND: usize = 57;
     pub const PROCESS_RESUME: usize = 58;
+    /// Change the permissions of a range of a process's mappings (MM7).
+    pub const PROCESS_PROTECT: usize = 59;
     // 60 was `thread_create`: retired, not reused (AB5)
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
@@ -340,6 +342,8 @@ pub mod syscall {
     /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
     pub const THREAD_SET_SCHED: usize = 65;
     pub const THREAD_GET_SCHED: usize = 66;
+    /// Describe the region of a process at or after an address (MM7).
+    pub const PROCESS_MAP_INFO: usize = 67;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
