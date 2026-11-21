@@ -906,9 +906,23 @@ pub fn exit() -> ! {
             // switch, or the mark would stay set with no flag and no poke owed (PR 263 review)
             sc.reschedule_on(h);
         }
-        // negative control (L11d): the stack is freed while this thread still runs on it
+        // negative control (L11d): the stack is freed while this thread still runs on it. The bug only bites if another thread takes the
+        // freed slot before this one has switched away, which is a race; the control makes it certain: the slot is taken at once and its
+        // new owner writes to it (soak, 2026-11-21: the race alone no longer lost often enough for `teardown_with_threads_on_other_harts`
+        // to notice)
         #[cfg(feature = "fault-early-reap")]
-        reap_if_dead(running_here());
+        {
+            // (`reap_if_dead` itself refuses a thread that is in transit, which is the guard this control removes: reap directly)
+            let me = running_here();
+            if kernel().threads.get(&me).is_some_and(|t| t.detached) && sched().reap(me).is_ok() {
+                if let Some(t) = kernel().threads.remove(&me) {
+                    note_stack_use(me, &t);
+                }
+                if let Some(mut stolen) = crate::kstack::alloc() {
+                    stolen.fill(0xdead_dead_dead_dead);
+                }
+            }
+        }
         reschedule();
     });
     unreachable!("an exited thread was scheduled again");
