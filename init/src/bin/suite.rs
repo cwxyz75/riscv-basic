@@ -2695,8 +2695,8 @@ fn own_stack() -> Result<u64, Detail> {
 fn new_thread(f: extern "C" fn(usize) -> !, arg: usize) -> Result<u64, Detail> {
     let top = own_stack()?;
     Ok(ok(
-        sys::thread_create(me()?, f as *const () as usize as u64, top, arg as u64),
-        "thread_create",
+        sys::thread_on_stack(me()?, f as *const () as usize as u64, top, arg as u64),
+        "thread_on_stack",
     )?
     .a1 as u64)
 }
@@ -2718,11 +2718,11 @@ extern "C" fn worker_wait_event(arg: usize) -> ! {
     sys::thread_exit(if r.status == 0 { 0 } else { 1 })
 }
 
-fn thread_create_argument_checks() -> Outcome {
+fn caller_stack_argument_checks() -> Outcome {
     let top = own_stack()?;
     let me = me()?;
     let entry = worker_set as *const () as usize as u64;
-    let go = |p: u64, entry: u64, sp: u64| st(sys::thread_create(p, entry, sp, 0));
+    let go = |p: u64, entry: u64, sp: u64| st(sys::thread_on_stack(p, entry, sp, 0));
     ensure_eq!(go(BAD, entry, top), Some(S::BadHandle), "bad handle");
     let ev = event()?;
     ensure_eq!(
@@ -2755,19 +2755,18 @@ fn thread_create_argument_checks() -> Outcome {
     );
     ensure_eq!(go(me, entry, 0), Some(S::InvalidArgs), "sp 0");
     ensure_eq!(
-        st(rt::syscall(
-            rt::abi::syscall::THREAD_CREATE,
-            [
-                me as usize ^ (1usize << 40),
-                entry as usize,
-                top as usize,
-                0,
-                0,
-                0
-            ]
-        )),
+        go(me ^ (1u64 << 40), entry, top),
         Some(S::BadHandle),
         "a wide handle"
+    );
+    // syscall 60 was `thread_create`: retired, never reused (AB5)
+    ensure_eq!(
+        st(rt::syscall(
+            60,
+            [me as usize, entry as usize, top as usize, 0, 0, 0]
+        )),
+        Some(S::BadSyscall),
+        "the retired number"
     );
     // a process that has not started, and one that has ended
     let p = proc_create()?;
@@ -3367,7 +3366,7 @@ fn thread_limit_and_slots_are_reused() -> Outcome {
     let mut ts: Vec<u64> = Vec::new();
     loop {
         let top = base + (ts.len() as u64 + 1) * STACK_PAGES * 4096;
-        let r = sys::thread_create(me, worker_wait_event as *const () as usize as u64, top, ev);
+        let r = sys::thread_on_stack(me, worker_wait_event as *const () as usize as u64, top, ev);
         if r.status != 0 {
             ensure_eq!(st(r), Some(S::NoMemory), "the limit is NO_MEMORY");
             break;
@@ -3561,8 +3560,8 @@ fn child_thread(p: u64, slot: u64, arg: u64) -> Result<u64, Detail> {
     )?;
     sys::handle_close(v);
     Ok(ok(
-        sys::thread_create(p, child_entry()?, base + 4 * 4096, arg),
-        "thread_create in a child",
+        sys::thread_on_stack(p, child_entry()?, base + 4 * 4096, arg),
+        "thread_on_stack in a child",
     )?
     .a1 as u64)
 }
@@ -3659,8 +3658,8 @@ fn child_with_a_ready_exit_thread() -> Result<(u64, u64, u64), Detail> {
     nap(3)?;
     // a thread that would exit(42) at once
     let t = ok(
-        sys::thread_create(p, child_entry()?, base + 4 * 4096, 8),
-        "thread_create",
+        sys::thread_on_stack(p, child_entry()?, base + 4 * 4096, 8),
+        "thread_on_stack",
     )?
     .a1 as u64;
     Ok((p, m, t))
@@ -3774,7 +3773,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     thread_ended_with(t, 42)?;
     thread_ended_with(b, 42)?;
     ensure_eq!(
-        st(sys::thread_create(
+        st(sys::thread_on_stack(
             p,
             child_entry()?,
             0x20_0000_0000 + 0x4000,
@@ -4733,7 +4732,7 @@ fn kill_needs_the_kill_right_and_nothing_else() -> Outcome {
         "KILL does not allow mapping into the process"
     );
     ensure_eq!(
-        st(sys::thread_create(
+        st(sys::thread_on_stack(
             kill_only,
             child_entry()?,
             0x20_0000_0000 + 0x4000,
@@ -5210,7 +5209,7 @@ fn the_process_handle_the_launcher_returns_cannot_manage() -> Outcome {
         "no MANAGE: the caller cannot map into the child"
     );
     ensure_eq!(
-        st(sys::thread_create(proc, 0x10000, 0x20_0000_0000, 0)),
+        st(sys::thread_on_stack(proc, 0x10000, 0x20_0000_0000, 0)),
         Some(S::AccessDenied),
         "nor add threads"
     );
@@ -10812,7 +10811,7 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     );
     let entry = child_entry()?;
     ensure_eq!(
-        st(sys::thread_create(p, entry, base + 4 * 4096, 16)),
+        st(sys::thread_on_stack(p, entry, base + 4 * 4096, 16)),
         Some(S::NoMemory),
         "a thread whose stack does not fit the job"
     );
@@ -10828,7 +10827,7 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         "four pages of room"
     );
     let t = ok(
-        sys::thread_create(p, entry, base + 4 * 4096, 16),
+        sys::thread_on_stack(p, entry, base + 4 * 4096, 16),
         "the thread now fits",
     )?
     .a1 as u64;
@@ -11251,7 +11250,7 @@ fn thousands_of_threads_come_and_go() -> Outcome {
     let me = me()?;
     let entry = worker_set as *const () as usize as u64;
     for round in 0..2000u32 {
-        let r = sys::thread_create(me, entry, top, u64::from(round));
+        let r = sys::thread_on_stack(me, entry, top, u64::from(round));
         ensure!(
             r.status == 0,
             "thread_create: status {} in round {round}",
@@ -11448,7 +11447,7 @@ fn bench_thread_create_join(n: u32) -> Result<u64, Detail> {
     let entry = bench_exit as *const () as usize as u64;
     let t0 = cycles();
     for round in 0..n {
-        let r = sys::thread_create(me, entry, top, u64::from(round));
+        let r = sys::thread_on_stack(me, entry, top, u64::from(round));
         ensure!(
             r.status == 0,
             "thread_create: status {} in round {round}",
@@ -11707,7 +11706,7 @@ fn instruction_counts_report() -> Outcome {
     let me = me()?;
     let entry = bench_exit as *const () as usize as u64;
     counted("thread_create_join", n, || {
-        let t = ok(sys::thread_create(me, entry, top, 0), "thread_create")?.a1 as u64;
+        let t = ok(sys::thread_on_stack(me, entry, top, 0), "thread_on_stack")?.a1 as u64;
         let w = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(t);
@@ -11848,10 +11847,7 @@ pub fn app_main() -> i32 {
             vmo_closed_while_mapped_keeps_its_pages,
         ),
         ("many_children_do_not_leak", many_children_do_not_leak),
-        (
-            "thread_create_argument_checks",
-            thread_create_argument_checks,
-        ),
+        ("caller_stack_argument_checks", caller_stack_argument_checks),
         (
             "threads_share_memory_and_report_exit_codes",
             threads_share_memory_and_report_exit_codes,

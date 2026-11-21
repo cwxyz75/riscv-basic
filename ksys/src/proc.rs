@@ -67,7 +67,7 @@ pub struct Process {
     /// `process_suspend` stopped it: every thread parks at its next return to user mode (a thread blocked in a call
     /// stays blocked, and parks when the call returns) until `process_resume` or a kill. SIG2, SYSCALLS.md.
     pub stopped: bool,
-    /// User threads that exist and have not ended (counted from `thread_create`, before the
+    /// User threads that exist and have not ended (counted from `thread_spawn`, before the
     /// thread first runs). The process is torn down when this reaches 0.
     pub threads_alive: usize,
     /// The thread objects of the live threads, to mark them TERMINATED when they end.

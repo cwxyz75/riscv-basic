@@ -230,7 +230,8 @@ pub fn app_main() -> i32 {
             let me = rt::sys::process_self().a1 as u64;
             let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
             loop {
-                let r = rt::sys::thread_create(me, exit_eight as *const () as usize as u64, top, 0);
+                let r =
+                    rt::sys::thread_on_stack(me, exit_eight as *const () as usize as u64, top, 0);
                 if r.status == 0 {
                     rt::sys::handle_close(r.a1 as u64);
                 }
@@ -316,9 +317,9 @@ pub fn app_main() -> i32 {
             let me = rt::sys::process_self().a1 as u64;
             let top1 = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
             let first =
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top1, 0);
             let second =
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top1, 0);
             let mut code = 0;
             if first.status == 0 {
                 code |= 1;
@@ -529,7 +530,7 @@ pub fn app_main() -> i32 {
             for k in 0..2 {
                 // SAFETY: only the address of the static stack is taken; each new thread owns its own.
                 let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top, 0);
             }
             loop {
                 core::hint::spin_loop();
@@ -594,7 +595,7 @@ fn spawn(f: extern "C" fn(usize) -> !, arg: usize) -> u64 {
     let me = rt::sys::process_self().a1 as u64;
     // Only the address of the static is taken; the one new thread uses it as its stack.
     let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
-    let r = rt::sys::thread_create(me, f as *const () as usize as u64, top, arg as u64);
+    let r = rt::sys::thread_on_stack(me, f as *const () as usize as u64, top, arg as u64);
     if r.status != 0 {
         rt::sys::exit(100 + (-(r.status as i64)) as i32);
     }
@@ -669,7 +670,7 @@ fn unmap_while_siblings_touch() -> i32 {
     for k in 0..2 {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, reader as *const () as usize as u64, top, k as u64);
+        let t = rt::sys::thread_on_stack(me, reader as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900 + (-(t.status as i64)) as i32;
         }
@@ -874,7 +875,7 @@ fn churn(seed: u64) -> i32 {
                     // SAFETY: the slot's stack is free (the flag was clear).
                     let top =
                         unsafe { core::ptr::addr_of_mut!(CHURN_STACKS.0[slot]) } as u64 + 4096;
-                    let t = rt::sys::thread_create(
+                    let t = rt::sys::thread_on_stack(
                         me,
                         churn_worker as *const () as usize as u64,
                         top,
@@ -1017,7 +1018,7 @@ fn fp_threads() -> i32 {
     for k in 0..2usize {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, fp_worker as *const () as usize as u64, top, k as u64);
+        let t = rt::sys::thread_on_stack(me, fp_worker as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900;
         }
@@ -1192,7 +1193,7 @@ fn vec_fresh() -> i32 {
     }
     // SAFETY: only the address of the static stack is taken (the thread's entry uses no stack).
     let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[0]) } as u64 + 8192;
-    let t = rt::sys::thread_create(
+    let t = rt::sys::thread_on_stack(
         me,
         vec_fresh_thread as *const () as usize as u64,
         top,
@@ -1400,7 +1401,8 @@ fn vec_threads() -> i32 {
     for k in 0..2usize {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, vec_worker as *const () as usize as u64, top, k as u64);
+        let t =
+            rt::sys::thread_on_stack(me, vec_worker as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900;
         }

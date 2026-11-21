@@ -346,3 +346,65 @@ fn every_failure_after_the_checks_gives_back_what_it_took() {
     w.us.procs.get_mut(&2).unwrap().threads_alive = abi::limits::MAX_THREADS_PER_PROCESS;
     assert_eq!(w.spawn(w.plain()), Err(Status::NoMemory));
 }
+
+#[test]
+fn the_priority_is_inherited_clamped_to_the_job_and_at_least_one() {
+    // (moved from the retired `thread_create` tests, AB5: with priority 0 in the record the thread takes its creator's base priority)
+    let mut w = world();
+    let low = w.vmos.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.vmos
+        .jobs
+        .set_sched(
+            low,
+            SchedLimits {
+                max_prio: 4,
+                ..w.vmos.jobs.sched(low).unwrap()
+            },
+        )
+        .unwrap();
+    w.us.procs.get_mut(&2).unwrap().job = low;
+    let mut prio_of = |creator: u8| {
+        let rec = w.plain();
+        w.record(rec);
+        ksys::thread_spawn(
+            &mut w.us,
+            &mut w.mm,
+            &mut w.vmos,
+            1,
+            creator,
+            [w.ph, REC, 0, 0, 0, 0],
+        )
+        .unwrap()
+        .prio
+    };
+    assert_eq!(prio_of(10), 4, "clamped to the job's maximum");
+    assert_eq!(prio_of(2), 2, "inherited below the maximum");
+    assert_eq!(prio_of(0), 1, "never the idle priority");
+    assert_eq!(
+        ksys::clamp_prio(&w.vmos.jobs, JobId::ROOT, 200),
+        63.min(w.vmos.jobs.sched(JobId::ROOT).unwrap().max_prio)
+    );
+}
+
+#[test]
+fn a_full_handle_table_refuses_with_no_memory_and_charges_nothing() {
+    // (AB1: a process's table has no fixed size any more, so the guest cannot fill it: the host table has a limit of 64)
+    let mut w = world();
+    let mut held = Vec::new();
+    {
+        let ksys::UserState { objs, procs, .. } = &mut w.us;
+        let p = procs.get_mut(&1).unwrap();
+        while let Ok(h) = kcore::ipc::event_create(objs, &mut p.handles) {
+            held.push(h);
+        }
+        assert!(held.len() >= 50, "the table filled up");
+    }
+    let plain = w.plain();
+    assert_eq!(w.spawn(plain).map(|_| ()), Err(Status::NoMemory));
+    assert_eq!(w.us.procs[&2].threads_alive, 0, "nothing was started");
+    assert_eq!(w.threads_charged(JobId::ROOT), 0, "nothing was charged");
+    let ksys::UserState { objs, procs, .. } = &mut w.us;
+    let p = procs.get_mut(&1).unwrap();
+    p.handles.close(objs, held.pop().unwrap()).unwrap();
+    assert!(w.spawn(plain).is_ok());
+}

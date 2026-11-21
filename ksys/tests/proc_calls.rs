@@ -160,7 +160,6 @@ fn calls_that_are_not_these_are_left_to_the_kernel() {
         machine: &mut w.tlb,
     };
     assert!(proc_call(nr::PROCESS_CREATE, [0; 6], &mut c).is_none());
-    assert!(proc_call(nr::THREAD_CREATE, [0; 6], &mut c).is_none());
 }
 
 #[test]

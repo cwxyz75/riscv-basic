@@ -208,7 +208,6 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_SUSPEND
         | nr::PROCESS_RESUME
         | nr::PROCESS_INFO
-        | nr::THREAD_CREATE
         | nr::THREAD_SPAWN
         | nr::THREAD_INFO
         | nr::THREAD_INTERRUPT => {
