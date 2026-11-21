@@ -25,7 +25,7 @@ pub fn app_main() -> i32 {
             break;
         }
         for _ in 0..32 {
-            let w = sys::socket_write(pair.a1 as u32, block.as_ptr(), block.len());
+            let w = sys::socket_write(pair.a1 as u64, block.as_ptr(), block.len());
             if w.status != 0 {
                 break 'fill;
             }

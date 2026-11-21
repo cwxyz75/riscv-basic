@@ -56,11 +56,11 @@ struct Block {
     /// Where the slot's MMIO page is mapped in this process (for the reset).
     va: u64,
     /// The slot's MMIO VMO.
-    mmio: u32,
-    dma: u32,
-    irq: Option<u32>,
+    mmio: u64,
+    dma: u64,
+    irq: Option<u64>,
     /// The driver process handle, once one was started.
-    driver: Option<u32>,
+    driver: Option<u64>,
 }
 
 fn rd(va: u64, off: usize) -> u32 {
@@ -84,12 +84,12 @@ fn reset(va: u64) {
     wr(va, INTERRUPT_ACK, rd(va, INTERRUPT_STATUS));
 }
 
-fn read_dtb(res: u32, me: u32) -> Option<Vec<u8>> {
+fn read_dtb(res: u64, me: u64) -> Option<Vec<u8>> {
     let r = sys::resource_dtb(res);
     if r.status != 0 {
         return None;
     }
-    let (vmo, len) = (r.a1 as u32, r.a2);
+    let (vmo, len) = (r.a1 as u64, r.a2);
     let ok =
         sys::process_map(me, vmo, DTB_VA, 0, (len as u64).div_ceil(4096) * 4096, PF_R).status == 0;
     sys::handle_close(vmo);
@@ -103,12 +103,12 @@ fn read_dtb(res: u32, me: u32) -> Option<Vec<u8>> {
 }
 
 /// Is the slot at `pa` a virtio device of `want` (a device id)? If so its page stays mapped at `va`.
-fn probe(res: u32, me: u32, pa: u64, va: u64, want: u32) -> Option<u32> {
+fn probe(res: u64, me: u64, pa: u64, va: u64, want: u32) -> Option<u64> {
     let vmo = sys::vmo_create_physical(res, pa, 4096);
     if vmo.status != 0 {
         return None;
     }
-    let vmo = vmo.a1 as u32;
+    let vmo = vmo.a1 as u64;
     let mapped = sys::process_map(me, vmo, va, 0, 4096, PF_RW).status == 0;
     let found = mapped && rd(va, MAGIC) == 0x7472_6976 && rd(va, DEVICE_ID) == want;
     if mapped && !found {
@@ -125,10 +125,10 @@ fn probe(res: u32, me: u32, pa: u64, va: u64, want: u32) -> Option<u32> {
 /// A virtio network device, claimable by one client at a time (S8). The DMA memory exists only while it is claimed.
 struct Net {
     va: u64,
-    mmio: u32,
-    irq: Option<u32>,
+    mmio: u64,
+    irq: Option<u64>,
     /// While claimed: the claimant's connection key and the manager's own handles to the three DMA VMOs.
-    claim: Option<(u64, [u32; 3])>,
+    claim: Option<(u64, [u64; 3])>,
 }
 
 impl Net {
@@ -145,8 +145,8 @@ impl Net {
 
 struct Rng {
     va: u64,
-    mmio: u32,
-    claim: Option<(u64, u32)>,
+    mmio: u64,
+    claim: Option<(u64, u64)>,
 }
 
 impl Rng {
@@ -158,7 +158,7 @@ impl Rng {
     }
 }
 
-fn blkd_image(bi: u32) -> Option<Vec<u8>> {
+fn blkd_image(bi: u64) -> Option<Vec<u8>> {
     let total = sys::vmo_get_size(bi).a1;
     let prefix = rt::spawn::read_image(bi, 0, (total as u64).min(128 * 1024))?;
     let entries = bootimg::parse_prefix(&prefix, total).ok()?;
@@ -176,7 +176,7 @@ impl Block {
 
     /// Start a driver on a fresh channel; `Err` is the status to answer. The client's end moves
     /// into the reply.
-    fn open(&mut self, image: &[u8]) -> Result<u32, Status> {
+    fn open(&mut self, image: &[u8]) -> Result<u64, Status> {
         if self.driver_alive() {
             return Err(Status::Busy);
         }
@@ -188,10 +188,10 @@ impl Block {
         if pair.status != 0 {
             return Err(Status::Failed);
         }
-        let (mine, theirs) = (pair.a1 as u32, pair.a2 as u32);
-        let dup = |h: u32| {
+        let (mine, theirs) = (pair.a1 as u64, pair.a2 as u64);
+        let dup = |h: u64| {
             let r = sys::handle_duplicate(h, Rights::SAME.0);
-            (r.status == 0).then_some(r.a1 as u32)
+            (r.status == 0).then_some(r.a1 as u64)
         };
         let (m, d) = (dup(self.mmio), dup(self.dma));
         let (Some(mmio), Some(dma)) = (m, d) else {
@@ -242,17 +242,17 @@ const HOLD_TIMEOUT: u64 = 30_000;
 
 struct DevMgr {
     core: Core<u64>,
-    res: u32,
+    res: u64,
     blocks: Vec<Block>,
     nets: Vec<Net>,
     rngs: Vec<Rng>,
     /// The real-time clocks: one VMO of each register page (claimed read-only, by any number of clients).
-    rtcs: Vec<u32>,
+    rtcs: Vec<u64>,
     image: Option<Vec<u8>>,
 }
 
 impl DevMgr {
-    fn reply(&mut self, key: u64, txid: u32, status: Status, handle: Option<u32>) {
+    fn reply(&mut self, key: u64, txid: u32, status: Status, handle: Option<u64>) {
         let _ = self
             .core
             .send(key, devmgr::encode_reply(txid, status), handle);
@@ -267,7 +267,7 @@ impl Service for DevMgr {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], hs: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], hs: &[u64]) {
         let txid_of = |m: &[u8]| {
             m.get(..4)
                 .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -321,7 +321,7 @@ impl Service for DevMgr {
                     if d.status != 0 {
                         return self.reply(key, txid, Status::Failed, None);
                     }
-                    self.reply(key, txid, Status::Ok, Some(d.a1 as u32))
+                    self.reply(key, txid, Status::Ok, Some(d.a1 as u64))
                 }
                 Err(Some(t)) => self.reply(key, t, Status::BadRequest, None),
                 Err(None) => {}
@@ -379,7 +379,7 @@ impl DevMgr {
         }
         let mk = |pages: u64| {
             let r = sys::vmo_create_dma(res, pages);
-            (r.status == 0).then_some(r.a1 as u32)
+            (r.status == 0).then_some(r.a1 as u64)
         };
         let (rx, tx, q) = (mk(NET_RX_PAGES), mk(NET_TX_PAGES), mk(NET_QUEUE_PAGES));
         let (Some(rx), Some(tx), Some(q)) = (rx, tx, q) else {
@@ -389,11 +389,11 @@ impl DevMgr {
             return fail(self, Status::Failed);
         };
         reset(n.va);
-        let dup = |h: u32| {
+        let dup = |h: u64| {
             let r = sys::handle_duplicate(h, Rights::SAME.0);
-            (r.status == 0).then_some(r.a1 as u32)
+            (r.status == 0).then_some(r.a1 as u64)
         };
-        let mut give: Vec<u32> = Vec::new();
+        let mut give: Vec<u64> = Vec::new();
         let mut ok = true;
         for h in [n.mmio, rx, tx, q].into_iter().chain(n.irq) {
             match dup(h) {
@@ -443,11 +443,11 @@ impl DevMgr {
         if dma.status != 0 {
             return fail(self, Status::Failed);
         }
-        let dma = dma.a1 as u32;
+        let dma = dma.a1 as u64;
         reset(r.va);
-        let dup = |h: u32| {
+        let dup = |h: u64| {
             let d = sys::handle_duplicate(h, Rights::SAME.0);
-            (d.status == 0).then_some(d.a1 as u32)
+            (d.status == 0).then_some(d.a1 as u64)
         };
         let (Some(m), Some(d)) = (dup(r.mmio), dup(dma)) else {
             sys::handle_close(dma);
@@ -494,7 +494,7 @@ pub fn app_main() -> i32 {
     ) else {
         return 3;
     };
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     let Some(blob) = read_dtb(res, me) else {
         return 4;
     };
@@ -516,7 +516,7 @@ pub fn app_main() -> i32 {
         // the device's interrupt (the AIA is required, PL6); a source the kernel will not give (taken already) leaves the device without one
         let irq_of = || {
             let i = sys::interrupt_create(res, slot.irq);
-            (i.status == 0).then_some(i.a1 as u32)
+            (i.status == 0).then_some(i.a1 as u64)
         };
         if let Some(mmio) = probe(res, me, slot.base, va, ID_BLOCK) {
             let dma = sys::vmo_create_dma(res, 4);
@@ -526,7 +526,7 @@ pub fn app_main() -> i32 {
             blocks.push(Block {
                 va,
                 mmio,
-                dma: dma.a1 as u32,
+                dma: dma.a1 as u64,
                 irq: irq_of(),
                 driver: None,
             });
@@ -546,7 +546,7 @@ pub fn app_main() -> i32 {
         }
     }
     // the real-time clocks (a goldfish RTC on QEMU `virt`): a VMO of each one's register page, kept for claims
-    let mut rtcs: Vec<u32> = Vec::new();
+    let mut rtcs: Vec<u64> = Vec::new();
     for n in nodes
         .iter()
         .filter(|n| n.is_compatible("google,goldfish-rtc"))
@@ -555,7 +555,7 @@ pub fn app_main() -> i32 {
             if size >= 4096 && base % 4096 == 0 {
                 let v = sys::vmo_create_physical(res, base, 4096);
                 if v.status == 0 {
-                    rtcs.push(v.a1 as u32);
+                    rtcs.push(v.a1 as u64);
                 }
             }
         }
@@ -567,7 +567,7 @@ pub fn app_main() -> i32 {
     }
     let mut mgr = DevMgr {
         core: Core::new(
-            p.a1 as u32,
+            p.a1 as u64,
             POOL,
             rt::abi::limits::MAX_MSG_BYTES,
             rt::abi::limits::MAX_MSG_HANDLES,

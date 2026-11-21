@@ -72,7 +72,7 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
 }
 
 impl W {
-    fn create(&mut self, ok: bool, a: [u64; 6]) -> Result<u32, Status> {
+    fn create(&mut self, ok: bool, a: [u64; 6]) -> Result<u64, Status> {
         ksys::process_create(
             &mut self.us,
             &mut self.mm,
@@ -88,20 +88,19 @@ impl W {
     }
     fn job_handle(&mut self, job: JobId, rights: Rights) -> u64 {
         let p = self.us.procs.get_mut(&1).unwrap();
-        u64::from(
-            ipc::job_object_create(
-                &mut self.us.objs,
-                &mut p.handles,
-                job,
-                rights,
-                &mut Quota {
-                    jobs: &mut self.vmos.jobs,
-                    job: Some(JobId::ROOT),
-                },
-            )
-            .unwrap()
-            .0,
+
+        ipc::job_object_create(
+            &mut self.us.objs,
+            &mut p.handles,
+            job,
+            rights,
+            &mut Quota {
+                jobs: &mut self.vmos.jobs,
+                job: Some(JobId::ROOT),
+            },
         )
+        .unwrap()
+        .0
     }
 }
 
@@ -135,19 +134,28 @@ fn a_process_is_made_in_the_created_state_and_charged() {
 }
 
 #[test]
-fn pids_are_never_reused_while_live_and_wrap_without_overflow() {
+fn pids_are_never_reused_while_live_and_never_wrap() {
     let mut w = world(400);
     w.create(true, [0; 6]).unwrap();
     w.create(true, [0; 6]).unwrap();
-    let pids: Vec<u32> = w.us.procs.keys().copied().collect();
+    let pids: Vec<u64> = w.us.procs.keys().copied().collect();
     assert_eq!(pids.len(), 3);
-    // the counter at the top: it wraps to 1 and skips the live process 1
-    w.us.next_pid = u32::MAX;
+    // CNT1: the counter never wraps. At the top a creation is refused with NO_MEMORY and leaves nothing behind
+    w.us.next_pid = u64::MAX - 1;
     w.create(true, [0; 6]).unwrap();
-    assert!(w.us.procs.contains_key(&u32::MAX));
-    w.create(true, [0; 6]).unwrap();
-    assert_eq!(w.us.procs.len(), 5);
-    assert!(w.us.next_pid >= 2, "wrapped past the live pid 1");
+    assert!(w.us.procs.contains_key(&(u64::MAX - 1)));
+    let before = w.us.procs.len();
+    assert_eq!(w.create(true, [0; 6]), Err(Status::NoMemory));
+    assert_eq!(
+        w.us.procs.len(),
+        before,
+        "the refused creation made nothing"
+    );
+    assert_eq!(
+        w.us.next_pid,
+        u64::MAX,
+        "and the counter did not move past the end"
+    );
 }
 
 #[test]
@@ -167,10 +175,7 @@ fn the_job_handle_is_checked_and_the_new_process_is_charged_to_that_job() {
         },
     )
     .unwrap();
-    assert_eq!(
-        w.create(true, [u64::from(e.0), 0, 0, 0, 0, 0]),
-        Err(Status::WrongType)
-    );
+    assert_eq!(w.create(true, [e.0, 0, 0, 0, 0, 0]), Err(Status::WrongType));
     let weak = w.job_handle(JobId::ROOT, Rights::INSPECT);
     assert_eq!(
         w.create(true, [weak, 0, 0, 0, 0, 0]),

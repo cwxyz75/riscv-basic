@@ -90,7 +90,7 @@ pub mod fp {
     pub fn check_hart() {
         unimplemented!()
     }
-    pub fn thread_gone(tid: u32) {
+    pub fn thread_gone(tid: u64) {
         unimplemented!()
     }
     pub fn entry_count() -> usize {

@@ -162,7 +162,7 @@ pub fn app_main() -> i32 {
             // table, so a thread started on them takes no first-touch fault), then block forever
             // Give the parent time to map the pages (a scheduler that runs the child first, as
             // the round-robin class does, would otherwise fault here before they exist).
-            let ev = rt::sys::event_create().a1 as u32;
+            let ev = rt::sys::event_create().a1 as u64;
             rt::sys::object_wait(ev, rt::abi::signals::USER_MASK, rt::sys::clock_get() + 60);
             for page in 0..4usize {
                 // SAFETY: the parent mapped these pages read-write before starting us.
@@ -177,7 +177,7 @@ pub fn app_main() -> i32 {
             // take a socket end from the bootstrap channel and drain it to the end of the
             // stream; the exit code is how many bytes arrived
             use rt::abi::status::Status;
-            let mut hbuf = [0u32; 1];
+            let mut hbuf = [0u64; 1];
             let mut mbuf = [0u8; 8];
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
             let r =
@@ -207,7 +207,7 @@ pub fn app_main() -> i32 {
         }
         27 => {
             // wait on a port with nothing bound, forever (only a kill ends this)
-            let port = rt::sys::port_create().a1 as u32;
+            let port = rt::sys::port_create().a1 as u64;
             rt::sys::port_wait(port, u64::MAX);
             return 9;
         }
@@ -227,12 +227,13 @@ pub fn app_main() -> i32 {
         }
         24 => {
             // create short-lived threads in a loop until killed
-            let me = rt::sys::process_self().a1 as u32;
+            let me = rt::sys::process_self().a1 as u64;
             let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
             loop {
-                let r = rt::sys::thread_create(me, exit_eight as *const () as usize as u64, top, 0);
+                let r =
+                    rt::sys::thread_on_stack(me, exit_eight as *const () as usize as u64, top, 0);
                 if r.status == 0 {
-                    rt::sys::handle_close(r.a1 as u32);
+                    rt::sys::handle_close(r.a1 as u64);
                 }
             }
         }
@@ -245,7 +246,7 @@ pub fn app_main() -> i32 {
                 if v.status != 0 {
                     return if v.status == -5 { pages } else { -1 };
                 }
-                let vmo = v.a1 as u32;
+                let vmo = v.a1 as u64;
                 let buf = [1u8; 4096];
                 for page in 0..256u64 {
                     let w = rt::sys::vmo_write(vmo, page * 4096, buf.as_ptr(), 4096);
@@ -290,7 +291,7 @@ pub fn app_main() -> i32 {
             {
                 code |= 2;
             }
-            let ev = rt::sys::event_create().a1 as u32;
+            let ev = rt::sys::event_create().a1 as u64;
             if rt::sys::vmo_create_physical(ev, 0x1000_1000, 4096).status == -2
                 && rt::sys::vmo_create_dma(ev, 1).status == -2
             {
@@ -313,12 +314,12 @@ pub fn app_main() -> i32 {
         33 => {
             // S4.5: a thread bomb. Threads on two static stacks: the second must be refused when
             // the job allows only this thread plus one more.
-            let me = rt::sys::process_self().a1 as u32;
+            let me = rt::sys::process_self().a1 as u64;
             let top1 = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
             let first =
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top1, 0);
             let second =
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top1, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top1, 0);
             let mut code = 0;
             if first.status == 0 {
                 code |= 1;
@@ -343,7 +344,7 @@ pub fn app_main() -> i32 {
                     };
                 }
                 for _ in 0..32 {
-                    let w = rt::sys::socket_write(pair.a1 as u32, block.as_ptr(), block.len());
+                    let w = rt::sys::socket_write(pair.a1 as u64, block.as_ptr(), block.len());
                     if w.status != 0 {
                         return if w.status == -5 {
                             (queued / 1024) as i32
@@ -456,7 +457,7 @@ pub fn app_main() -> i32 {
                     rt::sys::futex_wait(W.as_ptr(), 0, u64::MAX);
                 }
             }
-            let me = rt::sys::process_self().a1 as u32;
+            let me = rt::sys::process_self().a1 as u64;
             for _ in 0..3 {
                 let rec = rt::SpawnArgs {
                     entry: sleeper as *const () as usize as u64,
@@ -504,7 +505,7 @@ pub fn app_main() -> i32 {
             // SIG2: stop the whole process (this thread included), and say so once resumed, then exit 4
             // (its own `process_self` handle has no KILL, so the parent sends it a handle to the process that has)
             rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
-            let (mut buf, mut got) = ([0u8; 4], [0u32; 1]);
+            let (mut buf, mut got) = ([0u8; 4], [0u64; 1]);
             let r = rt::sys::channel_read(rt::BOOTSTRAP, buf.as_mut_ptr(), 4, got.as_mut_ptr(), 1);
             if r.status != 0 || r.a2 != 1 || rt::sys::process_suspend(got[0]).status != 0 {
                 return 1;
@@ -523,13 +524,13 @@ pub fn app_main() -> i32 {
         41 => {
             // S5d: a process with two spinning sibling threads (and itself spinning): ended from
             // outside while they run on other harts.
-            let me = rt::sys::process_self().a1 as u32;
+            let me = rt::sys::process_self().a1 as u64;
             // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
             #[allow(clippy::needless_range_loop)]
             for k in 0..2 {
                 // SAFETY: only the address of the static stack is taken; each new thread owns its own.
                 let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-                rt::sys::thread_create(me, spin_forever as *const () as usize as u64, top, 0);
+                rt::sys::thread_on_stack(me, spin_forever as *const () as usize as u64, top, 0);
             }
             loop {
                 core::hint::spin_loop();
@@ -590,15 +591,15 @@ struct Stack([u8; 8192]);
 static mut STACK: Stack = Stack([0; 8192]);
 
 /// Start a second thread running `f(arg)` on a static stack; returns its thread handle.
-fn spawn(f: extern "C" fn(usize) -> !, arg: usize) -> u32 {
-    let me = rt::sys::process_self().a1 as u32;
+fn spawn(f: extern "C" fn(usize) -> !, arg: usize) -> u64 {
+    let me = rt::sys::process_self().a1 as u64;
     // Only the address of the static is taken; the one new thread uses it as its stack.
     let top = core::ptr::addr_of_mut!(STACK) as u64 + 8192;
-    let r = rt::sys::thread_create(me, f as *const () as usize as u64, top, arg as u64);
+    let r = rt::sys::thread_on_stack(me, f as *const () as usize as u64, top, arg as u64);
     if r.status != 0 {
         rt::sys::exit(100 + (-(r.status as i64)) as i32);
     }
-    r.a1 as u32
+    r.a1 as u64
 }
 
 extern "C" fn spin_forever(_: usize) -> ! {
@@ -610,7 +611,7 @@ extern "C" fn spin_forever(_: usize) -> ! {
 extern "C" fn exit_soon(_: usize) -> ! {
     let t = rt::sys::clock_get() + 3;
     // an event nobody signals: a timed wait
-    let ev = rt::sys::event_create().a1 as u32;
+    let ev = rt::sys::event_create().a1 as u64;
     rt::sys::object_wait(ev, 1 << 24, t);
     rt::sys::exit(9)
 }
@@ -632,7 +633,7 @@ extern "C" fn exit_eight(_: usize) -> ! {
 }
 
 extern "C" fn exit_eight_late(_: usize) -> ! {
-    let gate = rt::sys::event_create().a1 as u32;
+    let gate = rt::sys::event_create().a1 as u64;
     rt::sys::object_wait(gate, 1 << 24, rt::sys::clock_get() + 20);
     rt::sys::thread_exit(8)
 }
@@ -663,13 +664,13 @@ fn pattern(round: u64) -> u64 {
 /// other harts' TLBs, a worker would read the *previous* round's data through its stale entry
 /// (a different frame from the new mapping). The exit code is 0, or the first failing round.
 fn unmap_while_siblings_touch() -> i32 {
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
     #[allow(clippy::needless_range_loop)]
     for k in 0..2 {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, reader as *const () as usize as u64, top, k as u64);
+        let t = rt::sys::thread_on_stack(me, reader as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900 + (-(t.status as i64)) as i32;
         }
@@ -679,7 +680,7 @@ fn unmap_while_siblings_touch() -> i32 {
         if v.status != 0 {
             return 910;
         }
-        let vmo = v.a1 as u32;
+        let vmo = v.a1 as u64;
         let want = pattern(round).to_le_bytes();
         if rt::sys::vmo_write(vmo, 0, want.as_ptr(), 8).status != 0 {
             return 911;
@@ -689,7 +690,7 @@ fn unmap_while_siblings_touch() -> i32 {
             return 912;
         }
         // a second VMO with other contents, to give a freed frame something to be reused for
-        let junk = rt::sys::vmo_create(1).a1 as u32;
+        let junk = rt::sys::vmo_create(1).a1 as u64;
         let _ = rt::sys::vmo_write(junk, 0, [0xee; 8].as_ptr(), 8);
         PHASE.store((round << 2) | READ, Ordering::Release);
         let mut spins = 0u64;
@@ -776,7 +777,7 @@ fn churn(seed: u64) -> i32 {
         x ^= x << 17;
         x % n
     };
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     let buf = [0x42u8; 4096];
     let mut out = [0u8; 4096];
     for _ in 0..1500u32 {
@@ -786,7 +787,7 @@ fn churn(seed: u64) -> i32 {
                 if c.status != 0 {
                     return 100;
                 }
-                let (a, b) = (c.a1 as u32, c.a2 as u32);
+                let (a, b) = (c.a1 as u64, c.a2 as u64);
                 if rt::sys::channel_write(a, buf.as_ptr(), 16, core::ptr::null(), 0).status != 0 {
                     return 101;
                 }
@@ -803,7 +804,7 @@ fn churn(seed: u64) -> i32 {
                 if v.status != 0 {
                     return 110;
                 }
-                let vmo = v.a1 as u32;
+                let vmo = v.a1 as u64;
                 if rt::sys::vmo_write(vmo, 0, buf.as_ptr(), 4096).status != 0 {
                     return 111;
                 }
@@ -823,7 +824,7 @@ fn churn(seed: u64) -> i32 {
                 if p.status != 0 {
                     return 120;
                 }
-                let (a, b) = (p.a1 as u32, p.a2 as u32);
+                let (a, b) = (p.a1 as u64, p.a2 as u64);
                 if rt::sys::socket_write(a, buf.as_ptr(), 100).status != 0 {
                     return 121;
                 }
@@ -838,13 +839,13 @@ fn churn(seed: u64) -> i32 {
                 if e.status != 0 {
                     return 130;
                 }
-                if rt::sys::event_signal(e.a1 as u32, 0, rt::abi::signals::USER_MASK & 0x0100_0000)
+                if rt::sys::event_signal(e.a1 as u64, 0, rt::abi::signals::USER_MASK & 0x0100_0000)
                     .status
                     != 0
                 {
                     return 131;
                 }
-                rt::sys::handle_close(e.a1 as u32);
+                rt::sys::handle_close(e.a1 as u64);
             }
             4 => {
                 let port = rt::sys::port_create();
@@ -852,7 +853,7 @@ fn churn(seed: u64) -> i32 {
                 if port.status != 0 || ev.status != 0 {
                     return 140;
                 }
-                let (p, e) = (port.a1 as u32, ev.a1 as u32);
+                let (p, e) = (port.a1 as u64, ev.a1 as u64);
                 rt::sys::event_signal(e, 0, rt::abi::signals::USER_MASK & 0x0100_0000);
                 if rt::sys::port_bind(p, e, rt::abi::signals::USER_MASK, 9).status != 0 {
                     return 141;
@@ -874,7 +875,7 @@ fn churn(seed: u64) -> i32 {
                     // SAFETY: the slot's stack is free (the flag was clear).
                     let top =
                         unsafe { core::ptr::addr_of_mut!(CHURN_STACKS.0[slot]) } as u64 + 4096;
-                    let t = rt::sys::thread_create(
+                    let t = rt::sys::thread_on_stack(
                         me,
                         churn_worker as *const () as usize as u64,
                         top,
@@ -884,7 +885,7 @@ fn churn(seed: u64) -> i32 {
                         CHURN_BUSY[slot].store(0, Ordering::Release);
                         return 150;
                     }
-                    rt::sys::handle_close(t.a1 as u32);
+                    rt::sys::handle_close(t.a1 as u64);
                 }
             }
             _ => {
@@ -1011,13 +1012,13 @@ extern "C" fn fp_worker(k: usize) -> ! {
 }
 
 fn fp_threads() -> i32 {
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     // (indexed on purpose: an iterator would make a reference to the `static mut`, and only its address may be taken)
     #[allow(clippy::needless_range_loop)]
     for k in 0..2usize {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, fp_worker as *const () as usize as u64, top, k as u64);
+        let t = rt::sys::thread_on_stack(me, fp_worker as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900;
         }
@@ -1175,7 +1176,7 @@ fn vec_keep(seed: u64, mode: u64, slot: usize) -> i32 {
 /// instruction first: compiled code (the user build is RVA23U64) may already have used the vector unit in this process, and a thread of its
 /// own starts with the unit off. The thread stores what it saw in `VFRESH` and signals through its last word.
 fn vec_fresh() -> i32 {
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     // SAFETY: only addresses of statics are taken; the thread writes `VFRESH` and its buffer, and this thread reads them after the done flag.
     let (res, buf) = unsafe {
         (
@@ -1192,7 +1193,7 @@ fn vec_fresh() -> i32 {
     }
     // SAFETY: only the address of the static stack is taken (the thread's entry uses no stack).
     let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[0]) } as u64 + 8192;
-    let t = rt::sys::thread_create(
+    let t = rt::sys::thread_on_stack(
         me,
         vec_fresh_thread as *const () as usize as u64,
         top,
@@ -1395,12 +1396,13 @@ extern "C" fn vec_worker(k: usize) -> ! {
 }
 
 fn vec_threads() -> i32 {
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     #[allow(clippy::needless_range_loop)]
     for k in 0..2usize {
         // SAFETY: only the address of the static stack is taken; each worker owns its own.
         let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[k]) } as u64 + 8192;
-        let t = rt::sys::thread_create(me, vec_worker as *const () as usize as u64, top, k as u64);
+        let t =
+            rt::sys::thread_on_stack(me, vec_worker as *const () as usize as u64, top, k as u64);
         if t.status != 0 {
             return 900;
         }
@@ -1425,7 +1427,7 @@ fn vec_threads() -> i32 {
 
 fn socket_hand() -> i32 {
     use rt::abi::signals as sig;
-    let reply = |tag: u8, a: u32, b: i32, c: u32, h: Option<u32>| {
+    let reply = |tag: u8, a: u32, b: i32, c: u32, h: Option<u64>| {
         let mut m = [0u8; 13];
         m[0] = tag;
         m[1..5].copy_from_slice(&a.to_le_bytes());
@@ -1440,11 +1442,11 @@ fn socket_hand() -> i32 {
             usize::from(h.is_some()),
         );
     };
-    let mut kept = 0u32;
+    let mut kept = 0u64;
     loop {
         let w = rt::sys::object_wait(rt::BOOTSTRAP, sig::READABLE | sig::PEER_CLOSED, u64::MAX);
         let mut m = [0u8; 8];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = rt::sys::channel_read(rt::BOOTSTRAP, m.as_mut_ptr(), 8, h.as_mut_ptr(), 1);
         if r.status != 0 {
             if w.a1 as u32 & sig::PEER_CLOSED != 0 {
@@ -1459,8 +1461,8 @@ fn socket_hand() -> i32 {
                     reply(b'C', 0, p.status as i32, 0, None);
                     continue;
                 }
-                kept = p.a1 as u32;
-                reply(b'C', 0, 0, 0, Some(p.a2 as u32));
+                kept = p.a1 as u64;
+                reply(b'C', 0, 0, 0, Some(p.a2 as u64));
             }
             b'H' => {
                 if r.a2 == 1 {

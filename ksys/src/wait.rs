@@ -30,12 +30,9 @@ pub struct ObjectWait {
     pub deadline: u64,
 }
 
-/// `object_wait(handle, mask, deadline)`: the handle is 32 bits, carries WAIT, and the mask is a non-empty set of waitable signals.
-pub fn object_wait_check(us: &UserState, me: u32, a: [u64; 6]) -> Result<ObjectWait, Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    let (handle, deadline) = (Handle(a[0] as u32), a[2]);
+/// `object_wait(handle, mask, deadline)`: the handle carries WAIT, and the mask is a non-empty set of waitable signals.
+pub fn object_wait_check(us: &UserState, me: u64, a: [u64; 6]) -> Result<ObjectWait, Status> {
+    let (handle, deadline) = (Handle(a[0]), a[2]);
     let p = us.procs.get(&me).ok_or(Status::BadState)?;
     if !p.handles.get(handle)?.rights.contains(Rights::WAIT) {
         return Err(Status::AccessDenied);
@@ -51,7 +48,7 @@ pub fn object_wait_check(us: &UserState, me: u32, a: [u64; 6]) -> Result<ObjectW
 }
 
 /// The signal word of the process's handle (the error is BAD_HANDLE, WRONG_TYPE... as `signals_of` says; a handle that names nothing).
-pub fn signals_of(us: &UserState, me: u32, h: Handle) -> Result<u32, Status> {
+pub fn signals_of(us: &UserState, me: u64, h: Handle) -> Result<u32, Status> {
     let p = us.procs.get(&me).ok_or(Status::BadState)?;
     ipc::signals_of(&us.objs, &p.handles, h)
 }
@@ -75,19 +72,16 @@ pub fn object_wait_report(
 
 // ---- port_wait ----
 
-/// `port_wait(port, deadline)`: the handle must be 32 bits wide.
+/// `port_wait(port, deadline)`.
 pub fn port_wait_check(a: [u64; 6]) -> Result<(Handle, u64), Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    Ok((Handle(a[0] as u32), a[1]))
+    Ok((Handle(a[0]), a[1]))
 }
 
 /// One poll of the port: the key and observed signals of a ready binding, or `None`.
 pub fn port_poll(
     us: &mut UserState,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     h: Handle,
 ) -> Result<Option<(u64, u32)>, Status> {
     let UserState { objs, procs, .. } = us;
@@ -108,6 +102,58 @@ pub fn port_wait_report(
     }
 }
 
+/// `port_wait_many(port, buffer, capacity, deadline)` (AB4): the handle and deadline, after the capacity (1 to `PORT_PACKETS_MAX`) is checked.
+pub fn port_wait_many_check(a: [u64; 6]) -> Result<(Handle, u64, usize, u64), Status> {
+    let cap = usize::try_from(a[2]).map_err(|_| Status::InvalidArgs)?;
+    if cap == 0 || cap > abi::limits::PORT_PACKETS_MAX {
+        return Err(Status::InvalidArgs);
+    }
+    Ok((Handle(a[0]), a[1], cap, a[3]))
+}
+
+/// One poll of the port for up to `cap` ready bindings, written as records at `buf` (`key: u64`, `observed: u32`, four zero bytes). The buffer
+/// is verified writable before anything is dequeued (INVALID_ARGS, nothing changes), and the records are written in the same locked step that
+/// dequeues them, so a packet is never taken and then lost. The number of records written (0: nothing ready).
+#[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)] // INVARIANT: cap is at most PORT_PACKETS_MAX (checked by `port_wait_many_check`)
+pub fn port_poll_many<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    me: u64,
+    h: Handle,
+    buf: u64,
+    cap: usize,
+) -> Result<usize, Status> {
+    let UserState { objs, procs, .. } = us;
+    let p = procs.get_mut(&me).ok_or(Status::BadState)?;
+    let len = cap * abi::limits::PORT_PACKET_BYTES;
+    verify_writable(&mut p.aspace, mm, vmos, buf, len).map_err(|_| Status::InvalidArgs)?;
+    let got = ipc::port_poll_many_in(objs, &p.handles, h, &mut vmos.jobs, cap)?;
+    let mut bytes = Vec::with_capacity(got.len() * abi::limits::PORT_PACKET_BYTES);
+    for &(key, observed) in &got {
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&observed.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+    }
+    copy_to_user_verified(&mut p.aspace, mm, buf, &bytes)?;
+    Ok(got.len())
+}
+
+/// How `port_wait_many` reports: the count, else INTERRUPTED if the interrupt flag was taken, else TIMED_OUT.
+pub fn port_wait_many_report(
+    count: usize,
+    deadline: u64,
+    take_interrupt: impl FnOnce() -> bool,
+) -> Reply {
+    if count > 0 {
+        return Ok((Some(count as u64), None));
+    }
+    if deadline != 0 && take_interrupt() {
+        return fail(Status::Interrupted);
+    }
+    fail(Status::TimedOut)
+}
+
 // ---- futex_wait and futex_wake ----
 
 /// What `futex_wait` decided before sleeping.
@@ -125,7 +171,7 @@ pub fn futex_wait_check<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     who: u64,
     a: [u64; 6],
 ) -> Result<FutexCheck, Status> {
@@ -164,7 +210,7 @@ pub fn futex_wait_report(
 }
 
 /// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first. Returns the thread ids the caller must wake.
-pub fn futex_wake(us: &mut UserState, me: u32, a: [u64; 6]) -> Result<Vec<u64>, Status> {
+pub fn futex_wake(us: &mut UserState, me: u64, a: [u64; 6]) -> Result<Vec<u64>, Status> {
     let (addr, count) = (a[0], a[1]);
     if addr & 3 != 0 || addr < abi::user::BASE || addr.saturating_add(4) > abi::user::TOP {
         return Err(Status::InvalidArgs);
@@ -209,14 +255,11 @@ pub fn channel_call_send<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
 ) -> Result<Call, Status> {
-    if a[0] > u64::from(u32::MAX) {
-        return Err(Status::BadHandle);
-    }
-    let ch = Handle(a[0] as u32);
+    let ch = Handle(a[0]);
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let rec = copy_from_user(&mut p.aspace, mm, vmos, a[1], abi::CHANNEL_CALL_ARGS_BYTES)?;
@@ -248,7 +291,7 @@ pub fn channel_call_send<M: PhysMem>(
         return Err(Status::AccessDenied);
     }
     let data = copy_from_user(&mut p.aspace, mm, vmos, req_bytes, nbytes)?;
-    let raw = copy_from_user(&mut p.aspace, mm, vmos, req_handles, nhandles * 4)?;
+    let raw = copy_from_user(&mut p.aspace, mm, vmos, req_handles, nhandles * 8)?;
     ipc::channel_write_in(
         objs,
         &mut p.handles,
@@ -270,7 +313,7 @@ pub fn channel_call_send<M: PhysMem>(
 
 /// The test that ends a call's sleep: the thread was killed or interrupted, or a reply with its transaction id (or the peer closing) is there.
 /// A thread that is not a user thread, or a process that is gone, ends it too.
-pub fn channel_call_ready(us: &UserState, me: u32, c: &Call, interrupted: bool) -> bool {
+pub fn channel_call_ready(us: &UserState, me: u64, c: &Call, interrupted: bool) -> bool {
     let Some(p) = us.procs.get(&me) else {
         return true;
     };
@@ -298,7 +341,7 @@ pub fn channel_call_reply<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     c: &Call,
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {
@@ -315,7 +358,7 @@ pub fn channel_call_reply<M: PhysMem>(
         Ok((nb, nh)) => (|| {
             verify_writable(&mut p.aspace, mm, vmos, c.rd_bytes, nb)
                 .map_err(|e| (e, None, None))?;
-            verify_writable(&mut p.aspace, mm, vmos, c.rd_handles, nh * 4)
+            verify_writable(&mut p.aspace, mm, vmos, c.rd_handles, nh * 8)
                 .map_err(|e| (e, None, None))?;
             let got = ipc::channel_read_txid_in(
                 objs,
@@ -334,7 +377,7 @@ pub fn channel_call_reply<M: PhysMem>(
                 copy_to_user_verified(
                     &mut p.aspace,
                     mm,
-                    c.rd_handles + (i as u64) * 4,
+                    c.rd_handles + (i as u64) * 8,
                     &h.0.to_le_bytes(),
                 )
                 .map_err(|e| (e, None, None))?;

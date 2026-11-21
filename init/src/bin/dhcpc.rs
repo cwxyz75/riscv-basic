@@ -85,7 +85,7 @@ pub fn app_main() -> i32 {
     else {
         return 3;
     };
-    let me = sys::process_self().a1 as u32;
+    let me = sys::process_self().a1 as u64;
     if sys::process_map(me, blob_vmo, BLOB_VA, 0, 4096, 3).status != 0 {
         return 4;
     }
@@ -113,8 +113,8 @@ pub fn app_main() -> i32 {
             Ok(_) => {
                 let gate = sys::event_create();
                 if gate.status == 0 {
-                    sys::object_wait(gate.a1 as u32, 1 << 24, sys::clock_get() + 50);
-                    sys::handle_close(gate.a1 as u32);
+                    sys::object_wait(gate.a1 as u64, 1 << 24, sys::clock_get() + 50);
+                    sys::handle_close(gate.a1 as u64);
                 }
             }
             Err(_) => return 7,

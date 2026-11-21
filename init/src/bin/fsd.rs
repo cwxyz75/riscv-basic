@@ -137,7 +137,7 @@ impl Service for Server {
         &mut self.core
     }
 
-    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]) {
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u64]) {
         if self.core.conn(key).is_some_and(|c| c.listener) {
             return self.forwarded_open(msg, handles);
         }
@@ -166,7 +166,7 @@ impl Service for Server {
 impl Server {
     /// An open the registry forwarded to a listener: the client's endpoint becomes a connection to the volume's base
     /// directory in an account of its own, with the rights it asked for (never more than the mount allows).
-    fn forwarded_open(&mut self, msg: &[u8], hs: &[u32]) {
+    fn forwarded_open(&mut self, msg: &[u8], hs: &[u64]) {
         let ok = file::decode_request(msg)
             .ok()
             .filter(|r| r.op == op::OPEN && r.payload.is_empty() && hs.len() == 1);
@@ -277,7 +277,7 @@ impl Server {
     fn add_conn(
         &mut self,
         account: svc::AccountId,
-        ch: u32,
+        ch: u64,
         node: NodeId,
         rights: u32,
         is_dir: bool,
@@ -319,7 +319,7 @@ impl Server {
         status: i32,
         a: u64,
         payload: &[u8],
-        handle: Option<u32>,
+        handle: Option<u64>,
     ) {
         let Some(bytes) = encode_reply(txid, status, a, payload) else {
             // out of memory (or a payload that cannot be a reply): drop the connection
@@ -334,10 +334,10 @@ impl Server {
         }
     }
 
-    fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u32>) {
+    fn handle_request(&mut self, key: u64, msg: &[u8], endpoint: Option<u64>) {
         // file times are the time of the change, not of the last open (review finding 9)
         self.stamp();
-        let close_ep = |ep: Option<u32>| {
+        let close_ep = |ep: Option<u64>| {
             if let Some(h) = ep {
                 sys::handle_close(h);
             }
@@ -828,7 +828,7 @@ impl Server {
         path: &[u8],
         fl: u16,
         want: u32,
-        endpoint: u32,
+        endpoint: u64,
     ) -> Result<u8, i32> {
         let denied = Status::AccessDenied.code();
         self.changed();
@@ -983,7 +983,7 @@ pub fn app_main() -> i32 {
     }
     let mut server = Server {
         fs,
-        core: Core::new(p.a1 as u32, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
+        core: Core::new(p.a1 as u64, POOL, file::MAX_MESSAGE, 1, HOLD_TIMEOUT),
         dirty_since: None,
         clock,
         link_stop: None,

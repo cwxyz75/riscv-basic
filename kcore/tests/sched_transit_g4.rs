@@ -5,7 +5,7 @@ use kcore::sched::State;
 use kcore::sched2::{FixedPrio, SchedAttr, MS};
 use kcore::sched_smp::Sched2;
 
-fn two_harts() -> (Sched2<FixedPrio>, u32) {
+fn two_harts() -> (Sched2<FixedPrio>, u64) {
     let s = Sched2::new(2, FixedPrio::new);
     let a = s
         .adopt_current_on(

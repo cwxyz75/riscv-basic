@@ -17,10 +17,10 @@ use crate::Process;
 /// `process_kill`: the pid to end. A process that has ended (or is gone) is BAD_STATE.
 pub fn kill_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u32, Box<Process>>,
-    me: u32,
+    procs: &BTreeMap<u64, Box<Process>>,
+    me: u64,
     ph: Handle,
-) -> Result<u32, Status> {
+) -> Result<u64, Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
     let (_, tpid, terminated, _) = ipc::process_of(objs, &caller.handles, ph, Rights::KILL)?;
     if terminated || !procs.contains_key(&tpid) {
@@ -33,11 +33,11 @@ pub fn kill_target(
 /// killed process is BAD_STATE. The caller bumps the attention epoch and, to stop, kicks the other harts.
 pub fn stop_target(
     objs: &mut Kobjs,
-    procs: &mut BTreeMap<u32, Box<Process>>,
-    me: u32,
+    procs: &mut BTreeMap<u64, Box<Process>>,
+    me: u64,
     ph: Handle,
     stop: bool,
-) -> Result<u32, Status> {
+) -> Result<u64, Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
     let (_, tpid, terminated, _) = ipc::process_of(objs, &caller.handles, ph, Rights::KILL)?;
     let target = procs.get_mut(&tpid).ok_or(Status::BadState)?;
@@ -55,18 +55,18 @@ pub fn stop_target(
 /// caller; the flag says whether the caller is inside too (and so ends last).
 pub fn job_kill_victims(
     objs: &Kobjs,
-    procs: &BTreeMap<u32, Box<Process>>,
+    procs: &BTreeMap<u64, Box<Process>>,
     jobs: &mut Jobs,
-    me: u32,
+    me: u64,
     jh: Handle,
-) -> Result<(Vec<u32>, bool), Status> {
+) -> Result<(Vec<u64>, bool), Status> {
     let caller = procs.get(&me).ok_or(Status::BadState)?;
     let job = ipc::job_of(objs, &caller.handles, jh, Rights::KILL)?;
     let mut limits = jobs.limits(job).ok_or(Status::BadState)?;
     limits.processes = 0;
     limits.threads = 0;
     let _ = jobs.set_limits(job, limits);
-    let inside: Vec<u32> = procs
+    let inside: Vec<u64> = procs
         .iter()
         .filter(|(_, p)| jobs.is_within(p.job, job))
         .map(|(&pid, _)| pid)
@@ -78,17 +78,17 @@ pub fn job_kill_victims(
 /// The kernel thread behind a thread handle with `need`, and the process it belongs to. Handle 0 is the calling thread.
 pub fn thread_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u32, Box<Process>>,
-    me: u32,
+    procs: &BTreeMap<u64, Box<Process>>,
+    me: u64,
     current: Tid,
     h: u64,
     need: Rights,
-) -> Result<(Tid, u32), Status> {
+) -> Result<(Tid, u64), Status> {
     if h == 0 {
         return Ok((current, me));
     }
     let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let handle = Handle(h as u32);
+    let handle = Handle(h);
     ipc::thread_of(objs, &caller.handles, handle, need)?;
     let obj = caller.handles.get(handle)?.obj;
     let pid = match objs.get(obj) {
@@ -111,9 +111,9 @@ pub fn thread_target(
 /// not exceed the thread's job's `max_prio`.
 pub fn thread_set_sched_target(
     objs: &Kobjs,
-    procs: &BTreeMap<u32, Box<Process>>,
+    procs: &BTreeMap<u64, Box<Process>>,
     jobs: &Jobs,
-    me: u32,
+    me: u64,
     current: Tid,
     a: [u64; 6],
 ) -> Result<(Tid, u8, u8), Status> {
@@ -134,21 +134,16 @@ pub fn thread_set_sched_target(
 /// scheduling limits and returns the job (the caller then lowers the priorities of its threads above the new maximum).
 pub fn job_set_sched(
     objs: &Kobjs,
-    procs: &BTreeMap<u32, Box<Process>>,
+    procs: &BTreeMap<u64, Box<Process>>,
     jobs: &mut Jobs,
-    me: u32,
+    me: u64,
     a: [u64; 6],
 ) -> Result<JobId, Status> {
     if a[1] > 63 || a[3] > 65536 {
         return Err(Status::InvalidArgs);
     }
     let caller = procs.get(&me).ok_or(Status::BadState)?;
-    let job = ipc::job_of(
-        objs,
-        &caller.handles,
-        Handle(a[0] as u32),
-        Rights::SET_LIMITS,
-    )?;
+    let job = ipc::job_of(objs, &caller.handles, Handle(a[0]), Rights::SET_LIMITS)?;
     let limits = SchedLimits {
         max_prio: a[1] as u8,
         rt_budget: a[2],

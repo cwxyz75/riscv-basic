@@ -28,7 +28,7 @@ pub trait Service {
     fn core(&mut self) -> &mut Core<Self::Conn>;
     /// One request arrived on connection `key`, with the handles that came with it (the callee owns them:
     /// it must close or keep each). Replies go out through `core().send`.
-    fn request(&mut self, key: u64, msg: &[u8], handles: &[u32]);
+    fn request(&mut self, key: u64, msg: &[u8], handles: &[u64]);
     /// A connection ended (its state is handed back so the server can release what it held).
     fn closed(&mut self, conn: Self::Conn);
     /// An event on something that is not a connection (a key the server bound itself on the port, for example
@@ -47,7 +47,7 @@ pub trait Service {
 }
 
 struct Slot<C> {
-    ch: u32,
+    ch: u64,
     /// The kernel object id of `ch`, to spot a client that hands over both ends of one channel.
     koid: u64,
     state: C,
@@ -56,7 +56,7 @@ struct Slot<C> {
 /// How a read from a connection ended.
 pub enum Read {
     /// A message and the handles that came with it.
-    Msg(Vec<u8>, Vec<u32>),
+    Msg(Vec<u8>, Vec<u64>),
     /// Nothing to read now (or a reply is being held, so nothing is read).
     Nothing,
     /// The connection ended (the peer closed, or the message broke the protocol: it has been closed).
@@ -75,7 +75,7 @@ pub enum Sent {
 
 /// The runtime around one port.
 pub struct Core<C> {
-    port: u32,
+    port: u64,
     accounts: Accounts,
     conns: ConnTable<Slot<C>>,
     /// Kernel object ids of the channel ends we serve.
@@ -94,7 +94,7 @@ impl<C> Core<C> {
     /// request in bytes, `max_handles` the most handles one request may carry (a message with more is a
     /// protocol violation), `hold_timeout` how long (ticks) a reply may be held before its connection ends.
     pub fn new(
-        port: u32,
+        port: u64,
         pool: Limits,
         max_msg: usize,
         max_handles: usize,
@@ -130,7 +130,7 @@ impl<C> Core<C> {
     }
 
     /// The port (a server may bind its own objects on it, with keys that have the top bit set).
-    pub fn port(&self) -> u32 {
+    pub fn port(&self) -> u64 {
         self.port
     }
 
@@ -168,7 +168,7 @@ impl<C> Core<C> {
     /// polled on a timer instead. Its WRITABLE signal cannot be trusted for this: a channel is "writable"
     /// while it has room for *some* message, not for a 32 KiB one, so a binding on it would be ready all
     /// the time and the loop would spin (T28).
-    fn bind(&self, key: u64, ch: u32, held: bool) {
+    fn bind(&self, key: u64, ch: u64, held: bool) {
         sys::port_unbind(self.port, key);
         if !held {
             sys::port_bind(self.port, ch, signals::READABLE | signals::PEER_CLOSED, key);
@@ -178,7 +178,7 @@ impl<C> Core<C> {
     /// Start serving `ch` as a connection of `account`. `None` if it cannot be served (not a channel end we
     /// may read and write, both ends of one channel, the port cannot watch it, or the account is at its
     /// limit): nothing changes then, and the handle is still the caller's to close.
-    pub fn add_conn(&mut self, ch: u32, account: AccountId, state: C) -> Option<u64> {
+    pub fn add_conn(&mut self, ch: u64, account: AccountId, state: C) -> Option<u64> {
         // Only a channel end we may read and write can be served: probe with a zero-sized read (an event
         // or a VMO answers WRONG_TYPE; a channel says SHOULD_WAIT, PEER_CLOSED or BUFFER_TOO_SMALL and
         // loses nothing).
@@ -258,8 +258,8 @@ impl<C> Core<C> {
     /// Send `bytes` (and `handle`, which the runtime now owns) on a connection. If the client has no room
     /// the reply is held and the connection is not read again until it drains; if the account cannot hold
     /// it, the connection ends.
-    pub fn send(&mut self, key: u64, bytes: Vec<u8>, handle: Option<u32>) -> Sent {
-        let close_handle = |h: Option<u32>| {
+    pub fn send(&mut self, key: u64, bytes: Vec<u8>, handle: Option<u64>) -> Sent {
+        let close_handle = |h: Option<u64>| {
             if let Some(h) = h {
                 sys::handle_close(h);
             }
@@ -320,7 +320,7 @@ impl<C> Core<C> {
 
     /// Send one reply that carries several handles (a device claim). No hold: if the client has no room or is gone, the
     /// handles are closed and the connection ends (a claim reply is only ever the answer to a request just read).
-    pub fn send_handles(&mut self, key: u64, bytes: Vec<u8>, handles: Vec<u32>) -> Sent {
+    pub fn send_handles(&mut self, key: u64, bytes: Vec<u8>, handles: Vec<u64>) -> Sent {
         let Some(slot) = self.conns.get(key) else {
             for h in handles {
                 sys::handle_close(h);
@@ -397,7 +397,7 @@ impl<C> Core<C> {
             return Read::Nothing;
         }
         let ch = slot.ch;
-        let mut hs = [0u32; svc_max_handles()];
+        let mut hs = [0u64; svc_max_handles()];
         let r = sys::channel_read(
             ch,
             self.rx.as_mut_ptr(),
@@ -420,7 +420,7 @@ impl<C> Core<C> {
             }
         }
         let (nb, nh) = (r.a1, r.a2);
-        let handles: Vec<u32> = hs[..nh].to_vec();
+        let handles: Vec<u64> = hs[..nh].to_vec();
         let mut msg = Vec::new();
         if msg.try_reserve_exact(nb).is_err() {
             for &h in &handles {

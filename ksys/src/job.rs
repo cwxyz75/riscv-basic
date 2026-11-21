@@ -42,7 +42,7 @@ fn read_limits<M: PhysMem>(c: &mut Ctx<'_, M>, ptr: u64) -> Result<Limits, Statu
 
 /// `None`: `n` is not one of these calls.
 pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option<Reply> {
-    let h = Handle(a[0] as u32);
+    let h = Handle(a[0]);
     let e = |s: Status| (s, None, None);
     let r: Reply = match n {
         // `job_create(parent, limits_ptr) -> handle`: a child job of the job `parent` (needs MANAGE) with the six limits at
@@ -65,7 +65,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                     job: Some(c.job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(x) => {
                     c.vmos.jobs.release(id);
                     Err(e(x))

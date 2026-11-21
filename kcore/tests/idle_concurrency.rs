@@ -54,7 +54,7 @@ fn send_pokes(w: &World, mut pokes: u64, me: usize) {
 }
 
 /// A hart's trap-handler work: make its designation right, switch to what it picks, "run" it.
-fn look(w: &World, h: usize, idle: u32) {
+fn look(w: &World, h: usize, idle: u64) {
     let mut s = w.sched.lock().unwrap();
     s.reschedule_on(h);
     let pokes = s.take_pokes();

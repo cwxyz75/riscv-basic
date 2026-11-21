@@ -13,7 +13,7 @@
 
 use crate::console::Console;
 use crate::{irq, kmem, thread};
-use abi::limits::{MAX_HANDLES, MAX_MSG_BYTES, MAX_MSG_HANDLES};
+use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::syscall as nr;
@@ -29,6 +29,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
+use kcore::handle::MAX_SLOTS as MAX_HANDLES;
 use kcore::ipc::{self, ReadError};
 use kcore::job::{JobId, Resource};
 use kcore::pagetable::{PageTable, Perms};
@@ -70,7 +71,20 @@ fn state() -> &'static mut UserState {
     // before any context switch, so no two live `&mut` alias.
     unsafe {
         let slot = &mut *addr_of_mut!(USER);
-        slot.get_or_insert_with(|| UserState::with_irq_slots(crate::aia::slots()))
+        slot.get_or_insert_with(|| {
+            let mut s = UserState::with_irq_slots(crate::aia::slots());
+            // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
+            if let Some(n) = crate::dtb::ff_value("koid") {
+                s.objs.fast_forward_koid(n);
+            }
+            if let Some(n) = crate::dtb::ff_value("objgen") {
+                s.objs.set_first_generation(n);
+            }
+            if let Some(n) = crate::dtb::ff_value("handlegen") {
+                s.first_handle_gen = n;
+            }
+            s
+        })
     }
 }
 

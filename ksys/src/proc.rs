@@ -34,9 +34,9 @@ pub trait Machine {
 /// A call acting on the process table: every process, the kernel objects, the memory and the ledger, and which process is calling.
 pub struct PCtx<'a, M: PhysMem, X: Machine> {
     pub objs: &'a mut Kobjs,
-    pub procs: &'a mut BTreeMap<u32, Box<Process>>,
+    pub procs: &'a mut BTreeMap<u64, Box<Process>>,
     /// The calling process.
-    pub me: u32,
+    pub me: u64,
     pub mm: &'a mut Mm<M>,
     pub vmos: &'a mut Vmos,
     pub machine: &'a mut X,
@@ -67,7 +67,7 @@ pub struct Process {
     /// `process_suspend` stopped it: every thread parks at its next return to user mode (a thread blocked in a call
     /// stays blocked, and parks when the call returns) until `process_resume` or a kill. SIG2, SYSCALLS.md.
     pub stopped: bool,
-    /// User threads that exist and have not ended (counted from `thread_create`, before the
+    /// User threads that exist and have not ended (counted from `thread_spawn`, before the
     /// thread first runs). The process is torn down when this reaches 0.
     pub threads_alive: usize,
     /// The thread objects of the live threads, to mark them TERMINATED when they end.
@@ -119,7 +119,7 @@ fn resolve_map_args(
     ph: Handle,
     vh: Handle,
     flags: u64,
-) -> Result<(u32, u64), Status> {
+) -> Result<(u64, u64), Status> {
     let pe = caller.handles.get(ph)?;
     let ve = caller.handles.get(vh)?;
     let tpid = match objs.get(pe.obj) {
@@ -161,7 +161,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
     let me = *me;
     let r: Reply = match n {
         nr::PROCESS_MAP => (|| {
-            let (ph, vh) = (Handle(a[0] as u32), Handle(a[1] as u32));
+            let (ph, vh) = (Handle(a[0]), Handle(a[1]));
             let (vaddr, offset, length, flags) = (a[2], a[3], a[4], a[5]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (tpid, vid) = resolve_map_args(objs, caller, ph, vh, flags).map_err(e)?;
@@ -228,7 +228,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             Ok((None, None))
         })(),
         nr::PROCESS_UNMAP => (|| {
-            let ph = Handle(a[0] as u32);
+            let ph = Handle(a[0]);
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (_, tpid, _, _) =
                 ipc::process_of(objs, &caller.handles, ph, Rights::MANAGE).map_err(e)?;
@@ -251,8 +251,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
         nr::PROCESS_INFO => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (_, _, terminated, code) =
-                ipc::process_of(objs, &caller.handles, Handle(a[0] as u32), Rights::INSPECT)
-                    .map_err(e)?;
+                ipc::process_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
             if !terminated {
                 return bad(Status::BadState);
             }
@@ -261,8 +260,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
         nr::THREAD_INFO => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (terminated, code) =
-                ipc::thread_of(objs, &caller.handles, Handle(a[0] as u32), Rights::INSPECT)
-                    .map_err(e)?;
+                ipc::thread_of(objs, &caller.handles, Handle(a[0]), Rights::INSPECT).map_err(e)?;
             if !terminated {
                 return bad(Status::BadState);
             }
@@ -282,7 +280,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     job: Some(job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(x) => Err(e(x)),
             }
         })(),
@@ -303,7 +301,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     job: Some(job),
                 },
             ) {
-                Ok(h) => Ok((Some(u64::from(h.0)), None)),
+                Ok(h) => Ok((Some(h.0), None)),
                 Err(x) => {
                     vmos.jobs.release(JobId::ROOT);
                     Err(e(x))
@@ -327,7 +325,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     // another view of the same process object
                     objs.retain(obj);
                     let h = p.handles.insert(obj, rights).expect("room was checked");
-                    Ok((Some(u64::from(h.0)), None))
+                    Ok((Some(h.0), None))
                 }
                 None => {
                     let job = p.job;
@@ -351,7 +349,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                     if own.is_none() {
                         p.obj = Some(obj);
                     }
-                    Ok((Some(u64::from(h.0)), None))
+                    Ok((Some(h.0), None))
                 }
             }
         })(),

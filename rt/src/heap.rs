@@ -27,7 +27,7 @@ struct State {
     /// Bytes mapped so far (from `HEAP_BASE`).
     mapped: usize,
     /// Our `process_self` handle, once fetched (0: not yet).
-    me: u32,
+    me: u64,
 }
 
 pub struct UserHeap {
@@ -90,13 +90,13 @@ impl State {
             if r.status != 0 {
                 return false;
             }
-            self.me = r.a1 as u32;
+            self.me = r.a1 as u64;
         }
         let v = sys::vmo_create((by / 4096) as u64);
         if v.status != 0 {
             return false;
         }
-        let vmo = v.a1 as u32;
+        let vmo = v.a1 as u64;
         // Commit the chunk now, so that exhaustion (the job's page limit, or the frames) is a failed
         // allocation here and not a fault on first touch that ends the program (slice V).
         // (in slices: one call commits at most MAX_COMMIT_PAGES pages)

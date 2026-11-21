@@ -9,7 +9,7 @@
 use alloc::boxed::Box;
 use core::arch::{asm, global_asm};
 use core::ffi::{c_int, c_long, c_void};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rt::abi::signals;
 use rt::sync::Mutex;
 
@@ -38,7 +38,7 @@ pub struct Tcb {
     retval: *mut c_void,
     /// The thread object's handle: 0 until the creator has stored it (a thread can start, and even
     /// exit, before `pthread_create` returns).
-    handle: AtomicU32,
+    handle: AtomicU64,
     start: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
     arg: *mut c_void,
     keys: [*mut c_void; KEYS],
@@ -80,13 +80,13 @@ pub fn errno_ptr() -> *mut c_int {
     }
 }
 
-fn new_tcb(main: bool, handle: u32) -> *mut Tcb {
+fn new_tcb(main: bool, handle: u64) -> *mut Tcb {
     Box::into_raw(Box::new(Tcb {
         me: core::ptr::null_mut(),
         errno: 0,
         state: AtomicU32::new(0),
         retval: core::ptr::null_mut(),
-        handle: AtomicU32::new(handle),
+        handle: AtomicU64::new(handle),
         start: None,
         arg: core::ptr::null_mut(),
         keys: [core::ptr::null_mut(); KEYS],
@@ -135,9 +135,9 @@ pub fn on_big_stack(f: extern "C" fn(usize) -> c_int, arg: usize) -> c_int {
     let base = MAIN_STACK_TOP - MAIN_STACK_BYTES;
     let vmo = rt::sys::vmo_create(MAIN_STACK_BYTES / 4096);
     if vmo.status == 0 {
-        let me = rt::sys::process_self().a1 as u32;
-        let m = rt::sys::process_map(me, vmo.a1 as u32, base, 0, MAIN_STACK_BYTES, 3);
-        rt::sys::handle_close(vmo.a1 as u32);
+        let me = rt::sys::process_self().a1 as u64;
+        let m = rt::sys::process_map(me, vmo.a1 as u64, base, 0, MAIN_STACK_BYTES, 3);
+        rt::sys::handle_close(vmo.a1 as u64);
         rt::sys::handle_close(me);
         if m.status == 0 {
             // SAFETY: the stack was just mapped; `f` is a plain function.
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn pthread_create(
         },
         ..Default::default()
     };
-    let me = rt::sys::process_self().a1 as u32;
+    let me = rt::sys::process_self().a1 as u64;
     let r = rt::sys::thread_spawn(me, &rec);
     rt::sys::handle_close(me);
     if r.status != 0 {
@@ -232,14 +232,14 @@ pub unsafe extern "C" fn pthread_create(
     }
     // (a detached thread may already have run and freed `t`: it is not touched again)
     if !detached {
-        (*t).handle.store(r.a1 as u32, Ordering::SeqCst);
+        (*t).handle.store(r.a1 as u64, Ordering::SeqCst);
     }
     0
 }
 
 /// The thread object's handle, once the creator has stored it (a thread can start, and even exit, before
 /// `pthread_create` returns).
-unsafe fn handle_of(t: *mut Tcb) -> u32 {
+unsafe fn handle_of(t: *mut Tcb) -> u64 {
     loop {
         let h = (*t).handle.load(Ordering::SeqCst);
         if h != 0 {

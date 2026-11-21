@@ -15,9 +15,9 @@ entries before their implementation (S3b, S3c).
   `a0` to `a5`; nothing else is read. On return `a0` is a **status** (0 or a negative
   code, below) and `a1` onwards carry results where an entry says so. All other
   registers are preserved.
-- A **handle** is a 32-bit value. 0 is never valid. The low 13 bits are the table slot
-  plus 1 (at most 8191 slots); the high 19 bits are a generation that changes every time the slot is freed,
-  so a stale value fails (INVARIANTS H2). Values are meaningful only in the process
+- A **handle** is a 64-bit value (AB1). 0 is never valid. The low 24 bits are the table slot
+  plus 1 (at most 2^24 - 1 slots; the table grows on demand); the high 40 bits are a generation that changes every time the slot is freed,
+  so a stale value fails (INVARIANTS H2). A slot that has used all 2^40 generations is retired. Values are meaningful only in the process
   that holds them.
 - **Pointers** are user virtual addresses; the kernel validates them (inside the
   caller's own address space, mapped with the needed permission) and copies. It never
@@ -91,7 +91,7 @@ change.
 
 ## Limits
 
-`MAX_HANDLES` 4096 per process (the handle encoding allows 65535); `MAX_MSG_BYTES`
+A process holds as many handles as its job's object quota and memory allow (up to 2^24 - 1; there is no fixed `MAX_HANDLES`); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
 `MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
 alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
@@ -180,7 +180,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 82 | port_unbind | `a0` port, `a1` key | |
 | 83 | port_wait | `a0` port, `a1` deadline | `a1` key, `a2` observed |
 | 84 | port_rearm | `a0` port, `a1` key | |
-| 60 | thread_create | `a0` process, `a1` entry, `a2` sp, `a3` arg | `a1` handle |
+| 85 | port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
 | 61 | thread_exit | `a0` code | does not return |
 | 62 | thread_info | `a0` thread | `a1` exit code |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
@@ -200,7 +200,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 111 | futex_wake | `a0` address, `a1` count | `a1` woken |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 
-A handles array is `nhandles` 32-bit values; a handles buffer receives that many.
+A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
 ### Execution model of a syscall (S3b)
 
@@ -212,9 +212,9 @@ kernel never keeps a reference to shared state across such a point). That keeps 
 it with locks, and long syscalls (a 64 KiB message copy, the object sweep) are a latency
 cost the real-time band will feel. The kernel does not touch the user's `sp`, `gp` or `tp`
 (it has its own stack and uses no thread pointer); S5 must reload `gp`/`tp` on entry.
-Arguments declared 32-bit (handles, rights, signal masks, `txid`) must fit in 32 bits: a
-value with higher bits set is BAD_HANDLE (a handle), ACCESS_DENIED (rights) or INVALID_ARGS
-(a signal mask or `txid`), never silently truncated.
+Handles are full 64-bit registers (a value that names nothing is BAD_HANDLE from the table). Arguments declared 32-bit (rights, signal masks,
+`txid`) must fit in 32 bits: a value with higher bits set is ACCESS_DENIED (rights) or INVALID_ARGS (a signal mask or `txid`), never
+silently truncated.
 
 ### Copying from and to user memory
 
@@ -265,7 +265,7 @@ The identity of the object a handle names (`koid`: unique among live objects, ne
 of its peer (`peer_koid`; 0 for an object with no peer, or whose peer is gone). No right is
 needed. It lets a server see that two handles it holds are the two ends of one channel (a client
 can hand a server both ends of a channel it made, so that neither end ever sees PEER_CLOSED).
-Errors: BAD_HANDLE (also a handle value wider than 32 bits). Tests: `object_info_names_objects_and_peers`.
+Errors: BAD_HANDLE. Tests: `object_info_names_objects_and_peers`.
 
 ### object_wait(handle, mask, deadline) -> status, observed
 
@@ -306,8 +306,8 @@ Rights: WRITE and READ on `channel`; TRANSFER on the request handles.
 Effects: as `channel_write` then `channel_read_txid` with the request's transaction id.
 Messages with other transaction ids stay queued, for other readers or later reads.
 Blocking: until the reply arrives, the peer closes, or the deadline.
-Errors before anything is sent, in order: INVALID_ARGS (a bad `args` pointer); BAD_HANDLE
-(also: any `a0` over 32 bits); TOO_BIG (request over the limits); INVALID_ARGS (a request under
+Errors before anything is sent, in order: INVALID_ARGS (a bad `args` pointer); BAD_HANDLE;
+TOO_BIG (request over the limits); INVALID_ARGS (a request under
 4 bytes); WRONG_TYPE, then ACCESS_DENIED (no READ or no WRITE on the channel); INVALID_ARGS
 (a bad request pointer); then those of `channel_write` for the request (BAD_HANDLE for a listed
 handle, ACCESS_DENIED for one without TRANSFER, INVALID_ARGS for a duplicate, NOT_SUPPORTED,
@@ -537,7 +537,7 @@ is no call that returns the caller's own job, and `job_root` is for the process 
 started. Limits are exhausted with NO_MEMORY.
 
 What is charged: a process from `process_create` to its teardown; a thread from the moment it is
-created (`process_start` or `thread_create`) until it ends; a VMO page from the moment it is first
+created (`process_start` or `thread_spawn`) until it ends; a VMO page from the moment it is first
 committed (a write, a read through a mapping, a fault) until the VMO is freed; **page tables** as
 a worst-case estimate: one page for a process's root table and, per mapped region, one page per
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
@@ -605,11 +605,19 @@ does (a caller inside the job ends too, last). Errors: BAD_HANDLE; WRONG_TYPE; A
 A handle with every job right to the root job. Only a process started by the kernel may ask
 (`init`); everything else gets ACCESS_DENIED. Tests: `job_*` in `init`.
 
+### Retired numbers
+
+A retired number is never reused: a call to it is BAD_SYSCALL.
+
+| number | was | retired |
+|---|---|---|
+| 60 | `thread_create` (replaced by `thread_spawn` with CALLER_STACK) | AB5 |
+
 ## Threads (S3c-2b)
 
 A process runs one or more user threads, all sharing its address space and handle table.
 The first thread starts at `process_start` (or at load, for a kernel-started process); more
-are made with `thread_spawn` (the kernel provisions the stack) or `thread_create` (the caller's). A thread is a kernel object (kind THREAD): a handle to it can
+are made with `thread_spawn` (the kernel provisions the stack, or the caller brings one: CALLER_STACK). A thread is a kernel object (kind THREAD): a handle to it can
 be waited on (TERMINATED) and asked for its exit code. Rights: DUPLICATE, TRANSFER, MANAGE,
 INSPECT, WAIT. There are at most `MAX_THREADS_PER_PROCESS` (2048) live threads per process. A thread's kernel stack (four frames) is **billed to the process's job as four pages, for as long as the thread lives** (and the thread itself counts against the job's thread limit); the job's page limit can therefore refuse a thread.
 
@@ -620,21 +628,6 @@ process had already been given one (`process_exit`, `process_kill`, a fault). `p
 stops at its next return to user mode (a blocked one is woken to die), and the process object
 is TERMINATED only after the last of its threads has gone and its memory is freed. A thread
 that was killed before it ever ran never runs user code.
-
-### thread_create(process, entry, sp, arg) -> status, handle
-
-(The older call: the stack is the caller's, and a thread that used a mapped stack never frees it. New code uses `thread_spawn`, below in this file and in `SCHED-SMP-SPEC.md` 5.3.)
-
-Start a new thread in a running process: it begins at `entry` in U-mode with `a0 = arg`, the
-stack pointer `sp`, and every other register zero. The new thread's stack is the caller's to
-provide (map a VMO, pass the top). Rights: MANAGE on `process`. Errors, in order: BAD_HANDLE;
-WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the process has not been started, or has ended or is
-dying); INVALID_ARGS (`entry` not in an executable mapping of the process; `sp` not 16-byte
-aligned or outside `BASE..=TOP`); NO_MEMORY (the process already has `MAX_THREADS_PER_PROCESS`
-threads, the system already has `MAX_USER_THREADS` (4096; each thread costs a kernel stack), the
-caller's handle table is full, the system-wide object cap `MAX_OBJECTS` is reached, or the process's
-job or an ancestor is at its thread limit, or has fewer than four pages of its page limit left for the stack). The process handle may be the caller's
-`process_self` handle. On error nothing changes. Tests: `thread_create_*`.
 
 ### thread_exit(code) -> does not return
 
@@ -741,6 +734,16 @@ Wait until some binding is ready or the absolute time `deadline` (nanoseconds) p
 mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
 Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;
 ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once.
+
+### port_wait_many(port, buffer, capacity, deadline) -> status, count
+
+`port_wait` for a batch (AB4). `capacity` is 1 to 64; each record in `buffer` is 16 bytes: `key` (`u64`), `observed` (`u32`, `signals & mask`) and four bytes of zero. Waits as `port_wait` does (`deadline` in nanoseconds, 0: do not
+block, `u64::MAX`: none) until at least one binding is ready, then takes every ready binding up to `capacity`, each at most once, in the order that many
+successive `port_wait` calls would have given them (the port's rotation moves past the last one taken, and a delivered one-shot binding disarms exactly as it
+does for `port_wait`). `count` is how many records were written. Rights: WAIT. Errors: INVALID_ARGS (`capacity` 0 or above 64, or `buffer` not writable user
+memory for `capacity` records; checked before anything is taken, and again in the step that takes the packets, so a packet is never taken and lost); BAD_HANDLE
+(also if the handle stops naming anything while waiting); WRONG_TYPE; ACCESS_DENIED; INTERRUPTED (as `port_wait`); TIMED_OUT. `port_wait` stays until the system
+library wraps it (AB7). Tests: `port_wait_many_*`; `a_batch_wait_equals_that_many_single_waits` (host model).
 
 ## Entry template
 
@@ -902,7 +905,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | process_suspend, process_resume | specified and implemented (SIG2) |
-| thread_create, thread_exit, thread_info | specified (S3c-2b) |
+| thread_spawn, thread_exit, thread_info | specified (S3c-2b) |
 | job_create, job_set_limits, job_info, job_kill, job_root | specified and implemented (S4.5) |
 | socket_create, socket_write, socket_read | specified (S3c-3) |
 | socket_shutdown | specified and implemented (tidy-up, T17) |
@@ -1020,13 +1023,13 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
 
 * **The boundary moves.** Programs call the functions of the system library the kernel maps into every process
   (`sys_<name>`); syscall numbers and registers become private, and this file becomes the reference of that library.
-* **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle.
+* **Handles are 64 bits** (24 slot bits, 40 generation bits); handle arrays are 8 bytes per handle. (Built: AB1.)
 * **Times are nanoseconds**; `clock_get` is computed in user mode by the system library.
 * **Identifiers** (koid, thread id) are 64-bit and never reused; no counter wraps.
 * **Memory:** `vmo_create` by bytes with RESIZABLE, `vmo_set_size`, `vmo_decommit`, `vmo_create_child` (SNAPSHOT,
   PRIVATE), `process_map` with ANYWHERE returning the address, `process_unmap` and `process_protect` over ranges,
   `process_map_info`, `process_clone_region`, and the pager calls.
-* **Threads and exceptions:** `thread_create` is removed; `thread_spawn` gains SUSPENDED; `thread_suspend`,
+* **Threads and exceptions:** `thread_spawn` is the only way to make a thread; it gains SUSPENDED; `thread_suspend`,
   `thread_resume`, `thread_read_state`, `thread_write_state`; `process_exception_channel`, `job_exception_channel`,
   `exception_resume`.
 * **Waiting:** `port_wait_many`.

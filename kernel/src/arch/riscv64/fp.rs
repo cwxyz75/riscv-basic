@@ -58,11 +58,11 @@ pub fn check_hart() {
 
 struct FpState {
     tokens: Tokens,
-    threads: BTreeMap<u32, FpThread>,
+    threads: BTreeMap<u64, FpThread>,
     harts: [FpHart; crate::percpu::MAX_HARTS],
     /// The vector unit's twin of the three fields above.
     vtokens: Tokens,
-    vthreads: BTreeMap<u32, VecThread>,
+    vthreads: BTreeMap<u64, VecThread>,
     vharts: [FpHart; crate::percpu::MAX_HARTS],
 }
 
@@ -76,10 +76,10 @@ static STATE: Cell = Cell(UnsafeCell::new(None));
 #[allow(clippy::large_stack_frames)] // KT13: audited, once, at the first use of the FP state
 fn init_state(slot: &mut Option<FpState>) {
     *slot = Some(FpState {
-        tokens: Tokens::new(),
+        tokens: Tokens::starting_at(crate::dtb::ff_value("fptoken").unwrap_or(0)),
         threads: BTreeMap::new(),
         harts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
-        vtokens: Tokens::new(),
+        vtokens: Tokens::starting_at(crate::dtb::ff_value("fptoken").unwrap_or(0)),
         vthreads: BTreeMap::new(),
         vharts: [const { FpHart::new() }; crate::percpu::MAX_HARTS],
     });
@@ -283,7 +283,7 @@ fn hart() -> usize {
 
 /// This hart's register file now holds `tid`'s latest FP (`fp`) or vector state: record the claim, and drop the one the thread's previous holder
 /// hart had (that copy is stale now). Under the big lock.
-fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u32, h: usize, fp: bool) {
+fn claim<R>(t: &mut kcore::fp::UnitThread<R>, harts: &mut [FpHart], tid: u64, h: usize, fp: bool) {
     use core::sync::atomic::Ordering::Release;
     let cells = |hart: usize| {
         let p = crate::percpu::hart(hart);
@@ -551,7 +551,7 @@ fn vec_first_use(frame: &mut TrapFrame) -> bool {
 }
 
 /// A thread has ended: forget its FP and vector state.
-pub fn thread_gone(tid: u32) {
+pub fn thread_gone(tid: u64) {
     let s = state();
     // (a claim must not outlive the state it names)
     for (t, fp) in [

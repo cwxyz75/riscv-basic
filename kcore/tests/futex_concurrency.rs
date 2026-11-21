@@ -19,7 +19,7 @@ use shuttle::{
     thread,
 };
 
-const KEY: (u32, u64) = (1, 0x1000);
+const KEY: (u64, u64) = (1, 0x1000);
 
 /// The waiter's side of `futex_wait`: under the lock, sleep only if the word still holds `expected`.
 /// Returns true if it went to sleep (and must be woken).

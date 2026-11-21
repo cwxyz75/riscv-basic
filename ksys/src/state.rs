@@ -12,7 +12,7 @@ use kcore::sched::Tid;
 
 /// What a new user thread needs to start (looked up by the thread itself: a thread's start argument is one word).
 pub struct ThreadStart {
-    pub pid: u32,
+    pub pid: u64,
     pub entry: u64,
     pub sp: u64,
     pub arg: u64,
@@ -27,11 +27,13 @@ pub struct ThreadStart {
 /// Everything the syscall layer keeps about user mode: the kernel objects, the processes and threads, the wait tables, and the kernel's own handles.
 pub struct UserState {
     pub objs: Kobjs,
-    pub procs: BTreeMap<u32, Box<Process>>,
-    pub thread_pid: BTreeMap<Tid, u32>,
+    pub procs: BTreeMap<u64, Box<Process>>,
+    pub thread_pid: BTreeMap<Tid, u64>,
     /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
     pub sched_flags: BTreeMap<Tid, u8>,
-    pub next_pid: u32,
+    pub next_pid: u64,
+    /// The generation new handle tables start their slots at (0; `ff=handlegen:` in test builds).
+    pub first_handle_gen: u64,
     /// VMOs whose last handle is gone but that some address space still maps: freed when the
     /// last mapping goes (SYSCALLS.md: a VMO lives while a handle or a mapping does).
     pub pending_vmos: Vec<u64>,
@@ -88,6 +90,7 @@ impl UserState {
             thread_pid: BTreeMap::new(),
             sched_flags: BTreeMap::new(),
             next_pid: 1,
+            first_handle_gen: 0,
             pending_vmos: Vec::new(),
             cleaning: BTreeSet::new(),
             interrupts: BTreeSet::new(),

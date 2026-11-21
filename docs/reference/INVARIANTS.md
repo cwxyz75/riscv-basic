@@ -15,7 +15,7 @@ get filled in as each area is built.
 | # | Invariant | How checked |
 |---|---|---|
 | H1 | A handle value cannot be forged: only the kernel mints values, and a value names an entry in the caller's own table | `kcore/tests/handle_model.rs`: random and adversarial values never resolve unless live (S3a) |
-| H2 | Stale values fail: a closed or reused slot's old value is rejected (generation counter); value 0 is never valid | `handle_model` (S3a); a slot that has used all 2^19 generations is retired, never reused, so no stale value comes back by wrap-around (the retirement test) |
+| H2 | Stale values fail: a closed or reused slot's old value is rejected (a 40-bit generation counter in bits 24 to 63 of the 64-bit value); value 0 is never valid | `handle_model` (S3a, extended for AB1: 100,000 live handles, slot numbers above 8191); a slot that has used all 2^40 generations is retired, never reused, so no stale value comes back by wrap-around (the retirement tests, with the generation fast-forwarded to 2^40 - 2) |
 | H3 | Rights only shrink: duplicate, replace, transfer and open never produce a handle with a right its source lacked | `handle_model`, `channel_model` (a model of every handle's rights), `rights_escalation_is_refused` (S3a) |
 | H4 | A message in flight owns its handles: if the channel dies they are closed, never leaked, and never duplicated | `channel_model`, `registry_model`, `cycles_are_swept` with `Registry::live()` as the leak counter (S3a) |
 | H5 | Authority is holding a handle: no syscall consults identity, a path or ambient state to grant access | Review against `SYSCALLS.md` (S3) |
@@ -188,7 +188,7 @@ Each becomes a row above, with its check, in the change that builds its mechanis
 
 | # | Invariant | Where specified |
 |---|---|---|
-| CNT1 | No kernel counter wraps: a counter retires what it counts or refuses with NO_MEMORY at its limit | KERNEL-V1-SPEC 3.3 |
+| CNT1 | No kernel counter wraps: a counter retires what it counts or refuses at its limit (thread ids `Error::Exhausted`, process ids NO_MEMORY, object and handle slots are retired at their last generation; koids, FP/vector tokens and the entropy and scheduler tick counters are u64 and saturate or are unreachable). Ticket-lock counters wrap by design (modular compare, bounded distance) | `kcore/tests/counters_cnt1.rs`, `handle_model`, `create_calls` (the pid limit), and the kernel-only boot with every counter started 16 below 2^32 (`ff=` boot arguments, test builds only; `os-ktest-small`) |
 | ABI1 | A program enters the kernel only through the system library; an `ecall` from anywhere else is an exception | 3.1 |
 | COW1 | A write through one member of a VMO family is never visible through another member entitled to the old contents | 4.3 |
 | COW2 | Every page of a family is charged to exactly one job; a charge moves only with its page and within one job | 4.3 |

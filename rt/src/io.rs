@@ -19,7 +19,7 @@ pub enum IoError {
 
 /// Wait for `mask` on `h`. A wait that *fails* (a handle without WAIT, a bad handle) must end
 /// the operation with that error: ignoring it would turn the caller's loop into a busy spin.
-fn wait(h: u32, mask: u32, deadline: u64) -> Result<(), IoError> {
+fn wait(h: u64, mask: u32, deadline: u64) -> Result<(), IoError> {
     let r = sys::object_wait(h, mask, deadline);
     match r.status() {
         Some(Status::Ok) | Some(Status::TimedOut) => Ok(()),
@@ -29,7 +29,7 @@ fn wait(h: u32, mask: u32, deadline: u64) -> Result<(), IoError> {
 
 /// Read up to `buf.len()` bytes; `Ok(0)` is end of stream (the peer closed after the data
 /// drained). Blocks until at least one byte or the end.
-pub fn read(h: u32, buf: &mut [u8]) -> Result<usize, IoError> {
+pub fn read(h: u64, buf: &mut [u8]) -> Result<usize, IoError> {
     if buf.is_empty() {
         return Ok(0);
     }
@@ -49,7 +49,7 @@ pub fn read(h: u32, buf: &mut [u8]) -> Result<usize, IoError> {
 }
 
 /// Write all of `data`, waiting for room as needed.
-pub fn write_all(h: u32, mut data: &[u8]) -> Result<(), IoError> {
+pub fn write_all(h: u64, mut data: &[u8]) -> Result<(), IoError> {
     let mut nomem_since: Option<u64> = None;
     while !data.is_empty() {
         // The kernel refuses a single write larger than one socket buffer (TOO_BIG).
@@ -82,7 +82,7 @@ pub fn write_all(h: u32, mut data: &[u8]) -> Result<(), IoError> {
 pub fn nap(ticks: u64) {
     let e = sys::event_create();
     if e.status == 0 {
-        let h = e.a1 as u32;
+        let h = e.a1 as u64;
         sys::object_wait(h, signals::USER_MASK, sys::clock_get() + ticks + 1); // (+1: the clock floors)
         sys::handle_close(h);
     }

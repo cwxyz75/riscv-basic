@@ -578,6 +578,8 @@ pub enum Error {
     NoCurrent,
     BadPriority,
     NotExited,
+    /// The thread id counter reached its limit (CNT1: a counter never wraps; the creation is refused).
+    Exhausted,
 }
 
 /// One hart's run queue: an RT class, a normal class and the hart's idle thread, strict precedence in `pick`.
@@ -628,13 +630,13 @@ impl<N: Class> HartRq<N> {
         self.threads.get(&tid)
     }
 
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the thread id counter is a u32 that gains one per thread; the thread limit keeps it far from the end
+    #[allow(clippy::arithmetic_side_effects)]
     fn fresh(&mut self, attr: SchedAttr, state: State) -> Result<Tid, Error> {
         if attr.prio > PRIO_MAX {
             return Err(Error::BadPriority);
         }
         let tid = self.next_tid;
-        self.next_tid += 1;
+        self.next_tid = tid.checked_add(1).ok_or(Error::Exhausted)?;
         self.threads.insert(
             tid,
             ThreadSched {

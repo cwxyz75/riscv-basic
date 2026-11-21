@@ -56,31 +56,31 @@ pub fn load_profiles(img: &[u8], entries: &[proto::bootimg::Entry]) -> Vec<Loade
 /// console server: the shell runs a script from it, and the session has no volumes).
 #[derive(Clone, Copy)]
 pub enum Term {
-    Serial(u32),
+    Serial(u64),
     /// A byte socket a backend provider holds the other end of (UV7): the console server serves it, treats its closing as a
     /// detach and takes a new one on the stack's `term` channel.
-    Backend(u32),
-    Socket(u32),
+    Backend(u64),
+    Socket(u64),
 }
 
 /// The services of one interactive session, in start order.
 pub struct Stack {
     /// The job every process of the session lives in (handle with every right): `stop_stack` ends
     /// whatever is left in it, and its limits are the whole session's.
-    pub session: u32,
-    pub memfsd: u32,
-    pub launcher: u32,
-    pub consoled: Option<u32>,
-    pub sh: u32,
+    pub session: u64,
+    pub memfsd: u64,
+    pub launcher: u64,
+    pub consoled: Option<u64>,
+    pub sh: u64,
     /// `sh` writes here when the user says `halt`.
-    pub halt: Option<u32>,
+    pub halt: Option<u64>,
     /// A connection to the service registry, to ask the volumes to commit before the session ends.
     pub registry: Option<rt::fs::Fs>,
     /// Init's end of the console server's attach channel (a `Term::Backend` session): `proto::console::term`.
-    pub term: Option<u32>,
+    pub term: Option<u64>,
 }
 
-pub fn kill_close(h: u32) {
+pub fn kill_close(h: u64) {
     rt::sys::process_kill(h, -1);
     rt::sys::handle_close(h);
 }
@@ -88,14 +88,14 @@ pub fn kill_close(h: u32) {
 /// The authority a session manager needs from `init` and nothing the kernel gives only to its first process: a handle to the
 /// root job (to make each session's job) and to the root resource (for the device manager).
 pub struct Powers {
-    pub root_job: u32,
-    pub resource: u32,
+    pub root_job: u64,
+    pub resource: u64,
 }
 
 pub fn start_stack(
     powers: &Powers,
     term: Term,
-    image_vmo: u32,
+    image_vmo: u64,
     img: &[u8],
     entries: &[proto::bootimg::Entry],
     who: &Loaded,
@@ -103,12 +103,12 @@ pub fn start_stack(
     use proto::startup::Startup;
     use rt::abi::rights::Rights;
     use rt::sys;
-    let chan = || -> Result<(u32, u32), i32> {
+    let chan = || -> Result<(u64, u64), i32> {
         let c = sys::channel_create();
         if c.status != 0 {
             return Err(30);
         }
-        Ok((c.a1 as u32, c.a2 as u32))
+        Ok((c.a1 as u64, c.a2 as u64))
     };
     // The session's job, and under it the job the launcher makes every program's job in (S4.5).
     // Limits are generous for the services and bounded for programs: all together at most 64 MiB
@@ -118,13 +118,13 @@ pub fn start_stack(
     if root.status != 0 {
         return Err(38);
     }
-    let root = root.a1 as u32;
+    let root = root.a1 as u64;
     let session = sys::job_create(root, &[32, 64, 49152, 40, 4000, 1536 * 1024]);
     sys::handle_close(root);
     if session.status != 0 {
         return Err(38);
     }
-    let session = session.a1 as u32;
+    let session = session.a1 as u64;
     // (a profile's quota can only lower what programs may have)
     let (app_procs, app_pages) = match &who.profile.quota {
         Some(q) => (q.processes.min(16), (q.memory_mib * 256).min(40960)),
@@ -135,12 +135,12 @@ pub fn start_stack(
         sys::handle_close(session);
         return Err(38);
     }
-    let apps = apps.a1 as u32;
+    let apps = apps.a1 as u64;
     let start_env = |name: &[u8],
                      roles: Vec<(Role, u32)>,
-                     handles: &[u32],
+                     handles: &[u64],
                      extra: Vec<Vec<u8>>|
-     -> Result<u32, i32> {
+     -> Result<u64, i32> {
         let path: Vec<u8> = [&b"bin/"[..], name].concat();
         let Some(image) = image_entry(img, entries, &path) else {
             for &h in handles {
@@ -169,7 +169,7 @@ pub fn start_stack(
             33
         })
     };
-    let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u32]| -> Result<u32, i32> {
+    let start = |name: &[u8], roles: Vec<(Role, u32)>, handles: &[u64]| -> Result<u64, i32> {
         start_env(name, roles, handles, Vec::new())
     };
     // the launcher: its only client is the shell
@@ -183,7 +183,7 @@ pub fn start_stack(
     let launcher = start(
         b"launcher",
         alloc::vec![(Role::ServiceLaunch, 0), (Role::Job, 1)],
-        &[launch_theirs, apps_for_launcher.a1 as u32],
+        &[launch_theirs, apps_for_launcher.a1 as u64],
     )?;
     // the filesystem: init clones one connection for the shell and lets go of the root
     let (fs_mine, fs_theirs) = chan()?;
@@ -194,7 +194,7 @@ pub fn start_stack(
     let memfsd = start_env(
         b"memfsd",
         alloc::vec![(Role::ServiceFs, 0), (Role::BootImage, 1)],
-        &[fs_theirs, image_dup.a1 as u32],
+        &[fs_theirs, image_dup.a1 as u64],
         // the profile's home is `/home` in this session
         alloc::vec![[&b"HOME_SRC="[..], who.profile.home.as_bytes()].concat()],
     )?;
@@ -235,7 +235,7 @@ pub fn start_stack(
     })();
     // `/proc`: the process directory server (UV6). It gets the session job (to inspect, nothing else) and a control channel on
     // which the shell tells it about the programs it starts; the shell gets one connection to its root.
-    let proc_conn = (|| -> Option<(rt::fs::Fs, u32)> {
+    let proc_conn = (|| -> Option<(rt::fs::Fs, u64)> {
         let (root_mine, root_theirs) = chan().ok()?;
         let (ctl_mine, ctl_theirs) = chan().ok()?;
         let job = sys::handle_duplicate(session, Rights::INSPECT.0 | Rights::TRANSFER.0);
@@ -245,7 +245,7 @@ pub fn start_stack(
         start(
             b"procd",
             alloc::vec![(Role::ServiceFs, 0), (Role::Job, 1), (Role::ServiceProc, 2)],
-            &[root_theirs, job.a1 as u32, ctl_theirs],
+            &[root_theirs, job.a1 as u64, ctl_theirs],
         )
         .ok()?;
         let mut d = rt::fs::Fs::new(root_mine);
@@ -257,14 +257,14 @@ pub fn start_stack(
     })();
     // the console server: the serial line, the terminal socket, the control channel (a session with a terminal socket of its
     // own has none: its shell reads a script from the socket)
-    let mut term_init: Option<u32> = None;
+    let mut term_init: Option<u64> = None;
     let (consoled, tty_sh, ctl_sh) = match term {
         Term::Serial(serial) | Term::Backend(serial) => {
             let tty = sys::socket_create();
             if tty.status != 0 {
                 return Err(36);
             }
-            let (tty_console, tty_sh) = (tty.a1 as u32, tty.a2 as u32);
+            let (tty_console, tty_sh) = (tty.a1 as u64, tty.a2 as u64);
             let (ctl_console, ctl_sh) = chan()?;
             let serial_dup = sys::handle_duplicate(serial, Rights::SAME.0);
             if serial_dup.status != 0 {
@@ -272,7 +272,7 @@ pub fn start_stack(
             }
             let mut roles =
                 alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)];
-            let mut hs = alloc::vec![serial_dup.a1 as u32, tty_console, ctl_console];
+            let mut hs = alloc::vec![serial_dup.a1 as u64, tty_console, ctl_console];
             let mut env = Vec::new();
             if matches!(term, Term::Backend(_)) {
                 let (mine, theirs) = chan()?;
@@ -297,10 +297,10 @@ pub fn start_stack(
         if res.status != 0 {
             return None;
         }
-        let res = res.a1 as u32;
-        let dup = |h: u32| {
+        let res = res.a1 as u64;
+        let dup = |h: u64| {
             let d = sys::handle_duplicate(h, Rights::SAME.0);
-            (d.status == 0).then_some(d.a1 as u32)
+            (d.status == 0).then_some(d.a1 as u64)
         };
         let (dm_mine, dm_theirs) = chan().ok()?;
         start(
@@ -461,8 +461,8 @@ pub fn stop_stack(mut s: Stack) {
 /// return 0, which lets the kernel run its leak checks and power off.
 pub fn supervise(
     powers: &Powers,
-    serial: u32,
-    image_vmo: u32,
+    serial: u64,
+    image_vmo: u64,
     img: &[u8],
     entries: &[proto::bootimg::Entry],
     recovery: bool,
@@ -518,7 +518,7 @@ pub fn supervise(
         if port.status != 0 {
             return 41;
         }
-        let port = port.a1 as u32;
+        let port = port.a1 as u64;
         let watched = [
             Some(stack.sh),
             stack.consoled,
@@ -574,11 +574,11 @@ pub fn supervise(
 
 /// The channel to `authd` and the process behind it.
 pub struct Authd {
-    pub ch: u32,
+    pub ch: u64,
 }
 
 pub fn start_authd(
-    image_vmo: u32,
+    image_vmo: u64,
     img: &[u8],
     entries: &[proto::bootimg::Entry],
     recovery: bool,
@@ -590,7 +590,7 @@ pub fn start_authd(
     if c.status != 0 {
         return None;
     }
-    let (mine, theirs) = (c.a1 as u32, c.a2 as u32);
+    let (mine, theirs) = (c.a1 as u64, c.a2 as u64);
     let image = rt::sys::handle_duplicate(image_vmo, Rights::SAME.0);
     if image.status != 0 {
         return None;
@@ -606,7 +606,7 @@ pub fn start_authd(
         ..proto::startup::Startup::default()
     };
     let bytes = startup.encode().ok()?;
-    rt::spawn::spawn(bin, &bytes, &[theirs, image.a1 as u32]).ok()?;
+    rt::spawn::spawn(bin, &bytes, &[theirs, image.a1 as u64]).ok()?;
     Some(Authd { ch: mine })
 }
 
@@ -641,7 +641,7 @@ impl Authd {
 
 /// The login prompts, on the serial line (before the console server of a session exists, and after it is gone).
 pub struct Login {
-    pub serial: u32,
+    pub serial: u64,
     pub pending: Vec<u8>,
 }
 

@@ -26,7 +26,7 @@ use rt::abi::signals;
 use rt::startup::{self, EXIT_BAD_STARTUP, EXIT_NO_STARTUP};
 use rt::sys;
 
-fn read_image(vmo: u32) -> Option<Vec<u8>> {
+fn read_image(vmo: u64) -> Option<Vec<u8>> {
     let size = sys::vmo_get_size(vmo);
     if size.status != 0 {
         return None;
@@ -45,7 +45,7 @@ fn entry<'a>(img: &'a [u8], entries: &[proto::bootimg::Entry], name: &[u8]) -> O
     img.get(e.offset as usize..(e.offset + e.size) as usize)
 }
 
-fn reply(ch: u32, text: &str) {
+fn reply(ch: u64, text: &str) {
     sys::channel_write(ch, text.as_ptr(), text.len(), core::ptr::null(), 0);
 }
 

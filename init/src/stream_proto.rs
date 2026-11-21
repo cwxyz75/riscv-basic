@@ -9,34 +9,34 @@ use super::*;
 
 const MAX: u64 = u64::MAX;
 /// A job with an IPC byte limit and nothing else limited.
-fn ipc_job(root: u32, ipc: u64) -> Result<u32, Detail> {
+fn ipc_job(root: u64, ipc: u64) -> Result<u64, Detail> {
     Ok(ok(
         sys::job_create(root, &[MAX, MAX, MAX, MAX, MAX, ipc]),
         "an IPC-limited job",
     )?
-    .a1 as u32)
+    .a1 as u64)
 }
 
 /// A socket hand: a child that obeys one-letter commands on its bootstrap channel.
 struct Hand {
-    proc: u32,
-    ch: u32,
+    proc: u64,
+    ch: u64,
 }
 
 struct Reply {
     a: u32,
     status: i32,
-    handle: Option<u32>,
+    handle: Option<u64>,
 }
 
 impl Hand {
-    fn start(job: u32) -> Result<Hand, Detail> {
+    fn start(job: u64) -> Result<Hand, Detail> {
         let (proc, ch) = launch_image_in(IMAGE.load(Ordering::Relaxed), 70, job)?;
         Ok(Hand { proc, ch })
     }
 
     /// Send a command (`cmd`, `n`, and an optional handle) without waiting for the reply.
-    fn send(&self, cmd: u8, n: u8, h: Option<u32>) -> Outcome {
+    fn send(&self, cmd: u8, n: u8, h: Option<u64>) -> Outcome {
         let m = [cmd, n];
         let hs = [h.unwrap_or(0)];
         ok(
@@ -60,7 +60,7 @@ impl Hand {
         );
         ensure_eq!(r.status, 0, "the hand answered in time");
         let mut b = [0u8; 13];
-        let mut h = [0u32; 1];
+        let mut h = [0u64; 1];
         let r = sys::channel_read(self.ch, b.as_mut_ptr(), 13, h.as_mut_ptr(), 1);
         ensure_eq!((r.status, r.a1), (0, 13), "a reply of 13 bytes");
         Ok(Reply {
@@ -70,7 +70,7 @@ impl Hand {
         })
     }
 
-    fn cmd(&self, cmd: u8, n: u8, h: Option<u32>) -> Result<Reply, Detail> {
+    fn cmd(&self, cmd: u8, n: u8, h: Option<u64>) -> Result<Reply, Detail> {
         self.send(cmd, n, h)?;
         self.reply()
     }
@@ -83,7 +83,7 @@ impl Hand {
     }
 }
 
-fn ipc_used(j: u32) -> Result<u64, Detail> {
+fn ipc_used(j: u64) -> Result<u64, Detail> {
     Ok(job_use(j, 5)?.0)
 }
 
@@ -194,7 +194,7 @@ pub fn a_client_at_quota_stalls_only_itself() -> Outcome {
         .ok_or_else(|| msg_at(line!()))?;
     // the suite plays the server: write into each client's pair until it says no
     let block = [5u8; 1024];
-    let fill = |h: u32| -> (u64, i32) {
+    let fill = |h: u64| -> (u64, i32) {
         let mut n = 0u64;
         loop {
             let w = sys::socket_write(h, block.as_ptr(), block.len());
@@ -260,9 +260,9 @@ pub fn a_client_at_quota_stalls_only_itself() -> Outcome {
 pub fn one_socket_two_one_shot_bindings() -> Outcome {
     let (a, b) = {
         let r = ok(sys::socket_create(), "a socket pair")?;
-        (r.a1 as u32, r.a2 as u32)
+        (r.a1 as u64, r.a2 as u64)
     };
-    let port = ok(sys::port_create(), "a port")?.a1 as u32;
+    let port = ok(sys::port_create(), "a port")?.a1 as u64;
     let (rd, wr) = (1u64, 2u64);
     let bind = |mask: u32, key: u64| sys::port_bind_flags(port, a, mask, key, abi_oneshot());
     let first = bind(sig::READABLE, rd);
@@ -486,7 +486,7 @@ enum Refuse {
 struct Held(Vec<(u64, u64)>);
 
 impl Held {
-    fn admit(&mut self, h: u32) -> Result<(), Refuse> {
+    fn admit(&mut self, h: u64) -> Result<(), Refuse> {
         // a zero-length read and write must both succeed: it is a socket and it has READ and WRITE
         let mut b = [0u8; 1];
         let (r, w) = (
@@ -505,7 +505,7 @@ impl Held {
         if port.status != 0 {
             return Err(Refuse::NotBindable);
         }
-        let p = port.a1 as u32;
+        let p = port.a1 as u64;
         let bound = sys::port_bind_flags(p, h, sig::READABLE, 0, abi_oneshot());
         sys::handle_close(p);
         if bound.status != 0 {
@@ -532,9 +532,9 @@ impl Held {
 /// P6: a passed handle that is not a usable socket is refused and harms nothing.
 pub fn a_bad_stream_handle_is_refused() -> Outcome {
     let mut held = Held(Vec::new());
-    let sock = |what: &str| -> Result<(u32, u32), Detail> {
+    let sock = |what: &str| -> Result<(u64, u64), Detail> {
         let r = ok(sys::socket_create(), what)?;
-        Ok((r.a1 as u32, r.a2 as u32))
+        Ok((r.a1 as u64, r.a2 as u64))
     };
     let (a, b) = sock("a pair")?;
     ensure_eq!(held.admit(a), Ok(()), "a good socket is admitted");
@@ -551,7 +551,7 @@ pub fn a_bad_stream_handle_is_refused() -> Outcome {
     // a channel instead of a socket
     let ch = ok(sys::channel_create(), "a channel")?;
     ensure_eq!(
-        held.admit(ch.a1 as u32),
+        held.admit(ch.a1 as u64),
         Err(Refuse::NotASocket),
         "a channel"
     );
@@ -574,7 +574,7 @@ pub fn a_bad_stream_handle_is_refused() -> Outcome {
         ),
     ] {
         let (x, y) = sock(what)?;
-        let weak = ok(sys::handle_replace(x, rights.0), what)?.a1 as u32;
+        let weak = ok(sys::handle_replace(x, rights.0), what)?.a1 as u64;
         ensure_eq!(held.admit(weak), Err(want), "{what}");
         sys::handle_close(weak);
         sys::handle_close(y);
@@ -582,7 +582,7 @@ pub fn a_bad_stream_handle_is_refused() -> Outcome {
     // nothing above harmed the good one, and a fresh good socket is still admitted
     let (c, d) = sock("another pair")?;
     ensure_eq!(held.admit(c), Ok(()), "a fresh socket after the refusals");
-    for h in [a, b, c, d, ch.a1 as u32, ch.a2 as u32] {
+    for h in [a, b, c, d, ch.a1 as u64, ch.a2 as u64] {
         sys::handle_close(h);
     }
     Ok(())
@@ -594,12 +594,12 @@ pub fn a_bad_stream_handle_is_refused() -> Outcome {
 pub fn stream_budgets_with_the_launcher_defaults() -> Outcome {
     let root = root_job()?;
     // the launcher's defaults: 256 objects, 192 KiB of IPC bytes
-    let j = Ok::<u32, Detail>(
+    let j = Ok::<u64, Detail>(
         ok(
             sys::job_create(root, &[MAX, MAX, MAX, MAX, 256, 192 * KIB]),
             "a job with the launcher's defaults",
         )?
-        .a1 as u32,
+        .a1 as u64,
     )?;
     let hand = Hand::start(j)?;
     // empty pairs: how many before the object quota ends it (each pair is two objects; the process and its channel count too)
@@ -681,7 +681,7 @@ pub fn bystander_cost_of_sleeping_bindings() -> Outcome {
             if r.status != 0 {
                 break;
             }
-            let (a, b) = (r.a1 as u32, r.a2 as u32);
+            let (a, b) = (r.a1 as u64, r.a2 as u64);
             socks.push((a, b));
             for (mask, key) in [(sig::READABLE, 1u64), (sig::PEER_CLOSED, 2)] {
                 let k = ((socks.len() as u64) << 8) | key;

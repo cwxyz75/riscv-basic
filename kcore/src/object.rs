@@ -23,15 +23,7 @@ const SWEEP_MIN: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjId {
     index: u32,
-    gen: u32,
-}
-
-impl ObjId {
-    /// A number that names this object for as long as it lives and never again afterwards (the
-    /// slot's generation is part of it): the "kernel object id" user programs may compare.
-    pub fn koid(&self) -> u64 {
-        (u64::from(self.gen) << 32) | (u64::from(self.index) + 1)
-    }
+    gen: u64,
 }
 
 /// What the registry needs from the objects it stores.
@@ -68,7 +60,9 @@ pub trait Object {
 }
 
 struct Slot<T> {
-    gen: u32,
+    gen: u64,
+    /// The object's kernel id (`Registry::koid`): a counter from 1 assigned at creation, never reused (CNT1).
+    koid: u64,
     refs: u32,
     obj: Option<T>,
     /// The job this object is charged to (S4.5c), if it is charged at all. When the object is
@@ -78,6 +72,10 @@ struct Slot<T> {
 
 pub struct Registry<T: Object> {
     slots: Vec<Slot<T>>,
+    /// The koid the next object gets (a counter from 1; test builds start it high, `fast_forward_koid`).
+    next_koid: u64,
+    /// The generation a new slot starts at (0; test builds start it near the limit, `set_first_generation`).
+    first_gen: u64,
     free: Vec<u32>,
     live: usize,
     /// `needs_sweep` once `live` passes this.
@@ -130,6 +128,8 @@ impl<T: Object> Default for Registry<T> {
 impl<T: Object> Registry<T> {
     pub fn new() -> Registry<T> {
         Registry {
+            next_koid: 1,
+            first_gen: 0,
             // Reserved once: growing a table this size by doubling needs a contiguous block
             // twice as large as the old one, and an allocation failure is a kernel panic
             // (found by the trust-boundary audit). Owners cap `live` at `MAX_OBJECTS`, and
@@ -229,6 +229,22 @@ impl<T: Object> Registry<T> {
         &self.dirty
     }
 
+    /// The kernel id of a live object: a counter value from 1, assigned at creation, never reused (what `object_info` reports).
+    pub fn koid(&self, id: ObjId) -> Option<u64> {
+        self.slot(id).map(|s| s.koid)
+    }
+
+    /// For test builds (`ff=koid:<n>`): the next object gets koid `n`.
+    pub fn fast_forward_koid(&mut self, n: u64) {
+        self.next_koid = n.max(1);
+    }
+
+    /// For test builds (`ff=objgen:<n>`): slots made from now on start at generation `n`, so the retirement of an exhausted slot is reached in a few
+    /// reuses.
+    pub fn set_first_generation(&mut self, n: u64) {
+        self.first_gen = n;
+    }
+
     /// Is anything waiting in the dirty log?
     pub fn has_dirty(&self) -> bool {
         !self.dirty.is_empty() || self.dirty_overflow
@@ -250,9 +266,13 @@ impl<T: Object> Registry<T> {
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: live is bounded by MAX_OBJECTS (checked by every caller's quota test)
     pub fn create_charged(&mut self, obj: T, job: Option<JobId>) -> ObjId {
         self.live += 1;
+        // (a u64 counter from 1: 2^64 creations is 584 years at a billion a second; saturating keeps the arithmetic total)
+        let koid = self.next_koid;
+        self.next_koid = self.next_koid.saturating_add(1);
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.refs = 1;
+            slot.koid = koid;
             slot.obj = Some(obj);
             slot.job = job;
             ObjId {
@@ -261,14 +281,15 @@ impl<T: Object> Registry<T> {
             }
         } else {
             self.slots.push(Slot {
-                gen: 0,
+                gen: self.first_gen,
+                koid,
                 refs: 1,
                 obj: Some(obj),
                 job,
             });
             ObjId {
                 index: self.slots.len() as u32 - 1,
-                gen: 0,
+                gen: self.first_gen,
             }
         }
     }
@@ -377,12 +398,16 @@ impl<T: Object> Registry<T> {
             }
             let obj = slot.obj.take().expect("slot was live");
             let charged = slot.job.take();
-            slot.gen = slot.gen.wrapping_add(1);
+            // (CNT1: a slot whose generation is exhausted is retired, not wrapped)
+            let retire = slot.gen == u64::MAX;
+            slot.gen = slot.gen.saturating_add(1);
             self.log(id, false);
             if let Some(job) = charged {
                 self.credits.push((job, obj.charged_bytes()));
             }
-            self.free.push(id.index);
+            if !retire {
+                self.free.push(id.index);
+            }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
             // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
@@ -502,8 +527,11 @@ impl<T: Object> Registry<T> {
                 self.credits.push((job, obj.charged_bytes()));
             }
             slot.refs = 0;
-            slot.gen = slot.gen.wrapping_add(1);
-            self.free.push(index);
+            let retire = slot.gen == u64::MAX;
+            slot.gen = slot.gen.saturating_add(1);
+            if !retire {
+                self.free.push(index);
+            }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
             // The references a doomed object holds go away with it. Those to other doomed

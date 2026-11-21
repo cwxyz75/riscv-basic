@@ -1,4 +1,4 @@
-//! Thread creation (TS3c): `thread_create` over the user-mode state, with what the machine decides (the creating thread's priority) passed in
+//! Thread creation (TS3c, AB5): `thread_spawn` over the user-mode state, with what the machine decides (the creating thread's priority) passed in
 //! and what the machine does (spawning the kernel thread) left to the caller, which gets back a [`Spawn`].
 
 use crate::UserState;
@@ -16,11 +16,11 @@ use kcore::Mm;
 /// Frames in a kernel stack.
 pub const KSTACK_PAGES: u64 = abi::layout::KSTACK_BYTES / 4096;
 
-/// What the caller does after `thread_create`: spawn the kernel thread `token` names, at priority `prio`, and return `handle`.
+/// What the caller does after `thread_spawn`: spawn the kernel thread `token` names, at priority `prio`, and return `handle`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Spawn {
     pub token: usize,
-    pub handle: u32,
+    pub handle: u64,
     pub prio: u8,
 }
 
@@ -56,7 +56,7 @@ pub fn clamp_prio(jobs: &Jobs, job: JobId, want: u8) -> u8 {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a u64 counter that gains one per thread start
 pub fn new_start(
     us: &mut UserState,
-    pid: u32,
+    pid: u64,
     entry: u64,
     sp: u64,
     arg: u64,
@@ -81,68 +81,6 @@ pub fn new_start(
     token
 }
 
-/// `thread_create(process, entry, sp, arg) -> handle` (SYSCALLS.md). `me` is the calling process, `creator_prio` the base priority the new
-/// thread inherits from the creating thread (the default 10 if that is not a user thread).
-#[allow(clippy::expect_used, clippy::arithmetic_side_effects)] // INVARIANT: the target process was looked up a few lines above under the same lock; threads_alive is below MAX_THREADS_PER_PROCESS (checked first)
-pub fn thread_create(
-    us: &mut UserState,
-    jobs: &mut Jobs,
-    me: u32,
-    creator_prio: u8,
-    a: [u64; 6],
-) -> Result<Spawn, Status> {
-    let ph = Handle(a[0] as u32);
-    let (entry, sp, arg) = (a[1], a[2], a[3]);
-    let caller = us.procs.get(&me).ok_or(Status::BadState)?;
-    let (_, tpid, _, _) = ipc::process_of(&us.objs, &caller.handles, ph, Rights::MANAGE)?;
-    let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
-    if target.state != crate::ProcState::Running
-        || target.exit_code.is_some()
-        || target.killed.is_some()
-    {
-        return Err(Status::BadState);
-    }
-    let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
-    let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
-    if !entry_ok || !sp_ok {
-        return Err(Status::InvalidArgs);
-    }
-    if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
-        || total_threads(us) >= abi::limits::MAX_USER_THREADS
-    {
-        return Err(Status::NoMemory);
-    }
-    let tjob = target.job;
-    // a new thread inherits its creator's base priority, clamped to its job's maximum
-    let prio = clamp_prio(jobs, tjob, creator_prio);
-    charge_thread(jobs, tjob).map_err(crate::job_status)?;
-    let UserState { objs, procs, .. } = us;
-    let caller = procs.get_mut(&me).ok_or(Status::BadState)?;
-    let job = caller.job;
-    let (handle, obj) = match ipc::thread_object_create_in(
-        objs,
-        &mut caller.handles,
-        tpid,
-        &mut Quota {
-            jobs,
-            job: Some(job),
-        },
-    ) {
-        Ok(x) => x,
-        Err(e) => {
-            credit_thread(jobs, tjob);
-            return Err(e);
-        }
-    };
-    procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
-    let token = new_start(us, tpid, entry, sp, arg, Some(obj));
-    Ok(Spawn {
-        token,
-        handle: handle.0,
-        prio,
-    })
-}
-
 /// `thread_spawn(process, args) -> handle, tid` (SYSCALLS.md, SCHED-SMP-SPEC 5.3): create and start a thread, with a stack the kernel maps in
 /// the process's stack arena (freed when the thread ends) unless the caller brings its own. `handle` is 0 for a detached thread. The caller
 /// spawns the kernel thread `token` names at `prio` and returns the handle and the tid.
@@ -157,12 +95,12 @@ pub fn thread_spawn<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
-    me: u32,
+    me: u64,
     creator_prio: u8,
     a: [u64; 6],
 ) -> Result<Spawn, Status> {
     use abi::spawn as sp;
-    let ph = Handle(a[0] as u32);
+    let ph = Handle(a[0]);
     // the record first (a bad pointer is the first error), then the handle
     let raw = {
         let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
@@ -276,7 +214,7 @@ pub fn thread_spawn<M: PhysMem>(
         let tables = stack_len / 4096 / 512 + 4;
         let undo =
             |made: Option<(Handle, ObjId)>,
-             procs: &mut alloc::collections::BTreeMap<u32, alloc::boxed::Box<crate::Process>>,
+             procs: &mut alloc::collections::BTreeMap<u64, alloc::boxed::Box<crate::Process>>,
              objs: &mut kcore::ipc::Kobjs,
              jobs: &mut Jobs| {
                 if let Some((h, _)) = made {
@@ -342,10 +280,10 @@ pub fn thread_spawn<M: PhysMem>(
 pub fn process_start(
     us: &mut UserState,
     jobs: &mut Jobs,
-    me: u32,
+    me: u64,
     a: [u64; 6],
 ) -> Result<(usize, u8), Status> {
-    let (ph, bh) = (Handle(a[0] as u32), Handle(a[3] as u32));
+    let (ph, bh) = (Handle(a[0]), Handle(a[3]));
     let (entry, sp, arg) = (a[1], a[2], a[4]);
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let pe = caller.handles.get(ph)?;
@@ -391,6 +329,7 @@ pub fn process_start(
         return Err(e);
     }
     // Commit: the channel end moves into the new process as its handle 1.
+    let first_gen = us.first_handle_gen;
     let UserState { procs, objs, .. } = us;
     let caller = procs.get_mut(&me).expect("caller exists");
     let moved = match caller.handles.remove_for_transfer(objs, bh) {
@@ -410,6 +349,8 @@ pub fn process_start(
         abi::BOOTSTRAP_HANDLE,
         "the bootstrap channel must be handle 1"
     );
+    // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
+    target.handles.set_first_generation(first_gen);
     target.entry = entry;
     target.arg = arg;
     target.start_sp = sp;

@@ -38,7 +38,7 @@ const EINTR: c_int = 4;
 /// The exit code of a program ended by the default action of signal `sig`.
 pub const SIGNALED_BASE: i32 = -2000;
 
-static CHAN: AtomicU32 = AtomicU32::new(0);
+static CHAN: AtomicU64 = AtomicU64::new(0);
 static OWN_PID: AtomicU32 = AtomicU32::new(0);
 static PARENT_PID: AtomicU32 = AtomicU32::new(0);
 /// The absolute time (ms) the pending `alarm` fires, 0 for none, and its repeat interval (0 for none).
@@ -95,7 +95,7 @@ fn bit(sig: c_int) -> u64 {
 }
 
 /// Install the signal channel and the pids (start-up); 0 means none.
-pub fn init(chan: u32, pid: u32, ppid: u32) {
+pub fn init(chan: u64, pid: u32, ppid: u32) {
     CHAN.store(chan, Ordering::Relaxed);
     OWN_PID.store(pid, Ordering::Relaxed);
     PARENT_PID.store(ppid, Ordering::Relaxed);
@@ -106,7 +106,7 @@ pub fn own_pid() -> u32 {
 }
 
 /// The signal channel's handle, for a wait that wants to be woken by a signal (0 if there is none).
-pub fn channel() -> u32 {
+pub fn channel() -> u64 {
     CHAN.load(Ordering::Relaxed)
 }
 
@@ -246,7 +246,7 @@ pub enum Wait {
 
 /// Wait until one of `items` (object, signal mask) is ready, `deadline` (absolute ms; `u64::MAX` for never) passes, or a
 /// signal's handler has run. With `restart`, a handler installed with `SA_RESTART` does not end the wait.
-pub fn wait_any(items: &[(u32, u32)], deadline: u64, restart: bool) -> Wait {
+pub fn wait_any(items: &[(u64, u32)], deadline: u64, restart: bool) -> Wait {
     loop {
         let d = deliver();
         if d.ran && !(restart && d.restart) {
@@ -274,7 +274,7 @@ pub fn wait_any(items: &[(u32, u32)], deadline: u64, restart: bool) -> Wait {
             }
             continue;
         }
-        let port = p.a1 as u32;
+        let port = p.a1 as u64;
         for (i, &(h, m)) in items.iter().enumerate() {
             sys::port_bind_flags(port, h, m, i as u64, port_flags::ONESHOT);
         }
@@ -303,7 +303,7 @@ pub fn wait_any(items: &[(u32, u32)], deadline: u64, restart: bool) -> Wait {
 // ---- blocking stream I/O that signals can interrupt ----
 
 /// Read from a stream socket; `Ok(0)` is end of stream; `Err(errno)`.
-pub fn stream_read(h: u32, buf: &mut [u8]) -> Result<usize, c_int> {
+pub fn stream_read(h: u64, buf: &mut [u8]) -> Result<usize, c_int> {
     if buf.is_empty() {
         return Ok(0);
     }
@@ -328,7 +328,7 @@ pub fn stream_read(h: u32, buf: &mut [u8]) -> Result<usize, c_int> {
 
 /// Write to a stream socket, waiting for room: the number written, which is less than `data.len()` only if a signal's handler
 /// interrupted after something was written; `Err(EPIPE)` for a closed stream, `Err(EINTR)` if nothing was written.
-pub fn stream_write(h: u32, data: &[u8]) -> Result<usize, c_int> {
+pub fn stream_write(h: u64, data: &[u8]) -> Result<usize, c_int> {
     let mut done = 0;
     let mut nomem_since: Option<u64> = None;
     while done < data.len() {

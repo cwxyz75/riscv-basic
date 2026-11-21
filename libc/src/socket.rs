@@ -9,7 +9,7 @@ use crate::errno;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rt::abi::signals as sig;
 use rt::fs::Fs;
 use rt::net::{Listener, Net, NetError, Stream, Udp};
@@ -18,7 +18,7 @@ use sockshim::errno::*;
 use sockshim::{opt, SetOpt};
 
 /// The `/svc` directory of the namespace (0 if the program has no network view).
-pub static SVC: AtomicU32 = AtomicU32::new(0);
+pub static SVC: AtomicU64 = AtomicU64::new(0);
 
 static NET: Mutex<Option<Net>> = Mutex::new(None);
 static NET_TXIDS: AtomicU32 = AtomicU32::new(1 << 20);
@@ -805,7 +805,7 @@ pub struct PollFd {
 }
 
 /// The current readiness of a socket and the objects whose signals can change it: `(revents, [(handle, mask)])`.
-fn sock_ready(s: &mut Sock, events: i16) -> (i16, Vec<(u32, u32)>) {
+fn sock_ready(s: &mut Sock, events: i16) -> (i16, Vec<(u64, u32)>) {
     let mut watch = Vec::new();
     let ev = match &mut s.st {
         St::Stream(st) => {
@@ -877,7 +877,7 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
     } else {
         now() + timeout_ms as u64
     };
-    let mut port = 0u32;
+    let mut port = 0u64;
     loop {
         // a signal's handler that ran ends the call (`EINTR`), before and while it waits
         if crate::sig::deliver().ran {
@@ -887,7 +887,7 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
             return fail(4);
         }
         let mut ready = 0;
-        let mut watch: Vec<(u32, u32)> = Vec::new();
+        let mut watch: Vec<(u64, u32)> = Vec::new();
         for p in list.iter_mut() {
             p.revents = 0;
             if p.fd < 0 {
@@ -919,7 +919,7 @@ pub unsafe extern "C" fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: c_int) ->
         if p.status != 0 {
             return fail(ENOBUFS);
         }
-        port = p.a1 as u32;
+        port = p.a1 as u64;
         for (i, (h, mask)) in watch.iter().enumerate() {
             let _ =
                 rt::sys::port_bind_flags(port, *h, *mask, i as u64, rt::abi::port_flags::ONESHOT);

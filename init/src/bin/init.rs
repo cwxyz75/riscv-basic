@@ -18,7 +18,7 @@ use session::*;
 
 /// Read the boot image table through the VMO: (header, then entries) as `proto::bootimg::parse`
 /// wants contiguous bytes, so read the whole image (it is small) into the heap.
-fn read_image(vmo: u32) -> Option<Vec<u8>> {
+fn read_image(vmo: u64) -> Option<Vec<u8>> {
     let size = rt::sys::vmo_get_size(vmo);
     if size.status != 0 {
         return None;
@@ -66,7 +66,7 @@ pub fn app_main() -> i32 {
         if c.status != 0 {
             return 10;
         }
-        (c.a1 as u32, c.a2 as u32)
+        (c.a1 as u64, c.a2 as u64)
     };
     let launcher_startup = proto::startup::Startup {
         args: alloc::vec![b"launcher".to_vec()],
@@ -89,7 +89,7 @@ pub fn app_main() -> i32 {
         if c.status != 0 {
             return 14;
         }
-        (c.a1 as u32, c.a2 as u32)
+        (c.a1 as u64, c.a2 as u64)
     };
     let fs_image_dup = rt::sys::handle_duplicate(image_vmo, rt::abi::rights::Rights::SAME.0);
     if fs_image_dup.status != 0 {
@@ -103,7 +103,7 @@ pub fn app_main() -> i32 {
     let Ok(fbytes) = fs_startup.encode() else {
         return 16;
     };
-    let Ok(_fs_proc) = rt::spawn::spawn(fs_img, &fbytes, &[fs_theirs, fs_image_dup.a1 as u32])
+    let Ok(_fs_proc) = rt::spawn::spawn(fs_img, &fbytes, &[fs_theirs, fs_image_dup.a1 as u64])
     else {
         return 17;
     };
@@ -175,14 +175,14 @@ pub fn app_main() -> i32 {
                     let w = rt::sys::vmo_write(image_vmo, 0, b"XXXX".as_ptr(), 4);
                     let me = rt::sys::process_self();
                     let mw =
-                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0000_0000, 0, 4096, 3);
+                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0000_0000, 0, 4096, 3);
                     let mr =
-                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0001_0000, 0, 4096, 1);
+                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0001_0000, 0, 4096, 1);
                     let mx =
-                        rt::sys::process_map(me.a1 as u32, image_vmo, 0x9_0002_0000, 0, 4096, 5);
+                        rt::sys::process_map(me.a1 as u64, image_vmo, 0x9_0002_0000, 0, 4096, 5);
                     let d = rt::sys::handle_duplicate(image_vmo, 0x7ff);
                     let d2 = rt::sys::handle_duplicate(image_vmo, 1 << 31);
-                    let w2 = rt::sys::vmo_write(d2.a1 as u32, 0, b"XXXX".as_ptr(), 4);
+                    let w2 = rt::sys::vmo_write(d2.a1 as u64, 0, b"XXXX".as_ptr(), 4);
                     let msg = alloc::format!(
                         "rights: write={} mapw={} mapr={} mapx={} dup_all={} dup_same={} write_dup={}\r\n",
                         w.status as i32, mw.status as i32, mr.status as i32, mx.status as i32,
@@ -248,8 +248,8 @@ pub fn app_main() -> i32 {
 /// `run <name> args...`: spawn a boot-image program through the launcher, give it an empty
 /// stdin, return what it printed followed by `[exit N]` (or an error line).
 fn run_program(
-    launch_ch: u32,
-    image_vmo: u32,
+    launch_ch: u64,
+    image_vmo: u64,
     entries: &[proto::bootimg::Entry],
     words: &[&[u8]],
     txid: u32,
@@ -269,28 +269,28 @@ fn run_program(
     let Some(e) = entries.iter().find(|e| e.name == path) else {
         return alloc::format!("run: {}: not found\r\n", String::from_utf8_lossy(name));
     };
-    let narrow = |h: u32, r: u32| -> Option<u32> {
+    let narrow = |h: u64, r: u32| -> Option<u64> {
         let d = sys::handle_duplicate(h, Rights::SAME.0);
         if d.status != 0 {
             return None;
         }
-        let n = sys::handle_replace(d.a1 as u32, r);
+        let n = sys::handle_replace(d.a1 as u64, r);
         sys::handle_close(h);
-        (n.status == 0).then_some(n.a1 as u32)
+        (n.status == 0).then_some(n.a1 as u64)
     };
     let s1 = sys::socket_create();
     let s2 = sys::socket_create();
     if s1.status != 0 || s2.status != 0 {
         for s in [&s1, &s2] {
             if s.status == 0 {
-                sys::handle_close(s.a1 as u32);
-                sys::handle_close(s.a2 as u32);
+                sys::handle_close(s.a1 as u64);
+                sys::handle_close(s.a2 as u64);
             }
         }
         return String::from("run: could not make pipes\r\n");
     }
-    let (in_w, in_r) = (s1.a1 as u32, s1.a2 as u32);
-    let (out_r, out_w) = (s2.a1 as u32, s2.a2 as u32);
+    let (in_w, in_r) = (s1.a1 as u64, s1.a2 as u64);
+    let (out_r, out_w) = (s2.a1 as u64, s2.a2 as u64);
     let (Some(in_r), Some(out_w)) = (
         narrow(in_r, Rights::READ.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
         narrow(out_w, Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0),
@@ -432,15 +432,15 @@ fn fs_write(root: &mut rt::fs::Fs, path: &[u8], text: &[u8]) -> String {
 }
 
 /// Narrow a handle to `rights` (duplicate, then replace the duplicate, then close the original).
-fn narrow_handle(h: u32, rights: u32) -> Option<u32> {
+fn narrow_handle(h: u64, rights: u32) -> Option<u64> {
     use rt::sys;
     let d = sys::handle_duplicate(h, rt::abi::rights::Rights::SAME.0);
     if d.status != 0 {
         return None;
     }
-    let n = sys::handle_replace(d.a1 as u32, rights);
+    let n = sys::handle_replace(d.a1 as u64, rights);
     sys::handle_close(h);
-    (n.status == 0).then_some(n.a1 as u32)
+    (n.status == 0).then_some(n.a1 as u64)
 }
 
 /// S4d test aid: start `consoled` with the serial socket, then talk to it on the terminal socket
@@ -450,7 +450,7 @@ fn narrow_handle(h: u32, rights: u32) -> Option<u32> {
 /// (Ctrl-C) reports `interrupt` and what became of the job; anything else answers `got: <line>`.
 /// UV4: `raw`, `cbreak` and `size` switch the terminal's mode (see `terminal_demo`), `resize` sets the window size
 /// and reads it back.
-fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+fn console_session(serial: u64, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
     use rt::abi::rights::Rights;
     use rt::sys;
     let Some(cimg) = image_entry(img, entries, b"bin/consoled") else {
@@ -467,8 +467,8 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
     if tty.status != 0 || ctl_pair.status != 0 {
         return 22;
     }
-    let (tty_mine, tty_theirs) = (tty.a1 as u32, tty.a2 as u32);
-    let (ctl_mine, ctl_theirs) = (ctl_pair.a1 as u32, ctl_pair.a2 as u32);
+    let (tty_mine, tty_theirs) = (tty.a1 as u64, tty.a2 as u64);
+    let (ctl_mine, ctl_theirs) = (ctl_pair.a1 as u64, ctl_pair.a2 as u64);
     let startup = proto::startup::Startup {
         args: alloc::vec![b"consoled".to_vec()],
         roles: alloc::vec![(Role::Serial, 0), (Role::Tty, 1), (Role::ServiceConsole, 2)],
@@ -481,7 +481,7 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
         return 24;
     };
     let _ = io::write_all(tty_mine, b"console ready\n");
-    let mut job: Option<u32> = None;
+    let mut job: Option<u64> = None;
     let mut line: Vec<u8> = Vec::new();
     let mut txid = 0u32;
     let mut buf = [0u8; 64];
@@ -529,14 +529,14 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                                 };
                                 let bytes = st.encode().ok()?;
                                 let out_w = narrow_handle(
-                                    out.a2 as u32,
+                                    out.a2 as u64,
                                     Rights::WRITE.0 | Rights::WAIT.0 | Rights::TRANSFER.0,
                                 )?;
                                 rt::spawn::spawn(spin_img, &bytes, &[out_w]).ok()
                             })
                             .flatten();
                         if out.status == 0 {
-                            sys::handle_close(out.a1 as u32);
+                            sys::handle_close(out.a1 as u64);
                         }
                         let msg = match spawned {
                             Some(p) => {
@@ -546,7 +546,7 @@ fn console_session(serial: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -
                                     txid,
                                     proto::console::Control::SetForeground,
                                 );
-                                let hs = [dup.a1 as u32];
+                                let hs = [dup.a1 as u64];
                                 let w = sys::channel_write(
                                     ctl_mine,
                                     msg.as_ptr(),
@@ -676,7 +676,7 @@ const SESSION_SCRIPTS: &[(&str, &str)] = &[
 ];
 
 /// Read what the shell of a session writes, line by line (the callback returns false to stop), until it ends.
-fn read_session_lines(sock: u32, mut each: impl FnMut(&str) -> bool) {
+fn read_session_lines(sock: u64, mut each: impl FnMut(&str) -> bool) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 256];
     loop {
@@ -704,14 +704,14 @@ fn own_powers() -> Option<Powers> {
     let job = rt::sys::job_root();
     let res = rt::sys::resource_root();
     (job.status == 0 && res.status == 0).then_some(Powers {
-        root_job: job.a1 as u32,
-        resource: res.a1 as u32,
+        root_job: job.a1 as u64,
+        resource: res.a1 as u64,
     })
 }
 
 fn sessions_test(
-    serial: u32,
-    image_vmo: u32,
+    serial: u64,
+    image_vmo: u64,
     img: &[u8],
     entries: &[proto::bootimg::Entry],
 ) -> i32 {
@@ -724,12 +724,12 @@ fn sessions_test(
         return 19;
     };
     say("sessions ready\r\n");
-    let open = |who: &Loaded| -> Option<(Stack, u32)> {
+    let open = |who: &Loaded| -> Option<(Stack, u64)> {
         let s = sys::socket_create();
         if s.status != 0 {
             return None;
         }
-        let (mine, theirs) = (s.a1 as u32, s.a2 as u32);
+        let (mine, theirs) = (s.a1 as u64, s.a2 as u64);
         let stack =
             start_stack(&powers, Term::Socket(theirs), image_vmo, img, entries, who).ok()?;
         Some((stack, mine))
@@ -777,7 +777,7 @@ fn sessions_test(
         l != "spinning"
     });
     let job = sys::handle_duplicate(stack.session, rt::abi::rights::Rights::SAME.0);
-    let running = sys::job_info(job.a1 as u32, 0).a1;
+    let running = sys::job_info(job.a1 as u64, 0).a1;
     say(&alloc::format!(
         "job processes while open: {}\r\n",
         if running >= 5 {
@@ -788,23 +788,23 @@ fn sessions_test(
     ));
     stop_stack(stack);
     // (processes are reaped a moment after the kill)
-    let mut left = sys::job_info(job.a1 as u32, 0).a1;
+    let mut left = sys::job_info(job.a1 as u64, 0).a1;
     for _ in 0..100 {
         if left == 0 {
             break;
         }
         io::nap(20);
-        left = sys::job_info(job.a1 as u32, 0).a1;
+        left = sys::job_info(job.a1 as u64, 0).a1;
     }
     say(&alloc::format!("job processes after close: {left}\r\n"));
     sys::handle_close(mine);
-    sys::handle_close(job.a1 as u32);
+    sys::handle_close(job.a1 as u64);
     0
 }
 
 /// One control call to `consoled`: the reply's value (0 for a plain reply), `None` when it failed. Events that arrive
 /// meanwhile are dropped (the caller is not looking for them).
-fn ctl_call(ctl: u32, txid: &mut u32, c: proto::console::Control) -> Option<u32> {
+fn ctl_call(ctl: u64, txid: &mut u32, c: proto::console::Control) -> Option<u32> {
     use rt::sys;
     *txid += 1;
     let msg = proto::console::encode(*txid, c);
@@ -834,7 +834,7 @@ fn ctl_call(ctl: u32, txid: &mut u32, c: proto::console::Control) -> Option<u32>
 /// `event: resize CxR`, `event: interrupt` or `event: hangup` for the events. The byte `q` (the carriage return when
 /// echo is on) ends it: the stand-in prints the window size and mode it reads back, restores cooked mode and prints
 /// `mode: cooked`.
-fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, first: &str) {
+fn terminal_demo(tty: u64, ctl: u64, txid: &mut u32, mode: u8, query: bool, first: &str) {
     use proto::console::{Control, Event};
     use rt::abi::status::Status;
     use rt::sys;
@@ -902,7 +902,7 @@ fn terminal_demo(tty: u32, ctl: u32, txid: &mut u32, mode: u8, query: bool, firs
 }
 
 /// Read from a socket until `needle` has arrived (everything read so far is returned), or `ms` have passed.
-fn read_until(sock: u32, needle: &[u8], ms: u64) -> Option<Vec<u8>> {
+fn read_until(sock: u64, needle: &[u8], ms: u64) -> Option<Vec<u8>> {
     use rt::abi::signals;
     use rt::sys;
     let deadline = sys::clock_get() + ms;
@@ -929,7 +929,7 @@ fn read_until(sock: u32, needle: &[u8], ms: u64) -> Option<Vec<u8>> {
 /// UV7 acceptance, driven from `init` as a terminal backend provider: a session whose terminal is served by `consoled` over a
 /// byte socket we hold. A long job runs; the backend closes (a detach: the job and the session carry on); a new backend
 /// attaches and is shown what the terminal last displayed, and can use it (Ctrl-C reaches the job); then a hangup ends it.
-fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
+fn detach_test(serial: u64, image_vmo: u64, img: &[u8], entries: &[proto::bootimg::Entry]) -> i32 {
     use rt::abi::rights::Rights;
     use rt::abi::signals;
     use rt::sys;
@@ -943,9 +943,9 @@ fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootim
     let Some(who) = profiles.iter().find(|l| l.profile.name == "alice") else {
         return 20;
     };
-    let pair = || -> Option<(u32, u32)> {
+    let pair = || -> Option<(u64, u64)> {
         let s = sys::socket_create();
-        (s.status == 0).then_some((s.a1 as u32, s.a2 as u32))
+        (s.status == 0).then_some((s.a1 as u64, s.a2 as u64))
     };
     let Some((mut mine, theirs)) = pair() else {
         return 21;
@@ -959,12 +959,12 @@ fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootim
     let Some(term) = stack.term else {
         return 23;
     };
-    let job = sys::handle_duplicate(stack.session, Rights::SAME.0).a1 as u32;
+    let job = sys::handle_duplicate(stack.session, Rights::SAME.0).a1 as u64;
     let mut txid = 0u32;
-    let mut call = |op: u16, handle: Option<u32>| -> bool {
+    let mut call = |op: u16, handle: Option<u64>| -> bool {
         txid += 1;
         let msg = proto::console::term::encode(txid, op);
-        let hs: &[u32] = match &handle {
+        let hs: &[u64] = match &handle {
             Some(h) => core::slice::from_ref(h),
             None => &[],
         };
@@ -978,7 +978,7 @@ fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootim
         let r = sys::channel_read(term, b.as_mut_ptr(), b.len(), core::ptr::null_mut(), 0);
         r.status == 0 && proto::console::decode_reply(&b[..r.a1]) == Some((txid, 0))
     };
-    let ended = |h: u32| sys::object_wait(h, signals::TERMINATED, 0).status == 0;
+    let ended = |h: u64| sys::object_wait(h, signals::TERMINATED, 0).status == 0;
 
     // 1. a backend is attached: the shell's prompt, then a long job that prints once
     if read_until(mine, b"$ ", 8000).is_none() {
@@ -1070,7 +1070,7 @@ fn detach_test(serial: u32, image_vmo: u32, img: &[u8], entries: &[proto::bootim
 /// Start the session manager and wait for it (T128). `init` keeps the kernel's first-process authority and gives `sessiond`
 /// handles to the root job, the root resource, the boot image and the serial line, and nothing else: it never holds a profile
 /// text, a password or a verifier. `sessiond` ends the system by exiting 0 (a `halt`); any other code is a failure.
-fn run_sessiond(serial: u32, image_vmo: u32, recovery: bool) -> i32 {
+fn run_sessiond(serial: u64, image_vmo: u64, recovery: bool) -> i32 {
     use rt::abi::rights::Rights;
     use rt::sys;
     // the table is at the start of the image; the program is read from its extent
@@ -1100,15 +1100,15 @@ fn run_sessiond(serial: u32, image_vmo: u32, recovery: bool) -> i32 {
     if job.status != 0 || res.status != 0 {
         return 51;
     }
-    let dup = |h: u32| {
+    let dup = |h: u64| {
         let d = sys::handle_duplicate(h, Rights::SAME.0);
-        (d.status == 0).then_some(d.a1 as u32)
+        (d.status == 0).then_some(d.a1 as u64)
     };
     let (Some(image), Some(ser), Some(j), Some(r)) = (
         dup(image_vmo),
         dup(serial),
-        dup(job.a1 as u32),
-        dup(res.a1 as u32),
+        dup(job.a1 as u64),
+        dup(res.a1 as u64),
     ) else {
         return 52;
     };

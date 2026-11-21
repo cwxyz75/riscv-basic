@@ -56,7 +56,7 @@ pub struct Event {
 
 /// A process, as a kernel object: what a process handle names.
 pub struct ProcessObj {
-    pub pid: u32,
+    pub pid: u64,
     pub terminated: bool,
     /// Stopped by `process_suspend`: raises STOPPED.
     pub stopped: bool,
@@ -68,7 +68,7 @@ pub struct ProcessObj {
 
 /// A user thread, as a kernel object: what a thread handle names.
 pub struct ThreadObj {
-    pub pid: u32,
+    pub pid: u64,
     pub terminated: bool,
     pub exit_code: i32,
 }
@@ -1097,6 +1097,47 @@ pub fn port_poll_in(
     Ok(observed)
 }
 
+/// Up to `max` ready bindings at once (`port_wait_many`, AB4): each ready binding at most once, in the order `max` successive
+/// `port_poll_in` calls would give them, with the same effects (the cursor moves past the last one given, a delivered one-shot binding
+/// disarms). Empty if nothing is ready. Needs WAIT on the port.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: n is the binding count and is non-zero in the loop; next < n
+pub fn port_poll_many_in(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    jobs: &mut Jobs,
+    max: usize,
+) -> Result<Vec<(u64, u32)>, Status> {
+    let port_obj = port_of(reg, table, port, Rights::WAIT)?;
+    prune_port(reg, jobs, port_obj);
+    let picked: Vec<(usize, u64, u32, ObjId)> = match reg.get(port_obj) {
+        Some(KObj::Port(p)) => {
+            let n = p.bindings.len();
+            (0..n)
+                .map(|i| (p.next + i) % n)
+                .filter(|&i| binding_ready(reg, &p.bindings[i]))
+                .take(max)
+                .map(|i| (i, p.bindings[i].key, p.bindings[i].mask, p.bindings[i].obj))
+                .collect()
+        }
+        _ => return Err(Status::BadHandle),
+    };
+    let observed: Vec<(u64, u32)> = picked
+        .iter()
+        .filter_map(|&(_, key, mask, obj)| object_signals(reg, obj).map(|s| (key, s & mask)))
+        .collect();
+    let Some(KObj::Port(p)) = reg.get_mut(port_obj) else {
+        return Err(Status::BadHandle);
+    };
+    for &(i, ..) in &picked {
+        p.next = i + 1;
+        if p.bindings[i].oneshot {
+            p.bindings[i].armed = false;
+        }
+    }
+    Ok(observed)
+}
+
 /// Arm binding `key` again (a one-shot binding that was delivered; harmless on one that is armed): it
 /// is ready at once if its object's signals match now. Rights: MANAGE on the port.
 pub fn port_rearm_in(
@@ -1129,8 +1170,9 @@ pub fn object_info(reg: &Kobjs, table: &HandleTable, h: Handle) -> Result<(u64, 
     let peer = obj
         .peer()
         .filter(|&p| reg.is_alive(p))
-        .map_or(0, |p| p.koid());
-    Ok((entry.obj.koid(), peer))
+        .and_then(|p| reg.koid(p))
+        .unwrap_or(0);
+    Ok((reg.koid(entry.obj).ok_or(Status::BadHandle)?, peer))
 }
 
 /// A VMO object for VMO store id `id`, with a handle in `table` (default VMO rights).
@@ -1324,7 +1366,7 @@ pub fn vmo_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Resu
 pub fn process_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     kill_on_close: bool,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
@@ -1356,7 +1398,7 @@ pub fn process_of(
     table: &HandleTable,
     h: Handle,
     need: Rights,
-) -> Result<(ObjId, u32, bool, i32), Status> {
+) -> Result<(ObjId, u64, bool, i32), Status> {
     let entry = table.get(h)?;
     match reg.get(entry.obj) {
         Some(KObj::Process(p)) => {
@@ -1391,7 +1433,7 @@ pub fn process_set_stopped(reg: &mut Kobjs, obj: ObjId, stopped: bool) {
 pub fn thread_object_create_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
     if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
@@ -1506,7 +1548,7 @@ pub fn vmo_object_create(
 pub fn process_object_create(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
     kill_on_close: bool,
 ) -> Result<(Handle, ObjId), Status> {
     process_object_create_in(
@@ -1523,7 +1565,7 @@ pub fn process_object_create(
 pub fn thread_object_create(
     reg: &mut Kobjs,
     table: &mut HandleTable,
-    pid: u32,
+    pid: u64,
 ) -> Result<(Handle, ObjId), Status> {
     thread_object_create_in(
         reg,
@@ -1604,6 +1646,14 @@ pub fn port_unbind(
     key: u64,
 ) -> Result<(), Status> {
     port_unbind_in(reg, table, port, key, &mut Jobs::new())
+}
+pub fn port_poll_many(
+    reg: &mut Kobjs,
+    table: &HandleTable,
+    port: Handle,
+    max: usize,
+) -> Result<Vec<(u64, u32)>, Status> {
+    port_poll_many_in(reg, table, port, &mut Jobs::new(), max)
 }
 pub fn port_poll(
     reg: &mut Kobjs,

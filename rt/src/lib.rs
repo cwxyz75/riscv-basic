@@ -50,6 +50,15 @@ pub struct SpawnArgs {
     pub reserved: u64,
 }
 
+/// One record of `port_wait_many` (SYSCALLS.md): a ready binding's key and the signals observed under its mask.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortPacket {
+    pub key: u64,
+    pub observed: u32,
+    pub zero: u32,
+}
+
 /// The result of a raw syscall: the status code and the two result registers.
 #[derive(Debug, Clone, Copy)]
 pub struct Ret {
@@ -130,23 +139,23 @@ pub mod sys {
     pub fn debug_stat(which: u64) -> u64 {
         syscall(DEBUG_STAT, [which as usize, 0, 0, 0, 0, 0]).a1 as u64
     }
-    pub fn handle_close(h: u32) -> Ret {
+    pub fn handle_close(h: u64) -> Ret {
         syscall(HANDLE_CLOSE, [h as usize, 0, 0, 0, 0, 0])
     }
-    pub fn handle_duplicate(h: u32, rights: u32) -> Ret {
+    pub fn handle_duplicate(h: u64, rights: u32) -> Ret {
         syscall(HANDLE_DUPLICATE, [h as usize, rights as usize, 0, 0, 0, 0])
     }
-    pub fn handle_replace(h: u32, rights: u32) -> Ret {
+    pub fn handle_replace(h: u64, rights: u32) -> Ret {
         syscall(HANDLE_REPLACE, [h as usize, rights as usize, 0, 0, 0, 0])
     }
     pub fn channel_create() -> Ret {
         syscall(CHANNEL_CREATE, [0; 6])
     }
     pub fn channel_write(
-        ch: u32,
+        ch: u64,
         bytes: *const u8,
         nbytes: usize,
-        handles: *const u32,
+        handles: *const u64,
         nhandles: usize,
     ) -> Ret {
         syscall(
@@ -162,10 +171,10 @@ pub mod sys {
         )
     }
     pub fn channel_read(
-        ch: u32,
+        ch: u64,
         bytes: *mut u8,
         max_bytes: usize,
-        handles: *mut u32,
+        handles: *mut u64,
         max_handles: usize,
     ) -> Ret {
         syscall(
@@ -181,11 +190,11 @@ pub mod sys {
         )
     }
     pub fn channel_read_txid(
-        ch: u32,
+        ch: u64,
         txid: u32,
         bytes: *mut u8,
         max_bytes: usize,
-        handles: *mut u32,
+        handles: *mut u64,
         max_handles: usize,
     ) -> Ret {
         syscall(
@@ -203,51 +212,51 @@ pub mod sys {
     pub fn event_create() -> Ret {
         syscall(EVENT_CREATE, [0; 6])
     }
-    pub fn event_signal(ev: u32, clear: u32, set: u32) -> Ret {
+    pub fn event_signal(ev: u64, clear: u32, set: u32) -> Ret {
         syscall(
             EVENT_SIGNAL,
             [ev as usize, clear as usize, set as usize, 0, 0, 0],
         )
     }
-    pub fn object_signals(h: u32) -> Ret {
+    pub fn object_signals(h: u64) -> Ret {
         syscall(OBJECT_SIGNALS, [h as usize, 0, 0, 0, 0, 0])
     }
     /// Wait until `signals(h) & mask != 0` or the absolute time `deadline` in **milliseconds** on the `clock_get` clock (0: do not
     /// wait, u64::MAX: forever).
-    pub fn object_wait(h: u32, mask: u32, deadline: u64) -> Ret {
+    pub fn object_wait(h: u64, mask: u32, deadline: u64) -> Ret {
         object_wait_ns(h, mask, deadline_ns(deadline))
     }
     /// `object_wait` with the deadline in nanoseconds on the `clock_ns` clock (the ABI's own unit).
-    pub fn object_wait_ns(h: u32, mask: u32, deadline: u64) -> Ret {
+    pub fn object_wait_ns(h: u64, mask: u32, deadline: u64) -> Ret {
         syscall(
             OBJECT_WAIT,
             [h as usize, mask as usize, deadline as usize, 0, 0, 0],
         )
     }
-    pub fn object_info(h: u32) -> Ret {
+    pub fn object_info(h: u64) -> Ret {
         syscall(OBJECT_INFO, [h as usize, 0, 0, 0, 0, 0])
     }
     pub fn vmo_create(pages: u64) -> Ret {
         syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
     }
     /// A VMO whose pages are charged to `job` (a handle with MANAGE) instead of the caller's own.
-    pub fn vmo_create_in(pages: u64, job: u32) -> Ret {
+    pub fn vmo_create_in(pages: u64, job: u64) -> Ret {
         syscall(VMO_CREATE, [pages as usize, job as usize, 0, 0, 0, 0])
     }
-    pub fn vmo_read(vmo: u32, offset: u64, buf: *mut u8, len: usize) -> Ret {
+    pub fn vmo_read(vmo: u64, offset: u64, buf: *mut u8, len: usize) -> Ret {
         syscall(
             VMO_READ,
             [vmo as usize, offset as usize, buf as usize, len, 0, 0],
         )
     }
     /// Commit pages `[offset, offset + len)` of a VMO now (needs the COMMIT right); the creator's job pays.
-    pub fn vmo_commit(vmo: u32, offset: u64, len: u64) -> Ret {
+    pub fn vmo_commit(vmo: u64, offset: u64, len: u64) -> Ret {
         syscall(
             VMO_COMMIT,
             [vmo as usize, offset as usize, len as usize, 0, 0, 0],
         )
     }
-    pub fn vmo_write(vmo: u32, offset: u64, buf: *const u8, len: usize) -> Ret {
+    pub fn vmo_write(vmo: u64, offset: u64, buf: *const u8, len: usize) -> Ret {
         syscall(
             VMO_WRITE,
             [vmo as usize, offset as usize, buf as usize, len, 0, 0],
@@ -257,23 +266,23 @@ pub mod sys {
     pub fn resource_root() -> Ret {
         syscall(RESOURCE_ROOT, [0; 6])
     }
-    pub fn vmo_create_physical(resource: u32, pa: u64, bytes: u64) -> Ret {
+    pub fn vmo_create_physical(resource: u64, pa: u64, bytes: u64) -> Ret {
         syscall(
             VMO_CREATE_PHYSICAL,
             [resource as usize, pa as usize, bytes as usize, 0, 0, 0],
         )
     }
-    pub fn vmo_create_dma(resource: u32, pages: u64) -> Ret {
+    pub fn vmo_create_dma(resource: u64, pages: u64) -> Ret {
         syscall(
             VMO_CREATE_DMA,
             [resource as usize, pages as usize, 0, 0, 0, 0],
         )
     }
-    pub fn vmo_phys_addr(vmo: u32) -> Ret {
+    pub fn vmo_phys_addr(vmo: u64) -> Ret {
         syscall(VMO_PHYS_ADDR, [vmo as usize, 0, 0, 0, 0, 0])
     }
     /// A read-only VMO holding the device tree; `a2` is its length in bytes.
-    pub fn resource_dtb(resource: u32) -> Ret {
+    pub fn resource_dtb(resource: u64) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])
     }
     /// Sleep if the 32-bit word at `addr` still equals `expected`; `deadline` is an absolute time in milliseconds on the `clock_get`
@@ -292,23 +301,23 @@ pub mod sys {
     pub fn futex_wake(addr: *const u32, count: u32) -> Ret {
         syscall(FUTEX_WAKE, [addr as usize, count as usize, 0, 0, 0, 0])
     }
-    pub fn interrupt_create(resource: u32, irq: u32) -> Ret {
+    pub fn interrupt_create(resource: u64, irq: u32) -> Ret {
         syscall(
             INTERRUPT_CREATE,
             [resource as usize, irq as usize, 0, 0, 0, 0],
         )
     }
-    pub fn interrupt_ack(interrupt: u32) -> Ret {
+    pub fn interrupt_ack(interrupt: u64) -> Ret {
         syscall(INTERRUPT_ACK, [interrupt as usize, 0, 0, 0, 0, 0])
     }
-    pub fn vmo_get_size(vmo: u32) -> Ret {
+    pub fn vmo_get_size(vmo: u64) -> Ret {
         syscall(VMO_GET_SIZE, [vmo as usize, 0, 0, 0, 0, 0])
     }
     pub fn process_create() -> Ret {
         syscall(PROCESS_CREATE, [0; 6])
     }
     /// A process charged to `job` (a handle with MANAGE) instead of the caller's own job.
-    pub fn process_create_in(job: u32) -> Ret {
+    pub fn process_create_in(job: u64) -> Ret {
         syscall(PROCESS_CREATE, [job as usize, 0, 0, 0, 0, 0])
     }
     /// The limits of a job: processes, threads, pages, jobs, objects, ipc bytes (`u64::MAX` means
@@ -316,24 +325,24 @@ pub mod sys {
     pub type Limits = [u64; 6];
     /// No limit on anything.
     pub const NO_LIMITS: Limits = [u64::MAX; 6];
-    pub fn job_create(parent: u32, limits: &Limits) -> Ret {
+    pub fn job_create(parent: u64, limits: &Limits) -> Ret {
         syscall(
             JOB_CREATE,
             [parent as usize, limits.as_ptr() as usize, 0, 0, 0, 0],
         )
     }
-    pub fn job_set_limits(job: u32, limits: &Limits) -> Ret {
+    pub fn job_set_limits(job: u64, limits: &Limits) -> Ret {
         syscall(
             JOB_SET_LIMITS,
             [job as usize, limits.as_ptr() as usize, 0, 0, 0, 0],
         )
     }
     /// `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes. Returns `a1` = used, `a2` = limit.
-    pub fn job_info(job: u32, which: u64) -> Ret {
+    pub fn job_info(job: u64, which: u64) -> Ret {
         syscall(JOB_INFO, [job as usize, which as usize, 0, 0, 0, 0])
     }
     /// Set a job's scheduling limits (`max_prio`, RT budget in ns per 100 ms window, CPU weight): SET_LIMITS.
-    pub fn job_set_sched(job: u32, max_prio: u8, rt_budget_ns: u64, cpu_weight: u32) -> Ret {
+    pub fn job_set_sched(job: u64, max_prio: u8, rt_budget_ns: u64, cpu_weight: u32) -> Ret {
         syscall(
             JOB_SET_SCHED,
             [
@@ -347,17 +356,17 @@ pub mod sys {
         )
     }
     /// Set a thread's base priority (1 to 63) and flags (bit 0: round robin); `thread` 0 is the caller.
-    pub fn thread_set_sched(thread: u32, priority: u8, flags: u8) -> Ret {
+    pub fn thread_set_sched(thread: u64, priority: u8, flags: u8) -> Ret {
         syscall(
             THREAD_SET_SCHED,
             [thread as usize, priority as usize, flags as usize, 0, 0, 0],
         )
     }
     /// `a1` packs the base priority (bits 0-7), flags (8-15) and effective priority (16-23); `a2` is the thread id.
-    pub fn thread_get_sched(thread: u32) -> Ret {
+    pub fn thread_get_sched(thread: u64) -> Ret {
         syscall(THREAD_GET_SCHED, [thread as usize, 0, 0, 0, 0, 0])
     }
-    pub fn job_kill(job: u32, code: i32) -> Ret {
+    pub fn job_kill(job: u64, code: i32) -> Ret {
         syscall(JOB_KILL, [job as usize, code as usize, 0, 0, 0, 0])
     }
     pub fn job_root() -> Ret {
@@ -367,8 +376,8 @@ pub mod sys {
         syscall(PROCESS_SELF, [0; 6])
     }
     pub fn process_map(
-        process: u32,
-        vmo: u32,
+        process: u64,
+        vmo: u64,
         vaddr: u64,
         vmo_offset: u64,
         length: u64,
@@ -386,13 +395,13 @@ pub mod sys {
             ],
         )
     }
-    pub fn process_unmap(process: u32, vaddr: u64) -> Ret {
+    pub fn process_unmap(process: u64, vaddr: u64) -> Ret {
         syscall(
             PROCESS_UNMAP,
             [process as usize, vaddr as usize, 0, 0, 0, 0],
         )
     }
-    pub fn process_start(process: u32, entry: u64, sp: u64, bootstrap: u32, arg: u64) -> Ret {
+    pub fn process_start(process: u64, entry: u64, sp: u64, bootstrap: u64, arg: u64) -> Ret {
         syscall(
             PROCESS_START,
             [
@@ -408,22 +417,22 @@ pub mod sys {
     pub fn socket_create() -> Ret {
         syscall(SOCKET_CREATE, [0; 6])
     }
-    pub fn socket_write(socket: u32, bytes: *const u8, len: usize) -> Ret {
+    pub fn socket_write(socket: u64, bytes: *const u8, len: usize) -> Ret {
         syscall(
             SOCKET_WRITE,
             [socket as usize, bytes as usize, len, 0, 0, 0],
         )
     }
-    pub fn socket_read(socket: u32, buf: *mut u8, max: usize) -> Ret {
+    pub fn socket_read(socket: u64, buf: *mut u8, max: usize) -> Ret {
         syscall(SOCKET_READ, [socket as usize, buf as usize, max, 0, 0, 0])
     }
-    pub fn socket_shutdown(socket: u32) -> Ret {
+    pub fn socket_shutdown(socket: u64) -> Ret {
         syscall(SOCKET_SHUTDOWN, [socket as usize, 0, 0, 0, 0, 0])
     }
     pub fn port_create() -> Ret {
         syscall(PORT_CREATE, [0; 6])
     }
-    pub fn port_bind(port: u32, object: u32, mask: u32, key: u64) -> Ret {
+    pub fn port_bind(port: u64, object: u64, mask: u32, key: u64) -> Ret {
         syscall(
             PORT_BIND,
             [
@@ -437,7 +446,7 @@ pub mod sys {
         )
     }
     /// `port_bind` with flags (`abi::port_flags::ONESHOT`).
-    pub fn port_bind_flags(port: u32, object: u32, mask: u32, key: u64, flags: u64) -> Ret {
+    pub fn port_bind_flags(port: u64, object: u64, mask: u32, key: u64, flags: u64) -> Ret {
         syscall(
             PORT_BIND,
             [
@@ -450,35 +459,49 @@ pub mod sys {
             ],
         )
     }
-    pub fn port_rearm(port: u32, key: u64) -> Ret {
+    pub fn port_rearm(port: u64, key: u64) -> Ret {
         syscall(PORT_REARM, [port as usize, key as usize, 0, 0, 0, 0])
     }
-    pub fn port_unbind(port: u32, key: u64) -> Ret {
+    pub fn port_unbind(port: u64, key: u64) -> Ret {
         syscall(PORT_UNBIND, [port as usize, key as usize, 0, 0, 0, 0])
     }
     /// Wait for a binding to be ready; `deadline` in absolute milliseconds as for `object_wait`.
-    pub fn port_wait(port: u32, deadline: u64) -> Ret {
+    pub fn port_wait(port: u64, deadline: u64) -> Ret {
         port_wait_ns(port, deadline_ns(deadline))
     }
-    /// `port_wait` with the deadline in nanoseconds.
-    pub fn port_wait_ns(port: u32, deadline: u64) -> Ret {
-        syscall(PORT_WAIT, [port as usize, deadline as usize, 0, 0, 0, 0])
-    }
-    pub fn thread_create(process: u32, entry: u64, sp: u64, arg: u64) -> Ret {
+    /// Wait for bindings to be ready and take up to `buf.len()` (1 to 64) of them at once; `deadline` as for `port_wait`. `a1` of the
+    /// result is how many records were written.
+    pub fn port_wait_many(port: u64, buf: &mut [super::PortPacket], deadline: u64) -> Ret {
         syscall(
-            THREAD_CREATE,
+            PORT_WAIT_MANY,
             [
-                process as usize,
-                entry as usize,
-                sp as usize,
-                arg as usize,
+                port as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+                deadline_ns(deadline) as usize,
                 0,
                 0,
             ],
         )
     }
+    /// `port_wait` with the deadline in nanoseconds.
+    pub fn port_wait_ns(port: u64, deadline: u64) -> Ret {
+        syscall(PORT_WAIT, [port as usize, deadline as usize, 0, 0, 0, 0])
+    }
+    /// A thread on a stack the caller provides (`thread_spawn` with CALLER_STACK; the call `thread_create` is retired, AB5): it starts at
+    /// `entry` with `a0 = arg` and `sp` as given. `a1` of the result is its handle, `a2` its tid.
+    pub fn thread_on_stack(process: u64, entry: u64, sp: u64, arg: u64) -> Ret {
+        let rec = SpawnArgs {
+            entry,
+            arg,
+            flags: abi::spawn::CALLER_STACK,
+            sp,
+            ..SpawnArgs::default()
+        };
+        thread_spawn(process, &rec)
+    }
     /// Create and start a thread (SYSCALLS.md `thread_spawn`): `a1` is its handle (0 if detached), `a2` its tid.
-    pub fn thread_spawn(process: u32, rec: &SpawnArgs) -> Ret {
+    pub fn thread_spawn(process: u64, rec: &SpawnArgs) -> Ret {
         syscall(
             THREAD_SPAWN,
             [
@@ -492,7 +515,7 @@ pub mod sys {
         )
     }
     /// Reserved (T56): always NOT_SUPPORTED for a valid thread handle.
-    pub fn thread_interrupt(thread: u32) -> Ret {
+    pub fn thread_interrupt(thread: u64) -> Ret {
         syscall(THREAD_INTERRUPT, [thread as usize, 0, 0, 0, 0, 0])
     }
     pub fn thread_exit(code: i32) -> ! {
@@ -501,24 +524,24 @@ pub mod sys {
             core::hint::spin_loop();
         }
     }
-    pub fn thread_info(thread: u32) -> Ret {
+    pub fn thread_info(thread: u64) -> Ret {
         syscall(THREAD_INFO, [thread as usize, 0, 0, 0, 0, 0])
     }
-    pub fn process_kill(process: u32, code: i32) -> Ret {
+    pub fn process_kill(process: u64, code: i32) -> Ret {
         syscall(PROCESS_KILL, [process as usize, code as usize, 0, 0, 0, 0])
     }
     /// Stop every thread of `process` until `process_resume` (needs KILL).
-    pub fn process_suspend(process: u32) -> Ret {
+    pub fn process_suspend(process: u64) -> Ret {
         syscall(PROCESS_SUSPEND, [process as usize, 0, 0, 0, 0, 0])
     }
-    pub fn process_resume(process: u32) -> Ret {
+    pub fn process_resume(process: u64) -> Ret {
         syscall(PROCESS_RESUME, [process as usize, 0, 0, 0, 0, 0])
     }
-    pub fn process_info(process: u32) -> Ret {
+    pub fn process_info(process: u64) -> Ret {
         syscall(PROCESS_INFO, [process as usize, 0, 0, 0, 0, 0])
     }
     /// `channel_call`; `args.deadline` is an absolute time in **milliseconds** on the `clock_get` clock (0: poll, `u64::MAX`: never).
-    pub fn channel_call(ch: u32, args: &super::CallArgs) -> Ret {
+    pub fn channel_call(ch: u64, args: &super::CallArgs) -> Ret {
         let ns = super::CallArgs {
             req_bytes: args.req_bytes,
             req_handles: args.req_handles,
@@ -533,7 +556,7 @@ pub mod sys {
         channel_call_ns(ch, &ns)
     }
     /// `channel_call` with `args.deadline` in nanoseconds (the ABI's own unit).
-    pub fn channel_call_ns(ch: u32, args: &super::CallArgs) -> Ret {
+    pub fn channel_call_ns(ch: u64, args: &super::CallArgs) -> Ret {
         syscall(
             CHANNEL_CALL,
             [
@@ -549,7 +572,7 @@ pub mod sys {
 }
 
 /// The handle value of the bootstrap channel every process starts with (SYSCALLS.md).
-pub const BOOTSTRAP: u32 = 1;
+pub const BOOTSTRAP: u64 = 1;
 
 /// The argument record of `channel_call` (SYSCALLS.md; 56 bytes).
 #[repr(C)]
