@@ -4,7 +4,6 @@ kind: slice
 title: `thread_suspend`, `thread_resume`, thread state read and write, `thread_spawn` SUSPENDED
 area: kernel
 horizon: long
-blocked_by: [L19]
 refs: [KERNEL-V1-SPEC, OD137]
 ---
 
