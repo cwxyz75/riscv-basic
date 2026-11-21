@@ -62,7 +62,7 @@ pub struct Kmem {
     _vmos: Held<'static, Vmos>,
 }
 
-/// The frame database alone (`FRAME`), for the code that needs only frames: the heap's pool and the kernel stacks.
+/// The frame database alone (`FRAME`), for the code that needs only frames: the heap's pool (the kernel stacks also need the address space, so they use `get`).
 pub struct Frames {
     pub mm: &'static mut Mm<DirectMap>,
     _frame: Held<'static, Mm<DirectMap>>,
@@ -77,6 +77,10 @@ pub struct JobsRef {
 /// Take `JOBS` alone (not inside `get`'s three locks: taking it again would be a recursive take).
 #[track_caller]
 pub fn jobs() -> JobsRef {
+    debug_assert!(
+        crate::bkl::held(),
+        "the job ledger touched without the big kernel lock"
+    );
     let mut g = JOBS.lock();
     // SAFETY: as in `get`.
     unsafe {
@@ -510,5 +514,6 @@ pub fn kernel_half_unchanged() -> bool {
 /// Must be called with the big kernel lock held, like `get`.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a sum of three frame counts, each at most the number of frames
 pub fn free_frames_accounted() -> usize {
-    get().mm.db.free_count() + crate::kstack::frames_held() + crate::heap::frames_held()
+    let free = get().mm.db.free_count(); // (the locks are released before the two calls below)
+    free + crate::kstack::frames_held() + crate::heap::frames_held()
 }

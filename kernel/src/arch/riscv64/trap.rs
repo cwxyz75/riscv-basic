@@ -581,6 +581,13 @@ fn trap_body(frame: &mut TrapFrame) {
         15 => Access::Write,
         _ => fatal(frame, format_args!("unexpected trap")),
     };
+    // (a fault taken while a lock of class VMO or later is held cannot be handled: the handler would take them again. Say what it was.)
+    if crate::bkl::violates(crate::bkl::Class::Vmo) {
+        fatal(
+            frame,
+            format_args!("kernel page fault with a memory lock held"),
+        );
+    }
     let k = kmem::get();
     match k
         .aspace

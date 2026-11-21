@@ -118,7 +118,7 @@ pub fn order_check(held: Class, probe: Class) -> bool {
             let _ = write!(crate::console::Console, "");
             crate::console::with_uart_for_test();
         }
-        // (the other classes have no lock in the kernel yet: the pure pair table covers them, `klock/tests/order.rs`)
+        // (the other classes are probed by pretending to hold them; the pure pair table is in `klock/tests/order.rs`)
         other => note_acquire(other, 0),
     }
     let flagged = VIOLATIONS.load(Ordering::SeqCst) > before;

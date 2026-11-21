@@ -4,7 +4,7 @@
 //!
 //! Allocation tries the boot heap, then the grown one. It never grows by itself: the allocator runs with
 //! interrupts off, from the timer interrupt and with or without the big kernel lock, and the frame database is
-//! under the big lock. Growth happens at **safe points** (`service`, called with the big lock held at the tail
+//! under the big lock and its own `FRAME` lock (L16). Growth happens at **safe points** (`service`, called with the big lock held at the tail
 //! of every trap that takes the big lock and by the idle loop): when the free bytes fall below `LOW_WATER` the heap is extended
 //! by `GROW_STEP`. A single syscall allocates far less than `LOW_WATER`, so an allocation cannot find both heaps
 //! empty unless something allocates without bound (which the caps of OD50 and the job quotas forbid). The grown
