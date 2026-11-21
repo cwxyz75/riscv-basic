@@ -4,7 +4,7 @@ kind: slice
 title: Reserved ABI space for shadow stacks, landing pads and pointer masking
 area: security
 horizon: long
-blocked_by: [MM7, EX1]
+blocked_by: [EX1]
 refs: [KERNEL-V1-SPEC, OD139]
 ---
 

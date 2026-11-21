@@ -155,7 +155,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 32 | object_signals | `a0` handle | `a1` the signal word |
 | 33 | object_wait | `a0` handle, `a1` mask, `a2` deadline | `a1` observed signals |
 | 34 | object_info | `a0` handle | `a1` koid, `a2` peer koid |
-| 40 | vmo_create | `a0` pages | `a1` handle |
+| 40 | vmo_create | `a0` bytes, `a1` job (0: the caller's), `a2` flags | `a1` handle |
 | 41 | vmo_read | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 42 | vmo_write | `a0` vmo, `a1` offset, `a2` buffer, `a3` length | |
 | 43 | vmo_get_size | `a0` vmo | `a1` bytes |
@@ -163,15 +163,21 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 45 | vmo_create_dma | `a0` resource, `a1` pages | `a1` handle |
 | 46 | vmo_phys_addr | `a0` vmo | `a1` physical address |
 | 47 | vmo_commit | `a0` vmo, `a1` offset, `a2` length | |
+| 48 | vmo_decommit | `a0` vmo, `a1` offset, `a2` length | |
+| 49 | vmo_set_size | `a0` vmo, `a1` bytes | |
 | 50 | process_create | | `a1` handle |
 | 51 | process_self | | `a1` handle |
-| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr, `a3` vmo_offset, `a4` length, `a5` flags | |
-| 53 | process_unmap | `a0` process, `a1` vaddr | |
+| 52 | process_map | `a0` process, `a1` vmo, `a2` vaddr (0 with ANYWHERE), `a3` vmo_offset, `a4` length, `a5` flags (R 1, W 2, X 4, ANYWHERE 8) | `a1` the address, for ANYWHERE |
+| 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
 | 56 | process_info | `a0` process | `a1` exit code |
 | 57 | process_suspend | `a0` process | |
+| 59 | process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags | |
 | 58 | process_resume | `a0` process | |
+| 67 | process_map_info | `a0` process, `a1` vaddr, `a2` buffer | `a1` the next region's base, or 0 |
+| 68 | vmo_create_child | `a0` vmo, `a1` offset, `a2` bytes, `a3` job (0: the caller's), `a4` flags | `a1` handle |
+| 69 | process_clone_region | `a0` source process, `a1` target process, `a2` vaddr, `a3` mode | |
 | 70 | socket_create | | `a1`, `a2` the two handles |
 | 71 | socket_write | `a0` socket, `a1` bytes, `a2` length | `a1` written |
 | 72 | socket_read | `a0` socket, `a1` buffer, `a2` max | `a1` read |
@@ -345,10 +351,10 @@ the signal **TERMINATED** (bit 3) when it has ended. **Closing the last handle t
 kills it** (so a creator that drops its handle cannot leave an unmanageable process behind);
 closing the last handle to a VMO frees it once nothing maps it.
 
-### vmo_create(pages, job) -> status, handle
+### vmo_create(bytes, job, flags) -> status, handle
 
 New zero-filled VMO whose pages are charged to a job as they are first touched (S4.5): `job` is
-a job handle with MANAGE, or 0 for the caller's own job. Errors: INVALID_ARGS (`pages` is 0 or
+a job handle with MANAGE, or 0 for the caller's own job. `flags` (MM6): bit 0 `RESIZABLE` makes the VMO's size changeable (`vmo_set_size`); any other bit is INVALID_ARGS. The size is in bytes, rounded up to whole pages (`vmo_get_size` returns the rounded size). Errors: INVALID_ARGS (`bytes` is 0 or
 over the limit); BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED (`job`); NO_MEMORY (object cap or kernel
 memory). A page that cannot be charged is refused when it is first touched, with NO_MEMORY from
 `vmo_write`, or as a fault that ends the process. Tests: `vmo_*` in `init`.
@@ -360,6 +366,22 @@ WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (a bad user pointer, or the range does n
 inside the VMO: `offset + length` wraps or exceeds its size; a zero `length` is allowed
 anywhere inside or at the end). `length` is limited to `MAX_MSG_BYTES` per call (TOO_BIG).
 Nothing is written on an error.
+
+### vmo_decommit(vmo, offset, length) -> status
+
+Give back the pages `[offset, offset + length)` of a VMO (MM6): every mapping of them, in every address space, goes and every hart drops its translations **before** any frame is freed, then the VMO drops its references, the frames return to the allocator and the VMO's creating job is credited. The range reads as zeros afterwards, through a mapping (the page faults in again as a fresh zero page, charged then (a member of a family with a parent maps the shared zero frame for a read and is charged at its first write)) and through `vmo_read`. Pages that were never committed cost nothing. Rights: WRITE. `offset` and `length` must be page aligned and `length` not 0 (INVALID_ARGS), the range inside the VMO (INVALID_ARGS). Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; NOT_SUPPORTED (a device or DMA VMO: their frames are fixed); INVALID_ARGS; BAD_STATE (a process of another job than the VMO's has a mapping that covers part of the range: V1, INVARIANTS: such a process holds its mapping on the promise that touching it never fails on the VMO's job; nothing changes). For a member of a family (MM8) a page inside the window it inherits becomes an explicit hole: it reads zeros whatever its parent shows now or later, and a read maps the shared zero frame, uncharged; the hole's slot (8 bytes) is kernel bookkeeping not charged to the job, as the page index of any VMO is. Outside that window the pages simply go. The mappings stay (the regions keep their length); only the pages go. A decommit that finds nothing mapped anywhere costs no shootdown. Tests: `vmo_decommit_and_resize_from_user_mode`, `kcore/tests/vmo_ops_model.rs`.
+
+### vmo_set_size(vmo, bytes) -> status
+
+Change the size of a VMO made with `RESIZABLE` (MM6); `bytes` must be a whole number of pages, not 0, and at most the VMO limit (INVALID_ARGS). Growing changes the size and nothing else (no page is committed). Shrinking decommits the pages past the new end exactly as `vmo_decommit` does (mappings and translations first, then the frames) and the size follows; a mapping that reaches past the new end keeps its length, and **touching its part past the end is a page fault that ends the process** (the address is in no backed region). Rights: WRITE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no WRITE, or the VMO was not made RESIZABLE: every device and DMA VMO is not, and is refused here, before the size is looked at); INVALID_ARGS; BAD_STATE (a shrink, when a process of another job than the VMO's maps part of the tail: as for `vmo_decommit`; or the VMO has children, MM8). Growing never fails on a mapping. Sizes are whole pages until the byte-sized VMOs of MM6's full text (work/T207.md). Tests: `vmo_decommit_and_resize_from_user_mode`, `touching_past_a_shrunk_vmo_ends_the_process_cleanly`.
+
+### vmo_create_child(vmo, offset, bytes, job, flags) -> status, handle
+
+Make a copy-on-write child of the bytes `[offset, offset + bytes)` of a VMO (MM8, KERNEL-V1-SPEC 4.3). `flags` is exactly one of `child_flags::SNAPSHOT` (1) or `PRIVATE` (2). Rights: READ on the source; the new handle carries the full VMO rights. `job` is a job handle with MANAGE, or 0 for the caller's own. **SNAPSHOT**: afterwards the source and the child each see the source's contents as they were, and each one's later writes are private to the writer. The child is charged to the source's job (`job` must be it: ACCESS_DENIED otherwise), so a page never changes payer (COW2). The source's committed pages move to a hidden node that both hang under (or, when the source holds nothing of its own since the last SNAPSHOT, the child hangs under the node that is already there: a `fork` that clones every region of one VMO makes one node); every writable translation of the source is made read-only and dropped from every hart's TLB before the call returns (COW1); the first write to a page the writer only inherits copies it into the writer (charged to the writer's job), or takes the frame over when no other node can see it. When a leaf goes and a hidden node is left with one child, the node is merged into it. **PRIVATE**: the child sees the source's pages, including later changes to pages it has not written (a page nobody has committed reads as zeros through the shared zero frame, read-only, and a later write by the source shows); the child's writes copy into the child and are charged to its job; the source never sees them. Allowed across jobs. No chain of children, counted from the deepest descendant of the source, is more than 64 links (BAD_STATE). `offset` and `bytes` must be page aligned and `bytes` not 0 (INVALID_ARGS), the range inside the source (INVALID_ARGS). Errors, in order: INVALID_ARGS (flags, alignment, zero length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (READ; MANAGE on the job; a SNAPSHOT into another job); BAD_STATE (**a SNAPSHOT while a process of another job than the VMO's maps the source**: V1, such a process holds its mapping on the promise that a write never charges the VMO's job, and a SNAPSHOT would turn its next write into a copy); then NOT_SUPPORTED (a device or DMA VMO), INVALID_ARGS (the range), BAD_STATE (too deep), NO_MEMORY (including no room for the handle: the source is not touched until the handle exists). A source that is written between two SNAPSHOTs while the earlier children live adds a hidden node each time, so one written VMO can have about 64 live SNAPSHOT children before the next is BAD_STATE (the spec's depth limit; children of an unwritten source share one node). Nothing changes on an error. Everything that holds a page of a family (the member's own mappings, the mappings of everything below it, in every address space) is kept coherent: a copy, or a page that becomes visible where a read had mapped the shared zero frame, drops the stale translations of every address space and every hart before the thread that caused it runs on. `vmo_write` and `vmo_commit` work on members; `vmo_decommit` of a member's range inside the window it inherits leaves an explicit hole (zeros whatever the parent shows, no frame, no charge); `vmo_set_size` is refused (BAD_STATE) for a VMO with children and otherwise works (a grown member reads zeros for the new pages). Tests: `copy_on_write_children_from_user_mode` (with its negative control, the `fault-skip-cow-protect` kernel), `kcore/tests/vmofamily_model.rs` (random trees against a reference, through `vmo_read`/`vmo_write` and two address spaces, with protect cycles, decommit and resize; mutation-checked), `kcore/tests/vmofamily_concurrency.rs` (shuttle), `ksys/tests/proc_calls.rs`.
+
+### process_clone_region(source, target, vaddr, mode) -> status
+
+Map the region of `source` that **starts at** `vaddr` into `target` at the same address with the same permissions and ceiling (MM8); no VMO handle is exposed, so a `fork` shim can loop over `process_map_info` and clone every region. `mode` `clone_mode::SHARE` (1) maps the same VMO; `SNAPSHOT` (2) maps a SNAPSHOT child of the source's VMO range (as `vmo_create_child` does, with its rules), which must be charged to the target's job (ACCESS_DENIED otherwise: a fork child runs in its parent's job). Rights: MANAGE on both processes (and so authority over everything either maps: a holder of MANAGE on two processes can read and write the source's memory through a SHARE without any VMO handle, as the spec intends). The target must have no mapping in the range. Errors, in order: INVALID_ARGS (mode, alignment); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no region starts at `vaddr`, the target has a mapping there); BAD_STATE (either process has ended; a SNAPSHOT while a process of another job maps the VMO; too deep; a stranger's VMO that is not committed, as for `process_map`); NOT_SUPPORTED (a SNAPSHOT of a device or DMA region); NO_MEMORY (the target is at the region limit; no memory). The page tables are charged to the target's job as for `process_map`. Nothing changes on an error. Tests: `process_clone_region_shares_or_snapshots_a_region_into_another_process`.
 
 ### vmo_commit(vmo, offset, length) -> status
 
@@ -477,15 +499,25 @@ otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger ch
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
 process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
-`length` 0; unknown flag bits; W with X; the range outside the user half (or including page zero) or outside the
+`length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 is refused unless the flag ANYWHERE is set) or outside the
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
+
+**ANYWHERE (MM7):** the flag `ANYWHERE` (8; `vaddr` must be 0, else INVALID_ARGS) asks the kernel to choose (every argument error is found first, so a call refused for its arguments draws nothing from the entropy pool; one that fails later, for V1 or for want of memory, has drawn up to nine values): a page-aligned place in the mapping arena (`0x9_0000_0000`, above the runtime heap's range, up to the stack arena), picked at random (the kernel entropy pool: HD1): eight random positions are tried, then the first fit from a random start, wrapping once; the address comes back in `a1`. NO_MEMORY when nothing fits. A mapping that touches another of the same VMO at the next offset with the same permissions becomes part of it. The mapping remembers what it may later be raised to (`process_protect`): read, write if the VMO handle had WRITE, execute if it had EXECUTE.
 Tests: `process_map_*` in `init`.
 
-### process_unmap(process, vaddr) -> status
+### process_unmap(process, vaddr, length) -> status
 
-Remove the mapping that starts at `vaddr`. Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE;
-ACCESS_DENIED; BAD_STATE; INVALID_ARGS (no mapping starts there).
+With `length` 0 (the original call): remove the mapping that starts at `vaddr`, whole. (A mapping is the region: two `process_map` calls of the same VMO at adjacent addresses, contiguous offsets and the same permissions are one mapping, so removing it by its start removes both; the range form below addresses pages and does not care.) With a `length` (MM7): remove every page of `[vaddr, vaddr + length)`; holes are fine, and a mapping that reaches past either edge is split there and the rest stays. Every hart drops its translations before a freed frame can be reused (TLB2). Rights: MANAGE. Errors: BAD_HANDLE; WRONG_TYPE;
+ACCESS_DENIED; BAD_STATE; INVALID_ARGS (`length` 0: no mapping starts there; otherwise `vaddr` or `length` not page aligned, or the range is not inside the user half); NO_MEMORY (the call needs to split a mapping and the address space is at its region limit: a range that lands on mapping boundaries needs no split and never fails for this).
+
+### process_protect(process, vaddr, length, flags) -> status
+
+Change the permissions of `[vaddr, vaddr + length)` to `flags` (R = 1, W = 2, X = 4; read is always implied; MM7). The **whole range must be mapped** (mappings that touch count as one), and `flags` must be within what each mapping may be raised to (read; write if the VMO handle that mapped it had WRITE; execute if it had EXECUTE), and never W with X. Mappings are split at the edges, the page-table entries change in place (no frame moves), and neighbours that now agree merge. A permission taken away is dropped by every hart before the call returns; pages that became executable are synchronised for instruction fetch on every hart (PL7). Rights: MANAGE. Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (MANAGE; or `flags` beyond the ceiling of part of the range, checked after the range is known to be mapped); INVALID_ARGS (unknown flag bits or W with X; `vaddr` or `length` not page aligned, `length` 0, or the range not inside the user half; part of the range not mapped); BAD_STATE (the process has ended); NO_MEMORY (the split would pass the region limit). Nothing changes on an error. Tests: `process_protect_*` in `init`, `kcore/tests/region_ops_model.rs`.
+
+### process_map_info(process, vaddr, buffer) -> status, next
+
+Describe the mapping that contains `vaddr`, or the first one above it (MM7): six 64-bit words are written to `buffer` in the caller's memory: base, length in bytes, permissions, the permissions it may be raised to (bit 0 read, bit 1 write, bit 2 execute), the VMO's id, and the byte offset into the VMO. `a1` is the base of the next mapping above this one, or 0. With no mapping at or above `vaddr` the record is all zeros and `a1` is 0. Rights: INSPECT on `process`. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE; INVALID_ARGS (a bad buffer). Tests: `process_protect_*` in `init`.
 
 ### process_start(process, entry, sp, bootstrap, arg) -> status
 
@@ -547,7 +579,7 @@ a worst-case estimate: one page for a process's root table and, per mapped regio
 512 pages it spans plus four, charged to the process's job when the region is mapped and credited
 when it is unmapped or the process ends (the kernel's own objects are bounded by the global caps,
 not charged). **Objects** are charged to the job they are created for: the creating process's job, except that a
-process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(pages, job)`)
+process object and a VMO made with a job handle (`process_create(job)`, `vmo_create(bytes, job)`)
 are charged to that job (a channel or socket pair counts two) and credited when they are destroyed. **Queued data** is charged to the job
 that created the *endpoint holding the queue* (so the creator of a conversation pays for both
 buffers, whoever writes into them), credited when read or when the endpoint is destroyed; a
@@ -910,8 +942,9 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | port_create, port_bind, port_unbind, port_wait | specified (S3c-3) |
 | debug_write, process_exit, thread_yield, clock_get, object_signals | specified (S3b numbers above); implemented in S3b |
 | vmo_create, vmo_read, vmo_write, vmo_get_size | specified (S3c-2a) |
-| vmo_set_size, vmo_create_child | planned, later |
-| process_map, process_unmap (stand in for vmar_*; protect is later) | specified (S3c-2a) |
+| vmo_set_size, vmo_create_child | specified and implemented (MM6, MM8) |
+| process_clone_region | specified and implemented (MM8) |
+| process_map, process_unmap, process_protect, process_map_info | specified (S3c-2a, MM7) |
 | process_create, process_self, process_start, process_kill, process_info | specified (S3c-2a) |
 | process_suspend, process_resume | specified and implemented (SIG2) |
 | thread_spawn, thread_exit, thread_info | specified (S3c-2b) |

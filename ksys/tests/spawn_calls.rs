@@ -41,6 +41,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         thread_objs: BTreeMap::new(),
         job,
         table_charge: BTreeMap::new(),
+        charge_end: BTreeMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,

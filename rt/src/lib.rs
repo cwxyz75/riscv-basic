@@ -237,11 +237,70 @@ pub mod sys {
         syscall(OBJECT_INFO, [h as usize, 0, 0, 0, 0, 0])
     }
     pub fn vmo_create(pages: u64) -> Ret {
-        syscall(VMO_CREATE, [pages as usize, 0, 0, 0, 0, 0])
+        syscall(
+            VMO_CREATE,
+            [pages.saturating_mul(4096) as usize, 0, 0, 0, 0, 0],
+        )
+    }
+    /// A VMO of `bytes` bytes (rounded up to whole pages), charged to `job` (0: the caller's own), with `flags` (`abi::vmo_flags`).
+    pub fn vmo_create_bytes(bytes: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE,
+            [bytes as usize, job as usize, flags as usize, 0, 0, 0],
+        )
     }
     /// A VMO whose pages are charged to `job` (a handle with MANAGE) instead of the caller's own.
     pub fn vmo_create_in(pages: u64, job: u64) -> Ret {
-        syscall(VMO_CREATE, [pages as usize, job as usize, 0, 0, 0, 0])
+        syscall(
+            VMO_CREATE,
+            [
+                pages.saturating_mul(4096) as usize,
+                job as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+    /// A VMO with `flags` (`abi::vmo_flags`: RESIZABLE), charged to `job` (0: the caller's own).
+    pub fn vmo_create_flags(pages: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE,
+            [
+                pages.saturating_mul(4096) as usize,
+                job as usize,
+                flags as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Give back the committed pages of `[offset, offset + len)` of a VMO (needs WRITE; page aligned): every mapping of them goes, and they read as zeros.
+    pub fn vmo_decommit(vmo: u64, offset: u64, len: u64) -> Ret {
+        syscall(
+            VMO_DECOMMIT,
+            [vmo as usize, offset as usize, len as usize, 0, 0, 0],
+        )
+    }
+    /// Change the size of a resizable VMO to `bytes` (a multiple of the page size; needs WRITE).
+    pub fn vmo_set_size(vmo: u64, bytes: u64) -> Ret {
+        syscall(VMO_SET_SIZE, [vmo as usize, bytes as usize, 0, 0, 0, 0])
+    }
+    /// A copy-on-write child of `bytes` bytes of `vmo` from `offset`, charged to `job` (0: the caller's own): `flags` is `child_flags::SNAPSHOT` or `PRIVATE` (MM8). Returns the handle.
+    pub fn vmo_create_child(vmo: u64, offset: u64, bytes: u64, job: u64, flags: u64) -> Ret {
+        syscall(
+            VMO_CREATE_CHILD,
+            [
+                vmo as usize,
+                offset as usize,
+                bytes as usize,
+                job as usize,
+                flags as usize,
+                0,
+            ],
+        )
     }
     pub fn vmo_read(vmo: u64, offset: u64, buf: *mut u8, len: usize) -> Ret {
         syscall(
@@ -399,6 +458,65 @@ pub mod sys {
         syscall(
             PROCESS_UNMAP,
             [process as usize, vaddr as usize, 0, 0, 0, 0],
+        )
+    }
+    /// Unmap every page of `[vaddr, vaddr + len)`: holes are fine and mappings are split at the edges (MM7).
+    pub fn process_unmap_range(process: u64, vaddr: u64, len: u64) -> Ret {
+        syscall(
+            PROCESS_UNMAP,
+            [process as usize, vaddr as usize, len as usize, 0, 0, 0],
+        )
+    }
+    /// Change the permissions of a fully mapped range (`flags`: R 1, W 2, X 4; MM7).
+    pub fn process_protect(process: u64, vaddr: u64, len: u64, flags: u64) -> Ret {
+        syscall(
+            PROCESS_PROTECT,
+            [
+                process as usize,
+                vaddr as usize,
+                len as usize,
+                flags as usize,
+                0,
+                0,
+            ],
+        )
+    }
+    /// Map `length` bytes of `vmo` where the kernel chooses; the address is in `a1` (MM7).
+    pub fn process_map_anywhere(
+        process: u64,
+        vmo: u64,
+        vmo_offset: u64,
+        length: u64,
+        flags: u64,
+    ) -> Ret {
+        process_map(
+            process,
+            vmo,
+            0,
+            vmo_offset,
+            length,
+            flags | abi::map_flags::ANYWHERE,
+        )
+    }
+    /// The mapping at or after `vaddr`: six words in `buf` (base, length, permissions, ceiling, VMO id, VMO offset); `a1` is the next base or 0 (MM7).
+    pub fn process_map_info(process: u64, vaddr: u64, buf: *mut u64) -> Ret {
+        syscall(
+            PROCESS_MAP_INFO,
+            [process as usize, vaddr as usize, buf as usize, 0, 0, 0],
+        )
+    }
+    /// Map the region of `source` that starts at `vaddr` into `target` at the same address: `clone_mode::SHARE` or `SNAPSHOT` (MM8).
+    pub fn process_clone_region(source: u64, target: u64, vaddr: u64, mode: u64) -> Ret {
+        syscall(
+            PROCESS_CLONE_REGION,
+            [
+                source as usize,
+                target as usize,
+                vaddr as usize,
+                mode as usize,
+                0,
+                0,
+            ],
         )
     }
     pub fn process_start(process: u64, entry: u64, sp: u64, bootstrap: u64, arg: u64) -> Ret {

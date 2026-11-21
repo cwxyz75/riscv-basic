@@ -97,6 +97,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         thread_objs: BTreeMap::new(),
         job: JobId::ROOT,
         table_charge: BTreeMap::new(),
+        charge_end: BTreeMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: abi::user::STACK_ARENA_BASE,
         privileged: true,

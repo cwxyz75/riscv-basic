@@ -196,6 +196,34 @@ pub mod rights {
 
 /// Signal bits (SYSCALLS.md, "Signals").
 /// Flags for `port_bind` (its fifth argument).
+/// Flags for `vmo_create` (its third argument, MM6).
+pub mod vmo_flags {
+    /// The VMO's size may change (`vmo_set_size`).
+    pub const RESIZABLE: u64 = 1;
+}
+
+/// Flags for `vmo_create_child` (its fifth argument, MM8): exactly one.
+pub mod child_flags {
+    /// The source and the child each see the source's contents as they were; later writes are private to the writer. The child is charged to the source's job.
+    pub const SNAPSHOT: u64 = 1;
+    /// The child sees the source's pages, including later changes to those it has not written; its writes are private to it.
+    pub const PRIVATE: u64 = 2;
+}
+
+/// Flags of `process_map` beyond the permissions (R 1, W 2, X 4): MM7.
+pub mod map_flags {
+    /// The kernel picks a free place at random (`vaddr` must be 0); the address is returned in `a1`.
+    pub const ANYWHERE: u64 = 8;
+}
+
+/// Modes of `process_clone_region` (its fourth argument, MM8).
+pub mod clone_mode {
+    /// The target maps the same VMO with the same permissions.
+    pub const SHARE: u64 = 1;
+    /// The target maps a SNAPSHOT child of the source's VMO.
+    pub const SNAPSHOT: u64 = 2;
+}
+
 pub mod port_flags {
     /// The binding disarms itself when `port_wait` reports it, until `port_rearm`.
     pub const ONESHOT: u64 = 1;
@@ -309,6 +337,10 @@ pub mod syscall {
     pub const VMO_CREATE_DMA: usize = 45;
     pub const VMO_PHYS_ADDR: usize = 46;
     pub const VMO_COMMIT: usize = 47;
+    /// Give back the committed pages of a range of a VMO (MM6): they read as zeros afterwards.
+    pub const VMO_DECOMMIT: usize = 48;
+    /// Change the size of a resizable VMO (MM6).
+    pub const VMO_SET_SIZE: usize = 49;
     pub const PROCESS_CREATE: usize = 50;
     pub const PROCESS_SELF: usize = 51;
     pub const PROCESS_MAP: usize = 52;
@@ -319,6 +351,8 @@ pub mod syscall {
     /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
     pub const PROCESS_SUSPEND: usize = 57;
     pub const PROCESS_RESUME: usize = 58;
+    /// Change the permissions of a range of a process's mappings (MM7).
+    pub const PROCESS_PROTECT: usize = 59;
     // 60 was `thread_create`: retired, not reused (AB5)
     pub const THREAD_EXIT: usize = 61;
     pub const THREAD_INFO: usize = 62;
@@ -330,6 +364,12 @@ pub mod syscall {
     /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
     pub const THREAD_SET_SCHED: usize = 65;
     pub const THREAD_GET_SCHED: usize = 66;
+    /// Describe the region of a process at or after an address (MM7).
+    pub const PROCESS_MAP_INFO: usize = 67;
+    /// Make a copy-on-write child of a range of a VMO (MM8): SNAPSHOT or PRIVATE.
+    pub const VMO_CREATE_CHILD: usize = 68;
+    /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
+    pub const PROCESS_CLONE_REGION: usize = 69;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -370,6 +410,9 @@ pub mod user {
     pub const MAX_DEBUG_WRITE: usize = 4096;
     /// The stack arena: where `thread_spawn` maps the stacks it provisions (32 GiB nothing else is given).
     pub const STACK_ARENA_BASE: u64 = crate::arch::USER_STACK_ARENA_BASE;
+    /// Where the arena that ANYWHERE mappings are placed in starts: above the runtime heap's range (`rt::heap`: 128 MiB from 0x8_0000_0000),
+    /// which grows at fixed addresses and reserves nothing.
+    pub const MAP_ARENA_BASE: u64 = 0x9_0000_0000;
     pub const STACK_ARENA_END: u64 = crate::arch::USER_STACK_ARENA_END;
 }
 

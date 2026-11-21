@@ -34,7 +34,7 @@ pub use lifecycle::{
     job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
     thread_target,
 };
-pub use proc::{proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
+pub use proc::{cow_sync, proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
 pub use state::{ThreadStart, UserState};
 pub use thread::{
     charge_thread, clamp_prio, credit_thread, new_start, process_start, thread_spawn,

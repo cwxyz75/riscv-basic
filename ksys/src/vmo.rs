@@ -42,9 +42,14 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
     let h = |i: usize| Handle(a[i]);
     let r: Reply = (|| match n {
         nr::VMO_CREATE => {
-            if a[0] == 0 || a[0] > abi::limits::MAX_VMO_PAGES {
+            // (a0 is a size in bytes, rounded up to whole pages)
+            if a[0] == 0
+                || a[0].div_ceil(4096) > abi::limits::MAX_VMO_PAGES
+                || a[2] & !abi::vmo_flags::RESIZABLE != 0
+            {
                 return fail(Status::InvalidArgs);
             }
+            let pages = a[0].div_ceil(4096);
             // a1: the job the memory is charged to (a handle with MANAGE), or 0 for the caller's own
             let job = if a[1] == 0 {
                 job
@@ -52,7 +57,10 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 ipc::job_of(objs, handles, h(1), Rights::MANAGE).map_err(|e| (e, None, None))?
             };
             vmos.reserve_one().map_err(|e| (e, None, None))?;
-            let id = vmos.create_in(jobs, a[0], job);
+            let id = vmos.create_in(jobs, pages, job);
+            if a[2] & abi::vmo_flags::RESIZABLE != 0 {
+                vmos.set_resizable(id);
+            }
             match ipc::vmo_object_create_in(
                 objs,
                 handles,

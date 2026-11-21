@@ -4,7 +4,6 @@ kind: slice
 title: Position-independent programs and address randomisation for them
 area: security
 horizon: long
-blocked_by: [MM7]
 refs: [KERNEL-V1-SPEC, OD139]
 ---
 

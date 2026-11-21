@@ -23,12 +23,17 @@ mod alloc_free {
     pub const R: u64 = 1;
     pub const W: u64 = 2;
     pub const X: u64 = 4;
+    pub const ANY: u64 = abi::map_flags::ANYWHERE;
 }
 
 #[derive(Default)]
 struct Tlb {
     shootdowns: u32,
     flushes: u32,
+    /// Executable pages the instruction caches were synchronised for (PL7).
+    icache_pages: u64,
+    /// Draws from the entropy pool (ANYWHERE).
+    randoms: u32,
 }
 impl Machine for Tlb {
     fn shootdown(&mut self) {
@@ -36,6 +41,13 @@ impl Machine for Tlb {
     }
     fn flush_tlb(&mut self) {
         self.flushes += 1;
+    }
+    fn icache_sync(&mut self, pages: u64) {
+        self.icache_pages += pages;
+    }
+    fn random_below(&mut self, _n: u64) -> u64 {
+        self.randoms += 1;
+        0
     }
 }
 
@@ -69,6 +81,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         thread_objs: BTreeMap::new(),
         job,
         table_charge: BTreeMap::new(),
+        charge_end: BTreeMap::new(),
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
@@ -129,6 +142,20 @@ impl W {
         )
         .unwrap()
         .0
+    }
+    /// Like `vmo`, with the VMO's id too (the tests that look inside the store).
+    fn vmo_and_id(&mut self, pages: u64, job: JobId) -> (u64, u64) {
+        let id = self.vmos.create_in(&mut self.jobs, pages, job);
+        let p = self.procs.get_mut(&1).unwrap();
+        let h = ipc::vmo_object_create_in(
+            &mut self.objs,
+            &mut p.handles,
+            id,
+            &mut Self::q(&mut self.jobs),
+        )
+        .unwrap()
+        .0;
+        (h, id)
     }
     fn call(&mut self, n: usize, a: [u64; 6]) -> Reply {
         let mut c = PCtx {
@@ -283,10 +310,9 @@ fn process_map_argument_errors() {
         ("zero length", [ph, v, VA, 0, 0, R]),
         ("unknown flag", [ph, v, VA, 0, 4096, 8]),
         ("write and execute", [ph, v, VA, 0, 4096, W | X]),
-        (
-            "below the user range",
-            [ph, v, USER_BASE - 4096, 0, 4096, R],
-        ),
+        // (address 0 is no longer "below the user range": it asks for ANYWHERE, MM7)
+        ("zero length anywhere", [ph, v, 0, 0, 0, R | ANY]),
+        ("unaligned length anywhere", [ph, v, 0, 0, 100, R | ANY]),
         ("above the user range", [ph, v, TOP, 0, 4096, R]),
         ("wrapping range", [ph, v, u64::MAX - 4095, 0, 8192, R]),
         (
@@ -735,4 +761,766 @@ fn job_set_sched_rows() {
         Err(Status::InvalidArgs),
         "a budget over the 100 ms window"
     );
+}
+
+// ---- MM6: vmo_decommit and vmo_set_size ----
+
+/// Fault a page of process `pid` in (a write through its address space maps it).
+fn touch(w: &mut W, pid: u64, va: u64) {
+    let t = w.procs.get_mut(&pid).unwrap();
+    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, b"x").unwrap();
+}
+
+#[test]
+fn decommit_takes_the_pages_from_every_mapping_and_asks_for_the_shootdown_only_when_something_was_mapped(
+) {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    // committed but mapped nowhere: nothing to drop, no shootdown
+    w.vmos.commit(&mut w.mm, &mut w.jobs, id, 0, 4).unwrap();
+    let before = w.mm.db.free_count();
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 2 * 4096, 0, 0, 0]);
+    assert_eq!(w.mm.db.free_count(), before + 2, "two frames came back");
+    assert_eq!(
+        (w.tlb.shootdowns, w.tlb.flushes),
+        (0, 0),
+        "no translation existed: no shootdown"
+    );
+    // mapped and touched in two processes of the VMO's own job: both lose the pages, one shootdown
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, W | R]);
+    touch(&mut w, 1, VA + 2 * 4096);
+    touch(&mut w, 2, VA + 3 * 4096);
+    let jobs_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    w.ok(nr::VMO_DECOMMIT, [v, 2 * 4096, 2 * 4096, 0, 0, 0]);
+    assert_eq!(w.tlb.shootdowns, 1);
+    assert_eq!(w.tlb.flushes, 1);
+    for pid in [1, 2] {
+        let a = &w.procs[&pid].aspace;
+        assert!(a.table().translate(&w.mm, VA + 2 * 4096).is_none());
+        assert!(a.table().translate(&w.mm, VA + 3 * 4096).is_none());
+    }
+    assert_eq!(
+        jobs_before - w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
+        2,
+        "the VMO's job is credited for the two pages that were committed"
+    );
+}
+
+#[test]
+fn a_mapping_in_another_job_stops_a_decommit_and_a_shrink_but_not_a_grow() {
+    let (mut w, ph) = world();
+    // process 2 lives in another job than the VMO's
+    let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = other;
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    w.vmos.set_resizable(id);
+    w.vmos.commit(&mut w.mm, &mut w.jobs, id, 0, 4).unwrap();
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, R]);
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]),
+        Status::BadState,
+        "V1: a stranger's mapping"
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 2 * 4096, 0, 0, 0, 0]),
+        Status::BadState,
+        "a shrink under it"
+    );
+    assert_eq!(w.vmos.pages(id), Some(4), "nothing changed");
+    assert_eq!(w.vmos.committed_pages(id), Some(4));
+    w.ok(nr::VMO_SET_SIZE, [v, 8 * 4096, 0, 0, 0, 0]); // growing takes nothing
+    assert_eq!(w.vmos.pages(id), Some(8));
+    // a range the stranger does not map is fine
+    w.ok(nr::VMO_DECOMMIT, [v, 5 * 4096, 4096, 0, 0, 0]);
+    // once the stranger has unmapped, the pages can go
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 4 * 4096, 0, 0, 0]);
+    assert_eq!(w.vmos.committed_pages(id), Some(0));
+}
+
+#[test]
+fn set_size_checks_resizability_before_the_size() {
+    let (mut w, _) = world();
+    let fixed = w.vmo(2, JobId::ROOT);
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [fixed, 100, 0, 0, 0, 0]),
+        Status::AccessDenied,
+        "not resizable, whatever the size"
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [fixed, 0, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    let (v, id) = w.vmo_and_id(2, JobId::ROOT);
+    w.vmos.set_resizable(id);
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 100, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_SET_SIZE, [v, 0, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 0, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_DECOMMIT, [v, 4096, 2 * 4096, 0, 0, 0]),
+        Status::InvalidArgs,
+        "past the end"
+    );
+}
+
+#[test]
+fn process_map_anywhere_picks_free_places_that_do_not_overlap_and_returns_them() {
+    let (mut w, ph) = world();
+    let v = w.vmo(4, JobId::ROOT);
+    let first = w
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, W | R | ANY])
+        .0
+        .expect("the address comes back");
+    let second = w
+        .ok(nr::PROCESS_MAP, [ph, v, 0, 0, 2 * 4096, R | ANY])
+        .0
+        .expect("and again");
+    for at in [first, second] {
+        assert!(
+            at.is_multiple_of(4096)
+                && (abi::user::MAP_ARENA_BASE..abi::user::STACK_ARENA_BASE).contains(&at),
+            "inside the arena: {at:#x}"
+        );
+    }
+    assert!(
+        first.abs_diff(second) >= 2 * 4096,
+        "two mappings do not overlap"
+    );
+    // the mappings are there (touching them works), and an explicit address still returns nothing
+    touch(&mut w, 2, first);
+    assert_eq!(w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4096, R]).0, None);
+    let _ = USER_BASE;
+}
+
+// ---- MM7: ranges, protect, info ----
+
+/// A handle in process 1 to the same VMO as `h` with only `rights`.
+fn weaker(w: &mut W, h: u64, rights: Rights) -> u64 {
+    let p = w.procs.get_mut(&1).unwrap();
+    p.handles
+        .duplicate(&mut w.objs, abi::Handle(h), rights)
+        .unwrap()
+        .0
+}
+
+/// A page of process 1's own memory for the info records.
+fn info_buffer(w: &mut W) -> u64 {
+    let me = w.handle_to(1);
+    let own = w.vmo(1, JobId::ROOT);
+    let buf = 0x70_0000u64;
+    w.ok(nr::PROCESS_MAP, [me, own, buf, 0, 4096, W | R]);
+    buf
+}
+
+fn info(w: &mut W, buf: u64, ph: u64, at: u64) -> ([u64; 6], u64) {
+    let next = w
+        .ok(nr::PROCESS_MAP_INFO, [ph, at, buf, 0, 0, 0])
+        .0
+        .unwrap();
+    let mut rec = [0u64; 6];
+    let t = w.procs.get_mut(&1).unwrap();
+    let bytes =
+        copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, buf, 48).unwrap();
+    for (i, r) in rec.iter_mut().enumerate() {
+        *r = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    (rec, next)
+}
+
+#[test]
+fn unmap_with_a_length_splits_regions_credits_and_asks_for_the_shootdown() {
+    let (mut w, ph) = world();
+    let v = w.vmo(8, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 8 * 4096, W | R]);
+    touch(&mut w, 2, VA + 3 * 4096);
+    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    // the middle: two regions are left, the hole is a hole
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 4 * 4096, 0, 0, 0]);
+    assert_eq!(w.procs[&2].aspace.region_count(), 2);
+    assert!(
+        w.procs[&2]
+            .aspace
+            .table()
+            .translate(&w.mm, VA + 3 * 4096)
+            .is_none(),
+        "the touched page went"
+    );
+    assert_eq!(w.tlb.shootdowns, 1);
+    // a range that is all hole, and one that overlaps a hole and a region, are fine
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 2 * 4096, 0, 0, 0]);
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 7 * 4096, 4 * 4096, 0, 0, 0]);
+    assert_eq!(
+        w.procs[&2].aspace.region_count(),
+        2,
+        "the tail went, the head stayed: {:?}",
+        w.procs[&2].aspace.regions_info()
+    );
+    // errors: unaligned, wrapping
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, VA + 1, 4096, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, VA, 100, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_UNMAP, [ph, u64::MAX - 4095, 8192, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    // the original form still removes the region that starts at the address, whole
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    assert_eq!(
+        w.procs[&2].aspace.region_count(),
+        1,
+        "the head went, the one page of the tail stayed"
+    );
+}
+
+#[test]
+fn protect_changes_rights_in_place_within_the_ceiling_and_pays_for_what_it_must() {
+    let (mut w, ph) = world();
+    let v = w.vmo(4, JobId::ROOT);
+    let ro = weaker(&mut w, v, Rights(Rights::READ.0 | Rights::MAP.0));
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4 * 4096, R | W]);
+    touch(&mut w, 2, VA);
+    // a downgrade: write goes, the other harts are told
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 4 * 4096, R, 0, 0]);
+    assert_eq!(
+        (w.tlb.shootdowns, w.tlb.flushes),
+        (1, 1),
+        "a downgrade is shot down"
+    );
+    let pte = w.procs[&2]
+        .aspace
+        .table()
+        .translate(&w.mm, VA)
+        .unwrap()
+        .perms;
+    assert!(pte.read && !pte.write, "the page table says read-only");
+    // an upgrade within the ceiling needs no shootdown
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 4 * 4096, R | W, 0, 0]);
+    assert_eq!(w.tlb.shootdowns, 1);
+    // execute needs EXECUTE on the VMO handle that mapped it (the full-rights handle has it), and makes the pages visible to fetch
+    w.ok(nr::PROCESS_PROTECT, [ph, VA, 2 * 4096, R | X, 0, 0]);
+    assert_eq!(
+        w.tlb.icache_pages, 1,
+        "one mapped page became executable (the others fault in later)"
+    );
+    // errors
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 4096, W | X, 0, 0]),
+        Status::InvalidArgs,
+        "write with execute"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 4096, 8, 0, 0]),
+        Status::InvalidArgs,
+        "an unknown flag"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA + 1, 4096, R, 0, 0]),
+        Status::InvalidArgs,
+        "unaligned"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 8 * 4096, R, 0, 0]),
+        Status::InvalidArgs,
+        "past the mapping: a hole in the range"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA, 0, R, 0, 0]),
+        Status::InvalidArgs,
+        "no length"
+    );
+    // the ceiling: a mapping made through a handle without WRITE can never become writable
+    w.ok(nr::PROCESS_MAP, [ph, ro, VA + 16 * 4096, 0, 4 * 4096, R]);
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [ph, VA + 16 * 4096, 4096, R | W, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_PROTECT, [999, VA, 4096, R, 0, 0]),
+        Status::BadHandle
+    );
+}
+
+#[test]
+fn map_info_walks_the_regions_and_a_protect_splits_and_merges_them() {
+    let (mut w, ph) = world();
+    let buf = info_buffer(&mut w);
+    let v = w.vmo(8, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 8 * 4096, R | W]);
+    let (rec, next) = info(&mut w, buf, ph, 0);
+    assert_eq!(rec[0], VA);
+    assert_eq!(rec[1], 8 * 4096);
+    assert_eq!(
+        (rec[2], rec[3]),
+        (0b011, 0b111),
+        "perms as bits (read, write) and the ceiling (the VMO handle had every right)"
+    );
+    assert_eq!(rec[5], 0, "the VMO offset");
+    assert_eq!(next, 0, "no region after it");
+    // protect the middle: three regions, the pieces know their offsets
+    w.ok(nr::PROCESS_PROTECT, [ph, VA + 2 * 4096, 3 * 4096, R, 0, 0]);
+    let (a, n1) = info(&mut w, buf, ph, VA);
+    assert_eq!((a[0], a[1], a[2]), (VA, 2 * 4096, 0b011));
+    assert_eq!(n1, VA + 2 * 4096);
+    let (b, n2) = info(&mut w, buf, ph, n1);
+    assert_eq!(
+        (b[0], b[1], b[2], b[5]),
+        (VA + 2 * 4096, 3 * 4096, 0b001, 2 * 4096)
+    );
+    assert_eq!(n2, VA + 5 * 4096);
+    // protect it back: the three merge into one again
+    w.ok(
+        nr::PROCESS_PROTECT,
+        [ph, VA + 2 * 4096, 3 * 4096, R | W, 0, 0],
+    );
+    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    // an address in a hole reports the next region; past the last, nothing
+    let (c, _) = info(&mut w, buf, ph, VA + 8 * 4096);
+    assert_eq!(c[1], 0, "no region at or after");
+}
+
+#[test]
+fn the_tables_of_a_split_mapping_stay_charged_until_no_region_is_left_in_their_span() {
+    let (mut w, ph) = world();
+    let v = w.vmo(2, JobId::ROOT);
+    let pages = |w: &W| w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let base = pages(&w);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R | W]);
+    let charged = pages(&w) - base;
+    assert!(charged > 0);
+    // the first page goes: the second stays, and so does the whole charge (its tables are still there)
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 4096, 0, 0, 0]);
+    assert_eq!(
+        pages(&w) - base,
+        charged,
+        "nothing is credited while a page of the mapping stays"
+    );
+    // a mapping folded into its neighbour keeps its own charge too
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 4096, R | W]);
+    let both = pages(&w) - base;
+    w.ok(nr::PROCESS_UNMAP, [ph, VA + 4096, 4096, 0, 0, 0]);
+    assert!(
+        pages(&w) - base > 0,
+        "the charge of the mapping that stayed is still there: {both}"
+    );
+    // the last page goes: everything comes back
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 4096, 0, 0, 0]);
+    assert_eq!(
+        pages(&w),
+        base,
+        "no region left: the tables' charge is credited"
+    );
+}
+
+#[test]
+fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first() {
+    let (mut w, ph) = world();
+    let v = w.vmo(2, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 2 * 4096, R | W]);
+    for (name, at, len) in [
+        ("below the user range", 0u64, 4096u64),
+        ("the kernel half", 0xffff_ffc0_0000_0000, 4096),
+        ("over the top", TOP - 4096, 8192),
+        ("wrapping", u64::MAX - 4095, 8192),
+    ] {
+        assert_eq!(
+            w.err(nr::PROCESS_UNMAP, [ph, at, len, 0, 0, 0]),
+            Status::InvalidArgs,
+            "unmap {name}"
+        );
+        assert_eq!(
+            w.err(nr::PROCESS_PROTECT, [ph, at, len, R, 0, 0]),
+            Status::InvalidArgs,
+            "protect {name}"
+        );
+    }
+    // ANYWHERE: a bad flag, W with X, an unaligned offset, past the VMO's end: all InvalidArgs, and none takes entropy or a place
+    let spent = w.tlb.randoms;
+    for (name, a) in [
+        ("bad flag", [ph, v, 0, 0, 4096, 16 | ANY]),
+        ("ANYWHERE with an address", [ph, v, VA, 0, 4096, R | ANY]),
+        ("address 0 without the flag", [ph, v, 0, 0, 4096, R]),
+        ("write with execute", [ph, v, 0, 0, 4096, W | X | ANY]),
+        ("unaligned offset", [ph, v, 0, 1, 4096, R | ANY]),
+        ("past the VMO", [ph, v, 0, 0, 3 * 4096, R | ANY]),
+        ("bigger than the arena", [ph, v, 0, 0, 1 << 40, R | ANY]),
+    ] {
+        assert_eq!(
+            w.err(nr::PROCESS_MAP, a),
+            Status::InvalidArgs,
+            "anywhere {name}"
+        );
+    }
+    assert_eq!(
+        w.tlb.randoms, spent,
+        "a refused ANYWHERE does not draw from the pool"
+    );
+}
+
+// ---- MM8: vmo_create_child and process_clone_region ----
+
+fn byte(w: &mut W, pid: u64, va: u64) -> u8 {
+    let t = w.procs.get_mut(&pid).unwrap();
+    let b = copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, 1).unwrap()[0];
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+    b
+}
+
+fn put(w: &mut W, pid: u64, va: u64, b: u8) {
+    let t = w.procs.get_mut(&pid).unwrap();
+    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, &[b]).unwrap();
+    // (what the kernel does after every call and fault)
+    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+}
+
+#[test]
+fn a_snapshot_child_keeps_the_contents_as_they_were_and_the_source_write_protects_and_copies() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    put(&mut w, 1, VA, 7);
+    put(&mut w, 1, VA + 4096, 8);
+    let shoot = w.tlb.shootdowns;
+    let (child, _) = w.ok(
+        nr::VMO_CREATE_CHILD,
+        [v, 0, 4 * 4096, 0, abi::child_flags::SNAPSHOT, 0],
+    );
+    let child = child.unwrap();
+    assert_eq!(
+        w.tlb.shootdowns,
+        shoot + 1,
+        "the source's writable translations are shot down"
+    );
+    assert!(
+        !w.procs[&1]
+            .aspace
+            .table()
+            .translate(&w.mm, VA)
+            .unwrap()
+            .perms
+            .write,
+        "and no longer writable"
+    );
+    assert_eq!(
+        w.vmos.committed_pages(id),
+        Some(0),
+        "the pages moved to the hidden node"
+    );
+    // the child, mapped in the other process, sees the old bytes; a write through the source does not reach it
+    w.ok(nr::PROCESS_MAP, [ph, child, VA, 0, 4 * 4096, W | R]);
+    assert_eq!(byte(&mut w, 2, VA), 7);
+    put(&mut w, 1, VA, 70);
+    assert_eq!(byte(&mut w, 1, VA), 70, "the source sees its own write");
+    assert_eq!(byte(&mut w, 2, VA), 7, "the child still sees the old page");
+    // and a write through the child does not reach the source
+    put(&mut w, 2, VA + 4096, 80);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 80);
+    assert_eq!(byte(&mut w, 1, VA + 4096), 8);
+    // a member gives a page back: it reads zero afterwards (and the other side is untouched); the source can too
+    w.ok(nr::VMO_DECOMMIT, [child, 4096, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 0, "the child's page is gone");
+    assert_eq!(
+        byte(&mut w, 1, VA + 4096),
+        8,
+        "the source still has its own"
+    );
+    w.ok(nr::VMO_DECOMMIT, [v, 0, 4096, 0, 0, 0]);
+    assert_eq!(byte(&mut w, 1, VA), 0);
+    assert_eq!(
+        byte(&mut w, 2, VA),
+        7,
+        "and the child still has what the snapshot showed"
+    );
+    // a page nobody wrote reads zero in both, and the charge is exact: frames in use are the jobs' pages (no tables charged to the job's pages here)
+    assert_eq!(byte(&mut w, 1, VA + 3 * 4096), 0);
+    assert_eq!(byte(&mut w, 2, VA + 3 * 4096), 0);
+}
+
+#[test]
+fn a_child_is_refused_when_it_would_break_a_rule() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let other = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    let (v, id) = w.vmo_and_id(4, JobId::ROOT);
+    let snap = abi::child_flags::SNAPSHOT;
+    let private = abi::child_flags::PRIVATE;
+    for bad_flags in [0, snap | private, 4] {
+        assert_eq!(
+            w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, bad_flags, 0]),
+            Status::InvalidArgs,
+            "exactly one of SNAPSHOT or PRIVATE"
+        );
+    }
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 1, 4096, 0, private, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 3 * 4096, 2 * 4096, 0, private, 0]),
+        Status::InvalidArgs,
+        "past the end"
+    );
+    // a job handle other than the source's job: a SNAPSHOT is refused, a PRIVATE child may be charged elsewhere
+    let jh = {
+        let p = w.procs.get_mut(&1).unwrap();
+        let obj = w.objs.create(ipc::KObj::Job(other));
+        p.handles.insert(&mut w.objs, obj, Rights::ALL).unwrap().0
+    };
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, jh, snap, 0]),
+        Status::AccessDenied,
+        "COW2: the pages never change payer"
+    );
+    w.ok(nr::VMO_CREATE_CHILD, [v, 0, 4096, jh, private, 0]);
+    // V1: a SNAPSHOT is refused while a process of another job maps the source, and nothing changes
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    let stranger = w.jobs.create(JobId::ROOT, Limits::UNLIMITED).unwrap();
+    w.procs.get_mut(&2).unwrap().job = stranger;
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0],
+    );
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
+        Status::BadState,
+        "the stranger's mapping is promised that a write never charges the VMO's job"
+    );
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.procs.get_mut(&2).unwrap().job = JobId::ROOT;
+    // a call that fails for want of a handle slot changes nothing (no hidden node, the source stays as it was)
+    let vmos_before = w.vmos.count();
+    let full = {
+        let p = w.procs.get_mut(&1).unwrap();
+        let mut n = 0;
+        while p.handles.room() > 0 {
+            let obj = w.objs.create(ipc::KObj::Job(JobId::ROOT));
+            p.handles.insert(&mut w.objs, obj, Rights::ALL).unwrap();
+            n += 1;
+        }
+        n
+    };
+    assert!(full > 0);
+    assert_eq!(
+        w.err(nr::VMO_CREATE_CHILD, [v, 0, 4096, 0, snap, 0]),
+        Status::NoMemory
+    );
+    assert_eq!(w.vmos.count(), vmos_before, "no VMO was made");
+    assert!(!w.vmos.has_parent(id), "the source was not restructured");
+    w.vmos.audit_families(true).unwrap();
+}
+
+#[test]
+fn process_clone_region_shares_or_snapshots_a_region_into_another_process() {
+    let (mut w, ph) = world();
+    let ph1 = w.handle_to(1);
+    let (v, _) = w.vmo_and_id(4, JobId::ROOT);
+    w.ok(nr::PROCESS_MAP, [ph1, v, VA, 0, 4 * 4096, W | R]);
+    put(&mut w, 1, VA, 5);
+    // SHARE: the same VMO, both see each other's writes
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0],
+    );
+    assert_eq!(byte(&mut w, 2, VA), 5);
+    put(&mut w, 2, VA, 6);
+    assert_eq!(byte(&mut w, 1, VA), 6);
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    // SNAPSHOT: each has its own from here
+    w.ok(
+        nr::PROCESS_CLONE_REGION,
+        [ph1, ph, VA, abi::clone_mode::SNAPSHOT, 0, 0],
+    );
+    assert_eq!(byte(&mut w, 2, VA), 6);
+    put(&mut w, 1, VA, 9);
+    put(&mut w, 2, VA + 4096, 10);
+    assert_eq!(byte(&mut w, 1, VA), 9);
+    assert_eq!(byte(&mut w, 2, VA), 6, "the child kept the old page");
+    assert_eq!(byte(&mut w, 1, VA + 4096), 0);
+    assert_eq!(byte(&mut w, 2, VA + 4096), 10);
+    // refusals: nothing at the address; the target already has a mapping there; a bad mode
+    assert_eq!(
+        w.err(
+            nr::PROCESS_CLONE_REGION,
+            [ph1, ph, VA + 0x10_0000, abi::clone_mode::SHARE, 0, 0]
+        ),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(
+            nr::PROCESS_CLONE_REGION,
+            [ph1, ph, VA, abi::clone_mode::SHARE, 0, 0]
+        ),
+        Status::InvalidArgs,
+        "the target has a region there"
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_CLONE_REGION, [ph1, ph, VA, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    // everything goes back: the processes' regions, then the VMOs
+    w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
+    w.ok(nr::PROCESS_UNMAP, [ph1, VA, 0, 0, 0, 0]);
+}
+
+// ---- the memory calls under random sequences (KT8's job for the calls on the process table) ----
+
+/// A deterministic sequence of random memory calls (map, unmap, protect, decommit, resize, children, clones, touches) over two processes:
+/// none may panic, the frame database and the families keep their audits after every call or touch, and every translation of every
+/// process shows what its VMO shows (the VMO's own frame, or zeros where it has none), writable only where the VMO owns the page.
+#[test]
+fn random_memory_calls_never_panic_and_keep_their_audits() {
+    // (how many calls of each kind succeeded over all seeds: the sequences must do real work)
+    let mut succeeded = std::collections::BTreeMap::<usize, u32>::new();
+    for seed in 1..=25u64 {
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut w, ph) = world();
+        let ph1 = w.handle_to(1);
+        let procs = [ph1, ph];
+        let mut vmo_handles: Vec<u64> = (0..3)
+            .map(|_| {
+                let (h, id) = w.vmo_and_id(8, JobId::ROOT);
+                w.vmos.set_resizable(id);
+                h
+            })
+            .collect();
+        for step in 0..400 {
+            let p = procs[rnd(2) as usize];
+            let v = vmo_handles[rnd(vmo_handles.len() as u64) as usize];
+            let va = VA + rnd(6) * 0x10_0000 + rnd(4) * 4096;
+            let len = (1 + rnd(6)) * 4096;
+            let off = rnd(4) * 4096;
+            let flags = [R, R | W, R | X, W, R | W | X][rnd(5) as usize];
+            let call = match rnd(13) {
+                0 | 1 => (nr::PROCESS_MAP, [p, v, va, off, len, flags]),
+                2 => (nr::PROCESS_UNMAP, [p, va, len, 0, 0, 0]),
+                10 => (nr::PROCESS_UNMAP, [p, va, 0, 0, 0, 0]),
+                11 => (nr::PROCESS_MAP, [p, v, 0, off, len, (flags & 3 | R) | ANY]),
+                3 => (nr::PROCESS_PROTECT, [p, va, len, flags, 0, 0]),
+                4 => (nr::VMO_DECOMMIT, [v, off, len, 0, 0, 0]),
+                5 => (nr::VMO_SET_SIZE, [v, (1 + rnd(10)) * 4096, 0, 0, 0, 0]),
+                6 => (
+                    nr::VMO_CREATE_CHILD,
+                    [
+                        v,
+                        off,
+                        len,
+                        0,
+                        [abi::child_flags::SNAPSHOT, abi::child_flags::PRIVATE][rnd(2) as usize],
+                        0,
+                    ],
+                ),
+                7 => (
+                    nr::PROCESS_CLONE_REGION,
+                    [
+                        procs[rnd(2) as usize],
+                        p,
+                        va,
+                        [abi::clone_mode::SHARE, abi::clone_mode::SNAPSHOT][rnd(2) as usize],
+                        0,
+                        0,
+                    ],
+                ),
+                8 | 9 => {
+                    // a touch: a write or a read through the process's address space, wherever it is mapped
+                    let pid = if p == ph1 { 1 } else { 2 };
+                    let t = w.procs.get_mut(&pid).unwrap();
+                    let _ = copy_to_user(
+                        &mut t.aspace,
+                        &mut w.mm,
+                        &mut w.vmos,
+                        &mut w.jobs,
+                        va,
+                        &[step as u8],
+                    );
+                    ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
+                    (0, [0; 6])
+                }
+                _ => {
+                    // a new VMO, so that children and clones have more to work on
+                    if vmo_handles.len() < 8 {
+                        vmo_handles.push(w.vmo(4, JobId::ROOT));
+                    }
+                    (0, [0; 6])
+                }
+            };
+            let r = if call.0 == 0 {
+                Err((Status::BadSyscall, None, None)) // (a touch or a new VMO: no call was made)
+            } else {
+                w.call(call.0, call.1)
+            };
+            if r.is_ok() {
+                *succeeded.entry(call.0).or_default() += 1;
+            }
+            if let Ok((Some(h), _)) = r {
+                if call.0 == nr::VMO_CREATE_CHILD && vmo_handles.len() < 12 {
+                    vmo_handles.push(h);
+                }
+            }
+            w.mm.db
+                .audit()
+                .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            w.vmos
+                .audit_families(true)
+                .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            for (pid, proc) in w.procs.iter() {
+                for r in proc.aspace.regions_info() {
+                    for pg in 0..r.pages {
+                        let va = r.start + pg * 4096;
+                        let Some(t) = proc.aspace.table().translate(&w.mm, va) else {
+                            continue;
+                        };
+                        match w.vmos.frame_info(r.vmo, r.vmo_page + pg) {
+                            Some((pfn, own)) => {
+                                assert_eq!(t.pfn, pfn, "seed {seed} step {step}: process {pid} {va:#x} maps another frame than its VMO's");
+                                assert!(own || !t.perms.write, "seed {seed} step {step}: process {pid} {va:#x} is writable but not owned");
+                            }
+                            None => {
+                                // (nothing committed: only the shared zero frame can be mapped, read-only, and it reads zeros)
+                                use kcore::pagetable::PhysMem;
+                                let mut b = [0u8; 8];
+                                w.mm.mem.read_bytes(t.pfn << 12, &mut b);
+                                assert!(b == [0; 8] && !t.perms.write, "seed {seed} step {step}: process {pid} {va:#x} maps a page its VMO does not have");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for n in [
+        nr::PROCESS_MAP,
+        nr::PROCESS_UNMAP,
+        nr::PROCESS_PROTECT,
+        nr::VMO_DECOMMIT,
+        nr::VMO_SET_SIZE,
+        nr::VMO_CREATE_CHILD,
+        nr::PROCESS_CLONE_REGION,
+    ] {
+        assert!(
+            succeeded.get(&n).copied().unwrap_or(0) > 5,
+            "call {n} never did anything: {succeeded:?}"
+        );
+    }
 }

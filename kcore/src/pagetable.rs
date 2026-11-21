@@ -502,6 +502,69 @@ impl<F: PageTableFormat> PageTable<F> {
         None
     }
 
+    /// Change the permissions of the 4 KiB leaf at `va` in place (the frame stays): returns the old permissions, or `None` if nothing is
+    /// mapped there (or a huge page is: not ours to change one page at a time). The caller flushes the translations that a
+    /// permission it took away may still be cached under, on every hart.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the slot is a table frame plus index * 8 with index < 512, as in `translate`
+    pub fn protect<M: PhysMem>(&mut self, mm: &mut Mm<M>, va: u64, perms: Perms) -> Option<Perms> {
+        if !va.is_multiple_of(PAGE_SIZE) || !F::is_canonical(va) {
+            return None;
+        }
+        let mut table = self.root;
+        for level in (0..F::LEVELS).rev() {
+            let slot = (table << 12) + index(va, level) * 8;
+            let pte = mm.mem.read_u64(slot);
+            if !F::is_valid(pte) {
+                return None;
+            }
+            if F::is_leaf(pte, level) {
+                if level != 0 {
+                    return None;
+                }
+                mm.mem.write_u64(slot, F::leaf_entry(F::pfn_of(pte), perms));
+                return Some(F::perms_of(pte));
+            }
+            if level == 0 {
+                return None;
+            }
+            table = F::pfn_of(pte);
+        }
+        None
+    }
+
+    /// The first address at or after `va`, below `end`, that has a mapping (a page or a huge leaf), skipping every span whose table is absent
+    /// (a 4 KiB page, 2 MiB or 1 GiB at a time, as far up as the first invalid entry): a walk over a mostly empty range costs what is
+    /// mapped, not the length of the range. `None` when nothing is mapped in `[va, end)`, or when the walk reaches a non-canonical
+    /// address (a range that spans the hole between the halves is walked one half at a time).
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the spans are 1 << (12 + 9 * level) with level < 4; the next start is computed with checked arithmetic
+    pub fn next_mapped<M: PhysMem>(&self, mm: &Mm<M>, mut va: u64, end: u64) -> Option<u64> {
+        while va < end {
+            if !F::is_canonical(va) {
+                return None;
+            }
+            let mut table = self.root;
+            let mut skip = None;
+            for level in (0..F::LEVELS).rev() {
+                let pte = mm.mem.read_u64((table << 12) + index(va, level) * 8);
+                if !F::is_valid(pte) {
+                    skip = Some(PAGE_SIZE << (9 * level));
+                    break;
+                }
+                if F::is_leaf(pte, level) {
+                    return Some(va);
+                }
+                if level == 0 {
+                    skip = Some(PAGE_SIZE);
+                    break;
+                }
+                table = F::pfn_of(pte);
+            }
+            let span = skip?;
+            va = (va / span).checked_add(1)?.checked_mul(span)?;
+        }
+        None
+    }
+
     /// Translate `va` (any byte of a page). Huge leaves translate too.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: indices are below 512; the span is 1 << (9 * level) with level < 4; a leaf's pfn plus an in-span page offset stays a frame number
     pub fn translate<M: PhysMem>(&self, mm: &Mm<M>, va: u64) -> Option<Translation> {

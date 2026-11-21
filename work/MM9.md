@@ -4,7 +4,7 @@ kind: slice
 title: Pager-backed VMOs: page faults that block, `pager_create`, `pager_create_vmo`, `pager_supply`, `pager_fail`
 area: kernel
 horizon: long
-blocked_by: [MM8, EX2]
+blocked_by: [EX2]
 refs: [KERNEL-V1-SPEC, OD133]
 ---
 

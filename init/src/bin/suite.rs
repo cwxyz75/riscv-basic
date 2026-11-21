@@ -1472,7 +1472,22 @@ fn process_map_argument_checks() -> Outcome {
         Some(S::InvalidArgs),
         "writable and executable"
     );
-    ensure_eq!(map(0, 0, 4096, PF_R), Some(S::InvalidArgs), "page zero");
+    // (address 0 is not mappable: ANYWHERE is a flag since MM7, and these two calls are refused as before)
+    ensure_eq!(
+        map(0, 0, 0, PF_R),
+        Some(S::InvalidArgs),
+        "ANYWHERE with no length"
+    );
+    ensure_eq!(
+        map(0, 0, 100, PF_R),
+        Some(S::InvalidArgs),
+        "ANYWHERE with an unaligned length"
+    );
+    ensure_eq!(
+        map(0x800, 0, 4096, PF_R),
+        Some(S::InvalidArgs),
+        "inside page zero"
+    );
     ensure_eq!(
         map(TOP - 4096, 0, 8192, PF_R),
         Some(S::InvalidArgs),
@@ -2647,6 +2662,527 @@ fn vmo_closed_while_mapped_keeps_its_pages() -> Outcome {
     // SAFETY: as above.
     unsafe { core::ptr::write_volatile(0x500_1000 as *mut u32, 1) };
     ensure_eq!(st(sys::process_unmap(me, 0x500_0000)), Some(S::Ok), "unmap");
+    Ok(())
+}
+
+/// MM6: `vmo_decommit` and `vmo_set_size` from user mode. A resizable VMO is mapped and written; a decommitted range reads zero through
+/// the mapping (its translations are gone) and through the VMO, the rest keeps its data; the argument and rights errors; a resize changes
+/// `vmo_get_size`, a shrink takes the tail's data with it.
+fn vmo_decommit_and_resize_from_user_mode() -> Outcome {
+    const BASE: u64 = 0x540_0000;
+    let me = me()?;
+    let v = ok(
+        sys::vmo_create_flags(8, 0, rt::abi::vmo_flags::RESIZABLE),
+        "a resizable VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, v, BASE, 0, 8 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it"
+    );
+    let word = |p: u64| (p as u32 + 1) * 0x1111;
+    for p in 0..8u64 {
+        // SAFETY: BASE..BASE + 8 pages is mapped read-write in this process.
+        unsafe { core::ptr::write_volatile((BASE + p * 4096) as *mut u32, word(p)) };
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 2 * 4096, 3 * 4096)),
+        Some(S::Ok),
+        "decommit pages 2 to 4"
+    );
+    for p in 0..8u64 {
+        // SAFETY: as above (a decommitted page faults in again, as zeros).
+        let got = unsafe { core::ptr::read_volatile((BASE + p * 4096) as *const u32) };
+        let want = if (2..5).contains(&p) { 0 } else { word(p) };
+        ensure_eq!(got, want, "page {p} through the mapping");
+        let mut b = [0u8; 4];
+        ensure_eq!(
+            st(sys::vmo_read(v, p * 4096, b.as_mut_ptr(), 4)),
+            Some(S::Ok),
+            "read through the VMO"
+        );
+        ensure_eq!(u32::from_le_bytes(b), want, "page {p} through the VMO");
+    }
+    // the errors
+    let ev = event()?;
+    for (what, call) in [
+        ("decommit", sys::vmo_decommit(BAD, 0, 4096)),
+        ("set_size", sys::vmo_set_size(BAD, 4096)),
+    ] {
+        ensure_eq!(
+            st(call),
+            Some(S::BadHandle),
+            "{what} on a handle that is not one"
+        );
+    }
+    ensure_eq!(
+        st(sys::vmo_decommit(ev, 0, 4096)),
+        Some(S::WrongType),
+        "decommit on an event"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(ev, 4096)),
+        Some(S::WrongType),
+        "set_size on an event"
+    );
+    sys::handle_close(ev);
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 100, 4096)),
+        Some(S::InvalidArgs),
+        "unaligned offset"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 100)),
+        Some(S::InvalidArgs),
+        "unaligned length"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 0)),
+        Some(S::InvalidArgs),
+        "no length"
+    );
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 4 * 4096, 5 * 4096)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    let weak = ok(
+        sys::handle_duplicate(v, Rights::READ.0 | Rights::MAP.0),
+        "a duplicate without WRITE",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::vmo_decommit(weak, 0, 4096)),
+        Some(S::AccessDenied),
+        "decommit needs WRITE"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(weak, 4096)),
+        Some(S::AccessDenied),
+        "set_size needs WRITE"
+    );
+    let fixed = vmo(2)?;
+    ensure_eq!(
+        st(sys::vmo_set_size(fixed, 4 * 4096)),
+        Some(S::AccessDenied),
+        "a VMO that is not resizable"
+    );
+    ensure_eq!(
+        st(sys::vmo_set_size(v, 100)),
+        Some(S::InvalidArgs),
+        "a size that is not whole pages"
+    );
+    ensure_eq!(st(sys::vmo_set_size(v, 0)), Some(S::InvalidArgs), "no size");
+    // resizing
+    ensure_eq!(st(sys::vmo_set_size(v, 12 * 4096)), Some(S::Ok), "grow");
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, 12 * 4096, "the new size");
+    ensure_eq!(st(sys::vmo_set_size(v, 5 * 4096)), Some(S::Ok), "shrink");
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, 5 * 4096, "the shrunk size");
+    ensure_eq!(st(sys::vmo_set_size(v, 8 * 4096)), Some(S::Ok), "grow back");
+    let mut b = [0xffu8; 4];
+    ensure_eq!(
+        st(sys::vmo_read(v, 6 * 4096, b.as_mut_ptr(), 4)),
+        Some(S::Ok),
+        "read a page that was cut off"
+    );
+    ensure_eq!(u32::from_le_bytes(b), 0, "what the shrink took is gone");
+    ensure_eq!(
+        st(sys::vmo_read(v, 4 * 4096, b.as_mut_ptr(), 4)),
+        Some(S::Ok),
+        "read the last page that stayed"
+    );
+    ensure_eq!(
+        u32::from_le_bytes(b),
+        0,
+        "(page 4 was decommitted before: it reads zero)"
+    );
+    ensure_eq!(st(sys::process_unmap(me, BASE)), Some(S::Ok), "unmap");
+    // V1: a process of another job that maps the range stops a decommit and a shrink (nothing changes), until it unmaps
+    {
+        let root = root_job()?;
+        let j = job(root, u64::MAX, u64::MAX, 256)?;
+        let stranger = ok(sys::process_create_in(j), "a process in another job")?.a1 as u64;
+        let shared = ok(
+            sys::vmo_create_flags(4, 0, rt::abi::vmo_flags::RESIZABLE),
+            "a resizable VMO of our own job",
+        )?
+        .a1 as u64;
+        ensure_eq!(
+            st(sys::vmo_commit(shared, 0, 4 * 4096)),
+            Some(S::Ok),
+            "committed, so that a stranger may map it"
+        );
+        ensure_eq!(
+            st(sys::process_map(
+                stranger,
+                shared,
+                0x60_0000,
+                0,
+                4 * 4096,
+                PF_R
+            )),
+            Some(S::Ok),
+            "the stranger maps it"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::BadState),
+            "a decommit under a stranger's mapping"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 2 * 4096)),
+            Some(S::BadState),
+            "a shrink under a stranger's mapping"
+        );
+        ensure_eq!(
+            sys::vmo_get_size(shared).a1 as u64,
+            4 * 4096,
+            "nothing changed"
+        );
+        ensure_eq!(
+            st(sys::vmo_set_size(shared, 8 * 4096)),
+            Some(S::Ok),
+            "growing is allowed"
+        );
+        ensure_eq!(
+            st(sys::process_unmap(stranger, 0x60_0000)),
+            Some(S::Ok),
+            "the stranger lets go"
+        );
+        ensure_eq!(
+            st(sys::vmo_decommit(shared, 0, 4096)),
+            Some(S::Ok),
+            "now the pages can go"
+        );
+        for h in [shared, stranger, j, root] {
+            sys::handle_close(h);
+        }
+    }
+    for h in [weak, fixed, v] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM7: ranges, protect and info from user mode: the "map twice the size and trim" idiom, ANYWHERE, a JIT-style flip from writable to
+/// executable that then runs (and write with execute refused), the error rows, and `process_map_info`'s record.
+fn process_protect_and_range_unmap_from_user_mode() -> Outcome {
+    let me = me()?;
+    // two ANYWHERE mappings differ and do not overlap
+    let v = vmo(8)?;
+    let a = ok(
+        sys::process_map_anywhere(me, v, 0, 8 * 4096, PF_R | PF_W),
+        "ANYWHERE",
+    )?
+    .a1 as u64;
+    let b = ok(
+        sys::process_map_anywhere(me, v, 0, 8 * 4096, PF_R),
+        "ANYWHERE again",
+    )?
+    .a1 as u64;
+    ensure!(
+        a.is_multiple_of(4096) && b.is_multiple_of(4096) && a != b,
+        "distinct page-aligned places: {a:#x} {b:#x}"
+    );
+    ensure!(a.abs_diff(b) >= 8 * 4096, "no overlap");
+    ensure_eq!(
+        st(sys::process_unmap(me, b)),
+        Some(S::Ok),
+        "unmap the second"
+    );
+    // trim: keep the middle four pages
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 2 * 4096)),
+        Some(S::Ok),
+        "trim the head"
+    );
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a + 6 * 4096, 2 * 4096)),
+        Some(S::Ok),
+        "trim the tail"
+    );
+    // SAFETY: pages 2 to 5 of the mapping stay mapped read-write.
+    unsafe {
+        core::ptr::write_volatile((a + 2 * 4096) as *mut u32, 0xabcd);
+        core::ptr::write_volatile((a + 5 * 4096) as *mut u32, 0xef01);
+    }
+    let mut rec = [0u64; 6];
+    let next = ok(sys::process_map_info(me, a, rec.as_mut_ptr()), "map_info")?.a1 as u64;
+    ensure_eq!(
+        (rec[0], rec[1], rec[2], rec[5]),
+        (a + 2 * 4096, 4 * 4096, 0b011, 2 * 4096),
+        "the record of what is left"
+    );
+    ensure!(next == 0 || next > a, "the next base");
+    // holes are fine
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 8 * 4096)),
+        Some(S::Ok),
+        "unmap over holes"
+    );
+    ensure_eq!(
+        st(sys::process_unmap_range(me, a, 4096)),
+        Some(S::Ok),
+        "unmap only hole"
+    );
+    // the JIT flip: write code, make it executable, run it
+    const CODE: u64 = 0x5a0_0000;
+    let c = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(me, c, CODE, 0, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map for writing"
+    );
+    // addi a0, zero, 42 ; ret
+    let code: [u32; 2] = [0x02a0_0513, 0x0000_8067];
+    // SAFETY: the page is mapped read-write.
+    unsafe {
+        core::ptr::write_volatile(CODE as *mut u32, code[0]);
+        core::ptr::write_volatile((CODE + 4) as *mut u32, code[1]);
+    }
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_W | PF_X)),
+        Some(S::InvalidArgs),
+        "write with execute"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_R | PF_X)),
+        Some(S::Ok),
+        "flip to executable"
+    );
+    // SAFETY: the page holds the two instructions written above and is executable now; `fence.i` synchronises this hart's fetch.
+    let got = unsafe {
+        core::arch::asm!("fence.i");
+        let f: extern "C" fn() -> u64 = core::mem::transmute(CODE as usize);
+        f()
+    };
+    ensure_eq!(got, 42, "the code ran");
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "and back to writable"
+    );
+    // errors
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 2 * 4096, PF_R)),
+        Some(S::InvalidArgs),
+        "a hole in the range"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE + 1, 4096, PF_R)),
+        Some(S::InvalidArgs),
+        "unaligned"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 0, PF_R)),
+        Some(S::InvalidArgs),
+        "no length"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, CODE, 4096, 8)),
+        Some(S::InvalidArgs),
+        "unknown flag"
+    );
+    ensure_eq!(
+        st(sys::process_protect(BAD, CODE, 4096, PF_R)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::process_protect(ev, CODE, 4096, PF_R)),
+        Some(S::WrongType),
+        "not a process"
+    );
+    sys::handle_close(ev);
+    // the ceiling: a mapping made through a handle without WRITE can never be made writable
+    let ro = ok(
+        sys::handle_duplicate(c, Rights::READ.0 | Rights::MAP.0),
+        "a read-only handle",
+    )?
+    .a1 as u64;
+    const RO: u64 = 0x5b0_0000;
+    ensure_eq!(
+        st(sys::process_map(me, ro, RO, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "map read-only"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, RO, 4096, PF_R | PF_W)),
+        Some(S::AccessDenied),
+        "beyond the ceiling"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, RO, 4096, PF_R | PF_X)),
+        Some(S::AccessDenied),
+        "execute without the right"
+    );
+    for at in [CODE, RO] {
+        ensure_eq!(st(sys::process_unmap(me, at)), Some(S::Ok), "unmap");
+    }
+    for h in [v, c, ro] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM7: a page made read-only by `process_protect` faults on a write and ends the process.
+fn a_write_to_a_protected_page_ends_the_process() -> Outcome {
+    let (p, _m) = launch(101)?;
+    wait_ended(p, 1000)?;
+    let r = sys::process_info(p);
+    ensure_eq!((r.status, r.a1 as i64), (0, -1001), "a page fault ended it");
+    Ok(())
+}
+
+/// MM8: copy-on-write children from user mode. A SNAPSHOT child keeps the source's contents as they were and each side's later writes are
+/// private to it (the source's own writable mapping has to lose its write permission at the call: the negative control that skips that
+/// shows the child changing under a write through the source); a PRIVATE child sees what its source changes and its own writes stay
+/// its own; the argument errors; a VMO that inherits pages is not decommitted.
+fn copy_on_write_children_from_user_mode() -> Outcome {
+    const A: u64 = 0x5c0_0000;
+    const B: u64 = 0x5d0_0000;
+    const C: u64 = 0x5e0_0000;
+    let me = me()?;
+    let rd = |va: u64| -> u32 {
+        // SAFETY: the callers pass addresses inside mappings of this process.
+        unsafe { core::ptr::read_volatile(va as *const u32) }
+    };
+    let wr = |va: u64, v: u32| {
+        // SAFETY: as above, for mappings that are writable.
+        unsafe { core::ptr::write_volatile(va as *mut u32, v) }
+    };
+    let snap = rt::abi::child_flags::SNAPSHOT;
+    let private = rt::abi::child_flags::PRIVATE;
+    let v = vmo(4)?;
+    ensure_eq!(
+        st(sys::process_map(me, v, A, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the source"
+    );
+    for p in 0..4u64 {
+        wr(A + p * 4096, 100 + p as u32);
+    }
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 4 * 4096, 0, 0)),
+        Some(S::InvalidArgs),
+        "a flag is needed"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 4 * 4096, 0, snap | private)),
+        Some(S::InvalidArgs),
+        "exactly one flag"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(v, 0, 5 * 4096, 0, snap)),
+        Some(S::InvalidArgs),
+        "past the end"
+    );
+    ensure_eq!(
+        st(sys::vmo_create_child(BAD, 0, 4096, 0, snap)),
+        Some(S::BadHandle),
+        "no such VMO"
+    );
+    let c = ok(
+        sys::vmo_create_child(v, 0, 4 * 4096, 0, snap),
+        "a SNAPSHOT child",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, c, B, 0, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map the child"
+    );
+    for p in 0..4u64 {
+        ensure_eq!(
+            rd(B + p * 4096),
+            100 + p as u32,
+            "the child starts with the source's contents, page {p}"
+        );
+    }
+    // a write through the source's old writable mapping must reach neither the child nor the hidden pages
+    wr(A, 7_000);
+    ensure_eq!(rd(A), 7_000, "the source sees its write");
+    ensure_eq!(rd(B), 100, "the child does not");
+    wr(B + 4096, 8_000);
+    ensure_eq!(rd(B + 4096), 8_000, "the child sees its write");
+    ensure_eq!(rd(A + 4096), 101, "the source does not");
+    // a loader-style protect of the source's mapping (read-only, then writable again) must not make a page it only inherits writable
+    ensure_eq!(
+        st(sys::process_protect(me, A, 4 * 4096, PF_R)),
+        Some(S::Ok),
+        "protect read-only"
+    );
+    ensure_eq!(
+        st(sys::process_protect(me, A, 4 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "and back"
+    );
+    wr(A + 3 * 4096, 9_000);
+    ensure_eq!(rd(A + 3 * 4096), 9_000, "the source sees its write");
+    ensure_eq!(
+        rd(B + 3 * 4096),
+        103,
+        "the child does not, after a protect either"
+    );
+    ensure_eq!(rd(A + 2 * 4096), 102, "an untouched page is still shared");
+    ensure_eq!(rd(B + 2 * 4096), 102, "in both");
+    // a member gives a page back: it reads zero afterwards, the other side keeps what it saw
+    ensure_eq!(
+        st(sys::vmo_decommit(v, 0, 4096)),
+        Some(S::Ok),
+        "decommit on a member of a family"
+    );
+    ensure_eq!(rd(A), 0, "the source's page reads zero");
+    ensure_eq!(rd(B), 100, "the child's does not change");
+    ensure_eq!(
+        st(sys::vmo_decommit(c, 4096, 4096)),
+        Some(S::Ok),
+        "and the child's own"
+    );
+    ensure_eq!(rd(B + 4096), 0, "reads zero");
+    ensure_eq!(rd(A + 4096), 101, "the source keeps its page");
+    // a PRIVATE child of a fresh VMO sees the source's later changes, and its own writes stay its own
+    let u = vmo(2)?;
+    let um = 0x5f0_0000;
+    ensure_eq!(
+        st(sys::process_map(me, u, um, 0, 2 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map u"
+    );
+    wr(um, 1);
+    wr(um + 4096, 2);
+    let pc = ok(
+        sys::vmo_create_child(u, 0, 2 * 4096, 0, private),
+        "a PRIVATE child",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::process_map(me, pc, C, 0, 2 * 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "map it"
+    );
+    ensure_eq!(rd(C), 1, "it reads the source");
+    wr(um, 11);
+    ensure_eq!(rd(C), 11, "and sees what the source changes");
+    wr(C + 4096, 22);
+    ensure_eq!(rd(C + 4096), 22, "its own write");
+    ensure_eq!(rd(um + 4096), 2, "does not reach the source");
+    // everything goes
+    for (h, va) in [(c, B), (pc, C), (v, A), (u, um)] {
+        ensure_eq!(st(sys::process_unmap(me, va)), Some(S::Ok), "unmap");
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM6: a mapping that outlives a shrink: touching the part of it past the VMO's new end ends the process with a page fault.
+fn touching_past_a_shrunk_vmo_ends_the_process_cleanly() -> Outcome {
+    let (p, _m) = launch(100)?;
+    wait_ended(p, 1000)?;
+    let r = sys::process_info(p);
+    ensure_eq!((r.status, r.a1 as i64), (0, -1001), "a page fault ended it");
     Ok(())
 }
 
@@ -12389,6 +12925,26 @@ pub fn app_main() -> i32 {
         (
             "job_limits_stop_a_thread_bomb",
             job_limits_stop_a_thread_bomb,
+        ),
+        (
+            "process_protect_and_range_unmap_from_user_mode",
+            process_protect_and_range_unmap_from_user_mode,
+        ),
+        (
+            "a_write_to_a_protected_page_ends_the_process",
+            a_write_to_a_protected_page_ends_the_process,
+        ),
+        (
+            "vmo_decommit_and_resize_from_user_mode",
+            vmo_decommit_and_resize_from_user_mode,
+        ),
+        (
+            "copy_on_write_children_from_user_mode",
+            copy_on_write_children_from_user_mode,
+        ),
+        (
+            "touching_past_a_shrunk_vmo_ends_the_process_cleanly",
+            touching_past_a_shrunk_vmo_ends_the_process_cleanly,
         ),
         (
             "job_memory_limits_stop_a_hog_and_are_credited_back",

@@ -503,9 +503,13 @@ fn a_fault_the_existing_mapping_cannot_satisfy_is_refused_not_retried_forever() 
     let (mut mm, mut vmos, mut a) = setup(40);
     let mut jobs = kcore::job::Jobs::new();
     let id = vmos.create(&mut jobs, 2);
-    // The region says RW, but the page tables already hold a read-only mapping there
+    // The region says R+X, but the page tables already hold a read-only mapping there
     // (as if some other code had mapped it).
-    a.map_region(&mut vmos, BASE, 2, id, 0, Perms::RW).unwrap();
+    let rx = Perms {
+        exec: true,
+        ..Perms::R
+    };
+    a.map_region(&mut vmos, BASE, 2, id, 0, rx).unwrap();
     let mut pt2 = PageTable::from_root(a.table().root());
     pt2.map(&mut mm, BASE, 3000, Perms::R).unwrap();
     assert_eq!(
@@ -514,9 +518,9 @@ fn a_fault_the_existing_mapping_cannot_satisfy_is_refused_not_retried_forever() 
         "spurious read: fine"
     );
     assert_eq!(
-        a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Write),
+        a.handle_fault(&mut mm, &mut vmos, &mut jobs, BASE, Access::Exec),
         Err(FaultError::Denied),
-        "a write the mapping cannot do must not 'succeed' and re-fault forever"
+        "an access the mapping cannot do must not 'succeed' and re-fault forever"
     );
     pt2.unmap(&mut mm, BASE);
     a.destroy(&mut mm, &mut vmos, &mut jobs);

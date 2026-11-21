@@ -96,6 +96,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     if frame.is_syscall() {
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
+        // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
+        super::calls::cow_sync();
         return;
     }
     match frame.decode_user() {
@@ -155,6 +157,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                     }
                 }
             };
+            // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
+            super::calls::cow_sync();
             if resolved {
                 // (the pages the fault mapped were flushed one by one above)
             } else {
@@ -243,6 +247,12 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_SELF
         | nr::PROCESS_MAP
         | nr::PROCESS_UNMAP
+        | nr::PROCESS_PROTECT
+        | nr::PROCESS_MAP_INFO
+        | nr::VMO_DECOMMIT
+        | nr::VMO_SET_SIZE
+        | nr::VMO_CREATE_CHILD
+        | nr::PROCESS_CLONE_REGION
         | nr::PROCESS_START
         | nr::PROCESS_KILL
         | nr::PROCESS_SUSPEND
