@@ -128,3 +128,16 @@ fn the_class_numbers_are_the_documented_ones() {
         assert_eq!(c as usize, i + 1, "{c:?}");
     }
 }
+
+#[test]
+fn a_held_stack_knows_when_it_is_empty() {
+    // (KT10: the mutant "is_empty gives true" survived the first mutation run)
+    let mut h = Held::new();
+    assert!(h.is_empty());
+    assert_eq!(h.len(), 0);
+    h.push(Class::Obj, 0);
+    assert!(!h.is_empty());
+    assert_eq!(h.len(), 1);
+    h.pop(Class::Obj, 0);
+    assert!(h.is_empty());
+}

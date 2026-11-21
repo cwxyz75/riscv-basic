@@ -1,0 +1,1 @@
+klock/src/lib.rs:274:9: replace Spin<T, M>::try_lock -> Option<Guard<'_, T, M>> with Some(Default::default())

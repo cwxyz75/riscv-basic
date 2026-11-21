@@ -1,0 +1,21 @@
+--- klock/src/lib.rs
++++ replace || with && in Spin<T, M>::try_lock
+@@ -269,17 +269,17 @@
+         }
+     }
+ 
+     /// Take the lock only if it is free right now.
+     pub fn try_lock(&self) -> Option<Guard<'_, T, M>> {
+         let was = M::irq_save();
+         let me = M::hart();
+         let depth = Depth::new();
+-        if self.ticket.held_by(me) || !self.ticket.try_lock(me, &depth) {
++        if self.ticket.held_by(me) && /* ~ changed by cargo-mutants ~ */ !self.ticket.try_lock(me, &depth) {
+             M::irq_restore(was);
+             return None;
+         }
+         // (a successful try_lock is a take like any other: the checker sees it after the fact, which is as good for
+         // order violations because the violation is a property of the sequence, not of the wait)
+         M::acquired(self.class, self.instance);
+         Some(Guard {
+             lock: self,

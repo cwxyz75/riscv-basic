@@ -1,0 +1,302 @@
+[
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Held::is_empty",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 122,
+          "column": 5
+        },
+        "end": {
+          "line": 124,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 123,
+        "column": 9
+      },
+      "end": {
+        "line": 123,
+        "column": 22
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Held::is_empty",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 122,
+          "column": 5
+        },
+        "end": {
+          "line": 124,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 123,
+        "column": 9
+      },
+      "end": {
+        "line": 123,
+        "column": 22
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Held::is_empty",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 122,
+          "column": 5
+        },
+        "end": {
+          "line": 124,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 123,
+        "column": 18
+      },
+      "end": {
+        "line": 123,
+        "column": 20
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::try_lock",
+      "return_type": "-> Option<Guard<'_, T, M>>",
+      "span": {
+        "start": {
+          "line": 272,
+          "column": 5
+        },
+        "end": {
+          "line": 290,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 274,
+        "column": 9
+      },
+      "end": {
+        "line": 289,
+        "column": 11
+      }
+    },
+    "replacement": "None",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::try_lock",
+      "return_type": "-> Option<Guard<'_, T, M>>",
+      "span": {
+        "start": {
+          "line": 272,
+          "column": 5
+        },
+        "end": {
+          "line": 290,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 274,
+        "column": 9
+      },
+      "end": {
+        "line": 289,
+        "column": 11
+      }
+    },
+    "replacement": "Some(Default::default())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::try_lock",
+      "return_type": "-> Option<Guard<'_, T, M>>",
+      "span": {
+        "start": {
+          "line": 272,
+          "column": 5
+        },
+        "end": {
+          "line": 290,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 277,
+        "column": 36
+      },
+      "end": {
+        "line": 277,
+        "column": 38
+      }
+    },
+    "replacement": "&&",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::try_lock",
+      "return_type": "-> Option<Guard<'_, T, M>>",
+      "span": {
+        "start": {
+          "line": 272,
+          "column": 5
+        },
+        "end": {
+          "line": 290,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 277,
+        "column": 39
+      },
+      "end": {
+        "line": 277,
+        "column": 40
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::is_free",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 292,
+          "column": 5
+        },
+        "end": {
+          "line": 295,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 294,
+        "column": 9
+      },
+      "end": {
+        "line": 294,
+        "column": 30
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "Spin<T, M>::is_free",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 292,
+          "column": 5
+        },
+        "end": {
+          "line": 295,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 294,
+        "column": 9
+      },
+      "end": {
+        "line": 294,
+        "column": 30
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  },
+  {
+    "package": "klock",
+    "file": "klock/src/lib.rs",
+    "function": {
+      "function_name": "<impl Drop for Guard<'_, T, M>>::drop",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 326,
+          "column": 5
+        },
+        "end": {
+          "line": 331,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 327,
+        "column": 9
+      },
+      "end": {
+        "line": 330,
+        "column": 34
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  }
+]

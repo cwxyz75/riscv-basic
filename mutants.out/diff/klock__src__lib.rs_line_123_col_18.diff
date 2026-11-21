@@ -1,0 +1,21 @@
+--- klock/src/lib.rs
++++ replace == with != in Held::is_empty
+@@ -115,17 +115,17 @@
+         }
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.len
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+-        self.len == 0
++        self.len != /* ~ changed by cargo-mutants ~ */ 0
+     }
+ 
+     #[allow(clippy::indexing_slicing)] // INVARIANT: len <= MAX_HELD, the stack's length, by `push`
+     pub fn holds(&self, class: Class) -> bool {
+         self.stack[..self.len].iter().any(|&(c, _)| c == class)
+     }
+ 
+     /// Would taking `(class, instance)` now be legal? Legal when nothing is held, or the new class is greater than

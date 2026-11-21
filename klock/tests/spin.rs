@@ -55,8 +55,44 @@ fn the_guard_gives_exclusive_access_and_restores_interrupts() {
         IRQ_ON.with(|i| *i.borrow()),
         "interrupts are back on after the drop"
     );
+    assert!(lock.is_free(), "the drop released the lock"); // (before the blocking take below: a missing unlock fails here, not by hanging)
     assert_eq!(*lock.lock(), 6);
     assert!(lock.is_free());
+}
+
+#[test]
+fn try_lock_takes_a_free_lock_and_is_free_says_so() {
+    // (KT10: the mutants "try_lock gives None", "delete !" in it and "is_free gives true" survived the first mutation run)
+    LOG.with(|l| l.borrow_mut().clear());
+    let lock: Spin<u32, Host> = Spin::new(Class::Jobs, 7, 1);
+    assert!(lock.is_free(), "a new lock is free");
+    {
+        let mut g = lock.try_lock().expect("try_lock takes a lock nobody holds");
+        assert!(!lock.is_free(), "held: not free");
+        assert!(
+            !IRQ_ON.with(|i| *i.borrow()),
+            "interrupts are off while a try_lock guard lives"
+        );
+        *g += 1;
+        assert!(
+            lock.try_lock().is_none(),
+            "a second try_lock fails while held"
+        );
+        assert!(
+            !IRQ_ON.with(|i| *i.borrow()),
+            "and the failed one leaves interrupts as they were (off: the guard is alive)"
+        );
+    }
+    // (checked before any blocking take: a drop that did not unlock fails here instead of hanging the test)
+    assert!(lock.is_free(), "the drop of the guard releases the lock");
+    assert!(IRQ_ON.with(|i| *i.borrow()), "and gives interrupts back");
+    let log = LOG.with(|l| l.borrow().clone());
+    assert_eq!(
+        log,
+        vec![("take", Class::Jobs, 7), ("drop", Class::Jobs, 7)],
+        "the checker hears a try_lock like any take (the failed one is not a take)"
+    );
+    assert_eq!(*lock.try_lock().expect("free again"), 2);
 }
 
 #[test]
