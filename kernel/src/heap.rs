@@ -335,7 +335,7 @@ pub fn init() {
 /// Free bytes in both heaps (for leak checks in the self-tests).
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free() of both heaps is at most their sizes
 pub fn free_bytes() -> usize {
-    irq::without(|| with_heaps(|h| h.boot.free() + h.grown.free()))
+    with_heaps(|h| h.boot.free() + h.grown.free())
 }
 
 /// Bytes of the grown heap (zero until the first growth).
@@ -354,7 +354,7 @@ pub fn frames_held() -> usize {
         pages + 1 + pages.div_ceil(512)
     };
     // (the slabs' frames and the pool's are the heap's too: counting them keeps `free_frames_accounted` constant while the heap caches)
-    grown + irq::without(|| with_heaps(|h| h.slab.frames() + h.pool_count))
+    grown + with_heaps(|h| h.slab.frames() + h.pool_count)
 }
 
 /// Add `bytes` (rounded up to pages) to the grown heap: take frames from the frame database, map them at the end
@@ -373,7 +373,7 @@ pub fn grow(bytes: usize) -> usize {
     while mapped < pages {
         let Some(f) = k.mm.db.alloc() else { break };
         let va = HEAP_WINDOW_BASE + (have + mapped * PAGE_SIZE as usize) as u64;
-        if pt.map(&mut k.mm, va, f, Perms::RW).is_err() {
+        if pt.map(k.mm, va, f, Perms::RW).is_err() {
             let _ = k.mm.db.dec(f);
             break;
         }
@@ -386,19 +386,18 @@ pub fn grow(bytes: usize) -> usize {
     // the new pages until the allocator hands them out)
     crate::arch::tlb_flush_all();
     let added = mapped * PAGE_SIZE as usize;
-    irq::without(|| {
-        with_heaps(|h| {
-            // SAFETY: the pages `[window + have, window + have + added)` were just mapped read-write, are
-            // contiguous with the grown heap (or start it), and nothing else uses them.
-            unsafe {
-                if have == 0 {
-                    h.grown.init(HEAP_WINDOW_BASE as *mut u8, added);
-                } else {
-                    h.grown.extend(added);
-                }
+    // (the big kernel lock is held and interrupts are off; `irq::without` would take the BKL again, after the memory locks `k` holds)
+    with_heaps(|h| {
+        // SAFETY: the pages `[window + have, window + have + added)` were just mapped read-write, are
+        // contiguous with the grown heap (or start it), and nothing else uses them.
+        unsafe {
+            if have == 0 {
+                h.grown.init(HEAP_WINDOW_BASE as *mut u8, added);
+            } else {
+                h.grown.extend(added);
             }
-            note_free(h);
-        });
+        }
+        note_free(h);
     });
     GROWN_BYTES.store(have + added, Ordering::Relaxed);
     added
@@ -439,36 +438,32 @@ fn service_pool() {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a frame number is below 2^52, so its address in the direct map (a kernel virtual address) does not overflow, and a pool frame is a direct-map address, so subtracting the base cannot underflow
 fn rebalance_pool() {
     debug_assert!(crate::bkl::held());
-    let k = crate::kmem::get();
-    let count = || irq::without(|| with_heaps(|h| h.pool_count));
+    let k = crate::kmem::frames();
+    let count = || with_heaps(|h| h.pool_count);
     while count() < POOL_TARGET {
         let Some(pfn) = k.mm.db.alloc() else {
             POOL_STARVED.store(true, Ordering::Relaxed);
             break;
         };
         let frame = (DIRECT_BASE + (pfn << 12)) as usize;
-        irq::without(|| {
-            with_heaps(|h| {
-                Pool {
-                    head: &mut h.pool_head,
-                    count: &mut h.pool_count,
-                }
-                .push(frame);
-                note_free(h);
-            })
+        with_heaps(|h| {
+            Pool {
+                head: &mut h.pool_head,
+                count: &mut h.pool_count,
+            }
+            .push(frame);
+            note_free(h);
         });
     }
     while count() > POOL_TARGET {
-        let frame = irq::without(|| {
-            with_heaps(|h| {
-                let f = Pool {
-                    head: &mut h.pool_head,
-                    count: &mut h.pool_count,
-                }
-                .pop();
-                note_free(h);
-                f
-            })
+        let frame = with_heaps(|h| {
+            let f = Pool {
+                head: &mut h.pool_head,
+                count: &mut h.pool_count,
+            }
+            .pop();
+            note_free(h);
+            f
         });
         let Some(frame) = frame else { break };
         let pfn = (frame as u64 - DIRECT_BASE) >> 12;
@@ -492,7 +487,7 @@ pub fn init_window() {
 /// (an equal pair means nothing was kept).
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: class < CLASSES; the sums are bounded by the memory the heaps hold, and the arithmetic that could wrap is wrapping on purpose
 pub fn leak_oracle() -> usize {
-    irq::without(|| {
+    {
         with_heaps(|h| {
             let mut small = 0usize;
             for class in 0..slab::CLASSES {
@@ -507,7 +502,7 @@ pub fn leak_oracle() -> usize {
                 .wrapping_sub(GROWN_BYTES.load(Ordering::Relaxed))
                 .wrapping_sub(small)
         })
-    })
+    }
 }
 
 /// How many frees the slab refused so far (a double free, a stray or misaligned address): zero unless the kernel has a bug.

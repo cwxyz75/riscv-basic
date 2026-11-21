@@ -74,12 +74,12 @@ pub(super) fn cleanup_dead() {
                 // the object's reference on its VMO goes; a region that still maps it keeps it alive (L15)
                 ipc::KObj::Vmo(id) => irq::without(|| {
                     let k = kmem::get();
-                    let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+                    let _ = k.vmos.release(k.mm, k.jobs, id);
                 }),
                 ipc::KObj::Process(p) if p.kill_on_close && !p.terminated => {
                     request_kill(p.pid, -2000)
                 }
-                ipc::KObj::Job(id) => irq::without(|| kmem::get().jobs.release(id)),
+                ipc::KObj::Job(id) => irq::without(|| kmem::jobs().jobs.release(id)),
                 ipc::KObj::Interrupt(i) => irq::without(|| {
                     // mask the source unless a newer object already owns it
                     let s = state();

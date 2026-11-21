@@ -131,10 +131,10 @@ fn make_slot() -> Option<u32> {
     let top = slot_base(slot) + KSTACK_SLOT_BYTES;
     for (i, &f) in frames.iter().enumerate() {
         let va = top - (PAGES - i as u64) * PAGE_SIZE;
-        if pt.map(&mut k.mm, va, f, Perms::RW).is_err() {
+        if pt.map(k.mm, va, f, Perms::RW).is_err() {
             // undo this slot's mappings so far, and give every frame back
             for j in 0..i {
-                let _ = pt.unmap(&mut k.mm, top - (PAGES - j as u64) * PAGE_SIZE);
+                let _ = pt.unmap(k.mm, top - (PAGES - j as u64) * PAGE_SIZE);
             }
             for &f in &frames {
                 let _ = k.mm.db.dec(f);

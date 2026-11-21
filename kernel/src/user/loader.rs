@@ -12,6 +12,8 @@ pub fn start(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadError> {
 
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::redundant_closure_call)]
+// (the closures stand for the critical sections `irq::without` made: the caller holds the big lock, which must not be taken again after the memory locks)
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::expect_used,
@@ -26,29 +28,30 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     if !kmem::kernel_half_unchanged() {
         return Err(LoadError::KernelHalfChanged);
     }
+    // (the caller took the big kernel lock: the closures below run under it, and must not take it again after the memory locks `k` holds)
     let k = kmem::get();
     let table =
-        PageTable::new_with_kernel_half(&mut k.mm, k.aspace.table()).ok_or(LoadError::NoMemory)?;
+        PageTable::new_with_kernel_half(k.mm, k.aspace.table()).ok_or(LoadError::NoMemory)?;
     let mut aspace = AddressSpace::new(table);
     let mut vmo_ids: Vec<u64> = Vec::new();
     let built = (|| -> Result<(), LoadError> {
         for seg in &parsed.segments {
             let (first, end) = seg.pages();
-            let id = k.vmos.create(&mut k.jobs, end - first);
+            let id = k.vmos.create(k.jobs, end - first);
             vmo_ids.push(id);
             let bytes = &image[seg.offset as usize..(seg.offset + seg.filesz) as usize];
             k.vmos
-                .write(&mut k.mm, &mut k.jobs, id, seg.vaddr % 4096, bytes)
+                .write(k.mm, k.jobs, id, seg.vaddr % 4096, bytes)
                 .map_err(|_| LoadError::NoMemory)?;
             aspace
-                .map_region(&mut k.vmos, first * 4096, end - first, id, 0, seg.perms)
+                .map_region(k.vmos, first * 4096, end - first, id, 0, seg.perms)
                 .map_err(|_| LoadError::NoMemory)?;
         }
-        let stack = k.vmos.create(&mut k.jobs, STACK_PAGES);
+        let stack = k.vmos.create(k.jobs, STACK_PAGES);
         vmo_ids.push(stack);
         aspace
             .map_region(
-                &mut k.vmos,
+                k.vmos,
                 STACK_TOP - STACK_PAGES * 4096,
                 STACK_PAGES,
                 stack,
@@ -58,19 +61,19 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             .map_err(|_| LoadError::NoMemory)?;
         Ok(())
     })();
-    let (pid, asid, first_gen) = irq::without(|| {
+    let (pid, asid, first_gen) = (|| {
         let s = state();
         let pid = s.next_pid;
         // (CNT1: the counter never wraps or repeats: at its end no process is started)
         let ok = pid.checked_add(1).map(|n| s.next_pid = n).is_some();
         (ok.then_some(pid), (pid & 0xffff) as u16, s.first_handle_gen)
-    });
+    })();
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
     if let Err(e) = built {
-        aspace.destroy_user(&mut k.mm, &mut k.vmos, &mut k.jobs);
+        aspace.destroy_user(k.mm, k.vmos, k.jobs);
         for id in vmo_ids {
-            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+            let _ = k.vmos.release(k.mm, k.jobs, id);
         }
         return Err(e);
     }
@@ -100,11 +103,16 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
-    let made = irq::without(|| -> bool {
+    let made = (|| -> bool {
         let s = state();
-        let Ok((kernel_end, process_end)) =
-            ipc::channel_create_in(&mut s.objs, &mut s.ktable, &mut quota(JobId::ROOT))
-        else {
+        let Ok((kernel_end, process_end)) = ipc::channel_create_in(
+            &mut s.objs,
+            &mut s.ktable,
+            &mut ipc::Quota {
+                jobs: &mut *k.jobs,
+                job: Some(JobId::ROOT),
+            },
+        ) else {
             return false;
         };
         let entry = s
@@ -124,26 +132,26 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         // (AB3, test builds: the generations the later handles start at; the bootstrap handle above is value 1 by the ABI)
         process.handles.set_first_generation(first_gen);
         true
-    });
+    })();
     if !made {
-        process
-            .aspace
-            .destroy_user(&mut k.mm, &mut k.vmos, &mut k.jobs);
+        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
         for id in process.vmos {
-            let _ = k.vmos.release(&mut k.mm, &mut k.jobs, id);
+            let _ = k.vmos.release(k.mm, k.jobs, id);
         }
         return Err(LoadError::NoMemory);
     }
-    let token = irq::without(|| {
+    let token = (|| {
         let s = state();
         let (entry, arg) = (process.entry, process.arg);
         // (the root job has no limits: these charges only keep its usage honest)
-        let jobs = &mut kmem::get().jobs;
+        let jobs = &mut *k.jobs;
         let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
         let _ = charge_thread(jobs, JobId::ROOT);
         s.procs.insert(pid, Box::new(process));
         new_start(s, pid, entry, STACK_TOP, arg, None)
-    });
+    })();
+    // (the thread's stack comes from the same locks)
+    drop(k);
     // user threads may run on any hart (kernel threads stay on the boot hart by default)
     let tid = thread::spawn_free("user", 10, user_thread_main, token);
     Ok((pid, tid))

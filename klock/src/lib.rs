@@ -207,6 +207,7 @@ pub trait Machine {
     /// Between looks at a held lock.
     fn relax();
     /// The checker: the hart is about to take `(class, instance)` (it panics on a violation) ...
+    #[track_caller]
     fn acquired(class: Class, instance: u32);
     /// ... and has released it.
     fn released(class: Class, instance: u32);
@@ -249,6 +250,7 @@ impl<T, M: Machine> Spin<T, M> {
         }
     }
 
+    #[track_caller]
     /// Take the lock: save and disable interrupts, run the order check, spin for the ticket.
     pub fn lock(&self) -> Guard<'_, T, M> {
         let was = M::irq_save();

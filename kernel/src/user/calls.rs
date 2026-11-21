@@ -55,9 +55,9 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
             objs: &mut s.objs,
             procs: &mut s.procs,
             me,
-            mm: &mut k.mm,
-            vmos: &mut k.vmos,
-            jobs: &mut k.jobs,
+            mm: k.mm,
+            vmos: k.vmos,
+            jobs: k.jobs,
             machine: &mut KernelMachine,
         };
         ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
@@ -75,18 +75,10 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let kernel_half_ok = kmem::kernel_half_unchanged(); // (before the memory locks: it takes them itself)
         let k = kmem::get();
-        let kernel_half_ok = kmem::kernel_half_unchanged();
-        let handle = ksys::process_create(
-            s,
-            &mut k.mm,
-            &mut k.jobs,
-            k.aspace.table(),
-            kernel_half_ok,
-            me,
-            a,
-        )
-        .map_err(|e| (e, None, None))?;
+        let handle = ksys::process_create(s, k.mm, k.jobs, k.aspace.table(), kernel_half_ok, me, a)
+            .map_err(|e| (e, None, None))?;
         Ok((Some(handle), None))
     })
 }
@@ -98,7 +90,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        ksys::process_start(s, &mut kmem::get().jobs, me, a).map_err(|e| (e, None, None))
+        ksys::process_start(s, kmem::jobs().jobs, me, a).map_err(|e| (e, None, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.
@@ -156,8 +148,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let creator = creator_prio(s);
         let k = kmem::get();
-        ksys::thread_spawn(s, &mut k.mm, &mut k.vmos, &mut k.jobs, me, creator, a)
-            .map_err(|e| (e, None, None))
+        ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
     })?;
     // Spawned after the state borrow is gone: spawning can switch to the new thread at once.
     let tid = thread::spawn_free_detached("user", spawn.prio, user_thread_main, spawn.token);
@@ -215,7 +206,7 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
         let (tid, prio, flags) = ksys::thread_set_sched_target(
             &s.objs,
             &s.procs,
-            &kmem::get().jobs,
+            kmem::jobs().jobs,
             me,
             thread::current(),
             a,
@@ -242,22 +233,34 @@ pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
 
 /// `job_set_sched(job, max_prio, rt_budget_ns, cpu_weight)`: needs SET_LIMITS. No value may exceed the parent job's;
 /// lowering `max_prio` lowers the base priority of every thread in the job and below that is above it.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
-        let jobs = &mut kmem::get().jobs;
-        let job =
-            ksys::job_set_sched(&s.objs, &s.procs, jobs, me, a).map_err(|e| (e, None, None))?;
-        // PR1: clamp the threads of the job and everything below it
-        let clamp: Vec<(Tid, u8)> = s
-            .thread_pid
-            .iter()
-            .filter_map(|(&tid, pid)| {
-                let pj = s.procs.get(pid)?.job;
-                let max = jobs.sched(pj)?.max_prio;
+        // (`JOBS` is held only while the ledger is read: `thread::priority_of` takes the big kernel lock, which comes before it)
+        let (job, candidates) = {
+            let jobs = kmem::jobs();
+            let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)
+                .map_err(|e| (e, None, None))?;
+            // PR1: the threads of the job and everything below it, with the maximum their own job now allows
+            let candidates: Vec<(Tid, u8)> = s
+                .thread_pid
+                .iter()
+                .filter_map(|(&tid, pid)| {
+                    let pj = s.procs.get(pid)?.job;
+                    let max = jobs.jobs.sched(pj)?.max_prio;
+                    jobs.jobs.is_within(pj, job).then_some((tid, max))
+                })
+                .collect();
+            (job, candidates)
+        };
+        let _ = job;
+        let clamp: Vec<(Tid, u8)> = candidates
+            .into_iter()
+            .filter_map(|(tid, max)| {
                 let now = thread::priority_of(tid)?;
-                (jobs.is_within(pj, job) && now > max).then_some((tid, max.max(1)))
+                (now > max).then_some((tid, max.max(1)))
             })
             .collect();
         thread::set_priorities(&clamp);
@@ -274,7 +277,7 @@ pub(super) fn job_kill(a: [u64; 6]) -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (victims, me_inside) =
-            ksys::job_kill_victims(&s.objs, &s.procs, &mut kmem::get().jobs, me, Handle(a[0]))
+            ksys::job_kill_victims(&s.objs, &s.procs, kmem::jobs().jobs, me, Handle(a[0]))
                 .map_err(|e| (e, None, None))?;
         Ok((victims, me_inside, me))
     })?;

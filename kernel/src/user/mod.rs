@@ -51,10 +51,36 @@ pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.el
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the
 /// kernel's own objects).
-fn quota(job: JobId) -> ipc::Quota<'static> {
-    ipc::Quota {
-        jobs: &mut kmem::get().jobs,
-        job: Some(job),
+#[track_caller]
+fn quota(job: JobId) -> QuotaGuard {
+    let held = kmem::jobs();
+    // SAFETY: the reference is to the ledger the guard in `held` keeps locked; `QuotaGuard` drops the quota before the guard.
+    let jobs: &'static mut kcore::job::Jobs = unsafe { &mut *(held.jobs as *mut kcore::job::Jobs) };
+    QuotaGuard {
+        q: ipc::Quota {
+            jobs,
+            job: Some(job),
+        },
+        _held: held,
+    }
+}
+
+/// A [`ipc::Quota`] that holds the `JOBS` lock while it exists (it derefs to the quota).
+pub(crate) struct QuotaGuard {
+    q: ipc::Quota<'static>,
+    _held: kmem::JobsRef,
+}
+
+impl core::ops::Deref for QuotaGuard {
+    type Target = ipc::Quota<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.q
+    }
+}
+
+impl core::ops::DerefMut for QuotaGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.q
     }
 }
 
@@ -102,8 +128,8 @@ pub fn reported() -> (u32, u32) {
 /// J2). Applies the credits of destroyed objects first.
 pub fn job_ledger() -> (usize, u64, u64, u64, u64) {
     irq::without(|| {
-        ipc::settle(&mut state().objs, &mut kmem::get().jobs);
-        let jobs = &kmem::get().jobs;
+        ipc::settle(&mut state().objs, kmem::jobs().jobs);
+        let jobs = &kmem::jobs().jobs;
         let u = jobs.usage(JobId::ROOT).unwrap_or_default();
         (jobs.live(), u.processes, u.threads, u.objects, u.ipc_bytes)
     })

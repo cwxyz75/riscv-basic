@@ -60,6 +60,7 @@ pub fn check_use(class: Class) {
     }
 }
 
+#[track_caller]
 fn note_acquire(class: Class, instance: u32) {
     let bad = percpu::this().held.with(|h| {
         let bad = h.check(class, instance);
@@ -139,6 +140,7 @@ fn who() -> u32 {
     percpu::this().index.load(Ordering::Relaxed) as u32
 }
 
+#[track_caller]
 /// Take the BKL. Interrupts must already be off (a handler taking it while the interrupted code
 /// spun for it with interrupts on would deadlock the hart). Reentrant.
 pub fn lock() {
@@ -267,6 +269,7 @@ impl klock::Machine for Machine {
         spin_watchdog(&mut n, "a spin lock");
         percpu::this().spins.store(n, Ordering::Relaxed);
     }
+    #[track_caller]
     fn acquired(class: Class, instance: u32) {
         percpu::this()
             .last_class

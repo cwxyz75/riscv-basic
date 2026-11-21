@@ -37,36 +37,105 @@ impl PhysMem for DirectMap {
     }
 }
 
-/// Everything the fault handler and the self-tests share.
+/// The kernel's memory state, in three locks of their own (L16): the VMO store (`VMO`), the job ledger (`JOBS`) and the frame database
+/// (`FRAME`), nested in that order inside the big kernel lock (which still protects everything else, and the kernel's own address space).
+type Cell<T> = klock::Spin<Option<T>, crate::bkl::Machine>;
+type Held<'a, T> = klock::Guard<'a, Option<T>, crate::bkl::Machine>;
+
+static VMOS: Cell<Vmos> = klock::Spin::new(klock::Class::Vmo, 0, None);
+static JOBS: Cell<kcore::job::Jobs> = klock::Spin::new(klock::Class::Jobs, 0, None);
+static FRAMES: Cell<Mm<DirectMap>> = klock::Spin::new(klock::Class::Frame, 0, None);
+static mut KASPACE: Option<AddressSpace> = None;
+
+/// Everything the fault handler and the self-tests share: the three locks held (taken in class order, released in reverse), and the
+/// kernel's address space (under the big kernel lock). Not `Send`; callers must not keep it across a context switch or across an access
+/// that can fault (the handler takes the same locks).
 pub struct Kmem {
-    pub mm: Mm<DirectMap>,
-    pub vmos: Vmos,
+    pub mm: &'static mut Mm<DirectMap>,
+    pub vmos: &'static mut Vmos,
     /// The job ledger (L16): not part of the VMO store.
-    pub jobs: kcore::job::Jobs,
-    pub aspace: AddressSpace,
+    pub jobs: &'static mut kcore::job::Jobs,
+    pub aspace: &'static mut AddressSpace,
+    // (dropped in this order: FRAME, then JOBS, then VMO)
+    _frame: Held<'static, Mm<DirectMap>>,
+    _jobs: Held<'static, kcore::job::Jobs>,
+    _vmos: Held<'static, Vmos>,
 }
 
-static mut KMEM: Option<Kmem> = None;
+/// The frame database alone (`FRAME`), for the code that needs only frames: the heap's pool and the kernel stacks.
+pub struct Frames {
+    pub mm: &'static mut Mm<DirectMap>,
+    _frame: Held<'static, Mm<DirectMap>>,
+}
 
-/// The kernel memory state, protected by the big kernel lock (`get` asserts it is held once the
-/// lock is enforced). Callers must not keep this reference across an access that can fault (the
-/// self-tests drop it before touching lazily committed memory) or across a context switch.
-///
-/// A safe function only because the aliasing rule is enforced by the lock and by convention.
+/// The job ledger alone (`JOBS`), for the code that only charges or refunds objects.
+pub struct JobsRef {
+    pub jobs: &'static mut kcore::job::Jobs,
+    _jobs: Held<'static, kcore::job::Jobs>,
+}
+
+/// Take `JOBS` alone (not inside `get`'s three locks: taking it again would be a recursive take).
 #[track_caller]
-#[allow(clippy::expect_used)] // INVARIANT: KMEM is set by `init` before anything else calls this (boot order); a panic is the right answer to a kernel bug
-pub fn get() -> &'static mut Kmem {
+pub fn jobs() -> JobsRef {
+    let mut g = JOBS.lock();
+    // SAFETY: as in `get`.
+    unsafe {
+        JobsRef {
+            jobs: inside(&mut g),
+            _jobs: g,
+        }
+    }
+}
+
+/// The value inside a held lock, as a reference that lives as long as the guard does (the owner keeps the guard next to it).
+///
+/// SAFETY (callers): the reference must not outlive the guard it came from; `Kmem` and `Frames` store both and drop the guard last.
+#[allow(clippy::expect_used)] // INVARIANT: `init` fills every cell before anything takes one (boot order)
+unsafe fn inside<T>(g: &mut Held<'static, T>) -> &'static mut T {
+    let p: *mut T = g.as_mut().expect("kmem::init was not called");
+    // SAFETY: the pointer is to the lock's own storage (a static), valid for 'static; the guard held by the caller keeps others out.
+    unsafe { &mut *p }
+}
+
+/// The kernel memory state: takes `VMO`, `JOBS` and `FRAME` in that order (the order checker sees them). Needs the big kernel lock
+/// (asserted once it is enforced). Callers must not keep it across an access that can fault or across a context switch.
+#[track_caller]
+#[allow(clippy::expect_used)] // INVARIANT: KASPACE is set by `init` before anything else calls this (boot order); a panic is the right answer to a kernel bug
+pub fn get() -> Kmem {
     debug_assert!(
         crate::bkl::held(),
         "memory state touched without the big kernel lock"
     );
-    // SAFETY: the big kernel lock is held (checked above once it is enforced); `init` filled the option before any
-    // user of `get` runs, and callers follow the rule above, so no two live
-    // references alias.
+    let mut vmo = VMOS.lock();
+    let mut jobs = JOBS.lock();
+    let mut frame = FRAMES.lock();
+    // SAFETY: each reference comes from the guard stored next to it; the guards drop after the references (field order). The big
+    // kernel lock is held (checked above), so nobody else reaches the address space.
     unsafe {
-        (*addr_of_mut!(KMEM))
-            .as_mut()
-            .expect("kmem::init was not called")
+        Kmem {
+            mm: inside(&mut frame),
+            vmos: inside(&mut vmo),
+            jobs: inside(&mut jobs),
+            aspace: (*addr_of_mut!(KASPACE))
+                .as_mut()
+                .expect("kmem::init was not called"),
+            _frame: frame,
+            _jobs: jobs,
+            _vmos: vmo,
+        }
+    }
+}
+
+/// The frame database alone: takes only `FRAME`. No big kernel lock is needed for the lock itself.
+#[track_caller]
+pub fn frames() -> Frames {
+    let mut frame = FRAMES.lock();
+    // SAFETY: as in `get`.
+    unsafe {
+        Frames {
+            mm: inside(&mut frame),
+            _frame: frame,
+        }
     }
 }
 
@@ -296,14 +365,10 @@ pub fn init() {
     let root = pt.root();
     let aspace = AddressSpace::new(PageTable::from_root(root));
     // SAFETY: called once at boot with interrupts off, before anything calls `get`.
-    unsafe {
-        *addr_of_mut!(KMEM) = Some(Kmem {
-            mm,
-            vmos: Vmos::new(),
-            jobs: kcore::job::Jobs::new(),
-            aspace,
-        })
-    };
+    unsafe { *addr_of_mut!(KASPACE) = Some(aspace) };
+    *VMOS.lock() = Some(Vmos::new());
+    *JOBS.lock() = Some(kcore::job::Jobs::new());
+    *FRAMES.lock() = Some(mm);
     let token = crate::arch::aspace_token(root);
     KERNEL_ASPACE.store(token, core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the new table maps everything the kernel is executing from and
