@@ -12,7 +12,9 @@ pub(super) fn aspace_token_of(p: &Process) -> u64 {
 pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) -> u64 {
     asids.refresh(&mut p.tag);
     let me = crate::percpu::this();
-    if p.tag.gen > me.asid_seen.load(Ordering::Relaxed) {
+    if p.tag.gen > me.asid_seen.load(Ordering::Relaxed)
+        && !cfg!(feature = "fault-asid-reuse-no-flush")
+    {
         crate::arch::tlb_flush_all();
         me.asid_seen.store(p.tag.gen, Ordering::Relaxed);
     }
@@ -53,9 +55,10 @@ pub fn activate_current() {
             != token
             || crate::arch::aspace_current() != token
         {
-            // SAFETY: `token` names a live process root whose upper half is the kernel's; installing it
-            // drops the translations of whatever table was active.
-            unsafe { crate::arch::aspace_install(token) };
+            // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
+            // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
+            // No flush: translations are tagged with the ASID (L18).
+            unsafe { crate::arch::aspace_install_tagged(token) };
         }
     }
 }

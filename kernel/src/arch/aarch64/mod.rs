@@ -252,6 +252,9 @@ pub mod cpu {
     pub fn asid_bits() -> u32 {
         unimplemented!()
     }
+    pub unsafe fn aspace_install_tagged(token: u64) {
+        unimplemented!()
+    }
     pub fn tlb_flush_page(va: u64, asid: u16) {
         unimplemented!()
     }
