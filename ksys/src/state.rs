@@ -22,6 +22,19 @@ pub struct ThreadStart {
     pub stack: Option<SpawnStack>,
     pub rr: bool,
     pub spawned: bool,
+    /// Made with `spawn::SUSPENDED` (EX1): the spawner builds its first register image and it runs only after `thread_resume`.
+    pub suspended: bool,
+}
+
+/// What `thread_write_state` leaves for a parked thread to apply to its own frame when it wakes.
+#[derive(Default, Clone, Copy)]
+pub struct PendingRegs {
+    /// A new GENERAL image.
+    pub general: Option<[u64; 32]>,
+    /// FP state was written: the frame's FS says Initial so the return loads it.
+    pub fp: bool,
+    /// Vector state was written.
+    pub vec: bool,
 }
 
 /// Everything the syscall layer keeps about user mode: the kernel objects, the processes and threads, the wait tables, and the kernel's own handles.
@@ -39,6 +52,31 @@ pub struct UserState {
     /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
     /// hart skip the cleanup while one cleaner was preempted).
     pub cleaning: BTreeSet<Tid>,
+    /// The suspend state of every thread with a suspend count above 0 (EX1): present exactly while a thread is suspended or stopped by it.
+    pub suspends: BTreeMap<Tid, kcore::suspend::Suspend>,
+    /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
+    /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
+    pub initial_regs: BTreeMap<Tid, [u64; 32]>,
+    /// Pagers and the threads waiting for their pages (MM9).
+    pub pagers: kcore::pager::Pagers,
+    /// The kernel's end (a handle in `ktable`) of each pager's request channel, by pager id.
+    pub pager_ends: BTreeMap<u64, abi::Handle>,
+    /// The next pager id.
+    pub next_pager: u64,
+    /// Threads a call that failed has to wake anyway (a partly done supply): the kernel takes them after the call.
+    pub pending_wake: Vec<Tid>,
+    /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
+    pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
+    /// The exception each stopped thread waits for, by its serial (EX2); a decision about any other (an older one, a resolved one) does nothing.
+    pub exc_pending: BTreeMap<Tid, u64>,
+    /// The next exception serial.
+    pub next_exc: u64,
+    /// Register writes for threads parked at the return to user mode, applied by the thread itself to its own frame when it wakes (EX1: nobody
+    /// else writes a frame its owner holds a `&mut` to).
+    pub pending_regs: BTreeMap<Tid, PendingRegs>,
+    /// Threads asleep in the park at the return to user mode (a stopped process, or a suspend), so that a suspend that finds one there knows it
+    /// is parked at the return and not blocked in a call.
+    pub parked_tids: BTreeSet<Tid>,
     /// Threads with a pending `thread_interrupt`: the next blocking wait that would sleep returns INTERRUPTED and takes the flag.
     pub interrupts: BTreeSet<Tid>,
     /// Thread starts waiting for their thread to run, by token.
@@ -92,10 +130,23 @@ impl UserState {
             asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
             cleaning: BTreeSet::new(),
+            suspends: BTreeMap::new(),
+            initial_regs: BTreeMap::new(),
+            job_exc: BTreeMap::new(),
+            pagers: kcore::pager::Pagers::new(),
+            pager_ends: BTreeMap::new(),
+            next_pager: 1,
+            pending_wake: Vec::new(),
+            exc_pending: BTreeMap::new(),
+            next_exc: 1,
+            pending_regs: BTreeMap::new(),
+            parked_tids: BTreeSet::new(),
             interrupts: BTreeSet::new(),
             starts: BTreeMap::new(),
             next_token: 1,
-            ktable: HandleTable::new(256),
+            // (one end of each process's and job's exception channel lives here, and the creators' ends of bootstrap channels: bounded by the
+            // object cap, whose charges the objects themselves carry)
+            ktable: HandleTable::new(abi::limits::MAX_OBJECTS),
             futexes: kcore::futex::Futexes::new(),
             waits: kcore::wait::WaitTable::new(),
             irq_objs: alloc::vec::Vec::new(),

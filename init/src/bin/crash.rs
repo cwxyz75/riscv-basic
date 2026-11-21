@@ -257,6 +257,25 @@ pub fn app_main() -> i32 {
             unsafe { core::ptr::write_volatile((BASE + 4096) as *mut u8, 2) };
             return 0;
         }
+        110 => {
+            // MM9: a reader of a pager's VMO. The parent sends the VMO; map it and read a byte of page 3 (which waits for the pager), and
+            // exit with that byte.
+            rt::sys::object_wait(rt::BOOTSTRAP, rt::abi::signals::READABLE, u64::MAX);
+            let mut m = [0u8; 8];
+            let mut h = [0u64; 1];
+            let r = rt::sys::channel_read(rt::BOOTSTRAP, m.as_mut_ptr(), 8, h.as_mut_ptr(), 1);
+            if r.status != 0 || r.a2 != 1 {
+                return -1;
+            }
+            let me = rt::sys::process_self().a1 as u64;
+            const BASE: usize = 0x560_0000;
+            if rt::sys::process_map(me, h[0], BASE as u64, 0, 16 * 4096, 3).status != 0 {
+                return -2;
+            }
+            // SAFETY: the 16 pages are mapped read-write in this process; the read waits for the pager to supply page 3.
+            let b = unsafe { core::ptr::read_volatile((BASE + 3 * 4096 + 16) as *const u8) };
+            return i32::from(b);
+        }
         100 => {
             // MM6: shrink a resizable VMO under a mapping, then touch the part that went: a clean fault, the process ends
             let me = rt::sys::process_self().a1 as u64;

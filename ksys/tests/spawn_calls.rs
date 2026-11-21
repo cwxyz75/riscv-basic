@@ -31,6 +31,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         arg: 0,
         exit_code: None,
         kernel_end: None,
+        exc_channel: None,
         start_sp: 0,
         obj: None,
         state: ProcState::Running,
@@ -285,7 +286,7 @@ fn the_error_rows_in_order() {
         ("entry not executable", (0usize, CODE + 0x10_000)),
         ("reserved", (7, 1)),
         ("priority over 63", (5, 64)),
-        ("unknown flag", (5, 8u64 << 32)),
+        ("unknown flag", (5, 16u64 << 32)),
         ("stack too big", (3, sp::MAX_STACK + 1)),
         ("guard too big", (4, sp::MAX_STACK + 1)),
         ("a stack pointer without CALLER_STACK", (6, 16)),
@@ -420,4 +421,111 @@ fn a_full_handle_table_refuses_with_no_memory_and_charges_nothing() {
     let p = procs.get_mut(&1).unwrap();
     p.handles.close(objs, held.pop().unwrap()).unwrap();
     assert!(w.spawn(plain).is_ok());
+}
+
+#[test]
+fn a_suspended_thread_is_made_with_its_object_stopped_and_a_register_image() {
+    use abi::signals;
+    let mut w = world();
+    // SUSPENDED with DETACHED could never be resumed
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED | sp::DETACHED) << 32;
+    assert_eq!(w.spawn(r), Err(Status::InvalidArgs));
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED) << 32;
+    let s = w.spawn(r).unwrap();
+    assert!(s.suspended);
+    // the object says SUSPENDED from the start, and the image is the entry, the stack and the argument (a1 is filled with the tid later)
+    let obj = s.obj.unwrap();
+    assert_eq!(
+        ipc::signals_of_object(&w.us.objs, obj).unwrap() & signals::SUSPENDED,
+        signals::SUSPENDED
+    );
+    let image = s.image.as_ref().unwrap();
+    assert_eq!(image[31], CODE, "the pc is the entry");
+    assert_eq!(image[9], 7, "a0 is the argument");
+    assert_eq!(image[3], 0x1234, "tp");
+    // the spawner records the stopped state once it has the tid; suspend, resume and state then work on it
+    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    assert!(w
+        .us
+        .suspends
+        .get(&77)
+        .is_some_and(|x| x.stopped() && x.parked()));
+    assert_eq!(
+        w.us.initial_regs.get(&77).map(|g| g[10]),
+        Some(77),
+        "a1 is the tid"
+    );
+    // a resume lowers it to 0: SUSPENDED falls and the parked thread is to be woken
+    let (tid, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert_eq!((tid, wake), (77, true));
+    assert_eq!(
+        ipc::signals_of_object(&w.us.objs, obj).unwrap() & signals::SUSPENDED,
+        0
+    );
+    assert_eq!(
+        ksys::thread_resume(&mut w.us, 1, 5, s.handle),
+        Err(Status::BadState),
+        "not suspended any more"
+    );
+}
+
+#[test]
+fn a_resume_before_a_suspended_thread_first_runs_is_not_lost() {
+    let mut w = world();
+    let mut r = w.plain();
+    r[5] = u64::from(sp::SUSPENDED) << 32;
+    let s = w.spawn(r).unwrap();
+    // the spawner's half, and a resume at once (the fork-child sequence with no pause)
+    ksys::thread_registered_by_spawner(&mut w.us, 77, &s);
+    ksys::thread_spawned_suspended(&mut w.us, 77, &s);
+    let (tid, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert_eq!((tid, wake), (77, true));
+    // the thread's own registration, when it first runs: the image the spawner made says that the stopped state was registered, and a resume
+    // has used it up, so the thread does not make it again (the kernel's `user_thread_main` tests this)
+    assert!(w.us.initial_regs.contains_key(&77));
+    assert!(!w.us.suspends.contains_key(&77), "not suspended again");
+}
+
+#[test]
+fn a_thread_asleep_in_the_park_at_the_return_counts_as_parked_not_blocked_in_a_call() {
+    let mut w = world();
+    let s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 88, &s);
+    // the thread is asleep in the park of a stopped process (the scheduler says "blocked"): a suspend finds it there
+    w.us.parked_tids.insert(88);
+    ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| true).unwrap();
+    assert!(
+        ksys::thread_state_target(&w.us, 1, 5, s.handle, true).is_ok(),
+        "its registers can be written: it is parked at the return to user mode"
+    );
+    // a thread that is blocked in a call and not parked there: a read, no write
+    let s2 = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 89, &s2);
+    ksys::thread_suspend(&mut w.us, 1, 5, s2.handle, |_| true).unwrap();
+    assert!(ksys::thread_state_target(&w.us, 1, 5, s2.handle, false).is_ok());
+    assert_eq!(
+        ksys::thread_state_target(&w.us, 1, 5, s2.handle, true),
+        Err(Status::BadState)
+    );
+}
+
+#[test]
+fn a_suspend_that_finds_a_thread_still_asleep_in_the_park_raises_suspended() {
+    // (resume, then suspend again before the woken thread has run to leave the park: the signal the resume dropped must rise again)
+    let mut w = world();
+    let s = w.spawn(w.plain()).unwrap();
+    ksys::thread_registered_by_spawner(&mut w.us, 90, &s);
+    w.us.parked_tids.insert(90);
+    let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
+    assert!(raised, "parked at the return: stopped, SUSPENDED up");
+    let (_, wake) = ksys::thread_resume(&mut w.us, 1, 5, s.handle).unwrap();
+    assert!(wake);
+    // the thread has not run: it is still in `parked_tids`
+    let (_, raised) = ksys::thread_suspend(&mut w.us, 1, 5, s.handle, |_| false).unwrap();
+    assert!(
+        raised,
+        "suspended again while still in the park: SUSPENDED rises again"
+    );
 }

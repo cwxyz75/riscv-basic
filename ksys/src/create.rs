@@ -101,6 +101,7 @@ pub fn process_create<M: PhysMem>(
             arg: 0,
             exit_code: None,
             kernel_end: None,
+            exc_channel: None,
             start_sp: 0,
             obj: Some(obj),
             state: ProcState::Created,

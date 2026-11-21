@@ -151,6 +151,12 @@ pub mod rights {
         );
         pub const PORT: Rights =
             Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::WAIT.0);
+        /// An exception (EX2): resolve it (`exception_resume`), pass it on, hand it to another thread.
+        pub const EXCEPTION: Rights = Rights(Self::TRANSFER.0 | Self::MANAGE.0);
+        /// A pager (MM9): create its VMOs, supply and fail their pages (MANAGE).
+        pub const PAGER: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
+        /// The VMO of a pager: every right of a VMO but COMMIT (committing would put zeros where the pager's data belongs).
+        pub const PAGER_VMO: Rights = Rights(Self::VMO.0 & !Self::COMMIT.0);
         pub const THREAD: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
@@ -241,6 +247,9 @@ pub mod signals {
     pub const INTERRUPT: u32 = 1 << 5;
     /// A process is stopped by `process_suspend` (level: cleared by `process_resume`; never set with TERMINATED).
     pub const STOPPED: u32 = 1 << 6;
+    /// A thread has stopped because of `thread_suspend` (level: cleared when its suspend count falls to 0; never set with TERMINATED; EX1). A
+    /// thread blocked in a call has stopped where it is.
+    pub const SUSPENDED: u32 = 1 << 7;
     /// User signals: bits 24 to 31, changed only by `event_signal`.
     pub const USER_MASK: u32 = 0xff00_0000;
     /// Every signal a wait or a port binding may name.
@@ -251,6 +260,7 @@ pub mod signals {
         | WRITE_CLOSED
         | INTERRUPT
         | STOPPED
+        | SUSPENDED
         | USER_MASK;
 }
 
@@ -370,6 +380,32 @@ pub mod syscall {
     pub const VMO_CREATE_CHILD: usize = 68;
     /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
     pub const PROCESS_CLONE_REGION: usize = 69;
+    /// Raise a thread's suspend count: it stops at its next return to user mode (EX1).
+    pub const THREAD_SUSPEND: usize = 74;
+    /// Lower it; at 0 the thread runs again.
+    pub const THREAD_RESUME: usize = 75;
+    /// Read a stopped thread's registers.
+    pub const THREAD_READ_STATE: usize = 76;
+    /// Write a stopped thread's registers.
+    pub const THREAD_WRITE_STATE: usize = 77;
+    /// The user end of the channel exceptions of a process's threads are delivered on (EX2).
+    pub const PROCESS_EXCEPTION_CHANNEL: usize = 78;
+    /// The same for the processes of a job that have no handler of their own.
+    pub const JOB_EXCEPTION_CHANNEL: usize = 79;
+    /// Say what becomes of a thread that took an exception: RETRY, NEXT or KILL.
+    pub const EXCEPTION_RESUME: usize = 97;
+    /// `pager_create() -> (pager, channel)` (MM9).
+    pub const PAGER_CREATE: usize = 103;
+    /// `pager_create_vmo(pager, key, bytes) -> vmo`.
+    pub const PAGER_CREATE_VMO: usize = 104;
+    /// `pager_supply(pager, vmo, offset, length, source, source_offset)`.
+    pub const PAGER_SUPPLY: usize = 105;
+    /// `pager_fail(pager, vmo, offset, length, status)`.
+    pub const PAGER_FAIL: usize = 106;
+    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+    pub const PAGER_QUERY_DIRTY: usize = 107;
+    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+    pub const PAGER_WRITEBACK_DONE: usize = 108;
     pub const SOCKET_CREATE: usize = 70;
     pub const SOCKET_WRITE: usize = 71;
     pub const SOCKET_READ: usize = 72;
@@ -394,6 +430,16 @@ pub mod syscall {
     pub const FUTEX_WAKE: usize = 111;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
+}
+
+/// Pagers (MM9, KERNEL-V1-SPEC 4.4): the request message on a pager's channel.
+pub mod pager {
+    /// A request: five little-endian words (key, byte offset, byte length, kind, reserved 0).
+    pub const REQUEST_BYTES: usize = 40;
+    /// Read: supply these pages.
+    pub const READ: u64 = 1;
+    /// Reserved for dirty tracking: write these pages back (not produced).
+    pub const WRITEBACK: u64 = 2;
 }
 
 /// The user address space (SYSCALLS.md, "User address space and process start").
@@ -430,6 +476,40 @@ pub mod spawn {
     pub const DETACHED: u32 = 2;
     /// Flag: the stack is the caller's (`sp` at offset 48); the kernel provisions nothing.
     pub const CALLER_STACK: u32 = 4;
+    /// Flag: the thread exists but does not run until `thread_resume` (EX1): its registers can be written first.
+    pub const SUSPENDED: u32 = 8;
+}
+
+/// Exceptions (EX2, KERNEL-V1-SPEC 3.6): the message the kernel writes to an exception channel and what a handler may do about it.
+pub mod exception {
+    /// Bytes of the message: five little-endian words, `kind` (`abi::arch::fault`), `tid`, `pc`, `address`, `cause` (the architecture's raw cause: on
+    /// RISC-V 12, 13 and 15 for a page fault on an instruction fetch, a load and a store). Two handles come with it: the thread (INSPECT,
+    /// MANAGE, WAIT) and the exception.
+    pub const MESSAGE_BYTES: usize = 40;
+    /// Handles in the message.
+    pub const MESSAGE_HANDLES: usize = 2;
+    /// `exception_resume`: the thread goes on from its state (which the handler may have changed).
+    pub const RETRY: u64 = 1;
+    /// Offer the exception to the next level (the job, then each ancestor job); with none left the process ends as it always did.
+    pub const NEXT: u64 = 2;
+    /// End the process with the usual fault exit code.
+    pub const KILL: u64 = 3;
+}
+
+/// `thread_read_state` / `thread_write_state` (EX1): the kinds and, for RISC-V, the layouts (per architecture: `abi::arch`).
+pub mod thread_state {
+    /// x1 to x31, then pc: 32 words.
+    pub const GENERAL: u64 = 1;
+    /// f0 to f31, then fcsr: 33 words.
+    pub const FP: u64 = 2;
+    /// vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each.
+    pub const VECTOR: u64 = 3;
+    /// Words of the GENERAL layout.
+    pub const GENERAL_WORDS: usize = 32;
+    /// Words of the FP layout.
+    pub const FP_WORDS: usize = 33;
+    /// Words before the vector registers in the VECTOR layout.
+    pub const VECTOR_HEADER_WORDS: usize = 4;
 }
 
 /// The kernel's address-space layout (Sv39, kernel in the upper half).

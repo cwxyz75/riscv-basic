@@ -632,6 +632,102 @@ pub mod sys {
             ],
         )
     }
+    /// The user end of the channel the exceptions of `process`'s threads are delivered on (EX2; needs MANAGE): a message of
+    /// `abi::exception::MESSAGE_BYTES` bytes with two handles (the thread, the exception) per fault the kernel cannot resolve.
+    pub fn process_exception_channel(process: u64) -> Ret {
+        syscall(PROCESS_EXCEPTION_CHANNEL, [process as usize, 0, 0, 0, 0, 0])
+    }
+    /// The same for the processes of `job` (and of the jobs below it) that have no channel of their own.
+    pub fn job_exception_channel(job: u64) -> Ret {
+        syscall(JOB_EXCEPTION_CHANNEL, [job as usize, 0, 0, 0, 0, 0])
+    }
+    /// A pager (MM9): returns the pager handle (a1) and the user end of the channel the kernel writes its page requests on (a2), each
+    /// `abi::pager::REQUEST_BYTES` bytes: key, byte offset, byte length, kind, 0.
+    pub fn pager_create() -> Ret {
+        syscall(PAGER_CREATE, [0; 6])
+    }
+    /// A VMO of `bytes` bytes whose pages `pager` supplies (needs MANAGE on the pager). Its handle has every VMO right but COMMIT; touching a page
+    /// nobody supplied asks the pager for it (the key goes in the request) and waits.
+    pub fn pager_create_vmo(pager: u64, key: u64, bytes: u64) -> Ret {
+        syscall(
+            PAGER_CREATE_VMO,
+            [pager as usize, key as usize, bytes as usize, 0, 0, 0],
+        )
+    }
+    /// Move `length` bytes of `source` (committed pages of an anonymous VMO, WRITE) from `source_offset` to `vmo` at `offset`; the threads
+    /// waiting for those pages go on.
+    pub fn pager_supply(
+        pager: u64,
+        vmo: u64,
+        offset: u64,
+        length: u64,
+        source: u64,
+        source_offset: u64,
+    ) -> Ret {
+        syscall(
+            PAGER_SUPPLY,
+            [
+                pager as usize,
+                vmo as usize,
+                offset as usize,
+                length as usize,
+                source as usize,
+                source_offset as usize,
+            ],
+        )
+    }
+    /// The pager cannot supply these pages: the threads waiting for them fail with `status` (a faulting thread takes a PAGER exception).
+    pub fn pager_fail(pager: u64, vmo: u64, offset: u64, length: u64, status: i32) -> Ret {
+        syscall(
+            PAGER_FAIL,
+            [
+                pager as usize,
+                vmo as usize,
+                offset as usize,
+                length as usize,
+                status as isize as usize,
+                0,
+            ],
+        )
+    }
+    /// Reserved for dirty tracking (MM9 names it): NOT_SUPPORTED.
+    pub fn pager_query_dirty() -> Ret {
+        syscall(PAGER_QUERY_DIRTY, [0; 6])
+    }
+    /// Reserved for dirty tracking (MM9 names it): NOT_SUPPORTED.
+    pub fn pager_writeback_done() -> Ret {
+        syscall(PAGER_WRITEBACK_DONE, [0; 6])
+    }
+    /// Say what becomes of the thread that took `exception`: `abi::exception::RETRY`, `NEXT` or `KILL`.
+    pub fn exception_resume(exception: u64, how: u64) -> Ret {
+        syscall(
+            EXCEPTION_RESUME,
+            [exception as usize, how as usize, 0, 0, 0, 0],
+        )
+    }
+    /// Raise a thread's suspend count (EX1; needs MANAGE): it stops at its next return to user mode, or where it is if it is blocked in a call.
+    /// Its object then raises SUSPENDED.
+    pub fn thread_suspend(thread: u64) -> Ret {
+        syscall(THREAD_SUSPEND, [thread as usize, 0, 0, 0, 0, 0])
+    }
+    /// Lower a thread's suspend count (EX1); at 0 it runs again. BAD_STATE when it is not suspended.
+    pub fn thread_resume(thread: u64) -> Ret {
+        syscall(THREAD_RESUME, [thread as usize, 0, 0, 0, 0, 0])
+    }
+    /// Read a stopped thread's registers into `buf` (EX1): `kind` is `abi::thread_state::GENERAL`, `FP` or `VECTOR`; `len` is exactly the layout's size.
+    pub fn thread_read_state(thread: u64, kind: u64, buf: *mut u8, len: usize) -> Ret {
+        syscall(
+            THREAD_READ_STATE,
+            [thread as usize, kind as usize, buf as usize, len, 0, 0],
+        )
+    }
+    /// Write a stopped thread's registers from `buf` (EX1); refused while the thread is inside a blocking call.
+    pub fn thread_write_state(thread: u64, kind: u64, buf: *const u8, len: usize) -> Ret {
+        syscall(
+            THREAD_WRITE_STATE,
+            [thread as usize, kind as usize, buf as usize, len, 0, 0],
+        )
+    }
     /// Reserved (T56): always NOT_SUPPORTED for a valid thread handle.
     pub fn thread_interrupt(thread: u64) -> Ret {
         syscall(THREAD_INTERRUPT, [thread as usize, 0, 0, 0, 0, 0])

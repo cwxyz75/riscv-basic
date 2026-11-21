@@ -21,11 +21,33 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
     aspace_token_of(p)
 }
 
+/// Register writes (`thread_write_state`) that were left for this thread while it was parked: applied here, by the thread to its own frame (the
+/// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
+fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
+    let pending = irq::without(|| {
+        let s = state();
+        if s.pending_regs.is_empty() {
+            return None;
+        }
+        s.pending_regs.remove(&thread::current())
+    });
+    let Some(p) = pending else {
+        return;
+    };
+    if !frame.is_from_user() {
+        return; // (a kernel frame: nothing was written for it)
+    }
+    if let Some(g) = p.general {
+        frame.set_general(&g);
+    }
+    crate::fp::apply_written(thread::current(), frame, p.fp, p.vec);
+}
+
 /// Make the calling thread's process the current address space, just before returning to
 /// user mode. Needed because the hart's address space belongs to whichever user thread last ran:
 /// threads of different processes are switched between, and the kernel half is shared so
 /// kernel code runs under any of them, but returning to user mode must use *this* one.
-pub fn activate_current() {
+pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // (the epoch first, then the marks: a kill that lands after this load moves the epoch and is seen at the next trap)
     crate::percpu::this()
         .attention_seen
@@ -33,6 +55,7 @@ pub fn activate_current() {
     // A process that was killed while its thread was not running dies here, at the point
     // where it would otherwise return to user mode.
     park_while_stopped();
+    apply_pending_regs(frame);
     let token = irq::without(|| {
         let s = state();
         let UserState {
@@ -96,6 +119,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     if frame.is_syscall() {
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
+        // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held
+        pager_after_call(frame);
         // (MM8) a copy-on-write fault inside a kernel copy to or from user memory replaced translations this and other harts may cache
         super::calls::cow_sync();
         return;
@@ -106,7 +131,8 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             let cause = fault.code;
             let access = fault.access.unwrap_or(Access::Read);
             let va = fault.address;
-            let resolved = {
+            let mut pager_need = None;
+            let mut resolved = {
                 let pid = state().thread_pid.get(&thread::current()).copied();
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
@@ -123,6 +149,11 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
                             // thread still runs under the old one)
                             kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
+                        }
+                        if let Err(kcore::aspace::FaultError::NeedPager(n)) = &r {
+                            pager_need = Some(*n);
+                            // (the fault has the need in its error: the slot a kernel copy reads must not keep it for another thread's call)
+                            let _ = k.vmos.take_need();
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {
@@ -157,6 +188,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                     }
                 }
             };
+            // (MM9) the page is a pager's and was not supplied: wait for it with no lock held (PG1); on a supply the access is tried again, and
+            // a pager that failed or died raises a PAGER exception
+            let mut pager_status = None;
+            if let Some(need) = pager_need {
+                match pager_wait(need, false) {
+                    Ok(()) => resolved = true,
+                    Err(status) => pager_status = Some(status),
+                }
+            }
             // (MM8) a copy or a first touch of a page other mappings may show an older version of: drop those, on every hart
             super::calls::cow_sync();
             if resolved {
@@ -175,7 +215,15 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                         ),
                     );
                 }
-                exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind()));
+                match pager_status {
+                    Some(status) => raise_fault(ksys::exception::Fault {
+                        kind: abi::arch::fault::PAGER,
+                        pc: fault.pc,
+                        address: fault.address,
+                        cause: i64::from(status.code()) as u64,
+                    }),
+                    None => fault_or_exit(&fault),
+                }
             }
         }
         UserTrap::Fault(fault)
@@ -185,7 +233,43 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             // for it, from zeros; the instruction is retried. (A real illegal instruction traps again
             // with the unit on and ends the process below.)
         }
-        UserTrap::Fault(fault) => exit_process(abi::arch::fault::exit_code(fault.kind.abi_kind())),
+        UserTrap::Fault(fault) => fault_or_exit(&fault),
+    }
+}
+
+/// A fault the kernel cannot resolve (EX2): offered to the process's exception channel, then its job's and each ancestor's; the thread stops until a
+/// handler resolves it (RETRY comes back here and returns to user mode to try the instruction again). With no handler anywhere the process ends,
+/// as it always did, with `-1000 - kind`.
+fn fault_or_exit(fault: &crate::arch::Fault) {
+    raise_fault(ksys::exception::Fault {
+        kind: fault.kind.abi_kind(),
+        pc: fault.pc,
+        address: fault.address,
+        cause: fault.code,
+    });
+}
+
+/// `fault_or_exit` for a fault already described (a PAGER fault, MM9, has the pager's status as its cause).
+fn raise_fault(f: ksys::exception::Fault) {
+    let delivered = irq::without(|| {
+        let s = state();
+        let tid = thread::current();
+        let Some(&pid) = s.thread_pid.get(&tid) else {
+            return false;
+        };
+        if !ksys::exception::deliver(s, kmem::jobs().jobs, pid, tid, &f, None) {
+            return false;
+        }
+        // (the thread is stopped before anyone can read the message: the big lock is held throughout)
+        ksys::exception::stop_thread(s, tid);
+        sync_suspends(s);
+        true
+    });
+    if delivered {
+        commit_wake(); // the channel is readable now
+        park_while_stopped();
+    } else {
+        exit_process(abi::arch::fault::exit_code(f.kind));
     }
 }
 
@@ -260,7 +344,19 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         | nr::PROCESS_INFO
         | nr::THREAD_SPAWN
         | nr::THREAD_INFO
-        | nr::THREAD_INTERRUPT => {
+        | nr::THREAD_INTERRUPT
+        | nr::THREAD_SUSPEND
+        | nr::PROCESS_EXCEPTION_CHANNEL
+        | nr::JOB_EXCEPTION_CHANNEL
+        | nr::EXCEPTION_RESUME
+        | nr::THREAD_RESUME
+        | nr::THREAD_READ_STATE
+        | nr::THREAD_WRITE_STATE
+        | nr::PAGER_CREATE
+        | nr::PAGER_SUPPLY
+        | nr::PAGER_FAIL
+        | nr::PAGER_QUERY_DIRTY
+        | nr::PAGER_WRITEBACK_DONE => {
             let r = process_call(n, a);
             notify();
             reply(frame, r);
@@ -296,6 +392,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
                     | nr::PORT_UNBIND
                     | nr::PORT_REARM
             ) {
+                if n == nr::HANDLE_CLOSE {
+                    // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
+                    irq::without(|| ksys::exception::reap_closed_job_channels(state()));
+                }
                 notify();
             }
             // Slice W step 3: wake the threads whose wait this syscall ended, by id (a handle removed

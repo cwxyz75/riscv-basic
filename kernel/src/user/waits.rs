@@ -95,6 +95,88 @@ pub(super) fn futex_wake(a: [u64; 6]) -> (Reply, Vec<u64>) {
     }
 }
 
+/// Wait for a page of a pager's VMO (MM9, KERNEL-V1-SPEC 4.5, PG1): register as a waiter (the request goes to the pager once per page), let go of every
+/// lock, and sleep until the pager supplies the page, fails it, dies, or this thread is killed or interrupted. `Ok` when the page was supplied
+/// (the caller tries again) or the wait was cut short by a kill or an interrupt (the return to user mode ends the process, or the access is
+/// tried again); `Err` with the pager's status when the page cannot be had.
+pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Result<(), Status> {
+    let me = thread::current();
+    let begun = irq::without(|| {
+        let k = kmem::get();
+        ksys::pager::pager_wait_begin(state(), k.vmos, k.jobs, me, need)
+    });
+    // (a pager found dead while registering wakes the others through `pending_wake`)
+    let mut woken = irq::without(|| core::mem::take(&mut state().pending_wake));
+    woken.extend(begun.as_ref().map(|w| w.as_slice()).unwrap_or(&[]));
+    thread::wake_many(&woken);
+    begun?;
+    // (the page came in since the call found it missing: nothing was registered)
+    if !irq::without(|| state().pagers.waiting(me)) {
+        return Ok(());
+    }
+    // (the request is in the pager's channel: its reader must see it)
+    commit_wake();
+    loop {
+        // a request that did not fit in a full channel is tried again every 10 ms, by the waiters of that pager
+        let unsent = irq::without(|| state().pagers.has_unsent(need.pager));
+        let deadline = if unsent {
+            thread::now_ns().saturating_add(10_000_000)
+        } else {
+            u64::MAX
+        };
+        thread::wait_deadline_private(
+            || {
+                killed_now().is_some()
+                    || (in_call && interrupted_now())
+                    || ksys::pager::pager_wait_done(state(), me)
+            },
+            deadline,
+        );
+        let ended = irq::without(|| {
+            ksys::pager::pager_wait_done(state(), me)
+                || killed_now().is_some()
+                || (in_call && interrupted_now())
+        });
+        if ended {
+            break;
+        }
+        let woken = irq::without(|| {
+            let k = kmem::get();
+            ksys::pager::pager_flush(state(), k.vmos, k.jobs, need.pager)
+        });
+        thread::wake_many(&woken);
+        commit_wake();
+    }
+    // a fault ignores `thread_interrupt` (the flag stays for the next blocking call); a call that was interrupted or killed while it waited
+    // reports INTERRUPTED and takes the flag
+    let stopped = in_call && (irq::without(|| killed_now().is_some()) || take_interrupt());
+    match irq::without(|| ksys::pager::pager_wait_end(state(), me)) {
+        Some(Err(e)) => Err(e),
+        Some(Ok(())) => Ok(()),
+        None if stopped => Err(Status::Interrupted),
+        None => Ok(()),
+    }
+}
+
+/// After a call that failed with SHOULD_WAIT because a page of a pager's VMO was not there (MM9): wait for the page, and make the call's answer
+/// what the wait came to: SHOULD_WAIT again (the page is there now, try again) or the pager's failure status.
+pub(super) fn pager_after_call(frame: &mut crate::trap::TrapFrame) {
+    // (one load when no pager page was missing: the common case takes no lock)
+    if !kcore::aspace::PAGER_NEED_PENDING.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let need = irq::without(|| kmem::get().vmos.take_need());
+    let Some(need) = need else {
+        return;
+    };
+    if frame.arg(10) as i64 != i64::from(Status::ShouldWait.code()) {
+        return; // (the call went on without the page: nothing to wait for)
+    }
+    if let Err(status) = pager_wait(need, true) {
+        status_ret(frame, status);
+    }
+}
+
 /// `port_wait(port, deadline)`: wait until a binding is ready (the port's READABLE signal),
 /// then report one in turn.
 pub(super) fn port_wait(a: [u64; 6]) -> Reply {
@@ -194,14 +276,33 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     );
     irq::without(|| state().waits.forget(me));
     // the reply (a reply that came wins; an interrupt that ended the wait reports INTERRUPTED, the request stays queued)
-    irq::without(|| {
-        let s = state();
-        let k = kmem::get();
-        match caller_pid(s) {
-            Ok(pid) => {
-                ksys::channel_call_reply(s, k.mm, k.vmos, k.jobs, pid, &call, take_interrupt_held)
+    loop {
+        let r = irq::without(|| {
+            let s = state();
+            let k = kmem::get();
+            match caller_pid(s) {
+                Ok(pid) => ksys::channel_call_reply(
+                    s,
+                    k.mm,
+                    k.vmos,
+                    k.jobs,
+                    pid,
+                    &call,
+                    take_interrupt_held,
+                ),
+                Err(e) => Err((e, None, None)),
             }
-            Err(e) => Err((e, None, None)),
+        });
+        // (MM9) a reply buffer in a page of a pager's VMO that is not there: the reply stays queued; wait for the page here and take the reply
+        // again, since a retry by the caller would send the request a second time
+        if matches!(&r, Err((Status::ShouldWait, _, _))) {
+            if let Some(need) = irq::without(|| kmem::get().vmos.take_need()) {
+                match pager_wait(need, true) {
+                    Ok(()) => continue,
+                    Err(e) => return Err((e, None, None)),
+                }
+            }
         }
-    })
+        return r;
+    }
 }

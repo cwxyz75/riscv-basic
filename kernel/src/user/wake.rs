@@ -44,6 +44,11 @@ pub fn commit_wake() {
 /// global wait queue that used to be woken here, OD43, is gone).
 pub fn notify() {
     cleanup_dead();
+    // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
+    let woken = irq::without(|| ksys::pager::reap_closed_channels(state()));
+    if !woken.is_empty() {
+        thread::wake_many(&woken);
+    }
     commit_wake();
     // the safe point where the kernel heap may grow (heap.rs)
     irq::without(crate::heap::service);
@@ -80,6 +85,16 @@ pub(super) fn cleanup_dead() {
                     request_kill(p.pid, -2000)
                 }
                 ipc::KObj::Job(id) => irq::without(|| kmem::jobs().jobs.release(id)),
+                // the last handle to an exception was closed without a decision: it is NEXT (EX2)
+                ipc::KObj::Exception(e) => act_on_resolution(irq::without(|| {
+                    let s = state();
+                    ksys::exception::exception_dropped(s, kmem::jobs().jobs, &e)
+                })),
+                // the last handle to a pager: every wait for its pages fails, and the kernel's end of its channel goes (MM9)
+                ipc::KObj::Pager(id) => {
+                    let woken = irq::without(|| ksys::pager::pager_destroyed(state(), id));
+                    thread::wake_many(&woken);
+                }
                 ipc::KObj::Interrupt(i) => irq::without(|| {
                     // mask the source unless a newer object already owns it
                     let s = state();

@@ -23,22 +23,27 @@ extern crate alloc;
 mod create;
 mod job;
 mod lifecycle;
+pub mod pager;
 mod proc;
 mod state;
 mod thread;
 mod vmo;
 mod wait;
 pub use create::process_create;
+pub mod exception;
 pub use job::{job_call, job_status};
 pub use lifecycle::{
     job_kill_victims, job_set_sched, kill_target, stop_target, thread_set_sched_target,
     thread_target,
 };
 pub use proc::{cow_sync, proc_call, Machine, PCtx, ProcState, Process, SpawnStack};
-pub use state::{ThreadStart, UserState};
+pub use state::{PendingRegs, ThreadStart, UserState};
 pub use thread::{
-    charge_thread, clamp_prio, credit_thread, new_start, process_start, thread_spawn,
-    total_threads, Spawn, KSTACK_PAGES,
+    charge_thread, clamp_prio, credit_thread, initial_general, new_start, process_start,
+    thread_at_return, thread_blocks, thread_is_suspended, thread_registered_by_spawner,
+    thread_resume, thread_spawn, thread_spawned_suspended, thread_start_suspended,
+    thread_state_target, thread_stop_pending, thread_suspend, thread_suspend_forget,
+    thread_unparked, total_threads, Spawn, KSTACK_PAGES,
 };
 pub use vmo::vmo_call;
 pub use wait::{

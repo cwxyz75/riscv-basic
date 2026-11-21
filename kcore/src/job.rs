@@ -21,7 +21,7 @@ pub const MAX_JOBS: usize = 256;
 /// "No limit" for any resource.
 pub const UNLIMITED: u64 = u64::MAX;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(u32);
 
 impl JobId {

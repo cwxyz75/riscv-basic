@@ -784,7 +784,7 @@ fn wait_arguments_are_checked() -> Outcome {
         "an empty mask"
     );
     ensure_eq!(
-        st(sys::object_wait(e, 1 << 7, 0)),
+        st(sys::object_wait(e, 1 << 8, 0)),
         Some(S::InvalidArgs),
         "a bit that is no signal"
     );
@@ -1777,6 +1777,16 @@ fn launch_image(image: u64, arg: u64) -> Result<(u64, u64), Detail> {
 /// With a job, our handles to the child's memory are closed after mapping, so that the job's
 /// usage can be seen going back to zero when the child ends.
 fn launch_image_in(image: u64, arg: u64, job: u64) -> Result<(u64, u64), Detail> {
+    launch_image_with(image, arg, job, &|_| Ok(()))
+}
+
+/// `launch_image_in`, calling `before_start(process)` once the child is built and before it runs (to give it an exception channel, say).
+fn launch_image_with(
+    image: u64,
+    arg: u64,
+    job: u64,
+    before_start: &dyn Fn(u64) -> Result<(), Detail>,
+) -> Result<(u64, u64), Detail> {
     ensure!(image != 0, "no image was fetched");
     let mut eh = [0u8; 64];
     ok(
@@ -1850,6 +1860,7 @@ fn launch_image_in(image: u64, arg: u64, job: u64) -> Result<(u64, u64), Detail>
     if job != 0 {
         sys::handle_close(stack);
     }
+    before_start(proc)?;
     let (mine, theirs) = channel()?;
     ok(
         sys::process_start(proc, entry, 0x10_0000_0000 + 16 * 4096, theirs, arg),
@@ -3172,6 +3183,1291 @@ fn copy_on_write_children_from_user_mode() -> Outcome {
     // everything goes
     for (h, va) in [(c, B), (pc, C), (v, A), (u, um)] {
         ensure_eq!(st(sys::process_unmap(me, va)), Some(S::Ok), "unmap");
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+// ---- EX1: thread_suspend, thread_resume, thread_read_state, thread_write_state, thread_spawn SUSPENDED ----
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .globl ex1_spin_a1
+    .balign 4
+ex1_spin_a1:                    # spins until a1 holds 0x5a5a5a, then ends with exit code 77
+    li   t1, 0x5a5a5a
+1:  beq  a1, t1, 2f
+    j    1b
+2:  li   a0, 77
+    li   a7, 61
+    ecall
+    .globl ex1_exit_55
+    .balign 4
+ex1_exit_55:                    # ends with exit code 55
+    li   a0, 55
+    li   a7, 61
+    ecall
+    .globl ex1_handler
+    .balign 4
+ex1_handler:                    # a "signal handler": counts a hit, returns to the address the debugger left in t6
+    li   t5, 1
+    la   t4, EX1_HITS
+    amoadd.w zero, t5, (t4)
+    jr   t6
+    .globl ex1_spin_f1
+    .balign 4
+ex1_spin_f1:                    # spins until f1 holds 0x1234567, then ends with exit code 66
+1:  fmv.x.d t0, f1
+    li   t1, 0x1234567
+    beq  t0, t1, 2f
+    j    1b
+2:  li   a0, 66
+    li   a7, 61
+    ecall
+"#
+);
+
+extern "C" {
+    fn ex1_spin_a1();
+    fn ex1_exit_55();
+    fn ex1_handler();
+    fn ex1_spin_f1();
+}
+
+#[no_mangle]
+static EX1_HITS: AtomicU32 = AtomicU32::new(0);
+
+const EX1_MAGIC: u64 = 0x5a5a5a;
+const GENERAL: u64 = rt::abi::thread_state::GENERAL;
+const FPK: u64 = rt::abi::thread_state::FP;
+const VECK: u64 = rt::abi::thread_state::VECTOR;
+
+/// Start a thread at `entry` on a stack of its own; `flags` are extra `thread_spawn` flags. Returns (handle, tid).
+fn ex1_spawn(entry: unsafe extern "C" fn(), flags: u32) -> Result<(u64, u64), Detail> {
+    let top = own_stack()?;
+    let rec = rt::SpawnArgs {
+        entry: entry as usize as u64,
+        flags: rt::abi::spawn::CALLER_STACK | flags,
+        sp: top,
+        ..rt::SpawnArgs::default()
+    };
+    let r = ok(sys::thread_spawn(me()?, &rec), "thread_spawn")?;
+    Ok((r.a1 as u64, r.a2 as u64))
+}
+
+fn ex1_pause(ticks: u64) -> Result<(), Detail> {
+    let gate = event()?;
+    let _ = sys::object_wait(gate, 1 << 24, sys::clock_get() + ticks);
+    sys::handle_close(gate);
+    Ok(())
+}
+
+/// Poll `cond` (every tick) until it holds or `ticks` have passed.
+fn ex1_until(ticks: u64, cond: impl Fn() -> bool) -> bool {
+    let end = sys::clock_get() + ticks;
+    while sys::clock_get() < end {
+        if cond() {
+            return true;
+        }
+        let _ = ex1_pause(1);
+    }
+    cond()
+}
+
+fn ex1_signals(t: u64) -> u32 {
+    sys::object_signals(t).a1 as u32
+}
+
+fn ex1_read(t: u64) -> Result<[u64; 32], Detail> {
+    let mut g = [0u64; 32];
+    ok(
+        sys::thread_read_state(t, GENERAL, g.as_mut_ptr() as *mut u8, 256),
+        "thread_read_state",
+    )?;
+    Ok(g)
+}
+
+fn ex1_write(t: u64, g: &[u64; 32]) -> Option<S> {
+    st(sys::thread_write_state(
+        t,
+        GENERAL,
+        g.as_ptr() as *const u8,
+        256,
+    ))
+}
+
+/// A running thread is suspended (it stops, its object says SUSPENDED), its registers are read twice (the same) and one is written: after
+/// the resume the thread sees the value. The resume of a thread that is not suspended is BAD_STATE.
+fn thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written() -> Outcome {
+    let (t, tid) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(3)?;
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        0,
+        "a running thread is not SUSPENDED"
+    );
+    ensure_eq!(
+        st(sys::thread_resume(t)),
+        Some(S::BadState),
+        "resume of a thread that is not suspended"
+    );
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    let r = sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "SUSPENDED rises");
+    let (g1, g2) = (ex1_read(t)?, ex1_read(t)?);
+    ensure_eq!(g1, g2, "a stopped thread's registers do not change");
+    let entry = ex1_spin_a1 as *const () as usize as u64;
+    ensure!(
+        g1[31] >= entry && g1[31] < entry + 16,
+        "the pc {:#x} is in the spin loop at {entry:#x}",
+        g1[31]
+    );
+    ensure_eq!(g1[10], tid, "a1 is the tid a spawned thread starts with");
+    let mut w = g1;
+    w[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &w), Some(S::Ok), "write a1");
+    ensure_eq!(ex1_read(t)?, w, "what was written reads back");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500);
+    ensure_eq!(r.status, 0, "the thread saw the new a1 and ended");
+    ensure_eq!(
+        sys::thread_info(t).a1,
+        77,
+        "its exit code says it saw the value"
+    );
+    Ok(())
+}
+
+/// The signal-injection sequence: stop a thread, point its pc at a handler (leaving the old pc where the handler returns to), let it run the
+/// handler, and see it continue where it was.
+fn a_stopped_thread_can_be_sent_to_a_handler_and_back() -> Outcome {
+    EX1_HITS.store(0, Ordering::SeqCst);
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut g = ex1_read(t)?;
+    let old_pc = g[31];
+    g[30] = old_pc; // t6 (x31) is word 30
+    g[31] = ex1_handler as *const () as usize as u64;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "point the pc at the handler");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure!(
+        ex1_until(100, || EX1_HITS.load(Ordering::SeqCst) == 1),
+        "the handler ran"
+    );
+    ex1_pause(2)?;
+    ensure_eq!(EX1_HITS.load(Ordering::SeqCst), 1, "and only once");
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "stop it again");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped again"
+    );
+    let mut g = ex1_read(t)?;
+    ensure!(
+        g[31] >= ex1_spin_a1 as *const () as usize as u64
+            && g[31] < ex1_spin_a1 as *const () as usize as u64 + 16,
+        "back in the loop at {:#x}",
+        g[31]
+    );
+    g[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "set a1");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 77, "having gone back to its loop");
+    // (another thread redirected to a function of its own)
+    let (u, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    ensure_eq!(st(sys::thread_suspend(u)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(u, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut g = ex1_read(u)?;
+    g[31] = ex1_exit_55 as *const () as usize as u64;
+    ensure_eq!(ex1_write(u, &g), Some(S::Ok), "redirect the pc");
+    ensure_eq!(st(sys::thread_resume(u)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(u, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(sys::thread_info(u).a1, 55, "at the new pc");
+    Ok(())
+}
+
+/// A thread started SUSPENDED runs only after `thread_resume`, with the registers written beforehand (the `fork` child sequence).
+fn a_thread_started_suspended_runs_only_after_resume_with_registers_written_first() -> Outcome {
+    let top = own_stack()?;
+    let rec = |flags: u32| rt::SpawnArgs {
+        entry: ex1_spin_a1 as *const () as usize as u64,
+        flags: rt::abi::spawn::CALLER_STACK | flags,
+        sp: top,
+        ..rt::SpawnArgs::default()
+    };
+    ensure_eq!(
+        st(sys::thread_spawn(
+            me()?,
+            &rec(rt::abi::spawn::SUSPENDED | rt::abi::spawn::DETACHED)
+        )),
+        Some(S::InvalidArgs),
+        "SUSPENDED with DETACHED could never be resumed"
+    );
+    let r = ok(
+        sys::thread_spawn(me()?, &rec(rt::abi::spawn::SUSPENDED)),
+        "spawn SUSPENDED",
+    )?;
+    let (t, tid) = (r.a1 as u64, r.a2 as u64);
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        sig::SUSPENDED,
+        "SUSPENDED is up at once"
+    );
+    ex1_pause(4)?;
+    ensure_eq!(ex1_signals(t) & sig::TERMINATED, 0, "it has not run");
+    let mut g = ex1_read(t)?;
+    ensure_eq!(
+        g[31],
+        ex1_spin_a1 as *const () as usize as u64,
+        "it starts at its entry"
+    );
+    ensure_eq!(g[1], top, "with its stack");
+    ensure_eq!(g[10], tid, "and its tid in a1");
+    g[10] = EX1_MAGIC; // as a forked child is given its parent's registers with a return value changed
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write before it ever ran");
+    ex1_pause(3)?;
+    ensure_eq!(ex1_signals(t) & sig::TERMINATED, 0, "still not running");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(ex1_signals(t) & sig::SUSPENDED, 0, "SUSPENDED falls");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it runs and ends"
+    );
+    ensure_eq!(
+        sys::thread_info(t).a1,
+        77,
+        "from the registers that were written"
+    );
+    Ok(())
+}
+
+/// The fork-child sequence with no pause at all: the spawner writes the child's registers and resumes it at once.
+fn a_thread_started_suspended_and_resumed_at_once_runs() -> Outcome {
+    for _ in 0..8 {
+        let (t, _) = ex1_spawn(ex1_spin_a1, rt::abi::spawn::SUSPENDED)?;
+        let mut g = ex1_read(t)?;
+        g[10] = EX1_MAGIC;
+        ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write at once");
+        ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume at once");
+        ensure_eq!(
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+            0,
+            "it runs"
+        );
+        ensure_eq!(
+            sys::thread_info(t).a1,
+            77,
+            "from the registers that were written"
+        );
+    }
+    // a thread that is not suspended can be suspended at once too: it is known from the moment the spawn returns
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend at once");
+    ensure!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status == 0,
+        "it stops"
+    );
+    let mut g = ex1_read(t)?;
+    g[10] = EX1_MAGIC;
+    ensure_eq!(ex1_write(t, &g), Some(S::Ok), "write");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    Ok(())
+}
+
+/// The refusals, nesting, and a thread blocked in a call.
+fn suspend_and_state_calls_check_their_arguments_and_rights() -> Outcome {
+    let (t, _) = ex1_spawn(ex1_spin_a1, 0)?;
+    ex1_pause(2)?;
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::BadState),
+        "read of a running thread"
+    );
+    ensure_eq!(
+        ex1_write(t, &g),
+        Some(S::BadState),
+        "write to a running thread"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            0,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::BadState),
+        "a thread cannot read its own registers"
+    );
+    let weak = weaker(t, Rights::WAIT.0)?;
+    ensure_eq!(
+        st(sys::thread_suspend(weak)),
+        Some(S::AccessDenied),
+        "suspend needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::thread_resume(weak)),
+        Some(S::AccessDenied),
+        "resume needs MANAGE"
+    );
+    ensure_eq!(
+        st(sys::thread_suspend(BAD)),
+        Some(S::BadHandle),
+        "suspend: bad handle"
+    );
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::thread_suspend(ev)),
+        Some(S::WrongType),
+        "suspend: an event"
+    );
+    // nesting: two suspends, one resume leaves it suspended
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "and again");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "one resume");
+    ensure_eq!(
+        ex1_signals(t) & sig::SUSPENDED,
+        sig::SUSPENDED,
+        "still suspended"
+    );
+    // the argument checks on a stopped thread
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            248
+        )),
+        Some(S::InvalidArgs),
+        "a length that is not the layout's"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            99,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::InvalidArgs),
+        "an unknown kind"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(t, GENERAL, 8 as *mut u8, 256)),
+        Some(S::InvalidArgs),
+        "a bad buffer"
+    );
+    let mut w = ex1_read(t)?;
+    let pc = w[31];
+    w[31] = rt::abi::user::TOP;
+    ensure_eq!(
+        ex1_write(t, &w),
+        Some(S::InvalidArgs),
+        "a pc that is not a user address"
+    );
+    w[31] = pc | 1;
+    ensure_eq!(
+        ex1_write(t, &w),
+        Some(S::InvalidArgs),
+        "a pc that is not 2-aligned"
+    );
+    w[31] = pc;
+    ensure_eq!(ex1_read(t)?[31], pc, "nothing changed");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "the second resume");
+    ensure_eq!(ex1_signals(t) & sig::SUSPENDED, 0, "SUSPENDED falls at 0");
+    ensure_eq!(
+        st(sys::thread_resume(t)),
+        Some(S::BadState),
+        "a third resume"
+    );
+    w[10] = EX1_MAGIC;
+    // (end it: suspend, set a1, resume)
+    ensure_eq!(st(sys::thread_suspend(t)), Some(S::Ok), "suspend");
+    ensure_eq!(
+        sys::object_wait(t, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(ex1_write(t, &w), Some(S::Ok), "set a1");
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ends"
+    );
+    ensure_eq!(
+        st(sys::thread_suspend(t)),
+        Some(S::BadState),
+        "suspend of an ended thread"
+    );
+    // a thread blocked in a call has stopped where it is: SUSPENDED rises at once, its registers can be read, not written
+    let gate = event()?;
+    let b = new_thread(worker_wait_event, gate as usize)?;
+    ex1_pause(4)?;
+    ensure_eq!(
+        st(sys::thread_suspend(b)),
+        Some(S::Ok),
+        "suspend a blocked thread"
+    );
+    ensure_eq!(
+        sys::object_wait(b, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "SUSPENDED rises while it is blocked"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            b,
+            GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read it"
+    );
+    ensure_eq!(
+        ex1_write(b, &g),
+        Some(S::BadState),
+        "write is refused inside a blocking call"
+    );
+    ensure_eq!(st(sys::thread_resume(b)), Some(S::Ok), "resume it");
+    ensure_eq!(ex1_signals(b) & sig::SUSPENDED, 0, "SUSPENDED falls");
+    ensure_eq!(ex1_signals(b) & sig::TERMINATED, 0, "it goes on waiting");
+    // a suspend that arrives while it is blocked and a wake that ends the wait: it parks instead of returning
+    ensure_eq!(st(sys::thread_suspend(b)), Some(S::Ok), "suspend again");
+    ensure_eq!(
+        sys::object_wait(b, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    ensure_eq!(
+        st(sys::event_signal(gate, 0, 1 << 24)),
+        Some(S::Ok),
+        "end its wait"
+    );
+    ex1_pause(3)?;
+    ensure_eq!(
+        ex1_signals(b) & sig::TERMINATED,
+        0,
+        "it has not returned from its call: it is parked"
+    );
+    ensure_eq!(st(sys::thread_resume(b)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(b, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "now it returns and ends"
+    );
+    ensure_eq!(
+        WOKEN_STATUS.load(Ordering::SeqCst),
+        0,
+        "its wait had succeeded"
+    );
+    Ok(())
+}
+
+/// FP and vector state round-trip, and a thread started with FP state written for it uses it.
+fn fp_and_vector_state_round_trip_through_thread_state() -> Outcome {
+    let (t, _) = ex1_spawn(ex1_spin_f1, rt::abi::spawn::SUSPENDED)?;
+    let mut f = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            FPK,
+            f.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read FP of a thread that never used it"
+    );
+    ensure_eq!(f, [0u64; 33], "zeros");
+    f[1] = 0x123_4567;
+    f[10] = 0xdead_beef_0000_0001;
+    f[32] = 0x61; // fcsr: frm 3, fflags 1
+    ensure_eq!(
+        st(sys::thread_write_state(
+            t,
+            FPK,
+            f.as_ptr() as *const u8,
+            264
+        )),
+        Some(S::Ok),
+        "write FP"
+    );
+    let mut back = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            t,
+            FPK,
+            back.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read FP"
+    );
+    ensure_eq!(back, f, "FP state round-trips");
+    // the vector unit, if there is one: find the register length by the size the call accepts
+    let mut vlen = 0;
+    for vlenb in [16usize, 32, 64, 128, 256] {
+        let n = 32 + 32 * vlenb;
+        let mut v = vec![0u8; n];
+        if st(sys::thread_read_state(t, VECK, v.as_mut_ptr(), n)) == Some(S::Ok) {
+            vlen = n;
+            ensure!(
+                v.iter().all(|&b| b == 0),
+                "a thread that never used the vector unit reads zeros"
+            );
+            for (i, b) in v.iter_mut().enumerate().skip(32) {
+                *b = (i % 251) as u8;
+            }
+            ensure_eq!(
+                st(sys::thread_write_state(t, VECK, v.as_ptr(), n)),
+                Some(S::Ok),
+                "write the vector state"
+            );
+            let mut w = vec![0u8; n];
+            ensure_eq!(
+                st(sys::thread_read_state(t, VECK, w.as_mut_ptr(), n)),
+                Some(S::Ok),
+                "read it back"
+            );
+            ensure!(v == w, "vector state round-trips");
+            break;
+        }
+    }
+    ensure!(
+        vlen != 0
+            || st(sys::thread_read_state(t, VECK, [0u8; 8].as_mut_ptr(), 8))
+                == Some(S::NotSupported),
+        "a machine without a vector unit says NOT_SUPPORTED"
+    );
+    // the thread starts with the FP state written for it: f1 holds the pattern it waits for
+    ensure_eq!(st(sys::thread_resume(t)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it ran and ended"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 66, "having seen f1");
+    // a thread that has run (it uses the FP unit: its first FP instruction turned it on) gets FP state written while it is stopped: the unit is
+    // loaded from the new state when it runs again
+    let (u, _) = ex1_spawn(ex1_spin_f1, 0)?;
+    ex1_pause(3)?;
+    ensure_eq!(
+        st(sys::thread_suspend(u)),
+        Some(S::Ok),
+        "suspend a running thread that uses FP"
+    );
+    ensure_eq!(
+        sys::object_wait(u, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "stopped"
+    );
+    let mut z = [0u64; 33];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            u,
+            FPK,
+            z.as_mut_ptr() as *mut u8,
+            264
+        )),
+        Some(S::Ok),
+        "read its FP state"
+    );
+    ensure_eq!(
+        z[1],
+        0,
+        "f1 is still zero: the thread is waiting for the pattern"
+    );
+    z[1] = 0x123_4567;
+    ensure_eq!(
+        st(sys::thread_write_state(
+            u,
+            FPK,
+            z.as_ptr() as *const u8,
+            264
+        )),
+        Some(S::Ok),
+        "write f1"
+    );
+    ensure_eq!(st(sys::thread_resume(u)), Some(S::Ok), "resume");
+    ensure_eq!(
+        sys::object_wait(u, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "it sees the new f1 and ends"
+    );
+    ensure_eq!(sys::thread_info(u).a1, 66, "its exit code says it did");
+    Ok(())
+}
+
+// ---- EX2: exception channels ----
+
+const EX2_PAGE: u64 = 0x5b0_0000;
+
+extern "C" fn ex2_writer(_arg: usize) -> ! {
+    // SAFETY: EX2_PAGE is mapped read-only by the test, so this store faults; the handler makes it writable and retries.
+    unsafe { core::ptr::write_volatile(EX2_PAGE as *mut u32, 0xe2e2) };
+    sys::thread_exit(42)
+}
+
+/// Read one exception message from `ch`: (kind, tid, pc, address, cause, thread handle, exception handle).
+type Ex2Message = (u64, u64, u64, u64, u64, u64, u64);
+
+fn ex2_message(ch: u64) -> Result<Ex2Message, Detail> {
+    let r = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 1000);
+    ensure_eq!(r.status, 0, "an exception message arrives");
+    let mut b = [0u8; 40];
+    let mut hs = [0u64; 4];
+    let r = ok(
+        sys::channel_read(ch, b.as_mut_ptr(), 40, hs.as_mut_ptr(), 4),
+        "read the exception message",
+    )?;
+    ensure_eq!(r.a1, 40, "40 bytes");
+    ensure_eq!(r.a2, 2, "the thread and the exception");
+    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    Ok((w(0), w(1), w(2), w(3), w(4), hs[0], hs[1]))
+}
+
+/// The SIGSEGV-handler pattern: a thread of our own process stores to a read-only page; we are the handler (the process's channel is ours): we make
+/// the page writable and RETRY, and the store succeeds.
+fn a_handler_thread_can_make_a_faulting_store_succeed_and_retry() -> Outcome {
+    let me = me()?;
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(me, v, EX2_PAGE, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "map read-only"
+    );
+    let ch = ok(sys::process_exception_channel(me), "the channel")?.a1 as u64;
+    ensure_eq!(
+        st(sys::process_exception_channel(me)),
+        Some(S::BadState),
+        "a second channel while the first is open"
+    );
+    let top = own_stack()?;
+    let r = ok(
+        sys::thread_on_stack(me, ex2_writer as *const () as usize as u64, top, 0),
+        "the faulting thread",
+    )?;
+    let (t, tid) = (r.a1 as u64, r.a2 as u64);
+    let (kind, mtid, pc, addr, _cause, th, eh) = ex2_message(ch)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::PAGE_FAULT),
+        "a page fault"
+    );
+    ensure_eq!(mtid, tid, "from that thread");
+    ensure_eq!(addr, EX2_PAGE, "at the page");
+    ensure!(
+        pc >= ex2_writer as *const () as usize as u64
+            && pc < ex2_writer as *const () as usize as u64 + 64,
+        "in the store at {pc:#x}"
+    );
+    // the thread is stopped (SUSPENDED) and its state can be read
+    ensure_eq!(
+        sys::object_wait(th, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "the thread stops"
+    );
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            th,
+            rt::abi::thread_state::GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read its registers"
+    );
+    ensure_eq!(g[31], pc, "the pc the message says");
+    ensure_eq!(
+        st(sys::process_protect(me, EX2_PAGE, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "make the page writable"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, 9)),
+        Some(S::InvalidArgs),
+        "an unknown decision"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::Ok),
+        "RETRY"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::BadState),
+        "resolved once"
+    );
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the thread goes on and ends"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 42, "its store went through");
+    // SAFETY: the page is writable now and was written by the retried store.
+    ensure_eq!(
+        unsafe { core::ptr::read_volatile(EX2_PAGE as *const u32) },
+        0xe2e2,
+        "the value is there"
+    );
+    // (this process's own channel goes: a later accidental fault in the suite ends it with a code instead of waiting for a handler nobody runs)
+    for h in [eh, th, ch, t] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// A handler in the parent catches a child's illegal instruction, reads where it was, and kills it: the child ends with the usual code.
+fn a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction() -> Outcome {
+    let ch = core::cell::Cell::new(0u64);
+    let (p, _mine) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        ch.set(ok(sys::process_exception_channel(p), "the child's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (kind, _tid, pc, _addr, _cause, th, eh) = ex2_message(ch.get())?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::ILLEGAL),
+        "an illegal instruction"
+    );
+    ensure!(pc != 0, "with a pc");
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        sys::object_wait(th, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "the child's thread stops"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            th,
+            rt::abi::thread_state::GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read its registers"
+    );
+    ensure_eq!(g[31], pc, "at that pc");
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::KILL)),
+        Some(S::Ok),
+        "KILL"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -1002, "the usual exit code");
+    Ok(())
+}
+
+/// NEXT reaches the job's channel, and closing the exception handle is NEXT; the last level's NEXT ends the process as it always did.
+fn next_reaches_the_job_channel_and_closing_the_handle_is_next() -> Outcome {
+    let job = self::job(root_job()?, u64::MAX, u64::MAX, u64::MAX)?;
+    let jch = ok(sys::job_exception_channel(job), "its channel")?.a1 as u64;
+    // 1: NEXT
+    let pch = core::cell::Cell::new(0u64);
+    let (p, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, job, &|p| {
+        pch.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch.get())?;
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::NEXT)),
+        Some(S::Ok),
+        "NEXT"
+    );
+    sys::handle_close(th);
+    let (kind, _, _, _, _, th2, eh2) = ex2_message(jch)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::ILLEGAL),
+        "it came to the job's channel"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh2, rt::abi::exception::NEXT)),
+        Some(S::Ok),
+        "NEXT again: no level is left"
+    );
+    sys::handle_close(th2);
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        -1002,
+        "the process ended as it always did"
+    );
+    // 2: closing the exception handle is NEXT
+    let pch2 = core::cell::Cell::new(0u64);
+    let (q, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, job, &|p| {
+        pch2.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch2.get())?;
+    sys::handle_close(eh);
+    sys::handle_close(th);
+    let (_, _, _, _, _, th2, eh2) = ex2_message(jch)?;
+    ensure_eq!(
+        st(sys::exception_resume(eh2, rt::abi::exception::KILL)),
+        Some(S::Ok),
+        "KILL at the job"
+    );
+    sys::handle_close(th2);
+    wait_ended(q, 500)?;
+    ensure_eq!(
+        sys::process_info(q).a1 as i64,
+        -1002,
+        "ended with the usual code"
+    );
+    Ok(())
+}
+
+/// A process with a pending exception that is killed leaks nothing (the end-of-suite checks count objects, frames and charges), and a process
+/// whose channel nobody reads any more ends as it always did.
+fn a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped(
+) -> Outcome {
+    let pch = core::cell::Cell::new(0u64);
+    let (p, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        pch.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch.get())?;
+    ensure_eq!(
+        st(sys::process_kill(p, 7)),
+        Some(S::Ok),
+        "kill it with the exception pending"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::BadState),
+        "its exceptions are discarded"
+    );
+    sys::handle_close(eh);
+    sys::handle_close(th);
+    sys::handle_close(pch.get());
+    // a channel nobody reads: the user end is closed before the child runs, so the fault is not delivered and the child ends as it always did
+    let (q, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        let c = ok(sys::process_exception_channel(p), "a channel")?.a1 as u64;
+        sys::handle_close(c);
+        Ok(())
+    })?;
+    wait_ended(q, 500)?;
+    ensure_eq!(sys::process_info(q).a1 as i64, -1002, "the usual code");
+    Ok(())
+}
+
+// ---- MM9: pagers ----
+
+static PG_PAGER: AtomicU64 = AtomicU64::new(0);
+static PG_CH: AtomicU64 = AtomicU64::new(0);
+static PG_VMO: AtomicU64 = AtomicU64::new(0);
+static PG_STOP: AtomicU32 = AtomicU32::new(0);
+static PG_SERVED: AtomicU32 = AtomicU32::new(0);
+static PG_BAD: AtomicU32 = AtomicU32::new(0);
+static PG_SEEN: AtomicU32 = AtomicU32::new(0);
+const PG_KEY: u64 = 0x5eed;
+const PG_PAGES: u64 = 16;
+const PG_MAP: u64 = 0x5c0_0000;
+
+/// A pager thread: serves each request on the channel by filling a page with `page + 1` and moving it in with `pager_supply`.
+extern "C" fn pg_server(_arg: usize) -> ! {
+    while PG_STOP.load(Ordering::SeqCst) == 0 {
+        let ch = PG_CH.load(Ordering::SeqCst);
+        if sys::object_wait(ch, sig::READABLE, sys::clock_get() + 20).status != 0 {
+            continue;
+        }
+        let mut b = [0u8; 40];
+        let r = sys::channel_read(ch, b.as_mut_ptr(), 40, core::ptr::null_mut(), 0);
+        if r.status != 0 || r.a1 != 40 {
+            continue;
+        }
+        let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        let (key, off, len, kind) = (w(0), w(1), w(2), w(3));
+        if key != PG_KEY || kind != rt::abi::pager::READ || len != 4096 || off % 4096 != 0 {
+            PG_BAD.fetch_add(1, Ordering::SeqCst);
+            continue;
+        }
+        let src = sys::vmo_create(1).a1 as u64;
+        let fill = [(off / 4096 + 1) as u8; 4096];
+        sys::vmo_write(src, 0, fill.as_ptr(), 4096);
+        let r = sys::pager_supply(
+            PG_PAGER.load(Ordering::SeqCst),
+            PG_VMO.load(Ordering::SeqCst),
+            off,
+            4096,
+            src,
+            0,
+        );
+        sys::handle_close(src);
+        if r.status == 0 {
+            PG_SERVED.fetch_add(1, Ordering::SeqCst);
+        } else {
+            PG_BAD.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    sys::thread_exit(0)
+}
+
+/// A pager, the channel its requests arrive on, and a VMO of `PG_PAGES` pages of it.
+fn pager_vmo() -> Result<(u64, u64, u64), Detail> {
+    let r = ok(sys::pager_create(), "pager_create")?;
+    let (pager, ch) = (r.a1 as u64, r.a2 as u64);
+    let v = ok(
+        sys::pager_create_vmo(pager, PG_KEY, PG_PAGES * 4096),
+        "pager_create_vmo",
+    )?
+    .a1 as u64;
+    Ok((pager, ch, v))
+}
+
+/// Read one request from `ch`: (key, offset, length, kind).
+fn pager_request(ch: u64) -> Result<(u64, u64, u64, u64), Detail> {
+    let r = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 1000);
+    ensure_eq!(r.status, 0, "a request arrives");
+    let mut b = [0u8; 40];
+    let r = ok(
+        sys::channel_read(ch, b.as_mut_ptr(), 40, core::ptr::null_mut(), 0),
+        "read the request",
+    )?;
+    ensure_eq!(r.a1, 40, "40 bytes");
+    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    Ok((w(0), w(1), w(2), w(3)))
+}
+
+/// Start a child (`launch(110)`) that reads page 3 of `v` (a copy of the handle is sent to it).
+fn pager_reader(v: u64) -> Result<(u64, u64), Detail> {
+    let (p, m) = launch(110)?;
+    let dup = ok(
+        sys::handle_duplicate(v, Rights::SAME.0),
+        "duplicate the VMO",
+    )?
+    .a1 as u64;
+    ensure_eq!(
+        st(sys::channel_write(m, b"v".as_ptr(), 1, &dup, 1)),
+        Some(S::Ok),
+        "send the VMO"
+    );
+    Ok((p, m))
+}
+
+/// MM9: a pager thread serves a 16-page VMO; a reader in another process and a kernel copy in this one both see the pattern.
+fn a_pager_serves_a_vmo_to_a_reader_in_another_process() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(sys::vmo_get_size(v).a1 as u64, PG_PAGES * 4096, "its size");
+    ensure_eq!(
+        st(sys::vmo_commit(v, 0, 4096)),
+        Some(S::AccessDenied),
+        "no COMMIT: it would put zeros where the pager's data belongs"
+    );
+    let mine = ok(sys::handle_duplicate(v, Rights::SAME.0), "duplicate")?.a1 as u64;
+    PG_PAGER.store(pager, Ordering::SeqCst);
+    PG_CH.store(ch, Ordering::SeqCst);
+    PG_VMO.store(mine, Ordering::SeqCst);
+    PG_STOP.store(0, Ordering::SeqCst);
+    PG_SERVED.store(0, Ordering::SeqCst);
+    PG_BAD.store(0, Ordering::SeqCst);
+    let server = new_thread(pg_server, 0)?;
+    // a kernel copy of an absent page asks the pager and waits; the call then says "try again", and the page is there
+    let mut b = [0u8; 8];
+    let mut tries = 0;
+    loop {
+        let r = sys::vmo_read(v, 5 * 4096 + 8, b.as_mut_ptr(), 8);
+        if r.status == 0 {
+            break;
+        }
+        ensure_eq!(
+            st(r),
+            Some(S::ShouldWait),
+            "a kernel copy waits for the pager"
+        );
+        tries += 1;
+        ensure!(tries < 10, "the page never arrived");
+    }
+    ensure_eq!(b, [6u8; 8], "page 5 holds 5 + 1");
+    // another process reads page 3 through its own mapping
+    let (p, _m) = pager_reader(v)?;
+    wait_ended(p, 2000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        4,
+        "it saw page 3 hold 3 + 1"
+    );
+    PG_STOP.store(1, Ordering::SeqCst);
+    ensure_eq!(
+        sys::object_wait(server, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the pager thread ends"
+    );
+    ensure_eq!(
+        PG_BAD.load(Ordering::SeqCst),
+        0,
+        "every request was well formed"
+    );
+    ensure!(
+        PG_SERVED.load(Ordering::SeqCst) >= 2,
+        "it served both pages"
+    );
+    for h in [v, mine, pager, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM9 (PG1): a reader killed while it waits for a pager leaves nothing behind, and a slow pager stops nobody else.
+fn killing_a_reader_waiting_for_a_pager_leaks_nothing() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    let (p, _m) = pager_reader(v)?;
+    let (key, off, len, kind) = pager_request(ch)?;
+    ensure_eq!(
+        (key, off, len, kind),
+        (PG_KEY, 3 * 4096, 4096, rt::abi::pager::READ),
+        "it asked for page 3, with the VMO's key"
+    );
+    // the pager does nothing: the reader waits, and everyone else goes on
+    let (q, _mq) = launch(8)?;
+    wait_ended(q, 500)?;
+    ensure_eq!(
+        st(sys::object_wait(p, sig::TERMINATED, sys::clock_get() + 4)),
+        Some(S::TimedOut),
+        "the reader is still waiting"
+    );
+    ensure_eq!(st(sys::process_kill(p, -5)), Some(S::Ok), "kill it");
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -5, "its exit code");
+    // (the kernel checks after init that no waiter or pager is left)
+    for h in [v, pager, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// MM9: a pager that goes away fails the reader waiting for it with a PAGER fault.
+fn a_pager_that_dies_fails_the_reader_with_a_pager_fault() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    let (p, _m) = pager_reader(v)?;
+    pager_request(ch)?;
+    ensure_eq!(
+        st(sys::handle_close(pager)),
+        Some(S::Ok),
+        "the pager's last handle goes"
+    );
+    wait_ended(p, 1000)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        i64::from(rt::abi::arch::fault::exit_code(rt::abi::arch::fault::PAGER)),
+        "the reader ended with a PAGER fault"
+    );
+    for h in [v, ch] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+extern "C" fn pg_reader(_arg: usize) -> ! {
+    // SAFETY: PG_MAP is the test's read-write mapping of the pager's VMO; the read waits for page 2.
+    let b = unsafe { core::ptr::read_volatile((PG_MAP + 2 * 4096) as *const u8) };
+    PG_SEEN.store(u32::from(b), Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// MM9: `pager_fail` makes the waiting thread take a PAGER exception with the status as its cause; the handler supplies the page and RETRYs.
+fn a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry() -> Outcome {
+    let me = me()?;
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(
+        st(sys::process_map(
+            me,
+            v,
+            PG_MAP,
+            0,
+            PG_PAGES * 4096,
+            PF_R | PF_W
+        )),
+        Some(S::Ok),
+        "map the pager's VMO"
+    );
+    let ech = ok(sys::process_exception_channel(me), "the channel")?.a1 as u64;
+    PG_SEEN.store(0, Ordering::SeqCst);
+    let t = new_thread(pg_reader, 0)?;
+    let (_, off, _, _) = pager_request(ch)?;
+    ensure_eq!(off, 2 * 4096, "it asked for page 2");
+    ensure_eq!(
+        st(sys::pager_fail(
+            pager,
+            v,
+            2 * 4096,
+            4096,
+            S::TimedOut.code()
+        )),
+        Some(S::Ok),
+        "fail it"
+    );
+    let (kind, _tid, _pc, addr, cause, th, eh) = ex2_message(ech)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::PAGER),
+        "a PAGER fault"
+    );
+    ensure_eq!(addr, PG_MAP + 2 * 4096, "at the page");
+    ensure_eq!(
+        cause,
+        S::TimedOut.code() as i64 as u64,
+        "with the pager's status as the cause"
+    );
+    // the handler supplies the page after all and retries
+    let src = vmo(1)?;
+    let fill = [0x77u8; 4096];
+    ensure_eq!(
+        st(sys::vmo_write(src, 0, fill.as_ptr(), 4096)),
+        Some(S::Ok),
+        "fill a page"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 2 * 4096, 4096, src, 0)),
+        Some(S::Ok),
+        "supply it"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::Ok),
+        "RETRY"
+    );
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the reader goes on"
+    );
+    ensure_eq!(
+        PG_SEEN.load(Ordering::SeqCst),
+        0x77,
+        "and reads the page the handler supplied"
+    );
+    for h in [eh, th, ech, src, v, pager, ch] {
+        sys::handle_close(h);
+    }
+    ensure_eq!(st(sys::process_unmap(me, PG_MAP)), Some(S::Ok), "unmap");
+    Ok(())
+}
+
+/// MM9: the argument rows of the pager calls, the reserved dirty-tracking names, and PRIVATE children of a pager's VMO.
+fn pager_calls_check_their_arguments() -> Outcome {
+    let (pager, ch, v) = pager_vmo()?;
+    ensure_eq!(
+        st(sys::pager_create_vmo(BAD, 1, 4096)),
+        Some(S::BadHandle),
+        "bad pager handle"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(v, 1, 4096)),
+        Some(S::WrongType),
+        "a VMO is not a pager"
+    );
+    let weak = weaker(pager, Rights::DUPLICATE.0)?;
+    ensure_eq!(
+        st(sys::pager_create_vmo(weak, 1, 4096)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(pager, 1, 0)),
+        Some(S::InvalidArgs),
+        "zero bytes"
+    );
+    ensure_eq!(
+        st(sys::pager_create_vmo(pager, 1, 100)),
+        Some(S::InvalidArgs),
+        "not a whole page"
+    );
+    let src = vmo(1)?;
+    let plain = vmo(1)?;
+    let ro = weaker(src, Rights::READ.0)?;
+    ensure_eq!(
+        st(sys::pager_supply(pager, plain, 0, 4096, src, 0)),
+        Some(S::InvalidArgs),
+        "not a pager's VMO"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 1, 4096, src, 0)),
+        Some(S::InvalidArgs),
+        "offset not aligned"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 0, 4096, ro, 0)),
+        Some(S::AccessDenied),
+        "the source needs WRITE"
+    );
+    ensure_eq!(
+        st(sys::pager_supply(pager, v, 0, 4096, src, 0)),
+        Some(S::BadState),
+        "nothing committed in the source"
+    );
+    ensure_eq!(
+        st(sys::pager_fail(pager, v, 0, 4096, 0)),
+        Some(S::InvalidArgs),
+        "OK is not a failure"
+    );
+    ensure_eq!(
+        st(sys::pager_query_dirty()),
+        Some(S::NotSupported),
+        "dirty tracking is reserved"
+    );
+    ensure_eq!(
+        st(sys::pager_writeback_done()),
+        Some(S::NotSupported),
+        "writeback is reserved"
+    );
+    // a SNAPSHOT of a pager's VMO is refused; a PRIVATE child is made (it asks the parent's pager for what it inherits)
+    ensure_eq!(
+        st(sys::vmo_create_child(
+            v,
+            0,
+            4096,
+            0,
+            rt::abi::child_flags::SNAPSHOT
+        )),
+        Some(S::NotSupported),
+        "no SNAPSHOT of a pager's VMO"
+    );
+    let c = ok(
+        sys::vmo_create_child(v, 0, 4096, 0, rt::abi::child_flags::PRIVATE),
+        "a PRIVATE child",
+    )?
+    .a1 as u64;
+    for h in [c, ro, plain, src, weak, v, pager, ch] {
         sys::handle_close(h);
     }
     Ok(())
@@ -11774,7 +13070,7 @@ fn thread_spawn_error_cases() -> Outcome {
                 ..good
             },
         ),
-        ("a reserved flag", rt::SpawnArgs { flags: 8, ..good }),
+        ("a reserved flag", rt::SpawnArgs { flags: 16, ..good }),
         (
             "the reserved word",
             rt::SpawnArgs {
@@ -12941,6 +14237,66 @@ pub fn app_main() -> i32 {
         (
             "copy_on_write_children_from_user_mode",
             copy_on_write_children_from_user_mode,
+        ),
+        (
+            "thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written",
+            thread_suspend_stops_a_thread_and_its_registers_can_be_read_and_written,
+        ),
+        (
+            "a_stopped_thread_can_be_sent_to_a_handler_and_back",
+            a_stopped_thread_can_be_sent_to_a_handler_and_back,
+        ),
+        (
+            "a_thread_started_suspended_runs_only_after_resume_with_registers_written_first",
+            a_thread_started_suspended_runs_only_after_resume_with_registers_written_first,
+        ),
+        (
+            "a_thread_started_suspended_and_resumed_at_once_runs",
+            a_thread_started_suspended_and_resumed_at_once_runs,
+        ),
+        (
+            "a_handler_thread_can_make_a_faulting_store_succeed_and_retry",
+            a_handler_thread_can_make_a_faulting_store_succeed_and_retry,
+        ),
+        (
+            "a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction",
+            a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction,
+        ),
+        (
+            "next_reaches_the_job_channel_and_closing_the_handle_is_next",
+            next_reaches_the_job_channel_and_closing_the_handle_is_next,
+        ),
+        (
+            "a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped",
+            a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped,
+        ),
+        (
+            "a_pager_serves_a_vmo_to_a_reader_in_another_process",
+            a_pager_serves_a_vmo_to_a_reader_in_another_process,
+        ),
+        (
+            "killing_a_reader_waiting_for_a_pager_leaks_nothing",
+            killing_a_reader_waiting_for_a_pager_leaks_nothing,
+        ),
+        (
+            "a_pager_that_dies_fails_the_reader_with_a_pager_fault",
+            a_pager_that_dies_fails_the_reader_with_a_pager_fault,
+        ),
+        (
+            "a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry",
+            a_pager_failure_is_a_pager_exception_and_a_supplied_page_lets_it_retry,
+        ),
+        (
+            "pager_calls_check_their_arguments",
+            pager_calls_check_their_arguments,
+        ),
+        (
+            "suspend_and_state_calls_check_their_arguments_and_rights",
+            suspend_and_state_calls_check_their_arguments_and_rights,
+        ),
+        (
+            "fp_and_vector_state_round_trip_through_thread_state",
+            fp_and_vector_state_round_trip_through_thread_state,
         ),
         (
             "touching_past_a_shrunk_vmo_ends_the_process_cleanly",
