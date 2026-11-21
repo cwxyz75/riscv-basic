@@ -31,8 +31,9 @@ const HOLD_TIMEOUT: u64 = 30_000;
 /// Port keys with this bit set are listeners the registry watches (the runtime's connection keys count up
 /// from 1 and never reach it).
 const LISTENER_KEY: u64 = 1 << 63;
-// (A listener's port key is the tag OR the listener's handle: a 64-bit handle has bit 63 clear until its slot has been reused 2^39 times, about 17 years
-// at a million reuses a second (KERNEL-V1-SPEC 3.2), so the two do not meet.)
+// (A listener's port key is the tag OR the **slot** of its handle (bits 0 to 23): the full 64-bit value can have bit 63 set after many reuses of a slot,
+// and two live handles never share a slot.)
+const SLOT_MASK: u64 = 0xff_ffff;
 
 struct Conn {
     view: View,
@@ -67,7 +68,7 @@ impl Registry {
     }
 
     fn drop_listener(&self, h: u64) {
-        sys::port_unbind(self.core.port(), LISTENER_KEY | h);
+        sys::port_unbind(self.core.port(), LISTENER_KEY | (h & SLOT_MASK));
         sys::handle_close(h);
     }
 
@@ -93,11 +94,11 @@ impl Service for Registry {
         if key & LISTENER_KEY == 0 || observed & signals::PEER_CLOSED == 0 {
             return;
         }
-        let h = key & !LISTENER_KEY;
+        let slot = key & !LISTENER_KEY;
         let names: Vec<Vec<u8>> = self
             .dir
             .listeners()
-            .filter(|(_, l)| **l == h)
+            .filter(|(_, l)| **l & SLOT_MASK == slot)
             .map(|(n, _)| n.to_vec())
             .collect();
         for n in names {
@@ -268,7 +269,7 @@ impl Service for Registry {
                     self.core.port(),
                     ep,
                     signals::PEER_CLOSED,
-                    LISTENER_KEY | ep,
+                    LISTENER_KEY | (ep & SLOT_MASK),
                 )
                 .status
                     != 0
@@ -284,7 +285,7 @@ impl Service for Registry {
                         self.send(key, txid, 0, 0, &[]);
                     }
                     Err(e) => {
-                        sys::port_unbind(self.core.port(), LISTENER_KEY | ep);
+                        sys::port_unbind(self.core.port(), LISTENER_KEY | (ep & SLOT_MASK));
                         sys::handle_close(ep);
                         let st = match e {
                             svc::Refuse::Quota => status::QUOTA,

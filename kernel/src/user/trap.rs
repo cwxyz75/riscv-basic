@@ -281,7 +281,7 @@ pub(super) fn fail(s: Status) -> Reply {
     clippy::expect_used,
     clippy::indexing_slicing
 )]
-// INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
+// INVARIANT: a is [u64; 6] and every `h(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
 pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let tid = thread::current();
     let s = state();

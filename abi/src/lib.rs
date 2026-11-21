@@ -237,6 +237,9 @@ pub mod limits {
     pub const MAX_MSG_BYTES: usize = 65536;
     pub const MAX_MSG_HANDLES: usize = 64;
     pub const MAX_QUEUED_MSGS: usize = 128;
+    /// Handles one process may hold (AB1). The table grows on demand and a duplicate is not an object, so nothing else bounds it: 65,536 slots is
+    /// under 2 MiB of kernel heap per process. A per-job handle quota replaces this (T189).
+    pub const MAX_PROCESS_HANDLES: usize = 65_536;
     /// Bytes a channel endpoint may have queued (so 128 large messages cannot pile up).
     pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
     /// Kernel objects in existence at once; creating more is NO_MEMORY. A stand-in for

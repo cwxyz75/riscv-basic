@@ -65,7 +65,7 @@ impl HandleTable {
     /// few reuses of a slot instead of 2^40.
     pub fn starting_at_generation(limit: usize, gen: u64) -> HandleTable {
         let mut t = HandleTable::new(limit);
-        t.first_gen = gen.min(GENERATIONS);
+        t.first_gen = gen.min(GENERATIONS - 1);
         t
     }
 
@@ -78,7 +78,7 @@ impl HandleTable {
     /// Make room, in memory, for `n` more handles: the slots they may need and the free list that gives them back, so that neither growing nor
     /// closing a handle can fail for lack of memory after this returned `Ok` (KT9: a message must not be lost, nor a handle leaked, because an
     /// allocation failed half-way).
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len(), and both are below the encoding's 8191 slots
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: free.len() <= slots.len(), and both are below the encoding's 2^24 - 1 slots
     pub fn reserve(&mut self, n: usize) -> Result<(), Status> {
         let fresh = n.saturating_sub(self.free.len());
         self.slots

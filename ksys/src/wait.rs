@@ -198,7 +198,7 @@ fn le64(b: &[u8], at: usize) -> u64 {
 /// `channel_call(channel, record)`, the request half: read the record, check it, and send the request. `Err` is the call's result (nothing was
 /// sent unless the error came after the send, which none does). `interrupted` is whether a `thread_interrupt` is pending (it ends the call before
 /// anything is sent, so a retry sends one request, not two) and is taken here.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 8 is small; the record read is of fixed size
 pub fn channel_call_send<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,

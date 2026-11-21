@@ -91,7 +91,7 @@ change.
 
 ## Limits
 
-A process holds as many handles as its job's object quota and memory allow (up to 2^24 - 1; there is no fixed `MAX_HANDLES`); `MAX_MSG_BYTES`
+`MAX_PROCESS_HANDLES` 65,536 per process (the encoding allows 2^24 - 1; a per-job handle quota replaces the cap, T189); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
 `MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
 alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket

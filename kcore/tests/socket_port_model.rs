@@ -25,7 +25,10 @@ fn port_bind(
 }
 
 fn world() -> (Kobjs, HandleTable) {
-    (Kobjs::new(), HandleTable::new(kcore::handle::MAX_SLOTS))
+    (
+        Kobjs::new(),
+        HandleTable::new(abi::limits::MAX_PROCESS_HANDLES),
+    )
 }
 
 fn weaker(reg: &mut Kobjs, t: &mut HandleTable, h: Handle, rights: Rights) -> Handle {

@@ -254,5 +254,8 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
     it, else the same set spelled out, else the part LLVM 17 accepts (`init/build.rs`). `v`, `zfa` and `zvbb` are unstable features on the stable
     toolchain and warn "will become a hard error": `work/T187.md`. `senvcfg` enables CBZE, CBCFE and CBIE (flush) on every hart and the boot
     stops if a bit does not stick. Alternative: a target specification (nightly only).
+  - 2026-11-20, AB1: a process holds at most `MAX_PROCESS_HANDLES` (65,536) handles, not up to 2^24 - 1 bounded by the job's object quota as the item and
+    KERNEL-V1-SPEC 3.2 say: a duplicate is not an object, so no quota bounded a table and one process could take hundreds of MiB of kernel heap (Fable review of
+    PR 324). A job handle quota is T189. Alternative: charge slots to Pages now.
   - Thresholds: 5% for instruction counts, 8 KiB for the stack budget, 200 perturbation seeds, 1 ms for the idle-suspend
     threshold, 64 pages per reservation, 15 pages of fault-around. Each is one constant, in its item.

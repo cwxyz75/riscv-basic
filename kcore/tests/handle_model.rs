@@ -396,3 +396,27 @@ fn a_handle_value_keeps_its_forty_bit_generation_in_the_high_bits() {
     );
     t.drain(&mut reg);
 }
+
+#[test]
+fn near_misses_of_live_handles_are_refused() {
+    // the H1 forgery the random one cannot reach: a live slot with the generation one off, a live value with a high bit flipped
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(16);
+    let h = event_create(&mut reg, &mut t).unwrap();
+    t.close(&mut reg, h).unwrap();
+    let h = event_create(&mut reg, &mut t).unwrap(); // generation 1 of slot 0
+    assert_eq!(h.0 >> 24, 1);
+    for forged in [
+        h.0 ^ (1 << 24),  // generation 0
+        h.0 ^ (3 << 24),  // generation 2
+        h.0 ^ (1 << 63),  // the top generation bit
+        h.0 ^ (1 << 40),  // a middle generation bit
+        h.0 ^ 1,          // another slot (not live)
+        h.0 & !0xff_ffff, // slot number 0 is never valid
+        h.0 | 0xff_ffff,  // a slot beyond the table
+    ] {
+        assert_eq!(t.get(Handle(forged)), Err(Status::BadHandle), "{forged:#x}");
+    }
+    assert!(t.get(h).is_ok());
+    t.drain(&mut reg);
+}

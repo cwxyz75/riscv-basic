@@ -2,6 +2,7 @@
 //! machine facts, whether the kernel half of its own table still matches the snapshot and the kernel table itself, are passed in.
 
 use crate::{ProcState, Process, UserState};
+use abi::limits::MAX_PROCESS_HANDLES as MAX_HANDLES;
 use abi::rights::Rights;
 use abi::status::Status;
 use abi::Handle;
@@ -10,7 +11,6 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kcore::aspace::{AddressSpace, Vmos};
 use kcore::handle::HandleTable;
-use kcore::handle::MAX_SLOTS as MAX_HANDLES;
 use kcore::ipc::{self, Quota};
 use kcore::job::Resource;
 use kcore::pagetable::{PageTable, PhysMem};

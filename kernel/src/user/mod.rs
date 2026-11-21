@@ -13,6 +13,7 @@
 
 use crate::console::Console;
 use crate::{irq, kmem, thread};
+use abi::limits::MAX_PROCESS_HANDLES as MAX_HANDLES;
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
 use abi::rights::Rights;
 use abi::status::Status;
@@ -29,7 +30,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::aspace::{Access, AddressSpace};
 use kcore::elf;
 use kcore::handle::HandleTable;
-use kcore::handle::MAX_SLOTS as MAX_HANDLES;
 use kcore::ipc::{self, ReadError};
 use kcore::job::{JobId, Resource};
 use kcore::pagetable::{PageTable, Perms};

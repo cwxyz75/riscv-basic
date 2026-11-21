@@ -12,7 +12,10 @@ use kcore::ipc::*;
 use std::collections::{HashMap, VecDeque};
 
 fn world() -> (Kobjs, HandleTable) {
-    (Kobjs::new(), HandleTable::new(kcore::handle::MAX_SLOTS))
+    (
+        Kobjs::new(),
+        HandleTable::new(abi::limits::MAX_PROCESS_HANDLES),
+    )
 }
 
 #[test]

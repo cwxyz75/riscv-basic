@@ -532,3 +532,7 @@ test finisher and power or reset node are cut from every window. A device not on
 (`kcore::devwin::ALLOWED`). The interrupt sources an interrupt object may name follow the same list (PL5c): only the `interrupts` of the
 admitted devices whose interrupt parent is the supervisor-domain APLIC (`kcore::aiatree`); an unknown source is refused. Reason: a denylist fails open for any device nobody thought of, and on QEMU `virt` it would have made fw-cfg
 (whose DMA interface writes guest RAM), the writable flash banks and the PCI ECAM window mappable by the holder of the resource handle.
+
+## Amendment 2026-11-20: the handle cap (AB1)
+
+Section 3.2: a process holds at most 65,536 handles until the job ledger has a handle resource (`work/T189.md`). A duplicate is not an object, so the "job's object quota" does not bound a table; the cap does. The encoding still allows 2^24 - 1.
