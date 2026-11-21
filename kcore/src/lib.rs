@@ -29,6 +29,7 @@ pub mod chaos;
 pub mod devwin;
 pub mod donate;
 pub mod elf;
+pub mod fcache;
 pub mod fdt;
 pub mod fp;
 pub mod frame;
