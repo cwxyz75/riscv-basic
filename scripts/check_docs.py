@@ -173,6 +173,7 @@ PROGRESS = re.compile(r"(?i)\b(nothing (here )?is built|nothing in it is built|n
 ATOMICS = {
     "kcore/src/sync.rs": (15, "the re-export of the atomics (core's, loom's or shuttle's): the layer itself"),
     "kcore/src/ticket.rs": (13, "the ticket lock protocol, modelled under loom and shuttle"),
+    "kcore/src/handle.rs": (4, "two process-wide counters of the handle tables: slot growth events and clamped tables (MM5), read by the kernel so a syscall that grew nothing skips the charging pass"),
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
