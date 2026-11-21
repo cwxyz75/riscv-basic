@@ -294,7 +294,12 @@ pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
 
 /// Charge the growth of the calling thread's handle table to its process's job (MM5; `HandleTable::settle_growth`): a job that cannot pay
 /// leaves the table unable to grow, so the calls that insert handles say NO_MEMORY.
-pub(super) fn settle_handle_table() {
+pub(super) fn settle_handle_table(growth_at_entry: u64) {
+    // (the usual syscall grew no table anywhere while it ran: two loads and out, before the big lock is touched. `growth_at_entry` is the
+    // count when this call began, kept by the call itself, so a thread that was switched to another hart meanwhile still compares its own)
+    if kcore::handle::growth_events() == growth_at_entry && kcore::handle::clamped_tables() == 0 {
+        return;
+    }
     irq::without(|| {
         let s = state();
         let Some(&pid) = s.thread_pid.get(&thread::current()) else {

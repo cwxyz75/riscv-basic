@@ -158,6 +158,7 @@ pub(super) fn status_ret(frame: &mut crate::trap::TrapFrame, s: Status) {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     crate::latency::set_syscall(frame.arg(17) as usize);
+    let growth_at_entry = kcore::handle::growth_events();
     let (n, a) = (
         frame.arg(17) as usize,
         [
@@ -263,7 +264,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         // status already set above
     }
     // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
-    settle_handle_table();
+    settle_handle_table(growth_at_entry);
 }
 
 pub(super) fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {
