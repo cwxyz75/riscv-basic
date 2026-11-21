@@ -814,8 +814,9 @@ Effects: the handles are removed from the caller's table *only if the whole call
 succeeds*; the message holds one reference to each handle's object.
 Blocking: never.
 Errors, checked in this order: TOO_BIG (over MAX_MSG_BYTES or MAX_MSG_HANDLES; first,
-because it bounds the work of every later check); BAD_HANDLE (the channel, then each
-listed handle); WRONG_TYPE (not a channel); ACCESS_DENIED (no WRITE on the channel, then
+because it bounds the work of every later check); BAD_HANDLE (the channel, before
+any user memory is read); INVALID_ARGS (`bytes` or the handle list is not readable user
+memory); BAD_HANDLE (each listed handle); WRONG_TYPE (not a channel); ACCESS_DENIED (no WRITE on the channel, then
 a listed handle without TRANSFER); INVALID_ARGS (a handle listed twice); NOT_SUPPORTED
 (either endpoint *of this channel*, by object identity, is in the list: that would put
 an endpoint in its own queue); PEER_CLOSED; SHOULD_WAIT (the peer's queue holds
