@@ -74,6 +74,8 @@ pub struct Process {
     /// The creator's end of the bootstrap channel (a handle in `UserState::ktable`), until
     /// a test or server takes it with `take_bootstrap`.
     pub kernel_end: Option<Handle>,
+    /// The kernel's end of the channel exceptions of this process's threads are delivered on (EX2; a handle in `UserState::ktable`).
+    pub exc_channel: Option<Handle>,
     /// Where the first thread starts the stack (0: the default `STACK_TOP`).
     pub start_sp: u64,
     /// The process's object (for TERMINATED and kill-on-close), if it has one.

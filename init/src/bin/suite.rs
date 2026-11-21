@@ -1777,6 +1777,16 @@ fn launch_image(image: u64, arg: u64) -> Result<(u64, u64), Detail> {
 /// With a job, our handles to the child's memory are closed after mapping, so that the job's
 /// usage can be seen going back to zero when the child ends.
 fn launch_image_in(image: u64, arg: u64, job: u64) -> Result<(u64, u64), Detail> {
+    launch_image_with(image, arg, job, &|_| Ok(()))
+}
+
+/// `launch_image_in`, calling `before_start(process)` once the child is built and before it runs (to give it an exception channel, say).
+fn launch_image_with(
+    image: u64,
+    arg: u64,
+    job: u64,
+    before_start: &dyn Fn(u64) -> Result<(), Detail>,
+) -> Result<(u64, u64), Detail> {
     ensure!(image != 0, "no image was fetched");
     let mut eh = [0u8; 64];
     ok(
@@ -1850,6 +1860,7 @@ fn launch_image_in(image: u64, arg: u64, job: u64) -> Result<(u64, u64), Detail>
     if job != 0 {
         sys::handle_close(stack);
     }
+    before_start(proc)?;
     let (mine, theirs) = channel()?;
     ok(
         sys::process_start(proc, entry, 0x10_0000_0000 + 16 * 4096, theirs, arg),
@@ -3820,6 +3831,258 @@ fn fp_and_vector_state_round_trip_through_thread_state() -> Outcome {
         "it sees the new f1 and ends"
     );
     ensure_eq!(sys::thread_info(u).a1, 66, "its exit code says it did");
+    Ok(())
+}
+
+// ---- EX2: exception channels ----
+
+const EX2_PAGE: u64 = 0x5b0_0000;
+
+extern "C" fn ex2_writer(_arg: usize) -> ! {
+    // SAFETY: EX2_PAGE is mapped read-only by the test, so this store faults; the handler makes it writable and retries.
+    unsafe { core::ptr::write_volatile(EX2_PAGE as *mut u32, 0xe2e2) };
+    sys::thread_exit(42)
+}
+
+/// Read one exception message from `ch`: (kind, tid, pc, address, cause, thread handle, exception handle).
+type Ex2Message = (u64, u64, u64, u64, u64, u64, u64);
+
+fn ex2_message(ch: u64) -> Result<Ex2Message, Detail> {
+    let r = sys::object_wait(ch, sig::READABLE, sys::clock_get() + 1000);
+    ensure_eq!(r.status, 0, "an exception message arrives");
+    let mut b = [0u8; 40];
+    let mut hs = [0u64; 4];
+    let r = ok(
+        sys::channel_read(ch, b.as_mut_ptr(), 40, hs.as_mut_ptr(), 4),
+        "read the exception message",
+    )?;
+    ensure_eq!(r.a1, 40, "40 bytes");
+    ensure_eq!(r.a2, 2, "the thread and the exception");
+    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    Ok((w(0), w(1), w(2), w(3), w(4), hs[0], hs[1]))
+}
+
+/// The SIGSEGV-handler pattern: a thread of our own process stores to a read-only page; we are the handler (the process's channel is ours): we make
+/// the page writable and RETRY, and the store succeeds.
+fn a_handler_thread_can_make_a_faulting_store_succeed_and_retry() -> Outcome {
+    let me = me()?;
+    let v = vmo(1)?;
+    ensure_eq!(
+        st(sys::process_map(me, v, EX2_PAGE, 0, 4096, PF_R)),
+        Some(S::Ok),
+        "map read-only"
+    );
+    let ch = ok(sys::process_exception_channel(me), "the channel")?.a1 as u64;
+    ensure_eq!(
+        st(sys::process_exception_channel(me)),
+        Some(S::BadState),
+        "a second channel while the first is open"
+    );
+    let top = own_stack()?;
+    let r = ok(
+        sys::thread_on_stack(me, ex2_writer as *const () as usize as u64, top, 0),
+        "the faulting thread",
+    )?;
+    let (t, tid) = (r.a1 as u64, r.a2 as u64);
+    let (kind, mtid, pc, addr, _cause, th, eh) = ex2_message(ch)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::PAGE_FAULT),
+        "a page fault"
+    );
+    ensure_eq!(mtid, tid, "from that thread");
+    ensure_eq!(addr, EX2_PAGE, "at the page");
+    ensure!(
+        pc >= ex2_writer as *const () as usize as u64
+            && pc < ex2_writer as *const () as usize as u64 + 64,
+        "in the store at {pc:#x}"
+    );
+    // the thread is stopped (SUSPENDED) and its state can be read
+    ensure_eq!(
+        sys::object_wait(th, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "the thread stops"
+    );
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        st(sys::thread_read_state(
+            th,
+            rt::abi::thread_state::GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read its registers"
+    );
+    ensure_eq!(g[31], pc, "the pc the message says");
+    ensure_eq!(
+        st(sys::process_protect(me, EX2_PAGE, 4096, PF_R | PF_W)),
+        Some(S::Ok),
+        "make the page writable"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, 9)),
+        Some(S::InvalidArgs),
+        "an unknown decision"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::Ok),
+        "RETRY"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::BadState),
+        "resolved once"
+    );
+    ensure_eq!(
+        sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 500).status,
+        0,
+        "the thread goes on and ends"
+    );
+    ensure_eq!(sys::thread_info(t).a1, 42, "its store went through");
+    // SAFETY: the page is writable now and was written by the retried store.
+    ensure_eq!(
+        unsafe { core::ptr::read_volatile(EX2_PAGE as *const u32) },
+        0xe2e2,
+        "the value is there"
+    );
+    Ok(())
+}
+
+/// A handler in the parent catches a child's illegal instruction, reads where it was, and kills it: the child ends with the usual code.
+fn a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction() -> Outcome {
+    let ch = core::cell::Cell::new(0u64);
+    let (p, _mine) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        ch.set(ok(sys::process_exception_channel(p), "the child's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (kind, _tid, pc, _addr, _cause, th, eh) = ex2_message(ch.get())?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::ILLEGAL),
+        "an illegal instruction"
+    );
+    ensure!(pc != 0, "with a pc");
+    let mut g = [0u64; 32];
+    ensure_eq!(
+        sys::object_wait(th, sig::SUSPENDED, sys::clock_get() + 500).status,
+        0,
+        "the child's thread stops"
+    );
+    ensure_eq!(
+        st(sys::thread_read_state(
+            th,
+            rt::abi::thread_state::GENERAL,
+            g.as_mut_ptr() as *mut u8,
+            256
+        )),
+        Some(S::Ok),
+        "read its registers"
+    );
+    ensure_eq!(g[31], pc, "at that pc");
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::KILL)),
+        Some(S::Ok),
+        "KILL"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(sys::process_info(p).a1 as i64, -1002, "the usual exit code");
+    Ok(())
+}
+
+/// NEXT reaches the job's channel, and closing the exception handle is NEXT; the last level's NEXT ends the process as it always did.
+fn next_reaches_the_job_channel_and_closing_the_handle_is_next() -> Outcome {
+    let job = self::job(root_job()?, u64::MAX, u64::MAX, u64::MAX)?;
+    let jch = ok(sys::job_exception_channel(job), "its channel")?.a1 as u64;
+    // 1: NEXT
+    let pch = core::cell::Cell::new(0u64);
+    let (p, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, job, &|p| {
+        pch.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch.get())?;
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::NEXT)),
+        Some(S::Ok),
+        "NEXT"
+    );
+    sys::handle_close(th);
+    let (kind, _, _, _, _, th2, eh2) = ex2_message(jch)?;
+    ensure_eq!(
+        kind,
+        u64::from(rt::abi::arch::fault::ILLEGAL),
+        "it came to the job's channel"
+    );
+    ensure_eq!(
+        st(sys::exception_resume(eh2, rt::abi::exception::NEXT)),
+        Some(S::Ok),
+        "NEXT again: no level is left"
+    );
+    sys::handle_close(th2);
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        sys::process_info(p).a1 as i64,
+        -1002,
+        "the process ended as it always did"
+    );
+    // 2: closing the exception handle is NEXT
+    let pch2 = core::cell::Cell::new(0u64);
+    let (q, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, job, &|p| {
+        pch2.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch2.get())?;
+    sys::handle_close(eh);
+    sys::handle_close(th);
+    let (_, _, _, _, _, th2, eh2) = ex2_message(jch)?;
+    ensure_eq!(
+        st(sys::exception_resume(eh2, rt::abi::exception::KILL)),
+        Some(S::Ok),
+        "KILL at the job"
+    );
+    sys::handle_close(th2);
+    wait_ended(q, 500)?;
+    ensure_eq!(
+        sys::process_info(q).a1 as i64,
+        -1002,
+        "ended with the usual code"
+    );
+    Ok(())
+}
+
+/// A process with a pending exception that is killed leaks nothing (the end-of-suite checks count objects, frames and charges), and a process
+/// whose channel nobody reads any more ends as it always did.
+fn a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped(
+) -> Outcome {
+    let pch = core::cell::Cell::new(0u64);
+    let (p, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        pch.set(ok(sys::process_exception_channel(p), "the process's channel")?.a1 as u64);
+        Ok(())
+    })?;
+    let (_, _, _, _, _, th, eh) = ex2_message(pch.get())?;
+    ensure_eq!(
+        st(sys::process_kill(p, 7)),
+        Some(S::Ok),
+        "kill it with the exception pending"
+    );
+    wait_ended(p, 500)?;
+    ensure_eq!(
+        st(sys::exception_resume(eh, rt::abi::exception::RETRY)),
+        Some(S::BadState),
+        "its exceptions are discarded"
+    );
+    sys::handle_close(eh);
+    sys::handle_close(th);
+    sys::handle_close(pch.get());
+    // a channel nobody reads: the user end is closed before the child runs, so the fault is not delivered and the child ends as it always did
+    let (q, _m) = launch_image_with(IMAGE.load(Ordering::Relaxed), 5, 0, &|p| {
+        let c = ok(sys::process_exception_channel(p), "a channel")?.a1 as u64;
+        sys::handle_close(c);
+        Ok(())
+    })?;
+    wait_ended(q, 500)?;
+    ensure_eq!(sys::process_info(q).a1 as i64, -1002, "the usual code");
     Ok(())
 }
 
@@ -13603,6 +13866,22 @@ pub fn app_main() -> i32 {
         (
             "a_thread_started_suspended_and_resumed_at_once_runs",
             a_thread_started_suspended_and_resumed_at_once_runs,
+        ),
+        (
+            "a_handler_thread_can_make_a_faulting_store_succeed_and_retry",
+            a_handler_thread_can_make_a_faulting_store_succeed_and_retry,
+        ),
+        (
+            "a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction",
+            a_parent_handler_can_kill_a_child_that_took_an_illegal_instruction,
+        ),
+        (
+            "next_reaches_the_job_channel_and_closing_the_handle_is_next",
+            next_reaches_the_job_channel_and_closing_the_handle_is_next,
+        ),
+        (
+            "a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped",
+            a_process_killed_with_a_pending_exception_leaks_nothing_and_a_closed_channel_is_skipped,
         ),
         (
             "suspend_and_state_calls_check_their_arguments_and_rights",

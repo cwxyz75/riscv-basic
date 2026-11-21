@@ -632,6 +632,22 @@ pub mod sys {
             ],
         )
     }
+    /// The user end of the channel the exceptions of `process`'s threads are delivered on (EX2; needs MANAGE): a message of
+    /// `abi::exception::MESSAGE_BYTES` bytes with two handles (the thread, the exception) per fault the kernel cannot resolve.
+    pub fn process_exception_channel(process: u64) -> Ret {
+        syscall(PROCESS_EXCEPTION_CHANNEL, [process as usize, 0, 0, 0, 0, 0])
+    }
+    /// The same for the processes of `job` (and of the jobs below it) that have no channel of their own.
+    pub fn job_exception_channel(job: u64) -> Ret {
+        syscall(JOB_EXCEPTION_CHANNEL, [job as usize, 0, 0, 0, 0, 0])
+    }
+    /// Say what becomes of the thread that took `exception`: `abi::exception::RETRY`, `NEXT` or `KILL`.
+    pub fn exception_resume(exception: u64, how: u64) -> Ret {
+        syscall(
+            EXCEPTION_RESUME,
+            [exception as usize, how as usize, 0, 0, 0, 0],
+        )
+    }
     /// Raise a thread's suspend count (EX1; needs MANAGE): it stops at its next return to user mode, or where it is if it is blocked in a call.
     /// Its object then raises SUSPENDED.
     pub fn thread_suspend(thread: u64) -> Ret {

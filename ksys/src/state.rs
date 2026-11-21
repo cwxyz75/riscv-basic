@@ -57,6 +57,8 @@ pub struct UserState {
     /// The GENERAL register image (`abi::thread_state`) of every user thread that has not entered user mode yet, from its registration until the
     /// jump (EX1): `thread_read_state` and `thread_write_state` act on it, and the thread starts from it.
     pub initial_regs: BTreeMap<Tid, [u64; 32]>,
+    /// The kernel's end of each job's exception channel (EX2; handles in `ktable`).
+    pub job_exc: BTreeMap<kcore::job::JobId, abi::Handle>,
     /// Register writes for threads parked at the return to user mode, applied by the thread itself to its own frame when it wakes (EX1: nobody
     /// else writes a frame its owner holds a `&mut` to).
     pub pending_regs: BTreeMap<Tid, PendingRegs>,
@@ -118,6 +120,7 @@ impl UserState {
             cleaning: BTreeSet::new(),
             suspends: BTreeMap::new(),
             initial_regs: BTreeMap::new(),
+            job_exc: BTreeMap::new(),
             pending_regs: BTreeMap::new(),
             parked_tids: BTreeSet::new(),
             interrupts: BTreeSet::new(),
