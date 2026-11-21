@@ -245,7 +245,7 @@ pub fn thread_spawn<M: PhysMem>(
             .aspace
             .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
         {
-            let _ = vmos.destroy(mm, vmo);
+            let _ = vmos.release(mm, vmo);
             vmos.jobs.credit(tjob, Resource::Pages, tables);
             undo(made, procs, objs, &mut vmos.jobs);
             return Err(match e {

@@ -65,11 +65,11 @@ pub fn world_with(handles: usize) -> World {
     let mut vmos = Vmos::new();
     let rw = vmos.create(16);
     aspace
-        .map_region(&vmos, BASE, 16, rw, 0, Perms::RW.user())
+        .map_region(&mut vmos, BASE, 16, rw, 0, Perms::RW.user())
         .unwrap();
     let ro = vmos.create(1);
     aspace
-        .map_region(&vmos, RO, 1, ro, 0, Perms::R.user())
+        .map_region(&mut vmos, RO, 1, ro, 0, Perms::R.user())
         .unwrap();
     World {
         objs: Kobjs::new(),
@@ -144,7 +144,7 @@ pub fn cleanup(w: &mut World) {
         for o in dead.drain(..) {
             match o {
                 KObj::Vmo(id) => {
-                    let _ = w.vmos.destroy(&mut w.mm, id);
+                    let _ = w.vmos.release(&mut w.mm, id);
                 }
                 KObj::Job(id) => w.vmos.jobs.release(id),
                 _ => {}

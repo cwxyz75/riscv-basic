@@ -41,14 +41,14 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
                 .write(&mut k.mm, id, seg.vaddr % 4096, bytes)
                 .map_err(|_| LoadError::NoMemory)?;
             aspace
-                .map_region(&k.vmos, first * 4096, end - first, id, 0, seg.perms)
+                .map_region(&mut k.vmos, first * 4096, end - first, id, 0, seg.perms)
                 .map_err(|_| LoadError::NoMemory)?;
         }
         let stack = k.vmos.create(STACK_PAGES);
         vmo_ids.push(stack);
         aspace
             .map_region(
-                &k.vmos,
+                &mut k.vmos,
                 STACK_TOP - STACK_PAGES * 4096,
                 STACK_PAGES,
                 stack,
@@ -68,9 +68,9 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
     if let Err(e) = built {
-        aspace.destroy_user(&mut k.mm);
+        aspace.destroy_user(&mut k.mm, &mut k.vmos);
         for id in vmo_ids {
-            let _ = k.vmos.destroy(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, id);
         }
         return Err(e);
     }
@@ -125,9 +125,9 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         true
     });
     if !made {
-        process.aspace.destroy_user(&mut k.mm);
+        process.aspace.destroy_user(&mut k.mm, &mut k.vmos);
         for id in process.vmos {
-            let _ = k.vmos.destroy(&mut k.mm, id);
+            let _ = k.vmos.release(&mut k.mm, id);
         }
         return Err(LoadError::NoMemory);
     }

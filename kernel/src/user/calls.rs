@@ -20,10 +20,7 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
         nr::JOB_KILL => job_kill(a),
         nr::JOB_ROOT | nr::RESOURCE_ROOT | nr::PROCESS_SELF => process_table_call(n, a),
         nr::PROCESS_MAP => process_table_call(n, a),
-        nr::PROCESS_UNMAP => process_table_call(n, a).inspect(|_| {
-            REAP_DIRTY.store(true, Ordering::SeqCst);
-            reap_vmos();
-        }),
+        nr::PROCESS_UNMAP => process_table_call(n, a),
         nr::PROCESS_START => process_start(a),
         nr::PROCESS_KILL => process_kill(a),
         nr::PROCESS_SUSPEND => process_stop(a, true),

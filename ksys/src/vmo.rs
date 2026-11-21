@@ -63,7 +63,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.destroy(mm, id);
+                    let _ = vmos.release(mm, id);
                     fail(e)
                 }
             }
@@ -95,7 +95,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.destroy(mm, id);
+                    let _ = vmos.release(mm, id);
                     fail(e)
                 }
             }
@@ -129,7 +129,7 @@ pub fn vmo_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             ) {
                 Ok(h) => Ok((Some(h.0), None)),
                 Err(e) => {
-                    let _ = vmos.destroy(mm, id);
+                    let _ = vmos.release(mm, id);
                     fail(e)
                 }
             }

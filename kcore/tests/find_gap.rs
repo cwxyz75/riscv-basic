@@ -35,7 +35,7 @@ fn find_gap_agrees_with_a_scan() {
                 let first = rng.below(PAGES);
                 let n = 1 + rng.below(8).min(PAGES - first - 1);
                 let free = (first..first + n).all(|p| !used[p as usize]);
-                let r = a.map_region(&vmos, LO + first * 4096, n, v, 0, perms);
+                let r = a.map_region(&mut vmos, LO + first * 4096, n, v, 0, perms);
                 assert_eq!(r.is_ok(), free, "seed {seed}: mapping {first}+{n}");
                 if r.is_ok() {
                     for p in first..first + n {
@@ -45,7 +45,9 @@ fn find_gap_agrees_with_a_scan() {
             } else {
                 // unmap one region at random
                 let start = rng.below(PAGES);
-                if a.unmap_region(&mut mm, LO + start * 4096).is_ok() {
+                if a.unmap_region(&mut mm, &mut vmos, LO + start * 4096)
+                    .is_ok()
+                {
                     // find its extent in the model: pages from `start` while used and not the start of another
                     // region is not recoverable from `used`, so rebuild the model from the address space instead
                     for p in 0..PAGES {

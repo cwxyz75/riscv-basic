@@ -33,7 +33,7 @@ fn world() -> W {
     let mut aspace = AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap());
     let v = vmos.create(4);
     aspace
-        .map_region(&vmos, MEM, 4, v, 0, Perms::RW.user())
+        .map_region(&mut vmos, MEM, 4, v, 0, Perms::RW.user())
         .unwrap();
     let p = Process {
         aspace,

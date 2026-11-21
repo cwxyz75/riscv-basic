@@ -380,7 +380,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 }
             }
             if k.vmos.write(&mut k.mm, id, 0, &copy).is_err() {
-                let _ = k.vmos.destroy(&mut k.mm, id);
+                let _ = k.vmos.release(&mut k.mm, id);
                 return fail(Status::NoMemory);
             }
             let rights =
@@ -388,7 +388,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             match ipc::vmo_object_create_with(objs, &mut p.handles, id, rights, &mut quota(p.job)) {
                 Ok(hd) => Ok((Some(hd.0), Some(blob.len() as u64))),
                 Err(e) => {
-                    let _ = k.vmos.destroy(&mut k.mm, id);
+                    let _ = k.vmos.release(&mut k.mm, id);
                     fail(e)
                 }
             }

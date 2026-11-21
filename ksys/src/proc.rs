@@ -238,7 +238,7 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
             target
                 .aspace
-                .unmap_region(mm, a[1])
+                .unmap_region(mm, vmos, a[1])
                 .map_err(|_| e(Status::InvalidArgs))?;
             // other harts may still cache the translations of what was just unmapped
             machine.shootdown();

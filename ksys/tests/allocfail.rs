@@ -324,7 +324,7 @@ fn armed_cleanup(w: &mut World) {
     for o in dead.drain(..) {
         match o {
             kcore::ipc::KObj::Vmo(id) => {
-                let _ = w.vmos.destroy(&mut w.mm, id);
+                let _ = w.vmos.release(&mut w.mm, id);
             }
             kcore::ipc::KObj::Job(id) => w.vmos.jobs.release(id),
             _ => {}

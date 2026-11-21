@@ -39,7 +39,7 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
     let v = vmos.create_physical(MMIO_PFN, 2);
     assert_eq!(vmos.kind(v), Some(VmoKind::Device));
     assert_eq!(vmos.phys_addr(v), None, "D2: only DMA VMOs have an address");
-    a.map_region(&vmos, BASE, 2, v, 0, rw()).unwrap();
+    a.map_region(&mut vmos, BASE, 2, v, 0, rw()).unwrap();
     a.handle_fault(&mut mm, &mut vmos, BASE, kcore::aspace::Access::Write)
         .unwrap();
     a.handle_fault(&mut mm, &mut vmos, BASE + 4096, kcore::aspace::Access::Read)
@@ -57,9 +57,9 @@ fn a_physical_vmo_maps_device_frames_without_touching_the_database() {
     let mut b = [0u8; 4];
     assert_eq!(vmos.read(&mut mm, v, 0, &mut b), Err(VmoError::Device));
     assert_eq!(vmos.write(&mut mm, v, 0, &b), Err(VmoError::Device));
-    vmos.destroy(&mut mm, v).unwrap();
-    a.unmap_region(&mut mm, BASE).unwrap();
-    a.destroy(&mut mm);
+    vmos.release(&mut mm, v).unwrap();
+    a.unmap_region(&mut mm, &mut vmos, BASE).unwrap();
+    a.destroy(&mut mm, &mut vmos);
     assert_eq!(
         mm.db.free_count(),
         free_before + 1,
@@ -89,7 +89,7 @@ fn a_dma_vmo_is_contiguous_zeroed_charged_and_freed_exactly() {
         "the hole of one frame is too small"
     );
     assert_eq!(mm.db.free_count(), free - 7 + 1 - 8);
-    vmos.destroy(&mut mm, v).unwrap();
+    vmos.release(&mut mm, v).unwrap();
     assert_eq!(
         mm.db.free_count(),
         free - 7 + 1,
@@ -131,7 +131,7 @@ fn dma_limits_and_failure_leave_nothing_behind() {
         Err(VmoError::OutOfRange),
         "the system-wide DMA budget"
     );
-    vmos.destroy(&mut mm, ids.pop().unwrap()).unwrap();
+    vmos.release(&mut mm, ids.pop().unwrap()).unwrap();
     assert!(
         vmos.create_dma(&mut mm, 1, JobId::ROOT).is_ok(),
         "budget comes back"
@@ -180,7 +180,7 @@ fn the_jobs_page_charge_follows_dma_exactly() {
     assert_eq!(used(&vmos), 4);
     assert_eq!(vmos.create_dma(&mut mm, 3, job), Err(VmoError::NoMemory));
     assert_eq!(used(&vmos), 4);
-    vmos.destroy(&mut mm, a).unwrap();
+    vmos.release(&mut mm, a).unwrap();
     assert_eq!(used(&vmos), 0, "destroy credits exactly");
     assert_eq!(mm.db.free_count(), 200);
 }
@@ -213,7 +213,7 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
                     let (id, _, pages) = live[rng.below(live.len() as u64) as usize];
                     let va = BASE + next_slot * (1 << 21);
                     next_slot += 1;
-                    if a.map_region(&vmos, va, pages, id, 0, rw()).is_ok() {
+                    if a.map_region(&mut vmos, va, pages, id, 0, rw()).is_ok() {
                         for p in 0..pages {
                             let _ = a.handle_fault(
                                 &mut mm,
@@ -227,25 +227,25 @@ fn random_creation_mapping_and_destruction_balance_the_frames() {
                 }
                 3 if !mapped.is_empty() => {
                     let (va, _) = mapped.swap_remove(rng.below(mapped.len() as u64) as usize);
-                    a.unmap_region(&mut mm, va).unwrap();
+                    a.unmap_region(&mut mm, &mut vmos, va).unwrap();
                 }
                 4 if !live.is_empty() => {
                     let (id, _, _) = live.swap_remove(rng.below(live.len() as u64) as usize);
-                    vmos.destroy(&mut mm, id).unwrap();
+                    vmos.release(&mut mm, id).unwrap();
                 }
                 _ => {}
             }
             mm.db.audit().unwrap();
         }
         for (id, _, _) in live.drain(..) {
-            vmos.destroy(&mut mm, id).unwrap();
+            vmos.release(&mut mm, id).unwrap();
         }
         for (va, _) in mapped.drain(..) {
-            a.unmap_region(&mut mm, va).unwrap();
+            a.unmap_region(&mut mm, &mut vmos, va).unwrap();
         }
         // everything but the address space's own tables is back
         assert!(mm.db.free_count() >= after_root, "seed {seed}: frames lost");
-        a.destroy(&mut mm);
+        a.destroy(&mut mm, &mut vmos);
         assert_eq!(mm.db.free_count(), base_free, "seed {seed}: exact");
         assert_eq!(vmos.count(), 0);
     }

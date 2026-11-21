@@ -134,7 +134,7 @@ Each rebuilds all of user space; they are grouped so the churn happens once.
 ### Phase 6: kernel memory and the remaining lock peels
 
 - [ ] **MM4** the slab allocator
-- [ ] **L15** mappings hold a VMO reference
+- [x] **L15** mappings hold a VMO reference (`Vmos::retain`/`release`, regions hold a reference, `reap_vmos` and `pending_vmos` deleted)
 - [ ] **L16** `JOBS`, per-family `VMO`, `FRAME`; page reservations
 - [ ] **MM5** all kernel memory charged to jobs
 - [ ] **L17** per-process address-space locks, with the fault path shaped for pagers

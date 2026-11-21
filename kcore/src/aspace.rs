@@ -88,6 +88,9 @@ struct Vmo {
     /// The job charged for this VMO's committed pages (it holds one use of it).
     job: JobId,
     pages: u64,
+    /// Holders of the VMO: its creator (the object a handle names, or the kernel for its own) and every region that maps it (L15). The VMO is
+    /// freed when the last is gone.
+    refs: u32,
     /// Committed pages by index: the frame, on which the VMO holds one reference.
     committed: PageMap,
 }
@@ -197,6 +200,7 @@ impl Vmos {
             kind: VmoKind::Plain,
             job,
             pages,
+            refs: 1,
             committed: PageMap::new(),
         })
     }
@@ -210,6 +214,7 @@ impl Vmos {
             kind: VmoKind::Device,
             job: JobId::ROOT,
             pages,
+            refs: 1,
             committed: PageMap::from_run(pages, first),
         })
     }
@@ -243,6 +248,7 @@ impl Vmos {
             kind: VmoKind::Dma,
             job,
             pages,
+            refs: 1,
             committed: PageMap::from_run(pages, first),
         }))
     }
@@ -275,9 +281,29 @@ impl Vmos {
         self.vmo(id)?.committed.get(page)
     }
 
-    /// Destroy a VMO, dropping its references. Pages still mapped stay alive.
-    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
-    pub fn destroy<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
+    /// Take one more reference on a VMO (a region maps it). `Err` if the id is not a live VMO.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a VMO has one reference per region plus its creator's: bounded by the region and object limits, far below u32::MAX
+    pub fn retain(&mut self, id: u64) -> Result<(), VmoGone> {
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
+        v.refs += 1;
+        Ok(())
+    }
+
+    /// How many holders a live VMO has (its creator and the regions that map it).
+    pub fn refs(&self, id: u64) -> Option<u32> {
+        self.vmo(id).map(|v| v.refs)
+    }
+
+    /// Drop one reference on a VMO; the last one frees it: its pages go back and its job is credited. The creator's reference is dropped when the
+    /// object a handle names is destroyed (or by the kernel for its own VMOs), a mapping's when the region goes (L15: no scan for VMOs that
+    /// nothing maps any more). Frames still mapped somewhere hold references of their own.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: refs >= 1 for a live VMO; dma_pages was increased by exactly vmo.pages when the VMO was created, so it is at least vmo.pages
+    pub fn release<M: PhysMem>(&mut self, mm: &mut Mm<M>, id: u64) -> Result<(), VmoGone> {
+        let v = Self::vmo_in(&mut self.slots, id).ok_or(VmoGone)?;
+        v.refs -= 1;
+        if v.refs > 0 {
+            return Ok(());
+        }
         let vmo = self.take(id).ok_or(VmoGone)?;
         if vmo.kind == VmoKind::Device {
             // device frames are not ours: nothing was charged and nothing is freed
@@ -538,7 +564,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: start + len was checked with checked_add and canonical-ness first; pages <= MAX_REGION_PAGES keeps the products small; `end - 1` cannot underflow because len > 0
     pub fn map_region(
         &mut self,
-        vmos: &Vmos,
+        vmos: &mut Vmos,
         start: u64,
         pages: u64,
         vmo: u64,
@@ -579,6 +605,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
         if self.regions.range(start..end).next().is_some() {
             return Err(RegionError::Overlap);
         }
+        // (the region holds a reference on its VMO until it goes: L15)
+        vmos.retain(vmo).map_err(|_| RegionError::NoSuchVmo)?;
         self.regions.insert(
             start,
             Region {
@@ -616,16 +644,6 @@ impl<F: PageTableFormat> AddressSpace<F> {
         (at.checked_add(bytes)? <= hi).then_some(at)
     }
 
-    /// Add the ids of every VMO this address space maps to `out`.
-    pub fn collect_vmos(&self, out: &mut alloc::collections::BTreeSet<u64>) {
-        out.extend(self.regions.values().map(|r| r.vmo));
-    }
-
-    /// Does any region of this address space map VMO `vmo`?
-    pub fn maps_vmo(&self, vmo: u64) -> bool {
-        self.regions.values().any(|r| r.vmo == vmo)
-    }
-
     /// The permissions of the region covering `va`, if there is one (mapped yet or not).
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a region's start plus its size was checked when it was inserted
     pub fn region_perms_at(&self, va: u64) -> Option<Perms> {
@@ -640,6 +658,7 @@ impl<F: PageTableFormat> AddressSpace<F> {
     pub fn unmap_region<M: PhysMem>(
         &mut self,
         mm: &mut Mm<M>,
+        vmos: &mut Vmos,
         start: u64,
     ) -> Result<(), RegionError> {
         let region = self.regions.remove(&start).ok_or(RegionError::NoRegion)?;
@@ -655,6 +674,8 @@ impl<F: PageTableFormat> AddressSpace<F> {
                 );
             }
         }
+        // the region's reference on its VMO goes last (the VMO may be freed by it: the frames the mapping held are already dropped)
+        let _ = vmos.release(mm, region.vmo);
         Ok(())
     }
 
@@ -779,19 +800,19 @@ impl<F: PageTableFormat> AddressSpace<F> {
 
     /// Unmap everything and free the tables of a process whose table shares the kernel's
     /// upper half (`PageTable::new_with_kernel_half`): the shared half is left alone.
-    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>) {
+    pub fn destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, start);
+            let _ = self.unmap_region(mm, vmos, start);
         }
         self.table.destroy_user(mm);
     }
 
     /// Unmap everything and free the tables.
-    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>) {
+    pub fn destroy<M: PhysMem>(mut self, mm: &mut Mm<M>, vmos: &mut Vmos) {
         let starts: alloc::vec::Vec<u64> = self.regions.keys().copied().collect();
         for start in starts {
-            let _ = self.unmap_region(mm, start);
+            let _ = self.unmap_region(mm, vmos, start);
         }
         self.table.destroy(mm);
     }
