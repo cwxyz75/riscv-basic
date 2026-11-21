@@ -46,6 +46,10 @@ pub struct HandleTable {
     first_gen: u64,
     /// The most slots the table may have (`MAX_SLOTS`; a test lowers it to fill the table cheaply).
     slot_cap: usize,
+    /// The handle limit the table was made with: `limit` goes down to the slots it has while its job cannot pay for more (MM5).
+    full_limit: usize,
+    /// Bytes of the table's growth charged to its job's kernel bytes (MM5): what `settle_growth` has charged so far.
+    charged: u64,
 }
 
 impl HandleTable {
@@ -55,6 +59,8 @@ impl HandleTable {
             slots: Vec::new(),
             free: Vec::new(),
             limit: limit.min(MAX_SLOTS),
+            full_limit: limit.min(MAX_SLOTS),
+            charged: 0,
             live: 0,
             first_gen: 0,
             slot_cap: MAX_SLOTS,
@@ -94,6 +100,38 @@ impl HandleTable {
             .try_reserve(self.slots.len() + fresh - self.free.len())
             .map_err(|_| Status::NoMemory)?;
         Ok(())
+    }
+
+    /// The memory the table's two vectors hold, in bytes: their capacity, not their length (they grow by doubling, and the memory is held
+    /// whether or not it is used).
+    pub fn slot_bytes(&self) -> u64 {
+        const SLOT: u64 = core::mem::size_of::<Slot>() as u64;
+        const FREE: u64 = core::mem::size_of::<u32>() as u64;
+        (self.slots.capacity() as u64)
+            .saturating_mul(SLOT)
+            .saturating_add((self.free.capacity() as u64).saturating_mul(FREE))
+    }
+
+    /// Bytes of growth charged so far.
+    pub fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// Settle the table's growth with its job (MM5): `charge(n)` asks the ledger for `n` more bytes and says whether it was granted. A
+    /// refusal keeps the table from growing further (its handle limit drops to the slots it has: the free slots stay usable, a new one
+    /// is NO_MEMORY) until a later call is granted; the growth that already happened stays pending, so the overshoot is bounded by one
+    /// call's insertions (per thread: threads of one process that each have an unsettled call add up, bounded by the thread limit). Called after the calls that can insert, never in the middle of one.
+    pub fn settle_growth(&mut self, charge: impl FnOnce(u64) -> bool) {
+        let have = self.slot_bytes();
+        let pending = have.saturating_sub(self.charged);
+        if pending == 0 || charge(pending) {
+            if pending > 0 {
+                self.charged = have;
+            }
+            self.limit = self.full_limit;
+        } else {
+            self.limit = self.slots.len().max(self.live).min(self.full_limit);
+        }
     }
 
     pub fn len(&self) -> usize {

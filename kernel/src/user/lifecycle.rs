@@ -161,6 +161,8 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
     });
 }
 
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
 pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
@@ -178,6 +180,11 @@ pub(super) fn teardown_memory(process: Box<Process>) {
         // the address space and its page tables are gone: no hart may keep translations through them
         crate::smp::shootdown();
         k.jobs.credit(process.job, Resource::Pages, tables);
+        k.jobs.credit(
+            process.job,
+            Resource::KernelBytes,
+            process.handles.charged(),
+        );
         k.jobs.credit(process.job, Resource::Processes, 1);
         k.jobs.release(process.job);
     });
@@ -283,6 +290,30 @@ pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
     let s = state();
     let pid = s.thread_pid.get(&tid)?;
     Some(s.procs.get(pid)?.job)
+}
+
+/// Charge the growth of the calling thread's handle table to its process's job (MM5; `HandleTable::settle_growth`): a job that cannot pay
+/// leaves the table unable to grow, so the calls that insert handles say NO_MEMORY.
+pub(super) fn settle_handle_table() {
+    irq::without(|| {
+        let s = state();
+        let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+            return;
+        };
+        let Some(p) = s.procs.get_mut(&pid) else {
+            return;
+        };
+        if p.handles.slot_bytes() == p.handles.charged() {
+            return; // (the usual case: no growth, nothing to take)
+        }
+        let job = p.job;
+        let j = kmem::jobs();
+        p.handles.settle_growth(|n| {
+            j.jobs
+                .charge(job, kcore::job::Resource::KernelBytes, n)
+                .is_ok()
+        });
+    });
 }
 
 /// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
