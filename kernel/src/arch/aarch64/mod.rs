@@ -258,6 +258,9 @@ pub mod cpu {
     pub fn aspace_current_asid() -> u16 {
         unimplemented!()
     }
+    pub fn icache_flush_local() {
+        unimplemented!()
+    }
     pub fn tlb_flush_page(va: u64, asid: u16) {
         unimplemented!()
     }
