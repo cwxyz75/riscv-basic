@@ -9,6 +9,7 @@ pub const FID_HART_SUSPEND: usize = 3;
 /// SBI error: the call is not supported.
 pub const SBI_ERR_NOT_SUPPORTED: isize = -2;
 pub const EID_RFENCE: usize = 0x5246_4E43;
+pub const FID_REMOTE_FENCE_I: usize = 0;
 pub const FID_REMOTE_SFENCE_VMA: usize = 1;
 pub const EID_IPI: usize = 0x73_5049;
 /// The base extension (function 3 probes for another extension) and the legacy console putchar call.

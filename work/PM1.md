@@ -4,7 +4,7 @@ kind: slice
 title: Harts go offline and come back: `hart_set_online`, `hart_info`
 area: sched
 horizon: long
-blocked_by: [L18, L19]
+blocked_by: [L19]
 refs: [KERNEL-V1-SPEC, OD132]
 ---
 

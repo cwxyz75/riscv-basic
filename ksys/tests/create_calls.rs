@@ -51,7 +51,7 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
             PageTable::new_with_kernel_half(mm, kernel).unwrap(),
         ),
         handles: HandleTable::new(64),
-        asid: 1,
+        tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
         entry: 0,
         arg: 0,

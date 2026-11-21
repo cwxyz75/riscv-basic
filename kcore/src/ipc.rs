@@ -333,8 +333,12 @@ pub fn channel_create_in(
             c.peer = Some(other);
         }
     }
-    let ha = table.insert(a, Rights::CHANNEL).expect("room was checked");
-    let hb = table.insert(b, Rights::CHANNEL).expect("room was checked");
+    let ha = table
+        .insert(reg, a, Rights::CHANNEL)
+        .expect("room was checked");
+    let hb = table
+        .insert(reg, b, Rights::CHANNEL)
+        .expect("room was checked");
     Ok((ha, hb))
 }
 
@@ -499,7 +503,11 @@ fn read_at(
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());
     for e in &msg.handles {
-        handles.push(table.insert(e.obj, e.rights).expect("room was checked"));
+        handles.push(
+            table
+                .insert(reg, e.obj, e.rights)
+                .expect("room was checked"),
+        );
     }
     Ok(Received {
         data: msg.data,
@@ -605,7 +613,9 @@ pub fn event_create_in(
     }
     q.objects(reg, 1)?;
     let id = reg.create_charged(KObj::Event(Event { signals: 0 }), q.job);
-    Ok(table.insert(id, Rights::EVENT).expect("room was checked"))
+    Ok(table
+        .insert(reg, id, Rights::EVENT)
+        .expect("room was checked"))
 }
 
 /// Clear then set user signals on an event.
@@ -770,8 +780,12 @@ pub fn socket_create_in(
             s.peer = Some(other);
         }
     }
-    let ha = table.insert(a, Rights::SOCKET).expect("room was checked");
-    let hb = table.insert(b, Rights::SOCKET).expect("room was checked");
+    let ha = table
+        .insert(reg, a, Rights::SOCKET)
+        .expect("room was checked");
+    let hb = table
+        .insert(reg, b, Rights::SOCKET)
+        .expect("room was checked");
     Ok((ha, hb))
 }
 
@@ -944,7 +958,9 @@ pub fn port_create_in(
         }),
         q.job,
     );
-    Ok(table.insert(obj, Rights::PORT).expect("room was checked"))
+    Ok(table
+        .insert(reg, obj, Rights::PORT)
+        .expect("room was checked"))
 }
 
 /// Drop the bindings whose object has been destroyed (the spec says they disappear at once,
@@ -1205,7 +1221,7 @@ pub fn resource_object_create_in(
     q.objects(reg, 1)?;
     let obj = reg.create_charged(KObj::Resource, q.job);
     Ok(table
-        .insert(obj, Rights::RESOURCE)
+        .insert(reg, obj, Rights::RESOURCE)
         .expect("room was checked"))
 }
 
@@ -1231,7 +1247,7 @@ pub fn interrupt_object_create_in(
         q.job,
     );
     let h = table
-        .insert(obj, Rights::INTERRUPT)
+        .insert(reg, obj, Rights::INTERRUPT)
         .expect("room was checked");
     Ok((h, obj))
 }
@@ -1324,7 +1340,7 @@ pub fn vmo_object_create_with(
     }
     q.objects(reg, 1)?;
     let obj = reg.create_charged(KObj::Vmo(id), q.job);
-    Ok(table.insert(obj, rights).expect("room was checked"))
+    Ok(table.insert(reg, obj, rights).expect("room was checked"))
 }
 
 /// A job object for ledger job `id` (whose use the object takes over), with a handle in
@@ -1342,7 +1358,7 @@ pub fn job_object_create(
     }
     q.objects(reg, 1)?;
     let obj = reg.create_charged(KObj::Job(id), q.job);
-    Ok(table.insert(obj, rights).expect("room was checked"))
+    Ok(table.insert(reg, obj, rights).expect("room was checked"))
 }
 
 /// The job behind a job handle that carries `need`.
@@ -1402,7 +1418,7 @@ pub fn process_object_create_in(
     );
     Ok((
         table
-            .insert(obj, Rights::PROCESS)
+            .insert(reg, obj, Rights::PROCESS)
             .expect("room was checked"),
         obj,
     ))
@@ -1465,7 +1481,9 @@ pub fn thread_object_create_in(
         q.job,
     );
     Ok((
-        table.insert(obj, Rights::THREAD).expect("room was checked"),
+        table
+            .insert(reg, obj, Rights::THREAD)
+            .expect("room was checked"),
         obj,
     ))
 }

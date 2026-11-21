@@ -3,7 +3,22 @@
 use super::*;
 
 pub(super) fn aspace_token_of(p: &Process) -> u64 {
-    crate::arch::aspace_token_asid(p.aspace.table().root(), p.asid)
+    crate::arch::aspace_token_asid(p.aspace.table().root(), p.tag.asid)
+}
+
+/// The token to install for `p` on this hart (interrupts off, big lock held): a tag of an older generation names an ASID that may be
+/// another space's now, so the space takes a fresh one first, and this hart flushes everything if it has not since the generation turned
+/// (TLB1 per generation, L18).
+pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) -> u64 {
+    asids.refresh(&mut p.tag);
+    let me = crate::percpu::this();
+    if p.tag.gen > me.asid_seen.load(Ordering::Relaxed)
+        && !cfg!(feature = "fault-asid-reuse-no-flush")
+    {
+        crate::arch::tlb_flush_all();
+        me.asid_seen.store(p.tag.gen, Ordering::Relaxed);
+    }
+    aspace_token_of(p)
 }
 
 /// Make the calling thread's process the current address space, just before returning to
@@ -20,10 +35,18 @@ pub fn activate_current() {
     park_while_stopped();
     let token = irq::without(|| {
         let s = state();
-        s.thread_pid
+        let UserState {
+            asids,
+            procs,
+            thread_pid,
+            ..
+        } = s;
+        let p = thread_pid
             .get(&thread::current())
-            .and_then(|pid| s.procs.get(pid))
-            .map(|p| aspace_token_of(p))
+            .and_then(|pid| procs.get_mut(pid))?;
+        // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
+        // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
+        Some(install_token_of(asids, p))
     });
     if let Some(token) = token {
         if crate::percpu::this()
@@ -32,9 +55,10 @@ pub fn activate_current() {
             != token
             || crate::arch::aspace_current() != token
         {
-            // SAFETY: `token` names a live process root whose upper half is the kernel's; installing it
-            // drops the translations of whatever table was active.
-            unsafe { crate::arch::aspace_install(token) };
+            // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
+            // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
+            // No flush: translations are tagged with the ASID (L18).
+            unsafe { crate::arch::aspace_install_noflush(token) };
         }
     }
 }
@@ -43,6 +67,10 @@ pub fn activate_current() {
 /// before any IPI that tells a hart to look. A hart that returns to user mode records the epoch it saw (`activate_current`, before it
 /// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
 pub(super) static ATTENTION: AtomicU64 = AtomicU64::new(1);
+
+/// How much of the reachability sweep one creating call does (MM10): up to this many slices of this many marked objects or slots each.
+const SWEEP_SLICES_PER_CALL: usize = 4;
+const SWEEP_SLICE_BUDGET: usize = 256;
 
 pub(super) fn bump_attention() {
     ATTENTION.fetch_add(1, Ordering::SeqCst);
@@ -86,7 +114,13 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                             .aspace
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
-                            kmem::flush_pages(m.first, m.last, p.asid);
+                            if m.exec > 0 {
+                                // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
+                                crate::smp::icache_sync(m.exec);
+                            }
+                            // (the ASID this hart is running under, not the process's current tag: a refresh by another hart can have moved the tag while this
+                            // thread still runs under the old one)
+                            kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
                         }
                         if cfg!(feature = "fault-log") {
                             if let Err(e) = &r {
@@ -303,10 +337,25 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
             | nr::SOCKET_CREATE
             | nr::PORT_CREATE
             | nr::INTERRUPT_CREATE
-    ) && s.objs.needs_sweep()
+    ) && (s.objs.sweep_active() || s.objs.needs_sweep())
     {
-        let roots = s.roots();
-        s.objs.sweep(&roots);
+        // (MM10) the sweep runs in slices: this call starts one if garbage cycles have piled up, and runs a few slices of it; the next
+        // creating call carries on. The worst interrupts-off span of a sweep is a slice, not the whole object graph.
+        if !s.objs.sweep_active() {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots);
+        }
+        let mut slices = 0;
+        while s.objs.sweep_active() && slices < SWEEP_SLICES_PER_CALL {
+            s.objs.sweep_step(SWEEP_SLICE_BUDGET);
+            slices += 1;
+        }
+        // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
+        // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
+        if s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
+            let roots = s.roots();
+            s.objs.sweep(&roots);
+        }
     }
     let UserState {
         objs,

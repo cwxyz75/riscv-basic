@@ -8,7 +8,7 @@ use crate::console::Console;
 use crate::percpu::{self, IPI_RESCHED, MAX_HARTS};
 use crate::{irq, kmem, timer};
 use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Per-hart boot stacks: 32 KiB each, like every kernel thread, with a canary at the bottom
 /// (`stack_canaries_intact` checks it).
@@ -257,6 +257,38 @@ pub fn shootdown() {
     if cfg!(feature = "fault-skip-shootdown") {
         return; // negative control: the test that guards this must fail
     }
+    // a whole-address-space flush (start = 0, size = 0) of every ASID on those harts
+    remote_rfence(FID_REMOTE_SFENCE_VMA, "remote_sfence_vma");
+}
+
+/// Executable pages made visible by a fault, and the times the instruction caches were synchronised for them (PL7): counters for the
+/// tests (`debug_stat` 110 and 111).
+static ICACHE_PAGES: AtomicU64 = AtomicU64::new(0);
+static ICACHE_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// `pages` executable pages were just mapped into a live address space (a fault): make every hart's instruction fetches agree with memory
+/// before the thread runs them (PL7): `fence.i` here and SBI `remote_fence_i` on every other online hart, once for all the pages. A frame
+/// the kernel wrote (a program image copied into a VMO, zero-filled lazily) may still sit in a data cache the instruction side has not
+/// seen. Invisible on QEMU; correct on hardware by review. Call it inside the locked region of the fault, before the thread returns.
+pub fn icache_sync(pages: u64) {
+    ICACHE_PAGES.fetch_add(pages, Ordering::Relaxed);
+    ICACHE_SYNCS.fetch_add(1, Ordering::Relaxed);
+    crate::arch::icache_flush_local();
+    remote_rfence(FID_REMOTE_FENCE_I, "remote_fence_i");
+}
+
+/// Executable pages mapped by faults so far.
+pub fn icache_pages() -> u64 {
+    ICACHE_PAGES.load(Ordering::Relaxed)
+}
+
+/// Times `icache_sync` ran.
+pub fn icache_syncs() -> u64 {
+    ICACHE_SYNCS.load(Ordering::Relaxed)
+}
+
+/// One SBI RFENCE call (`fid`: remote `fence.i` or `sfence.vma` over everything) on every other online hart, synchronous in M-mode.
+fn remote_rfence(fid: usize, what: &str) {
     let me = percpu::this().index.load(Ordering::Relaxed);
     // every other online hart, as the (mask, base) groups the firmware wants: one call per group of 64 ids, not per hart. No array: the first
     // hart of a group makes the call for the whole group (this runs on the deepest kernel path, the reap on a fresh thread: T173)
@@ -276,9 +308,8 @@ pub fn shootdown() {
                 mask |= 1usize << (id_of(j) & 63);
             }
         }
-        // a whole-address-space flush (start = 0, size = 0) of every ASID on those harts
-        let r = sbi5(EID_RFENCE, FID_REMOTE_SFENCE_VMA, [mask, base, 0, 0, 0]);
-        assert!(r.error == 0, "SBI remote_sfence_vma failed ({})", r.error);
+        let r = sbi5(EID_RFENCE, fid, [mask, base, 0, 0, 0]);
+        assert!(r.error == 0, "SBI {what} failed ({})", r.error);
     }
 }
 

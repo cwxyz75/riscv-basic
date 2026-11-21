@@ -7,8 +7,7 @@ core::arch::global_asm!(
     .balign 4
 enter_user:                      # a0 entry, a1 user sp, a2 arg, a3 address-space token, a4 kernel stack top, a5 tp, a6 a1 for the thread
     csrci sstatus, 2             # interrupts off until we are in U-mode
-    csrw  satp, a3
-    sfence.vma zero, zero
+    csrw  satp, a3               # no flush: the token's ASID is unique and this hart flushed for its generation (L18)
     csrw  sepc, a0
     sd    a4, 0(tp)              # PerHart.kstack_top: where the next trap from user mode lands
     csrw  sscratch, tp           # from now on a trap is a trap from user mode

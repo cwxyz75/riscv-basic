@@ -195,6 +195,7 @@ pub mod sbi {
     pub const FID_HART_SUSPEND: usize = 0;
     pub const SBI_ERR_NOT_SUPPORTED: isize = 0;
     pub const EID_RFENCE: usize = 0;
+    pub const FID_REMOTE_FENCE_I: usize = 0;
     pub const FID_REMOTE_SFENCE_VMA: usize = 0;
     pub const EID_IPI: usize = 0;
     pub fn ipi_calls() -> usize {
@@ -247,6 +248,18 @@ pub mod cpu {
         unimplemented!()
     }
     pub fn tlb_flush_all() {
+        unimplemented!()
+    }
+    pub fn asid_bits() -> u32 {
+        unimplemented!()
+    }
+    pub unsafe fn aspace_install_noflush(token: u64) {
+        unimplemented!()
+    }
+    pub fn aspace_current_asid() -> u16 {
+        unimplemented!()
+    }
+    pub fn icache_flush_local() {
         unimplemented!()
     }
     pub fn tlb_flush_page(va: u64, asid: u16) {

@@ -61,12 +61,12 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             .map_err(|_| LoadError::NoMemory)?;
         Ok(())
     })();
-    let (pid, asid, first_gen) = (|| {
+    let (pid, tag, first_gen) = (|| {
         let s = state();
         let pid = s.next_pid;
         // (CNT1: the counter never wraps or repeats: at its end no process is started)
         let ok = pid.checked_add(1).map(|n| s.next_pid = n).is_some();
-        (ok.then_some(pid), (pid & 0xffff) as u16, s.first_handle_gen)
+        (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
     })();
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
@@ -81,7 +81,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         live_tids: Default::default(),
         aspace,
         handles: HandleTable::new(MAX_HANDLES),
-        asid,
+        tag,
         vmos: vmo_ids,
         entry: parsed.entry,
         arg,
@@ -121,7 +121,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             .expect("a fresh handle can be transferred");
         let first = process
             .handles
-            .insert(entry.obj, entry.rights)
+            .insert(&mut s.objs, entry.obj, entry.rights)
             .expect("an empty table has room");
         assert_eq!(
             first,

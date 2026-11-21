@@ -1309,7 +1309,7 @@ fn queued_handles_and_headers_count_against_the_budget() {
     let dups: Vec<Handle> = (0..8)
         .map(|_| {
             let en = t.get(e).unwrap();
-            t.insert(en.obj, en.rights).unwrap()
+            t.insert(&mut reg, en.obj, en.rights).unwrap()
         })
         .collect();
     channel_write(&mut reg, &mut t, a, b"", &dups).unwrap();

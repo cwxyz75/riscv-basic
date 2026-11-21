@@ -29,6 +29,50 @@ pub unsafe fn aspace_install(token: u64) {
     unsafe { asm!("csrw satp, {}", "sfence.vma zero, zero", in(reg) token) };
 }
 
+/// How many bits of ASID this hart implements (1 to 16), probed by writing ones to `satp`'s ASID field and reading it back (L18). Writes the
+/// current table back with the field unchanged; call it with interrupts off, on a hart that has a page table installed.
+pub fn asid_bits() -> u32 {
+    let old: u64;
+    let back: u64;
+    // SAFETY: reads `satp`, writes the same mode and table with every ASID bit set, reads it back and restores the old value: the table is
+    // the one already installed, so nothing the hart executes from or touches changes; the flush drops entries cached under the probe.
+    unsafe {
+        asm!("csrr {old}, satp", old = out(reg) old);
+        let probe = old | (0xffffu64 << 44);
+        asm!("csrw satp, {p}", "csrr {b}, satp", "csrw satp, {o}", "sfence.vma zero, zero", p = in(reg) probe, b = out(reg) back, o = in(reg) old);
+    }
+    ((back >> 44) & 0xffff).count_ones().clamp(1, 16)
+}
+
+/// Install the address space `token` **without flushing** (L18, KERNEL-V1-SPEC 5.4): translations are tagged with the ASID, so the ones
+/// cached for the space being left stay out of the way, and the ones cached for another ASID are not this space's. What makes that sound
+/// is outside this function: ASIDs are unique among live spaces of a generation (`kcore::asid`), a hart flushes everything before it
+/// installs a tag of a newer generation (`user::install_token_of`), and every unmap, spawn-stack free and teardown flushes the other
+/// harts before a frame is reused (`smp::shootdown`). Also the way a hart goes back to the kernel's own table (ASID 0) when it leaves a
+/// user space: the user entries stay cached under their ASID, and nothing runs under that ASID until its owner does.
+///
+/// # Safety
+/// `token` names a live top-level table that maps everything the kernel executes from and touches; for a user space its ASID is the
+/// allocator's (never 0) and of the current generation, and the caller has done the flush the hart owes for that generation.
+#[inline(always)]
+pub unsafe fn aspace_install_noflush(token: u64) {
+    // SAFETY: the caller guarantees the table and the ASID rules above.
+    unsafe { asm!("csrw satp, {}", in(reg) token) };
+}
+
+/// The ASID in this hart's `satp` right now (what a flush of one of the running space's pages must name).
+#[inline(always)]
+pub fn aspace_current_asid() -> u16 {
+    ((aspace_current() >> 44) & 0xffff) as u16
+}
+
+/// Make this hart's instruction fetches see the stores it (and the kernel, through the direct map) has made to memory: `fence.i` (PL7).
+#[inline(always)]
+pub fn icache_flush_local() {
+    // SAFETY: `fence.i` synchronises the instruction stream with this hart's earlier stores; no other effect.
+    unsafe { asm!("fence.i") };
+}
+
 /// Flush the whole TLB of this hart.
 #[inline(always)]
 pub fn tlb_flush_all() {

@@ -50,7 +50,8 @@ pub struct Process {
     pub live_tids: alloc::collections::BTreeSet<Tid>,
     pub aspace: AddressSpace,
     pub handles: HandleTable,
-    pub asid: u16,
+    /// The address-space identifier and the generation it was allocated in (L18); the allocator is `UserState::asids`.
+    pub tag: kcore::asid::AsTag,
     pub vmos: Vec<u64>,
     pub entry: u64,
     pub arg: u64,
@@ -329,7 +330,10 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 Some(obj) => {
                     // another view of the same process object
                     objs.retain(obj);
-                    let h = p.handles.insert(obj, rights).expect("room was checked");
+                    let h = p
+                        .handles
+                        .insert(objs, obj, rights)
+                        .expect("room was checked");
                     Ok((Some(h.0), None))
                 }
                 None => {

@@ -68,6 +68,8 @@ struct Slot<T> {
     /// The job this object is charged to (S4.5c), if it is charged at all. When the object is
     /// destroyed, one object and the bytes it still held are queued as credits for that job.
     job: Option<JobId>,
+    /// The epoch of the sweep that last marked this object reachable (MM10); an object created during a sweep gets the sweep's epoch.
+    mark: u64,
 }
 
 /// Bytes of bookkeeping the registry keeps around each object (its slot: generation, koid, count, the job the object is charged to), for the
@@ -104,6 +106,37 @@ pub struct Registry<T: Object> {
     dirty_spare: Vec<(ObjId, bool)>,
     /// The graveyard's twin: `drain_dead` hands out one and keeps the other, so its capacity survives (`recycle` returns it).
     spare: Vec<T>,
+    /// Where a sweep is (MM10): `Idle`, marking reachable objects in slices, or freeing the unmarked ones in slices.
+    phase: Phase,
+    /// The number of the current (or last) sweep: an object whose `mark` equals it is reachable.
+    epoch: u64,
+    /// Marked objects whose references have not been followed yet (the worklist of the marking phase).
+    mark_work: Vec<ObjId>,
+    /// Where the freeing phase is up to in the slot table.
+    cursor: usize,
+    /// Scratch for the references of the object being scanned (kept between calls: a slice allocates only when an object holds more than before).
+    scan: Vec<ObjId>,
+    /// Objects the current sweep has freed so far.
+    swept: usize,
+}
+
+/// The phases of an incremental sweep (MM10, KERNEL-V1-SPEC 4.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Marking,
+    Freeing,
+}
+
+/// What one slice of a sweep did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepStep {
+    /// The sweep is not finished: call `sweep_step` again (between slices the owner may do anything, including mutate the graph: the
+    /// barrier, `Registry::shade`, keeps what is reachable marked).
+    More,
+    /// The sweep is finished; this many objects were freed (at least this many: an object that dies through the release cascade of an
+    /// earlier slice's victim is not counted; `sweep`, which frees in one slice, counts exactly).
+    Done(usize),
 }
 
 /// How many log entries are kept before the log is compacted and, failing that, dropped (the
@@ -152,6 +185,12 @@ impl<T: Object> Registry<T> {
             work: Vec::with_capacity(PREALLOC_SLOTS),
             dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
             spare: Vec::new(),
+            phase: Phase::Idle,
+            epoch: 0,
+            mark_work: Vec::with_capacity(PREALLOC_SLOTS),
+            cursor: 0,
+            scan: Vec::with_capacity(64),
+            swept: 0,
         }
     }
 
@@ -270,6 +309,12 @@ impl<T: Object> Registry<T> {
     #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: live is bounded by MAX_OBJECTS (checked by every caller's quota test)
     pub fn create_charged(&mut self, obj: T, job: Option<JobId>) -> ObjId {
         self.live += 1;
+        // (an object made while a sweep runs is reachable by definition: the sweep must not free it)
+        let born_mark = if self.phase == Phase::Idle {
+            0
+        } else {
+            self.epoch
+        };
         // (a u64 counter from 1: 2^64 creations is 584 years at a billion a second; saturating keeps the arithmetic total)
         let koid = self.next_koid;
         self.next_koid = self.next_koid.saturating_add(1);
@@ -279,6 +324,7 @@ impl<T: Object> Registry<T> {
             slot.koid = koid;
             slot.obj = Some(obj);
             slot.job = job;
+            slot.mark = born_mark;
             ObjId {
                 index,
                 gen: slot.gen,
@@ -290,6 +336,7 @@ impl<T: Object> Registry<T> {
                 refs: 1,
                 obj: Some(obj),
                 job,
+                mark: born_mark,
             });
             ObjId {
                 index: self.slots.len() as u32 - 1,
@@ -494,61 +541,115 @@ impl<T: Object> Registry<T> {
     /// `roots` must list every object that something outside the registry (a handle
     /// table) still refers to: **an omitted root is destroyed even though a handle to it
     /// exists** (the handle then fails with BAD_HANDLE, never with a wrong object). The
-    /// caller passes the objects of *all* handle tables.
+    /// caller passes the objects of *all* handle tables. Runs the whole sweep at once (the
+    /// slices of `sweep_begin` and `sweep_step`, back to back).
+    pub fn sweep(&mut self, roots: &[ObjId]) -> usize {
+        // (a sweep already running was started with an older set of roots: finish it, then sweep again with these)
+        while self.sweep_active() {
+            self.sweep_step(usize::MAX);
+        }
+        if !self.sweep_begin(roots) {
+            return 0;
+        }
+        loop {
+            if let SweepStep::Done(n) = self.sweep_step(usize::MAX) {
+                return n;
+            }
+        }
+    }
+
+    /// Is a sweep in progress (between `sweep_begin` and its last `sweep_step`)?
+    pub fn sweep_active(&self) -> bool {
+        self.phase != Phase::Idle
+    }
+
+    /// Start a sweep in slices (MM10, KERNEL-V1-SPEC 4.6): mark `roots` (the objects of every handle table, as for `sweep`) and return
+    /// true, or false if a sweep is already running. Then call `sweep_step` until it says `Done`. **While a sweep runs, every new handle
+    /// to an object must be shaded** (`HandleTable::insert` does it, which is why it takes the registry): a handle moved out of a queued
+    /// message into a table would otherwise hide its object from the marker, which may already have passed the message's channel.
+    pub fn sweep_begin(&mut self, roots: &[ObjId]) -> bool {
+        if self.phase != Phase::Idle {
+            return false;
+        }
+        self.epoch = self.epoch.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
+        self.phase = Phase::Marking;
+        self.mark_work.clear();
+        self.cursor = 0;
+        self.swept = 0;
+        for &r in roots {
+            self.shade(r);
+        }
+        true
+    }
+
+    /// Mark `id` reachable if a sweep is running and it is not marked yet (the write barrier of the incremental sweep; a no-op when no sweep
+    /// runs or `id` is not a live object). Its references are followed in a later slice.
+    pub fn shade(&mut self, id: ObjId) {
+        if self.phase == Phase::Idle {
+            return;
+        }
+        let epoch = self.epoch;
+        let Some(slot) = self.slots.get_mut(id.index as usize) else {
+            return;
+        };
+        if slot.gen != id.gen || slot.obj.is_none() || slot.mark == epoch {
+            return;
+        }
+        slot.mark = epoch;
+        self.mark_work.push(id);
+    }
+
+    /// One slice of the sweep: follow the references of up to `budget` marked objects, or (once everything reachable is marked) free the
+    /// unmarked objects among the next `budget` slots. Between slices anything may happen to the object graph as long as new handles are
+    /// shaded and nothing is unmarked. `More` until the last slice, which says how many objects the whole sweep freed.
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::expect_used,
         clippy::indexing_slicing
-    )] // INVARIANT: ids come from the registry's own slot table and index it
-    pub fn sweep(&mut self, roots: &[ObjId]) -> usize {
-        let mut reached = alloc::vec![false; self.slots.len()];
-        let mut work: Vec<ObjId> = roots.to_vec();
-        while let Some(id) = work.pop() {
-            if !self.is_alive(id) || core::mem::replace(&mut reached[id.index as usize], true) {
+    )] // INVARIANT: ids come from the registry's own slot table and index it; the cursor is below the slot count when used
+    pub fn sweep_step(&mut self, budget: usize) -> SweepStep {
+        if self.phase == Phase::Idle {
+            return SweepStep::Done(0);
+        }
+        // marking (also after a shade that reached a white object while freeing: its references must be followed before anything is freed)
+        let mut left = budget;
+        while left > 0 {
+            let Some(id) = self.mark_work.pop() else {
+                break;
+            };
+            left -= 1;
+            if !self.is_alive(id) {
                 continue;
             }
+            let mut refs = core::mem::take(&mut self.scan);
+            refs.clear();
             self.slots[id.index as usize]
                 .obj
                 .as_ref()
                 .expect("live")
-                .held(&mut work);
+                .held(&mut refs);
+            for &r in &refs {
+                self.shade(r);
+            }
+            self.scan = refs;
         }
-        let doomed: Vec<u32> = (0..self.slots.len() as u32)
-            .filter(|&i| self.slots[i as usize].obj.is_some() && !reached[i as usize])
-            .collect();
+        if !self.mark_work.is_empty() {
+            return SweepStep::More;
+        }
+        self.phase = Phase::Freeing;
+        // freeing
+        let end = self.slots.len().min(self.cursor.saturating_add(left));
         let mut dropped_refs: Vec<ObjId> = Vec::new();
         let mut peers: Vec<ObjId> = Vec::new();
-        for &index in &doomed {
-            let slot = &mut self.slots[index as usize];
-            let id = ObjId {
-                index,
-                gen: slot.gen,
-            };
-            let obj = slot.obj.take().expect("live");
-            self.dirty_log_doomed(id);
-            let slot = &mut self.slots[index as usize];
-            if let Some(job) = slot.job.take() {
-                self.credits.push((job, obj.charged_bytes()));
+        for index in self.cursor..end {
+            let slot = &self.slots[index];
+            if slot.obj.is_none() || slot.mark == self.epoch {
+                continue;
             }
-            slot.refs = 0;
-            let retire = slot.gen == u64::MAX;
-            slot.gen = slot.gen.saturating_add(1);
-            if !retire {
-                self.free.push(index);
-            }
-            self.live -= 1;
-            self.meter = self.meter.saturating_sub(obj.meter());
-            // The references a doomed object holds go away with it. Those to other doomed
-            // objects are moot; those to survivors must be given back, or the survivor
-            // could never be freed.
-            obj.held(&mut dropped_refs);
-            if let Some(peer) = obj.peer() {
-                peers.push(peer);
-            }
-            if obj.needs_cleanup() {
-                self.bury(obj);
-            }
+            self.swept += 1;
+            self.doom_slot(index as u32, &mut dropped_refs, &mut peers);
         }
+        self.cursor = end;
         for peer in peers {
             if let Some(p) = self.get_mut(peer) {
                 p.peer_destroyed();
@@ -559,9 +660,52 @@ impl<T: Object> Registry<T> {
                 self.release(id);
             }
         }
+        if self.cursor < self.slots.len() {
+            return SweepStep::More;
+        }
         // Never past the cap (garbage cycles must not be able to fill it), and never so close
         // to it that every creation sweeps while the objects are all genuinely reachable.
         self.threshold = SWEEP_MIN.max(self.live * 2).min(PREALLOC_SLOTS - 4);
-        doomed.len()
+        self.phase = Phase::Idle;
+        SweepStep::Done(self.swept)
+    }
+
+    /// Destroy the object in slot `index` as the sweep does: give its job the credit, free the slot, and collect the references it held
+    /// (to give back) and its peer (to tell).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )] // INVARIANT: the slot holds a live object (checked by the caller), so `live` is at least 1
+    fn doom_slot(&mut self, index: u32, dropped_refs: &mut Vec<ObjId>, peers: &mut Vec<ObjId>) {
+        let slot = &mut self.slots[index as usize];
+        let id = ObjId {
+            index,
+            gen: slot.gen,
+        };
+        let obj = slot.obj.take().expect("live");
+        self.dirty_log_doomed(id);
+        let slot = &mut self.slots[index as usize];
+        if let Some(job) = slot.job.take() {
+            self.credits.push((job, obj.charged_bytes()));
+        }
+        slot.refs = 0;
+        let retire = slot.gen == u64::MAX;
+        slot.gen = slot.gen.saturating_add(1);
+        if !retire {
+            self.free.push(index);
+        }
+        self.live -= 1;
+        self.meter = self.meter.saturating_sub(obj.meter());
+        // The references a doomed object holds go away with it. Those to other doomed
+        // objects are moot; those to survivors must be given back, or the survivor
+        // could never be freed.
+        obj.held(dropped_refs);
+        if let Some(peer) = obj.peer() {
+            peers.push(peer);
+        }
+        if obj.needs_cleanup() {
+            self.bury(obj);
+        }
     }
 }
