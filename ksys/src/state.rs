@@ -32,6 +32,8 @@ pub struct UserState {
     /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
     pub sched_flags: BTreeMap<Tid, u8>,
     pub next_pid: u64,
+    /// The address-space identifier allocator (L18): every process holds a tag from it.
+    pub asids: kcore::asid::Asids,
     /// The generation new handle tables start their slots at (0; `ff=handlegen:` in test builds).
     pub first_handle_gen: u64,
     /// Threads that are inside `cleanup_dead` (a per-thread recursion guard, T63: a global flag made every other
@@ -87,6 +89,7 @@ impl UserState {
             thread_pid: BTreeMap::new(),
             sched_flags: BTreeMap::new(),
             next_pid: 1,
+            asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
             cleaning: BTreeSet::new(),
             interrupts: BTreeSet::new(),

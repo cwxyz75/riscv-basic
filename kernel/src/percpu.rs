@@ -103,6 +103,9 @@ pub struct PerHart {
     pub last_class: AtomicU32,
     /// This hart's magazines of free slab objects, one per size class (MM4): touched only by this hart with interrupts off.
     pub magazines: Magazines,
+    /// The newest ASID generation this hart has flushed for (L18, `kcore::asid::HartGen`): it flushes everything before it installs an address
+    /// space of a newer generation.
+    pub asid_seen: AtomicU64,
     /// This hart's cache of free frames (L16): touched only by this hart with interrupts off.
     pub frame_cache: FrameCacheCell,
 }
@@ -260,6 +263,7 @@ impl PerHart {
             spins: AtomicU64::new(0),
             last_class: AtomicU32::new(0),
             magazines: Magazines::new(),
+            asid_seen: AtomicU64::new(0),
             frame_cache: FrameCacheCell::new(),
         }
     }

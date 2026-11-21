@@ -50,7 +50,8 @@ pub struct Process {
     pub live_tids: alloc::collections::BTreeSet<Tid>,
     pub aspace: AddressSpace,
     pub handles: HandleTable,
-    pub asid: u16,
+    /// The address-space identifier and the generation it was allocated in (L18); the allocator is `UserState::asids`.
+    pub tag: kcore::asid::AsTag,
     pub vmos: Vec<u64>,
     pub entry: u64,
     pub arg: u64,

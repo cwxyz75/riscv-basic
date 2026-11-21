@@ -36,7 +36,7 @@ pub(super) fn user_thread_main(token: usize) {
         if ts.rr {
             s.sched_flags.insert(thread::current(), 1);
         }
-        let token = aspace_token_of(p);
+        let token = install_token_of(&mut s.asids, p);
         // A thread that was created before its job's maximum was lowered has not been seen by the clamp (it was in
         // no table yet): clamp it now (PR1; review of task 8).
         let max = kmem::jobs()
