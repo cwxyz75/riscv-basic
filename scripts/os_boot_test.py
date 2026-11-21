@@ -107,6 +107,8 @@ BOOT = re.compile(r"^##BOOT (\S+) (\S+)$")
 # malformed `##` line.
 BENCH = re.compile(r"^##BENCH (\w+) (\d+) ([\w/]+)$")
 LAST_BENCH = []
+# `##FF <name>=<value> ...` (T189): what the kernel understood of an `ff=` boot argument (test builds), so a run meant to start counters near their end cannot pass on a typo
+LAST_FF = []
 
 
 LAST_DISK = [None]
@@ -1098,8 +1100,11 @@ def parse(lines):
     """-> (boot, tests, done, panics, malformed): tests is a list of (name, ok, detail)."""
     boot, tests, done, panics, bad = None, [], None, [], []
     LAST_BENCH.clear()
+    LAST_FF.clear()
     for line in lines:
-        if m := BOOT.match(line):
+        if line.startswith("##FF "):
+            LAST_FF.append(line)
+        elif m := BOOT.match(line):
             boot = m.groups()
         elif m := TEST.match(line):
             tests.append((m[1], m[2] == "PASS", m[3] or ""))
@@ -1123,6 +1128,12 @@ def problems(lines, status, timed_out, expect_fail: bool, required=None):
         found.append("no ##BOOT line")
     if bad:
         found.append(f"malformed ## lines: {bad}")
+    if "ff=" in os.environ.get("OS_BOOT_ARGS", ""):
+        # (T189) the run asked for counters near their end: the kernel must say it understood, and every name and value
+        if not LAST_FF:
+            found.append("the boot arguments carry ff= but the kernel reported no ##FF line (the counters did not start where the run asked)")
+        elif any(" error " in l for l in LAST_FF):
+            found.append(f"ff= was not understood: {LAST_FF}")
     if panics:
         found.append(f"panic: {panics}")
     if not tests:

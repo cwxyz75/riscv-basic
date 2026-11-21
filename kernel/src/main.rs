@@ -125,6 +125,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     kmem::init();
     heap::init_window(); // (before the kernel half is snapshotted, like the stack window)
     dtb::require_extensions(); // PL1: every hart has the profile's extensions, or the kernel stops here
+    if let Some(line) = dtb::ff_report() {
+        let _ = writeln!(out, "{line}"); // (T189: what `ff=` asked for, so the harness can insist on it)
+    }
     fp::init_boot_hart(); // PL2: the vector register length (every other hart must agree)
     fp::enable_cache_block_ops_or_stop(); // PL3: cbo.zero and friends for user mode
     kstack::init(); // the stack window's top-level page-table entry must exist before the kernel half is snapshotted
