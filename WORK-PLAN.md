@@ -133,9 +133,9 @@ Each rebuilds all of user space; they are grouped so the churn happens once.
 
 ### Phase 6: kernel memory and the remaining lock peels
 
-- [ ] **MM4** the slab allocator
+- [ ] **MM4** the slab allocator (in progress, 2026-11-21: `kcore::slab` and the kernel half are merged, small objects up to 2048 bytes come from slabs behind per-hart magazines with a frame pool; what is left is T196: the `FRAME` lock, inline frame runs, and `linked_list_allocator` leaving the kernel)
 - [x] **L15** mappings hold a VMO reference (`Vmos::retain`/`release`, regions hold a reference, `reap_vmos` and `pending_vmos` deleted)
-- [ ] **L16** `JOBS`, per-family `VMO`, `FRAME`; page reservations
+- [ ] **L16** `JOBS`, per-family `VMO`, `FRAME`; page reservations (in progress: part a is merged, the job ledger is out of the VMO store; left: the three locks as real locks nested inside the big lock, the per-hart frame caches, the page reservations)
 - [ ] **MM5** all kernel memory charged to jobs
 - [ ] **L17** per-process address-space locks, with the fault path shaped for pagers
 - [ ] **L18** the ASID allocator with generations; batched shootdown
