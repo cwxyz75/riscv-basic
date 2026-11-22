@@ -1103,10 +1103,11 @@ Hands the lock to the waiter with the best effective priority at that moment (fi
 INVALID_ARGS; ACCESS_DENIED (the caller does not own it, or the word is poisoned); NOT_SUPPORTED (the caller's tid does not fit in 30 bits); SHOULD_WAIT (a pager's page); BAD_STATE (the caller's process is gone). `futex_wait` and `futex_wake` gain a flags argument whose
 bit 0 (shared key) is reserved: NOT_SUPPORTED.
 
-### channel_call (will amend the last paragraph, task 22)
+### channel_call, priority (L22, built)
 
-"From task 22 the caller lends its effective priority to the thread that reads its request, until a message with the
-same transaction id is written back, the call ends for any reason, or that thread ends."
+The caller lends its effective priority to the thread that reads its request, until the call ends for any reason (the
+reply, a timeout, a kill, an interrupt, the peer closing) or that thread ends. A request left queued by a call that
+timed out lends nothing when it is read later. `thread_get_sched` shows the reader's raised effective priority.
 
 ## Planned changes (KERNEL-V1-SPEC.md, OD126 to OD141)
 

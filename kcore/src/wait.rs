@@ -179,21 +179,19 @@ impl WaitTable {
             self.watching.clear();
         }
         // (the log names an object once for every `get_mut` of it: each object is looked at once per commit, forced if any of its entries was, and a port
-        // that a bound object's touch would evaluate again is evaluated once)
-        let mut order: Vec<ObjId> = Vec::new();
-        let mut forced_of: BTreeMap<ObjId, bool> = BTreeMap::new();
-        for &(obj, forced) in &dirty.items {
-            match forced_of.get_mut(&obj) {
-                Some(f) => *f |= forced,
-                None => {
-                    forced_of.insert(obj, forced);
-                    order.push(obj);
-                }
+        // that a bound object's touch would evaluate again is evaluated once. The log is short (a syscall touches a handful of objects), so this is a scan
+        // of what was already seen, not a map: every commit pays for it)
+        let items = &dirty.items;
+        let mut fired: Vec<ObjId> = Vec::new();
+        for (i, &(obj, forced)) in items.iter().enumerate() {
+            if items.iter().take(i).any(|&(o, _)| o == obj) {
+                continue; // (looked at when it first appeared, with every entry of it)
             }
-        }
-        let mut fired: BTreeSet<ObjId> = BTreeSet::new();
-        for obj in order {
-            let forced = forced_of.get(&obj).copied().unwrap_or(false);
+            let forced = forced
+                || items
+                    .iter()
+                    .skip(i.saturating_add(1))
+                    .any(|&(o, f)| o == obj && f);
             // (a port touched itself: what it binds may have changed)
             if self.watching.contains_key(&obj) {
                 self.watch_port(obj, bound(obj));
@@ -201,15 +199,15 @@ impl WaitTable {
             if forced || !fired.contains(&obj) {
                 self.fire(obj, forced, &signals, &call_ready, &mut woken);
             }
-            fired.insert(obj);
+            fired.push(obj);
             // the ports that bind the touched object
-            let ports: Vec<ObjId> = self
-                .watchers
-                .get(&obj)
-                .map_or_else(Vec::new, |s| s.iter().copied().collect());
-            for port in ports {
-                if fired.insert(port) {
-                    self.fire(port, false, &signals, &call_ready, &mut woken);
+            if let Some(ports) = self.watchers.get(&obj) {
+                let ports: Vec<ObjId> = ports.iter().copied().collect();
+                for port in ports {
+                    if !fired.contains(&port) {
+                        fired.push(port);
+                        self.fire(port, false, &signals, &call_ready, &mut woken);
+                    }
                 }
             }
         }

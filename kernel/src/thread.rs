@@ -947,6 +947,46 @@ pub fn pi_op<R>(
     r
 }
 
+/// Donations the graph refused because a cycle of blocked calls or a chain too long would have followed: the diagnostic of SCHED-SMP-SPEC 4.8 (L22),
+/// `debug_stat` selector 20.
+pub static DONATIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A `channel_call` has finished (L24): a thread it woke for a direct hand-off that is still queued on this hart (the caller did not block after all) is
+/// offered to the other harts, which the hand-off had left unmarked.
+pub fn push_owed() {
+    irq::without(|| {
+        sched().push_owed_on(hart());
+        note_resched();
+    });
+}
+
+/// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
+/// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
+pub fn pi_donate(from: Tid, to: Tid) {
+    irq::without(|| {
+        pi_op(|d| match d.donate(from, to) {
+            Ok(ch) => ((), ch.as_slice().to_vec()),
+            Err(e) => {
+                // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
+                if matches!(
+                    e,
+                    kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
+                ) {
+                    DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
+                ((), alloc::vec::Vec::new())
+            }
+        });
+    });
+}
+
+/// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
+pub fn pi_revoke(tid: Tid) {
+    irq::without(|| {
+        pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
+    });
+}
+
 /// A user thread enters the donation graph at its base priority (when it registers, big lock held).
 pub fn pi_register(tid: Tid) {
     irq::without(|| {
@@ -1215,6 +1255,20 @@ pub fn wake_many_quiet(tids: &[Tid]) {
     note_resched();
 }
 
+/// `wake_many` by a thread that is about to block (a `channel_call` that queued its request, L24): each woken thread is placed on this hart with no IPI
+/// and runs here when the caller blocks. Interrupts off, as `wake_many`; the big lock is held.
+pub fn wake_many_sync(tids: &[Tid]) {
+    irq::without(|| {
+        for &tid in tids {
+            if sched().state(tid) == Some(State::Blocked) {
+                WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = sched().wake_sync_on(hart(), tid);
+        }
+        note_resched();
+    });
+}
+
 /// Is `tid` blocked right now (a test hook)?
 pub fn is_blocked(tid: Tid) -> bool {
     irq::without(|| sched().state(tid) == Some(State::Blocked))
@@ -1296,6 +1350,7 @@ fn count_sleep(slept: &mut bool) {
 pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
+        20 => DONATIONS_REFUSED.load(Relaxed),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
