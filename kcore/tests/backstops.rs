@@ -10,7 +10,10 @@ fn a_large_machine_has_the_figures_of_the_table() {
     let b = Backstops::for_ram(4 * GIB, 32768);
     assert_eq!(b.objects, (4 * GIB / 4096) as usize);
     assert_eq!(b.ipc_bytes, (4 * GIB / 32) as usize);
-    assert_eq!(b.processes, 4096);
+    assert_eq!(
+        b.processes, 64,
+        "RAM / 1 MiB is 4096, held to the address spaces one call may lock (T214)"
+    );
     assert_eq!(
         b.user_threads, 32768,
         "RAM / 64 KiB is 65536, the stack window has 32768 slots"
@@ -19,10 +22,10 @@ fn a_large_machine_has_the_figures_of_the_table() {
 }
 
 #[test]
-fn processes_stop_at_two_to_the_twenty() {
+fn processes_stop_at_the_address_spaces_a_call_may_hold() {
     assert_eq!(
         Backstops::for_ram(4096 * GIB, usize::MAX).processes,
-        1 << 20
+        kcore::limits::AS_HELD_MOST
     );
 }
 
@@ -33,7 +36,7 @@ fn a_small_machine_keeps_the_old_figures_and_a_bigger_one_differs() {
     let mid = Backstops::for_ram(128 * MIB, 32768);
     let big = Backstops::for_ram(4 * GIB, 32768);
     assert!(mid.objects < big.objects && mid.ipc_bytes < big.ipc_bytes);
-    assert!(mid.processes < big.processes && mid.dma_total_pages < big.dma_total_pages);
+    assert!(mid.dma_total_pages < big.dma_total_pages);
 }
 
 #[test]

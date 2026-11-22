@@ -6,6 +6,10 @@ use abi::limits::{
     MAX_DMA_TOTAL_PAGES, MAX_IPC_BYTES, MAX_OBJECTS, MAX_PROCESSES, MAX_USER_THREADS,
 };
 
+/// The address spaces one hart may hold at once under the lock-order checker (`klock::Class::As`): the calls that look at every process
+/// (`AsLocks::all`) take them all, so the process backstop may not pass it (T214 replaces those calls; then the figure of the table applies).
+pub const AS_HELD_MOST: usize = 64;
+
 /// A page, for the DMA figure.
 const PAGE: u64 = 4096;
 
@@ -16,7 +20,7 @@ pub struct Backstops {
     pub objects: usize,
     /// Bytes queued in all channels and sockets: RAM / 32.
     pub ipc_bytes: usize,
-    /// Live processes: RAM / 1 MiB, at most 2^20.
+    /// Live processes: RAM / 1 MiB, at most 2^20 (until the calls that take every process's address space at once are gone, T214, at most `AS_HELD_MOST`).
     pub processes: usize,
     /// Live user threads: RAM / 64 KiB, at most the slots of the kernel-stack window.
     pub user_threads: usize,
@@ -41,7 +45,7 @@ impl Backstops {
         let d = Backstops::DEFAULT;
         let objects = (ram / 4096) as usize;
         let ipc_bytes = (ram / 32) as usize;
-        let processes = ((ram >> 20) as usize).min(1 << 20);
+        let processes = ((ram >> 20) as usize).min(1 << 20).min(AS_HELD_MOST);
         let user_threads = ((ram >> 16) as usize).min(stack_slots);
         let dma_total_pages = ram / 16 / PAGE;
         Backstops {
