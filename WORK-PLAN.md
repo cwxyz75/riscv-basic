@@ -163,7 +163,7 @@ Phase 6d (`epic/phase-6d`, merged into `main` on its epic gate): the wait tables
 
 Phase 6e (`epic/phase-6e`, merged into `main` on its epic gate): the first steps of the end of the big lock.
 
-- [x] **PL8** (part a, PRs 423 to 425) the five system-wide backstops derived from RAM (`kcore::limits::Backstops`; the registry grows its tables as objects are made instead of reserving for its cap; the process backstop is held to 64 until T214); part b (the per-process ceilings as job quotas) waits for the `Limits` flag day of phase 12 and for L20, see `work/PL8.md`
+- [ ] **PL8** (part a built, PRs 423 to 425) the five system-wide backstops derived from RAM (`kcore::limits::Backstops`; the registry grows its tables as objects are made instead of reserving for its cap; the process backstop is held to 64 until T214); part b (the per-process ceilings as job quotas) waits for the `Limits` flag day of phase 12 and for L20, see `work/PL8.md`
 - [ ] **L19** (parts: PR 418 chunked teardown; PR 426 the kernel's thread table as a real `TT` lock; PRs 427 and 428 `futex_wait` with no big lock: the quiet entry, the thread's own `UserBinding`, the allocator's published generation) the rest: `PROCS` (the process table out of `UserState`), the handle drain and sweep of teardown (T206)
 - [ ] **T213** (built in L19's PR 427: `futex_wait` runs with no big lock on a quiet return; scaling 0.25 measured in a debug build, not the 3.0 target: what is left is written in `work/T213.md`)
 
