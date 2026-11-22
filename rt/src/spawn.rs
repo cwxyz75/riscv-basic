@@ -120,6 +120,10 @@ pub fn spawn_in_exact(
     let Ok(parsed) = elf::parse(image) else {
         return early(handles, SpawnError::BadElf);
     };
+    // (a static-PIE is placed by a loader that chooses its base: not yet, HD2 part b; its link addresses are offsets, not addresses to map)
+    if parsed.pie {
+        return early(handles, SpawnError::BadElf);
+    }
     if parsed.segments.len() > MAX_SEGMENTS {
         return early(handles, SpawnError::BadElf);
     }

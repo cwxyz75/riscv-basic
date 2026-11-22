@@ -2,8 +2,10 @@
 //! executable into the segments to map (OD40). Pure and panic-free on any input: a
 //! user program is hostile data. The policy is deliberately small:
 //!
-//! * `ET_EXEC`, 64-bit little-endian, `EM_RISCV`, version 1; no interpreter, no dynamic
-//!   section (static binaries only).
+//! * `ET_EXEC` or `ET_DYN`, 64-bit little-endian, `EM_RISCV`, version 1; no interpreter. An `ET_EXEC` has no dynamic section. An `ET_DYN` is a
+//!   **static-PIE** (HD2): link addresses start at 0, the image is placed at a base the loader chooses, and its dynamic section may hold only the
+//!   `DT_RELA` family, whose entries are all `R_RISCV_RELATIVE` and name 8-byte words inside the image's writable segments: the program's own
+//!   startup applies them (the loader maps, it does not relocate). No `DT_NEEDED`, no symbol relocations, no `DT_REL`/`DT_JMPREL`.
 //! * only `PT_LOAD` segments produce mappings; `PT_GNU_STACK` may not ask for an
 //!   executable stack; other program headers are ignored.
 //! * a segment must lie inside the user half, inside the file, with
@@ -44,6 +46,8 @@ pub enum ElfError {
     BadProgramHeaders,
     TooManySegments,
     Dynamic,
+    /// A static-PIE's relocation table is malformed, or holds a relocation that is not `R_RISCV_RELATIVE` on a word of a writable segment.
+    Relocation,
     ExecStack,
     SegmentOutsideFile,
     SegmentOutsideUser,
@@ -85,7 +89,28 @@ impl Segment {
 pub struct Image {
     pub entry: u64,
     pub segments: Vec<Segment>,
+    /// A static-PIE (`ET_DYN`): `entry` and the segments' `vaddr` are offsets from a base the loader chooses.
+    pub pie: bool,
+    /// For a static-PIE, the bytes from the base to the end of its last segment, rounded up to a page (what one reservation must cover); 0 for `ET_EXEC`.
+    pub span: u64,
 }
+
+const DT_NULL: u64 = 0;
+const DT_HASH: u64 = 4;
+const DT_STRTAB: u64 = 5;
+const DT_SYMTAB: u64 = 6;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+const DT_STRSZ: u64 = 10;
+const DT_SYMENT: u64 = 11;
+const DT_FLAGS: u64 = 30;
+const DT_GNU_HASH: u64 = 0x6fff_fef5;
+const DT_FLAGS_1: u64 = 0x6fff_fffb;
+const DT_RELACOUNT: u64 = 0x6fff_fff9;
+const R_RISCV_RELATIVE: u64 = 3;
+/// Most bytes a static-PIE may span (the same bound as the segments together, plus what the gaps between them can cost).
+pub const MAX_PIE_SPAN: u64 = 128 * 1024 * 1024;
 
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every caller checked `at + 2 <= b.len()` (the header and table sizes were checked against the file length first)
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -116,9 +141,11 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     if bytes[5] != 1 {
         return Err(ElfError::NotLittleEndian);
     }
-    if u16_at(bytes, 16) != 2 {
-        return Err(ElfError::BadType); // ET_EXEC only
-    }
+    let pie = match u16_at(bytes, 16) {
+        2 => false, // ET_EXEC
+        3 => true,  // ET_DYN: a static-PIE
+        _ => return Err(ElfError::BadType),
+    };
     if u16_at(bytes, 18) != 243 {
         return Err(ElfError::BadMachine); // EM_RISCV
     }
@@ -143,11 +170,19 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     let _ = table_end;
     let mut segments: Vec<Segment> = Vec::new();
     let mut total: u64 = 0;
+    let mut dynamic: Option<(u64, u64)> = None; // (file offset, filesz) of a static-PIE's PT_DYNAMIC
     for i in 0..phnum {
         let at = phoff as usize + i * PHDR;
         let (kind, flags) = (u32_at(bytes, at), u32_at(bytes, at + 4));
         match kind {
-            PT_INTERP | PT_DYNAMIC => return Err(ElfError::Dynamic),
+            PT_INTERP => return Err(ElfError::Dynamic),
+            PT_DYNAMIC => {
+                if !pie || dynamic.is_some() {
+                    return Err(ElfError::Dynamic);
+                }
+                let (offset, filesz) = (u64_at(bytes, at + 8), u64_at(bytes, at + 32));
+                dynamic = Some((offset, filesz));
+            }
             PT_GNU_STACK => {
                 if flags & PF_X != 0 {
                     return Err(ElfError::ExecStack);
@@ -165,13 +200,20 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
                 let end = vaddr
                     .checked_add(memsz)
                     .ok_or(ElfError::SegmentOutsideUser)?;
-                if vaddr < BASE || end > TOP {
-                    return Err(ElfError::SegmentOutsideUser);
-                }
-                // The stack (and its guard page below) belongs to the kernel's process setup.
-                let stack_lo = abi::user::STACK_TOP - (abi::user::STACK_PAGES + 1) * PAGE_SIZE;
-                if vaddr < abi::user::STACK_TOP && end > stack_lo {
-                    return Err(ElfError::OverlapsStack);
+                if pie {
+                    // (offsets from the base: the span is what must fit the user half, checked below; the stack is the loader's to avoid)
+                    if end > MAX_PIE_SPAN {
+                        return Err(ElfError::SegmentOutsideUser);
+                    }
+                } else {
+                    if vaddr < BASE || end > TOP {
+                        return Err(ElfError::SegmentOutsideUser);
+                    }
+                    // The stack (and its guard page below) belongs to the kernel's process setup.
+                    let stack_lo = abi::user::STACK_TOP - (abi::user::STACK_PAGES + 1) * PAGE_SIZE;
+                    if vaddr < abi::user::STACK_TOP && end > stack_lo {
+                        return Err(ElfError::OverlapsStack);
+                    }
                 }
                 let file_end = offset
                     .checked_add(filesz)
@@ -225,5 +267,86 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
     {
         return Err(ElfError::EntryNotExecutable);
     }
-    Ok(Image { entry, segments })
+    let span = if pie {
+        segments
+            .iter()
+            .map(|s| s.vaddr.saturating_add(s.memsz))
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(PAGE_SIZE)
+    } else {
+        0
+    };
+    if let Some((doff, dsz)) = dynamic {
+        check_relocations(bytes, &segments, doff, dsz)?;
+    }
+    Ok(Image {
+        entry,
+        segments,
+        pie,
+        span,
+    })
+}
+
+/// A static-PIE's dynamic section and relocation table (see the module comment): only the allowed tags, a table inside a loaded segment's file bytes, every
+/// entry an `R_RISCV_RELATIVE` (symbol 0) on an 8-byte word inside a writable segment.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: every range is checked against the file length with checked_add before the reads; the loop counts below the table's checked size
+fn check_relocations(
+    bytes: &[u8],
+    segments: &[Segment],
+    doff: u64,
+    dsz: u64,
+) -> Result<(), ElfError> {
+    let end = doff.checked_add(dsz).ok_or(ElfError::Dynamic)?;
+    if end > bytes.len() as u64 || !dsz.is_multiple_of(16) {
+        return Err(ElfError::Dynamic);
+    }
+    let (mut rela, mut relasz, mut relaent) = (None::<u64>, 0u64, 24u64);
+    let mut terminated = false;
+    for i in 0..(dsz / 16) as usize {
+        let at = doff as usize + i * 16;
+        let (tag, val) = (u64_at(bytes, at), u64_at(bytes, at + 8));
+        match tag {
+            DT_NULL => {
+                terminated = true;
+                break;
+            }
+            DT_RELA => rela = Some(val),
+            DT_RELASZ => relasz = val,
+            DT_RELAENT => relaent = val,
+            // (tolerated and ignored: a static link may leave an empty symbol table and its hash, the flags and the count of relative relocations)
+            DT_HASH | DT_GNU_HASH | DT_STRTAB | DT_SYMTAB | DT_STRSZ | DT_SYMENT | DT_FLAGS
+            | DT_FLAGS_1 | DT_RELACOUNT => {}
+            _ => return Err(ElfError::Dynamic),
+        }
+    }
+    if !terminated || relaent != 24 || !relasz.is_multiple_of(24) {
+        return Err(ElfError::Dynamic);
+    }
+    let Some(rela) = rela.filter(|_| relasz > 0) else {
+        return Ok(()); // no relocations at all: a position-independent program that needs none
+    };
+    // the table lies in the file bytes of one loaded segment (its address is a link address: a vaddr)
+    let table_end = rela.checked_add(relasz).ok_or(ElfError::Relocation)?;
+    let seg = segments
+        .iter()
+        .find(|s| s.vaddr <= rela && table_end <= s.vaddr.saturating_add(s.filesz))
+        .ok_or(ElfError::Relocation)?;
+    let at0 = (seg.offset + (rela - seg.vaddr)) as usize; // (inside the file: the segment's file range was checked)
+    for i in 0..(relasz / 24) as usize {
+        let at = at0 + i * 24;
+        let (r_off, info) = (u64_at(bytes, at), u64_at(bytes, at + 8));
+        if info != R_RISCV_RELATIVE {
+            return Err(ElfError::Relocation); // (type 3 in the low word, symbol 0 in the high)
+        }
+        let word_end = r_off.checked_add(8).ok_or(ElfError::Relocation)?;
+        let in_writable = r_off.is_multiple_of(8)
+            && segments
+                .iter()
+                .any(|s| s.perms.write && s.vaddr <= r_off && word_end <= s.vaddr + s.memsz);
+        if !in_writable {
+            return Err(ElfError::Relocation);
+        }
+    }
+    Ok(())
 }

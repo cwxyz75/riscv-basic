@@ -25,6 +25,9 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(LoadError::NoProgram);
     }
     let parsed = elf::parse(image).map_err(LoadError::Elf)?;
+    if parsed.pie {
+        return Err(LoadError::Elf(elf::ElfError::BadType)); // (placement of a static-PIE is HD2 part b)
+    }
     if !kmem::kernel_half_unchanged() {
         return Err(LoadError::KernelHalfChanged);
     }
