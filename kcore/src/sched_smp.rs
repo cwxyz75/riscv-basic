@@ -99,6 +99,8 @@ struct Hint {
     queued_len: AtomicUsize,
     /// Bit `p` (1 to 63): a thread of priority `p` queued here would run instead of what runs now (`HartRq::would_run`).
     would_run: AtomicU64,
+    /// The `would_run_key` the mask above was computed for (`u64::MAX`: none yet).
+    key: AtomicU64,
 }
 
 impl Hint {
@@ -107,12 +109,17 @@ impl Hint {
             cur_eff: AtomicU8::new(0),
             queued_len: AtomicUsize::new(0),
             would_run: AtomicU64::new(0),
+            key: AtomicU64::new(u64::MAX),
         }
     }
     fn publish<N: Class>(&self, rq: &HartRq<N>) {
         self.cur_eff.store(rq.cur_eff(), Ordering::Release);
         self.queued_len.store(rq.queued_len(), Ordering::Release);
-        self.would_run.store(rq.would_run_mask(), Ordering::Release);
+        let key = rq.would_run_key();
+        if self.key.load(Ordering::Relaxed) != key {
+            self.would_run.store(rq.would_run_mask(), Ordering::Release);
+            self.key.store(key, Ordering::Relaxed);
+        }
     }
 }
 

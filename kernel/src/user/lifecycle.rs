@@ -190,7 +190,9 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
         // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
         let process = s.procs.remove(&pid);
         if let Some(p) = process.as_ref() {
-            thread::charge_running();
+            if !p.live_tids.is_empty() {
+                thread::charge_running(); // (the threads that end with the process may be running on any hart)
+            }
             for tid in &p.live_tids {
                 s.thread_pid.remove(tid);
                 // (the threads that end with the process: their CPU time goes to their objects and the process's total, AB6)
@@ -307,7 +309,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
         let cpu = {
-            thread::charge_running(); // (this thread's last interval counts)
+            thread::charge_here(); // (this thread's last interval counts; it runs here)
             thread::cpu_ns(tid)
         };
         let tobj = p.thread_objs.remove(&tid);
