@@ -203,10 +203,12 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 11: hardening
 
-- [ ] **HD2** position-independent programs, address randomisation
-- [ ] **HD3** kernel address randomisation
-- [ ] **HD4** the debug resource; a release kernel with no test code
-- [x] **HD5** reserved ABI space (the flags, the state kind, the `features` word, the usercopy pin; PR on `epic/phase-11`); the X-SPECULATION record is `work/X-SPECULATION.md`
+Phase 11 (`epic/phase-11`, merged into `main` on its epic gate as a **partial** phase: what is built is whole and booted; HD2 and HD3 continue in later epics):
+
+- [ ] **HD2** position-independent programs and address randomisation: step 1 built (PR 436: the ELF front end accepts static-PIE, host-tested; the loaders refuse one until it is placed); steps 2 to 4 (the self-relocating startup or a relocating loader, the PIE builds of every program and the C programs, placement and the `aslr=off` knob) are open, with what a build spike found in `work/HD2.md`
+- [ ] **HD3** address randomisation for the kernel (not started)
+- [ ] **HD4** the debug resource; a release kernel with no test code: part 1 (PR 435: `KObj::Debug`, `debug_root`, the handle on `debug_write` and `debug_stat`, `Role::Debug`, `rt::debug`) and part 2 (PR 434: the test modules are not compiled into a `release` kernel, `scripts/release_symbols.py` in the release smoke) are built; part 3 (the release kernel running the `k` shard from a separately built suite) is open (`work/HD4.md`)
+- [x] **HD5** reserved ABI space (PR 433; the X-SPECULATION record is `work/X-SPECULATION.md`)
 
 ### Phase 12: the boundary and the freeze
 
@@ -318,3 +320,5 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
   - 2026-11-22, phase 6d cut again: **6d** closes with L21, L22, L24 and the chunked teardown of L19 (merged into `main` on its epic gate) and the end of the big lock (L19 rest, L20, PL8) becomes a **phase 6e** run next, before phase 10. Reason: `UserState` (objects, handle tables, process table, waits) is one structure that every `ksys` call takes by `&mut` under the big lock; `PROCS`, `TT` and `OBJ` as real locks mean re-deriving the order (AS before OBJ, while an AS is named through a handle read under OBJ) and splitting that structure, which is a redesign of its own, best done once with the lock profile in hand and not after the phases that add syscalls (10 to 12 add or change several, and each would have to be written twice). Phases 10 and 12 depend on it (`work.py blocked`: SC2 on L20, PM1 on L19, KT14 on L20, and the freeze), so it is the next epic, not a later one; the cut only keeps the finished and verified work from waiting on the redesign. Alternative: keep one long epic.
   - 2026-11-22, phase 6e cut: **6e** closes with PL8 part a, the `TT` lock and the quiet `futex_wait` (L19 in part, T213 in part), all verified (the k shard at 4 harts; the epic gate's smoke), and the rest of the end of the big lock becomes a **phase 6f**; phase 11 (HD2 to HD5: nothing in it waits on L19 or L20) runs before it. Reason: what is left is the `UserState` split (PROCS and OBJ as locks, the lock order AS before OBJ with the copies out of the object lock: `work/L20.md`), a redesign of every syscall over `UserState` and the order the handle resolution needs, that is best done as one epic with the lock-wait trace of the new `futex_wait` in hand; and merging what is built and booted keeps the unbooted part small. Alternative: stay in one epic until L20 is done.
 
+
+  - 2026-11-22, phase 11 cut: **11** closes with HD5, HD4 parts 1 and 2 and step 1 of HD2 (merged into `main` on its epic gate), and HD2's remaining steps, HD3 and HD4 part 3 stay open for later epics. Reason: HD2 (steps 2 to 4) and HD3 are toolchain and boot-path changes (a self-relocating startup and a PIE build of every program including the C ones; a position-independent kernel with a randomised slide and direct-map base) that need long edit-build-boot loops, the build spike of HD2 showed the prebuilt `core` is not position independent (the options are in `work/HD2.md`), and the phase's finished items change what a program may do (the debug calls) and are best merged while small. The end of the big lock (phase 6f: L19 `PROCS`, L20, PL8 part b) is what phases 10 and 12 wait for; HD2 and HD3 do not wait for it. Alternative: stay in one epic until HD2 and HD3 are done.
