@@ -119,3 +119,4 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-22 | L24 | Direct hand-off: the sync wake hint and donation at wake | direct hand-off (PR 417) |
 | 2026-11-22 | T60 | Ports wake every waiter, not one (slice W, PW not built) | ports wake one waiter: exact ready set and the wake-one baton (the per-port thread pool in the service runtime is a user-space follow-up) (PR 414-416) |
 | 2026-11-22 | T61 | A binding outlives the handle it was made through (design review D17) | a binding ends with the handle it was made through (PR 416) |
+| 2026-11-22 | HD5 | Reserved ABI space for shadow stacks, landing pads and pointer masking | reserved ABI space: the process_map flags, the CFI state kind, process_start's features word, the usercopy pin, X-SPECULATION (PR 433) |
