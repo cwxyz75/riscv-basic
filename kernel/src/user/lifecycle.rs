@@ -297,14 +297,16 @@ pub(super) fn teardown_memory(process: Box<Process>) {
                 drop(k);
                 let mut first = 0;
                 while first < pages {
-                    let k = kmem::mem();
-                    let _ = k.vmos.decommit(
-                        k.mm,
-                        k.jobs,
-                        id,
-                        first,
-                        TEARDOWN_CHUNK.min(pages.saturating_sub(first)),
-                    );
+                    {
+                        let k = kmem::mem();
+                        let _ = k.vmos.decommit(
+                            k.mm,
+                            k.jobs,
+                            id,
+                            first,
+                            TEARDOWN_CHUNK.min(pages.saturating_sub(first)),
+                        );
+                    }
                     first = first.saturating_add(TEARDOWN_CHUNK);
                     irq::without(|| {});
                 }
