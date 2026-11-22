@@ -12310,6 +12310,28 @@ fn pi_unlock(w: &AtomicU32) -> i64 {
     i64::from(sys::futex_unlock_pi(w.as_ptr()).status)
 }
 
+/// The boots that start the thread ids near 2^32 (`ff=tid:...`, the counters' fast-forward) give every thread an id that does not fit in the lock
+/// word's 30 bits: a PI futex is NOT_SUPPORTED there, and that is what is tested instead (SYSCALLS.md, T216).
+fn pi_ids_do_not_fit() -> Option<Outcome> {
+    if sys::thread_get_sched(0).a2 as u64 <= 0x3fff_ffff {
+        return None;
+    }
+    let p = PI_WORD.as_ptr();
+    Some((|| -> Outcome {
+        ensure_eq!(
+            st(sys::futex_lock_pi(p, sys::clock_get() + 50)),
+            Some(S::NotSupported),
+            "a thread id that does not fit cannot lock a PI futex"
+        );
+        ensure_eq!(
+            st(sys::futex_unlock_pi(p)),
+            Some(S::NotSupported),
+            "nor unlock one"
+        );
+        Ok(())
+    })())
+}
+
 fn pi_reset() {
     for a in [
         &PI_WORD,
@@ -12369,6 +12391,9 @@ extern "C" fn pi_high_waiter(_: usize) -> ! {
 /// The classic three-thread inversion: a low-priority thread owns the lock and a hog of middle priority runs on every hart, so the owner gets no CPU
 /// (checked first: the control); a high-priority thread then waits for the lock, and through the donation the owner runs, finishes and unlocks.
 fn pi_futex_bounds_inversion() -> Outcome {
+    if let Some(r) = pi_ids_do_not_fit() {
+        return r;
+    }
     pi_reset();
     let harts = job_use(root_job()?, 7)?.0;
     ok(
@@ -12464,6 +12489,9 @@ extern "C" fn pi_waiter_a(_: usize) -> ! {
 
 /// An owner that exits holding the lock poisons it: the waiter is woken with BAD_STATE, and so is the next thread that asks.
 fn pi_futex_owner_death_poisons() -> Outcome {
+    if let Some(r) = pi_ids_do_not_fit() {
+        return r;
+    }
     pi_reset();
     let owner = new_thread(pi_dying_owner, 0)?;
     ensure!(
@@ -12533,6 +12561,9 @@ extern "C" fn pi_deadlock_b(_: usize) -> ! {
 
 /// Two threads each hold a lock and ask for the other's: the second ask is refused with BAD_STATE at once (no sleep), and A gets its lock afterwards.
 fn pi_futex_deadlock_is_refused() -> Outcome {
+    if let Some(r) = pi_ids_do_not_fit() {
+        return r;
+    }
     pi_reset();
     let a = new_thread(pi_deadlock_a, 0)?;
     let b = new_thread(pi_deadlock_b, 0)?;
@@ -12563,6 +12594,9 @@ fn pi_futex_deadlock_is_refused() -> Outcome {
 
 /// The error cases: a bad address, a relock, a poll, and an unlock by a thread that does not own it.
 fn pi_futex_argument_errors() -> Outcome {
+    if let Some(r) = pi_ids_do_not_fit() {
+        return r;
+    }
     pi_reset();
     let p = PI_WORD.as_ptr();
     ensure_eq!(
