@@ -1351,6 +1351,12 @@ pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
         20 => DONATIONS_REFUSED.load(Relaxed),
+        // 120 to 124: the backstops (PL8): objects, queued IPC bytes, processes, user threads, DMA pages
+        120 => crate::user::backstops().objects as u64,
+        121 => crate::user::backstops().ipc_bytes as u64,
+        122 => crate::user::backstops().processes as u64,
+        123 => crate::user::backstops().user_threads as u64,
+        124 => crate::user::backstops().dma_total_pages,
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

@@ -173,7 +173,7 @@ pub fn thread_spawn<M: PhysMem>(
         return Err(Status::InvalidArgs);
     }
     if target.threads_alive >= abi::limits::MAX_THREADS_PER_PROCESS
-        || total_threads(us) >= abi::limits::MAX_USER_THREADS
+        || total_threads(us) >= us.backstops.user_threads
     {
         return Err(Status::NoMemory);
     }
@@ -355,7 +355,7 @@ pub fn process_start(
     {
         return Err(Status::BadState);
     }
-    if total_threads(us) >= abi::limits::MAX_USER_THREADS {
+    if total_threads(us) >= us.backstops.user_threads {
         return Err(Status::NoMemory);
     }
     let entry_ok = target

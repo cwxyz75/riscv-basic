@@ -574,7 +574,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
         // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
         // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
-        if s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
+        if s.objs.live() + 8 >= s.objs.cap() {
             let roots = s.roots();
             s.objs.sweep(&roots);
         }

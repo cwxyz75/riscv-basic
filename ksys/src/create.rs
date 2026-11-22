@@ -30,7 +30,7 @@ pub fn process_create<M: PhysMem>(
     me: u64,
     a: [u64; 6],
 ) -> Result<u64, Status> {
-    if us.procs.len() >= abi::limits::MAX_PROCESSES || !kernel_half_ok {
+    if us.procs.len() >= us.backstops.processes || !kernel_half_ok {
         return Err(Status::NoMemory);
     }
     // The job the new process is charged to: the one named by the handle in a0 (MANAGE), or the caller's own when a0 is 0.
