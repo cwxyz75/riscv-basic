@@ -535,6 +535,13 @@ impl Vmos {
         false
     }
 
+    /// Put `need` in the slot (and set the flag to match), returning what was there: the page-fault path without the big lock saves the slot
+    /// before its fault and puts it back after, so it never takes or leaves a need that a syscall on another hart has yet to read.
+    pub fn swap_need(&mut self, need: Option<PagerNeed>) -> Option<PagerNeed> {
+        PAGER_NEED_PENDING.store(need.is_some(), core::sync::atomic::Ordering::Release);
+        core::mem::replace(&mut self.need, need)
+    }
+
     /// The page a pager must supply that the last failed access needed (taken: the kernel asks for it once).
     pub fn take_need(&mut self) -> Option<PagerNeed> {
         PAGER_NEED_PENDING.store(false, core::sync::atomic::Ordering::Release);

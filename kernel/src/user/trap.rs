@@ -129,24 +129,28 @@ pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     // SAFETY: see above: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for the whole call.
     let cell = unsafe { &*cell };
     let access = fault.access.unwrap_or(Access::Read);
-    let r = {
-        #[cfg(not(feature = "fault-skip-as-lock"))]
+    let (r, log_pending) = {
         let _as = cell.lock();
-        // (negative control: the fault reaches the space without its lock, as if the lock were not there)
-        #[cfg(not(feature = "fault-skip-as-lock"))]
-        let space = {
-            let _ = &_as;
-            cell.held_mut()
+        let space = cell.held_mut();
+        let r = {
+            let k = kmem::mem();
+            // (the pager-need slot is shared with the kernel copies of syscalls on other harts, which read it after they let the memory locks go:
+            // this fault must leave it as it found it; the need it may meet is in its error, and the full path asks again)
+            let saved = k.vmos.swap_need(None);
+            let r = space.handle_fault_mapped(k.mm, k.vmos, k.jobs, fault.address, access);
+            let _ = k.vmos.swap_need(saved);
+            r
         };
-        #[cfg(feature = "fault-skip-as-lock")]
-        let space = cell.unchecked_mut_for_negative_control();
-        let k = kmem::mem();
-        let r = space.handle_fault_mapped(k.mm, k.vmos, k.jobs, fault.address, access);
-        if let Err(kcore::aspace::FaultError::NeedPager(_)) = &r {
-            // (the slot a kernel copy reads must not keep this need for another thread's call; the full path asks again)
-            let _ = k.vmos.take_need();
+        // (MM8) translations this fault took away from the space (a write that replaced a shared page): every hart drops its TLB **before** the
+        // thread runs on, and by this fault's own hart, not by whichever hart syncs the global copy log first, so that the duty is not lost to it. The
+        // memory locks are let go first, as `cow_sync` does it.
+        if space.take_replaced() > 0 {
+            crate::smp::shootdown();
+            kmem::flush_tlb();
         }
-        r
+        // The copy log (`COPY_PENDING`) is read while the lock is held: a sync takes every address space's lock, so none is running now, and
+        // one that follows finds what this fault logged. If it is set the big lock serialises with a sync that is already under way.
+        (r, kcore::aspace::COPY_PENDING.load(Ordering::Acquire))
     };
     let Ok(m) = r else {
         return false;
@@ -156,9 +160,8 @@ pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
         crate::smp::icache_sync(m.exec);
     }
     kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
-    // (MM8) a write that replaced a shared page leaves translations other harts may hold: the same sync as after a call. It takes the big lock
-    // and can switch threads, so it is the full return to user mode (`activate_current` after a switch); a load when nothing is pending.
-    if kcore::aspace::COPY_PENDING.load(Ordering::Acquire) {
+    // The log's sync takes the big lock and can switch threads, so it is the full return to user mode (`activate_current` after a switch).
+    if log_pending {
         crate::bkl::lock();
         super::calls::cow_sync();
         commit_wake();
