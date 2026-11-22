@@ -13500,6 +13500,10 @@ fn ten_thousand_threads_leak_nothing() -> Outcome {
         let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 500);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(r.a1 as u64);
+        if round % 2000 == 1999 {
+            // (the test takes minutes on a slow machine and says nothing otherwise: the harness's no-output limit is 180 s)
+            println!("ten_thousand_threads_leak_nothing: {} rounds", round + 1);
+        }
     }
     job_use_settles(root, 2, base, 1000)?;
     sys::handle_close(root);

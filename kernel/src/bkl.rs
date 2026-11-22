@@ -18,6 +18,9 @@ pub use klock::Class;
 
 /// Owner of the BKL: hart index + 1, or 0 when free.
 static OWNER: AtomicUsize = AtomicUsize::new(0);
+/// Where the current owner took the lock (debug builds: the spin detector names it, T212).
+static OWNER_SITE: core::sync::atomic::AtomicPtr<core::panic::Location<'static>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static ENFORCED: AtomicBool = AtomicBool::new(false);
 /// Violations of the lock order seen (the checker counts instead of panicking while a test is
 /// deliberately provoking one).
@@ -170,6 +173,11 @@ pub fn lock() {
     OWNER.store(me as usize + 1, Ordering::Relaxed);
     if outermost {
         percpu::this().bkl_takes.fetch_add(1, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        OWNER_SITE.store(
+            core::panic::Location::caller() as *const _ as *mut _,
+            Ordering::Relaxed,
+        );
     }
     #[cfg(feature = "latency-trace")]
     if outermost_take {
@@ -236,10 +244,13 @@ fn spin_watchdog(spins: &mut u64, what: &str) {
         if *spins == 30_000_000 {
             *spins = 0;
             panic!(
-                "hart {} has spun for {what} (last class asked for: {}) for 30 million iterations; the big kernel lock is owned by hart+1 = {}",
+                "hart {} has spun for {what} (last class asked for: {}) for 30 million iterations; the big kernel lock is owned by hart+1 = {}, taken at {}",
                 who(),
                 percpu::this().last_class.load(Ordering::Relaxed),
-                OWNER.load(Ordering::Relaxed)
+                OWNER.load(Ordering::Relaxed),
+                // SAFETY: the pointer is null or a `&'static Location` stored by `lock`.
+                unsafe { OWNER_SITE.load(Ordering::Relaxed).as_ref() }
+                    .map_or("?".into(), |l| alloc::format!("{}:{}", l.file(), l.line()))
             );
         }
     }
