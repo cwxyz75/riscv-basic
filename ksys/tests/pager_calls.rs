@@ -44,7 +44,10 @@ fn world() -> W {
         1,
         Box::new(Process {
             live_tids: Default::default(),
-            aspace: AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap()),
+            aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+                1,
+                AddressSpace::new(PageTable::new_with_kernel_half(&mut mm, &kernel).unwrap()),
+            )),
             handles: HandleTable::new(64),
             tag: kcore::asid::AsTag { asid: 1, gen: 1 },
             vmos: Vec::new(),

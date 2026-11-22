@@ -47,9 +47,10 @@ fn world(frames: usize) -> W {
 fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process {
     ksys::Process {
         live_tids: Default::default(),
-        aspace: kcore::aspace::AddressSpace::new(
-            PageTable::new_with_kernel_half(mm, kernel).unwrap(),
-        ),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+            1,
+            kcore::aspace::AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        )),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),

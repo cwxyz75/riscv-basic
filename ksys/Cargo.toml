@@ -7,6 +7,7 @@ description = "OS track: the kernel's syscall layer as host-testable logic behin
 [dependencies]
 abi = { path = "../abi" }
 kcore = { path = "../kcore" }
+klock = { path = "../klock" }
 
 [dev-dependencies]
 kfuzz-gen = { path = "../kfuzz-gen" }

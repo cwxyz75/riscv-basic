@@ -245,7 +245,7 @@ pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
         let k = kmem::get();
         let mut process = process;
-        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
+        klock::aslock::AsCell::take(process.aspace).destroy_user(k.mm, k.vmos, k.jobs);
         for id in core::mem::take(&mut process.vmos) {
             let _ = k.vmos.release(k.mm, k.jobs, id);
         }
@@ -273,8 +273,12 @@ pub(super) fn free_spawn_stack(p: &mut Process, tid: Tid) {
     let Some(st) = p.stacks.remove(&tid) else {
         return;
     };
+    let _as = klock::aslock::AsCell::hold(&p.aspace); // (before the memory locks: AS comes first)
     let k = kmem::get();
-    let _ = p.aspace.unmap_region(k.mm, k.vmos, k.jobs, st.region);
+    let _ = p
+        .aspace
+        .held_mut()
+        .unmap_region(k.mm, k.vmos, k.jobs, st.region);
     if let Some(tables) = p.table_charge.remove(&st.region) {
         k.jobs.credit(p.job, Resource::Pages, tables);
     }

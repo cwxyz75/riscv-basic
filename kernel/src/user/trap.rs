@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn aspace_token_of(p: &Process) -> u64 {
-    crate::arch::aspace_token_asid(p.aspace.table().root(), p.tag.asid)
+    crate::arch::aspace_token_asid(p.aspace.root(), p.tag.asid)
 }
 
 /// The token to install for `p` on this hart (interrupts off, big lock held): a tag of an older generation names an ASID that may be
@@ -152,10 +152,12 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                 let pid = state().thread_pid.get(&thread::current()).copied();
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
-                        let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
+                        let _as = klock::aslock::AsCell::hold(&p.aspace);
+                        let k = kmem::get();
                         let r = p
                             .aspace
+                            .held_mut()
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
                             if m.exec > 0 {
@@ -504,12 +506,14 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     {
         // (the memory locks are held only inside this block and in the two calls below that need them: every other call may take the
         // big kernel lock, which comes before them in the order)
+        let as_cell = p.aspace.clone();
+        let _as = klock::aslock::AsCell::hold(&as_cell); // (the caller's address space, before the memory locks)
         let k = kmem::get();
         let mut ctx = ksys::Ctx {
             objs: &mut *objs,
             handles: &mut p.handles,
             job: p.job,
-            aspace: &mut p.aspace,
+            aspace: as_cell.held_mut(),
             mm: k.mm,
             vmos: k.vmos,
             jobs: k.jobs,
@@ -538,8 +542,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 return fail(Status::TooBig);
             }
             let bytes = {
+                let _as = klock::aslock::AsCell::hold(&p.aspace);
                 let k = kmem::get();
-                copy_from_user(&mut p.aspace, k.mm, k.vmos, k.jobs, ptr, len)
+                copy_from_user(p.aspace.held_mut(), k.mm, k.vmos, k.jobs, ptr, len)
             }
             .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);

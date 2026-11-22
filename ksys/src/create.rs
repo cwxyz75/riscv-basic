@@ -93,7 +93,10 @@ pub fn process_create<M: PhysMem>(
         pid,
         Box::new(Process {
             live_tids: Default::default(),
-            aspace: AddressSpace::new(table),
+            aspace: alloc::sync::Arc::new(klock::aslock::AsCell::new(
+                pid,
+                AddressSpace::new(table),
+            )),
             handles: HandleTable::new(MAX_HANDLES),
             tag,
             vmos: Vec::new(),

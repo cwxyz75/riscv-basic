@@ -23,6 +23,7 @@
 )] // KT3 (KERNEL-V1-SPEC 7.4); sites that remain carry `#[allow] // INVARIANT:`
 #![no_std]
 
+pub mod aslock;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -69,10 +70,19 @@ impl Class {
         Class::Uart,
     ];
 
-    /// May a hart hold two locks of this class at once (in ascending instance order)? Only the run queues (migration,
-    /// pull); every other class "never two" (3.3).
+    /// May a hart hold two locks of this class at once (in ascending instance order)? The run queues (migration,
+    /// pull) and the address spaces (a call that names a target process takes the caller's and the target's, ascending by process id); every other class "never two" (3.3).
     pub fn allows_two(self) -> bool {
-        self == Class::Rq
+        matches!(self, Class::Rq | Class::As)
+    }
+
+    /// How many locks of this class one hart may hold at once, when `allows_two`: two run queues, and as many address spaces as there are
+    /// processes (a call that touches all of them takes them ascending, SCHED-SMP-SPEC 3.3).
+    pub fn most_at_once(self) -> usize {
+        match self {
+            Class::As => 64,
+            _ => 2,
+        }
     }
 
     /// Is a recursive take by the holding hart legal? The legacy lock (a depth count) and the console line (a panic
@@ -92,7 +102,7 @@ pub struct Violation {
 }
 
 /// The most locks one hart may hold at once.
-pub const MAX_HELD: usize = 8;
+pub const MAX_HELD: usize = 72;
 
 /// What one hart holds: a stack of `(class, instance)`.
 #[derive(Clone, Copy, Debug)]
@@ -155,7 +165,10 @@ impl Held {
             .filter(|&&(c, _)| c == class)
             .count();
         if class > top
-            || (class == top && class.allows_two() && instance > top_instance && same < 2)
+            || (class == top
+                && class.allows_two()
+                && instance > top_instance
+                && same < class.most_at_once())
         {
             Ok(())
         } else {
@@ -289,6 +302,26 @@ impl<T, M: Machine> Spin<T, M> {
             was,
             _not_send: PhantomData,
         })
+    }
+
+    /// Does the calling hart hold the lock?
+    pub fn held_by_this_hart(&self) -> bool {
+        self.ticket.held_by(M::hart())
+    }
+
+    /// The value's address, for a holder that proved it holds the lock (`aslock`).
+    pub(crate) fn value_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+
+    /// The value, consuming the lock: no one else can hold it.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+
+    /// The value, through `&mut self`: no other reference to the lock exists, so no one can hold it.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
     }
 
     /// Is nobody holding or waiting for the lock?

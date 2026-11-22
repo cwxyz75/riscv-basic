@@ -79,7 +79,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     }
     let process = Process {
         live_tids: Default::default(),
-        aspace,
+        aspace: alloc::sync::Arc::new(klock::aslock::AsCell::new(pid, aspace)),
         handles: HandleTable::new(MAX_HANDLES),
         tag,
         vmos: vmo_ids,
@@ -136,7 +136,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         true
     })();
     if !made {
-        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
+        klock::aslock::AsCell::take(process.aspace).destroy_user(k.mm, k.vmos, k.jobs);
         for id in process.vmos {
             let _ = k.vmos.release(k.mm, k.jobs, id);
         }

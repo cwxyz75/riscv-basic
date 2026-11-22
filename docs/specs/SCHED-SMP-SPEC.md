@@ -1487,3 +1487,14 @@ Sections 3.3 and 7 (task 14). The futex table is 64 buckets (`kcore::futex::Fute
 
 The acceptance figure, `pair_scaling` futex at least 3.0 at four harts, is not met by the item alone (`work/T213.md`): a blocking `futex_wait` still takes the big lock at entry and at the resume, and that waits for L17 parts b and c.
 
+## Amendment 2026-11-22: the `AS` lock and how its users take it (L17)
+
+Sections 3.3 and 3.10. Each process's `AddressSpace` is behind a lock of class `AS` (`klock::aslock::AsCell`, shared by `Arc` so a syscall can hold it while the process table is borrowed). The order of 3.3 stands: **`AS` comes before the memory locks** (`VMO`, `JOBS`, `FRAME`), so a syscall takes the address spaces it touches *first*, in ascending process id, and then `kmem::get()`; the pure code under them reaches an address space through `held_mut`/`held_ref`, which panic if this hart does not hold the lock (the first run of a path that forgot it finds it). Details the section left open:
+
+* **Which spaces.** The caller's for a call that only copies to or from its own memory (`dispatch`, the waits, thread-state copies); **all of them** for a call that names another process or looks at every one (`process_call`, `thread_spawn`, `process_start`, `pager_supply`, `cow_sync`): the checker allows up to 64 `AS` locks held at once (`Class::most_at_once`, ascending instance = process id) and the per-hart held-stack holds 72. Taking only the caller's and the target's needs the target resolved before the memory locks are taken; it is a refinement for when the lock-free fault path (part c) makes the wait on an unrelated space matter.
+* **No sleeping with them held**, as for the memory locks: each is dropped before any wait.
+* **The page-table root** of a space is read with no lock (`AsCell::root`: it never changes while the space lives); teardown and a failed load take the value out of a cell nobody else holds (`AsCell::take`).
+* **Host tests** run before the kernel installs its hooks (`klock::aslock::install`): there is no hart to ask, so `held_mut` does not check. The check is the kernel's, in debug builds, over the suite.
+
+The page-fault path takes the one `AS` lock and then the memory locks, without the big lock.
+

@@ -346,6 +346,7 @@ dependencies = [
  "abi",
  "kcore",
  "kfuzz-gen",
+ "klock",
 ]
 
 [[package]]

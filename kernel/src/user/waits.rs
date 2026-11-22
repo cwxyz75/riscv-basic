@@ -36,6 +36,7 @@ fn in_process<R>(
     irq::without(|| {
         let s = state();
         let me = caller_pid(s)?;
+        let _as = AsLocks::of(s, &[me]); // (the caller's address space, before the memory locks)
         f(s, &mut kmem::get(), me)
     })
     .map_err(|e| (e, None, None))
@@ -100,6 +101,7 @@ pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let (me, addr) = match irq::without(|| -> Result<(u64, u64, ksys::FutexCheck), Status> {
         let s = state();
         let me = caller_pid(s)?;
+        let _as = AsLocks::of(s, &[me]);
         let w = {
             let k = kmem::get();
             ksys::futex_wait_resolve(s, k.mm, k.vmos, k.jobs, me, a)?
@@ -318,6 +320,7 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     loop {
         let r = irq::without(|| {
             let s = state();
+            let _as = AsLocks::caller(s);
             let k = kmem::get();
             match caller_pid(s) {
                 Ok(pid) => ksys::channel_call_reply(

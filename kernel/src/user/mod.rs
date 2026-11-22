@@ -183,6 +183,7 @@ pub enum LoadError {
     KernelHalfChanged,
 }
 
+mod aslocks;
 mod calls;
 mod kobjects;
 mod lifecycle;
@@ -190,6 +191,8 @@ mod loader;
 mod trap;
 mod waits;
 mod wake;
+#[allow(unused_imports)]
+pub use aslocks::*;
 #[allow(unused_imports)]
 pub use calls::*;
 #[allow(unused_imports)]
