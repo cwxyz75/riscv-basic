@@ -39,6 +39,8 @@ pub struct PendingRegs {
 
 /// Everything the syscall layer keeps about user mode: the kernel objects, the processes and threads, the wait tables, and the kernel's own handles.
 pub struct UserState {
+    /// The system-wide ceilings (PL8): processes and user threads are checked against them, the object and IPC ones live in the registry.
+    pub backstops: kcore::limits::Backstops,
     pub objs: Kobjs,
     pub procs: BTreeMap<u64, Box<Process>>,
     pub thread_pid: BTreeMap<Tid, u64>,
@@ -152,6 +154,7 @@ impl UserState {
             // (one end of each process's and job's exception channel lives here, and the creators' ends of bootstrap channels: bounded by the
             // object cap, whose charges the objects themselves carry)
             ktable: HandleTable::new(abi::limits::MAX_OBJECTS),
+            backstops: kcore::limits::Backstops::DEFAULT,
             waits: kcore::wait::WaitTable::new(),
             irq_objs: alloc::vec::Vec::new(),
             line: String::new(),

@@ -93,11 +93,13 @@ change.
 
 A process holds as many handles as its job's object quota and memory allow (up to 2^24 - 1; there is no fixed `MAX_HANDLES`); `MAX_MSG_BYTES`
 65536 and `MAX_MSG_HANDLES` 64 per message; `MAX_QUEUED_MSGS` 128 and
-`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_OBJECTS` 16384 kernel objects
-alive at once (creating more is NO_MEMORY); `MAX_IPC_BYTES` 2 MiB of queued channel and socket
-data (message bytes, headers, queued handles, port bindings) in the whole system;
-`MAX_REGIONS` 16384 per address space; `MAX_THREADS_PER_PROCESS` 2048 and `MAX_USER_THREADS` 4096;
-`MAX_PROCESSES` 64.
+`MAX_QUEUED_BYTES` 256 KiB per channel endpoint; `MAX_REGIONS` 16384 per address space and
+`MAX_THREADS_PER_PROCESS` 2048. The system-wide **backstops** are derived from the RAM the machine has (PL8, KERNEL-V1-SPEC 2.5) and are
+never below the figures these constants had (16384 objects, 2 MiB of queued IPC bytes, 64 processes, 4096 user threads, 1024 DMA pages):
+kernel objects alive at once, RAM / 4096 (creating more is NO_MEMORY); queued channel and socket data (message bytes, headers, queued
+handles, port bindings), RAM / 32; processes, RAM / 1 MiB, at most 2^20; user threads, RAM / 64 KiB, at most the slots of the
+kernel-stack window; pages held by DMA VMOs, RAM / 16. A test reads them through `debug_stat` 120 to 124. They sit behind the job quotas,
+which a program meets first.
 
 These keep the kernel from panicking and from running out of heap (OD50; the heap grows at safe points, slice T step 2, so the caps also bound its growth); they are
 not per-process limits. A real bound needs per-job quotas (work items Q-OS9
@@ -460,7 +462,7 @@ quota).
 ### vmo_create_dma(resource, pages) -> status, handle
 
 A VMO of `pages` physically contiguous, zeroed frames, committed now and charged to the caller's
-job as pages. At most `MAX_DMA_PAGES` (64) per object and `MAX_DMA_TOTAL_PAGES` (1024) in the
+job as pages. At most `MAX_DMA_PAGES` (64) per object and the DMA backstop (RAM / 16 pages, at least 1024) in the
 system (INVALID_ARGS past either, or for 0); NO_MEMORY if the job is out of pages or no
 free aligned block of the size rounded up to a power of two exists (a 33-page request needs a free aligned 64-page block; the frame
 allocator is a buddy allocator, MM2). The returned handle has VMO rights without EXECUTE plus **DMA**.

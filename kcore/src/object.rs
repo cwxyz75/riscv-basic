@@ -15,6 +15,15 @@ use alloc::vec::Vec;
 /// Slots reserved when a registry is created (`abi::limits::MAX_OBJECTS`).
 const PREALLOC_SLOTS: usize = 16384;
 
+/// Make sure `v` can hold `want` elements without growing again (amortised: the capacity doubles).
+fn reserve_to<V>(v: &mut Vec<V>, want: usize) -> Result<(), abi::status::Status> {
+    if v.capacity() < want {
+        v.try_reserve(want.saturating_sub(v.len()))
+            .map_err(|_| abi::status::Status::NoMemory)?;
+    }
+    Ok(())
+}
+
 /// The object count above which `needs_sweep` is true until the first sweep.
 const SWEEP_MIN: usize = 256;
 
@@ -96,6 +105,10 @@ pub struct Registry<T: Object> {
     /// Sum of `meter()` over live objects (kept by the owner through `meter_add` /
     /// `meter_sub` as data is queued and dequeued, and by destruction).
     meter: usize,
+    /// The most objects that may be live (the backstop, PL8: the default is `abi::limits::MAX_OBJECTS`; the kernel sets it from RAM at boot).
+    cap: usize,
+    /// The most bytes that may be queued in all channels and sockets (PL8).
+    ipc_cap: usize,
     /// Credits for charged objects that were destroyed since the last `take_credits`:
     /// (job, bytes the object still held). One object per entry.
     credits: Vec<(JobId, usize)>,
@@ -189,6 +202,8 @@ impl<T: Object> Registry<T> {
             threshold: SWEEP_MIN,
             graveyard: Vec::new(),
             meter: 0,
+            cap: abi::limits::MAX_OBJECTS,
+            ipc_cap: abi::limits::MAX_IPC_BYTES,
             credits: Vec::with_capacity(PREALLOC_SLOTS),
             dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
@@ -446,6 +461,23 @@ impl<T: Object> Registry<T> {
         self.credits.drain(..)
     }
 
+    /// The most objects that may be live.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The most bytes that may be queued in all channels and sockets together.
+    pub fn ipc_cap(&self) -> usize {
+        self.ipc_cap
+    }
+
+    /// Set the backstops (PL8, at boot, before objects exist in numbers): the tables grow as objects are made (`reserve_one`), so a large cap
+    /// reserves nothing.
+    pub fn set_caps(&mut self, objects: usize, ipc_bytes: usize) {
+        self.cap = objects;
+        self.ipc_cap = ipc_bytes;
+    }
+
     /// Bytes currently counted by the meter.
     pub fn meter(&self) -> usize {
         self.meter
@@ -556,6 +588,13 @@ impl<T: Object> Registry<T> {
         // (a slot in the graveyard and in its twin for every live object, so that however many cleanup-needing objects die at once, and
         // whichever of the two vectors is in place, burying them does not allocate)
         let want = self.live.saturating_add(1);
+        // (the tables every creation and destruction pushes to are grown here, before the object exists, by doubling, and not reserved for the
+        // most objects there can be: with the cap derived from RAM that would be 100 MB at 4 GiB, PL8)
+        reserve_to(&mut self.slots, want)?;
+        reserve_to(&mut self.free, want)?;
+        reserve_to(&mut self.credits, want)?;
+        reserve_to(&mut self.work, want)?;
+        reserve_to(&mut self.mark_work, want)?;
         for v in [&mut self.graveyard, &mut self.spare] {
             let more = want.saturating_sub(v.len());
             if v.capacity() < want {

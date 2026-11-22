@@ -79,3 +79,28 @@ fn the_object_cap_refuses_both_constructors_and_makes_nothing() {
     assert_eq!(reg.live(), abi::limits::MAX_OBJECTS, "nothing was made");
     assert_eq!(t.len(), 0, "and no handle either");
 }
+
+#[test]
+fn the_object_cap_is_a_setting_and_the_tables_grow_to_meet_it() {
+    // PL8: a cap above what the registry reserves at creation is met by growing as objects are made (`reserve_one`), and the cap is what refuses
+    use kcore::ipc::KObj;
+    let mut reg = Kobjs::new();
+    let cap = abi::limits::MAX_OBJECTS + 1000;
+    reg.set_caps(cap, abi::limits::MAX_IPC_BYTES);
+    let mut t = HandleTable::new(8);
+    let mut jobs = Jobs::new();
+    let mut q = Quota {
+        jobs: &mut jobs,
+        job: None,
+    };
+    for i in 0..cap as u64 - 1 {
+        reg.create(KObj::Vmo(i));
+    }
+    assert!(vmo_object_create_with(&mut reg, &mut t, 1, Rights::READ, &mut q).is_ok());
+    assert_eq!(reg.live(), cap);
+    assert_eq!(
+        vmo_object_create_with(&mut reg, &mut t, 1, Rights::READ, &mut q),
+        Err(Status::NoMemory),
+        "the set cap, not the old constant, refuses"
+    );
+}

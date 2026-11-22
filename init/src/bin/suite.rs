@@ -6541,7 +6541,9 @@ fn kill_a_child_blocked_in_port_wait() -> Outcome {
 
 fn socket_memory_is_bounded() -> Outcome {
     let chunk = [7u8; SOCKET_BUFFER];
-    let mut pairs = [(0u64, 0u64); 64];
+    // (the system-wide budget is derived from RAM, PL8: stat 121; a few sockets more than it holds must be refused)
+    let most = sys::debug_stat(121) as usize / SOCKET_BUFFER + 16;
+    let mut pairs = vec![(0u64, 0u64); most];
     let mut n = 0;
     let mut hit_the_limit = false;
     while n < pairs.len() {
@@ -6559,7 +6561,7 @@ fn socket_memory_is_bounded() -> Outcome {
             break;
         }
     }
-    ensure!(hit_the_limit, "300 sockets of 64 KiB were accepted");
+    ensure!(hit_the_limit, "{most} sockets of 64 KiB were accepted");
     // closing the sockets gives the budget back
     for &(a, b) in &pairs[..n] {
         sys::handle_close(a);
@@ -6662,6 +6664,36 @@ fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
         event().is_ok(),
         "objects can be made again after the channels are closed"
     );
+    Ok(())
+}
+
+/// PL8: the backstops are derived from the memory of the machine (KERNEL-V1-SPEC 2.5), read through `debug_stat` 120 to 124. The formulas are
+/// restated here, from the frame count the kernel reports (stat 102), so a change to either side fails the test.
+fn backstops_follow_the_ram_of_the_machine() -> Outcome {
+    let ram = sys::debug_stat(102) * 4096;
+    let slots = 32768u64; // the kernel-stack window (1 GiB) over a 32 KiB slot
+    ensure!(
+        ram >= 64 << 20,
+        "the machine has at least 64 MiB, it has {ram}"
+    );
+    let want = [
+        (120, (ram / 4096).max(16384), "objects: RAM / 4096"),
+        (121, (ram / 32).max(2 << 20), "queued IPC bytes: RAM / 32"),
+        (
+            122,
+            (ram >> 20).clamp(64, 1 << 20),
+            "processes: RAM / 1 MiB",
+        ),
+        (
+            123,
+            (ram >> 16).min(slots).max(4096),
+            "user threads: RAM / 64 KiB, at most the stack window",
+        ),
+        (124, (ram / 16 / 4096).max(1024), "DMA pages: RAM / 16"),
+    ];
+    for (which, expect, what) in want {
+        ensure_eq!(sys::debug_stat(which), expect, "{what}");
+    }
     Ok(())
 }
 
@@ -15081,6 +15113,10 @@ pub fn app_main() -> i32 {
         (
             "kill_a_child_blocked_in_port_wait",
             kill_a_child_blocked_in_port_wait,
+        ),
+        (
+            "backstops_follow_the_ram_of_the_machine",
+            backstops_follow_the_ram_of_the_machine,
         ),
         (
             "the_object_cap_is_reached_without_a_kernel_panic",

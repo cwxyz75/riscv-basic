@@ -6,8 +6,7 @@ use crate::handle::{Entry, HandleTable};
 use crate::job::{JobId, Jobs, Resource};
 use crate::object::{ObjId, Object, Registry};
 use abi::limits::{
-    MAX_IPC_BYTES, MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_OBJECTS, MAX_QUEUED_BYTES, MAX_QUEUED_MSGS,
-    SOCKET_BUFFER,
+    MAX_MSG_BYTES, MAX_MSG_HANDLES, MAX_QUEUED_BYTES, MAX_QUEUED_MSGS, SOCKET_BUFFER,
 };
 use abi::rights::Rights;
 use abi::signals;
@@ -370,7 +369,7 @@ pub fn channel_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<(Handle, Handle), Status> {
-    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > MAX_OBJECTS {
+    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
@@ -481,7 +480,7 @@ pub fn channel_write_from(
     }
     // The system-wide budget for queued data (a user must not be able to exhaust kernel memory).
     let cost = data.len() + MSG_OVERHEAD + handles.len() * core::mem::size_of::<Entry>();
-    if reg.meter() + cost > MAX_IPC_BYTES {
+    if reg.meter() + cost > reg.ipc_cap() {
         return Err(Status::NoMemory);
     }
     // The job of the endpoint that receives the message pays for it, until it is read or the
@@ -682,7 +681,7 @@ pub fn event_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -850,7 +849,7 @@ pub fn socket_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<(Handle, Handle), Status> {
-    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > MAX_OBJECTS {
+    if table.room() < 2 || table.reserve(2).is_err() || reg.live() + 2 > reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 2)?;
@@ -926,7 +925,7 @@ pub fn socket_write_in(
     }
     // Both limits apply: this end's buffer and the system-wide budget (NO_MEMORY, not
     // SHOULD_WAIT: other sockets' readers will not make room for this one).
-    let global_room = MAX_IPC_BYTES.saturating_sub(meter);
+    let global_room = reg.ipc_cap().saturating_sub(meter);
     if global_room == 0 {
         return Err(Status::NoMemory);
     }
@@ -1034,7 +1033,7 @@ pub fn port_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1365,7 +1364,7 @@ pub fn resource_object_create_in(
     table: &mut HandleTable,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1384,7 +1383,7 @@ pub fn interrupt_object_create_in(
     irq: u32,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1485,7 +1484,7 @@ pub fn vmo_object_create_with(
     rights: Rights,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1503,7 +1502,7 @@ pub fn job_object_create(
     rights: Rights,
     q: &mut Quota,
 ) -> Result<Handle, Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1536,7 +1535,7 @@ pub fn pager_object_create_in(
     rights: Rights,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1588,7 +1587,7 @@ pub fn process_object_create_in(
     kill_on_close: bool,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1662,7 +1661,7 @@ pub fn exception_object_create_in(
     e: ExceptionObj,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
@@ -1732,7 +1731,7 @@ pub fn thread_object_create_in(
     pid: u64,
     q: &mut Quota,
 ) -> Result<(Handle, ObjId), Status> {
-    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= MAX_OBJECTS {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
         return Err(Status::NoMemory);
     }
     q.objects(reg, 1)?;
