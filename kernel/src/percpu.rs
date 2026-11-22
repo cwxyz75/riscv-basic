@@ -72,6 +72,10 @@ pub struct PerHart {
     pub work_done: AtomicBool,
     /// The address-space token last installed for user mode on this hart (so a switch is made only when needed).
     pub active_aspace: AtomicU64,
+    /// The process id of the user thread this hart is running (0: none), set where its address space is installed (`activate_current`) and
+    /// so true for every return to user mode: the calls that run without the big kernel lock (`futex_wake`, L14) read it instead of the
+    /// thread-to-process map.
+    pub cur_pid: AtomicU64,
     /// Times this hart took the big kernel lock from free (outermost takes): the measure of how often a hart needs it.
     pub bkl_takes: AtomicU64,
     /// The thread this hart is running (its context's id). Written only by this hart; read by it without the big lock.
@@ -248,6 +252,7 @@ impl PerHart {
             work_result: AtomicU64::new(0),
             work_done: AtomicBool::new(false),
             active_aspace: AtomicU64::new(0),
+            cur_pid: AtomicU64::new(0),
             bkl_takes: AtomicU64::new(0),
             running: AtomicU64::new(0),
             prev: AtomicU64::new(0),

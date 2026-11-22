@@ -22,6 +22,14 @@ struct W {
     vmos: Vmos,
     jobs: kcore::job::Jobs,
     mm: Mm<FakeMem>,
+    futexes: kcore::futex::FutexTable<kcore::futex::LocalBuckets>,
+}
+
+/// `futex_wake` as the kernel runs it, collecting the ids it would wake.
+fn wake(w: &W, pid: u64, a: [u64; 6]) -> Result<Vec<u64>, Status> {
+    let mut ids = Vec::new();
+    ksys::futex_wake(&w.futexes, pid, a, |t| ids.extend_from_slice(t))?;
+    Ok(ids)
 }
 
 fn world() -> W {
@@ -65,7 +73,13 @@ fn world() -> W {
     };
     let mut us = UserState::new();
     us.procs.insert(1, Box::new(p));
-    W { us, vmos, jobs, mm }
+    W {
+        us,
+        vmos,
+        jobs,
+        mm,
+        futexes: kcore::futex::FutexTable::new(kcore::futex::LocalBuckets::new()),
+    }
 }
 
 impl W {
@@ -282,6 +296,7 @@ fn futex_wait_compares_polls_and_enqueues() {
     let check = |w: &mut W, addr: u64, expected: u64, deadline: u64| {
         ksys::futex_wait_check(
             &mut w.us,
+            &w.futexes,
             &mut w.mm,
             &mut w.vmos,
             &mut w.jobs,
@@ -315,26 +330,29 @@ fn futex_wait_compares_polls_and_enqueues() {
         ksys::FutexCheck::Done(Status::TimedOut),
         "a poll"
     );
-    assert!(!w.us.futexes.contains(who), "neither refusal enqueued");
+    assert!(
+        !w.futexes.contains((1, MEM), who),
+        "neither refusal enqueued"
+    );
     assert_eq!(check(&mut w, MEM, 5, 9).unwrap(), ksys::FutexCheck::Sleep);
-    assert!(w.us.futexes.contains(who));
+    assert!(w.futexes.contains((1, MEM), who));
     // woken by futex_wake: removed from the table, so the report is a plain success
-    let ids = ksys::futex_wake(&mut w.us, 1, [MEM, 1, 0, 0, 0, 0]).unwrap();
+    let ids = wake(&w, 1, [MEM, 1, 0, 0, 0, 0]).unwrap();
     assert_eq!(ids, vec![who]);
     assert_eq!(
-        ksys::futex_wait_report(&mut w.us, who, || true),
+        ksys::futex_wait_report(&w.futexes, (1, MEM), who, || true),
         Ok((None, None))
     );
     // a sleeper whose deadline passed is still in the table: the report removes it
     assert_eq!(check(&mut w, MEM, 5, 9).unwrap(), ksys::FutexCheck::Sleep);
     assert_eq!(
-        ksys::futex_wait_report(&mut w.us, who, || false),
+        ksys::futex_wait_report(&w.futexes, (1, MEM), who, || false),
         Err((Status::TimedOut, None, None))
     );
-    assert!(!w.us.futexes.contains(who));
+    assert!(!w.futexes.contains((1, MEM), who));
     assert_eq!(check(&mut w, MEM, 5, 9).unwrap(), ksys::FutexCheck::Sleep);
     assert_eq!(
-        ksys::futex_wait_report(&mut w.us, who, || true),
+        ksys::futex_wait_report(&w.futexes, (1, MEM), who, || true),
         Err((Status::Interrupted, None, None))
     );
 }
@@ -344,21 +362,17 @@ fn futex_wake_checks_the_address_and_counts() {
     let mut w = world();
     for addr in [BASE - 4, BASE + 2, TOP - 2, u64::MAX - 1, 0] {
         assert_eq!(
-            ksys::futex_wake(&mut w.us, 1, [addr, 1, 0, 0, 0, 0]),
+            wake(&w, 1, [addr, 1, 0, 0, 0, 0]),
             Err(Status::InvalidArgs),
             "{addr:#x}"
         );
     }
-    assert_eq!(
-        ksys::futex_wake(&mut w.us, 9, [MEM, 1, 0, 0, 0, 0]),
-        Err(Status::BadState),
-        "not a process"
-    );
     w.poke(MEM, &5u32.to_le_bytes());
     for who in [1u64, 2, 3] {
         assert_eq!(
             ksys::futex_wait_check(
                 &mut w.us,
+                &w.futexes,
                 &mut w.mm,
                 &mut w.vmos,
                 &mut w.jobs,
@@ -371,16 +385,13 @@ fn futex_wake_checks_the_address_and_counts() {
         );
     }
     assert_eq!(
-        ksys::futex_wake(&mut w.us, 1, [MEM, 2, 0, 0, 0, 0]).unwrap(),
+        wake(&w, 1, [MEM, 2, 0, 0, 0, 0]).unwrap(),
         vec![1, 2],
         "oldest first, at most count"
     );
+    assert_eq!(wake(&w, 1, [MEM, 9, 0, 0, 0, 0]).unwrap(), vec![3]);
     assert_eq!(
-        ksys::futex_wake(&mut w.us, 1, [MEM, 9, 0, 0, 0, 0]).unwrap(),
-        vec![3]
-    );
-    assert_eq!(
-        ksys::futex_wake(&mut w.us, 1, [MEM, 9, 0, 0, 0, 0]).unwrap(),
+        wake(&w, 1, [MEM, 9, 0, 0, 0, 0]).unwrap(),
         Vec::<u64>::new()
     );
 }

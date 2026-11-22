@@ -1477,3 +1477,13 @@ Section 5.2: the ratios to "the task-1 baseline" become absolute numbers, from `
 
 `pair_scaling` runs one, two and four pairs of two kinds (futex ping-pong and `channel_call`) and prints `pair_scaling_<kind>_n<N>`, ns per round trip over all pairs; `bench_compare.py` prints the scaling (the cost at N = 1 over the cost at N). The first-touch page-fault loop and the 64 KiB copy of the 6.1 table are not part of the suite: the page-fault path has its own count in `bench/counts.tsv`, and a copy loop measures the QEMU memory system, not a lock. `rt_latency` reports the 99th percentile and the maximum of the 50 samples of the existing probe; the histogram and the priority-40 user program wait for task 8's user priorities (6.1).
 
+## Amendment 2026-11-22: how the futex peel is built (L14)
+
+Sections 3.3 and 7 (task 14). The futex table is 64 buckets (`kcore::futex::FutexTable`, `bucket_of` a hash of the process and the address), each a `FUTEX` lock; `futex_wake` takes no big kernel lock (the trap handler's quiet path, with the wakes issued under the bucket lock), and `futex_wait` holds the big lock only to validate and translate the word and to queue. Three details the section did not settle:
+
+* **The compare reads the word's physical address.** `futex_wait` resolves the word (committing a lazily backed page) under the big lock and the memory locks, lets the memory locks go (`FUTEX` is before `VMO`, and the two never nest), and under the bucket lock reads the word again with one aligned 64-bit load at the physical address and queues. The page cannot go in between: every unmap, decommit and teardown takes the big lock, which the waiter holds. When L17 gives an address space its own lock, that lock is what pins the page.
+* **The sleeper prepares before it looks.** The sleep loop is prepare, then the look at the table, then the block (3.7); the old order (look, then prepare) was safe only because the waker held the big lock. A wake that dequeues the sleeper after its look finds it prepared and is not lost (PK1); the model test has the old order as its negative control.
+* **The process of a lock-free call** is the one `activate_current` recorded for the hart's running thread (`PerHart.cur_pid`), because the thread-to-process map is under the big lock.
+
+The acceptance figure, `pair_scaling` futex at least 3.0 at four harts, is not met by the item alone (`work/T213.md`): a blocking `futex_wait` still takes the big lock at entry and at the resume, and that waits for L17 parts b and c.
+

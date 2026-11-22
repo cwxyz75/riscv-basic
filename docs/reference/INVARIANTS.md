@@ -83,8 +83,8 @@ get filled in as each area is built.
 
 | # | Invariant | How checked |
 |---|---|---|
-| F1 | The futex table (like all shared kernel state) is touched only under the BKL; a thread is in it only between its enqueue in `futex_wait` and its own `forget` on the way out of that call, so a table entry never outlives its thread and a reused thread id cannot inherit one | `kcore::futex` unit and model tests, QEMU `kill_a_futex_waiter`, the end-of-run check `no_process_or_vmo_survives_init` (no sleeper left) |
-| F2 | The user word is read and the sleeper enqueued in one BKL region, so a wake that follows a user-mode store is never lost; the sleep ends only by removal from the table (a wake) or the deadline | loom/shuttle model, QEMU `futex_*` (a never-sleeping mutant fails three) |
+| F1 | The futex table is touched only under the lock of the bucket its key hashes to (class `FUTEX`, L14; `forget_process` and the leak count take the buckets one after another, never two); a thread is in it only between its enqueue in `futex_wait` and its own `forget` on the way out of that call, so a table entry never outlives its thread and a reused thread id cannot inherit one | `kcore::futex` unit and model tests, QEMU `kill_a_futex_waiter`, the end-of-run check `no_process_or_vmo_survives_init` (no sleeper left) |
+| F2 | The user word is read and the sleeper enqueued in one region of the key's bucket lock, so a wake that follows a user-mode store (it takes the same lock) is never lost; the sleeper prepares to block before it looks at the table, so a wake that dequeues it after the look is never lost either (PK1); the sleep ends only by removal from the table (a wake, a kill, a timeout: each takes a sleeper out exactly once) or the deadline | loom/shuttle models (`futex_concurrency`, with the negative control that looks before it prepares), QEMU `futex_*` (a never-sleeping mutant fails three) |
 | F3 | A wake reaches only sleepers of the caller's own process, oldest first | `kcore::futex` tests, QEMU `futex_wake_counts_and_fifo` (another process wakes nobody) |
 
 ### Hart rules (S5a)

@@ -1041,6 +1041,40 @@ pub fn wait_deadline_private(ready: impl FnMut() -> bool, deadline: u64) -> bool
     wait_deadline_registered(ready, || {}, deadline)
 }
 
+/// `wait_deadline_private` for a wait whose waker holds no big kernel lock (L14, the futex): the thread **prepares first** and only then
+/// looks at its condition (SCHED-SMP-SPEC 3.7), so a wake that dequeues the thread after the look finds it prepared and is not lost. (Under
+/// the big lock the look could come first, as nothing could interleave; the futex's wake no longer takes it.) A thread that leaves with a
+/// preparation standing meets it as a spurious early return of its next block, which every wait in the kernel rechecks.
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
+pub fn wait_deadline_futex(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    let mut slept = false;
+    loop {
+        let result = irq::without(|| {
+            // (EX1, MM8: a stop the thread owes and the translations a copy made stale, before it prepares: the stop can itself block it)
+            crate::user::suspend_blocks();
+            crate::user::cow_sync();
+            let _ = sched().prepare_block_on(hart());
+            if ready() {
+                return Some(true);
+            }
+            if now_ns() >= deadline {
+                return Some(false);
+            }
+            count_sleep(&mut slept);
+            if sched()
+                .sleep_until_on(hart(), deadline)
+                .expect("running thread")
+            {
+                reschedule();
+            }
+            None
+        });
+        if let Some(r) = result {
+            return r;
+        }
+    }
+}
+
 /// `wait_deadline_private`, calling `register` (in the same interrupts-off region, with the lock held)
 /// just before each sleep: the waiter's registration in the wait table, so that the thread that makes
 /// its condition true wakes exactly it. The caller removes the registration after the wait returns.
@@ -1097,6 +1131,19 @@ pub fn wake_many(tids: &[Tid]) {
         }
         note_resched();
     });
+}
+
+/// `wake_many` for a caller that already has interrupts off and holds no big kernel lock (L14: `futex_wake` wakes with its bucket lock held).
+/// The same wakes, the same reschedule mark; the switch itself happens where the caller returns (a trap's exit, X7).
+pub fn wake_many_quiet(tids: &[Tid]) {
+    debug_assert!(!irq::enabled(), "a quiet wake needs interrupts off");
+    for &tid in tids {
+        if sched().state(tid) == Some(State::Blocked) {
+            WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = sched().wake_on(hart(), tid);
+    }
+    note_resched();
 }
 
 /// Is `tid` blocked right now (a test hook)?
