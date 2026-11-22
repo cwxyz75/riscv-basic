@@ -300,6 +300,7 @@ pub(super) fn thread_interrupt(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = thread_target(s, me, a[0], Rights::MANAGE)?;
         s.interrupts.insert(tid);
+        sync_interrupts(s);
         Ok(tid)
     })?;
     // (after the state closure has ended: a wake can switch threads)

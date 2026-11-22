@@ -240,6 +240,43 @@ pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     true
 }
 
+/// What the first half of the quiet `futex_wait` found.
+enum QuietEnter {
+    /// Nothing was changed that the full path would not do again.
+    Fallback,
+    /// The call is complete (a poll, or the word differs): the status to report.
+    Done(abi::status::Status),
+    /// The thread is queued: sleep.
+    Sleep(ksys::FutexWord),
+}
+
+/// The first half of `futex_wait_quiet`, in a frame of its own (the memory-lock guards would push the caller over the stack budget): translate, compare
+/// and queue under the process's `AS` lock.
+#[inline(never)]
+fn futex_wait_enter(cell: &klock::aslock::AsCell, a: [u64; 6], pid: u64, who: u64) -> QuietEnter {
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let r = {
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None); // (as the quiet fault does: the slot is the kernel copies' on other harts)
+        let r = ksys::futex_wait_resolve_in(space, k.mm, k.vmos, k.jobs, a);
+        let _ = k.vmos.swap_need(saved);
+        r
+    };
+    let Ok(w) = r else {
+        return QuietEnter::Fallback; // (the full path finds the same error, or the pager need, and acts on it)
+    };
+    if space.take_replaced() > 0 {
+        crate::smp::shootdown();
+        kmem::flush_tlb();
+    }
+    // (the enqueue under the held `AS`, the memory locks let go: `FUTEX` is before them)
+    match ksys::futex_wait_enqueue(&futex_table(), &kmem::DirectMap, pid, who, &w) {
+        ksys::FutexCheck::Done(status) => QuietEnter::Done(status),
+        ksys::FutexCheck::Sleep => QuietEnter::Sleep(w),
+    }
+}
+
 /// `futex_wait` from user mode with **no big kernel lock** (L19, T213): the quiet path of the trap handler calls this with the frame past the call
 /// instruction, `light_save` done and the return quiet. True: the call is complete (its result is in the frame, and the thread may have slept and
 /// switched harts meanwhile). False: nothing was changed, and the trap takes the full path, which does the call from the beginning
@@ -266,6 +303,7 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     );
     if cell.is_null()
         || SUSPEND_STATES.load(Ordering::Acquire) != 0
+        || INTERRUPT_FLAGS.load(Ordering::Acquire) != 0
         || kcore::aspace::COPY_PENDING.load(Ordering::Acquire)
     {
         return false;
@@ -275,35 +313,21 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     let cell = unsafe { &*cell };
     let seen = ATTENTION.load(Ordering::SeqCst);
     let who = thread::current() as u64;
-    let w = {
-        let _as = cell.lock();
-        let space = cell.held_mut();
-        let r = {
-            let k = kmem::mem();
-            let saved = k.vmos.swap_need(None); // (as the quiet fault does: the slot is the kernel copies' on other harts)
-            let r = ksys::futex_wait_resolve_in(space, k.mm, k.vmos, k.jobs, a);
-            let _ = k.vmos.swap_need(saved);
-            r
-        };
-        let Ok(w) = r else {
-            return false; // (the full path finds the same error, or the pager need, and acts on it)
-        };
-        if space.take_replaced() > 0 {
-            crate::smp::shootdown();
-            kmem::flush_tlb();
+    let w = match futex_wait_enter(cell, a, pid, who) {
+        QuietEnter::Fallback => return false,
+        QuietEnter::Done(status) => {
+            reply(frame, fail(status));
+            return true;
         }
-        // (the enqueue under the held `AS`, the memory locks let go: `FUTEX` is before them)
-        match ksys::futex_wait_enqueue(&futex_table(), &kmem::DirectMap, pid, who, &w) {
-            ksys::FutexCheck::Done(status) => {
-                reply(frame, fail(status));
-                return true;
-            }
-            ksys::FutexCheck::Sleep => w,
-        }
+        QuietEnter::Sleep(w) => w,
     };
     let key = (pid, w.addr);
     thread::wait_deadline_futex_quiet(
-        || ATTENTION.load(Ordering::SeqCst) != seen || !futex_table().contains(key, who),
+        || {
+            ATTENTION.load(Ordering::SeqCst) != seen
+                || INTERRUPT_FLAGS.load(Ordering::Acquire) != 0
+                || !futex_table().contains(key, who)
+        },
         w.deadline,
     );
     if futex_table().forget(key, who) {

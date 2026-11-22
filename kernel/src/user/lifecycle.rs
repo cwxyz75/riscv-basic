@@ -368,6 +368,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         crate::fp::thread_gone(tid);
         s.sched_flags.remove(&tid);
         s.interrupts.remove(&tid);
+        sync_interrupts(s);
         ksys::thread_suspend_forget(s, tid);
         sync_suspends(s);
         let pid = s.thread_pid.remove(&tid)?;
@@ -429,7 +430,12 @@ pub(super) fn interrupted_now() -> bool {
 
 /// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
 pub(super) fn take_interrupt() -> bool {
-    irq::without(|| state().interrupts.remove(&thread::current()))
+    irq::without(|| {
+        let s = state();
+        let had = s.interrupts.remove(&thread::current());
+        sync_interrupts(s);
+        had
+    })
 }
 
 /// The job the user thread `tid` belongs to (`None` for a kernel thread): who pays for the register state the kernel keeps for it (MM5).
@@ -471,7 +477,10 @@ pub(super) fn settle_handle_table(growth_at_entry: u64) {
 
 /// `take_interrupt` for a caller that already holds the big kernel lock (and the memory locks, so it must not take the big lock again).
 pub(super) fn take_interrupt_held() -> bool {
-    state().interrupts.remove(&thread::current())
+    let s = state();
+    let had = s.interrupts.remove(&thread::current());
+    sync_interrupts(s);
+    had
 }
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
@@ -542,6 +551,16 @@ pub(super) fn suspended_now() -> bool {
 /// so that the common case costs one load and takes no lock (a kernel thread may block holding a lock the big lock must not be taken under).
 pub(super) static SUSPEND_STATES: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// How many threads have a pending interrupt flag (`thread_interrupt`): a copy of `UserState::interrupts.len()`, kept by `sync_interrupts`, read with no
+/// lock by the quiet `futex_wait` (L19): a call that would take the flag must take the full path.
+pub(super) static INTERRUPT_FLAGS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Record the size of the interrupt set after a change (under the big lock).
+pub(super) fn sync_interrupts(s: &UserState) {
+    INTERRUPT_FLAGS.store(s.interrupts.len(), Ordering::Release);
+}
 
 /// Record the size of the suspend table after a change (under the big lock).
 pub(super) fn sync_suspends(s: &UserState) {
