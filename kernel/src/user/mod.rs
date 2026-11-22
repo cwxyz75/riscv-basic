@@ -114,6 +114,8 @@ fn state() -> &'static mut UserState {
             } else {
                 crate::arch::asid_bits()
             });
+            // (L19) the generation, for the return to user mode that holds no big lock
+            trap::publish_asid_generation(s.asids.generation_cell());
             // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
             if let Some(n) = crate::dtb::ff_value("koid") {
                 s.objs.fast_forward_koid(n);

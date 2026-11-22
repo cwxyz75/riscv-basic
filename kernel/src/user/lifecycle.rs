@@ -540,7 +540,8 @@ pub(super) fn suspended_now() -> bool {
 
 /// How many threads have suspend state (a copy of `UserState::suspends.len()`, kept by `sync_suspends`): `thread::block` looks here, with no lock,
 /// so that the common case costs one load and takes no lock (a kernel thread may block holding a lock the big lock must not be taken under).
-static SUSPEND_STATES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub(super) static SUSPEND_STATES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Record the size of the suspend table after a change (under the big lock).
 pub(super) fn sync_suspends(s: &UserState) {

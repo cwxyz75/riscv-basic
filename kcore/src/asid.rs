@@ -28,6 +28,8 @@ pub struct Asids {
     gen: u64,
     /// The next ASID to hand out in this generation.
     next: u32,
+    /// The generation, readable with no lock (`generation_cell`): a thread whose tag is of this generation may keep its ASID with no look at the allocator.
+    published: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
 impl Asids {
@@ -40,7 +42,13 @@ impl Asids {
             max: u16::MAX >> (16 - bits), // (bits is 1 to 16: 2^bits - 1)
             gen: 1,
             next: 1,
+            published: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    /// The cell that holds the current generation, for readers that do not hold the allocator's lock.
+    pub fn generation_cell(&self) -> alloc::sync::Arc<core::sync::atomic::AtomicU64> {
+        self.published.clone()
     }
 
     /// The generation ASIDs are being handed out in now.
@@ -58,6 +66,8 @@ impl Asids {
         if self.next > u32::from(self.max) {
             self.gen = self.gen.saturating_add(1); // (a u64 counter: it does not wrap in any lifetime)
             self.next = 1;
+            self.published
+                .store(self.gen, core::sync::atomic::Ordering::Release);
         }
         let asid = self.next as u16; // (<= max <= 0xffff)
         self.next = self.next.saturating_add(1);

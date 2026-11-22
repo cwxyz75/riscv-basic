@@ -194,12 +194,24 @@ pub fn futex_wait_resolve<M: PhysMem>(
     me: u64,
     a: [u64; 6],
 ) -> Result<FutexWord, Status> {
+    let p = us.procs.get_mut(&me).ok_or(Status::BadState)?;
+    futex_wait_resolve_in(p.aspace.held_mut(), mm, vmos, jobs, a)
+}
+
+/// `futex_wait_resolve` on an address space the caller holds the lock of (the quiet path of L19 has no `UserState`: it reaches the space through
+/// the hart's record of its running process).
+pub fn futex_wait_resolve_in<M: PhysMem>(
+    space: &mut kcore::aspace::AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    a: [u64; 6],
+) -> Result<FutexWord, Status> {
     let (addr, expected, deadline) = (a[0], a[1], a[2]);
     if expected > u64::from(u32::MAX) {
         return Err(Status::InvalidArgs);
     }
-    let p = us.procs.get_mut(&me).ok_or(Status::BadState)?;
-    let pa = kcore::usercopy::resolve_user_word(p.aspace.held_mut(), mm, vmos, jobs, addr)?;
+    let pa = kcore::usercopy::resolve_user_word(space, mm, vmos, jobs, addr)?;
     Ok(FutexWord {
         addr,
         pa,

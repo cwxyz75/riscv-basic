@@ -79,7 +79,20 @@ fn guard_intact(stack: &[u64]) -> bool {
     stack[..GUARD_WORDS].iter().all(|&w| w == CANARY)
 }
 
+/// What a user thread's return to user mode needs, kept in the thread's own record so that the common return reads it with no big lock (L19):
+/// the process, its address-space tag and token, and its address-space cell (as an address: it lives as long as the process, which is torn down
+/// only when its last thread has gone). Set under the big lock whenever the full path installs the thread's space.
+#[derive(Clone, Copy)]
+pub struct UserBinding {
+    pub pid: u64,
+    pub tag: kcore::asid::AsTag,
+    pub token: u64,
+    pub aspace: usize,
+}
+
 struct KThread {
+    /// `None` until the thread first returns to user mode (and for kernel threads).
+    user: Option<UserBinding>,
     ctx: Box<Context>,
     /// `None` for the boot thread, which runs on the boot stack.
     stack: Option<crate::kstack::KStack>,
@@ -122,6 +135,18 @@ static mut SCHED: Option<KSched> = None;
 
 /// What each job's threads have run (SCHED-SMP-SPEC 4.10): charged by the scheduler's run queues, read by `job_info`. Set once, by `init`.
 static mut JOB_SCHED: Option<alloc::sync::Arc<kcore::jobsched::JobSchedTable>> = None;
+
+/// Record what thread `tid`'s return to user mode needs (the full path, under the big lock).
+pub fn bind_user(tid: Tid, b: UserBinding) {
+    if let Some(t) = kernel().threads.get_mut(&tid) {
+        t.user = Some(b);
+    }
+}
+
+/// What thread `tid`'s return to user mode needs, if the full path has recorded it (a `TT` lock, no big lock).
+pub fn user_binding(tid: Tid) -> Option<UserBinding> {
+    kernel().threads.get(&tid).and_then(|t| t.user)
+}
 
 /// The job accounting table.
 #[allow(clippy::expect_used)] // INVARIANT: set by `init` before any user thread exists
@@ -190,11 +215,7 @@ pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 /// across a context switch.
 #[track_caller]
 fn kernel() -> KernelRef {
-    // (K1: until the big lock is gone, the raw context pointers a switch takes from the table depend on it as much as on `TT`)
-    debug_assert!(
-        crate::bkl::held(),
-        "the thread table touched without the big kernel lock"
-    );
+    // (L19: the table is its own lock; the quiet paths of the trap handler read and switch with no big lock)
     KernelRef(KERNEL.lock())
 }
 
@@ -248,6 +269,7 @@ pub fn init(boot_prio: Prio) {
     threads.insert(
         boot,
         KThread {
+            user: None,
             ctx: Box::default(),
             stack: None,
             name: "boot",
@@ -310,6 +332,7 @@ pub fn join_scheduler() -> ! {
         k.threads.insert(
             tid,
             KThread {
+                user: None,
                 ctx: Box::default(),
                 stack: None,
                 name: "idle",
@@ -461,6 +484,7 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
     let top = stack.top();
     let ctx = Context::new(entry, arg, top);
     KThread {
+        user: None,
         ctx,
         stack: Some(stack),
         name,
@@ -1209,6 +1233,33 @@ pub fn wait_deadline_futex(mut ready: impl FnMut() -> bool, deadline: u64) -> bo
         });
         if let Some(r) = result {
             return r;
+        }
+    }
+}
+
+/// `wait_deadline_futex` for the quiet path of L19: **no big kernel lock** (the thread table is `TT`, the scheduler has its own locks, the switch
+/// releases a lock the thread does not hold). Interrupts are off (it runs inside a trap). `ready` must be readable with no lock. The thread
+/// prepares to block before it looks, as the full version does; nothing else of the full version is needed (the caller took the quiet path only
+/// with no suspend state and no copy-on-write sync pending, and `ready` says when something else has happened: the attention epoch moved).
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
+pub fn wait_deadline_futex_quiet(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    let mut slept = false;
+    loop {
+        let _ = sched().prepare_block_on(hart());
+        if ready() {
+            let _ = sched().cancel_block_on(hart());
+            return true;
+        }
+        if now_ns() >= deadline {
+            let _ = sched().cancel_block_on(hart());
+            return false;
+        }
+        count_sleep(&mut slept);
+        if sched()
+            .sleep_until_on(hart(), deadline)
+            .expect("running thread")
+        {
+            reschedule();
         }
     }
 }
