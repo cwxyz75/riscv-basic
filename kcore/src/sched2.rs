@@ -1040,6 +1040,17 @@ impl<N: Class> HartRq<N> {
         Ok(())
     }
 
+    /// The condition was already true: not waiting after all (a standing preparation or notification is dropped).
+    #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
+    pub fn cancel_block(&mut self) -> Result<(), Error> {
+        let c = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .ok_or(Error::NoCurrent)?;
+        self.threads.get_mut(&c).expect("current exists").park = crate::park::ParkState::Idle;
+        Ok(())
+    }
+
     /// Block the current thread unless a notification is waiting (then it is consumed). Returns whether it blocked.
     #[allow(clippy::expect_used)] // INVARIANT: `c` is the current thread, which has a record
     pub fn block_current(&mut self) -> Result<bool, Error> {

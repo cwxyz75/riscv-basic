@@ -111,3 +111,5 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-21 | AB6 | CPU time readable for a thread, a process and a job | CPU time of threads and processes (PR 391) |
 | 2026-11-21 | T73 | RT budgets are accounted but not enforced | RT budgets enforced by L25 (hart throttle, job demotion) (PR 390) |
 | 2026-11-21 | T80 | Only the launcher and the tests set job priority limits | the launcher sets 20 and the session job 31 (L8); the driver jobs' ceiling is T210 (PR 389) |
+| 2026-11-22 | L14 | Futex peel: bucket locks | futex bucket locks (64 buckets, class FUTEX); futex_wake without the big kernel lock; futex_wait holds it only to translate and queue; the prepare-first sleep; loom and shuttle models with kill, timeout and the negative control. The 3.0 scaling at four harts is not met: T213 (PR 403) |
+| 2026-11-22 | L17 | Memory peel: per-process `AS` | the per-process AS lock (part b: every use of an address space under its lock, ahead of the memory locks) and the page fault without the big kernel lock (part c). The user copies stay under the big lock until L20 (T215); no negative control for AS yet (T214) (PR 404, 405) |

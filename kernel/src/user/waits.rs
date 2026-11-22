@@ -36,6 +36,7 @@ fn in_process<R>(
     irq::without(|| {
         let s = state();
         let me = caller_pid(s)?;
+        let _as = AsLocks::of(s, &[me]); // (the caller's address space, before the memory locks)
         f(s, &mut kmem::get(), me)
     })
     .map_err(|e| (e, None, None))
@@ -67,31 +68,71 @@ pub(super) fn object_wait(a: [u64; 6]) -> Reply {
     ksys::object_wait_report(seen, &w, take_interrupt)
 }
 
+/// The futex buckets (L14): sixty-four locks of class `Futex`, a key to its bucket by hash, never two at once (SCHED-SMP-SPEC 3.3).
+pub(super) struct KBuckets(
+    [klock::Spin<kcore::futex::Futexes, crate::bkl::Machine>; kcore::futex::BUCKETS],
+);
+
+static FUTEX: KBuckets = KBuckets(
+    [const { klock::Spin::new(klock::Class::Futex, 0, kcore::futex::Futexes::new()) };
+        kcore::futex::BUCKETS],
+);
+
+impl kcore::futex::Buckets for &'static KBuckets {
+    #[allow(clippy::indexing_slicing)] // INVARIANT: the table asks for b < BUCKETS, the array's length
+    fn with<R>(&self, b: usize, f: impl FnOnce(&mut kcore::futex::Futexes) -> R) -> R {
+        f(&mut self.0[b].lock())
+    }
+}
+
+/// The futex table (`kcore::futex::FutexTable` over the bucket locks). Callable with interrupts on or off, with or without the big kernel
+/// lock: each operation takes one bucket's lock.
+pub(super) fn futex_table() -> kcore::futex::FutexTable<&'static KBuckets> {
+    kcore::futex::FutexTable::new(&FUTEX)
+}
+
 /// `futex_wait(addr, expected, deadline)` (S7b, SYSCALLS.md): sleep on the 32-bit word at `addr`
-/// if it still equals `expected`. The check and the enqueue are one step under the big kernel lock,
-/// so a wake that follows a user-mode store is never lost.
+/// if it still equals `expected`. The big kernel lock is held only to translate the word and to queue; the sleep holds nothing (L14). The
+/// word is read again under the key's bucket lock, with no memory lock held, and the thread is queued in the same step, so a wake that
+/// follows a user-mode store (it takes the same bucket lock) is never lost.
 pub(super) fn futex_wait(a: [u64; 6]) -> Reply {
     let who = thread::current() as u64;
     let deadline = a[2];
-    match in_process(|s, k, me| ksys::futex_wait_check(s, k.mm, k.vmos, k.jobs, me, who, a))? {
-        ksys::FutexCheck::Done(status) => return fail(status),
-        ksys::FutexCheck::Sleep => {}
-    }
+    let (me, addr) = match irq::without(|| -> Result<(u64, u64, ksys::FutexCheck), Status> {
+        let s = state();
+        let me = caller_pid(s)?;
+        let _as = AsLocks::of(s, &[me]);
+        let w = {
+            let k = kmem::get();
+            ksys::futex_wait_resolve(s, k.mm, k.vmos, k.jobs, me, a)?
+        }; // (the memory locks are let go: `FUTEX` is before them in the order)
+        let c = ksys::futex_wait_enqueue(&futex_table(), &kmem::DirectMap, me, who, &w);
+        Ok((me, w.addr, c))
+    }) {
+        Ok((me, addr, ksys::FutexCheck::Sleep)) => (me, addr),
+        Ok((_, _, ksys::FutexCheck::Done(status))) => return fail(status),
+        Err(e) => return fail(e),
+    };
+    let key = (me, addr);
     // sleep until woken (removed from the table), killed, or the deadline: not on the global queue,
     // only `futex_wake` and a kill wake this thread (by id)
-    thread::wait_deadline_private(
-        || killed_now().is_some() || interrupted_now() || !state().futexes.contains(who),
+    thread::wait_deadline_futex(
+        || killed_now().is_some() || interrupted_now() || !futex_table().contains(key, who),
         deadline,
     );
     // still in the table: the deadline (or a kill) ended the wait: leave it
-    irq::without(|| ksys::futex_wait_report(state(), who, take_interrupt))
+    irq::without(|| ksys::futex_wait_report(&futex_table(), key, who, take_interrupt))
 }
 
-/// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first.
-pub(super) fn futex_wake(a: [u64; 6]) -> (Reply, Vec<u64>) {
-    match in_process(|s, _, me| ksys::futex_wake(s, me, a)) {
-        Ok(ids) => (Ok((Some(ids.len() as u64), None)), ids),
-        Err(e) => (Err(e), Vec::new()),
+/// `futex_wake(addr, count)` for the thread of process `pid`: wake up to `count` sleepers on `addr`, oldest first, the wakes issued with the
+/// bucket lock held. Needs no big kernel lock (L14); interrupts off.
+pub fn futex_wake(pid: u64, a: [u64; 6]) -> Reply {
+    if pid == 0 {
+        return fail(Status::BadState);
+    }
+    match ksys::futex_wake(&futex_table(), pid, a, thread::wake_many_quiet) {
+        Ok(n) => Ok((Some(n as u64), None)),
+        Err(e) => fail(e),
     }
 }
 
@@ -279,6 +320,7 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     loop {
         let r = irq::without(|| {
             let s = state();
+            let _as = AsLocks::caller(s);
             let k = kmem::get();
             match caller_pid(s) {
                 Ok(pid) => ksys::channel_call_reply(

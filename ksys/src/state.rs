@@ -84,8 +84,6 @@ pub struct UserState {
     pub next_token: usize,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     pub ktable: HandleTable,
-    /// The futex wait table (S7b).
-    pub futexes: kcore::futex::Futexes,
     /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
     /// signals match, instead of by the global queue.
     pub waits: kcore::wait::WaitTable,
@@ -147,7 +145,6 @@ impl UserState {
             // (one end of each process's and job's exception channel lives here, and the creators' ends of bootstrap channels: bounded by the
             // object cap, whose charges the objects themselves carry)
             ktable: HandleTable::new(abi::limits::MAX_OBJECTS),
-            futexes: kcore::futex::Futexes::new(),
             waits: kcore::wait::WaitTable::new(),
             irq_objs: alloc::vec::Vec::new(),
             line: String::new(),

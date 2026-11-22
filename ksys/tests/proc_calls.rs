@@ -67,7 +67,10 @@ struct W {
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
         live_tids: Default::default(),
-        aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+            1,
+            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        )),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -214,7 +217,7 @@ fn process_map_maps_into_the_target_and_charges_its_tables() {
     // the target's memory shows it, the caller's does not
     let t = w.procs.get_mut(&2).unwrap();
     copy_to_user(
-        &mut t.aspace,
+        t.aspace.held_mut(),
         &mut w.mm,
         &mut w.vmos,
         &mut w.jobs,
@@ -224,7 +227,7 @@ fn process_map_maps_into_the_target_and_charges_its_tables() {
     .unwrap();
     assert_eq!(
         copy_from_user(
-            &mut t.aspace,
+            t.aspace.held_mut(),
             &mut w.mm,
             &mut w.vmos,
             &mut w.jobs,
@@ -236,7 +239,7 @@ fn process_map_maps_into_the_target_and_charges_its_tables() {
     );
     let me = w.procs.get_mut(&1).unwrap();
     assert!(copy_from_user(
-        &mut me.aspace,
+        me.aspace.held_mut(),
         &mut w.mm,
         &mut w.vmos,
         &mut w.jobs,
@@ -861,7 +864,15 @@ fn job_set_sched_rows() {
 /// Fault a page of process `pid` in (a write through its address space maps it).
 fn touch(w: &mut W, pid: u64, va: u64) {
     let t = w.procs.get_mut(&pid).unwrap();
-    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, b"x").unwrap();
+    copy_to_user(
+        t.aspace.held_mut(),
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        va,
+        b"x",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -890,7 +901,7 @@ fn decommit_takes_the_pages_from_every_mapping_and_asks_for_the_shootdown_only_w
     assert_eq!(w.tlb.shootdowns, 1);
     assert_eq!(w.tlb.flushes, 1);
     for pid in [1, 2] {
-        let a = &w.procs[&pid].aspace;
+        let a = w.procs[&pid].aspace.held_ref();
         assert!(a.table().translate(&w.mm, VA + 2 * 4096).is_none());
         assert!(a.table().translate(&w.mm, VA + 3 * 4096).is_none());
     }
@@ -1023,8 +1034,15 @@ fn info(w: &mut W, buf: u64, ph: u64, at: u64) -> ([u64; 6], u64) {
         .unwrap();
     let mut rec = [0u64; 6];
     let t = w.procs.get_mut(&1).unwrap();
-    let bytes =
-        copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, buf, 48).unwrap();
+    let bytes = copy_from_user(
+        t.aspace.held_mut(),
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        buf,
+        48,
+    )
+    .unwrap();
     for (i, r) in rec.iter_mut().enumerate() {
         *r = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
     }
@@ -1037,13 +1055,14 @@ fn unmap_with_a_length_splits_regions_credits_and_asks_for_the_shootdown() {
     let v = w.vmo(8, JobId::ROOT);
     w.ok(nr::PROCESS_MAP, [ph, v, VA, 0, 8 * 4096, W | R]);
     touch(&mut w, 2, VA + 3 * 4096);
-    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    assert_eq!(w.procs[&2].aspace.held_ref().region_count(), 1);
     // the middle: two regions are left, the hole is a hole
     w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 4 * 4096, 0, 0, 0]);
-    assert_eq!(w.procs[&2].aspace.region_count(), 2);
+    assert_eq!(w.procs[&2].aspace.held_ref().region_count(), 2);
     assert!(
         w.procs[&2]
             .aspace
+            .held_ref()
             .table()
             .translate(&w.mm, VA + 3 * 4096)
             .is_none(),
@@ -1054,10 +1073,10 @@ fn unmap_with_a_length_splits_regions_credits_and_asks_for_the_shootdown() {
     w.ok(nr::PROCESS_UNMAP, [ph, VA + 2 * 4096, 2 * 4096, 0, 0, 0]);
     w.ok(nr::PROCESS_UNMAP, [ph, VA + 7 * 4096, 4 * 4096, 0, 0, 0]);
     assert_eq!(
-        w.procs[&2].aspace.region_count(),
+        w.procs[&2].aspace.held_ref().region_count(),
         2,
         "the tail went, the head stayed: {:?}",
-        w.procs[&2].aspace.regions_info()
+        w.procs[&2].aspace.held_ref().regions_info()
     );
     // errors: unaligned, wrapping
     assert_eq!(
@@ -1075,7 +1094,7 @@ fn unmap_with_a_length_splits_regions_credits_and_asks_for_the_shootdown() {
     // the original form still removes the region that starts at the address, whole
     w.ok(nr::PROCESS_UNMAP, [ph, VA, 0, 0, 0, 0]);
     assert_eq!(
-        w.procs[&2].aspace.region_count(),
+        w.procs[&2].aspace.held_ref().region_count(),
         1,
         "the head went, the one page of the tail stayed"
     );
@@ -1097,6 +1116,7 @@ fn protect_changes_rights_in_place_within_the_ceiling_and_pays_for_what_it_must(
     );
     let pte = w.procs[&2]
         .aspace
+        .held_ref()
         .table()
         .translate(&w.mm, VA)
         .unwrap()
@@ -1181,7 +1201,7 @@ fn map_info_walks_the_regions_and_a_protect_splits_and_merges_them() {
         nr::PROCESS_PROTECT,
         [ph, VA + 2 * 4096, 3 * 4096, R | W, 0, 0],
     );
-    assert_eq!(w.procs[&2].aspace.region_count(), 1);
+    assert_eq!(w.procs[&2].aspace.held_ref().region_count(), 1);
     // an address in a hole reports the next region; past the last, nothing
     let (c, _) = info(&mut w, buf, ph, VA + 8 * 4096);
     assert_eq!(c[1], 0, "no region at or after");
@@ -1269,14 +1289,30 @@ fn the_range_calls_stay_in_the_user_half_and_anywhere_checks_its_arguments_first
 
 fn byte(w: &mut W, pid: u64, va: u64) -> u8 {
     let t = w.procs.get_mut(&pid).unwrap();
-    let b = copy_from_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, 1).unwrap()[0];
+    let b = copy_from_user(
+        t.aspace.held_mut(),
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        va,
+        1,
+    )
+    .unwrap()[0];
     ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
     b
 }
 
 fn put(w: &mut W, pid: u64, va: u64, b: u8) {
     let t = w.procs.get_mut(&pid).unwrap();
-    copy_to_user(&mut t.aspace, &mut w.mm, &mut w.vmos, &mut w.jobs, va, &[b]).unwrap();
+    copy_to_user(
+        t.aspace.held_mut(),
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        va,
+        &[b],
+    )
+    .unwrap();
     // (what the kernel does after every call and fault)
     ksys::cow_sync(&mut w.procs, &mut w.mm, &mut w.vmos, &mut w.tlb);
 }
@@ -1303,6 +1339,7 @@ fn a_snapshot_child_keeps_the_contents_as_they_were_and_the_source_write_protect
     assert!(
         !w.procs[&1]
             .aspace
+            .held_ref()
             .table()
             .translate(&w.mm, VA)
             .unwrap()
@@ -1540,7 +1577,7 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
                     let pid = if p == ph1 { 1 } else { 2 };
                     let t = w.procs.get_mut(&pid).unwrap();
                     let _ = copy_to_user(
-                        &mut t.aspace,
+                        t.aspace.held_mut(),
                         &mut w.mm,
                         &mut w.vmos,
                         &mut w.jobs,
@@ -1578,10 +1615,10 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
                 .audit_families(true)
                 .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
             for (pid, proc) in w.procs.iter() {
-                for r in proc.aspace.regions_info() {
+                for r in proc.aspace.held_ref().regions_info() {
                     for pg in 0..r.pages {
                         let va = r.start + pg * 4096;
-                        let Some(t) = proc.aspace.table().translate(&w.mm, va) else {
+                        let Some(t) = proc.aspace.held_ref().table().translate(&w.mm, va) else {
                             continue;
                         };
                         match w.vmos.frame_info(r.vmo, r.vmo_page + pg) {

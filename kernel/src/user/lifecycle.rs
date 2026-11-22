@@ -102,15 +102,22 @@ pub(super) fn user_thread_main(token: usize) {
         let p = procs
             .get_mut(&ts.pid)
             .expect("a process lives while one of its threads does");
+        crate::percpu::this().cur_as.store(
+            alloc::sync::Arc::as_ptr(&p.aspace).cast_mut(),
+            Ordering::Release,
+        );
         install_token_of(asids, p)
     };
     crate::percpu::this()
         .active_aspace
         .store(token, Ordering::SeqCst);
-    // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
-    // (loads from this thread's stack and CSR writes) run before `sret`.
-    // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
-    // vector state loaded if a write gave it any, in this hart's entry frame
+    crate::percpu::this()
+        .cur_pid
+        .store(ts.pid, Ordering::Relaxed); // (the lock-free calls read it: L14)
+                                           // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
+                                           // (loads from this thread's stack and CSR writes) run before `sret`.
+                                           // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
+                                           // vector state loaded if a write gave it any, in this hart's entry frame
     let entry_frame = {
         let image = state().initial_regs.remove(&thread::current());
         let image = image.unwrap_or_else(|| {
@@ -202,7 +209,7 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
         }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
         // already; this is the backstop)
-        s.futexes.forget_process(pid);
+        futex_table().forget_process(pid);
         process
     })
 }
@@ -242,7 +249,7 @@ pub(super) fn teardown_memory(process: Box<Process>) {
     irq::without(|| {
         let k = kmem::get();
         let mut process = process;
-        process.aspace.destroy_user(k.mm, k.vmos, k.jobs);
+        klock::aslock::AsCell::take(process.aspace).destroy_user(k.mm, k.vmos, k.jobs);
         for id in core::mem::take(&mut process.vmos) {
             let _ = k.vmos.release(k.mm, k.jobs, id);
         }
@@ -270,8 +277,12 @@ pub(super) fn free_spawn_stack(p: &mut Process, tid: Tid) {
     let Some(st) = p.stacks.remove(&tid) else {
         return;
     };
+    let _as = klock::aslock::AsCell::hold(&p.aspace); // (before the memory locks: AS comes first)
     let k = kmem::get();
-    let _ = p.aspace.unmap_region(k.mm, k.vmos, k.jobs, st.region);
+    let _ = p
+        .aspace
+        .held_mut()
+        .unmap_region(k.mm, k.vmos, k.jobs, st.region);
     if let Some(tables) = p.table_charge.remove(&st.region) {
         k.jobs.credit(p.job, Resource::Pages, tables);
     }

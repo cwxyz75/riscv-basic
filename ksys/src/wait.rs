@@ -11,6 +11,7 @@ use abi::status::Status;
 use abi::Handle;
 use alloc::vec::Vec;
 use kcore::aspace::Vmos;
+use kcore::futex::{Buckets, FutexTable};
 use kcore::ipc::{self, ReadError};
 use kcore::job::Jobs;
 use kcore::pagetable::PhysMem;
@@ -129,7 +130,7 @@ pub fn port_poll_many<M: PhysMem>(
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let len = cap * abi::limits::PORT_PACKET_BYTES;
-    verify_writable(&mut p.aspace, mm, vmos, jobs, buf, len).map_err(|e| match e {
+    verify_writable(p.aspace.held_mut(), mm, vmos, jobs, buf, len).map_err(|e| match e {
         // (MM9) a page of a pager's VMO that is not there: the kernel waits for it and the call says "try again"
         Status::ShouldWait => Status::ShouldWait,
         _ => Status::InvalidArgs,
@@ -141,7 +142,7 @@ pub fn port_poll_many<M: PhysMem>(
         bytes.extend_from_slice(&observed.to_le_bytes());
         bytes.extend_from_slice(&[0; 4]);
     }
-    copy_to_user_verified(&mut p.aspace, mm, buf, &bytes)?;
+    copy_to_user_verified(p.aspace.held_mut(), mm, buf, &bytes)?;
     Ok(got.len())
 }
 
@@ -171,10 +172,80 @@ pub enum FutexCheck {
     Done(Status),
 }
 
-/// `futex_wait(addr, expected, deadline)`: compare the word with `expected` and enqueue the thread, one step under the lock, so that a wake
-/// after a user-mode store is never lost. `who` is the thread's id.
-pub fn futex_wait_check<M: PhysMem>(
+/// The word `futex_wait` is about: where it is in physical memory, resolved and made resident (L14).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct FutexWord {
+    /// The user address (the futex's key, with the process).
+    pub addr: u64,
+    /// The physical address of the word's 32 bits.
+    pub pa: u64,
+    pub expected: u32,
+    pub deadline: u64,
+}
+
+/// First half of `futex_wait(addr, expected, deadline)` (the big kernel lock held, and the memory locks, which are let go before the second
+/// half): validate the arguments and translate the word, committing a lazily backed page, so that the word is in a frame. The frame cannot
+/// go while the big lock is held (every unmap, decommit and teardown takes it), which is what keeps it from the second half's read.
+pub fn futex_wait_resolve<M: PhysMem>(
     us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    a: [u64; 6],
+) -> Result<FutexWord, Status> {
+    let (addr, expected, deadline) = (a[0], a[1], a[2]);
+    if expected > u64::from(u32::MAX) {
+        return Err(Status::InvalidArgs);
+    }
+    let p = us.procs.get_mut(&me).ok_or(Status::BadState)?;
+    let pa = kcore::usercopy::resolve_user_word(p.aspace.held_mut(), mm, vmos, jobs, addr)?;
+    Ok(FutexWord {
+        addr,
+        pa,
+        expected: expected as u32,
+        deadline,
+    })
+}
+
+/// Read the 32-bit word at physical address `pa` with one aligned 64-bit load (as `read_user_u32`: a store by another hart is seen whole).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: (pa & 4) * 8 is 0 or 32, below the shift width of a u64
+fn read_word<M: PhysMem>(mem: &M, pa: u64) -> u32 {
+    (mem.read_u64(pa & !7) >> ((pa & 4) * 8)) as u32
+}
+
+/// Second half: under the key's bucket lock (no memory lock held: `FUTEX` is before them), compare the word with `expected` and queue the
+/// thread, one step, so that a wake after a user-mode store (which takes the same lock) is never lost. `who` is the thread's id.
+pub fn futex_wait_enqueue<M: PhysMem, B: Buckets>(
+    table: &FutexTable<B>,
+    mem: &M,
+    me: u64,
+    who: u64,
+    w: &FutexWord,
+) -> FutexCheck {
+    if w.deadline == 0 {
+        // a poll: equal, and no time to wait (not queued)
+        return FutexCheck::Done(
+            if u64::from(read_word(mem, w.pa)) != u64::from(w.expected) {
+                Status::ShouldWait
+            } else {
+                Status::TimedOut
+            },
+        );
+    }
+    let queued = table.wait_if((me, w.addr), who, || read_word(mem, w.pa) == w.expected);
+    if queued {
+        FutexCheck::Sleep
+    } else {
+        FutexCheck::Done(Status::ShouldWait) // the word changed: do not sleep
+    }
+}
+
+/// `futex_wait` in one call, for the host tests (the kernel calls the halves, letting go of the memory locks between them).
+#[allow(clippy::too_many_arguments)]
+pub fn futex_wait_check<M: PhysMem, B: Buckets>(
+    us: &mut UserState,
+    table: &FutexTable<B>,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
     jobs: &mut Jobs,
@@ -182,31 +253,18 @@ pub fn futex_wait_check<M: PhysMem>(
     who: u64,
     a: [u64; 6],
 ) -> Result<FutexCheck, Status> {
-    let (addr, expected, deadline) = (a[0], a[1], a[2]);
-    if expected > u64::from(u32::MAX) {
-        return Err(Status::InvalidArgs);
-    }
-    let UserState { procs, futexes, .. } = us;
-    let p = procs.get_mut(&me).ok_or(Status::BadState)?;
-    let word = kcore::usercopy::read_user_u32(&mut p.aspace, mm, vmos, jobs, addr)?;
-    if u64::from(word) != expected {
-        return Ok(FutexCheck::Done(Status::ShouldWait)); // the word changed: do not sleep
-    }
-    if deadline == 0 {
-        return Ok(FutexCheck::Done(Status::TimedOut)); // a poll: equal, and no time to wait
-    }
-    let fresh = futexes.wait((me, addr), who);
-    debug_assert!(fresh, "a thread sleeps on one futex at a time");
-    Ok(FutexCheck::Sleep)
+    let w = futex_wait_resolve(us, mm, vmos, jobs, me, a)?;
+    Ok(futex_wait_enqueue(table, &mm.mem, me, who, &w))
 }
 
 /// How `futex_wait` reports once the sleep is over: still in the table means the deadline (or a kill or an interrupt) ended it.
-pub fn futex_wait_report(
-    us: &mut UserState,
+pub fn futex_wait_report<B: Buckets>(
+    table: &FutexTable<B>,
+    key: (u64, u64),
     who: u64,
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {
-    let timed_out = us.futexes.forget(who);
+    let timed_out = table.forget(key, who);
     if timed_out && take_interrupt() {
         fail(Status::Interrupted)
     } else if timed_out {
@@ -216,16 +274,26 @@ pub fn futex_wait_report(
     }
 }
 
-/// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in this process, oldest first. Returns the thread ids the caller must wake.
-pub fn futex_wake(us: &mut UserState, me: u64, a: [u64; 6]) -> Result<Vec<u64>, Status> {
+/// The arguments of `futex_wake(addr, count)`, checked: the word's address and how many to wake. Nothing here touches shared state (L14: the
+/// call runs without the big kernel lock).
+pub fn futex_wake_args(a: [u64; 6]) -> Result<(u64, u64), Status> {
     let (addr, count) = (a[0], a[1]);
     if addr & 3 != 0 || addr < abi::user::BASE || addr.saturating_add(4) > abi::user::TOP {
         return Err(Status::InvalidArgs);
     }
-    if !us.procs.contains_key(&me) {
-        return Err(Status::BadState);
-    }
-    Ok(us.futexes.wake((me, addr), count))
+    Ok((addr, count))
+}
+
+/// `futex_wake(addr, count)`: wake up to `count` sleepers on `addr` in process `me`, oldest first. `wake` is run on the thread ids taken from the
+/// queue with the bucket lock still held. Returns how many.
+pub fn futex_wake<B: Buckets>(
+    table: &FutexTable<B>,
+    me: u64,
+    a: [u64; 6],
+    wake: impl FnOnce(&[u64]),
+) -> Result<usize, Status> {
+    let (addr, count) = futex_wake_args(a)?;
+    Ok(table.wake_with((me, addr), count, wake))
 }
 
 // ---- channel_call ----
@@ -271,7 +339,7 @@ pub fn channel_call_send<M: PhysMem>(
     let UserState { objs, procs, .. } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let rec = copy_from_user(
-        &mut p.aspace,
+        p.aspace.held_mut(),
         mm,
         vmos,
         jobs,
@@ -305,8 +373,15 @@ pub fn channel_call_send<M: PhysMem>(
         }
         return Err(Status::AccessDenied);
     }
-    let data = copy_from_user(&mut p.aspace, mm, vmos, jobs, req_bytes, nbytes)?;
-    let raw = copy_from_user(&mut p.aspace, mm, vmos, jobs, req_handles, nhandles * 8)?;
+    let data = copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?;
+    let raw = copy_from_user(
+        p.aspace.held_mut(),
+        mm,
+        vmos,
+        jobs,
+        req_handles,
+        nhandles * 8,
+    )?;
     ipc::channel_write_in(
         objs,
         &mut p.handles,
@@ -372,9 +447,9 @@ pub fn channel_call_reply<M: PhysMem>(
         c.rd_max_handles,
     ) {
         Ok((nb, nh)) => (|| {
-            verify_writable(&mut p.aspace, mm, vmos, jobs, c.rd_bytes, nb)
+            verify_writable(p.aspace.held_mut(), mm, vmos, jobs, c.rd_bytes, nb)
                 .map_err(|e| (e, None, None))?;
-            verify_writable(&mut p.aspace, mm, vmos, jobs, c.rd_handles, nh * 8)
+            verify_writable(p.aspace.held_mut(), mm, vmos, jobs, c.rd_handles, nh * 8)
                 .map_err(|e| (e, None, None))?;
             let got = ipc::channel_read_txid_in(
                 objs,
@@ -386,12 +461,12 @@ pub fn channel_call_reply<M: PhysMem>(
                 jobs,
             )
             .map_err(|_| (Status::BadState, None, None))?;
-            copy_to_user_verified(&mut p.aspace, mm, c.rd_bytes, &got.data)
+            copy_to_user_verified(p.aspace.held_mut(), mm, c.rd_bytes, &got.data)
                 .map_err(|e| (e, None, None))?;
             // (the handle numbers go out one at a time from the stack: nothing here allocates after the message has been taken: KT9)
             for (i, h) in got.handles.iter().enumerate() {
                 copy_to_user_verified(
-                    &mut p.aspace,
+                    p.aspace.held_mut(),
                     mm,
                     c.rd_handles + (i as u64) * 8,
                     &h.0.to_le_bytes(),

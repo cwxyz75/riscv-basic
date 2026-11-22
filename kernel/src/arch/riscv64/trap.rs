@@ -420,13 +420,13 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     crate::latency::off_end(span, core::panic::Location::caller());
 }
 
-/// `clock_get` and `thread_yield` from user mode without the big kernel lock (L12c). False: not one of those, or the return is not
+/// `clock_get`, `thread_yield` (L12c) and `futex_wake` (L14) from user mode without the big kernel lock. False: not one of those, or the return is not
 /// quiet (a kill or stop to look for) or dirty FP or vector registers could not be saved without the lock (`fp::light_save`): the full path.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: sepc + 4 steps past an ecall
 fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     use abi::syscall as nr;
     let n = frame.arg(17) as usize;
-    if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD)
+    if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD && n != nr::FUTEX_WAKE)
         || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
     {
@@ -435,6 +435,17 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     frame.sepc += 4; // past the ecall
     if n == nr::CLOCK_GET {
         frame.set_return(0, Some(crate::thread::now_ns()), None);
+    } else if n == nr::FUTEX_WAKE {
+        // L14: the bucket lock and the scheduler's own locks, no big lock; the lock only for a switch the wake asked for
+        crate::user::futex_wake_quiet(frame);
+        if crate::thread::need_resched_pending() {
+            crate::bkl::lock();
+            crate::thread::switch_if_designated();
+            crate::user::commit_wake();
+            crate::thread::preempt_point();
+            crate::user::activate_current(frame);
+            crate::bkl::unlock();
+        }
     } else {
         frame.set_return(0, None, None);
         if crate::thread::yield_fast() {
@@ -468,10 +479,18 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 5 && !ready;
-    // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
+    // L12c, L14: `clock_get`, `thread_yield` and `futex_wake` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
     // (no kill or stop recorded) and the user's FP state is not dirty.
     if from_user && cause == 8 && ready && lock_free_syscall(frame) {
         // handled
+    } else if from_user
+        && ready
+        && matches!(cause, 12 | 13 | 15)
+        && crate::fp::light_save(frame)
+        && crate::user::user_return_is_quiet()
+        && crate::user::page_fault_quiet(frame)
+    {
+        // L17 part c: a page fault resolved under the process's AS lock and the memory locks, with no big lock; anything else takes the full path
     } else if cause == (1 << 63) | 5 && ready {
         // The scheduler's tick (SCHED-SMP-SPEC task 12). Its work is done under the scheduler's own lock. A tick that
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to

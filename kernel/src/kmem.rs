@@ -179,6 +179,38 @@ pub fn get() -> Kmem {
     }
 }
 
+/// The three memory locks and nothing else (L17 part c: the page-fault path without the big kernel lock): the same `VMO`, `JOBS`, `FRAME`
+/// as `get`, in the same order, but not the kernel's address space, which only the big lock protects.
+pub struct Mem {
+    pub mm: &'static mut Mm<DirectMap>,
+    pub vmos: &'static mut Vmos,
+    pub jobs: &'static mut kcore::job::Jobs,
+    // (dropped in this order: FRAME, then JOBS, then VMO)
+    _frame: Held<'static, Mm<DirectMap>>,
+    _jobs: Held<'static, kcore::job::Jobs>,
+    _vmos: Held<'static, Vmos>,
+}
+
+/// Take `VMO`, `JOBS` and `FRAME`. No big kernel lock is needed for the locks themselves; the caller must hold the address-space lock
+/// of the space it works on (`AS` is before them in the order).
+#[track_caller]
+pub fn mem() -> Mem {
+    let mut vmo = VMOS.lock();
+    let mut jobs = JOBS.lock();
+    let mut frame = FRAMES.lock();
+    // SAFETY: as in `get`: each reference comes from the guard stored next to it, which drops after it.
+    unsafe {
+        Mem {
+            mm: inside(&mut frame),
+            vmos: inside(&mut vmo),
+            jobs: inside(&mut jobs),
+            _frame: frame,
+            _jobs: jobs,
+            _vmos: vmo,
+        }
+    }
+}
+
 /// The frame database alone: takes only `FRAME`. No big kernel lock is needed for the lock itself.
 #[track_caller]
 pub fn frames() -> Frames {

@@ -588,7 +588,8 @@ fn user_mode_ticks_take_no_big_lock() -> Result<(), String> {
 /// L12c: the same for a user thread that does nothing but call `clock_get`, and for one that only calls `thread_yield`.
 fn user_clock_get_and_yield_take_no_big_lock() -> Result<(), String> {
     no_big_lock_for(80, "a user thread calling clock_get")?;
-    no_big_lock_for(81, "a user thread calling thread_yield")
+    no_big_lock_for(81, "a user thread calling thread_yield")?;
+    no_big_lock_for(82, "a user thread calling futex_wake")
 }
 
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)

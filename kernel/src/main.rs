@@ -162,6 +162,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // thread and interrupts come on.
     thread::init(sched_tests::MAIN_PRIO);
     // From here the big kernel lock is real: entry points assert that it is held.
+    user::install_hooks(); // (the address-space locks run on this machine's interrupt state and order checker)
     bkl::enforce();
     // The other harts join the scheduler (each adopts its boot context as its idle thread).
     {

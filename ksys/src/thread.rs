@@ -125,7 +125,7 @@ pub fn thread_spawn<M: PhysMem>(
     // the record first (a bad pointer is the first error), then the handle
     let raw = {
         let c = us.procs.get_mut(&me).ok_or(Status::BadState)?;
-        copy_from_user(&mut c.aspace, mm, vmos, jobs, a[1], sp::ARGS_BYTES)?
+        copy_from_user(c.aspace.held_mut(), mm, vmos, jobs, a[1], sp::ARGS_BYTES)?
     };
     let w = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
     let (entry, arg, tp, stack_bytes, guard_bytes) = (w(0), w(1), w(2), w(3), w(4));
@@ -148,7 +148,11 @@ pub fn thread_spawn<M: PhysMem>(
         return Err(Status::BadState);
     }
     let own_stack = flags & sp::CALLER_STACK != 0;
-    let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+    let entry_ok = target
+        .aspace
+        .held_ref()
+        .region_perms_at(entry)
+        .is_some_and(|p| p.exec);
     let sizes_ok = stack_bytes <= sp::MAX_STACK && guard_bytes <= sp::MAX_STACK;
     let sp_ok = if own_stack {
         caller_sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&caller_sp)
@@ -193,8 +197,9 @@ pub fn thread_spawn<M: PhysMem>(
         let total = guard_len + stack_len + guard_len;
         let at = target
             .aspace
+            .held_ref()
             .find_gap(lo, hi, total, target.stack_hint)
-            .or_else(|| target.aspace.find_gap(lo, hi, total, lo));
+            .or_else(|| target.aspace.held_ref().find_gap(lo, hi, total, lo));
         match at {
             Some(at) => Some(at + guard_len),
             None => return Err(Status::NoMemory),
@@ -271,9 +276,10 @@ pub fn thread_spawn<M: PhysMem>(
             user: true,
         };
         let t = procs.get_mut(&tpid).expect("target exists");
-        if let Err(e) = t
-            .aspace
-            .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
+        if let Err(e) =
+            t.aspace
+                .held_mut()
+                .map_region(vmos, region, stack_len / 4096, vmo, 0, perms)
         {
             let _ = vmos.release(mm, jobs, vmo);
             jobs.credit(tjob, Resource::Pages, tables);
@@ -352,7 +358,11 @@ pub fn process_start(
     if total_threads(us) >= abi::limits::MAX_USER_THREADS {
         return Err(Status::NoMemory);
     }
-    let entry_ok = target.aspace.region_perms_at(entry).is_some_and(|p| p.exec);
+    let entry_ok = target
+        .aspace
+        .held_ref()
+        .region_perms_at(entry)
+        .is_some_and(|p| p.exec);
     let sp_ok = sp.is_multiple_of(16) && (abi::user::BASE..=abi::user::TOP).contains(&sp);
     if !entry_ok || !sp_ok {
         return Err(Status::InvalidArgs);

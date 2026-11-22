@@ -81,6 +81,23 @@ pub fn read_user_u32<M: PhysMem>(
     Ok((word >> ((pa & 4) * 8)) as u32)
 }
 
+/// The physical address of the 32-bit word at user address `va` (4-aligned, readable), with its page made resident (a lazily backed page is
+/// committed). `futex_wait` (L14) reads the word again under its bucket lock with `PhysMem::read_u64` on the address this returns, so that the
+/// compare and the enqueue are one step without a memory lock held; the caller keeps the page from going (the big kernel lock) until then.
+pub fn resolve_user_word<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    va: u64,
+) -> Result<u64, Status> {
+    if va & 3 != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    check_range(va, 4)?;
+    resolve(aspace, mm, vmos, jobs, va, Access::Read)
+}
+
 /// Read `len` bytes at user address `va`. A zero length succeeds without looking at `va`.
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: check_range proved va + len does not overflow and stays below the user limit; done < len bounds every slice and sum
 pub fn copy_from_user<M: PhysMem>(

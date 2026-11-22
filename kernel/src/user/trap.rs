@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn aspace_token_of(p: &Process) -> u64 {
-    crate::arch::aspace_token_asid(p.aspace.table().root(), p.tag.asid)
+    crate::arch::aspace_token_asid(p.aspace.root(), p.tag.asid)
 }
 
 /// The token to install for `p` on this hart (interrupts off, big lock held): a tag of an older generation names an ASID that may be
@@ -64,9 +64,16 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
             thread_pid,
             ..
         } = s;
-        let p = thread_pid
-            .get(&thread::current())
-            .and_then(|pid| procs.get_mut(pid))?;
+        let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+        crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
+        let p = procs.get_mut(&pid);
+        crate::percpu::this().cur_as.store(
+            p.as_ref().map_or(core::ptr::null_mut(), |p| {
+                alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
+            }),
+            Ordering::Release,
+        );
+        let p = p?;
         // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
         // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
         Some(install_token_of(asids, p))
@@ -97,6 +104,88 @@ const SWEEP_SLICE_BUDGET: usize = 256;
 
 pub(super) fn bump_attention() {
     ATTENTION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A user page fault resolved with **no big kernel lock** (L17 part c, KERNEL-V1-SPEC 4.5): the faulting hart takes its process's `AS` lock,
+/// then the memory locks (`VMO`, `JOBS`, `FRAME`), maps the page, and lets go. True: the page is mapped and the thread retries the instruction.
+/// False: nothing was changed that the full path would not do again (a bad address, a region that is not there, a page a pager has not
+/// supplied, no memory), and the trap takes the full path, which finds the same answer under the big lock and acts on it (a kill, a pager wait).
+///
+/// The process is the one `activate_current` (or the thread's first entry) recorded for this hart: the faulting thread belongs to it, and a
+/// process is torn down only when its last thread has gone, so the cell outlives this call. The lock is what keeps the space from changing under
+/// the fault: every other reach of the space (a map, an unmap, a protect, a copy) holds it too (AS1).
+pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
+    use crate::arch::{FaultKind, UserTrap};
+    let UserTrap::Fault(fault) = frame.decode_user() else {
+        return false;
+    };
+    if fault.kind != FaultKind::PageFault || fault.address >= abi::user::TOP {
+        return false;
+    }
+    let cell = crate::percpu::this().cur_as.load(Ordering::Acquire);
+    if cell.is_null() {
+        return false;
+    }
+    // SAFETY: see above: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for the whole call.
+    let cell = unsafe { &*cell };
+    let access = fault.access.unwrap_or(Access::Read);
+    let (r, log_pending) = {
+        let _as = cell.lock();
+        let space = cell.held_mut();
+        let r = {
+            let k = kmem::mem();
+            // (the pager-need slot is shared with the kernel copies of syscalls on other harts, which read it after they let the memory locks go:
+            // this fault must leave it as it found it; the need it may meet is in its error, and the full path asks again)
+            let saved = k.vmos.swap_need(None);
+            let r = space.handle_fault_mapped(k.mm, k.vmos, k.jobs, fault.address, access);
+            let _ = k.vmos.swap_need(saved);
+            r
+        };
+        // (MM8) translations this fault took away from the space (a write that replaced a shared page): every hart drops its TLB **before** the
+        // thread runs on, and by this fault's own hart, not by whichever hart syncs the global copy log first, so that the duty is not lost to it. The
+        // memory locks are let go first, as `cow_sync` does it.
+        if space.take_replaced() > 0 {
+            crate::smp::shootdown();
+            kmem::flush_tlb();
+        }
+        // The copy log (`COPY_PENDING`) is read while the lock is held: a sync takes every address space's lock, so none is running now, and
+        // one that follows finds what this fault logged. If it is set the big lock serialises with a sync that is already under way.
+        (r, kcore::aspace::COPY_PENDING.load(Ordering::Acquire))
+    };
+    let Ok(m) = r else {
+        return false;
+    };
+    if m.exec > 0 {
+        // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
+        crate::smp::icache_sync(m.exec);
+    }
+    kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
+    // The log's sync takes the big lock and can switch threads, so it is the full return to user mode (`activate_current` after a switch).
+    if log_pending {
+        crate::bkl::lock();
+        super::calls::cow_sync();
+        commit_wake();
+        thread::preempt_point();
+        activate_current(frame);
+        crate::bkl::unlock();
+    }
+    true
+}
+
+/// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call
+/// instruction. The process is the one `activate_current` recorded for this hart's running thread; the rest takes only the key's bucket lock
+/// and the scheduler's own locks. A wake that outranks this thread leaves `need_resched` set: the caller takes the lock for the switch.
+pub fn futex_wake_quiet(frame: &mut crate::trap::TrapFrame) {
+    let a = [
+        frame.arg(10),
+        frame.arg(11),
+        frame.arg(12),
+        frame.arg(13),
+        frame.arg(14),
+        frame.arg(15),
+    ];
+    let pid = crate::percpu::this().cur_pid.load(Ordering::Relaxed);
+    reply(frame, futex_wake(pid, a));
 }
 
 /// Has nothing happened since this hart last returned to user mode that could end or stop the thread it is about to resume? (No
@@ -136,10 +225,12 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
                 let pid = state().thread_pid.get(&thread::current()).copied();
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
-                        let k = kmem::get();
                         let p = state().procs.get_mut(&pid).expect("process exists");
+                        let _as = klock::aslock::AsCell::hold(&p.aspace);
+                        let k = kmem::get();
                         let r = p
                             .aspace
+                            .held_mut()
                             .handle_fault_mapped(k.mm, k.vmos, k.jobs, va, access);
                         if let Ok(m) = &r {
                             if m.exec > 0 {
@@ -315,11 +406,9 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
         nr::FUTEX_WAKE => {
-            let (r, woken) = futex_wake(a);
-            // wake exactly the sleepers that were removed from the table, by id (not everyone)
-            let tids: Vec<Tid> = woken.into_iter().map(|t| t as Tid).collect();
-            thread::wake_many(&tids);
-            reply(frame, r);
+            // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
+            let pid = irq::without(|| caller_pid(state()).unwrap_or(0));
+            reply(frame, futex_wake(pid, a));
         }
         nr::PROCESS_CREATE
         | nr::JOB_SET_SCHED
@@ -490,12 +579,14 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     {
         // (the memory locks are held only inside this block and in the two calls below that need them: every other call may take the
         // big kernel lock, which comes before them in the order)
+        let as_cell = p.aspace.clone();
+        let _as = klock::aslock::AsCell::hold(&as_cell); // (the caller's address space, before the memory locks)
         let k = kmem::get();
         let mut ctx = ksys::Ctx {
             objs: &mut *objs,
             handles: &mut p.handles,
             job: p.job,
-            aspace: &mut p.aspace,
+            aspace: as_cell.held_mut(),
             mm: k.mm,
             vmos: k.vmos,
             jobs: k.jobs,
@@ -524,8 +615,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 return fail(Status::TooBig);
             }
             let bytes = {
+                let _as = klock::aslock::AsCell::hold(&p.aspace);
                 let k = kmem::get();
-                copy_from_user(&mut p.aspace, k.mm, k.vmos, k.jobs, ptr, len)
+                copy_from_user(p.aspace.held_mut(), k.mm, k.vmos, k.jobs, ptr, len)
             }
             .map_err(|e| (e, None, None))?;
             emit(line, pass, failed, &bytes);

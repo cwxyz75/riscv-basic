@@ -134,7 +134,7 @@ pub fn pager_supply<M: PhysMem>(
     if us
         .procs
         .values()
-        .any(|p| p.job != src_job && p.aspace.maps_vmo_range(src, sfirst, count))
+        .any(|p| p.job != src_job && p.aspace.held_ref().maps_vmo_range(src, sfirst, count))
     {
         return Err(Status::BadState);
     }
@@ -144,7 +144,8 @@ pub fn pager_supply<M: PhysMem>(
     // the source's pages leave every address space that maps them, and every hart drops its translation, before the frames change owner
     let mut cleared = 0u64;
     for p in us.procs.values_mut() {
-        cleared = cleared.saturating_add(p.aspace.unmap_vmo_pages(mm, src, sfirst, count));
+        cleared =
+            cleared.saturating_add(p.aspace.held_mut().unmap_vmo_pages(mm, src, sfirst, count));
     }
     if cleared > 0 {
         machine.shootdown();
