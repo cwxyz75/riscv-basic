@@ -228,6 +228,14 @@ impl Jobs {
         self.live
     }
 
+    /// The ids of the live jobs (the root included), lowest slot first.
+    pub fn live_ids(&self) -> Vec<JobId> {
+        (0..MAX_JOBS as u32)
+            .map(JobId)
+            .filter(|&id| self.exists(id))
+            .collect()
+    }
+
     pub fn exists(&self, id: JobId) -> bool {
         self.rec(id).is_some()
     }

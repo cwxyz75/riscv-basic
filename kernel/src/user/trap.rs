@@ -484,6 +484,9 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     if let Some(status) = bad_args {
         return fail(status);
     }
+    if n == nr::JOB_INFO {
+        thread::charge_running(); // (`job_info` 9 and 10 read the CPU accounts: the caller's own running time is charged first)
+    }
     {
         // (the memory locks are held only inside this block and in the two calls below that need them: every other call may take the
         // big kernel lock, which comes before them in the order)
@@ -500,6 +503,8 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
                 skip_forced_touch: cfg!(feature = "fault-skip-forced-touch"),
             },
             harts_online: crate::smp::online() as u64,
+            job_sched: crate::thread::job_sched(),
+            now_ns: crate::timer::now_ns(),
             windows: crate::kmem::device_windows(),
         };
         if let Some(r) = ksys::ipc_call(n, a, &mut ctx) {

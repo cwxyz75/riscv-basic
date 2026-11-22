@@ -12198,6 +12198,131 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
     }
 }
 
+// --- The real-time demo (SCHED-SMP-SPEC 6.1, OS-ARCHITECTURE section 8; task 8) ---------------------------------------------------
+//
+// "A high-priority thread stays responsive while low-priority CPU hogs run": one hog per online hart at the default priority keeps every
+// hart busy, and a probe thread sleeps to a deadline 3 ms away 30 times and records how late each wake was. At a real-time priority the
+// lateness is small; at the hogs' own priority (the negative control) the probe waits for a slice end, so a bound that only passes when
+// the priority matters is the evidence that the bound means something.
+
+static RT_STOP: AtomicU32 = AtomicU32::new(0);
+static RT_PROBE_PRIO: AtomicU32 = AtomicU32::new(0);
+static RT_WORST_LATE_US: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn rt_hog(_: usize) -> ! {
+    while RT_STOP.load(Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    sys::thread_exit(0)
+}
+
+extern "C" fn rt_probe(_: usize) -> ! {
+    sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
+    let gate = sys::event_create().a1 as u64;
+    let mut worst = 0u64;
+    for _ in 0..30 {
+        let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
+        sys::object_wait(gate, 1 << 24, target);
+        // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
+        let late = sys::clock_ns().saturating_sub(target * 1_000_000);
+        worst = worst.max(late / 1000); // microseconds
+    }
+    RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
+    sys::handle_close(gate);
+    sys::thread_exit(0)
+}
+
+/// The probe's worst lateness (microseconds) at `prio` with a hog on every hart.
+fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
+    let harts = job_use(root_job()?, 7)?.0;
+    RT_STOP.store(0, Ordering::SeqCst);
+    RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
+    RT_WORST_LATE_US.store(u64::MAX, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        hogs.push(new_thread(rt_hog, 0)?);
+    }
+    nap_ticks(5); // the hogs are running, one per hart
+    let probe = new_thread(rt_probe, 0)?;
+    let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
+    RT_STOP.store(1, Ordering::SeqCst);
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    sys::handle_close(probe);
+    ensure_eq!(w.status, 0, "the probe finished");
+    Ok(RT_WORST_LATE_US.load(Ordering::SeqCst))
+}
+
+fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not() -> Outcome {
+    let rt = worst_lateness_us(40)?;
+    println!("##BENCH rt_user_latency_max_us {rt} us");
+    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late: the kernel's own probe uses the same 4 ms)
+    ensure!(
+        rt <= 4_000,
+        "a real-time thread woke {rt} us late with a hog on every hart (bound 4 ms)"
+    );
+    // the negative control: at the hogs' priority the wake waits for a slice to end
+    let normal = worst_lateness_us(10)?;
+    ensure!(
+        normal > 6_000,
+        "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
+    );
+    Ok(())
+}
+
+/// Spin for `ms` milliseconds of the clock.
+fn spin_ms(ms: u64) {
+    let until = sys::clock_get() + ms;
+    while sys::clock_get() < until {
+        core::hint::spin_loop();
+    }
+}
+
+/// SCHED-SMP-SPEC 4.5 and 4.10 (task 8): the CPU time a job's threads run is counted (`job_info` 10, the job and the jobs below it), and
+/// the part of it run at a real-time **base** priority is counted again in the window's figure (`job_info` 9), against the job's budget.
+fn job_info_counts_the_cpu_time_its_threads_run() -> Outcome {
+    let root = root_job()?;
+    let (_, budget) = job_use(root, 9)?;
+    ensure_eq!(
+        budget,
+        100_000_000,
+        "the root job's budget is the whole window"
+    );
+    let before = job_use(root, 10)?.0;
+    spin_ms(30);
+    let after = job_use(root, 10)?.0;
+    ensure!(
+        after >= before + 25_000_000,
+        "30 ms of spinning added only {} ns to the job's CPU time",
+        after - before
+    );
+    // at a real-time priority the same spin shows in the window's real-time figure (the window may end during it: 100 ms windows, so spin
+    // until a spin of 30 ms has been counted twice at most; the figure is what ran since the window began)
+    ok(sys::thread_set_sched(0, 40, 0), "become real-time")?;
+    let mut best = 0;
+    for _ in 0..4 {
+        spin_ms(30);
+        best = best.max(job_use(root, 9)?.0);
+    }
+    ok(sys::thread_set_sched(0, 10, 0), "back to the normal band")?;
+    ensure!(
+        best >= 25_000_000,
+        "the real-time figure never passed 25 ms with 120 ms of real-time spinning in 100 ms windows (best {best} ns)"
+    );
+    // a normal thread adds no real-time time: the figure stops growing when the window is the same and we run at priority 10
+    let (a, _) = job_use(root, 9)?;
+    spin_ms(10);
+    let (b, _) = job_use(root, 9)?;
+    ensure!(
+        b <= a + 5_000_000 || b < a,
+        "10 ms of normal-band spinning added {} ns of real-time time",
+        b.saturating_sub(a)
+    );
+    Ok(())
+}
+
 fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     let root = root_job()?;
     // a job is a job: the other kinds of handle are the wrong type
@@ -12231,7 +12356,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -12250,7 +12375,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -14333,6 +14458,14 @@ pub fn app_main() -> i32 {
         (
             "job_syscalls_check_handles_rights_and_arguments",
             job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "job_info_counts_the_cpu_time_its_threads_run",
+            job_info_counts_the_cpu_time_its_threads_run,
+        ),
+        (
+            "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not",
+            a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not,
         ),
         (
             "job_limits_stop_a_process_bomb_and_usage_comes_back",

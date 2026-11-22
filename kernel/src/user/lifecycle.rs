@@ -22,6 +22,10 @@ pub(super) fn user_thread_main(token: usize) {
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
         s.thread_pid.insert(thread::current(), ts.pid);
+        // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
+        if let Some(p) = s.procs.get(&ts.pid) {
+            thread::set_job(thread::current(), thread::job_sched().tag(p.job.index()));
+        }
         // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
         // SUSPENDED thread's spawner has made it already
         let tid = thread::current();

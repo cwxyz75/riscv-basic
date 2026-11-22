@@ -165,7 +165,7 @@ fn job_info_rows() {
         Status::AccessDenied
     );
     assert_eq!(
-        w.err(nr::JOB_INFO, [root, 9, 0, 0, 0, 0]),
+        w.err(nr::JOB_INFO, [root, 11, 0, 0, 0, 0]),
         Status::InvalidArgs
     );
     // the usage counts what was made: a channel is two objects, charged to the job
@@ -185,4 +185,54 @@ fn a_job_handle_is_a_full_register_and_a_value_that_names_nothing_is_bad_handle(
         assert_eq!(wide_argument_error(n, &[1 << 32, 0, 0, 0, 0, 0]), None);
         assert_eq!(w.err(n, [1 << 40 | 1, 0, 0, 0, 0, 0]), Status::BadHandle);
     }
+}
+
+/// SCHED-SMP-SPEC 4.5, 4.10: `job_info` 9 is the RT time run in the current window against the budget, 10 the CPU time of the job and
+/// the jobs below it; a reused slot starts from nothing.
+#[test]
+fn job_info_reports_rt_and_cpu_time_of_the_subtree() {
+    let mut w = world();
+    let root = root_handle(&mut w, Rights::JOB);
+    w.poke(BASE, &limits([NONE; 6]));
+    let a = w.ok(nr::JOB_CREATE, [root, BASE, 0, 0, 0, 0]).0.unwrap();
+    let b = w.ok(nr::JOB_CREATE, [a, BASE, 0, 0, 0, 0]).0.unwrap();
+    let ids = w.jobs.live_ids();
+    let (ja, jb) = (ids[1].index(), ids[2].index());
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [a, 9, 0, 0, 0, 0]),
+        (Some(0), Some(100_000_000))
+    );
+    let (ta, tb) = (w.job_sched.tag(ja), w.job_sched.tag(jb));
+    w.job_sched.charge(ta, 30_000_000, true, 40_000_000); // 30 ms of RT time in window 0
+    w.job_sched.charge(tb, 5_000_000, false, 45_000_000); // 5 ms of ordinary time in the child
+    assert_eq!(w.ok(nr::JOB_INFO, [a, 9, 0, 0, 0, 0]).0, Some(30_000_000));
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [a, 10, 0, 0, 0, 0]),
+        (Some(35_000_000), Some(0)),
+        "the job and the child"
+    );
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [b, 10, 0, 0, 0, 0]).0,
+        Some(5_000_000),
+        "the child alone"
+    );
+    assert_eq!(
+        w.ok(nr::JOB_INFO, [b, 9, 0, 0, 0, 0]).0,
+        Some(0),
+        "the child ran no RT time"
+    );
+}
+
+#[test]
+fn a_job_slot_that_is_used_again_starts_with_no_cpu_time() {
+    let mut w = world();
+    let root = root_handle(&mut w, Rights::JOB);
+    w.poke(BASE, &limits([NONE; 6]));
+    w.ok(nr::JOB_CREATE, [root, BASE, 0, 0, 0, 0]);
+    // (the next job takes slot 2: time left there by an earlier job must not show in it)
+    w.job_sched.charge(2, 9_000_000, true, 9_000_000);
+    let b = w.ok(nr::JOB_CREATE, [root, BASE, 0, 0, 0, 0]).0.unwrap();
+    assert_eq!(w.jobs.live_ids()[2].index(), 2);
+    assert_eq!(w.ok(nr::JOB_INFO, [b, 10, 0, 0, 0, 0]).0, Some(0));
+    assert_eq!(w.ok(nr::JOB_INFO, [b, 9, 0, 0, 0, 0]).0, Some(0));
 }
