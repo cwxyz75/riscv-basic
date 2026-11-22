@@ -12219,13 +12219,13 @@ extern "C" fn rt_hog(_: usize) -> ! {
 extern "C" fn rt_probe(_: usize) -> ! {
     sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
     let gate = sys::event_create().a1 as u64;
-    let cycles_per_ms = sys::debug_stat(105) / 1000;
     let mut worst = 0u64;
     for _ in 0..30 {
-        let target = sys::clock_get() + 3;
+        let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
         sys::object_wait(gate, 1 << 24, target);
-        let late = (cycles() as i64 - (target * cycles_per_ms) as i64).max(0) as u64;
-        worst = worst.max(late * 1000 / cycles_per_ms.max(1)); // microseconds
+        // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
+        let late = sys::clock_ns().saturating_sub(target * 1_000_000);
+        worst = worst.max(late / 1000); // microseconds
     }
     RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
     sys::handle_close(gate);
