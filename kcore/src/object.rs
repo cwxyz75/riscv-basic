@@ -41,6 +41,8 @@ pub trait Object {
     }
     /// Called when the peer has been destroyed.
     fn peer_destroyed(&mut self) {}
+    /// The objects this one watches (a port's bound objects, L21c): called when it is destroyed, so that their `watchers` counts go back down.
+    fn for_each_watched(&self, _f: &mut dyn FnMut(ObjId)) {}
     /// Does destroying this object require work the registry cannot do (freeing a VMO's
     /// pages, killing a process)? If so it is kept in the registry's graveyard for the owner
     /// to collect with [`Registry::drain_dead`].
@@ -515,6 +517,7 @@ impl<T: Object> Registry<T> {
             }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
+            obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
             // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
             // rather than failing a destruction: KT9)
             if work.try_reserve(obj.held_count()).is_ok() {
@@ -751,6 +754,7 @@ impl<T: Object> Registry<T> {
         }
         self.live -= 1;
         self.meter = self.meter.saturating_sub(obj.meter());
+        obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
         // The references a doomed object holds go away with it. Those to other doomed
         // objects are moot; those to survivors must be given back, or the survivor
         // could never be freed.
