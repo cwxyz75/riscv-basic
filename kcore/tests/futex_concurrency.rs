@@ -120,6 +120,7 @@ fn sleep_loop(table: &Mutex<Futexes>, park: &AtomicU32, who: u64, prepare_first:
         }
         let ready = !table.lock().unwrap().contains(who);
         if ready {
+            park.store(IDLE, Ordering::SeqCst); // (`cancel_block_on`: nothing stays prepared)
             return false;
         }
         if !prepare_first {

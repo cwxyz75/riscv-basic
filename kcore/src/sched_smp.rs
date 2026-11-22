@@ -944,6 +944,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.lq(hart).prepare_block()
     }
 
+    /// The current thread of `hart` is not going to wait after all: nothing stays prepared or notified.
+    pub fn cancel_block_on(&self, hart: usize) -> Result<(), Error> {
+        self.lq(hart).cancel_block()
+    }
+
     /// Block the current thread of `hart` unless a notification is waiting. Returns whether it blocked.
     pub fn block_on(&self, hart: usize) -> Result<bool, Error> {
         self.charge_now(hart); // (the outgoing thread's run is charged to it, before the designation changes: PR 273 review)

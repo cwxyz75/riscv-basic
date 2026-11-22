@@ -108,6 +108,13 @@ pub fn app_main() -> i32 {
                 core::hint::black_box(rt::sys::clock_get());
             }
         }
+        82 => {
+            // spin calling `futex_wake` on a word nobody sleeps on (L14)
+            static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            loop {
+                let _ = rt::sys::futex_wake(WORD.as_ptr(), 1);
+            }
+        }
         81 => {
             // spin calling `thread_yield` (L12c)
             loop {

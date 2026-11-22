@@ -107,10 +107,13 @@ pub(super) fn user_thread_main(token: usize) {
     crate::percpu::this()
         .active_aspace
         .store(token, Ordering::SeqCst);
-    // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
-    // (loads from this thread's stack and CSR writes) run before `sret`.
-    // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
-    // vector state loaded if a write gave it any, in this hart's entry frame
+    crate::percpu::this()
+        .cur_pid
+        .store(ts.pid, Ordering::Relaxed); // (the lock-free calls read it: L14)
+                                           // The lock is released here, with interrupts still off: only `enter_user`'s own instructions
+                                           // (loads from this thread's stack and CSR writes) run before `sret`.
+                                           // (EX1) the image the thread starts from (the spawner's or an earlier `thread_write_state`'s, or the one made at registration), with its FP and
+                                           // vector state loaded if a write gave it any, in this hart's entry frame
     let entry_frame = {
         let image = state().initial_regs.remove(&thread::current());
         let image = image.unwrap_or_else(|| {

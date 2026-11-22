@@ -479,7 +479,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     // An inter-hart interrupt (an external one carrying only message 1, `external_trap`) takes the lock only when it has scheduling to do; a secondary
     // hart's timer before the scheduler exists touches nothing shared.
     let light = cause == (1 << 63) | 5 && !ready;
-    // L12c: `clock_get` and `thread_yield` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
+    // L12c, L14: `clock_get`, `thread_yield` and `futex_wake` from user mode need no big lock (a yield takes it only to switch), when the return is quiet
     // (no kill or stop recorded) and the user's FP state is not dirty.
     if from_user && cause == 8 && ready && lock_free_syscall(frame) {
         // handled

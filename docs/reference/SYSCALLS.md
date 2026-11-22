@@ -478,7 +478,7 @@ pages. The tree is data from the firmware: the reader (`kcore::fdt::parse`) is h
 ### futex_wait(address, expected, deadline) -> status
 
 Sleep if the 32-bit word at `address` (in the caller's address space) still equals `expected`. The
-check and the enqueue are one step under the key's bucket lock (no big kernel lock is held while it sleeps, and `futex_wake` takes none: L14), so a wake that follows a user-mode store
+check and the enqueue are one step under the key's bucket lock (no big kernel lock is held while it sleeps, and `futex_wake` takes it only for a switch its wake asked for, or when a kill, stop or dirty FP state needs the full path: L14), so a wake that follows a user-mode store
 to the word is never lost; the word is read with one aligned atomic load. `deadline` is an absolute
 time in nanoseconds: `0` polls (equal: TIMED_OUT at once, no sleep), `u64::MAX` waits forever. OK when woken (the
 sleeper left the table because of a `futex_wake`); spurious wakeups are allowed, so callers re-check.

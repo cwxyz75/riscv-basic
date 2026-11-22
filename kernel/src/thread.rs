@@ -516,7 +516,7 @@ fn reap_if_dead(tid: Tid) {
 /// A wake (or a priority change, or a new thread) may have designated another thread for this hart: send the pokes it owes, and if
 /// the designation is no longer the thread that is running, remember it (`need_resched`). **A wake never switches** (SCHED-SMP-SPEC
 /// X7): the switch happens at the next defined point, `preempt_point`: the end of the outermost critical section (`irq::without`),
-/// the return to user mode, or the thread's own block, yield or exit. Interrupts are off and the big kernel lock is held.
+/// the return to user mode, or the thread's own block, yield or exit. Interrupts are off; the big kernel lock is held except on the quiet `futex_wake` path (L14).
 fn note_resched() {
     let h = hart();
     let (pokes, switch) = {
@@ -1043,8 +1043,8 @@ pub fn wait_deadline_private(ready: impl FnMut() -> bool, deadline: u64) -> bool
 
 /// `wait_deadline_private` for a wait whose waker holds no big kernel lock (L14, the futex): the thread **prepares first** and only then
 /// looks at its condition (SCHED-SMP-SPEC 3.7), so a wake that dequeues the thread after the look finds it prepared and is not lost. (Under
-/// the big lock the look could come first, as nothing could interleave; the futex's wake no longer takes it.) A thread that leaves with a
-/// preparation standing meets it as a spurious early return of its next block, which every wait in the kernel rechecks.
+/// the big lock the look could come first, as nothing could interleave; the futex's wake no longer takes it.) A thread that leaves cancels the
+/// preparation, so it never runs user code with a park word set.
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn wait_deadline_futex(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
     let mut slept = false;
@@ -1055,9 +1055,11 @@ pub fn wait_deadline_futex(mut ready: impl FnMut() -> bool, deadline: u64) -> bo
             crate::user::cow_sync();
             let _ = sched().prepare_block_on(hart());
             if ready() {
+                let _ = sched().cancel_block_on(hart()); // (a wake that dequeued us after the look is spent: nothing stays prepared)
                 return Some(true);
             }
             if now_ns() >= deadline {
+                let _ = sched().cancel_block_on(hart());
                 return Some(false);
             }
             count_sleep(&mut slept);
