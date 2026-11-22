@@ -12357,9 +12357,10 @@ fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
         (95_000_000..=105_000_000).contains(&spun),
         "a thread that spun for 100 ms was charged {spun} ns"
     );
+    // (the thread's start-up, its event and its two calls cost about a millisecond on a loaded CI machine: the point is that 50 ms of sleep cost nothing)
     ensure!(
-        slept < 1_000_000,
-        "a thread that slept was charged {slept} ns"
+        slept < 5_000_000,
+        "a thread that slept 50 ms was charged {slept} ns"
     );
     // an ended thread's handle keeps the total
     let spun_handle = ok(sys::thread_cpu_ns(spin), "thread cpu of an ended thread")?.a1 as u64;
