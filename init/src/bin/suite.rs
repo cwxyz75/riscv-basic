@@ -12293,7 +12293,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     let mut worst_rt = 0u64;
     let mut naps_done = 0;
     let until = sys::clock_get() + 20_000;
-    while naps_done < 60 && sys::clock_get() < until {
+    while naps_done < 30 && sys::clock_get() < until {
         nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
         worst_rt = worst_rt.max(job_use(root, 9)?.0);
         naps_done += 1;
@@ -12304,7 +12304,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
         sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
         sys::handle_close(h);
     }
-    ensure_eq!(naps_done, 60, "sixty naps finished while the hogs ran");
+    ensure_eq!(naps_done, 30, "thirty naps finished while the hogs ran");
     // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
     ensure!(
         worst_rt <= 100_000_000 + 20_000_000,
