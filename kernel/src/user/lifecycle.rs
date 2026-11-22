@@ -308,10 +308,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         p.live_tids.remove(&tid);
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
-        let cpu = {
-            thread::charge_here(); // (this thread's last interval counts; it runs here)
-            thread::cpu_ns(tid)
-        };
+        let cpu = thread::charge_and_cpu_ns(); // (this thread's last interval counts; it runs here)
         let tobj = p.thread_objs.remove(&tid);
         ipc::thread_cpu_final(objs, tobj, p.obj, cpu);
         if let Some(o) = tobj {

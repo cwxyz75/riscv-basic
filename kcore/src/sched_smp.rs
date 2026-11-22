@@ -352,6 +352,14 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.read_record(tid, |r| r.state)
     }
     /// A copy of the thread's record.
+    /// Charge hart `h`'s running thread up to now and read thread `tid`'s CPU time, which is that thread when it runs on `h` (one run-queue lock for
+    /// both: a thread's exit asks for its own final figure).
+    pub fn charge_and_cpu_on(&self, h: usize, tid: Tid) -> Option<Time> {
+        self.charge_now(h);
+        let mine = self.lq(h).record(tid).map(|r| r.cpu);
+        mine.or_else(|| self.cpu_of(tid))
+    }
+
     /// A thread's CPU nanoseconds so far (`record(tid).cpu` without cloning the record).
     pub fn cpu_of(&self, tid: Tid) -> Option<Time> {
         self.read_record(tid, |r| r.cpu)

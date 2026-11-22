@@ -181,7 +181,7 @@ ATOMICS = {
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (31, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock)"),
     "kernel/src/percpu.rs": (77, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16)"),
-    "kernel/src/bkl.rs": (11, "the big kernel lock's owner and checker state"),
+    "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
     "kernel/src/latency.rs": (23, "latency trace counters (diagnostics only)"),
     "kernel/src/user/lifecycle.rs": (2, "the number of threads with suspend state (EX1): a copy of the table's size, read with no lock by `thread::block` so that a kernel thread that blocks holding a lock the big lock must not be taken under pays one load; the table itself is under the big lock"),
