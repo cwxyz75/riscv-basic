@@ -792,7 +792,7 @@ Watch `object` for `mask`; report it under `key` (chosen by the caller, unique w
 port). Rights: MANAGE on `port`, WAIT on `object`. `mask` must be non-empty and within the
 waitable signals. Errors, in order: BAD_HANDLE (port, then object); WRONG_TYPE (`port` is not
 a port); ACCESS_DENIED; INVALID_ARGS (bad mask; `object` is a port; `key` already bound);
-NO_MEMORY (no room for the binding: it costs 32 bytes of the port's job queued-data quota and of the system-wide budget; there is no fixed count). `flags` is `0` or `ONESHOT` (`abi::port_flags`, 1); any other bit is INVALID_ARGS (checked with the mask).
+NO_MEMORY (no room for the binding: it costs 32 bytes of the port's job queued-data quota and of the system-wide budget; there is no fixed count). `flags` is `0` or `ONESHOT` (`abi::port_flags`, 1); any other bit is INVALID_ARGS (checked with the mask). **The binding ends when the handle it was made through is closed, replaced or sent away** (L21c; a binding made through another handle to the same object stays), and when its object dies.
 
 ### port_rearm(port, key) -> status
 
@@ -808,7 +808,7 @@ Wait until some binding is ready or the absolute time `deadline` (nanoseconds) p
 `u64::MAX`: no deadline), then return one ready binding's `key` and `observed` (`signals &
 mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
 Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;
-ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once.
+ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once. **When a port becomes ready it wakes one waiter, the first in line** (L21b); that waiter's poll passes the wake on to the next while a binding is still ready, so threads waiting on one port take bindings in turn and the others stay asleep.
 
 ### port_wait_many(port, buffer, capacity, deadline) -> status, count
 

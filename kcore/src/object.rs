@@ -41,6 +41,8 @@ pub trait Object {
     }
     /// Called when the peer has been destroyed.
     fn peer_destroyed(&mut self) {}
+    /// The objects this one watches (a port's bound objects, L21c): called when it is destroyed, so that their `watchers` counts go back down.
+    fn for_each_watched(&self, _f: &mut dyn FnMut(ObjId)) {}
     /// Does destroying this object require work the registry cannot do (freeing a VMO's
     /// pages, killing a process)? If so it is kept in the registry's graveyard for the owner
     /// to collect with [`Registry::drain_dead`].
@@ -70,6 +72,9 @@ struct Slot<T> {
     job: Option<JobId>,
     /// The epoch of the sweep that last marked this object reachable (MM10); an object created during a sweep gets the sweep's epoch.
     mark: u64,
+    /// How many port bindings name this object (L21c): a handle removed to an object that no port binds needs no look at the ports. It can run
+    /// high (a port that died with its bindings does not hand them back), never low.
+    watchers: u32,
 }
 
 /// Bytes of bookkeeping the registry keeps around each object (its slot: generation, koid, count, the job the object is charged to), for the
@@ -100,6 +105,9 @@ pub struct Registry<T: Object> {
     dirty: Vec<(ObjId, bool)>,
     /// The log filled up and was dropped: the consumer must treat every object as touched.
     dirty_overflow: bool,
+    /// Handles removed since the last `take_gone` (L21c): the object, the identity of the table and the handle's value. Bindings of a port made through
+    /// one of them end.
+    gone: Vec<(ObjId, u64, u64)>,
     /// The work list of `release` (objects whose last reference just went), kept between calls so a release never allocates.
     work: Vec<ObjId>,
     /// The dirty log's twin: `take_dirty` swaps it in (`recycle_dirty` gives the emptied log back), so taking the log allocates nothing.
@@ -182,6 +190,7 @@ impl<T: Object> Registry<T> {
             credits: Vec::with_capacity(PREALLOC_SLOTS),
             dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
+            gone: Vec::new(),
             work: Vec::with_capacity(PREALLOC_SLOTS),
             dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
             spare: Vec::new(),
@@ -238,6 +247,36 @@ impl<T: Object> Registry<T> {
     /// wake whatever its signals say, to re-validate their handle.
     pub fn touch_forced(&mut self, id: ObjId) {
         self.log(id, true);
+    }
+
+    /// A handle to `obj` was removed (`table` is the table's identity, `handle` the value it had): remembered if some port binds the object, so that
+    /// the bindings made through that handle can end (L21c). Never fails: a note that cannot be made leaves a binding that outlives its handle
+    /// (T61's old behaviour), not a failure of the close.
+    pub fn handle_gone(&mut self, obj: ObjId, table: u64, handle: u64) {
+        if self.slot(obj).is_some_and(|s| s.watchers > 0) && self.gone.try_reserve(1).is_ok() {
+            self.gone.push((obj, table, handle));
+        }
+    }
+
+    /// The handles removed since the last call (oldest first), for ending the bindings made through them.
+    pub fn take_gone(&mut self) -> Vec<(ObjId, u64, u64)> {
+        core::mem::take(&mut self.gone)
+    }
+
+    /// One more (`delta` 1) or one fewer (`-1`) port binding names `obj`.
+    pub fn watch_adjust(&mut self, obj: ObjId, delta: i32) {
+        if let Some(s) = self.slot_mut(obj) {
+            s.watchers = if delta >= 0 {
+                s.watchers.saturating_add(1)
+            } else {
+                s.watchers.saturating_sub(1)
+            };
+        }
+    }
+
+    /// How many port bindings name `obj` (at least: see `Slot::watchers`).
+    pub fn watch_count(&self, obj: ObjId) -> u32 {
+        self.slot(obj).map_or(0, |s| s.watchers)
     }
 
     /// Everything touched since the last call, oldest first (duplicates possible).
@@ -325,6 +364,7 @@ impl<T: Object> Registry<T> {
             slot.obj = Some(obj);
             slot.job = job;
             slot.mark = born_mark;
+            slot.watchers = 0;
             ObjId {
                 index,
                 gen: slot.gen,
@@ -337,6 +377,7 @@ impl<T: Object> Registry<T> {
                 obj: Some(obj),
                 job,
                 mark: born_mark,
+                watchers: 0,
             });
             ObjId {
                 index: self.slots.len() as u32 - 1,
@@ -461,6 +502,7 @@ impl<T: Object> Registry<T> {
             }
             self.live -= 1;
             self.meter = self.meter.saturating_sub(obj.meter());
+            obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
             // (room for the references the object held, before they are queued: if there is none they are leaked, which `sweep` reclaims later,
             // rather than failing a destruction: KT9)
             if work.try_reserve(obj.held_count()).is_ok() {
@@ -697,6 +739,7 @@ impl<T: Object> Registry<T> {
         }
         self.live -= 1;
         self.meter = self.meter.saturating_sub(obj.meter());
+        obj.for_each_watched(&mut |o| self.watch_adjust(o, -1));
         // The references a doomed object holds go away with it. Those to other doomed
         // objects are moot; those to survivors must be given back, or the survivor
         // could never be freed.

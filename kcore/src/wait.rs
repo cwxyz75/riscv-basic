@@ -15,10 +15,23 @@ use alloc::vec::Vec;
 /// A thread id as the kernel names it.
 pub type Waiter = u64;
 
+/// What a registration waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Any of these signals on the object.
+    Mask(u32),
+    /// A `port_wait`: a thread that will **poll** the port when it wakes, which is what lets a port wake one such waiter and rely on the poll to
+    /// pass the wake on (L21b). A plain wait on a port's READABLE (`object_wait`) does not poll, so it never takes the baton.
+    Poller(u32),
+    /// The reply with this transaction id on a channel end (a `channel_call`, L21d), or the peer going: not READABLE, which any queued message
+    /// would also raise.
+    Call(u32),
+}
+
 #[derive(Default)]
 pub struct WaitTable {
     /// The registrations on each object: (thread, the signals it waits for).
-    regs: BTreeMap<ObjId, Vec<(Waiter, u32)>>,
+    regs: BTreeMap<ObjId, Vec<(Waiter, Kind)>>,
     /// The object each registered thread waits on (a thread waits on one object at a time).
     by_thread: BTreeMap<Waiter, ObjId>,
     /// The ports with waiters that bind each object (L21a): a port's READABLE follows the objects bound to it, so a touch of one of them is
@@ -37,7 +50,10 @@ impl WaitTable {
     /// replaced.
     pub fn register(&mut self, thread: Waiter, obj: ObjId, mask: u32) {
         self.forget(thread);
-        self.regs.entry(obj).or_default().push((thread, mask));
+        self.regs
+            .entry(obj)
+            .or_default()
+            .push((thread, Kind::Mask(mask)));
         self.by_thread.insert(thread, obj);
     }
 
@@ -57,9 +73,33 @@ impl WaitTable {
         true
     }
 
-    /// `register` on a port: `thread` waits for any of `mask` on `port`, which binds `bound` now (L21a).
+    /// `thread` waits for the reply with transaction id `txid` on channel end `ch` (or its peer closing): a `channel_call` (L21d). An unrelated
+    /// message that arrives on the end does not release it.
+    pub fn register_call(&mut self, thread: Waiter, ch: ObjId, txid: u32) {
+        self.forget(thread);
+        self.regs
+            .entry(ch)
+            .or_default()
+            .push((thread, Kind::Call(txid)));
+        self.by_thread.insert(thread, ch);
+    }
+
+    /// `register` on a port: `thread` waits for any of `mask` on `port`, which binds `bound` now (L21a). It is released with every other such waiter
+    /// when the port turns ready (an `object_wait`); `register_poller` is the `port_wait` kind that takes the baton.
     pub fn register_port(&mut self, thread: Waiter, port: ObjId, mask: u32, bound: Vec<ObjId>) {
         self.register(thread, port, mask);
+        self.watch_port(port, bound);
+    }
+
+    /// `thread` is in `port_wait` (or `port_wait_many`) on `port`, which binds `bound` now: it will poll the port when it wakes, so the port wakes one
+    /// such waiter at a time (L21b).
+    pub fn register_poller(&mut self, thread: Waiter, port: ObjId, mask: u32, bound: Vec<ObjId>) {
+        self.forget(thread);
+        self.regs
+            .entry(port)
+            .or_default()
+            .push((thread, Kind::Poller(mask)));
+        self.by_thread.insert(thread, port);
         self.watch_port(port, bound);
     }
 
@@ -124,6 +164,7 @@ impl WaitTable {
         &mut self,
         signals: impl Fn(ObjId) -> Option<u32>,
         bound: impl Fn(ObjId) -> Vec<ObjId>,
+        call_ready: impl Fn(ObjId, u32) -> bool,
         dirty: impl core::borrow::Borrow<Dirty>,
     ) -> Vec<Waiter> {
         let dirty: &Dirty = dirty.borrow();
@@ -132,31 +173,43 @@ impl WaitTable {
             // the log lost entries (forced touches among them): release everyone, they re-check
             let all: Vec<ObjId> = self.regs.keys().copied().collect();
             for obj in all {
-                self.fire(obj, true, &signals, &mut woken);
+                self.fire(obj, true, &signals, &call_ready, &mut woken);
             }
             self.watchers.clear();
             self.watching.clear();
         }
-        // (the log names an object once for every `get_mut` of it: an object and a port are looked at once per commit)
-        let mut done: BTreeSet<(ObjId, bool)> = BTreeSet::new();
-        let mut ports_done: BTreeSet<ObjId> = BTreeSet::new();
+        // (the log names an object once for every `get_mut` of it: each object is looked at once per commit, forced if any of its entries was, and a port
+        // that a bound object's touch would evaluate again is evaluated once)
+        let mut order: Vec<ObjId> = Vec::new();
+        let mut forced_of: BTreeMap<ObjId, bool> = BTreeMap::new();
         for &(obj, forced) in &dirty.items {
-            if !done.insert((obj, forced)) {
-                continue;
+            match forced_of.get_mut(&obj) {
+                Some(f) => *f |= forced,
+                None => {
+                    forced_of.insert(obj, forced);
+                    order.push(obj);
+                }
             }
+        }
+        let mut fired: BTreeSet<ObjId> = BTreeSet::new();
+        for obj in order {
+            let forced = forced_of.get(&obj).copied().unwrap_or(false);
             // (a port touched itself: what it binds may have changed)
             if self.watching.contains_key(&obj) {
                 self.watch_port(obj, bound(obj));
             }
-            self.fire(obj, forced, &signals, &mut woken);
+            if forced || !fired.contains(&obj) {
+                self.fire(obj, forced, &signals, &call_ready, &mut woken);
+            }
+            fired.insert(obj);
             // the ports that bind the touched object
             let ports: Vec<ObjId> = self
                 .watchers
                 .get(&obj)
                 .map_or_else(Vec::new, |s| s.iter().copied().collect());
             for port in ports {
-                if ports_done.insert(port) {
-                    self.fire(port, false, &signals, &mut woken);
+                if fired.insert(port) {
+                    self.fire(port, false, &signals, &call_ready, &mut woken);
                 }
             }
         }
@@ -168,20 +221,36 @@ impl WaitTable {
         obj: ObjId,
         forced: bool,
         signals: &impl Fn(ObjId) -> Option<u32>,
+        call_ready: &impl Fn(ObjId, u32) -> bool,
         woken: &mut Vec<Waiter>,
     ) {
         let Some(list) = self.regs.get_mut(&obj) else {
             return;
         };
         let now = signals(obj);
+        // (a port wakes **one** waiter, the first in line, when it turns readable: the others stay asleep. The waiter that was woken polls, which logs
+        // the port, so the commit that follows looks at it again and wakes the next one if a binding is still ready: the baton, L21b)
+        let mut baton_out = false;
         let mut keep = Vec::with_capacity(list.len());
-        for (thread, mask) in list.drain(..) {
-            let release = forced || now.is_none_or(|s| s & mask != 0);
+        for (thread, kind) in list.drain(..) {
+            let by_signals = match kind {
+                Kind::Mask(mask) | Kind::Poller(mask) => now.is_some_and(|s| s & mask != 0),
+                Kind::Call(txid) => {
+                    now.is_some_and(|s| s & abi::signals::PEER_CLOSED != 0) || call_ready(obj, txid)
+                }
+            };
+            let release = if forced || now.is_none() {
+                true // (a removed handle, or the object gone: everyone re-validates)
+            } else if by_signals && matches!(kind, Kind::Poller(_)) {
+                !core::mem::replace(&mut baton_out, true)
+            } else {
+                by_signals
+            };
             if release {
                 self.by_thread.remove(&thread);
                 woken.push(thread);
             } else {
-                keep.push((thread, mask));
+                keep.push((thread, kind));
             }
         }
         if keep.is_empty() {

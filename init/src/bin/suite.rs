@@ -6372,6 +6372,85 @@ fn port_wait_blocks_until_an_object_is_ready() -> Outcome {
 /// Slice W step 6: a one-shot binding is delivered once and stays quiet (though its level is still
 /// high) until `port_rearm`; a blocked waiter is woken by the re-arm; and a port takes far more
 /// bindings than the old fixed cap of 256 (the job quota is the limit).
+static PW_DONE: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn pw_waiter(arg: usize) -> ! {
+    let r = sys::port_wait(arg as u64, sys::clock_get() + 8_000);
+    if r.status == 0 && r.a1 == 7 {
+        PW_DONE.fetch_add(1, Ordering::SeqCst);
+    }
+    sys::thread_exit(0)
+}
+
+/// L21b: a port wakes one waiter and the poll of that waiter passes the baton, so every thread waiting on a port whose binding is ready (and stays
+/// ready: it is level-triggered) gets its turn and reports the binding.
+fn several_waiters_on_one_port_are_woken_in_turn() -> Outcome {
+    PW_DONE.store(0, Ordering::SeqCst);
+    let p = port()?;
+    let ev = event()?;
+    ok(sys::port_bind(p, ev, 1 << 24, 7), "bind")?;
+    let mut ts = Vec::new();
+    for _ in 0..5 {
+        ts.push(new_thread(pw_waiter, p as usize)?);
+    }
+    nap_ticks(30); // all of them are asleep in port_wait
+    ensure_eq!(
+        PW_DONE.load(Ordering::SeqCst),
+        0,
+        "a waiter returned with nothing ready"
+    );
+    ok(sys::event_signal(ev, 0, 1 << 24), "signal")?;
+    for t in &ts {
+        let w = sys::object_wait(*t, sig::TERMINATED, sys::clock_get() + 8_000);
+        ensure_eq!(w.status, 0, "a waiter finished");
+    }
+    for t in ts {
+        sys::handle_close(t);
+    }
+    ensure_eq!(
+        PW_DONE.load(Ordering::SeqCst),
+        5,
+        "every waiter was woken in turn and saw the binding"
+    );
+    Ok(())
+}
+
+/// L21c (T61): a binding ends with the handle it was made through; a binding made through another handle to the same object stays.
+fn a_binding_ends_with_the_handle_it_was_made_through() -> Outcome {
+    let p = port()?;
+    let ev = event()?;
+    let dup = ok(sys::handle_duplicate(ev, Rights::SAME.0), "duplicate")?.a1 as u64;
+    ok(
+        sys::port_bind(p, ev, 1 << 24, 1),
+        "bind through the first handle",
+    )?;
+    ok(
+        sys::port_bind(p, dup, 1 << 25, 2),
+        "bind through the duplicate",
+    )?;
+    ok(
+        sys::event_signal(ev, 0, (1 << 24) | (1 << 25)),
+        "signal both",
+    )?;
+    let r = sys::port_wait(p, 0);
+    ensure_eq!(r.status, 0, "both bindings are ready");
+    // the first handle goes: its binding goes with it, and only the duplicate's key (2) is ever reported again
+    ok(sys::handle_close(ev), "close the first handle")?;
+    for _ in 0..4 {
+        let r = sys::port_wait(p, 0);
+        ensure!(
+            r.status == 0 && r.a1 == 2,
+            "a binding made through a closed handle was still reported (status {}, key {})",
+            r.status,
+            r.a1
+        );
+    }
+    ok(sys::handle_close(dup), "close the duplicate")?;
+    let r = sys::port_wait(p, sys::clock_get() + 20);
+    ensure_eq!(st(r), Some(S::TimedOut), "no binding is left");
+    Ok(())
+}
+
 fn port_oneshot_rearm_and_many_bindings() -> Outcome {
     let p = port()?;
     let ev = event()?;
@@ -14778,6 +14857,8 @@ pub fn app_main() -> i32 {
             lua_script_matches_the_host_build,
         ),
         ("futex_argument_errors", futex_argument_errors),
+        ("several_waiters_on_one_port_are_woken_in_turn", several_waiters_on_one_port_are_woken_in_turn),
+        ("a_binding_ends_with_the_handle_it_was_made_through", a_binding_ends_with_the_handle_it_was_made_through),
         ("pi_futex_bounds_inversion", pi_futex_bounds_inversion),
         ("pi_futex_owner_death_poisons", pi_futex_owner_death_poisons),
         ("pi_futex_deadlock_is_refused", pi_futex_deadlock_is_refused),
