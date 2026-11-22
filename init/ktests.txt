@@ -38,6 +38,7 @@ process_start_argument_checks
 fetch_the_program_image
 fetch_the_hello_image
 child_exit_code_and_terminated_signal
+debug_calls_need_a_debug_resource
 child_faults_are_contained
 parent_and_child_talk
 kill_a_spinning_child

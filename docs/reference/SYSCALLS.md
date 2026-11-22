@@ -140,11 +140,11 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 
 | # | Call | Arguments | Results |
 |---|---|---|---|
-| 0 | debug_write | `a0` ptr, `a1` len | |
+| 0 | debug_write | `a0` debug (WRITE), `a1` ptr, `a2` len | |
 | 1 | process_exit | `a0` code | does not return |
 | 2 | thread_yield | | |
 | 3 | clock_get | | `a1` nanoseconds since boot |
-| 4 | debug_stat | `a0` which | `a1` the kernel counter |
+| 4 | debug_stat | `a0` debug (INSPECT), `a1` which | `a1` the kernel counter |
 | 10 | handle_close | `a0` handle | |
 | 11 | handle_duplicate | `a0` handle, `a1` rights | `a1` new handle |
 | 12 | handle_replace | `a0` handle, `a1` rights | `a1` new handle |
@@ -215,6 +215,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
 | 95 | resource_root | | `a1` handle |
+| 114 | debug_root | | `a1` handle |
 | 100 | interrupt_create | `a0` resource, `a1` source | `a1` handle |
 | 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
 | 110 | futex_wait | `a0` address, `a1` expected, `a2` deadline | |
@@ -250,9 +251,9 @@ touches memory, whatever the pointer. A call that fails on a pointer changes not
 `debug_write` is limited to 4096 bytes per call (TOO_BIG beyond). It is a debugging aid for
 the trusted boot-time suite: nothing ties a `##TEST` line to the program that wrote it.
 
-### debug_stat(which) -> value
+### debug_stat(debug, which) -> value
 
-A measuring aid for the boot-time suite (like `debug_write`; no rights, no effect on the system): `a1` is
+A measuring aid for the boot-time suite (like `debug_write`; needs a **debug resource** handle with INSPECT, HD4: BAD_HANDLE, WRONG_TYPE for a handle of another kind, ACCESS_DENIED without the right; no effect on the system): `a1` is
 a kernel counter, `which` 0 the number of times a thread blocked in a wait, 1 how many of those blocks
 were by a thread that had been woken without being satisfied (a *spurious wake*), 2 how many threads
 were woken; 3 device interrupts taken on the AIA, 4 how many of those on a hart other than the boot hart, 5 how many on a hart they were not aimed at (always 0). 6 the `time` counter (10 MHz on QEMU `virt`: the benchmarks' clock), 7 whether the kernel command line has `bench=full` (1) or not (0), 13 which part of the suite the kernel line asks for (0 all, 1 `shard=a`, 2 `shard=b`; the smoke tier runs the two as parallel boots, OD121). Any other index reads 0. The counters only grow. They exist to measure the wake path
@@ -263,14 +264,16 @@ nearly every syscall.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
 
-`which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
+`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
 
-### debug_write(ptr, len) -> status
+### debug_write(debug, ptr, len) -> status
 
-Sends bytes to the serial console. Rights: none (a debugging aid for the boot-time
-suite; real processes get a console channel in S4). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
-Errors: INVALID_ARGS (bad pointer);
-TOO_BIG (len over 4096).
+Sends bytes to the serial console. Rights: WRITE on a **debug resource** handle (HD4: the process the kernel starts gets one from `debug_root`, and hands a duplicate on in its startup message (`Role::Debug`) to the trusted services it starts; the launcher does not pass one to the programs it starts for clients. A program without one is refused (BAD_HANDLE, WRONG_TYPE for another kind, ACCESS_DENIED without WRITE) and prints nothing, so it can no longer forge a `##TEST` line; real processes have a console channel). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG (len over 4096); INVALID_ARGS (bad pointer). Tests: `debug_calls_need_a_debug_resource`, `debug_write_pointer_rules`.
+
+### debug_root() -> debug
+
+The debug resource (HD4): a new object of kind debug, with a handle carrying DUPLICATE, TRANSFER, WRITE and INSPECT. Only a privileged process (the one the kernel starts) may ask: ACCESS_DENIED otherwise; NO_MEMORY. Test: `the_root_handles_are_for_privileged_processes_only` (`ksys/tests/proc_calls.rs`), `debug_calls_need_a_debug_resource`.
 
 ### process_exit(code) -> does not return
 

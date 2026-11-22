@@ -161,7 +161,8 @@ pub fn start_stack(
         let Ok(bytes) = st.encode() else {
             return Err(32);
         };
-        rt::spawn::spawn_in(image, &bytes, handles, session).map_err(|e| {
+        // (the services of a user's session are quiet and its shell is the user's: none holds a debug resource, HD4)
+        rt::spawn::spawn_in_exact(image, &bytes, handles, session).map_err(|e| {
             sys::debug_write(
                 alloc::format!(
                     "sessiond: could not start {}: {e:?}\n",

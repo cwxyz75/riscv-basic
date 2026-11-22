@@ -172,6 +172,9 @@ pub mod rights {
         );
         /// The root resource: mint device memory, DMA buffers and interrupts. Held only by early boot code.
         pub const RESOURCE: Rights = Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0);
+        /// A debug resource (HD4): `debug_write` needs WRITE, `debug_stat` INSPECT; it can be duplicated and handed on.
+        pub const DEBUG: Rights =
+            Rights(Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WRITE.0 | Self::INSPECT.0);
         /// An interrupt object: wait for it, inspect it, acknowledge it (MANAGE).
         pub const INTERRUPT: Rights = Rights(
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::WAIT.0 | Self::INSPECT.0 | Self::MANAGE.0,
@@ -338,11 +341,13 @@ pub mod time {
 
 /// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
 pub mod syscall {
+    /// `debug_write(debug, ptr, len)`: needs a debug resource handle with WRITE (HD4).
     pub const DEBUG_WRITE: usize = 0;
     pub const PROCESS_EXIT: usize = 1;
     pub const THREAD_YIELD: usize = 2;
     pub const CLOCK_GET: usize = 3;
     /// A kernel counter by index (a measuring aid for the boot-time suite, like `DEBUG_WRITE`).
+    /// `debug_stat(debug, which)`: needs a debug resource handle with INSPECT (HD4).
     pub const DEBUG_STAT: usize = 4;
     pub const HANDLE_CLOSE: usize = 10;
     pub const HANDLE_DUPLICATE: usize = 11;
@@ -448,6 +453,8 @@ pub mod syscall {
     pub const FUTEX_WAKE: usize = 111;
     pub const FUTEX_LOCK_PI: usize = 112;
     pub const FUTEX_UNLOCK_PI: usize = 113;
+    /// The debug resource (HD4): a privileged process (the one the kernel started) gets the handle that `debug_write` and `debug_stat` now need.
+    pub const DEBUG_ROOT: usize = 114;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

@@ -51,6 +51,15 @@ pub fn app_main() -> i32 {
             // exit normally with a chosen code
             return 42;
         }
+        83 => {
+            // HD4: a program started with no startup message has no debug resource, and is not privileged: it can neither write a verdict
+            // line to the console nor ask for the resource (exit code 0: both refused as they should be)
+            let w = rt::sys::debug_write(b"##TEST forged_by_a_confined_child PASS");
+            let r = rt::sys::debug_root();
+            let ok = w.status == rt::abi::status::Status::BadHandle as i32
+                && r.status == rt::abi::status::Status::AccessDenied as i32;
+            return i32::from(!ok);
+        }
         10 => {
             // jump into kernel text
             // SAFETY: as above.

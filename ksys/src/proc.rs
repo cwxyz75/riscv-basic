@@ -873,6 +873,24 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 Err(x) => Err(e(x)),
             }
         })(),
+        nr::DEBUG_ROOT => (|| {
+            let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
+            if !caller.privileged {
+                return bad(Status::AccessDenied);
+            }
+            let job = caller.job;
+            match ipc::debug_object_create_in(
+                objs,
+                &mut caller.handles,
+                &mut ipc::Quota {
+                    jobs,
+                    job: Some(job),
+                },
+            ) {
+                Ok(h) => Ok((Some(h.0), None)),
+                Err(x) => Err(e(x)),
+            }
+        })(),
         nr::JOB_ROOT => (|| {
             let caller = procs.get_mut(&me).ok_or(e(Status::BadState))?;
             if !caller.privileged {
