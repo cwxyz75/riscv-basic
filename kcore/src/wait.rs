@@ -5,7 +5,8 @@
 //! table only evaluates them for touched objects.
 //!
 //! A registration is removed when it fires; a thread that is woken any other way (a timer, a kill)
-//! calls `forget`. Ports and `channel_call`'s exact reply registration come in later steps.
+//! calls `forget`. A port's waiters are looked at when an object it binds is touched (L21a); `channel_call`'s exact reply registration comes
+//! later (L21d).
 
 use crate::object::{Dirty, ObjId};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -66,6 +67,9 @@ impl WaitTable {
     /// calls it when a thread registers on a port and when the port is touched (a bind, unbind or rearm), so the memory is never older than the port's
     /// last change.
     pub fn watch_port(&mut self, port: ObjId, bound: Vec<ObjId>) {
+        if self.watching.get(&port) == Some(&bound) {
+            return; // (nothing changed: the log names a port once for every `get_mut` of it, which a poll or a rearm makes without binding anything new)
+        }
         self.unwatch_port(port);
         for &o in &bound {
             self.watchers.entry(o).or_default().insert(port);
@@ -133,7 +137,13 @@ impl WaitTable {
             self.watchers.clear();
             self.watching.clear();
         }
+        // (the log names an object once for every `get_mut` of it: an object and a port are looked at once per commit)
+        let mut done: BTreeSet<(ObjId, bool)> = BTreeSet::new();
+        let mut ports_done: BTreeSet<ObjId> = BTreeSet::new();
         for &(obj, forced) in &dirty.items {
+            if !done.insert((obj, forced)) {
+                continue;
+            }
             // (a port touched itself: what it binds may have changed)
             if self.watching.contains_key(&obj) {
                 self.watch_port(obj, bound(obj));
@@ -145,7 +155,9 @@ impl WaitTable {
                 .get(&obj)
                 .map_or_else(Vec::new, |s| s.iter().copied().collect());
             for port in ports {
-                self.fire(port, false, &signals, &mut woken);
+                if ports_done.insert(port) {
+                    self.fire(port, false, &signals, &mut woken);
+                }
             }
         }
         woken
@@ -194,6 +206,28 @@ impl WaitTable {
         }
         if self.by_thread.len() != self.regs.values().map(Vec::len).sum::<usize>() {
             return Err("the two indexes disagree".into());
+        }
+        // the port watch (L21a): only ports with a waiter are watched, and the two maps are each other's inverse
+        for (port, bound) in &self.watching {
+            if !self.regs.contains_key(port) {
+                return Err(alloc::format!("port {port:?} is watched with no waiter"));
+            }
+            for o in bound {
+                if !self.watchers.get(o).is_some_and(|s| s.contains(port)) {
+                    return Err(alloc::format!(
+                        "port {port:?} watches {o:?} but is not in its watchers"
+                    ));
+                }
+            }
+        }
+        for (o, ports) in &self.watchers {
+            for p in ports {
+                if !self.watching.get(p).is_some_and(|b| b.contains(o)) {
+                    return Err(alloc::format!(
+                        "{o:?} lists port {p:?}, which does not watch it"
+                    ));
+                }
+            }
         }
         Ok(())
     }

@@ -149,7 +149,19 @@ fn run(seed: u64) {
                     if let (Some(p), Some(o)) =
                         (pick(&mut rng, &tables[ti]), pick(&mut rng, &tables[ti]))
                     {
-                        let _ = port_bind(reg, &tables[ti], p, o, 0xffff_ffff, rng.below(8));
+                        // (a mask outside the waitable bits is refused, and then no port ever binds anything: this one is real)
+                        if port_bind(
+                            reg,
+                            &tables[ti],
+                            p,
+                            o,
+                            u64::from(abi::signals::WAITABLE),
+                            rng.below(8),
+                        )
+                        .is_ok()
+                        {
+                            BINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
                 12 => {
@@ -208,11 +220,17 @@ fn run(seed: u64) {
     }
 }
 
+static BINDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[test]
 fn every_change_of_signals_or_liveness_is_logged() {
     for seed in 1..=SEEDS {
         run(seed);
     }
+    assert!(
+        BINDS.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "no port ever bound anything: the port branch of the check is vacuous"
+    );
 }
 
 #[test]

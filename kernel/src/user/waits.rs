@@ -430,7 +430,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
         commit_wake();
         // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
         // registered on the port: the wait table re-evaluates a port's signal (which follows its
-        // bindings) whenever anything was touched.
+        // bindings) when an object it binds, or the port, was touched (L21a).
         let me = thread::current();
         thread::wait_deadline_registered(
             || {
