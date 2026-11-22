@@ -190,6 +190,11 @@ pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 /// across a context switch.
 #[track_caller]
 fn kernel() -> KernelRef {
+    // (K1: until the big lock is gone, the raw context pointers a switch takes from the table depend on it as much as on `TT`)
+    debug_assert!(
+        crate::bkl::held(),
+        "the thread table touched without the big kernel lock"
+    );
     KernelRef(KERNEL.lock())
 }
 
