@@ -152,6 +152,26 @@ mod on {
         }
     }
 
+    /// The same figures as `##BENCH` lines for the benchmark harness (SCHED-SMP-SPEC 6.1: `irq_off_max`, `bkl_profile`): the
+    /// interrupts-off maximum, the longest BKL hold of any syscall, and the maximum hold and wait of the ten worst.
+    #[inline(never)]
+    fn bench_lines(irq_off: u64, worst: &[(u64, usize)]) {
+        use core::fmt::Write;
+        let mut out = crate::console::Console;
+        let _ = writeln!(out, "##BENCH irq_off_max {} ns", irq_off * 100);
+        if let Some((v, _)) = worst.first() {
+            let _ = writeln!(out, "##BENCH bkl_hold_max {} ns", v * 100);
+        }
+        for (v, n) in worst.iter().take(10) {
+            let _ = writeln!(out, "##BENCH bkl_hold_max_sys{n} {} ns", v * 100);
+            let _ = writeln!(
+                out,
+                "##BENCH bkl_wait_max_sys{n} {} ns",
+                WAIT_MAX[*n].load(Relaxed) * 100
+            );
+        }
+    }
+
     /// Print the summary (the end of a run): the interrupts-off maximum, and the busiest and longest BKL holds.
     pub fn report() {
         use core::fmt::Write;
@@ -172,6 +192,7 @@ mod on {
             .filter(|(v, _)| *v > 0)
             .collect();
         worst.sort_unstable_by(|a, b| b.cmp(a));
+        bench_lines(m, &worst);
         for (v, n) in worst.into_iter().take(10) {
             let _ = writeln!(
                 out,

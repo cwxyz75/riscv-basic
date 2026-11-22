@@ -201,7 +201,7 @@ ATOMICS = {
     "kernel/src/console.rs": (10, "the console's panic flag and line state, and the UART's address, the firmware-console switch and its two counters (PL5b)"),
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
-    "kernel/src/sched_tests.rs": (47, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured)"),
+    "kernel/src/sched_tests.rs": (49, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile)"),
     "kernel/src/smp_tests.rs": (16, "self-test flags and counters"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")

@@ -175,7 +175,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 9: the scheduler's remaining tasks
 
-- [ ] **L1** the remaining benchmarks (`pair_scaling`, `rt_latency`) and absolute targets
+- [x] **L1** the remaining benchmarks (`pair_scaling`, `rt_latency`, `irq_off_max`, `bkl_profile`) and absolute targets (this PR)
 - [ ] **L8** RT budget accounting and the priority policy of the launcher and the device manager
 - [ ] **L22** donation through `channel_call`
 - [ ] **L23** PI futex

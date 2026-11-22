@@ -1,0 +1,6 @@
+# Latency-trace baseline (SCHED-SMP-SPEC 6.1, `make os-latency`): label, name, value, unit. Whole suite, four harts, QEMU debug build,
+# the machine of the first measurement (2026-11-22). These are the *before* numbers of the lock peels (tasks 15 to 20): the longest
+# interrupts-off span and the longest big-lock hold of any syscall in the suite. Per-syscall rows are printed by the run, not baselined
+# (which syscalls are the worst moves). Regenerate with `make os-latency` and copy target/latency.tsv here on purpose.
+smp4	irq_off_max	138863000	ns
+smp4	bkl_hold_max	138864000	ns

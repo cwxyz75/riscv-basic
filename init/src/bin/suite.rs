@@ -13601,6 +13601,124 @@ fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail
     Ok(ns)
 }
 
+// --- pair_scaling (SCHED-SMP-SPEC 6.1) -------------------------------------------------------------------------------
+//
+// N independent pairs of threads, all released at once, each pair doing a fixed number of round trips: the wall time from the release
+// to the last exit, over the operations of all pairs, is the reported cost (`pair_scaling_<kind>_n<N>`, ns per round trip). The scaling
+// of 5.2 is the cost at N = 1 over the cost at N: how many times more round trips a second N pairs get through (`bench_compare.py`
+// prints it). On a boot with fewer harts than N it shows how little the pairs share, which is the point of running it at both counts.
+
+const PS_MAX: usize = 4;
+static PS_GO: AtomicU32 = AtomicU32::new(0);
+static PS_ROUNDS: AtomicU32 = AtomicU32::new(0);
+static PS_WORD: [AtomicU32; PS_MAX] = [const { AtomicU32::new(0) }; PS_MAX];
+static PS_CHAN: [AtomicU64; PS_MAX] = [const { AtomicU64::new(0) }; PS_MAX];
+
+/// Hold a thread until main sets `PS_GO`, so that every pair starts together.
+fn ps_gate() {
+    while PS_GO.load(Ordering::SeqCst) == 0 {
+        sys::futex_wait(PS_GO.as_ptr(), 0, u64::MAX);
+    }
+}
+
+/// Wait until `word` holds `want` (a futex wait with the value re-checked).
+fn ps_await(word: &AtomicU32, want: u32) {
+    loop {
+        let v = word.load(Ordering::SeqCst);
+        if v == want {
+            return;
+        }
+        sys::futex_wait(word.as_ptr(), v, u64::MAX);
+    }
+}
+
+/// One half of a futex ping-pong: `arg` is `pair * 2 + side`; side 0 raises the word to 1 and waits for 0, side 1 the reverse.
+extern "C" fn ps_futex_side(arg: usize) -> ! {
+    let (word, side) = (&PS_WORD[arg / 2], (arg % 2) as u32);
+    ps_gate();
+    for _ in 0..PS_ROUNDS.load(Ordering::SeqCst) {
+        ps_await(word, side);
+        word.store(1 - side, Ordering::SeqCst);
+        sys::futex_wake(word.as_ptr(), 1);
+    }
+    sys::thread_exit(0)
+}
+
+/// A client: `PS_ROUNDS` `channel_call`s on the pair's channel.
+extern "C" fn ps_call_client(arg: usize) -> ! {
+    let ch = PS_CHAN[arg].load(Ordering::SeqCst);
+    let mut reply = [0u8; 16];
+    ps_gate();
+    for i in 0..PS_ROUNDS.load(Ordering::SeqCst) {
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&(i + 1).to_le_bytes());
+        let args = CallArgs {
+            req_bytes: req.as_ptr() as u64,
+            req_handles: 0,
+            req_nbytes: 8,
+            req_nhandles: 0,
+            rep_bytes: reply.as_mut_ptr() as u64,
+            rep_handles: 0,
+            rep_max_bytes: 16,
+            rep_max_handles: 0,
+            deadline: u64::MAX,
+        };
+        if sys::channel_call(ch, &args).status != 0 {
+            sys::thread_exit(1);
+        }
+    }
+    sys::thread_exit(0)
+}
+
+/// Run `pairs` pairs of the given kind for `rounds` round trips each; report and return ns per round trip over all pairs.
+fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
+    PS_GO.store(0, Ordering::SeqCst);
+    PS_ROUNDS.store(rounds, Ordering::SeqCst);
+    let mut threads = Vec::new(); // (handle to wait for, handles to close afterwards)
+    let mut closing = Vec::new();
+    for p in 0..pairs {
+        if kind == "futex" {
+            PS_WORD[p].store(0, Ordering::SeqCst);
+            threads.push(new_thread(ps_futex_side, p * 2)?);
+            threads.push(new_thread(ps_futex_side, p * 2 + 1)?);
+        } else {
+            let (mine, theirs) = channel()?;
+            PS_CHAN[p].store(mine, Ordering::SeqCst);
+            closing.push(mine);
+            let server = new_thread(bench_call_server, theirs as usize)?;
+            threads.push(new_thread(ps_call_client, p)?);
+            closing.push(server);
+        }
+    }
+    nap_ticks(3); // everyone is at the gate
+    let t0 = cycles();
+    PS_GO.store(1, Ordering::SeqCst);
+    sys::futex_wake(PS_GO.as_ptr(), u32::MAX);
+    for t in &threads {
+        let w = sys::object_wait(*t, sig::TERMINATED, sys::clock_get() + 120_000);
+        ensure_eq!(w.status, 0, "a pair thread ended");
+    }
+    let c = cycles() - t0;
+    let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
+    let ns = bench_line(&name, c, u64::from(rounds) * pairs as u64);
+    for t in threads {
+        sys::handle_close(t);
+    }
+    for h in closing {
+        sys::handle_close(h); // the channel ends make the servers exit; the server handles are closed with them
+    }
+    Ok(ns)
+}
+
+fn bench_pair_scaling(k: u32) -> Result<u64, Detail> {
+    let mut last = 0;
+    for pairs in [1, 2, 4] {
+        last = bench_pairs("futex", pairs, 500 * k)?;
+        last += bench_pairs("channel_call", pairs, 250 * k)?;
+    }
+    Ok(last)
+}
+
 /// The benchmarks (a tenth of the iterations unless the kernel command line says `bench=full`): they run on every
 /// boot so they cannot rot, and `make os-bench` runs them in full and compares with `bench/baseline.tsv`.
 fn benchmarks() -> Outcome {
@@ -13611,6 +13729,7 @@ fn benchmarks() -> Outcome {
     let c0 = bench_channel_call("channel_call_rt", 1000 * k, 0)?;
     let c100 = bench_channel_call("channel_call_rt_100_bystanders", 1000 * k, 100)?;
     let d = bench_port_drain_64(1000 * k)?;
+    let ps = bench_pair_scaling(k)?;
     // sanity only (the numbers are for the baseline): every operation took some time, and was not absurd
     for (what, ns) in [
         ("thread", t),
@@ -13618,6 +13737,7 @@ fn benchmarks() -> Outcome {
         ("call", c0),
         ("call with bystanders", c100),
         ("port drain", d),
+        ("pair scaling", ps),
     ] {
         ensure!(
             ns > 0 && ns < 1_000_000_000,
