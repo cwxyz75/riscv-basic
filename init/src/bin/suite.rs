@@ -12291,11 +12291,14 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
         ok(sys::thread_set_sched(h, 40, 0), "a hog turns real-time")?;
     }
     let mut worst_rt = 0u64;
+    let mut trace: Vec<(u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far)
     let mut naps_done = 0;
     let until = sys::clock_get() + 20_000;
     while naps_done < 30 && sys::clock_get() < until {
         nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
-        worst_rt = worst_rt.max(job_use(root, 9)?.0);
+        let used = job_use(root, 9)?.0;
+        worst_rt = worst_rt.max(used);
+        trace.push((sys::clock_get() % 100, used / 1_000_000));
         naps_done += 1;
     }
     RT_STOP.store(1, Ordering::SeqCst);
@@ -12308,7 +12311,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
     ensure!(
         worst_rt <= 100_000_000 + 20_000_000,
-        "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms)"
+        "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms, {harts} harts); (ms into window, RT ms): {trace:?}"
     );
     Ok(())
 }
