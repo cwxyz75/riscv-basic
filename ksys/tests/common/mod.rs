@@ -54,6 +54,7 @@ pub struct World {
     pub aspace: AddressSpace,
     pub job: JobId,
     pub faults: Faults,
+    pub job_sched: kcore::jobsched::JobSchedTable,
 }
 
 pub fn world_with(handles: usize) -> World {
@@ -82,6 +83,7 @@ pub fn world_with(handles: usize) -> World {
         aspace,
         job: JobId::ROOT,
         faults: Faults::default(),
+        job_sched: kcore::jobsched::JobSchedTable::new(),
     }
 }
 
@@ -104,6 +106,8 @@ impl World {
             jobs: &mut self.jobs,
             faults: self.faults,
             harts_online: 4,
+            job_sched: &self.job_sched,
+            now_ns: 0,
             windows: &WINDOWS,
         };
         ipc_call(n, a, &mut c)

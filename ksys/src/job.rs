@@ -55,6 +55,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             let limits = read_limits(c, a[1]).map_err(e)?;
             let jobs = &mut c.jobs;
             let id = jobs.create(parent, limits).map_err(|x| e(job_status(x)))?;
+            c.job_sched.reset(id.index()); // (the slot may have been used before)
             match ipc::job_object_create(
                 c.objs,
                 c.handles,
@@ -103,6 +104,26 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 7 => return Ok((Some(c.harts_online), Some(c.harts_online))),
                 // 8: kernel memory in bytes (MM5), its limit an eighth of the page limit
                 8 => Resource::KernelBytes,
+                // 9 (SCHED-SMP-SPEC 4.5, 4.10): the real-time CPU nanoseconds this job's threads have run in the current 100 ms window, and the
+                // job's budget per window (accounted, not enforced). The spec's 7 and 8 were taken by UV6 and MM5 before this call was built.
+                9 => {
+                    let s = c.jobs.sched(job).ok_or(e(Status::BadState))?;
+                    return Ok((
+                        Some(c.job_sched.rt_used(job.index(), c.now_ns)),
+                        Some(s.rt_budget),
+                    ));
+                }
+                // 10: CPU nanoseconds run by the threads of this job and of the jobs below it (jobs already freed are not counted); no limit (0)
+                10 => {
+                    let sum = c
+                        .jobs
+                        .live_ids()
+                        .into_iter()
+                        .filter(|&j| c.jobs.is_within(j, job))
+                        .map(|j| c.job_sched.cpu(j.index()))
+                        .fold(0u64, u64::saturating_add);
+                    return Ok((Some(sum), Some(0)));
+                }
                 _ => return fail(Status::InvalidArgs),
             };
             let jobs = &c.jobs;

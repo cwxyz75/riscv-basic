@@ -100,6 +100,32 @@ static mut KERNEL: Option<Kernel> = None;
 /// every hart with no lock of its own; each call takes the locks it needs and says which. Set once, by `init`.
 static mut SCHED: Option<KSched> = None;
 
+/// What each job's threads have run (SCHED-SMP-SPEC 4.10): charged by the scheduler's run queues, read by `job_info`. Set once, by `init`.
+static mut JOB_SCHED: Option<alloc::sync::Arc<kcore::jobsched::JobSchedTable>> = None;
+
+/// The job accounting table.
+#[allow(clippy::expect_used)] // INVARIANT: set by `init` before any user thread exists
+pub fn job_sched() -> &'static kcore::jobsched::JobSchedTable {
+    // SAFETY: written once by `init` before any other hart starts, then only read.
+    unsafe {
+        (*core::ptr::addr_of!(JOB_SCHED))
+            .as_deref()
+            .expect("thread::init was not called")
+    }
+}
+
+/// Bring this hart's running thread's accounting up to now (a reader of the accounts calls it first: no tick does it).
+pub fn charge_running() {
+    let was = irq::save_and_disable();
+    sched().charge_now(hart());
+    irq::restore(was);
+}
+
+/// The user thread `tid` belongs to job `job` from now on: its CPU time is charged there (needs interrupts off and the big lock, like the rest).
+pub fn set_job(tid: Tid, job: u32) {
+    let _ = sched().set_job(tid, job);
+}
+
 /// The scheduler (every method takes `&self`; interrupts must be off).
 #[allow(clippy::expect_used)] // INVARIANT: SCHED is set by `init` before any other hart starts or any scheduler call is made
 fn sched() -> &'static KSched {
@@ -163,6 +189,10 @@ pub fn init(boot_prio: Prio) {
     })
     .with_clock(crate::timer::now_ns); // (charge the running thread at every settle: no tick does it)
                                        // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
+    let job_table = alloc::sync::Arc::new(kcore::jobsched::JobSchedTable::new());
+    sched.set_job_table(job_table.clone());
+    // SAFETY: the one write (see `job_sched`): interrupts off, one hart.
+    unsafe { *addr_of_mut!(JOB_SCHED) = Some(job_table) };
     sched.set_deferred(true);
     // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
     for h in 1..harts {

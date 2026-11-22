@@ -54,3 +54,42 @@ fn a_thread_that_sleeps_is_charged_for_its_own_run() {
     s.switched(0);
     assert_eq!(s.record(a).unwrap().cpu, 500 * MS);
 }
+
+#[test]
+fn a_threads_run_is_charged_to_its_job_and_its_real_time_part_to_the_window() {
+    use kcore::jobsched::JobSchedTable;
+    use std::sync::Arc;
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    NOW.store(0, Ordering::SeqCst);
+    let s = Sched2::new(1, FixedPrio::new).with_clock(clock);
+    let table = Arc::new(JobSchedTable::new());
+    s.set_job_table(table.clone());
+    let rt = SchedAttr {
+        prio: 40,
+        rr: false,
+    };
+    let a = s.spawn_on(0, rt, Some(0)).unwrap();
+    s.set_job(a, 3).unwrap();
+    s.reschedule_on(0);
+    s.switched(0);
+    NOW.store(12 * MS, Ordering::SeqCst);
+    s.yield_on(0).unwrap();
+    s.switched(0);
+    assert_eq!(table.cpu(3), 12 * MS, "A ran 12 ms: the job pays");
+    assert_eq!(
+        table.rt_used(3, 12 * MS),
+        12 * MS,
+        "its base priority is real-time"
+    );
+    assert_eq!(table.cpu(0), 0, "the root's slot is untouched");
+    // a normal-band thread of another job is charged cpu time and no RT time
+    let b = s.spawn_on(0, attr(), Some(0)).unwrap();
+    s.set_job(b, 4).unwrap();
+    s.reschedule_on(0);
+    s.switched(0);
+    NOW.store(20 * MS, Ordering::SeqCst);
+    s.yield_on(0).ok();
+    s.switched(0);
+    assert_eq!(table.rt_used(4, 20 * MS), 0);
+    assert!(table.cpu(4) + table.cpu(3) <= 20 * MS);
+}

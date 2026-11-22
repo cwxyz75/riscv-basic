@@ -40,6 +40,7 @@ pub mod harts;
 pub mod ipc;
 pub mod isa;
 pub mod job;
+pub mod jobsched;
 pub mod latch;
 pub mod linestate;
 pub mod memmap;

@@ -595,6 +595,8 @@ pub struct HartRq<N: Class> {
     hard_timers: BTreeSet<(Time, Tid)>,
     next_tid: Tid,
     pub bad_picks: u32,
+    /// Where the running thread's job is charged (SCHED-SMP-SPEC 4.10): the table is shared by every hart's queue.
+    jobs: Option<alloc::sync::Arc<crate::jobsched::JobSchedTable>>,
 }
 
 impl<N: Class> HartRq<N> {
@@ -610,6 +612,24 @@ impl<N: Class> HartRq<N> {
             hard_timers: BTreeSet::new(),
             next_tid: 1,
             bad_picks: 0,
+            jobs: None,
+        }
+    }
+
+    /// Charge every thread's CPU time to its job in `table` from now on.
+    pub fn set_job_table(&mut self, table: alloc::sync::Arc<crate::jobsched::JobSchedTable>) {
+        self.jobs = Some(table);
+    }
+
+    /// Which job a thread's time is charged to (a kernel thread keeps job 0, the root's).
+    pub fn set_job(&mut self, tid: Tid, job: u32) -> Result<(), Error> {
+        self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?.job = job;
+        Ok(())
+    }
+
+    fn charge_job(&self, t: &ThreadSched, ran: Time) {
+        if let Some(j) = &self.jobs {
+            j.charge(t.job, ran, band(t.base.prio) == Band::Rt, self.now);
         }
     }
 
@@ -969,6 +989,7 @@ impl<N: Class> HartRq<N> {
             if let Some(mut t) = self.threads.remove(&c) {
                 t.cpu += dt;
                 t.slice_left = t.slice_left.saturating_sub(dt);
+                self.charge_job(&t, dt);
                 self.threads.insert(c, t);
             }
         }
@@ -1021,6 +1042,7 @@ impl<N: Class> HartRq<N> {
                 Band::Rt => self.rt.account(&mut t, dt, now),
                 _ => self.normal.account(&mut t, dt, now),
             };
+            self.charge_job(&t, dt);
             self.threads.insert(c, t);
             if rotate {
                 if self.cur == Some(c) {

@@ -12198,6 +12198,57 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
     }
 }
 
+/// Spin for `ms` milliseconds of the clock.
+fn spin_ms(ms: u64) {
+    let until = sys::clock_get() + ms;
+    while sys::clock_get() < until {
+        core::hint::spin_loop();
+    }
+}
+
+/// SCHED-SMP-SPEC 4.5 and 4.10 (task 8): the CPU time a job's threads run is counted (`job_info` 10, the job and the jobs below it), and
+/// the part of it run at a real-time **base** priority is counted again in the window's figure (`job_info` 9), against the job's budget.
+fn job_info_counts_the_cpu_time_its_threads_run() -> Outcome {
+    let root = root_job()?;
+    let (_, budget) = job_use(root, 9)?;
+    ensure_eq!(
+        budget,
+        100_000_000,
+        "the root job's budget is the whole window"
+    );
+    let before = job_use(root, 10)?.0;
+    spin_ms(30);
+    let after = job_use(root, 10)?.0;
+    ensure!(
+        after >= before + 25_000_000,
+        "30 ms of spinning added only {} ns to the job's CPU time",
+        after - before
+    );
+    // at a real-time priority the same spin shows in the window's real-time figure (the window may end during it: 100 ms windows, so spin
+    // until a spin of 30 ms has been counted twice at most; the figure is what ran since the window began)
+    ok(sys::thread_set_sched(0, 40, 0), "become real-time")?;
+    let mut best = 0;
+    for _ in 0..4 {
+        spin_ms(30);
+        best = best.max(job_use(root, 9)?.0);
+    }
+    ok(sys::thread_set_sched(0, 10, 0), "back to the normal band")?;
+    ensure!(
+        best >= 25_000_000,
+        "the real-time figure never passed 25 ms with 120 ms of real-time spinning in 100 ms windows (best {best} ns)"
+    );
+    // a normal thread adds no real-time time: the figure stops growing when the window is the same and we run at priority 10
+    let (a, _) = job_use(root, 9)?;
+    spin_ms(10);
+    let (b, _) = job_use(root, 9)?;
+    ensure!(
+        b <= a + 5_000_000 || b < a,
+        "10 ms of normal-band spinning added {} ns of real-time time",
+        b.saturating_sub(a)
+    );
+    Ok(())
+}
+
 fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     let root = root_job()?;
     // a job is a job: the other kinds of handle are the wrong type
@@ -12231,7 +12282,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -12250,7 +12301,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -14333,6 +14384,10 @@ pub fn app_main() -> i32 {
         (
             "job_syscalls_check_handles_rights_and_arguments",
             job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "job_info_counts_the_cpu_time_its_threads_run",
+            job_info_counts_the_cpu_time_its_threads_run,
         ),
         (
             "job_limits_stop_a_process_bomb_and_usage_comes_back",

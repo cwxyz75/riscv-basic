@@ -444,6 +444,19 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.lq(hart).next_event()
     }
 
+    /// Charge every thread's CPU time to its job in `table` (SCHED-SMP-SPEC 4.10, task 8). Call once, before threads run.
+    pub fn set_job_table(&self, table: Arc<crate::jobsched::JobSchedTable>) {
+        for h in 0..self.harts() {
+            self.lq(h).set_job_table(table.clone());
+        }
+    }
+
+    /// The job a thread's time is charged to (default 0: the root's, which is where kernel threads stay).
+    pub fn set_job(&self, tid: Tid, job: u32) -> Result<(), Error> {
+        let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+        self.lq(home).set_job(tid, job)
+    }
+
     /// Set a thread's timer slack (SCHED-SMP-SPEC 4.11): nanoseconds, clamped to 1 ms, applied to its next sleep.
     pub fn set_timer_slack(&self, tid: Tid, slack: Time) -> Result<(), Error> {
         let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
@@ -837,8 +850,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self
     }
 
-    /// Charge hart `h`'s running thread up to the clock source's now (no-op without a source).
-    fn charge_now(&self, h: usize) {
+    /// Charge hart `h`'s running thread up to the clock source's now (no-op without a source): a reader of the accounts (`job_info`)
+    /// calls this first, because a tickless hart with one runnable thread has no event that would.
+    pub fn charge_now(&self, h: usize) {
         if let Some(f) = self.clock {
             self.lq(h).charge(f());
         }
