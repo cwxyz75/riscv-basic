@@ -113,6 +113,10 @@ pub struct PerHart {
     /// The newest ASID generation this hart has flushed for (L18, `kcore::asid::HartGen`): it flushes everything before it installs an address
     /// space of a newer generation.
     pub asid_seen: AtomicU64,
+    /// The thread and the address-space tag (generation and ASID, packed) whose `UserBinding` this hart last wrote (L19): the full path's return writes it
+    /// only when either changes, so a syscall that returns to the same thread under the same tag does not take the thread table.
+    pub bound_tid: AtomicU64,
+    pub bound_tag: AtomicU64,
     /// This hart's cache of free frames (L16): touched only by this hart with interrupts off.
     pub frame_cache: FrameCacheCell,
 }
@@ -273,6 +277,8 @@ impl PerHart {
             last_class: AtomicU32::new(0),
             magazines: Magazines::new(),
             asid_seen: AtomicU64::new(0),
+            bound_tid: AtomicU64::new(u64::MAX),
+            bound_tag: AtomicU64::new(0),
             frame_cache: FrameCacheCell::new(),
         }
     }

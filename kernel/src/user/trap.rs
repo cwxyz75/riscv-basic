@@ -77,16 +77,26 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
         // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
         // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
         let token = install_token_of(asids, p);
-        // (what the next return of this thread can use with no big lock: `activate_current_quiet`)
-        thread::bind_user(
-            thread::current(),
-            thread::UserBinding {
-                pid,
-                tag: p.tag,
-                token,
-                aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
-            },
-        );
+        // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
+        // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
+        let me = crate::percpu::this();
+        let tid = thread::current() as u64;
+        let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
+        if me.bound_tid.load(Ordering::Relaxed) != tid
+            || me.bound_tag.load(Ordering::Relaxed) != key
+        {
+            thread::bind_user(
+                thread::current(),
+                thread::UserBinding {
+                    pid,
+                    tag: p.tag,
+                    token,
+                    aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
+                },
+            );
+            me.bound_tid.store(tid, Ordering::Relaxed);
+            me.bound_tag.store(key, Ordering::Relaxed);
+        }
         Some(token)
     });
     if let Some(token) = token {
