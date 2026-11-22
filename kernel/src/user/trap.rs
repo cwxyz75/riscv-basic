@@ -459,6 +459,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         _ => {
             let result = dispatch(n, a);
+            if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
+                // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
+                lend_to_reader();
+            }
             // A syscall that can change a signal wakes every waiter (after the borrows of
             // `dispatch` are gone, since waking may switch threads).
             if matches!(
@@ -500,6 +504,23 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
     }
     // (MM5) whatever this call added to the caller's handle table is charged to its job now, between calls, never in the middle of one
     settle_handle_table(growth_at_entry);
+}
+
+/// The requests the call just read (`channel_read`, `channel_read_txid`) were sent by threads blocked in `channel_call`: each lends its priority to
+/// the calling thread, the one that read the request (L22). Skipped for a caller whose call has ended (its request stayed queued after a timeout).
+fn lend_to_reader() {
+    let me = thread::current();
+    let calls = irq::without(|| {
+        let s = state();
+        let read = s.objs.take_dequeued_calls();
+        read.into_iter()
+            .filter(|(caller, txid)| s.calls.get(&(*caller as Tid)) == Some(txid))
+            .map(|(caller, _)| caller as Tid)
+            .collect::<Vec<Tid>>()
+    });
+    for caller in calls {
+        thread::pi_donate(caller, me);
+    }
 }
 
 pub(super) fn reply(frame: &mut crate::trap::TrapFrame, r: Reply) {

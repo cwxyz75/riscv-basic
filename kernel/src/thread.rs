@@ -947,6 +947,30 @@ pub fn pi_op<R>(
     r
 }
 
+/// Donations the graph refused (a cycle of blocked calls, or a chain too long): the diagnostic of SCHED-SMP-SPEC 4.8 (L22).
+pub static DONATIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
+/// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
+pub fn pi_donate(from: Tid, to: Tid) {
+    irq::without(|| {
+        pi_op(|d| match d.donate(from, to) {
+            Ok(ch) => ((), ch.as_slice().to_vec()),
+            Err(_) => {
+                DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                ((), alloc::vec::Vec::new())
+            }
+        });
+    });
+}
+
+/// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
+pub fn pi_revoke(tid: Tid) {
+    irq::without(|| {
+        pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
+    });
+}
+
 /// A user thread enters the donation graph at its base priority (when it registers, big lock held).
 pub fn pi_register(tid: Tid) {
     irq::without(|| {

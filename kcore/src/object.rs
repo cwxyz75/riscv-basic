@@ -103,6 +103,8 @@ pub struct Registry<T: Object> {
     dirty: Vec<(ObjId, bool)>,
     /// The log filled up and was dropped: the consumer must treat every object as touched.
     dirty_overflow: bool,
+    /// Requests of `channel_call`s that were read since the last `take_dequeued_calls` (L22): the calling thread and the transaction id.
+    dequeued_calls: Vec<(u64, u32)>,
     /// Handles removed since the last `take_gone` (L21c): the object, the identity of the table and the handle's value. Bindings of a port made through
     /// one of them end.
     gone: Vec<(ObjId, u64, u64)>,
@@ -189,6 +191,7 @@ impl<T: Object> Registry<T> {
             dirty: Vec::with_capacity(DIRTY_RESERVE),
             dirty_overflow: false,
             gone: Vec::new(),
+            dequeued_calls: Vec::new(),
             work: Vec::with_capacity(PREALLOC_SLOTS),
             dirty_spare: Vec::with_capacity(DIRTY_RESERVE),
             spare: Vec::new(),
@@ -254,6 +257,18 @@ impl<T: Object> Registry<T> {
         if self.slot(obj).is_some_and(|s| s.watchers > 0) && self.gone.try_reserve(1).is_ok() {
             self.gone.push((obj, table, handle));
         }
+    }
+
+    /// A `channel_call` request from thread `caller` with transaction id `txid` was just read (L22).
+    pub fn note_dequeued_call(&mut self, caller: u64, txid: u32) {
+        if self.dequeued_calls.try_reserve(1).is_ok() {
+            self.dequeued_calls.push((caller, txid));
+        }
+    }
+
+    /// The requests read since the last call, for lending their callers' priority to the readers.
+    pub fn take_dequeued_calls(&mut self) -> Vec<(u64, u32)> {
+        core::mem::take(&mut self.dequeued_calls)
     }
 
     /// The handles removed since the last call (oldest first), for ending the bindings made through them.
