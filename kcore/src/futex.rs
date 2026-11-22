@@ -21,6 +21,8 @@ pub type Waiter = u64;
 pub struct Futexes {
     queues: BTreeMap<Key, VecDeque<Waiter>>,
     sleeping_on: BTreeMap<Waiter, Key>,
+    /// The priority-inheritance futexes of this bucket (L23): a different protocol on the same keys, under the same lock.
+    pub pi: crate::pifutex::PiFutexes,
 }
 
 impl Futexes {
@@ -28,6 +30,7 @@ impl Futexes {
         Futexes {
             queues: BTreeMap::new(),
             sleeping_on: BTreeMap::new(),
+            pi: crate::pifutex::PiFutexes::new(),
         }
     }
 
@@ -142,6 +145,18 @@ impl<B: Buckets> FutexTable<B> {
             debug_assert!(fresh, "a thread sleeps on one futex at a time");
             true
         })
+    }
+
+    /// Run `f` on the bucket of `key` with its lock held (the PI futexes and anything else that works on a bucket as a whole).
+    pub fn with_key<R>(&self, key: Key, f: impl FnOnce(&mut Futexes) -> R) -> R {
+        self.buckets.with(bucket_of(key), f)
+    }
+
+    /// Run `f` on every bucket, one after another (never two at once).
+    pub fn for_each_bucket(&self, mut f: impl FnMut(&mut Futexes)) {
+        for b in 0..BUCKETS {
+            self.buckets.with(b, &mut f);
+        }
     }
 
     /// Queue `who` on `key` unconditionally (a test hook and the models).

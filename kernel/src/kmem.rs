@@ -37,6 +37,31 @@ impl PhysMem for DirectMap {
     }
 }
 
+/// A 32-bit word of user memory reached by its physical address through the direct map, with atomic operations (the PI futex's lock word, L23: the
+/// user stores to it with its own compare-and-swaps, so the kernel's reads and writes must be atomic too).
+pub struct PhysWord(pub u64);
+
+impl kcore::pifutex::Word for PhysWord {
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: DIRECT_BASE + pa: pa is a physical address inside RAM, which the direct map covers
+    fn load(&self) -> u32 {
+        // SAFETY: `self.0` is the physical address of a resident, 4-aligned user word that the caller keeps from going (the big kernel lock and
+        // the address-space lock were held when it was resolved, and the caller holds the big lock still); the direct map covers it.
+        unsafe { core::sync::atomic::AtomicU32::from_ptr((DIRECT_BASE + self.0) as *mut u32) }
+            .load(core::sync::atomic::Ordering::SeqCst)
+    }
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: as `load`
+    fn cas(&self, old: u32, new: u32) -> Result<u32, u32> {
+        // SAFETY: as in `load`.
+        unsafe { core::sync::atomic::AtomicU32::from_ptr((DIRECT_BASE + self.0) as *mut u32) }
+            .compare_exchange(
+                old,
+                new,
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+            )
+    }
+}
+
 /// The kernel's memory state, in three locks of their own (L16): the VMO store (`VMO`), the job ledger (`JOBS`) and the frame database
 /// (`FRAME`), nested in that order inside the big kernel lock (which still protects everything else, and the kernel's own address space).
 type Cell<T> = klock::Spin<Option<T>, crate::bkl::Machine>;

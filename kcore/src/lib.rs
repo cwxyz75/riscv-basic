@@ -49,6 +49,7 @@ pub mod pagemap;
 pub mod pager;
 pub mod pagetable;
 pub mod park;
+pub mod pifutex;
 pub mod sched;
 pub mod sched2;
 pub mod sched_smp;
