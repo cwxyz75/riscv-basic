@@ -243,33 +243,87 @@ pub(super) fn teardown_objects(process: &mut Process, code: i32) {
     });
 }
 
+/// The pages one chunk of a teardown unmaps or gives back (SCHED-SMP-SPEC X4: 64 pages).
+const TEARDOWN_CHUNK: u64 = 64;
+
+/// Free the memory of a process that is gone from the table (L19). **No big kernel lock**: the process is private to this thread (nothing can fault in
+/// its space, no call can name it), so what is left is the memory locks, taken for one chunk of at most `TEARDOWN_CHUNK` pages at a time and let go
+/// between chunks, which are switch points even for a caller whose trap left interrupts off, so that no section is proportional to what the process
+/// mapped or owned. Each chunk is shot down before its locks are let go (TLB2).
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
 pub(super) fn teardown_memory(process: Box<Process>) {
-    irq::without(|| {
-        let k = kmem::get();
-        let mut process = process;
-        klock::aslock::AsCell::take(process.aspace).destroy_user(k.mm, k.vmos, k.jobs);
-        for id in core::mem::take(&mut process.vmos) {
-            let _ = k.vmos.release(k.mm, k.jobs, id);
+    let mut process = process;
+    let mut aspace = klock::aslock::AsCell::take(process.aspace);
+    // 1. the mappings, a chunk at a time. Each chunk is unmapped and shot down in one interrupts-off section under the memory locks (TLB2: nothing it
+    // frees, a table or a VMO's last frame, can be reused before every hart has dropped what it cached; X6: the hart cannot change under the shootdown);
+    // then a switch point (X4: a trap from user mode arrives here with interrupts off, so the chunk boundary is where a tick's switch is taken)
+    loop {
+        let was = irq::save_and_disable();
+        let done = {
+            let k = kmem::mem();
+            let done = aspace.destroy_user_chunk(k.mm, k.vmos, k.jobs, TEARDOWN_CHUNK);
+            crate::smp::shootdown();
+            done
+        };
+        irq::restore(was);
+        irq::without(|| {});
+        if done {
+            break;
         }
-        // the stacks `thread_spawn` mapped for threads that were still alive (their mappings went with the address space)
-        for st in process.stacks.values() {
-            let _ = k.vmos.release(k.mm, k.jobs, st.vmo);
+    }
+    {
+        // the tables go with a shootdown of their own, inside the locks, so no hart's walk cache outlives them
+        let was = irq::save_and_disable();
+        {
+            let k = kmem::mem();
+            aspace.finish_destroy_user(k.mm, k.jobs);
+            crate::smp::shootdown();
         }
-        let tables: u64 = process.table_charge.values().sum();
-        // the address space and its page tables are gone: no hart may keep translations through them
-        crate::smp::shootdown();
-        k.jobs.credit(process.job, Resource::Pages, tables);
-        k.jobs.credit(
-            process.job,
-            Resource::KernelBytes,
-            process.handles.charged(),
-        );
-        k.jobs.credit(process.job, Resource::Processes, 1);
-        k.jobs.release(process.job);
-    });
+        irq::restore(was);
+    }
+    // 2. the VMOs the process owned: the pages of one that nothing else holds go back in chunks, then the VMO itself
+    let ids: alloc::vec::Vec<u64> = core::mem::take(&mut process.vmos)
+        .into_iter()
+        .chain(process.stacks.values().map(|st| st.vmo))
+        .collect();
+    for id in ids {
+        irq::without(|| {}); // a switch point (X4)
+        {
+            let k = kmem::mem();
+            if k.vmos.is_unshared_plain(id) {
+                let pages = k.vmos.pages(id).unwrap_or(0);
+                drop(k);
+                let mut first = 0;
+                while first < pages {
+                    let k = kmem::mem();
+                    let _ = k.vmos.decommit(
+                        k.mm,
+                        k.jobs,
+                        id,
+                        first,
+                        TEARDOWN_CHUNK.min(pages.saturating_sub(first)),
+                    );
+                    first = first.saturating_add(TEARDOWN_CHUNK);
+                    irq::without(|| {});
+                }
+            }
+        }
+        let k = kmem::mem();
+        let _ = k.vmos.release(k.mm, k.jobs, id);
+    }
+    // 3. what the process was charged
+    let k = kmem::mem();
+    let tables: u64 = process.table_charge.values().sum();
+    k.jobs.credit(process.job, Resource::Pages, tables);
+    k.jobs.credit(
+        process.job,
+        Resource::KernelBytes,
+        process.handles.charged(),
+    );
+    k.jobs.credit(process.job, Resource::Processes, 1);
+    k.jobs.release(process.job);
 }
 
 /// Unmap and free the stack `thread_spawn` gave thread `tid`, if it has one. The thread is in the kernel, on its
