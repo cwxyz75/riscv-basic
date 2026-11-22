@@ -405,6 +405,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, r);
         }
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
+        nr::FUTEX_LOCK_PI => reply(frame, futex_lock_pi(a)),
+        nr::FUTEX_UNLOCK_PI => reply(frame, futex_unlock_pi(a)),
         nr::FUTEX_WAKE => {
             // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
             let pid = irq::without(|| caller_pid(state()).unwrap_or(0));

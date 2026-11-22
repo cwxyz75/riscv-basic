@@ -428,6 +428,8 @@ pub mod syscall {
     pub const RESOURCE_DTB: usize = 102;
     pub const FUTEX_WAIT: usize = 110;
     pub const FUTEX_WAKE: usize = 111;
+    pub const FUTEX_LOCK_PI: usize = 112;
+    pub const FUTEX_UNLOCK_PI: usize = 113;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

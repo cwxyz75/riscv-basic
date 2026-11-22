@@ -98,6 +98,22 @@ pub fn resolve_user_word<M: PhysMem>(
     resolve(aspace, mm, vmos, jobs, va, Access::Read)
 }
 
+/// `resolve_user_word` for a word the kernel will write (a PI futex's lock word, L23): the page must be writable by the user, and a copy-on-write
+/// page is replaced by the caller's own first.
+pub fn resolve_user_word_for_write<M: PhysMem>(
+    aspace: &mut AddressSpace,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    va: u64,
+) -> Result<u64, Status> {
+    if va & 3 != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    check_range(va, 4)?;
+    resolve(aspace, mm, vmos, jobs, va, Access::Write)
+}
+
 /// Read `len` bytes at user address `va`. A zero length succeeds without looking at `va`.
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: check_range proved va + len does not overflow and stays below the user limit; done < len bounds every slice and sum
 pub fn copy_from_user<M: PhysMem>(

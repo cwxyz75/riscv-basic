@@ -86,6 +86,10 @@ port_oneshot_rearm_and_many_bindings
 benchmarks_run_and_report
 instruction_counts_report
 futex_argument_errors
+pi_futex_bounds_inversion
+pi_futex_owner_death_poisons
+pi_futex_deadlock_is_refused
+pi_futex_argument_errors
 futex_times_out_not_early
 futex_wake_counts_and_fifo
 kill_a_futex_waiter

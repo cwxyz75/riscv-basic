@@ -12272,6 +12272,357 @@ fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not(
     Ok(())
 }
 
+// --- The priority-inheritance futex (L23, SCHED-SMP-SPEC 4.8 and 6.2) ---------------------------------------------------------------
+//
+// The lock word is 0 (free) or the owner's tid; user code takes it with a compare-and-swap and calls the kernel only when that fails.
+
+static PI_WORD: AtomicU32 = AtomicU32::new(0);
+static PI_WORD2: AtomicU32 = AtomicU32::new(0);
+static PI_STATE: AtomicU32 = AtomicU32::new(0);
+static PI_GO: AtomicU32 = AtomicU32::new(0);
+static PI_PROGRESS: AtomicU32 = AtomicU32::new(0);
+static PI_RESULT_A: AtomicU64 = AtomicU64::new(u64::MAX);
+static PI_RESULT_B: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn pi_my_tid() -> u32 {
+    sys::thread_get_sched(0).a2 as u32
+}
+
+/// Lock as a program does: the fast path, then the kernel. The status (0: owned).
+fn pi_lock(w: &AtomicU32, deadline_ms: u64) -> i64 {
+    let me = pi_my_tid();
+    if w.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        return 0;
+    }
+    i64::from(sys::futex_lock_pi(w.as_ptr(), deadline_ms).status)
+}
+
+fn pi_unlock(w: &AtomicU32) -> i64 {
+    let me = pi_my_tid();
+    if w.compare_exchange(me, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        return 0;
+    }
+    i64::from(sys::futex_unlock_pi(w.as_ptr()).status)
+}
+
+fn pi_reset() {
+    for a in [&PI_WORD, &PI_WORD2, &PI_STATE, &PI_GO, &PI_PROGRESS] {
+        a.store(0, Ordering::SeqCst);
+    }
+    PI_RESULT_A.store(u64::MAX, Ordering::SeqCst);
+    PI_RESULT_B.store(u64::MAX, Ordering::SeqCst);
+}
+
+fn pi_wait_for(a: &AtomicU32, want: u32, ms: u64) -> bool {
+    let until = sys::clock_get() + ms;
+    while a.load(Ordering::SeqCst) != want {
+        if sys::clock_get() > until {
+            return false;
+        }
+        nap_ticks(1);
+    }
+    true
+}
+
+/// The low-priority owner of the classic inversion: it takes the lock, says so, and when it is told to go it does work that needs the CPU.
+extern "C" fn pi_low_owner(_: usize) -> ! {
+    sys::thread_set_sched(0, 5, 0);
+    pi_lock(&PI_WORD, u64::MAX);
+    PI_STATE.store(1, Ordering::SeqCst);
+    while PI_GO.load(Ordering::SeqCst) == 0 {
+        core::hint::spin_loop();
+    }
+    for _ in 0..200_000 {
+        PI_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    }
+    pi_unlock(&PI_WORD);
+    PI_STATE.store(2, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// The high-priority waiter: asks for the lock with a deadline and records how it went and how long it took.
+extern "C" fn pi_high_waiter(_: usize) -> ! {
+    sys::thread_set_sched(0, 25, 0);
+    let t0 = sys::clock_get();
+    let r = pi_lock(&PI_WORD, t0 + 4_000);
+    PI_RESULT_A.store(r as u64, Ordering::SeqCst);
+    PI_RESULT_B.store(sys::clock_get() - t0, Ordering::SeqCst);
+    if r == 0 {
+        pi_unlock(&PI_WORD);
+    }
+    sys::thread_exit(0)
+}
+
+/// The classic three-thread inversion: a low-priority thread owns the lock and a hog of middle priority runs on every hart, so the owner gets no CPU
+/// (checked first: the control); a high-priority thread then waits for the lock, and through the donation the owner runs, finishes and unlocks.
+fn pi_futex_bounds_inversion() -> Outcome {
+    pi_reset();
+    let harts = job_use(root_job()?, 7)?.0;
+    ok(
+        sys::thread_set_sched(0, 31, 0),
+        "main to the top of the normal band",
+    )?;
+    let low = new_thread(pi_low_owner, 0)?;
+    ensure!(
+        pi_wait_for(&PI_STATE, 1, 5_000),
+        "the low-priority thread never took the lock"
+    );
+    RT_STOP.store(0, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        let h = new_thread(rt_hog, 0)?;
+        ok(sys::thread_set_sched(h, 15, 0), "a hog above the owner")?;
+        hogs.push(h);
+    }
+    nap_ticks(10);
+    PI_GO.store(1, Ordering::SeqCst);
+    nap_ticks(200);
+    let starved = PI_PROGRESS.load(Ordering::SeqCst);
+    let high = new_thread(pi_high_waiter, 0)?;
+    // the owner is boosted by the waiter; a change of its own base priority meanwhile (to the same value, even) must not drop the boost
+    nap_ticks(20);
+    let eff_before = (sys::thread_get_sched(low).a1 >> 16) & 0xff;
+    ok(
+        sys::thread_set_sched(low, 6, 0),
+        "the owner's base priority changes while it is boosted",
+    )?;
+    let eff_after = (sys::thread_get_sched(low).a1 >> 16) & 0xff;
+    let w = sys::object_wait(high, sig::TERMINATED, sys::clock_get() + 20_000);
+    RT_STOP.store(1, Ordering::SeqCst);
+    ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    sys::object_wait(low, sig::TERMINATED, sys::clock_get() + 20_000);
+    sys::handle_close(low);
+    sys::handle_close(high);
+    ensure_eq!(w.status, 0, "the high-priority thread finished");
+    ensure_eq!(
+        eff_before,
+        25,
+        "the owner runs at the waiter's priority while it waits"
+    );
+    ensure_eq!(
+        eff_after,
+        25,
+        "a change of the owner's base priority dropped the boost"
+    );
+    ensure_eq!(starved, 0, "the owner made progress under a hog on every hart: the hogs do not load the harts, so the test shows nothing");
+    ensure_eq!(
+        PI_RESULT_A.load(Ordering::SeqCst),
+        0,
+        "the high-priority thread got the lock"
+    );
+    let took = PI_RESULT_B.load(Ordering::SeqCst);
+    ensure!(took < 3_000, "the lock took {took} ms to come");
+    ensure!(
+        PI_PROGRESS.load(Ordering::SeqCst) == 200_000,
+        "the owner did not finish its work"
+    );
+    ensure_eq!(
+        PI_WORD.load(Ordering::SeqCst),
+        0,
+        "the word is free at the end"
+    );
+    Ok(())
+}
+
+extern "C" fn pi_dying_owner(_: usize) -> ! {
+    pi_lock(&PI_WORD, u64::MAX);
+    PI_STATE.store(1, Ordering::SeqCst);
+    while PI_GO.load(Ordering::SeqCst) == 0 {
+        sys::thread_yield();
+    }
+    sys::thread_exit(0) // (still holding the lock)
+}
+
+extern "C" fn pi_waiter_a(_: usize) -> ! {
+    let t0 = sys::clock_get();
+    let r = pi_lock(&PI_WORD, t0 + 5_000);
+    PI_RESULT_A.store(r as u64, Ordering::SeqCst);
+    PI_RESULT_B.store(sys::clock_get() - t0, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// An owner that exits holding the lock poisons it: the waiter is woken with BAD_STATE, and so is the next thread that asks.
+fn pi_futex_owner_death_poisons() -> Outcome {
+    pi_reset();
+    let owner = new_thread(pi_dying_owner, 0)?;
+    ensure!(
+        pi_wait_for(&PI_STATE, 1, 5_000),
+        "the owner never took the lock"
+    );
+    let waiter = new_thread(pi_waiter_a, 0)?;
+    nap_ticks(50); // the waiter is queued
+    PI_GO.store(1, Ordering::SeqCst); // the owner exits
+    let w = sys::object_wait(waiter, sig::TERMINATED, sys::clock_get() + 10_000);
+    sys::object_wait(owner, sig::TERMINATED, sys::clock_get() + 10_000);
+    sys::handle_close(owner);
+    sys::handle_close(waiter);
+    ensure_eq!(
+        w.status,
+        0,
+        "the waiter finished (it was woken, not left to its deadline)"
+    );
+    ensure_eq!(
+        PI_RESULT_A.load(Ordering::SeqCst) as i64,
+        S::BadState.code() as i64,
+        "the waiter was told the lock is poisoned"
+    );
+    let waited = PI_RESULT_B.load(Ordering::SeqCst);
+    ensure!(
+        waited < 3_000,
+        "the waiter was left to its deadline ({waited} ms of 5000), not woken by the owner's death"
+    );
+    ensure!(
+        PI_WORD.load(Ordering::SeqCst) & (1 << 30) != 0,
+        "the word does not say the owner died"
+    );
+    ensure_eq!(
+        st(sys::futex_lock_pi(PI_WORD.as_ptr(), sys::clock_get() + 100)),
+        Some(S::BadState),
+        "a later thread finds it poisoned"
+    );
+    Ok(())
+}
+
+extern "C" fn pi_deadlock_a(_: usize) -> ! {
+    pi_lock(&PI_WORD, u64::MAX);
+    PI_STATE.store(1, Ordering::SeqCst);
+    while PI_STATE.load(Ordering::SeqCst) < 2 {
+        sys::thread_yield();
+    }
+    // (B holds the second lock: wait for it, which B will end by refusing the cycle and then handing the lock over)
+    let r = pi_lock(&PI_WORD2, sys::clock_get() + 8_000);
+    PI_RESULT_A.store(r as u64, Ordering::SeqCst);
+    if r == 0 {
+        pi_unlock(&PI_WORD2);
+    }
+    pi_unlock(&PI_WORD);
+    sys::thread_exit(0)
+}
+
+extern "C" fn pi_deadlock_b(_: usize) -> ! {
+    pi_lock(&PI_WORD2, u64::MAX);
+    PI_STATE.store(2, Ordering::SeqCst);
+    nap_ticks(100); // A is waiting for the second lock
+                    // A holds the first and waits for ours: waiting for it would close the cycle
+    let r = pi_lock(&PI_WORD, sys::clock_get() + 8_000);
+    PI_RESULT_B.store(r as u64, Ordering::SeqCst);
+    pi_unlock(&PI_WORD2); // hands the lock to A
+    sys::thread_exit(0)
+}
+
+/// Two threads each hold a lock and ask for the other's: the second ask is refused with BAD_STATE at once (no sleep), and A gets its lock afterwards.
+fn pi_futex_deadlock_is_refused() -> Outcome {
+    pi_reset();
+    let a = new_thread(pi_deadlock_a, 0)?;
+    let b = new_thread(pi_deadlock_b, 0)?;
+    let wa = sys::object_wait(a, sig::TERMINATED, sys::clock_get() + 20_000);
+    let wb = sys::object_wait(b, sig::TERMINATED, sys::clock_get() + 20_000);
+    sys::handle_close(a);
+    sys::handle_close(b);
+    ensure_eq!(wa.status, 0, "A finished");
+    ensure_eq!(wb.status, 0, "B finished");
+    ensure_eq!(
+        PI_RESULT_B.load(Ordering::SeqCst) as i64,
+        S::BadState.code() as i64,
+        "the ask that closes the cycle is refused"
+    );
+    ensure_eq!(
+        PI_RESULT_A.load(Ordering::SeqCst),
+        0,
+        "A got the second lock once B let go of it"
+    );
+    ensure_eq!(PI_WORD.load(Ordering::SeqCst), 0, "the first word is free");
+    ensure_eq!(
+        PI_WORD2.load(Ordering::SeqCst),
+        0,
+        "the second word is free"
+    );
+    Ok(())
+}
+
+/// The error cases: a bad address, a relock, a poll, and an unlock by a thread that does not own it.
+fn pi_futex_argument_errors() -> Outcome {
+    pi_reset();
+    let p = PI_WORD.as_ptr();
+    ensure_eq!(
+        st(sys::futex_lock_pi(
+            (p as usize + 1) as *const u32,
+            sys::clock_get() + 50
+        )),
+        Some(S::InvalidArgs),
+        "a misaligned address"
+    );
+    ensure_eq!(
+        st(sys::futex_lock_pi(
+            0x10 as *const u32,
+            sys::clock_get() + 50
+        )),
+        Some(S::InvalidArgs),
+        "an address below user memory"
+    );
+    ensure_eq!(
+        st(sys::futex_unlock_pi(0x7fff_ff00_0000 as *const u32)),
+        Some(S::InvalidArgs),
+        "an unmapped address"
+    );
+    ensure_eq!(
+        pi_lock(&PI_WORD, u64::MAX),
+        0,
+        "a free lock is taken in user mode"
+    );
+    ensure_eq!(
+        st(sys::futex_lock_pi(p, sys::clock_get() + 50)),
+        Some(S::BadState),
+        "a relock would wait for itself"
+    );
+    ensure_eq!(pi_unlock(&PI_WORD), 0, "released by the owner");
+    ensure_eq!(
+        st(sys::futex_unlock_pi(p)),
+        Some(S::AccessDenied),
+        "an unlock of a free lock"
+    );
+    // a lock held by another thread: a poll that would have to wait times out, a wait times out at its deadline, an unlock is refused
+    PI_STATE.store(0, Ordering::SeqCst);
+    PI_GO.store(0, Ordering::SeqCst);
+    let owner = new_thread(pi_dying_owner, 0)?;
+    ensure!(
+        pi_wait_for(&PI_STATE, 1, 5_000),
+        "the owner never took the lock"
+    );
+    ensure_eq!(
+        st(sys::futex_lock_pi(p, 0)),
+        Some(S::TimedOut),
+        "a poll of a lock that is held"
+    );
+    let t0 = sys::clock_get();
+    ensure_eq!(
+        st(sys::futex_lock_pi(p, t0 + 60)),
+        Some(S::TimedOut),
+        "a wait that reaches its deadline"
+    );
+    ensure!(
+        sys::clock_get() >= t0 + 60,
+        "it returned before its deadline"
+    );
+    ensure_eq!(
+        st(sys::futex_unlock_pi(p)),
+        Some(S::AccessDenied),
+        "an unlock by a thread that is not the owner"
+    );
+    PI_GO.store(1, Ordering::SeqCst);
+    sys::object_wait(owner, sig::TERMINATED, sys::clock_get() + 10_000);
+    sys::handle_close(owner);
+    Ok(())
+}
+
 /// SCHED-SMP-SPEC 4.5 (task 25): a real-time spinner on every hart does not hang the system. The job's budget (the root's: one whole window
 /// of CPU per 100 ms) is spent by the hogs within a fraction of each window and they are demoted to the top of the normal band until it ends, so
 /// a thread there (this one, at 31) keeps getting the CPU, and the real-time time the job is billed per window stays at its budget.
@@ -14380,6 +14731,10 @@ pub fn app_main() -> i32 {
             lua_script_matches_the_host_build,
         ),
         ("futex_argument_errors", futex_argument_errors),
+        ("pi_futex_bounds_inversion", pi_futex_bounds_inversion),
+        ("pi_futex_owner_death_poisons", pi_futex_owner_death_poisons),
+        ("pi_futex_deadlock_is_refused", pi_futex_deadlock_is_refused),
+        ("pi_futex_argument_errors", pi_futex_argument_errors),
         ("futex_times_out_not_early", futex_times_out_not_early),
         ("futex_wake_counts_and_fifo", futex_wake_counts_and_fifo),
         ("kill_a_futex_waiter", kill_a_futex_waiter),
