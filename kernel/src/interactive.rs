@@ -79,7 +79,7 @@ fn bridge_main(_: usize) {
 }
 
 /// Run the interactive system to the end of `init`; returns the kernel-side checks.
-pub fn run() -> crate::user_tests::Report {
+pub fn run() -> crate::report::Report {
     let mut tests: Vec<(String, Outcome)> = Vec::new();
     let threads_before = thread::thread_count();
     let result = (|| -> Result<i32, String> {
@@ -171,7 +171,7 @@ pub fn run() -> crate::user_tests::Report {
             ))
         },
     ));
-    crate::user_tests::Report {
+    crate::report::Report {
         tests,
         user_reported: user::reported(),
     }

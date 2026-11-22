@@ -28,12 +28,17 @@ mod kmem;
 mod kstack;
 mod latency;
 mod percpu;
+mod report;
+#[cfg(not(feature = "release"))]
 mod sched_tests;
+#[cfg(not(feature = "release"))]
 mod selftest;
 mod smp;
+#[cfg(not(feature = "release"))]
 mod smp_tests;
 mod thread;
 mod user;
+#[cfg(not(feature = "release"))]
 mod user_tests;
 
 use core::fmt::Write;
@@ -44,6 +49,9 @@ use kcore::testlog;
 /// The release build: no boot self-tests, no `##` lines for passing checks, no banners. It boots
 /// straight to the shell (T48). A failing kernel-side check, a panic and the final verdict on a
 /// failure still print, so a broken release build is not silent.
+/// The boot thread's priority (the test modules build theirs from it).
+const MAIN_PRIO: u8 = 40;
+
 const RELEASE: bool = cfg!(feature = "release");
 
 /// A zero-initialised static: it lives in .bss, so this checks `_start` cleared it.
@@ -152,7 +160,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         let _ = writeln!(out, "harts online: {}", smp::online());
     }
 
-    for (name, test) in selftest::TESTS.iter().filter(|_| !RELEASE) {
+    #[cfg(not(feature = "release"))]
+    for (name, test) in selftest::TESTS.iter() {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
@@ -160,7 +169,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     }
     // S2: threads, the timer and the scheduler. The boot thread becomes a real-time
     // thread and interrupts come on.
-    thread::init(sched_tests::MAIN_PRIO);
+    thread::init(MAIN_PRIO);
     // From here the big kernel lock is real: entry points assert that it is held.
     user::install_hooks(); // (the address-space locks run on this machine's interrupt state and order checker)
     bkl::enforce();
@@ -183,11 +192,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         &alloc::format!("scheduler_class_is_{}", class.replace('-', "_")),
         Ok(()),
     );
-    for (name, test) in sched_tests::TESTS
-        .iter()
-        .chain(sched_tests::PRIORITY_TESTS)
-        .filter(|_| !RELEASE)
-    {
+    #[cfg(not(feature = "release"))]
+    for (name, test) in sched_tests::TESTS.iter().chain(sched_tests::PRIORITY_TESTS) {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
@@ -213,7 +219,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         );
         thread::join(t);
     }
-    for (name, test) in smp_tests::TESTS.iter().filter(|_| !RELEASE) {
+    #[cfg(not(feature = "release"))]
+    for (name, test) in smp_tests::TESTS.iter() {
         match test() {
             Ok(()) => tally.record(name, Ok(())),
             Err(detail) => tally.record(name, Err(&detail)),
