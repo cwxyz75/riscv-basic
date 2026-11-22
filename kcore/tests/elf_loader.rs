@@ -132,7 +132,7 @@ fn every_rule_has_a_rejection() {
     b[5] = 2;
     expect(b, ElfError::NotLittleEndian);
     let mut b = ok.clone();
-    b[16] = 3; // ET_DYN
+    b[16] = 4; // ET_CORE (ET_DYN is a static-PIE now: HD2)
     expect(b, ElfError::BadType);
     let mut b = ok.clone();
     b[18] = 62; // x86-64
@@ -346,7 +346,7 @@ fn mutated_images_never_panic_and_accepted_ones_are_safe_to_map() {
         if let Ok(img) = parse(&b) {
             for (i, s) in img.segments.iter().enumerate() {
                 assert!(
-                    s.vaddr >= BASE && s.vaddr + s.memsz <= TOP,
+                    img.pie || (s.vaddr >= BASE && s.vaddr + s.memsz <= TOP),
                     "seed {seed}: outside the user half"
                 );
                 assert!(
@@ -396,4 +396,259 @@ fn a_segment_may_not_touch_the_stack_or_its_guard_page() {
         parse(&seg(STACK_TOP, 4096)).is_ok(),
         "above the stack top is fine"
     );
+}
+
+// ---- HD2: static-PIE (ET_DYN) images ----
+
+const DT_NULL: u64 = 0;
+const DT_NEEDED: u64 = 1;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+
+/// A static-PIE: text at 0x0 (file 0x1000), data at 0x2000 (file 0x2000) holding a dynamic section at 0x2000 and a relocation table at 0x2100.
+/// `dynamic` is the dynamic section's entries, `relas` the relocations as (offset, info, addend).
+fn pie(dynamic: &[(u64, u64)], relas: &[(u64, u64, u64)]) -> Vec<u8> {
+    let phs = [
+        load(PF_R | PF_X, 0x1000, 0x0, 0x800, 0x800),
+        load(PF_R | PF_W, 0x2000, 0x2000, 0x400, 0x3000),
+        Ph {
+            kind: 2, // PT_DYNAMIC
+            flags: PF_R | PF_W,
+            offset: 0x2000,
+            vaddr: 0x2000,
+            filesz: (dynamic.len() * 16) as u64,
+            memsz: (dynamic.len() * 16) as u64,
+        },
+    ];
+    let mut b = build(0x10, &phs, 0);
+    b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b.resize(0x2400, 0);
+    for (i, (tag, val)) in dynamic.iter().enumerate() {
+        b[0x2000 + i * 16..0x2000 + i * 16 + 8].copy_from_slice(&tag.to_le_bytes());
+        b[0x2000 + i * 16 + 8..0x2000 + i * 16 + 16].copy_from_slice(&val.to_le_bytes());
+    }
+    for (i, (off, info, add)) in relas.iter().enumerate() {
+        let at = 0x2100 + i * 24;
+        b[at..at + 8].copy_from_slice(&off.to_le_bytes());
+        b[at + 8..at + 16].copy_from_slice(&info.to_le_bytes());
+        b[at + 16..at + 24].copy_from_slice(&add.to_le_bytes());
+    }
+    b
+}
+
+fn good_dyn() -> Vec<(u64, u64)> {
+    vec![
+        (DT_RELA, 0x2100),
+        (DT_RELASZ, 48),
+        (DT_RELAENT, 24),
+        (DT_NULL, 0),
+    ]
+}
+
+fn good_pie() -> Vec<u8> {
+    pie(&good_dyn(), &[(0x2200, 3, 0x40), (0x2208, 3, 0x1000)])
+}
+
+#[test]
+fn a_static_pie_with_relative_relocations_is_accepted_and_reports_its_span() {
+    let img = parse(&good_pie()).unwrap();
+    assert!(img.pie);
+    assert_eq!(img.entry, 0x10);
+    assert_eq!(img.span, 0x5000, "the data segment ends at 0x2000 + 0x3000");
+    assert_eq!(img.segments.len(), 2);
+    assert_eq!(
+        img.segments[0].vaddr, 0,
+        "link addresses are offsets from the base"
+    );
+    // an ET_EXEC image is not one
+    let e = parse(&good()).unwrap();
+    assert!((!e.pie, e.span) == (true, 0));
+}
+
+#[test]
+fn a_static_pie_with_no_relocations_is_accepted() {
+    let b = pie(&[(DT_NULL, 0)], &[]);
+    assert!(parse(&b).unwrap().pie);
+}
+
+#[test]
+fn every_static_pie_rule_has_a_rejection() {
+    let bad = |dynamic: &[(u64, u64)], relas: &[(u64, u64, u64)], want: ElfError| {
+        assert_eq!(parse(&pie(dynamic, relas)), Err(want));
+    };
+    // a needed library, or any tag outside the allowed few
+    bad(&[(DT_NEEDED, 1), (DT_NULL, 0)], &[], ElfError::Dynamic);
+    bad(&[(17, 0x2100), (DT_NULL, 0)], &[], ElfError::Dynamic); // DT_REL
+    bad(&[(23, 0x2100), (DT_NULL, 0)], &[], ElfError::Dynamic); // DT_JMPREL
+                                                                // no terminating DT_NULL
+    bad(
+        &[(DT_RELA, 0x2100), (DT_RELASZ, 0), (DT_RELAENT, 24)],
+        &[],
+        ElfError::Dynamic,
+    );
+    // a wrong entry size, a table size that is not a whole number of entries
+    bad(
+        &[
+            (DT_RELA, 0x2100),
+            (DT_RELASZ, 24),
+            (DT_RELAENT, 12),
+            (DT_NULL, 0),
+        ],
+        &[(0x2200, 3, 0)],
+        ElfError::Dynamic,
+    );
+    bad(
+        &[
+            (DT_RELA, 0x2100),
+            (DT_RELASZ, 30),
+            (DT_RELAENT, 24),
+            (DT_NULL, 0),
+        ],
+        &[(0x2200, 3, 0)],
+        ElfError::Dynamic,
+    );
+    // a relocation that is not R_RISCV_RELATIVE: R_RISCV_64 (2), a symbolic one (symbol 1 in the high word), type 0
+    for info in [2u64, 3 | (1 << 32), 0] {
+        bad(
+            &[
+                (DT_RELA, 0x2100),
+                (DT_RELASZ, 24),
+                (DT_RELAENT, 24),
+                (DT_NULL, 0),
+            ],
+            &[(0x2200, info, 0)],
+            ElfError::Relocation,
+        );
+    }
+    // a word outside every writable segment (in the text, past the image, unaligned, straddling the end)
+    for off in [0x100u64, 0x5000, 0x2201, 0x4ffc, u64::MAX - 3] {
+        bad(
+            &[
+                (DT_RELA, 0x2100),
+                (DT_RELASZ, 24),
+                (DT_RELAENT, 24),
+                (DT_NULL, 0),
+            ],
+            &[(off, 3, 0)],
+            ElfError::Relocation,
+        );
+    }
+    // a table that is not in the file bytes of a loaded segment
+    bad(
+        &[
+            (DT_RELA, 0x4000),
+            (DT_RELASZ, 24),
+            (DT_RELAENT, 24),
+            (DT_NULL, 0),
+        ],
+        &[(0x2200, 3, 0)],
+        ElfError::Relocation,
+    );
+    bad(
+        &[
+            (DT_RELA, u64::MAX - 8),
+            (DT_RELASZ, 24),
+            (DT_RELAENT, 24),
+            (DT_NULL, 0),
+        ],
+        &[(0x2200, 3, 0)],
+        ElfError::Relocation,
+    );
+}
+
+#[test]
+fn a_dynamic_section_is_refused_in_a_fixed_image_and_an_interpreter_everywhere() {
+    // ET_EXEC with a PT_DYNAMIC: still the old refusal
+    let phs = [
+        load(PF_R | PF_X, 0x1000, 0x1_0000, 0x800, 0x800),
+        Ph {
+            kind: 2,
+            flags: PF_R,
+            offset: 0x2000,
+            vaddr: 0x1_2000,
+            filesz: 16,
+            memsz: 16,
+        },
+    ];
+    let b = build(0x1_0010, &phs, 0x2200);
+    assert_eq!(parse(&b), Err(ElfError::Dynamic));
+    // a static-PIE with a PT_INTERP
+    let phs = [
+        load(PF_R | PF_X, 0x1000, 0x0, 0x800, 0x800),
+        Ph {
+            kind: 3,
+            flags: PF_R,
+            offset: 0,
+            vaddr: 0,
+            filesz: 0,
+            memsz: 0,
+        },
+    ];
+    let mut b = build(0x10, &phs, 0x2200);
+    b[16..18].copy_from_slice(&3u16.to_le_bytes());
+    assert_eq!(parse(&b), Err(ElfError::Dynamic));
+    // two dynamic headers
+    let mut b = pie(&good_dyn(), &[]);
+    b[56..58].copy_from_slice(&4u16.to_le_bytes());
+    let extra = {
+        let mut h = vec![0u8; 56];
+        h[0..4].copy_from_slice(&2u32.to_le_bytes());
+        h
+    };
+    let at = 64 + 3 * 56;
+    b.splice(at..at, extra);
+    assert_eq!(parse(&b), Err(ElfError::Dynamic));
+}
+
+#[test]
+fn a_static_pie_too_big_for_the_user_half_is_refused() {
+    let phs = [load(PF_R | PF_X, 0x1000, 0x0, 0x800, MAX_PIE_SPAN + 4096)];
+    let mut b = build(0x10, &phs, 0x2200);
+    b[16..18].copy_from_slice(&3u16.to_le_bytes());
+    b.resize(0x2100, 0);
+    assert_eq!(parse(&b), Err(ElfError::SegmentOutsideUser));
+}
+
+#[test]
+fn mutated_static_pies_never_panic_and_accepted_ones_are_safe_to_relocate() {
+    let base = good_pie();
+    for seed in 0..SEEDS * 10 {
+        let mut rng = Rng::new(seed ^ 0x9e37_79b9);
+        let mut b = base.clone();
+        for _ in 0..1 + rng.below(6) {
+            if b.is_empty() {
+                break;
+            }
+            match rng.below(4) {
+                0 => {
+                    let i = rng.below(b.len().min(0x2200) as u64) as usize;
+                    b[i] = rng.next() as u8;
+                }
+                1 => {
+                    let i = rng.below(b.len() as u64) as usize;
+                    b[i] ^= 1 << rng.below(8);
+                }
+                2 => b.truncate(rng.below(b.len() as u64 + 1) as usize),
+                _ => {
+                    let i = rng.below(b.len().saturating_sub(8).max(1) as u64) as usize;
+                    if i + 8 <= b.len() {
+                        b[i..i + 8].copy_from_slice(&rng.next().to_le_bytes());
+                    }
+                }
+            }
+        }
+        if let Ok(img) = parse(&b) {
+            if img.pie {
+                assert!(img.span <= MAX_PIE_SPAN + 4096, "seed {seed}: span");
+                for s in &img.segments {
+                    assert!(
+                        s.vaddr + s.memsz <= img.span,
+                        "seed {seed}: a segment outside the span"
+                    );
+                    assert!(!(s.perms.write && s.perms.exec), "seed {seed}: W+X");
+                }
+            }
+        }
+    }
 }
