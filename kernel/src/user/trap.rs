@@ -66,7 +66,14 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
         } = s;
         let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
         crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
-        let p = procs.get_mut(&pid)?;
+        let p = procs.get_mut(&pid);
+        crate::percpu::this().cur_as.store(
+            p.as_ref().map_or(core::ptr::null_mut(), |p| {
+                alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
+            }),
+            Ordering::Release,
+        );
+        let p = p?;
         // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
         // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
         Some(install_token_of(asids, p))
@@ -97,6 +104,69 @@ const SWEEP_SLICE_BUDGET: usize = 256;
 
 pub(super) fn bump_attention() {
     ATTENTION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A user page fault resolved with **no big kernel lock** (L17 part c, KERNEL-V1-SPEC 4.5): the faulting hart takes its process's `AS` lock,
+/// then the memory locks (`VMO`, `JOBS`, `FRAME`), maps the page, and lets go. True: the page is mapped and the thread retries the instruction.
+/// False: nothing was changed that the full path would not do again (a bad address, a region that is not there, a page a pager has not
+/// supplied, no memory), and the trap takes the full path, which finds the same answer under the big lock and acts on it (a kill, a pager wait).
+///
+/// The process is the one `activate_current` (or the thread's first entry) recorded for this hart: the faulting thread belongs to it, and a
+/// process is torn down only when its last thread has gone, so the cell outlives this call. The lock is what keeps the space from changing under
+/// the fault: every other reach of the space (a map, an unmap, a protect, a copy) holds it too (AS1).
+pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
+    use crate::arch::{FaultKind, UserTrap};
+    let UserTrap::Fault(fault) = frame.decode_user() else {
+        return false;
+    };
+    if fault.kind != FaultKind::PageFault || fault.address >= abi::user::TOP {
+        return false;
+    }
+    let cell = crate::percpu::this().cur_as.load(Ordering::Acquire);
+    if cell.is_null() {
+        return false;
+    }
+    // SAFETY: see above: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for the whole call.
+    let cell = unsafe { &*cell };
+    let access = fault.access.unwrap_or(Access::Read);
+    let r = {
+        #[cfg(not(feature = "fault-skip-as-lock"))]
+        let _as = cell.lock();
+        // (negative control: the fault reaches the space without its lock, as if the lock were not there)
+        #[cfg(not(feature = "fault-skip-as-lock"))]
+        let space = {
+            let _ = &_as;
+            cell.held_mut()
+        };
+        #[cfg(feature = "fault-skip-as-lock")]
+        let space = cell.unchecked_mut_for_negative_control();
+        let k = kmem::mem();
+        let r = space.handle_fault_mapped(k.mm, k.vmos, k.jobs, fault.address, access);
+        if let Err(kcore::aspace::FaultError::NeedPager(_)) = &r {
+            // (the slot a kernel copy reads must not keep this need for another thread's call; the full path asks again)
+            let _ = k.vmos.take_need();
+        }
+        r
+    };
+    let Ok(m) = r else {
+        return false;
+    };
+    if m.exec > 0 {
+        // (PL7) code made visible: every hart's instruction fetches must agree with memory before it runs
+        crate::smp::icache_sync(m.exec);
+    }
+    kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
+    // (MM8) a write that replaced a shared page leaves translations other harts may hold: the same sync as after a call. It takes the big lock
+    // and can switch threads, so it is the full return to user mode (`activate_current` after a switch); a load when nothing is pending.
+    if kcore::aspace::COPY_PENDING.load(Ordering::Acquire) {
+        crate::bkl::lock();
+        super::calls::cow_sync();
+        commit_wake();
+        thread::preempt_point();
+        activate_current(frame);
+        crate::bkl::unlock();
+    }
+    true
 }
 
 /// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call

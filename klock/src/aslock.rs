@@ -144,6 +144,14 @@ impl AsCell {
         unsafe { &*self.lock.value_ptr() }
     }
 
+    /// The value with no lock held and no check: **only** the negative control `fault-skip-as-lock` of the kernel uses it, to show that the
+    /// guarding test fails when the page-fault path does not take the lock.
+    #[allow(clippy::mut_from_ref)] // (the negative control's point: it breaks the rule that makes the reference unique)
+    pub fn unchecked_mut_for_negative_control(&self) -> &mut AddressSpace {
+        // SAFETY: none: this is the deliberate breach, built only in the negative-control kernel.
+        unsafe { &mut *self.lock.value_ptr() }
+    }
+
     /// Take the lock of a cell shared by `Arc`, returning a holder that keeps the cell alive and releases the lock when it is dropped.
     /// The hold is not tied to a borrow, so a syscall can keep the locks of the address spaces it touches while the pure code takes the
     /// processes out of the table as it likes.

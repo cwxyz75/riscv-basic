@@ -102,6 +102,10 @@ pub(super) fn user_thread_main(token: usize) {
         let p = procs
             .get_mut(&ts.pid)
             .expect("a process lives while one of its threads does");
+        crate::percpu::this().cur_as.store(
+            alloc::sync::Arc::as_ptr(&p.aspace).cast_mut(),
+            Ordering::Release,
+        );
         install_token_of(asids, p)
     };
     crate::percpu::this()

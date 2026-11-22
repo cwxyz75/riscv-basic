@@ -99,6 +99,7 @@ OS_NOSATP_ELF  := target/os-fault-satp/$(KERNEL_TARGET)/debug/kernel
 OS_NOCOWPROT_ELF := target/os-fault-cowprot/$(KERNEL_TARGET)/debug/kernel
 OS_NODECOMMIT_ELF := target/os-fault-decommit/$(KERNEL_TARGET)/debug/kernel
 OS_NOPROTSHOOT_ELF := target/os-fault-protshoot/$(KERNEL_TARGET)/debug/kernel
+OS_NOASLOCK_ELF := target/os-fault-aslock/$(KERNEL_TARGET)/debug/kernel
 OS_NOKILL_ELF  := target/os-fault-killipi/$(KERNEL_TARGET)/debug/kernel
 OS_NOFPSAVE_ELF := target/os-fault-fpsave/$(KERNEL_TARGET)/debug/kernel
 OS_NOREPEND_ELF := target/os-fault-repend/$(KERNEL_TARGET)/debug/kernel
@@ -279,6 +280,8 @@ os-boot-test-smp-neg: kernel os-interactive
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOCOWPROT_ELF) copy_on_write_children_from_user_mode
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NODECOMMIT_ELF) decommit_while_siblings_touch
 	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOPROTSHOOT_ELF) protect_while_siblings_write
+	cd kernel && cargo build --features fault-skip-as-lock --target-dir ../target/os-fault-aslock
+	OS_SMP=4 OS_BOOT_TIMEOUT=240 python3 scripts/os_boot_test.py --neg $(OS_NOASLOCK_ELF) unmap_while_siblings_touch
 	cd kernel && cargo build --features fault-skip-kill-ipi --target-dir ../target/os-fault-killipi
 	OS_SMP=4 python3 scripts/os_boot_test.py --neg $(OS_NOKILL_ELF) kill_a_spinner_on_another_hart
 	cd kernel && cargo build --features fault-skip-fp-save --target-dir ../target/os-fault-fpsave
