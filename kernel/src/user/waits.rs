@@ -545,8 +545,8 @@ fn channel_call_inner(a: [u64; 6]) -> Reply {
             take_interrupt_held,
         )
     })?;
-    notify();
-    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
+    notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
+                   // Wait for the reply with that transaction id (or the peer closing, or the deadline).
     let me = thread::current();
     let ready = || {
         let s = state();

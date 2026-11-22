@@ -1239,6 +1239,20 @@ pub fn wake_many_quiet(tids: &[Tid]) {
     note_resched();
 }
 
+/// `wake_many` by a thread that is about to block (a `channel_call` that queued its request, L24): each woken thread is placed on this hart with no IPI
+/// and runs here when the caller blocks. Interrupts off, as `wake_many`; the big lock is held.
+pub fn wake_many_sync(tids: &[Tid]) {
+    irq::without(|| {
+        for &tid in tids {
+            if sched().state(tid) == Some(State::Blocked) {
+                WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = sched().wake_sync_on(hart(), tid);
+        }
+        note_resched();
+    });
+}
+
 /// Is `tid` blocked right now (a test hook)?
 pub fn is_blocked(tid: Tid) -> bool {
     irq::without(|| sched().state(tid) == Some(State::Blocked))

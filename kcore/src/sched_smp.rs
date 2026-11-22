@@ -500,7 +500,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.hint[h].cur_eff.load(Ordering::Acquire)
     }
 
-    /// 4.4 `select_hart` (rules 1, 3, 4 and 5; the synchronous-wake hint of rule 2 arrives with direct hand-off). Reads only
+    /// 4.4 `select_hart` (rules 1, 3, 4 and 5; rule 2, the synchronous-wake hint, is `wake_sync_on`'s). Reads only
     /// hints.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: harts() >= 1
     fn select_hart(&self, rec: &ThreadSched) -> usize {
@@ -987,16 +987,23 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     /// Wake `tid` (a blocked thread is placed and queued; a prepared one is notified; anything else is left alone).
     pub fn wake_on(&self, caller: usize, tid: Tid) -> Result<(), Error> {
-        self.wake_inner(caller, tid).map(|_| ())
+        self.wake_inner(caller, tid, false).map(|_| ())
+    }
+
+    /// `wake_on` by a thread that is **about to block** (a `channel_call` that has queued its request): the woken thread is placed on the waker's
+    /// own hart, with no IPI, because it will run there as soon as the waker blocks (direct hand-off, SCHED-SMP-SPEC 4.4 rule 2 and 5.5). A thread
+    /// pinned to another hart, or a waker's hart that is offline, is placed as an ordinary wake is.
+    pub fn wake_sync_on(&self, caller: usize, tid: Tid) -> Result<(), Error> {
+        self.wake_inner(caller, tid, true).map(|_| ())
     }
 
     /// `wake_on`, saying whether the wake counted: the thread was blocked (now runnable) or had prepared to wait (now
     /// notified, so it will not block). Anything else is left alone and does not count.
     pub fn wake_counted_on(&self, caller: usize, tid: Tid) -> Result<bool, Error> {
-        self.wake_inner(caller, tid)
+        self.wake_inner(caller, tid, false)
     }
 
-    fn wake_inner(&self, caller: usize, tid: Tid) -> Result<bool, Error> {
+    fn wake_inner(&self, caller: usize, tid: Tid, sync: bool) -> Result<bool, Error> {
         loop {
             let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
             self.charge_now(home); // (a tickless hart's clock is as old as its last look: the wake is stamped with the time it happens)
@@ -1011,7 +1018,14 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             // (a blocked thread still in transit is queued on the hart that is still executing it: that hart's own queue is the only one
             // that cannot be served before its switch is done, and no other hart may pull it until then, G4)
             let target = if rec.state == State::Blocked && !self.is_in_transit(tid) {
-                self.select_hart(&rec)
+                if sync
+                    && rec.affinity.is_none_or(|a| a as usize == caller)
+                    && self.is_online(caller)
+                {
+                    caller // (the waker blocks next: the woken thread runs here, 4.4 rule 2)
+                } else {
+                    self.select_hart(&rec)
+                }
             } else {
                 home
             };
