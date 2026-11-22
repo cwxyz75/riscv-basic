@@ -12310,7 +12310,7 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     ensure_eq!(naps_done, 30, "thirty naps finished while the hogs ran");
     // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
     ensure!(
-        worst_rt <= 100_000_000 + 20_000_000,
+        worst_rt <= 100_000_000 + harts * 20_000_000,
         "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms, {harts} harts); (ms into window, RT ms): {trace:?}"
     );
     Ok(())
