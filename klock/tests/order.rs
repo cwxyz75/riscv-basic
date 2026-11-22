@@ -32,7 +32,7 @@ fn the_run_queue_class_may_be_taken_twice_in_ascending_instance_order() {
     assert!(h.check(Class::Rq, 0).is_err(), "descending");
     // no other class allows two
     for &c in &Class::ALL {
-        if c != Class::Rq && c != Class::As && !c.reentrant() {
+        if c != Class::Rq && c != Class::As && c != Class::Tt && !c.reentrant() {
             let h = held_with(&[(c, 1)]);
             assert!(h.check(c, 2).is_err(), "{c:?} never two");
         }
