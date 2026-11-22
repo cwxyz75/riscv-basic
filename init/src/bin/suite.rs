@@ -12280,6 +12280,7 @@ static PI_WORD: AtomicU32 = AtomicU32::new(0);
 static PI_WORD2: AtomicU32 = AtomicU32::new(0);
 static PI_STATE: AtomicU32 = AtomicU32::new(0);
 static PI_GO: AtomicU32 = AtomicU32::new(0);
+static PI_RELEASE: AtomicU32 = AtomicU32::new(0);
 static PI_PROGRESS: AtomicU32 = AtomicU32::new(0);
 static PI_RESULT_A: AtomicU64 = AtomicU64::new(u64::MAX);
 static PI_RESULT_B: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -12310,7 +12311,14 @@ fn pi_unlock(w: &AtomicU32) -> i64 {
 }
 
 fn pi_reset() {
-    for a in [&PI_WORD, &PI_WORD2, &PI_STATE, &PI_GO, &PI_PROGRESS] {
+    for a in [
+        &PI_WORD,
+        &PI_WORD2,
+        &PI_STATE,
+        &PI_GO,
+        &PI_RELEASE,
+        &PI_PROGRESS,
+    ] {
         a.store(0, Ordering::SeqCst);
     }
     PI_RESULT_A.store(u64::MAX, Ordering::SeqCst);
@@ -12336,7 +12344,8 @@ extern "C" fn pi_low_owner(_: usize) -> ! {
     while PI_GO.load(Ordering::SeqCst) == 0 {
         core::hint::spin_loop();
     }
-    for _ in 0..200_000 {
+    // (the critical section: it runs, and counts, until main says it may let go, so that the boost can be looked at while it lasts)
+    while PI_RELEASE.load(Ordering::SeqCst) == 0 {
         PI_PROGRESS.fetch_add(1, Ordering::Relaxed);
     }
     pi_unlock(&PI_WORD);
@@ -12391,6 +12400,10 @@ fn pi_futex_bounds_inversion() -> Outcome {
         "the owner's base priority changes while it is boosted",
     )?;
     let eff_after = (sys::thread_get_sched(low).a1 >> 16) & 0xff;
+    // (the owner has been running on the waiter's priority under the hogs: it made progress, and the waiter is still waiting)
+    nap_ticks(50);
+    let progress_while_boosted = PI_PROGRESS.load(Ordering::SeqCst);
+    PI_RELEASE.store(1, Ordering::SeqCst);
     let w = sys::object_wait(high, sig::TERMINATED, sys::clock_get() + 20_000);
     RT_STOP.store(1, Ordering::SeqCst);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
@@ -12421,8 +12434,8 @@ fn pi_futex_bounds_inversion() -> Outcome {
     let took = PI_RESULT_B.load(Ordering::SeqCst);
     ensure!(took < 3_000, "the lock took {took} ms to come");
     ensure!(
-        PI_PROGRESS.load(Ordering::SeqCst) == 200_000,
-        "the owner did not finish its work"
+        progress_while_boosted > 0,
+        "the owner made no progress while the waiter lent it its priority"
     );
     ensure_eq!(
         PI_WORD.load(Ordering::SeqCst),
