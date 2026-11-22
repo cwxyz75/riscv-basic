@@ -4,6 +4,7 @@ user_mode_runs_and_prints
 clock_advances_in_user_mode
 unknown_syscalls_are_refused
 debug_write_pointer_rules
+debug_calls_need_a_debug_resource
 handle_syscalls_reject_bad_values
 a_process_holds_twenty_thousand_handles
 event_syscalls

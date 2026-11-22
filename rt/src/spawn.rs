@@ -49,10 +49,60 @@ pub fn spawn(image: &[u8], startup: &[u8], handles: &[u64]) -> Result<u64, Spawn
     spawn_in(image, startup, handles, 0)
 }
 
+/// `spawn` with exactly the startup message and handles given: the child gets **no** debug resource (HD4). The launcher uses this for the programs it
+/// starts on a client's behalf; `spawn` and `spawn_in` hand the caller's own debug resource on, for the trusted services a supervisor starts.
+pub fn spawn_exact(image: &[u8], startup: &[u8], handles: &[u64]) -> Result<u64, SpawnError> {
+    spawn_in_exact(image, startup, handles, 0)
+}
+
+/// The startup message and handles with a duplicate of this process's debug resource added (HD4), if it has one and the message is one it can
+/// extend; otherwise the ones given. The handles are consumed either way, as `spawn` consumes them.
+fn with_debug(startup: &[u8], handles: &[u64]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u64>) {
+    use proto::startup::{Role, Startup};
+    let plain = || (startup.to_vec(), handles.to_vec());
+    let dbg = crate::debug::handle();
+    if dbg == 0 {
+        return plain();
+    }
+    let Ok(mut st) = Startup::decode(startup, handles.len()) else {
+        return plain();
+    };
+    if st.roles.iter().any(|(r, _)| *r == Role::Debug) {
+        return plain();
+    }
+    let d = sys::handle_duplicate(dbg, Rights::SAME.0);
+    if d.status != 0 {
+        return plain();
+    }
+    st.roles.push((Role::Debug, handles.len() as u32));
+    match st.encode() {
+        Ok(bytes) => {
+            let mut hs = handles.to_vec();
+            hs.push(d.a1 as u64);
+            (bytes, hs)
+        }
+        Err(_) => {
+            sys::handle_close(d.a1 as u64);
+            plain()
+        }
+    }
+}
+
 /// Like [`spawn`], with the process and all the memory built for it charged to `job` (a job
 /// handle with MANAGE; 0 means the caller's own job). The new process lives in `job`, so its
 /// limits are the program's limits.
 pub fn spawn_in(
+    image: &[u8],
+    startup: &[u8],
+    handles: &[u64],
+    job: u64,
+) -> Result<u64, SpawnError> {
+    let (bytes, hs) = with_debug(startup, handles);
+    spawn_in_exact(image, &bytes, &hs, job)
+}
+
+/// `spawn_in` with exactly the startup message and handles given (no debug resource is added).
+pub fn spawn_in_exact(
     image: &[u8],
     startup: &[u8],
     handles: &[u64],

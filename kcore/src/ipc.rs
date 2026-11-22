@@ -165,6 +165,8 @@ pub enum KObj {
     Interrupt(IrqObj),
     /// The root resource (S6): the authority to mint device memory, DMA buffers and interrupts.
     Resource,
+    /// The debug resource (HD4): the authority to write to the kernel's console and read its counters.
+    Debug,
 }
 
 impl Object for KObj {
@@ -754,7 +756,12 @@ pub fn channel_has_txid(reg: &Kobjs, obj: ObjId, txid: u32) -> bool {
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
         KObj::Event(e) => e.signals,
-        KObj::Vmo(_) | KObj::Job(_) | KObj::Resource | KObj::Exception(_) | KObj::Pager(_) => 0,
+        KObj::Vmo(_)
+        | KObj::Job(_)
+        | KObj::Resource
+        | KObj::Debug
+        | KObj::Exception(_)
+        | KObj::Pager(_) => 0,
         KObj::Interrupt(i) => {
             if i.fired {
                 signals::INTERRUPT
@@ -1372,6 +1379,39 @@ pub fn resource_object_create_in(
     Ok(table
         .insert(reg, obj, Rights::RESOURCE)
         .expect("room was checked"))
+}
+
+/// The debug resource object, with a handle carrying `Rights::DEBUG` (HD4).
+#[allow(clippy::expect_used)] // INVARIANT: the table's room was checked at the top
+pub fn debug_object_create_in(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    q: &mut Quota,
+) -> Result<Handle, Status> {
+    if table.room() < 1 || table.reserve(1).is_err() || reg.live() >= reg.cap() {
+        return Err(Status::NoMemory);
+    }
+    q.objects(reg, 1)?;
+    let obj = reg.create_charged(KObj::Debug, q.job);
+    Ok(table
+        .insert(reg, obj, Rights::DEBUG)
+        .expect("room was checked"))
+}
+
+/// Check that `h` is a debug resource handle with the right `need` (WRITE to write, INSPECT to read a counter).
+pub fn debug_of(reg: &Kobjs, table: &HandleTable, h: Handle, need: Rights) -> Result<(), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Debug) => {
+            if entry.rights.contains(need) {
+                Ok(())
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
 }
 
 /// A new interrupt object for PLIC source `irq` (the caller has checked the resource, the range

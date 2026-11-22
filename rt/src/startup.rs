@@ -69,10 +69,17 @@ pub fn read() -> Result<Env, EnvError> {
             let (nb, nh) = (r.a1, r.a2);
             let hs: Vec<u64> = handles[..nh].to_vec();
             return match Startup::decode(&bytes[..nb], nh) {
-                Ok(startup) => Ok(Env {
-                    startup,
-                    handles: hs,
-                }),
+                Ok(startup) => {
+                    let env = Env {
+                        startup,
+                        handles: hs,
+                    };
+                    // (HD4: a program started with a debug resource prints with it)
+                    if let Some(h) = env.handle(Role::Debug) {
+                        crate::debug::set(h);
+                    }
+                    Ok(env)
+                }
                 Err(e) => {
                     for h in hs {
                         sys::handle_close(h);

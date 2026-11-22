@@ -92,7 +92,8 @@ fn unknown_syscalls_are_refused() -> Outcome {
 fn debug_write_pointer_rules() -> Outcome {
     let big = [b'x'; 4097];
     ensure_eq!(st(sys::debug_write(&big)), Some(S::TooBig), "4097 bytes");
-    let bad = |ptr: usize, len: usize| st(rt::syscall(abi_debug(), [ptr, len, 0, 0, 0, 0]));
+    let dbg = rt::debug::handle() as usize;
+    let bad = |ptr: usize, len: usize| st(rt::syscall(abi_debug(), [dbg, ptr, len, 0, 0, 0]));
     ensure_eq!(bad(0, 1), Some(S::InvalidArgs), "null pointer");
     ensure_eq!(
         bad(0, 0),
@@ -131,6 +132,56 @@ fn debug_write_pointer_rules() -> Outcome {
         Some(S::Ok),
         "the last four bytes of the stack are fine"
     );
+    Ok(())
+}
+
+/// HD4: `debug_write` and `debug_stat` need a debug resource: no handle, a handle of another kind, or one without the right is refused and prints or
+/// reads nothing (a program without one can no longer forge a `##TEST` line).
+fn debug_calls_need_a_debug_resource() -> Outcome {
+    use rt::abi::syscall as nr;
+    let dbg = rt::debug::handle();
+    ensure!(dbg != 0, "the suite has its debug resource");
+    let write = |h: u64| st(rt::syscall(nr::DEBUG_WRITE, [h as usize, 0, 0, 0, 0, 0]));
+    let stat = |h: u64| st(rt::syscall(nr::DEBUG_STAT, [h as usize, 0, 0, 0, 0, 0]));
+    ensure_eq!(write(dbg), Some(S::Ok), "the resource itself writes");
+    ensure_eq!(stat(dbg), Some(S::Ok), "and reads a counter");
+    ensure_eq!(write(0), Some(S::BadHandle), "no handle: no write");
+    ensure_eq!(stat(0), Some(S::BadHandle), "no handle: no counter");
+    ensure_eq!(
+        write(0x7777_7777),
+        Some(S::BadHandle),
+        "a handle that is not there"
+    );
+    let e = event()?;
+    ensure_eq!(
+        write(e),
+        Some(S::WrongType),
+        "an event is not a debug resource"
+    );
+    ensure_eq!(
+        stat(e),
+        Some(S::WrongType),
+        "an event is not a debug resource"
+    );
+    let inspect_only = weaker(dbg, Rights::INSPECT.0)?;
+    ensure_eq!(
+        write(inspect_only),
+        Some(S::AccessDenied),
+        "INSPECT alone does not write"
+    );
+    ensure_eq!(stat(inspect_only), Some(S::Ok), "INSPECT reads");
+    let write_only = weaker(dbg, Rights::WRITE.0)?;
+    ensure_eq!(
+        stat(write_only),
+        Some(S::AccessDenied),
+        "WRITE alone does not read a counter"
+    );
+    ensure_eq!(write(write_only), Some(S::Ok), "WRITE writes");
+    for h in [inspect_only, write_only, e] {
+        sys::handle_close(h);
+    }
+    // a second `debug_root` from the privileged suite is another handle to the same kind of authority
+    ensure!(rt::sys::debug_root().status == 0, "debug_root again");
     Ok(())
 }
 
@@ -14872,6 +14923,10 @@ pub fn app_main() -> i32 {
         ("clock_advances_in_user_mode", clock_advances_in_user_mode),
         ("unknown_syscalls_are_refused", unknown_syscalls_are_refused),
         ("debug_write_pointer_rules", debug_write_pointer_rules),
+        (
+            "debug_calls_need_a_debug_resource",
+            debug_calls_need_a_debug_resource,
+        ),
         (
             "handle_syscalls_reject_bad_values",
             handle_syscalls_reject_bad_values,
