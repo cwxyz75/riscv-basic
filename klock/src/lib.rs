@@ -71,9 +71,9 @@ impl Class {
     ];
 
     /// May a hart hold two locks of this class at once (in ascending instance order)? The run queues (migration,
-    /// pull) and the address spaces (a call that names a target process takes the caller's and the target's, ascending by process id); every other class "never two" (3.3).
+    /// pull), the address spaces (a call that names a target process takes the caller's and the target's, ascending by process id); every other class "never two" (3.3).
     pub fn allows_two(self) -> bool {
-        matches!(self, Class::Rq | Class::As)
+        matches!(self, Class::Rq | Class::As | Class::Tt)
     }
 
     /// How many locks of this class one hart may hold at once, when `allows_two`: two run queues, and as many address spaces as there are

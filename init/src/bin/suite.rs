@@ -6541,7 +6541,9 @@ fn kill_a_child_blocked_in_port_wait() -> Outcome {
 
 fn socket_memory_is_bounded() -> Outcome {
     let chunk = [7u8; SOCKET_BUFFER];
-    let mut pairs = [(0u64, 0u64); 64];
+    // (the system-wide budget is derived from RAM, PL8: stat 121; a few sockets more than it holds must be refused)
+    let most = sys::debug_stat(121) as usize / SOCKET_BUFFER + 16;
+    let mut pairs = vec![(0u64, 0u64); most];
     let mut n = 0;
     let mut hit_the_limit = false;
     while n < pairs.len() {
@@ -6559,7 +6561,7 @@ fn socket_memory_is_bounded() -> Outcome {
             break;
         }
     }
-    ensure!(hit_the_limit, "300 sockets of 64 KiB were accepted");
+    ensure!(hit_the_limit, "{most} sockets of 64 KiB were accepted");
     // closing the sockets gives the budget back
     for &(a, b) in &pairs[..n] {
         sys::handle_close(a);
@@ -6616,6 +6618,10 @@ fn dead_port_bindings_vanish_at_once() -> Outcome {
 /// Park events 64 at a time in channel messages until something refuses: the refusal must be
 /// NO_MEMORY, and everything must work again once the channels are closed.
 fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
+    // (the cap is derived from RAM, PL8: on a machine whose cap is beyond what this test can park, the job quotas' tests are what end in NO_MEMORY)
+    if sys::debug_stat(120) > 10 * 128 * 64 - 256 {
+        return Ok(());
+    }
     let mut chans = [0u64; 10];
     for i in 0..5 {
         let (a, b) = channel()?;
@@ -6665,6 +6671,32 @@ fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
     Ok(())
 }
 
+/// PL8: the backstops are derived from the memory of the machine (KERNEL-V1-SPEC 2.5), read through `debug_stat` 120 to 124. The formulas are
+/// restated here, from the frame count the kernel reports (stat 102), so a change to either side fails the test.
+fn backstops_follow_the_ram_of_the_machine() -> Outcome {
+    let ram = sys::debug_stat(102) * 4096;
+    let slots = 32768u64; // the kernel-stack window (1 GiB) over a 32 KiB slot
+    ensure!(
+        ram >= 64 << 20,
+        "the machine has at least 64 MiB, it has {ram}"
+    );
+    let want = [
+        (120, (ram / 4096).max(16384), "objects: RAM / 4096"),
+        (121, (ram / 32).max(2 << 20), "queued IPC bytes: RAM / 32"),
+        (122, 64, "processes: RAM / 1 MiB, held to 64 until T214"),
+        (
+            123,
+            (ram >> 16).min(slots).max(4096),
+            "user threads: RAM / 64 KiB, at most the stack window",
+        ),
+        (124, (ram / 16 / 4096).max(1024), "DMA pages: RAM / 16"),
+    ];
+    for (which, expect, what) in want {
+        ensure_eq!(sys::debug_stat(which), expect, "{what}");
+    }
+    Ok(())
+}
+
 fn mappings_per_process_are_bounded() -> Outcome {
     // in a process of its own that never starts: closing it frees every region at once (unmapping thousands of
     // regions one by one costs a shootdown each)
@@ -6703,9 +6735,11 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     let e = event()?;
     let mut sent = 0u32;
     let mut refused = None;
-    let mut chans = [0u64; 40];
+    // (the budget is derived from RAM, PL8: twenty pairs of channels fill 2 MiB of it, so as many more as the budget is bigger)
+    let scale = (sys::debug_stat(121) as usize / (2 << 20)).max(1);
+    let mut chans = vec![0u64; 40 * scale];
     let mut nch = 0;
-    'outer: for _ in 0..20 {
+    'outer: for _ in 0..20 * scale {
         let (a, b) = channel()?;
         chans[nch] = a;
         chans[nch + 1] = b;
@@ -6734,7 +6768,10 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
         matches!(refused, Some(S::NoMemory) | Some(S::ShouldWait)),
         "refused after {sent} messages with {refused:?}"
     );
-    ensure!(sent < 4000, "{sent} messages of 64 handles were accepted");
+    ensure!(
+        (sent as usize) < 4000 * scale,
+        "{sent} messages of 64 handles were accepted"
+    );
     for &c in &chans[..nch] {
         sys::handle_close(c);
     }
@@ -9242,8 +9279,9 @@ fn cycles_do_not_grow_memory() -> Outcome {
     // The OD39 loop: make two channels hold each other and drop every handle. 9,000 rounds
     // leave 18,000 unreachable objects (two per round: the pair that holds each other), more
     // than the kernel's cap of 16,384 (`MAX_OBJECTS`): it must keep sweeping or this ends in
-    // NoMemory.
-    for i in 0..9_000u32 {
+    // NoMemory. (The cap is derived from RAM now, PL8: the rounds are what it takes to pass it, at most 40,000.)
+    let rounds = (sys::debug_stat(120) / 2 + 500).min(40_000) as u32;
+    for i in 0..rounds {
         let (x, w) = channel().map_err(|mut d| {
             let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" at round {i}"));
             d
@@ -15081,6 +15119,10 @@ pub fn app_main() -> i32 {
         (
             "kill_a_child_blocked_in_port_wait",
             kill_a_child_blocked_in_port_wait,
+        ),
+        (
+            "backstops_follow_the_ram_of_the_machine",
+            backstops_follow_the_ram_of_the_machine,
         ),
         (
             "the_object_cap_is_reached_without_a_kernel_panic",

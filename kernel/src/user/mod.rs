@@ -99,12 +99,23 @@ fn state() -> &'static mut UserState {
         let slot = &mut *addr_of_mut!(USER);
         slot.get_or_insert_with(|| {
             let mut s = UserState::with_irq_slots(crate::aia::slots());
+            // the backstops (PL8): derived from the RAM the machine has, the kernel-stack window's slots bounding the threads
+            let b = kcore::limits::Backstops::for_ram(
+                kmem::stats().memory_frames.saturating_mul(4096),
+                crate::kstack::MAX_SLOTS as usize,
+            );
+            s.backstops = b;
+            s.objs.set_caps(b.objects, b.ipc_bytes);
+            // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
+            s.ktable = kcore::handle::HandleTable::new(b.objects);
             // the ASID field the harts implement (L18): the allocator hands out ASIDs from it and turns the generation when they are used up
             s.asids = kcore::asid::Asids::new(if cfg!(feature = "fault-asid-reuse-no-flush") {
                 1
             } else {
                 crate::arch::asid_bits()
             });
+            // (L19) the generation, for the return to user mode that holds no big lock
+            trap::publish_asid_generation(s.asids.generation_cell());
             // AB3 (test builds): counters that start near a boundary, `ff=koid:..,objgen:..,handlegen:..`
             if let Some(n) = crate::dtb::ff_value("koid") {
                 s.objs.fast_forward_koid(n);
@@ -118,6 +129,11 @@ fn state() -> &'static mut UserState {
             s
         })
     }
+}
+
+/// The backstops in force (a test hook: `debug_stat` 120 to 124).
+pub fn backstops() -> kcore::limits::Backstops {
+    irq::without(|| state().backstops)
 }
 
 /// The `##TEST` results user programs have reported so far (pass, fail).

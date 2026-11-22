@@ -255,6 +255,8 @@ pub struct Vmos {
     live: usize,
     /// Pages held by live DMA VMOs.
     dma_pages: u64,
+    /// The most pages DMA VMOs may hold together (the backstop, PL8).
+    dma_total_cap: u64,
     /// Pages that became visible, or were replaced, in a VMO that other mappings may reach through a family (`page_for`): (node, first page,
     /// count), neighbouring pages coalesced (a `vmo_commit` of a large VMO is one entry). The
     /// caller drains it with `invalidate_copies` (every address space drops what the new page makes stale) before the faulting thread runs on.
@@ -277,7 +279,10 @@ pub static PAGER_NEED_PENDING: core::sync::atomic::AtomicBool =
 
 impl Vmos {
     pub fn new() -> Vmos {
-        Vmos::default()
+        Vmos {
+            dma_total_cap: abi::limits::MAX_DMA_TOTAL_PAGES,
+            ..Vmos::default()
+        }
     }
 
     /// Make room for one more VMO, in memory: after `Ok`, `create`, `create_in`, `create_physical` and `create_dma` do not allocate for their
@@ -399,6 +404,11 @@ impl Vmos {
         })
     }
 
+    /// Set the backstop on the pages DMA VMOs may hold together (PL8, at boot).
+    pub fn set_dma_total_cap(&mut self, pages: u64) {
+        self.dma_total_cap = pages;
+    }
+
     /// A VMO of `pages` physically contiguous zeroed frames, charged to `job` now. At most
     /// `MAX_DMA_PAGES` per object and `MAX_DMA_TOTAL_PAGES` in the system.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: pages is checked against MAX_DMA_PAGES and the system total just above, so the sums are small; `first + i` is inside the contiguous run the allocator returned
@@ -409,8 +419,8 @@ impl Vmos {
         pages: u64,
         job: JobId,
     ) -> Result<u64, VmoError> {
-        use abi::limits::{MAX_DMA_PAGES, MAX_DMA_TOTAL_PAGES};
-        if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > MAX_DMA_TOTAL_PAGES {
+        use abi::limits::MAX_DMA_PAGES;
+        if pages == 0 || pages > MAX_DMA_PAGES || self.dma_pages + pages > self.dma_total_cap {
             return Err(VmoError::OutOfRange);
         }
         jobs.charge(job, Resource::Pages, pages)

@@ -76,7 +76,28 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
         let p = p?;
         // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
         // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
-        Some(install_token_of(asids, p))
+        let token = install_token_of(asids, p);
+        // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
+        // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
+        let me = crate::percpu::this();
+        let tid = thread::current() as u64;
+        let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
+        if me.bound_tid.load(Ordering::Relaxed) != tid
+            || me.bound_tag.load(Ordering::Relaxed) != key
+        {
+            thread::bind_user(
+                thread::current(),
+                thread::UserBinding {
+                    pid,
+                    tag: p.tag,
+                    token,
+                    aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
+                },
+            );
+            me.bound_tid.store(tid, Ordering::Relaxed);
+            me.bound_tag.store(key, Ordering::Relaxed);
+        }
+        Some(token)
     });
     if let Some(token) = token {
         if crate::percpu::this()
@@ -91,6 +112,63 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
             unsafe { crate::arch::aspace_install_noflush(token) };
         }
     }
+}
+
+/// The return to user mode of a thread that slept in a quiet call and wakes with nothing to look at (L19): `seen` is the attention epoch the call
+/// started under, and if it has not moved no process has been marked killed or stopped, no register write or suspend is pending, since. The
+/// thread's process, tag and token come from its own record (written by the full path), the tag must be of the allocator's current generation (a
+/// stale one needs a fresh ASID: the full path), and this hart flushes if it has not since the generation turned, exactly as `install_token_of`
+/// does. False: nothing was changed, and the caller takes the full path.
+pub fn activate_current_quiet(seen: u64) -> bool {
+    if ATTENTION.load(Ordering::SeqCst) != seen {
+        return false;
+    }
+    let me = crate::percpu::this();
+    let Some(b) = thread::user_binding(thread::current()) else {
+        return false;
+    };
+    if b.tag.gen != asid_generation() {
+        return false;
+    }
+    if b.tag.gen > me.asid_seen.load(Ordering::Relaxed)
+        && !cfg!(feature = "fault-asid-reuse-no-flush")
+    {
+        crate::arch::tlb_flush_all();
+        me.asid_seen.store(b.tag.gen, Ordering::Relaxed);
+    }
+    me.attention_seen.store(seen, Ordering::SeqCst);
+    me.cur_pid.store(b.pid, Ordering::Relaxed);
+    me.cur_as
+        .store(b.aspace as *mut klock::aslock::AsCell, Ordering::Release);
+    if me.active_aspace.swap(b.token, Ordering::SeqCst) != b.token
+        || crate::arch::aspace_current() != b.token
+    {
+        // SAFETY: `b.token` was made by the full path for this thread's process: a live root whose upper half is the kernel's, with an ASID of the
+        // generation just checked to be the current one. No flush: translations are tagged with the ASID (L18).
+        unsafe { crate::arch::aspace_install_noflush(b.token) };
+    }
+    true
+}
+
+/// The allocator's generation, for a return to user mode that does not hold the big lock (L19): set once at boot, when the user state is made.
+static ASID_GEN: core::sync::atomic::AtomicPtr<AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Publish the allocator's generation cell (once, at boot, under the big lock; the cell lives for ever).
+pub(super) fn publish_asid_generation(cell: alloc::sync::Arc<AtomicU64>) {
+    ASID_GEN.store(
+        alloc::sync::Arc::into_raw(cell).cast_mut(),
+        Ordering::Release,
+    );
+}
+
+fn asid_generation() -> u64 {
+    let p = ASID_GEN.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    // SAFETY: `publish_asid_generation` leaked an `Arc` (never freed), so the cell is alive for the rest of the run.
+    unsafe { (*p).load(Ordering::Acquire) }
 }
 
 /// The attention epoch (L12b): bumped, under the big lock, whenever a process is marked killed or stopped, **after** the mark is set and
@@ -162,6 +240,125 @@ pub fn page_fault_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     kmem::flush_pages(m.first, m.last, crate::arch::aspace_current_asid());
     // The log's sync takes the big lock and can switch threads, so it is the full return to user mode (`activate_current` after a switch).
     if log_pending {
+        crate::bkl::lock();
+        super::calls::cow_sync();
+        commit_wake();
+        thread::preempt_point();
+        activate_current(frame);
+        crate::bkl::unlock();
+    }
+    true
+}
+
+/// What the first half of the quiet `futex_wait` found.
+enum QuietEnter {
+    /// Nothing was changed that the full path would not do again.
+    Fallback,
+    /// The call is complete (a poll, or the word differs): the status to report.
+    Done(abi::status::Status),
+    /// The thread is queued: sleep.
+    Sleep(ksys::FutexWord),
+}
+
+/// The first half of `futex_wait_quiet`, in a frame of its own (the memory-lock guards would push the caller over the stack budget): translate, compare
+/// and queue under the process's `AS` lock.
+#[inline(never)]
+fn futex_wait_enter(cell: &klock::aslock::AsCell, a: [u64; 6], pid: u64, who: u64) -> QuietEnter {
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let r = {
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None); // (as the quiet fault does: the slot is the kernel copies' on other harts)
+        let r = ksys::futex_wait_resolve_in(space, k.mm, k.vmos, k.jobs, a);
+        let _ = k.vmos.swap_need(saved);
+        r
+    };
+    let Ok(w) = r else {
+        return QuietEnter::Fallback; // (the full path finds the same error, or the pager need, and acts on it)
+    };
+    if space.take_replaced() > 0 {
+        crate::smp::shootdown();
+        kmem::flush_tlb();
+    }
+    // (MM8, COW1) a first touch of a page of a VMO that has children logs a copy that every address space must drop before this thread sleeps or
+    // returns: the full path syncs it (`cow_sync`), and nothing is queued yet, so it does the call again
+    if kcore::aspace::COPY_PENDING.load(Ordering::Acquire) {
+        return QuietEnter::Fallback;
+    }
+    // (the enqueue under the held `AS`, the memory locks let go: `FUTEX` is before them)
+    match ksys::futex_wait_enqueue(&futex_table(), &kmem::DirectMap, pid, who, &w) {
+        ksys::FutexCheck::Done(status) => QuietEnter::Done(status),
+        ksys::FutexCheck::Sleep => QuietEnter::Sleep(w),
+    }
+}
+
+/// `futex_wait` from user mode with **no big kernel lock** (L19, T213): the quiet path of the trap handler calls this with the frame past the call
+/// instruction, `light_save` done and the return quiet. True: the call is complete (its result is in the frame, and the thread may have slept and
+/// switched harts meanwhile). False: nothing was changed, and the trap takes the full path, which does the call from the beginning
+/// (the caller puts `sepc` back before the call instruction).
+///
+/// The space is the one the hart recorded for its running process, held under its `AS` lock while the word is translated and compared and the
+/// thread queued (the frame cannot go: every unmap and decommit takes `AS`); the memory locks are let go before the bucket lock is taken (`FUTEX`
+/// comes before them). The sleep holds nothing. It ends in the table (a wake took the thread out: the call succeeded) or with the thread still in
+/// it: the deadline, or the attention epoch moved (a kill, a stop, a suspend, an interrupt): the thread leaves the table (a leave that finds it
+/// gone was a wake after all) and **the call starts again on the full path**, which reports TIMED_OUT, INTERRUPTED or the kill as it always has.
+pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
+    let a = [
+        frame.arg(10),
+        frame.arg(11),
+        frame.arg(12),
+        frame.arg(13),
+        frame.arg(14),
+        frame.arg(15),
+    ];
+    let me = crate::percpu::this();
+    let (pid, cell) = (
+        me.cur_pid.load(Ordering::Relaxed),
+        me.cur_as.load(Ordering::Acquire),
+    );
+    // (the epoch this hart last saw, **before** the flags: a kill, stop or suspend marks its state and then moves the epoch, so one that lands after this
+    // load makes `ATTENTION` differ from `seen` (the sleep's `ready` and the return both look), and one that landed before it is a difference here)
+    let seen = me.attention_seen.load(Ordering::SeqCst);
+    if ATTENTION.load(Ordering::SeqCst) != seen {
+        return false;
+    }
+    if cell.is_null()
+        || SUSPEND_STATES.load(Ordering::Acquire) != 0
+        || INTERRUPT_FLAGS.load(Ordering::Acquire) != 0
+        || kcore::aspace::COPY_PENDING.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    // SAFETY: the hart runs a thread of the process the cell belongs to (`activate_current` recorded it), so its `Arc` is alive for the whole call; the
+    // thread keeps running on whichever hart after a sleep, but only the lock below is taken through the reference, before any sleep.
+    let cell = unsafe { &*cell };
+    let who = thread::current() as u64;
+    let w = match futex_wait_enter(cell, a, pid, who) {
+        QuietEnter::Fallback => return false,
+        QuietEnter::Done(status) => {
+            reply(frame, fail(status));
+            return true;
+        }
+        QuietEnter::Sleep(w) => w,
+    };
+    let key = (pid, w.addr);
+    thread::wait_deadline_futex_quiet(
+        || {
+            ATTENTION.load(Ordering::SeqCst) != seen
+                || INTERRUPT_FLAGS.load(Ordering::Acquire) != 0
+                || !futex_table().contains(key, who)
+        },
+        w.deadline,
+    );
+    if futex_table().forget(key, who) {
+        // still queued: the deadline or an event ended the wait, and nothing was reported: the full path does the call again
+        return false;
+    }
+    reply(frame, Ok((None, None)));
+    if !activate_current_quiet(seen)
+        || kcore::aspace::COPY_PENDING.load(Ordering::Acquire)
+        || thread::need_resched_pending()
+    {
         crate::bkl::lock();
         super::calls::cow_sync();
         commit_wake();
@@ -574,7 +771,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
         // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
         // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
-        if s.objs.live() + 8 >= abi::limits::MAX_OBJECTS {
+        if s.objs.live() + 8 >= s.objs.cap() {
             let roots = s.roots();
             s.objs.sweep(&roots);
         }

@@ -479,6 +479,14 @@ pub fn init() {
     // (the shared zero frame is made now, so that a count of free frames taken later has it in its baseline)
     let mut vmos = Vmos::new();
     vmos.ensure_zero(&mut mm);
+    // (PL8) the DMA backstop is derived from RAM, like the others
+    vmos.set_dma_total_cap(
+        kcore::limits::Backstops::for_ram(
+            (memory_frames as u64).saturating_mul(PAGE_SIZE),
+            crate::kstack::MAX_SLOTS as usize,
+        )
+        .dma_total_pages,
+    );
     *VMOS.lock() = Some(vmos);
     *JOBS.lock() = Some(kcore::job::Jobs::new());
     *FRAMES.lock() = Some(mm);

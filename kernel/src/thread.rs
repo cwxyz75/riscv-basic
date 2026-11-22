@@ -79,7 +79,20 @@ fn guard_intact(stack: &[u64]) -> bool {
     stack[..GUARD_WORDS].iter().all(|&w| w == CANARY)
 }
 
+/// What a user thread's return to user mode needs, kept in the thread's own record so that the common return reads it with no big lock (L19):
+/// the process, its address-space tag and token, and its address-space cell (as an address: it lives as long as the process, which is torn down
+/// only when its last thread has gone). Set under the big lock whenever the full path installs the thread's space.
+#[derive(Clone, Copy)]
+pub struct UserBinding {
+    pub pid: u64,
+    pub tag: kcore::asid::AsTag,
+    pub token: u64,
+    pub aspace: usize,
+}
+
 struct KThread {
+    /// `None` until the thread first returns to user mode (and for kernel threads).
+    user: Option<UserBinding>,
     ctx: Box<Context>,
     /// `None` for the boot thread, which runs on the boot stack.
     stack: Option<crate::kstack::KStack>,
@@ -94,7 +107,27 @@ struct Kernel {
     queues: Vec<Waiters2>,
 }
 
-static mut KERNEL: Option<Kernel> = None;
+/// The kernel's thread table (class `TT`, instance 0; the scheduler's own table is instance 1, taken after it: SCHED-SMP-SPEC 3.3).
+static KERNEL: klock::Spin<Option<Kernel>, crate::bkl::Machine> =
+    klock::Spin::new(klock::Class::Tt, 0, None);
+
+/// The kernel's thread table, locked (`TT`).
+struct KernelRef(klock::Guard<'static, Option<Kernel>, crate::bkl::Machine>);
+
+impl core::ops::Deref for KernelRef {
+    type Target = Kernel;
+    #[allow(clippy::expect_used)] // INVARIANT: set by `init` before the first use (boot order)
+    fn deref(&self) -> &Kernel {
+        self.0.as_ref().expect("thread::init was not called")
+    }
+}
+
+impl core::ops::DerefMut for KernelRef {
+    #[allow(clippy::expect_used)] // INVARIANT: set by `init` before the first use (boot order)
+    fn deref_mut(&mut self) -> &mut Kernel {
+        self.0.as_mut().expect("thread::init was not called")
+    }
+}
 
 /// The scheduler core: its run queues are behind their own per-hart locks (class `RQ`, SCHED-SMP-SPEC task 11), so it is shared by
 /// every hart with no lock of its own; each call takes the locks it needs and says which. Set once, by `init`.
@@ -102,6 +135,18 @@ static mut SCHED: Option<KSched> = None;
 
 /// What each job's threads have run (SCHED-SMP-SPEC 4.10): charged by the scheduler's run queues, read by `job_info`. Set once, by `init`.
 static mut JOB_SCHED: Option<alloc::sync::Arc<kcore::jobsched::JobSchedTable>> = None;
+
+/// Record what thread `tid`'s return to user mode needs (the full path, under the big lock).
+pub fn bind_user(tid: Tid, b: UserBinding) {
+    if let Some(t) = kernel().threads.get_mut(&tid) {
+        t.user = Some(b);
+    }
+}
+
+/// What thread `tid`'s return to user mode needs, if the full path has recorded it (a `TT` lock, no big lock).
+pub fn user_binding(tid: Tid) -> Option<UserBinding> {
+    kernel().threads.get(&tid).and_then(|t| t.user)
+}
 
 /// The job accounting table.
 #[allow(clippy::expect_used)] // INVARIANT: set by `init` before any user thread exists
@@ -166,22 +211,12 @@ fn set_running(tid: Tid) {
 /// Counts iterations of the idle loop (so a test can see that idle ran).
 pub static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 
-/// The scheduler state. Callers hold interrupts disabled (so the timer interrupt
-/// cannot re-enter) and do not keep the reference across a context switch.
+/// The kernel's thread table, locked: the lock is `TT` (it is taken inside the big lock, before the scheduler's run queues). Do not keep the guard
+/// across a context switch.
 #[track_caller]
-#[allow(clippy::expect_used)] // INVARIANT: KERNEL is set by `init` before the first use (boot order)
-fn kernel() -> &'static mut Kernel {
-    debug_assert!(
-        !irq::enabled() && crate::bkl::held(),
-        "scheduler state touched without the big kernel lock"
-    );
-    // SAFETY: the big kernel lock is held (checked above in debug builds), and every
-    // caller drops the reference before any switch, so no two live `&mut` alias.
-    unsafe {
-        (*addr_of_mut!(KERNEL))
-            .as_mut()
-            .expect("thread::init was not called")
-    }
+fn kernel() -> KernelRef {
+    // (L19: the table is its own lock; the quiet paths of the trap handler read and switch with no big lock)
+    KernelRef(KERNEL.lock())
 }
 
 /// Turn the code that is running (the boot thread) into a thread (its id follows the harts' idle ids) and start the idle
@@ -203,7 +238,7 @@ pub fn init(boot_prio: Prio) {
         rq: (0..harts)
             .map(|h| klock::Spin::new(klock::Class::Rq, h as u32, HartRq::new(new_class())))
             .collect(),
-        table: klock::Spin::new(klock::Class::Tt, 0, Table::new()),
+        table: klock::Spin::new(klock::Class::Tt, 1, Table::new()), // (instance 1: the kernel's own table, `KERNEL`, is instance 0 and comes first)
     })
     .with_clock(crate::timer::now_ns); // (charge the running thread at every settle: no tick does it)
                                        // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
@@ -234,20 +269,18 @@ pub fn init(boot_prio: Prio) {
     threads.insert(
         boot,
         KThread {
+            user: None,
             ctx: Box::default(),
             stack: None,
             name: "boot",
             detached: false,
         },
     );
-    // SAFETY: called once, interrupts off, before any other use of KERNEL.
-    unsafe {
-        *addr_of_mut!(KERNEL) = Some(Kernel {
-            threads,
-            exits: Waiters2::new(),
-            queues: Vec::new(),
-        });
-    }
+    *KERNEL.lock() = Some(Kernel {
+        threads,
+        exits: Waiters2::new(),
+        queues: Vec::new(),
+    });
     // SAFETY: the one write (see `sched`): interrupts off, one hart.
     unsafe { *addr_of_mut!(SCHED) = Some(sched) };
     set_running(boot);
@@ -291,7 +324,7 @@ pub fn joined() -> usize {
 pub fn join_scheduler() -> ! {
     irq::without(|| {
         let h = hart();
-        let k = kernel();
+        let mut k = kernel();
         // the hart's boot context becomes its idle thread (the scheduler made the id when it was built)
         let tid = sched().idle(h);
         sched().set_clock(h, now_ns());
@@ -299,6 +332,7 @@ pub fn join_scheduler() -> ! {
         k.threads.insert(
             tid,
             KThread {
+                user: None,
                 ctx: Box::default(),
                 stack: None,
                 name: "idle",
@@ -310,8 +344,9 @@ pub fn join_scheduler() -> ! {
             .in_sched
             .store(true, Ordering::Release);
         JOINED.fetch_add(1, Ordering::SeqCst);
-        // Anything that became runnable for this hart while it was starting (its poke was forgotten or
-        // arrived before it was ready) is looked at now, not at the next tick (T65).
+        drop(k); // (not across the switch)
+                 // Anything that became runnable for this hart while it was starting (its poke was forgotten or
+                 // arrived before it was ready) is looked at now, not at the next tick (T65).
         reschedule_this_hart();
     });
     irq::enable();
@@ -430,7 +465,7 @@ fn spawn_with_affinity(
 ) -> Tid {
     let thread = new_kthread(name, entry, arg, detached);
     irq::without(|| {
-        let k = kernel();
+        let mut k = kernel();
         let tid = sched()
             .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
             .expect("valid priority");
@@ -449,6 +484,7 @@ fn new_kthread(name: &'static str, entry: fn(usize), arg: usize, detached: bool)
     let top = stack.top();
     let ctx = Context::new(entry, arg, top);
     KThread {
+        user: None,
         ctx,
         stack: Some(stack),
         name,
@@ -495,7 +531,7 @@ fn reap_prev() {
 /// Free `tid` if it is an exited detached thread (a joined one is freed by its joiner). The caller has completed the switch away
 /// from it and holds the big kernel lock.
 fn reap_if_dead(tid: Tid) {
-    let k = kernel();
+    let mut k = kernel();
     // (not while it is in transit: `prev` is consumed after the lock is taken again, which can wait, and by then the thread may have
     // resumed on another hart and exited there; the thread that replaces it on that hart reaps it once that switch is done: PR 266 review)
     let dead = k.threads.get(&tid).is_some_and(|t| t.detached)
@@ -506,7 +542,11 @@ fn reap_if_dead(tid: Tid) {
         // (it cannot fail under the big lock: a failure would leak the thread's stack, so it is loud in a debug build)
         debug_assert!(reaped, "reap of exited thread {tid} failed");
         if reaped {
-            if let Some(t) = k.threads.remove(&tid) {
+            // (the record, and with it the kernel stack, is dropped after the thread table is let go: freeing the stack takes the big lock's
+            // class, which comes before it in the order)
+            let gone = k.threads.remove(&tid);
+            drop(k);
+            if let Some(t) = gone {
                 note_stack_use(tid, &t);
             }
         }
@@ -547,6 +587,52 @@ pub fn preempt_point() {
     }
 }
 
+/// The contexts to switch between, or `None` when the scheduler's choice is the thread already running. The thread table is locked inside, and
+/// let go before the caller switches (a frame of its own: the guard and the checks would push `reschedule` over the stack budget).
+#[allow(clippy::expect_used)]
+// INVARIANT: the running and the next thread are threads the scheduler knows and the kernel table holds (every scheduler thread has a KThread: the same insert)
+#[inline(never)]
+fn pick_next() -> Option<(*mut Context, *const Context)> {
+    let mut k = kernel();
+    let h = hart();
+    let (pokes, next) = {
+        let sc = sched();
+        (sc.take_pokes(), sc.current_on(h))
+    };
+    send_pokes(pokes, h);
+    let running = running_here();
+    if next == running {
+        return None;
+    }
+    // (a double dispatch would panic here instead of running one thread on two harts)
+    debug_assert!(
+        (0..crate::smp::started())
+            .all(|y| y == h || crate::percpu::hart(y).running.load(Ordering::Relaxed) != next),
+        "thread {next} is already running on another hart"
+    );
+    let outgoing = k.threads.get_mut(&running).expect("running thread exists");
+    if let Some(stack) = &outgoing.stack {
+        assert!(
+            guard_intact(stack),
+            "stack overflow in thread {}",
+            outgoing.name
+        );
+    }
+    let old: *mut Context = &mut *outgoing.ctx;
+    set_running(next);
+    crate::percpu::this().prev.store(running, Ordering::Relaxed);
+    let incoming = k.threads.get(&next).expect("next thread exists");
+    if let Some(stack) = &incoming.stack {
+        assert!(
+            guard_intact(stack),
+            "stack of thread {} was overwritten while it slept",
+            incoming.name
+        );
+    }
+    let new: *const Context = &*incoming.ctx;
+    Some((old, new))
+}
+
 /// Switch to whichever thread the core says should run, if it is not this one.
 /// Interrupts must be off.
 #[allow(clippy::expect_used)] // INVARIANT: the running and the next thread are threads the scheduler knows and the kernel table holds (every scheduler thread has a KThread: the same insert)
@@ -557,46 +643,9 @@ fn reschedule() {
         .store(false, Ordering::Relaxed);
     // First, tell the harts that should look at the run queues (a wake or a priority change on
     // this hart found something better for them). They are poked, never changed from here.
-    let (old, new) = {
-        let k = kernel();
-        let h = hart();
-        let (pokes, next) = {
-            let sc = sched();
-            (sc.take_pokes(), sc.current_on(h))
-        };
-        send_pokes(pokes, h);
-        let running = running_here();
-        if next == running {
-            finish_switch();
-            return;
-        }
-        // (a double dispatch would panic here instead of running one thread on two harts)
-        debug_assert!(
-            (0..crate::smp::started())
-                .all(|y| y == h || crate::percpu::hart(y).running.load(Ordering::Relaxed) != next),
-            "thread {next} is already running on another hart"
-        );
-        let outgoing = k.threads.get_mut(&running).expect("running thread exists");
-        if let Some(stack) = &outgoing.stack {
-            assert!(
-                guard_intact(stack),
-                "stack overflow in thread {}",
-                outgoing.name
-            );
-        }
-        let old: *mut Context = &mut *outgoing.ctx;
-        set_running(next);
-        crate::percpu::this().prev.store(running, Ordering::Relaxed);
-        let incoming = k.threads.get(&next).expect("next thread exists");
-        if let Some(stack) = &incoming.stack {
-            assert!(
-                guard_intact(stack),
-                "stack of thread {} was overwritten while it slept",
-                incoming.name
-            );
-        }
-        let new: *const Context = &*incoming.ctx;
-        (old, new)
+    let Some((old, new)) = pick_next() else {
+        finish_switch();
+        return;
     };
     // A hart must never keep a user process's page table in `satp` across a switch: another hart
     // may tear that process down and free (and reuse) the root while this one is idle or running
@@ -1054,10 +1103,10 @@ pub fn effective_priority_of(tid: Tid) -> Option<Prio> {
 #[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the caller is a running thread; an exited thread is never scheduled again
 pub fn exit() -> ! {
     irq::without(|| {
-        let k = kernel();
         let h = hart();
-        let Kernel { exits, .. } = k;
         {
+            let mut k = kernel();
+            let Kernel { exits, .. } = &mut *k;
             let sc = sched();
             sc.exit_on(h).expect("running thread");
             exits.wake_all_on(sc, h);
@@ -1075,7 +1124,8 @@ pub fn exit() -> ! {
             // (`reap_if_dead` itself refuses a thread that is in transit, which is the guard this control removes: reap directly)
             let me = running_here();
             if kernel().threads.get(&me).is_some_and(|t| t.detached) && sched().reap(me).is_ok() {
-                if let Some(t) = kernel().threads.remove(&me) {
+                let gone = kernel().threads.remove(&me);
+                if let Some(t) = gone {
                     note_stack_use(me, &t);
                 }
                 if let Some(mut stolen) = crate::kstack::alloc() {
@@ -1095,7 +1145,7 @@ pub fn exit() -> ! {
 pub fn join(tid: Tid) -> bool {
     loop {
         let result = irq::without(|| {
-            let k = kernel();
+            let mut k = kernel();
             if tid == running_here() {
                 return Some(false);
             }
@@ -1107,7 +1157,9 @@ pub fn join(tid: Tid) -> bool {
                 Some(State::Exited) if sched().is_in_transit(tid) => None,
                 Some(State::Exited) => {
                     sched().reap(tid).expect("exited thread");
-                    if let Some(t) = k.threads.remove(&tid) {
+                    let gone = k.threads.remove(&tid);
+                    drop(k); // (the stack is freed after the thread table is let go)
+                    if let Some(t) = gone {
                         note_stack_use(tid, &t);
                     }
                     Some(true)
@@ -1117,6 +1169,7 @@ pub fn join(tid: Tid) -> bool {
                         let sc = sched();
                         k.exits.wait_on(sc, hart()).expect("running thread")
                     };
+                    drop(k); // (not across the switch)
                     if blocked {
                         reschedule();
                     }
@@ -1134,7 +1187,7 @@ pub fn join(tid: Tid) -> bool {
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: queues.len() >= 1 after the push just above
 pub fn new_queue() -> usize {
     irq::without(|| {
-        let k = kernel();
+        let mut k = kernel();
         k.queues.push(Waiters2::new());
         k.queues.len() - 1
     })
@@ -1180,6 +1233,33 @@ pub fn wait_deadline_futex(mut ready: impl FnMut() -> bool, deadline: u64) -> bo
         });
         if let Some(r) = result {
             return r;
+        }
+    }
+}
+
+/// `wait_deadline_futex` for the quiet path of L19: **no big kernel lock** (the thread table is `TT`, the scheduler has its own locks, the switch
+/// releases a lock the thread does not hold). Interrupts are off (it runs inside a trap). `ready` must be readable with no lock. The thread
+/// prepares to block before it looks, as the full version does; nothing else of the full version is needed (the caller took the quiet path only
+/// with no suspend state and no copy-on-write sync pending, and `ready` says when something else has happened: the attention epoch moved).
+#[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
+pub fn wait_deadline_futex_quiet(mut ready: impl FnMut() -> bool, deadline: u64) -> bool {
+    let mut slept = false;
+    loop {
+        let _ = sched().prepare_block_on(hart());
+        if ready() {
+            let _ = sched().cancel_block_on(hart());
+            return true;
+        }
+        if now_ns() >= deadline {
+            let _ = sched().cancel_block_on(hart());
+            return false;
+        }
+        count_sleep(&mut slept);
+        if sched()
+            .sleep_until_on(hart(), deadline)
+            .expect("running thread")
+        {
+            reschedule();
         }
     }
 }
@@ -1286,11 +1366,12 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
                 return true;
             }
             count_sleep(&mut slept);
-            let k = kernel();
+            let mut k = kernel();
             let blocked = {
                 let sc = sched();
                 k.queues[q].wait_on(sc, hart()).expect("running thread")
             };
+            drop(k); // (not across the switch)
             if blocked {
                 reschedule();
             }
@@ -1305,7 +1386,7 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
 #[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_one(q: usize) -> bool {
     irq::without(|| {
-        let k = kernel();
+        let mut k = kernel();
         let woke = {
             let sc = sched();
             k.queues[q].wake_one_on(sc, hart()).is_some()
@@ -1318,7 +1399,7 @@ pub fn wake_one(q: usize) -> bool {
 #[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_all(q: usize) {
     irq::without(|| {
-        let k = kernel();
+        let mut k = kernel();
         let n = {
             let sc = sched();
             k.queues[q].wake_all_on(sc, hart())
@@ -1351,6 +1432,12 @@ pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
         20 => DONATIONS_REFUSED.load(Relaxed),
+        // 120 to 124: the backstops (PL8): objects, queued IPC bytes, processes, user threads, DMA pages
+        120 => crate::user::backstops().objects as u64,
+        121 => crate::user::backstops().ipc_bytes as u64,
+        122 => crate::user::backstops().processes as u64,
+        123 => crate::user::backstops().user_threads as u64,
+        124 => crate::user::backstops().dma_total_pages,
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),
