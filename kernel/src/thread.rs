@@ -117,7 +117,7 @@ pub fn job_sched() -> &'static kcore::jobsched::JobSchedTable {
 /// CPU nanoseconds thread `tid` has run so far (0 for a thread the scheduler no longer knows). Callers read it after `charge_running`.
 pub fn cpu_ns(tid: Tid) -> u64 {
     let was = irq::save_and_disable();
-    let ns = sched().record(tid).map_or(0, |r| r.cpu);
+    let ns = sched().cpu_of(tid).unwrap_or(0);
     irq::restore(was);
     ns
 }

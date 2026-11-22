@@ -110,7 +110,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 9 => {
                     let s = c.jobs.sched(job).ok_or(e(Status::BadState))?;
                     return Ok((
-                        Some(c.job_sched.rt_used(job.index(), c.now_ns)),
+                        Some(c.job_sched.rt_used(job.index(), (c.clock)())),
                         Some(s.rt_budget),
                     ));
                 }

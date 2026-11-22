@@ -107,7 +107,7 @@ impl World {
             faults: self.faults,
             harts_online: 4,
             job_sched: &self.job_sched,
-            now_ns: 0,
+            clock: || 0,
             windows: &WINDOWS,
         };
         ipc_call(n, a, &mut c)

@@ -112,13 +112,7 @@ impl Hint {
     fn publish<N: Class>(&self, rq: &HartRq<N>) {
         self.cur_eff.store(rq.cur_eff(), Ordering::Release);
         self.queued_len.store(rq.queued_len(), Ordering::Release);
-        let mut mask = 0u64;
-        for p in 1..=PRIO_MAX {
-            if rq.would_run(p) {
-                mask |= 1 << p;
-            }
-        }
-        self.would_run.store(mask, Ordering::Release);
+        self.would_run.store(rq.would_run_mask(), Ordering::Release);
     }
 }
 
@@ -351,6 +345,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self.read_record(tid, |r| r.state)
     }
     /// A copy of the thread's record.
+    /// A thread's CPU nanoseconds so far (`record(tid).cpu` without cloning the record).
+    pub fn cpu_of(&self, tid: Tid) -> Option<Time> {
+        self.read_record(tid, |r| r.cpu)
+    }
+
     pub fn record(&self, tid: Tid) -> Option<ThreadSched> {
         self.read_record(tid, |r| r.clone())
     }

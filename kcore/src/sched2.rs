@@ -725,10 +725,16 @@ impl<N: Class> HartRq<N> {
         let Some(tid) = ran else {
             return changed;
         };
-        let rt = self
-            .threads
-            .get(&tid)
-            .is_some_and(|t| band(t.eff) == Band::Rt);
+        // (one lookup for the common thread, which has nothing to do with real-time budgets)
+        let Some((rt, involved)) = self.threads.get(&tid).map(|t| {
+            let rt = band(t.eff) == Band::Rt;
+            (rt, rt || band(t.base.prio) == Band::Rt)
+        }) else {
+            return changed;
+        };
+        if !involved {
+            return changed;
+        }
         if rt {
             self.rt_ran += share;
             if self.rt_blocked() {
@@ -1411,6 +1417,39 @@ impl<N: Class> HartRq<N> {
             _ => self.normal.displaces(cand, cur),
         }
     }
+    /// `would_run(p)` for every priority 1 to 63 at once, bit `p` (what a hart publishes after every change): the state `would_run` looks at
+    /// is read once, not 63 times.
+    pub(crate) fn would_run_mask(&self) -> u64 {
+        let blocked = self.rt_blocked();
+        let idle = self.cur == self.idle;
+        let cur = self.cur_eff();
+        // (a running real-time thread that has spent the hart's share, with a normal thread queued here: any normal candidate takes the hart)
+        let spent = !idle
+            && RT_ENFORCE
+            && cur >= 32
+            && self.win == self.now / RT_WINDOW
+            && self.rt_ran >= RT_HART_MAX
+            && !self.normal.is_empty();
+        let mut mask = 0u64;
+        for p in 1..=PRIO_MAX {
+            let rt = band(p) == Band::Rt;
+            let yes = if rt && blocked {
+                false
+            } else if idle || (!rt && spent) {
+                true
+            } else if p <= cur {
+                false
+            } else if rt {
+                self.rt.displaces(p, cur)
+            } else {
+                self.normal.displaces(p, cur)
+            };
+            if yes {
+                mask |= 1 << p;
+            }
+        }
+        mask
+    }
     /// The best queued effective priority, if anything is queued here.
     pub(crate) fn queued_top(&self) -> Option<Prio> {
         if self.rt_blocked() {
@@ -1585,5 +1624,40 @@ impl<N: Class> HartRq<N> {
             return Err(alloc::format!("{} bad picks", self.bad_picks));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// `would_run_mask` is `would_run` for every priority (the publish of a hart's hints reads the state once instead of 63 times).
+    #[test]
+    fn the_mask_is_would_run_for_every_priority() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300 {
+            let mut h = HartRq::new(FixedPrio::new());
+            h.adopt_idle();
+            for _ in 0..(next() % 6) {
+                let _ = h.spawn(SchedAttr {
+                    prio: 1 + (next() % 63) as u8,
+                    rr: false,
+                });
+            }
+            // run for a while so the real-time share can be spent
+            for _ in 0..(next() % 120) {
+                h.advance(MS);
+            }
+            let mask = h.would_run_mask();
+            for p in 1..=PRIO_MAX {
+                assert_eq!(h.would_run(p), mask & (1 << p) != 0, "priority {p}");
+            }
+        }
     }
 }
