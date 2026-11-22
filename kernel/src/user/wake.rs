@@ -26,6 +26,12 @@ pub fn commit_wake() {
     irq::without(|| {
         let s = state();
         let UserState { objs, waits, .. } = s;
+        // bindings made through a handle that was just removed end (L21c); the ports they leave are touched, so the commit below looks at them
+        let gone = objs.take_gone();
+        if !gone.is_empty() {
+            let j = kmem::jobs();
+            ipc::end_bindings_made_through(objs, j.jobs, &gone);
+        }
         let dirty = objs.take_dirty();
         if dirty.items.is_empty() && !dirty.overflow {
             return;
@@ -33,6 +39,7 @@ pub fn commit_wake() {
         let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
             |id| ipc::port_bound_objects(objs, id),
+            |ch, txid| ipc::channel_has_txid(objs, ch, txid),
             &dirty,
         );
         objs.recycle_dirty(dirty);

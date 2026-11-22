@@ -127,14 +127,30 @@ fn run(seed: u64) {
         let woken = waits.commit(
             |id| signals_of_object(&reg, id),
             |id| port_bound_objects(&reg, id),
+            |_, _| false,
             dirty,
         );
+        // the ports that woke a waiter in this commit (the baton, L21b): the woken thread polls, which logs the port, so the next commit looks at
+        // it again; the model does the same
+        let mut baton: BTreeMap<ObjId, usize> = BTreeMap::new();
         for t in &woken {
             let (obj, mask) = masks.remove(t).expect("a woken thread was registered");
             let sig = signals_of_object(&reg, obj);
             let justified = sig.is_none_or(|s| s & mask != 0) || forced.contains(&obj);
             assert!(justified, "seed {seed} step {step}: thread {t} woken without cause (signals {sig:?}, mask {mask:#x})");
             assert!(!waits.is_registered(*t));
+            if is_port(&reg, obj) && sig.is_some() && !forced.contains(&obj) {
+                *baton.entry(obj).or_default() += 1;
+                reg.touch(obj); // the woken thread's poll
+            }
+        }
+        for (obj, n) in &baton {
+            // PW: a port wakes one waiter at a time, not all of them
+            assert_eq!(
+                *n, 1,
+                "seed {seed} step {step}: a port woke {n} waiters for one readiness"
+            );
+            let _ = obj;
         }
         // a removed handle is a forced touch: every thread waiting on that object was released (so
         // that it can re-validate its handle and report BAD_HANDLE)
@@ -144,13 +160,14 @@ fn run(seed: u64) {
                 "seed {seed} step {step}: thread {t} still waits on {obj:?} though a handle to it was removed"
             );
         }
-        // W4: nobody left waiting has a true predicate or a dead object
+        // W4: nobody left waiting has a true predicate or a dead object, except a thread behind the one the port woke (PW: the baton passes
+        // when that thread has polled; the model's poll above logged the port, so the next commit wakes the next waiter)
         for (t, (obj, mask)) in &masks {
             assert!(waits.is_registered(*t));
             match signals_of_object(&reg, *obj) {
                 None => panic!("seed {seed} step {step} {what}: thread {t} still waits on a dead object"),
                 Some(s) => assert!(
-                    s & mask == 0,
+                    s & mask == 0 || baton.contains_key(obj),
                     "seed {seed} step {step} {what}: thread {t} was not woken though its signals {s:#x} match {mask:#x}"
                 ),
             }
@@ -221,12 +238,22 @@ fn register_replaces_and_forget_is_idempotent() {
     event_signal(&mut reg, &t, a, 0, 1 << 24).unwrap(); // the old object: nobody waits there now
     let d = reg.take_dirty();
     assert!(w
-        .commit(|i| signals_of_object(&reg, i), |_| Vec::new(), d)
+        .commit(
+            |i| signals_of_object(&reg, i),
+            |_| Vec::new(),
+            |_, _| false,
+            d
+        )
         .is_empty());
     event_signal(&mut reg, &t, b, 0, 1 << 25).unwrap();
     let d = reg.take_dirty();
     assert_eq!(
-        w.commit(|i| signals_of_object(&reg, i), |_| Vec::new(), d),
+        w.commit(
+            |i| signals_of_object(&reg, i),
+            |_| Vec::new(),
+            |_, _| false,
+            d
+        ),
         vec![1]
     );
     assert!(!w.forget(1));
@@ -246,7 +273,12 @@ fn an_overflowed_log_releases_every_registration() {
         items: Vec::new(),
         overflow: true,
     };
-    let woken = w.commit(|i| signals_of_object(&reg, i), |_| Vec::new(), overflowed);
+    let woken = w.commit(
+        |i| signals_of_object(&reg, i),
+        |_| Vec::new(),
+        |_, _| false,
+        overflowed,
+    );
     assert_eq!(
         woken,
         vec![7],
@@ -288,6 +320,7 @@ fn a_port_waiter_costs_an_unrelated_commit_nothing() {
                 signals_of_object(reg, i)
             },
             |i| port_bound_objects(reg, i),
+            |_, _| false,
             d,
         )
     };
@@ -307,4 +340,159 @@ fn a_port_waiter_costs_an_unrelated_commit_nothing() {
         w.watchers_of(t.get(events[500]).unwrap().obj).is_empty(),
         "the watch is gone with the waiter"
     );
+}
+
+#[test]
+fn a_call_waits_for_its_own_reply_not_for_any_message() {
+    // (L21d) `channel_call` registers for the reply with its transaction id: an unrelated message queued on the end does not release it, the
+    // reply does, and so does the peer going away
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(16);
+    let (a, b) = channel_create(&mut reg, &mut t).unwrap();
+    let oa = t.get(a).unwrap().obj;
+    let mut w = WaitTable::new();
+    let commit = |w: &mut WaitTable, reg: &mut Kobjs| {
+        let d = reg.take_dirty();
+        w.commit(
+            |i| signals_of_object(reg, i),
+            |_| Vec::new(),
+            |ch, tx| channel_has_txid(reg, ch, tx),
+            d,
+        )
+    };
+    reg.take_dirty();
+    w.register_call(1, oa, 7);
+    // an unrelated message (transaction id 9) arrives on the end: READABLE is up, the call is not released
+    channel_write(&mut reg, &mut t, b, &9u32.to_le_bytes(), &[]).unwrap();
+    assert!(
+        commit(&mut w, &mut reg).is_empty(),
+        "an unrelated message released a call"
+    );
+    // its reply (transaction id 7)
+    channel_write(&mut reg, &mut t, b, &7u32.to_le_bytes(), &[]).unwrap();
+    assert_eq!(
+        commit(&mut w, &mut reg),
+        vec![1],
+        "the reply did not release the call"
+    );
+    // the peer closing releases a call that is still waiting
+    w.register_call(2, oa, 8);
+    reg.take_dirty();
+    t.close(&mut reg, b).unwrap();
+    assert_eq!(
+        commit(&mut w, &mut reg),
+        vec![2],
+        "the peer going did not release the call"
+    );
+    w.audit(|id| reg.is_alive(id)).unwrap();
+}
+
+#[test]
+fn a_port_wakes_one_waiter_and_the_poll_passes_the_baton() {
+    // (L21b) two threads wait on a port; one ready binding wakes one of them (the first), and the next commit after that one's poll wakes the
+    // other only if a binding is still ready
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(16);
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let pobj = t.get(port).unwrap().obj;
+    let e = event_create(&mut reg, &mut t).unwrap();
+    port_bind(&mut reg, &t, port, e, u64::from(1u32 << 24), 1).unwrap();
+    let mut w = WaitTable::new();
+    let commit = |w: &mut WaitTable, reg: &mut Kobjs| {
+        let d = reg.take_dirty();
+        w.commit(
+            |i| signals_of_object(reg, i),
+            |i| port_bound_objects(reg, i),
+            |_, _| false,
+            d,
+        )
+    };
+    reg.take_dirty();
+    w.register_port(
+        1,
+        pobj,
+        abi::signals::READABLE,
+        port_bound_objects(&reg, pobj),
+    );
+    w.register_port(
+        2,
+        pobj,
+        abi::signals::READABLE,
+        port_bound_objects(&reg, pobj),
+    );
+    event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
+    assert_eq!(
+        commit(&mut w, &mut reg),
+        vec![1],
+        "one waiter, the first, is woken"
+    );
+    assert!(w.is_registered(2), "the other stays asleep");
+    // thread 1 polls (the binding stays ready: it is level-triggered): the port is logged, and the baton passes
+    assert!(port_poll(&mut reg, &t, port).unwrap().is_some());
+    assert_eq!(
+        commit(&mut w, &mut reg),
+        vec![2],
+        "the poll passed the baton to the next waiter"
+    );
+    // the signal goes: a poll that finds nothing leaves nobody woken
+    event_signal(&mut reg, &t, e, 1 << 24, 0).unwrap();
+    assert!(commit(&mut w, &mut reg).is_empty());
+}
+
+#[test]
+fn a_binding_ends_with_the_handle_it_was_made_through() {
+    // (L21c, T61) closing, replacing or sending the handle a binding was made through ends the binding; a binding made through another handle to the
+    // same object stays; the object's own handle table entries are unaffected
+    let mut reg = Kobjs::new();
+    let mut jobs = kcore::job::Jobs::new();
+    let mut t = HandleTable::new(32);
+    let mut other = HandleTable::new(32);
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let ev = event_create(&mut reg, &mut t).unwrap();
+    let dup = t.duplicate(&mut reg, ev, Rights::SAME).unwrap();
+    port_bind(&mut reg, &t, port, ev, u64::from(1u32 << 24), 1).unwrap();
+    port_bind(&mut reg, &t, port, dup, u64::from(1u32 << 25), 2).unwrap();
+    let pobj = t.get(port).unwrap().obj;
+    let bound = |reg: &Kobjs| port_bound_objects(reg, pobj).len();
+    assert_eq!(bound(&reg), 2);
+    let settle = |reg: &mut Kobjs, jobs: &mut kcore::job::Jobs| {
+        let gone = reg.take_gone();
+        end_bindings_made_through(reg, jobs, &gone);
+    };
+    // close the first handle: its binding (key 1) ends, the one through the duplicate stays
+    t.close(&mut reg, ev).unwrap();
+    settle(&mut reg, &mut jobs);
+    assert_eq!(
+        bound(&reg),
+        1,
+        "the binding made through the closed handle ended"
+    );
+    event_signal(&mut reg, &t, dup, 0, 1 << 24).unwrap(); // the ended binding's signal: the port is not readable for it
+    assert!(
+        port_poll(&mut reg, &t, port).unwrap().is_none(),
+        "an ended binding delivered"
+    );
+    event_signal(&mut reg, &t, dup, 0, 1 << 25).unwrap();
+    assert_eq!(
+        port_poll(&mut reg, &t, port).unwrap().map(|(k, _)| k),
+        Some(2)
+    );
+    // replace the duplicate: the old value stops working, and so does the binding made through it
+    let new = t.replace(&mut reg, dup, Rights::SAME).unwrap();
+    settle(&mut reg, &mut jobs);
+    assert_eq!(bound(&reg), 0, "a replaced handle's binding ended");
+    // a binding made through a handle that is then sent away ends too
+    let moved = t.duplicate(&mut reg, new, Rights::SAME).unwrap();
+    port_bind(&mut reg, &t, port, moved, u64::from(1u32 << 24), 3).unwrap();
+    assert_eq!(bound(&reg), 1);
+    let entry = t.remove_for_transfer(&mut reg, moved).unwrap();
+    settle(&mut reg, &mut jobs);
+    assert_eq!(bound(&reg), 0, "a transferred handle's binding ended");
+    let _ = other.insert(&mut reg, entry.obj, entry.rights);
+    // a process's death (drain) ends every binding made through its handles
+    port_bind(&mut reg, &t, port, new, u64::from(1u32 << 24), 4).unwrap();
+    assert_eq!(bound(&reg), 1);
+    t.drain(&mut reg);
+    settle(&mut reg, &mut jobs);
+    assert_eq!(bound(&reg), 0);
 }

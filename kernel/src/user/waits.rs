@@ -39,6 +39,20 @@ pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
     }
 }
 
+/// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
+pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
+    let s = state();
+    let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        return;
+    };
+    let Some(p) = s.procs.get(&pid) else {
+        return;
+    };
+    if let Ok(entry) = p.handles.get(h) {
+        s.waits.register_call(thread, entry.obj, txid);
+    }
+}
+
 /// The calling process and the machine's memory, for a `ksys` function that takes them (interrupts off, lock held).
 fn in_process<R>(
     f: impl FnOnce(&mut UserState, &mut kmem::Kmem, u64) -> Result<R, Status>,
@@ -498,13 +512,7 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     commit_wake();
     thread::wait_deadline_registered(
         ready,
-        || {
-            register_wait(
-                me,
-                call.ch,
-                abi::signals::READABLE | abi::signals::PEER_CLOSED,
-            )
-        },
+        || register_call_wait(me, call.ch, call.txid),
         call.deadline,
     );
     irq::without(|| state().waits.forget(me));

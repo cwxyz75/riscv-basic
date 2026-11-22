@@ -124,6 +124,8 @@ pub struct IrqObj {
 
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
 struct Binding {
+    /// The table and handle the binding was made through (L21c): it ends when that handle is closed, replaced or sent away.
+    via: (u64, u64),
     obj: ObjId,
     mask: u32,
     key: u64,
@@ -706,6 +708,17 @@ pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
     }
 }
 
+/// Is there a message with transaction id `txid` (its first four bytes, little endian) queued at channel end `obj`? (`channel_call`'s wait, L21d.)
+pub fn channel_has_txid(reg: &Kobjs, obj: ObjId, txid: u32) -> bool {
+    match reg.get(obj) {
+        Some(KObj::Channel(c)) => c
+            .queue
+            .iter()
+            .any(|m| m.data.get(..4) == Some(&txid.to_le_bytes()[..])),
+        _ => false,
+    }
+}
+
 /// The signal word of a live object (None if it is gone).
 fn object_signals(reg: &Kobjs, obj: ObjId) -> Option<u32> {
     Some(match reg.get(obj)? {
@@ -1099,6 +1112,7 @@ pub fn port_bind_flags_in(
         return Err(Status::BadHandle);
     };
     p.bindings.push(Binding {
+        via: (table.id(), object.0),
         obj: oe.obj,
         mask,
         key,
@@ -1106,7 +1120,55 @@ pub fn port_bind_flags_in(
         armed: true,
     });
     reg.meter_add(BINDING_COST);
+    reg.watch_adjust(oe.obj, 1);
     Ok(())
+}
+
+/// Handles to bound objects were removed (`Registry::take_gone`): every binding of every port made through one of them ends (L21c, T61: closing,
+/// replacing or sending the handle a binding was made through ends it). The ports are touched, so that their waiters look again.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < bindings.len() (loop bound); `next` is at most the length and counts the bindings before it
+pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjId, u64, u64)]) {
+    if gone.is_empty() {
+        return;
+    }
+    let ports: Vec<ObjId> = reg
+        .live_ids()
+        .into_iter()
+        .filter(|&i| matches!(reg.get(i), Some(KObj::Port(_))))
+        .collect();
+    for port in ports {
+        let mut ended: Vec<ObjId> = Vec::new();
+        let mut bindings = match reg.get_mut(port) {
+            Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
+            _ => continue,
+        };
+        let mut before_next = 0;
+        let next = match reg.get(port) {
+            Some(KObj::Port(p)) => p.next,
+            _ => 0,
+        };
+        let mut i = 0;
+        bindings.retain(|b| {
+            let end = gone.iter().any(|&(o, t, h)| b.obj == o && b.via == (t, h));
+            if end {
+                ended.push(b.obj);
+                if i < next {
+                    before_next += 1;
+                }
+            }
+            i += 1;
+            !end
+        });
+        if let Some(KObj::Port(p)) = reg.get_mut(port) {
+            p.bindings = bindings;
+            p.next -= before_next.min(p.next);
+        }
+        for o in &ended {
+            reg.watch_adjust(*o, -1);
+        }
+        reg.meter_sub(ended.len() * BINDING_COST);
+        credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
+    }
 }
 
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: next is at least 1 when a binding is removed behind it
@@ -1127,10 +1189,11 @@ pub fn port_unbind_in(
         .iter()
         .position(|b| b.key == key)
         .ok_or(Status::InvalidArgs)?;
-    p.bindings.remove(at);
+    let gone_obj = p.bindings.remove(at).obj;
     if p.next > at {
         p.next -= 1;
     }
+    reg.watch_adjust(gone_obj, -1);
     reg.meter_sub(BINDING_COST);
     credit_bytes(reg, jobs, port_obj, BINDING_COST);
     Ok(())
