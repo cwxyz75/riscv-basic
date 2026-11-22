@@ -190,8 +190,12 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
         // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
         let process = s.procs.remove(&pid);
         if let Some(p) = process.as_ref() {
+            thread::charge_running();
             for tid in &p.live_tids {
                 s.thread_pid.remove(tid);
+                // (the threads that end with the process: their CPU time goes to their objects and the process's total, AB6)
+                let tobj = p.thread_objs.get(tid).copied();
+                ipc::thread_cpu_final(&mut s.objs, tobj, p.obj, thread::cpu_ns(*tid));
             }
         }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
@@ -302,7 +306,13 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         p.live_tids.remove(&tid);
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
-        if let Some(o) = p.thread_objs.remove(&tid) {
+        let cpu = {
+            thread::charge_running(); // (this thread's last interval counts)
+            thread::cpu_ns(tid)
+        };
+        let tobj = p.thread_objs.remove(&tid);
+        ipc::thread_cpu_final(objs, tobj, p.obj, cpu);
+        if let Some(o) = tobj {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;

@@ -11,6 +11,8 @@ struct tm {
 };
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID 3
 struct timespec { time_t tv_sec; long tv_nsec; };
 typedef int clockid_t;
 int clock_gettime(clockid_t clock, struct timespec *ts);

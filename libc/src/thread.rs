@@ -611,8 +611,13 @@ pub extern "C" fn sched_yield() -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn clock_gettime(_clock: c_int, ts: *mut Timespec) -> c_int {
-    let ns = rt::sys::clock_ns();
+pub unsafe extern "C" fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int {
+    // CLOCK_PROCESS_CPUTIME_ID (2) and CLOCK_THREAD_CPUTIME_ID (3) are the CPU time of the process and of the calling thread (AB6)
+    let ns = match clock {
+        2 => rt::sys::process_cpu_ns(rt::sys::process_self().a1 as u64).a1 as u64,
+        3 => rt::sys::thread_cpu_ns(0).a1 as u64,
+        _ => rt::sys::clock_ns(),
+    };
     (*ts).tv_sec = (ns / 1_000_000_000) as i64;
     (*ts).tv_nsec = (ns % 1_000_000_000) as c_long;
     0

@@ -63,7 +63,8 @@ pub extern "C" fn time(out: *mut TimeT) -> TimeT {
 
 #[no_mangle]
 pub extern "C" fn clock() -> c_long {
-    (rt::sys::clock_get() * 1000) as c_long // CLOCKS_PER_SEC is 1,000,000
+    // the process's CPU time (AB6), in CLOCKS_PER_SEC = 1,000,000 units
+    (rt::sys::process_cpu_ns(rt::sys::process_self().a1 as u64).a1 as u64 / 1000) as c_long
 }
 
 #[no_mangle]

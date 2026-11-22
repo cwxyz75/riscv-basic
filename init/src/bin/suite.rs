@@ -12313,6 +12313,84 @@ fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
     Ok(())
 }
 
+static CPU_SPIN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CPU_SLEEP_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Spins for 100 ms of the clock and reports the CPU time its own thread was charged (handle 0: the caller).
+extern "C" fn cpu_spinner(_: usize) -> ! {
+    let start = sys::clock_ns();
+    while sys::clock_ns() < start + 100_000_000 {
+        core::hint::spin_loop();
+    }
+    CPU_SPIN_NS.store(sys::thread_cpu_ns(0).a1 as u64, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// Sleeps 50 ms and reports the same.
+extern "C" fn cpu_sleeper(_: usize) -> ! {
+    let gate = sys::event_create().a1 as u64;
+    sys::object_wait(gate, 1 << 24, sys::clock_get() + 50);
+    CPU_SLEEP_NS.store(sys::thread_cpu_ns(0).a1 as u64, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// AB6 (SCHED-SMP-SPEC 4.10, AC1): a thread that spins for 100 ms is charged about 100 ms, one that sleeps under 1 ms, an ended thread's handle keeps
+/// its figure, and the process's figure is at least the sum of the threads we made and read.
+fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
+    CPU_SPIN_NS.store(u64::MAX, Ordering::SeqCst);
+    CPU_SLEEP_NS.store(u64::MAX, Ordering::SeqCst);
+    let me_p = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let before = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
+    let spin = new_thread(cpu_spinner, 0)?;
+    let sleep = new_thread(cpu_sleeper, 0)?;
+    for t in [spin, sleep] {
+        ensure_eq!(
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000).status,
+            0,
+            "a thread ended"
+        );
+    }
+    let spun = CPU_SPIN_NS.load(Ordering::SeqCst);
+    let slept = CPU_SLEEP_NS.load(Ordering::SeqCst);
+    // (the thread's own figure at its end: 5 percent either way; the spec's 2 percent needs a quieter machine than a shared CI runner)
+    ensure!(
+        (95_000_000..=105_000_000).contains(&spun),
+        "a thread that spun for 100 ms was charged {spun} ns"
+    );
+    ensure!(
+        slept < 1_000_000,
+        "a thread that slept was charged {slept} ns"
+    );
+    // an ended thread's handle keeps the total
+    let spun_handle = ok(sys::thread_cpu_ns(spin), "thread cpu of an ended thread")?.a1 as u64;
+    ensure!(
+        spun_handle >= spun && spun_handle <= spun + 2_000_000,
+        "the ended thread's handle says {spun_handle} ns, the thread itself said {spun}"
+    );
+    // the process has at least what these two ran
+    let after = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
+    ensure!(
+        after >= before + spun_handle,
+        "the process's figure rose by {} ns, the spinner alone ran {spun_handle}",
+        after - before
+    );
+    // errors: an unknown selector, a handle that is no thread
+    ensure_eq!(
+        st(sys::thread_info_which(spin, 2)),
+        Some(S::InvalidArgs),
+        "an unknown selector"
+    );
+    ensure_eq!(
+        st(sys::thread_cpu_ns(me_p)),
+        Some(S::WrongType),
+        "a process handle is not a thread"
+    );
+    for h in [spin, sleep] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
 /// Spin for `ms` milliseconds of the clock.
 fn spin_ms(ms: u64) {
     let until = sys::clock_get() + ms;
@@ -14499,6 +14577,10 @@ pub fn app_main() -> i32 {
         (
             "job_syscalls_check_handles_rights_and_arguments",
             job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "cpu_time_is_counted_per_thread_and_process",
+            cpu_time_is_counted_per_thread_and_process,
         ),
         (
             "a_runaway_rt_thread_does_not_hang_the_system",

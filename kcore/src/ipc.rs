@@ -61,6 +61,9 @@ pub struct ProcessObj {
     /// Stopped by `process_suspend`: raises STOPPED.
     pub stopped: bool,
     pub exit_code: i32,
+    /// CPU nanoseconds run by the threads that have ended (the live ones are read from the scheduler when asked); the whole figure once
+    /// the process is over (`process_info` 1, AB6).
+    pub cpu_ns: u64,
     /// Destroying this object (the last handle closing) kills a still-running process. False
     /// for processes the kernel itself started: their `process_self` handles are only views.
     pub kill_on_close: bool,
@@ -73,6 +76,8 @@ pub struct ThreadObj {
     /// Stopped by `thread_suspend` (EX1): raises SUSPENDED.
     pub suspended: bool,
     pub exit_code: i32,
+    /// CPU nanoseconds the thread ran, final once it has ended (`thread_info` 1, AB6).
+    pub cpu_ns: u64,
 }
 
 /// Which level an exception was offered at (EX2): the process's own channel, then the job's and each ancestor's.
@@ -1485,6 +1490,7 @@ pub fn process_object_create_in(
             terminated: false,
             stopped: false,
             exit_code: 0,
+            cpu_ns: 0,
             kill_on_close,
         }),
         q.job,
@@ -1628,6 +1634,7 @@ pub fn thread_object_create_in(
             terminated: false,
             suspended: false,
             exit_code: 0,
+            cpu_ns: 0,
         }),
         q.job,
     );
@@ -1657,6 +1664,63 @@ pub fn thread_of(
         }
         Some(_) => Err(Status::WrongType),
         None => Err(Status::BadHandle),
+    }
+}
+
+/// What `thread_info` 1 needs (AB6): the thread object, its process, whether it has ended, and its final CPU nanoseconds (meaningful once ended).
+pub fn thread_cpu_info(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(ObjId, u64, bool, u64), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Thread(t)) => {
+            if entry.rights.contains(need) {
+                Ok((entry.obj, t.pid, t.terminated, t.cpu_ns))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// What `process_info` 1 needs (AB6): its pid, whether it has ended, and the CPU nanoseconds of its ended threads (all of them once it has ended).
+pub fn process_cpu_info(
+    reg: &Kobjs,
+    table: &HandleTable,
+    h: Handle,
+    need: Rights,
+) -> Result<(u64, bool, u64), Status> {
+    let entry = table.get(h)?;
+    match reg.get(entry.obj) {
+        Some(KObj::Process(p)) => {
+            if entry.rights.contains(need) {
+                Ok((p.pid, p.terminated, p.cpu_ns))
+            } else {
+                Err(Status::AccessDenied)
+            }
+        }
+        Some(_) => Err(Status::WrongType),
+        None => Err(Status::BadHandle),
+    }
+}
+
+/// A thread ended having run `ns` nanoseconds: the thread object keeps it, and the process object's total grows by it.
+pub fn thread_cpu_final(
+    reg: &mut Kobjs,
+    thread_obj: Option<ObjId>,
+    process_obj: Option<ObjId>,
+    ns: u64,
+) {
+    if let Some(KObj::Thread(t)) = thread_obj.and_then(|o| reg.get_mut(o)) {
+        t.cpu_ns = ns;
+    }
+    if let Some(KObj::Process(p)) = process_obj.and_then(|o| reg.get_mut(o)) {
+        p.cpu_ns = p.cpu_ns.saturating_add(ns);
     }
 }
 

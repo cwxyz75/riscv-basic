@@ -171,7 +171,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
-| 56 | process_info | `a0` process | `a1` exit code |
+| 56 | process_info | `a0` process, `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
 | 57 | process_suspend | `a0` process | |
 | 59 | process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags | |
 | 58 | process_resume | `a0` process | |
@@ -188,7 +188,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 84 | port_rearm | `a0` port, `a1` key | |
 | 85 | port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
 | 61 | thread_exit | `a0` code | does not return |
-| 62 | thread_info | `a0` thread | `a1` exit code |
+| 62 | thread_info | `a0` thread (0: the caller, for `which` 1), `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
 | 74 | thread_suspend | `a0` thread (MANAGE) | |
 | 75 | thread_resume | `a0` thread (MANAGE) | |
@@ -583,10 +583,10 @@ parks when the call returns (its timeout still runs, its signals still arrive), 
 runs no user code until the process is resumed. A kill ends a stopped process as usual. The process's other state (handles,
 memory, channels) is untouched and servers keep answering it. While stopped, the process object has the signal `STOPPED` (bit 6; waitable, cleared by `process_resume`; a process that ended has TERMINATED only), so a parent can wait for a stop. `process_info` still answers BAD_STATE. Tests: `process_suspend_*`.
 
-### process_info(process) -> status, exit_code
+### process_info(process, which) -> status, value
 
-The exit code of an ended process (`-1000 - kind` after a fault). Rights: INSPECT.
-Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+`which` 0 (the default): the exit code of an ended process (`-1000 - kind` after a fault). `which` 1 (AB6): the CPU nanoseconds the process's threads have run, the ended ones and the live ones (works while it runs; a process that has ended gives its total). Rights: INSPECT.
+Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (`which` 0, not ended yet); INVALID_ARGS (`which`).
 
 ## Jobs and limits (S4.5, OD56-OD58)
 
@@ -706,9 +706,9 @@ that was killed before it ever ran never runs user code.
 
 End the calling thread (see above). Its thread object is TERMINATED with exit code `code`.
 
-### thread_info(thread) -> status, exit_code
+### thread_info(thread, which) -> status, value
 
-The exit code of an ended thread (`-1000 - kind` is *not* used: a fault ends the process
+`which` 1 (AB6) is the CPU nanoseconds the thread has run (works while it runs, and gives the total once it has ended; handle 0 names the calling thread and needs no right); INVALID_ARGS for any `which` above 1. `which` 0, the default: the exit code of an ended thread (`-1000 - kind` is *not* used: a fault ends the process
 and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 
