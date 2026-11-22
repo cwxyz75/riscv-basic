@@ -64,9 +64,9 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
             thread_pid,
             ..
         } = s;
-        let p = thread_pid
-            .get(&thread::current())
-            .and_then(|pid| procs.get_mut(pid))?;
+        let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+        crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
+        let p = procs.get_mut(&pid)?;
         // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
         // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
         Some(install_token_of(asids, p))
@@ -97,6 +97,22 @@ const SWEEP_SLICE_BUDGET: usize = 256;
 
 pub(super) fn bump_attention() {
     ATTENTION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call
+/// instruction. The process is the one `activate_current` recorded for this hart's running thread; the rest takes only the key's bucket lock
+/// and the scheduler's own locks. A wake that outranks this thread leaves `need_resched` set: the caller takes the lock for the switch.
+pub fn futex_wake_quiet(frame: &mut crate::trap::TrapFrame) {
+    let a = [
+        frame.arg(10),
+        frame.arg(11),
+        frame.arg(12),
+        frame.arg(13),
+        frame.arg(14),
+        frame.arg(15),
+    ];
+    let pid = crate::percpu::this().cur_pid.load(Ordering::Relaxed);
+    reply(frame, futex_wake(pid, a));
 }
 
 /// Has nothing happened since this hart last returned to user mode that could end or stop the thread it is about to resume? (No
@@ -315,11 +331,9 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::FUTEX_WAIT => reply(frame, futex_wait(a)),
         nr::FUTEX_WAKE => {
-            let (r, woken) = futex_wake(a);
-            // wake exactly the sleepers that were removed from the table, by id (not everyone)
-            let tids: Vec<Tid> = woken.into_iter().map(|t| t as Tid).collect();
-            thread::wake_many(&tids);
-            reply(frame, r);
+            // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
+            let pid = irq::without(|| caller_pid(state()).unwrap_or(0));
+            reply(frame, futex_wake(pid, a));
         }
         nr::PROCESS_CREATE
         | nr::JOB_SET_SCHED

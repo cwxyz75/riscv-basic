@@ -8,9 +8,9 @@ smp4	thread_create_join	233618	ns
 smp4	wake_latency_event	236746	ns
 smp4	channel_call_rt	272642	ns
 smp4	channel_call_rt_100_bystanders	269488	ns
-smp4	pair_scaling_futex_n1	199744	ns
-smp4	pair_scaling_futex_n2	43828	ns
-smp4	pair_scaling_futex_n4	352979	ns
+smp4	pair_scaling_futex_n1	16831	ns
+smp4	pair_scaling_futex_n2	20400	ns
+smp4	pair_scaling_futex_n4	270023	ns
 smp4	pair_scaling_channel_call_n1	338760	ns
 smp4	pair_scaling_channel_call_n2	372542	ns
 smp4	pair_scaling_channel_call_n4	439213	ns

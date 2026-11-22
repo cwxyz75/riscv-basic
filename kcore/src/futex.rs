@@ -1,9 +1,13 @@
 //! The futex wait table (S7b, S7-SPEC section 4): who sleeps on which `(process, address)`.
 //!
-//! Pure bookkeeping. The kernel checks the user word and enqueues in one step under the big kernel
-//! lock (so a wake between a user store and the wait is never lost); wakes dequeue in FIFO order;
-//! a sleeper leaves the table when it is woken, times out, is killed or its process ends. A thread
+//! Pure bookkeeping. The kernel checks the user word and enqueues in one step under the key's bucket lock
+//! (so a wake between a user store and the wait is never lost); wakes dequeue in FIFO order under the same
+//! lock; a sleeper leaves the table when it is woken, times out, is killed or its process ends. A thread
 //! waits on at most one address at a time.
+//!
+//! L14: the table is 64 buckets by hash of the key (`FutexTable`), each its own lock in the kernel (class
+//! `FUTEX`, SCHED-SMP-SPEC 3.3, never two at once), so `futex_wake` needs no big kernel lock and wakes on
+//! different words do not meet. `Futexes` is one bucket and is the unit the model tests check.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
@@ -20,8 +24,11 @@ pub struct Futexes {
 }
 
 impl Futexes {
-    pub fn new() -> Futexes {
-        Futexes::default()
+    pub const fn new() -> Futexes {
+        Futexes {
+            queues: BTreeMap::new(),
+            sleeping_on: BTreeMap::new(),
+        }
     }
 
     /// Put `who` to sleep on `key`. A thread already sleeping is moved (it can only wait once);
@@ -93,6 +100,125 @@ impl Futexes {
     }
 }
 
+/// How many buckets the table has.
+pub const BUCKETS: usize = 64;
+
+/// The bucket of a key: a hash of the process and the address, so that the words of one process spread (a word is 4-aligned: its low two
+/// bits carry nothing).
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: wrapping multiplication and a shift of a u64
+pub fn bucket_of(key: Key) -> usize {
+    let h = (key.1 >> 2)
+        .wrapping_add(key.0.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_mul(0xff51_afd7_ed55_8ccd);
+    ((h >> 32) as usize) % BUCKETS
+}
+
+/// What the table needs from its locks: run `f` on bucket `b` (`b < BUCKETS`) with that bucket's lock held. The kernel implements it with one
+/// spinlock per bucket; the host tests with plain cells.
+pub trait Buckets {
+    fn with<R>(&self, b: usize, f: impl FnOnce(&mut Futexes) -> R) -> R;
+}
+
+/// The futex table: 64 buckets behind `Buckets`. Every operation takes the one bucket its key hashes to (never two at once), except the
+/// two that look at everything (`forget_process`, `len`), which take them one after another.
+pub struct FutexTable<B: Buckets> {
+    buckets: B,
+}
+
+impl<B: Buckets> FutexTable<B> {
+    pub const fn new(buckets: B) -> Self {
+        FutexTable { buckets }
+    }
+
+    /// The futex wait's one step: under the key's lock, `check` (the kernel reads the user word and compares it) and, if it says yes, `who`
+    /// is queued. Returns whether it was queued. A wake that follows a user store takes the same lock, so it finds the sleeper or the sleeper
+    /// finds the store.
+    pub fn wait_if(&self, key: Key, who: Waiter, check: impl FnOnce() -> bool) -> bool {
+        self.buckets.with(bucket_of(key), |f| {
+            if !check() {
+                return false;
+            }
+            let fresh = f.wait(key, who);
+            debug_assert!(fresh, "a thread sleeps on one futex at a time");
+            true
+        })
+    }
+
+    /// Queue `who` on `key` unconditionally (a test hook and the models).
+    pub fn wait(&self, key: Key, who: Waiter) -> bool {
+        self.buckets.with(bucket_of(key), |f| f.wait(key, who))
+    }
+
+    /// Wake up to `count` sleepers on `key`, oldest first, and run `then` on them **with the lock still held**, so that the wake of a
+    /// sleeper that has left the queue is issued before the lock is let go (SCHED-SMP-SPEC 3.8: `FUTEX` is before the run-queue locks).
+    pub fn wake_with(&self, key: Key, count: u64, then: impl FnOnce(&[Waiter])) -> usize {
+        self.buckets.with(bucket_of(key), |f| {
+            let woken = f.wake(key, count);
+            if !woken.is_empty() {
+                then(&woken);
+            }
+            woken.len()
+        })
+    }
+
+    /// Wake up to `count` sleepers on `key`, oldest first; they leave the table.
+    pub fn wake(&self, key: Key, count: u64) -> Vec<Waiter> {
+        self.buckets.with(bucket_of(key), |f| f.wake(key, count))
+    }
+
+    /// `who`, which sleeps on `key`, stops sleeping (timed out, killed): true if it was in the table.
+    pub fn forget(&self, key: Key, who: Waiter) -> bool {
+        self.buckets.with(bucket_of(key), |f| f.forget(who))
+    }
+
+    /// Is `who` still asleep on `key`?
+    pub fn contains(&self, key: Key, who: Waiter) -> bool {
+        self.buckets.with(bucket_of(key), |f| f.contains(who))
+    }
+
+    /// Everyone sleeping in process `pid` leaves (the process is gone); returns them. One bucket at a time.
+    pub fn forget_process(&self, pid: u64) -> Vec<Waiter> {
+        let mut gone = Vec::new();
+        for b in 0..BUCKETS {
+            gone.extend(self.buckets.with(b, |f| f.forget_process(pid)));
+        }
+        gone
+    }
+
+    /// How many sleepers there are (a leak counter for tests). Not one instant: the buckets are counted one after another.
+    pub fn len(&self) -> usize {
+        (0..BUCKETS)
+            .map(|b| self.buckets.with(b, |f| f.len()))
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Buckets for a single thread of control (the host tests): plain cells, no locks.
+pub struct LocalBuckets(Vec<core::cell::RefCell<Futexes>>);
+
+impl LocalBuckets {
+    pub fn new() -> Self {
+        LocalBuckets((0..BUCKETS).map(|_| Default::default()).collect())
+    }
+}
+
+impl Default for LocalBuckets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Buckets for LocalBuckets {
+    #[allow(clippy::indexing_slicing)] // INVARIANT: b < BUCKETS, the length of the vector
+    fn with<R>(&self, b: usize, f: impl FnOnce(&mut Futexes) -> R) -> R {
+        f(&mut self.0[b].borrow_mut())
+    }
+}
+
 #[cfg(all(test, not(any(loom, shuttle))))]
 mod tests {
     use super::*;
@@ -153,5 +279,53 @@ mod tests {
         );
         assert_eq!(f.wake((1, 4), 9), Vec::<u64>::new(), "it moved");
         assert_eq!(f.wake((1, 8), 9), [5]);
+    }
+
+    #[test]
+    fn the_table_keys_every_operation_to_its_bucket() {
+        let t = FutexTable::new(LocalBuckets::new());
+        // words that hash apart and words that collide behave the same: a key is a (process, address), never a bucket
+        let keys: Vec<Key> = (0..300u64).map(|i| (1 + i % 3, 0x1000 + 4 * i)).collect();
+        for (i, &k) in keys.iter().enumerate() {
+            assert!(t.wait_if(k, i as u64, || true));
+        }
+        assert_eq!(t.len(), keys.len());
+        let used: alloc::collections::BTreeSet<usize> =
+            keys.iter().map(|&k| bucket_of(k)).collect();
+        assert!(used.len() > BUCKETS / 2, "the hash spreads: {}", used.len());
+        assert!(
+            !t.wait_if((1, 8), 999, || false),
+            "a refused check queues nothing"
+        );
+        for (i, &k) in keys.iter().enumerate() {
+            assert!(t.contains(k, i as u64));
+            assert_eq!(t.wake(k, 5), [i as u64], "only its own word's sleeper");
+        }
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn a_process_ending_leaves_no_sleeper_in_any_bucket() {
+        let t = FutexTable::new(LocalBuckets::new());
+        for i in 0..100u64 {
+            t.wait((1 + i % 2, 0x1000 + 4 * i), i);
+        }
+        let mut gone = t.forget_process(1);
+        gone.sort();
+        assert_eq!(gone, (0..100u64).filter(|i| i % 2 == 0).collect::<Vec<_>>());
+        assert_eq!(t.len(), 50);
+    }
+
+    #[test]
+    fn a_wake_runs_its_action_with_the_sleepers_it_took() {
+        let t = FutexTable::new(LocalBuckets::new());
+        t.wait((1, 4), 7);
+        t.wait((1, 4), 8);
+        let mut seen: Vec<u64> = Vec::new();
+        assert_eq!(t.wake_with((1, 4), 1, |w| seen.extend_from_slice(w)), 1);
+        assert_eq!(seen, [7]);
+        assert_eq!(t.wake_with((1, 4), 5, |w| seen.extend_from_slice(w)), 1);
+        assert_eq!(seen, [7, 8]);
+        assert_eq!(t.wake_with((1, 4), 5, |_| panic!("nobody left")), 0);
     }
 }

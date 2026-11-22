@@ -152,7 +152,7 @@ Phase 6b (`epic/phase-6b`, merged into `main` on its epic gate):
 Phase 6c, **the end of the big lock** (an epic of its own, after phase 8; a decision below): the items that peel the big kernel lock and the one that needs the registry reworked.
 
 - [ ] **L17** (parts b and c) the per-process `AS` lock, page faults and user copies leave the big lock
-- [ ] **L14** futex bucket locks
+- [x] **L14** futex bucket locks (PR 403: the 64 buckets, `futex_wake` without the big lock, the prepare-first sleep; the 3.0 scaling is not met and waits for L17 b and c: T213)
 - [ ] **L19** `PROCS` and `TT`; teardown out of the big lock (and teardown's sweep in slices: T206)
 - [ ] **L21** the W remainder (exact ready set, wake-one)
 - [ ] **L20** the end of the big kernel lock; the `&'static mut` accessors deleted

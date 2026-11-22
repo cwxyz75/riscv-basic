@@ -154,7 +154,7 @@ pub fn process_count() -> usize {
 
 /// Threads sleeping on a futex (for leak checks).
 pub fn futex_sleepers() -> usize {
-    irq::without(|| state().futexes.len())
+    futex_table().len()
 }
 
 /// Threads waiting for a pager and pagers still alive (for leak checks, PG1).
