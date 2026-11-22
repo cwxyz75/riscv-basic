@@ -32,7 +32,7 @@ fn the_run_queue_class_may_be_taken_twice_in_ascending_instance_order() {
     assert!(h.check(Class::Rq, 0).is_err(), "descending");
     // no other class allows two
     for &c in &Class::ALL {
-        if c != Class::Rq && !c.reentrant() {
+        if c != Class::Rq && c != Class::As && !c.reentrant() {
             let h = held_with(&[(c, 1)]);
             assert!(h.check(c, 2).is_err(), "{c:?} never two");
         }
@@ -140,4 +140,26 @@ fn a_held_stack_knows_when_it_is_empty() {
     assert_eq!(h.len(), 1);
     h.pop(Class::Obj, 0);
     assert!(h.is_empty());
+}
+
+#[test]
+fn address_spaces_may_be_taken_ascending_up_to_the_process_limit() {
+    // (a call that names a process, or all of them, takes the address spaces of up to 64 processes in ascending order)
+    let mut h = Held::new();
+    for pid in 1..=64u32 {
+        h.check(Class::As, pid).unwrap();
+        h.push(Class::As, pid);
+    }
+    assert!(h.check(Class::As, 65).is_err(), "a 65th");
+    let h = held_with(&[(Class::As, 5)]);
+    assert!(h.check(Class::As, 4).is_err(), "descending");
+    assert!(
+        h.check(Class::Vmo, 0).is_ok(),
+        "the memory locks come after"
+    );
+    let h = held_with(&[(Class::Vmo, 0)]);
+    assert!(
+        h.check(Class::As, 1).is_err(),
+        "AS before the memory locks, never after"
+    );
 }

@@ -20,7 +20,10 @@ use common::FakeMem;
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
         live_tids: Default::default(),
-        aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+            1,
+            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        )),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),

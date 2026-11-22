@@ -47,7 +47,7 @@ fn world() -> W {
         .unwrap();
     let p = Process {
         live_tids: Default::default(),
-        aspace,
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(1, aspace)),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -113,7 +113,7 @@ impl W {
     fn poke(&mut self, at: u64, d: &[u8]) {
         let p = self.us.procs.get_mut(&1).unwrap();
         kcore::usercopy::copy_to_user(
-            &mut p.aspace,
+            p.aspace.held_mut(),
             &mut self.mm,
             &mut self.vmos,
             &mut self.jobs,
@@ -125,7 +125,7 @@ impl W {
     fn peek(&mut self, at: u64, n: usize) -> Vec<u8> {
         let p = self.us.procs.get_mut(&1).unwrap();
         kcore::usercopy::copy_from_user(
-            &mut p.aspace,
+            p.aspace.held_mut(),
             &mut self.mm,
             &mut self.vmos,
             &mut self.jobs,

@@ -136,6 +136,19 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
         if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
             machine.read_cpu(s, me, n, a); // (before the memory lock: AB6)
         }
+        // (the calls that name a process, or all of them: every address space, before the memory locks; these touch none)
+        let _as = if matches!(
+            n,
+            nr::PROCESS_SELF
+                | nr::JOB_ROOT
+                | nr::RESOURCE_ROOT
+                | nr::PROCESS_INFO
+                | nr::THREAD_INFO
+        ) {
+            AsLocks::none()
+        } else {
+            AsLocks::all(s)
+        };
         let k = kmem::get();
         let mut ctx = ksys::PCtx {
             objs: &mut s.objs,
@@ -157,11 +170,12 @@ pub(crate) fn cow_sync() {
     }
     irq::without(|| {
         let s = state();
-        // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB
+        let _as = AsLocks::all(s); // (every address space: the copy log names pages of any; before the memory locks)
+                                   // a translation a copy-on-write fault replaced (in the address space of the thread that took it): every hart drops its TLB
         let replaced = caller_pid(s)
             .ok()
             .and_then(|pid| s.procs.get_mut(&pid))
-            .is_some_and(|p| p.aspace.take_replaced() > 0);
+            .is_some_and(|p| p.aspace.held_mut().take_replaced() > 0);
         if replaced {
             crate::smp::shootdown();
             kmem::flush_tlb();
@@ -197,6 +211,7 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     let (started, first_prio) = irq::without(|| -> Result<(usize, u8), ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let _as = AsLocks::all(s);
         ksys::process_start(s, kmem::jobs().jobs, me, a).map_err(|e| (e, None, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
@@ -254,6 +269,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let creator = creator_prio(s);
+        let _as = AsLocks::all(s);
         let k = kmem::get();
         ksys::thread_spawn(s, k.mm, k.vmos, k.jobs, me, creator, a).map_err(|e| (e, None, None))
     })?;
@@ -312,6 +328,7 @@ pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
     let r = irq::without(|| -> Result<Vec<Tid>, ReplyErr> {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let _as = AsLocks::all(s);
         let k = kmem::get();
         ksys::pager::pager_supply(
             s,
@@ -498,9 +515,10 @@ fn state_write(
     use abi::thread_state as ts;
     // (the memory locks are held for the copy only: writing FP or vector state charges the job, which takes them itself)
     let data = {
+        let _as = AsLocks::of(s, &[me]);
         let k = kmem::get();
         let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-        kcore::usercopy::copy_from_user(&mut caller.aspace, k.mm, k.vmos, k.jobs, buf, len)
+        kcore::usercopy::copy_from_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, len)
             .map_err(|e| (e, None, None))?
     };
     // (the two fixed layouts become words; the vector layout is written as bytes: it can be large and its allocation was the copy's)
@@ -571,9 +589,10 @@ fn state_read(
             .collect(),
         _ => crate::fp::read_vec(tid).ok_or((Status::NoMemory, None, None))?,
     };
+    let _as = AsLocks::of(s, &[me]);
     let k = kmem::get();
     let caller = s.procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
-    kcore::usercopy::copy_to_user(&mut caller.aspace, k.mm, k.vmos, k.jobs, buf, &bytes)
+    kcore::usercopy::copy_to_user(caller.aspace.held_mut(), k.mm, k.vmos, k.jobs, buf, &bytes)
         .map_err(|e| (e, None, None))?;
     Ok((None, None))
 }

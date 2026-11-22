@@ -21,7 +21,10 @@ const CODE: u64 = 0x40_0000;
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
         live_tids: Default::default(),
-        aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+            1,
+            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        )),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -73,6 +76,7 @@ fn world() -> W {
         .get_mut(&2)
         .unwrap()
         .aspace
+        .held_mut()
         .map_region(&mut vmos, CODE, 1, code, 0, Perms::RX.user())
         .unwrap();
     let data = vmos.create(&mut jobs, 1);
@@ -80,6 +84,7 @@ fn world() -> W {
         .get_mut(&2)
         .unwrap()
         .aspace
+        .held_mut()
         .map_region(&mut vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
         .unwrap();
     let p = us.procs.get_mut(&1).unwrap();

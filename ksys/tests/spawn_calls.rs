@@ -23,7 +23,10 @@ const REC: u64 = 0x50_0000;
 fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
     Process {
         live_tids: Default::default(),
-        aspace: AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        aspace: std::sync::Arc::new(klock::aslock::AsCell::new(
+            1,
+            AddressSpace::new(PageTable::new_with_kernel_half(mm, kernel).unwrap()),
+        )),
         handles: HandleTable::new(64),
         tag: kcore::asid::AsTag { asid: 1, gen: 1 },
         vmos: Vec::new(),
@@ -77,6 +80,7 @@ fn world() -> W {
         .get_mut(&2)
         .unwrap()
         .aspace
+        .held_mut()
         .map_region(&mut vmos, CODE, 1, code, 0, Perms::RX.user())
         .unwrap();
     let data = vmos.create(&mut jobs, 1);
@@ -84,6 +88,7 @@ fn world() -> W {
         .get_mut(&2)
         .unwrap()
         .aspace
+        .held_mut()
         .map_region(&mut vmos, CODE + 0x10_000, 1, data, 0, Perms::RW.user())
         .unwrap();
     let rec = vmos.create(&mut jobs, 1);
@@ -91,6 +96,7 @@ fn world() -> W {
         .get_mut(&1)
         .unwrap()
         .aspace
+        .held_mut()
         .map_region(&mut vmos, REC, 1, rec, 0, Perms::RW.user())
         .unwrap();
     let p = us.procs.get_mut(&1).unwrap();
@@ -119,7 +125,7 @@ impl W {
         let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
         let p = self.us.procs.get_mut(&1).unwrap();
         kcore::usercopy::copy_to_user(
-            &mut p.aspace,
+            p.aspace.held_mut(),
             &mut self.mm,
             &mut self.vmos,
             &mut self.jobs,
@@ -177,9 +183,14 @@ fn a_thread_gets_a_stack_between_guards_in_the_arena() {
     assert!(t.table_charge.contains_key(&stack.region));
     assert_eq!(t.stack_hint, stack.region + sp::DEFAULT_STACK);
     // the guard below the stack and the guard above are not mapped: the next stack is not flush
-    assert!(t.aspace.region_perms_at(stack.region - 4096).is_none());
     assert!(t
         .aspace
+        .held_ref()
+        .region_perms_at(stack.region - 4096)
+        .is_none());
+    assert!(t
+        .aspace
+        .held_ref()
         .region_perms_at(stack.region + sp::DEFAULT_STACK)
         .is_none());
     let s2 = w.spawn(w.plain()).unwrap();
