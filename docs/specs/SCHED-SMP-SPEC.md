@@ -1510,3 +1510,7 @@ Sections 3.3 and 4.8. The donation graph (`kcore::donate`) is one instance in th
 * **User code owns the word and can make the kernel's record stale** (a plain store of 0 and another thread's fast-path lock): the next call on the key that finds the word naming another owner than the record, and the exit of the record's old owner, **dissolve** the record: its waiters end with BAD_STATE and the word is left alone. A program that misuses the word loses its waiters, never the kernel's consistency.
 * **The outcome is left for the woken thread** (`Granted` or `Died`), so it never reads the word after its sleep.
 
+## Amendment 2026-11-22: the port watch (L21a)
+
+Section 5 (the W remainder, task 21), first slice. The wait table remembers, for each port with a waiter, the objects the port binds (`WaitTable::watch_port`, renewed when the port is touched: the registry logs a port at every bind, unbind, rearm and poll, as it logs every `get_mut`), and a commit evaluates a port only when an object it binds, or the port itself, was touched. Before, every commit that touched anything evaluated every port with a waiter by walking all its bindings (a sleeping waiter on a port of 6,144 bindings cost every syscall 145 us, T60). The wake is still of every waiter of the port; the ready set and the wake-one baton are the next slice (L21b).
+

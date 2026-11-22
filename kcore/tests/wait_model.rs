@@ -126,7 +126,7 @@ fn run(seed: u64) {
             .collect();
         let woken = waits.commit(
             |id| signals_of_object(&reg, id),
-            |id| is_port(&reg, id),
+            |id| port_bound_objects(&reg, id),
             dirty,
         );
         for t in &woken {
@@ -179,7 +179,11 @@ fn run(seed: u64) {
                 };
                 if let Some(s) = signals_of_object(&reg, obj) {
                     if s & mask == 0 {
-                        waits.register(t, obj, mask);
+                        if is_port(&reg, obj) {
+                            waits.register_port(t, obj, mask, port_bound_objects(&reg, obj));
+                        } else {
+                            waits.register(t, obj, mask);
+                        }
                         masks.insert(t, (obj, mask));
                     }
                 }
@@ -217,12 +221,12 @@ fn register_replaces_and_forget_is_idempotent() {
     event_signal(&mut reg, &t, a, 0, 1 << 24).unwrap(); // the old object: nobody waits there now
     let d = reg.take_dirty();
     assert!(w
-        .commit(|i| signals_of_object(&reg, i), |_| false, d)
+        .commit(|i| signals_of_object(&reg, i), |_| Vec::new(), d)
         .is_empty());
     event_signal(&mut reg, &t, b, 0, 1 << 25).unwrap();
     let d = reg.take_dirty();
     assert_eq!(
-        w.commit(|i| signals_of_object(&reg, i), |_| false, d),
+        w.commit(|i| signals_of_object(&reg, i), |_| Vec::new(), d),
         vec![1]
     );
     assert!(!w.forget(1));
@@ -242,10 +246,65 @@ fn an_overflowed_log_releases_every_registration() {
         items: Vec::new(),
         overflow: true,
     };
-    let woken = w.commit(|i| signals_of_object(&reg, i), |_| false, overflowed);
+    let woken = w.commit(|i| signals_of_object(&reg, i), |_| Vec::new(), overflowed);
     assert_eq!(
         woken,
         vec![7],
         "everyone is released: a forced touch may have been lost"
+    );
+}
+
+#[test]
+fn a_port_waiter_costs_an_unrelated_commit_nothing() {
+    // (L21a) a port with a waiter is evaluated only when an object it binds, or the port itself, is touched: a thousand bindings and a sleeping
+    // waiter used to be walked by every commit on the system
+    use std::cell::Cell;
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(2048);
+    let port = port_create(&mut reg, &mut t).unwrap();
+    let pobj = t.get(port).unwrap().obj;
+    let mut events = Vec::new();
+    for k in 0..1000u64 {
+        let e = event_create(&mut reg, &mut t).unwrap();
+        events.push(e);
+        port_bind(&mut reg, &t, port, e, u64::from(abi::signals::USER_MASK), k).unwrap();
+    }
+    let other = event_create(&mut reg, &mut t).unwrap();
+    let mut w = WaitTable::new();
+    w.register_port(
+        1,
+        pobj,
+        abi::signals::READABLE,
+        port_bound_objects(&reg, pobj),
+    );
+    reg.take_dirty();
+    let calls = Cell::new(0usize);
+    let commit = |w: &mut WaitTable, reg: &mut Kobjs| {
+        calls.set(0);
+        let d = reg.take_dirty();
+        w.commit(
+            |i| {
+                calls.set(calls.get() + 1);
+                signals_of_object(reg, i)
+            },
+            |i| port_bound_objects(reg, i),
+            d,
+        )
+    };
+    // a touch of an object the port does not bind: nothing is evaluated (nobody waits on it, and the port's thousand bindings are not walked)
+    event_signal(&mut reg, &t, other, 0, 1 << 24).unwrap();
+    assert!(commit(&mut w, &mut reg).is_empty());
+    assert_eq!(
+        calls.get(),
+        0,
+        "nothing was evaluated for an unrelated touch"
+    );
+    // a touch of a bound object that makes the port readable: the port is evaluated once, and the waiter is released
+    event_signal(&mut reg, &t, events[500], 0, 1 << 24).unwrap();
+    assert_eq!(commit(&mut w, &mut reg), vec![1]);
+    assert_eq!(calls.get(), 1, "one evaluation for one bound touch");
+    assert!(
+        w.watchers_of(t.get(events[500]).unwrap().obj).is_empty(),
+        "the watch is gone with the waiter"
     );
 }

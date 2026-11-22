@@ -25,7 +25,17 @@ pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
         return;
     };
     if let Ok(entry) = p.handles.get(h) {
-        s.waits.register(thread, entry.obj, mask);
+        if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
+            // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
+            s.waits.register_port(
+                thread,
+                entry.obj,
+                mask,
+                ipc::port_bound_objects(&s.objs, entry.obj),
+            );
+        } else {
+            s.waits.register(thread, entry.obj, mask);
+        }
     }
 }
 
@@ -420,7 +430,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
         commit_wake();
         // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
         // registered on the port: the wait table re-evaluates a port's signal (which follows its
-        // bindings) whenever anything was touched.
+        // bindings) when an object it binds, or the port, was touched (L21a).
         let me = thread::current();
         thread::wait_deadline_registered(
             || {
