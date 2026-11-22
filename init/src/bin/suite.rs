@@ -6697,6 +6697,80 @@ fn backstops_follow_the_ram_of_the_machine() -> Outcome {
     Ok(())
 }
 
+/// HD5: the reserved places in the ABI are named and refused with the stated status, and a refusal changes nothing (KERNEL-V1-SPEC 7.5).
+fn reserved_abi_space_is_refused() -> Outcome {
+    use rt::abi::{map_flags, start_features, syscall as nr, thread_state};
+    let p = proc_create()?;
+    let v = vmo(1)?;
+    let at = 0x10_0000_0000u64;
+    for flag in [
+        map_flags::SHADOW_STACK,
+        map_flags::RESERVED_9,
+        map_flags::SHADOW_STACK | map_flags::RESERVED_9,
+    ] {
+        ensure_eq!(
+            st(sys::process_map(p, v, at, 0, 4096, PF_R | flag)),
+            Some(S::NotSupported),
+            "process_map with the reserved flag {flag:#x}"
+        );
+    }
+    ok(
+        sys::process_map(p, v, at, 0, 4096, PF_R),
+        "the same map without the flag: nothing was mapped by the refusals",
+    )?;
+    ensure_eq!(
+        st(sys::thread_read_state(
+            0,
+            thread_state::CFI,
+            core::ptr::null_mut(),
+            0
+        )),
+        Some(S::NotSupported),
+        "the CFI state kind, read"
+    );
+    ensure_eq!(
+        st(sys::thread_write_state(
+            0,
+            thread_state::CFI,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::NotSupported),
+        "the CFI state kind, write"
+    );
+    let (a, _b) = channel()?;
+    let q = proc_create()?;
+    for (features, want) in [
+        (start_features::LANDING_PADS, S::NotSupported),
+        (start_features::SHADOW_STACK, S::NotSupported),
+        (start_features::POINTER_MASKING, S::NotSupported),
+        (start_features::ALL, S::NotSupported),
+        (8, S::InvalidArgs),
+        (1 << 63, S::InvalidArgs),
+        (start_features::LANDING_PADS | 8, S::InvalidArgs),
+    ] {
+        ensure_eq!(
+            st(rt::syscall(
+                nr::PROCESS_START,
+                [q as usize, 0, 0, a as usize, 0, features as usize]
+            )),
+            Some(want),
+            "process_start with features {features:#x}"
+        );
+    }
+    ensure_eq!(
+        st(sys::process_start(q, 0, 0, a, 0)),
+        Some(S::InvalidArgs),
+        "with features 0 the call is the old one: its entry is checked, and refused"
+    );
+    ensure_eq!(
+        sys::handle_duplicate(a, Rights::SAME.0).status,
+        0,
+        "the bootstrap handle is still ours: nothing moved"
+    );
+    Ok(())
+}
+
 fn mappings_per_process_are_bounded() -> Outcome {
     // in a process of its own that never starts: closing it frees every region at once (unmapping thousands of
     // regions one by one costs a shootdown each)
@@ -15123,6 +15197,10 @@ pub fn app_main() -> i32 {
         (
             "backstops_follow_the_ram_of_the_machine",
             backstops_follow_the_ram_of_the_machine,
+        ),
+        (
+            "reserved_abi_space_is_refused",
+            reserved_abi_space_is_refused,
         ),
         (
             "the_object_cap_is_reached_without_a_kernel_panic",

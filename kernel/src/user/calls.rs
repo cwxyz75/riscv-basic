@@ -474,6 +474,7 @@ pub(super) fn thread_state_call(a: [u64; 6], write: bool) -> Reply {
             Some(n) => (ts::VECTOR_HEADER_WORDS * 8 + 32 * n) as u64,
             None => return bad(Status::NotSupported),
         },
+        ts::CFI => return bad(Status::NotSupported), // (HD5: reserved)
         _ => return bad(Status::InvalidArgs),
     };
     if len != want {

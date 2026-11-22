@@ -1,10 +1,11 @@
 ---
 id: X-SPECULATION
 kind: topic
-title: Speculative-execution exposure and mitigations
+title: Speculative-execution exposure
 area: security
 horizon: someday
-refs: [KERNEL-V1-SPEC, OD139]
 ---
 
-Recorded by OD139, not designed: every address space maps the kernel half including the direct map of all RAM; there is no branch-predictor isolation between user and kernel or between processes; syscall arguments index tables with no speculation barrier; the `time` counter is readable from user mode at full resolution. QEMU cannot show whether a mitigation works, so this waits for a hardware target. First questions when it is taken up: which RVA23 cores are affected by which class, whether the direct map can leave user address spaces, and whether `scounteren` should gate `time` per job.
+What this kernel does not defend against, recorded so that it is a known gap and not a surprise (KERNEL-V1-SPEC 7.5, HD5): the direct map is present in every address space (a speculative load from a user process can reach kernel memory the architecture says is inaccessible, on a core that has the problem); there is no branch-predictor isolation between processes or between user and kernel (no barrier at a switch, no retpoline-style code); the `time` counter is readable from user mode (a high-resolution clock for cache attacks, `clock_get` is not the only source). The reserved ABI places of HD5 (shadow stacks, landing pads, pointer masking) are the control-flow half of the same hardening; this item is the data half.
+
+(Not specified, not scheduled, not committed. A first slice would be to decide which cores the kernel targets (RVA23 has no known speculative-leak errata list yet), measure `time` access from user mode under `scounteren`, and decide whether the direct map can leave the user address spaces at the cost of a switch of tables at every trap.)
