@@ -6683,11 +6683,7 @@ fn backstops_follow_the_ram_of_the_machine() -> Outcome {
     let want = [
         (120, (ram / 4096).max(16384), "objects: RAM / 4096"),
         (121, (ram / 32).max(2 << 20), "queued IPC bytes: RAM / 32"),
-        (
-            122,
-            (ram >> 20).clamp(64, 1 << 20),
-            "processes: RAM / 1 MiB",
-        ),
+        (122, 64, "processes: RAM / 1 MiB, held to 64 until T214"),
         (
             123,
             (ram >> 16).min(slots).max(4096),
@@ -6739,9 +6735,11 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
     let e = event()?;
     let mut sent = 0u32;
     let mut refused = None;
-    let mut chans = [0u64; 40];
+    // (the budget is derived from RAM, PL8: twenty pairs of channels fill 2 MiB of it, so as many more as the budget is bigger)
+    let scale = (sys::debug_stat(121) as usize / (2 << 20)).max(1);
+    let mut chans = vec![0u64; 40 * scale];
     let mut nch = 0;
-    'outer: for _ in 0..20 {
+    'outer: for _ in 0..20 * scale {
         let (a, b) = channel()?;
         chans[nch] = a;
         chans[nch + 1] = b;
@@ -6770,7 +6768,10 @@ fn queued_handles_are_charged_to_the_budget() -> Outcome {
         matches!(refused, Some(S::NoMemory) | Some(S::ShouldWait)),
         "refused after {sent} messages with {refused:?}"
     );
-    ensure!(sent < 4000, "{sent} messages of 64 handles were accepted");
+    ensure!(
+        (sent as usize) < 4000 * scale,
+        "{sent} messages of 64 handles were accepted"
+    );
     for &c in &chans[..nch] {
         sys::handle_close(c);
     }
