@@ -172,11 +172,16 @@ pub mod sys {
     /// A kernel counter (see SYSCALLS.md `debug_stat`): 0 blocking waits entered, 1 waits that were woken
     /// without being satisfied (spurious wakes), 2 threads woken.
     pub fn debug_stat(which: u64) -> u64 {
-        syscall(
+        let r = syscall(
             DEBUG_STAT,
             [crate::debug::handle() as usize, which as usize, 0, 0, 0, 0],
-        )
-        .a1 as u64
+        );
+        // (a refusal leaves `a1` as it was: the selector; 0 for a process with no debug resource)
+        if r.status == 0 {
+            r.a1 as u64
+        } else {
+            0
+        }
     }
     /// The debug resource, for a privileged process (the one the kernel started): ACCESS_DENIED for any other (HD4).
     pub fn debug_root() -> Ret {

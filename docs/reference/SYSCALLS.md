@@ -264,13 +264,12 @@ nearly every syscall.
 
 `which` 109 is the kernel heap's leak oracle (a wrapping figure: taken before and after something, the difference is the heap bytes it kept; MM5's acceptance test uses it).
 
-`which` 100 to 105 (PL4) are not counters: the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
+`which` 100 to 105 (PL4) are not counters (they need the same INSPECT right as every selector): the lowest byte address of RAM, the address after the highest, the frames of RAM the device tree describes, the frames the frame allocator manages, the physical address where the kernel image starts, and the frequency of the `time` counter (selector 6) in hertz. They come from the device tree and the kernel's layout, are fixed after boot, and need no rights; the suite uses them for the bounds of DMA addresses and the physical-VMO refusals. `which` 106 (PL6) counts the calls the kernel made to the SBI inter-processor-interrupt extension: always 0, since inter-hart interrupts are messages to the harts' IMSIC files (message id 1; device sources are ids 2 and up).
 
 ### debug_write(debug, ptr, len) -> status
 
 Sends bytes to the serial console. Rights: WRITE on a **debug resource** handle (HD4: the process the kernel starts gets one from `debug_root`, and hands a duplicate on in its startup message (`Role::Debug`) to the trusted services it starts; the launcher does not pass one to the programs it starts for clients. A program without one is refused (BAD_HANDLE, WRONG_TYPE for another kind, ACCESS_DENIED without WRITE) and prints nothing, so it can no longer forge a `##TEST` line; real processes have a console channel). Output is shown a line at a time: every call is flushed when it ends (a call that does not finish with a newline gets one), lines are cut at 512 bytes, and non-printable bytes are shown as `.`. A line that starts with `##` is prefixed `user: ` unless it is a well-formed `##TEST name PASS|FAIL` result (which the boot-time suite uses), so user code cannot forge the kernel's verdict lines.
-Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (bad pointer);
-TOO_BIG (len over 4096). Tests: `debug_calls_need_a_debug_resource`, `debug_write_pointer_rules`.
+Errors, in order: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; TOO_BIG (len over 4096); INVALID_ARGS (bad pointer). Tests: `debug_calls_need_a_debug_resource`, `debug_write_pointer_rules`.
 
 ### debug_root() -> debug
 

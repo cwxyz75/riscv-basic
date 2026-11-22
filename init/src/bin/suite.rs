@@ -141,20 +141,26 @@ fn debug_calls_need_a_debug_resource() -> Outcome {
     use rt::abi::syscall as nr;
     let dbg = rt::debug::handle();
     ensure!(dbg != 0, "the suite has its debug resource");
-    let write = |h: u64| st(rt::syscall(nr::DEBUG_WRITE, [h as usize, 0, 0, 0, 0, 0]));
+    // (the process-wide handle `sys::debug_write` and `sys::debug_stat` use is switched for each probe and put back)
+    let via = |h: u64| {
+        rt::debug::set(h);
+        let r = st(sys::debug_write(b""));
+        rt::debug::set(dbg);
+        r
+    };
     let stat = |h: u64| st(rt::syscall(nr::DEBUG_STAT, [h as usize, 0, 0, 0, 0, 0]));
-    ensure_eq!(write(dbg), Some(S::Ok), "the resource itself writes");
+    ensure_eq!(via(dbg), Some(S::Ok), "the resource itself writes");
     ensure_eq!(stat(dbg), Some(S::Ok), "and reads a counter");
-    ensure_eq!(write(0), Some(S::BadHandle), "no handle: no write");
+    ensure_eq!(via(0), Some(S::BadHandle), "no handle: no write");
     ensure_eq!(stat(0), Some(S::BadHandle), "no handle: no counter");
     ensure_eq!(
-        write(0x7777_7777),
+        via(0x7777_7777),
         Some(S::BadHandle),
         "a handle that is not there"
     );
     let e = event()?;
     ensure_eq!(
-        write(e),
+        via(e),
         Some(S::WrongType),
         "an event is not a debug resource"
     );
@@ -165,7 +171,7 @@ fn debug_calls_need_a_debug_resource() -> Outcome {
     );
     let inspect_only = weaker(dbg, Rights::INSPECT.0)?;
     ensure_eq!(
-        write(inspect_only),
+        via(inspect_only),
         Some(S::AccessDenied),
         "INSPECT alone does not write"
     );
@@ -176,12 +182,32 @@ fn debug_calls_need_a_debug_resource() -> Outcome {
         Some(S::AccessDenied),
         "WRITE alone does not read a counter"
     );
-    ensure_eq!(write(write_only), Some(S::Ok), "WRITE writes");
+    ensure_eq!(via(write_only), Some(S::Ok), "WRITE writes");
     for h in [inspect_only, write_only, e] {
         sys::handle_close(h);
     }
     // a second `debug_root` from the privileged suite is another handle to the same kind of authority
-    ensure!(rt::sys::debug_root().status == 0, "debug_root again");
+    let again = sys::debug_root();
+    ensure_eq!(again.status, 0, "debug_root again");
+    sys::handle_close(again.a1 as u64);
+    // a refused `debug_stat` reads as 0, not as the selector it was given
+    rt::debug::set(0);
+    let refused = sys::debug_stat(105);
+    rt::debug::set(dbg);
+    ensure_eq!(
+        refused,
+        0,
+        "a process with no debug resource reads no counters"
+    );
+    // a program the suite started with no startup message (so no debug resource, and not privileged) can neither forge a verdict line nor ask for the resource
+    let (p, _mine) = launch(83)?;
+    wait_ended(p, 500)?;
+    let r = sys::process_info(p);
+    ensure_eq!(
+        (r.status, r.a1 as i64),
+        (0, 0),
+        "the confined child's debug_write was BAD_HANDLE and its debug_root ACCESS_DENIED"
+    );
     Ok(())
 }
 
@@ -14924,10 +14950,6 @@ pub fn app_main() -> i32 {
         ("unknown_syscalls_are_refused", unknown_syscalls_are_refused),
         ("debug_write_pointer_rules", debug_write_pointer_rules),
         (
-            "debug_calls_need_a_debug_resource",
-            debug_calls_need_a_debug_resource,
-        ),
-        (
             "handle_syscalls_reject_bad_values",
             handle_syscalls_reject_bad_values,
         ),
@@ -15001,6 +15023,10 @@ pub fn app_main() -> i32 {
         (
             "child_exit_code_and_terminated_signal",
             child_exit_code_and_terminated_signal,
+        ),
+        (
+            "debug_calls_need_a_debug_resource",
+            debug_calls_need_a_debug_resource,
         ),
         ("child_faults_are_contained", child_faults_are_contained),
         ("parent_and_child_talk", parent_and_child_talk),

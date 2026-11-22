@@ -4,7 +4,6 @@ user_mode_runs_and_prints
 clock_advances_in_user_mode
 unknown_syscalls_are_refused
 debug_write_pointer_rules
-debug_calls_need_a_debug_resource
 handle_syscalls_reject_bad_values
 a_process_holds_twenty_thousand_handles
 event_syscalls
@@ -39,6 +38,7 @@ process_start_argument_checks
 fetch_the_program_image
 fetch_the_hello_image
 child_exit_code_and_terminated_signal
+debug_calls_need_a_debug_resource
 child_faults_are_contained
 parent_and_child_talk
 kill_a_spinning_child
