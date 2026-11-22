@@ -270,6 +270,11 @@ fn futex_wait_enter(cell: &klock::aslock::AsCell, a: [u64; 6], pid: u64, who: u6
         crate::smp::shootdown();
         kmem::flush_tlb();
     }
+    // (MM8, COW1) a first touch of a page of a VMO that has children logs a copy that every address space must drop before this thread sleeps or
+    // returns: the full path syncs it (`cow_sync`), and nothing is queued yet, so it does the call again
+    if kcore::aspace::COPY_PENDING.load(Ordering::Acquire) {
+        return QuietEnter::Fallback;
+    }
     // (the enqueue under the held `AS`, the memory locks let go: `FUTEX` is before them)
     match ksys::futex_wait_enqueue(&futex_table(), &kmem::DirectMap, pid, who, &w) {
         ksys::FutexCheck::Done(status) => QuietEnter::Done(status),
@@ -301,6 +306,12 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
         me.cur_pid.load(Ordering::Relaxed),
         me.cur_as.load(Ordering::Acquire),
     );
+    // (the epoch this hart last saw, **before** the flags: a kill, stop or suspend marks its state and then moves the epoch, so one that lands after this
+    // load makes `ATTENTION` differ from `seen` (the sleep's `ready` and the return both look), and one that landed before it is a difference here)
+    let seen = me.attention_seen.load(Ordering::SeqCst);
+    if ATTENTION.load(Ordering::SeqCst) != seen {
+        return false;
+    }
     if cell.is_null()
         || SUSPEND_STATES.load(Ordering::Acquire) != 0
         || INTERRUPT_FLAGS.load(Ordering::Acquire) != 0
@@ -311,7 +322,6 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     // SAFETY: the hart runs a thread of the process the cell belongs to (`activate_current` recorded it), so its `Arc` is alive for the whole call; the
     // thread keeps running on whichever hart after a sleep, but only the lock below is taken through the reference, before any sleep.
     let cell = unsafe { &*cell };
-    let seen = ATTENTION.load(Ordering::SeqCst);
     let who = thread::current() as u64;
     let w = match futex_wait_enter(cell, a, pid, who) {
         QuietEnter::Fallback => return false,
@@ -335,7 +345,10 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
         return false;
     }
     reply(frame, Ok((None, None)));
-    if !activate_current_quiet(seen) || kcore::aspace::COPY_PENDING.load(Ordering::Acquire) {
+    if !activate_current_quiet(seen)
+        || kcore::aspace::COPY_PENDING.load(Ordering::Acquire)
+        || thread::need_resched_pending()
+    {
         crate::bkl::lock();
         super::calls::cow_sync();
         commit_wake();
