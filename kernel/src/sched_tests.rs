@@ -608,18 +608,21 @@ mod priority {
     }
 
     static MAX_LATE: AtomicU64 = AtomicU64::new(0);
+    static P99_LATE: AtomicU64 = AtomicU64::new(0);
     static LATE_DONE: AtomicBool = AtomicBool::new(false);
 
     /// The latency probe: sleep 3 ticks 50 times, recording how late each wake was.
     fn probe(_: usize) {
-        let mut worst = 0;
+        let mut late = alloc::vec::Vec::new();
         for _ in 0..50 {
             // (nanoseconds on the real clock: there is no tick to round to)
             let target = thread::now_ns() + 3_000_000;
             thread::sleep_ticks(3);
-            worst = worst.max(thread::now_ns().saturating_sub(target));
+            late.push(thread::now_ns().saturating_sub(target));
         }
-        MAX_LATE.store(worst, SeqCst);
+        late.sort_unstable();
+        MAX_LATE.store(late[late.len() - 1], SeqCst);
+        P99_LATE.store(late[late.len() * 99 / 100], SeqCst);
         LATE_DONE.store(true, SeqCst);
     }
 
@@ -654,6 +657,13 @@ mod priority {
     pub fn realtime_thread_stays_responsive_under_load() -> Outcome {
         clean(|| {
             let late = lateness_under_load(MAIN_PRIO + 10)?;
+            // (SCHED-SMP-SPEC 6.1 `rt_latency`: the RT probe's lateness with every other hart loaded; 50 samples, so the 99th is the next to worst)
+            {
+                use core::fmt::Write;
+                let mut out = crate::console::Console;
+                let _ = writeln!(out, "##BENCH rt_latency_p99 {} ns", P99_LATE.load(SeqCst));
+                let _ = writeln!(out, "##BENCH rt_latency_max {late} ns");
+            }
             ensure(
                 // (the emulator delivers a timer interrupt up to a few milliseconds late on a loaded host: observed 2.2 ms; a thread of the hogs'
                 // own priority is held for whole slices, 10 ms, which is what the negative control checks)

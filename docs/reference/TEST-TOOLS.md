@@ -123,10 +123,15 @@ with `bench/counts.tsv`. A rise of more than 5 % fails; a fall of more than 5 % 
 benchmarks at a tenth of the iterations with sanity assertions only, so they cannot rot. `make os-bench` (soak) runs
 them in full at one and four harts and compares with `bench/baseline.tsv` through `scripts/bench_compare.py`: a
 threefold slowdown fails. The numbers are costs of the emulated machine and move with the host: read the ratios.
+`pair_scaling_<kind>_n<N>` (futex and `channel_call` pairs, one, two and four) is the cost per round trip over all pairs;
+`bench_compare.py` prints the scaling, the cost at one pair over the cost at N. `rt_latency_p99` and `rt_latency_max` are the
+real-time probe's lateness, printed by the kernel's scheduler test.
 
 **The latency trace.** `make os-latency` (soak) builds the kernel with the `latency-trace` feature, runs the suite at
 four harts and prints the longest interrupts-off span of any hart with where it began, and per syscall the big kernel
-lock's hold and wait. The test `the_latency_trace_can_see_a_long_section` proves a planted section is reported.
+lock's hold and wait. The test `the_latency_trace_can_see_a_long_section` proves a planted section is reported. The run also
+prints them as `##BENCH irq_off_max`, `bkl_hold_max` and, for the ten worst syscalls, `bkl_hold_max_sys<N>` and
+`bkl_wait_max_sys<N>`, and compares the first two with `bench/latency.tsv` (`bench_compare.py`).
 
 **Schedule perturbation.** `make os-chaos` (overnight) boots the kernel-only shard on the `chaos` kernel, one boot per
 seed in `CHAOS_SEEDS` and per hart count, with delays at lock, IPI, switch and user-return points. A failing seed is

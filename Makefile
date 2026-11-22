@@ -340,9 +340,14 @@ os-boot-test-lossy: kernel-main
 # prints the longest interrupts-off span (with its site) and the big-lock holds and waits per syscall; the test
 # `the_latency_trace_can_see_a_long_section` proves the instrumentation sees a 5 ms section within 20%.
 OS_LATENCY_ELF := target/os-latency/$(KERNEL_TARGET)/debug/kernel
+# (also the benchmarks of SCHED-SMP-SPEC 6.1 that need the trace: `irq_off_max`, `bkl_profile` and the `rt_latency` probe, as `##BENCH`
+# lines at one and four harts, and the suite's `pair_scaling`, compared with `bench/latency.tsv`; the numbers are the machine's, so the
+# threshold is generous like `os-bench`'s)
 os-latency: kernel-main
 	cd kernel && cargo build --features latency-trace --target-dir ../target/os-latency
-	OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
+	rm -f target/latency.tsv
+	OS_BENCH=target/latency.tsv OS_BENCH_FULL=1 OS_SHOW=latency: OS_SMP=4 python3 scripts/os_boot_test.py $(OS_LATENCY_ELF)
+	python3 scripts/bench_compare.py target/latency.tsv bench/latency.tsv --max-ratio $(BENCH_RATIO)
 
 os-boot-test-aia: kernel
 	OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)

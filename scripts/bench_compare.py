@@ -48,6 +48,21 @@ def compare(run, base, max_ratio):
     return problems
 
 
+def scaling(run):
+    """Print the scaling of every `pair_scaling_<kind>_n<N>` series (SCHED-SMP-SPEC 5.2): the cost at N = 1 over the cost at N,
+    which is how many times more round trips a second N pairs complete. Returns {(label, kind, N): ratio}."""
+    ratios = {}
+    for (label, name), (v, _) in sorted(run.items()):
+        kind, _, n = name.rpartition("_n")
+        if not kind.startswith("pair_scaling_") or not n.isdigit():
+            continue
+        one = run.get((label, f"{kind}_n1"))
+        if one and v:
+            ratios[(label, kind, int(n))] = one[0] / v
+            print(f"{label:6} {name:28} scaling x{one[0] / v:5.2f} over one pair")
+    return ratios
+
+
 def self_test():
     base = {("smp1", "thread_create_join"): (1000, "ns"), ("smp4", "wake_latency_event"): (500, "ns")}
     same = dict(base)
@@ -58,6 +73,8 @@ def self_test():
     assert not ok, ok
     assert len(bad) == 2, bad
     assert len(missing) == 2, missing
+    r = scaling({("smp4", "pair_scaling_futex_n1"): (900, "ns"), ("smp4", "pair_scaling_futex_n4"): (300, "ns")})
+    assert r == {("smp4", "pair_scaling_futex", 1): 1.0, ("smp4", "pair_scaling_futex", 4): 3.0}, r
     print("bench_compare self-test passed")
 
 
@@ -79,6 +96,7 @@ def main(argv):
     run = load(args[0], prefix)
     base = load(args[1] if len(args) == 2 else "bench/baseline.tsv", prefix)
     problems = compare(run, base, max_ratio)
+    scaling(run)
     if problems:
         print("\nbenchmark problems:", *problems, sep="\n  ", file=sys.stderr)
         return 1
