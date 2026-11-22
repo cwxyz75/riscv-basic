@@ -12198,6 +12198,80 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
     }
 }
 
+// --- The real-time demo (SCHED-SMP-SPEC 6.1, OS-ARCHITECTURE section 8; task 8) ---------------------------------------------------
+//
+// "A high-priority thread stays responsive while low-priority CPU hogs run": one hog per online hart at the default priority keeps every
+// hart busy, and a probe thread sleeps to a deadline 3 ms away 30 times and records how late each wake was. At a real-time priority the
+// lateness is small; at the hogs' own priority (the negative control) the probe waits for a slice end, so a bound that only passes when
+// the priority matters is the evidence that the bound means something.
+
+static RT_STOP: AtomicU32 = AtomicU32::new(0);
+static RT_PROBE_PRIO: AtomicU32 = AtomicU32::new(0);
+static RT_WORST_LATE_US: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn rt_hog(_: usize) -> ! {
+    while RT_STOP.load(Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    sys::thread_exit(0)
+}
+
+extern "C" fn rt_probe(_: usize) -> ! {
+    sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
+    let gate = sys::event_create().a1 as u64;
+    let cycles_per_ms = sys::debug_stat(105) / 1000;
+    let mut worst = 0u64;
+    for _ in 0..30 {
+        let target = sys::clock_get() + 3;
+        sys::object_wait(gate, 1 << 24, target);
+        let late = (cycles() as i64 - (target * cycles_per_ms) as i64).max(0) as u64;
+        worst = worst.max(late * 1000 / cycles_per_ms.max(1)); // microseconds
+    }
+    RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
+    sys::handle_close(gate);
+    sys::thread_exit(0)
+}
+
+/// The probe's worst lateness (microseconds) at `prio` with a hog on every hart.
+fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
+    let harts = job_use(root_job()?, 7)?.0;
+    RT_STOP.store(0, Ordering::SeqCst);
+    RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
+    RT_WORST_LATE_US.store(u64::MAX, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        hogs.push(new_thread(rt_hog, 0)?);
+    }
+    nap_ticks(5); // the hogs are running, one per hart
+    let probe = new_thread(rt_probe, 0)?;
+    let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
+    RT_STOP.store(1, Ordering::SeqCst);
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    sys::handle_close(probe);
+    ensure_eq!(w.status, 0, "the probe finished");
+    Ok(RT_WORST_LATE_US.load(Ordering::SeqCst))
+}
+
+fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not() -> Outcome {
+    let rt = worst_lateness_us(40)?;
+    println!("##BENCH rt_user_latency_max_us {rt} us");
+    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late: the kernel's own probe uses the same 4 ms)
+    ensure!(
+        rt <= 4_000,
+        "a real-time thread woke {rt} us late with a hog on every hart (bound 4 ms)"
+    );
+    // the negative control: at the hogs' priority the wake waits for a slice to end
+    let normal = worst_lateness_us(10)?;
+    ensure!(
+        normal > 6_000,
+        "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
+    );
+    Ok(())
+}
+
 /// Spin for `ms` milliseconds of the clock.
 fn spin_ms(ms: u64) {
     let until = sys::clock_get() + ms;
@@ -14388,6 +14462,10 @@ pub fn app_main() -> i32 {
         (
             "job_info_counts_the_cpu_time_its_threads_run",
             job_info_counts_the_cpu_time_its_threads_run,
+        ),
+        (
+            "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not",
+            a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not,
         ),
         (
             "job_limits_stop_a_process_bomb_and_usage_comes_back",
