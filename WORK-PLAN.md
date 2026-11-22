@@ -165,7 +165,7 @@ Phase 6e, **the end of the big lock** (an epic of its own, run next, before phas
 
 - [ ] **L19** (rest) `PROCS` and `TT`; the handle drain and sweep of teardown (T206)
 - [ ] **L20** the end of the big kernel lock; the `&'static mut` accessors deleted (with it T215, the chunked copies, and T213's `futex_wait`)
-- [ ] **PL8** limits derived from RAM; per-process ceilings as quotas (needs the object registry reworked: it preallocates its cap, T196)
+- [ ] **PL8** limits derived from RAM (part a, PR 423: the five backstops, built; the registry grows instead of preallocating); per-process ceilings as quotas (part b: waits for the `Limits` flag day of phase 12 and for L20, see `work/PL8.md`)
 
 The order of L14 to L19 is the default of SCHED-SMP-SPEC 7.2. If the lock profile after L12 says another class of syscalls
 holds the big lock longest, reorder on that evidence and record it below.
