@@ -382,6 +382,8 @@ os-release-run: os-release
 	qemu-system-riscv64 -machine virt,aia=aplic-imsic -cpu rva23s64 -bios default -m 256M -nographic -serial mon:stdio -monitor none -kernel $(OS_RELEASE_ELF)
 
 os-release-smoke: os-release
+	python3 scripts/release_symbols.py --self-test
+	python3 scripts/release_symbols.py $(OS_RELEASE_ELF)
 	python3 scripts/release_smoke_test.py $(OS_RELEASE_ELF)
 	@if S4_TIMEOUT=15 python3 scripts/release_smoke_test.py $(OS_RELEASE_ELF) --break-expectation >/dev/null 2>&1; then echo "the release smoke test passed a broken expectation"; exit 1; fi
 

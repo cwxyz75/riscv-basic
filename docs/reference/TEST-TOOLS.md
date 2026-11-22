@@ -48,7 +48,7 @@ harness fails a `k` boot that lacks a Kernel test or ran a System test.
 | `make os-ktest-4` | the kernel-only boot at four harts, every Kernel test |
 | `make os-ktest-release` | the kernel-only boot of the optimised build at four harts |
 | `make kquick` | format, the pure kernel crates' host tests and the four-hart kernel-only boot: one targeted boot for a kernel change |
-| `make os-release-smoke` | the release image boots to the shell and shows no test banners |
+| `make os-release-smoke` | the release image boots to the shell and shows no test banners, and its symbol table holds no test-only code (`scripts/release_symbols.py`: the self-tests, the user-mode test driver, the SMP and scheduler tests are not compiled into a `release` kernel, HD4; the deny-list is in the script and its self-test plants a name) |
 | `make home-boot-test` | the home computer boots and runs its checks |
 
 After a passing boot the harness prints the suite's guest time and the six slowest tests.
