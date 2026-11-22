@@ -1319,10 +1319,20 @@ unsupported! {
     fork() -> c_int = -1;
 }
 
-/// `getrusage`: nothing is accounted per process (the clock times are `times`' business): all zeros.
+/// `getrusage`: the process's CPU time (AB6) as `ru_utime` (the kernel does not split user from system time); everything else zero.
 #[no_mangle]
 pub unsafe extern "C" fn getrusage(_who: c_int, ru: *mut u8) -> c_int {
     core::ptr::write_bytes(ru, 0, 144);
+    let ns = rt::sys::process_cpu_ns(rt::sys::process_self().a1 as u64).a1 as u64;
+    let (sec, usec) = (
+        (ns / 1_000_000_000) as i64,
+        ((ns % 1_000_000_000) / 1000) as i64,
+    );
+    // SAFETY: `ru` is the caller's struct rusage (144 bytes); ru_utime is its first timeval.
+    unsafe {
+        (ru as *mut i64).write(sec);
+        (ru as *mut i64).add(1).write(usec);
+    }
     0
 }
 

@@ -68,6 +68,12 @@ impl ksys::Machine for KernelMachine {
     fn skip_cow_protect(&self) -> bool {
         cfg!(feature = "fault-skip-cow-protect")
     }
+    fn thread_cpu_ns(&self, tid: kcore::sched::Tid) -> u64 {
+        thread::cpu_ns(tid)
+    }
+    fn current_thread_cpu_ns(&self) -> u64 {
+        thread::cpu_ns(thread::current())
+    }
     fn random_below(&mut self, n: u64) -> u64 {
         // (a pool that is not seeded yet gives nothing: the placement is then the first fit, which is still a valid place)
         crate::entropy::below(n).unwrap_or(0)
@@ -76,6 +82,9 @@ impl ksys::Machine for KernelMachine {
 
 /// The calls that only read and change the process table (`ksys::proc_call`).
 pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
+    if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
+        thread::charge_running(); // (the CPU time of what runs now, the caller included, is brought up to date before it is read: AB6)
+    }
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
