@@ -645,15 +645,16 @@ pub(super) fn thread_set_sched(a: [u64; 6]) -> Reply {
 }
 
 /// `thread_get_sched(thread) -> sched, tid`: `sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and
-/// the effective priority (16 to 23; equal to the base until donation exists). Needs INSPECT (none for 0).
+/// the effective priority (16 to 23: the base raised by what is donated to the thread, L23). Needs INSPECT (none for 0).
 pub(super) fn thread_get_sched(a: [u64; 6]) -> Reply {
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let (tid, _) = thread_target(s, me, a[0], Rights::INSPECT)?;
         let prio = u64::from(thread::priority_of(tid).ok_or((Status::BadState, None, None))?);
+        let eff = u64::from(thread::effective_priority_of(tid).unwrap_or(prio as u8));
         let flags = u64::from(s.sched_flags.get(&tid).copied().unwrap_or(0));
-        Ok((Some(prio | flags << 8 | prio << 16), Some(tid)))
+        Ok((Some(prio | flags << 8 | eff << 16), Some(tid)))
     })
 }
 

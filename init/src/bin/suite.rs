@@ -12383,6 +12383,14 @@ fn pi_futex_bounds_inversion() -> Outcome {
     nap_ticks(200);
     let starved = PI_PROGRESS.load(Ordering::SeqCst);
     let high = new_thread(pi_high_waiter, 0)?;
+    // the owner is boosted by the waiter; a change of its own base priority meanwhile (to the same value, even) must not drop the boost
+    nap_ticks(20);
+    let eff_before = (sys::thread_get_sched(low).a1 >> 16) & 0xff;
+    ok(
+        sys::thread_set_sched(low, 6, 0),
+        "the owner's base priority changes while it is boosted",
+    )?;
+    let eff_after = (sys::thread_get_sched(low).a1 >> 16) & 0xff;
     let w = sys::object_wait(high, sig::TERMINATED, sys::clock_get() + 20_000);
     RT_STOP.store(1, Ordering::SeqCst);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
@@ -12394,6 +12402,16 @@ fn pi_futex_bounds_inversion() -> Outcome {
     sys::handle_close(low);
     sys::handle_close(high);
     ensure_eq!(w.status, 0, "the high-priority thread finished");
+    ensure_eq!(
+        eff_before,
+        25,
+        "the owner runs at the waiter's priority while it waits"
+    );
+    ensure_eq!(
+        eff_after,
+        25,
+        "a change of the owner's base priority dropped the boost"
+    );
     ensure_eq!(starved, 0, "the owner made progress under a hog on every hart: the hogs do not load the harts, so the test shows nothing");
     ensure_eq!(
         PI_RESULT_A.load(Ordering::SeqCst),
@@ -12424,8 +12442,10 @@ extern "C" fn pi_dying_owner(_: usize) -> ! {
 }
 
 extern "C" fn pi_waiter_a(_: usize) -> ! {
-    let r = pi_lock(&PI_WORD, sys::clock_get() + 5_000);
+    let t0 = sys::clock_get();
+    let r = pi_lock(&PI_WORD, t0 + 5_000);
     PI_RESULT_A.store(r as u64, Ordering::SeqCst);
+    PI_RESULT_B.store(sys::clock_get() - t0, Ordering::SeqCst);
     sys::thread_exit(0)
 }
 
@@ -12453,6 +12473,11 @@ fn pi_futex_owner_death_poisons() -> Outcome {
         PI_RESULT_A.load(Ordering::SeqCst) as i64,
         S::BadState.code() as i64,
         "the waiter was told the lock is poisoned"
+    );
+    let waited = PI_RESULT_B.load(Ordering::SeqCst);
+    ensure!(
+        waited < 3_000,
+        "the waiter was left to its deadline ({waited} ms of 5000), not woken by the owner's death"
     );
     ensure!(
         PI_WORD.load(Ordering::SeqCst) & (1 << 30) != 0,

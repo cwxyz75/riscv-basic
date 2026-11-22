@@ -996,7 +996,17 @@ fn set_priority_held(tid: Tid, prio: Prio) {
     let _ = sched().set_priority_on(hart(), tid, prio);
     if let Some(ch) = changes {
         pi_apply(ch.as_slice());
+        // (the scheduler wrote the new base as the effective priority too, and the graph's change list is empty when the donated priority was
+        // already the larger one: the effective priority is set from the graph in every case, or a boosted owner would fall back to its base)
+        if let Some(eff) = d.eff(tid) {
+            let _ = sched().set_effective_on(hart(), tid, eff);
+        }
     }
+}
+
+/// A thread's effective priority: its base raised by what is donated to it (the base for a thread that is not in the graph).
+pub fn effective_priority_of(tid: Tid) -> Option<Prio> {
+    irq::without(|| PI.lock().eff(tid).or_else(|| sched().priority(tid)))
 }
 
 /// End the calling thread. Its stack is freed by whoever `join`s it, or, if it is detached, by the hart that switches away from it

@@ -42,9 +42,12 @@ fn setup() -> (Bucket, W) {
     let word = Arc::new(AtomicU32::new(0));
     let w = W(word);
     let mut pi = PiFutexes::new();
-    assert_eq!(pi.lock(&mut d, &w, KEY, 1, |_| true), Ok(Lock::Acquired));
+    assert_eq!(
+        pi.lock(&mut d, &w, KEY, 1, |_| true, true),
+        Ok(Lock::Acquired)
+    );
     assert!(matches!(
-        pi.lock(&mut d, &w, KEY, 2, |_| true),
+        pi.lock(&mut d, &w, KEY, 2, |_| true, true),
         Ok(Lock::Blocked { .. })
     ));
     (Arc::new(Mutex::new((pi, d))), w)
@@ -100,7 +103,7 @@ fn death_races_timeout() {
     let dier = thread::spawn(move || {
         let mut g = b2.lock().unwrap();
         let (pi, d) = &mut *g;
-        let (woken, _) = pi.owner_died(d, 1);
+        let (woken, _) = pi.owner_died(d, 1, |_| None);
         if !woken.is_empty() {
             PiFutexes::poison(&word);
         }

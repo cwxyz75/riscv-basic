@@ -665,8 +665,8 @@ ACCESS_DENIED; INVALID_ARGS (priority 0 or above 63, a reserved flag bit); BAD_S
 
 ### thread_get_sched(thread) -> status, sched, tid
 
-`sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and the effective priority (16 to 23; equal to the base until
-donation exists, task 22); `tid` is the kernel thread id. `thread` 0 names the caller. Needs INSPECT on a handle. Errors:
+`sched` packs the base priority (bits 0 to 7), the flags (8 to 15) and the effective priority (16 to 23: the base raised by what is
+donated to the thread, L23); `tid` is the kernel thread id. `thread` 0 names the caller. Needs INSPECT on a handle. Errors:
 BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE.
 
 ### job_kill(job, code) -> status
@@ -1088,15 +1088,19 @@ base priority of every thread in the job and its descendants that is above it. E
 ACCESS_DENIED (no SET_LIMITS; or a value above the parent's); INVALID_ARGS. `job_info` gains selectors 6 (`max_prio`),
 7 (RT time used this window, budget), 8 (CPU nanoseconds used by the job's subtree, 0).
 
-### futex_lock_pi(address, deadline) -> status   and   futex_unlock_pi(address) -> status
+### futex_lock_pi(address, deadline) -> status
 
 The word at `address` holds 0 (free) or the owner's tid in bits 0-29, with bit 31 set while threads wait in the
 kernel and bit 30 if an owner died holding it. A thread takes a free lock in user mode by compare-and-swap from 0 to
 its tid and releases an uncontended one by compare-and-swap back to 0; it calls the kernel only when either fails.
 `futex_lock_pi` returns OK when the caller owns the lock; while it waits, the owner runs at least at the caller's
 effective priority. A deadline of 0 polls (TIMED_OUT if it would wait). **Built (L23).** The tid is the kernel thread id (`thread_get_sched` with thread 0 names the caller's); a thread whose tid does not fit in 30 bits cannot use PI futexes (NOT_SUPPORTED). A waiter that gives up leaves the `WAITERS` bit set; the next unlock finds no queue and writes 0. Errors: INVALID_ARGS (as `futex_wait`); BAD_STATE (the word names no live thread of this process, and the kernel then poisons it; the lock is poisoned; the caller owns it already; or waiting would close a cycle of waiting threads: a deadlock; a waiter whose owner dies holding it, with the word poisoned, gets this too); NOT_SUPPORTED (the caller's tid does not fit); TIMED_OUT; INTERRUPTED.
-`futex_unlock_pi` hands the lock to the highest-priority waiter (first come among equals) or frees it. Errors:
-INVALID_ARGS; ACCESS_DENIED (the caller does not own it). `futex_wait` and `futex_wake` gain a flags argument whose
+(A chain of waiters deeper than 8 is BAD_STATE too, and a lock word in a page of a pager's VMO that is not there is SHOULD_WAIT: try again.)
+
+### futex_unlock_pi(address) -> status
+
+Hands the lock to the waiter with the best effective priority at that moment (first come among equals) or frees it. Errors:
+INVALID_ARGS; ACCESS_DENIED (the caller does not own it, or the word is poisoned); NOT_SUPPORTED (the caller's tid does not fit in 30 bits); SHOULD_WAIT (a pager's page); BAD_STATE (the caller's process is gone). `futex_wait` and `futex_wake` gain a flags argument whose
 bit 0 (shared key) is reserved: NOT_SUPPORTED.
 
 ### channel_call (will amend the last paragraph, task 22)

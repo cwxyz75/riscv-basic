@@ -48,6 +48,8 @@ pub enum PiError {
 pub enum Lock {
     /// The caller owns the lock.
     Acquired,
+    /// A poll (`wait` false) found the lock held: nothing was queued and nothing donated.
+    WouldBlock,
     /// The caller is queued and donating to the owner: block until the lock is handed over, a kill, an interrupt or the deadline. `changes` are
     /// the effective priorities the donation moved, for the kernel to apply.
     Blocked { changes: Vec<Change> },
@@ -88,6 +90,8 @@ pub struct PiFutexes {
     owned: BTreeMap<Tid, BTreeSet<Key>>,
     /// Waiters taken out of a queue by the owner (hand-over, death) that have not yet noticed.
     outcomes: BTreeMap<Tid, Outcome>,
+    /// Waiters a call ended without being asked to (a record the user's own stores made stale): the caller wakes them (`drain_wake`).
+    to_wake: Vec<Tid>,
 }
 
 /// Does the id fit in the lock word?
@@ -102,11 +106,41 @@ impl PiFutexes {
             waiting: BTreeMap::new(),
             owned: BTreeMap::new(),
             outcomes: BTreeMap::new(),
+            to_wake: Vec::new(),
         }
     }
 
+    /// The waiters that a call woke on its own (`Outcome::Died`): to be woken by the caller, with the bucket lock still held.
+    pub fn drain_wake(&mut self) -> Vec<Tid> {
+        core::mem::take(&mut self.to_wake)
+    }
+
+    /// The record of `key` no longer matches the word (user code stored to it outside the protocol: a plain store, a fast-path lock after an
+    /// unlock that was not ours): its waiters are ended with `Died`, their donations revoked, and the record dissolved. Returns the priority changes.
+    fn dissolve(&mut self, d: &mut Donations, key: Key) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let Some(rec) = self.recs.remove(&key) else {
+            return changes;
+        };
+        if let Some(keys) = self.owned.get_mut(&rec.owner) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.owned.remove(&rec.owner);
+            }
+        }
+        for t in rec.waiters {
+            self.waiting.remove(&t);
+            self.outcomes.insert(t, Outcome::Died);
+            self.to_wake.push(t);
+            changes.extend_from_slice(d.revoke(t).as_slice());
+        }
+        changes
+    }
+
     /// `futex_lock_pi` for thread `me` on `key`. `live(t)` says whether `t` is a live thread of the caller's process. Needs `me` registered in
-    /// `d`. On `Blocked` the caller sleeps and then asks `still_waiting`/`cancel`.
+    /// `d`. With `wait` false a lock that is held is not waited for (`WouldBlock`, nothing queued). On `Blocked` the caller sleeps and then asks
+    /// `still_waiting`/`cancel`; the priority changes of a `Blocked` and of a stale record's dissolution come back together in `Blocked.changes`
+    /// (and `drain_wake` names the waiters that were ended).
     pub fn lock<W: Word>(
         &mut self,
         d: &mut Donations,
@@ -114,7 +148,9 @@ impl PiFutexes {
         key: Key,
         me: Tid,
         live: impl Fn(Tid) -> bool,
+        wait: bool,
     ) -> Result<Lock, PiError> {
+        let mut stale_changes: Vec<Change> = Vec::new();
         if !fits(me) {
             return Err(PiError::NoId);
         }
@@ -139,35 +175,31 @@ impl PiFutexes {
                 let _ = w.cas(v, (v | OWNER_DIED) & !WAITERS);
                 return Err(PiError::BadState);
             }
+            if !wait {
+                return Ok(Lock::WouldBlock);
+            }
             if v & WAITERS == 0 && w.cas(v, v | WAITERS).is_err() {
                 continue; // the word changed: look again
             }
-            // queue in effective-priority order, FIFO among equals
-            let mine = d.eff(me).unwrap_or(0);
+            // (the word names another owner than the record does: user code stored to it outside the protocol; the old waiters are ended)
+            if self.recs.get(&key).is_some_and(|r| r.owner != owner) {
+                stale_changes.extend(self.dissolve(d, key));
+            }
+            // queued in arrival order: the unlock picks the best effective priority at that time, first come among equals
             let rec = self.recs.entry(key).or_insert_with(|| Rec {
                 owner,
                 waiters: VecDeque::new(),
             });
-            if rec.owner != owner {
-                // (the user fast path handed the lock on with no waiters: the record is stale and has none)
-                debug_assert!(rec.waiters.is_empty());
-                if let Some(keys) = self.owned.get_mut(&rec.owner) {
-                    keys.remove(&key);
-                }
-                rec.owner = owner;
-            }
-            let at = rec
-                .waiters
-                .iter()
-                .position(|&t| d.eff(t).unwrap_or(0) < mine)
-                .unwrap_or(rec.waiters.len());
-            rec.waiters.insert(at, me);
+            rec.waiters.push_back(me);
             self.waiting.insert(me, key);
             self.owned.entry(owner).or_default().insert(key);
             return match d.donate(me, owner) {
-                Ok(ch) => Ok(Lock::Blocked {
-                    changes: ch.as_slice().to_vec(),
-                }),
+                Ok(ch) => {
+                    stale_changes.extend_from_slice(ch.as_slice());
+                    Ok(Lock::Blocked {
+                        changes: stale_changes,
+                    })
+                }
                 Err(DonateError::Cycle | DonateError::TooDeep | DonateError::NoThread) => {
                     // (the classic deadlock, or a chain too long: refused, and nothing stays queued)
                     self.leave_queue(me);
@@ -197,6 +229,11 @@ impl PiFutexes {
             if v & OWNER_DIED != 0 || Tid::from(v & OWNER_MASK) != me {
                 return Err(PiError::NotOwner);
             }
+            // (a record of another owner than the word's: user stores made it stale; its waiters are ended, and this unlock frees the word)
+            let mut stale: Vec<Change> = Vec::new();
+            if self.recs.get(&key).is_some_and(|r| r.owner != me) {
+                stale = self.dissolve(d, key);
+            }
             let Some(rec) = self.recs.get_mut(&key).filter(|r| !r.waiters.is_empty()) else {
                 // nobody queued (a `WAITERS` bit left by a waiter that gave up): free
                 if w.cas(v, 0).is_err() {
@@ -205,7 +242,15 @@ impl PiFutexes {
                 self.drop_rec(key);
                 return Ok(Unlock::Free);
             };
-            let Some(&first) = rec.waiters.front() else {
+            // the waiter with the best effective priority now (donations that reached a waiter while it was queued count), first come among equals
+            let mut best: Option<(usize, Tid, u8)> = None;
+            for (i, &t) in rec.waiters.iter().enumerate() {
+                let e = d.eff(t).unwrap_or(0);
+                if best.is_none_or(|(_, _, be)| e > be) {
+                    best = Some((i, t, e));
+                }
+            }
+            let Some((at, first, _)) = best else {
                 continue; // (filtered above: the queue is not empty)
             };
             let more = rec.waiters.len() > 1;
@@ -213,9 +258,9 @@ impl PiFutexes {
             if w.cas(v, new).is_err() {
                 continue; // a waiter set `WAITERS` meanwhile: again
             }
-            rec.waiters.pop_front();
+            rec.waiters.remove(at);
             let rest: Vec<Tid> = rec.waiters.iter().copied().collect();
-            let mut changes: Vec<Change> = Vec::new();
+            let mut changes: Vec<Change> = stale;
             self.waiting.remove(&first);
             self.outcomes.insert(first, Outcome::Granted);
             changes.extend_from_slice(d.revoke(first).as_slice());
@@ -225,7 +270,7 @@ impl PiFutexes {
                     changes.extend_from_slice(ch.as_slice());
                 }
             }
-            // the record follows the lock
+            // the record follows the lock (`me` is the record's owner here: a record of another owner was dissolved above)
             if let Some(keys) = self.owned.get_mut(&me) {
                 keys.remove(&key);
                 if keys.is_empty() {
@@ -263,12 +308,21 @@ impl PiFutexes {
         d.revoke(who).as_slice().to_vec()
     }
 
-    /// Thread `dead` has gone: every PI futex it owned that has waiters is poisoned. Returns, for each, its key and the waiters to wake (they
-    /// leave the queue, their donations are revoked), and the priorities that moved. The caller sets `OWNER_DIED` in the words (`poison`).
+    /// The keys of the PI futexes with waiters that `owner` owns (the kernel reads their words, outside the bucket lock, before `owner_died`).
+    pub fn owned_keys(&self, owner: Tid) -> Vec<Key> {
+        self.owned
+            .get(&owner)
+            .map_or_else(Vec::new, |k| k.iter().copied().collect())
+    }
+
+    /// Thread `dead` has gone: every PI futex it owned that has waiters is poisoned. `word_of(key)` is the word's current value (or `None` if its
+    /// page is gone). Returns, for each, its key and the waiters to wake (they leave the queue, their donations are revoked), and the priorities
+    /// that moved. The caller sets `OWNER_DIED` in the words (`poison`).
     pub fn owner_died(
         &mut self,
         d: &mut Donations,
         dead: Tid,
+        word_of: impl Fn(Key) -> Option<u32>,
     ) -> (Vec<(Key, Vec<Tid>)>, Vec<Change>) {
         let mut out = Vec::new();
         let mut changes = Vec::new();
@@ -276,6 +330,14 @@ impl PiFutexes {
             return (out, changes);
         };
         for key in keys {
+            // a word that no longer names the dead thread (user stores handed it on outside the protocol) is not its lock any more: the record
+            // is dissolved (its waiters end with `Died` and are in `drain_wake`) and the word is left alone; a word that is gone (its page) or
+            // still names the dead thread is poisoned
+            if word_of(key).is_some_and(|v| Tid::from(v & OWNER_MASK) != dead) {
+                self.owned.entry(dead).or_default().insert(key);
+                changes.extend(self.dissolve(d, key));
+                continue;
+            }
             let Some(rec) = self.recs.remove(&key) else {
                 continue;
             };
