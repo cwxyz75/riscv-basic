@@ -21,8 +21,10 @@ use alloc::vec::Vec;
 pub struct Message {
     pub data: Vec<u8>,
     pub handles: Vec<Entry>,
-    /// The thread that sent this as a `channel_call` request and waits for the reply (L22): the thread that reads it is lent its priority.
-    pub caller: Option<u64>,
+    /// The thread that sent this as a `channel_call` request and waits for the reply (L22), and the number of that call (a counter that names this one
+    /// call among the caller's, so that a request left queued by an earlier call, read later, is not mistaken for the live one): the thread that reads
+    /// it is lent the caller's priority.
+    pub caller: Option<(u64, u64)>,
 }
 
 /// Kernel memory a queued message costs beyond its bytes (the queue node and the `Message`).
@@ -425,7 +427,7 @@ pub fn channel_write_from(
     data: &[u8],
     handles: &[Handle],
     jobs: &mut Jobs,
-    caller: Option<u64>,
+    caller: Option<(u64, u64)>,
 ) -> Result<(), Status> {
     if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
         return Err(Status::TooBig);
@@ -568,14 +570,9 @@ fn read_at(
     let mut handles = Vec::new();
     handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
     let msg = c.queue.remove(i).expect("picked");
-    if let Some(caller) = msg.caller {
+    if let Some((caller, call)) = msg.caller {
         // a call's request was read: its reader is lent the caller's priority (the kernel does it after the call, L22)
-        reg.note_dequeued_call(
-            caller,
-            msg.data
-                .get(..4)
-                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        );
+        reg.note_dequeued_call(caller, call);
     }
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());

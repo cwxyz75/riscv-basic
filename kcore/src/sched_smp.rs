@@ -720,6 +720,13 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// Hart `h` makes its own designation right: pull what outranks it, preempt for what waits, and push what it leaves.
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn settle(&self, h: usize) {
+        self.settle_with(h, true);
+    }
+
+    /// `settle`; with `push` false the threads left queued here are not offered to other harts (a direct hand-off: the waker blocks next and the thread
+    /// it woke runs here, L24; `push_owed_on` gives the marks if it does not).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
+    fn settle_with(&self, h: usize, push: bool) {
         self.settles.fetch_add(1, Ordering::Relaxed);
         self.charge_now(h);
         self.pending[h].store(false, Ordering::Release);
@@ -755,11 +762,19 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
         // whatever is still queued here may belong on a hart running something lower: for each other hart, the best queued
         // thread here that may run there (O(harts), not O(threads))
-        self.push_queue(h);
+        if push {
+            self.push_queue(h);
+        }
     }
 
     /// A thread is left queued on `g`: look at the best one (and the best one that is not pinned, which any hart may take)
     /// and push each (one mark apiece, `push_marks`).
+    /// The marks a direct hand-off left out (L24): hart `h` woke a thread for itself, expecting to block, and did not (or is done with it): any thread
+    /// still queued here that another hart could run is offered to one now.
+    pub fn push_owed_on(&self, h: usize) {
+        self.push_queue(h);
+    }
+
     fn push_queue(&self, g: usize) {
         self.push_queue_from(g, g);
     }
@@ -1044,7 +1059,17 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 }
                 Placed::Done(counts) => return Ok(counts),
                 Placed::Queued(counts) => {
-                    self.after_enqueue(tid, target, caller);
+                    if sync && target == caller {
+                        // the waker blocks next: the thread runs here, so no hart is marked for it (that is the hand-off). If the waker does not block
+                        // after all, `push_owed_on` gives the marks that were left out.
+                        if self.deferred.load(Ordering::Relaxed) {
+                            self.settle_or_defer(caller);
+                        } else {
+                            self.settle_with(caller, false);
+                        }
+                    } else {
+                        self.after_enqueue(tid, target, caller);
+                    }
                     return Ok(counts);
                 }
                 Placed::Err(e) => return Err(e),

@@ -12477,6 +12477,7 @@ static CD_B: AtomicU64 = AtomicU64::new(0);
 static CD_PRIO: AtomicU32 = AtomicU32::new(0);
 static CD_READ: AtomicU32 = AtomicU32::new(0);
 static CD_GO: AtomicU32 = AtomicU32::new(0);
+static CD_ABORT: AtomicU32 = AtomicU32::new(0);
 static CD_WORK: AtomicU32 = AtomicU32::new(0);
 static CD_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
 static CD_MS: AtomicU64 = AtomicU64::new(0);
@@ -12489,9 +12490,13 @@ extern "C" fn cd_server(_: usize) -> ! {
     let r = sys::channel_read(b, req.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
     if r.status == 0 {
         CD_READ.store(1, Ordering::SeqCst);
-        // the answer needs the CPU: it waits to be told the hogs are up, then works
+        // the answer needs the CPU: it waits to be told the hogs are up, then works (unless the run was given up: a starved server that finally runs
+        // after the hogs stop must neither work nor answer, or the control would see a reply)
         while CD_GO.load(Ordering::SeqCst) == 0 {
             core::hint::spin_loop();
+        }
+        if CD_ABORT.load(Ordering::SeqCst) != 0 {
+            sys::thread_exit(0);
         }
         for _ in 0..200_000 {
             CD_WORK.fetch_add(1, Ordering::Relaxed);
@@ -12529,7 +12534,7 @@ fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
     CD_A.store(r.a1 as u64, Ordering::SeqCst);
     CD_B.store(r.a2 as u64, Ordering::SeqCst);
     CD_PRIO.store(client_prio, Ordering::SeqCst);
-    for a in [&CD_READ, &CD_GO, &CD_WORK] {
+    for a in [&CD_READ, &CD_GO, &CD_WORK, &CD_ABORT] {
         a.store(0, Ordering::SeqCst);
     }
     CD_STATUS.store(u64::MAX, Ordering::SeqCst);
@@ -12563,6 +12568,9 @@ fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
     // (the call's own deadline is 1.5 s: a client of low priority cannot even return from its timeout while the hogs hold every hart, so they
     // are stopped after 2.5 s whatever happened, and the client is then waited for)
     let _ = sys::object_wait(client, sig::TERMINATED, sys::clock_get() + 2_500);
+    // (what the server did while the hogs held the harts: read now, before they stop and let a starved server run)
+    let work_under_hogs = CD_WORK.load(Ordering::SeqCst);
+    CD_ABORT.store(1, Ordering::SeqCst);
     RT_STOP.store(1, Ordering::SeqCst);
     let w = sys::object_wait(client, sig::TERMINATED, sys::clock_get() + 20_000);
     ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
@@ -12579,7 +12587,7 @@ fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
     Ok((
         CD_STATUS.load(Ordering::SeqCst),
         CD_MS.load(Ordering::SeqCst),
-        CD_WORK.load(Ordering::SeqCst),
+        work_under_hogs,
     ))
 }
 
@@ -12592,7 +12600,7 @@ fn a_call_lends_its_priority_to_the_server() -> Outcome {
         S::TimedOut.code() as i64,
         "without a higher-priority caller the starved server answered: the hogs do not load the harts, so the test shows nothing"
     );
-    ensure_eq!(work, 0, "the starved server made progress");
+    ensure_eq!(work, 0, "the starved server made progress under the hogs");
     let (status, ms, work) = donation_run(25)?;
     ensure_eq!(
         status,

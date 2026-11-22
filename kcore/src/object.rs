@@ -106,7 +106,7 @@ pub struct Registry<T: Object> {
     /// The log filled up and was dropped: the consumer must treat every object as touched.
     dirty_overflow: bool,
     /// Requests of `channel_call`s that were read since the last `take_dequeued_calls` (L22): the calling thread and the transaction id.
-    dequeued_calls: Vec<(u64, u32)>,
+    dequeued_calls: Vec<(u64, u64)>,
     /// Handles removed since the last `take_gone` (L21c): the object, the identity of the table and the handle's value. Bindings of a port made through
     /// one of them end.
     gone: Vec<(ObjId, u64, u64)>,
@@ -261,16 +261,22 @@ impl<T: Object> Registry<T> {
         }
     }
 
-    /// A `channel_call` request from thread `caller` with transaction id `txid` was just read (L22).
-    pub fn note_dequeued_call(&mut self, caller: u64, txid: u32) {
-        if self.dequeued_calls.try_reserve(1).is_ok() {
-            self.dequeued_calls.push((caller, txid));
+    /// A `channel_call` request from thread `caller`, call number `call`, was just read (L22). The notes are bounded: a read that nobody drains
+    /// (the reply of a call, a kernel end's read) leaves at most this many.
+    pub fn note_dequeued_call(&mut self, caller: u64, call: u64) {
+        if self.dequeued_calls.len() < 64 && self.dequeued_calls.try_reserve(1).is_ok() {
+            self.dequeued_calls.push((caller, call));
         }
     }
 
     /// The requests read since the last call, for lending their callers' priority to the readers.
-    pub fn take_dequeued_calls(&mut self) -> Vec<(u64, u32)> {
+    pub fn take_dequeued_calls(&mut self) -> Vec<(u64, u64)> {
         core::mem::take(&mut self.dequeued_calls)
+    }
+
+    /// Forget the notes (a read whose request is not a call's to be lent from: a reply, a kernel end's read).
+    pub fn clear_dequeued_calls(&mut self) {
+        self.dequeued_calls.clear();
     }
 
     /// The handles removed since the last call (oldest first), for ending the bindings made through them.

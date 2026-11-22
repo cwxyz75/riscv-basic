@@ -1336,16 +1336,36 @@ fn a_calls_request_names_its_caller_to_whoever_reads_it() {
     let (a, b) = channel_create(&mut reg, &mut t).unwrap();
     let mut msg = 7u32.to_le_bytes().to_vec();
     msg.extend_from_slice(b"hi");
-    channel_write_from(&mut reg, &mut t, a, &msg, &[], &mut jobs, Some(42)).unwrap();
+    channel_write_from(&mut reg, &mut t, a, &msg, &[], &mut jobs, Some((42, 100))).unwrap();
     channel_write_in(&mut reg, &mut t, a, &9u32.to_le_bytes(), &[], &mut jobs).unwrap();
     // (the plain read takes the oldest: the call's request)
     channel_read_in(&mut reg, &mut t, b, 64, 0, &mut jobs).unwrap();
-    assert_eq!(reg.take_dequeued_calls(), vec![(42, 7)]);
+    assert_eq!(reg.take_dequeued_calls(), vec![(42, 100)]);
     // the ordinary message names nobody
     channel_read_in(&mut reg, &mut t, b, 64, 0, &mut jobs).unwrap();
     assert!(reg.take_dequeued_calls().is_empty());
     // a txid read of a call's request does too
-    channel_write_from(&mut reg, &mut t, a, &msg, &[], &mut jobs, Some(43)).unwrap();
+    channel_write_from(&mut reg, &mut t, a, &msg, &[], &mut jobs, Some((43, 101))).unwrap();
     channel_read_txid_in(&mut reg, &mut t, b, 7, 64, 0, &mut jobs).unwrap();
-    assert_eq!(reg.take_dequeued_calls(), vec![(43, 7)]);
+    assert_eq!(reg.take_dequeued_calls(), vec![(43, 101)]);
+    // the notes are bounded and can be dropped
+    for i in 0..100 {
+        channel_write_from(
+            &mut reg,
+            &mut t,
+            a,
+            &msg,
+            &[],
+            &mut jobs,
+            Some((44, 200 + i)),
+        )
+        .unwrap();
+        channel_read_in(&mut reg, &mut t, b, 64, 0, &mut jobs).unwrap();
+    }
+    assert!(
+        reg.take_dequeued_calls().len() <= 64,
+        "a read nobody drains grew the list without bound"
+    );
+    reg.clear_dequeued_calls();
+    assert!(reg.take_dequeued_calls().is_empty());
 }

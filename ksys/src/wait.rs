@@ -362,7 +362,11 @@ pub fn channel_call_send<M: PhysMem>(
 ) -> Result<Call, Status> {
     let ch = Handle(a[0]);
     let UserState {
-        objs, procs, calls, ..
+        objs,
+        procs,
+        calls,
+        next_call,
+        ..
     } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let rec = copy_from_user(
@@ -401,6 +405,8 @@ pub fn channel_call_send<M: PhysMem>(
         return Err(Status::AccessDenied);
     }
     let data = copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?;
+    let call = *next_call;
+    *next_call = next_call.wrapping_add(1);
     let raw = copy_from_user(
         p.aspace.held_mut(),
         mm,
@@ -416,10 +422,10 @@ pub fn channel_call_send<M: PhysMem>(
         &data,
         &crate::handle_list(&raw)?,
         jobs,
-        Some(caller),
+        Some((caller, call)),
     )?;
     // (from here until the call ends, a server that reads the request lends it the caller's priority: L22)
-    calls.insert(caller, le32(&data, 0));
+    calls.insert(caller, call);
     Ok(Call {
         ch,
         txid: le32(&data, 0),
@@ -467,6 +473,7 @@ pub fn channel_call_reply<M: PhysMem>(
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {
     let UserState { objs, procs, .. } = us;
+    objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
     let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
     let out: Reply = match ipc::channel_peek(
         objs,

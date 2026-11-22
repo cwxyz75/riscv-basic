@@ -524,6 +524,7 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     let r = channel_call_inner(a);
     // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
     let me = thread::current();
+    thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
     thread::pi_revoke(me);
     irq::without(|| state().calls.remove(&me));
     r

@@ -947,8 +947,18 @@ pub fn pi_op<R>(
     r
 }
 
-/// Donations the graph refused (a cycle of blocked calls, or a chain too long): the diagnostic of SCHED-SMP-SPEC 4.8 (L22).
+/// Donations the graph refused because a cycle of blocked calls or a chain too long would have followed: the diagnostic of SCHED-SMP-SPEC 4.8 (L22),
+/// `debug_stat` selector 20.
 pub static DONATIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A `channel_call` has finished (L24): a thread it woke for a direct hand-off that is still queued on this hart (the caller did not block after all) is
+/// offered to the other harts, which the hand-off had left unmarked.
+pub fn push_owed() {
+    irq::without(|| {
+        sched().push_owed_on(hart());
+        note_resched();
+    });
+}
 
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
@@ -956,8 +966,14 @@ pub fn pi_donate(from: Tid, to: Tid) {
     irq::without(|| {
         pi_op(|d| match d.donate(from, to) {
             Ok(ch) => ((), ch.as_slice().to_vec()),
-            Err(_) => {
-                DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            Err(e) => {
+                // (a cycle or a chain too long is a deadlock of blocked calls, which their deadlines will break: that is what is counted)
+                if matches!(
+                    e,
+                    kcore::donate::DonateError::Cycle | kcore::donate::DonateError::TooDeep
+                ) {
+                    DONATIONS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                }
                 ((), alloc::vec::Vec::new())
             }
         });
@@ -1334,6 +1350,7 @@ fn count_sleep(slept: &mut bool) {
 pub fn wake_stat(which: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     match which {
+        20 => DONATIONS_REFUSED.load(Relaxed),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

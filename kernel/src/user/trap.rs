@@ -514,7 +514,7 @@ fn lend_to_reader() {
         let s = state();
         let read = s.objs.take_dequeued_calls();
         read.into_iter()
-            .filter(|(caller, txid)| s.calls.get(&(*caller as Tid)) == Some(txid))
+            .filter(|(caller, call)| s.calls.get(&(*caller as Tid)) == Some(call))
             .map(|(caller, _)| caller as Tid)
             .collect::<Vec<Tid>>()
     });
