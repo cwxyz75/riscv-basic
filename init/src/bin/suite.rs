@@ -12272,6 +12272,47 @@ fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not(
     Ok(())
 }
 
+/// SCHED-SMP-SPEC 4.5 (task 25): a real-time spinner on every hart does not hang the system. The job's budget (the root's: one whole window
+/// of CPU per 100 ms) is spent by the hogs within a fraction of each window and they are demoted to the top of the normal band until it ends, so
+/// a thread there (this one, at 31) keeps getting the CPU, and the real-time time the job is billed per window stays at its budget.
+fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
+    let root = root_job()?;
+    let harts = job_use(root, 7)?.0;
+    RT_STOP.store(0, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        hogs.push(new_thread(rt_hog, 0)?);
+    }
+    ok(
+        sys::thread_set_sched(0, 31, 0),
+        "main to the top of the normal band",
+    )?;
+    for &h in &hogs {
+        ok(sys::thread_set_sched(h, 40, 0), "a hog turns real-time")?;
+    }
+    let mut worst_rt = 0u64;
+    let mut naps_done = 0;
+    let until = sys::clock_get() + 20_000;
+    while naps_done < 60 && sys::clock_get() < until {
+        nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
+        worst_rt = worst_rt.max(job_use(root, 9)?.0);
+        naps_done += 1;
+    }
+    RT_STOP.store(1, Ordering::SeqCst);
+    ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    ensure_eq!(naps_done, 60, "sixty naps finished while the hogs ran");
+    // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
+    ensure!(
+        worst_rt <= 100_000_000 + 20_000_000,
+        "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms)"
+    );
+    Ok(())
+}
+
 /// Spin for `ms` milliseconds of the clock.
 fn spin_ms(ms: u64) {
     let until = sys::clock_get() + ms;
@@ -14458,6 +14499,10 @@ pub fn app_main() -> i32 {
         (
             "job_syscalls_check_handles_rights_and_arguments",
             job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "a_runaway_rt_thread_does_not_hang_the_system",
+            a_runaway_rt_thread_does_not_hang_the_system,
         ),
         (
             "job_info_counts_the_cpu_time_its_threads_run",

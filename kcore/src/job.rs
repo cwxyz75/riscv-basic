@@ -150,7 +150,7 @@ pub enum JobError {
 pub struct SchedLimits {
     /// The highest base priority a thread of this job may have (0 to 63; above 31 is the real-time band).
     pub max_prio: u8,
-    /// Real-time CPU nanoseconds per 100 ms window (0: none). Accounted, not yet enforced.
+    /// Real-time CPU nanoseconds per 100 ms window (0: none). Enforced (SCHED-SMP-SPEC 4.5).
     pub rt_budget: u64,
     /// Reserved for the fair class (1 to 65536); stored.
     pub cpu_weight: u32,
@@ -226,6 +226,15 @@ impl Jobs {
     /// How many jobs are alive (the root included).
     pub fn live(&self) -> usize {
         self.live
+    }
+
+    /// Call `f` for every live job (the root included), lowest slot first; allocates nothing.
+    pub fn for_each_live(&self, mut f: impl FnMut(JobId)) {
+        for i in 0..MAX_JOBS as u32 {
+            if self.exists(JobId(i)) {
+                f(JobId(i));
+            }
+        }
     }
 
     /// The ids of the live jobs (the root included), lowest slot first.

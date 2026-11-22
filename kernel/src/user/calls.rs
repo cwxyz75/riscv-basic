@@ -584,7 +584,8 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
             let jobs = kmem::jobs();
             let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)
                 .map_err(|e| (e, None, None))?;
-            // PR1: the threads of the job and everything below it, with the maximum their own job now allows
+            thread::job_sched().sync_budgets(jobs.jobs); // (the scheduler's mirror of every job's RT budget)
+                                                         // PR1: the threads of the job and everything below it, with the maximum their own job now allows
             let candidates: Vec<(Tid, u8)> = s
                 .thread_pid
                 .iter()

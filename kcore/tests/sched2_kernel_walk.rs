@@ -220,6 +220,8 @@ impl<N: Class> World<N> {
                         // GP1 per class, recomputed from the reference
                         let bad = if self.rr && r.prio < 32 {
                             self.cur(h).is_none() // round robin: a hart must not idle while a normal thread it may run waits
+                        } else if self.s.rt_throttled_on(h) {
+                            false // NM1: this hart's RT share of the window is spent and the normal band has work
                         } else {
                             c < r.prio // fixed priority, and real-time strict precedence
                         };

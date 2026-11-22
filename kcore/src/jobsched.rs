@@ -19,6 +19,8 @@ const WINDOW_MAX: u64 = (1 << (64 - USED_BITS)) - 1;
 struct JobSched {
     /// Bumped when the slot is reused: a thread of the earlier job that is charged late carries the old generation and is dropped.
     generation: AtomicU64,
+    /// The job's RT budget per window, mirrored from its limits (`set_budget`); a full window until told otherwise.
+    budget: AtomicU64,
     cpu: AtomicU64,
     /// `window << USED_BITS | used`.
     rt: AtomicU64,
@@ -41,6 +43,7 @@ impl JobSchedTable {
             recs: (0..MAX_JOBS)
                 .map(|_| JobSched {
                     generation: AtomicU64::new(0),
+                    budget: AtomicU64::new(RT_WINDOW),
                     cpu: AtomicU64::new(0),
                     rt: AtomicU64::new(0),
                 })
@@ -105,6 +108,46 @@ impl JobSchedTable {
                 Err(seen) => cur = seen,
             }
         }
+    }
+
+    /// The job's RT budget per window changed (job creation, `job_set_sched`).
+    pub fn set_budget(&self, job: u32, ns: u64) {
+        if let Some(r) = self.rec(job) {
+            r.budget.store(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Mirror every live job's RT budget from its limits (after a job is made, and after `job_set_sched`, which clamps the jobs below).
+    pub fn sync_budgets(&self, jobs: &crate::job::Jobs) {
+        jobs.for_each_live(|id| {
+            if let Some(s) = jobs.sched(id) {
+                self.set_budget(id.index(), s.rt_budget);
+            }
+        });
+    }
+
+    /// Has the job a thread of tag `tag` belongs to used its RT budget in the window `now` is in? (A tag of a gone job: no.)
+    pub fn exhausted(&self, tag: u32, now: Time) -> bool {
+        let Some(r) = self.rec(tag & 0xff) else {
+            return false;
+        };
+        if r.generation.load(Ordering::Relaxed) as u32 & 0xff_ffff != tag >> 8 {
+            return false;
+        }
+        self.rt_used(tag & 0xff, now) >= r.budget.load(Ordering::Relaxed)
+    }
+
+    /// The RT time left in the job's budget for the window `now` is in (`None` for a tag of a gone job).
+    pub fn rt_left(&self, tag: u32, now: Time) -> Option<u64> {
+        let r = self.rec(tag & 0xff)?;
+        if r.generation.load(Ordering::Relaxed) as u32 & 0xff_ffff != tag >> 8 {
+            return None;
+        }
+        Some(
+            r.budget
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.rt_used(tag & 0xff, now)),
+        )
     }
 
     /// The job's total CPU time, nanoseconds (its own threads only; a subtree is summed by the caller).

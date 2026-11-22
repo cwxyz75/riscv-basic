@@ -175,7 +175,7 @@ ATOMICS = {
     "kcore/src/ticket.rs": (13, "the ticket lock protocol, modelled under loom and shuttle"),
     "kcore/src/handle.rs": (4, "two process-wide counters of the handle tables: slot growth events and clamped tables (MM5), read by the kernel so a syscall that grew nothing skips the charging pass"),
     "kcore/src/aspace.rs": (4, "`PAGER_NEED_PENDING` (MM9: set when a pager page was missing, read after every call so the common case takes no lock), `COPY_PENDING`: set when the VMO store logged a page that makes translations stale (MM8), read by the kernel after every call and fault so the common case costs one load; the log itself is under the VMO lock"),
-    "kcore/src/jobsched.rs": (7, "per-job CPU and real-time accounting (SCHED-SMP-SPEC 4.10, L8): each hart charges the running thread's job with no lock, one atomic for the CPU total and one that packs the real-time window with its used time so a boundary is one compare-and-swap; tested under real threads in `kcore/tests/jobsched.rs`"),
+    "kcore/src/jobsched.rs": (9, "per-job CPU and real-time accounting (SCHED-SMP-SPEC 4.10, L8): each hart charges the running thread's job with no lock, one atomic for the CPU total and one that packs the real-time window with its used time so a boundary is one compare-and-swap; tested under real threads in `kcore/tests/jobsched.rs`"),
     "kcore/src/park.rs": (4, "the park word of the block/wake protocol (PK1), modelled under loom and shuttle"),
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
