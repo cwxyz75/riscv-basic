@@ -25,7 +25,17 @@ pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
         return;
     };
     if let Ok(entry) = p.handles.get(h) {
-        s.waits.register(thread, entry.obj, mask);
+        if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
+            // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
+            s.waits.register_port(
+                thread,
+                entry.obj,
+                mask,
+                ipc::port_bound_objects(&s.objs, entry.obj),
+            );
+        } else {
+            s.waits.register(thread, entry.obj, mask);
+        }
     }
 }
 

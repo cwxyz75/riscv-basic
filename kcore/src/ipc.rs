@@ -1106,6 +1106,8 @@ pub fn port_bind_flags_in(
         armed: true,
     });
     reg.meter_add(BINDING_COST);
+    // (the port's READABLE can change, and what it binds has: waiters on it look again, L21a)
+    reg.touch(port_obj);
     Ok(())
 }
 
@@ -1133,6 +1135,7 @@ pub fn port_unbind_in(
     }
     reg.meter_sub(BINDING_COST);
     credit_bytes(reg, jobs, port_obj, BINDING_COST);
+    reg.touch(port_obj);
     Ok(())
 }
 
@@ -1232,6 +1235,7 @@ pub fn port_rearm_in(
         .find(|b| b.key == key)
         .ok_or(Status::InvalidArgs)?;
     b.armed = true;
+    reg.touch(port_obj);
     Ok(())
 }
 

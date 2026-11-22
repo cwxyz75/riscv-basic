@@ -8,7 +8,7 @@
 //! calls `forget`. Ports and `channel_call`'s exact reply registration come in later steps.
 
 use crate::object::{Dirty, ObjId};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// A thread id as the kernel names it.
@@ -20,6 +20,11 @@ pub struct WaitTable {
     regs: BTreeMap<ObjId, Vec<(Waiter, u32)>>,
     /// The object each registered thread waits on (a thread waits on one object at a time).
     by_thread: BTreeMap<Waiter, ObjId>,
+    /// The ports with waiters that bind each object (L21a): a port's READABLE follows the objects bound to it, so a touch of one of them is
+    /// what can release a port's waiters; a commit evaluates only those ports (before, every port with a waiter on every commit).
+    watchers: BTreeMap<ObjId, BTreeSet<ObjId>>,
+    /// What each such port binds, as of the last time it was looked at (so the entries above can be taken back).
+    watching: BTreeMap<ObjId, Vec<ObjId>>,
 }
 
 impl WaitTable {
@@ -45,9 +50,48 @@ impl WaitTable {
             v.retain(|(t, _)| *t != thread);
             if v.is_empty() {
                 self.regs.remove(&obj);
+                self.unwatch_port(obj);
             }
         }
         true
+    }
+
+    /// `register` on a port: `thread` waits for any of `mask` on `port`, which binds `bound` now (L21a).
+    pub fn register_port(&mut self, thread: Waiter, port: ObjId, mask: u32, bound: Vec<ObjId>) {
+        self.register(thread, port, mask);
+        self.watch_port(port, bound);
+    }
+
+    /// `port` has waiters and binds `bound` now: remember which touches can release them (L21a). Replaces what was remembered for the port. The kernel
+    /// calls it when a thread registers on a port and when the port is touched (a bind, unbind or rearm), so the memory is never older than the port's
+    /// last change.
+    pub fn watch_port(&mut self, port: ObjId, bound: Vec<ObjId>) {
+        self.unwatch_port(port);
+        for &o in &bound {
+            self.watchers.entry(o).or_default().insert(port);
+        }
+        self.watching.insert(port, bound);
+    }
+
+    fn unwatch_port(&mut self, port: ObjId) {
+        let Some(old) = self.watching.remove(&port) else {
+            return;
+        };
+        for o in old {
+            if let Some(set) = self.watchers.get_mut(&o) {
+                set.remove(&port);
+                if set.is_empty() {
+                    self.watchers.remove(&o);
+                }
+            }
+        }
+    }
+
+    /// The ports with waiters that watch `obj` (a test hook).
+    pub fn watchers_of(&self, obj: ObjId) -> Vec<ObjId> {
+        self.watchers
+            .get(&obj)
+            .map_or_else(Vec::new, |s| s.iter().copied().collect())
     }
 
     pub fn is_registered(&self, thread: Waiter) -> bool {
@@ -69,32 +113,39 @@ impl WaitTable {
     /// are removed. An overflowed log releases every registration (the lost entries may have been forced
     /// touches); each waiter re-checks its own condition.
     ///
-    /// `derived` says which objects' signals follow *other* objects' (a port's READABLE follows the
-    /// objects bound to it, which are touched, not the port): their registrations are evaluated on
-    /// every commit that touched anything. (Until ports are registrations themselves, step 4.)
+    /// A port's READABLE follows the objects bound to it, which are touched, not the port (L21a): the ports with waiters are remembered
+    /// by what they bind (`watch_port`), and a touch of a bound object evaluates exactly those ports. A touch of a port itself (a bind, unbind
+    /// or rearm: the kernel touches it) first renews what is remembered for it, with `bound` (the objects it binds now), then evaluates it.
     pub fn commit(
         &mut self,
         signals: impl Fn(ObjId) -> Option<u32>,
-        derived: impl Fn(ObjId) -> bool,
+        bound: impl Fn(ObjId) -> Vec<ObjId>,
         dirty: impl core::borrow::Borrow<Dirty>,
     ) -> Vec<Waiter> {
         let dirty: &Dirty = dirty.borrow();
         let mut woken = Vec::new();
-        let touched = dirty.overflow || !dirty.items.is_empty();
         if dirty.overflow {
             // the log lost entries (forced touches among them): release everyone, they re-check
             let all: Vec<ObjId> = self.regs.keys().copied().collect();
             for obj in all {
                 self.fire(obj, true, &signals, &mut woken);
             }
+            self.watchers.clear();
+            self.watching.clear();
         }
         for &(obj, forced) in &dirty.items {
+            // (a port touched itself: what it binds may have changed)
+            if self.watching.contains_key(&obj) {
+                self.watch_port(obj, bound(obj));
+            }
             self.fire(obj, forced, &signals, &mut woken);
-        }
-        if touched {
-            let follow: Vec<ObjId> = self.regs.keys().copied().filter(|o| derived(*o)).collect();
-            for obj in follow {
-                self.fire(obj, false, &signals, &mut woken);
+            // the ports that bind the touched object
+            let ports: Vec<ObjId> = self
+                .watchers
+                .get(&obj)
+                .map_or_else(Vec::new, |s| s.iter().copied().collect());
+            for port in ports {
+                self.fire(port, false, &signals, &mut woken);
             }
         }
         woken
@@ -123,6 +174,7 @@ impl WaitTable {
         }
         if keep.is_empty() {
             self.regs.remove(&obj);
+            self.unwatch_port(obj);
         } else {
             *list = keep;
         }
