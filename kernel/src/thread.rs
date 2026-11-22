@@ -122,6 +122,13 @@ pub fn cpu_ns(tid: Tid) -> u64 {
     ns
 }
 
+/// Bring this hart's running thread's accounting up to now (the exiting thread's own last interval: no other hart's lock is taken).
+pub fn charge_here() {
+    let was = irq::save_and_disable();
+    sched().charge_now(hart());
+    irq::restore(was);
+}
+
 /// Bring every hart's running thread's accounting up to now (a reader of the accounts calls it first: no tick does it).
 pub fn charge_running() {
     let was = irq::save_and_disable();

@@ -1417,19 +1417,32 @@ impl<N: Class> HartRq<N> {
             _ => self.normal.displaces(cand, cur),
         }
     }
-    /// `would_run(p)` for every priority 1 to 63 at once, bit `p` (what a hart publishes after every change): the state `would_run` looks at
-    /// is read once, not 63 times.
-    pub(crate) fn would_run_mask(&self) -> u64 {
+    /// What `would_run` depends on: whether the real-time band is held back, whether the hart is idle, the effective priority that runs, and
+    /// whether a running real-time thread has spent the hart's share with a normal thread queued here (then any normal candidate takes it).
+    fn would_run_state(&self) -> (bool, bool, Prio, bool) {
         let blocked = self.rt_blocked();
         let idle = self.cur == self.idle;
         let cur = self.cur_eff();
-        // (a running real-time thread that has spent the hart's share, with a normal thread queued here: any normal candidate takes the hart)
         let spent = !idle
             && RT_ENFORCE
             && cur >= 32
             && self.win == self.now / RT_WINDOW
             && self.rt_ran >= RT_HART_MAX
             && !self.normal.is_empty();
+        (blocked, idle, cur, spent)
+    }
+
+    /// The state of `would_run_mask` packed into a number: the mask is the same whenever the key is (the classes' `displaces` are functions of
+    /// the two priorities alone), so a hart that publishes after a change that left the key alone need not compute the 63 bits again.
+    pub(crate) fn would_run_key(&self) -> u64 {
+        let (blocked, idle, cur, spent) = self.would_run_state();
+        u64::from(idle) | u64::from(cur) << 1 | u64::from(blocked) << 9 | u64::from(spent) << 10
+    }
+
+    /// `would_run(p)` for every priority 1 to 63 at once, bit `p` (what a hart publishes after every change): the state `would_run` looks at
+    /// is read once, not 63 times.
+    pub(crate) fn would_run_mask(&self) -> u64 {
+        let (blocked, idle, cur, spent) = self.would_run_state();
         let mut mask = 0u64;
         for p in 1..=PRIO_MAX {
             let rt = band(p) == Band::Rt;
