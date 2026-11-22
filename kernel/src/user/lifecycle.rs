@@ -248,30 +248,40 @@ const TEARDOWN_CHUNK: u64 = 64;
 
 /// Free the memory of a process that is gone from the table (L19). **No big kernel lock**: the process is private to this thread (nothing can fault in
 /// its space, no call can name it), so what is left is the memory locks, taken for one chunk of at most `TEARDOWN_CHUNK` pages at a time and let go
-/// between chunks, with interrupts on, so that another thread (a tick's switch included) gets in and no section is proportional to what the process
-/// mapped or owned. The order keeps TLB2: every mapping goes first (the frames stay held by their VMOs), every hart drops what it cached, and only then
-/// are the VMOs' own frames given back.
+/// between chunks, which are switch points even for a caller whose trap left interrupts off, so that no section is proportional to what the process
+/// mapped or owned. Each chunk is shot down before its locks are let go (TLB2).
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[inline(never)]
 pub(super) fn teardown_memory(process: Box<Process>) {
     let mut process = process;
     let mut aspace = klock::aslock::AsCell::take(process.aspace);
-    // 1. the mappings, a chunk at a time
+    // 1. the mappings, a chunk at a time. Each chunk is unmapped and shot down in one interrupts-off section under the memory locks (TLB2: nothing it
+    // frees, a table or a VMO's last frame, can be reused before every hart has dropped what it cached; X6: the hart cannot change under the shootdown);
+    // then a switch point (X4: a trap from user mode arrives here with interrupts off, so the chunk boundary is where a tick's switch is taken)
     loop {
+        let was = irq::save_and_disable();
         let done = {
             let k = kmem::mem();
-            aspace.destroy_user_chunk(k.mm, k.vmos, k.jobs, TEARDOWN_CHUNK)
+            let done = aspace.destroy_user_chunk(k.mm, k.vmos, k.jobs, TEARDOWN_CHUNK);
+            crate::smp::shootdown();
+            done
         };
+        irq::restore(was);
+        irq::without(|| {});
         if done {
             break;
         }
     }
-    // no hart may keep translations through the space (before its page tables, and the frames the VMOs still hold, are freed)
-    crate::smp::shootdown();
     {
-        let k = kmem::mem();
-        aspace.finish_destroy_user(k.mm, k.jobs);
+        // the tables go with a shootdown of their own, inside the locks, so no hart's walk cache outlives them
+        let was = irq::save_and_disable();
+        {
+            let k = kmem::mem();
+            aspace.finish_destroy_user(k.mm, k.jobs);
+            crate::smp::shootdown();
+        }
+        irq::restore(was);
     }
     // 2. the VMOs the process owned: the pages of one that nothing else holds go back in chunks, then the VMO itself
     let ids: alloc::vec::Vec<u64> = core::mem::take(&mut process.vmos)
@@ -279,6 +289,7 @@ pub(super) fn teardown_memory(process: Box<Process>) {
         .chain(process.stacks.values().map(|st| st.vmo))
         .collect();
     for id in ids {
+        irq::without(|| {}); // a switch point (X4)
         {
             let k = kmem::mem();
             if k.vmos.is_unshared_plain(id) {
@@ -295,6 +306,7 @@ pub(super) fn teardown_memory(process: Box<Process>) {
                         TEARDOWN_CHUNK.min(pages.saturating_sub(first)),
                     );
                     first = first.saturating_add(TEARDOWN_CHUNK);
+                    irq::without(|| {});
                 }
             }
         }
