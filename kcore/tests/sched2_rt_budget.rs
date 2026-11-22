@@ -134,3 +134,48 @@ fn a_job_with_no_budget_gets_no_real_time_at_all() {
     assert!(ran[0] + ran[1] >= 2 * RT_WINDOW - 2 * MS);
     assert!(h.record(r).unwrap().eff <= DEMOTED_PRIO);
 }
+
+/// The job's budget is shared by every hart (4.5): four real-time spinners of one job, one per hart, together get about the budget in a window,
+/// not the budget each. (Found by the epic gate at four harts: the figure read 360 ms of a 100 ms budget.)
+#[test]
+fn a_job_budget_is_shared_by_the_harts_that_run_its_threads() {
+    use kcore::sched_smp::Sched2;
+    let table = Arc::new(JobSchedTable::new());
+    let tag = table.tag(0);
+    let s = Sched2::new(4, FixedPrio::new);
+    s.set_job_table(table.clone());
+    let mut hogs = Vec::new();
+    for h in 0..4 {
+        let t = s.spawn_on(h, rt(40), Some(h)).unwrap();
+        s.set_job(t, tag).unwrap();
+        hogs.push(t);
+    }
+    for h in 0..4 {
+        s.reschedule_on(h);
+        s.switched(h);
+    }
+    let mut worst = 0u64;
+    let mut now = RT_WINDOW; // a window start
+    for _ in 1..=300u64 {
+        now += MS;
+        for h in 0..4 {
+            // (a tickless hart takes an interrupt only at the event it programmed)
+            if s.next_event_on(h).is_some_and(|e| e <= now) {
+                s.tick_on(h, now);
+                s.switched(h);
+                s.reschedule_on(h);
+                s.switched(h);
+            }
+        }
+        // sample the figure of the window just before it ends (the last full millisecond of each window)
+        if now % RT_WINDOW == RT_WINDOW - MS {
+            let used = table.rt_used(0, now);
+            worst = worst.max(used);
+        }
+    }
+    assert!(
+        worst <= RT_WINDOW + 4 * 15 * MS,
+        "the job's real-time time in a window reached {} ms (budget 100)",
+        worst / MS
+    );
+}

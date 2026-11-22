@@ -34,6 +34,8 @@ pub const TIMESLICE: Time = 10 * MS;
 pub const RT_WINDOW: Time = 100 * MS;
 pub const RT_HART_MAX: Time = 80 * MS;
 pub const RT_RR_SLICE: Time = 10 * MS;
+/// While a real-time-base thread runs, its hart accounts at least this often (the job's budget is shared by every hart).
+pub const RT_ACCT_PERIOD: Time = 10 * MS;
 pub const RT_ENFORCE: bool = true;
 /// What a thread of a job that has used its RT budget counts as until the window ends (the top of the normal band, round robin).
 pub const DEMOTED_PRIO: Prio = 31;
@@ -670,7 +672,9 @@ impl<N: Class> HartRq<N> {
             }
             if band(t.base.prio) == Band::Rt {
                 if let Some(left) = self.jobs.as_ref().and_then(|j| j.rt_left(t.job, self.now)) {
-                    put((self.now + left.max(1)).min(window_end));
+                    // (other harts drain the same budget and this hart cannot see them: look again every `RT_ACCT_PERIOD`, so an exhausted job
+                    // is found within that, on every hart that runs one of its real-time threads)
+                    put((self.now + left.clamp(1, RT_ACCT_PERIOD)).min(window_end));
                 }
             }
         }
@@ -901,6 +905,9 @@ impl<N: Class> HartRq<N> {
         if RT_ENFORCE {
             self.undemote_if_over(&mut t);
             self.demote_if_exhausted(&mut t);
+            if t.demoted_window != 0 {
+                self.demoted.insert(tid); // (it may have come from another hart: this one ends the demotion at the window's end)
+            }
         }
         match band(t.eff) {
             Band::Rt => self.rt.enqueue(&mut t, how, self.now),
@@ -1127,6 +1134,8 @@ impl<N: Class> HartRq<N> {
         let t = self.threads.get_mut(&tid).expect("exists");
         t.base.prio = prio;
         t.eff = prio;
+        t.demoted_window = 0; // (a new priority ends a demotion; the budget demotes again if it must)
+        self.demoted.remove(&tid);
         match state {
             State::Runnable if old != prio => {
                 self.class_enqueue(tid, Enq::AttrChanged);
@@ -1153,7 +1162,10 @@ impl<N: Class> HartRq<N> {
         if state == State::Runnable {
             self.class_dequeue(tid, Deq::AttrChange);
         }
-        self.threads.get_mut(&tid).expect("exists").eff = eff;
+        let t = self.threads.get_mut(&tid).expect("exists");
+        t.eff = eff;
+        t.demoted_window = 0; // (a donation ends a demotion: the donor's priority is what counts, and the budget demotes again if it must)
+        self.demoted.remove(&tid);
         match state {
             State::Runnable => {
                 self.class_enqueue(tid, Enq::AttrChanged);

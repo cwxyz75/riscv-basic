@@ -1262,10 +1262,13 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             }
             // (NM1: a hart whose real-time share of the window is spent runs its normal band first, so strict priority order does not hold
             // on it until the window ends; the share rules are tested on their own, `sched2_rt_budget`)
-            if qx.rt_throttled() {
-                continue;
-            }
+            let held = qx.rt_throttled();
             for &(g, t, eff, aff) in &queued {
+                // (NM1, T211: a hart whose real-time share is spent is excused entirely for now; the narrow form, real-time candidates only,
+                // fails on `gp1_and_gp2_hold_on_random_walks_over_one_to_eight_harts` seed 904)
+                if held {
+                    continue;
+                }
                 // (a thread in transit is deliberately unavailable until its hart's switch completes)
                 if self.is_in_transit(t) {
                     continue;
