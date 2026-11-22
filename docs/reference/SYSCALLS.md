@@ -217,6 +217,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 101 | interrupt_ack | `a0` interrupt | `a1` claims so far |
 | 110 | futex_wait | `a0` address, `a1` expected, `a2` deadline | |
 | 111 | futex_wake | `a0` address, `a1` count | `a1` woken |
+| 112 | futex_lock_pi | `a0` address, `a1` deadline | |
+| 113 | futex_unlock_pi | `a0` address | |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 
 A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
@@ -1092,8 +1094,7 @@ The word at `address` holds 0 (free) or the owner's tid in bits 0-29, with bit 3
 kernel and bit 30 if an owner died holding it. A thread takes a free lock in user mode by compare-and-swap from 0 to
 its tid and releases an uncontended one by compare-and-swap back to 0; it calls the kernel only when either fails.
 `futex_lock_pi` returns OK when the caller owns the lock; while it waits, the owner runs at least at the caller's
-effective priority. Errors: INVALID_ARGS (as `futex_wait`); BAD_STATE (the word names no live thread of this process;
-the lock is poisoned; or waiting would close a cycle of waiting threads: a deadlock); TIMED_OUT; INTERRUPTED.
+effective priority. A deadline of 0 polls (TIMED_OUT if it would wait). **Built (L23).** The tid is the kernel thread id (`thread_get_sched` with thread 0 names the caller's); a thread whose tid does not fit in 30 bits cannot use PI futexes (NOT_SUPPORTED). A waiter that gives up leaves the `WAITERS` bit set; the next unlock finds no queue and writes 0. Errors: INVALID_ARGS (as `futex_wait`); BAD_STATE (the word names no live thread of this process, and the kernel then poisons it; the lock is poisoned; the caller owns it already; or waiting would close a cycle of waiting threads: a deadlock; a waiter whose owner dies holding it, with the word poisoned, gets this too); NOT_SUPPORTED (the caller's tid does not fit); TIMED_OUT; INTERRUPTED.
 `futex_unlock_pi` hands the lock to the highest-priority waiter (first come among equals) or frees it. Errors:
 INVALID_ARGS; ACCESS_DENIED (the caller does not own it). `futex_wait` and `futex_wake` gain a flags argument whose
 bit 0 (shared key) is reserved: NOT_SUPPORTED.

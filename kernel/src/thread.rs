@@ -919,6 +919,52 @@ pub fn sleep_ticks(n: u64) {
     }
 }
 
+/// The donation graph (L23, SCHED-SMP-SPEC 4.8), under its own lock of class `PI`: user threads are in it from their registration to their exit; an
+/// edge exists only while the donor waits (a PI futex now; `channel_call` with L22).
+static PI: klock::Spin<kcore::donate::Donations, crate::bkl::Machine> =
+    klock::Spin::new(klock::Class::Pi, 0, kcore::donate::Donations::new());
+
+/// Apply what a donation changed to the scheduler (the `PI` lock is held, so two change lists never interleave): each thread's effective
+/// priority, and a reschedule where one is owed. Interrupts off.
+fn pi_apply(changes: &[kcore::donate::Change]) {
+    for c in changes {
+        let _ = sched().set_effective_on(hart(), c.tid, c.eff);
+    }
+    if !changes.is_empty() {
+        note_resched();
+    }
+}
+
+/// Run `f` on the donation graph with the `PI` lock held and apply the priority changes it returns before the lock is let go. Interrupts must
+/// be off, and the big lock need not be held (the PI futex calls this with a futex bucket's lock held: `FUTEX` is before `PI`).
+pub fn pi_op<R>(
+    f: impl FnOnce(&mut kcore::donate::Donations) -> (R, alloc::vec::Vec<kcore::donate::Change>),
+) -> R {
+    debug_assert!(!irq::enabled(), "the donation graph needs interrupts off");
+    let mut d = PI.lock();
+    let (r, changes) = f(&mut d);
+    pi_apply(&changes);
+    r
+}
+
+/// A user thread enters the donation graph at its base priority (when it registers, big lock held).
+pub fn pi_register(tid: Tid) {
+    irq::without(|| {
+        let base = sched().priority(tid).unwrap_or(1);
+        let mut d = PI.lock();
+        if d.eff(tid).is_none() {
+            d.add_thread(tid, base); // (a thread the spawner registered is registered again by itself: the first stands)
+        }
+    });
+}
+
+/// A user thread leaves the graph (it has exited): the donations it made and received lapse. Big lock held.
+pub fn pi_gone(tid: Tid) {
+    irq::without(|| {
+        pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
+    });
+}
+
 /// A thread's current priority (its base: nothing donates yet).
 pub fn priority_of(tid: Tid) -> Option<Prio> {
     irq::without(|| sched().priority(tid))
@@ -929,7 +975,7 @@ pub fn priority_of(tid: Tid) -> Option<Prio> {
 pub fn set_priorities(changes: &[(Tid, Prio)]) {
     irq::without(|| {
         for &(tid, prio) in changes {
-            let _ = sched().set_priority_on(hart(), tid, prio);
+            set_priority_held(tid, prio);
         }
         note_resched();
     });
@@ -937,9 +983,20 @@ pub fn set_priorities(changes: &[(Tid, Prio)]) {
 
 pub fn set_priority(tid: Tid, prio: Prio) {
     irq::without(|| {
-        let _ = sched().set_priority_on(hart(), tid, prio);
+        set_priority_held(tid, prio);
         note_resched();
     });
+}
+
+/// A thread's base priority changes (interrupts off, big lock held): the graph first (the effective priority is the larger of the new base and
+/// what is donated to it), then the scheduler, then the effective priorities the graph computed.
+fn set_priority_held(tid: Tid, prio: Prio) {
+    let mut d = PI.lock();
+    let changes = d.eff(tid).map(|_| d.set_base(tid, prio));
+    let _ = sched().set_priority_on(hart(), tid, prio);
+    if let Some(ch) = changes {
+        pi_apply(ch.as_slice());
+    }
 }
 
 /// End the calling thread. Its stack is freed by whoever `join`s it, or, if it is detached, by the hart that switches away from it

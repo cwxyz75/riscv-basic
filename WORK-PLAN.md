@@ -181,7 +181,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 - [x] **L1** the remaining benchmarks (`pair_scaling`, `rt_latency`, `irq_off_max`, `bkl_profile`) and absolute targets (PR 388)
 - [x] **L8** RT budget accounting and the priority policy of the launcher and the device manager: (PR 389: accounting, `job_info` 9 and 10, the user-level RT demo as a suite test with its negative control, the session job's 31; the `devmgr` driver-job policy is T210, with L25)
 - [ ] **L22** donation through `channel_call` (phase 9b: after L21)
-- [ ] **L23** PI futex (phase 9b: after L14)
+- [x] **L23** PI futex (the donation graph in the kernel under the `PI` lock, `futex_lock_pi`/`futex_unlock_pi`, the model and loom tests, the four QEMU tests; PR below; leftovers T216)
 - [ ] **L24** direct hand-off (phase 9b)
 - [x] **L25** RT budgets enforced (PR 390)
 - [x] **AB6** CPU time for threads, processes and jobs (PR 391)

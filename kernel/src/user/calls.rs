@@ -281,6 +281,7 @@ pub(super) fn thread_spawn(a: [u64; 6]) -> Reply {
         // (EX1) the thread is known to `thread_suspend` and the rest from the moment this call returns; a SUSPENDED one is stopped, with its
         // register image, before the handle that can resume it is handed back
         ksys::thread_registered_by_spawner(s, tid, &spawn);
+        thread::pi_register(tid); // (the donation graph, L23)
         if spawn.suspended {
             ksys::thread_spawned_suspended(s, tid, &spawn);
             sync_suspends(s);

@@ -1599,6 +1599,34 @@ impl<N: Class> HartRq<N> {
         })
     }
 
+    /// `set_effective` without the reschedule (donation, L23): returns whether this hart's designation may now be wrong.
+    #[allow(clippy::expect_used)] // INVARIANT: the thread was looked up in the same call
+    pub(crate) fn set_effective_quiet(&mut self, tid: Tid, eff: Prio) -> Result<bool, Error> {
+        if eff > PRIO_MAX {
+            return Err(Error::BadPriority);
+        }
+        let t = self.threads.get(&tid).ok_or(Error::NoSuchThread)?;
+        let (state, old) = (t.state, t.eff);
+        if old == eff {
+            return Ok(false);
+        }
+        if state == State::Runnable {
+            self.class_dequeue(tid, Deq::AttrChange);
+        }
+        let t = self.threads.get_mut(&tid).expect("exists");
+        t.eff = eff;
+        t.demoted_window = 0; // (a donation ends a demotion: the donor's priority is what counts, and the budget demotes again if it must)
+        self.demoted.remove(&tid);
+        Ok(match state {
+            State::Runnable => {
+                self.class_enqueue(tid, Enq::AttrChanged);
+                true
+            }
+            State::Running => true,
+            _ => false,
+        })
+    }
+
     /// The timers and the slice accounting of `advance`, up to `now`, without the final designation by a remote caller
     /// (this is the hart's own tick). Same as `advance`; the name says whose call it is.
     pub(crate) fn tick_to(&mut self, now: Time) {

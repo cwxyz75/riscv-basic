@@ -142,11 +142,11 @@ os-models:
 	RUSTFLAGS="--cfg shuttle" cargo test -p netring --release --test doorbell_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test latch_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test ticket_concurrency --target-dir target/loom
-	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --target-dir target/loom
+	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p kcore --release --test park_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test latch_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test ticket_concurrency --target-dir target/shuttle
-	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --target-dir target/shuttle
+	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test futex_concurrency --test pifutex_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test idle_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test rq_concurrency --target-dir target/shuttle
 	RUSTFLAGS="--cfg shuttle" cargo test -p kcore --release --test fcache_concurrency --target-dir target/shuttle

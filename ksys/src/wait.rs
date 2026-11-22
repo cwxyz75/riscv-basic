@@ -274,6 +274,30 @@ pub fn futex_wait_report<B: Buckets>(
     }
 }
 
+/// The lock word of a PI futex, resolved and made resident for writing (L23).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct PiWord {
+    pub addr: u64,
+    pub pa: u64,
+}
+
+/// First half of `futex_lock_pi` and `futex_unlock_pi` (the big kernel lock held, and the caller's `AS` lock and the memory locks, which are let go
+/// before the second half): translate the word for writing, committing a page that is lazily backed or copy-on-write. The frame cannot go while
+/// the big lock is held.
+pub fn futex_pi_resolve<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    addr: u64,
+) -> Result<PiWord, Status> {
+    let p = us.procs.get_mut(&me).ok_or(Status::BadState)?;
+    let pa =
+        kcore::usercopy::resolve_user_word_for_write(p.aspace.held_mut(), mm, vmos, jobs, addr)?;
+    Ok(PiWord { addr, pa })
+}
+
 /// The arguments of `futex_wake(addr, count)`, checked: the word's address and how many to wake. Nothing here touches shared state (L14: the
 /// call runs without the big kernel lock).
 pub fn futex_wake_args(a: [u64; 6]) -> Result<(u64, u64), Status> {

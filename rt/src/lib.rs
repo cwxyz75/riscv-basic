@@ -360,6 +360,22 @@ pub mod sys {
     pub fn futex_wake(addr: *const u32, count: u32) -> Ret {
         syscall(FUTEX_WAKE, [addr as usize, count as usize, 0, 0, 0, 0])
     }
+    /// Take the priority-inheritance futex at `addr` (the slow path: user code first tries a compare-and-swap of 0 to its tid, bits 0 to 29 of the
+    /// word); `deadline` in milliseconds as `futex_wait`. OK when the caller owns it. While it waits the owner runs at least at the caller's priority.
+    pub fn futex_lock_pi(addr: *const u32, deadline: u64) -> Ret {
+        futex_lock_pi_ns(addr, deadline_ns(deadline))
+    }
+    /// `futex_lock_pi` with the deadline in nanoseconds.
+    pub fn futex_lock_pi_ns(addr: *const u32, deadline: u64) -> Ret {
+        syscall(
+            FUTEX_LOCK_PI,
+            [addr as usize, deadline as usize, 0, 0, 0, 0],
+        )
+    }
+    /// Release the priority-inheritance futex at `addr` (the slow path): the lock goes to the highest-priority waiter, or the word becomes 0.
+    pub fn futex_unlock_pi(addr: *const u32) -> Ret {
+        syscall(FUTEX_UNLOCK_PI, [addr as usize, 0, 0, 0, 0, 0])
+    }
     pub fn interrupt_create(resource: u64, irq: u32) -> Ret {
         syscall(
             INTERRUPT_CREATE,

@@ -1134,6 +1134,24 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         Ok(())
     }
 
+    /// Set a thread's *effective* priority (what donation, `kcore::donate`, computes) and leave its base alone (L23): a queued thread moves to where it
+    /// now belongs, a running one may be preempted; its hart is marked (or, if it is the caller's, looks at once).
+    pub fn set_effective_on(&self, caller: usize, tid: Tid, eff: Prio) -> Result<(), Error> {
+        let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+        self.charge_now(home);
+        let changed = self.lq(home).set_effective_quiet(tid, eff)?;
+        if !changed {
+            return Ok(());
+        }
+        let me_first = self.push_marks(tid, home, caller);
+        if home == caller || me_first {
+            self.settle_or_defer(caller);
+        } else {
+            self.mark(home);
+        }
+        Ok(())
+    }
+
     /// Hart `hart`'s tick: the clock moves to `now`, its due timers fire, the running thread is accounted.
     pub fn tick_on(&self, hart: usize, now: Time) {
         {

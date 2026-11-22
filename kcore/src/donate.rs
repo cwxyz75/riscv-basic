@@ -87,8 +87,10 @@ pub struct Donations {
 }
 
 impl Donations {
-    pub fn new() -> Donations {
-        Donations::default()
+    pub const fn new() -> Donations {
+        Donations {
+            nodes: BTreeMap::new(),
+        }
     }
 
     pub fn add_thread(&mut self, tid: Tid, base: Prio) {

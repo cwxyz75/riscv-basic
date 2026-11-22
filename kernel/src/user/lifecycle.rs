@@ -22,7 +22,8 @@ pub(super) fn user_thread_main(token: usize) {
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
         s.thread_pid.insert(thread::current(), ts.pid);
-        // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
+        thread::pi_register(thread::current()); // (the donation graph, L23)
+                                                // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
         if let Some(p) = s.procs.get(&ts.pid) {
             thread::set_job(thread::current(), thread::job_sched().tag(p.job.index()));
         }
@@ -314,6 +315,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         ksys::thread_suspend_forget(s, tid);
         sync_suspends(s);
         let pid = s.thread_pid.remove(&tid)?;
+        pi_thread_gone(tid, pid); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
         p.live_tids.remove(&tid);
