@@ -483,6 +483,14 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
     // (no kill or stop recorded) and the user's FP state is not dirty.
     if from_user && cause == 8 && ready && lock_free_syscall(frame) {
         // handled
+    } else if from_user
+        && ready
+        && matches!(cause, 12 | 13 | 15)
+        && crate::fp::light_save(frame)
+        && crate::user::user_return_is_quiet()
+        && crate::user::page_fault_quiet(frame)
+    {
+        // L17 part c: a page fault resolved under the process's AS lock and the memory locks, with no big lock; anything else takes the full path
     } else if cause == (1 << 63) | 5 && ready {
         // The scheduler's tick (SCHED-SMP-SPEC task 12). Its work is done under the scheduler's own lock. A tick that
         // interrupted **kernel code** (an idle hart, a kernel thread) takes the big kernel lock only if the hart has to
