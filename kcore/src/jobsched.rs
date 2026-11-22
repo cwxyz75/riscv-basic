@@ -17,6 +17,8 @@ const USED_MASK: u64 = (1 << USED_BITS) - 1;
 const WINDOW_MAX: u64 = (1 << (64 - USED_BITS)) - 1;
 
 struct JobSched {
+    /// Bumped when the slot is reused: a thread of the earlier job that is charged late carries the old generation and is dropped.
+    generation: AtomicU64,
     cpu: AtomicU64,
     /// `window << USED_BITS | used`.
     rt: AtomicU64,
@@ -38,6 +40,7 @@ impl JobSchedTable {
         JobSchedTable {
             recs: (0..MAX_JOBS)
                 .map(|_| JobSched {
+                    generation: AtomicU64::new(0),
                     cpu: AtomicU64::new(0),
                     rt: AtomicU64::new(0),
                 })
@@ -49,9 +52,20 @@ impl JobSchedTable {
         self.recs.get(job as usize)
     }
 
-    /// A job slot is (re)used: start from nothing.
+    /// What a thread of the job in slot `job` keeps as its `ThreadSched.job`: the slot and the slot's generation now (8 bits of slot,
+    /// `MAX_JOBS` is 256). A charge whose tag is not the slot's current one belongs to a job that has gone and is dropped.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the generation is masked to 24 bits and the slot is below 256
+    pub fn tag(&self, job: u32) -> u32 {
+        let g = self.rec(job).map_or(0, |r| {
+            r.generation.load(Ordering::Relaxed) as u32 & 0xff_ffff
+        });
+        (g << 8) | (job & 0xff)
+    }
+
+    /// A job slot is (re)used: start from nothing (and charges tagged before this are dropped).
     pub fn reset(&self, job: u32) {
         if let Some(r) = self.rec(job) {
+            r.generation.fetch_add(1, Ordering::Relaxed);
             r.cpu.store(0, Ordering::Relaxed);
             r.rt.store(0, Ordering::Relaxed);
         }
@@ -61,8 +75,13 @@ impl JobSchedTable {
     /// (time run on a donated priority is not the job's, 4.5). The part of the interval before the window that `now` is in belongs
     /// to the window that is over and is not counted in `rt_used`.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: nanosecond counts far below u64::MAX within a boot; the window id is clamped
-    pub fn charge(&self, job: u32, ran: Time, rt_base: bool, now: Time) {
-        let Some(r) = self.rec(job) else { return };
+    pub fn charge(&self, tag: u32, ran: Time, rt_base: bool, now: Time) {
+        let Some(r) = self.rec(tag & 0xff) else {
+            return;
+        };
+        if r.generation.load(Ordering::Relaxed) as u32 & 0xff_ffff != tag >> 8 {
+            return; // the job this thread belonged to is gone and the slot is someone else's
+        }
         r.cpu.fetch_add(ran, Ordering::Relaxed);
         if !rt_base || ran == 0 {
             return;

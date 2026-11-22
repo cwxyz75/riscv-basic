@@ -202,8 +202,9 @@ fn job_info_reports_rt_and_cpu_time_of_the_subtree() {
         w.ok(nr::JOB_INFO, [a, 9, 0, 0, 0, 0]),
         (Some(0), Some(100_000_000))
     );
-    w.job_sched.charge(ja, 30_000_000, true, 40_000_000); // 30 ms of RT time in window 0
-    w.job_sched.charge(jb, 5_000_000, false, 45_000_000); // 5 ms of ordinary time in the child
+    let (ta, tb) = (w.job_sched.tag(ja), w.job_sched.tag(jb));
+    w.job_sched.charge(ta, 30_000_000, true, 40_000_000); // 30 ms of RT time in window 0
+    w.job_sched.charge(tb, 5_000_000, false, 45_000_000); // 5 ms of ordinary time in the child
     assert_eq!(w.ok(nr::JOB_INFO, [a, 9, 0, 0, 0, 0]).0, Some(30_000_000));
     assert_eq!(
         w.ok(nr::JOB_INFO, [a, 10, 0, 0, 0, 0]),

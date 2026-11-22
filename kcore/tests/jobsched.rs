@@ -64,6 +64,18 @@ fn a_reset_slot_starts_from_nothing() {
 }
 
 #[test]
+fn a_charge_for_a_job_that_is_gone_is_dropped_when_the_slot_is_reused() {
+    let t = JobSchedTable::new();
+    let old = t.tag(5);
+    t.charge(old, 4 * MS, true, 10 * MS);
+    t.reset(5); // the job ends and another takes the slot
+    t.charge(old, 9 * MS, true, 20 * MS); // the dead job's last thread is charged late
+    assert_eq!((t.cpu(5), t.rt_used(5, 20 * MS)), (0, 0));
+    t.charge(t.tag(5), 2 * MS, false, 25 * MS);
+    assert_eq!(t.cpu(5), 2 * MS);
+}
+
+#[test]
 fn an_out_of_range_job_is_ignored() {
     let t = JobSchedTable::new();
     t.charge(u32::MAX, MS, true, 5 * MS);

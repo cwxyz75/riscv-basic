@@ -850,6 +850,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         self
     }
 
+    /// Charge every online hart's running thread up to now, each under its own run-queue lock, lowest hart first.
+    pub fn charge_all(&self) {
+        for h in 0..self.harts() {
+            if self.is_online(h) {
+                self.charge_now(h);
+            }
+        }
+    }
+
     /// Charge hart `h`'s running thread up to the clock source's now (no-op without a source): a reader of the accounts (`job_info`)
     /// calls this first, because a tickless hart with one runnable thread has no event that would.
     pub fn charge_now(&self, h: usize) {
@@ -1058,6 +1067,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             return Err(Error::BadPriority);
         }
         let home = self.home_of(tid).ok_or(Error::NoSuchThread)?;
+        self.charge_now(home); // (what the thread ran so far was run at its old priority: the band decides what the job pays)
         let changed = self.lq(home).set_priority_quiet(tid, prio)?;
         if !changed {
             return Ok(());

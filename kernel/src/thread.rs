@@ -114,10 +114,10 @@ pub fn job_sched() -> &'static kcore::jobsched::JobSchedTable {
     }
 }
 
-/// Bring this hart's running thread's accounting up to now (a reader of the accounts calls it first: no tick does it).
+/// Bring every hart's running thread's accounting up to now (a reader of the accounts calls it first: no tick does it).
 pub fn charge_running() {
     let was = irq::save_and_disable();
-    sched().charge_now(hart());
+    sched().charge_all();
     irq::restore(was);
 }
 
