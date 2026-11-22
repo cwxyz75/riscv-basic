@@ -418,9 +418,16 @@ fn call_record(w: &mut W, ch: u64, nbytes: u32, deadline: u64) -> [u64; 6] {
 }
 
 fn send(w: &mut W, a: [u64; 6], interrupted: bool) -> Result<ksys::Call, Status> {
-    ksys::channel_call_send(&mut w.us, &mut w.mm, &mut w.vmos, &mut w.jobs, 1, a, || {
-        interrupted
-    })
+    ksys::channel_call_send(
+        &mut w.us,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        1,
+        7,
+        a,
+        || interrupted,
+    )
 }
 
 #[test]

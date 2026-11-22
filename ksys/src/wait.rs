@@ -346,21 +346,28 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// `channel_call(channel, record)`, the request half: read the record, check it, and send the request. `Err` is the call's result (nothing was
+/// `channel_call(channel, record)`, the request half (`caller` is the calling thread's id): read the record, check it, and send the request. `Err` is the call's result (nothing was
 /// sent unless the error came after the send, which none does). `interrupted` is whether a `thread_interrupt` is pending (it ends the call before
 /// anything is sent, so a retry sends one request, not two) and is taken here.
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: nhandles <= MAX_MSG_HANDLES was checked first, so nhandles * 4 is small; the record read is of fixed size
 pub fn channel_call_send<M: PhysMem>(
     us: &mut UserState,
     mm: &mut Mm<M>,
     vmos: &mut Vmos,
     jobs: &mut Jobs,
     me: u64,
+    caller: u64,
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
 ) -> Result<Call, Status> {
     let ch = Handle(a[0]);
-    let UserState { objs, procs, .. } = us;
+    let UserState {
+        objs,
+        procs,
+        calls,
+        next_call,
+        ..
+    } = us;
     let p = procs.get_mut(&me).ok_or(Status::BadState)?;
     let rec = copy_from_user(
         p.aspace.held_mut(),
@@ -398,6 +405,8 @@ pub fn channel_call_send<M: PhysMem>(
         return Err(Status::AccessDenied);
     }
     let data = copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?;
+    let call = *next_call;
+    *next_call = next_call.wrapping_add(1);
     let raw = copy_from_user(
         p.aspace.held_mut(),
         mm,
@@ -406,14 +415,17 @@ pub fn channel_call_send<M: PhysMem>(
         req_handles,
         nhandles * 8,
     )?;
-    ipc::channel_write_in(
+    ipc::channel_write_from(
         objs,
         &mut p.handles,
         ch,
         &data,
         &crate::handle_list(&raw)?,
         jobs,
+        Some((caller, call)),
     )?;
+    // (from here until the call ends, a server that reads the request lends it the caller's priority: L22)
+    calls.insert(caller, call);
     Ok(Call {
         ch,
         txid: le32(&data, 0),
@@ -461,6 +473,7 @@ pub fn channel_call_reply<M: PhysMem>(
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {
     let UserState { objs, procs, .. } = us;
+    objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
     let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
     let out: Reply = match ipc::channel_peek(
         objs,

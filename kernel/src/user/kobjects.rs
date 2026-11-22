@@ -60,6 +60,7 @@ impl KernelEnd {
                 MAX_MSG_HANDLES,
                 kmem::jobs().jobs,
             );
+            s.objs.clear_dequeued_calls(); // (a kernel end's read lends nothing: L22)
             match got {
                 Ok(msg) => {
                     for h in msg.handles {

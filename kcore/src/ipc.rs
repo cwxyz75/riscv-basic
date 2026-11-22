@@ -21,6 +21,10 @@ use alloc::vec::Vec;
 pub struct Message {
     pub data: Vec<u8>,
     pub handles: Vec<Entry>,
+    /// The thread that sent this as a `channel_call` request and waits for the reply (L22), and the number of that call (a counter that names this one
+    /// call among the caller's, so that a request left queued by an earlier call, read later, is not mistaken for the live one): the thread that reads
+    /// it is lent the caller's priority.
+    pub caller: Option<(u64, u64)>,
 }
 
 /// Kernel memory a queued message costs beyond its bytes (the queue node and the `Message`).
@@ -396,12 +400,6 @@ pub fn channel_create_in(
 /// into it. Changes nothing unless it succeeds. The checks run in the order SYSCALLS.md
 /// lists them: sizes first (they bound the work of everything after), then handles,
 /// then the channel itself.
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::unreachable
-)] // INVARIANT: i < handles.len() (the duplicate check loop); the queue and byte counts are bounded by the per-channel limits checked first
 pub fn channel_write_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -409,6 +407,27 @@ pub fn channel_write_in(
     data: &[u8],
     handles: &[Handle],
     jobs: &mut Jobs,
+) -> Result<(), Status> {
+    channel_write_from(reg, table, ch, data, handles, jobs, None)
+}
+
+/// `channel_write_in` for the request of a `channel_call` sent by thread `caller` (L22): the message carries the caller's id, and the thread that
+/// reads it is lent the caller's priority until the call ends.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unreachable
+)] // INVARIANT: i < handles.len() (the duplicate check loop); the queue and byte counts are bounded by the per-channel limits checked first
+pub fn channel_write_from(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    data: &[u8],
+    handles: &[Handle],
+    jobs: &mut Jobs,
+    caller: Option<(u64, u64)>,
 ) -> Result<(), Status> {
     if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
         return Err(Status::TooBig);
@@ -502,6 +521,7 @@ pub fn channel_write_in(
         p.queue.push_back(Message {
             data: bytes,
             handles: entries,
+            caller,
         });
         reg.meter_add(cost);
     }
@@ -550,6 +570,10 @@ fn read_at(
     let mut handles = Vec::new();
     handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
     let msg = c.queue.remove(i).expect("picked");
+    if let Some((caller, call)) = msg.caller {
+        // a call's request was read: its reader is lent the caller's priority (the kernel does it after the call, L22)
+        reg.note_dequeued_call(caller, call);
+    }
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());
     for e in &msg.handles {

@@ -521,12 +521,33 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {
+    let r = channel_call_inner(a);
+    // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
+    let me = thread::current();
+    thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
+    thread::pi_revoke(me);
+    irq::without(|| state().calls.remove(&me));
+    r
+}
+
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn channel_call_inner(a: [u64; 6]) -> Reply {
     // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
-        ksys::channel_call_send(s, k.mm, k.vmos, k.jobs, me, a, take_interrupt_held)
+        ksys::channel_call_send(
+            s,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            me,
+            thread::current() as u64,
+            a,
+            take_interrupt_held,
+        )
     })?;
-    notify();
-    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
+    notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
+                   // Wait for the reply with that transaction id (or the peer closing, or the deadline).
     let me = thread::current();
     let ready = || {
         let s = state();

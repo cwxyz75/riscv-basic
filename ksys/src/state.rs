@@ -42,6 +42,11 @@ pub struct UserState {
     pub objs: Kobjs,
     pub procs: BTreeMap<u64, Box<Process>>,
     pub thread_pid: BTreeMap<Tid, u64>,
+    /// The `channel_call` each thread is waiting in, by call number (L22): set when the request is sent, cleared when the call ends. A server that
+    /// reads a request is lent the caller's priority only while this still says the caller waits in **that** call.
+    pub calls: BTreeMap<Tid, u64>,
+    /// The next call number.
+    pub next_call: u64,
     /// Scheduling flags (bit 0: round robin) set by `thread_set_sched`, by thread.
     pub sched_flags: BTreeMap<Tid, u8>,
     pub next_pid: u64,
@@ -123,6 +128,8 @@ impl UserState {
             objs: Kobjs::new(),
             procs: BTreeMap::new(),
             thread_pid: BTreeMap::new(),
+            calls: BTreeMap::new(),
+            next_call: 1,
             sched_flags: BTreeMap::new(),
             next_pid: 1,
             asids: kcore::asid::Asids::new(16),
