@@ -480,3 +480,23 @@ fn read_user_u32_reads_both_halves_of_a_word_whole() {
     );
     w.teardown();
 }
+
+#[test]
+fn a_pointer_with_bits_set_above_the_user_half_is_refused() {
+    // HD5 (KERNEL-V1-SPEC 7.5): the upper bits of a user pointer are reserved for pointer masking (a tag in the top byte), which this kernel does not
+    // have: a pointer with any of them set is INVALID_ARGS, never an address in some other half or a tagged one. The flag bit that will say "tags are
+    // on" is `abi::map_flags::RESERVED_9`.
+    let mut w = world();
+    region(&mut w, 0x1_0000, 1, Perms::RW.user());
+    for tag in [1u64 << 56, 1u64 << 63, 0xff00_0000_0000_0000, 1u64 << 39] {
+        let va = 0x1_0000 | tag;
+        assert_eq!(w.read(va, 8), Err(Status::InvalidArgs), "{va:#x}");
+        assert_eq!(w.write(va, &[1; 8]), Err(Status::InvalidArgs), "{va:#x}");
+    }
+    assert_eq!(
+        w.read(0x1_0000, 8),
+        Ok(vec![0; 8]),
+        "the untagged address works"
+    );
+    w.teardown();
+}

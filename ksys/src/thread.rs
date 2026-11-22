@@ -334,7 +334,7 @@ pub fn process_start(
     a: [u64; 6],
 ) -> Result<(usize, u8), Status> {
     let (ph, bh) = (Handle(a[0]), Handle(a[3]));
-    let (entry, sp, arg) = (a[1], a[2], a[4]);
+    let (entry, sp, arg, features) = (a[1], a[2], a[4], a[5]);
     let caller = us.procs.get(&me).ok_or(Status::BadState)?;
     let pe = caller.handles.get(ph)?;
     let be = caller.handles.get(bh)?;
@@ -347,6 +347,13 @@ pub fn process_start(
     }
     if !pe.rights.contains(Rights::MANAGE) || !be.rights.contains(Rights::TRANSFER) {
         return Err(Status::AccessDenied);
+    }
+    // HD5: the `features` word is reserved: the named mechanisms are not there (NOT_SUPPORTED), anything else is not a feature (INVALID_ARGS)
+    if features & !abi::start_features::ALL != 0 {
+        return Err(Status::InvalidArgs);
+    }
+    if features != 0 {
+        return Err(Status::NotSupported);
     }
     let target = us.procs.get(&tpid).ok_or(Status::BadState)?;
     if target.state != crate::ProcState::Created

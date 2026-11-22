@@ -535,7 +535,7 @@ neither the caller's nor the target process's must already be committed over the
 otherwise; slice V, INVARIANTS V1): a process cannot be killed, or a stranger charged, by memory it was handed.
 Rights: MANAGE on `process`; MAP on `vmo`, plus READ for any mapping, WRITE if W, EXECUTE if X.
 Errors, in order: BAD_HANDLE (process, then vmo); WRONG_TYPE; ACCESS_DENIED; BAD_STATE (the
-process has ended); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
+process has ended); NOT_SUPPORTED (a reserved flag bit, HD5: `SHADOW_STACK` 256 and bit 9 (512) are named for mechanisms this kernel does not have; nothing is mapped); INVALID_ARGS (`vaddr`, `vmo_offset` or `length` not page aligned or
 `length` 0; unknown flag bits; W with X; the range outside the user half (page zero is never mapped; address 0 is refused unless the flag ANYWHERE is set) or outside the
 VMO; overlap with an existing mapping; a process picks its own stack, so no address range is
 reserved); NO_MEMORY. Mapping into a running process takes effect at once.
@@ -556,7 +556,7 @@ Change the permissions of `[vaddr, vaddr + length)` to `flags` (R = 1, W = 2, X 
 
 Describe the mapping that contains `vaddr`, or the first one above it (MM7): six 64-bit words are written to `buffer` in the caller's memory: base, length in bytes, permissions, the permissions it may be raised to (bit 0 read, bit 1 write, bit 2 execute), the VMO's id, and the byte offset into the VMO. `a1` is the base of the next mapping above this one, or 0. With no mapping at or above `vaddr` the record is all zeros and `a1` is 0. Rights: INSPECT on `process`. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE; INVALID_ARGS (a bad buffer). Tests: `process_protect_*` in `init`.
 
-### process_start(process, entry, sp, bootstrap, arg) -> status
+### process_start(process, entry, sp, bootstrap, arg, features) -> status
 
 Start the process's first thread at `entry` with stack pointer `sp` and `a0 = arg`. The
 channel endpoint `bootstrap` leaves the caller's table and becomes the new process's handle 1
@@ -564,10 +564,10 @@ channel endpoint `bootstrap` leaves the caller's table and becomes the new proce
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be
 16-byte aligned and in the user half (what is mapped below it is the caller's business).
 Errors, in order: BAD_HANDLE (process, then bootstrap); WRONG_TYPE (not a process / not a
-channel); ACCESS_DENIED; BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads, or the process's job or an ancestor
+channel); ACCESS_DENIED; NOT_SUPPORTED (`features`, HD5, the sixth argument, a 64-bit word that must be 0: bit 0 landing pads, bit 1 a shadow stack, bit 2 pointer masking are named for mechanisms this kernel does not have; any other bit is INVALID_ARGS); BAD_STATE (already started, or ended); INVALID_ARGS (`entry` or `sp`); NO_MEMORY (the system already has `MAX_USER_THREADS` threads, or the process's job or an ancestor
 is at its thread limit; the refusal comes before anything changes).
 On any error nothing changes (the handle stays with the caller). Tests: `process_start_*`,
-`a_refused_process_start_changes_nothing_and_can_be_retried`.
+`a_refused_process_start_changes_nothing_and_can_be_retried`, `reserved_abi_space_is_refused`.
 
 ### process_kill(process, code) -> status
 
@@ -1074,7 +1074,7 @@ ACCESS_DENIED.
 
 ### thread_read_state(thread, kind, buffer, length) -> status, thread_write_state(thread, kind, buffer, length) -> status
 
-(EX1.) Read or write the user registers of a thread that has **stopped**: SUSPENDED is up (parked at the return to user mode or blocked in a call), or it was made SUSPENDED and has not run. Rights: MANAGE on a thread handle (0, the caller itself, is BAD_STATE: it is running). `kind` and the layouts (RISC-V; `abi::thread_state`): GENERAL (1) is 32 little-endian words, x1 to x31 then pc (256 bytes); FP (2) is f0 to f31 then fcsr (264 bytes; fcsr's 8 defined bits); VECTOR (3) is vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each (`32 + 32 * vlenb` bytes; NOT_SUPPORTED on a machine without a vector unit). `length` must be exactly the layout's size (INVALID_ARGS). A thread that never used the FP or vector unit reads zeros; a write gives it the state (charged to its job's kernel bytes, NO_MEMORY at the limit) and it runs with the unit on. A write to a thread that has run is **left for the thread to apply to its own frame when it wakes** (a read in between shows the pending value); the layout of every kind is applied before the thread runs another instruction. A write is refused (BAD_STATE) while the thread is **inside a blocking call** (a read is allowed: its user registers are as they were when it entered); a write to a GENERAL pc that is not a user address, or not 2-aligned, is INVALID_ARGS and changes nothing. Errors, in order: INVALID_ARGS (kind, length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not stopped; a write inside a blocking call; the thread itself); INVALID_ARGS (a bad buffer; the pc). Tests: `a_stopped_thread_can_be_sent_to_a_handler_and_back` (the signal-injection sequence), `a_thread_started_suspended_runs_only_after_resume_with_registers_written_first` (the `fork` child sequence), `fp_and_vector_state_round_trip_through_thread_state`.
+(HD5: `kind` 4, `CFI`, is reserved for the shadow-stack pointer and the landing-pad expectation and is NOT_SUPPORTED on both calls, before any handle is looked at: `reserved_abi_space_is_refused`.) (EX1.) Read or write the user registers of a thread that has **stopped**: SUSPENDED is up (parked at the return to user mode or blocked in a call), or it was made SUSPENDED and has not run. Rights: MANAGE on a thread handle (0, the caller itself, is BAD_STATE: it is running). `kind` and the layouts (RISC-V; `abi::thread_state`): GENERAL (1) is 32 little-endian words, x1 to x31 then pc (256 bytes); FP (2) is f0 to f31 then fcsr (264 bytes; fcsr's 8 defined bits); VECTOR (3) is vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each (`32 + 32 * vlenb` bytes; NOT_SUPPORTED on a machine without a vector unit). `length` must be exactly the layout's size (INVALID_ARGS). A thread that never used the FP or vector unit reads zeros; a write gives it the state (charged to its job's kernel bytes, NO_MEMORY at the limit) and it runs with the unit on. A write to a thread that has run is **left for the thread to apply to its own frame when it wakes** (a read in between shows the pending value); the layout of every kind is applied before the thread runs another instruction. A write is refused (BAD_STATE) while the thread is **inside a blocking call** (a read is allowed: its user registers are as they were when it entered); a write to a GENERAL pc that is not a user address, or not 2-aligned, is INVALID_ARGS and changes nothing. Errors, in order: INVALID_ARGS (kind, length); BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not stopped; a write inside a blocking call; the thread itself); INVALID_ARGS (a bad buffer; the pc). Tests: `a_stopped_thread_can_be_sent_to_a_handler_and_back` (the signal-injection sequence), `a_thread_started_suspended_runs_only_after_resume_with_registers_written_first` (the `fork` child sequence), `fp_and_vector_state_round_trip_through_thread_state`.
 
 ### thread_interrupt(thread) -> status   (replaces the reserved entry at task 26)
 

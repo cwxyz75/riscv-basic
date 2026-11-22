@@ -220,6 +220,24 @@ pub mod child_flags {
 pub mod map_flags {
     /// The kernel picks a free place at random (`vaddr` must be 0); the address is returned in `a1`.
     pub const ANYWHERE: u64 = 8;
+    /// Reserved (HD5, KERNEL-V1-SPEC 7.5): a shadow-stack mapping. Named so that adding the mechanism changes nothing that exists; refused with
+    /// NOT_SUPPORTED.
+    pub const SHADOW_STACK: u64 = 1 << 8;
+    /// Reserved (HD5): refused with NOT_SUPPORTED.
+    pub const RESERVED_9: u64 = 1 << 9;
+}
+
+/// The `features` word of `process_start` (its sixth argument, HD5): it must be zero. The named bits are mechanisms this kernel does not have, and
+/// are refused with NOT_SUPPORTED; any other bit is INVALID_ARGS.
+pub mod start_features {
+    /// Forward-edge control-flow integrity (landing pads).
+    pub const LANDING_PADS: u64 = 1;
+    /// A shadow stack.
+    pub const SHADOW_STACK: u64 = 2;
+    /// Pointer masking.
+    pub const POINTER_MASKING: u64 = 4;
+    /// The named bits.
+    pub const ALL: u64 = LANDING_PADS | SHADOW_STACK | POINTER_MASKING;
 }
 
 /// Modes of `process_clone_region` (its fourth argument, MM8).
@@ -506,6 +524,8 @@ pub mod thread_state {
     pub const FP: u64 = 2;
     /// vtype, vl, vstart, vcsr, then v0 to v31 of `vlenb` bytes each.
     pub const VECTOR: u64 = 3;
+    /// Reserved (HD5): the shadow-stack pointer and the landing-pad expectation. Refused with NOT_SUPPORTED.
+    pub const CFI: u64 = 4;
     /// Words of the GENERAL layout.
     pub const GENERAL_WORDS: usize = 32;
     /// Words of the FP layout.
