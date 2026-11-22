@@ -206,7 +206,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 - [ ] **HD2** position-independent programs, address randomisation
 - [ ] **HD3** kernel address randomisation
 - [ ] **HD4** the debug resource; a release kernel with no test code
-- [x] **HD5** reserved ABI space (the flags, the state kind, the `features` word, the usercopy pin; PR on `epic/phase-11`); the X-SPECULATION record is a topic item still to write
+- [x] **HD5** reserved ABI space (the flags, the state kind, the `features` word, the usercopy pin; PR on `epic/phase-11`); the X-SPECULATION record is `work/X-SPECULATION.md`
 
 ### Phase 12: the boundary and the freeze
 
