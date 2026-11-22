@@ -136,7 +136,19 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
         if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
             machine.read_cpu(s, me, n, a); // (before the memory lock: AB6)
         }
-        let _as = AsLocks::all(s); // (the calls that name a process, or all of them: every address space, before the memory locks)
+        // (the calls that name a process, or all of them: every address space, before the memory locks; these touch none)
+        let _as = if matches!(
+            n,
+            nr::PROCESS_SELF
+                | nr::JOB_ROOT
+                | nr::RESOURCE_ROOT
+                | nr::PROCESS_INFO
+                | nr::THREAD_INFO
+        ) {
+            AsLocks::none()
+        } else {
+            AsLocks::all(s)
+        };
         let k = kmem::get();
         let mut ctx = ksys::PCtx {
             objs: &mut s.objs,

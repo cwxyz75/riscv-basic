@@ -65,7 +65,9 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         let s = state();
         let pid = s.next_pid;
         // (CNT1: the counter never wraps or repeats: at its end no process is started)
-        let ok = pid.checked_add(1).map(|n| s.next_pid = n).is_some();
+        // (the 64 address-space locks one call may hold bound the process count: the syscall layer checks it, and so does this)
+        let ok = s.procs.len() < abi::limits::MAX_PROCESSES
+            && pid.checked_add(1).map(|n| s.next_pid = n).is_some();
         (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
     })();
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));

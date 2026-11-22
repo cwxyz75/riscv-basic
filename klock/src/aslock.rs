@@ -5,7 +5,9 @@
 //! Two ways in: [`AsCell::lock`] takes the lock for a stretch of code (the fault path, which holds nothing else), and
 //! [`AsCell::held_mut`] reaches the value of a lock **the caller took earlier** (a syscall takes the address spaces it touches before the
 //! memory locks, in the order of 3.3, and the pure code that runs under them reads them through this): it checks that this hart holds
-//! the lock and gives the value out through `&mut self`, so the borrow checker keeps it unique.
+//! the lock (always, once the kernel has installed its hooks) and hands out the value. The cell is shared by `Arc`, so the borrow checker does
+//! **not** keep the references unique: the pure code makes one reference at a time and drops it before asking for another, as the kernel does
+//! with `state()` (`work/T214.md` files the stricter shape).
 
 use crate::{Class, Guard, Machine, Spin};
 extern crate alloc;
@@ -137,8 +139,8 @@ impl AsCell {
     #[track_caller]
     pub fn held_ref(&self) -> &AddressSpace {
         assert!(self.held(), "an address space reached without its AS lock");
-        // SAFETY: this hart holds the lock, so no other hart writes the value; a shared reference made through `&self` while the pure
-        // code runs does not meet a `held_mut` (that needs `&mut` of the cell).
+        // SAFETY: this hart holds the lock, so no other hart writes the value; the caller does not keep it across a `held_mut` of the
+        // same cell (the discipline of `held_mut`).
         unsafe { &*self.lock.value_ptr() }
     }
 

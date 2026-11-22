@@ -9,12 +9,26 @@
 use super::*;
 use klock::aslock::{AsCell, AsHold};
 
-/// Address spaces held until this is dropped.
-pub(super) struct AsLocks(#[allow(dead_code)] Vec<AsHold>);
+/// Address spaces held until this is dropped (released last taken first, the order the checker and the saved interrupt state expect).
+pub(super) struct AsLocks(Vec<AsHold>);
+
+impl Drop for AsLocks {
+    fn drop(&mut self) {
+        while let Some(h) = self.0.pop() {
+            drop(h);
+        }
+    }
+}
 
 impl AsLocks {
     /// The address spaces of the processes `pids` (any order, repeats and absent ones are fine), in ascending order. The big lock is held.
     pub(super) fn of(s: &UserState, pids: &[u64]) -> AsLocks {
+        if let [me] = pids {
+            return match s.procs.get(me) {
+                Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
+                None => AsLocks::none(),
+            };
+        }
         let mut ids: Vec<u64> = pids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -25,11 +39,16 @@ impl AsLocks {
         AsLocks(cells.iter().map(AsCell::hold).collect())
     }
 
-    /// The calling process's address space.
+    /// No address space (a call that touches none).
+    pub(super) fn none() -> AsLocks {
+        AsLocks(Vec::new())
+    }
+
+    /// The calling process's address space (one allocation).
     pub(super) fn caller(s: &UserState) -> AsLocks {
-        match caller_pid(s) {
-            Ok(me) => AsLocks::of(s, &[me]),
-            Err(_) => AsLocks(Vec::new()),
+        match caller_pid(s).ok().and_then(|me| s.procs.get(&me)) {
+            Some(p) => AsLocks(alloc::vec![AsCell::hold(&p.aspace)]),
+            None => AsLocks::none(),
         }
     }
 

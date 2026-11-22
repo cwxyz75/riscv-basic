@@ -2,7 +2,7 @@
 //!
 //! * [`Class`] is the planned hierarchy: a hart holding class *n* may take only classes numbered above *n*. A class
 //!   may be taken twice only where the table says so ([`Class::allows_two`]), in ascending instance order.
-//! * [`Held`] is the checker's per-hart stack (eight deep) of what the hart holds, and the pure rule
+//! * [`Held`] is the checker's per-hart stack (`MAX_HELD` deep: enough for every process's address space and the locks after them) of what the hart holds, and the pure rule
 //!   [`Held::check`] that the kernel's lock sites call through [`Machine::acquired`].
 //! * [`Spin`] is a fair (ticket) spinlock over [`kcore::ticket`] that saves and restores the interrupt state through a
 //!   [`Machine`], tells the checker, and hands out a guard. It is **not** reentrant (the legacy lock and the console
