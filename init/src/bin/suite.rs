@@ -6618,6 +6618,10 @@ fn dead_port_bindings_vanish_at_once() -> Outcome {
 /// Park events 64 at a time in channel messages until something refuses: the refusal must be
 /// NO_MEMORY, and everything must work again once the channels are closed.
 fn the_object_cap_is_reached_without_a_kernel_panic() -> Outcome {
+    // (the cap is derived from RAM, PL8: on a machine whose cap is beyond what this test can park, the job quotas' tests are what end in NO_MEMORY)
+    if sys::debug_stat(120) > 10 * 128 * 64 - 256 {
+        return Ok(());
+    }
     let mut chans = [0u64; 10];
     for i in 0..5 {
         let (a, b) = channel()?;
@@ -9274,8 +9278,9 @@ fn cycles_do_not_grow_memory() -> Outcome {
     // The OD39 loop: make two channels hold each other and drop every handle. 9,000 rounds
     // leave 18,000 unreachable objects (two per round: the pair that holds each other), more
     // than the kernel's cap of 16,384 (`MAX_OBJECTS`): it must keep sweeping or this ends in
-    // NoMemory.
-    for i in 0..9_000u32 {
+    // NoMemory. (The cap is derived from RAM now, PL8: the rounds are what it takes to pass it, at most 40,000.)
+    let rounds = (sys::debug_stat(120) / 2 + 500).min(40_000) as u32;
+    for i in 0..rounds {
         let (x, w) = channel().map_err(|mut d| {
             let _ = core::fmt::Write::write_fmt(&mut d, format_args!(" at round {i}"));
             d

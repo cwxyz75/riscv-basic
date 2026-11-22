@@ -106,6 +106,8 @@ fn state() -> &'static mut UserState {
             );
             s.backstops = b;
             s.objs.set_caps(b.objects, b.ipc_bytes);
+            // (the kernel's own table holds one end per process and job: bounded by the object backstop, like the rest)
+            s.ktable = kcore::handle::HandleTable::new(b.objects);
             // the ASID field the harts implement (L18): the allocator hands out ASIDs from it and turns the generation when they are used up
             s.asids = kcore::asid::Asids::new(if cfg!(feature = "fault-asid-reuse-no-flush") {
                 1

@@ -266,7 +266,7 @@ impl Quota<'_> {
     fn objects(&mut self, reg: &mut Kobjs, n: u64) -> Result<(), Status> {
         settle(reg, self.jobs);
         // (room for the object's destruction to record itself, before anything is charged or made: KT9)
-        reg.reserve_one()?;
+        reg.reserve_for(n as usize)?;
         match self.job {
             Some(job) => {
                 self.jobs

@@ -585,9 +585,14 @@ impl<T: Object> Registry<T> {
     /// cleanup): the caller creates the object only after this returned `Ok`, so creating and then destroying it cannot fail for lack of
     /// memory (KT9).
     pub fn reserve_one(&mut self) -> Result<(), abi::status::Status> {
+        self.reserve_for(1)
+    }
+
+    /// `reserve_one` for `n` objects made together (a channel or a socket makes two).
+    pub fn reserve_for(&mut self, n: usize) -> Result<(), abi::status::Status> {
         // (a slot in the graveyard and in its twin for every live object, so that however many cleanup-needing objects die at once, and
         // whichever of the two vectors is in place, burying them does not allocate)
-        let want = self.live.saturating_add(1);
+        let want = self.live.saturating_add(n);
         // (the tables every creation and destruction pushes to are grown here, before the object exists, by doubling, and not reserved for the
         // most objects there can be: with the cap derived from RAM that would be 100 MB at 4 GiB, PL8)
         reserve_to(&mut self.slots, want)?;
@@ -595,13 +600,8 @@ impl<T: Object> Registry<T> {
         reserve_to(&mut self.credits, want)?;
         reserve_to(&mut self.work, want)?;
         reserve_to(&mut self.mark_work, want)?;
-        for v in [&mut self.graveyard, &mut self.spare] {
-            let more = want.saturating_sub(v.len());
-            if v.capacity() < want {
-                v.try_reserve_exact(more)
-                    .map_err(|_| abi::status::Status::NoMemory)?;
-            }
-        }
+        reserve_to(&mut self.graveyard, want)?;
+        reserve_to(&mut self.spare, want)?;
         Ok(())
     }
 
@@ -767,7 +767,7 @@ impl<T: Object> Registry<T> {
         }
         // Never past the cap (garbage cycles must not be able to fill it), and never so close
         // to it that every creation sweeps while the objects are all genuinely reachable.
-        self.threshold = SWEEP_MIN.max(self.live * 2).min(PREALLOC_SLOTS - 4);
+        self.threshold = SWEEP_MIN.max(self.live * 2).min(self.cap.saturating_sub(4));
         self.phase = Phase::Idle;
         SweepStep::Done(self.swept)
     }
