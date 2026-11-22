@@ -426,7 +426,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
 fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     use abi::syscall as nr;
     let n = frame.arg(17) as usize;
-    if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD && n != nr::FUTEX_WAKE)
+    if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD && n != nr::FUTEX_WAKE && n != nr::FUTEX_WAIT)
         || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
     {
@@ -435,6 +435,13 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     frame.sepc += 4; // past the ecall
     if n == nr::CLOCK_GET {
         frame.set_return(0, Some(crate::thread::now_ns()), None);
+    } else if n == nr::FUTEX_WAIT {
+        // L19, T213: the whole call with no big lock, from the translation of the word to the wake; false: nothing was done (or the wait ended
+        // for a reason the full path reports), and the call starts again there
+        if !crate::user::futex_wait_quiet(frame) {
+            frame.sepc -= 4;
+            return false;
+        }
     } else if n == nr::FUTEX_WAKE {
         // L14: the bucket lock and the scheduler's own locks, no big lock; the lock only for a switch the wake asked for
         crate::user::futex_wake_quiet(frame);
