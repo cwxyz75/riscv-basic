@@ -7,7 +7,9 @@
 //! [`HartRq`], hosts an RT class, a normal class and the hart's idle thread with **strict precedence in the core**
 //! (`pick`: RT, then normal, then idle). The RT class is FIFO within a level (a preempted thread returns to the
 //! front; optional round robin with `rr`); the normal class is today's fixed priority with a 10 ms round robin
-//! slice. RT budgets, throttling and donation exist as constants and fields only (`RT_ENFORCE` is false).
+//! slice. RT budgets are enforced (task 25): a hart that has run its RT band for `RT_HART_MAX` of a window gives the normal band the rest
+//! of it when the normal band has work (NM1), and a job that has used its budget has its RT-base threads demoted to `DEMOTED_PRIO` until
+//! the window ends. Donation exists as a field only.
 //!
 //! This stage runs **one hart's queue** (the model the differential test drives against the old scheduler
 //! `sched::Sched`, which stays as the oracle: for priorities in the normal band the two must have the same
@@ -32,7 +34,11 @@ pub const TIMESLICE: Time = 10 * MS;
 pub const RT_WINDOW: Time = 100 * MS;
 pub const RT_HART_MAX: Time = 80 * MS;
 pub const RT_RR_SLICE: Time = 10 * MS;
-pub const RT_ENFORCE: bool = false;
+/// While a real-time-base thread runs, its hart accounts at least this often (the job's budget is shared by every hart).
+pub const RT_ACCT_PERIOD: Time = 10 * MS;
+pub const RT_ENFORCE: bool = true;
+/// What a thread of a job that has used its RT budget counts as until the window ends (the top of the normal band, round robin).
+pub const DEMOTED_PRIO: Prio = 31;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Band {
@@ -90,7 +96,10 @@ pub struct ThreadSched {
     pub base: SchedAttr,
     /// Copy of the donation graph's answer (`kcore::donate`, task 7); equal to `base.prio` until then.
     pub eff: Prio,
+    /// 0: not demoted; else the id of the RT window it was demoted in, plus one.
     pub demoted_window: u64,
+    /// The effective priority to go back to when the demotion ends.
+    pub undemoted: Prio,
     pub state: State,
     pub affinity: Option<u8>,
     pub last_hart: u8,
@@ -595,6 +604,13 @@ pub struct HartRq<N: Class> {
     hard_timers: BTreeSet<(Time, Tid)>,
     next_tid: Tid,
     pub bad_picks: u32,
+    /// Where the running thread's job is charged (SCHED-SMP-SPEC 4.10): the table is shared by every hart's queue.
+    jobs: Option<alloc::sync::Arc<crate::jobsched::JobSchedTable>>,
+    /// The RT window (`now / RT_WINDOW`) the figures below belong to, and the RT-band time this hart has run in it (NM1's throttle).
+    win: u64,
+    rt_ran: Time,
+    /// Threads demoted here in the window `win`: the window's end puts them back.
+    demoted: BTreeSet<Tid>,
 }
 
 impl<N: Class> HartRq<N> {
@@ -610,6 +626,219 @@ impl<N: Class> HartRq<N> {
             hard_timers: BTreeSet::new(),
             next_tid: 1,
             bad_picks: 0,
+            jobs: None,
+            win: 0,
+            rt_ran: 0,
+            demoted: BTreeSet::new(),
+        }
+    }
+
+    /// Charge every thread's CPU time to its job in `table` from now on.
+    pub fn set_job_table(&mut self, table: alloc::sync::Arc<crate::jobsched::JobSchedTable>) {
+        self.jobs = Some(table);
+    }
+
+    /// Which job a thread's time is charged to (a kernel thread keeps job 0, the root's).
+    pub fn set_job(&mut self, tid: Tid, job: u32) -> Result<(), Error> {
+        self.threads.get_mut(&tid).ok_or(Error::NoSuchThread)?.job = job;
+        Ok(())
+    }
+
+    /// When the budgets next need this hart's timer (4.5): the end of the window while anything is throttled or demoted (to clear it),
+    /// and, while an RT thread runs, the moment this hart's RT share would be spent with the normal band waiting, and the moment the
+    /// thread's job would use its budget.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: now plus a window is far below u64::MAX
+    fn enforce_event(&self) -> Option<Time> {
+        if !RT_ENFORCE {
+            return None;
+        }
+        let window_end = (self.now / RT_WINDOW + 1) * RT_WINDOW;
+        let mut ev: Option<Time> = None;
+        let mut put = |t: Time| ev = Some(ev.map_or(t, |e| e.min(t)));
+        if self.rt_blocked() || !self.demoted.is_empty() {
+            put(window_end);
+        }
+        if let Some(t) = self
+            .cur
+            .filter(|&c| Some(c) != self.idle)
+            .and_then(|c| self.threads.get(&c))
+            .filter(|t| band(t.eff) == Band::Rt)
+        {
+            if !self.normal.is_empty()
+                && self.win == self.now / RT_WINDOW
+                && self.rt_ran < RT_HART_MAX
+            {
+                put((self.now + (RT_HART_MAX - self.rt_ran)).min(window_end));
+            }
+            if band(t.base.prio) == Band::Rt {
+                if let Some(left) = self.jobs.as_ref().and_then(|j| j.rt_left(t.job, self.now)) {
+                    // (other harts drain the same budget and this hart cannot see them: look again every `RT_ACCT_PERIOD`, so an exhausted job
+                    // is found within that, on every hart that runs one of its real-time threads)
+                    put((self.now + left.clamp(1, RT_ACCT_PERIOD)).min(window_end));
+                }
+            }
+        }
+        ev
+    }
+
+    /// Is the RT band held back on this hart right now (the throttle of 4.5)?
+    pub fn rt_throttled(&self) -> bool {
+        self.rt_blocked()
+    }
+
+    /// Is the RT band held back on this hart? It has run `RT_HART_MAX` of the window and the normal band has a thread to run
+    /// (SCHED-SMP-SPEC 4.5, NM1): work-conserving, so with the normal band empty RT runs on.
+    fn rt_blocked(&self) -> bool {
+        RT_ENFORCE
+            && self.win == self.now / RT_WINDOW
+            && self.rt_ran >= RT_HART_MAX
+            && self.normal_has_work()
+    }
+
+    /// A thread of the normal band is queued here or is the one running (a hart that has just switched to it must not hand the hart back).
+    fn normal_has_work(&self) -> bool {
+        !self.normal.is_empty()
+            || self
+                .cur
+                .filter(|&c| Some(c) != self.idle)
+                .and_then(|c| self.threads.get(&c))
+                .is_some_and(|t| band(t.eff) == Band::Normal)
+    }
+
+    /// Time moved on by `dt` (now `self.now`); `ran` is the thread that ran for it, if any (not the idle thread). Rolls the RT window, adds
+    /// the hart's RT time (by effective band) and demotes the thread if its job has used its budget. Returns whether the designation may
+    /// now be wrong.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: nanosecond counts far below u64::MAX within a boot
+    fn enforce_tick(&mut self, ran: Option<Tid>, dt: Time) -> bool {
+        if !RT_ENFORCE {
+            return false;
+        }
+        let w = self.now / RT_WINDOW;
+        let mut changed = false;
+        // (the part of the interval that lies in the window `now` is in)
+        let share = dt.min(self.now - w * RT_WINDOW);
+        if w != self.win {
+            self.win = w;
+            self.rt_ran = 0;
+            changed = self.restore_demoted();
+        }
+        let Some(tid) = ran else {
+            return changed;
+        };
+        // (one lookup for the common thread, which has nothing to do with real-time budgets)
+        let Some((rt, involved)) = self.threads.get(&tid).map(|t| {
+            let rt = band(t.eff) == Band::Rt;
+            (rt, rt || band(t.base.prio) == Band::Rt)
+        }) else {
+            return changed;
+        };
+        if !involved {
+            return changed;
+        }
+        if rt {
+            self.rt_ran += share;
+            if self.rt_blocked() {
+                changed = true; // the running RT thread must give way to the normal band
+            }
+        }
+        match self.threads.get(&tid).map(|t| t.state) {
+            Some(State::Running) => {
+                if let Some(mut t) = self.threads.remove(&tid) {
+                    changed |= self.demote_if_exhausted(&mut t);
+                    self.threads.insert(tid, t);
+                }
+            }
+            Some(State::Runnable)
+                if self
+                    .threads
+                    .get(&tid)
+                    .is_some_and(|t| self.is_exhausted_rt(t)) =>
+            {
+                // (queued: a requeue demotes it on the way in)
+                self.class_dequeue(tid, Deq::AttrChange);
+                self.class_enqueue(tid, Enq::AttrChanged);
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// Is `t` a real-time-base thread, queued or running in the RT band, whose job has used its budget in this window?
+    fn is_exhausted_rt(&self, t: &ThreadSched) -> bool {
+        t.demoted_window == 0
+            && band(t.base.prio) == Band::Rt
+            && band(t.eff) == Band::Rt
+            && self
+                .jobs
+                .as_ref()
+                .is_some_and(|j| j.exhausted(t.job, self.now))
+    }
+
+    /// Demote `t` (a thread that is running or about to be queued) if its base is real-time and its job has used its budget in this
+    /// window. The thread is not in a class queue. Returns whether it was demoted.
+    fn demote_if_exhausted(&mut self, t: &mut ThreadSched) -> bool {
+        let Some(j) = self.jobs.as_ref() else {
+            return false;
+        };
+        if t.demoted_window != 0 || band(t.base.prio) != Band::Rt || band(t.eff) != Band::Rt {
+            return false;
+        }
+        if !j.exhausted(t.job, self.now) {
+            return false;
+        }
+        t.undemoted = t.eff;
+        t.eff = DEMOTED_PRIO;
+        t.demoted_window = (self.now / RT_WINDOW).saturating_add(1);
+        t.slice_left = TIMESLICE;
+        self.demoted.insert(t.tid);
+        true
+    }
+
+    /// Put a thread back after its window is over (a lazy check at enqueue, like the spec says).
+    fn undemote_if_over(&self, t: &mut ThreadSched) {
+        if t.demoted_window != 0 && t.demoted_window != (self.now / RT_WINDOW).saturating_add(1) {
+            t.eff = t.undemoted.max(t.base.prio);
+            t.demoted_window = 0;
+        }
+    }
+
+    /// The window rolled: every thread demoted here goes back to its priority (queued ones move class). Returns whether anything did.
+    #[allow(clippy::expect_used)] // INVARIANT: a tid in `demoted` was looked up in the same iteration
+    fn restore_demoted(&mut self) -> bool {
+        let tids: Vec<Tid> = core::mem::take(&mut self.demoted).into_iter().collect();
+        let mut any = false;
+        for tid in tids {
+            let Some(t) = self.threads.get(&tid) else {
+                continue;
+            };
+            if t.demoted_window == 0 {
+                continue;
+            }
+            let state = t.state;
+            if state == State::Runnable {
+                self.class_dequeue(tid, Deq::AttrChange);
+            }
+            let t = self.threads.get_mut(&tid).expect("exists");
+            t.eff = t.undemoted.max(t.base.prio);
+            t.demoted_window = 0;
+            if state == State::Runnable {
+                self.class_enqueue(tid, Enq::AttrChanged);
+            }
+            any = true;
+        }
+        any
+    }
+
+    fn charge_job(&self, t: &ThreadSched, ran: Time) {
+        if let Some(j) = &self.jobs {
+            // (real-time time is what a thread of real-time **base** priority runs *in the band*: a demoted thread runs as a normal one, and
+            // counting it would keep the figure growing for the rest of the window after the budget is spent)
+            j.charge(
+                t.job,
+                ran,
+                band(t.base.prio) == Band::Rt && t.demoted_window == 0,
+                self.now,
+            );
         }
     }
 
@@ -645,6 +874,7 @@ impl<N: Class> HartRq<N> {
                 base: attr,
                 eff: attr.prio,
                 demoted_window: 0,
+                undemoted: 0,
                 state,
                 affinity: None,
                 last_hart: 0,
@@ -678,6 +908,13 @@ impl<N: Class> HartRq<N> {
     #[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the thread was found in `threads` by every caller before this call
     fn class_enqueue(&mut self, tid: Tid, how: Enq) {
         let mut t = self.threads.remove(&tid).expect("thread exists");
+        if RT_ENFORCE {
+            self.undemote_if_over(&mut t);
+            self.demote_if_exhausted(&mut t);
+            if t.demoted_window != 0 {
+                self.demoted.insert(tid); // (it may have come from another hart: this one ends the demotion at the window's end)
+            }
+        }
         match band(t.eff) {
             Band::Rt => self.rt.enqueue(&mut t, how, self.now),
             Band::Normal => self.normal.enqueue(&mut t, how, self.now),
@@ -703,10 +940,12 @@ impl<N: Class> HartRq<N> {
     fn pick(&mut self) {
         debug_assert!(self.cur.is_none() || self.cur == self.idle);
         loop {
-            let picked = self
-                .rt
-                .pick(self.now)
-                .or_else(|| self.normal.pick(self.now));
+            let picked = if self.rt_blocked() {
+                None
+            } else {
+                self.rt.pick(self.now)
+            }
+            .or_else(|| self.normal.pick(self.now));
             let Some(tid) = picked else {
                 self.cur = self.idle;
                 return;
@@ -729,11 +968,15 @@ impl<N: Class> HartRq<N> {
         let Some(c) = self.cur else {
             return true;
         };
+        let blocked = self.rt_blocked();
         if Some(c) == self.idle {
-            return !self.rt.q.is_empty() || self.normal.top().is_some();
+            return (!self.rt.q.is_empty() && !blocked) || self.normal.top().is_some();
         }
         let t = &self.threads[&c];
-        self.rt.preempts(t, self.now) || self.normal.preempts(t, self.now)
+        if blocked && band(t.eff) == Band::Rt {
+            return true; // the throttle: the normal band has work and this hart's RT share is spent
+        }
+        (!blocked && self.rt.preempts(t, self.now)) || self.normal.preempts(t, self.now)
     }
 
     /// Make the designation right after something changed: dispatch if there is no current thread, preempt the
@@ -897,6 +1140,8 @@ impl<N: Class> HartRq<N> {
         let t = self.threads.get_mut(&tid).expect("exists");
         t.base.prio = prio;
         t.eff = prio;
+        t.demoted_window = 0; // (a new priority ends a demotion; the budget demotes again if it must)
+        self.demoted.remove(&tid);
         match state {
             State::Runnable if old != prio => {
                 self.class_enqueue(tid, Enq::AttrChanged);
@@ -923,7 +1168,10 @@ impl<N: Class> HartRq<N> {
         if state == State::Runnable {
             self.class_dequeue(tid, Deq::AttrChange);
         }
-        self.threads.get_mut(&tid).expect("exists").eff = eff;
+        let t = self.threads.get_mut(&tid).expect("exists");
+        t.eff = eff;
+        t.demoted_window = 0; // (a donation ends a demotion: the donor's priority is what counts, and the budget demotes again if it must)
+        self.demoted.remove(&tid);
         match state {
             State::Runnable => {
                 self.class_enqueue(tid, Enq::AttrChanged);
@@ -949,7 +1197,11 @@ impl<N: Class> HartRq<N> {
                 Band::Rt => self.rt.next_event(t, self.now),
                 _ => self.normal.next_event(t, self.now),
             });
-        match (timer, slice) {
+        let timer_slice = match (timer, slice) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match (timer_slice, self.enforce_event()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -959,19 +1211,23 @@ impl<N: Class> HartRq<N> {
     /// designation. Tickless kernels (L13) call it before every change of designation, so a switch between two interrupts charges each
     /// thread what it used; the rotation decision itself waits for the next timer event.
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: the nanosecond clock is far below u64::MAX within a boot
-    pub fn charge(&mut self, now: Time) {
+    /// Returns whether the budgets now want this hart to look at its queues (the throttle began, a thread was demoted, a window rolled).
+    pub fn charge(&mut self, now: Time) -> bool {
         let dt = now.saturating_sub(self.now);
         if dt == 0 {
-            return;
+            return false;
         }
         self.now += dt;
         if let Some(c) = self.cur.filter(|&c| Some(c) != self.idle) {
             if let Some(mut t) = self.threads.remove(&c) {
                 t.cpu += dt;
                 t.slice_left = t.slice_left.saturating_sub(dt);
+                self.charge_job(&t, dt);
                 self.threads.insert(c, t);
             }
         }
+        let ran = self.cur.filter(|&c| Some(c) != self.idle);
+        self.enforce_tick(ran, dt)
     }
 
     /// Set a thread's timer slack (nanoseconds, clamped to `MAX_SLACK`); it applies to its next sleep.
@@ -993,6 +1249,7 @@ impl<N: Class> HartRq<N> {
         // its equal-priority peers never ran: T127.)
         let ran = self.cur.filter(|&c| Some(c) != self.idle);
         self.now += dt;
+        self.enforce_tick(None, dt); // (the window rolls before anything is queued)
         let due: Vec<(Time, Tid)> = self.timers.range(..(self.now + 1, 0)).copied().collect();
         for (d, tid) in due {
             self.timers.remove(&(d, tid));
@@ -1021,6 +1278,7 @@ impl<N: Class> HartRq<N> {
                 Band::Rt => self.rt.account(&mut t, dt, now),
                 _ => self.normal.account(&mut t, dt, now),
             };
+            self.charge_job(&t, dt);
             self.threads.insert(c, t);
             if rotate {
                 if self.cur == Some(c) {
@@ -1038,6 +1296,7 @@ impl<N: Class> HartRq<N> {
                     self.class_enqueue(c, Enq::SliceEnd);
                 }
             }
+            self.enforce_tick(Some(c), dt);
         }
         self.reschedule();
     }
@@ -1066,6 +1325,7 @@ impl<N: Class> HartRq<N> {
                 base: attr,
                 eff: attr.prio,
                 demoted_window: 0,
+                undemoted: 0,
                 state,
                 affinity,
                 last_hart,
@@ -1133,8 +1393,20 @@ impl<N: Class> HartRq<N> {
     /// Would a thread of priority `cand` queued on this hart run instead of what runs now? An idle hart takes anything;
     /// otherwise the thread must outrank the current one and its band's class must be willing to preempt.
     pub(crate) fn would_run(&self, cand: Prio) -> bool {
+        if band(cand) == Band::Rt && self.rt_blocked() {
+            return false; // this hart's RT share is spent and the normal band has work (4.5)
+        }
         if self.cur == self.idle {
             return cand > 0;
+        }
+        if band(cand) != Band::Rt
+            && self.cur_eff() >= 32
+            && self.win == self.now / RT_WINDOW
+            && self.rt_ran >= RT_HART_MAX
+            && !self.normal.is_empty()
+            && RT_ENFORCE
+        {
+            return true; // the running real-time thread has spent this hart's share and the normal band has work here (NM1)
         }
         let cur = self.cur_eff();
         if cand <= cur {
@@ -1145,8 +1417,57 @@ impl<N: Class> HartRq<N> {
             _ => self.normal.displaces(cand, cur),
         }
     }
+    /// What `would_run` depends on: whether the real-time band is held back, whether the hart is idle, the effective priority that runs, and
+    /// whether a running real-time thread has spent the hart's share with a normal thread queued here (then any normal candidate takes it).
+    fn would_run_state(&self) -> (bool, bool, Prio, bool) {
+        let blocked = self.rt_blocked();
+        let idle = self.cur == self.idle;
+        let cur = self.cur_eff();
+        let spent = !idle
+            && RT_ENFORCE
+            && cur >= 32
+            && self.win == self.now / RT_WINDOW
+            && self.rt_ran >= RT_HART_MAX
+            && !self.normal.is_empty();
+        (blocked, idle, cur, spent)
+    }
+
+    /// The state of `would_run_mask` packed into a number: the mask is the same whenever the key is (the classes' `displaces` are functions of
+    /// the two priorities alone), so a hart that publishes after a change that left the key alone need not compute the 63 bits again.
+    pub(crate) fn would_run_key(&self) -> u64 {
+        let (blocked, idle, cur, spent) = self.would_run_state();
+        u64::from(idle) | u64::from(cur) << 1 | u64::from(blocked) << 9 | u64::from(spent) << 10
+    }
+
+    /// `would_run(p)` for every priority 1 to 63 at once, bit `p` (what a hart publishes after every change): the state `would_run` looks at
+    /// is read once, not 63 times.
+    pub(crate) fn would_run_mask(&self) -> u64 {
+        let (blocked, idle, cur, spent) = self.would_run_state();
+        let mut mask = 0u64;
+        for p in 1..=PRIO_MAX {
+            let rt = band(p) == Band::Rt;
+            let yes = if rt && blocked {
+                false
+            } else if idle || (!rt && spent) {
+                true
+            } else if p <= cur {
+                false
+            } else if rt {
+                self.rt.displaces(p, cur)
+            } else {
+                self.normal.displaces(p, cur)
+            };
+            if yes {
+                mask |= 1 << p;
+            }
+        }
+        mask
+    }
     /// The best queued effective priority, if anything is queued here.
     pub(crate) fn queued_top(&self) -> Option<Prio> {
+        if self.rt_blocked() {
+            return self.normal.top(); // (the RT queue waits for the window to end: it is not what this hart will run next)
+        }
         self.rt.top().or_else(|| self.normal.top())
     }
     /// The best queued thread that satisfies `ok`.
@@ -1255,6 +1576,8 @@ impl<N: Class> HartRq<N> {
         let t = self.threads.get_mut(&tid).expect("exists");
         t.base.prio = prio;
         t.eff = prio;
+        t.demoted_window = 0; // (a new priority ends a demotion; the budget demotes again if it must)
+        self.demoted.remove(&tid);
         Ok(match state {
             State::Runnable if old != prio => {
                 self.class_enqueue(tid, Enq::AttrChanged);
@@ -1314,5 +1637,40 @@ impl<N: Class> HartRq<N> {
             return Err(alloc::format!("{} bad picks", self.bad_picks));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// `would_run_mask` is `would_run` for every priority (the publish of a hart's hints reads the state once instead of 63 times).
+    #[test]
+    fn the_mask_is_would_run_for_every_priority() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300 {
+            let mut h = HartRq::new(FixedPrio::new());
+            h.adopt_idle();
+            for _ in 0..(next() % 6) {
+                let _ = h.spawn(SchedAttr {
+                    prio: 1 + (next() % 63) as u8,
+                    rr: false,
+                });
+            }
+            // run for a while so the real-time share can be spent
+            for _ in 0..(next() % 120) {
+                h.advance(MS);
+            }
+            let mask = h.would_run_mask();
+            for p in 1..=PRIO_MAX {
+                assert_eq!(h.would_run(p), mask & (1 << p) != 0, "priority {p}");
+            }
+        }
     }
 }

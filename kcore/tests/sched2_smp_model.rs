@@ -149,7 +149,9 @@ impl World {
                         for h in 0..self.harts {
                             if r.pin.is_none_or(|p| p == h) {
                                 let c = self.cur(h).map_or(0, |c| self.t[&c].prio);
-                                if c < r.prio {
+                                // (NM1: a hart whose real-time share of the window is spent does not run a real-time thread over a normal one)
+                                let held = self.s.rt_throttled_on(h); // (T211)
+                                if c < r.prio && !held {
                                     ctx(format!(
                                         "GP1: hart {h} runs priority {c}, thread {tid} (priority {}) waits",
                                         r.prio

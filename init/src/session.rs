@@ -125,6 +125,9 @@ pub fn start_stack(
         return Err(38);
     }
     let session = session.a1 as u64;
+    // Policy (SCHED-SMP-SPEC 4.9): a session's programs stay in the normal band (at most 31) and have no real-time budget.
+    // (`apps` below starts with these values, and the launcher lowers each program's job to 20.)
+    let _ = sys::job_set_sched(session, 31, 0, 1024);
     // (a profile's quota can only lower what programs may have)
     let (app_procs, app_pages) = match &who.profile.quota {
         Some(q) => (q.processes.min(16), (q.memory_mib * 256).min(40960)),

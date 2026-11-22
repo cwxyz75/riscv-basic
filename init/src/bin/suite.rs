@@ -12198,6 +12198,254 @@ fn job_use_settles(j: u64, which: u64, want: u64, ticks: u64) -> Outcome {
     }
 }
 
+// --- The real-time demo (SCHED-SMP-SPEC 6.1, OS-ARCHITECTURE section 8; task 8) ---------------------------------------------------
+//
+// "A high-priority thread stays responsive while low-priority CPU hogs run": one hog per online hart at the default priority keeps every
+// hart busy, and a probe thread sleeps to a deadline 3 ms away 30 times and records how late each wake was. At a real-time priority the
+// lateness is small; at the hogs' own priority (the negative control) the probe waits for a slice end, so a bound that only passes when
+// the priority matters is the evidence that the bound means something.
+
+static RT_STOP: AtomicU32 = AtomicU32::new(0);
+static RT_PROBE_PRIO: AtomicU32 = AtomicU32::new(0);
+static RT_WORST_LATE_US: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn rt_hog(_: usize) -> ! {
+    while RT_STOP.load(Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    sys::thread_exit(0)
+}
+
+extern "C" fn rt_probe(_: usize) -> ! {
+    sys::thread_set_sched(0, RT_PROBE_PRIO.load(Ordering::SeqCst) as u8, 0);
+    let gate = sys::event_create().a1 as u64;
+    let mut worst = 0u64;
+    for _ in 0..30 {
+        let target = sys::clock_get() + 3; // milliseconds: the wait's own unit
+        sys::object_wait(gate, 1 << 24, target);
+        // (the same clock before and after, in nanoseconds: the time counter has another origin, the firmware's start)
+        let late = sys::clock_ns().saturating_sub(target * 1_000_000);
+        worst = worst.max(late / 1000); // microseconds
+    }
+    RT_WORST_LATE_US.store(worst, Ordering::SeqCst);
+    sys::handle_close(gate);
+    sys::thread_exit(0)
+}
+
+/// The probe's worst lateness (microseconds) at `prio` with a hog on every hart.
+fn worst_lateness_us(prio: u32) -> Result<u64, Detail> {
+    let harts = job_use(root_job()?, 7)?.0;
+    RT_STOP.store(0, Ordering::SeqCst);
+    RT_PROBE_PRIO.store(prio, Ordering::SeqCst);
+    RT_WORST_LATE_US.store(u64::MAX, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        hogs.push(new_thread(rt_hog, 0)?);
+    }
+    nap_ticks(5); // the hogs are running, one per hart
+    let probe = new_thread(rt_probe, 0)?;
+    let w = sys::object_wait(probe, sig::TERMINATED, sys::clock_get() + 20_000);
+    RT_STOP.store(1, Ordering::SeqCst);
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    sys::handle_close(probe);
+    ensure_eq!(w.status, 0, "the probe finished");
+    Ok(RT_WORST_LATE_US.load(Ordering::SeqCst))
+}
+
+fn a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not() -> Outcome {
+    let rt = worst_lateness_us(40)?;
+    println!("##BENCH rt_user_latency_max_us {rt} us");
+    // (QEMU on a loaded host delivers a timer interrupt up to a few ms late: the kernel's own probe uses the same 4 ms)
+    ensure!(
+        rt <= 4_000,
+        "a real-time thread woke {rt} us late with a hog on every hart (bound 4 ms)"
+    );
+    // the negative control: at the hogs' priority the wake waits for a slice to end
+    let normal = worst_lateness_us(10)?;
+    ensure!(
+        normal > 6_000,
+        "an equal-priority probe was only {normal} us late: the hogs are not loading the harts"
+    );
+    Ok(())
+}
+
+/// SCHED-SMP-SPEC 4.5 (task 25): a real-time spinner on every hart does not hang the system. The job's budget (the root's: one whole window
+/// of CPU per 100 ms) is spent by the hogs within a fraction of each window and they are demoted to the top of the normal band until it ends, so
+/// a thread there (this one, at 31) keeps getting the CPU, and the real-time time the job is billed per window stays at its budget.
+fn a_runaway_rt_thread_does_not_hang_the_system() -> Outcome {
+    let root = root_job()?;
+    let harts = job_use(root, 7)?.0;
+    RT_STOP.store(0, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        hogs.push(new_thread(rt_hog, 0)?);
+    }
+    ok(
+        sys::thread_set_sched(0, 31, 0),
+        "main to the top of the normal band",
+    )?;
+    for &h in &hogs {
+        ok(sys::thread_set_sched(h, 40, 0), "a hog turns real-time")?;
+    }
+    let mut worst_rt = 0u64;
+    let mut trace: Vec<(u64, u64)> = Vec::new(); // (ms into the 100 ms window, RT ms billed so far)
+    let mut naps_done = 0;
+    let until = sys::clock_get() + 20_000;
+    while naps_done < 30 && sys::clock_get() < until {
+        nap_ticks(10); // the hogs hold every hart: this sleep needs a hart to wake on
+        let used = job_use(root, 9)?.0;
+        worst_rt = worst_rt.max(used);
+        trace.push((sys::clock_get() % 100, used / 1_000_000));
+        naps_done += 1;
+    }
+    RT_STOP.store(1, Ordering::SeqCst);
+    ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    ensure_eq!(naps_done, 30, "thirty naps finished while the hogs ran");
+    // (without the budget the job's real-time time in a window would be about `harts` windows long; allow a tick or two of overshoot)
+    ensure!(
+        worst_rt <= 100_000_000 + harts * 20_000_000,
+        "the job was billed {worst_rt} ns of real-time time in one 100 ms window (budget 100 ms, {harts} harts); (ms into window, RT ms): {trace:?}"
+    );
+    Ok(())
+}
+
+static CPU_SPIN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CPU_SLEEP_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Spins for 100 ms of the clock and reports the CPU time its own thread was charged (handle 0: the caller).
+extern "C" fn cpu_spinner(_: usize) -> ! {
+    let start = sys::clock_ns();
+    while sys::clock_ns() < start + 100_000_000 {
+        core::hint::spin_loop();
+    }
+    CPU_SPIN_NS.store(sys::thread_cpu_ns(0).a1 as u64, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// Sleeps 50 ms and reports the same.
+extern "C" fn cpu_sleeper(_: usize) -> ! {
+    let gate = sys::event_create().a1 as u64;
+    sys::object_wait(gate, 1 << 24, sys::clock_get() + 50);
+    CPU_SLEEP_NS.store(sys::thread_cpu_ns(0).a1 as u64, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// AB6 (SCHED-SMP-SPEC 4.10, AC1): a thread that spins for 100 ms is charged about 100 ms, one that sleeps under 1 ms, an ended thread's handle keeps
+/// its figure, and the process's figure is at least the sum of the threads we made and read.
+fn cpu_time_is_counted_per_thread_and_process() -> Outcome {
+    CPU_SPIN_NS.store(u64::MAX, Ordering::SeqCst);
+    CPU_SLEEP_NS.store(u64::MAX, Ordering::SeqCst);
+    let me_p = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let before = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
+    let spin = new_thread(cpu_spinner, 0)?;
+    let sleep = new_thread(cpu_sleeper, 0)?;
+    for t in [spin, sleep] {
+        ensure_eq!(
+            sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 20_000).status,
+            0,
+            "a thread ended"
+        );
+    }
+    let spun = CPU_SPIN_NS.load(Ordering::SeqCst);
+    let slept = CPU_SLEEP_NS.load(Ordering::SeqCst);
+    // (the thread's own figure at its end: 5 percent either way; the spec's 2 percent needs a quieter machine than a shared CI runner)
+    ensure!(
+        (95_000_000..=105_000_000).contains(&spun),
+        "a thread that spun for 100 ms was charged {spun} ns"
+    );
+    // (the thread's start-up, its event and its two calls cost about a millisecond on a loaded CI machine: the point is that 50 ms of sleep cost nothing)
+    ensure!(
+        slept < 5_000_000,
+        "a thread that slept 50 ms was charged {slept} ns"
+    );
+    // an ended thread's handle keeps the total
+    let spun_handle = ok(sys::thread_cpu_ns(spin), "thread cpu of an ended thread")?.a1 as u64;
+    ensure!(
+        spun_handle >= spun && spun_handle <= spun + 2_000_000,
+        "the ended thread's handle says {spun_handle} ns, the thread itself said {spun}"
+    );
+    // the process has at least what these two ran
+    let after = ok(sys::process_cpu_ns(me_p), "process cpu")?.a1 as u64;
+    ensure!(
+        after >= before + spun_handle,
+        "the process's figure rose by {} ns, the spinner alone ran {spun_handle}",
+        after - before
+    );
+    // errors: an unknown selector, a handle that is no thread
+    ensure_eq!(
+        st(sys::thread_info_which(spin, 2)),
+        Some(S::InvalidArgs),
+        "an unknown selector"
+    );
+    ensure_eq!(
+        st(sys::thread_cpu_ns(me_p)),
+        Some(S::WrongType),
+        "a process handle is not a thread"
+    );
+    for h in [spin, sleep] {
+        sys::handle_close(h);
+    }
+    Ok(())
+}
+
+/// Spin for `ms` milliseconds of the clock.
+fn spin_ms(ms: u64) {
+    let until = sys::clock_get() + ms;
+    while sys::clock_get() < until {
+        core::hint::spin_loop();
+    }
+}
+
+/// SCHED-SMP-SPEC 4.5 and 4.10 (task 8): the CPU time a job's threads run is counted (`job_info` 10, the job and the jobs below it), and
+/// the part of it run at a real-time **base** priority is counted again in the window's figure (`job_info` 9), against the job's budget.
+fn job_info_counts_the_cpu_time_its_threads_run() -> Outcome {
+    let root = root_job()?;
+    let (_, budget) = job_use(root, 9)?;
+    ensure_eq!(
+        budget,
+        100_000_000,
+        "the root job's budget is the whole window"
+    );
+    let before = job_use(root, 10)?.0;
+    spin_ms(30);
+    let after = job_use(root, 10)?.0;
+    ensure!(
+        after >= before + 25_000_000,
+        "30 ms of spinning added only {} ns to the job's CPU time",
+        after - before
+    );
+    // at a real-time priority the same spin shows in the window's real-time figure (the window may end during it: 100 ms windows, so spin
+    // until a spin of 30 ms has been counted twice at most; the figure is what ran since the window began)
+    ok(sys::thread_set_sched(0, 40, 0), "become real-time")?;
+    let mut best = 0;
+    for _ in 0..4 {
+        spin_ms(30);
+        best = best.max(job_use(root, 9)?.0);
+    }
+    ok(sys::thread_set_sched(0, 10, 0), "back to the normal band")?;
+    ensure!(
+        best >= 25_000_000,
+        "the real-time figure never passed 25 ms with 120 ms of real-time spinning in 100 ms windows (best {best} ns)"
+    );
+    // a normal thread adds no real-time time: the figure stops growing when the window is the same and we run at priority 10
+    let (a, _) = job_use(root, 9)?;
+    spin_ms(10);
+    let (b, _) = job_use(root, 9)?;
+    ensure!(
+        b <= a + 5_000_000 || b < a,
+        "10 ms of normal-band spinning added {} ns of real-time time",
+        b.saturating_sub(a)
+    );
+    Ok(())
+}
+
 fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     let root = root_job()?;
     // a job is a job: the other kinds of handle are the wrong type
@@ -12231,7 +12479,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
         "job_create on a closed handle"
     );
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "an unknown resource"
     );
@@ -12250,7 +12498,7 @@ fn job_syscalls_check_handles_rights_and_arguments() -> Outcome {
     );
     sys::handle_close(child);
     ensure_eq!(
-        st(sys::job_info(root, 9)),
+        st(sys::job_info(root, 11)),
         Some(S::InvalidArgs),
         "the resource after the last"
     );
@@ -13252,6 +13500,10 @@ fn ten_thousand_threads_leak_nothing() -> Outcome {
         let w = sys::object_wait(r.a1 as u64, sig::TERMINATED, sys::clock_get() + 500);
         ensure_eq!(w.status, 0, "a thread ended");
         sys::handle_close(r.a1 as u64);
+        if round % 2000 == 1999 {
+            // (the test takes minutes on a slow machine and says nothing otherwise: the harness's no-output limit is 180 s)
+            println!("ten_thousand_threads_leak_nothing: {} rounds", round + 1);
+        }
     }
     job_use_settles(root, 2, base, 1000)?;
     sys::handle_close(root);
@@ -13601,6 +13853,124 @@ fn bench_channel_call(name: &str, n: u32, bystanders: u32) -> Result<u64, Detail
     Ok(ns)
 }
 
+// --- pair_scaling (SCHED-SMP-SPEC 6.1) -------------------------------------------------------------------------------
+//
+// N independent pairs of threads, all released at once, each pair doing a fixed number of round trips: the wall time from the release
+// to the last exit, over the operations of all pairs, is the reported cost (`pair_scaling_<kind>_n<N>`, ns per round trip). The scaling
+// of 5.2 is the cost at N = 1 over the cost at N: how many times more round trips a second N pairs get through (`bench_compare.py`
+// prints it). On a boot with fewer harts than N it shows how little the pairs share, which is the point of running it at both counts.
+
+const PS_MAX: usize = 4;
+static PS_GO: AtomicU32 = AtomicU32::new(0);
+static PS_ROUNDS: AtomicU32 = AtomicU32::new(0);
+static PS_WORD: [AtomicU32; PS_MAX] = [const { AtomicU32::new(0) }; PS_MAX];
+static PS_CHAN: [AtomicU64; PS_MAX] = [const { AtomicU64::new(0) }; PS_MAX];
+
+/// Hold a thread until main sets `PS_GO`, so that every pair starts together.
+fn ps_gate() {
+    while PS_GO.load(Ordering::SeqCst) == 0 {
+        sys::futex_wait(PS_GO.as_ptr(), 0, u64::MAX);
+    }
+}
+
+/// Wait until `word` holds `want` (a futex wait with the value re-checked).
+fn ps_await(word: &AtomicU32, want: u32) {
+    loop {
+        let v = word.load(Ordering::SeqCst);
+        if v == want {
+            return;
+        }
+        sys::futex_wait(word.as_ptr(), v, u64::MAX);
+    }
+}
+
+/// One half of a futex ping-pong: `arg` is `pair * 2 + side`; side 0 raises the word to 1 and waits for 0, side 1 the reverse.
+extern "C" fn ps_futex_side(arg: usize) -> ! {
+    let (word, side) = (&PS_WORD[arg / 2], (arg % 2) as u32);
+    ps_gate();
+    for _ in 0..PS_ROUNDS.load(Ordering::SeqCst) {
+        ps_await(word, side);
+        word.store(1 - side, Ordering::SeqCst);
+        sys::futex_wake(word.as_ptr(), 1);
+    }
+    sys::thread_exit(0)
+}
+
+/// A client: `PS_ROUNDS` `channel_call`s on the pair's channel.
+extern "C" fn ps_call_client(arg: usize) -> ! {
+    let ch = PS_CHAN[arg].load(Ordering::SeqCst);
+    let mut reply = [0u8; 16];
+    ps_gate();
+    for i in 0..PS_ROUNDS.load(Ordering::SeqCst) {
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&(i + 1).to_le_bytes());
+        let args = CallArgs {
+            req_bytes: req.as_ptr() as u64,
+            req_handles: 0,
+            req_nbytes: 8,
+            req_nhandles: 0,
+            rep_bytes: reply.as_mut_ptr() as u64,
+            rep_handles: 0,
+            rep_max_bytes: 16,
+            rep_max_handles: 0,
+            deadline: u64::MAX,
+        };
+        if sys::channel_call(ch, &args).status != 0 {
+            sys::thread_exit(1);
+        }
+    }
+    sys::thread_exit(0)
+}
+
+/// Run `pairs` pairs of the given kind for `rounds` round trips each; report and return ns per round trip over all pairs.
+fn bench_pairs(kind: &str, pairs: usize, rounds: u32) -> Result<u64, Detail> {
+    PS_GO.store(0, Ordering::SeqCst);
+    PS_ROUNDS.store(rounds, Ordering::SeqCst);
+    let mut threads = Vec::new(); // (handle to wait for, handles to close afterwards)
+    let mut closing = Vec::new();
+    for p in 0..pairs {
+        if kind == "futex" {
+            PS_WORD[p].store(0, Ordering::SeqCst);
+            threads.push(new_thread(ps_futex_side, p * 2)?);
+            threads.push(new_thread(ps_futex_side, p * 2 + 1)?);
+        } else {
+            let (mine, theirs) = channel()?;
+            PS_CHAN[p].store(mine, Ordering::SeqCst);
+            closing.push(mine);
+            let server = new_thread(bench_call_server, theirs as usize)?;
+            threads.push(new_thread(ps_call_client, p)?);
+            closing.push(server);
+        }
+    }
+    nap_ticks(3); // everyone is at the gate
+    let t0 = cycles();
+    PS_GO.store(1, Ordering::SeqCst);
+    sys::futex_wake(PS_GO.as_ptr(), u32::MAX);
+    for t in &threads {
+        let w = sys::object_wait(*t, sig::TERMINATED, sys::clock_get() + 120_000);
+        ensure_eq!(w.status, 0, "a pair thread ended");
+    }
+    let c = cycles() - t0;
+    let name = alloc::format!("pair_scaling_{kind}_n{pairs}");
+    let ns = bench_line(&name, c, u64::from(rounds) * pairs as u64);
+    for t in threads {
+        sys::handle_close(t);
+    }
+    for h in closing {
+        sys::handle_close(h); // the channel ends make the servers exit; the server handles are closed with them
+    }
+    Ok(ns)
+}
+
+fn bench_pair_scaling(k: u32) -> Result<u64, Detail> {
+    let mut last = 0;
+    for pairs in [1, 2, 4] {
+        last = bench_pairs("futex", pairs, 500 * k)?;
+        last += bench_pairs("channel_call", pairs, 250 * k)?;
+    }
+    Ok(last)
+}
+
 /// The benchmarks (a tenth of the iterations unless the kernel command line says `bench=full`): they run on every
 /// boot so they cannot rot, and `make os-bench` runs them in full and compares with `bench/baseline.tsv`.
 fn benchmarks() -> Outcome {
@@ -13611,6 +13981,7 @@ fn benchmarks() -> Outcome {
     let c0 = bench_channel_call("channel_call_rt", 1000 * k, 0)?;
     let c100 = bench_channel_call("channel_call_rt_100_bystanders", 1000 * k, 100)?;
     let d = bench_port_drain_64(1000 * k)?;
+    let ps = bench_pair_scaling(k)?;
     // sanity only (the numbers are for the baseline): every operation took some time, and was not absurd
     for (what, ns) in [
         ("thread", t),
@@ -13618,6 +13989,7 @@ fn benchmarks() -> Outcome {
         ("call", c0),
         ("call with bystanders", c100),
         ("port drain", d),
+        ("pair scaling", ps),
     ] {
         ensure!(
             ns > 0 && ns < 1_000_000_000,
@@ -14213,6 +14585,22 @@ pub fn app_main() -> i32 {
         (
             "job_syscalls_check_handles_rights_and_arguments",
             job_syscalls_check_handles_rights_and_arguments,
+        ),
+        (
+            "cpu_time_is_counted_per_thread_and_process",
+            cpu_time_is_counted_per_thread_and_process,
+        ),
+        (
+            "a_runaway_rt_thread_does_not_hang_the_system",
+            a_runaway_rt_thread_does_not_hang_the_system,
+        ),
+        (
+            "job_info_counts_the_cpu_time_its_threads_run",
+            job_info_counts_the_cpu_time_its_threads_run,
+        ),
+        (
+            "a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not",
+            a_real_time_thread_stays_responsive_while_hogs_run_and_a_normal_one_does_not,
         ),
         (
             "job_limits_stop_a_process_bomb_and_usage_comes_back",

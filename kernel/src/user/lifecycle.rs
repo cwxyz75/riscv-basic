@@ -22,6 +22,10 @@ pub(super) fn user_thread_main(token: usize) {
         // Registered here, by the thread itself, before it can make a syscall: the spawner
         // cannot be preempted into leaving a window where the thread is unknown.
         s.thread_pid.insert(thread::current(), ts.pid);
+        // (its CPU time is charged to its process's job from its first slice on: SCHED-SMP-SPEC 4.10)
+        if let Some(p) = s.procs.get(&ts.pid) {
+            thread::set_job(thread::current(), thread::job_sched().tag(p.job.index()));
+        }
         // (EX1) the register image the thread will start from, which `thread_read_state` and `thread_write_state` act on until it does; a
         // SUSPENDED thread's spawner has made it already
         let tid = thread::current();
@@ -186,8 +190,14 @@ pub(super) fn teardown_take(pid: u64) -> Option<Box<Process>> {
         // (the process's own set of live threads says which entries go: no walk of every thread in the system, T191)
         let process = s.procs.remove(&pid);
         if let Some(p) = process.as_ref() {
+            if !p.live_tids.is_empty() {
+                thread::charge_running(); // (the threads that end with the process may be running on any hart)
+            }
             for tid in &p.live_tids {
                 s.thread_pid.remove(tid);
+                // (the threads that end with the process: their CPU time goes to their objects and the process's total, AB6)
+                let tobj = p.thread_objs.get(tid).copied();
+                ipc::thread_cpu_final(&mut s.objs, tobj, p.obj, thread::cpu_ns(*tid));
             }
         }
         // nobody of this process sleeps on a futex any more (a killed sleeper has normally left
@@ -298,7 +308,10 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         p.live_tids.remove(&tid);
         // A code the process was already given by a kill wins over this thread's own.
         let code = p.killed.unwrap_or(code);
-        if let Some(o) = p.thread_objs.remove(&tid) {
+        let cpu = thread::charge_and_cpu_ns(); // (this thread's last interval counts; it runs here)
+        let tobj = p.thread_objs.remove(&tid);
+        ipc::thread_cpu_final(objs, tobj, p.obj, cpu);
+        if let Some(o) = tobj {
             ipc::thread_mark_terminated(objs, o, code);
         }
         p.threads_alive -= 1;

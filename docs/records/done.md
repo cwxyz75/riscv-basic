@@ -105,3 +105,9 @@ deletes the item's file from `work/` and appends its line here. The first rows a
 | 2026-11-21 | EX1 | `thread_suspend`, `thread_resume`, thread state read and write, `thread_spawn` SUSPENDED | EX2 (PR MM9) |
 | 2026-11-21 | EX2 | Exception channels: faults delivered to a handler, `exception_resume` | exception channels, exception_resume, PAGER-ready fault kinds (PR 380) |
 | 2026-11-21 | MM9 | Pager-backed VMOs: page faults that block, `pager_create`, `pager_create_vmo`, `pager_supply`, `pager_fail` | pager-backed VMOs, blocking faults, pager_supply moving frames (PR 381) |
+| 2026-11-21 | L1 | Benchmark suite: the remaining benchmarks and absolute targets | the remaining benchmarks and absolute targets (PR 388) |
+| 2026-11-21 | L8 | RT budget accounting, job_info 7 and 8, rtdemo, the launcher and devmgr priority policy | per-job CPU and RT accounting, job_info 9 and 10, the RT demo, the session ceiling (devmgr policy is T210) (PR 389) |
+| 2026-11-21 | L25 | RT budgets enforced: hart throttle, job demotion, window events | RT budgets enforced: hart throttle, job demotion, window events (PR 390) |
+| 2026-11-21 | AB6 | CPU time readable for a thread, a process and a job | CPU time of threads and processes (PR 391) |
+| 2026-11-21 | T73 | RT budgets are accounted but not enforced | RT budgets enforced by L25 (hart throttle, job demotion) (PR 390) |
+| 2026-11-21 | T80 | Only the launcher and the tests set job priority limits | the launcher sets 20 and the session job 31 (L8); the driver jobs' ceiling is T210 (PR 389) |

@@ -49,6 +49,10 @@ impl Machine for Tlb {
         self.randoms += 1;
         0
     }
+    /// A thread's CPU time is a thousand nanoseconds per tid (AB6: so a test can tell whose it read).
+    fn thread_cpu_ns(&self, tid: kcore::sched::Tid) -> u64 {
+        tid * 1000
+    }
 }
 
 struct W {
@@ -491,6 +495,94 @@ fn process_and_thread_info_report_the_exit_code_only_when_ended() {
     );
     ipc::thread_mark_terminated(&mut w.objs, tobj, 3);
     assert_eq!(w.ok(nr::THREAD_INFO, [thandle.0, 0, 0, 0, 0, 0]).0, Some(3));
+}
+
+/// AB6: `thread_info` 1 and `process_info` 1 give CPU nanoseconds: live threads from the machine, ended ones from the objects.
+#[test]
+fn thread_and_process_info_report_cpu_time() {
+    let (mut w, ph) = world();
+    let (pobj, target, ..) = ipc::process_of(
+        &w.objs,
+        &w.procs[&1].handles,
+        abi::Handle(ph),
+        Rights::INSPECT,
+    )
+    .unwrap();
+    let make = |w: &mut W, tid: u64| {
+        let p = w.procs.get_mut(&1).unwrap();
+        let (h, o) = ipc::thread_object_create_in(
+            &mut w.objs,
+            &mut p.handles,
+            target,
+            &mut W::q(&mut w.jobs),
+        )
+        .unwrap();
+        let t = w.procs.get_mut(&target).unwrap();
+        t.live_tids.insert(tid);
+        t.thread_objs.insert(tid, o);
+        (h.0, o)
+    };
+    let (h7, o7) = make(&mut w, 7);
+    let (h9, _) = make(&mut w, 9);
+    assert_eq!(
+        w.ok(nr::THREAD_INFO, [h7, 1, 0, 0, 0, 0]).0,
+        Some(7000),
+        "a live thread"
+    );
+    assert_eq!(w.ok(nr::THREAD_INFO, [h9, 1, 0, 0, 0, 0]).0, Some(9000));
+    assert_eq!(
+        w.ok(nr::PROCESS_INFO, [ph, 1, 0, 0, 0, 0]).0,
+        Some(16_000),
+        "a process is the sum of its live threads"
+    );
+    // thread 7 ends having run 5 us: the object keeps it and the process's total grows by it
+    {
+        let p = w.procs.get_mut(&target).unwrap();
+        p.live_tids.remove(&7);
+        p.thread_objs.remove(&7);
+    }
+    ipc::thread_cpu_final(&mut w.objs, Some(o7), Some(pobj), 5000);
+    ipc::thread_mark_terminated(&mut w.objs, o7, 0);
+    assert_eq!(
+        w.ok(nr::THREAD_INFO, [h7, 1, 0, 0, 0, 0]).0,
+        Some(5000),
+        "an ended thread"
+    );
+    assert_eq!(
+        w.ok(nr::PROCESS_INFO, [ph, 1, 0, 0, 0, 0]).0,
+        Some(14_000),
+        "ended plus live"
+    );
+    // the exit code is still selector 0, and an unknown selector is refused
+    assert_eq!(w.ok(nr::THREAD_INFO, [h7, 0, 0, 0, 0, 0]).0, Some(0));
+    assert_eq!(
+        w.err(nr::THREAD_INFO, [h7, 2, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    assert_eq!(
+        w.err(nr::PROCESS_INFO, [ph, 2, 0, 0, 0, 0]),
+        Status::InvalidArgs
+    );
+    // INSPECT is the right
+    let manage_only = {
+        let p = w.procs.get_mut(&1).unwrap();
+        p.handles
+            .duplicate(&mut w.objs, abi::Handle(ph), Rights::MANAGE)
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        w.err(nr::PROCESS_INFO, [manage_only, 1, 0, 0, 0, 0]),
+        Status::AccessDenied
+    );
+    assert_eq!(
+        w.err(nr::THREAD_INFO, [0x999, 1, 0, 0, 0, 0]),
+        Status::BadHandle
+    );
+    assert_eq!(
+        w.err(nr::THREAD_INFO, [ph, 1, 0, 0, 0, 0]),
+        Status::WrongType
+    );
 }
 
 #[test]

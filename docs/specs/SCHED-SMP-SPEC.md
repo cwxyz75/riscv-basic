@@ -1462,3 +1462,18 @@ Section 3.3: one lock class is added, `ENTROPY` (the kernel entropy generator's 
 ## Amendment 2026-11-21: the per-hart frame cache (L16 part c)
 
 Section 3.10, Frames: a cached frame **stays allocated in the database with reference count 1**, held by the cache, instead of having reference count zero. The leak oracles still count it as free (`free_frames_accounted` adds the caches' lengths); the database never lists it free, so no other hart can take it, and the cache's drain checks that each frame it returns still has exactly its one reference. Only a frame whose sole reference the caller holds goes back to a cache (`free_sole`): the kernel's own frames; user pages stay on the database. Zeroing at allocation is left out of the cache: no consumer of it needs zeroed frames (the slab pool does not), and a frame that does is zeroed by its taker. The model of the cache's refill and drain is a **shuttle** model (`kcore/tests/fcache_concurrency.rs`), not loom: the repository's concurrency models of this kind (`rq_concurrency`) are shuttle, and the property (no frame held twice, none lost) needs random schedules over a locked database, not exhaustive ones.
+
+## Amendment 2026-11-22: the task-1 baseline and the absolute targets (L1)
+
+Section 5.2: the ratios to "the task-1 baseline" become absolute numbers, from `bench/baseline.tsv` (QEMU TCG, debug build, four harts, the machine of the first measurement; provisional in the sense of T75, and compared by ratio, not by wall time). The rows that were ratios:
+
+| Quantity | Baseline (four harts) | Target |
+|---|---|---|
+| Create, run nothing, exit, join | 234 us per thread (`thread_create_join`) | at most 117 us, and at most three `channel_call` round trips (a round trip is 273 us today, so the second bound is the looser one) |
+| `channel_call` round trip, same hart, direct hand-off | 273 us (`channel_call_rt`) | at most 164 us; with 100 bystanders (`channel_call_rt_100_bystanders`) at most 1.1 times the number without |
+| Scaling, four independent pairs against one | futex 0.57 (`pair_scaling_futex_n4` against `_n1`: 353 us and 200 us per round trip over all pairs; two pairs reach 4.6, because one pair alone pays an idle-hart wake on every hop), `channel_call` 0.77 | futex at least 3.0 after task 14, `channel_call` at least 2.5 after task 20 (unchanged) |
+| RT wake-to-run (B3), four harts, normal-band hogs | 873 us worst of 50 samples (`rt_latency_p99`, `rt_latency_max`; the kernel-thread probe, three hogs) | 300 us at the 99th percentile, 1 ms worst (unchanged); the baseline is already inside the worst-case bound and outside the 99th-percentile bound |
+| Longest interrupts-off span and longest big-lock hold of any syscall in the suite (`irq_off_max`, `bkl_hold_max` of `make os-latency`, `bench/latency.tsv`) | 139 ms, at `thread.rs:558` (the BKL hold: syscall 1) | B2 (200 us) after the lock peels; each peel's PR records the new figure |
+
+`pair_scaling` runs one, two and four pairs of two kinds (futex ping-pong and `channel_call`) and prints `pair_scaling_<kind>_n<N>`, ns per round trip over all pairs; `bench_compare.py` prints the scaling (the cost at N = 1 over the cost at N). The first-touch page-fault loop and the 64 KiB copy of the 6.1 table are not part of the suite: the page-fault path has its own count in `bench/counts.tsv`, and a copy loop measures the QEMU memory system, not a lock. `rt_latency` reports the 99th percentile and the maximum of the 50 samples of the existing probe; the histogram and the priority-40 user program wait for task 8's user priorities (6.1).
+

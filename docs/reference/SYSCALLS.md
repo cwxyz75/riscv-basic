@@ -171,7 +171,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 53 | process_unmap | `a0` process, `a1` vaddr, `a2` length | |
 | 54 | process_start | `a0` process, `a1` entry, `a2` sp, `a3` bootstrap channel, `a4` arg | |
 | 55 | process_kill | `a0` process, `a1` code | |
-| 56 | process_info | `a0` process | `a1` exit code |
+| 56 | process_info | `a0` process, `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
 | 57 | process_suspend | `a0` process | |
 | 59 | process_protect | `a0` process, `a1` vaddr, `a2` length, `a3` flags | |
 | 58 | process_resume | `a0` process | |
@@ -188,7 +188,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 84 | port_rearm | `a0` port, `a1` key | |
 | 85 | port_wait_many | `a0` port, `a1` buffer, `a2` capacity, `a3` deadline | `a1` count |
 | 61 | thread_exit | `a0` code | does not return |
-| 62 | thread_info | `a0` thread | `a1` exit code |
+| 62 | thread_info | `a0` thread (0: the caller, for `which` 1), `a1` which (0 exit code, 1 CPU time) | `a1` exit code, or CPU nanoseconds |
 | 63 | thread_interrupt | `a0` thread (MANAGE) | |
 | 74 | thread_suspend | `a0` thread (MANAGE) | |
 | 75 | thread_resume | `a0` thread (MANAGE) | |
@@ -208,7 +208,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 24 | channel_call | `a0` channel, `a1` args pointer | `a1` nbytes, `a2` nhandles |
 | 90 | job_create | `a0` parent job, `a1` pointer to the limits | `a1` handle |
 | 91 | job_set_limits | `a0` job, `a1` pointer to the limits | |
-| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
+| 92 | job_info | `a0` job, `a1` which (0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 scheduling limits, 7 processors, 8 kernel bytes, 9 real-time time, 10 CPU time) | `a1` used, `a2` limit (for 6: `max_prio`, `rt_budget` ns; for 7: the number of online harts in both) |
 | 96 | job_set_sched | `a0` job, `a1` max_prio 0-63, `a2` rt_budget ns per 100 ms, `a3` cpu_weight 1-65536 | |
 | 93 | job_kill | `a0` job, `a1` exit code | |
 | 94 | job_root | | `a1` handle |
@@ -583,10 +583,10 @@ parks when the call returns (its timeout still runs, its signals still arrive), 
 runs no user code until the process is resumed. A kill ends a stopped process as usual. The process's other state (handles,
 memory, channels) is untouched and servers keep answering it. While stopped, the process object has the signal `STOPPED` (bit 6; waitable, cleared by `process_resume`; a process that ended has TERMINATED only), so a parent can wait for a stop. `process_info` still answers BAD_STATE. Tests: `process_suspend_*`.
 
-### process_info(process) -> status, exit_code
+### process_info(process, which) -> status, value
 
-The exit code of an ended process (`-1000 - kind` after a fault). Rights: INSPECT.
-Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
+`which` 0 (the default): the exit code of an ended process (`-1000 - kind` after a fault). `which` 1 (AB6): the CPU nanoseconds the process's threads have run, the ended ones and the live ones (works while it runs; a process that has ended gives its total). Rights: INSPECT.
+Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; BAD_STATE (`which` 0, not ended yet); INVALID_ARGS (`which`).
 
 ## Jobs and limits (S4.5, OD56-OD58)
 
@@ -635,7 +635,7 @@ read). The rights are checked before the pointer is touched.
 
 ### job_info(job, which) -> status, used, limit
 
-Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
+Needs INSPECT. `which`: 0 processes, 1 threads, 2 pages, 3 jobs, 4 objects, 5 ipc bytes, 6 the job's scheduling limits (`a1` its `max_prio`, `a2` its `rt_budget` in ns per 100 ms window; see `job_set_sched`), 7 the processors its threads may run on (UV6; the number of online harts, in `a1` and `a2`: there is no CPU affinity yet), 9 the real-time CPU time (SCHED-SMP-SPEC 4.5, task 8): `a1` the nanoseconds the job's own threads have run **at a real-time base priority** in the current 100 ms window (the windows are aligned to multiples of 100 ms since boot; the figure restarts at zero with each), `a2` the job's `rt_budget` (enforced: a job that has used it has its real-time threads demoted to priority 31, round robin, until the window ends), 10 the CPU time (`a1`: the nanoseconds run by the threads of the job and of the jobs below it since each was created; the root job also holds the kernel's own threads, which are charged to it; a job that has been freed is no longer counted; `a2` 0), 8 kernel memory in bytes (MM5: the memory the kernel holds because of the job's programs, other than pages they map; its limit is an eighth of the job's page limit in bytes, none without one); `used` counts the job and everything
 below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 **Kernel bytes (`which` 8)** are charged for object bodies (every call that creates an object: `channel_create`, `event_create`, `socket_create`, `port_create`, `vmo_create`, `thread_spawn`, `process_create`, `job_create`, ... returns NO_MEMORY when the job or an ancestor would pass its kernel-byte limit) and for the growth of a process's handle table (charged when the call that grew it returns: a job that cannot pay leaves the table unable to grow, so the calls that insert a handle return NO_MEMORY, while closing and reusing handles still work; the table stays unable to grow until the next call the process makes after its job has room again, so the first insert after room returns can still be refused once) and for a thread's floating-point and vector register state, charged at the thread's first use of the unit. A job at its limit that makes a thread use floating point or vector instructions for the first time ends the process with the illegal-instruction exit code: the instruction faults like any illegal one (a program built for RVA23 whose start-up code is vectorised dies this way in a job whose kernel-byte limit is too small to run a single thread's register state).
@@ -646,7 +646,7 @@ below it. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (`which`).
 
 Set a job's scheduling limits (slice SC, SCHED-SMP-SPEC 4.9). Needs SET_LIMITS. `max_prio` (0 to 63) is the highest **base**
 priority any thread of the job may have (the real-time band, 32 to 63, therefore only exists in a job whose maximum reaches
-it); `rt_budget_ns` is real-time CPU per 100 ms window (accounted, **not yet enforced**); `cpu_weight` (1 to 65536) is stored
+it); `rt_budget_ns` is real-time CPU per 100 ms window, enforced: when the job's threads of real-time base priority have run that long in a window they count as priority 31, round robin, until it ends, and a hart that has run real-time threads for 80 ms of a window gives the normal band the rest of it when the normal band has work; `cpu_weight` (1 to 65536) is stored
 for a later fair class. No value may exceed the parent job's (PR2: ACCESS_DENIED); a new job starts with its parent's values;
 **lowering `max_prio` lowers the base priority of every live thread in the job and below it that is above it, at once**
 (PR1: a job with maximum 0 still runs its threads at priority 1, the lowest a user thread has) and lowers every descendant job's values; a thread created but not yet run is clamped when it first runs. `rt_budget_ns` above the 100 ms window is INVALID_ARGS. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED (no SET_LIMITS, or a value above
@@ -706,9 +706,9 @@ that was killed before it ever ran never runs user code.
 
 End the calling thread (see above). Its thread object is TERMINATED with exit code `code`.
 
-### thread_info(thread) -> status, exit_code
+### thread_info(thread, which) -> status, value
 
-The exit code of an ended thread (`-1000 - kind` is *not* used: a fault ends the process
+`which` 1 (AB6) is the CPU nanoseconds the thread has run (works while it runs, and gives the total once it has ended; handle 0 names the calling thread and needs no right); INVALID_ARGS for any `which` above 1. `which` 0, the default: the exit code of an ended thread (`-1000 - kind` is *not* used: a fault ends the process
 and the thread's code is the same as the process's). Rights: INSPECT. Errors: BAD_HANDLE;
 WRONG_TYPE; ACCESS_DENIED; BAD_STATE (not ended yet).
 

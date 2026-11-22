@@ -39,6 +39,14 @@ pub trait Machine {
     fn skip_cow_protect(&self) -> bool {
         false
     }
+    /// CPU nanoseconds the live thread `tid` has run (AB6: `thread_info` 1 and `process_info` 1); 0 where there is no scheduler.
+    fn thread_cpu_ns(&self, _tid: Tid) -> u64 {
+        0
+    }
+    /// The same for the calling thread (`thread_info` with handle 0).
+    fn current_thread_cpu_ns(&self) -> u64 {
+        0
+    }
     /// Negative control: leave out the shootdown that call number `call` (`VMO_DECOMMIT` or `PROCESS_PROTECT`) owes the other harts before a
     /// frame is freed or a permission is taken away. Never true in a real kernel.
     fn skip_shootdown(&self, _call: usize) -> bool {
@@ -775,6 +783,25 @@ pub fn proc_call<M: PhysMem, X: Machine>(
                 .map_err(|_| e(Status::InvalidArgs))?;
             Ok((Some(next), None))
         })(),
+        // `process_info(process, which)`: 0 the exit code of an ended process (BAD_STATE while it runs), 1 the CPU nanoseconds its threads have
+        // run, ended and live (needs INSPECT, works while it runs; AB6)
+        nr::PROCESS_INFO if a[1] == 1 => (|| {
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let (pid, terminated, ended) =
+                ipc::process_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)
+                    .map_err(e)?;
+            let live = if terminated {
+                0
+            } else {
+                procs.get(&pid).map_or(0, |p| {
+                    p.live_tids
+                        .iter()
+                        .fold(0u64, |s, &t| s.saturating_add(machine.thread_cpu_ns(t)))
+                })
+            };
+            Ok((Some(ended.saturating_add(live)), None))
+        })(),
+        nr::PROCESS_INFO if a[1] != 0 => fail(Status::InvalidArgs),
         nr::PROCESS_INFO => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (_, _, terminated, code) =
@@ -784,6 +811,28 @@ pub fn proc_call<M: PhysMem, X: Machine>(
             }
             Ok((Some(code as i64 as u64), None))
         })(),
+        // `thread_info(thread, which)`: 0 the exit code of an ended thread, 1 its CPU nanoseconds (works while it runs; AB6)
+        // (handle 0 names the calling thread, as in `thread_set_sched`: it needs no right)
+        nr::THREAD_INFO if a[1] == 1 && a[0] == 0 => {
+            Ok((Some(machine.current_thread_cpu_ns()), None))
+        }
+        nr::THREAD_INFO if a[1] == 1 => (|| {
+            let caller = procs.get(&me).ok_or(e(Status::BadState))?;
+            let (obj, pid, terminated, final_ns) =
+                ipc::thread_cpu_info(objs, &caller.handles, Handle(a[0]), Rights::INSPECT)
+                    .map_err(e)?;
+            if terminated {
+                return Ok((Some(final_ns), None));
+            }
+            let tid = procs.get(&pid).and_then(|p| {
+                p.thread_objs
+                    .iter()
+                    .find(|(_, &o)| o == obj)
+                    .map(|(&t, _)| t)
+            });
+            Ok((Some(tid.map_or(0, |t| machine.thread_cpu_ns(t))), None))
+        })(),
+        nr::THREAD_INFO if a[1] != 0 => fail(Status::InvalidArgs),
         nr::THREAD_INFO => (|| {
             let caller = procs.get(&me).ok_or(e(Status::BadState))?;
             let (terminated, code) =

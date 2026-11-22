@@ -49,7 +49,48 @@ pub(super) fn process_call(n: usize, a: [u64; 6]) -> Reply {
 }
 
 /// What the process calls of `ksys` need of this machine.
-pub(super) struct KernelMachine;
+/// The machine under `ksys`. CPU times (AB6) are read **before** the memory lock is taken (the scheduler's tables come before it in the lock order)
+/// and kept here for the call to look up.
+#[derive(Default)]
+pub(super) struct KernelMachine {
+    cpu: Vec<(kcore::sched::Tid, u64)>,
+    current: u64,
+}
+
+impl KernelMachine {
+    /// For `thread_info` 1 and `process_info` 1: the CPU time of every thread the call may be asked about.
+    fn read_cpu(&mut self, s: &UserState, me: u64, n: usize, a: [u64; 6]) {
+        let Some(caller) = s.procs.get(&me) else {
+            return;
+        };
+        let h = abi::Handle(a[0]);
+        if n == nr::THREAD_INFO {
+            if a[0] == 0 {
+                self.current = thread::cpu_ns(thread::current());
+            } else if let Ok((obj, pid, ..)) =
+                ipc::thread_cpu_info(&s.objs, &caller.handles, h, Rights::INSPECT)
+            {
+                let tid = s.procs.get(&pid).and_then(|p| {
+                    p.thread_objs
+                        .iter()
+                        .find(|(_, &o)| o == obj)
+                        .map(|(&t, _)| t)
+                });
+                if let Some(t) = tid {
+                    self.cpu.push((t, thread::cpu_ns(t)));
+                }
+            }
+        } else if let Ok((pid, ..)) =
+            ipc::process_cpu_info(&s.objs, &caller.handles, h, Rights::INSPECT)
+        {
+            if let Some(p) = s.procs.get(&pid) {
+                for &t in &p.live_tids {
+                    self.cpu.push((t, thread::cpu_ns(t)));
+                }
+            }
+        }
+    }
+}
 
 impl ksys::Machine for KernelMachine {
     fn shootdown(&mut self) {
@@ -68,6 +109,15 @@ impl ksys::Machine for KernelMachine {
     fn skip_cow_protect(&self) -> bool {
         cfg!(feature = "fault-skip-cow-protect")
     }
+    fn thread_cpu_ns(&self, tid: kcore::sched::Tid) -> u64 {
+        self.cpu
+            .iter()
+            .find(|(t, _)| *t == tid)
+            .map_or(0, |(_, ns)| *ns)
+    }
+    fn current_thread_cpu_ns(&self) -> u64 {
+        self.current
+    }
     fn random_below(&mut self, n: u64) -> u64 {
         // (a pool that is not seeded yet gives nothing: the placement is then the first fit, which is still a valid place)
         crate::entropy::below(n).unwrap_or(0)
@@ -76,9 +126,16 @@ impl ksys::Machine for KernelMachine {
 
 /// The calls that only read and change the process table (`ksys::proc_call`).
 pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
+    if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
+        thread::charge_running(); // (the CPU time of what runs now, the caller included, is brought up to date before it is read: AB6)
+    }
     irq::without(|| -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let mut machine = KernelMachine::default();
+        if (n == nr::PROCESS_INFO || n == nr::THREAD_INFO) && a[1] == 1 {
+            machine.read_cpu(s, me, n, a); // (before the memory lock: AB6)
+        }
         let k = kmem::get();
         let mut ctx = ksys::PCtx {
             objs: &mut s.objs,
@@ -87,7 +144,7 @@ pub(super) fn process_table_call(n: usize, a: [u64; 6]) -> Reply {
             mm: k.mm,
             vmos: k.vmos,
             jobs: k.jobs,
-            machine: &mut KernelMachine,
+            machine: &mut machine,
         };
         ksys::proc_call(n, a, &mut ctx).unwrap_or_else(|| bad(Status::BadSyscall))
     })
@@ -110,7 +167,7 @@ pub(crate) fn cow_sync() {
             kmem::flush_tlb();
         }
         let k = kmem::get();
-        ksys::cow_sync(&mut s.procs, k.mm, k.vmos, &mut KernelMachine);
+        ksys::cow_sync(&mut s.procs, k.mm, k.vmos, &mut KernelMachine::default());
     });
 }
 
@@ -256,8 +313,16 @@ pub(super) fn pager_supply_call(a: [u64; 6]) -> Reply {
         let s = state();
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let k = kmem::get();
-        ksys::pager::pager_supply(s, k.mm, k.vmos, k.jobs, &mut KernelMachine, me, a)
-            .map_err(|e| (e, None, None))
+        ksys::pager::pager_supply(
+            s,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            &mut KernelMachine::default(),
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))
     });
     match r {
         Ok(woken) => {
@@ -584,7 +649,8 @@ pub(super) fn job_set_sched(a: [u64; 6]) -> Reply {
             let jobs = kmem::jobs();
             let job = ksys::job_set_sched(&s.objs, &s.procs, jobs.jobs, me, a)
                 .map_err(|e| (e, None, None))?;
-            // PR1: the threads of the job and everything below it, with the maximum their own job now allows
+            thread::job_sched().sync_budgets(jobs.jobs); // (the scheduler's mirror of every job's RT budget)
+                                                         // PR1: the threads of the job and everything below it, with the maximum their own job now allows
             let candidates: Vec<(Tid, u8)> = s
                 .thread_pid
                 .iter()

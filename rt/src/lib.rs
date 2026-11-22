@@ -741,6 +741,18 @@ pub mod sys {
     pub fn thread_info(thread: u64) -> Ret {
         syscall(THREAD_INFO, [thread as usize, 0, 0, 0, 0, 0])
     }
+    /// `thread_info` with an explicit selector (tests of the error rows).
+    pub fn thread_info_which(thread: u64, which: u64) -> Ret {
+        syscall(THREAD_INFO, [thread as usize, which as usize, 0, 0, 0, 0])
+    }
+    /// CPU nanoseconds a thread has run (`a1`); handle 0 names the calling thread (AB6).
+    pub fn thread_cpu_ns(thread: u64) -> Ret {
+        syscall(THREAD_INFO, [thread as usize, 1, 0, 0, 0, 0])
+    }
+    /// CPU nanoseconds the threads of a process have run, ended and live (`a1`; AB6).
+    pub fn process_cpu_ns(process: u64) -> Ret {
+        syscall(PROCESS_INFO, [process as usize, 1, 0, 0, 0, 0])
+    }
     pub fn process_kill(process: u64, code: i32) -> Ret {
         syscall(PROCESS_KILL, [process as usize, code as usize, 0, 0, 0, 0])
     }
