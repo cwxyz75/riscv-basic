@@ -17,7 +17,7 @@ system, so stopping between phases loses nothing.
 **Start.** The plan starts when the owner says so. From then on every item in it, the lock-peel tasks included, has the
 owner's go-ahead: the sentences in older `L` items about waiting for one are superseded (each carries a note).
 
-**Where the plan stands (2026-11-21).** Phases 1 to 5 are merged into `main`. Phase 6 was cut in two: 6a (PR 359, merge commit `a153f9e`: the slab allocator, L15, L16, MM5, L17 part a) and 6b (PR 368, `c8fc2c6`: L18, PL7, MM10) are merged; the items that peel the big lock (L17 parts b and c, L14, L19, L21, L20) and PL8 are a phase 6c that runs after phase 8. Phase 7 (MM6 in part, MM7, MM8) is merged into `main` (PR 375, merge commit `e72c82b`); MM6 stays open for the caps, which wait for phase 6c (T207). Phase 8 (EX1, EX2, MM9; PRs 379 to 381) is complete on `epic/phase-8` and goes to `main` on the epic gate; phase 9 is next, then phase 6c. The owner started the plan again on 2026-11-21 and asked for it to run without input until it is done; the earlier pause (2026-11-20, to change how work is branched and tested: OD144) is over.
+**Where the plan stands (2026-11-22).** Phases 1 to 5 are merged into `main`. Phase 6 was cut in two: 6a (PR 359, merge commit `a153f9e`: the slab allocator, L15, L16, MM5, L17 part a) and 6b (PR 368, `c8fc2c6`: L18, PL7, MM10) are merged; the items that peel the big lock (L17 parts b and c, L14, L19, L21, L20) and PL8 are a phase 6c that runs after phase 8. Phase 7 (MM6 in part, MM7, MM8) is merged into `main` (PR 375, merge commit `e72c82b`); MM6 stays open for the caps, which wait for phase 6c (T207). Phase 8 (EX1, EX2, MM9; PRs 379 to 381, merge commit `8532fd2`) is merged into `main`. Phase 9 (L1, L8, L25, AB6; PRs 388 to 391) is complete on `epic/phase-9` and goes to `main` on the epic gate; L22, L23 and L24 wait for L21 and L14 and move to a phase 9b after phase 6c, which runs next. The owner started the plan again on 2026-11-21 and asked for it to run without input until it is done; the earlier pause (2026-11-20, to change how work is branched and tested: OD144) is over.
 
 **Epics (OD144, 2026-11-20).** From phase 4 on, each phase is an epic branch, `epic/phase-<n>`, cut from `main`. Every item is a
 feature branch off the epic and a pull request into it, merged on the feature gate (build and host tests, no QEMU). When the
@@ -177,11 +177,11 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 - [x] **L1** the remaining benchmarks (`pair_scaling`, `rt_latency`, `irq_off_max`, `bkl_profile`) and absolute targets (PR 388)
 - [x] **L8** RT budget accounting and the priority policy of the launcher and the device manager: (PR 389: accounting, `job_info` 9 and 10, the user-level RT demo as a suite test with its negative control, the session job's 31; the `devmgr` driver-job policy is T210, with L25)
-- [ ] **L22** donation through `channel_call`
-- [ ] **L23** PI futex
-- [ ] **L24** direct hand-off
-- [x] **L25** RT budgets enforced (this PR)
-- [x] **AB6** CPU time for threads, processes and jobs (this PR)
+- [ ] **L22** donation through `channel_call` (phase 9b: after L21)
+- [ ] **L23** PI futex (phase 9b: after L14)
+- [ ] **L24** direct hand-off (phase 9b)
+- [x] **L25** RT budgets enforced (PR 390)
+- [x] **AB6** CPU time for threads, processes and jobs (PR 391)
 
 ### Phase 10: scale and power
 
