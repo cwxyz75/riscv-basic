@@ -96,7 +96,7 @@ pub struct Ctx<'a, M: PhysMem> {
     pub harts_online: u64,
     /// What each job's threads have run (SCHED-SMP-SPEC 4.10; `job_info` 9 and 10) and the clock it is read against (nanoseconds since boot).
     pub job_sched: &'a kcore::jobsched::JobSchedTable,
-    pub now_ns: u64,
+    pub clock: fn() -> u64,
     /// The device windows a physical VMO may name (page-aligned `(start, end)` byte ranges, built from the device tree at boot: PL5).
     pub windows: &'a [(u64, u64)],
 }
