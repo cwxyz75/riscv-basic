@@ -328,6 +328,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             .expect("every hart has an idle thread")
     }
     /// The thread designated to run on `hart` (its idle thread when nothing else does).
+    /// Is hart `h`'s real-time band held back by NM1 (its RT share of the window is spent and the normal band has work)?
+    pub fn rt_throttled_on(&self, hart: usize) -> bool {
+        self.lq(hart).rt_throttled()
+    }
+
     #[allow(clippy::expect_used)] // INVARIANT: a hart always has a current thread (its idle thread at least)
     pub fn current_on(&self, hart: usize) -> Tid {
         self.lq(hart)
@@ -599,7 +604,14 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 continue;
             }
             let ok = aff.is_none_or(|a| a as usize == x);
-            if ok && self.would_run_hint(x, eff) {
+            // (the hart the thread is queued on is asked directly: its hint was published before this thread was queued, and with the
+            // normal band's first thread the answer for a hart whose real-time share is spent changes)
+            let runs = if x == g {
+                self.lq(x).would_run(eff)
+            } else {
+                self.would_run_hint(x, eff)
+            };
+            if ok && runs {
                 let key = (self.view_cur(x), x);
                 if best.is_none_or(|b| key < b) {
                     best = Some(key);
@@ -655,17 +667,21 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
                 })
             };
-            let Some((tid, p0)) = found else { continue };
+            let Some((tid, _)) = found else { continue };
             let moved = {
                 let (mut dst, mut src) = self.lq2(h, g);
                 let mine = dst.cur_eff().max(dst.queued_top().unwrap_or(0));
                 // the record may have moved, been taken, or changed while no lock was held
+                // (the best one this hart would actually run: a real-time thread is not for a hart whose share of the window is spent, and
+                // must not hide the normal ones below it)
                 let again = src.queued_top_where(&|t| {
-                    src.record(t).is_some_and(|r| allowed(r, h)) && !self.is_in_transit(t)
+                    src.record(t)
+                        .is_some_and(|r| allowed(r, h) && dst.would_run(r.eff))
+                        && !self.is_in_transit(t)
                 });
                 match again {
-                    Some((t2, p)) if t2 == tid && p == p0 && p > mine && dst.would_run(p) => {
-                        let rec = src.detach_queued(tid).expect("it was queued");
+                    Some((t2, p)) if p > mine => {
+                        let rec = src.detach_queued(t2).expect("it was queued");
                         dst.attach(rec, Enq::Migrated, h as u8);
                         true
                     }
@@ -675,6 +691,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             if moved {
                 self.pulls.fetch_add(1, Ordering::Relaxed);
                 n += 1;
+                // (what is left on `g` may be for `g` itself or another hart, and the one mark owed for it was consumed by this pull: a hart whose
+                // real-time share is spent runs its own normal threads, and a pull of the real-time one above them must not hide them)
+                self.push_queue_from(g, h);
             } else {
                 // not for this hart (it has something at least as good, or would only queue it): hand it on, or the one
                 // mark that was owed for it, which this hart consumed, would leave it waiting while a lower hart idles
@@ -728,7 +747,12 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// A thread is left queued on `g`: look at the best one (and the best one that is not pinned, which any hart may take)
     /// and push each (one mark apiece, `push_marks`).
     fn push_queue(&self, g: usize) {
-        let (top, free) = {
+        self.push_queue_from(g, g);
+    }
+
+    /// `push_queue(g)` on behalf of hart `caller`, which holds no lock (a pull that left threads behind on `g`).
+    fn push_queue_from(&self, g: usize, caller: usize) {
+        let (top, free, low) = {
             let src = self.lq(g);
             (
                 src.queued_top_where(&|t| !self.is_in_transit(t))
@@ -737,10 +761,16 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                     !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.affinity.is_none())
                 })
                 .map(|(t, _)| t),
+                // (the best normal one: below a real-time thread that other harts may not run, such as while their share is spent, it
+                // would otherwise never be offered)
+                src.queued_top_where(&|t| {
+                    !self.is_in_transit(t) && src.record(t).is_some_and(|r| r.eff < 32)
+                })
+                .map(|(t, _)| t),
             )
         };
-        for t in [top, free].into_iter().flatten() {
-            self.push_marks(t, g, g);
+        for t in [top, free, low].into_iter().flatten() {
+            self.push_marks(t, g, caller);
         }
     }
 
@@ -791,6 +821,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             base: attr,
             eff: attr.prio,
             demoted_window: 0,
+            undemoted: 0,
             state: State::Runnable,
             affinity: affinity.map(|a| a as u8),
             last_hart: caller as u8,
@@ -863,7 +894,10 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// calls this first, because a tickless hart with one runnable thread has no event that would.
     pub fn charge_now(&self, h: usize) {
         if let Some(f) = self.clock {
-            self.lq(h).charge(f());
+            let look = self.lq(h).charge(f());
+            if look {
+                self.mark(h); // (the budgets changed what should run here: the hart looks at its queues)
+            }
         }
     }
 
@@ -1224,6 +1258,11 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             .collect();
         for (x, qx) in qs.iter().enumerate() {
             if !self.is_online(x) {
+                continue;
+            }
+            // (NM1: a hart whose real-time share of the window is spent runs its normal band first, so strict priority order does not hold
+            // on it until the window ends; the share rules are tested on their own, `sched2_rt_budget`)
+            if qx.rt_throttled() {
                 continue;
             }
             for &(g, t, eff, aff) in &queued {

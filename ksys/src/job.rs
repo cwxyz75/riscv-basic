@@ -56,6 +56,7 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             let jobs = &mut c.jobs;
             let id = jobs.create(parent, limits).map_err(|x| e(job_status(x)))?;
             c.job_sched.reset(id.index()); // (the slot may have been used before)
+            c.job_sched.sync_budgets(c.jobs);
             match ipc::job_object_create(
                 c.objs,
                 c.handles,
@@ -115,13 +116,12 @@ pub fn job_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 }
                 // 10: CPU nanoseconds run by the threads of this job and of the jobs below it (jobs already freed are not counted); no limit (0)
                 10 => {
-                    let sum = c
-                        .jobs
-                        .live_ids()
-                        .into_iter()
-                        .filter(|&j| c.jobs.is_within(j, job))
-                        .map(|j| c.job_sched.cpu(j.index()))
-                        .fold(0u64, u64::saturating_add);
+                    let mut sum = 0u64;
+                    c.jobs.for_each_live(|j| {
+                        if c.jobs.is_within(j, job) {
+                            sum = sum.saturating_add(c.job_sched.cpu(j.index()));
+                        }
+                    });
                     return Ok((Some(sum), Some(0)));
                 }
                 _ => return fail(Status::InvalidArgs),
