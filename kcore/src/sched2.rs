@@ -821,7 +821,14 @@ impl<N: Class> HartRq<N> {
 
     fn charge_job(&self, t: &ThreadSched, ran: Time) {
         if let Some(j) = &self.jobs {
-            j.charge(t.job, ran, band(t.base.prio) == Band::Rt, self.now);
+            // (real-time time is what a thread of real-time **base** priority runs *in the band*: a demoted thread runs as a normal one, and
+            // counting it would keep the figure growing for the rest of the window after the budget is spent)
+            j.charge(
+                t.job,
+                ran,
+                band(t.base.prio) == Band::Rt && t.demoted_window == 0,
+                self.now,
+            );
         }
     }
 
