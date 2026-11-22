@@ -37,10 +37,12 @@ fn run(seed: u64) {
     let mut tables = [HandleTable::new(64), HandleTable::new(64)];
     let mut waits = WaitTable::new();
     let mut masks: BTreeMap<u64, (ObjId, u32)> = BTreeMap::new(); // what each registered thread waits for
+    let mut jobs = kcore::job::Jobs::new();
+    let mut pollers: BTreeSet<u64> = BTreeSet::new(); // the port waiters that poll when they wake (`port_wait`): only they take the baton
     for step in 0..STEPS {
         let ti = rng.below(2) as usize;
         let mut what = String::new();
-        match rng.below(14) {
+        match rng.below(16) {
             0 => {
                 let _ = channel_create(&mut reg, &mut tables[ti]);
             }
@@ -107,6 +109,19 @@ fn run(seed: u64) {
                     let _ = tables[ti].replace(&mut reg, h, Rights::SAME);
                 }
             }
+            13 => {
+                if let Some(p) = pick(&mut rng, &tables[ti]) {
+                    what = "port_unbind".into();
+                    let _ = port_unbind(&mut reg, &tables[ti], p, rng.below(6));
+                }
+            }
+            14 => {
+                // a poll by any thread (a waiter that woke, or a pool member that never waited): it logs the port and may disarm a one-shot
+                if let Some(p) = pick(&mut rng, &tables[ti]) {
+                    what = "port_poll".into();
+                    let _ = port_poll(&mut reg, &tables[ti], p);
+                }
+            }
             _ => {
                 if rng.chance(40) {
                     tables[ti].drain(&mut reg);
@@ -116,7 +131,9 @@ fn run(seed: u64) {
                 }
             }
         }
-        // the kernel's commit
+        // the kernel's commit: bindings made through a handle that went end first (L21c), the ports they leave are touched
+        let gone = reg.take_gone();
+        end_bindings_made_through(&mut reg, &mut jobs, &gone);
         let dirty = reg.take_dirty();
         let forced: BTreeSet<ObjId> = dirty
             .items
@@ -139,7 +156,7 @@ fn run(seed: u64) {
             let justified = sig.is_none_or(|s| s & mask != 0) || forced.contains(&obj);
             assert!(justified, "seed {seed} step {step}: thread {t} woken without cause (signals {sig:?}, mask {mask:#x})");
             assert!(!waits.is_registered(*t));
-            if is_port(&reg, obj) && sig.is_some() && !forced.contains(&obj) {
+            if is_port(&reg, obj) && sig.is_some() && !forced.contains(&obj) && pollers.remove(t) {
                 *baton.entry(obj).or_default() += 1;
                 reg.touch(obj); // the woken thread's poll
             }
@@ -197,9 +214,16 @@ fn run(seed: u64) {
                 if let Some(s) = signals_of_object(&reg, obj) {
                     if s & mask == 0 {
                         if is_port(&reg, obj) {
-                            waits.register_port(t, obj, mask, port_bound_objects(&reg, obj));
+                            if rng.chance(70) {
+                                waits.register_poller(t, obj, mask, port_bound_objects(&reg, obj));
+                                pollers.insert(t);
+                            } else {
+                                waits.register_port(t, obj, mask, port_bound_objects(&reg, obj));
+                                pollers.remove(&t);
+                            }
                         } else {
                             waits.register(t, obj, mask);
+                            pollers.remove(&t);
                         }
                         masks.insert(t, (obj, mask));
                     }
@@ -408,25 +432,34 @@ fn a_port_wakes_one_waiter_and_the_poll_passes_the_baton() {
         )
     };
     reg.take_dirty();
-    w.register_port(
+    w.register_poller(
         1,
         pobj,
         abi::signals::READABLE,
         port_bound_objects(&reg, pobj),
     );
-    w.register_port(
+    w.register_poller(
         2,
         pobj,
         abi::signals::READABLE,
         port_bound_objects(&reg, pobj),
     );
-    event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
-    assert_eq!(
-        commit(&mut w, &mut reg),
-        vec![1],
-        "one waiter, the first, is woken"
+    // (a plain wait on the port's READABLE, an `object_wait`, never polls: it is released with the first and takes no baton)
+    w.register_port(
+        3,
+        pobj,
+        abi::signals::READABLE,
+        port_bound_objects(&reg, pobj),
     );
-    assert!(w.is_registered(2), "the other stays asleep");
+    event_signal(&mut reg, &t, e, 0, 1 << 24).unwrap();
+    let mut first = commit(&mut w, &mut reg);
+    first.sort();
+    assert_eq!(
+        first,
+        vec![1, 3],
+        "the first poller and the plain waiter are woken"
+    );
+    assert!(w.is_registered(2), "the other poller stays asleep");
     // thread 1 polls (the binding stays ready: it is level-triggered): the port is logged, and the baton passes
     assert!(port_poll(&mut reg, &t, port).unwrap().is_some());
     assert_eq!(
@@ -495,4 +528,33 @@ fn a_binding_ends_with_the_handle_it_was_made_through() {
     t.drain(&mut reg);
     settle(&mut reg, &mut jobs);
     assert_eq!(bound(&reg), 0);
+}
+
+#[test]
+fn the_watch_count_of_a_bound_object_returns_to_zero_when_the_port_dies() {
+    // (L21c) the count that lets a handle removal skip the ports must not stay high for objects that were polled through a temporary port (the usual
+    // idiom): it is given back when the port is destroyed, by a release and by a sweep
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(16);
+    let ev = event_create(&mut reg, &mut t).unwrap();
+    let eobj = t.get(ev).unwrap().obj;
+    let port = port_create(&mut reg, &mut t).unwrap();
+    port_bind(&mut reg, &t, port, ev, u64::from(1u32 << 24), 1).unwrap();
+    assert_eq!(reg.watch_count(eobj), 1);
+    t.close(&mut reg, port).unwrap(); // the port's last handle: released
+    assert_eq!(
+        reg.watch_count(eobj),
+        0,
+        "a released port gave its counts back"
+    );
+    // the same through a sweep: a port that is only reachable from itself (a doomed cycle) dies in the sweep
+    let port = port_create(&mut reg, &mut t).unwrap();
+    port_bind(&mut reg, &t, port, ev, u64::from(1u32 << 24), 1).unwrap();
+    assert_eq!(reg.watch_count(eobj), 1);
+    let pobj = t.get(port).unwrap().obj;
+    // (the registry's own bookkeeping is what the sweep frees: roots without the port's handle doom it)
+    t.close(&mut reg, port).unwrap();
+    reg.sweep(&[eobj]);
+    assert!(!reg.is_alive(pobj));
+    assert_eq!(reg.watch_count(eobj), 0);
 }

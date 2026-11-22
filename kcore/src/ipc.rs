@@ -165,6 +165,14 @@ pub enum KObj {
 }
 
 impl Object for KObj {
+    fn for_each_watched(&self, f: &mut dyn FnMut(ObjId)) {
+        if let KObj::Port(p) = self {
+            for b in &p.bindings {
+                f(b.obj);
+            }
+        }
+    }
+
     fn held_count(&self) -> usize {
         match self {
             KObj::Channel(c) => c.queue.iter().map(|m| m.handles.len()).sum(),
@@ -1131,12 +1139,25 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
     if gone.is_empty() {
         return;
     }
+    // (a set, so that a process that dies with thousands of bound handles costs one lookup per binding, not one comparison per pair)
+    let gone: alloc::collections::BTreeSet<(ObjId, u64, u64)> = gone.iter().copied().collect();
     let ports: Vec<ObjId> = reg
         .live_ids()
         .into_iter()
         .filter(|&i| matches!(reg.get(i), Some(KObj::Port(_))))
         .collect();
     for port in ports {
+        // (looked at without logging it: only a port that loses a binding is touched)
+        let any = match reg.get(port) {
+            Some(KObj::Port(p)) => p
+                .bindings
+                .iter()
+                .any(|b| gone.contains(&(b.obj, b.via.0, b.via.1))),
+            _ => false,
+        };
+        if !any {
+            continue;
+        }
         let mut ended: Vec<ObjId> = Vec::new();
         let mut bindings = match reg.get_mut(port) {
             Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
@@ -1149,7 +1170,7 @@ pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjI
         };
         let mut i = 0;
         bindings.retain(|b| {
-            let end = gone.iter().any(|&(o, t, h)| b.obj == o && b.via == (t, h));
+            let end = gone.contains(&(b.obj, b.via.0, b.via.1));
             if end {
                 ended.push(b.obj);
                 if i < next {
