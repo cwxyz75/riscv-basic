@@ -3,5 +3,5 @@ smp1	count_channel_write_read_64	26302	instr
 smp1	count_event_signal_wait	31509	instr
 smp1	count_page_fault_fresh_page	9296	instr
 smp1	count_thread_create_join	205334	instr
-smp1	count_futex_wake_no_waiter	879	instr
-smp1	count_channel_call_round_trip	139885	instr
+smp1	count_futex_wake_no_waiter	795	instr
+smp1	count_channel_call_round_trip	147817	instr
