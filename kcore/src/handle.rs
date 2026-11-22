@@ -54,7 +54,12 @@ pub fn clamped_tables() -> u64 {
     CLAMPED_TABLES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The next table's identity (L21c): a binding of a port names the table and handle it was made through.
+static NEXT_TABLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 pub struct HandleTable {
+    /// This table's identity, never reused.
+    id: u64,
     slots: Vec<Slot>,
     free: Vec<u32>,
     limit: usize,
@@ -83,6 +88,7 @@ impl HandleTable {
     /// A table that holds at most `limit` handles (capped at 2^24 - 1 by the encoding). It grows on demand: nothing is sized for the limit.
     pub fn new(limit: usize) -> HandleTable {
         HandleTable {
+            id: NEXT_TABLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             slots: Vec::new(),
             free: Vec::new(),
             limit: limit.min(MAX_SLOTS),
@@ -93,6 +99,11 @@ impl HandleTable {
             first_gen: 0,
             slot_cap: MAX_SLOTS,
         }
+    }
+
+    /// The table's identity (L21c).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// For tests: a table whose new slots start at generation `gen`, so that retirement (the generation reaching 2^40) can be reached in a
@@ -275,6 +286,7 @@ impl HandleTable {
         let slot = self.decode(h).ok_or(Status::BadHandle)?;
         let entry = self.remove(slot);
         reg.touch_forced(entry.obj);
+        reg.handle_gone(entry.obj, self.id, h.0);
         reg.release(entry.obj);
         Ok(())
     }
@@ -336,8 +348,9 @@ impl HandleTable {
         // (the room in memory first: the new handle goes into the slot the old one frees, or into a new slot if that one retires)
         self.reserve(1)?;
         let entry = self.remove(slot);
-        // the old value stops working: waiters on it must re-validate (a forced touch)
+        // the old value stops working: waiters on it must re-validate (a forced touch), and bindings made through it end (L21c)
         reg.touch_forced(entry.obj);
+        reg.handle_gone(entry.obj, self.id, h.0);
         Ok(self
             .insert(reg, entry.obj, rights)
             .expect("a slot was just freed"))
@@ -362,6 +375,7 @@ impl HandleTable {
         }
         let entry = self.remove(slot);
         reg.touch_forced(entry.obj);
+        reg.handle_gone(entry.obj, self.id, h.0);
         Ok(entry)
     }
 
@@ -394,8 +408,10 @@ impl HandleTable {
     pub fn drain<T: Object>(&mut self, reg: &mut Registry<T>) {
         for slot in 0..self.slots.len() {
             if self.slots[slot].entry.is_some() {
+                let gone = Self::encode(slot, self.slots[slot].gen);
                 let entry = self.remove(slot);
                 reg.touch_forced(entry.obj);
+                reg.handle_gone(entry.obj, self.id, gone.0);
                 reg.release(entry.obj);
             }
         }

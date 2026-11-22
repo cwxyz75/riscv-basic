@@ -792,7 +792,7 @@ Watch `object` for `mask`; report it under `key` (chosen by the caller, unique w
 port). Rights: MANAGE on `port`, WAIT on `object`. `mask` must be non-empty and within the
 waitable signals. Errors, in order: BAD_HANDLE (port, then object); WRONG_TYPE (`port` is not
 a port); ACCESS_DENIED; INVALID_ARGS (bad mask; `object` is a port; `key` already bound);
-NO_MEMORY (no room for the binding: it costs 32 bytes of the port's job queued-data quota and of the system-wide budget; there is no fixed count). `flags` is `0` or `ONESHOT` (`abi::port_flags`, 1); any other bit is INVALID_ARGS (checked with the mask).
+NO_MEMORY (no room for the binding: it costs 32 bytes of the port's job queued-data quota and of the system-wide budget; there is no fixed count). `flags` is `0` or `ONESHOT` (`abi::port_flags`, 1); any other bit is INVALID_ARGS (checked with the mask). **The binding ends when the handle it was made through is closed, replaced or sent away** (L21c; a binding made through another handle to the same object stays), and when its object dies.
 
 ### port_rearm(port, key) -> status
 
@@ -808,7 +808,7 @@ Wait until some binding is ready or the absolute time `deadline` (nanoseconds) p
 `u64::MAX`: no deadline), then return one ready binding's `key` and `observed` (`signals &
 mask`). Successive calls rotate through the ready bindings, so none starves. Rights: WAIT.
 Errors: BAD_HANDLE (also if the handle stops naming anything while waiting); WRONG_TYPE;
-ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once.
+ACCESS_DENIED; TIMED_OUT. A killed process stops waiting at once. **When a port becomes ready it wakes one waiter, the first in line** (L21b); that waiter's poll passes the wake on to the next while a binding is still ready, so threads waiting on one port take bindings in turn and the others stay asleep.
 
 ### port_wait_many(port, buffer, capacity, deadline) -> status, count
 
@@ -1103,10 +1103,11 @@ Hands the lock to the waiter with the best effective priority at that moment (fi
 INVALID_ARGS; ACCESS_DENIED (the caller does not own it, or the word is poisoned); NOT_SUPPORTED (the caller's tid does not fit in 30 bits); SHOULD_WAIT (a pager's page); BAD_STATE (the caller's process is gone). `futex_wait` and `futex_wake` gain a flags argument whose
 bit 0 (shared key) is reserved: NOT_SUPPORTED.
 
-### channel_call (will amend the last paragraph, task 22)
+### channel_call, priority (L22, built)
 
-"From task 22 the caller lends its effective priority to the thread that reads its request, until a message with the
-same transaction id is written back, the call ends for any reason, or that thread ends."
+The caller lends its effective priority to the thread that reads its request, until the call ends for any reason (the
+reply, a timeout, a kill, an interrupt, the peer closing) or that thread ends. A request left queued by a call that
+timed out lends nothing when it is read later. `thread_get_sched` shows the reader's raised effective priority.
 
 ## Planned changes (KERNEL-V1-SPEC.md, OD126 to OD141)
 

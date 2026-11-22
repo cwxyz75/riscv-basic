@@ -21,35 +21,60 @@ pub fn wake_signal_waiters() {
 /// table decide, and wake those threads by id. Called after every syscall and wherever a signal can have
 /// changed outside one.
 pub fn commit_wake() {
+    commit_wake_with(false);
+}
+
+/// `commit_wake`, with the wakes placed on this hart as a direct hand-off when `sync` is true (a `channel_call` about to block, L24).
+fn commit_wake_with(sync: bool) {
     // (the wakes are made in the same critical section as the commit, and as one batch: every woken thread
     // is runnable before any of them runs, T62)
     irq::without(|| {
         let s = state();
         let UserState { objs, waits, .. } = s;
+        // bindings made through a handle that was just removed end (L21c); the ports they leave are touched, so the commit below looks at them
+        let gone = objs.take_gone();
+        if !gone.is_empty() {
+            let j = kmem::jobs();
+            ipc::end_bindings_made_through(objs, j.jobs, &gone);
+        }
         let dirty = objs.take_dirty();
         if dirty.items.is_empty() && !dirty.overflow {
             return;
         }
         let woken = waits.commit(
             |id| ipc::signals_of_object(objs, id),
-            |id| matches!(objs.get(id), Some(ipc::KObj::Port(_))),
+            |id| ipc::port_bound_objects(objs, id),
+            |ch, txid| ipc::channel_has_txid(objs, ch, txid),
             &dirty,
         );
         objs.recycle_dirty(dirty);
-        thread::wake_many(&woken);
+        if sync {
+            thread::wake_many_sync(&woken);
+        } else {
+            thread::wake_many(&woken);
+        }
     });
 }
 
 /// Clean up what the syscall destroyed and wake exactly the threads whose wait it ended (slice W: the
 /// global wait queue that used to be woken here, OD43, is gone).
 pub fn notify() {
+    notify_with(false);
+}
+
+/// `notify` for a `channel_call` that has queued its request and is about to block: the wake of the server is a direct hand-off (L24).
+pub fn notify_sync() {
+    notify_with(true);
+}
+
+fn notify_with(sync: bool) {
     cleanup_dead();
     // (MM9) a pager whose request channel lost its reader is dead: the waits for its pages fail
     let woken = irq::without(|| ksys::pager::reap_closed_channels(state()));
     if !woken.is_empty() {
         thread::wake_many(&woken);
     }
-    commit_wake();
+    commit_wake_with(sync);
     // the safe point where the kernel heap may grow (heap.rs)
     irq::without(crate::heap::service);
 }

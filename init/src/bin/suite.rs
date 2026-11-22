@@ -6372,6 +6372,85 @@ fn port_wait_blocks_until_an_object_is_ready() -> Outcome {
 /// Slice W step 6: a one-shot binding is delivered once and stays quiet (though its level is still
 /// high) until `port_rearm`; a blocked waiter is woken by the re-arm; and a port takes far more
 /// bindings than the old fixed cap of 256 (the job quota is the limit).
+static PW_DONE: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn pw_waiter(arg: usize) -> ! {
+    let r = sys::port_wait(arg as u64, sys::clock_get() + 8_000);
+    if r.status == 0 && r.a1 == 7 {
+        PW_DONE.fetch_add(1, Ordering::SeqCst);
+    }
+    sys::thread_exit(0)
+}
+
+/// L21b: a port wakes one waiter and the poll of that waiter passes the baton, so every thread waiting on a port whose binding is ready (and stays
+/// ready: it is level-triggered) gets its turn and reports the binding.
+fn several_waiters_on_one_port_are_woken_in_turn() -> Outcome {
+    PW_DONE.store(0, Ordering::SeqCst);
+    let p = port()?;
+    let ev = event()?;
+    ok(sys::port_bind(p, ev, 1 << 24, 7), "bind")?;
+    let mut ts = Vec::new();
+    for _ in 0..5 {
+        ts.push(new_thread(pw_waiter, p as usize)?);
+    }
+    nap_ticks(30); // all of them are asleep in port_wait
+    ensure_eq!(
+        PW_DONE.load(Ordering::SeqCst),
+        0,
+        "a waiter returned with nothing ready"
+    );
+    ok(sys::event_signal(ev, 0, 1 << 24), "signal")?;
+    for t in &ts {
+        let w = sys::object_wait(*t, sig::TERMINATED, sys::clock_get() + 8_000);
+        ensure_eq!(w.status, 0, "a waiter finished");
+    }
+    for t in ts {
+        sys::handle_close(t);
+    }
+    ensure_eq!(
+        PW_DONE.load(Ordering::SeqCst),
+        5,
+        "every waiter was woken in turn and saw the binding"
+    );
+    Ok(())
+}
+
+/// L21c (T61): a binding ends with the handle it was made through; a binding made through another handle to the same object stays.
+fn a_binding_ends_with_the_handle_it_was_made_through() -> Outcome {
+    let p = port()?;
+    let ev = event()?;
+    let dup = ok(sys::handle_duplicate(ev, Rights::SAME.0), "duplicate")?.a1 as u64;
+    ok(
+        sys::port_bind(p, ev, 1 << 24, 1),
+        "bind through the first handle",
+    )?;
+    ok(
+        sys::port_bind(p, dup, 1 << 25, 2),
+        "bind through the duplicate",
+    )?;
+    ok(
+        sys::event_signal(ev, 0, (1 << 24) | (1 << 25)),
+        "signal both",
+    )?;
+    let r = sys::port_wait(p, 0);
+    ensure_eq!(r.status, 0, "both bindings are ready");
+    // the first handle goes: its binding goes with it, and only the duplicate's key (2) is ever reported again
+    ok(sys::handle_close(ev), "close the first handle")?;
+    for _ in 0..4 {
+        let r = sys::port_wait(p, 0);
+        ensure!(
+            r.status == 0 && r.a1 == 2,
+            "a binding made through a closed handle was still reported (status {}, key {})",
+            r.status,
+            r.a1
+        );
+    }
+    ok(sys::handle_close(dup), "close the duplicate")?;
+    let r = sys::port_wait(p, sys::clock_get() + 20);
+    ensure_eq!(st(r), Some(S::TimedOut), "no binding is left");
+    Ok(())
+}
+
 fn port_oneshot_rearm_and_many_bindings() -> Outcome {
     let p = port()?;
     let ev = event()?;
@@ -12388,6 +12467,151 @@ extern "C" fn pi_high_waiter(_: usize) -> ! {
     sys::thread_exit(0)
 }
 
+// --- Donation through channel_call (L22, SCHED-SMP-SPEC 4.8) ---------------------------------------------------------------------------------
+//
+// A server of low priority reads a call's request and then needs the CPU to answer it while mid-priority hogs run on every hart. Without donation it
+// starves and the call times out; with the caller's high priority lent to it, it runs and answers.
+
+static CD_A: AtomicU64 = AtomicU64::new(0);
+static CD_B: AtomicU64 = AtomicU64::new(0);
+static CD_PRIO: AtomicU32 = AtomicU32::new(0);
+static CD_READ: AtomicU32 = AtomicU32::new(0);
+static CD_GO: AtomicU32 = AtomicU32::new(0);
+static CD_ABORT: AtomicU32 = AtomicU32::new(0);
+static CD_WORK: AtomicU32 = AtomicU32::new(0);
+static CD_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+static CD_MS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn cd_server(_: usize) -> ! {
+    sys::thread_set_sched(0, 5, 0);
+    let b = CD_B.load(Ordering::SeqCst);
+    sys::object_wait(b, sig::READABLE, sys::clock_get() + 8_000);
+    let mut req = [0u8; 16];
+    let r = sys::channel_read(b, req.as_mut_ptr(), 16, core::ptr::null_mut(), 0);
+    if r.status == 0 {
+        CD_READ.store(1, Ordering::SeqCst);
+        // the answer needs the CPU: it waits to be told the hogs are up, then works (unless the run was given up: a starved server that finally runs
+        // after the hogs stop must neither work nor answer, or the control would see a reply)
+        while CD_GO.load(Ordering::SeqCst) == 0 {
+            core::hint::spin_loop();
+        }
+        if CD_ABORT.load(Ordering::SeqCst) != 0 {
+            sys::thread_exit(0);
+        }
+        for _ in 0..200_000 {
+            CD_WORK.fetch_add(1, Ordering::Relaxed);
+        }
+        sys::channel_write(b, req.as_ptr(), 4, core::ptr::null(), 0);
+    }
+    sys::thread_exit(0)
+}
+
+extern "C" fn cd_client(_: usize) -> ! {
+    sys::thread_set_sched(0, CD_PRIO.load(Ordering::SeqCst) as u8, 0);
+    let req = 1u32.to_le_bytes();
+    let mut reply = [0u8; 16];
+    let t0 = sys::clock_get();
+    let args = CallArgs {
+        req_bytes: req.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: 4,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: 0,
+        rep_max_bytes: 16,
+        rep_max_handles: 0,
+        deadline: t0 + 1_500,
+    };
+    let r = sys::channel_call(CD_A.load(Ordering::SeqCst), &args);
+    CD_STATUS.store(r.status as i64 as u64, Ordering::SeqCst);
+    CD_MS.store(sys::clock_get() - t0, Ordering::SeqCst);
+    sys::thread_exit(0)
+}
+
+/// One run: a server of priority 5 and a client of `client_prio`; hogs of priority 15 on every hart once the server has read the request.
+fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
+    let r = ok(sys::channel_create(), "channel_create")?;
+    CD_A.store(r.a1 as u64, Ordering::SeqCst);
+    CD_B.store(r.a2 as u64, Ordering::SeqCst);
+    CD_PRIO.store(client_prio, Ordering::SeqCst);
+    for a in [&CD_READ, &CD_GO, &CD_WORK, &CD_ABORT] {
+        a.store(0, Ordering::SeqCst);
+    }
+    CD_STATUS.store(u64::MAX, Ordering::SeqCst);
+    let harts = job_use(root_job()?, 7)?.0;
+    ok(
+        sys::thread_set_sched(0, 31, 0),
+        "main to the top of the normal band",
+    )?;
+    let server = new_thread(cd_server, 0)?;
+    nap_ticks(10);
+    let client = new_thread(cd_client, 0)?;
+    // the server reads the request (nothing else is running: it gets the CPU), then the hogs take every hart
+    let until = sys::clock_get() + 5_000;
+    while CD_READ.load(Ordering::SeqCst) == 0 && sys::clock_get() < until {
+        nap_ticks(1);
+    }
+    ensure_eq!(
+        CD_READ.load(Ordering::SeqCst),
+        1,
+        "the server never read the request"
+    );
+    RT_STOP.store(0, Ordering::SeqCst);
+    let mut hogs = Vec::new();
+    for _ in 0..harts {
+        let h = new_thread(rt_hog, 0)?;
+        ok(sys::thread_set_sched(h, 15, 0), "a hog above the server")?;
+        hogs.push(h);
+    }
+    nap_ticks(10);
+    CD_GO.store(1, Ordering::SeqCst);
+    // (the call's own deadline is 1.5 s: a client of low priority cannot even return from its timeout while the hogs hold every hart, so they
+    // are stopped after 2.5 s whatever happened, and the client is then waited for)
+    let _ = sys::object_wait(client, sig::TERMINATED, sys::clock_get() + 2_500);
+    // (what the server did while the hogs held the harts: read now, before they stop and let a starved server run)
+    let work_under_hogs = CD_WORK.load(Ordering::SeqCst);
+    CD_ABORT.store(1, Ordering::SeqCst);
+    RT_STOP.store(1, Ordering::SeqCst);
+    let w = sys::object_wait(client, sig::TERMINATED, sys::clock_get() + 20_000);
+    ok(sys::thread_set_sched(0, 10, 0), "main back to normal")?;
+    for h in hogs {
+        sys::object_wait(h, sig::TERMINATED, sys::clock_get() + 20_000);
+        sys::handle_close(h);
+    }
+    sys::object_wait(server, sig::TERMINATED, sys::clock_get() + 20_000);
+    sys::handle_close(server);
+    sys::handle_close(client);
+    sys::handle_close(CD_A.load(Ordering::SeqCst));
+    sys::handle_close(CD_B.load(Ordering::SeqCst));
+    ensure_eq!(w.status, 0, "the client finished");
+    Ok((
+        CD_STATUS.load(Ordering::SeqCst),
+        CD_MS.load(Ordering::SeqCst),
+        work_under_hogs,
+    ))
+}
+
+/// A call lends its priority to the thread that reads its request: a server of priority 5 answers a priority-25 caller under hogs of priority 15; a
+/// caller of the server's own priority gets nothing lent and its call times out (the control: the hogs do starve the server).
+fn a_call_lends_its_priority_to_the_server() -> Outcome {
+    let (status, _, work) = donation_run(5)?;
+    ensure_eq!(
+        status as i64,
+        S::TimedOut.code() as i64,
+        "without a higher-priority caller the starved server answered: the hogs do not load the harts, so the test shows nothing"
+    );
+    ensure_eq!(work, 0, "the starved server made progress under the hogs");
+    let (status, ms, work) = donation_run(25)?;
+    ensure_eq!(
+        status,
+        0,
+        "the call with a priority-25 caller did not get its reply"
+    );
+    ensure!(ms < 1_400, "the reply took {ms} ms");
+    ensure_eq!(work, 200_000, "the server did not finish its work");
+    Ok(())
+}
+
 /// The classic three-thread inversion: a low-priority thread owns the lock and a hog of middle priority runs on every hart, so the owner gets no CPU
 /// (checked first: the control); a high-priority thread then waits for the lock, and through the donation the owner runs, finishes and unlocks.
 fn pi_futex_bounds_inversion() -> Outcome {
@@ -14778,6 +15002,9 @@ pub fn app_main() -> i32 {
             lua_script_matches_the_host_build,
         ),
         ("futex_argument_errors", futex_argument_errors),
+        ("several_waiters_on_one_port_are_woken_in_turn", several_waiters_on_one_port_are_woken_in_turn),
+        ("a_binding_ends_with_the_handle_it_was_made_through", a_binding_ends_with_the_handle_it_was_made_through),
+        ("a_call_lends_its_priority_to_the_server", a_call_lends_its_priority_to_the_server),
         ("pi_futex_bounds_inversion", pi_futex_bounds_inversion),
         ("pi_futex_owner_death_poisons", pi_futex_owner_death_poisons),
         ("pi_futex_deadlock_is_refused", pi_futex_deadlock_is_refused),

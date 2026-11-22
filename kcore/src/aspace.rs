@@ -1176,6 +1176,14 @@ impl Vmos {
         self.vmo(id).map(|v| v.refs)
     }
 
+    /// Is `id` a plain VMO that only one reference holds and that has no parent and no children (L19: its pages can be given back in chunks before
+    /// the last reference goes, because nothing else maps or inherits them)?
+    pub fn is_unshared_plain(&self, id: u64) -> bool {
+        self.vmo(id).is_some_and(|v| {
+            v.refs == 1 && v.kind == VmoKind::Plain && v.parent.is_none() && v.children.is_empty()
+        })
+    }
+
     /// Drop one reference on a VMO; the last one frees it: its pages go back and its job is credited. The creator's reference is dropped when the
     /// object a handle names is destroyed (or by the kernel for its own VMOs), a mapping's when the region goes (L15: no scan for VMOs that
     /// nothing maps any more). Frames still mapped somewhere hold references of their own.
@@ -2593,6 +2601,52 @@ impl<F: PageTableFormat> AddressSpace<F> {
         for start in starts {
             let _ = self.unmap_region(mm, vmos, jobs, start);
         }
+        self.reserve.release(jobs);
+        self.table.destroy_user(mm);
+    }
+
+    /// Unmap up to `budget` pages of a dying address space, lowest first, and say whether nothing is left mapped (L19: a process's teardown runs in
+    /// chunks, with the memory locks let go between them, so that no section is proportional to what the process mapped). Only a space no thread can
+    /// run in or fault in (its process is gone from the table): nothing is kept consistent for a fault in between, and a region is cut from the front as
+    /// its pages go. A region's reference on its VMO is dropped with its last page, as `unmap_region` drops it.
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: n <= region.pages and the region's range was checked when it was inserted; budget >= n
+    pub fn destroy_user_chunk<M: PhysMem>(
+        &mut self,
+        mm: &mut Mm<M>,
+        vmos: &mut Vmos,
+        jobs: &mut Jobs,
+        mut budget: u64,
+    ) -> bool {
+        while budget > 0 {
+            let Some((&start, region)) = self.regions.iter().next() else {
+                return true;
+            };
+            let n = region.pages.min(budget);
+            for p in 0..n {
+                if let Some((pfn, _)) = self.table.unmap(mm, start + p * PAGE_SIZE) {
+                    if mm.db.is_managed(pfn) {
+                        let _ = mm.db.dec(pfn);
+                    }
+                }
+            }
+            budget -= n;
+            let Some(mut region) = self.regions.remove(&start) else {
+                return true;
+            };
+            if n == region.pages {
+                let _ = vmos.release(mm, jobs, region.vmo);
+            } else {
+                region.pages -= n;
+                region.vmo_page += n;
+                self.regions.insert(start + n * PAGE_SIZE, region);
+            }
+        }
+        self.regions.is_empty()
+    }
+
+    /// The end of `destroy_user_chunk`'s work, once it has said it is done: give back the page reservation and free the tables of a process whose
+    /// table shares the kernel's upper half.
+    pub fn finish_destroy_user<M: PhysMem>(mut self, mm: &mut Mm<M>, jobs: &mut Jobs) {
         self.reserve.release(jobs);
         self.table.destroy_user(mm);
     }

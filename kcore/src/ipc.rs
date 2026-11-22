@@ -21,6 +21,10 @@ use alloc::vec::Vec;
 pub struct Message {
     pub data: Vec<u8>,
     pub handles: Vec<Entry>,
+    /// The thread that sent this as a `channel_call` request and waits for the reply (L22), and the number of that call (a counter that names this one
+    /// call among the caller's, so that a request left queued by an earlier call, read later, is not mistaken for the live one): the thread that reads
+    /// it is lent the caller's priority.
+    pub caller: Option<(u64, u64)>,
 }
 
 /// Kernel memory a queued message costs beyond its bytes (the queue node and the `Message`).
@@ -124,6 +128,8 @@ pub struct IrqObj {
 
 /// One binding of a port: watch `obj` for `mask`, report as `key`.
 struct Binding {
+    /// The table and handle the binding was made through (L21c): it ends when that handle is closed, replaced or sent away.
+    via: (u64, u64),
     obj: ObjId,
     mask: u32,
     key: u64,
@@ -163,6 +169,14 @@ pub enum KObj {
 }
 
 impl Object for KObj {
+    fn for_each_watched(&self, f: &mut dyn FnMut(ObjId)) {
+        if let KObj::Port(p) = self {
+            for b in &p.bindings {
+                f(b.obj);
+            }
+        }
+    }
+
     fn held_count(&self) -> usize {
         match self {
             KObj::Channel(c) => c.queue.iter().map(|m| m.handles.len()).sum(),
@@ -386,12 +400,6 @@ pub fn channel_create_in(
 /// into it. Changes nothing unless it succeeds. The checks run in the order SYSCALLS.md
 /// lists them: sizes first (they bound the work of everything after), then handles,
 /// then the channel itself.
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::unreachable
-)] // INVARIANT: i < handles.len() (the duplicate check loop); the queue and byte counts are bounded by the per-channel limits checked first
 pub fn channel_write_in(
     reg: &mut Kobjs,
     table: &mut HandleTable,
@@ -399,6 +407,27 @@ pub fn channel_write_in(
     data: &[u8],
     handles: &[Handle],
     jobs: &mut Jobs,
+) -> Result<(), Status> {
+    channel_write_from(reg, table, ch, data, handles, jobs, None)
+}
+
+/// `channel_write_in` for the request of a `channel_call` sent by thread `caller` (L22): the message carries the caller's id, and the thread that
+/// reads it is lent the caller's priority until the call ends.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::arithmetic_side_effects,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unreachable
+)] // INVARIANT: i < handles.len() (the duplicate check loop); the queue and byte counts are bounded by the per-channel limits checked first
+pub fn channel_write_from(
+    reg: &mut Kobjs,
+    table: &mut HandleTable,
+    ch: Handle,
+    data: &[u8],
+    handles: &[Handle],
+    jobs: &mut Jobs,
+    caller: Option<(u64, u64)>,
 ) -> Result<(), Status> {
     if data.len() > MAX_MSG_BYTES || handles.len() > MAX_MSG_HANDLES {
         return Err(Status::TooBig);
@@ -492,6 +521,7 @@ pub fn channel_write_in(
         p.queue.push_back(Message {
             data: bytes,
             handles: entries,
+            caller,
         });
         reg.meter_add(cost);
     }
@@ -540,6 +570,10 @@ fn read_at(
     let mut handles = Vec::new();
     handles.try_reserve_exact(n).map_err(|_| Status::NoMemory)?;
     let msg = c.queue.remove(i).expect("picked");
+    if let Some((caller, call)) = msg.caller {
+        // a call's request was read: its reader is lent the caller's priority (the kernel does it after the call, L22)
+        reg.note_dequeued_call(caller, call);
+    }
     reg.meter_sub(msg.cost());
     credit_bytes(reg, jobs, me, msg.cost());
     for e in &msg.handles {
@@ -703,6 +737,17 @@ pub fn port_bound_objects(reg: &Kobjs, port: ObjId) -> Vec<ObjId> {
     match reg.get(port) {
         Some(KObj::Port(p)) => p.bindings.iter().map(|b| b.obj).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Is there a message with transaction id `txid` (its first four bytes, little endian) queued at channel end `obj`? (`channel_call`'s wait, L21d.)
+pub fn channel_has_txid(reg: &Kobjs, obj: ObjId, txid: u32) -> bool {
+    match reg.get(obj) {
+        Some(KObj::Channel(c)) => c
+            .queue
+            .iter()
+            .any(|m| m.data.get(..4) == Some(&txid.to_le_bytes()[..])),
+        _ => false,
     }
 }
 
@@ -1099,6 +1144,7 @@ pub fn port_bind_flags_in(
         return Err(Status::BadHandle);
     };
     p.bindings.push(Binding {
+        via: (table.id(), object.0),
         obj: oe.obj,
         mask,
         key,
@@ -1106,7 +1152,68 @@ pub fn port_bind_flags_in(
         armed: true,
     });
     reg.meter_add(BINDING_COST);
+    reg.watch_adjust(oe.obj, 1);
     Ok(())
+}
+
+/// Handles to bound objects were removed (`Registry::take_gone`): every binding of every port made through one of them ends (L21c, T61: closing,
+/// replacing or sending the handle a binding was made through ends it). The ports are touched, so that their waiters look again.
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < bindings.len() (loop bound); `next` is at most the length and counts the bindings before it
+pub fn end_bindings_made_through(reg: &mut Kobjs, jobs: &mut Jobs, gone: &[(ObjId, u64, u64)]) {
+    if gone.is_empty() {
+        return;
+    }
+    // (a set, so that a process that dies with thousands of bound handles costs one lookup per binding, not one comparison per pair)
+    let gone: alloc::collections::BTreeSet<(ObjId, u64, u64)> = gone.iter().copied().collect();
+    let ports: Vec<ObjId> = reg
+        .live_ids()
+        .into_iter()
+        .filter(|&i| matches!(reg.get(i), Some(KObj::Port(_))))
+        .collect();
+    for port in ports {
+        // (looked at without logging it: only a port that loses a binding is touched)
+        let any = match reg.get(port) {
+            Some(KObj::Port(p)) => p
+                .bindings
+                .iter()
+                .any(|b| gone.contains(&(b.obj, b.via.0, b.via.1))),
+            _ => false,
+        };
+        if !any {
+            continue;
+        }
+        let mut ended: Vec<ObjId> = Vec::new();
+        let mut bindings = match reg.get_mut(port) {
+            Some(KObj::Port(p)) => core::mem::take(&mut p.bindings),
+            _ => continue,
+        };
+        let mut before_next = 0;
+        let next = match reg.get(port) {
+            Some(KObj::Port(p)) => p.next,
+            _ => 0,
+        };
+        let mut i = 0;
+        bindings.retain(|b| {
+            let end = gone.contains(&(b.obj, b.via.0, b.via.1));
+            if end {
+                ended.push(b.obj);
+                if i < next {
+                    before_next += 1;
+                }
+            }
+            i += 1;
+            !end
+        });
+        if let Some(KObj::Port(p)) = reg.get_mut(port) {
+            p.bindings = bindings;
+            p.next -= before_next.min(p.next);
+        }
+        for o in &ended {
+            reg.watch_adjust(*o, -1);
+        }
+        reg.meter_sub(ended.len() * BINDING_COST);
+        credit_bytes(reg, jobs, port, ended.len() * BINDING_COST);
+    }
 }
 
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: next is at least 1 when a binding is removed behind it
@@ -1127,10 +1234,11 @@ pub fn port_unbind_in(
         .iter()
         .position(|b| b.key == key)
         .ok_or(Status::InvalidArgs)?;
-    p.bindings.remove(at);
+    let gone_obj = p.bindings.remove(at).obj;
     if p.next > at {
         p.next -= 1;
     }
+    reg.watch_adjust(gone_obj, -1);
     reg.meter_sub(BINDING_COST);
     credit_bytes(reg, jobs, port_obj, BINDING_COST);
     Ok(())

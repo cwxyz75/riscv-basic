@@ -17,6 +17,30 @@ pub(super) fn signals_now(h: Handle) -> Result<u32, Status> {
 /// before it sleeps; interrupts off, lock held). A handle that names nothing has no registration (its
 /// wait ended already: the predicate was true).
 pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
+    register_wait_kind(thread, h, mask, false);
+}
+
+/// `register_wait` for a thread in `port_wait` or `port_wait_many`: it polls the port when it wakes, so the port wakes one such waiter at a time
+/// (L21b). Any other wait on a port (`object_wait` on its READABLE) is released with the rest and takes no baton.
+pub(super) fn register_poll_wait(thread: Tid, h: Handle) {
+    register_wait_kind(thread, h, abi::signals::READABLE, true);
+}
+
+/// The port the calling process's handle `h` names, touched (logged) so that the commit after a wait looks at it again: a thread woken by the baton
+/// that cannot poll (a bad buffer, a handle that went) must still pass it on (L21b).
+pub(super) fn touch_port_of(h: Handle) {
+    irq::without(|| {
+        let s = state();
+        let Ok(pid) = caller_pid(s) else { return };
+        if let Some(entry) = s.procs.get(&pid).and_then(|p| p.handles.get(h).ok()) {
+            if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
+                s.objs.touch(entry.obj);
+            }
+        }
+    });
+}
+
+fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
     let s = state();
     let Some(pid) = s.thread_pid.get(&thread).copied() else {
         return;
@@ -25,7 +49,31 @@ pub(super) fn register_wait(thread: Tid, h: Handle, mask: u32) {
         return;
     };
     if let Ok(entry) = p.handles.get(h) {
-        s.waits.register(thread, entry.obj, mask);
+        if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
+            // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
+            let bound = ipc::port_bound_objects(&s.objs, entry.obj);
+            if poller {
+                s.waits.register_poller(thread, entry.obj, mask, bound);
+            } else {
+                s.waits.register_port(thread, entry.obj, mask, bound);
+            }
+        } else {
+            s.waits.register(thread, entry.obj, mask);
+        }
+    }
+}
+
+/// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
+pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
+    let s = state();
+    let Some(pid) = s.thread_pid.get(&thread).copied() else {
+        return;
+    };
+    let Some(p) = s.procs.get(&pid) else {
+        return;
+    };
+    if let Ok(entry) = p.handles.get(h) {
+        s.waits.register_call(thread, entry.obj, txid);
     }
 }
 
@@ -420,7 +468,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
         commit_wake();
         // Ready, killed, or the handle stopped naming a port (the poll then says so). The thread is
         // registered on the port: the wait table re-evaluates a port's signal (which follows its
-        // bindings) whenever anything was touched.
+        // bindings) when an object it binds, or the port, was touched (L21a).
         let me = thread::current();
         thread::wait_deadline_registered(
             || {
@@ -428,10 +476,11 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
                     || interrupted_now()
                     || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
             },
-            || register_wait(me, h, abi::signals::READABLE),
+            || register_poll_wait(me, h),
             deadline,
         );
         irq::without(|| state().waits.forget(me));
+        touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
         got = poll()?;
     }
     ksys::port_wait_report(got, deadline, take_interrupt)
@@ -439,6 +488,7 @@ pub(super) fn port_wait(a: [u64; 6]) -> Reply {
 
 /// `port_wait_many(port, buffer, capacity, deadline)` (AB4): `port_wait`'s wait, returning up to `capacity` ready bindings as records in
 /// `buffer` and their count in `a1`.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the poll closure and the wait's); T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
     let (h, buf, cap, deadline) = ksys::port_wait_many_check(a).map_err(|e| (e, None, None))?;
     let poll =
@@ -458,10 +508,11 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
                     || interrupted_now()
                     || signals_now(h).map_or(true, |s| s & abi::signals::READABLE != 0)
             },
-            || register_wait(me, h, abi::signals::READABLE),
+            || register_poll_wait(me, h),
             deadline,
         );
         irq::without(|| state().waits.forget(me));
+        touch_port_of(h); // (the wake may have been the baton: it is passed on whatever the poll does)
         got = poll()?;
     }
     ksys::port_wait_many_report(got, deadline, take_interrupt)
@@ -470,12 +521,33 @@ pub(super) fn port_wait_many(a: [u64; 6]) -> Reply {
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub(super) fn channel_call(a: [u64; 6]) -> Reply {
+    let r = channel_call_inner(a);
+    // the call is over, whichever way: the priority it lent to the server that read its request goes back, and the record of its wait goes (L22)
+    let me = thread::current();
+    thread::push_owed(); // (the server the request woke for a hand-off is on this hart: if the caller did not block, other harts are offered it, L24)
+    thread::pi_revoke(me);
+    irq::without(|| state().calls.remove(&me));
+    r
+}
+
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn channel_call_inner(a: [u64; 6]) -> Reply {
     // the request: read the record, check it, send (an interrupt already pending ends the call before anything is sent)
     let call = in_process(|s, k, me| {
-        ksys::channel_call_send(s, k.mm, k.vmos, k.jobs, me, a, take_interrupt_held)
+        ksys::channel_call_send(
+            s,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            me,
+            thread::current() as u64,
+            a,
+            take_interrupt_held,
+        )
     })?;
-    notify();
-    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
+    notify_sync(); // (the request is queued and this thread blocks next: the server it wakes runs on this hart, L24)
+                   // Wait for the reply with that transaction id (or the peer closing, or the deadline).
     let me = thread::current();
     let ready = || {
         let s = state();
@@ -488,13 +560,7 @@ pub(super) fn channel_call(a: [u64; 6]) -> Reply {
     commit_wake();
     thread::wait_deadline_registered(
         ready,
-        || {
-            register_wait(
-                me,
-                call.ch,
-                abi::signals::READABLE | abi::signals::PEER_CLOSED,
-            )
-        },
+        || register_call_wait(me, call.ch, call.txid),
         call.deadline,
     );
     irq::without(|| state().waits.forget(me));
