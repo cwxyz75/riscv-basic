@@ -204,7 +204,10 @@ pub struct JobsRef {
 #[track_caller]
 pub fn jobs() -> JobsRef {
     let mut g = JOBS.lock();
-    // SAFETY: as in `get`.
+    // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
+    // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
+    // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
+    // fields are public); no caller does (T242: every use is `kmem::get().field`).
     unsafe {
         JobsRef {
             jobs: inside(&mut g),
@@ -230,8 +233,10 @@ pub fn get() -> Kmem {
     let mut vmo = VMOS.lock();
     let mut jobs = JOBS.lock();
     let mut frame = FRAMES.lock();
-    // SAFETY: each reference comes from the guard stored next to it; the guards drop after the references (field order). The big
-    // kernel lock is held (checked above), so nobody else reaches the address space.
+    // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
+    // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
+    // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
+    // fields are public); no caller does (T242: every use is `kmem::get().field`); the object lock keeps the kernel address space to this hart.
     unsafe {
         Kmem {
             mm: inside(&mut frame),
@@ -250,7 +255,10 @@ pub fn get_as() -> KmemAs {
     let mut jobs = JOBS.lock();
     let mut kas = KASPACE.lock();
     let mut frame = FRAMES.lock();
-    // SAFETY: as in `get`: each reference comes from the guard stored next to it, which drops after it.
+    // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
+    // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
+    // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
+    // fields are public); no caller does (T242: every use is `kmem::get().field`).
     unsafe {
         KmemAs {
             mm: inside(&mut frame),
@@ -284,7 +292,10 @@ pub fn mem() -> Mem {
     let mut vmo = VMOS.lock();
     let mut jobs = JOBS.lock();
     let mut frame = FRAMES.lock();
-    // SAFETY: as in `get`: each reference comes from the guard stored next to it, which drops after it.
+    // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
+    // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
+    // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
+    // fields are public); no caller does (T242: every use is `kmem::get().field`).
     unsafe {
         Mem {
             mm: inside(&mut frame),
@@ -301,7 +312,10 @@ pub fn mem() -> Mem {
 #[track_caller]
 pub fn frames() -> Frames {
     let mut frame = FRAMES.lock();
-    // SAFETY: as in `get`.
+    // SAFETY: every reference points into the storage of the lock whose guard is stored in the same struct, and the guards are fields declared after the
+    // references, so they drop after them. The spin locks are not recursive (a second take on this hart panics) and are held with interrupts off, so no
+    // other `&mut` to the same value exists while this one does. The type does not stop safe code from moving a reference out and past the guard's drop (the
+    // fields are public); no caller does (T242: every use is `kmem::get().field`).
     unsafe {
         Frames {
             mm: inside(&mut frame),
@@ -684,7 +698,8 @@ fn kernel_half_now() -> [u64; 256] {
 /// Remember the kernel half now (called once, after the S1 memory tests, before any process).
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 pub fn snapshot_kernel_half() {
-    // SAFETY: called once at boot, interrupts off or a single thread, before `kernel_half_unchanged`.
+    // SAFETY: the one call (`kmain`, after the memory tests) is before any reader: `kernel_half_unchanged` is called only on the paths that load or end a process, and
+    // the first process is loaded after it. Interrupts are on and the other harts are running by then, but none of them reads `KERNEL_HALF` yet (T242).
     unsafe { *addr_of_mut!(KERNEL_HALF) = kernel_half_now() };
 }
 

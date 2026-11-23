@@ -122,7 +122,8 @@ impl StateUnit for HartUnit {
     /// In place: the trap paths save into the thread's own copy and build no 264-byte temporary (the kernel's stack budget, KT13).
     fn save_into(&mut self, r: &mut FpRegs) {
         let (f, fcsr) = (r.f.as_mut_ptr(), &mut r.fcsr as *mut u32);
-        // SAFETY: the unit is switched on for exactly these instructions; `f` points at 32 u64s.
+        // SAFETY: `f` points at the 32 u64s of the live `&mut FpRegs` and `fcsr` at its u32, and only those are written; the unit is switched on for exactly these instructions and goes
+        // back to Off; interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`, and this hart's registers hold the thread's state (T242).
         unsafe {
             core::arch::asm!(
                 "csrs sstatus, {on}",
@@ -149,7 +150,7 @@ impl StateUnit for HartUnit {
 
     fn load(&mut self, r: &FpRegs) {
         let (f, fcsr) = (r.f.as_ptr(), u64::from(r.fcsr));
-        // SAFETY: as `save`, reading instead of writing. The FP registers are deliberately *not*
+        // SAFETY: as `save`: `f` points at the 32 u64s of the live `&FpRegs`, `c` at its fcsr, they are only read, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc`. The FP registers are deliberately *not*
         // declared clobbered: the kernel executes no FP instruction of its own (it runs with the unit
         // off, INVARIANTS FP3), so the compiler holds nothing in them; declaring them would make it
         // save and restore the callee-saved ones with FP instructions in this function's prologue,
@@ -198,9 +199,10 @@ impl StateUnit for VecHartUnit {
         }
         let mut csrs = [0u64; 4]; // vstart, vcsr, vl, vtype
         let stride = n.saturating_mul(8);
-        // SAFETY: the unit is switched on for exactly these instructions. `r.v` is 32 * vlenb bytes and each `vs8r.v` stores eight registers
+        // SAFETY: `r.v` is 32 * vlenb bytes (checked above; `vlenb` is the same on every hart, `check_hart`) and each `vs8r.v` stores eight registers
         // (8 * vlenb bytes) at the pointer, which steps by that stride; `csrs` is four u64s. The registers are deliberately not declared
-        // clobbered (the kernel holds nothing in them, as for FP).
+        // clobbered (the kernel holds nothing in them, as for FP). `vstart` is saved, zeroed and restored, the vector registers are only read, whole-register stores do not
+        // depend on `vtype`/`vill`, the unit goes back to Off, and interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc` (T242).
         unsafe {
             core::arch::asm!(
                 "csrs sstatus, {on}",
@@ -242,12 +244,16 @@ impl StateUnit for VecHartUnit {
 
     fn load(&mut self, r: &VecRegs) {
         let n = vlenb();
+        if r.v.len() != n.saturating_mul(32) {
+            return; // (as in `save_into`: the four `vl8re8.v` read 32 * vlenb bytes; every `VecRegs` has that length, and the length is now checked here too, T242)
+        }
         let stride = n.saturating_mul(8);
         // a saved `vill` (the user's last vsetvl was illegal) is restored by an illegal vtype again: a reserved bit set
         let vtype = if r.vtype >> 63 != 0 { 1 << 8 } else { r.vtype };
         // SAFETY: as `save`, reading instead of writing. `vstart` is cleared first (a whole-register load skips elements below it), the length
         // and type are restored by `vsetvl` (it keeps the saved `vl`: that was already at most the maximum for this type), the registers by
-        // `vl8re8.v` and the user's `vcsr` and `vstart` last.
+        // `vl8re8.v` and the user's `vcsr` and `vstart` last. `r.v` is 32 * vlenb bytes (checked above); the user-written `vl`/`vtype`/`vcsr`/`vstart` go through `vsetvl` and WARL CSR
+        // writes, which cannot trap in S-mode (a bad `vtype` only sets `vill`); interrupts are off across the block (the trap context, or the object lock, which asserts it), so no switch can save another thread's registers between the `csrs` and the `csrc` (T242).
         unsafe {
             core::arch::asm!(
                 "csrs sstatus, {on}",
@@ -341,9 +347,10 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
         if me.vs_claim.load(Acquire) != tid || buf == 0 {
             return false;
         }
-        // SAFETY: the claim names the thread running here, so its registers are in this hart's unit and nothing else touches its saved copy;
-        // `buf` is the address of that copy's box, which lives until `thread_gone` (which clears the claim first and runs only for a thread that
-        // is not running).
+        // SAFETY: the claim names the thread running here (set only under the object lock together with the holder and `vs_buf`; another hart clears it only when it
+        // loads or saves the same thread, which cannot run in two places, and thread ids are never reused), so its registers are in this hart's unit and nothing else
+        // touches its saved copy. `buf` is the address of that copy's box, which is freed or replaced only by `thread_gone` and `write_vec`'s replacement, each of which drops
+        // the claim first under the object lock and runs only for a thread that is not running (T242).
         unsafe { VecHartUnit.save_into(&mut *(buf as *mut VecRegs)) };
         frame.sstatus = (frame.sstatus & !VS_MASK) | VS_CLEAN;
     }
@@ -352,7 +359,7 @@ pub fn light_save(frame: &mut TrapFrame) -> bool {
         if me.fs_claim.load(Acquire) != tid || buf == 0 {
             return false;
         }
-        // SAFETY: as above, for the FP unit's copy.
+        // SAFETY: as above, for the FP unit's copy (`fs_claim`, `fs_buf`; `write_fp`'s replacement drops the claim first, for a parked target) (T242).
         unsafe { HartUnit.save_into(&mut *(buf as *mut FpRegs)) };
         frame.sstatus = (frame.sstatus & !FS_MASK) | FS_CLEAN;
     }

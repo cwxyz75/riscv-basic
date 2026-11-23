@@ -238,7 +238,8 @@ fn aim_and_unmask(irq: u32) {
     if let Some(a) = aimed(irq) {
         a.store(hart_id, Ordering::Relaxed);
     }
-    // SAFETY: the source's target word (hart index in bits 31:18, message id in bits 10:0), then
+    // SAFETY: the controller exists (the caller found it in the tree) and `irq` is in 1..=62, checked by the caller against the allow
+    // list in user/trap.rs, so the three registers are inside its mapped window. The source's target word (hart index in bits 31:18, message id in bits 10:0), then
     // the set-pending and enable-set number registers of the supervisor APLIC. Pending goes first:
     // set while masked it is forwarded exactly once when the enable follows (the reverse order could
     // forward twice). Setting pending on a level source whose line is low is ignored by the hardware.
@@ -279,7 +280,8 @@ pub fn retarget_from(from: usize, to: usize) {
 
 /// Mask source `irq`.
 pub fn disable(irq: u32) {
-    // SAFETY: the enable-clear number register of the supervisor APLIC.
+    // SAFETY: the controller exists and `irq` was allowed (an Interrupt object or the allow list) before this is reached; the enable-clear number
+    // register of the supervisor APLIC is inside its mapped window and writing a source number only masks that source.
     unsafe { write_volatile(reg(CLRIENUM), irq) };
 }
 

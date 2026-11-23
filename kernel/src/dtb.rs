@@ -43,8 +43,10 @@ pub fn dtb_blob() -> Option<&'static [u8]> {
         return None;
     }
     let head = (crate::kmem::direct_base() + DTB.load(Ordering::Relaxed) as u64) as *const u8;
-    // SAFETY: `locate` checked the header and bounded `len`; the tree's frames are direct-mapped read-only and never freed (they are not
-    // in the frame allocator).
+    // SAFETY: `locate` checked the header and bounded `len` (40 bytes to 256 KiB, the end below 64 GiB), and nobody writes the tree: its frames are reserved and
+    // never in the frame allocator. Before `kmem::init` the early boot table maps them; after it, the direct map covers the frames that are inside the tree's own
+    // `/memory` ranges and below the direct map's limit and skips the others, so a tree whose blob lies outside its `/memory` would fault here: firmware-dependent,
+    // not reachable from user mode or another hart (T242).
     Some(unsafe { core::slice::from_raw_parts(head, len) })
 }
 

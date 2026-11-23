@@ -77,8 +77,10 @@ fn slot_base(slot: u32) -> u64 {
 impl Deref for KStack {
     type Target = [u64];
     fn deref(&self) -> &[u64] {
-        // SAFETY: the slot's four stack pages are mapped read-write for as long as the kernel runs
-        // (slots are never unmapped), and this `KStack` is the only owner of the slot's contents.
+        // SAFETY: the slot's four stack pages are mapped read-write for as long as the kernel runs (slots are never unmapped) and the pointer is page-aligned, so the
+        // reads are valid. Exclusive ownership of the contents does NOT hold while a thread runs on this stack: `stacks_intact`, the switch path and `current_stack_use`
+        // form this slice while the thread (or another hart's thread) writes the live frames; only the guard words and the words below the live frames are
+        // read in those uses, which is harmless in practice and not sound by the letter of the aliasing rules (T242).
         unsafe {
             core::slice::from_raw_parts(self.bottom() as *const u64, KSTACK_BYTES as usize / 8)
         }
