@@ -55,71 +55,74 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // where it would otherwise return to user mode.
     park_while_stopped();
     apply_pending_regs(frame);
-    let token = any_state(|s| {
-        let UserState {
-            asids,
-            procs,
-            thread_pid,
-            ..
-        } = s;
-        let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
-        crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
-        let p = procs.get_mut(&pid);
-        let (ls, le) = p
-            .as_ref()
-            .map_or((0, 0), |p| (p.libsys.text_start, p.libsys.text_end));
-        crate::percpu::this()
-            .cur_lib_start
-            .store(ls, Ordering::Relaxed);
-        crate::percpu::this()
-            .cur_lib_end
-            .store(le, Ordering::Relaxed);
-        crate::percpu::this().cur_as.store(
-            p.as_ref().map_or(core::ptr::null_mut(), |p| {
-                alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
-            }),
-            Ordering::Release,
-        );
-        let p = p?;
-        // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
-        // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
-        let token = install_token_of(asids, p);
-        // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
-        // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
-        let me = crate::percpu::this();
-        let tid = thread::current() as u64;
-        let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
-        if me.bound_tid.load(Ordering::Relaxed) != tid
-            || me.bound_tag.load(Ordering::Relaxed) != key
-        {
-            thread::bind_user(
-                thread::current(),
-                thread::UserBinding {
-                    pid,
-                    tag: p.tag,
-                    token,
-                    aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
-                    lib: (p.libsys.text_start, p.libsys.text_end),
-                },
+    // (the token is computed and installed in one section of the object lock: a switch between the two would install a stale one, T241)
+    crate::bkl::ensure(|| {
+        let token = any_state(|s| {
+            let UserState {
+                asids,
+                procs,
+                thread_pid,
+                ..
+            } = s;
+            let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+            crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
+            let p = procs.get_mut(&pid);
+            let (ls, le) = p
+                .as_ref()
+                .map_or((0, 0), |p| (p.libsys.text_start, p.libsys.text_end));
+            crate::percpu::this()
+                .cur_lib_start
+                .store(ls, Ordering::Relaxed);
+            crate::percpu::this()
+                .cur_lib_end
+                .store(le, Ordering::Relaxed);
+            crate::percpu::this().cur_as.store(
+                p.as_ref().map_or(core::ptr::null_mut(), |p| {
+                    alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
+                }),
+                Ordering::Release,
             );
-            me.bound_tid.store(tid, Ordering::Relaxed);
-            me.bound_tag.store(key, Ordering::Relaxed);
+            let p = p?;
+            // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
+            // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
+            let token = install_token_of(asids, p);
+            // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
+            // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
+            let me = crate::percpu::this();
+            let tid = thread::current() as u64;
+            let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
+            if me.bound_tid.load(Ordering::Relaxed) != tid
+                || me.bound_tag.load(Ordering::Relaxed) != key
+            {
+                thread::bind_user(
+                    thread::current(),
+                    thread::UserBinding {
+                        pid,
+                        tag: p.tag,
+                        token,
+                        aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
+                        lib: (p.libsys.text_start, p.libsys.text_end),
+                    },
+                );
+                me.bound_tid.store(tid, Ordering::Relaxed);
+                me.bound_tag.store(key, Ordering::Relaxed);
+            }
+            Some(token)
+        });
+        if let Some(token) = token {
+            if crate::percpu::this()
+                .active_aspace
+                .swap(token, Ordering::SeqCst)
+                != token
+                || crate::arch::aspace_current() != token
+            {
+                // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
+                // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
+                // No flush: translations are tagged with the ASID (L18).
+                unsafe { crate::arch::aspace_install_noflush(token) };
+            }
         }
-        Some(token)
     });
-    if let Some(token) = token {
-        if crate::percpu::this()
-            .active_aspace
-            .swap(token, Ordering::SeqCst)
-            != token
-            || crate::arch::aspace_current() != token
-        {
-            // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
-            // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
-            // No flush: translations are tagged with the ASID (L18).
-            unsafe { crate::arch::aspace_install_noflush(token) };
-        }
-    }
 }
 
 /// The return to user mode of a thread that slept in a quiet call and wakes with nothing to look at (L19): `seen` is the attention epoch the call
