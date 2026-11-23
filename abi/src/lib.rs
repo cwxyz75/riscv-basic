@@ -461,6 +461,8 @@ pub mod syscall {
     pub const HART_SET_ONLINE: usize = 116;
     /// A hart's state (PM1): `a0` the root resource (INSPECT), `a1` the index; returns 0 offline, 1 starting, 2 online, 3 draining.
     pub const HART_INFO: usize = 117;
+    /// Suspend to RAM through the firmware (PM3): `a0` the root resource (MANAGE). NOT_SUPPORTED where it cannot be done.
+    pub const SYSTEM_SUSPEND: usize = 118;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

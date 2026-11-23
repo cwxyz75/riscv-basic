@@ -1560,6 +1560,8 @@ pub fn wake_stat(which: u64) -> u64 {
         124 => crate::user::backstops().dma_total_pages,
         // 125: the placement policy in force (PM4): 0 spread, 1 pack
         125 => irq::without(|| sched().policy() as u64),
+        // 126: whether the firmware has the system suspend extension (PM3): 1 yes, 0 no
+        126 => u64::from(crate::arch::sbi::system_suspend_present()),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

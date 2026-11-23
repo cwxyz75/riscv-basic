@@ -22,6 +22,15 @@ pub const FID_DBCN_WRITE_BYTE: usize = 2;
 /// The system reset extension (SRST), function system_reset (a0: 0 shutdown, 1 cold reboot; a1: 0 no reason, 1 system failure).
 pub const EID_SRST: usize = 0x5352_5354;
 pub const FID_SRST_RESET: usize = 0;
+/// The system suspend extension (SUSP; PM3).
+pub const EID_SUSP: usize = 0x5355_5350;
+
+/// Does the firmware have the system suspend extension? Asked of the base extension's `probe_extension`.
+pub fn system_suspend_present() -> bool {
+    let probe = sbi(EID_BASE, FID_PROBE_EXTENSION, EID_SUSP, 0, 0);
+    probe.error == 0 && probe.value != 0
+}
+
 /// `hart_get_status` result for a hart that exists and is waiting to be started.
 pub const HSM_STOPPED: usize = 1;
 
