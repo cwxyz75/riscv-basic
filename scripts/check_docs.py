@@ -303,6 +303,13 @@ def check_ram_literals():
     return out
 
 
+def check_unsafe_inventory():
+    """KT14: every `unsafe` in kernel/src is in the audit list with its current hash."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import unsafe_inventory
+    return unsafe_inventory.problems()
+
+
 def check_syscall_tests():
     """Every error SYSCALLS.md lists for a call has a row in docs/reference/syscall-tests.tsv naming a test that covers it (KT4)."""
     import io, contextlib
@@ -427,7 +434,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

@@ -198,12 +198,14 @@ fn vmo_resolve(
 
 /// The address space of the process this hart is running, for the copies that need only it (the same cell `page_fault_quiet` uses).
 fn current_space() -> Option<&'static klock::aslock::AsCell> {
-    let cell = crate::percpu::this().cur_as.load(Ordering::Acquire);
+    // (the calling thread's own record, not the hart's `cur_as`: the thread may have been switched out since it entered the call, and the hart then
+    // names whichever process last returned to user mode on it; KT14 found this)
+    let cell = thread::user_binding(thread::current())?.aspace as *const klock::aslock::AsCell;
     if cell.is_null() {
         return None;
     }
-    // SAFETY: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for as long as the caller runs on this thread
-    // (the cell is only used inside the syscall, and a process is torn down only when its last thread has gone).
+    // SAFETY: the binding is the calling thread's own, written when its process's space was installed for it; the cell's `Arc` lives as long as the process,
+    // which is torn down only when its last thread has gone, so it is alive for as long as the caller runs on this thread (the cell is only used inside the syscall).
     Some(unsafe { &*cell })
 }
 
@@ -581,6 +583,18 @@ pub fn call_from_library(pc: u64) -> bool {
     cfg!(feature = "fault-skip-entry-check") || e == 0 || (s <= pc && pc < e)
 }
 
+/// `call_from_library` for the full path, which runs after the thread may have slept in a quiet call and woken on another hart: the range is the thread's own
+/// (its binding), not the hart's.
+pub fn call_from_library_of_thread(pc: u64) -> bool {
+    if cfg!(feature = "fault-skip-entry-check") {
+        return true;
+    }
+    match thread::user_binding(thread::current()) {
+        Some(b) => b.lib.1 == 0 || (b.lib.0 <= pc && pc < b.lib.1),
+        None => true,
+    }
+}
+
 /// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call
 /// instruction. The process is the one `activate_current` recorded for this hart's running thread; the rest takes only the key's bucket lock
 /// and the scheduler's own locks. A wake that outranks this thread leaves `need_resched` set: the caller takes the lock for the switch.
@@ -635,7 +649,7 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     if frame.is_syscall() {
         // AB8: the system call instruction is allowed only inside the system library; anywhere else it is an illegal instruction, and the
         // process ends (or its exception port hears of it)
-        if !call_from_library(frame.pc()) {
+        if !call_from_library_of_thread(frame.pc()) {
             raise_fault(ksys::exception::Fault {
                 kind: abi::arch::fault::ILLEGAL,
                 pc: frame.pc(),
