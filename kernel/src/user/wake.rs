@@ -4,11 +4,12 @@ use super::*;
 
 /// An interrupt source fired (trap context, BKL held): hand it to the interrupt object that owns it.
 pub fn irq_fired(irq: u32) -> bool {
-    let s = state_locked();
-    let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {
-        return false;
-    };
-    ipc::interrupt_fire(&mut s.objs, obj, irq)
+    with_state(|s| {
+        let Some(&Some(obj)) = s.irq_objs.get(irq as usize) else {
+            return false;
+        };
+        ipc::interrupt_fire(&mut s.objs, obj, irq)
+    })
 }
 
 /// Wake the waiters whose condition the interrupt path changed, without the cleanup `notify` does.

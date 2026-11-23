@@ -479,9 +479,10 @@ pub(super) fn take_interrupt() -> bool {
 /// The job the user thread `tid` belongs to (`None` for a kernel thread): who pays for the register state the kernel keeps for it (MM5).
 /// Needs the big kernel lock.
 pub(crate) fn job_of_thread(tid: Tid) -> Option<JobId> {
-    let s = state_locked();
-    let pid = s.thread_pid.get(&tid)?;
-    Some(s.procs.get(pid)?.job)
+    with_state(|s| {
+        let pid = s.thread_pid.get(&tid)?;
+        Some(s.procs.get(pid)?.job)
+    })
 }
 
 /// Charge the growth of the calling thread's handle table to its process's job (MM5; `HandleTable::settle_growth`): a job that cannot pay
@@ -523,9 +524,10 @@ pub(super) fn take_interrupt_held() -> bool {
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
 pub(super) fn killed_now() -> Option<i32> {
-    let s = state_locked();
-    let pid = s.thread_pid.get(&thread::current())?;
-    s.procs.get(pid)?.killed
+    with_state(|s| {
+        let pid = s.thread_pid.get(&thread::current())?;
+        s.procs.get(pid)?.killed
+    })
 }
 
 /// Where a stopped process stops, a suspended thread stops (`thread_suspend`, EX1) and a killed one dies: the calling thread's return to user

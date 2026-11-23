@@ -65,14 +65,15 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         Ok(())
     })();
     let (pid, tag, first_gen) = (|| {
-        with_state(|s| {
+        {
+            let s = state_locked();
             let pid = s.next_pid;
             // (CNT1: the counter never wraps or repeats: at its end no process is started)
             // (the process backstop: the syscall layer checks it, and so does this)
             let ok = s.procs.len() < s.backstops.processes
                 && pid.checked_add(1).map(|n| s.next_pid = n).is_some();
             (ok.then_some(pid), s.asids.alloc(), s.first_handle_gen)
-        })
+        }
     })();
     let built = built.and_then(|()| pid.map(|_| ()).ok_or(LoadError::NoMemory));
     let pid = pid.unwrap_or(0);
@@ -149,7 +150,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(LoadError::NoMemory);
     }
     let token = (|| {
-        with_state(|s| {
+        {
+            let s = state_locked();
             let (entry, arg) = (process.entry, process.arg);
             // (the root job has no limits: these charges only keep its usage honest)
             let jobs = &mut *k.jobs;
@@ -157,7 +159,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             let _ = charge_thread(jobs, JobId::ROOT);
             s.procs.insert(pid, Box::new(process));
             new_start(s, pid, entry, STACK_TOP, arg, None)
-        })
+        }
     })();
     // (the thread's stack comes from the same locks)
     drop(k);
