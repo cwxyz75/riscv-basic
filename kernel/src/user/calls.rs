@@ -459,8 +459,9 @@ fn general_of(
     if let Some(g) = s.pending_regs.get(&tid).and_then(|p| p.general) {
         return Some(g);
     }
-    // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers;
-    // the big kernel lock is held, as for every other access to it.
+    // SAFETY: the thread is stopped in the kernel after a trap from user mode, so the frame at the top of its kernel stack is its saved registers and is mapped.
+    // The object lock does not order this read against the thread's own writes to the frame: a thread whose wait just ended writes its reply before it parks,
+    // so a read in that window can see old and new register values mixed (T241, part 2: not corruption).
     Some(unsafe { (*frame?).general() })
 }
 

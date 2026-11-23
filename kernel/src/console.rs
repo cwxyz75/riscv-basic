@@ -111,6 +111,27 @@ pub fn break_lock() {
     UART_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
+/// The panic handler's writer: its own line state and no UART lock (`break_lock` has let it through, and another hart may be inside `LINE` still: a panic
+/// must not form a second `&mut` to it, T240).
+pub struct PanicConsole {
+    line: kcore::linestate::LineState,
+}
+
+impl PanicConsole {
+    pub const fn new() -> PanicConsole {
+        PanicConsole {
+            line: kcore::linestate::LineState::new(),
+        }
+    }
+}
+
+impl fmt::Write for PanicConsole {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.line.kernel_text(s.as_bytes(), &mut put);
+        Ok(())
+    }
+}
+
 /// The physical line state shared by every writer (kernel and bridge): see
 /// `kcore::linestate`. Accessed only with interrupts off.
 static mut LINE: kcore::linestate::LineState = kcore::linestate::LineState::new();

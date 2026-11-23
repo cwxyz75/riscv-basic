@@ -285,8 +285,13 @@ impl core::fmt::Display for Trace {
             .kstack_top
             .load(core::sync::atomic::Ordering::Relaxed) as usize;
         let text = kmem::sections().text;
-        // (a stack is at most 64 KiB here; anything else is not the stack this hart is on)
-        if top == 0 || top <= sp || top - sp > 64 * 1024 {
+        // (a kernel stack is one slot: `sp` and `top` must be in the same one, or `top` is another thread's and the walk would cross a guard page, T240)
+        let slot = abi::layout::KSTACK_SLOT_BYTES as usize;
+        if top == 0
+            || top <= sp
+            || top - sp > abi::layout::KSTACK_BYTES as usize
+            || (top - 1) / slot != sp / slot
+        {
             return Ok(());
         }
         write!(f, " [stack")?;
@@ -307,6 +312,9 @@ impl core::fmt::Display for Trace {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     console::break_lock();
-    let _ = testlog::panic(&mut console::Console, &format_args!("{info}{Trace}"));
+    let _ = testlog::panic(
+        &mut console::PanicConsole::new(),
+        &format_args!("{info}{Trace}"),
+    );
     finisher::exit(false)
 }
