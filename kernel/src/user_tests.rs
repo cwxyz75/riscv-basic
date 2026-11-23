@@ -40,6 +40,7 @@ static mut HELPER_END: Option<user::KernelEnd> = None;
 /// A stand-in server on the kernel side of init's bootstrap channel (see the comment in
 /// suite.rs above `wait_arguments_are_checked`): the first 4 bytes of a request are a
 /// transaction id, the 5th the operation.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a test-only kernel thread whose frame holds the arms of the helper's requests; the boot-time stack budget check bounds it
 fn helper_main(_: usize) {
     // SAFETY: set by `run_all` just before this thread is spawned, taken once here.
     let end =
@@ -73,6 +74,10 @@ fn helper_main(_: usize) {
                             user::ktable_close(h);
                         }
                     }
+                }
+                b'A' => {
+                    // the conformance program image (AB9)
+                    let _ = end.write_with_vmo(&msg[..5], user::ABI_CONFORMANCE_ELF);
                 }
                 b'H' => {
                     // the `hello` program image, for the runtime tests

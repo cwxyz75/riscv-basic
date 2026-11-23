@@ -41,6 +41,8 @@ process_map_argument_checks
 process_start_argument_checks
 fetch_the_program_image
 fetch_the_hello_image
+fetch_the_conformance_image
+abi_conformance_passes
 child_exit_code_and_terminated_signal
 programs_are_placed_at_random
 the_system_library_is_in_every_process

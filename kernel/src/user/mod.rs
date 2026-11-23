@@ -47,6 +47,9 @@ pub static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"
 /// The boot image (S4-SPEC section 3): every user program and the fixture files, as one
 /// archive that becomes a read-only VMO for `init`.
 pub static BOOT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootimg.bin"));
+/// The conformance program of the system library (AB9): started by the boot-time suite, not part of the boot image.
+pub static ABI_CONFORMANCE_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/abi_conformance.elf"));
 pub static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 
 /// The quota to charge new objects to: `job` (the creating process's, or the root's for the

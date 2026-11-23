@@ -48,3 +48,38 @@ fn the_page_layout_round_trips() {
     };
     assert_eq!(libsys::page::Page::from_bytes(&p.to_bytes()), Some(p));
 }
+
+/// The symbols of the previous release (`symbols-v1.txt`) that `img` lacks.
+fn missing(list: &str, img: &Image) -> Vec<String> {
+    list.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| img.lookup(l).is_none())
+        .map(String::from)
+        .collect()
+}
+
+/// AB9, the versioning rule: the library only grows. Every symbol of the checked-in list of the previous release is still there.
+#[test]
+fn no_symbol_of_the_previous_release_is_missing() {
+    let dir = std::env::temp_dir().join(format!("libsys-test-v1-{}", std::process::id()));
+    let bytes = build::build(&dir).unwrap();
+    let len = libsys::image::image_len(&bytes).unwrap();
+    let img = Image::new(&bytes[..len]).unwrap();
+    let list = include_str!("../symbols-v1.txt");
+    assert_eq!(missing(list, &img), Vec::<String>::new());
+    // the check sees a removal
+    let with_removed = format!("{list}\nsys_a_call_that_was_removed\n");
+    assert_eq!(
+        missing(&with_removed, &img),
+        vec!["sys_a_call_that_was_removed".to_string()]
+    );
+    // and every call of the table is on the list (a new call is added to the list when it is released)
+    for &(name, _) in abi::syscall::TABLE {
+        assert!(
+            list.lines().any(|l| l == libsys::symbol_name(name)),
+            "{name} is not in symbols-v1.txt"
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
