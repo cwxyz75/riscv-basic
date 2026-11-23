@@ -202,9 +202,9 @@ holds the big lock longest, reorder on that evidence and record it below.
 ### Phase 10: scale and power
 
 - [ ] **SC2** (first step built, phase 10: the masks, `select_hart` and the pull through them, a counter and the host acceptance; the measurements at 16 and 32 harts are left) placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
-- [ ] **PM1** harts offline and online
+- [ ] **PM1** (built, phase 10; ticks at the epic gate) harts offline and online
 - [ ] **PM4** (built, phase 10: `Policy`, `system_set_placement`, the GP1 walks and a QEMU test under both; ticks at the epic's gate; `rt_latency` under pack is the soak's) the placement policy (`spread`, `pack`)
-- [ ] **PM3** `system_suspend`
+- [ ] **PM3** (built, phase 10, the firmware path not: T229; ticks at the epic gate) `system_suspend`
 
 ### Phase 11: hardening
 
@@ -250,6 +250,10 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
 - **Measurements and hardware checks nobody has made** (phases 6 and 7; each is in its work item): the sweep's worst interrupts-off section with 16,000 live objects (T206); the ASID-reuse control, the instruction-cache synchronisation and the unmap shootdown negative control, which QEMU 11.1.3 does not show and which need real hardware or an emulator that models them (T205, PL7, T193; the decommit and protect controls do show, and are in `os-boot-test-smp-neg`); a 2 GiB VMO sparsely touched at `-m 4G` (T207); `os-miri` over the new code (`kcore::asid`, `fcache`, the sweep, the region operations).
 
 ## Decisions taken without the owner
+
+  - 2026-11-23, PM3: `system_suspend` is built to the item's fallback acceptance: the sequence's host model and the NOT_SUPPORTED check. The firmware path (HSM-stopped harts, a physical resume entry, the real CSR and IMSIC restore) is T229, after T228, because the reference firmware has no SUSP extension and the path could not be run; code written blind is dead and unverified. The PR says plainly that the suspend path itself was not run.
+
+  - 2026-11-23, PM1: an offline hart is **logical**: it parks in its idle loop (still powered, still able to take the reschedule IPI that brings it back) instead of calling SBI HSM `hart_stop` and coming back through `hart_start`. Reason: the stop and start need the secondary bring-up made re-entrant, and on QEMU only the power differs; the invariants (HT1, HT2) are about the scheduler state. Recorded as T228. Also: the hart sets its own state (a call changes it only by asking: Draining or Starting, then an IPI), the displaced running thread is migrated by the hart itself at its own settle, never by another hart, and a hart with a pinned thread or the last online hart refuses with BAD_STATE.
 
   - 2026-11-23, PM4: `pack` differs from `spread` only in where a wake goes; what a hart pulls is the same. KERNEL-V1-SPEC 5.6 and the item say pack pulls only when idle and only from a hart with more than one queued thread, which would leave a thread waiting while a hart idles: GP1 (no hart runs lower than a waiting thread it may run) is the stronger rule and both policies must keep it. The policy is an enum with two methods, not a trait, until a third policy exists.
 

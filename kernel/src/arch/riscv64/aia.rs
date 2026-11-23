@@ -253,6 +253,30 @@ fn aim_and_unmask(irq: u32) {
     }
 }
 
+/// Re-aim every source that was aimed at hart `from` (the firmware's id) at hart `to` (PM1: `from` goes offline). Only the target word changes, not the enable
+/// or pending state: a message already on its way still reaches `from`'s IMSIC, which an offline hart keeps taking.
+pub fn retarget_from(from: usize, to: usize) {
+    let Some(i) = info() else {
+        return;
+    };
+    let Some(index) = i.hart_order.iter().position(|&h| h as usize == to) else {
+        return;
+    };
+    for &s in &i.sources {
+        let Some(a) = aimed(s) else { continue };
+        if a.load(Ordering::Relaxed) == from {
+            a.store(to, Ordering::Relaxed);
+            // SAFETY: the source's target word, as in `aim_and_unmask`.
+            unsafe {
+                write_volatile(
+                    reg(TARGET + 4 * (u64::from(s) - 1)),
+                    (index as u32) << 18 | eiid(s),
+                );
+            }
+        }
+    }
+}
+
 /// Mask source `irq`.
 pub fn disable(irq: u32) {
     // SAFETY: the enable-clear number register of the supervisor APLIC.

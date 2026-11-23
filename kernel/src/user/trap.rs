@@ -223,6 +223,34 @@ fn vmo_commit_call(a: [u64; 6]) -> Reply {
     r
 }
 
+/// `hart_set_online(resource, index, online)` and `hart_info(resource, index)` (PM1): the resource is checked under the object lock, which is dropped before the call waits
+/// for the hart (its displaced threads need the object domain to switch).
+fn hart_call(n: usize, a: [u64; 6]) -> Reply {
+    with_state(|s| -> Reply {
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        ipc::resource_of(&s.objs, &p.handles, Handle(a[0])).map_err(|e| (e, None, None))?;
+        Ok((None, None))
+    })?;
+    if n == nr::SYSTEM_SUSPEND {
+        // (PM3: with no system-suspend extension nothing is done; with it, the kernel still cannot stop its harts for the firmware, T229)
+        return fail(Status::NotSupported);
+    }
+    if n == nr::HART_INFO {
+        return match thread::hart_state_of(a[1]) {
+            Some(st) => Ok((Some(st), None)),
+            None => fail(Status::InvalidArgs),
+        };
+    }
+    if a[2] > 1 {
+        return fail(Status::InvalidArgs);
+    }
+    match thread::hart_set_online(a[1], a[2] == 1) {
+        Ok(()) => Ok((None, None)),
+        Err(e) => fail(e),
+    }
+}
+
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     with_state(|s| -> Reply {
@@ -669,6 +697,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::THREAD_EXIT => leave(a[0] as i32, false),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
+        nr::HART_SET_ONLINE | nr::HART_INFO | nr::SYSTEM_SUSPEND => reply(frame, hart_call(n, a)),
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
         nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
         nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),

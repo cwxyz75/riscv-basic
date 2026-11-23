@@ -161,7 +161,7 @@ pub mod rights {
             Self::DUPLICATE.0 | Self::TRANSFER.0 | Self::MANAGE.0 | Self::INSPECT.0 | Self::WAIT.0,
         );
         /// A job: create children and processes in it, set limits (MANAGE), end everything in it
-        /// (KILL), read usage (INSPECT).
+        /// (KILL), read usage (MANAGE).
         pub const JOB: Rights = Rights(
             Self::DUPLICATE.0
                 | Self::TRANSFER.0
@@ -457,6 +457,12 @@ pub mod syscall {
     pub const DEBUG_ROOT: usize = 114;
     /// Choose how a wake picks a hart (PM4): `a0` the root resource (MANAGE), `a1` the policy, 0 spread or 1 pack.
     pub const SYSTEM_SET_PLACEMENT: usize = 115;
+    /// Take a hart out of the scheduler or bring it back (PM1): `a0` the root resource (MANAGE), `a1` the hart's index, `a2` 1 online or 0 offline.
+    pub const HART_SET_ONLINE: usize = 116;
+    /// A hart's state (PM1): `a0` the root resource (INSPECT), `a1` the index; returns 0 offline, 1 starting, 2 online, 3 draining.
+    pub const HART_INFO: usize = 117;
+    /// Suspend to RAM through the firmware (PM3): `a0` the root resource (MANAGE). NOT_SUPPORTED where it cannot be done.
+    pub const SYSTEM_SUSPEND: usize = 118;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

@@ -374,13 +374,22 @@ fn idle_main(_: usize) {
     loop {
         IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
         let was = irq::save_and_disable();
+        if hart_idle_step() {
+            // (a hart going offline spins until it is empty, so a late `switched` or a record in transit is noticed)
+            irq::restore(was);
+            core::hint::spin_loop();
+            continue;
+        }
         // (negative control `fault-skip-poke`: the idle hart's only wake is a poke, which that kernel drops; a tick must not rescue it)
         if !cfg!(feature = "fault-skip-poke") && sched().idle_has_work(hart()) {
             irq::restore(was);
             irq::off(reschedule_this_hart);
             continue;
         }
-        if crate::heap::needs_service() {
+        if crate::heap::needs_service()
+            && crate::percpu::this().hart_state.load(Ordering::Acquire)
+                == crate::percpu::HART_ONLINE
+        {
             irq::off(crate::heap::service); // an idle hart is a safe point too
         }
         let ev = program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
@@ -401,6 +410,106 @@ fn idle_main(_: usize) {
             .fetch_add(now_ns().saturating_sub(idle_from), Ordering::Relaxed);
         irq::restore(was);
     }
+}
+
+/// The hart's own part of going offline and coming back (PM1), taken by its idle loop with interrupts off. Returns whether the hart must look again at once
+/// (it is draining). Draining: move the records homed here away (`evacuate`); when none are left, give back what is cached per hart (frames, heap magazines),
+/// flush the TLB and leave the shootdown and poke sets. Starting: flush the TLB, rejoin the scheduler with the current clock, then enter the shootdown set.
+fn hart_idle_step() -> bool {
+    use crate::percpu::{HART_DRAINING, HART_OFFLINE, HART_ONLINE, HART_STARTING};
+    let me = crate::percpu::this();
+    match me.hart_state.load(Ordering::Acquire) {
+        HART_DRAINING => {
+            if sched().is_scheduler_online(hart()) {
+                return false; // (the call has published Draining but `begin_offline` has not finished, or was refused: nothing to drain yet)
+            }
+            let left = sched().evacuate(hart());
+            // (what moved away may be a sleeper whose timer is now on a hart asleep with nothing armed, or a thread queued there: those harts are marked and must look)
+            let pokes = sched().take_pokes();
+            send_pokes(pokes, hart());
+            if left != 0 {
+                return true;
+            }
+            crate::kmem::flush_frame_cache();
+            crate::heap::return_magazines();
+            crate::arch::tlb_flush_all();
+            me.online.store(false, Ordering::SeqCst);
+            me.hart_state.store(HART_OFFLINE, Ordering::Release);
+            false
+        }
+        HART_STARTING => {
+            crate::arch::tlb_flush_all();
+            crate::arch::icache_flush_local(); // (code may have changed while this hart was out of the `fence.i` set)
+            sched().finish_online(hart(), now_ns());
+            me.online.store(true, Ordering::SeqCst);
+            me.hart_state.store(HART_ONLINE, Ordering::Release);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// `hart_set_online` (PM1): take hart `v` out of the scheduler or bring it back, and return when it has got there. `BadState`: it is the last online hart, a thread is
+/// pinned to it, or it is in the middle of the other change; `TimedOut`: it did not get there (a bug: the call leaves it as it is).
+pub fn hart_set_online(v: u64, online: bool) -> Result<(), abi::status::Status> {
+    use crate::percpu::{HART_DRAINING, HART_OFFLINE, HART_ONLINE, HART_STARTING};
+    use abi::status::Status;
+    let v = usize::try_from(v).map_err(|_| Status::InvalidArgs)?;
+    if v >= crate::smp::started() {
+        return Err(Status::InvalidArgs);
+    }
+    let st = crate::percpu::hart(v);
+    let (from, through, to) = if online {
+        (HART_OFFLINE, HART_STARTING, HART_ONLINE)
+    } else {
+        (HART_ONLINE, HART_DRAINING, HART_OFFLINE)
+    };
+    if st.hart_state.load(Ordering::Acquire) == to {
+        return Ok(());
+    }
+    if st
+        .hart_state
+        .compare_exchange(from, through, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Status::BadState);
+    }
+    if !online {
+        let refused = irq::off(|| sched().begin_offline(v).is_err());
+        if refused {
+            st.hart_state.store(HART_ONLINE, Ordering::Release);
+            return Err(Status::BadState);
+        }
+        // (device interrupts aimed at it go to the lowest other online hart)
+        if let Some(t) = (0..crate::smp::started()).find(|&i| {
+            i != v && crate::percpu::hart(i).hart_state.load(Ordering::Acquire) == HART_ONLINE
+        }) {
+            crate::aia::retarget_from(
+                st.hart_id.load(Ordering::Relaxed),
+                crate::percpu::hart(t).hart_id.load(Ordering::Relaxed),
+            );
+        }
+    }
+    crate::smp::send_ipi(v, crate::percpu::IPI_RESCHED);
+    let give_up = now_ns().saturating_add(2_000_000_000);
+    while st.hart_state.load(Ordering::Acquire) != to {
+        if now_ns() > give_up {
+            return Err(Status::TimedOut);
+        }
+        crate::smp::send_ipi(v, crate::percpu::IPI_RESCHED);
+        sleep_ns(100_000);
+    }
+    Ok(())
+}
+
+/// The state of hart `v` for `hart_info`: 0 offline, 1 starting, 2 online, 3 draining. `None`: no such hart.
+pub fn hart_state_of(v: u64) -> Option<u64> {
+    let v = usize::try_from(v)
+        .ok()
+        .filter(|&v| v < crate::smp::started())?;
+    Some(u64::from(
+        crate::percpu::hart(v).hart_state.load(Ordering::Acquire),
+    ))
 }
 
 /// First Rust code of every new thread (called from the assembly trampoline).
@@ -1451,6 +1560,8 @@ pub fn wake_stat(which: u64) -> u64 {
         124 => crate::user::backstops().dma_total_pages,
         // 125: the placement policy in force (PM4): 0 spread, 1 pack
         125 => irq::without(|| sched().policy() as u64),
+        // 126: whether the firmware has the system suspend extension (PM3): 1 yes, 0 no
+        126 => u64::from(crate::arch::sbi::system_suspend_present()),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

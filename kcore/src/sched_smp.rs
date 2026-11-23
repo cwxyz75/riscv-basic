@@ -330,6 +330,12 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         }
     }
 
+    /// Is hart `x` part of the scheduler (not offline, not yet joined)? The hart's own idle step asks it before it drains (PM1).
+    #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count
+    pub fn is_scheduler_online(&self, x: usize) -> bool {
+        self.online[x].load(Ordering::SeqCst)
+    }
+
     #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count
     fn is_online(&self, x: usize) -> bool {
         self.online[x].load(Ordering::Acquire)
@@ -384,6 +390,107 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     pub fn set_policy(&self, policy: Policy) {
         self.policy.store(policy as u8, Ordering::Relaxed);
     }
+    /// Take hart `v` out of the scheduler (PM1, KERNEL-V1-SPEC 5.3): refused (`BadState`) if it is the last online hart or a thread is pinned to it. It leaves
+    /// the `online` mask at once (nothing is placed, pushed or marked there from now on) and runs only its idle thread; what it was running is displaced when it
+    /// next looks at its queues (the caller pokes it), and `evacuate` moves the records homed there. Already offline: nothing to do.
+    #[allow(clippy::indexing_slicing)] // INVARIANT: v was checked below the hart count
+    pub fn begin_offline(&self, v: usize) -> Result<(), Error> {
+        if v >= self.harts() {
+            return Err(Error::NoSuchThread);
+        }
+        // (the last-hart check and the clearing of the bit are one step: two calls taking each other's hart offline cannot both pass)
+        loop {
+            let m = self.masks.online.load(Ordering::SeqCst);
+            if m & (1u64 << v) == 0 {
+                return Ok(()); // already offline
+            }
+            if m & !(1u64 << v) == 0 {
+                return Err(Error::BadState);
+            }
+            if self
+                .masks
+                .online
+                .compare_exchange(m, m & !(1u64 << v), Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        {
+            let mut q = self.lq(v);
+            if q.has_pinned(v) {
+                drop(q);
+                self.masks.online.fetch_or(1u64 << v, Ordering::SeqCst);
+                return Err(Error::BadState);
+            }
+            q.set_offline(true);
+        }
+        // (last: the hart's own idle step starts draining only when it sees this flag, so everything above has happened by then)
+        self.online[v].store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Move the records homed on offline hart `v` to online harts (PM1): queued threads and blocked ones with their timers, each under both harts' locks in
+    /// index order. Returns how many records are still homed there (the running thread before the hart displaced it, a thread in transit): ask again.
+    pub fn evacuate(&self, v: usize) -> usize {
+        let skip = |t: Tid| self.is_in_transit(t);
+        let movable = self.lq(v).movable(&skip);
+        for (tid, state) in movable {
+            // (negative control: the blocked threads of an offline hart stay homed there, with their timers, and HT1 and HT2 fail)
+            if cfg!(feature = "fault-offline-skip-blocked") && state == State::Blocked {
+                continue;
+            }
+            let Some(mut rec) = self.lq(v).record(tid).cloned() else {
+                continue;
+            };
+            if state == State::Exited {
+                rec.affinity = None; // (nothing will run it again: where it waits to be reaped does not matter)
+            }
+            let dest = self.select_hart(&rec);
+            if dest == v || !self.is_online(dest) {
+                continue;
+            }
+            let moved = {
+                let (mut src, mut dst) = self.lq2(v, dest);
+                if dst.is_offline() {
+                    continue; // (it went offline since `select_hart` looked: the next pass chooses again)
+                }
+                if state == State::Blocked || state == State::Exited {
+                    match src.detach_blocked(tid) {
+                        Some(r) => {
+                            dst.attach_blocked(r, dest as u8);
+                            // (a sleeper's timer is now on `dest`, which may be asleep with nothing armed: it must look)
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    match src.detach_queued(tid) {
+                        Some(r) => {
+                            dst.attach(r, Enq::Migrated, dest as u8);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if moved {
+                self.mark(dest);
+            }
+        }
+        self.lq(v).homed_count()
+    }
+
+    /// Bring hart `v` back (PM1): online again, its clock set to `now`, placement may choose it. Its queues are empty (it was drained).
+    pub fn finish_online(&self, v: usize, now: Time) {
+        {
+            let mut q = self.lq(v);
+            q.set_now(now);
+            q.set_offline(false);
+        }
+        self.set_online(v, true);
+    }
+
     /// How many times a settle looked into another hart's queue under its lock (SC2).
     pub fn pull_looks(&self) -> u64 {
         self.pull_looks.load(Ordering::Relaxed)
@@ -480,6 +587,10 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// and sent an IPI that `wfi` will see).
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     pub fn idle_has_work(&self, h: usize) -> bool {
+        if !self.is_online(h) {
+            // (PM1: an offline hart's idle loop only waits for its own transitions and pokes: nothing is queued here, and it pulls nothing)
+            return self.pending[h].load(Ordering::Acquire);
+        }
         {
             let q = self.lq(h);
             if self.pending[h].load(Ordering::Acquire) || q.queued_len() > 0 {
@@ -985,9 +1096,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             class_words: [0; 4],
             park: crate::park::ParkState::Idle,
         };
-        let target = self.select_hart(&probe);
-        let home = {
+        let (target, home) = loop {
+            let target = self.select_hart(&probe);
             let mut q = self.lq(target);
+            if q.is_offline() {
+                if affinity.is_some() {
+                    return Err(Error::BadState); // (pinned to a hart that is offline)
+                }
+                continue; // (it went offline since `select_hart` looked)
+            }
             q.fresh_as(
                 tid,
                 attr,
@@ -996,7 +1113,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 target as u8,
             )?;
             q.enqueue_runnable(tid, Enq::New);
-            q.record(tid).expect("just made").home.clone()
+            break (target, q.record(tid).expect("just made").home.clone());
         };
         // (the table comes after the run-queue lock: `TT` is ahead of `RQ` in the order)
         self.rqs.table().insert(tid, home);
@@ -1227,6 +1344,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
                 Ok(_) => Placed::Queued(counts),
                 Err(e) => Placed::Err(e),
             },
+            Some(dst) if dst.is_offline() => Placed::Retry, // (it went offline since `select_hart` looked)
             Some(dst) => match src.detach_woken(tid) {
                 Ok((rec, slept)) => {
                     dst.attach(rec, Enq::Wake { slept }, target as u8);
@@ -1343,6 +1461,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             let _ = h;
             return false; // negative control (L11d): nothing moves between harts but by push
         }
+        if !self.is_online(h) {
+            return false; // (an offline hart pulls nothing)
+        }
         let len = |x: usize| self.hint[x].queued_len.load(Ordering::Acquire);
         let mine = len(h);
         let busiest = (0..self.harts())
@@ -1364,6 +1485,9 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             return false;
         }
         let (mut dst, mut src) = self.lq2(h, g);
+        if dst.is_offline() {
+            return false;
+        }
         // everything that chose this move is looked at again under both locks (the lengths and the running priority were hints)
         if find(&src) != Some((tid, p))
             || src.queued_len() < dst.queued_len() + 2

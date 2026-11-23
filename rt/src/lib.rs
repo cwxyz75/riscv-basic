@@ -395,6 +395,21 @@ pub mod sys {
             [resource as usize, policy as usize, 0, 0, 0, 0],
         )
     }
+    /// Take hart `index` out of the scheduler (`online` 0) or bring it back (1) (PM1). Returns when it has got there.
+    pub fn hart_set_online(resource: u64, index: u64, online: u64) -> Ret {
+        syscall(
+            HART_SET_ONLINE,
+            [resource as usize, index as usize, online as usize, 0, 0, 0],
+        )
+    }
+    /// The state of hart `index` (PM1): 0 offline, 1 starting, 2 online, 3 draining.
+    pub fn hart_info(resource: u64, index: u64) -> Ret {
+        syscall(HART_INFO, [resource as usize, index as usize, 0, 0, 0, 0])
+    }
+    /// Suspend the machine to RAM through the firmware (PM3). NOT_SUPPORTED where the firmware has no such extension.
+    pub fn system_suspend(resource: u64) -> Ret {
+        syscall(SYSTEM_SUSPEND, [resource as usize, 0, 0, 0, 0, 0])
+    }
     /// A read-only VMO holding the device tree; `a2` is its length in bytes.
     pub fn resource_dtb(resource: u64) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])

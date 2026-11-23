@@ -181,7 +181,7 @@ ATOMICS = {
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
-    "kernel/src/percpu.rs": (85, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16)"),
+    "kernel/src/percpu.rs": (87, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1)"),
     "klock/src/aslock.rs": (3, "the installed machine hooks of the address-space lock: one pointer, stored once at boot and read with acquire (L17)"),
     "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
@@ -206,7 +206,7 @@ ATOMICS = {
     "kernel/src/arch/riscv64/finisher.rs": (3, "the test device's address from the device tree, set once at boot (PL5b)"),
     "kernel/src/interactive.rs": (4, "the interactive build's input flags"),
     "kernel/src/sched_tests.rs": (49, "self-test flags and counters (the deep-recursion test of KT13 adds the use it measured; L1 adds the probe's 99th percentile)"),
-    "kernel/src/smp_tests.rs": (16, "self-test flags and counters"),
+    "kernel/src/smp_tests.rs": (18, "self-test flags and counters (PM1: the offline test's tick counter)"),
 }
 ATOMIC_RE = re.compile(r"\bAtomic(?:U8|U16|U32|U64|Usize|Bool|I8|I16|I32|I64|Isize|Ptr)\b")
 

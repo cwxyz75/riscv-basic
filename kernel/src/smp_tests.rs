@@ -143,6 +143,140 @@ fn pack_keeps_light_threads_on_few_harts() -> Result<(), String> {
     Ok(())
 }
 
+static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn counting_sleeper(_: usize) {
+    while !SLEEPER_STOP.load(Ordering::Relaxed) {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+        thread::sleep_ns(300_000);
+    }
+}
+
+/// PM1 (KERNEL-V1-SPEC 5.3): harts go offline and come back in a random order while sleepers keep waking (their timers migrate), the last online hart refuses, and the
+/// offline hart takes no wakes and shows as offline; everything is online again at the end.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn harts_go_offline_and_come_back() -> Result<(), String> {
+    use crate::percpu::{HART_OFFLINE, HART_ONLINE};
+    let n = smp::started();
+    if n < 3 {
+        return Ok(());
+    }
+    SLEEPER_STOP.store(false, Ordering::Relaxed);
+    let sleepers: alloc::vec::Vec<_> = (0..4)
+        .map(|_| thread::spawn_free("counting_sleeper", 20, counting_sleeper, 0))
+        .collect();
+    let state = |h: usize| percpu::hart(h).hart_state.load(Ordering::Acquire);
+    let b0 = TICKS.load(Ordering::Relaxed);
+    thread::sleep_ticks(10);
+    let baseline = TICKS.load(Ordering::Relaxed) - b0; // (wakes in 10 ms with every hart online)
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut result = Ok(());
+    'rounds: for round in 0..8 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let v = 1 + (seed >> 33) as usize % (n - 1);
+        if let Err(e) = thread::hart_set_online(v as u64, false) {
+            result = Err(format!(
+                "round {round}: hart {v} would not go offline: {e:?}"
+            ));
+            break;
+        }
+        let entries = |h: usize| {
+            percpu::hart(h).idle_wfi.load(Ordering::Relaxed)
+                + percpu::hart(h).idle_suspend.load(Ordering::Relaxed)
+        };
+        let (t0, e0) = (TICKS.load(Ordering::Relaxed), entries(v));
+        thread::sleep_ticks(10);
+        let t1 = TICKS.load(Ordering::Relaxed);
+        if state(v) != HART_OFFLINE || percpu::hart(v).online.load(Ordering::Acquire) {
+            result = Err(format!(
+                "round {round}: hart {v} is not offline (state {})",
+                state(v)
+            ));
+            break;
+        }
+        if t1 < t0 + (baseline / 4).max(2) {
+            result = Err(format!(
+                "round {round}: the sleepers made {} wakes in 10 ms with hart {v} offline (baseline {baseline})",
+                t1 - t0
+            ));
+            break;
+        }
+        if entries(v).saturating_sub(e0) > 3 {
+            result = Err(format!(
+                "round {round}: the offline hart {v} kept taking wakes ({} idle entries)",
+                entries(v) - e0
+            ));
+            break;
+        }
+        // all but one: every other hart off, then the last one refuses
+        if round == 3 {
+            for h in (1..n).filter(|&h| h != v) {
+                if let Err(e) = thread::hart_set_online(h as u64, false) {
+                    result = Err(format!("hart {h} would not go offline: {e:?}"));
+                    break 'rounds;
+                }
+            }
+            if thread::hart_set_online(0, false).is_ok() {
+                result = Err("the last online hart went offline".into());
+                break;
+            }
+            thread::sleep_ticks(5);
+            if TICKS.load(Ordering::Relaxed) <= t1 {
+                result = Err("the sleepers stopped with one hart online".into());
+                break;
+            }
+            for h in (1..n).filter(|&h| h != v) {
+                if let Err(e) = thread::hart_set_online(h as u64, true) {
+                    result = Err(format!("hart {h} would not come back: {e:?}"));
+                    break 'rounds;
+                }
+            }
+        }
+        if let Err(e) = thread::hart_set_online(v as u64, true) {
+            result = Err(format!(
+                "round {round}: hart {v} would not come back: {e:?}"
+            ));
+            break;
+        }
+        if state(v) != HART_ONLINE {
+            result = Err(format!(
+                "round {round}: hart {v} is not online after coming back"
+            ));
+            break;
+        }
+    }
+    // (whatever happened, leave every hart online for the tests after this one)
+    for h in 1..n {
+        let _ = thread::hart_set_online(h as u64, true);
+    }
+    SLEEPER_STOP.store(true, Ordering::Relaxed);
+    for t in sleepers {
+        thread::join(t);
+    }
+    result?;
+    if smp::online() != n {
+        return Err(format!("{} of {n} harts online at the end", smp::online()));
+    }
+    // work still lands on every hart again
+    thread::set_placement(0);
+    SLEEPER_STOP.store(false, Ordering::Relaxed);
+    let a = thread::spawn_free("light_a", 20, periodic_light, 0);
+    let b = thread::spawn_free("light_b", 20, periodic_light, 0);
+    thread::sleep_ticks(20);
+    let took = harts_with_wakes(n);
+    SLEEPER_STOP.store(true, Ordering::Relaxed);
+    thread::join(a);
+    thread::join(b);
+    if took < 2 {
+        return Err(format!(
+            "after the round only {took} harts took the wakes of two light threads"
+        ));
+    }
+    Ok(())
+}
+
 /// PM2 (KERNEL-V1-SPEC 5.5): a hart with nothing to do for a long time enters the firmware's retentive suspend, and a hart whose next
 /// event is a hundred microseconds away uses `wfi`. On QEMU the two are equivalent in effect (OpenSBI's default retentive suspend is
 /// a `wfi`); the counters are what tells them apart.
@@ -205,6 +339,10 @@ pub const TESTS: &[Test] = &[
     (
         "pack_keeps_light_threads_on_few_harts",
         pack_keeps_light_threads_on_few_harts,
+    ),
+    (
+        "harts_go_offline_and_come_back",
+        harts_go_offline_and_come_back,
     ),
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),
