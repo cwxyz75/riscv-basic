@@ -2001,6 +2001,22 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     Ok(())
 }
 
+/// Wait until a thread that a child program started has run its start-up and gone to sleep (its CPU time stops moving). The child's threads all
+/// store their start argument in one place (`rt::start_arg`), so a thread started with another argument before this one has read its own would change what
+/// this one does (T243: on a loaded four-hart run the first thread was seen starting more than 3 ms late).
+fn started_and_blocked(t: u64) -> Outcome {
+    let mut last = 0u64;
+    for _ in 0..400 {
+        nap(5)?;
+        let now = sys::thread_cpu_ns(t).a1 as u64;
+        if now > 1_000_000 && now == last {
+            return Ok(());
+        }
+        last = now;
+    }
+    Err(detail("the thread never settled"))
+}
+
 /// `wait_ended` that says what the process and its threads look like when the wait runs out (T243: a failure seen only on the CI runners).
 fn wait_ended_or_say(proc: u64, threads: &[u64], ticks: u64) -> Outcome {
     let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
@@ -2008,6 +2024,7 @@ fn wait_ended_or_say(proc: u64, threads: &[u64], ticks: u64) -> Outcome {
         return Ok(());
     }
     let mut d = Detail::new();
+    let _ = sys::debug_stat(132); // (the kernel prints its scheduler state: T243)
     let pi = sys::process_info(proc);
     let _ = core::fmt::Write::write_fmt(
         &mut d,
@@ -2025,11 +2042,10 @@ fn wait_ended_or_say(proc: u64, threads: &[u64], ticks: u64) -> Outcome {
         let _ = core::fmt::Write::write_fmt(
             &mut d,
             format_args!(
-                "; thread {t:#x}: signals {:#x}, info status {} a1 {} a2 {}",
+                "; thread {t:#x}: signals {:#x}, info status {} cpu_ns {}",
                 sys::object_signals(t).a1,
                 ti.status,
-                ti.a1 as i64,
-                ti.a2
+                sys::thread_cpu_ns(t).a1
             ),
         );
     }
@@ -2159,7 +2175,8 @@ fn the_system_library_is_in_every_process() -> Outcome {
     let off = sys::debug_stat(128) == 1;
     let mut bases = Vec::new();
     for _ in 0..10 {
-        let (p, m) = launch(8)?;
+        // (a child that blocks, so that it is still there to be asked: one that exits at once may be gone before the question, which says BAD_STATE)
+        let (p, m) = launch(16)?;
         let mut at = 0u64;
         let mut small = (0u64, u64::MAX);
         for _ in 0..4096 {
@@ -2180,6 +2197,7 @@ fn the_system_library_is_in_every_process() -> Outcome {
         }
         ensure!(small.0 != 0, "the child has the library");
         bases.push(small.0);
+        sys::process_kill(p, 0);
         wait_ended(p, 500)?;
         sys::handle_close(p);
         sys::handle_close(m);
@@ -6030,7 +6048,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let (p, _m) = launch(16)?;
     nap(3)?;
     let b = child_thread(p, 0, 16)?;
-    nap(3)?;
+    started_and_blocked(b)?;
     let t = child_thread(p, 1, 7)?; // null load
     wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, -1001, "the fault code");
@@ -6039,7 +6057,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let (p, _m) = launch(16)?;
     nap(3)?;
     let b = child_thread(p, 0, 16)?;
-    nap(3)?;
+    started_and_blocked(b)?;
     let t = child_thread(p, 1, 8)?; // exit(42)
     wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, 42, "exit(42) from a thread");
@@ -14460,7 +14478,14 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::NoMemory),
         "a thread whose stack does not fit the job"
     );
-    ensure_eq!(job_use(j, 2)?.0, used, "a refused thread charged nothing");
+    // (nothing of the stack is charged; a page-table page that the attempt needed, where the random placement put the stack's end, may stay, so the room below is
+    // counted from what the job has now: T238)
+    let after = job_use(j, 2)?.0;
+    ensure!(
+        after >= used && after - used <= 1,
+        "a refused thread charged nothing but at most a page-table page: {used} -> {after}"
+    );
+    used = after;
     ensure_eq!(
         job_use(j, 1)?.0,
         1,
@@ -14471,11 +14496,21 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::Ok),
         "four pages of room"
     );
-    let t = ok(
-        sys::thread_on_stack(p, entry, base + 4 * 4096, 16),
-        "the thread now fits",
-    )?
-    .a1 as u64;
+    let r = sys::thread_on_stack(p, entry, base + 4 * 4096, 16);
+    if r.status != 0 {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "the thread now fits: status {} (use was {used} before the refusal, {after} after, and is {} now; limit {})",
+                r.status,
+                job_use(j, 2)?.0,
+                used + 4
+            ),
+        );
+        return Err(d);
+    }
+    let t = r.a1 as u64;
     ensure_eq!(
         job_use(j, 2)?.0,
         used + 4,

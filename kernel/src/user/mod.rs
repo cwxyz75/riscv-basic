@@ -97,7 +97,42 @@ pub(crate) static USER_READY: core::sync::atomic::AtomicBool =
 /// a helper may take it again), and ending the outermost one commits what `f` touched to the waiters (W1'). The reference does not outlive the closure.
 #[track_caller]
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut UserState) -> R) -> R {
+    // (T239, debug builds: the object lock makes this one flag, and a closure that opens `with_state` again would alias the `&mut`)
+    #[cfg(debug_assertions)]
+    let _one = StateOpen::enter();
     f(state())
+}
+
+/// Debug builds: a `with_state` closure is open (the flag is the object lock's, so one for the machine).
+#[cfg(debug_assertions)]
+static STATE_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STATE_SITE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(debug_assertions)]
+struct StateOpen;
+
+#[cfg(debug_assertions)]
+impl StateOpen {
+    #[track_caller]
+    fn enter() -> StateOpen {
+        #[allow(clippy::panic)] // (the check's report)
+        if STATE_OPEN.swap(true, Ordering::Relaxed) {
+            let at = core::panic::Location::caller();
+            let outer = STATE_SITE.load(Ordering::Relaxed);
+            panic!(
+                "with_state opened at {at} inside the one opened at line {outer} of the same file or another: two live `&mut UserState` (T239)"
+            );
+        }
+        STATE_SITE.store(core::panic::Location::caller().line(), Ordering::Relaxed);
+        StateOpen
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for StateOpen {
+    fn drop(&mut self) {
+        STATE_OPEN.store(false, Ordering::Relaxed);
+    }
 }
 
 /// `with_state` for a helper that is reached both with the object lock held and without it (see `bkl::ensure`).
@@ -254,3 +289,30 @@ pub use trap::*;
 pub use waits::*;
 #[allow(unused_imports)]
 pub use wake::*;
+
+/// Debug builds: what the user state says about the processes that are not finished (for `debug_stat` 132).
+#[cfg(debug_assertions)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report
+pub(crate) fn dump_state() {
+    use core::fmt::Write;
+    let mut out = crate::console::Console;
+    with_state(|s| {
+        let _ = writeln!(
+            out,
+            "##SCHED user: job exception channels {:?}, suspends {:?}, parked {:?}",
+            s.job_exc.keys().collect::<alloc::vec::Vec<_>>(),
+            s.suspends.keys().collect::<alloc::vec::Vec<_>>(),
+            s.parked_tids
+        );
+        for (pid, p) in &s.procs {
+            if p.live_tids.is_empty() && !p.stopped && p.killed.is_none() {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "##SCHED proc {pid}: state {:?} stopped {} killed {:?} exc_channel {:?} threads {:?} job {:?}",
+                p.state, p.stopped, p.killed, p.exc_channel, p.live_tids, p.job
+            );
+        }
+    });
+}

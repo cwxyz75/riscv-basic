@@ -846,6 +846,33 @@ pub fn reschedule_fast() -> bool {
     switch
 }
 
+/// Print what the scheduler knows (for `debug_stat` 132).
+#[cfg(debug_assertions)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report that holds a thread record
+fn dump_sched() {
+    use core::fmt::Write;
+    let sc = sched();
+    let mut out = crate::console::Console;
+    for i in 0..crate::smp::started() {
+        let _ = writeln!(
+            out,
+            "##SCHED hart {i}: current {} queued {} marked {} in transit {:?} next event {:?}",
+            sc.current_on(i),
+            sc.queued_on(i),
+            sc.resched_pending(i),
+            sc.in_transit(i),
+            sc.next_event_on(i)
+        );
+    }
+    for t in sc.tids() {
+        if (0..crate::smp::started()).any(|i| sc.idle(i) == t) {
+            continue;
+        }
+        let _ = writeln!(out, "##SCHED thread {t}: {:?}", sc.record(t));
+    }
+    crate::user::dump_state();
+}
+
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
 /// 100 ms (`program_timer`), and at each timer interrupt after that long a thread queued for more than 500 ms while a hart that may
 /// run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`). The same thread must be found in two
@@ -1569,6 +1596,12 @@ pub fn wake_stat(which: u64) -> u64 {
         // (HD2: is `aslr=off` in force?)
         128 => u64::from(crate::entropy::aslr_off()),
         131 => crate::user::clock_traps(),
+        // (T243, debug builds: print every hart's scheduler state and the record of every thread that is not idle, for a test that timed out)
+        132 => {
+            #[cfg(debug_assertions)]
+            dump_sched();
+            0
+        }
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

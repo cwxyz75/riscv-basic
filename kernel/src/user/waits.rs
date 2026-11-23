@@ -297,12 +297,13 @@ pub(super) fn futex_unlock_pi(a: [u64; 6]) -> Reply {
 
 /// A user thread has gone (big lock held): the PI futexes it owned that had waiters are poisoned (`OWNER_DIED`) and their waiters woken to report
 /// BAD_STATE; and it leaves the donation graph.
-pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+pub(super) fn pi_thread_gone(s: &mut UserState, tid: Tid, pid: u64) {
     if PI_USED.load(Ordering::Relaxed) {
         // the PI futexes with waiters that it owns, and what their words say now (read outside the bucket locks: the memory locks are after them)
         let mut keys: Vec<kcore::pifutex::Key> = Vec::new();
         futex_table().for_each_bucket(|f| keys.extend(f.pi.owned_keys(tid)));
-        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = with_state(|s| {
+        let words: alloc::collections::BTreeMap<kcore::pifutex::Key, u32> = {
             let _as = AsLocks::of(s, &[pid]);
             let k = kmem::get();
             let mut out = alloc::collections::BTreeMap::new();
@@ -318,7 +319,7 @@ pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
                 }
             }
             out
-        });
+        };
         let mut dead: Vec<(kcore::pifutex::Key, Vec<u64>)> = Vec::new();
         let mut ended: Vec<u64> = Vec::new();
         futex_table().for_each_bucket(|f| {
@@ -329,7 +330,7 @@ pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
         for (key, woken) in dead {
             // poison the word (if its page is still there), then wake the waiters
             if words.contains_key(&key) {
-                with_state(|s| {
+                {
                     let _as = AsLocks::of(s, &[pid]);
                     let w = {
                         let k = kmem::get();
@@ -338,7 +339,7 @@ pub(super) fn pi_thread_gone(tid: Tid, pid: u64) {
                     if let Some(w) = w {
                         kcore::pifutex::PiFutexes::poison(&kmem::PhysWord(w.pa));
                     }
-                });
+                }
             }
             thread::wake_many(&woken);
         }
@@ -398,8 +399,8 @@ pub(super) fn pager_wait(need: kcore::aspace::PagerNeed, in_call: bool) -> Resul
         );
         let ended = any_state(|s| {
             ksys::pager::pager_wait_done(s, me)
-                || killed_now().is_some()
-                || (in_call && interrupted_now())
+                || killed_in(s).is_some()
+                || (in_call && interrupted_in(s))
         });
         if ended {
             break;
