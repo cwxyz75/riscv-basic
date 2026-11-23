@@ -222,6 +222,35 @@ fn small_alloc(class: usize) -> Option<*mut u8> {
     got.map(|a| a as *mut u8)
 }
 
+/// Give every object in this hart's magazines back to the slabs (a hart going offline, PM1).
+pub fn return_magazines() {
+    let was = irq::save_and_disable();
+    crate::bkl::check_use(klock::Class::Heap);
+    let mag = &crate::percpu::this().magazines;
+    with_heaps(|h| {
+        let Heaps {
+            slab,
+            pool_head,
+            pool_count,
+            ..
+        } = h;
+        let mut pool = Pool {
+            head: pool_head,
+            count: pool_count,
+        };
+        for class in 0..slab::CLASSES {
+            // SAFETY: this hart's own magazines, interrupts off.
+            while let Some(a) = unsafe { mag.pop(class) } {
+                if slab.free(&mut DirectMem, &mut pool, a as u64).is_err() {
+                    SLAB_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        note_free(h);
+    });
+    irq::restore(was);
+}
+
 /// Return a small object: into this hart's magazine, draining half of it to the slabs when it is full.
 fn small_free(addr: usize) {
     let was = irq::save_and_disable();
