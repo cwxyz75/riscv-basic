@@ -589,6 +589,8 @@ pub enum Error {
     NotExited,
     /// The thread id counter reached its limit (CNT1: a counter never wraps; the creation is refused).
     Exhausted,
+    /// A hart cannot go offline: it is the last online hart, or a thread is pinned to it (PM1).
+    BadState,
 }
 
 /// One hart's run queue: an RT class, a normal class and the hart's idle thread, strict precedence in `pick`.
@@ -597,6 +599,8 @@ pub struct HartRq<N: Class> {
     normal: N,
     idle: Option<Tid>,
     cur: Option<Tid>,
+    /// The hart is offline (PM1): it runs only its idle thread, nothing queued here would run here, and what is homed here is moved away.
+    offline: bool,
     threads: BTreeMap<Tid, ThreadSched>,
     now: Time,
     timers: BTreeSet<(Time, Tid)>,
@@ -620,6 +624,7 @@ impl<N: Class> HartRq<N> {
             normal,
             idle: None,
             cur: None,
+            offline: false,
             threads: BTreeMap::new(),
             now: 0,
             timers: BTreeSet::new(),
@@ -939,6 +944,10 @@ impl<N: Class> HartRq<N> {
     #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a counter of bad picks (a test statistic)
     fn pick(&mut self) {
         debug_assert!(self.cur.is_none() || self.cur == self.idle);
+        if self.offline {
+            self.cur = self.idle;
+            return;
+        }
         loop {
             let picked = if self.rt_blocked() {
                 None
@@ -968,6 +977,9 @@ impl<N: Class> HartRq<N> {
         let Some(c) = self.cur else {
             return true;
         };
+        if self.offline {
+            return Some(c) != self.idle; // (an offline hart displaces what runs and picks nothing but its idle thread)
+        }
         let blocked = self.rt_blocked();
         if Some(c) == self.idle {
             return (!self.rt.q.is_empty() && !blocked) || self.normal.top().is_some();
@@ -1404,6 +1416,9 @@ impl<N: Class> HartRq<N> {
     /// Would a thread of priority `cand` queued on this hart run instead of what runs now? An idle hart takes anything;
     /// otherwise the thread must outrank the current one and its band's class must be willing to preempt.
     pub(crate) fn would_run(&self, cand: Prio) -> bool {
+        if self.offline {
+            return false;
+        }
         if band(cand) == Band::Rt && self.rt_blocked() {
             return false; // this hart's RT share is spent and the normal band has work (4.5)
         }
@@ -1447,12 +1462,19 @@ impl<N: Class> HartRq<N> {
     /// the two priorities alone), so a hart that publishes after a change that left the key alone need not compute the 63 bits again.
     pub(crate) fn would_run_key(&self) -> u64 {
         let (blocked, idle, cur, spent) = self.would_run_state();
-        u64::from(idle) | u64::from(cur) << 1 | u64::from(blocked) << 9 | u64::from(spent) << 10
+        u64::from(idle)
+            | u64::from(cur) << 1
+            | u64::from(blocked) << 9
+            | u64::from(spent) << 10
+            | u64::from(self.offline) << 11
     }
 
     /// `would_run(p)` for every priority 1 to 63 at once, bit `p` (what a hart publishes after every change): the state `would_run` looks at
     /// is read once, not 63 times.
     pub(crate) fn would_run_mask(&self) -> u64 {
+        if self.offline {
+            return 0;
+        }
         let (blocked, idle, cur, spent) = self.would_run_state();
         let mut mask = 0u64;
         for p in 1..=PRIO_MAX {
@@ -1535,6 +1557,74 @@ impl<N: Class> HartRq<N> {
         t.state = State::Runnable;
         t.runnable_since = self.now;
         Ok((self.threads.remove(&tid).expect("exists"), slept))
+    }
+
+    /// The records homed here that can move away now (PM1): queued runnable threads and blocked ones, but not the idle thread, the running thread and the threads
+    /// `skip` names (a thread in transit, whose switch is not done).
+    pub(crate) fn movable(&self, skip: &dyn Fn(Tid) -> bool) -> Vec<(Tid, State)> {
+        self.threads
+            .values()
+            .filter(|t| {
+                Some(t.tid) != self.idle
+                    && Some(t.tid) != self.cur
+                    && !skip(t.tid)
+                    && ((t.state == State::Runnable && self.is_queued(t.tid))
+                        || t.state == State::Blocked
+                        || t.state == State::Exited)
+            })
+            .map(|t| (t.tid, t.state))
+            .collect()
+    }
+
+    /// Take a blocked thread's record, timers cancelled, to move it to another hart (PM1); the deadline stays in the record.
+    pub(crate) fn detach_blocked(&mut self, tid: Tid) -> Option<ThreadSched> {
+        let t = self.threads.get(&tid)?;
+        if t.state != State::Blocked && t.state != State::Exited {
+            return None; // (an exited record waiting to be reaped moves like a blocked one, with no timer)
+        }
+        if let Some(d) = t.deadline {
+            self.timers.remove(&(d, tid));
+            self.hard_timers.remove(&(t.timer_hard, tid));
+        }
+        self.threads.remove(&tid)
+    }
+
+    /// Put a blocked thread's record here with its timers (PM1: the other end of `detach_blocked`). A deadline already passed fires at the next advance.
+    pub(crate) fn attach_blocked(&mut self, mut rec: ThreadSched, hart: u8) {
+        rec.last_hart = hart;
+        rec.home.set(usize::from(hart));
+        let tid = rec.tid;
+        if let Some(d) = rec.deadline {
+            self.timers.insert((d, tid));
+            self.hard_timers.insert((rec.timer_hard, tid));
+        }
+        self.threads.insert(tid, rec);
+    }
+
+    /// Is this hart offline (PM1)? Read under the run-queue lock by everything that is about to put a record here.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.offline
+    }
+
+    pub(crate) fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
+    }
+
+    /// How many records are homed here besides the idle thread's (PM1: an offline hart is empty when this is zero).
+    pub(crate) fn homed_count(&self) -> usize {
+        self.threads
+            .keys()
+            .filter(|&&t| Some(t) != self.idle)
+            .count()
+    }
+
+    /// Is a thread other than the idle thread pinned to this hart? (PM1: it makes going offline fail.)
+    pub(crate) fn has_pinned(&self, hart: usize) -> bool {
+        self.threads.values().any(|t| {
+            Some(t.tid) != self.idle
+                && t.affinity.is_some_and(|a| a as usize == hart)
+                && t.state != State::Exited
+        })
     }
 
     /// Put a record here and queue it.

@@ -143,6 +143,19 @@ pub fn frame_alloc() -> Option<u64> {
     r
 }
 
+/// Give every frame in this hart's cache back to the database (a hart going offline, PM1).
+pub fn flush_frame_cache() {
+    crate::bkl::check_use(klock::Class::Frame);
+    let was = crate::irq::save_and_disable();
+    // SAFETY: interrupts are off, and this is the calling hart's own record.
+    unsafe {
+        crate::percpu::this()
+            .frame_cache
+            .with(|c| c.flush(&mut SharedFrames))
+    };
+    crate::irq::restore(was);
+}
+
 /// Give a frame back to this hart's cache; the caller holds its only reference (a kernel-owned frame: a slab, the pool, a stack).
 pub fn frame_free_sole(pfn: u64) {
     crate::bkl::check_use(klock::Class::Frame);

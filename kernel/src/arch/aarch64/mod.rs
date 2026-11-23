@@ -17,6 +17,9 @@ pub mod aia {
     pub fn send_ipi(hart_id: usize) {
         unimplemented!()
     }
+    pub fn retarget_from(from: usize, to: usize) {
+        unimplemented!()
+    }
     pub fn claim() -> u64 {
         unimplemented!()
     }
@@ -236,6 +239,9 @@ pub mod sbi {
     pub const FID_REMOTE_FENCE_I: usize = 0;
     pub const FID_REMOTE_SFENCE_VMA: usize = 0;
     pub const EID_IPI: usize = 0;
+    pub fn system_suspend_present() -> bool {
+        unimplemented!()
+    }
     pub fn ipi_calls() -> usize {
         unimplemented!()
     }

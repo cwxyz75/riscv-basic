@@ -27,6 +27,12 @@ impl HeldCell {
     }
 }
 
+/// The states of a hart (PM1, KERNEL-V1-SPEC 5.3; the numbers are what `hart_info` returns).
+pub const HART_OFFLINE: u8 = 0;
+pub const HART_STARTING: u8 = 1;
+pub const HART_ONLINE: u8 = 2;
+pub const HART_DRAINING: u8 = 3;
+
 /// The layout of the first three fields is used by the trap assembly (`arch/riscv64/trap.rs`, `arch/riscv64/usermode.rs`).
 #[repr(C)]
 pub struct PerHart {
@@ -44,6 +50,8 @@ pub struct PerHart {
     pub hart_id: AtomicUsize,
     /// Set (release) once the hart is running kernel code.
     pub online: AtomicBool,
+    /// The hart's state for `hart_info` (PM1): `HART_OFFLINE`, `HART_STARTING`, `HART_ONLINE`, `HART_DRAINING`. Only the hart itself finishes a transition.
+    pub hart_state: AtomicU8,
     /// Timer interrupts this hart has taken.
     pub timer_ticks: AtomicU64,
     /// Inter-hart interrupts (IPIs) this hart has taken.
@@ -244,6 +252,7 @@ impl PerHart {
             index: AtomicUsize::new(0),
             hart_id: AtomicUsize::new(0),
             online: AtomicBool::new(false),
+            hart_state: AtomicU8::new(HART_OFFLINE),
             timer_ticks: AtomicU64::new(0),
             ipis: AtomicU64::new(0),
             in_user: AtomicBool::new(false),

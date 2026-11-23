@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
+Project: an experimental RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 
 - **The home computer** (BASIC and LOGO behind a boot menu): finished, v0.2. It
   lives in `home/` (its kernel is `home/kernel/`, plus the language crates). Read
@@ -16,6 +16,8 @@ Project: a toy RISC-V computer for QEMU (`virt`), in Rust, with two tracks:
 
 Work on one track must not change the other's contract (see "Layout and
 boundaries").
+
+We are working to improve the kernel in our experimental OS. Nobody uses this OS, it is development-only, so there is no real-world risk except debugging time. Please bundle smaller work items together into larger PRs where safe or reasonable to minimize time spent in test cycles. Please follow the work plan carefully. Please follow the testing policy. Do not stop work unless you run out of work or I ask you to stop explicitly.
 
 ## Commands
 

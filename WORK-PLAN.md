@@ -17,7 +17,7 @@ system, so stopping between phases loses nothing.
 **Start.** The plan starts when the owner says so. From then on every item in it, the lock-peel tasks included, has the
 owner's go-ahead: the sentences in older `L` items about waiting for one are superseded (each carries a note).
 
-**Where the plan stands (2026-11-22, evening).** Merged into `main`: phases 1 to 5, 6a to 6e (6c: L14, L17; 6d: L21, L22, L24 and the chunked teardown of L19; 6e: PL8 part a, the `TT` lock and `futex_wait` with no big lock, L19 and T213 in part), 7, 8 and 9 (9b: L23). Phase 11 is a partial phase (HD5, HD4 parts 1 and 2, HD2 step 1) whose epic PR is open. Open, in the order they will run: **6f** the end of the big lock (L19 `PROCS` and the handle drain, L20, PL8 part b, T213's last steps), which phases 10 and 12 wait for; HD2's steps 2 to 4, HD3 and HD4 part 3; then phase 10 (SC2, PM1, PM4, PM3) and phase 12 (AB7 to AB9, KT14, FZ1). The owner started the plan again on 2026-11-21 and asked for it to run without input until it is done. An item is ticked only when all of it is built and verified; a partly built item says what is built and what is left.
+**Where the plan stands (2026-11-23).** Merged into `main`: phases 1 to 5, 6a to 6e, 7, 8, 9 and 10 (SC2 stays open for the 16- and 32-hart measurements and the `OBJ` split; PM1, PM3 and PM4 are done). Phase 11 is a partial phase (HD5, HD4 parts 1 and 2, HD2 step 1) whose epic PR is open. Open, in the order they will run: **6f** the end of the big lock (L19 `PROCS` and the handle drain, L20, PL8 part b, T213's last steps; `epic/phase-6g` holds T215); HD2's steps 2 to 4, HD3 and HD4 part 3; then phase 12 (AB7 to AB9, KT14, FZ1). The owner started the plan again on 2026-11-21 and asked for it to run without input until it is done. An item is ticked only when all of it is built and verified; a partly built item says what is built and what is left.
 
 **Epics (OD144, 2026-11-20).** From phase 4 on, each phase is an epic branch, `epic/phase-<n>`, cut from `main`. Every item is a
 feature branch off the epic and a pull request into it, merged on the feature gate (build and host tests, no QEMU). When the
@@ -201,10 +201,10 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 10: scale and power
 
-- [ ] **SC2** placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
-- [ ] **PM1** harts offline and online
-- [ ] **PM4** the placement policy (`spread`, `pack`)
-- [ ] **PM3** `system_suspend`
+- [ ] **SC2** (first step built, phase 10: the masks, `select_hart` and the pull through them, a counter and the host acceptance; the measurements at 16 and 32 harts are left) placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
+- [x] **PM1** (#462; the acceptance gaps are T230) harts offline and online
+- [x] **PM4** (#461, #462; phase 10: `Policy`, `system_set_placement`, the GP1 walks and a QEMU test under both; ticks at the epic's gate; `rt_latency` under pack is the soak's) the placement policy (`spread`, `pack`)
+- [x] **PM3** (#462; built to the item's fallback acceptance, the firmware path is T229) `system_suspend`
 
 ### Phase 11: hardening
 
@@ -250,6 +250,12 @@ One standing line (OD144). The per-item list that stood here until 2026-11-20 is
 - **Measurements and hardware checks nobody has made** (phases 6 and 7; each is in its work item): the sweep's worst interrupts-off section with 16,000 live objects (T206); the ASID-reuse control, the instruction-cache synchronisation and the unmap shootdown negative control, which QEMU 11.1.3 does not show and which need real hardware or an emulator that models them (T205, PL7, T193; the decommit and protect controls do show, and are in `os-boot-test-smp-neg`); a 2 GiB VMO sparsely touched at `-m 4G` (T207); `os-miri` over the new code (`kcore::asid`, `fcache`, the sweep, the region operations).
 
 ## Decisions taken without the owner
+
+  - 2026-11-23, PM3: `system_suspend` is built to the item's fallback acceptance: the sequence's host model and the NOT_SUPPORTED check. The firmware path (HSM-stopped harts, a physical resume entry, the real CSR and IMSIC restore) is T229, after T228, because the reference firmware has no SUSP extension and the path could not be run; code written blind is dead and unverified. The PR says plainly that the suspend path itself was not run.
+
+  - 2026-11-23, PM1: an offline hart is **logical**: it parks in its idle loop (still powered, still able to take the reschedule IPI that brings it back) instead of calling SBI HSM `hart_stop` and coming back through `hart_start`. Reason: the stop and start need the secondary bring-up made re-entrant, and on QEMU only the power differs; the invariants (HT1, HT2) are about the scheduler state. Recorded as T228. Also: the hart sets its own state (a call changes it only by asking: Draining or Starting, then an IPI), the displaced running thread is migrated by the hart itself at its own settle, never by another hart, and a hart with a pinned thread or the last online hart refuses with BAD_STATE.
+
+  - 2026-11-23, PM4: `pack` differs from `spread` only in where a wake goes; what a hart pulls is the same. KERNEL-V1-SPEC 5.6 and the item say pack pulls only when idle and only from a hart with more than one queued thread, which would leave a thread waiting while a hart idles: GP1 (no hart runs lower than a waiting thread it may run) is the stronger rule and both policies must keep it. The policy is an enum with two methods, not a trait, until a third policy exists.
 
 (One line each: what, the alternative, why, and where it is recorded.)
 
