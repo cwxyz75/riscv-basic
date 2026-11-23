@@ -472,6 +472,93 @@ pub fn a_dead_client_frees_everything() -> Outcome {
     Ok(())
 }
 
+/// T233: a client writing to a socket is killed at a random moment while the server reads it in big chunks (the copy-out runs after the object lock is let go).
+/// Every read ends Ok (with at most what was written), ShouldWait or PeerClosed: never INVALID_ARGS (a copy-out that was refused for a buffer that is mapped), and the
+/// kernel does not panic. Rounds differ in how many reads happen before the kill and how many bytes the client had queued.
+pub fn a_kill_storm_on_a_stream_loses_no_range() -> Outcome {
+    let root = root_job()?;
+    let j = ipc_job(root, 1024 * KIB)?;
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..120u32 {
+        let hand = Hand::start(j)?;
+        let end = hand
+            .cmd(b'C', 0, None)?
+            .handle
+            .ok_or_else(|| msg_at(line!()))?;
+        let units = 1 + (next() % 16) as u8;
+        // the client writes `units` chunks of 4 KiB in the background while this thread reads
+        hand.send(b'W', units, None)?;
+        let kill_after = next() % 24;
+        let mut reads = 0u64;
+        let mut total = 0u64;
+        let mut killed = false;
+        let mut buf = [0u8; 4096];
+        let mut spins = 0u32;
+        loop {
+            if !killed && reads >= kill_after {
+                let _ = sys::process_kill(hand.proc, 9);
+                killed = true;
+            }
+            let r = sys::socket_read(end, buf.as_mut_ptr(), buf.len());
+            match r.status() {
+                Some(S::Ok) => {
+                    ensure!(r.a1 <= buf.len(), "a read returned more than the buffer");
+                    total += r.a1 as u64;
+                    reads += 1;
+                }
+                Some(S::ShouldWait) => {
+                    reads += 1;
+                    spins += 1;
+                    if spins > 200_000 {
+                        return Err(detail("the stream never ended"));
+                    }
+                    if killed {
+                        let _ = sys::object_wait(
+                            end,
+                            sig::PEER_CLOSED | sig::READABLE,
+                            sys::clock_get() + 50,
+                        );
+                    }
+                }
+                Some(S::PeerClosed) => break,
+                other => {
+                    let mut d = Detail::new();
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut d,
+                        format_args!(
+                            "round {round}: a read of a stream whose client is killed returned {other:?} (status {}) after {reads} reads and {total} bytes",
+                            r.status
+                        ),
+                    );
+                    return Err(d);
+                }
+            }
+            if !killed && total >= u64::from(units) * 4096 {
+                // everything the client wrote has been read: let the client go on its own
+                let _ = sys::process_kill(hand.proc, 9);
+                killed = true;
+            }
+        }
+        ensure!(
+            total <= u64::from(units) * 4096,
+            "a read returned more bytes than the client wrote"
+        );
+        sys::handle_close(end);
+        sys::handle_close(hand.proc);
+        sys::handle_close(hand.ch);
+    }
+    job_use_settles(j, 5, 0, 2000)?;
+    sys::handle_close(j);
+    sys::handle_close(root);
+    Ok(())
+}
+
 /// What the stack must check about a socket a client passes in (S9-SPEC 8.3). Prototype of the check, written here so it can be
 /// tested against the real kernel before it is written into `netd`.
 #[derive(Debug, PartialEq, Eq)]

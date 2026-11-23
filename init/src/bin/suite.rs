@@ -16277,6 +16277,10 @@ pub fn app_main() -> i32 {
             stream_proto::a_dead_client_frees_everything,
         ),
         (
+            "a_kill_storm_on_a_stream_loses_no_range",
+            stream_proto::a_kill_storm_on_a_stream_loses_no_range,
+        ),
+        (
             "a_bad_stream_handle_is_refused",
             stream_proto::a_bad_stream_handle_is_refused,
         ),
