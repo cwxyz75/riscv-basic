@@ -601,6 +601,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::THREAD_EXIT => leave(a[0] as i32, false),
         nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
+        nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
@@ -792,9 +793,6 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let UserState {
         objs,
         procs,
-        line,
-        pass,
-        fail: failed,
         irq_objs,
         ..
     } = s;
@@ -842,22 +840,7 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
         }
     }
     match n {
-        nr::DEBUG_WRITE => {
-            // (HD4: a debug resource handle with WRITE: no program writes to the console, or forges a test line, without one)
-            ipc::debug_of(objs, &p.handles, h(0), Rights::WRITE).map_err(|e| (e, None, None))?;
-            let (ptr, len) = (a[1], a[2] as usize);
-            if len > MAX_DEBUG_WRITE {
-                return fail(Status::TooBig);
-            }
-            let bytes = {
-                let _as = klock::aslock::AsCell::hold(&p.aspace);
-                let k = kmem::get();
-                copy_from_user(p.aspace.held_mut(), k.mm, k.vmos, k.jobs, ptr, len)
-            }
-            .map_err(|e| (e, None, None))?;
-            emit(line, pass, failed, &bytes);
-            Ok((None, None))
-        }
+        // (`DEBUG_WRITE` is answered in `syscall`, before this table: it holds the big lock only for the handle and the tally)
         nr::RESOURCE_DTB => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
             let Some(blob) =
@@ -968,44 +951,14 @@ pub(super) fn is_bench_line(text: &str) -> bool {
 /// message. A well-formed `##TEST name PASS|FAIL ...` line is a result and is counted;
 /// any other line starting `##` is prefixed so user code cannot forge the kernel's
 /// verdict lines (`##DONE`, `##PANIC`, `##BOOT`).
-#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a pair of test counters
-pub(super) fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u8]) {
-    let mut flush = |text: String| {
-        // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
-        if is_bench_line(&text) {
-            let _ = writeln!(Console, "{text}");
-            return;
-        }
-        let verdict = text.strip_prefix("##TEST ").and_then(|rest| {
-            let mut words = rest.split_whitespace();
-            words.next()?;
-            match words.next()? {
-                "PASS" => Some(true),
-                "FAIL" => Some(false),
-                _ => None,
-            }
-        });
-        match verdict {
-            Some(true) => {
-                *pass = pass.saturating_add(1);
-                let _ = writeln!(Console, "{text}");
-            }
-            Some(false) => {
-                *fail = fail.saturating_add(1);
-                let _ = writeln!(Console, "{text}");
-            }
-            None if text.starts_with("##") => {
-                // One piece, so the console's line guard sees a line that starts with "user:".
-                let _ = Console.write_str(&alloc::format!("user: {text}\n"));
-            }
-            None => {
-                let _ = writeln!(Console, "{text}");
-            }
-        }
-    };
+/// The lines a `debug_write` of `bytes` shows: cut at each newline and at 512 characters, printable ASCII only (anything else is a dot), and what is
+/// left when the bytes end is a line too. `line` carries a partial line from one call to the next (it is empty at the end of every call).
+#[inline(never)]
+fn debug_lines(line: &mut String, bytes: &[u8]) -> alloc::vec::Vec<String> {
+    let mut out = alloc::vec::Vec::new();
     for &b in bytes {
         if b == b'\n' {
-            flush(core::mem::take(line));
+            out.push(core::mem::take(line));
         } else {
             // Printable ASCII only: control bytes and anything else become '.'.
             line.push(if (0x20..0x7f).contains(&b) {
@@ -1014,13 +967,152 @@ pub(super) fn emit(line: &mut String, pass: &mut u32, fail: &mut u32, bytes: &[u
                 '.'
             });
             if line.len() >= 512 {
-                flush(core::mem::take(line));
+                out.push(core::mem::take(line));
             }
         }
     }
     if !line.is_empty() {
-        flush(core::mem::take(line));
+        out.push(core::mem::take(line));
     }
+    out
+}
+
+/// Show one line, as the console shows a program's output: a well-formed `##BENCH` line and a well-formed `##TEST name PASS|FAIL` result pass through
+/// (the verdicts are counted in `pass` and `fail`), any other line starting `##` is prefixed so user code cannot forge the kernel's verdict lines.
+#[allow(clippy::arithmetic_side_effects)] // INVARIANT: a pair of test counters
+#[inline(never)]
+fn show_debug_line(text: &str, pass: &mut u32, fail: &mut u32) {
+    // A well-formed `##BENCH name value unit` line (SCHED-SMP-SPEC 6.1, amends OD28) passes through like a result.
+    if is_bench_line(text) {
+        let _ = writeln!(Console, "{text}");
+        return;
+    }
+    let verdict = text.strip_prefix("##TEST ").and_then(|rest| {
+        let mut words = rest.split_whitespace();
+        words.next()?;
+        match words.next()? {
+            "PASS" => Some(true),
+            "FAIL" => Some(false),
+            _ => None,
+        }
+    });
+    match verdict {
+        Some(true) => {
+            *pass = pass.saturating_add(1);
+            let _ = writeln!(Console, "{text}");
+        }
+        Some(false) => {
+            *fail = fail.saturating_add(1);
+            let _ = writeln!(Console, "{text}");
+        }
+        None if text.starts_with("##") => {
+            // One piece, so the console's line guard sees a line that starts with "user:".
+            let _ = Console.write_str(&alloc::format!("user: {text}\n"));
+        }
+        None => {
+            let _ = writeln!(Console, "{text}");
+        }
+    }
+}
+
+/// The bytes of a `debug_write`, copied under the address-space lock and the memory locks (no big lock). The pager-need slot is a syscall's on whichever
+/// hart, so the copy leaves it as it found it; a failed copy hands the need it may have met (boxed: it is large) to its caller, which puts it back under the
+/// big lock for `pager_after_call`. A frame of its own for the stack budget.
+#[inline(never)]
+fn copy_debug_bytes(
+    aspace: &alloc::sync::Arc<klock::aslock::AsCell>,
+    ptr: u64,
+    len: usize,
+) -> Result<Vec<u8>, (Status, Option<alloc::boxed::Box<kcore::aspace::PagerNeed>>)> {
+    let _as = klock::aslock::AsCell::hold(aspace);
+    let k = kmem::mem(); // (the memory locks, no big lock: `kmem::get` asserts it)
+    let saved = k.vmos.swap_need(None);
+    let r = copy_from_user(aspace.held_mut(), k.mm, k.vmos, k.jobs, ptr, len);
+    let need = k.vmos.swap_need(saved);
+    r.map_err(|e| (e, need.map(alloc::boxed::Box::new)))
+}
+
+/// Add the well-formed `##TEST name PASS|FAIL` lines among `lines` to the tally (the big lock, briefly).
+#[inline(never)]
+fn tally_verdicts(lines: &[String]) {
+    let (mut pass, mut fail) = (0u32, 0u32);
+    for text in lines {
+        let mut words = match text.strip_prefix("##TEST ") {
+            Some(rest) => rest.split_whitespace(),
+            None => continue,
+        };
+        if words.next().is_some() {
+            match words.next() {
+                Some("PASS") => pass = pass.saturating_add(1),
+                Some("FAIL") => fail = fail.saturating_add(1),
+                _ => {}
+            }
+        }
+    }
+    if pass > 0 || fail > 0 {
+        irq::without(|| {
+            let s = state();
+            s.pass = s.pass.saturating_add(pass);
+            s.fail = s.fail.saturating_add(fail);
+        });
+    }
+}
+
+/// The big-lock part of `debug_write`: the handle (a debug resource with WRITE: no program writes to the console, or forges a test line, without one),
+/// the length, and the address space to copy from.
+#[inline(never)]
+fn debug_write_check(
+    a: [u64; 6],
+) -> Result<(alloc::sync::Arc<klock::aslock::AsCell>, u64, usize), ReplyErr> {
+    irq::without(|| -> Result<_, ReplyErr> {
+        let s = state();
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)
+            .map_err(|e| (e, None, None))?;
+        let len = a[2] as usize;
+        if len > MAX_DEBUG_WRITE {
+            return Err((Status::TooBig, None, None));
+        }
+        Ok((p.aspace.clone(), a[1], len))
+    })
+}
+
+/// Show the lines of a `debug_write` (no big lock: the console's own lock keeps each line whole).
+#[inline(never)]
+fn show_debug_lines(lines: &[String]) {
+    let (mut pass, mut fail) = (0u32, 0u32);
+    for text in lines {
+        show_debug_line(text, &mut pass, &mut fail);
+    }
+}
+
+/// `debug_write(debug, ptr, len)` (HD4): the big lock is held only to check the handle and, at the end, to add the verdicts to the tally; the copy from
+/// the program's memory takes its address-space lock and the memory locks, and the console's own lock keeps a line whole, so a program that prints
+/// does not hold up every other hart's syscalls for the length of a serial write (the latency profile of 2026-11-23: 18 s of big-lock wait behind it).
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the reply and the copy's error types); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn debug_write_call(a: [u64; 6]) -> Reply {
+    let (aspace, ptr, len) = debug_write_check(a)?;
+    // No big lock from here: the copy, the splitting and the console. (No caller holds a borrow of the state across a syscall's dispatch.)
+    let depth = crate::bkl::release_all();
+    let bytes = match copy_debug_bytes(&aspace, ptr, len) {
+        Ok(bytes) => bytes,
+        Err((status, need)) => {
+            crate::bkl::reacquire(depth);
+            if let Some(need) = need {
+                kmem::get().vmos.swap_need(Some(*need)); // (the call that waited for a pager's page: `pager_after_call` reads it)
+            }
+            return Err((status, None, None));
+        }
+    };
+    drop(aspace);
+    let mut partial = String::new();
+    let lines = debug_lines(&mut partial, &bytes);
+    // (the verdicts are counted before they are shown: the kernel's own `##DONE` line reads the tally)
+    tally_verdicts(&lines);
+    show_debug_lines(&lines);
+    crate::bkl::reacquire(depth);
+    Ok((None, None))
 }
 
 /// `decode_user` says Syscall only for a trap `is_syscall` already took.
