@@ -434,9 +434,40 @@ fn a_table_drained_in_slices_gives_back_what_a_whole_drain_does() {
         }
         assert_eq!(t.len(), 0, "budget {budget}: handles left");
         assert_eq!(reg.live(), 0, "budget {budget}: objects left");
-        assert!(t.drain_some(&mut reg, budget), "a drained table stays done");
+        // (a drained table is scanned again from the start: nothing in it, so it ends)
+        while !t.drain_some(&mut reg, budget) {}
         if budget == 1 {
             assert!(slices >= before, "one at a time takes a slice per handle");
         }
     }
+}
+
+#[test]
+fn a_slice_of_a_mostly_empty_table_is_bounded_by_the_slots_it_looks_at() {
+    // T206 review: a process that opened many handles and closed most of them leaves a table of holes; a slice looks at `budget` slots, not at every one
+    let mut reg = Kobjs::new();
+    let mut t = HandleTable::new(5000);
+    let all: Vec<Handle> = (0..2000)
+        .map(|_| event_create(&mut reg, &mut t).unwrap())
+        .collect();
+    for h in &all[..1990] {
+        t.close(&mut reg, *h).unwrap();
+    }
+    assert_eq!(t.len(), 10);
+    let mut slices = 0;
+    while !t.drain_some(&mut reg, 100) {
+        slices += 1;
+        assert!(slices < 1000);
+    }
+    assert!(slices >= 19, "2000 slots at 100 a slice: {slices} slices");
+    assert_eq!((t.len(), reg.live()), (0, 0));
+    // a drained table drains again: the cursor started over
+    let e = event_create(&mut reg, &mut t).unwrap();
+    let _ = e;
+    t.drain(&mut reg);
+    assert_eq!(
+        (t.len(), reg.live()),
+        (0, 0),
+        "a second drain closes what the table gained"
+    );
 }

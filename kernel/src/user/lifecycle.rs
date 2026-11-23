@@ -182,8 +182,13 @@ pub(super) fn teardown(pid: u64) -> i32 {
     };
     // A process that vanished without a recorded code is not mistaken for `exit(-1)`.
     let code = process.exit_code.or(process.killed).unwrap_or(i32::MIN);
+    // The process is private to this thread now: let the big lock go **completely** for the two long steps. A thread that comes here from a trap holds it at
+    // depth 1 (and a nested critical section is at depth 2, which never reaches a switch point), so without this the slices below would be slices of
+    // one hold. The slices take it themselves, one at a time (`irq::without` ends in a switch point at depth 1); nothing here holds a borrow of the state.
+    let depth = crate::bkl::release_all();
     teardown_objects(&mut process, code);
     teardown_memory(process);
+    crate::bkl::reacquire(depth);
     kmem::flush_tlb();
     notify(); // peers of what this process held now see PEER_CLOSED; waiters see TERMINATED
     code
