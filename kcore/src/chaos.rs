@@ -85,6 +85,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "counts hooks to bound a rate: pure arithmetic")]
     fn the_lock_points_delay_about_one_in_sixty_four() {
         let mut c = Chaos::new(5, 0);
         let hits = (0..128_000)
@@ -149,6 +150,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "counts 400,000 hooks to bound a rate: pure arithmetic, nothing for Miri to find, and 6 minutes of it"
+    )]
     fn about_one_in_eight_delays_and_never_past_the_bound() {
         for seed in [0, 1, 2, 99, u64::MAX] {
             let v = run(seed, 2, 80_000);

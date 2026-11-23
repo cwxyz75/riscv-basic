@@ -10,7 +10,7 @@ jobs:
   kernel:
     name: soak (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 80
     env:
       # the baseline is from a laptop; hosted runners are several times slower (SCHED-SMP-SPEC T75)
       BENCH_RATIO: "10"
@@ -71,7 +71,7 @@ jobs:
   miri:
     name: soak (miri)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly with Miri

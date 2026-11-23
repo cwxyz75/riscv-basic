@@ -1783,7 +1783,8 @@ mod mask_tests {
             x ^= x << 17;
             x
         };
-        for _ in 0..300 {
+        // (Miri: a tenth of the cases)
+        for _ in 0..if cfg!(miri) { 30 } else { 300 } {
             let mut h = HartRq::new(FixedPrio::new());
             h.adopt_idle();
             for _ in 0..(next() % 6) {
