@@ -45,6 +45,9 @@ extern "C" fn secondary_main(hart_id: usize, index: usize) -> ! {
     crate::fp::enable_cache_block_ops_or_stop(); // (PL3)
     crate::aia::init_hart(); // (the inter-hart interrupt is a message in this hart's IMSIC file)
     percpu::this().online.store(true, Ordering::Release);
+    percpu::this()
+        .hart_state
+        .store(percpu::HART_ONLINE, Ordering::Release);
     // Parked until the boot hart has set up the scheduler (interrupts on, touching nothing
     // shared), then this hart joins it for good.
     irq::enable();

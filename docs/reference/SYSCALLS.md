@@ -224,6 +224,8 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 113 | futex_unlock_pi | `a0` address | |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
 | 115 | system_set_placement | `a0` resource, `a1` policy | |
+| 116 | hart_set_online | `a0` resource, `a1` hart index, `a2` 1 online or 0 offline | |
+| 117 | hart_info | `a0` resource, `a1` hart index | `a1` state |
 
 A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
@@ -490,6 +492,19 @@ running the lowest priority) and 1 is **pack** (the lowest-indexed online hart r
 every hart is busy, spread's rule). Threads already placed stay where they are; the next wake uses the new rule; what a hart pulls is the same under both, so the scheduler's
 guarantee (no hart runs a lower priority than a thread waiting for it) holds under both. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE (not a resource);
 ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force.
+
+### hart_set_online(resource, index, online) -> status
+
+Takes hart `index` out of the scheduler (`online` 0) or brings it back (1) and returns when it has got there (PM1, KERNEL-V1-SPEC 5.3). Going offline is logical: the hart stays
+powered and parks in its idle loop (the firmware's hart-stop is not used; see tidy item T228). It leaves the placement, pull and mark sets and the shootdown and poke sets; the thread it
+was running is displaced and every thread and timer homed on it moves to online harts; its per-hart frame cache and heap magazines go back to the shared pools; device sources aimed at
+it are re-aimed at another online hart. Coming back: its clock is reset, its TLB flushed, and placement may choose it again. Idempotent when the hart is already in the requested
+state. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart, `online` above 1); BAD_STATE (it is the last online hart, a thread is pinned to it,
+or another call is changing it); TIMED_OUT (the hart did not get there within two seconds: a kernel bug, the state is left as it is).
+
+### hart_info(resource, index) -> state
+
+Returns in `a1` the state of hart `index`: 0 offline, 1 starting, 2 online, 3 draining. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart).
 
 ### futex_wait(address, expected, deadline) -> status
 
@@ -1004,6 +1019,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | resource_dtb | specified and implemented (S6c) |
 | system_set_placement | specified and implemented (PM4) |
+| hart_set_online, hart_info | specified and implemented (PM1) |
 | futex_wait, futex_wake | specified and implemented (S7b) |
 
 ## Planned changes (SCHED-SMP-SPEC.md; **none of this is implemented**)
@@ -1141,6 +1157,6 @@ rewritten call by call as each change lands. Full semantics: `docs/specs/KERNEL-
   `thread_resume`, `thread_read_state`, `thread_write_state`; `process_exception_channel`, `job_exception_channel`,
   `exception_resume`.
 * **Waiting:** `port_wait_many`.
-* **Harts and power** (root resource): `hart_set_online`, `hart_info`, `system_suspend`, `system_set_placement`.
+* **Harts and power** (root resource): `system_suspend`.
 * **Debug calls** need a debug resource handle.
 * **Limits:** the system-wide caps become backstops computed from RAM; per-process ceilings are job quotas.

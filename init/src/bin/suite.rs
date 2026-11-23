@@ -11876,6 +11876,82 @@ fn devd_serves_null_and_zero() -> Outcome {
 
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
+fn hart_calls_need_the_resource_and_take_harts_offline_and_back() -> Outcome {
+    // PM1: gated like the other root-resource calls; every hart but one goes offline and the last refuses; all come back
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let ev = event()?;
+    for f in [
+        |r: u64| sys::hart_info(r, 0),
+        |r: u64| sys::hart_set_online(r, 0, 1),
+    ] {
+        ensure_eq!(st(f(0xdead)), Some(S::BadHandle), "bad handle");
+        ensure_eq!(st(f(ev)), Some(S::WrongType), "an event is no resource");
+        let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u64;
+        ensure_eq!(st(f(weak)), Some(S::AccessDenied), "no MANAGE");
+        sys::handle_close(weak);
+    }
+    ensure_eq!(
+        st(sys::hart_info(res, 4096)),
+        Some(S::InvalidArgs),
+        "no such hart"
+    );
+    ensure_eq!(
+        st(sys::hart_set_online(res, 4096, 0)),
+        Some(S::InvalidArgs),
+        "no such hart"
+    );
+    ensure_eq!(
+        st(sys::hart_set_online(res, 0, 2)),
+        Some(S::InvalidArgs),
+        "online is 0 or 1"
+    );
+    let mut n = 0;
+    while st(sys::hart_info(res, n)) == Some(S::Ok) {
+        ensure_eq!(
+            ok(sys::hart_info(res, n), "hart_info")?.a1,
+            2,
+            "online at the start"
+        );
+        n += 1;
+    }
+    ensure_eq!(
+        st(sys::hart_set_online(res, 0, 1)),
+        Some(S::Ok),
+        "already online: nothing to do"
+    );
+    for i in 1..n {
+        ensure_eq!(st(sys::hart_set_online(res, i, 0)), Some(S::Ok), "offline");
+        ensure_eq!(
+            ok(sys::hart_info(res, i), "hart_info")?.a1,
+            0,
+            "offline reads back"
+        );
+    }
+    // (with the others offline, hart 0 is the last)
+    ensure_eq!(
+        st(sys::hart_set_online(res, 0, 0)),
+        Some(S::BadState),
+        "the last hart refuses"
+    );
+    // a thread still runs and ends with one hart
+    let t = new_thread(placement_probe, 0)?;
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+    ensure_eq!(r.status, 0, "a thread ran to its end on the one hart");
+    for i in 1..n {
+        ensure_eq!(
+            st(sys::hart_set_online(res, i, 1)),
+            Some(S::Ok),
+            "online again"
+        );
+        ensure_eq!(
+            ok(sys::hart_info(res, i), "hart_info")?.a1,
+            2,
+            "online reads back"
+        );
+    }
+    Ok(())
+}
+
 fn system_set_placement_needs_the_resource_and_changes_the_policy() -> Outcome {
     // PM4: the call is gated like the other root-resource calls; the policy in force reads back through debug_stat 125; the default is spread; the scheduler works under both
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
@@ -15033,6 +15109,10 @@ pub fn app_main() -> i32 {
         ("channel_round_trip", channel_round_trip),
         ("channel_sends_handles", channel_sends_handles),
         ("channel_syscall_errors", channel_syscall_errors),
+        (
+            "hart_calls_need_the_resource_and_take_harts_offline_and_back",
+            hart_calls_need_the_resource_and_take_harts_offline_and_back,
+        ),
         (
             "system_set_placement_needs_the_resource_and_changes_the_policy",
             system_set_placement_needs_the_resource_and_changes_the_policy,
