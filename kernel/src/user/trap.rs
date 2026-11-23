@@ -24,8 +24,7 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
 /// Register writes (`thread_write_state`) that were left for this thread while it was parked: applied here, by the thread to its own frame (the
 /// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
 fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
-    let pending = irq::without(|| {
-        let s = state();
+    let pending = with_state(|s| {
         if s.pending_regs.is_empty() {
             return None;
         }
@@ -56,8 +55,7 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // where it would otherwise return to user mode.
     park_while_stopped();
     apply_pending_regs(frame);
-    let token = irq::without(|| {
-        let s = state();
+    let token = with_state(|s| {
         let UserState {
             asids,
             procs,
@@ -173,8 +171,7 @@ fn asid_generation() -> u64 {
 
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
-    irq::without(|| -> Reply {
-        let s = state();
+    with_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
@@ -449,10 +446,10 @@ pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
             let va = fault.address;
             let mut pager_need = None;
             let mut resolved = {
-                let pid = state().thread_pid.get(&thread::current()).copied();
+                let pid = with_state(|s| s.thread_pid.get(&thread::current()).copied());
                 match pid {
                     Some(pid) if va < abi::user::TOP => {
-                        let p = state().procs.get_mut(&pid).expect("process exists");
+                        let p = state_locked().procs.get_mut(&pid).expect("process exists");
                         let _as = klock::aslock::AsCell::hold(&p.aspace);
                         let k = kmem::get();
                         let r = p
@@ -569,8 +566,7 @@ fn fault_or_exit(fault: &crate::arch::Fault) {
 
 /// `fault_or_exit` for a fault already described (a PAGER fault, MM9, has the pager's status as its cause).
 fn raise_fault(f: ksys::exception::Fault) {
-    let delivered = irq::without(|| {
-        let s = state();
+    let delivered = with_state(|s| {
         let tid = thread::current();
         let Some(&pid) = s.thread_pid.get(&tid) else {
             return false;
@@ -637,7 +633,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::FUTEX_UNLOCK_PI => reply(frame, futex_unlock_pi(a)),
         nr::FUTEX_WAKE => {
             // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
-            let pid = irq::without(|| caller_pid(state()).unwrap_or(0));
+            let pid = with_state(|s| caller_pid(s).unwrap_or(0));
             reply(frame, futex_wake(pid, a));
         }
         nr::PROCESS_CREATE
@@ -719,7 +715,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 if n == nr::HANDLE_CLOSE {
                     // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
-                    irq::without(|| ksys::exception::reap_closed_job_channels(state()));
+                    with_state(ksys::exception::reap_closed_job_channels);
                 }
                 notify();
             }
@@ -742,8 +738,7 @@ fn lend_to_reader() {
     let me = thread::current();
     // (the donation is made in the section that checked the call is still live: the caller's own end of the call, `pi_revoke` and the removal of its record,
     // is one section too, so a donation cannot outlive the call it was made for: `PI` is after the object lock in the order)
-    irq::without(|| {
-        let s = state();
+    with_state(|s| {
         let read = s.objs.take_dequeued_calls();
         for (caller, call) in read {
             if s.calls.get(&(caller as Tid)) == Some(&call) {
@@ -777,7 +772,7 @@ pub(super) fn fail(s: Status) -> Reply {
 // INVARIANT: a is [u64; 6] and every `h(i)`, `over(i)` is called with a constant below 6; the process of a calling thread exists; sizes were bounded by the limits checked first (nbytes <= MAX_MSG_BYTES, nhandles <= MAX_MSG_HANDLES, so nhandles * 4 and pages * 4096 are small); IRQ slots are below the table size (checked by the source number)
 pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let tid = thread::current();
-    let s = state();
+    let s = state_locked();
     let Some(&pid) = s.thread_pid.get(&tid) else {
         return fail(Status::BadState);
     };
@@ -1069,8 +1064,7 @@ fn tally_verdicts(lines: &[String]) {
         }
     }
     if pass > 0 || fail > 0 {
-        irq::without(|| {
-            let s = state();
+        with_state(|s| {
             s.pass = s.pass.saturating_add(pass);
             s.fail = s.fail.saturating_add(fail);
         });
@@ -1083,8 +1077,7 @@ fn tally_verdicts(lines: &[String]) {
 fn debug_write_check(
     a: [u64; 6],
 ) -> Result<(alloc::sync::Arc<klock::aslock::AsCell>, u64, usize), ReplyErr> {
-    irq::without(|| -> Result<_, ReplyErr> {
-        let s = state();
+    with_state(|s| -> Result<_, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)
