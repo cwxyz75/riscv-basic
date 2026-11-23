@@ -91,6 +91,8 @@ pub struct UserState {
     pub next_token: usize,
     /// Handles the kernel itself holds (the creator's ends of bootstrap channels).
     pub ktable: HandleTable,
+    /// The processes whose handle tables a running sweep has yet to shade (T206): taken from the end, the kernel's own table last.
+    pub root_scan: Vec<u64>,
     /// Threads waiting on an object's signals (slice W step 3): woken by id when a touched object's
     /// signals match, instead of by the global queue.
     pub waits: kcore::wait::WaitTable,
@@ -105,6 +107,40 @@ pub struct UserState {
 }
 
 impl UserState {
+    /// Start a sweep with its roots to be shaded a process table per slice (T206; `sweep_slice` does it): false if one runs.
+    pub fn sweep_start(&mut self) -> bool {
+        if !self.objs.sweep_begin_pending() {
+            return false;
+        }
+        self.root_scan = self.procs.keys().rev().copied().collect();
+        true
+    }
+
+    /// One slice of the running sweep: while roots are pending, shade the handles of the next process (a process that has gone since has none), then the
+    /// kernel's own; after that, `Registry::sweep_step`. A handle made or moved while this runs shades its object (`HandleTable::insert`,
+    /// `remove_for_transfer`).
+    pub fn sweep_slice(&mut self, budget: usize) -> kcore::object::SweepStep {
+        if self.objs.sweep_active() && self.objs.roots_are_pending() {
+            match self.root_scan.pop() {
+                Some(pid) => {
+                    if let Some(q) = self.procs.get(&pid) {
+                        for o in q.handles.objects() {
+                            self.objs.shade(o);
+                        }
+                    }
+                }
+                None => {
+                    for o in self.ktable.objects() {
+                        self.objs.shade(o);
+                    }
+                    self.objs.sweep_roots_done();
+                }
+            }
+            return kcore::object::SweepStep::More;
+        }
+        self.objs.sweep_step(budget)
+    }
+
     /// Every object something outside the registry can still reach: all processes' handles
     /// **and the kernel's own** (the creator ends of bootstrap channels). Any sweep must use
     /// all of these (a root left out is destroyed, whatever still points at it).
@@ -137,6 +173,7 @@ impl UserState {
             asids: kcore::asid::Asids::new(16),
             first_handle_gen: 0,
             cleaning: BTreeSet::new(),
+            root_scan: Vec::new(),
             suspends: BTreeMap::new(),
             initial_regs: BTreeMap::new(),
             job_exc: BTreeMap::new(),

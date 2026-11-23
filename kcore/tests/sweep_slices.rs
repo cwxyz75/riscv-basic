@@ -33,6 +33,8 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
         let mut rng = Rng::new(seed);
         let mut reg = Kobjs::new();
         let mut tables = [HandleTable::new(300), HandleTable::new(300)];
+        // the tables whose roots a pending sweep has yet to shade (T206)
+        let mut unscanned: Vec<usize> = Vec::new();
         for step in 0..1500 {
             let ctx = format!("seed {seed} step {step}");
             let ti = rng.below(2) as usize;
@@ -85,6 +87,12 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 11 => {
                     // the teardown's whole sweep, in the middle of a sliced one (it finishes that one first)
                     if rng.below(4) == 0 {
+                        for ti in unscanned.drain(..) {
+                            for o in tables[ti].objects() {
+                                reg.shade(o);
+                            }
+                        }
+                        reg.sweep_roots_done();
                         let roots: Vec<_> = tables.iter().flat_map(|t| t.objects()).collect();
                         reg.sweep(&roots);
                     }
@@ -92,8 +100,25 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 _ => {
                     // a slice of the sweep: start one if none runs and some garbage may exist
                     if !reg.sweep_active() {
-                        let roots: Vec<_> = tables.iter().flat_map(|t| t.objects()).collect();
-                        reg.sweep_begin(&roots);
+                        if rng.below(2) == 0 {
+                            reg.sweep_begin_pending();
+                            unscanned = vec![0, 1];
+                            if rng.below(2) == 0 {
+                                unscanned.reverse();
+                            }
+                        } else {
+                            let roots: Vec<_> = tables.iter().flat_map(|t| t.objects()).collect();
+                            reg.sweep_begin(&roots);
+                        }
+                    }
+                    // (a pending sweep's roots arrive one table per slice)
+                    if let Some(ti) = unscanned.pop() {
+                        for o in tables[ti].objects() {
+                            reg.shade(o);
+                        }
+                        if unscanned.is_empty() {
+                            reg.sweep_roots_done();
+                        }
                     }
                     let budget = 1 + rng.below(4) as usize;
                     let _ = reg.sweep_step(budget);
@@ -108,6 +133,12 @@ fn nothing_reachable_is_freed_and_every_cycle_is_between_two_sweeps() {
                 let _ = t.close(&mut reg, h);
             }
         }
+        for ti in unscanned.drain(..) {
+            for o in tables[ti].objects() {
+                reg.shade(o);
+            }
+        }
+        reg.sweep_roots_done();
         for _ in 0..2 {
             while reg.sweep_active() {
                 let _ = reg.sweep_step(3);

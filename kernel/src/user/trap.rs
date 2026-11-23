@@ -958,15 +958,14 @@ fn sweep_before_create(n: usize) {
     // (MM10) start one if garbage cycles have piled up, and run a few slices of it
     with_state(|s| {
         if !s.objs.sweep_active() {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots);
+            s.sweep_start();
         }
     });
     for _ in 0..SWEEP_SLICES_PER_CALL {
         if !with_state(|s| {
             s.objs.sweep_active()
                 && !matches!(
-                    s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                    s.sweep_slice(SWEEP_SLICE_BUDGET),
                     kcore::object::SweepStep::Done(_)
                 )
         }) {
@@ -975,18 +974,15 @@ fn sweep_before_create(n: usize) {
     }
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
     while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
-        with_state(|s| s.objs.sweep_step(SWEEP_SLICE_BUDGET));
+        with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
     }
     if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
-        let began = with_state(|s| {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots)
-        });
+        let began = with_state(|s| s.sweep_start());
         if began {
             while with_state(|s| {
                 s.objs.sweep_active()
                     && !matches!(
-                        s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                        s.sweep_slice(SWEEP_SLICE_BUDGET),
                         kcore::object::SweepStep::Done(_)
                     )
             }) {}
