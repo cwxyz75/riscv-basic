@@ -4,13 +4,14 @@ use super::*;
 
 /// The signal word of `h` in the calling process (0 if it names nothing). Interrupts off.
 pub(super) fn signals_now(h: Handle) -> Result<u32, Status> {
-    let s = state_locked();
-    let pid = s
-        .thread_pid
-        .get(&thread::current())
-        .ok_or(Status::BadState)?;
-    let p = s.procs.get(pid).ok_or(Status::BadState)?;
-    ipc::signals_of(&s.objs, &p.handles, h)
+    with_state(|s| {
+        let pid = s
+            .thread_pid
+            .get(&thread::current())
+            .ok_or(Status::BadState)?;
+        let p = s.procs.get(pid).ok_or(Status::BadState)?;
+        ipc::signals_of(&s.objs, &p.handles, h)
+    })
 }
 
 /// Register `thread` as waiting for `mask` on the object the calling process's handle `h` names (just
@@ -40,40 +41,42 @@ pub(super) fn touch_port_of(h: Handle) {
 }
 
 fn register_wait_kind(thread: Tid, h: Handle, mask: u32, poller: bool) {
-    let s = state_locked();
-    let Some(pid) = s.thread_pid.get(&thread).copied() else {
-        return;
-    };
-    let Some(p) = s.procs.get(&pid) else {
-        return;
-    };
-    if let Ok(entry) = p.handles.get(h) {
-        if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
-            // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
-            let bound = ipc::port_bound_objects(&s.objs, entry.obj);
-            if poller {
-                s.waits.register_poller(thread, entry.obj, mask, bound);
+    with_state(|s| {
+        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+            return;
+        };
+        let Some(p) = s.procs.get(&pid) else {
+            return;
+        };
+        if let Ok(entry) = p.handles.get(h) {
+            if matches!(s.objs.get(entry.obj), Some(ipc::KObj::Port(_))) {
+                // (a port's READABLE follows what it binds: the table remembers which touches can release its waiters, L21a)
+                let bound = ipc::port_bound_objects(&s.objs, entry.obj);
+                if poller {
+                    s.waits.register_poller(thread, entry.obj, mask, bound);
+                } else {
+                    s.waits.register_port(thread, entry.obj, mask, bound);
+                }
             } else {
-                s.waits.register_port(thread, entry.obj, mask, bound);
+                s.waits.register(thread, entry.obj, mask);
             }
-        } else {
-            s.waits.register(thread, entry.obj, mask);
         }
-    }
+    })
 }
 
 /// Register `thread` to wait for the reply with `txid` on the channel end the calling process's handle `h` names (a `channel_call`, L21d).
 pub(super) fn register_call_wait(thread: Tid, h: Handle, txid: u32) {
-    let s = state_locked();
-    let Some(pid) = s.thread_pid.get(&thread).copied() else {
-        return;
-    };
-    let Some(p) = s.procs.get(&pid) else {
-        return;
-    };
-    if let Ok(entry) = p.handles.get(h) {
-        s.waits.register_call(thread, entry.obj, txid);
-    }
+    with_state(|s| {
+        let Some(pid) = s.thread_pid.get(&thread).copied() else {
+            return;
+        };
+        let Some(p) = s.procs.get(&pid) else {
+            return;
+        };
+        if let Ok(entry) = p.handles.get(h) {
+            s.waits.register_call(thread, entry.obj, txid);
+        }
+    })
 }
 
 /// The calling process and the machine's memory, for a `ksys` function that takes them (interrupts off, lock held).
@@ -546,12 +549,13 @@ fn channel_call_inner(a: [u64; 6]) -> Reply {
                    // Wait for the reply with that transaction id (or the peer closing, or the deadline).
     let me = thread::current();
     let ready = || {
-        let s = state_locked();
-        let Some(&pid) = s.thread_pid.get(&thread::current()) else {
-            return true;
-        };
-        let interrupted = s.interrupts.contains(&thread::current());
-        ksys::channel_call_ready(s, pid, &call, interrupted)
+        with_state(|s| {
+            let Some(&pid) = s.thread_pid.get(&thread::current()) else {
+                return true;
+            };
+            let interrupted = s.interrupts.contains(&thread::current());
+            ksys::channel_call_ready(s, pid, &call, interrupted)
+        })
     };
     commit_wake();
     thread::wait_deadline_registered(
