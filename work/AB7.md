@@ -4,7 +4,7 @@ kind: slice
 title: The system library: `libsys.so` in the kernel image, mapped into every process; `rt` and the C library call through it
 area: kernel
 horizon: long
-blocked_by: [HD2]
+blocked_by: []
 refs: [KERNEL-V1-SPEC, OD128]
 ---
 
