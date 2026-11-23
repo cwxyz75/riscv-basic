@@ -12,3 +12,7 @@ refs: [KERNEL-V1-SPEC, OD139]
 **Acceptance, written first.** Ten boots give at least six distinct slides and at least four distinct direct-map bases (reported through `debug_stat` in test builds). `kernel_mappings_are_w_xor_x`, `direct_map_does_not_alias_the_image` and the trap-entry stack-guard arithmetic pass at every slide (a soak run of 20 seeds). The stated entropy (about 9 and 7 bits) is recorded in `INVARIANTS.md` next to the check.
 
 **Review.** Fable, soak.
+
+## Progress (2026-11-23)
+
+**Built** (one PR on `epic/phase-11b`): see the amendment of 2026-11-23 at the end of KERNEL-V1-SPEC and the WORK-PLAN decision. The image slide (about 9 bits) and the direct map's move (about 6 bits) come from the tree's seed, chosen in assembly and checked by the boot self-test `kaslr_choice_follows_the_seed` against `kcore::kaslr`; `kaslr=off` in test builds; `scripts/kaslr_check.py` is the ten-boot acceptance (run by `os-ktest-small`); a release kernel prints no address and carries no `kaslr=off` string. Not done: the 20-seed soak run (the owner's), and the entropy numbers are lower than the spec's 7 bits for the direct map (see the amendment). The Fable review remains.

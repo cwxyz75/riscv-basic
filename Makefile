@@ -193,6 +193,8 @@ os-ktest: os-ktest-small os-ktest-4
 os-ktest-small: kernel-main
 	OS_SHARD=k python3 scripts/os_boot_test.py --selftest-k
 	OS_SHARD=k OS_KFAST=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
+	# HD3: ten boots, at least six distinct slides and four distinct direct-map bases; `kaslr=off` gives one layout
+	python3 scripts/kaslr_check.py $(OS_ELF)
 	OS_SHARD=k OS_KFAST=1 OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	# AB3 (CNT1): every counter starts 16 below 2^32, so the whole shard runs across the old 32-bit boundaries
 	OS_BOOT_ARGS="aslr=off ff=tid:0xfffffff0,koid:0xfffffff0,objgen:0xfffffff0,handlegen:0xfffffff0,fptoken:0xfffffff0" OS_SHARD=k OS_KFAST=1 OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
