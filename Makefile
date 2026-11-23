@@ -195,7 +195,7 @@ os-ktest-small: kernel-main
 	OS_SHARD=k OS_KFAST=1 OS_SMP=1 python3 scripts/os_boot_test.py $(OS_ELF)
 	OS_SHARD=k OS_KFAST=1 OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 	# AB3 (CNT1): every counter starts 16 below 2^32, so the whole shard runs across the old 32-bit boundaries
-	OS_BOOT_ARGS="ff=tid:0xfffffff0,koid:0xfffffff0,objgen:0xfffffff0,handlegen:0xfffffff0,fptoken:0xfffffff0" OS_SHARD=k OS_KFAST=1 OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
+	OS_BOOT_ARGS="aslr=off ff=tid:0xfffffff0,koid:0xfffffff0,objgen:0xfffffff0,handlegen:0xfffffff0,fptoken:0xfffffff0" OS_SHARD=k OS_KFAST=1 OS_SMP=2 python3 scripts/os_boot_test.py $(OS_ELF)
 
 # four harts, every Kernel test
 os-ktest-4: kernel-main
@@ -212,6 +212,8 @@ os-ktest-release:
 OS_KRC_ELF := target/os-krc/$(KERNEL_TARGET)/release/kernel
 os-ktest-release-content:
 	cd init && cargo build --release
+	python3 scripts/check_pie.py --self-test
+	python3 scripts/check_pie.py target/$(KERNEL_TARGET)/release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --features release-suite --target-dir ../target/os-krc
 	OS_RELEASE_SUITE=1 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KRC_ELF)
 

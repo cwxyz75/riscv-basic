@@ -37,6 +37,22 @@ fn ok(r: Ret, what: &str) -> Result<Ret, Detail> {
     }
 }
 
+/// The address just above the mapping that holds my stack (the kernel places it, HD2: no fixed address), found with `process_map_info` on a local.
+fn my_stack_top() -> usize {
+    let local = 0u8;
+    let me = sys::process_self().a1 as u64;
+    let mut rec = [0u64; 6];
+    let _ = sys::process_map_info(me, core::ptr::addr_of!(local) as u64, rec.as_mut_ptr());
+    (rec[0] + rec[1]) as usize
+}
+
+/// A failure detail with this text.
+fn detail(what: &str) -> Detail {
+    let mut d = Detail::new();
+    let _ = core::fmt::Write::write_str(&mut d, what);
+    d
+}
+
 fn channel() -> Result<(u64, u64), Detail> {
     let r = ok(sys::channel_create(), "channel_create")?;
     Ok((r.a1 as u64, r.a2 as u64))
@@ -117,10 +133,10 @@ fn debug_write_pointer_rules() -> Outcome {
     );
     // a range that starts in my stack and runs off its top (the page above is unmapped)
     let local = 0u8;
-    let top = 0x20_0000_0000usize;
+    let top = my_stack_top();
     ensure!(
-        (&local as *const u8 as usize) < top,
-        "stack is where SYSCALLS.md says"
+        (&local as *const u8 as usize) < top && top - (&local as *const u8 as usize) <= 64 * 4096,
+        "my stack is the mapping the kernel placed"
     );
     ensure_eq!(
         bad(top - 4, 8),
@@ -1955,82 +1971,24 @@ fn launch_image_with(
     before_start: &dyn Fn(u64) -> Result<(), Detail>,
 ) -> Result<(u64, u64), Detail> {
     ensure!(image != 0, "no image was fetched");
-    let mut eh = [0u8; 64];
-    ok(
-        sys::vmo_read(image, 0, eh.as_mut_ptr(), 64),
-        "read the ELF header",
-    )?;
-    let (entry, phoff, phnum) = (le(&eh, 24, 8), le(&eh, 32, 8), le(&eh, 56, 2) as usize);
-    ensure!(phnum <= 16, "{phnum} program headers");
-    let mut ph = [0u8; 56 * 16];
-    ok(
-        sys::vmo_read(image, phoff, ph.as_mut_ptr(), 56 * phnum),
-        "read the program headers",
-    )?;
+    // (the image is read whole and parsed by the runtime's loader, which places a static-PIE, relocates it and maps its stack: HD2)
+    let size = ok(sys::vmo_get_size(image), "the image's size")?.a1 as u64;
+    let bytes = rt::spawn::read_image(image, 0, size).ok_or_else(|| detail("read the image"))?;
+    let parsed = kcore::elf::parse(&bytes).map_err(|_| detail("parse the image"))?;
     let proc = if job == 0 {
         proc_create()?
     } else {
         ok(sys::process_create_in(job), "process_create_in")?.a1 as u64
     };
-    for i in 0..phnum {
-        let h = &ph[i * 56..(i + 1) * 56];
-        if le(h, 0, 4) != 1 {
-            continue; // not PT_LOAD
-        }
-        let (flags, offset, vaddr, filesz, memsz) = (
-            le(h, 4, 4),
-            le(h, 8, 8),
-            le(h, 16, 8),
-            le(h, 32, 8),
-            le(h, 40, 8),
-        );
-        let lead = vaddr % 4096;
-        let pages = (lead + memsz).div_ceil(4096);
-        let seg = if job == 0 {
-            vmo(pages)?
-        } else {
-            ok(sys::vmo_create_in(pages, job), "vmo_create_in")?.a1 as u64
-        };
-        let mut done = 0u64;
-        let mut chunk = [0u8; 2048];
-        while done < filesz {
-            let n = (filesz - done).min(2048);
-            ok(
-                sys::vmo_read(image, offset + done, chunk.as_mut_ptr(), n as usize),
-                "read the image",
-            )?;
-            ok(
-                sys::vmo_write(seg, lead + done, chunk.as_ptr(), n as usize),
-                "fill the segment",
-            )?;
-            done += n;
-        }
-        let perms =
-            PF_R | if flags & 2 != 0 { PF_W } else { 0 } | if flags & 1 != 0 { PF_X } else { 0 };
-        ok(
-            sys::process_map(proc, seg, vaddr - lead, 0, pages * 4096, perms),
-            "map a segment",
-        )?;
-        if job != 0 {
-            sys::handle_close(seg);
-        }
-    }
-    let stack = if job == 0 {
-        vmo(16)?
-    } else {
-        ok(sys::vmo_create_in(16, job), "vmo_create_in")?.a1 as u64
-    };
-    ok(
-        sys::process_map(proc, stack, 0x10_0000_0000, 0, 16 * 4096, PF_R | PF_W),
-        "map the stack",
-    )?;
-    if job != 0 {
-        sys::handle_close(stack);
-    }
+    let (entry, stack_top) = rt::spawn::map_image(proc, &parsed, &bytes, job).map_err(|e| {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(&mut d, format_args!("map the image: {e:?}"));
+        d
+    })?;
     before_start(proc)?;
     let (mine, theirs) = channel()?;
     ok(
-        sys::process_start(proc, entry, 0x10_0000_0000 + 16 * 4096, theirs, arg),
+        sys::process_start(proc, entry, stack_top, theirs, arg),
         "start",
     )?;
     Ok((proc, mine))
@@ -2040,6 +1998,74 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
     ensure_eq!(r.status, 0, "the process ended");
     ensure!(r.a1 as u32 & sig::TERMINATED != 0, "TERMINATED is set");
+    Ok(())
+}
+
+/// HD2: where the kernel puts a child's code, its stack and an ANYWHERE mapping differs from launch to launch (ten launches: at least eight distinct values of each) when
+/// the kernel randomises, and is the same every time under `aslr=off`. Each address is read from the child's own address space before it runs.
+fn programs_are_placed_at_random() -> Outcome {
+    let image = IMAGE.load(Ordering::Relaxed);
+    let off = sys::debug_stat(128) == 1;
+    let seeded = sys::debug_stat(108) == 1;
+    let seen = core::cell::RefCell::new([Vec::<u64>::new(), Vec::new(), Vec::new()]);
+    for _ in 0..10 {
+        let (p, m) = launch_image_with(image, 8, 0, &|proc| {
+            let mut at = 0u64;
+            let (mut text, mut stack) = (0u64, 0u64);
+            for _ in 0..64 {
+                let mut rec = [0u64; 6];
+                let next = ok(
+                    sys::process_map_info(proc, at, rec.as_mut_ptr()),
+                    "map_info",
+                )?
+                .a1 as u64;
+                if rec[2] & 0b100 != 0 {
+                    text = rec[0];
+                } else if rec[1] == 64 * 4096 && rec[2] & 0b010 != 0 {
+                    stack = rec[0];
+                }
+                if next == 0 {
+                    break;
+                }
+                at = next;
+            }
+            let v = vmo(4)?;
+            let any = ok(
+                sys::process_map_anywhere(proc, v, 0, 4 * 4096, PF_R | PF_W),
+                "map anywhere",
+            )?
+            .a1 as u64;
+            sys::handle_close(v);
+            let mut seen = seen.borrow_mut();
+            seen[0].push(text);
+            seen[1].push(stack);
+            seen[2].push(any);
+            Ok(())
+        })?;
+        wait_ended(p, 500)?;
+        sys::handle_close(p);
+        sys::handle_close(m);
+    }
+    for (i, what) in ["code", "stack", "an ANYWHERE mapping"].iter().enumerate() {
+        let mut v = seen.borrow()[i].clone();
+        ensure_eq!(v.len(), 10, "ten launches were seen");
+        ensure!(v.iter().all(|&a| a != 0), "{what} was found in every child");
+        v.sort_unstable();
+        v.dedup();
+        if off {
+            ensure_eq!(
+                v.len(),
+                1,
+                "aslr=off: the {what} is where it was the last time"
+            );
+        } else if seeded {
+            ensure!(
+                v.len() >= 8,
+                "the {what} took only {} distinct places in ten launches",
+                v.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5559,7 +5585,39 @@ fn a_thread_hog_cannot_exhaust_the_kernel() -> Outcome {
 
 // Tests from the independent (Fable) review of S3c-2b.
 
-fn child_entry() -> Result<u64, Detail> {
+/// Map `v` (4 pages) read-write into child `p` where the kernel chooses (the child's own image and stack are placed at random, so no fixed address is free for sure).
+fn map_child_stack(p: u64, v: u64) -> Result<u64, Detail> {
+    Ok(ok(
+        sys::process_map_anywhere(p, v, 0, 4 * 4096, PF_R | PF_W),
+        "map a child stack",
+    )?
+    .a1 as u64)
+}
+
+/// The entry point of the program image inside child `p` (HD2: the image is a static-PIE, so the link-time entry is an offset from the base the kernel chose;
+/// the image's text is its executable mapping).
+fn child_entry(p: u64) -> Result<u64, Detail> {
+    let mut at = 0u64;
+    for _ in 0..64 {
+        let mut rec = [0u64; 6];
+        let next = ok(
+            sys::process_map_info(p, at, rec.as_mut_ptr()),
+            "the child's mappings",
+        )?
+        .a1 as u64;
+        if rec[2] & 0b100 != 0 {
+            // (the image's only executable mapping is its text, which starts at the base)
+            return Ok(rec[0] + link_entry()?);
+        }
+        if next == 0 {
+            break;
+        }
+        at = next;
+    }
+    Err(detail("the child has no executable mapping"))
+}
+
+fn link_entry() -> Result<u64, Detail> {
     let image = IMAGE.load(Ordering::Relaxed);
     let mut eh = [0u8; 64];
     ok(
@@ -5571,18 +5629,25 @@ fn child_entry() -> Result<u64, Detail> {
 
 /// Another thread in child `p` at the program entry with start arg `arg`, on its own stack.
 fn child_thread(p: u64, slot: u64, arg: u64) -> Result<u64, Detail> {
-    let base = 0x20_0000_0000 + slot * 0x10_0000;
+    let _ = slot;
     let v = vmo(4)?;
-    ok(
-        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
-        "map a child stack",
-    )?;
+    let base = map_child_stack(p, v)?;
     sys::handle_close(v);
-    Ok(ok(
-        sys::thread_on_stack(p, child_entry()?, base + 4 * 4096, arg),
-        "thread_on_stack in a child",
-    )?
-    .a1 as u64)
+    let entry = child_entry(p)?;
+    let r = sys::thread_on_stack(p, entry, base + 4 * 4096, arg);
+    if r.status != 0 {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "thread_on_stack in a child: status {} entry {entry:#x} stack {:#x}",
+                r.status,
+                base + 4 * 4096
+            ),
+        );
+        return Err(d);
+    }
+    Ok(r.a1 as u64)
 }
 
 fn thread_ended_with(t: u64, code: i64) -> Outcome {
@@ -5668,16 +5733,12 @@ fn replacing_a_handle_ends_a_siblings_wait() -> Outcome {
 
 fn child_with_a_ready_exit_thread() -> Result<(u64, u64, u64), Detail> {
     let (p, m) = launch(25)?;
-    let base = 0x20_0000_0000u64;
     let v = vmo(4)?;
-    ok(
-        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
-        "map the stack before the child runs",
-    )?;
+    let base = map_child_stack(p, v)?;
     nap(3)?;
     // a thread that would exit(42) at once
     let t = ok(
-        sys::thread_on_stack(p, child_entry()?, base + 4 * 4096, 8),
+        sys::thread_on_stack(p, child_entry(p)?, base + 4 * 4096, 8),
         "thread_on_stack",
     )?
     .a1 as u64;
@@ -5817,7 +5878,7 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     ensure_eq!(
         st(sys::thread_on_stack(
             p,
-            child_entry()?,
+            0x10000, // (any entry: the process has ended)
             0x20_0000_0000 + 0x4000,
             15
         )),
@@ -7076,7 +7137,7 @@ fn kill_needs_the_kill_right_and_nothing_else() -> Outcome {
     ensure_eq!(
         st(sys::thread_on_stack(
             kill_only,
-            child_entry()?,
+            0x10000,
             0x20_0000_0000 + 0x4000,
             0
         )),
@@ -9392,7 +9453,7 @@ fn channel_read_checks_the_message_not_the_capacity() -> Outcome {
     );
     // A buffer that is valid for only 8 bytes (the top of my stack) with a declared capacity
     // of a million: the message is 5 bytes, so only 5 bytes need to be writable.
-    let top = 0x20_0000_0000usize;
+    let top = my_stack_top();
     let r = sys::channel_read(b, (top - 8) as *mut u8, 1_000_000, core::ptr::null_mut(), 0);
     ensure_eq!(
         (r.status, r.a1),
@@ -14152,12 +14213,8 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     let (p, _m) = launch_image_in(IMAGE.load(Ordering::Relaxed), 16, j)?;
     nap(5)?;
     // map a stack for the thread first (its page-table charge is not what is measured)
-    let base = 0x20_0000_0000u64;
     let v = vmo(4)?;
-    ok(
-        sys::process_map(p, v, base, 0, 4 * 4096, PF_R | PF_W),
-        "map a child stack",
-    )?;
+    let base = map_child_stack(p, v)?;
     sys::handle_close(v);
     let (used, _) = job_use(j, 2)?;
     let limits = |pages: u64| [u64::MAX, u64::MAX, pages, u64::MAX, u64::MAX, u64::MAX];
@@ -14167,7 +14224,7 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::Ok),
         "set the page limit"
     );
-    let entry = child_entry()?;
+    let entry = child_entry(p)?;
     ensure_eq!(
         st(sys::thread_on_stack(p, entry, base + 4 * 4096, 16)),
         Some(S::NoMemory),
@@ -15322,6 +15379,10 @@ pub fn app_main() -> i32 {
         (
             "child_exit_code_and_terminated_signal",
             child_exit_code_and_terminated_signal,
+        ),
+        (
+            "programs_are_placed_at_random",
+            programs_are_placed_at_random,
         ),
         (
             "debug_calls_need_a_debug_resource",
