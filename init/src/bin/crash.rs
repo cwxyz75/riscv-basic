@@ -780,6 +780,9 @@ fn unmap_while_siblings_touch() -> i32 {
             return 900 + (-(t.status as i64)) as i32;
         }
     }
+    // (the previous round's VMOs stay open until this round's is mapped: a stale translation of the old page then shows the old bytes, whatever order the
+    // allocator hands frames back in; closing them first let a freed frame come straight back, and a missing shootdown went unseen: soak, 2026-11-23)
+    let mut previous: [u64; 2] = [0, 0];
     for round in 1..=ROUNDS {
         let v = rt::sys::vmo_create(1);
         if v.status != 0 {
@@ -793,6 +796,11 @@ fn unmap_while_siblings_touch() -> i32 {
         // map it read-only at X (PF_R = 1)
         if rt::sys::process_map(me, vmo, X, 0, 4096, 1).status != 0 {
             return 912;
+        }
+        for h in previous {
+            if h != 0 {
+                rt::sys::handle_close(h);
+            }
         }
         // a second VMO with other contents, to give a freed frame something to be reused for
         let junk = rt::sys::vmo_create(1).a1 as u64;
@@ -819,10 +827,14 @@ fn unmap_while_siblings_touch() -> i32 {
         if rt::sys::process_unmap(me, X).status != 0 {
             return 913;
         }
-        rt::sys::handle_close(vmo);
-        rt::sys::handle_close(junk);
+        previous = [vmo, junk];
         if FAIL.load(Ordering::Acquire) != 0 {
             return FAIL.load(Ordering::Acquire) as i32;
+        }
+    }
+    for h in previous {
+        if h != 0 {
+            rt::sys::handle_close(h);
         }
     }
     FAIL.load(Ordering::Acquire) as i32
