@@ -429,6 +429,15 @@ pub fn trap_entry(frame: &mut TrapFrame) {
 /// About to return to user mode: put the thread's FP and vector state in the units (if it has any) and set the
 /// returned `sstatus.FS` and `sstatus.VS` accordingly.
 pub fn return_to_user(frame: &mut TrapFrame) {
+    return_to_user_with(frame, false);
+}
+
+/// `return_to_user` for a caller that holds the object lock already (the first entry of a thread).
+pub fn return_to_user_held(frame: &mut TrapFrame) {
+    return_to_user_with(frame, true);
+}
+
+fn return_to_user_with(frame: &mut TrapFrame, held: bool) {
     if frame.sstatus & (1 << 8) != 0 {
         return;
     }
@@ -452,7 +461,9 @@ pub fn return_to_user(frame: &mut TrapFrame) {
     if fs_ok && vs_ok {
         return;
     }
-    crate::bkl::lock();
+    if !held {
+        crate::bkl::lock();
+    }
     let s = state();
     let fs = if fsb == 0 {
         None
@@ -487,7 +498,9 @@ pub fn return_to_user(frame: &mut TrapFrame) {
             None => Fs::Off,
         })
     };
-    crate::bkl::unlock();
+    if !held {
+        crate::bkl::unlock();
+    }
     match fs {
         None => {}
         Some(Fs::Off) => frame.sstatus &= !FS_MASK,
@@ -632,11 +645,8 @@ pub fn thread_gone(tid: u64) {
 /// How many threads hold FP or vector state (the end-of-suite leak check: none may survive their process).
 pub fn entry_count() -> usize {
     crate::irq::without(|| {
-        crate::bkl::lock();
         let s = state();
-        let n = s.threads.len() + s.vthreads.len();
-        crate::bkl::unlock();
-        n
+        s.threads.len() + s.vthreads.len()
     })
 }
 

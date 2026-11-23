@@ -3,7 +3,7 @@
 //! One lock protects all shared kernel state. It is taken by `irq::without` (disable interrupts,
 //! lock, run, unlock, restore), explicitly at the entry of every trap, and released on every path
 //! that leaves kernel code (the trap exit, `enter_user`, the idle loop's `wfi`). It is
-//! **reentrant per hart** (a depth count) and **released at a context switch** (K3, SCHED-SMP-SPEC
+//! **not reentrant** (a hart that holds it and asks again is a bug: `lock` asserts; the few entry points reached both ways use `ensure`) and **released at a context switch** (K3, SCHED-SMP-SPEC
 //! G4): the switching thread releases it completely (`release_all`, keeping its depth on its own
 //! stack) and the thread that resumes, on whatever hart, takes it back to that depth (`reacquire`).
 //!
@@ -145,24 +145,24 @@ fn who() -> u32 {
 
 #[track_caller]
 /// Take the BKL. Interrupts must already be off (a handler taking it while the interrupted code
-/// spun for it with interrupts on would deadlock the hart). Reentrant.
+/// spun for it with interrupts on would deadlock the hart). The hart must not hold it already (L20).
 pub fn lock() {
     debug_assert!(!crate::irq::enabled(), "BKL taken with interrupts on");
     let me = who();
-    // the order check applies to a reentrant take too: a path that holds HEAP or UART and then
-    // takes a lock the hart already owns is still taking it in the wrong order
+    assert!(
+        !LOCK.held_by(me),
+        "the object lock taken by a hart that holds it (L20)"
+    );
+    // the order check: a path that holds HEAP or UART and then takes the lock is taking it in the wrong order
     if violates(Class::Obj) {
         VIOLATIONS.fetch_add(1, Ordering::SeqCst);
         if PANIC_ON_VIOLATION.load(Ordering::Relaxed) {
             panic!("lock order violation: taking the BKL while holding a later lock");
         }
     }
-    if !LOCK.held_by(me) {
-        note_acquire(Class::Obj, 0);
-    }
-    let outermost = !LOCK.held_by(me);
+    note_acquire(Class::Obj, 0);
     #[cfg(feature = "latency-trace")]
-    let (outermost_take, asked) = (outermost, crate::timer::now());
+    let asked = crate::timer::now();
     let spins = core::cell::Cell::new(0u64);
     LOCK.lock(me, &percpu::this().bkl_depth, || {
         core::hint::spin_loop();
@@ -171,21 +171,33 @@ pub fn lock() {
         spins.set(n);
     });
     OWNER.store(me as usize + 1, Ordering::Relaxed);
-    if outermost {
-        percpu::this().bkl_takes.fetch_add(1, Ordering::Relaxed);
-        #[cfg(debug_assertions)]
-        OWNER_SITE.store(
-            core::panic::Location::caller() as *const _ as *mut _,
-            Ordering::Relaxed,
-        );
-    }
+    percpu::this().bkl_takes.fetch_add(1, Ordering::Relaxed);
+    #[cfg(debug_assertions)]
+    OWNER_SITE.store(
+        core::panic::Location::caller() as *const _ as *mut _,
+        Ordering::Relaxed,
+    );
     #[cfg(feature = "latency-trace")]
-    if outermost_take {
-        crate::latency::bkl_acquired(crate::timer::now().saturating_sub(asked));
+    crate::latency::bkl_acquired(crate::timer::now().saturating_sub(asked));
+}
+
+/// Does this hart hold the lock now (for real: unlike `held`, false before `enforce` too)?
+pub fn holds() -> bool {
+    LOCK.held_by(who())
+}
+
+/// Run `f` under the lock: as it is if this hart holds it, else in a critical section of its own. For the few entry points that are reached both ways (from
+/// a syscall's locked section and from the unlocked tail of a trap or a kernel thread); everything below them assumes the lock.
+#[track_caller]
+pub fn ensure<R>(f: impl FnOnce() -> R) -> R {
+    if holds() {
+        f()
+    } else {
+        crate::irq::without(f)
     }
 }
 
-/// Take the BKL only if it is free (or already ours).
+/// Take the BKL only if it is free.
 pub fn try_lock() -> bool {
     debug_assert!(!crate::irq::enabled());
     let me = who();

@@ -233,11 +233,9 @@ fn a_wake_switches_at_the_end_of_the_outermost_section() -> Outcome {
         let mut early = true;
         let mut after_inner = true;
         crate::irq::without(|| {
-            crate::irq::without(|| {
-                NR_GO.store(true, SeqCst);
-                thread::wake_one(q);
-                early = NR_RAN.load(SeqCst);
-            });
+            NR_GO.store(true, SeqCst);
+            thread::wake_one(q);
+            early = NR_RAN.load(SeqCst);
             after_inner = NR_RAN.load(SeqCst);
         });
         let late = NR_RAN.load(SeqCst);
