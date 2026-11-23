@@ -90,6 +90,15 @@ impl<N: Class> Rqs<N> for Local<N> {
     }
 }
 
+/// The three global masks of KERNEL-V1-SPEC 5.2 (bit `h` is hart `h`): `online` (the harts that are part of the scheduler), `idle` (online, nothing running but the idle
+/// thread, nothing queued) and `overloaded` (a thread queued there that the hart is not running). `idle` and `overloaded` are published when a hart's lock is released
+/// after a change, like the hints, and are **read only as hints**: every use is re-checked under the locks, so a stale bit costs a wasted look, never a wrong move.
+struct Masks {
+    online: AtomicU64,
+    idle: AtomicU64,
+    overloaded: AtomicU64,
+}
+
 /// What the other harts may read about hart `h` without its lock: published when `h`'s lock is released after a change, **read
 /// only as a hint** whose every use is re-checked under the locks (SCHED-SMP-SPEC 4.4).
 struct Hint {
@@ -127,6 +136,8 @@ impl Hint {
 struct Hq<'a, N: Class, R: Rqs<N> + 'a> {
     g: R::Guard<'a>,
     hint: &'a Hint,
+    masks: &'a Masks,
+    bit: u64,
     changed: bool,
 }
 
@@ -146,6 +157,19 @@ impl<N: Class, R: Rqs<N>> Drop for Hq<'_, N, R> {
     fn drop(&mut self) {
         if self.changed {
             self.hint.publish(&self.g);
+            let queued = self.g.queued_len() > 0;
+            let idle = !queued && self.g.cur_eff() == 0;
+            if idle {
+                self.masks.idle.fetch_or(self.bit, Ordering::AcqRel);
+            } else {
+                self.masks.idle.fetch_and(!self.bit, Ordering::AcqRel);
+            }
+            // (negative control: a hart that never says it has a queued thread is never pulled from, and a thread starves in the models)
+            if queued && !cfg!(feature = "fault-skip-overloaded") {
+                self.masks.overloaded.fetch_or(self.bit, Ordering::AcqRel);
+            } else {
+                self.masks.overloaded.fetch_and(!self.bit, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -161,6 +185,9 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// Harts that are part of the scheduler: only they are chosen to run or hold threads (a hart that has not joined
     /// yet is skipped by placement and by push). Every hart starts online; the kernel clears the others until they join.
     online: Vec<AtomicBool>,
+    masks: Masks,
+    /// How many times a hart looked into another hart's queue under its lock to pull (SC2: zero while no hart is overloaded).
+    pull_looks: AtomicU64,
     hint: Vec<Hint>,
     /// `transit[h]`: the thread (0: none) hart `h` has just been told to stop running and has queued (preempted, rotated, yielded) but
     /// whose context the kernel has not finished saving. It is not available to any other hart (no pull, no balance, no
@@ -204,6 +231,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             next_tid: AtomicU64::new(1),
             pending: (0..harts).map(|_| AtomicBool::new(false)).collect(),
             online: (0..harts).map(|_| AtomicBool::new(true)).collect(),
+            masks: {
+                let all = u64::MAX >> 64usize.saturating_sub(harts); // (harts is 1 to 64)
+                Masks {
+                    online: AtomicU64::new(all),
+                    idle: AtomicU64::new(all),
+                    overloaded: AtomicU64::new(0),
+                }
+            },
+            pull_looks: AtomicU64::new(0),
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU64::new(0)).collect(),
             deferred: AtomicBool::new(false),
@@ -263,6 +299,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         Hq {
             g: self.rqs.lock(x),
             hint: &self.hint[x],
+            masks: &self.masks,
+            bit: 1u64 << x,
             changed: false,
         }
     }
@@ -301,6 +339,17 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::indexing_slicing)] // INVARIANT: hart is a hart index below the hart count
     pub fn set_online(&self, hart: usize, online: bool) {
         self.online[hart].store(online, Ordering::Release);
+        if online {
+            self.masks.online.fetch_or(1 << hart, Ordering::AcqRel);
+        } else {
+            self.masks
+                .online
+                .fetch_and(!(1u64 << hart), Ordering::AcqRel);
+        }
+    }
+    /// How many times a settle looked into another hart's queue under its lock (SC2).
+    pub fn pull_looks(&self) -> u64 {
+        self.pull_looks.load(Ordering::Relaxed)
     }
     /// Set `hart`'s clock without running any timers (when it joins).
     pub fn set_clock(&self, hart: usize, now: Time) {
@@ -514,6 +563,15 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if self.view_cur(last) < rec.eff {
             return last;
         }
+        // an idle hart from the mask (the lowest: what the minimum below would pick when one is idle), without looking at the others
+        let idle =
+            self.masks.idle.load(Ordering::Acquire) & self.masks.online.load(Ordering::Acquire);
+        if idle != 0 {
+            let x = idle.trailing_zeros() as usize;
+            if self.view_cur(x) < rec.eff {
+                return x;
+            }
+        }
         let best = (0..self.harts())
             .filter(|&h| self.is_online(h))
             .min_by_key(|&h| (self.view_cur(h), h))
@@ -670,10 +728,12 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
     fn pull_work(&self, h: usize) -> usize {
         let mut n = 0;
-        for g in 0..self.harts() {
-            if g == h {
-                continue;
-            }
+        // only the harts that say they have a queued thread, lowest first (the mask is a hint: what is found is re-checked under the locks)
+        let mut cand = self.masks.overloaded.load(Ordering::Acquire) & !(1u64 << h);
+        while cand != 0 {
+            let g = cand.trailing_zeros() as usize;
+            cand &= cand - 1;
+            self.pull_looks.fetch_add(1, Ordering::Relaxed);
             // look at `g` alone, then take both locks in order and look again before moving anything
             let found = {
                 let src = self.lq(g);

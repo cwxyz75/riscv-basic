@@ -201,7 +201,7 @@ holds the big lock longest, reorder on that evidence and record it below.
 
 ### Phase 10: scale and power
 
-- [ ] **SC2** placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
+- [ ] **SC2** (first step built, phase 10: the masks, `select_hart` and the pull through them, a counter and the host acceptance; the measurements at 16 and 32 harts are left) placement by masks; scaling at 16 and 32 harts; the `OBJ` trigger evaluated
 - [ ] **PM1** harts offline and online
 - [ ] **PM4** the placement policy (`spread`, `pack`)
 - [ ] **PM3** `system_suspend`
