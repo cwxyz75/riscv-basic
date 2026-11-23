@@ -740,6 +740,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         _ => {
             // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
+            sweep_before_create(n);
             let result = irq::without(|| dispatch(n, a));
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
@@ -818,6 +819,63 @@ pub(super) fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
+/// Sweep before creating kernel objects if garbage cycles have piled up (OD39), as a series of slices, each its own critical section (MM10, T206, X4): this call
+/// starts a sweep if one is due and runs a few slices of it, and the next creating call carries on; near the cap a creation would be refused while garbage fills
+/// the registry, so the sweep is finished now, slice by slice, with the roots taken in the section that begins it.
+#[inline(never)]
+fn sweep_before_create(n: usize) {
+    if !matches!(
+        n,
+        nr::CHANNEL_CREATE
+            | nr::EVENT_CREATE
+            | nr::SOCKET_CREATE
+            | nr::PORT_CREATE
+            | nr::INTERRUPT_CREATE
+    ) {
+        return;
+    }
+    if !with_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
+        return;
+    }
+    // (MM10) start one if garbage cycles have piled up, and run a few slices of it
+    with_state(|s| {
+        if !s.objs.sweep_active() {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots);
+        }
+    });
+    for _ in 0..SWEEP_SLICES_PER_CALL {
+        if !with_state(|s| {
+            s.objs.sweep_active()
+                && !matches!(
+                    s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                    kcore::object::SweepStep::Done(_)
+                )
+        }) {
+            break;
+        }
+    }
+    // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
+    while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
+        with_state(|s| s.objs.sweep_step(SWEEP_SLICE_BUDGET));
+    }
+    if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
+        let began = with_state(|s| {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots)
+        });
+        if began {
+            while with_state(|s| {
+                s.objs.sweep_active()
+                    && !matches!(
+                        s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                        kcore::object::SweepStep::Done(_)
+                    )
+            }) {}
+        }
+    }
+}
+
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(
@@ -832,34 +890,6 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let Some(&pid) = s.thread_pid.get(&tid) else {
         return fail(Status::BadState);
     };
-    // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
-    if matches!(
-        n,
-        nr::CHANNEL_CREATE
-            | nr::EVENT_CREATE
-            | nr::SOCKET_CREATE
-            | nr::PORT_CREATE
-            | nr::INTERRUPT_CREATE
-    ) && (s.objs.sweep_active() || s.objs.needs_sweep())
-    {
-        // (MM10) the sweep runs in slices: this call starts one if garbage cycles have piled up, and runs a few slices of it; the next
-        // creating call carries on. The worst interrupts-off span of a sweep is a slice, not the whole object graph.
-        if !s.objs.sweep_active() {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots);
-        }
-        let mut slices = 0;
-        while s.objs.sweep_active() && slices < SWEEP_SLICES_PER_CALL {
-            s.objs.sweep_step(SWEEP_SLICE_BUDGET);
-            slices += 1;
-        }
-        // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
-        // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
-        if s.objs.live() + 8 >= s.objs.cap() {
-            let roots = s.roots();
-            s.objs.sweep(&roots);
-        }
-    }
     let UserState {
         objs,
         procs,
