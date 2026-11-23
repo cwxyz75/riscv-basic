@@ -74,6 +74,8 @@ pub struct HandleTable {
     charged: u64,
     /// Whether `settle_growth` has clamped `limit` (counted in `CLAMPED_TABLES`).
     clamped: bool,
+    /// Where `drain_some` goes on (T206): the slots below it have been looked at.
+    drain_next: usize,
 }
 
 impl Drop for HandleTable {
@@ -98,6 +100,7 @@ impl HandleTable {
             live: 0,
             first_gen: 0,
             slot_cap: MAX_SLOTS,
+            drain_next: 0,
         }
     }
 
@@ -404,9 +407,24 @@ impl HandleTable {
     }
 
     /// Close everything (process death).
-    #[allow(clippy::indexing_slicing)] // INVARIANT: slot < slots.len() (loop bound)
     pub fn drain<T: Object>(&mut self, reg: &mut Registry<T>) {
-        for slot in 0..self.slots.len() {
+        while !self.drain_some(reg, usize::MAX) {}
+    }
+
+    /// Look at up to `budget` slots, closing the handles in them, going on from where the last call stopped (T206: a process's teardown closes a table of
+    /// thousands in slices, with the lock let go between them; a table that was mostly holes costs as many slices as it has slots, never one long one).
+    /// True when the whole table has been looked at, and then the cursor starts again (a drained table that gains handles drains again). The table must not
+    /// gain handles between the slices of one drain (its process is gone).
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)] // INVARIANT: slot < slots.len() (loop bound); looked <= budget
+    pub fn drain_some<T: Object>(&mut self, reg: &mut Registry<T>, budget: usize) -> bool {
+        let mut looked = 0usize;
+        while self.drain_next < self.slots.len() {
+            if looked >= budget {
+                return false;
+            }
+            let slot = self.drain_next;
+            self.drain_next += 1;
+            looked += 1;
             if self.slots[slot].entry.is_some() {
                 let gone = Self::encode(slot, self.slots[slot].gen);
                 let entry = self.remove(slot);
@@ -415,6 +433,8 @@ impl HandleTable {
                 reg.release(entry.obj);
             }
         }
+        self.drain_next = 0;
+        true
     }
 }
 
