@@ -372,6 +372,23 @@ pub fn channel_call_send<M: PhysMem>(
     a: [u64; 6],
     take_interrupt: impl FnOnce() -> bool,
 ) -> Result<Call, Status> {
+    channel_call_send_staged(us, mm, vmos, jobs, me, caller, a, None, take_interrupt)
+}
+
+/// `channel_call_send` with the request's bytes and handle words already copied in by the caller before it took the object lock (T215): `staged` is used in place
+/// of the two copies (the record is read here as always, so every check and its order are unchanged).
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: as `channel_call_send`
+pub fn channel_call_send_staged<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    caller: u64,
+    a: [u64; 6],
+    mut staged: Option<crate::Staged>,
+    take_interrupt: impl FnOnce() -> bool,
+) -> Result<Call, Status> {
     let ch = Handle(a[0]);
     let UserState {
         objs,
@@ -416,17 +433,29 @@ pub fn channel_call_send<M: PhysMem>(
         }
         return Err(Status::AccessDenied);
     }
-    let data = copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?;
+    let (data, raw) = match staged.take() {
+        Some(st) if st.data.len() == nbytes && st.handles.len() == nhandles * 8 => {
+            (st.data, st.handles)
+        }
+        _ => (
+            copy_from_user(p.aspace.held_mut(), mm, vmos, jobs, req_bytes, nbytes)?,
+            Vec::new(),
+        ),
+    };
     let call = *next_call;
     *next_call = next_call.wrapping_add(1);
-    let raw = copy_from_user(
-        p.aspace.held_mut(),
-        mm,
-        vmos,
-        jobs,
-        req_handles,
-        nhandles * 8,
-    )?;
+    let raw = if raw.is_empty() && nhandles != 0 {
+        copy_from_user(
+            p.aspace.held_mut(),
+            mm,
+            vmos,
+            jobs,
+            req_handles,
+            nhandles * 8,
+        )?
+    } else {
+        raw
+    };
     ipc::channel_write_from(
         objs,
         &mut p.handles,
@@ -484,6 +513,23 @@ pub fn channel_call_reply<M: PhysMem>(
     c: &Call,
     take_interrupt: impl FnOnce() -> bool,
 ) -> Reply {
+    channel_call_reply_deferred(us, mm, vmos, jobs, me, c, &mut None, false, take_interrupt)
+}
+
+/// `channel_call_reply` that, when `defer_out` is set and the reply is `OUTSIDE_COPY_MIN` bytes or more, leaves the message in `deferred` for the caller to copy out
+/// after it let the object lock go (T215): the destinations were checked and the message taken, only the copy is left.
+#[allow(clippy::arithmetic_side_effects, clippy::too_many_arguments)] // INVARIANT: as `channel_call_reply`
+pub fn channel_call_reply_deferred<M: PhysMem>(
+    us: &mut UserState,
+    mm: &mut Mm<M>,
+    vmos: &mut Vmos,
+    jobs: &mut Jobs,
+    me: u64,
+    c: &Call,
+    deferred: &mut Option<crate::Deferred>,
+    defer_out: bool,
+    take_interrupt: impl FnOnce() -> bool,
+) -> Reply {
     let UserState { objs, procs, .. } = us;
     objs.clear_dequeued_calls(); // (the reply is read here, not by a server: a note an earlier read left must not be attributed to a later one, L22)
     let p = procs.get_mut(&me).ok_or((Status::BadState, None, None))?;
@@ -510,6 +556,16 @@ pub fn channel_call_reply<M: PhysMem>(
                 jobs,
             )
             .map_err(|_| (Status::BadState, None, None))?;
+            if defer_out && got.data.len() >= crate::OUTSIDE_COPY_MIN {
+                let (nb, nh) = (got.data.len() as u64, got.handles.len() as u64);
+                *deferred = Some(crate::Deferred {
+                    bytes_at: c.rd_bytes,
+                    data: got.data,
+                    handles_at: c.rd_handles,
+                    handles: got.handles,
+                });
+                return Ok((Some(nb), Some(nh)));
+            }
             copy_to_user_verified(p.aspace.held_mut(), mm, c.rd_bytes, &got.data)
                 .map_err(|e| (e, None, None))?;
             // (the handle numbers go out one at a time from the stack: nothing here allocates after the message has been taken: KT9)

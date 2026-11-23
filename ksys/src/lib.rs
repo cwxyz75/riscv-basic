@@ -50,11 +50,12 @@ pub use thread::{
 };
 pub use vmo::{vmo_call, vmo_commit_resolved, vmo_rw_resolved};
 pub use wait::{
-    channel_call_ready, channel_call_reply, channel_call_send, futex_pi_resolve, futex_wait_check,
-    futex_wait_enqueue, futex_wait_report, futex_wait_resolve, futex_wait_resolve_in, futex_wake,
-    futex_wake_args, object_wait_check, object_wait_report, port_poll, port_poll_many,
-    port_wait_check, port_wait_many_check, port_wait_many_report, port_wait_report, signals_of,
-    Call, FutexCheck, FutexWord, ObjectWait, PiWord,
+    channel_call_ready, channel_call_reply, channel_call_reply_deferred, channel_call_send,
+    channel_call_send_staged, futex_pi_resolve, futex_wait_check, futex_wait_enqueue,
+    futex_wait_report, futex_wait_resolve, futex_wait_resolve_in, futex_wake, futex_wake_args,
+    object_wait_check, object_wait_report, port_poll, port_poll_many, port_wait_check,
+    port_wait_many_check, port_wait_many_report, port_wait_report, signals_of, Call, FutexCheck,
+    FutexWord, ObjectWait, PiWord,
 };
 
 use abi::limits::{MAX_MSG_BYTES, MAX_MSG_HANDLES};
