@@ -47,6 +47,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
+        libsys: Default::default(),
     }
 }
 
@@ -126,7 +127,13 @@ impl W {
         bh: u64,
         arg: u64,
     ) -> Result<(usize, u8), Status> {
-        ksys::process_start(&mut self.us, &mut self.jobs, 1, [ph, entry, sp, bh, arg, 0])
+        ksys::process_start(
+            &mut self.us,
+            &mut self.jobs,
+            &mut ksys::NoMap,
+            1,
+            [ph, entry, sp, bh, arg, 0],
+        )
     }
     fn threads(&self, job: JobId) -> u64 {
         self.jobs.usage(job).unwrap().get(Resource::Threads)
@@ -258,4 +265,100 @@ fn every_refusal_changes_nothing() {
     );
     // and the retry succeeds: handle 1 was not taken
     w.start(w.ph, CODE, SP, bh, 0).unwrap();
+}
+
+/// AB7: a stand-in for the kernel's mapper of the system library.
+struct FakeLib {
+    maps: u32,
+    unmaps: u32,
+    fail: Option<Status>,
+}
+
+impl ksys::StartMap for FakeLib {
+    fn map(
+        &mut self,
+        _: &mut kcore::aspace::AddressSpace,
+        _: &mut kcore::job::Jobs,
+    ) -> Result<(ksys::LibRange, u64), Status> {
+        if let Some(e) = self.fail {
+            return Err(e);
+        }
+        self.maps += 1;
+        Ok((
+            ksys::LibRange {
+                base: 0x4_0000_0000,
+                text_start: 0x4_0000_0000,
+                text_end: 0x4_0000_3000,
+            },
+            0x5000,
+        ))
+    }
+    fn unmap(
+        &mut self,
+        _: &mut kcore::aspace::AddressSpace,
+        _: &mut kcore::job::Jobs,
+        _: ksys::LibRange,
+        _: u64,
+    ) {
+        self.unmaps += 1;
+    }
+}
+
+#[test]
+fn the_system_library_is_mapped_recorded_charged_and_passed_in_a2() {
+    let mut w = world();
+    let bh = w.channel();
+    let pages_before = w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages);
+    let mut lib = FakeLib {
+        maps: 0,
+        unmaps: 0,
+        fail: None,
+    };
+    let (token, _) = ksys::process_start(
+        &mut w.us,
+        &mut w.jobs,
+        &mut lib,
+        1,
+        [w.ph, CODE, SP, bh, 0, 0],
+    )
+    .unwrap();
+    assert_eq!((lib.maps, lib.unmaps), (1, 0));
+    let t = &w.us.procs[&2];
+    assert_eq!(t.libsys.base, 0x4_0000_0000);
+    assert_eq!(t.libsys.text_end, 0x4_0000_3000);
+    assert_eq!(
+        w.us.starts[&token].a2, 0x4_0000_0000,
+        "the first thread gets the base in a2"
+    );
+    // the page tables for the span are charged like a `process_map`'s, and recorded to be credited with the process
+    assert_eq!(t.table_charge[&0x4_0000_0000], 4);
+    assert_eq!(
+        w.jobs.usage(JobId::ROOT).unwrap().get(Resource::Pages),
+        pages_before + 4 + ksys::KSTACK_PAGES
+    );
+}
+
+#[test]
+fn a_library_that_cannot_be_mapped_leaves_the_process_as_it_was() {
+    let mut w = world();
+    let bh = w.channel();
+    let mut lib = FakeLib {
+        maps: 0,
+        unmaps: 0,
+        fail: Some(Status::NoMemory),
+    };
+    let r = ksys::process_start(
+        &mut w.us,
+        &mut w.jobs,
+        &mut lib,
+        1,
+        [w.ph, CODE, SP, bh, 0, 0],
+    );
+    assert_eq!(r.err(), Some(Status::NoMemory));
+    assert_eq!(w.us.procs[&2].state, ProcState::Created);
+    assert!(
+        w.us.procs[&1].handles.get(abi::Handle(bh)).is_ok(),
+        "the caller still holds the end"
+    );
+    assert_eq!(w.threads(JobId::ROOT), 0, "no thread is charged");
 }

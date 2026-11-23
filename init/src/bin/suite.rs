@@ -93,7 +93,7 @@ fn unknown_syscalls_are_refused() -> Outcome {
         "syscall 999"
     );
     ensure_eq!(
-        st(rt::syscall(5, [0; 6])),
+        st(rt::syscall(rt::abi::syscall::number(5), [0; 6])),
         Some(S::BadSyscall),
         "unassigned number 5"
     );
@@ -2001,6 +2001,64 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
     Ok(())
 }
 
+/// Wait until a thread that a child program started has run its start-up and gone to sleep (its CPU time stops moving). The child's threads all
+/// store their start argument in one place (`rt::start_arg`), so a thread started with another argument before this one has read its own would change what
+/// this one does (T243: on a loaded four-hart run the first thread was seen starting more than 3 ms late).
+fn started_and_blocked(t: u64) -> Outcome {
+    let mut last = 0u64;
+    let mut steady = 0u32;
+    for _ in 0..400 {
+        nap(5)?;
+        let now = sys::thread_cpu_ns(t).a1 as u64;
+        // (it has run at all, and has not moved over two naps: a release build's start-up is well under a millisecond)
+        if now > 0 && now == last {
+            steady += 1;
+            if steady >= 2 {
+                return Ok(());
+            }
+        } else {
+            steady = 0;
+        }
+        last = now;
+    }
+    Err(detail("the thread never settled"))
+}
+
+/// `wait_ended` that says what the process and its threads look like when the wait runs out (T243: a failure seen only on the CI runners).
+fn wait_ended_or_say(proc: u64, threads: &[u64], ticks: u64) -> Outcome {
+    let r = sys::object_wait(proc, sig::TERMINATED, sys::clock_get() + ticks);
+    if r.status == 0 {
+        return Ok(());
+    }
+    let mut d = Detail::new();
+    let _ = sys::debug_stat(132); // (the kernel prints its scheduler state: T243)
+    let pi = sys::process_info(proc);
+    let _ = core::fmt::Write::write_fmt(
+        &mut d,
+        format_args!(
+            "the process did not end (status {}): signals {:#x}, info status {} a1 {} a2 {}",
+            r.status,
+            sys::object_signals(proc).a1,
+            pi.status,
+            pi.a1 as i64,
+            pi.a2
+        ),
+    );
+    for &t in threads {
+        let ti = sys::thread_info(t);
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "; thread {t:#x}: signals {:#x}, info status {} cpu_ns {}",
+                sys::object_signals(t).a1,
+                ti.status,
+                sys::thread_cpu_ns(t).a1
+            ),
+        );
+    }
+    Err(d)
+}
+
 /// HD2: where the kernel puts a child's code, its stack and an ANYWHERE mapping differs from launch to launch (ten launches: at least eight distinct values of each) when
 /// the kernel randomises, and is the same every time under `aslr=off`. Each address is read from the child's own address space before it runs.
 fn programs_are_placed_at_random() -> Outcome {
@@ -2069,6 +2127,129 @@ fn programs_are_placed_at_random() -> Outcome {
     Ok(())
 }
 
+/// AB7: the system library is mapped into every process at a place of its own, text read-only and executable and a read-only data page after it; the first thread
+/// has its base in `a2`; the data page holds what the kernel put there; and `clock_get` is computed in user mode, with no trap.
+fn the_system_library_is_in_every_process() -> Outcome {
+    // this process: the library was found, its page is filled
+    let base = rt::library::base();
+    ensure!(base != 0, "the runtime found the library");
+    let page = rt::library::page().ok_or_else(|| detail("read the data page"))?;
+    ensure_eq!(page.abi_version, libsys::page::ABI, "the ABI version");
+    ensure_eq!(page.page_size, 4096, "the page size");
+    ensure!(
+        page.time_mult != 0 && page.time_shift == 32,
+        "the clock's constants"
+    );
+    ensure!(page.harts_online >= 1, "harts online");
+    ensure!(
+        page.time_base <= sys::debug_stat(6),
+        "the clock's zero is not later than now"
+    );
+    // its mappings: the text (read, execute) at the base, and the data page (read only) behind it
+    let (text_start, text_end) = rt::library::text();
+    ensure_eq!(text_start, base, "the text starts at the base");
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let (mut text, mut data) = (None, None);
+    let mut at = 0u64;
+    for _ in 0..4096 {
+        let mut rec = [0u64; 6];
+        let next = ok(sys::process_map_info(me, at, rec.as_mut_ptr()), "map_info")?.a1 as u64;
+        if rec[0] == base as u64 {
+            text = Some(rec);
+        } else if rec[0] > base as u64 && rec[0] < base as u64 + 0x10000 && rec[1] == 4096 {
+            data = Some(rec);
+        }
+        if next == 0 {
+            break;
+        }
+        at = next;
+    }
+    let (text, data) = (
+        text.ok_or_else(|| detail("no text mapping at the base"))?,
+        data.ok_or_else(|| detail("no data page mapping"))?,
+    );
+    ensure!(
+        text[2] & 0b101 == 0b101 && text[2] & 0b010 == 0,
+        "the text is read and execute, not write: {:#b}",
+        text[2]
+    );
+    ensure!(
+        text[1] >= (text_end - text_start) as u64,
+        "the mapping covers the code"
+    );
+    ensure_eq!(data[2] & 0b111, 0b001, "the data page is read only");
+    // two processes: different bases when the kernel randomises, the same under aslr=off; every child's first thread was given its own base
+    let off = sys::debug_stat(128) == 1;
+    let mut bases = Vec::new();
+    for _ in 0..10 {
+        // (a child that blocks, so that it is still there to be asked: one that exits at once may be gone before the question, which says BAD_STATE)
+        let (p, m) = launch(16)?;
+        let mut at = 0u64;
+        let mut small = (0u64, u64::MAX);
+        for _ in 0..4096 {
+            let mut rec = [0u64; 6];
+            let next = ok(
+                sys::process_map_info(p, at, rec.as_mut_ptr()),
+                "child map_info",
+            )?
+            .a1 as u64;
+            // (the library's text: the smallest executable mapping)
+            if rec[2] & 0b100 != 0 && rec[1] < small.1 {
+                small = (rec[0], rec[1]);
+            }
+            if next == 0 {
+                break;
+            }
+            at = next;
+        }
+        ensure!(small.0 != 0, "the child has the library");
+        bases.push(small.0);
+        sys::process_kill(p, 0);
+        wait_ended(p, 500)?;
+        sys::handle_close(p);
+        sys::handle_close(m);
+    }
+    bases.sort_unstable();
+    bases.dedup();
+    if off {
+        ensure_eq!(bases.len(), 1, "aslr=off: one place");
+    } else if sys::debug_stat(108) == 1 {
+        ensure!(
+            bases.len() >= 8,
+            "ten children had only {} distinct library places",
+            bases.len()
+        );
+    }
+    // `clock_get` through the library never enters the kernel; the same call through the raw entry does (the control)
+    let before = sys::debug_stat(131);
+    for _ in 0..1000 {
+        core::hint::black_box(sys::clock_get());
+    }
+    ensure_eq!(
+        sys::debug_stat(131),
+        before,
+        "1000 clock_get calls entered the kernel"
+    );
+    for _ in 0..10 {
+        core::hint::black_box(rt::library::raw(rt::abi::syscall::CLOCK_GET, [0; 6]));
+    }
+    ensure_eq!(
+        sys::debug_stat(131),
+        before + 10,
+        "the control: ten raw calls entered it ten times"
+    );
+    // and the two clocks agree
+    let (a, b) = (
+        sys::clock_ns(),
+        rt::library::raw(rt::abi::syscall::CLOCK_GET, [0; 6]).a1 as u64,
+    );
+    ensure!(
+        b >= a && b - a < 50_000_000,
+        "the user-mode clock ({a}) and the kernel's ({b}) agree"
+    );
+    Ok(())
+}
+
 fn child_exit_code_and_terminated_signal() -> Outcome {
     let (p, mine) = launch(8)?;
     wait_ended(p, 500)?;
@@ -2082,7 +2263,7 @@ fn child_exit_code_and_terminated_signal() -> Outcome {
 }
 
 fn child_faults_are_contained() -> Outcome {
-    for (variant, want) in [(1u64, -1001i64), (7, -1001), (5, -1002)] {
+    for (variant, want) in [(1u64, -1001i64), (7, -1001), (5, -1002), (84, -1002)] {
         let (p, _mine) = launch(variant)?;
         wait_ended(p, 500)?;
         let r = sys::process_info(p);
@@ -3393,14 +3574,16 @@ ex1_spin_a1:                    # spins until a1 holds 0x5a5a5a, then ends with 
 1:  beq  a1, t1, 2f
     j    1b
 2:  li   a0, 77
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
     .globl ex1_exit_55
     .balign 4
 ex1_exit_55:                    # ends with exit code 55
     li   a0, 55
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
     .globl ex1_handler
     .balign 4
 ex1_handler:                    # a "signal handler": counts a hit, returns to the address the debugger left in t6
@@ -3416,8 +3599,9 @@ ex1_spin_f1:                    # spins until f1 holds 0x1234567, then ends with
     beq  t0, t1, 2f
     j    1b
 2:  li   a0, 66
-    li   a7, 61
-    ecall
+    la   t4, EX1_EXIT
+    ld   t4, 0(t4)
+    jr   t4
 "#
 );
 
@@ -3430,6 +3614,9 @@ extern "C" {
 
 #[no_mangle]
 static EX1_HITS: AtomicU32 = AtomicU32::new(0);
+/// The library's `thread_exit` entry, which the routines above end in (AB8: no program makes a call of its own; they have no registers to spare for it).
+#[no_mangle]
+static EX1_EXIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 const EX1_MAGIC: u64 = 0x5a5a5a;
 const GENERAL: u64 = rt::abi::thread_state::GENERAL;
@@ -3438,6 +3625,10 @@ const VECK: u64 = rt::abi::thread_state::VECTOR;
 
 /// Start a thread at `entry` on a stack of its own; `flags` are extra `thread_spawn` flags. Returns (handle, tid).
 fn ex1_spawn(entry: unsafe extern "C" fn(), flags: u32) -> Result<(u64, u64), Detail> {
+    EX1_EXIT.store(
+        rt::library::entry(rt::abi::syscall::THREAD_EXIT),
+        Ordering::Relaxed,
+    );
     let top = own_stack()?;
     let rec = rt::SpawnArgs {
         entry: entry as usize as u64,
@@ -5595,9 +5786,10 @@ fn map_child_stack(p: u64, v: u64) -> Result<u64, Detail> {
 }
 
 /// The entry point of the program image inside child `p` (HD2: the image is a static-PIE, so the link-time entry is an offset from the base the kernel chose;
-/// the image's text is its executable mapping).
+/// the image's text is its larger executable mapping).
 fn child_entry(p: u64) -> Result<u64, Detail> {
     let mut at = 0u64;
+    let mut best = (0u64, 0u64);
     for _ in 0..64 {
         let mut rec = [0u64; 6];
         let next = ok(
@@ -5605,16 +5797,19 @@ fn child_entry(p: u64) -> Result<u64, Detail> {
             "the child's mappings",
         )?
         .a1 as u64;
-        if rec[2] & 0b100 != 0 {
-            // (the image's only executable mapping is its text, which starts at the base)
-            return Ok(rec[0] + link_entry()?);
+        // (AB7: a started child has the system library's text as well, a few pages: the image's text is the larger executable mapping)
+        if rec[2] & 0b100 != 0 && rec[1] > best.1 {
+            best = (rec[0], rec[1]);
         }
         if next == 0 {
             break;
         }
         at = next;
     }
-    Err(detail("the child has no executable mapping"))
+    if best.1 == 0 {
+        return Err(detail("the child has no executable mapping"));
+    }
+    Ok(best.0 + link_entry()?)
 }
 
 fn link_entry() -> Result<u64, Detail> {
@@ -5860,18 +6055,18 @@ fn a_thread_made_by_the_parent_faults_or_exits() -> Outcome {
     let (p, _m) = launch(16)?;
     nap(3)?;
     let b = child_thread(p, 0, 16)?;
-    nap(3)?;
+    started_and_blocked(b)?;
     let t = child_thread(p, 1, 7)?; // null load
-    wait_ended(p, 1000)?;
+    wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, -1001, "the fault code");
     thread_ended_with(t, -1001)?;
     thread_ended_with(b, -1001)?;
     let (p, _m) = launch(16)?;
     nap(3)?;
     let b = child_thread(p, 0, 16)?;
-    nap(3)?;
+    started_and_blocked(b)?;
     let t = child_thread(p, 1, 8)?; // exit(42)
-    wait_ended(p, 1000)?;
+    wait_ended_or_say(p, &[b, t], 1000)?;
     ensure_eq!(sys::process_info(p).a1 as i64, 42, "exit(42) from a thread");
     thread_ended_with(t, 42)?;
     thread_ended_with(b, 42)?;
@@ -7205,6 +7400,56 @@ fn fetch_the_hello_image() -> Outcome {
     let r = sys::channel_call(BOOTSTRAP, &args);
     ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
     HELLO_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+static ABI_CONFORMANCE_IMAGE: AtomicU64 = AtomicU64::new(0);
+
+fn fetch_the_conformance_image() -> Outcome {
+    let (m, n) = request(24, b'A', b"");
+    let mut reply = [0u8; 16];
+    let mut got = [0u64; 2];
+    let args = CallArgs {
+        req_bytes: m.as_ptr() as u64,
+        req_handles: 0,
+        req_nbytes: n as u32,
+        req_nhandles: 0,
+        rep_bytes: reply.as_mut_ptr() as u64,
+        rep_handles: got.as_mut_ptr() as u64,
+        rep_max_bytes: 16,
+        rep_max_handles: 2,
+        deadline: sys::clock_get() + 500,
+    };
+    let r = sys::channel_call(BOOTSTRAP, &args);
+    ensure_eq!((r.status, r.a2), (0, 1), "the reply carries the image");
+    ABI_CONFORMANCE_IMAGE.store(got[0], Ordering::Relaxed);
+    Ok(())
+}
+
+/// AB9: the conformance program (built against `libsys` alone) runs to the end with no check failed; each failure it found comes back as a message.
+fn abi_conformance_passes() -> Outcome {
+    let (p, mine) = launch_image(ABI_CONFORMANCE_IMAGE.load(Ordering::Relaxed), 0)?;
+    wait_ended(p, 3000)?;
+    let code = sys::process_info(p).a1 as i64;
+    let mut said = Detail::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let r = sys::channel_read(mine, buf.as_mut_ptr(), 256, core::ptr::null_mut(), 0);
+        if r.status != 0 {
+            break;
+        }
+        let n = (r.a1 as usize).min(256);
+        let _ = core::fmt::Write::write_fmt(
+            &mut said,
+            format_args!("[{}] ", core::str::from_utf8(&buf[..n]).unwrap_or("?")),
+        );
+    }
+    ensure_eq!(
+        code,
+        0,
+        "checks failed in the conformance program: {}",
+        core::str::from_utf8(said.as_bytes()).unwrap_or("?")
+    );
     Ok(())
 }
 
@@ -9351,12 +9596,13 @@ fn registers_survive_a_syscall() -> Outcome {
         (0x11usize, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77);
     let (mut a3, mut a4, mut a5, mut a6) = (0x88usize, 0x99, 0xaa, 0xbb);
     let (mut s2, mut s3, mut s4, mut s5) = (0xc1usize, 0xc2, 0xc3, 0xc4);
-    // SAFETY: a CLOCK_GET syscall; the registers named are inputs and outputs, a0-a2 are
+    // SAFETY: a THREAD_YIELD syscall (one the kernel answers: `clock_get` is user-mode code in the library and would use the temporaries); the registers named are inputs and outputs, a0-a2 are
     // clobbered by the results as the ABI says.
     unsafe {
         core::arch::asm!(
-            "ecall",
-            in("a7") rt::abi::syscall::CLOCK_GET,
+            "jalr {lib}",
+            lib = in(reg) rt::library::entry(rt::abi::syscall::THREAD_YIELD),
+            out("ra") _, out("a7") _,
             inout("t0") t0, inout("t1") t1, inout("t2") t2, inout("t3") t3, inout("t4") t4,
             inout("t5") t5, inout("t6") t6,
             inout("a3") a3, inout("a4") a4, inout("a5") a5, inout("a6") a6,
@@ -13834,15 +14080,15 @@ fn proc_create_in(job: u64) -> Result<u64, Detail> {
 
 fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
     let root = root_job()?;
-    // the child's own image and stack count against its job too: 64 pages leave it room for
+    // the child's own image, its stack and the page tables of the system library (AB7) count against its job too: 80 pages leave it room for
     // some of its own, but not for a hog
-    let j = job(root, u64::MAX, u64::MAX, 64)?;
+    let j = job(root, u64::MAX, u64::MAX, 80)?;
     let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 30, j)?;
     wait_ended(p, 3000)?;
     let got = sys::process_info(p).a1 as i64;
     ensure!(
-        (1..64).contains(&got),
-        "the hog got {got} pages of a 64-page job (and was told no)"
+        (1..80).contains(&got),
+        "the hog got {got} pages of an 80-page job (and was told no)"
     );
     // all of it is given back when the child is gone
     job_use_settles(j, 2, 0, 1000)?;
@@ -14216,7 +14462,17 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
     let v = vmo(4)?;
     let base = map_child_stack(p, v)?;
     sys::handle_close(v);
-    let (used, _) = job_use(j, 2)?;
+    // (the child may still be starting up, and every page it touches is charged: read the use again until it has stopped moving, T238)
+    let mut used = job_use(j, 2)?.0;
+    for _ in 0..50 {
+        nap(5)?;
+        let now = job_use(j, 2)?.0;
+        if now == used {
+            break;
+        }
+        used = now;
+    }
+    let used0 = used;
     let limits = |pages: u64| [u64::MAX, u64::MAX, pages, u64::MAX, u64::MAX, u64::MAX];
     // three pages of room: the four-page stack does not fit, and nothing changes
     ensure_eq!(
@@ -14230,7 +14486,14 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::NoMemory),
         "a thread whose stack does not fit the job"
     );
-    ensure_eq!(job_use(j, 2)?.0, used, "a refused thread charged nothing");
+    // (nothing of the stack is charged; a page-table page that the attempt needed, where the random placement put the stack's end, may stay, so the room below is
+    // counted from what the job has now: T238)
+    let after = job_use(j, 2)?.0;
+    ensure!(
+        after >= used && after - used <= 1,
+        "a refused thread charged nothing but at most a page-table page: {used} -> {after}"
+    );
+    used = after;
     ensure_eq!(
         job_use(j, 1)?.0,
         1,
@@ -14241,16 +14504,38 @@ fn thread_stacks_are_charged_to_the_job_and_credited_back() -> Outcome {
         Some(S::Ok),
         "four pages of room"
     );
-    let t = ok(
-        sys::thread_on_stack(p, entry, base + 4 * 4096, 16),
-        "the thread now fits",
-    )?
-    .a1 as u64;
-    ensure_eq!(
-        job_use(j, 2)?.0,
-        used + 4,
-        "the stack's four pages are charged"
-    );
+    let r = sys::thread_on_stack(p, entry, base + 4 * 4096, 16);
+    if r.status != 0 {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "the thread now fits: status {} (use was {used} before the refusal, {after} after, and is {} now; limit {})",
+                r.status,
+                job_use(j, 2)?.0,
+                used + 4
+            ),
+        );
+        return Err(d);
+    }
+    let t = r.a1 as u64;
+    let got = job_use(j, 2)?.0;
+    if got != used + 4 {
+        let mut d = Detail::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut d,
+            format_args!(
+                "the stack's four pages are charged: got {got}, want {} (before the refusal {used0}, after {after}); thread signals {:#x}, info status {}, cpu_ns {}, process signals {:#x}, use now {}",
+                used + 4,
+                sys::object_signals(t).a1,
+                sys::thread_info(t).status,
+                sys::thread_cpu_ns(t).a1,
+                sys::object_signals(p).a1,
+                job_use(j, 2)?.0
+            ),
+        );
+        return Err(d);
+    }
     // ending the process credits the stack back (everything settles to zero)
     ensure_eq!(st(sys::process_kill(p, 3)), Some(S::Ok), "kill");
     wait_ended(p, 1000)?;
@@ -15385,6 +15670,10 @@ pub fn app_main() -> i32 {
             programs_are_placed_at_random,
         ),
         (
+            "the_system_library_is_in_every_process",
+            the_system_library_is_in_every_process,
+        ),
+        (
             "debug_calls_need_a_debug_resource",
             debug_calls_need_a_debug_resource,
         ),
@@ -15660,6 +15949,11 @@ pub fn app_main() -> i32 {
             kill_needs_the_kill_right_and_nothing_else,
         ),
         ("fetch_the_hello_image", fetch_the_hello_image),
+        (
+            "fetch_the_conformance_image",
+            fetch_the_conformance_image,
+        ),
+        ("abi_conformance_passes", abi_conformance_passes),
         (
             "runtime_startup_heap_and_stdio",
             runtime_startup_heap_and_stdio,

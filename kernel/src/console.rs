@@ -21,7 +21,11 @@ pub fn try_read() -> Option<u8> {
     if base == 0 || FORCE_SBI.load(core::sync::atomic::Ordering::Relaxed) {
         return None; // the firmware's console is output only here
     }
-    // SAFETY: the 16550's line-status and receive registers, mapped like the transmit ones.
+    // SAFETY: `UART_BASE` is the ns16550 `reg` of `/chosen/stdout-path` (`fdt::console_base` refuses a register shift or width other than byte), mapped read-write
+    // in the direct map by the early table and by `kmem::init`; the line-status and receive registers are bytes at offsets 5 and 0 inside that page.
+    // Like every use of the base it trusts the device tree: the address is bounded by `DIRECT_MAP_PHYS_LIMIT` only, not checked against RAM or the image as
+    // the AIA's pages are (T241, part 3), so on a wrong tree this reads kernel memory. No UART lock is taken: the callers are the serial bridge's own
+    // thread, and a stale read costs a character, not memory safety (T242).
     unsafe {
         if read_volatile((base + LSR) as *const u8) & 1 != 0 {
             Some(read_volatile(base as *const u8))
@@ -111,6 +115,27 @@ pub fn break_lock() {
     UART_OWNER.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
+/// The panic handler's writer: its own line state and no UART lock (`break_lock` has let it through, and another hart may be inside `LINE` still: a panic
+/// must not form a second `&mut` to it, T240).
+pub struct PanicConsole {
+    line: kcore::linestate::LineState,
+}
+
+impl PanicConsole {
+    pub const fn new() -> PanicConsole {
+        PanicConsole {
+            line: kcore::linestate::LineState::new(),
+        }
+    }
+}
+
+impl fmt::Write for PanicConsole {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.line.kernel_text(s.as_bytes(), &mut put);
+        Ok(())
+    }
+}
+
 /// The physical line state shared by every writer (kernel and bridge): see
 /// `kcore::linestate`. Accessed only with interrupts off.
 static mut LINE: kcore::linestate::LineState = kcore::linestate::LineState::new();
@@ -124,9 +149,11 @@ fn put(byte: u8) {
         }
         return;
     }
-    // SAFETY: base + LSR and base are the 16550's byte-wide registers, mapped by the early
-    // boot table and by `kmem::init`'s device pages; volatile one-byte accesses are how the
-    // device is used and nothing else in this kernel touches them.
+    // SAFETY: `UART_BASE` is the ns16550 `reg` of `/chosen/stdout-path` (`fdt::console_base` refuses a register shift or width other than byte), mapped read-write in
+    // the direct map by the early table and by `kmem::init`'s device pages; the line-status and transmit registers are bytes at offsets 5 and 0 inside that page,
+    // and one-byte volatile accesses are how the device is used. It trusts the device tree like the receive path does: the address is bounded by
+    // `DIRECT_MAP_PHYS_LIMIT` only (T241, part 3), so on a wrong tree this writes kernel memory. Only the output path (inside `with_uart`) and `try_read` touch the
+    // registers (T242).
     unsafe {
         while read_volatile((base + LSR) as *const u8) & LSR_THR_EMPTY == 0 {}
         write_volatile(base as *mut u8, byte);

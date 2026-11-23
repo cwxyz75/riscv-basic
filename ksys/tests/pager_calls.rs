@@ -70,6 +70,7 @@ fn world() -> W {
             stacks: BTreeMap::new(),
             stack_hint: 0,
             privileged: false,
+            libsys: Default::default(),
         }),
     );
     let mut jobs = Jobs::new();

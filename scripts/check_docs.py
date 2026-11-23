@@ -181,7 +181,7 @@ ATOMICS = {
     "kcore/src/latch.rs": (4, "the one-way latch, modelled under loom and shuttle"),
     "kcore/src/sched2.rs": (2, "`Home`, the thread's hart: written under run-queue locks, read lock-free (L11b, shuttle model)"),
     "kcore/src/sched_smp.rs": (40, "the scheduler's shared state: marks, pokes, hints, transit slots, counters (L11b, shuttle model `rq_concurrency`; the hint's `key` is read and written only under the hart's run-queue lock), and the three global masks, hints published at the release of a run-queue lock (SC2), and the placement policy, one byte read at each wake (PM4)"),
-    "kernel/src/percpu.rs": (87, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1)"),
+    "kernel/src/percpu.rs": (91, "per-hart state, touched by its own hart or read by others: the audited per-hart layer (including the FP and vector claims, T166, the process and address-space lock of the running thread for the lock-free calls, L14 and L17, and the per-class magazine lengths of MM4, and the frame cache length mirror of L16, and the hart state of PM1, and the library text range of the running process, AB8)"),
     "klock/src/aslock.rs": (3, "the installed machine hooks of the address-space lock: one pointer, stored once at boot and read with acquire (L17)"),
     "kernel/src/bkl.rs": (13, "the big kernel lock's owner and checker state"),
     "kernel/src/chaos.rs": (10, "the chaos feature's per-hart generator states, enable flag, point mask and delay counter (KT7: test-build diagnostics, no code without the feature)"),
@@ -192,8 +192,8 @@ ATOMICS = {
     "kernel/src/thread.rs": (34, "scheduler ready flags, wake statistics, the watchdog's per-hart sample times and the stack-budget record (KT13: the high water, the first offender's use, its id and its name as two words, the exempt thread); and the count of donations the graph refused (L22)"),
     "kernel/src/arch/riscv64/timer.rs": (6, "the clock's zero (the counter value at the first tick), and the counter's frequency and fixed-point multiplier (PL4b), set once at boot and read by `now_ns`"),
     "kernel/src/user/wake.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the deferred-reap flag, the user-mode counters and the exit-cycle record: the part of the old user.rs that wakes and cleans up)"),
-    "kernel/src/user/mod.rs": (3, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),
-    "kernel/src/user/trap.rs": (6, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot"),
+    "kernel/src/user/mod.rs": (7, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the user-state slot); `STATE_OPEN` (debug builds: the open-closure flag of T239); `USER_READY`: the user state exists, read by the commit-on-drop of `irq::without` before it touches the state (L20)"),
+    "kernel/src/user/trap.rs": (8, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot; the count of `clock_get` calls the kernel answers (AB7: a test reads it to see that the library's clock does not enter the kernel)"),
     "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (14, "heap statistics, the growth guard, and the frame pool's readiness, size mirror, starvation flag and the refused-free counter"),
     "kernel/src/kmem.rs": (6, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23); the kernel page table's root, set once at boot (T224)"),
@@ -301,6 +301,13 @@ def check_ram_literals():
                     if RAM_LITERAL_RE.search(line.split("//", 1)[0]):
                         out.append(f"PL4: {os.path.relpath(path, ROOT)}:{n} assumes where RAM or the image is (RAM_SIZE, 0x8000_0000, KERNEL_PHYS, ...): it comes from the device tree and the boot code")
     return out
+
+
+def check_unsafe_inventory():
+    """KT14: every `unsafe` in kernel/src is in the audit list with its current hash."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import unsafe_inventory
+    return unsafe_inventory.problems()
 
 
 def check_syscall_tests():
@@ -427,7 +434,7 @@ def main():
 
     problems += check_layout() + check_links() + check_specs() + check_records_append_only()
 
-    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_arch() + check_workflows() + check_ram_literals()
+    problems += check_tiers() + check_atomics() + check_syscall_tests() + check_unsafe_inventory() + check_arch() + check_workflows() + check_ram_literals()
     if problems:
         print("docs check FAILED:")
         for p in problems:

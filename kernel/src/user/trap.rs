@@ -24,7 +24,7 @@ pub(super) fn install_token_of(asids: &mut kcore::asid::Asids, p: &mut Process) 
 /// Register writes (`thread_write_state`) that were left for this thread while it was parked: applied here, by the thread to its own frame (the
 /// `&mut` this function was given, so no one else ever writes it). Only a frame from user mode.
 fn apply_pending_regs(frame: &mut crate::trap::TrapFrame) {
-    let pending = with_state(|s| {
+    let pending = any_state(|s| {
         if s.pending_regs.is_empty() {
             return None;
         }
@@ -55,61 +55,74 @@ pub fn activate_current(frame: &mut crate::trap::TrapFrame) {
     // where it would otherwise return to user mode.
     park_while_stopped();
     apply_pending_regs(frame);
-    let token = with_state(|s| {
-        let UserState {
-            asids,
-            procs,
-            thread_pid,
-            ..
-        } = s;
-        let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
-        crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
-        let p = procs.get_mut(&pid);
-        crate::percpu::this().cur_as.store(
-            p.as_ref().map_or(core::ptr::null_mut(), |p| {
-                alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
-            }),
-            Ordering::Release,
-        );
-        let p = p?;
-        // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
-        // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
-        let token = install_token_of(asids, p);
-        // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
-        // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
-        let me = crate::percpu::this();
-        let tid = thread::current() as u64;
-        let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
-        if me.bound_tid.load(Ordering::Relaxed) != tid
-            || me.bound_tag.load(Ordering::Relaxed) != key
-        {
-            thread::bind_user(
-                thread::current(),
-                thread::UserBinding {
-                    pid,
-                    tag: p.tag,
-                    token,
-                    aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
-                },
+    // (the token is computed and installed in one section of the object lock: a switch between the two would install a stale one, T241)
+    crate::bkl::ensure(|| {
+        let token = any_state(|s| {
+            let UserState {
+                asids,
+                procs,
+                thread_pid,
+                ..
+            } = s;
+            let pid = thread_pid.get(&thread::current()).copied().unwrap_or(0);
+            crate::percpu::this().cur_pid.store(pid, Ordering::Relaxed);
+            let p = procs.get_mut(&pid);
+            let (ls, le) = p
+                .as_ref()
+                .map_or((0, 0), |p| (p.libsys.text_start, p.libsys.text_end));
+            crate::percpu::this()
+                .cur_lib_start
+                .store(ls, Ordering::Relaxed);
+            crate::percpu::this()
+                .cur_lib_end
+                .store(le, Ordering::Relaxed);
+            crate::percpu::this().cur_as.store(
+                p.as_ref().map_or(core::ptr::null_mut(), |p| {
+                    alloc::sync::Arc::as_ptr(&p.aspace).cast_mut()
+                }),
+                Ordering::Release,
             );
-            me.bound_tid.store(tid, Ordering::Relaxed);
-            me.bound_tag.store(key, Ordering::Relaxed);
+            let p = p?;
+            // (a tag of an older generation names an ASID that may be another space's now: take a fresh one before this space is installed,
+            // and flush this hart if it has not since the generation turned (TLB1 per generation, L18))
+            let token = install_token_of(asids, p);
+            // (what the next return of this thread can use with no big lock: `activate_current_quiet`; written only when the thread or its tag is not what
+            // this hart wrote last: the common syscall returns to the same thread under the same tag and takes no table for it)
+            let me = crate::percpu::this();
+            let tid = thread::current() as u64;
+            let key = (p.tag.gen << 16) | u64::from(p.tag.asid);
+            if me.bound_tid.load(Ordering::Relaxed) != tid
+                || me.bound_tag.load(Ordering::Relaxed) != key
+            {
+                thread::bind_user(
+                    thread::current(),
+                    thread::UserBinding {
+                        pid,
+                        tag: p.tag,
+                        token,
+                        aspace: alloc::sync::Arc::as_ptr(&p.aspace) as usize,
+                        lib: (p.libsys.text_start, p.libsys.text_end),
+                    },
+                );
+                me.bound_tid.store(tid, Ordering::Relaxed);
+                me.bound_tag.store(key, Ordering::Relaxed);
+            }
+            Some(token)
+        });
+        if let Some(token) = token {
+            if crate::percpu::this()
+                .active_aspace
+                .swap(token, Ordering::SeqCst)
+                != token
+                || crate::arch::aspace_current() != token
+            {
+                // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
+                // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
+                // No flush: translations are tagged with the ASID (L18).
+                unsafe { crate::arch::aspace_install_noflush(token) };
+            }
         }
-        Some(token)
     });
-    if let Some(token) = token {
-        if crate::percpu::this()
-            .active_aspace
-            .swap(token, Ordering::SeqCst)
-            != token
-            || crate::arch::aspace_current() != token
-        {
-            // SAFETY: `token` names a live process root whose upper half is the kernel's, with an ASID from the allocator (never 0) of
-            // the current generation (`install_token_of` refreshed it and flushed this hart if the generation had turned just above).
-            // No flush: translations are tagged with the ASID (L18).
-            unsafe { crate::arch::aspace_install_noflush(token) };
-        }
-    }
 }
 
 /// The return to user mode of a thread that slept in a quiet call and wakes with nothing to look at (L19): `seen` is the attention epoch the call
@@ -136,6 +149,8 @@ pub fn activate_current_quiet(seen: u64) -> bool {
     }
     me.attention_seen.store(seen, Ordering::SeqCst);
     me.cur_pid.store(b.pid, Ordering::Relaxed);
+    me.cur_lib_start.store(b.lib.0, Ordering::Relaxed);
+    me.cur_lib_end.store(b.lib.1, Ordering::Relaxed);
     me.cur_as
         .store(b.aspace as *mut klock::aslock::AsCell, Ordering::Release);
     if me.active_aspace.swap(b.token, Ordering::SeqCst) != b.token
@@ -176,7 +191,7 @@ fn vmo_resolve(
     h: u64,
     need: Rights,
 ) -> Result<(u64, alloc::sync::Arc<klock::aslock::AsCell>), ReplyErr> {
-    with_state(|s| {
+    locked_state(|s| {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         let id = ipc::vmo_of(&s.objs, &p.handles, Handle(h), need).map_err(|e| (e, None, None))?;
@@ -186,12 +201,14 @@ fn vmo_resolve(
 
 /// The address space of the process this hart is running, for the copies that need only it (the same cell `page_fault_quiet` uses).
 fn current_space() -> Option<&'static klock::aslock::AsCell> {
-    let cell = crate::percpu::this().cur_as.load(Ordering::Acquire);
+    // (the calling thread's own record, not the hart's `cur_as`: the thread may have been switched out since it entered the call, and the hart then
+    // names whichever process last returned to user mode on it; KT14 found this)
+    let cell = thread::user_binding(thread::current())?.aspace as *const klock::aslock::AsCell;
     if cell.is_null() {
         return None;
     }
-    // SAFETY: the hart runs a thread of the process the cell belongs to, so the cell's `Arc` is alive for as long as the caller runs on this thread
-    // (the cell is only used inside the syscall, and a process is torn down only when its last thread has gone).
+    // SAFETY: the binding is the calling thread's own, written when its process's space was installed for it; the cell's `Arc` lives as long as the process,
+    // which is torn down only when its last thread has gone, so it is alive for as long as the caller runs on this thread (the cell is only used inside the syscall).
     Some(unsafe { &*cell })
 }
 
@@ -233,12 +250,55 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
     })
 }
 
+/// The copy-in of a big `channel_call` request (T215), before the object lock is taken: the record is read, and if the request carries `OUTSIDE_COPY_MIN` bytes or
+/// more its bytes and handle words are copied under the caller's address-space lock and the memory locks only. Any failure returns `None` and the call copies for
+/// itself under the lock, so its errors and their order are unchanged.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the record is CHANNEL_CALL_ARGS_BYTES (56) long and the offsets read are below it; nhandles <= MAX_MSG_HANDLES was checked, so nhandles * 8 is small
+pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
+    let cell = current_space()?;
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let k = kmem::mem();
+    let saved = k.vmos.swap_need(None);
+    let staged = (|| {
+        let rec = copy_from_user(
+            space,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            a[1],
+            abi::CHANNEL_CALL_ARGS_BYTES,
+        )
+        .ok()?;
+        let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
+        let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
+        let (req_bytes, req_handles) = (le64(0), le64(8));
+        let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
+        if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES
+        {
+            return None;
+        }
+        let data = copy_from_user(space, k.mm, k.vmos, k.jobs, req_bytes, nbytes).ok()?;
+        let handles = if nhandles == 0 {
+            Vec::new()
+        } else {
+            copy_from_user(space, k.mm, k.vmos, k.jobs, req_handles, nhandles * 8).ok()?
+        };
+        Some(ksys::Staged { data, handles })
+    })();
+    let _ = k.vmos.swap_need(saved);
+    staged
+}
+
 /// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
 /// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
 /// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
 #[inline(never)]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
-fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
+pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
     let Some(d) = deferred else {
         return result;
     };
@@ -312,7 +372,7 @@ fn vmo_commit_call(a: [u64; 6]) -> Reply {
 /// `hart_set_online(resource, index, online)` and `hart_info(resource, index)` (PM1): the resource is checked under the object lock, which is dropped before the call waits
 /// for the hart (its displaced threads need the object domain to switch).
 fn hart_call(n: usize, a: [u64; 6]) -> Reply {
-    with_state(|s| -> Reply {
+    locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::resource_of(&s.objs, &p.handles, Handle(a[0])).map_err(|e| (e, None, None))?;
@@ -339,7 +399,7 @@ fn hart_call(n: usize, a: [u64; 6]) -> Reply {
 
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
-    with_state(|s| -> Reply {
+    locked_state(|s| -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::INSPECT)
@@ -352,6 +412,18 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
 /// before any IPI that tells a hart to look. A hart that returns to user mode records the epoch it saw (`activate_current`, before it
 /// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
 pub(super) static ATTENTION: AtomicU64 = AtomicU64::new(1);
+/// How many times the kernel answered `clock_get` (AB7: the system library computes it in user mode, so a program's reads add nothing; a test reads this to see it).
+static CLOCK_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one `clock_get` the kernel answered.
+pub fn note_clock_trap() {
+    CLOCK_TRAPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The `clock_get` calls the kernel has answered (`debug_stat` 131).
+pub fn clock_traps() -> u64 {
+    CLOCK_TRAPS.load(Ordering::Relaxed)
+}
 
 /// How much of the reachability sweep one creating call does (MM10): up to this many slices of this many marked objects or slots each.
 const SWEEP_SLICES_PER_CALL: usize = 4;
@@ -546,6 +618,29 @@ pub fn futex_wait_quiet(frame: &mut crate::trap::TrapFrame) -> bool {
     true
 }
 
+/// AB8: is `pc`, the address of a system call instruction from user mode, inside the text of the running process's system library? A process with no library
+/// (its range is zero) is not held to it. The `fault-skip-entry-check` build lets every call through (the negative control of the test).
+pub fn call_from_library(pc: u64) -> bool {
+    let me = crate::percpu::this();
+    let (s, e) = (
+        me.cur_lib_start.load(Ordering::Relaxed),
+        me.cur_lib_end.load(Ordering::Relaxed),
+    );
+    cfg!(feature = "fault-skip-entry-check") || e == 0 || (s <= pc && pc < e)
+}
+
+/// `call_from_library` for the full path, which runs after the thread may have slept in a quiet call and woken on another hart: the range is the thread's own
+/// (its binding), not the hart's.
+pub fn call_from_library_of_thread(pc: u64) -> bool {
+    if cfg!(feature = "fault-skip-entry-check") {
+        return true;
+    }
+    match thread::user_binding(thread::current()) {
+        Some(b) => b.lib.1 == 0 || (b.lib.0 <= pc && pc < b.lib.1),
+        None => true,
+    }
+}
+
 /// `futex_wake` from user mode with **no big kernel lock** (L14): the trap handler's quiet path calls this with the frame past the call
 /// instruction. The process is the one `activate_current` recorded for this hart's running thread; the rest takes only the key's bucket lock
 /// and the scheduler's own locks. A wake that outranks this thread leaves `need_resched` set: the caller takes the lock for the switch.
@@ -598,6 +693,17 @@ pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
 pub(super) fn user_trap_inner(frame: &mut crate::trap::TrapFrame) {
     use crate::arch::{FaultKind, UserTrap};
     if frame.is_syscall() {
+        // AB8: the system call instruction is allowed only inside the system library; anywhere else it is an illegal instruction, and the
+        // process ends (or its exception port hears of it)
+        if !call_from_library_of_thread(frame.pc()) {
+            raise_fault(ksys::exception::Fault {
+                kind: abi::arch::fault::ILLEGAL,
+                pc: frame.pc(),
+                address: frame.pc(),
+                cause: 8,
+            });
+            return;
+        }
         frame.skip_trap_instruction(); // past the call instruction
         syscall(frame);
         // (MM9) a kernel copy found a page of a pager's VMO missing: wait for it here, with no lock held
@@ -734,7 +840,7 @@ fn fault_or_exit(fault: &crate::arch::Fault) {
 
 /// `fault_or_exit` for a fault already described (a PAGER fault, MM9, has the pager's status as its cause).
 fn raise_fault(f: ksys::exception::Fault) {
-    let delivered = with_state(|s| {
+    let delivered = any_state(|s| {
         let tid = thread::current();
         let Some(&pid) = s.thread_pid.get(&tid) else {
             return false;
@@ -781,7 +887,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::THREAD_EXIT => leave(a[0] as i32, false),
-        nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
+        nr::CLOCK_GET => {
+            note_clock_trap();
+            frame.set_return(0, Some(thread::now_ns()), None)
+        }
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
         nr::HART_SET_ONLINE | nr::HART_INFO | nr::SYSTEM_SUSPEND => reply(frame, hart_call(n, a)),
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
@@ -804,7 +913,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::FUTEX_UNLOCK_PI => reply(frame, futex_unlock_pi(a)),
         nr::FUTEX_WAKE => {
             // (the quiet path of the trap handler takes this call without the big lock when it can; this is the same code with it held)
-            let pid = with_state(|s| caller_pid(s).unwrap_or(0));
+            let pid = locked_state(|s| caller_pid(s).unwrap_or(0));
             reply(frame, futex_wake(pid, a));
         }
         nr::PROCESS_CREATE
@@ -890,7 +999,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             ) {
                 if n == nr::HANDLE_CLOSE {
                     // (EX2) a job exception channel whose user end was just closed: the kernel's end goes (one test of an empty table otherwise)
-                    with_state(ksys::exception::reap_closed_job_channels);
+                    locked_state(ksys::exception::reap_closed_job_channels);
                 }
                 notify();
             }
@@ -913,7 +1022,7 @@ fn lend_to_reader() {
     let me = thread::current();
     // (the donation is made in the section that checked the call is still live: the caller's own end of the call, `pi_revoke` and the removal of its record,
     // is one section too, so a donation cannot outlive the call it was made for: `PI` is after the object lock in the order)
-    with_state(|s| {
+    locked_state(|s| {
         let read = s.objs.take_dequeued_calls();
         for (caller, call) in read {
             if s.calls.get(&(caller as Tid)) == Some(&call) {
@@ -952,17 +1061,17 @@ fn sweep_before_create(n: usize) {
     ) {
         return;
     }
-    if !with_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
+    if !locked_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
         return;
     }
     // (MM10) start one if garbage cycles have piled up, and run a few slices of it
-    with_state(|s| {
+    locked_state(|s| {
         if !s.objs.sweep_active() {
             s.sweep_start();
         }
     });
     for _ in 0..SWEEP_SLICES_PER_CALL {
-        if !with_state(|s| {
+        if !locked_state(|s| {
             s.objs.sweep_active()
                 && !matches!(
                     s.sweep_slice(SWEEP_SLICE_BUDGET),
@@ -973,10 +1082,11 @@ fn sweep_before_create(n: usize) {
         }
     }
     // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
-    while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
+    while locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active())
+    {
         with_state(|s| s.sweep_slice(SWEEP_SLICE_BUDGET));
     }
-    if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
+    if locked_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
         let began = with_state(|s| s.sweep_start());
         if began {
             while with_state(|s| {
@@ -1066,7 +1176,7 @@ pub(super) fn dispatch(
         // (`DEBUG_WRITE` is answered in `syscall`, before this table: it holds the big lock only for the handle and the tally)
         nr::SYSTEM_SET_PLACEMENT => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
-            if irq::without(|| thread::set_placement(a[1])) {
+            if thread::set_placement(a[1]) {
                 Ok((None, None))
             } else {
                 fail(Status::InvalidArgs)
@@ -1281,7 +1391,7 @@ fn tally_verdicts(lines: &[String]) {
         }
     }
     if pass > 0 || fail > 0 {
-        with_state(|s| {
+        locked_state(|s| {
             s.pass = s.pass.saturating_add(pass);
             s.fail = s.fail.saturating_add(fail);
         });
@@ -1294,7 +1404,7 @@ fn tally_verdicts(lines: &[String]) {
 fn debug_write_check(
     a: [u64; 6],
 ) -> Result<(alloc::sync::Arc<klock::aslock::AsCell>, u64, usize), ReplyErr> {
-    with_state(|s| -> Result<_, ReplyErr> {
+    locked_state(|s| -> Result<_, ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
         ipc::debug_of(&s.objs, &p.handles, Handle(a[0]), Rights::WRITE)

@@ -18,6 +18,8 @@ clockmodel = { path = "../clockmodel" }
 mounts = { path = "../mounts" }
 pathres = { path = "../pathres" }
 rt = { path = "../rt", features = ["heap"] }
+libsys = { path = "../libsys", default-features = false }
+abi = { path = "../abi" }
 shell-core = { path = "../shell-core" }
 ish = { path = "../ish" }
 profile = { path = "../profile" }

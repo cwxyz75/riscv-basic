@@ -339,132 +339,171 @@ pub mod time {
     pub const DEADLINE_NEVER: u64 = u64::MAX;
 }
 
-/// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers").
+/// Syscall numbers (SYSCALLS.md, "Syscall numbers and registers"). One table (AB7): it makes the constants and `TABLE`, which `libsys` turns into one
+/// `sys_<name>` wrapper per call (the name is the constant's, in lower case).
 pub mod syscall {
-    /// `debug_write(debug, ptr, len)`: needs a debug resource handle with WRITE (HD4).
-    pub const DEBUG_WRITE: usize = 0;
-    pub const PROCESS_EXIT: usize = 1;
-    pub const THREAD_YIELD: usize = 2;
-    pub const CLOCK_GET: usize = 3;
-    /// A kernel counter by index (a measuring aid for the boot-time suite, like `DEBUG_WRITE`).
-    /// `debug_stat(debug, which)`: needs a debug resource handle with INSPECT (HD4).
-    pub const DEBUG_STAT: usize = 4;
-    pub const HANDLE_CLOSE: usize = 10;
-    pub const HANDLE_DUPLICATE: usize = 11;
-    pub const HANDLE_REPLACE: usize = 12;
-    pub const CHANNEL_CREATE: usize = 20;
-    pub const CHANNEL_WRITE: usize = 21;
-    pub const CHANNEL_READ: usize = 22;
-    pub const CHANNEL_READ_TXID: usize = 23;
-    pub const CHANNEL_CALL: usize = 24;
-    pub const EVENT_CREATE: usize = 30;
-    pub const EVENT_SIGNAL: usize = 31;
-    pub const OBJECT_SIGNALS: usize = 32;
-    pub const OBJECT_WAIT: usize = 33;
-    pub const OBJECT_INFO: usize = 34;
-    pub const VMO_CREATE: usize = 40;
-    pub const VMO_READ: usize = 41;
-    pub const VMO_WRITE: usize = 42;
-    pub const VMO_GET_SIZE: usize = 43;
-    pub const VMO_CREATE_PHYSICAL: usize = 44;
-    pub const VMO_CREATE_DMA: usize = 45;
-    pub const VMO_PHYS_ADDR: usize = 46;
-    pub const VMO_COMMIT: usize = 47;
-    /// Give back the committed pages of a range of a VMO (MM6): they read as zeros afterwards.
-    pub const VMO_DECOMMIT: usize = 48;
-    /// Change the size of a resizable VMO (MM6).
-    pub const VMO_SET_SIZE: usize = 49;
-    pub const PROCESS_CREATE: usize = 50;
-    pub const PROCESS_SELF: usize = 51;
-    pub const PROCESS_MAP: usize = 52;
-    pub const PROCESS_UNMAP: usize = 53;
-    pub const PROCESS_START: usize = 54;
-    pub const PROCESS_KILL: usize = 55;
-    pub const PROCESS_INFO: usize = 56;
-    /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
-    pub const PROCESS_SUSPEND: usize = 57;
-    pub const PROCESS_RESUME: usize = 58;
-    /// Change the permissions of a range of a process's mappings (MM7).
-    pub const PROCESS_PROTECT: usize = 59;
-    // 60 was `thread_create`: retired, not reused (AB5)
-    pub const THREAD_EXIT: usize = 61;
-    pub const THREAD_INFO: usize = 62;
-    /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then
-    /// answers NOT_SUPPORTED.
-    pub const THREAD_INTERRUPT: usize = 63;
-    /// Create and start a thread with a kernel-provisioned stack (SCHED-SMP-SPEC 5.3, task 9).
-    pub const THREAD_SPAWN: usize = 64;
-    /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
-    pub const THREAD_SET_SCHED: usize = 65;
-    pub const THREAD_GET_SCHED: usize = 66;
-    /// Describe the region of a process at or after an address (MM7).
-    pub const PROCESS_MAP_INFO: usize = 67;
-    /// Make a copy-on-write child of a range of a VMO (MM8): SNAPSHOT or PRIVATE.
-    pub const VMO_CREATE_CHILD: usize = 68;
-    /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
-    pub const PROCESS_CLONE_REGION: usize = 69;
-    /// Raise a thread's suspend count: it stops at its next return to user mode (EX1).
-    pub const THREAD_SUSPEND: usize = 74;
-    /// Lower it; at 0 the thread runs again.
-    pub const THREAD_RESUME: usize = 75;
-    /// Read a stopped thread's registers.
-    pub const THREAD_READ_STATE: usize = 76;
-    /// Write a stopped thread's registers.
-    pub const THREAD_WRITE_STATE: usize = 77;
-    /// The user end of the channel exceptions of a process's threads are delivered on (EX2).
-    pub const PROCESS_EXCEPTION_CHANNEL: usize = 78;
-    /// The same for the processes of a job that have no handler of their own.
-    pub const JOB_EXCEPTION_CHANNEL: usize = 79;
-    /// Say what becomes of a thread that took an exception: RETRY, NEXT or KILL.
-    pub const EXCEPTION_RESUME: usize = 97;
-    /// `pager_create() -> (pager, channel)` (MM9).
-    pub const PAGER_CREATE: usize = 103;
-    /// `pager_create_vmo(pager, key, bytes) -> vmo`.
-    pub const PAGER_CREATE_VMO: usize = 104;
-    /// `pager_supply(pager, vmo, offset, length, source, source_offset)`.
-    pub const PAGER_SUPPLY: usize = 105;
-    /// `pager_fail(pager, vmo, offset, length, status)`.
-    pub const PAGER_FAIL: usize = 106;
-    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
-    pub const PAGER_QUERY_DIRTY: usize = 107;
-    /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
-    pub const PAGER_WRITEBACK_DONE: usize = 108;
-    pub const SOCKET_CREATE: usize = 70;
-    pub const SOCKET_WRITE: usize = 71;
-    pub const SOCKET_READ: usize = 72;
-    pub const SOCKET_SHUTDOWN: usize = 73;
-    pub const PORT_CREATE: usize = 80;
-    pub const PORT_BIND: usize = 81;
-    pub const PORT_UNBIND: usize = 82;
-    pub const PORT_WAIT: usize = 83;
-    pub const PORT_REARM: usize = 84;
-    /// Up to `PORT_PACKETS_MAX` ready bindings in one call (AB4).
-    pub const PORT_WAIT_MANY: usize = 85;
-    pub const JOB_CREATE: usize = 90;
-    pub const JOB_SET_LIMITS: usize = 91;
-    pub const JOB_INFO: usize = 92;
-    /// Set a job's `max_prio`, `rt_budget` and `cpu_weight`.
-    pub const JOB_SET_SCHED: usize = 96;
-    pub const JOB_KILL: usize = 93;
-    pub const JOB_ROOT: usize = 94;
-    pub const RESOURCE_ROOT: usize = 95;
-    pub const RESOURCE_DTB: usize = 102;
-    pub const FUTEX_WAIT: usize = 110;
-    pub const FUTEX_WAKE: usize = 111;
-    pub const FUTEX_LOCK_PI: usize = 112;
-    pub const FUTEX_UNLOCK_PI: usize = 113;
-    /// The debug resource (HD4): a privileged process (the one the kernel started) gets the handle that `debug_write` and `debug_stat` now need.
-    pub const DEBUG_ROOT: usize = 114;
-    /// Choose how a wake picks a hart (PM4): `a0` the root resource (MANAGE), `a1` the policy, 0 spread or 1 pack.
-    pub const SYSTEM_SET_PLACEMENT: usize = 115;
-    /// Take a hart out of the scheduler or bring it back (PM1): `a0` the root resource (MANAGE), `a1` the hart's index, `a2` 1 online or 0 offline.
-    pub const HART_SET_ONLINE: usize = 116;
-    /// A hart's state (PM1): `a0` the root resource (INSPECT), `a1` the index; returns 0 offline, 1 starting, 2 online, 3 draining.
-    pub const HART_INFO: usize = 117;
-    /// Suspend to RAM through the firmware (PM3): `a0` the root resource (MANAGE). NOT_SUPPORTED where it cannot be done.
-    pub const SYSTEM_SUSPEND: usize = 118;
-    pub const INTERRUPT_CREATE: usize = 100;
-    pub const INTERRUPT_ACK: usize = 101;
+    /// AB8: the number a call has in this build. Normally the number written in the table; when `ABI_SHUFFLE_SEED` is set in the environment at build time,
+    /// every number below [`LIMIT`] is mapped by a bijection (`n * mult + add` modulo `LIMIT`, `mult` odd) chosen by the seed, so that code that
+    /// writes a number of its own instead of using the table (or the library) fails the whole suite. Numbers at or above `LIMIT` are not calls and stay.
+    #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: i < bytes.len(); n < LIMIT = 128 and mult, add < 128, so the sum is small
+    pub const fn number(n: usize) -> usize {
+        match option_env!("ABI_SHUFFLE_SEED") {
+            Some(seed) if n < LIMIT => {
+                // FNV-1a of the seed text
+                let bytes = seed.as_bytes();
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                let mut i = 0;
+                while i < bytes.len() {
+                    h ^= bytes[i] as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                    i += 1;
+                }
+                let mut mult = (((h >> 8) as usize) & (LIMIT - 1)) | 1;
+                let add = (h as usize) & (LIMIT - 1);
+                if mult == 1 && add == 0 {
+                    mult = 3; // (never the identity: a seed means a shuffle)
+                }
+                (n * mult + add) % LIMIT
+            }
+            _ => n,
+        }
+    }
+
+    macro_rules! syscalls {
+        ($($(#[$m:meta])* $name:ident = $n:expr,)*) => {
+            $($(#[$m])* pub const $name: usize = number($n);)*
+            /// Every call: the constant's name and its number.
+            pub const TABLE: &[(&str, usize)] = &[$((stringify!($name), number($n))),*];
+        };
+    }
+    syscalls! {
+        /// `debug_write(debug, ptr, len)`: needs a debug resource handle with WRITE (HD4).
+        DEBUG_WRITE = 0,
+        PROCESS_EXIT = 1,
+        THREAD_YIELD = 2,
+        CLOCK_GET = 3,
+        /// A kernel counter by index (a measuring aid for the boot-time suite, like `DEBUG_WRITE`).
+        /// `debug_stat(debug, which)`: needs a debug resource handle with INSPECT (HD4).
+        DEBUG_STAT = 4,
+        HANDLE_CLOSE = 10,
+        HANDLE_DUPLICATE = 11,
+        HANDLE_REPLACE = 12,
+        CHANNEL_CREATE = 20,
+        CHANNEL_WRITE = 21,
+        CHANNEL_READ = 22,
+        CHANNEL_READ_TXID = 23,
+        CHANNEL_CALL = 24,
+        EVENT_CREATE = 30,
+        EVENT_SIGNAL = 31,
+        OBJECT_SIGNALS = 32,
+        OBJECT_WAIT = 33,
+        OBJECT_INFO = 34,
+        VMO_CREATE = 40,
+        VMO_READ = 41,
+        VMO_WRITE = 42,
+        VMO_GET_SIZE = 43,
+        VMO_CREATE_PHYSICAL = 44,
+        VMO_CREATE_DMA = 45,
+        VMO_PHYS_ADDR = 46,
+        VMO_COMMIT = 47,
+        /// Give back the committed pages of a range of a VMO (MM6): they read as zeros afterwards.
+        VMO_DECOMMIT = 48,
+        /// Change the size of a resizable VMO (MM6).
+        VMO_SET_SIZE = 49,
+        PROCESS_CREATE = 50,
+        PROCESS_SELF = 51,
+        PROCESS_MAP = 52,
+        PROCESS_UNMAP = 53,
+        PROCESS_START = 54,
+        PROCESS_KILL = 55,
+        PROCESS_INFO = 56,
+        /// Stop every thread of a process until `PROCESS_RESUME` (SIG2): needs KILL.
+        PROCESS_SUSPEND = 57,
+        PROCESS_RESUME = 58,
+        /// Change the permissions of a range of a process's mappings (MM7).
+        PROCESS_PROTECT = 59,
+        // 60 was `thread_create`: retired, not reused (AB5)
+        THREAD_EXIT = 61,
+        THREAD_INFO = 62,
+        /// Reserved (T56): tell a thread to stop what it is blocked in. Validates its arguments, then
+        /// answers NOT_SUPPORTED.
+        THREAD_INTERRUPT = 63,
+        /// Create and start a thread with a kernel-provisioned stack (SCHED-SMP-SPEC 5.3, task 9).
+        THREAD_SPAWN = 64,
+        /// Set a thread's base priority and flags (SCHED-SMP-SPEC 4.9, slice SC).
+        THREAD_SET_SCHED = 65,
+        THREAD_GET_SCHED = 66,
+        /// Describe the region of a process at or after an address (MM7).
+        PROCESS_MAP_INFO = 67,
+        /// Make a copy-on-write child of a range of a VMO (MM8): SNAPSHOT or PRIVATE.
+        VMO_CREATE_CHILD = 68,
+        /// Map a region of one process into another, shared or as a SNAPSHOT child (MM8): the primitive a `fork` shim loops over.
+        PROCESS_CLONE_REGION = 69,
+        /// Raise a thread's suspend count: it stops at its next return to user mode (EX1).
+        THREAD_SUSPEND = 74,
+        /// Lower it; at 0 the thread runs again.
+        THREAD_RESUME = 75,
+        /// Read a stopped thread's registers.
+        THREAD_READ_STATE = 76,
+        /// Write a stopped thread's registers.
+        THREAD_WRITE_STATE = 77,
+        /// The user end of the channel exceptions of a process's threads are delivered on (EX2).
+        PROCESS_EXCEPTION_CHANNEL = 78,
+        /// The same for the processes of a job that have no handler of their own.
+        JOB_EXCEPTION_CHANNEL = 79,
+        /// Say what becomes of a thread that took an exception: RETRY, NEXT or KILL.
+        EXCEPTION_RESUME = 97,
+        /// `pager_create() -> (pager, channel)` (MM9).
+        PAGER_CREATE = 103,
+        /// `pager_create_vmo(pager, key, bytes) -> vmo`.
+        PAGER_CREATE_VMO = 104,
+        /// `pager_supply(pager, vmo, offset, length, source, source_offset)`.
+        PAGER_SUPPLY = 105,
+        /// `pager_fail(pager, vmo, offset, length, status)`.
+        PAGER_FAIL = 106,
+        /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+        PAGER_QUERY_DIRTY = 107,
+        /// Reserved for dirty tracking (MM9 names it, answers NOT_SUPPORTED).
+        PAGER_WRITEBACK_DONE = 108,
+        SOCKET_CREATE = 70,
+        SOCKET_WRITE = 71,
+        SOCKET_READ = 72,
+        SOCKET_SHUTDOWN = 73,
+        PORT_CREATE = 80,
+        PORT_BIND = 81,
+        PORT_UNBIND = 82,
+        PORT_WAIT = 83,
+        PORT_REARM = 84,
+        /// Up to `PORT_PACKETS_MAX` ready bindings in one call (AB4).
+        PORT_WAIT_MANY = 85,
+        JOB_CREATE = 90,
+        JOB_SET_LIMITS = 91,
+        JOB_INFO = 92,
+        /// Set a job's `max_prio`, `rt_budget` and `cpu_weight`.
+        JOB_SET_SCHED = 96,
+        JOB_KILL = 93,
+        JOB_ROOT = 94,
+        RESOURCE_ROOT = 95,
+        RESOURCE_DTB = 102,
+        FUTEX_WAIT = 110,
+        FUTEX_WAKE = 111,
+        FUTEX_LOCK_PI = 112,
+        FUTEX_UNLOCK_PI = 113,
+        /// The debug resource (HD4): a privileged process (the one the kernel started) gets the handle that `debug_write` and `debug_stat` now need.
+        DEBUG_ROOT = 114,
+        /// Choose how a wake picks a hart (PM4): `a0` the root resource (MANAGE), `a1` the policy, 0 spread or 1 pack.
+        SYSTEM_SET_PLACEMENT = 115,
+        /// Take a hart out of the scheduler or bring it back (PM1): `a0` the root resource (MANAGE), `a1` the hart's index, `a2` 1 online or 0 offline.
+        HART_SET_ONLINE = 116,
+        /// A hart's state (PM1): `a0` the root resource (INSPECT), `a1` the index; returns 0 offline, 1 starting, 2 online, 3 draining.
+        HART_INFO = 117,
+        /// Suspend to RAM through the firmware (PM3): `a0` the root resource (MANAGE). NOT_SUPPORTED where it cannot be done.
+        SYSTEM_SUSPEND = 118,
+        INTERRUPT_CREATE = 100,
+        INTERRUPT_ACK = 101,
+    }
+    /// One more than the largest number in the table.
+    pub const LIMIT: usize = 128;
 }
 
 /// Pagers (MM9, KERNEL-V1-SPEC 4.4): the request message on a pager's channel.
@@ -621,5 +660,26 @@ mod tests {
         assert_eq!(finisher::PASS, 0x5555);
         assert_eq!(finisher::fail(1), 0x0001_3333);
         assert_eq!(finisher::fail(0xffff), 0xffff_3333);
+    }
+}
+
+#[cfg(test)]
+mod syscall_table_tests {
+    use super::syscall::*;
+    #[test]
+    fn table_is_complete_and_unique() {
+        for (i, &(name, n)) in TABLE.iter().enumerate() {
+            assert!(n < LIMIT, "{name} = {n} is not below LIMIT");
+            assert!(
+                TABLE[..i].iter().all(|&(_, m)| m != n),
+                "number {n} used twice"
+            );
+        }
+        assert!(TABLE.contains(&("DEBUG_WRITE", DEBUG_WRITE)));
+        assert!(TABLE.len() >= 80);
+        // the numbers that are not calls stay not calls, shuffled or not
+        assert!(TABLE
+            .iter()
+            .all(|&(_, n)| n != number(5) && n != number(60)));
     }
 }

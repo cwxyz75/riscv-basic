@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content os-ktest-shuffle os-ktest-entry-neg kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -216,8 +216,25 @@ os-ktest-release-content:
 	cd init && cargo build --release
 	python3 scripts/check_pie.py --self-test
 	python3 scripts/check_pie.py target/$(KERNEL_TARGET)/release
+	# AB7: no program makes a system call of its own (only the test programs `crash` and `suite` plant them)
+	python3 scripts/check_ecall.py --self-test
+	python3 scripts/check_ecall.py target/$(KERNEL_TARGET)/release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --features release-suite --target-dir ../target/os-krc
 	OS_RELEASE_SUITE=1 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KRC_ELF)
+
+# AB8: the kernel-only suite on a build whose syscall numbers are shuffled (`ABI_SHUFFLE_SEED`, `abi::syscall::number`): code that writes a number of its own
+# instead of using the table or the library fails. And the negative control: with the entry check off (`fault-skip-entry-check`) the test for a call from
+# outside the library must fail. The user programs are built into the shared target directory, so the next ordinary build rebuilds them.
+OS_SHUF_ELF := target/os-shuffle/$(KERNEL_TARGET)/release/kernel
+OS_NOENTRY_ELF := target/os-fault-entry/$(KERNEL_TARGET)/debug/kernel
+os-ktest-shuffle:
+	cd init && ABI_SHUFFLE_SEED=ab8-seed cargo build --release
+	cd kernel && ABI_SHUFFLE_SEED=ab8-seed OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-shuffle
+	OS_SHARD=k OS_SMP=2 python3 scripts/os_boot_test.py $(OS_SHUF_ELF)
+os-ktest-entry-neg:
+	cd init && cargo build
+	cd kernel && cargo build --features fault-skip-entry-check --target-dir ../target/os-fault-entry
+	OS_SHARD=k OS_SMP=1 python3 scripts/os_boot_test.py --neg $(OS_NOENTRY_ELF) child_faults_are_contained
 
 # `make os-repeat TARGET=<target> N=<n>`: run a target N times with SOAK_JOBS=1 and print `pass/N` (KT2, OD140); the serial log of
 # every failing run is saved under target/repeat/. Over a soak target this is a soak run, which only the owner starts (OD142).
@@ -482,7 +499,7 @@ feature: $(FEATURE_TARGETS)
 # Tier 1, the epic gate (OD144, TESTING.md): what an epic branch must pass before it merges into main. The feature gate, then the
 # boots: the suite on the default machine at four harts, the kernel-only boots, the instruction counts, the home computer's boot,
 # the release smoke.
-SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-ktest-release-content os-count os-release-smoke
+SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-ktest-release-content os-ktest-entry-neg os-ktest-shuffle os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the

@@ -158,7 +158,7 @@ retired at task 20; C3b's text is replaced by PK1 and W1' when task 20 lands. Ro
 
 | # | Class | Instances | Protects | IRQ | Nested same-class |
 |---|---|---|---|---|---|
-| 1 | `OBJ` | one | **What was the big kernel lock** (L20, amendment of 2026-11-23): the object registry, every handle table, the process table, the wait table and dirty log, the pagers and the interrupt objects (`UserState`), port and channel state including pending-call records, the IPC meter; a section ends by committing what it touched to the waiters (W1'). The scheduler and the thread table do not take it (`irq::off`); the kernel's page table, the stack slots and the heap window have locks of their own (T224) | external (interrupt objects) | reentrant (a depth count) until every user is explicit |
+| 1 | `OBJ` | one | **What was the big kernel lock** (L20, amendment of 2026-11-23): the object registry, every handle table, the process table, the wait table and dirty log, the pagers and the interrupt objects (`UserState`), port and channel state including pending-call records, the IPC meter; a section ends by committing what it touched to the waiters (W1'). The scheduler and the thread table do not take it (`irq::off`); the kernel's page table, the stack slots and the heap window have locks of their own (T224) | external (interrupt objects) | not reentrant: a second take on the hart panics; `with_state` assumes it is held, `locked_state` takes it, and the entry points reached both ways use `bkl::ensure` (L20) |
 | 2 | `AS` | per process | The region map, the page table, the ASID and the `ran_on` hart mask of one address space | no (page faults are traps, not interrupts) | never two (a syscall touches one address space) |
 | 3 | `PROCS` | one | (Merged into `OBJ`, 2026-11-23: the process table is part of `UserState`; the class is unused.) The process table and each process's lifecycle state | no | no |
 | 4 | `FUTEX` | 64 buckets, by hash of the key | Futex queues, PI-futex owner and waiter records | no | never two |
@@ -267,3 +267,9 @@ Each becomes a row above, with its check, in the change that builds its mechanis
 - No `unsafe` outside the hardware-facing kernel binary; each block has a
   `// SAFETY:` comment. The pure crates `forbid(unsafe_code)`.
 - Every change leaves the system booting and the suite green.
+- **ABI1 (entry, AB8).** A system call enters the kernel only from the text of the system library mapped into the calling process. The trap handler compares the
+  `sepc` of every user `ecall` with the library's text range of the process the hart is running (kept per hart beside `cur_pid`) before it dispatches, on the
+  quiet paths as well as the full one; a call from anywhere else is an illegal-instruction exception (the exception channel, else the process ends with
+  -1002) and is not carried out. The kernel-started first process is held to it too; only a process with no library range (none is started that way) is not.
+  The syscall numbers are private to `abi` and the library: a build with `ABI_SHUFFLE_SEED` permutes them, and the whole suite runs on it. Tests:
+  `child_faults_are_contained` (variant 84: an `ecall` in the program's own text), negative control `fault-skip-entry-check`, `make os-ktest-shuffle`.

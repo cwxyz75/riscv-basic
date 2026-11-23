@@ -78,6 +78,9 @@ pub mod fp {
     pub fn trap_entry(frame: &mut TrapFrame) {
         unimplemented!()
     }
+    pub fn return_to_user_held(frame: &mut TrapFrame) {
+        unimplemented!()
+    }
     pub fn return_to_user(frame: &mut TrapFrame) {
         unimplemented!()
     }
@@ -159,6 +162,9 @@ pub mod timer {
     pub fn now_ns() -> u64 {
         unimplemented!()
     }
+    pub fn clock_params() -> (u64, u64, u64) {
+        unimplemented!()
+    }
     pub fn now() -> u64 {
         unimplemented!()
     }
@@ -189,6 +195,9 @@ pub mod trap {
             unimplemented!()
         }
         pub fn skip_trap_instruction(&mut self) {
+            unimplemented!()
+        }
+        pub fn pc(&self) -> u64 {
             unimplemented!()
         }
         pub fn arg(&self, n: usize) -> u64 {

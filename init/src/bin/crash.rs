@@ -51,6 +51,14 @@ pub fn app_main() -> i32 {
             // exit normally with a chosen code
             return 42;
         }
+        84 => {
+            // AB8: a system call from the program's own text, not from the system library: an illegal instruction (the process ends with
+            // -1002); were it let through, the process would exit with 5
+            // SAFETY: the `ecall` is meant to be refused; with the check off it is `process_exit(5)`.
+            unsafe {
+                asm!("ecall", in("a7") rt::abi::syscall::PROCESS_EXIT, in("a0") 5usize, options(noreturn))
+            };
+        }
         83 => {
             // HD4: a program started with no startup message has no debug resource, and is not privileged: it can neither write a verdict
             // line to the console nor ask for the resource (exit code 0: both refused as they should be)
@@ -71,7 +79,7 @@ pub fn app_main() -> i32 {
             // SAFETY: `ecall` with sp pointing at kernel memory; the program uses no stack
             // until it exits, and the exit code (7) proves the syscall ran.
             unsafe {
-                asm!("mv sp, {k}", "li a7, 1", "li a0, 7", "ecall", k = in(reg) 0xffff_ffff_8020_0000usize, options(noreturn))
+                asm!("mv sp, {k}", "li a0, 7", "jr t1", k = in(reg) 0xffff_ffff_8020_0000usize, in("t1") rt::library::entry(rt::abi::syscall::PROCESS_EXIT), options(noreturn))
             };
         }
         12 => {
@@ -1388,7 +1396,7 @@ fn vec_round(
             "addi {spins}, {spins}, -1",
             "bnez {spins}, 2b",
             "beqz {y}, 3f",
-            "ecall",
+            "jalr {lib}",
             "3:",
             "mv {p}, {got}",
             "vs8r.v v0, ({p})", "add {p}, {p}, {s}",
@@ -1411,7 +1419,8 @@ fn vec_round(
             c = out(reg) c,
             vl = out(reg) vl,
             vt = out(reg) vt,
-            in("a7") rt::abi::syscall::THREAD_YIELD,
+            lib = in(reg) rt::library::entry(rt::abi::syscall::THREAD_YIELD),
+            out("ra") _, out("a7") _,
             out("a0") _, out("a1") _, out("a2") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _, out("v31") _
         );
@@ -1482,6 +1491,8 @@ fn vec_fresh() -> i32 {
             res.add(k).write_volatile(0);
         }
     }
+    // SAFETY: written before the thread that reads it exists.
+    unsafe { VFRESH_EXIT = rt::library::entry(rt::abi::syscall::THREAD_EXIT) };
     // SAFETY: only the address of the static stack is taken (the thread's entry uses no stack).
     let top = unsafe { core::ptr::addr_of_mut!(WORKER_STACKS.0[0]) } as u64 + 8192;
     let t = rt::sys::thread_on_stack(
@@ -1544,11 +1555,15 @@ core::arch::global_asm!(
     "fence w, w",
     "li t4, 1",
     "sd t4, 40(a0)",
-    "li a7, {exit}",
     "li a0, 0",
-    "ecall",
-    exit = const rt::abi::syscall::THREAD_EXIT,
+    "la t0, VFRESH_EXIT",
+    "ld t0, 0(t0)",
+    "jr t0",
 );
+
+/// The library's `thread_exit` entry, for the fresh thread above (which has no registers to spare for it).
+#[no_mangle]
+static mut VFRESH_EXIT: usize = 0;
 
 /// Edge states: the first vector instruction is a `vsetvli` (not a CSR read); an illegal `vtype` (`vill`) and a non-zero `vstart` survive a trap
 /// (a yield). Each is one assembly block, with the system call inside it: compiled code in between could use the vector unit and change the
@@ -1579,7 +1594,7 @@ fn vec_edges() -> i32 {
             "vsetvl zero, zero, {bad}",
             "csrr {vl}, vl",
             "csrr {vt}, vtype",
-            "ecall",
+            "jalr {lib}",
             "csrr {vl2}, vl",
             "csrr {vt2}, vtype",
             bad = in(reg) 1u64 << 8,
@@ -1587,7 +1602,8 @@ fn vec_edges() -> i32 {
             vt = out(reg) vt,
             vl2 = out(reg) vl2,
             vt2 = out(reg) vt2,
-            in("a7") rt::abi::syscall::THREAD_YIELD,
+            lib = in(reg) rt::library::entry(rt::abi::syscall::THREAD_YIELD),
+            out("ra") _, out("a7") _,
             out("a0") _, out("a1") _, out("a2") _,
         );
     }
@@ -1602,15 +1618,16 @@ fn vec_edges() -> i32 {
     unsafe {
         asm!(
             "csrw vstart, {two}",
-            "ecall",
+            "jalr {lib}",
             "csrr {v1}, vstart",
-            "ecall",
+            "jalr {lib}",
             "csrr {v2}, vstart",
             "csrw vstart, zero",
             two = in(reg) 2u64,
             v1 = out(reg) v1,
             v2 = out(reg) v2,
-            in("a7") rt::abi::syscall::THREAD_YIELD,
+            lib = in(reg) rt::library::entry(rt::abi::syscall::THREAD_YIELD),
+            out("ra") _, out("a7") _,
             out("a0") _, out("a1") _, out("a2") _,
         );
     }

@@ -26,7 +26,7 @@ pub fn base() -> Option<u64> {
 pub fn exit(ok: bool) -> ! {
     if let Some(base) = base().filter(|_| !crate::RELEASE) {
         let value = if ok { PASS } else { fail(1) };
-        // SAFETY: the SiFive test device the tree names is mapped through the direct map by the early boot table (all physical space below
+        // SAFETY: `base` came from the tree's sifive,test node and is bounded by the direct map's physical limit; the write is skipped in release builds. The SiFive test device the tree names is mapped through the direct map by the early boot table (all physical space below
         // 64 GiB) and by `kmem::init`; a 32-bit write of one of its documented values ends the run.
         unsafe { write_volatile((crate::kmem::direct_base() + base) as *mut u32, value) };
     } else {

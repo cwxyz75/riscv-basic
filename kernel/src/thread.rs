@@ -88,6 +88,8 @@ pub struct UserBinding {
     pub tag: kcore::asid::AsTag,
     pub token: u64,
     pub aspace: usize,
+    /// The library text range of the process (AB8).
+    pub lib: (u64, u64),
 }
 
 struct KThread {
@@ -151,7 +153,8 @@ pub fn user_binding(tid: Tid) -> Option<UserBinding> {
 /// The job accounting table.
 #[allow(clippy::expect_used)] // INVARIANT: set by `init` before any user thread exists
 pub fn job_sched() -> &'static kcore::jobsched::JobSchedTable {
-    // SAFETY: written once by `init` before any other hart starts, then only read.
+    // SAFETY: written once, by `init` (never again), so after that only shared references exist. The write is not before the other harts start: the other harts are already online and parked, but none of them calls `sched()` or `job_sched()` before it observes `SCHEDULER_READY` (stored with Release after both writes) or has entered the scheduler itself (`in_sched`): a parked hart's timer takes the light path, its IPI work uses only the lock, and every scheduler branch of the trap handler is gated on `scheduler_ready()`; no reader can see it
+    // half-written (T242).
     unsafe {
         (*core::ptr::addr_of!(JOB_SCHED))
             .as_deref()
@@ -201,8 +204,8 @@ pub fn set_placement(code: u64) -> bool {
 /// The scheduler (every method takes `&self`; interrupts must be off).
 #[allow(clippy::expect_used)] // INVARIANT: SCHED is set by `init` before any other hart starts or any scheduler call is made
 fn sched() -> &'static KSched {
-    // SAFETY: written once by `init` before any other hart is started or any scheduler call is made, and never again; after that
-    // it is only read through a shared reference.
+    // SAFETY: written once, by `init` (called once, from `kmain`), and never again; after that it is only read through a shared reference (`KSched` is internally locked). The
+    // write is not before the other harts start: the other harts are already online and parked, but none of them calls `sched()` or `job_sched()` before it observes `SCHEDULER_READY` (stored with Release after both writes) or has entered the scheduler itself (`in_sched`): a parked hart's timer takes the light path, its IPI work uses only the lock, and every scheduler branch of the trap handler is gated on `scheduler_ready()` (T242).
     unsafe {
         (*core::ptr::addr_of!(SCHED))
             .as_ref()
@@ -253,7 +256,7 @@ pub fn init(boot_prio: Prio) {
                                        // a wake never switches: the hart looks at its queues at its next defined point (`preempt_point`, SCHED-SMP-SPEC X7)
     let job_table = alloc::sync::Arc::new(kcore::jobsched::JobSchedTable::new());
     sched.set_job_table(job_table.clone());
-    // SAFETY: the one write (see `job_sched`): interrupts off, one hart.
+    // SAFETY: the one write (see `job_sched`): `init` runs once, with interrupts off on the boot hart, and no other hart reads `JOB_SCHED` until `SCHEDULER_READY` is set.
     unsafe { *addr_of_mut!(JOB_SCHED) = Some(job_table) };
     sched.set_deferred(true);
     // only hart 0 is part of the scheduler until the others join (`join_scheduler`)
@@ -290,7 +293,7 @@ pub fn init(boot_prio: Prio) {
         exits: Waiters2::new(),
         queues: Vec::new(),
     });
-    // SAFETY: the one write (see `sched`): interrupts off, one hart.
+    // SAFETY: the one write (see `sched`): `init` runs once, with interrupts off on the boot hart, and no other hart reads `SCHED` until `SCHEDULER_READY` is set.
     unsafe { *addr_of_mut!(SCHED) = Some(sched) };
     set_running(boot);
     // hart 0's idle thread (the other harts use their own boot context when they join): the scheduler made its id, this
@@ -844,6 +847,33 @@ pub fn reschedule_fast() -> bool {
     switch
 }
 
+/// Print what the scheduler knows (for `debug_stat` 132).
+#[cfg(debug_assertions)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a debug-only report that holds a thread record
+fn dump_sched() {
+    use core::fmt::Write;
+    let sc = sched();
+    let mut out = crate::console::Console;
+    for i in 0..crate::smp::started() {
+        let _ = writeln!(
+            out,
+            "##SCHED hart {i}: current {} queued {} marked {} in transit {:?} next event {:?}",
+            sc.current_on(i),
+            sc.queued_on(i),
+            sc.resched_pending(i),
+            sc.in_transit(i),
+            sc.next_event_on(i)
+        );
+    }
+    for t in sc.tids() {
+        if (0..crate::smp::started()).any(|i| sc.idle(i) == t) {
+            continue;
+        }
+        let _ = writeln!(out, "##SCHED thread {t}: {:?}", sc.record(t));
+    }
+    crate::user::dump_state();
+}
+
 /// The starvation watchdog (SCHED-SMP-SPEC 3.9; debug builds), now a timer entry (L13): a hart with queued work arms an event every
 /// 100 ms (`program_timer`), and at each timer interrupt after that long a thread queued for more than 500 ms while a hart that may
 /// run it idles is a lost wake, not a slow system: the report is a panic (`##PANIC starved thread`). The same thread must be found in two
@@ -1393,7 +1423,7 @@ pub fn wait_deadline_registered(
 ) -> bool {
     let mut slept = false;
     loop {
-        let result = irq::without(|| {
+        let result = crate::bkl::ensure(|| {
             if ready() {
                 return Some(true);
             }
@@ -1559,13 +1589,20 @@ pub fn wake_stat(which: u64) -> u64 {
         123 => crate::user::backstops().user_threads as u64,
         124 => crate::user::backstops().dma_total_pages,
         // 125: the placement policy in force (PM4): 0 spread, 1 pack
-        125 => irq::without(|| sched().policy() as u64),
+        125 => sched().policy() as u64,
         // 126: whether the firmware has the system suspend extension (PM3): 1 yes, 0 no
         126 => u64::from(crate::arch::sbi::system_suspend_present()),
         // 127: 1 if the scheduling class is round-robin (the controls that need a thread starved by priority skip themselves)
         127 => u64::from(cfg!(feature = "sched-round-robin")),
         // (HD2: is `aslr=off` in force?)
         128 => u64::from(crate::entropy::aslr_off()),
+        131 => crate::user::clock_traps(),
+        // (T243, debug builds: print every hart's scheduler state and the record of every thread that is not idle, for a test that timed out)
+        132 => {
+            #[cfg(debug_assertions)]
+            dump_sched();
+            0
+        }
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

@@ -47,7 +47,12 @@ harness fails a `k` boot that lacks a Kernel test or ran a System test.
 | `make os-ktest-small` | the kernel-only boot at one and two harts, without the tests marked `slow` |
 | `make os-ktest-4` | the kernel-only boot at four harts, every Kernel test |
 | `make os-ktest-release` | the kernel-only boot of the optimised build at four harts |
+| `scripts/check_ecall.py DIR [--self-test]` | AB7: no embedded user program has an `ecall` instruction (every call goes through `libsys`); only `crash` is exempt (its AB8 test makes a call from outside the library on purpose); run by `os-ktest-release-content` |
+| `cargo test -p libsys` | AB7: builds `libsys.so` and checks it (no relocations, a symbol per call in `abi::syscall::TABLE`, the data page's segment); the same check runs in the kernel's build script |
 | `scripts/kaslr_check.py ELF` | HD3: ten boots of the kernel (each stopped at its `kaslr:` line) show at least six slides and four direct-map bases, and `kaslr=off` one layout; run by `os-ktest-small` |
+| `scripts/unsafe_inventory.py [--list\|--check\|--self-test]` | KT14: every `unsafe` in `kernel/src` with a hash; the docs check fails for a block that is not in `docs/records/reviews/kt14-unsafe-audit.tsv` (a new or changed block is audited again) |
+| `make os-ktest-shuffle` | AB8: the kernel-only boot (two harts) of a release build whose syscall numbers are shuffled by a seed (`ABI_SHUFFLE_SEED`): a program or kernel path that uses a literal number fails |
+| `make os-ktest-entry-neg` | AB8: negative control `fault-skip-entry-check` (no `sepc` check); `child_faults_are_contained` must fail |
 | `make os-ktest-release-content` | the kernel-only boot at four harts of a kernel with the release content (feature `release-suite`: no boot self-tests, no scheduler or SMP tests), run from the separately built suite (HD4 part 3) |
 | `make kquick` | format, the pure kernel crates' host tests and the four-hart kernel-only boot: one targeted boot for a kernel change |
 | `make os-release-smoke` | the release image boots to the shell and shows no test banners, and its symbol table holds no test-only code (`scripts/release_symbols.py`: the self-tests, the user-mode test driver, the SMP and scheduler tests are not compiled into a `release` kernel, HD4; the deny-list is in the script and its self-test plants a name) |

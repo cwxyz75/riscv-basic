@@ -24,6 +24,8 @@ pub struct ThreadStart {
     pub spawned: bool,
     /// Made with `spawn::SUSPENDED` (EX1): the spawner builds its first register image and it runs only after `thread_resume`.
     pub suspended: bool,
+    /// The value of register `a2` at the thread's first instruction: the base of the system library (AB7) for the first thread of a process, else 0.
+    pub a2: u64,
 }
 
 /// What `thread_write_state` leaves for a parked thread to apply to its own frame when it wakes.

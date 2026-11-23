@@ -11,7 +11,7 @@ pub struct KernelEnd {
 impl Drop for KernelEnd {
     /// Dropping an end closes it, so a forgotten end cannot leak a kernel-table slot.
     fn drop(&mut self) {
-        with_state(|s| {
+        locked_state(|s| {
             let _ = s.ktable.close(&mut s.objs, self.handle);
         });
         notify();
@@ -20,7 +20,7 @@ impl Drop for KernelEnd {
 
 /// Take the kernel's end of `pid`'s bootstrap channel (once). Whoever takes it must `close` it.
 pub fn take_bootstrap(pid: u64) -> Option<KernelEnd> {
-    with_state(|s| {
+    locked_state(|s| {
         s.procs
             .get_mut(&pid)?
             .kernel_end
@@ -31,7 +31,7 @@ pub fn take_bootstrap(pid: u64) -> Option<KernelEnd> {
 
 impl KernelEnd {
     pub fn write(&self, data: &[u8]) -> Result<(), Status> {
-        let r = with_state(|s| {
+        let r = locked_state(|s| {
             ipc::channel_write_in(
                 &mut s.objs,
                 &mut s.ktable,
@@ -47,7 +47,7 @@ impl KernelEnd {
 
     /// Take the oldest message (handles in it are closed: the kernel does not keep them).
     pub fn read(&self) -> Result<Vec<u8>, Status> {
-        let r = with_state(|s| {
+        let r = locked_state(|s| {
             let got = ipc::channel_read_in(
                 &mut s.objs,
                 &mut s.ktable,
@@ -75,7 +75,7 @@ impl KernelEnd {
     /// Send `data` together with a new VMO holding `image` (the receiver gets a VMO handle
     /// with the default VMO rights). Used to hand a program image to a launcher.
     pub fn write_with_vmo(&self, data: &[u8], image: &[u8]) -> Result<(), Status> {
-        let r = with_state(|s| {
+        let r = locked_state(|s| {
             let k = kmem::get();
             let pages = (image.len() as u64).div_ceil(4096).max(1);
             let id = k.vmos.create(k.jobs, pages);
@@ -118,7 +118,7 @@ impl KernelEnd {
     /// Send `data` with handles that are in the kernel's table (`ktable_*` helpers make them);
     /// they move into the message. Nothing moves if the write fails.
     pub fn write_handles(&self, data: &[u8], handles: &[Handle]) -> Result<(), Status> {
-        let r = with_state(|s| {
+        let r = locked_state(|s| {
             ipc::channel_write_in(
                 &mut s.objs,
                 &mut s.ktable,
@@ -158,7 +158,7 @@ impl KernelEnd {
             },
             deadline,
         );
-        with_state(|s| s.waits.forget(me));
+        locked_state(|s| s.waits.forget(me));
         r
     }
 
@@ -176,7 +176,7 @@ pub struct KernelSocket {
 
 impl Drop for KernelSocket {
     fn drop(&mut self) {
-        with_state(|s| {
+        any_state(|s| {
             let _ = s.ktable.close(&mut s.objs, self.handle);
         });
         notify();
@@ -187,7 +187,7 @@ impl Drop for KernelSocket {
 /// table, ready to be sent to a process with [`KernelEnd::write_handles`].
 #[cfg_attr(not(feature = "interactive"), allow(dead_code))]
 pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
-    with_state(|s| {
+    any_state(|s| {
         let (kernel, user) =
             ipc::socket_create_in(&mut s.objs, &mut s.ktable, &mut quota(JobId::ROOT))?;
         Ok((KernelSocket { handle: kernel }, user))
@@ -198,14 +198,14 @@ pub fn kernel_socket_pair() -> Result<(KernelSocket, Handle), Status> {
 /// kernel's table.
 /// Close a handle in the kernel's own table (cleanup when a send did not happen).
 pub fn ktable_close(h: Handle) {
-    with_state(|s| {
+    any_state(|s| {
         let _ = s.ktable.close(&mut s.objs, h);
     });
     notify();
 }
 
 pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
-    with_state(|s| {
+    locked_state(|s| {
         let k = kmem::get();
         let pages = (bytes.len() as u64).div_ceil(4096).max(1);
         let id = k.vmos.create(k.jobs, pages);
@@ -244,7 +244,7 @@ pub fn ktable_readonly_vmo(bytes: &[u8]) -> Result<Handle, Status> {
 impl KernelSocket {
     /// Up to `max` bytes the process wrote to its end.
     pub fn read(&self, max: usize) -> Result<Vec<u8>, Status> {
-        let r = with_state(|s| {
+        let r = any_state(|s| {
             ipc::socket_read_in(&mut s.objs, &s.ktable, self.handle, max, kmem::jobs().jobs)
         });
         notify();
@@ -253,7 +253,7 @@ impl KernelSocket {
 
     /// Bytes for the process to read; returns how many were accepted.
     pub fn write(&self, data: &[u8]) -> Result<usize, Status> {
-        let r = with_state(|s| {
+        let r = any_state(|s| {
             ipc::socket_write_in(&mut s.objs, &s.ktable, self.handle, data, kmem::jobs().jobs)
         });
         notify();
@@ -262,6 +262,6 @@ impl KernelSocket {
 
     /// The socket's signals (READABLE, PEER_CLOSED, ...), 0 if it names nothing.
     pub fn signals(&self) -> u32 {
-        with_state(|s| ipc::signals_of(&s.objs, &s.ktable, self.handle).unwrap_or(0))
+        any_state(|s| ipc::signals_of(&s.objs, &s.ktable, self.handle).unwrap_or(0))
     }
 }

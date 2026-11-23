@@ -6,6 +6,7 @@ description = "OS track: the native userland runtime: syscall wrappers, panic ha
 
 [dependencies]
 abi = { path = "../abi" }
+libsys = { path = "../libsys", default-features = false }
 proto = { path = "../proto", optional = true }
 svc = { path = "../svc", optional = true }
 dns = { path = "../dns", optional = true }

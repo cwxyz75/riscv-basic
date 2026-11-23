@@ -83,6 +83,11 @@ impl TrapFrame {
         self.sepc += 4;
     }
 
+    /// The address of the instruction that trapped.
+    pub fn pc(&self) -> u64 {
+        self.sepc
+    }
+
     /// The user's register `x{n}` (a0 is 10, a7 is 17).
     #[allow(clippy::indexing_slicing)] // INVARIANT: n < 32, the register count of the trap frame (callers pass constants)
     pub fn arg(&self, n: usize) -> u64 {
@@ -347,6 +352,11 @@ pub fn init() {
     // SAFETY: writing stvec only changes where traps go; `trap_entry` is 4-byte
     // aligned code in the kernel text, valid at its upper-half address.
     unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
+    // AB7: user mode reads the `time` counter (bit 1): the system library computes `clock_get` from it, with no trap.
+    // SAFETY: `scounteren` only selects which counters user mode may read; no memory is touched.
+    unsafe {
+        core::arch::asm!("csrs scounteren, {}", in(reg) 2usize);
+    }
     // KT5: test builds let user mode read the retired-instruction counter (`rdinstret`, bit 2 of `scounteren`) so the suite can count the
     // instructions of a syscall path. The release build leaves it closed: a program has no use for it and it is a timing channel.
     #[cfg(any(not(feature = "release"), feature = "release-suite"))]
@@ -435,11 +445,13 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     if (n != nr::CLOCK_GET && n != nr::THREAD_YIELD && n != nr::FUTEX_WAKE && n != nr::FUTEX_WAIT)
         || !crate::fp::light_save(frame)
         || !crate::user::user_return_is_quiet()
+        || !crate::user::call_from_library(frame.pc())
     {
         return false;
     }
     frame.sepc += 4; // past the ecall
     if n == nr::CLOCK_GET {
+        crate::user::note_clock_trap();
         frame.set_return(0, Some(crate::thread::now_ns()), None);
     } else if n == nr::FUTEX_WAIT {
         // L19, T213: the whole call with no big lock, from the translation of the word to the wake; false: nothing was done (or the wait ended
@@ -480,7 +492,7 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::user::user_mode_left();
         // The kernel runs with the FP unit off (INVARIANTS FP3) on every path, including the light
         // IPI one that saves nothing: the frame keeps the user's FS for the return.
-        // SAFETY: clears sstatus.FS only.
+        // SAFETY: clears sstatus.FS and sstatus.VS (bits 14:13 and 10:9) only, turning the FP and vector units off for the kernel; the user's values stay in the frame.
         unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) (3usize << 13) | (3usize << 9)) };
     }
     // Every trap holds the big kernel lock while the kernel handles it (S5, K2), except the quiet ones of L12b and L12c (INVARIANTS K6); interrupts are

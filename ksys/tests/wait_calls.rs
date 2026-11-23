@@ -70,6 +70,7 @@ fn world() -> W {
         stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
+        libsys: Default::default(),
     };
     let mut us = UserState::new();
     us.procs.insert(1, Box::new(p));
@@ -632,5 +633,77 @@ fn the_reply_half_reports_by_what_is_there() {
         ),
         Ok((Some(104), Some(0))),
         "the message was still there"
+    );
+}
+
+// ---- T215: the copies of a big channel_call are outside the object lock ----
+
+#[test]
+fn a_big_call_takes_its_request_staged_and_leaves_its_reply_to_copy_out() {
+    let mut w = world();
+    let (client, server) = w.channel();
+    // the request: 2 KiB the caller copied in before the section; its record names a source nothing is mapped at
+    let mut a = call_record(&mut w, client, 2048, 9);
+    let nowhere = 0x7000_0000u64;
+    let mut rec = w.peek(MEM, 56);
+    rec[0..8].copy_from_slice(&nowhere.to_le_bytes());
+    w.poke(MEM, &rec);
+    a[1] = MEM;
+    let mut body = vec![7u8, 0, 0, 0];
+    body.extend((0..2044u32).map(|i| (i % 251) as u8));
+    let staged = ksys::Staged {
+        data: body.clone(),
+        handles: Vec::new(),
+    };
+    let call = ksys::channel_call_send_staged(
+        &mut w.us,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        1,
+        7,
+        a,
+        Some(staged),
+        || false,
+    )
+    .expect("the staged bytes are used, not the pointer");
+    assert_eq!(call.txid, 7);
+    // a reply of 2 KiB is left for the caller to copy out; the destination was checked and the message taken. (the call's own record is read again for the
+    // reply, from the `Call` it made: its reply buffer is 64 bytes, so a bigger `Call` is made by hand)
+    let big = ksys::Call {
+        rd_max_bytes: 4096,
+        rd_bytes: MEM + 0x1000,
+        ..call
+    };
+    let mut reply = vec![7u8, 0, 0, 0];
+    reply.extend((0..2044u32).map(|i| (i % 241) as u8));
+    ipc::channel_write_in(
+        &mut w.us.objs,
+        &mut w.us.procs.get_mut(&1).unwrap().handles,
+        abi::Handle(server),
+        &reply,
+        &[],
+        &mut w.jobs,
+    )
+    .unwrap();
+    let mut deferred = None;
+    let r = ksys::channel_call_reply_deferred(
+        &mut w.us,
+        &mut w.mm,
+        &mut w.vmos,
+        &mut w.jobs,
+        1,
+        &big,
+        &mut deferred,
+        true,
+        || false,
+    );
+    assert_eq!(r, Ok((Some(2048), Some(0))));
+    let d = deferred.expect("a big reply is left for the caller");
+    assert_eq!((d.bytes_at, d.data), (MEM + 0x1000, reply));
+    assert_eq!(
+        w.peek(MEM + 0x1000, 4),
+        vec![0; 4],
+        "nothing was copied in the call"
     );
 }
