@@ -169,6 +169,60 @@ fn asid_generation() -> u64 {
     unsafe { (*p).load(Ordering::Acquire) }
 }
 
+/// Resolve the VMO handle `h` of the calling thread with `need`, and the address space of its process: the part of the data-moving VMO calls that is
+/// the object domain (one short section).
+#[inline(never)]
+fn vmo_resolve(
+    h: u64,
+    need: Rights,
+) -> Result<(u64, alloc::sync::Arc<klock::aslock::AsCell>), ReplyErr> {
+    with_state(|s| {
+        let me = caller_pid(s).map_err(|e| (e, None, None))?;
+        let p = s.procs.get(&me).ok_or((Status::BadState, None, None))?;
+        let id = ipc::vmo_of(&s.objs, &p.handles, Handle(h), need).map_err(|e| (e, None, None))?;
+        Ok((id, p.aspace.clone()))
+    })
+}
+
+/// `vmo_read` and `vmo_write` (T215): the handle under the object lock, the copy under the caller's address-space lock and the memory locks only, so the
+/// copy of up to 64 KiB (and a pager's wait for a page) no longer holds the object domain up. The pager-need slot is saved and put back as the quiet fault does.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn vmo_rw_call(writing: bool, a: [u64; 6]) -> Reply {
+    let need = if writing { Rights::WRITE } else { Rights::READ };
+    let (id, aspace) = vmo_resolve(a[0], need)?;
+    let (r, pager) = {
+        let _as = klock::aslock::AsCell::hold(&aspace);
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        let r = ksys::vmo_rw_resolved(writing, aspace.held_mut(), k.mm, k.vmos, k.jobs, id, a);
+        let pager = k.vmos.swap_need(saved);
+        (r, pager)
+    };
+    if pager.is_some() {
+        kmem::get().vmos.swap_need(pager); // (`pager_after_call` reads it)
+    }
+    r
+}
+
+/// `vmo_commit` (T215): the handle under the object lock, the zeroing of up to `MAX_COMMIT_PAGES` pages under the memory locks only.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the pager need the copy may carry); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn vmo_commit_call(a: [u64; 6]) -> Reply {
+    let (id, _aspace) = vmo_resolve(a[0], Rights::COMMIT)?;
+    let (r, pager) = {
+        let k = kmem::mem();
+        let saved = k.vmos.swap_need(None);
+        let r = ksys::vmo_commit_resolved(k.mm, k.vmos, k.jobs, id, a[1], a[2]);
+        let pager = k.vmos.swap_need(saved);
+        (r, pager)
+    };
+    if pager.is_some() {
+        kmem::get().vmos.swap_need(pager);
+    }
+    r
+}
+
 /// `debug_stat(debug, which)` (HD4): a counter of the kernel, for a program that holds a debug resource with INSPECT.
 fn debug_stat_call(a: [u64; 6]) -> Reply {
     with_state(|s| -> Reply {
@@ -616,6 +670,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),
+        nr::VMO_READ | nr::VMO_WRITE => reply(frame, vmo_rw_call(n == nr::VMO_WRITE, a)),
+        nr::VMO_COMMIT => reply(frame, vmo_commit_call(a)),
         nr::OBJECT_WAIT => reply(frame, object_wait(a)),
         nr::PORT_WAIT => {
             // (a poll moves the port's cursor, which counts as a touch)
@@ -684,6 +740,7 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         _ => {
             // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
+            sweep_before_create(n);
             let result = irq::without(|| dispatch(n, a));
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
@@ -762,6 +819,63 @@ pub(super) fn fail(s: Status) -> Reply {
     Err((s, None, None))
 }
 
+/// Sweep before creating kernel objects if garbage cycles have piled up (OD39), as a series of slices, each its own critical section (MM10, T206, X4): this call
+/// starts a sweep if one is due and runs a few slices of it, and the next creating call carries on; near the cap a creation would be refused while garbage fills
+/// the registry, so the sweep is finished now, slice by slice, with the roots taken in the section that begins it.
+#[inline(never)]
+fn sweep_before_create(n: usize) {
+    if !matches!(
+        n,
+        nr::CHANNEL_CREATE
+            | nr::EVENT_CREATE
+            | nr::SOCKET_CREATE
+            | nr::PORT_CREATE
+            | nr::INTERRUPT_CREATE
+    ) {
+        return;
+    }
+    if !with_state(|s| s.objs.sweep_active() || s.objs.needs_sweep()) {
+        return;
+    }
+    // (MM10) start one if garbage cycles have piled up, and run a few slices of it
+    with_state(|s| {
+        if !s.objs.sweep_active() {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots);
+        }
+    });
+    for _ in 0..SWEEP_SLICES_PER_CALL {
+        if !with_state(|s| {
+            s.objs.sweep_active()
+                && !matches!(
+                    s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                    kcore::object::SweepStep::Done(_)
+                )
+        }) {
+            break;
+        }
+    }
+    // near the cap: a sweep that was running only frees what was garbage when it began, so finish it and then run a fresh one, all in slices
+    while with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap() && s.objs.sweep_active()) {
+        with_state(|s| s.objs.sweep_step(SWEEP_SLICE_BUDGET));
+    }
+    if with_state(|s| s.objs.live().saturating_add(8) >= s.objs.cap()) {
+        let began = with_state(|s| {
+            let roots = s.roots();
+            s.objs.sweep_begin(&roots)
+        });
+        if began {
+            while with_state(|s| {
+                s.objs.sweep_active()
+                    && !matches!(
+                        s.objs.sweep_step(SWEEP_SLICE_BUDGET),
+                        kcore::object::SweepStep::Done(_)
+                    )
+            }) {}
+        }
+    }
+}
+
 #[allow(clippy::large_stack_frames)]
 // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 #[allow(
@@ -776,34 +890,6 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     let Some(&pid) = s.thread_pid.get(&tid) else {
         return fail(Status::BadState);
     };
-    // Sweep before creating kernel objects if garbage cycles have piled up (OD39).
-    if matches!(
-        n,
-        nr::CHANNEL_CREATE
-            | nr::EVENT_CREATE
-            | nr::SOCKET_CREATE
-            | nr::PORT_CREATE
-            | nr::INTERRUPT_CREATE
-    ) && (s.objs.sweep_active() || s.objs.needs_sweep())
-    {
-        // (MM10) the sweep runs in slices: this call starts one if garbage cycles have piled up, and runs a few slices of it; the next
-        // creating call carries on. The worst interrupts-off span of a sweep is a slice, not the whole object graph.
-        if !s.objs.sweep_active() {
-            let roots = s.roots();
-            s.objs.sweep_begin(&roots);
-        }
-        let mut slices = 0;
-        while s.objs.sweep_active() && slices < SWEEP_SLICES_PER_CALL {
-            s.objs.sweep_step(SWEEP_SLICE_BUDGET);
-            slices += 1;
-        }
-        // near the cap a creation would be refused while garbage fills the registry: sweep now, all of it, with the roots as they are (a
-        // sweep that was running only frees what was garbage when it began, so `sweep` finishes it and then runs a fresh one)
-        if s.objs.live() + 8 >= s.objs.cap() {
-            let roots = s.roots();
-            s.objs.sweep(&roots);
-        }
-    }
     let UserState {
         objs,
         procs,

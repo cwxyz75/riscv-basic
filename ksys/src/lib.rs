@@ -45,7 +45,7 @@ pub use thread::{
     thread_state_target, thread_stop_pending, thread_suspend, thread_suspend_forget,
     thread_unparked, total_threads, Spawn, KSTACK_PAGES,
 };
-pub use vmo::vmo_call;
+pub use vmo::{vmo_call, vmo_commit_resolved, vmo_rw_resolved};
 pub use wait::{
     channel_call_ready, channel_call_reply, channel_call_send, futex_pi_resolve, futex_wait_check,
     futex_wait_enqueue, futex_wait_report, futex_wait_resolve, futex_wait_resolve_in, futex_wake,
