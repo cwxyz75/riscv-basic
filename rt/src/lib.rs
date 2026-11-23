@@ -406,6 +406,10 @@ pub mod sys {
     pub fn hart_info(resource: u64, index: u64) -> Ret {
         syscall(HART_INFO, [resource as usize, index as usize, 0, 0, 0, 0])
     }
+    /// Suspend the machine to RAM through the firmware (PM3). NOT_SUPPORTED where the firmware has no such extension.
+    pub fn system_suspend(resource: u64) -> Ret {
+        syscall(SYSTEM_SUSPEND, [resource as usize, 0, 0, 0, 0, 0])
+    }
     /// A read-only VMO holding the device tree; `a2` is its length in bytes.
     pub fn resource_dtb(resource: u64) -> Ret {
         syscall(RESOURCE_DTB, [resource as usize, 0, 0, 0, 0, 0])

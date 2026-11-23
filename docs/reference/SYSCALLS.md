@@ -226,6 +226,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 115 | system_set_placement | `a0` resource, `a1` policy | |
 | 116 | hart_set_online | `a0` resource, `a1` hart index, `a2` 1 online or 0 offline | |
 | 117 | hart_info | `a0` resource, `a1` hart index | `a1` state |
+| 118 | system_suspend | `a0` resource | |
 
 A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
@@ -491,7 +492,7 @@ Chooses how a wake picks a hart (PM4, KERNEL-V1-SPEC 5.6): `policy` 0 is **sprea
 running the lowest priority) and 1 is **pack** (the lowest-indexed online hart running something below the thread, so load consolidates and the other harts stay idle; when
 every hart is busy, spread's rule). Threads already placed stay where they are; the next wake uses the new rule; what a hart pulls is the same under both, so the scheduler's
 guarantee (no hart runs a lower priority than a thread waiting for it) holds under both. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE (not a resource);
-ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force.
+ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force, and 126 whether the firmware has the system-suspend extension (1) or not (0).
 
 ### hart_set_online(resource, index, online) -> status
 
@@ -505,6 +506,12 @@ or another call is changing it); TIMED_OUT (the hart did not get there within tw
 ### hart_info(resource, index) -> state
 
 Returns in `a1` the state of hart `index`: 0 offline, 1 starting, 2 online, 3 draining. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; INVALID_ARGS (no such hart).
+
+### system_suspend(resource) -> status
+
+Suspends the machine to RAM through the firmware (PM3, KERNEL-V1-SPEC 5.5). `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE; ACCESS_DENIED; NOT_SUPPORTED, with nothing changed: the firmware has no system-suspend extension (`debug_stat` 126 says
+whether it has), or it has and the kernel cannot yet stop its harts the way the extension requires (T229). **As built, the call is always NOT_SUPPORTED**: the QEMU `virt` firmware has no such extension, so the suspend path itself has never run; what is built is the
+save and restore sequence (`kcore::powerseq`, host-tested over a fake machine) the path will use.
 
 ### futex_wait(address, expected, deadline) -> status
 
@@ -1020,6 +1027,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | resource_dtb | specified and implemented (S6c) |
 | system_set_placement | specified and implemented (PM4) |
 | hart_set_online, hart_info | specified and implemented (PM1) |
+| system_suspend | specified; the firmware path is not built (PM3, T229): always NOT_SUPPORTED |
 | futex_wait, futex_wake | specified and implemented (S7b) |
 
 ## Planned changes (SCHED-SMP-SPEC.md; **none of this is implemented**)

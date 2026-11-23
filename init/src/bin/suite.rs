@@ -11876,6 +11876,45 @@ fn devd_serves_null_and_zero() -> Outcome {
 
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
+fn system_suspend_is_gated_and_not_supported_without_the_firmware() -> Outcome {
+    // PM3: gated like the other root-resource calls; the firmware of the reference machine has no suspend extension, and the call says so and changes nothing
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::system_suspend(0xdead)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    ensure_eq!(
+        st(sys::system_suspend(ev)),
+        Some(S::WrongType),
+        "an event is no resource"
+    );
+    let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u64;
+    ensure_eq!(
+        st(sys::system_suspend(weak)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    sys::handle_close(weak);
+    ensure_eq!(
+        sys::debug_stat(126),
+        0,
+        "the reference firmware has no SUSP"
+    );
+    ensure_eq!(
+        st(sys::system_suspend(res)),
+        Some(S::NotSupported),
+        "not supported, nothing done"
+    );
+    ensure_eq!(
+        ok(sys::hart_info(res, 0), "hart_info")?.a1,
+        2,
+        "hart 0 is still online"
+    );
+    Ok(())
+}
+
 fn hart_calls_need_the_resource_and_take_harts_offline_and_back() -> Outcome {
     // PM1: gated like the other root-resource calls; every hart but one goes offline and the last refuses; all come back
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
@@ -15109,6 +15148,10 @@ pub fn app_main() -> i32 {
         ("channel_round_trip", channel_round_trip),
         ("channel_sends_handles", channel_sends_handles),
         ("channel_syscall_errors", channel_syscall_errors),
+        (
+            "system_suspend_is_gated_and_not_supported_without_the_firmware",
+            system_suspend_is_gated_and_not_supported_without_the_firmware,
+        ),
         (
             "hart_calls_need_the_resource_and_take_harts_offline_and_back",
             hart_calls_need_the_resource_and_take_harts_offline_and_back,
