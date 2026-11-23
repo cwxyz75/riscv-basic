@@ -148,6 +148,14 @@ pub fn vlenb_read() -> usize {
 
 /// The per-hart pointer register's value.
 #[inline(always)]
+/// The stack pointer (for the panic handler's trace, T233).
+pub fn stack_pointer() -> usize {
+    let p: usize;
+    // SAFETY: reads `sp`; no memory is touched.
+    unsafe { asm!("mv {}, sp", out(reg) p, options(nomem, nostack, preserves_flags)) };
+    p
+}
+
 pub fn thread_pointer() -> usize {
     let p: usize;
     // SAFETY: reads `tp`; no memory is touched.

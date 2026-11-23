@@ -272,9 +272,41 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     finisher::exit(tally.fail == 0)
 }
 
+/// The words on the panicking thread's kernel stack that point into the kernel's code, innermost first: the return addresses of the calls that led here, among a few
+/// stale ones (T233: a panic whose location is the standard library's says nothing of its caller; resolve these with `llvm-addr2line -e <kernel ELF>`). Only a thread
+/// that entered from user mode has a known stack top (`PerHart.kstack_top`); on any other the list is empty. Reads nothing outside `[sp, kstack_top)`.
+struct Trace;
+
+impl core::fmt::Display for Trace {
+    #[allow(clippy::arithmetic_side_effects)] // INVARIANT: addresses below 2^56; the loop stays inside [sp, top) and counts to at most 32
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let sp = arch::stack_pointer() & !7;
+        let top = percpu::this()
+            .kstack_top
+            .load(core::sync::atomic::Ordering::Relaxed) as usize;
+        let text = kmem::sections().text;
+        // (a stack is at most 64 KiB here; anything else is not the stack this hart is on)
+        if top == 0 || top <= sp || top - sp > 64 * 1024 {
+            return Ok(());
+        }
+        write!(f, " [stack")?;
+        let (mut at, mut shown) = (sp, 0);
+        while at + 8 <= top && shown < 32 {
+            // SAFETY: `at` is 8-aligned and in `[sp, top)`, the live part of this hart's kernel stack, which is mapped and 8-byte readable.
+            let w = unsafe { core::ptr::read_volatile(at as *const u64) };
+            if w >= text.0 && w < text.1 {
+                write!(f, " {w:#x}")?;
+                shown += 1;
+            }
+            at += 8;
+        }
+        write!(f, "]")
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     console::break_lock();
-    let _ = testlog::panic(&mut console::Console, info);
+    let _ = testlog::panic(&mut console::Console, &format_args!("{info}{Trace}"));
     finisher::exit(false)
 }
