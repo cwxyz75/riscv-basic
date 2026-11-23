@@ -1566,6 +1566,7 @@ pub fn wake_stat(which: u64) -> u64 {
         127 => u64::from(cfg!(feature = "sched-round-robin")),
         // (HD2: is `aslr=off` in force?)
         128 => u64::from(crate::entropy::aslr_off()),
+        131 => crate::user::clock_traps(),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

@@ -124,6 +124,38 @@ pub struct Process {
     /// Started by the kernel (`start`): may ask for the root job (`job_root`). Nothing a program
     /// creates is privileged.
     pub privileged: bool,
+    /// Where the system library (AB7) is mapped in this process: its base and its text range (all zero when it is not).
+    pub libsys: LibRange,
+}
+
+/// Where the system library lies in a process: the base the kernel chose, and the text range (the only place `ecall` is allowed from, AB8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LibRange {
+    pub base: u64,
+    pub text_start: u64,
+    pub text_end: u64,
+}
+
+/// What `process_start` maps into the new process before it runs (AB7: the system library). The kernel provides it; the host tests use [`NoMap`].
+pub trait StartMap {
+    /// Map into `aspace`; returns where, and how many bytes of address space the mapping spans (page-table frames are charged for them).
+    fn map(
+        &mut self,
+        aspace: &mut AddressSpace,
+        jobs: &mut Jobs,
+    ) -> Result<(LibRange, u64), Status>;
+    /// Take back what `map` mapped (the process has not run).
+    fn unmap(&mut self, aspace: &mut AddressSpace, jobs: &mut Jobs, range: LibRange, span: u64);
+}
+
+/// Maps nothing.
+pub struct NoMap;
+
+impl StartMap for NoMap {
+    fn map(&mut self, _: &mut AddressSpace, _: &mut Jobs) -> Result<(LibRange, u64), Status> {
+        Ok((LibRange::default(), 0))
+    }
+    fn unmap(&mut self, _: &mut AddressSpace, _: &mut Jobs, _: LibRange, _: u64) {}
 }
 
 /// The stack a `thread_spawn` provisioned: its region in the address space and the VMO behind it.

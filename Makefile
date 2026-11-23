@@ -216,6 +216,9 @@ os-ktest-release-content:
 	cd init && cargo build --release
 	python3 scripts/check_pie.py --self-test
 	python3 scripts/check_pie.py target/$(KERNEL_TARGET)/release
+	# AB7: no program makes a system call of its own (only the test programs `crash` and `suite` plant them)
+	python3 scripts/check_ecall.py --self-test
+	python3 scripts/check_ecall.py target/$(KERNEL_TARGET)/release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --features release-suite --target-dir ../target/os-krc
 	OS_RELEASE_SUITE=1 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KRC_ELF)
 

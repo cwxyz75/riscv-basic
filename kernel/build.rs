@@ -45,6 +45,11 @@ fn main() {
     }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+    // AB7: the system library, built (and checked) here from `abi::syscall::TABLE`, and embedded; the kernel maps it into every process.
+    println!("cargo:rerun-if-changed=../libsys/src");
+    println!("cargo:rerun-if-changed=../abi/src");
+    let lib = libsys::build::build(&out.join("libsys")).expect("build libsys.so");
+    std::fs::write(out.join("libsys.so"), lib).expect("write libsys.so");
     // The user programs come from the dev build unless the release boot test asks otherwise.
     println!("cargo:rerun-if-env-changed=OS_USER_PROFILE");
     let profile = std::env::var("OS_USER_PROFILE").unwrap_or_else(|_| "debug".into());

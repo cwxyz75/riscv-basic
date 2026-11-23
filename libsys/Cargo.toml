@@ -1,0 +1,13 @@
+[package]
+name = "libsys"
+version = "0.1.0"
+edition = "2021"
+description = "AB7: the system library, a shared object the kernel maps into every process; one `sys_<name>` wrapper per call, and a read-only data page the kernel fills"
+
+[features]
+# The builder and the checker (host only: they run rustc and use `std`). `rt` takes the crate without it.
+default = ["build"]
+build = []
+
+[dependencies]
+abi = { path = "../abi" }

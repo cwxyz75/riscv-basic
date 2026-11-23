@@ -352,6 +352,18 @@ fn debug_stat_call(a: [u64; 6]) -> Reply {
 /// before any IPI that tells a hart to look. A hart that returns to user mode records the epoch it saw (`activate_current`, before it
 /// reads the marks); a trap from user mode that finds the epoch unchanged has nothing to die or stop for, and needs no big lock.
 pub(super) static ATTENTION: AtomicU64 = AtomicU64::new(1);
+/// How many times the kernel answered `clock_get` (AB7: the system library computes it in user mode, so a program's reads add nothing; a test reads this to see it).
+static CLOCK_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one `clock_get` the kernel answered.
+pub fn note_clock_trap() {
+    CLOCK_TRAPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The `clock_get` calls the kernel has answered (`debug_stat` 131).
+pub fn clock_traps() -> u64 {
+    CLOCK_TRAPS.load(Ordering::Relaxed)
+}
 
 /// How much of the reachability sweep one creating call does (MM10): up to this many slices of this many marked objects or slots each.
 const SWEEP_SLICES_PER_CALL: usize = 4;
@@ -781,7 +793,10 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
         }
         nr::PROCESS_EXIT => exit_process(a[0] as i32),
         nr::THREAD_EXIT => leave(a[0] as i32, false),
-        nr::CLOCK_GET => frame.set_return(0, Some(thread::now_ns()), None),
+        nr::CLOCK_GET => {
+            note_clock_trap();
+            frame.set_return(0, Some(thread::now_ns()), None)
+        }
         nr::DEBUG_STAT => reply(frame, debug_stat_call(a)),
         nr::HART_SET_ONLINE | nr::HART_INFO | nr::SYSTEM_SUSPEND => reply(frame, hart_call(n, a)),
         nr::DEBUG_WRITE => reply(frame, debug_write_call(a)),

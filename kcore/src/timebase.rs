@@ -4,7 +4,7 @@
 //! so no division), and nanoseconds to cycles exactly, rounded up so that a timer is never programmed early.
 
 /// Fixed-point shift of the cycles-to-nanoseconds multiplier.
-const SHIFT: u32 = 32;
+pub const SHIFT: u32 = 32;
 /// The fastest counter supported (`ns_to_cycles` multiplies a remainder below 10^9 by the rate, which must fit a `u64`).
 pub const MAX_HZ: u64 = 4_000_000_000;
 

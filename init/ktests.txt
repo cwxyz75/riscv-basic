@@ -43,6 +43,7 @@ fetch_the_program_image
 fetch_the_hello_image
 child_exit_code_and_terminated_signal
 programs_are_placed_at_random
+the_system_library_is_in_every_process
 debug_calls_need_a_debug_resource
 child_faults_are_contained
 parent_and_child_talk

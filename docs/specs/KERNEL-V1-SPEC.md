@@ -540,3 +540,18 @@ Section 3.7 said a static-PIE's startup code relocates itself. The loader does i
 ## Amendment 2026-11-23 (HD3): what 7.3 became
 
 The image is a static-PIE that `_start` relocates in place (the relocations are applied to the image where it stands in memory, with paging off, adding the slide). The slide is a multiple of 2 MiB below the 1 GiB slot of the image (the early table's `EARLY_L1`), so its entropy is 511 minus the image's size in 2 MiB pages choices (about 9 bits for today's image). The direct map is moved up by 0 to 64 whole gigabytes (65 positions: about 6 bits), not "among the free slots": the early table maps the 64 GiB of physical space the kernel supports before the device tree's memory is read, so its 64 slots must all fit between slot 256 and the kernel-stack window at slot 384; the self-test window moved to slot 448 to make the room. The choice is made in assembly by a scanner of the tree's own (`/chosen/kaslr-seed`, else `/chosen/rng-seed`), and `kcore::kaslr` is the model the boot self-test checks it against. The values are `kmem::direct_base()` and `arch::slide()`; `debug_stat` 129 and 130 report them (test builds and release alike: they are counters, not addresses). A fatal trap prints `sepc` minus the slide in a test build and only the cause in a release build.
+
+## Amendment 2026-11-23 (AB7): how the system library is built and mapped
+
+Section 3.1's library is built as follows. `libsys.so` is generated from `abi::syscall::TABLE` (one `sys_<name>` per call, the name the constant's in lower
+case) and linked by the kernel's build script, which runs `rustc` for the user target with a linker script of its own: one read-and-execute segment holds the headers,
+`.dynsym`, `.hash`, `.dynstr`, the code and `.dynamic`, and one read-only segment of one page with no file bytes is the data page. The object has no relocation of any
+kind (the build checks the section types and the dynamic tags), and `sys_raw` takes the call number in `a6` for a number the table does not name (the boot-time
+suite's bad-number tests). The kernel makes two shared VMOs of it (code and data page, charged to the root job) the first time a process starts, and maps both
+into every process at `process_start` (and at load, for a kernel-started process) at a random place of the mapping arena, the page tables charged to the
+process's job like a `process_map`'s; the process record keeps the base and the text range. Every thread of the process starts with the base in `a2`. The data
+page holds nine words (`libsys::page`): the ABI version, the clock's multiplier and shift, the page size, the two cache-block sizes, the harts online, flags and the
+counter's value at the clock's zero. `sys_clock_get` is code in the library that reads `time` and the page (the kernel sets `scounteren.TM`), so `clock_get`
+no longer enters the kernel (`debug_stat` 131 counts the calls the kernel still answers). `rt` reads the library's `.dynsym` once in `_start`; every call goes
+through the table that gives, so a program has no `ecall` of its own (`scripts/check_ecall.py`; `crash` and `suite` plant theirs on purpose). The kernel's own `clock_get`,
+`port_wait` and the other old shapes stay until AB8 takes the numbers private.

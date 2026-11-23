@@ -34,13 +34,15 @@ pub(super) fn user_thread_main(token: usize) {
             // then it is not made again)
             let spawner_done = s.initial_regs.contains_key(&tid);
             s.initial_regs.entry(tid).or_insert_with(|| {
-                ksys::initial_general(
+                let mut regs = ksys::initial_general(
                     ts.entry,
                     ts.sp,
                     ts.arg,
                     ts.tp,
                     if ts.spawned { tid } else { 0 },
-                )
+                );
+                regs[11] = ts.a2; // (`a2`: the system library's base, AB7)
+                regs
             });
             if ts.suspended && !spawner_done {
                 ksys::thread_start_suspended(s, tid);
@@ -123,13 +125,15 @@ pub(super) fn user_thread_main(token: usize) {
     let entry_frame = {
         let image = with_state(|s| s.initial_regs.remove(&thread::current()));
         let image = image.unwrap_or_else(|| {
-            ksys::initial_general(
+            let mut regs = ksys::initial_general(
                 ts.entry,
                 ts.sp,
                 ts.arg,
                 ts.tp,
                 if ts.spawned { thread::current() } else { 0 },
-            )
+            );
+            regs[11] = ts.a2;
+            regs
         });
         let mut frame = crate::trap::TrapFrame::from_general(&image);
         crate::fp::mark_present(thread::current(), &mut frame);

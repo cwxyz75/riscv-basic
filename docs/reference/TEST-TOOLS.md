@@ -47,6 +47,8 @@ harness fails a `k` boot that lacks a Kernel test or ran a System test.
 | `make os-ktest-small` | the kernel-only boot at one and two harts, without the tests marked `slow` |
 | `make os-ktest-4` | the kernel-only boot at four harts, every Kernel test |
 | `make os-ktest-release` | the kernel-only boot of the optimised build at four harts |
+| `scripts/check_ecall.py DIR [--self-test]` | AB7: no embedded user program has an `ecall` instruction (every call goes through `libsys`); `crash` and `suite` are exempt; run by `os-ktest-release-content` |
+| `cargo test -p libsys` | AB7: builds `libsys.so` and checks it (no relocations, a symbol per call in `abi::syscall::TABLE`, the data page's segment); the same check runs in the kernel's build script |
 | `scripts/kaslr_check.py ELF` | HD3: ten boots of the kernel (each stopped at its `kaslr:` line) show at least six slides and four direct-map bases, and `kaslr=off` one layout; run by `os-ktest-small` |
 | `make os-ktest-release-content` | the kernel-only boot at four harts of a kernel with the release content (feature `release-suite`: no boot self-tests, no scheduler or SMP tests), run from the separately built suite (HD4 part 3) |
 | `make kquick` | format, the pure kernel crates' host tests and the four-hart kernel-only boot: one targeted boot for a kernel change |
