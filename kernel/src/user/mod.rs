@@ -171,7 +171,7 @@ fn state() -> &'static mut UserState {
 
 /// The backstops in force (a test hook: `debug_stat` 120 to 124).
 pub fn backstops() -> kcore::limits::Backstops {
-    with_state(|s| s.backstops)
+    any_state(|s| s.backstops)
 }
 
 /// The `##TEST` results user programs have reported so far (pass, fail).
