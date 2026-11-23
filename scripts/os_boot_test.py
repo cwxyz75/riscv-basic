@@ -65,6 +65,7 @@ REQUIRED = [
     "user_mode_runs_and_prints", "clock_advances_in_user_mode", "unknown_syscalls_are_refused",
     "debug_write_pointer_rules", "debug_calls_need_a_debug_resource", "handle_syscalls_reject_bad_values", "a_process_holds_twenty_thousand_handles", "event_syscalls",
     "channel_round_trip", "channel_sends_handles", "channel_syscall_errors",
+    "big_messages_are_copied_outside_the_object_lock",
     "channel_buffer_too_small_keeps_message", "buffers_are_validated_before_a_read",
     "channel_txid_read", "channel_peer_closed", "user_cannot_forge_kernel_lines",
     "rights_cannot_be_widened", "stack_grows_lazily", "syscall_layer_bounds",

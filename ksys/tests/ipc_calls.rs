@@ -840,3 +840,81 @@ fn queued_bytes_are_charged_to_the_job() {
     }
     assert_eq!(st, Status::NoMemory, "a job's queued bytes are bounded");
 }
+
+#[test]
+fn big_messages_are_copied_outside_the_call() {
+    // T215: the bytes of a big write come in before the call (an unmapped source pointer is then never read), and a big read leaves its message for the caller to copy out
+    let mut w = world();
+    let (x, y) = w.pair(nr::CHANNEL_CREATE);
+    let msg: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let nowhere = 0x7000_0000u64;
+    let staged = ksys::Staged {
+        data: msg.clone(),
+        handles: Vec::new(),
+    };
+    let (r, _) = w.call_split(
+        nr::CHANNEL_WRITE,
+        [x, nowhere, 4096, 0, 0, 0],
+        Some(staged),
+        false,
+    );
+    assert!(
+        r.unwrap().is_ok(),
+        "the staged bytes are used, not the pointer"
+    );
+    // a staged write still fails on a bad handle, first
+    let staged = ksys::Staged {
+        data: msg.clone(),
+        handles: Vec::new(),
+    };
+    let (r, _) = w.call_split(
+        nr::CHANNEL_WRITE,
+        [999, nowhere, 4096, 0, 0, 0],
+        Some(staged),
+        false,
+    );
+    assert_eq!(r.unwrap().unwrap_err().0, Status::BadHandle);
+    let at = BASE + 0x2000;
+    let (r, d) = w.call_split(
+        nr::CHANNEL_READ,
+        [y, at, 8192, at + 0x4000, 4, 0],
+        None,
+        true,
+    );
+    assert_eq!(r.unwrap().unwrap(), (Some(4096), Some(0)));
+    let d = d.expect("a big message is left for the caller");
+    assert_eq!((d.bytes_at, d.data, d.handles.len()), (at, msg.clone(), 0));
+    assert_eq!(
+        w.peek(at, 16),
+        vec![0u8; 16],
+        "nothing was copied by the call"
+    );
+    // a small message is copied by the call itself
+    w.poke(BASE, b"small");
+    w.ok(nr::CHANNEL_WRITE, [x, BASE, 5, 0, 0, 0]);
+    let (r, d) = w.call_split(
+        nr::CHANNEL_READ,
+        [y, at, 8192, at + 0x4000, 4, 0],
+        None,
+        true,
+    );
+    assert_eq!(r.unwrap().unwrap(), (Some(5), Some(0)));
+    assert!(d.is_none());
+    assert_eq!(w.peek(at, 5), b"small");
+    // a stream is the same
+    let (s, t) = w.pair(nr::SOCKET_CREATE);
+    let staged = ksys::Staged {
+        data: msg.clone(),
+        handles: Vec::new(),
+    };
+    let (r, _) = w.call_split(
+        nr::SOCKET_WRITE,
+        [s, nowhere, 4096, 0, 0, 0],
+        Some(staged),
+        false,
+    );
+    assert_eq!(r.unwrap().unwrap().0, Some(4096));
+    let (r, d) = w.call_split(nr::SOCKET_READ, [t, at, 8192, 0, 0, 0], None, true);
+    assert_eq!(r.unwrap().unwrap().0, Some(4096));
+    assert_eq!(d.expect("left for the caller").data, msg);
+}

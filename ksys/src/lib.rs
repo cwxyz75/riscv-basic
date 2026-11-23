@@ -100,7 +100,31 @@ pub struct Ctx<'a, M: PhysMem> {
     pub clock: fn() -> u64,
     /// The device windows a physical VMO may name (page-aligned `(start, end)` byte ranges, built from the device tree at boot: PL5).
     pub windows: &'a [(u64, u64)],
+    /// The bytes of a big `channel_write` or `socket_write`, copied in before the caller took the object lock (T215); the call uses them in place of its own copy.
+    pub staged: Option<Staged>,
+    /// Set when the caller copies a big `channel_read` or `socket_read` message out after it let the object lock go (T215): the call leaves the message in
+    /// `deferred` instead of copying it.
+    pub defer_out: bool,
+    pub deferred: Option<Deferred>,
 }
+
+/// What a write call's caller copied in for it (T215): the message or stream bytes, and the raw handle numbers of a message.
+pub struct Staged {
+    pub data: Vec<u8>,
+    pub handles: Vec<u8>,
+}
+
+/// A message a read call took and left for its caller to copy out (T215): the destinations were checked against the message before it was taken.
+pub struct Deferred {
+    pub bytes_at: u64,
+    pub data: Vec<u8>,
+    pub handles_at: u64,
+    /// The handles the message carried, which the caller's buffer receives as 8-byte little-endian words.
+    pub handles: Vec<Handle>,
+}
+
+/// Messages and stream writes of at least this many bytes are copied outside the object lock (T215): below it the extra lock round trip costs more than the copy.
+pub const OUTSIDE_COPY_MIN: usize = 1024;
 
 pub(crate) fn fail(s: Status) -> Reply {
     Err((s, None, None))
@@ -146,6 +170,9 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         vmos,
         jobs,
         faults,
+        staged,
+        defer_out,
+        deferred,
         ..
     } = c;
     let (job, skip_forced_touch) = (*job, faults.skip_forced_touch);
@@ -223,8 +250,11 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
         nr::SOCKET_WRITE => {
             let len = a[2] as usize;
             ipc::socket_write_check(objs, handles, h(0), len).map_err(|e| (e, None, None))?;
-            let data =
-                copy_from_user(aspace, mm, vmos, jobs, a[1], len).map_err(|e| (e, None, None))?;
+            let data = match staged.take() {
+                Some(st) => st.data,
+                None => copy_from_user(aspace, mm, vmos, jobs, a[1], len)
+                    .map_err(|e| (e, None, None))?,
+            };
             ipc::socket_write_in(objs, handles, h(0), &data, jobs)
                 .map(|n| (Some(n as u64), None))
                 .map_err(|e| (e, None, None))
@@ -237,6 +267,16 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             verify_writable(aspace, mm, vmos, jobs, a[1], n).map_err(|e| (e, None, None))?;
             let data =
                 ipc::socket_read_in(objs, handles, h(0), max, jobs).map_err(|e| (e, None, None))?;
+            if *defer_out && data.len() >= OUTSIDE_COPY_MIN {
+                let got = data.len() as u64;
+                *deferred = Some(Deferred {
+                    bytes_at: a[1],
+                    data,
+                    handles_at: 0,
+                    handles: Vec::new(),
+                });
+                return Ok((Some(got), None));
+            }
             copy_to_user_verified(aspace, mm, a[1], &data).map_err(|e| (e, None, None))?;
             Ok((Some(data.len() as u64), None))
         }
@@ -296,10 +336,15 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
             if let Err(e) = handles.get(h(0)) {
                 return fail(e);
             }
-            let data = copy_from_user(aspace, mm, vmos, jobs, a[1], nbytes)
-                .map_err(|e| (e, None, None))?;
-            let raw = copy_from_user(aspace, mm, vmos, jobs, a[3], nhandles * 8)
-                .map_err(|e| (e, None, None))?;
+            let (data, raw) = match staged.take() {
+                Some(st) => (st.data, st.handles),
+                None => (
+                    copy_from_user(aspace, mm, vmos, jobs, a[1], nbytes)
+                        .map_err(|e| (e, None, None))?,
+                    copy_from_user(aspace, mm, vmos, jobs, a[3], nhandles * 8)
+                        .map_err(|e| (e, None, None))?,
+                ),
+            };
             ipc::channel_write_in(
                 objs,
                 handles,
@@ -346,6 +391,17 @@ pub fn ipc_call<M: PhysMem>(n: usize, a: [u64; 6], c: &mut Ctx<'_, M>) -> Option
                 Some(t) => ipc::channel_read_txid_in(objs, handles, h(0), t, mb, mh, jobs),
             };
             match got {
+                Ok(r) if *defer_out && r.data.len() >= OUTSIDE_COPY_MIN => {
+                    let counts = (r.data.len() as u64, r.handles.len() as u64);
+                    // (nothing here allocates: the message has been taken, and it must not be lost to a failed allocation, T10)
+                    *deferred = Some(Deferred {
+                        bytes_at,
+                        data: r.data,
+                        handles_at,
+                        handles: r.handles,
+                    });
+                    Ok((Some(counts.0), Some(counts.1)))
+                }
                 Ok(r) => {
                     // The destinations were verified: these writes allocate nothing (T10), and the handle numbers go out one at a time from the
                     // stack, so nothing here can fail for lack of memory after the message has been taken (KT9).

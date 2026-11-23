@@ -463,6 +463,96 @@ fn channel_sends_handles() -> Outcome {
     Ok(())
 }
 
+fn big_messages_are_copied_outside_the_object_lock() -> Outcome {
+    // T215: a message of 1 KiB or more is copied in before the call takes the object lock and out after it lets go; the answers are the ones of a small message
+    let (a, b) = channel()?;
+    let msg: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            msg.as_ptr(),
+            msg.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "write 4096 bytes"
+    );
+    let mut got = alloc::vec![0u8; 4096];
+    let r = sys::channel_read(b, got.as_mut_ptr(), 4096, core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "read them");
+    ensure_eq!(r.a1, 4096, "the length");
+    ensure!(got == msg, "the bytes arrive as they were sent");
+    // the order of errors is the small message's: a bad handle before a bad pointer, a bad pointer, then the write itself
+    ensure_eq!(
+        st(sys::channel_write(
+            BAD,
+            0x10 as *const u8,
+            4096,
+            core::ptr::null(),
+            0
+        )),
+        Some(S::BadHandle),
+        "bad handle, bad pointer"
+    );
+    let small = st(sys::channel_write(
+        a,
+        0x10 as *const u8,
+        8,
+        core::ptr::null(),
+        0,
+    ));
+    ensure!(small != Some(S::Ok), "a bad pointer is refused: {small:?}");
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            0x10 as *const u8,
+            4096,
+            core::ptr::null(),
+            0
+        )),
+        small,
+        "a big message says what a small one says"
+    );
+    // a bad destination loses no message, and the message is still whole after it
+    ensure_eq!(
+        st(sys::channel_write(
+            a,
+            msg.as_ptr(),
+            msg.len(),
+            core::ptr::null(),
+            0
+        )),
+        Some(S::Ok),
+        "write again"
+    );
+    let bad_read = st(sys::channel_read(
+        b,
+        0x10 as *mut u8,
+        4096,
+        core::ptr::null_mut(),
+        0,
+    ));
+    ensure!(
+        bad_read != Some(S::Ok),
+        "a bad destination is refused: {bad_read:?}"
+    );
+    let mut again = alloc::vec![0u8; 4096];
+    let r = sys::channel_read(b, again.as_mut_ptr(), 4096, core::ptr::null_mut(), 0);
+    ensure_eq!(st(r), Some(S::Ok), "the message was not lost");
+    ensure!(again == msg, "and it is whole");
+    // a stream is the same
+    let (s, t) = socket()?;
+    let w = sys::socket_write(s, msg.as_ptr(), msg.len());
+    ensure_eq!(st(w), Some(S::Ok), "socket write");
+    let mut sg = alloc::vec![0u8; 8192];
+    let r = sys::socket_read(t, sg.as_mut_ptr(), 8192);
+    ensure_eq!(st(r), Some(S::Ok), "socket read");
+    ensure_eq!(r.a1, 4096, "the stream's length");
+    ensure!(sg[..4096] == msg[..], "the stream's bytes");
+    Ok(())
+}
+
 fn channel_syscall_errors() -> Outcome {
     let (a, b) = channel()?;
     let e = event()?;
@@ -14984,6 +15074,10 @@ pub fn app_main() -> i32 {
         ("channel_round_trip", channel_round_trip),
         ("channel_sends_handles", channel_sends_handles),
         ("channel_syscall_errors", channel_syscall_errors),
+        (
+            "big_messages_are_copied_outside_the_object_lock",
+            big_messages_are_copied_outside_the_object_lock,
+        ),
         (
             "channel_buffer_too_small_keeps_message",
             channel_buffer_too_small_keeps_message,
