@@ -668,7 +668,8 @@ pub(super) fn syscall(frame: &mut crate::trap::TrapFrame) {
             reply(frame, r);
         }
         _ => {
-            let result = dispatch(n, a);
+            // (L20: the object calls are one section under the object lock, as the final design has them (SCHED-SMP-SPEC 3.3, T70))
+            let result = irq::without(|| dispatch(n, a));
             if matches!(n, nr::CHANNEL_READ | nr::CHANNEL_READ_TXID) {
                 // (L22) a thread that read a `channel_call` request is lent its caller's priority, while the caller still waits for that reply
                 lend_to_reader();

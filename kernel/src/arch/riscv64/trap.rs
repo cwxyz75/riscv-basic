@@ -547,6 +547,20 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         external_trap(frame, from_user);
     } else if light {
         trap_body(frame);
+    } else if from_user && cause == 8 && ready {
+        // L20: a syscall runs with **no big kernel lock** across the call: every section of it that touches shared state takes the lock itself
+        // (`irq::without`), and the lock is held again only for the FP save at entry and the tail (the wakes the call made, a switch it asked for, the
+        // address space for the return)
+        crate::bkl::lock();
+        crate::fp::trap_entry(frame);
+        crate::bkl::unlock();
+        trap_body(frame);
+        crate::bkl::lock();
+        crate::user::commit_wake();
+        crate::thread::preempt_point();
+        crate::user::activate_current(frame);
+        crate::heap::service();
+        crate::bkl::unlock();
     } else {
         crate::bkl::lock();
         crate::fp::trap_entry(frame);
