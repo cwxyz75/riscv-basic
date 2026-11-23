@@ -492,7 +492,7 @@ Chooses how a wake picks a hart (PM4, KERNEL-V1-SPEC 5.6): `policy` 0 is **sprea
 running the lowest priority) and 1 is **pack** (the lowest-indexed online hart running something below the thread, so load consolidates and the other harts stay idle; when
 every hart is busy, spread's rule). Threads already placed stay where they are; the next wake uses the new rule; what a hart pulls is the same under both, so the scheduler's
 guarantee (no hart runs a lower priority than a thread waiting for it) holds under both. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE (not a resource);
-ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force, and 126 whether the firmware has the system-suspend extension (1) or not (0). `debug_stat` 127 says 1 on a kernel built with the round-robin class (the suite's priority controls skip themselves there) and 0 otherwise. `debug_stat` 128 says 1 when the kernel was booted with `aslr=off` (test builds: every random placement is the first fit). `debug_stat` 129 is the kernel image's slide in 2 MiB pages and 130 the direct map's move in GiB (HD3).
+ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force, and 126 whether the firmware has the system-suspend extension (1) or not (0). `debug_stat` 127 says 1 on a kernel built with the round-robin class (the suite's priority controls skip themselves there) and 0 otherwise. `debug_stat` 128 says 1 when the kernel was booted with `aslr=off` (test builds: every random placement is the first fit). `debug_stat` 129 is the kernel image's slide in 2 MiB pages and 130 the direct map's move in GiB (HD3). `debug_stat` 131 is how many `clock_get` calls the kernel has answered (the system library computes the clock in user mode, AB7, so a program's reads do not count).
 
 ### hart_set_online(resource, index, online) -> status
 
@@ -592,7 +592,7 @@ Describe the mapping that contains `vaddr`, or the first one above it (MM7): six
 
 ### process_start(process, entry, sp, bootstrap, arg, features) -> status
 
-Start the process's first thread at `entry` with stack pointer `sp` and `a0 = arg`. The
+Start the process's first thread at `entry` with stack pointer `sp`, `a0 = arg` and `a2` the base of the system library, which the kernel maps into the process before it starts (AB7; every thread of the process starts with that base in `a2`). The
 channel endpoint `bootstrap` leaves the caller's table and becomes the new process's handle 1
 (the bootstrap channel). Rights: MANAGE on `process`; TRANSFER on `bootstrap`. The process must
 not have been started or ended, `entry` must lie in a mapping that is executable, `sp` must be

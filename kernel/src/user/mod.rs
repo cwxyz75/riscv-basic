@@ -215,6 +215,7 @@ mod calls;
 mod kobjects;
 mod lifecycle;
 mod loader;
+mod syslib;
 mod trap;
 mod waits;
 mod wake;

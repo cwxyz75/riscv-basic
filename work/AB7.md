@@ -15,3 +15,5 @@ refs: [KERNEL-V1-SPEC, OD128]
 **Acceptance, written first.** A host test parses the built `libsys.so` and checks: no relocation sections, every call in `abi`'s table has a symbol, the data page layout matches `abi`. QEMU: every program in the image runs with no `ecall` instruction of its own (a build check greps the user binaries' disassembly for `ecall` outside `libsys`: none); `sys_clock_get` enters the kernel zero times (trap counter); two processes see different library bases (with ASLR on).
 
 **Review.** Fable, soak.
+
+**Progress (2026-11-23).** Built on `ab7`: the call table (`abi::syscall::TABLE`), the `libsys` crate (builder, checker, symbol walker, data page layout), the kernel's mapping (`kernel/src/user/syslib.rs`, `ksys::StartMap`, `a2` of every thread), `rt::library`, the user-mode `clock_get`, `scripts/check_ecall.py`, and the suite test `the_system_library_is_in_every_process`. Left for the epic: Fable review and soak; T236 and T237 hold the shortcuts.

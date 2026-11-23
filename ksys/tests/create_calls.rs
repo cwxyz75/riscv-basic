@@ -73,6 +73,7 @@ fn blank(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> ksys::Process 
         stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
+        libsys: Default::default(),
     }
 }
 

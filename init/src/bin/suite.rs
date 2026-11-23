@@ -2069,6 +2069,127 @@ fn programs_are_placed_at_random() -> Outcome {
     Ok(())
 }
 
+/// AB7: the system library is mapped into every process at a place of its own, text read-only and executable and a read-only data page after it; the first thread
+/// has its base in `a2`; the data page holds what the kernel put there; and `clock_get` is computed in user mode, with no trap.
+fn the_system_library_is_in_every_process() -> Outcome {
+    // this process: the library was found, its page is filled
+    let base = rt::library::base();
+    ensure!(base != 0, "the runtime found the library");
+    let page = rt::library::page().ok_or_else(|| detail("read the data page"))?;
+    ensure_eq!(page.abi_version, libsys::page::ABI, "the ABI version");
+    ensure_eq!(page.page_size, 4096, "the page size");
+    ensure!(
+        page.time_mult != 0 && page.time_shift == 32,
+        "the clock's constants"
+    );
+    ensure!(page.harts_online >= 1, "harts online");
+    ensure!(
+        page.time_base <= sys::debug_stat(6),
+        "the clock's zero is not later than now"
+    );
+    // its mappings: the text (read, execute) at the base, and the data page (read only) behind it
+    let (text_start, text_end) = rt::library::text();
+    ensure_eq!(text_start, base, "the text starts at the base");
+    let me = ok(sys::process_self(), "process_self")?.a1 as u64;
+    let (mut text, mut data) = (None, None);
+    let mut at = 0u64;
+    for _ in 0..4096 {
+        let mut rec = [0u64; 6];
+        let next = ok(sys::process_map_info(me, at, rec.as_mut_ptr()), "map_info")?.a1 as u64;
+        if rec[0] == base as u64 {
+            text = Some(rec);
+        } else if rec[0] > base as u64 && rec[0] < base as u64 + 0x10000 && rec[1] == 4096 {
+            data = Some(rec);
+        }
+        if next == 0 {
+            break;
+        }
+        at = next;
+    }
+    let (text, data) = (
+        text.ok_or_else(|| detail("no text mapping at the base"))?,
+        data.ok_or_else(|| detail("no data page mapping"))?,
+    );
+    ensure!(
+        text[2] & 0b101 == 0b101 && text[2] & 0b010 == 0,
+        "the text is read and execute, not write: {:#b}",
+        text[2]
+    );
+    ensure!(
+        text[1] >= (text_end - text_start) as u64,
+        "the mapping covers the code"
+    );
+    ensure_eq!(data[2] & 0b111, 0b001, "the data page is read only");
+    // two processes: different bases when the kernel randomises, the same under aslr=off; every child's first thread was given its own base
+    let off = sys::debug_stat(128) == 1;
+    let mut bases = Vec::new();
+    for _ in 0..10 {
+        let (p, m) = launch(8)?;
+        let mut at = 0u64;
+        let mut small = (0u64, u64::MAX);
+        for _ in 0..4096 {
+            let mut rec = [0u64; 6];
+            let next = ok(
+                sys::process_map_info(p, at, rec.as_mut_ptr()),
+                "child map_info",
+            )?
+            .a1 as u64;
+            // (the library's text: the smallest executable mapping)
+            if rec[2] & 0b100 != 0 && rec[1] < small.1 {
+                small = (rec[0], rec[1]);
+            }
+            if next == 0 {
+                break;
+            }
+            at = next;
+        }
+        ensure!(small.0 != 0, "the child has the library");
+        bases.push(small.0);
+        wait_ended(p, 500)?;
+        sys::handle_close(p);
+        sys::handle_close(m);
+    }
+    bases.sort_unstable();
+    bases.dedup();
+    if off {
+        ensure_eq!(bases.len(), 1, "aslr=off: one place");
+    } else if sys::debug_stat(108) == 1 {
+        ensure!(
+            bases.len() >= 8,
+            "ten children had only {} distinct library places",
+            bases.len()
+        );
+    }
+    // `clock_get` through the library never enters the kernel; the same call through the raw entry does (the control)
+    let before = sys::debug_stat(131);
+    for _ in 0..1000 {
+        core::hint::black_box(sys::clock_get());
+    }
+    ensure_eq!(
+        sys::debug_stat(131),
+        before,
+        "1000 clock_get calls entered the kernel"
+    );
+    for _ in 0..10 {
+        core::hint::black_box(rt::library::raw(rt::abi::syscall::CLOCK_GET, [0; 6]));
+    }
+    ensure_eq!(
+        sys::debug_stat(131),
+        before + 10,
+        "the control: ten raw calls entered it ten times"
+    );
+    // and the two clocks agree
+    let (a, b) = (
+        sys::clock_ns(),
+        rt::library::raw(rt::abi::syscall::CLOCK_GET, [0; 6]).a1 as u64,
+    );
+    ensure!(
+        b >= a && b - a < 50_000_000,
+        "the user-mode clock ({a}) and the kernel's ({b}) agree"
+    );
+    Ok(())
+}
+
 fn child_exit_code_and_terminated_signal() -> Outcome {
     let (p, mine) = launch(8)?;
     wait_ended(p, 500)?;
@@ -5595,9 +5716,10 @@ fn map_child_stack(p: u64, v: u64) -> Result<u64, Detail> {
 }
 
 /// The entry point of the program image inside child `p` (HD2: the image is a static-PIE, so the link-time entry is an offset from the base the kernel chose;
-/// the image's text is its executable mapping).
+/// the image's text is its larger executable mapping).
 fn child_entry(p: u64) -> Result<u64, Detail> {
     let mut at = 0u64;
+    let mut best = (0u64, 0u64);
     for _ in 0..64 {
         let mut rec = [0u64; 6];
         let next = ok(
@@ -5605,16 +5727,19 @@ fn child_entry(p: u64) -> Result<u64, Detail> {
             "the child's mappings",
         )?
         .a1 as u64;
-        if rec[2] & 0b100 != 0 {
-            // (the image's only executable mapping is its text, which starts at the base)
-            return Ok(rec[0] + link_entry()?);
+        // (AB7: a started child has the system library's text as well, a few pages: the image's text is the larger executable mapping)
+        if rec[2] & 0b100 != 0 && rec[1] > best.1 {
+            best = (rec[0], rec[1]);
         }
         if next == 0 {
             break;
         }
         at = next;
     }
-    Err(detail("the child has no executable mapping"))
+    if best.1 == 0 {
+        return Err(detail("the child has no executable mapping"));
+    }
+    Ok(best.0 + link_entry()?)
 }
 
 fn link_entry() -> Result<u64, Detail> {
@@ -13834,15 +13959,15 @@ fn proc_create_in(job: u64) -> Result<u64, Detail> {
 
 fn job_memory_limits_stop_a_hog_and_are_credited_back() -> Outcome {
     let root = root_job()?;
-    // the child's own image and stack count against its job too: 64 pages leave it room for
+    // the child's own image, its stack and the page tables of the system library (AB7) count against its job too: 80 pages leave it room for
     // some of its own, but not for a hog
-    let j = job(root, u64::MAX, u64::MAX, 64)?;
+    let j = job(root, u64::MAX, u64::MAX, 80)?;
     let (p, _mine) = launch_image_in(IMAGE.load(Ordering::Relaxed), 30, j)?;
     wait_ended(p, 3000)?;
     let got = sys::process_info(p).a1 as i64;
     ensure!(
-        (1..64).contains(&got),
-        "the hog got {got} pages of a 64-page job (and was told no)"
+        (1..80).contains(&got),
+        "the hog got {got} pages of an 80-page job (and was told no)"
     );
     // all of it is given back when the child is gone
     job_use_settles(j, 2, 0, 1000)?;
@@ -15383,6 +15508,10 @@ pub fn app_main() -> i32 {
         (
             "programs_are_placed_at_random",
             programs_are_placed_at_random,
+        ),
+        (
+            "the_system_library_is_in_every_process",
+            the_system_library_is_in_every_process,
         ),
         (
             "debug_calls_need_a_debug_resource",

@@ -96,6 +96,7 @@ pub fn new_start(
             rr: false,
             spawned: false,
             suspended: false,
+            a2: 0,
         },
     );
     token
@@ -295,12 +296,15 @@ pub fn thread_spawn<M: PhysMem>(
         top = region + stack_len;
     }
     procs.get_mut(&tpid).expect("target exists").threads_alive += 1;
+    // (AB7: every thread of a process starts with the system library's base in `a2`, so that code that starts at the program's entry finds it)
+    let lib_base = procs.get(&tpid).map_or(0, |p| p.libsys.base);
     let token = new_start(us, tpid, entry, top, arg, made.map(|(_, o)| o));
     let st = us.starts.get_mut(&token).expect("just registered");
     st.tp = tp;
     st.stack = stack;
     st.rr = flags & sp::ROUND_ROBIN != 0;
     st.spawned = true;
+    st.a2 = lib_base;
     let suspended = flags & sp::SUSPENDED != 0;
     st.suspended = suspended;
     if let (true, Some((_, o))) = (suspended, made) {
@@ -314,7 +318,9 @@ pub fn thread_spawn<M: PhysMem>(
         pid: tpid,
         obj: made.map(|(_, o)| o),
         image: if suspended {
-            image_room.extend_from_slice(&initial_general(entry, top, arg, tp, 0));
+            let mut regs = initial_general(entry, top, arg, tp, 0);
+            regs[11] = lib_base;
+            image_room.extend_from_slice(&regs);
             Some(image_room.into_boxed_slice())
         } else {
             None
@@ -330,6 +336,7 @@ pub fn thread_spawn<M: PhysMem>(
 pub fn process_start(
     us: &mut UserState,
     jobs: &mut Jobs,
+    map: &mut dyn crate::StartMap,
     me: u64,
     a: [u64; 6],
 ) -> Result<(usize, u8), Status> {
@@ -389,6 +396,32 @@ pub fn process_start(
         credit_thread(jobs, tjob);
         return Err(e);
     }
+    // AB7: the system library goes into the address space now, while an error can still undo it (the charge for its page tables as the mappings of
+    // `process_map` are charged: its span's worth, recorded like theirs).
+    let (lib, span) = {
+        let t = us.procs.get_mut(&tpid).expect("target exists");
+        match map.map(t.aspace.held_mut(), jobs) {
+            Ok(x) => x,
+            Err(e) => {
+                credit_thread(jobs, tjob);
+                return Err(e);
+            }
+        }
+    };
+    // (as `process_map`'s estimate: a leaf table per 512 pages and four more; the span is a few pages)
+    let tables = if span == 0 {
+        0
+    } else {
+        (span / 4096 / 512).saturating_add(4)
+    };
+    if tables > 0 {
+        if let Err(x) = jobs.charge(tjob, Resource::Pages, tables) {
+            let t = us.procs.get_mut(&tpid).expect("target exists");
+            map.unmap(t.aspace.held_mut(), jobs, lib, span);
+            credit_thread(jobs, tjob);
+            return Err(crate::job_status(x));
+        }
+    }
     // Commit: the channel end moves into the new process as its handle 1.
     let first_gen = us.first_handle_gen;
     let UserState { procs, objs, .. } = us;
@@ -396,6 +429,9 @@ pub fn process_start(
     let moved = match caller.handles.remove_for_transfer(objs, bh) {
         Ok(m) => m,
         Err(e) => {
+            let t = procs.get_mut(&tpid).expect("target exists");
+            map.unmap(t.aspace.held_mut(), jobs, lib, span);
+            jobs.credit(tjob, Resource::Pages, tables);
             credit_thread(jobs, tjob);
             return Err(e);
         }
@@ -415,11 +451,22 @@ pub fn process_start(
     target.entry = entry;
     target.arg = arg;
     target.start_sp = sp;
+    target.libsys = lib;
+    if tables > 0 {
+        target.table_charge.insert(lib.base, tables);
+        target
+            .charge_end
+            .insert(lib.base, lib.base.saturating_add(span));
+    }
     target.state = crate::ProcState::Running;
     target.threads_alive = 1;
     // the first thread of a process starts at the default priority, clamped to its job's maximum
     let prio = clamp_prio(jobs, tjob, 10);
-    Ok((new_start(us, tpid, entry, sp, arg, None), prio))
+    let token = new_start(us, tpid, entry, sp, arg, None);
+    if let Some(t) = us.starts.get_mut(&token) {
+        t.a2 = lib.base;
+    }
+    Ok((token, prio))
 }
 
 // ---- EX1: thread_suspend, thread_resume, thread state ----

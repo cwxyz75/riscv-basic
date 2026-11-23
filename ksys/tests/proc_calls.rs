@@ -93,6 +93,7 @@ fn process(mm: &mut Mm<FakeMem>, kernel: &PageTable, job: JobId) -> Process {
         stacks: BTreeMap::new(),
         stack_hint: 0,
         privileged: false,
+        libsys: Default::default(),
     }
 }
 

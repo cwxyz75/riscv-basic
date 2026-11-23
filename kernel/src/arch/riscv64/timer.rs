@@ -43,6 +43,16 @@ pub fn now_ns() -> u64 {
     conversion().cycles_to_ns(c)
 }
 
+/// What user mode needs to compute the clock itself (the system library's data page, AB7): the multiplier and shift of `cycles_to_ns`, and the counter's
+/// value at the clock's zero.
+pub fn clock_params() -> (u64, u64, u64) {
+    (
+        MULT.load(Ordering::Relaxed),
+        u64::from(kcore::timebase::SHIFT),
+        BOOT_COUNT.load(Ordering::Relaxed),
+    )
+}
+
 pub fn now() -> u64 {
     let t: u64;
     // SAFETY: reads the `time` CSR (user-readable counter).

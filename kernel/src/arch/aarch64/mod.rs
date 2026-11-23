@@ -159,6 +159,9 @@ pub mod timer {
     pub fn now_ns() -> u64 {
         unimplemented!()
     }
+    pub fn clock_params() -> (u64, u64, u64) {
+        unimplemented!()
+    }
     pub fn now() -> u64 {
         unimplemented!()
     }

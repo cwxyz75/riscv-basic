@@ -217,7 +217,7 @@ Phase 11 (`epic/phase-11`, merged into `main` on its epic gate as a **partial** 
 
 ### Phase 12: the boundary and the freeze
 
-- [ ] **AB7** the system library
+- [ ] **AB7** the system library: `libsys` (generated from the call table, built and checked by the kernel's build script), the kernel maps it into every process at a random place and passes the base in `a2`, `rt` calls through it, `clock_get` is computed in user mode, `check_ecall.py`; built on a feature branch of phase 12, open for its epic's smoke and review (tidy items T236, T237)
 - [ ] **AB8** entry enforcement, shuffled numbers
 - [ ] **AB9** the conformance program, `SYSCALLS.md` rewritten, the versioning rule
 - [ ] **KT14** the audit of every `unsafe` block

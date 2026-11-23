@@ -220,7 +220,13 @@ pub(super) fn process_start(a: [u64; 6]) -> Reply {
     let (started, first_prio) = with_state(|s| -> Result<(usize, u8), ReplyErr> {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let _as = AsLocks::all(s);
-        ksys::process_start(s, kmem::jobs().jobs, me, a).map_err(|e| (e, None, None))
+        let mut k = kmem::get();
+        super::syslib::ensure(&mut k);
+        let mut lib = super::syslib::KernelLib {
+            mm: &mut *k.mm,
+            vmos: &mut *k.vmos,
+        };
+        ksys::process_start(s, k.jobs, &mut lib, me, a).map_err(|e| (e, None, None))
     })?;
     // The new thread (registered by itself once it runs). Spawned after the state borrow is
     // gone: spawning can switch to it at once.

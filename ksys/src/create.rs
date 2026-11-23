@@ -122,6 +122,7 @@ pub fn process_create<M: PhysMem>(
             stacks: BTreeMap::new(),
             stack_hint,
             privileged: false,
+            libsys: Default::default(),
         }),
     );
     Ok(handle.0)

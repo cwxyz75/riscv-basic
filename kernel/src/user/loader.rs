@@ -29,7 +29,8 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         return Err(LoadError::KernelHalfChanged);
     }
     // (the caller took the big kernel lock: the closures below run under it, and must not take it again after the memory locks `k` holds)
-    let k = kmem::get();
+    let mut k = kmem::get();
+    super::syslib::ensure(&mut k);
     let table =
         PageTable::new_with_kernel_half(k.mm, &kmem::kernel_table()).ok_or(LoadError::NoMemory)?;
     let mut aspace = AddressSpace::new(table);
@@ -39,6 +40,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
     // goes where it was linked, its stack below `STACK_TOP`.
     let mut base = 0u64;
     let mut stack_top = STACK_TOP;
+    let mut lib = ksys::LibRange::default();
     let built = (|| -> Result<(), LoadError> {
         let mut random = |n: u64| crate::entropy::placement_below(n);
         if parsed.pie {
@@ -84,6 +86,10 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
                 Perms::RW.user(),
             )
             .map_err(|_| LoadError::NoMemory)?;
+        // AB7: the system library, at a random place of its own
+        let (range, _) = super::syslib::map_into(k.mm, k.vmos, k.jobs, &mut aspace)
+            .map_err(|_| LoadError::NoMemory)?;
+        lib = range;
         Ok(())
     })();
     let (pid, tag, first_gen) = (|| {
@@ -131,6 +137,7 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
         stacks: BTreeMap::new(),
         stack_hint: super::calls::random_stack_hint(),
         privileged: true,
+        libsys: lib,
     };
     // Every process starts with one handle, value 1: the bootstrap channel (SYSCALLS.md).
     let mut process = process;
@@ -180,7 +187,11 @@ pub(super) fn start_locked(image: &[u8], arg: u64) -> Result<(u64, Tid), LoadErr
             let _ = jobs.charge(JobId::ROOT, Resource::Processes, 1);
             let _ = charge_thread(jobs, JobId::ROOT);
             s.procs.insert(pid, Box::new(process));
-            new_start(s, pid, entry, stack_top, arg, None)
+            let token = new_start(s, pid, entry, stack_top, arg, None);
+            if let Some(t) = s.starts.get_mut(&token) {
+                t.a2 = lib.base;
+            }
+            token
         }
     })();
     // (the thread's stack comes from the same locks)

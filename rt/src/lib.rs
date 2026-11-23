@@ -100,22 +100,31 @@ impl Ret {
     }
 }
 
-/// A raw syscall (SYSCALLS.md, "ABI").
+/// A raw syscall (SYSCALLS.md, "ABI"). Every call goes through the system library (AB7): the kernel maps `libsys.so` into the process and passes its base
+/// in `a2` of the first thread; `_start` reads the library's `.dynsym` into a table of entry points (`library::init`), and this calls the wrapper the table
+/// names for `number` (or the library's raw entry for a number it has no wrapper for). The program has no `ecall` of its own.
 pub fn syscall(number: usize, args: [usize; 6]) -> Ret {
+    call(library::entry(number), number, args)
+}
+
+/// Call the library's entry point `f` (a wrapper, or `sys_raw`, which takes `number` in `a6`).
+fn call(f: usize, number: usize, args: [usize; 6]) -> Ret {
     let (status, a1, a2): (usize, usize, usize);
-    // SAFETY: `ecall` traps to the kernel, which preserves every register except the
-    // results in a0 to a2 (SYSCALLS.md). No memory is touched except through pointers the
-    // caller passed, which the kernel validates.
+    // SAFETY: `f` is the address of a wrapper in the library the kernel mapped (read-only, executable); it issues the call and returns, touching only `a7` and
+    // the result registers (SYSCALLS.md: the kernel preserves every other register), which `clobber_abi` and the outputs declare. No memory is touched
+    // except through pointers the caller passed, which the kernel validates. (`a6` carries the number for the raw entry, which ignores `a7`.)
     unsafe {
         asm!(
-            "ecall",
-            in("a7") number,
+            "jalr {f}",
+            f = in(reg) f,
             inlateout("a0") args[0] => status,
             inlateout("a1") args[1] => a1,
             inlateout("a2") args[2] => a2,
             in("a3") args[3],
             in("a4") args[4],
             in("a5") args[5],
+            in("a6") number,
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -123,6 +132,109 @@ pub fn syscall(number: usize, args: [usize; 6]) -> Ret {
         status: status as i32,
         a1,
         a2,
+    }
+}
+
+/// The system library as the program sees it (AB7).
+pub mod library {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The address of the wrapper of each call, by number; 0 where the library has none.
+    #[allow(clippy::declare_interior_mutable_const)] // (the array's initialiser: each element is its own atomic)
+    static ENTRIES: [AtomicUsize; abi::syscall::LIMIT] = {
+        const NONE: AtomicUsize = AtomicUsize::new(0);
+        [NONE; abi::syscall::LIMIT]
+    };
+    /// `sys_raw`: the number in `a6`.
+    static RAW: AtomicUsize = AtomicUsize::new(0);
+    /// The base the kernel mapped the library at, and the data page's address.
+    static BASE: AtomicUsize = AtomicUsize::new(0);
+    static DATA: AtomicUsize = AtomicUsize::new(0);
+
+    /// Read the library's symbols from its mapping at `base` (what the kernel passed in `a2`). Returns whether it is the library; a process that was
+    /// started without one cannot make a call (nothing here may call `syscall` before this has succeeded).
+    pub fn init(base: usize) -> bool {
+        if base == 0 {
+            return false;
+        }
+        // SAFETY: the kernel mapped the library's first segment (headers, symbols and code, read-only) at `base`, at least a page of it, and nothing unmaps it.
+        let head = unsafe { core::slice::from_raw_parts(base as *const u8, 4096) };
+        let Some(len) = libsys::image::image_len(head) else {
+            return false;
+        };
+        // SAFETY: as above, for the segment's whole length (`image_len` read it from the headers the kernel mapped).
+        let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+        let Ok(img) = libsys::Image::new(bytes) else {
+            return false;
+        };
+        for sym in img.symbols() {
+            let at = base.wrapping_add(sym.value as usize);
+            if sym.name == "sys_raw" {
+                RAW.store(at, Ordering::Relaxed);
+            } else if sym.name == "libsys_data" {
+                DATA.store(at, Ordering::Relaxed);
+            } else if sym.name.starts_with("sys_") {
+                if let Some(&(_, n)) = abi::syscall::TABLE
+                    .iter()
+                    .find(|&&(c, _)| libsys::is_wrapper_of(sym.name, c))
+                {
+                    ENTRIES[n].store(at, Ordering::Relaxed);
+                }
+            }
+        }
+        BASE.store(base, Ordering::Relaxed);
+        RAW.load(Ordering::Relaxed) != 0
+    }
+
+    /// Where to call for `number`: its wrapper, else the raw entry. Without a library there is nothing to call: the program stops (`unimp` traps).
+    pub(crate) fn entry(number: usize) -> usize {
+        let f = ENTRIES.get(number).map_or(0, |e| e.load(Ordering::Relaxed));
+        let f = if f != 0 {
+            f
+        } else {
+            RAW.load(Ordering::Relaxed)
+        };
+        if f == 0 {
+            // SAFETY: `unimp` raises an illegal-instruction exception: the process dies with it, by design (there is no way to call the kernel).
+            unsafe { core::arch::asm!("unimp", options(noreturn)) }
+        }
+        f
+    }
+
+    /// A call through the library's raw entry, which takes the number as an argument: for a number the library has no wrapper for (the suite's calls with
+    /// numbers that are not calls) and for comparing a call that has a wrapper that does not enter the kernel (`clock_get`) with the call itself.
+    pub fn raw(number: usize, args: [usize; 6]) -> crate::Ret {
+        crate::call(RAW.load(Ordering::Relaxed), number, args)
+    }
+
+    /// The base the library is mapped at (0 before `init`).
+    pub fn base() -> usize {
+        BASE.load(Ordering::Relaxed)
+    }
+
+    /// The data page the kernel fills, as the library's `libsys_data` symbol places it.
+    pub fn page() -> Option<libsys::page::Page> {
+        let at = DATA.load(Ordering::Relaxed);
+        if at == 0 {
+            return None;
+        }
+        let mut raw = [0u8; libsys::page::WORDS * 8];
+        for (i, b) in raw.iter_mut().enumerate() {
+            // SAFETY: the data page is mapped read-only next to the library, `WORDS * 8` bytes of it are inside the page.
+            *b = unsafe { core::ptr::read_volatile((at + i) as *const u8) };
+        }
+        libsys::page::Page::from_bytes(&raw)
+    }
+
+    /// The text range of the library: from its base to the end of its code (the symbols and code are one segment).
+    pub fn text() -> (usize, usize) {
+        let base = BASE.load(Ordering::Relaxed);
+        if base == 0 {
+            return (0, 0);
+        }
+        // SAFETY: as in `init`.
+        let head = unsafe { core::slice::from_raw_parts(base as *const u8, 4096) };
+        (base, base + libsys::image::image_len(head).unwrap_or(0))
     }
 }
 
@@ -1011,7 +1123,9 @@ _start:
 /// The first Rust code of every program: call the program's `app_main` and exit with
 /// its result. (The kernel starts a process with `a0` = its start argument.)
 #[no_mangle]
-extern "C" fn rt_start(arg: usize) -> ! {
+extern "C" fn rt_start(arg: usize, _bootstrap: usize, library_base: usize) -> ! {
+    // (AB7: the system library first: no call can be made before its entry points are known)
+    let _ = library::init(library_base);
     START_ARG.store(arg, core::sync::atomic::Ordering::Relaxed);
     // (HD4: the process the kernel started takes its debug resource; any other gets ACCESS_DENIED here and may be given one in its startup message)
     let _ = debug::init_privileged();

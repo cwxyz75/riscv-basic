@@ -70,6 +70,7 @@ fn world() -> W {
         stacks: Default::default(),
         stack_hint: 0,
         privileged: false,
+        libsys: Default::default(),
     };
     let mut us = UserState::new();
     us.procs.insert(1, Box::new(p));

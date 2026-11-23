@@ -347,6 +347,11 @@ pub fn init() {
     // SAFETY: writing stvec only changes where traps go; `trap_entry` is 4-byte
     // aligned code in the kernel text, valid at its upper-half address.
     unsafe { core::arch::asm!("csrw stvec, {}", "csrw sscratch, zero", in(reg) entry) };
+    // AB7: user mode reads the `time` counter (bit 1): the system library computes `clock_get` from it, with no trap.
+    // SAFETY: `scounteren` only selects which counters user mode may read; no memory is touched.
+    unsafe {
+        core::arch::asm!("csrs scounteren, {}", in(reg) 2usize);
+    }
     // KT5: test builds let user mode read the retired-instruction counter (`rdinstret`, bit 2 of `scounteren`) so the suite can count the
     // instructions of a syscall path. The release build leaves it closed: a program has no use for it and it is a timing channel.
     #[cfg(any(not(feature = "release"), feature = "release-suite"))]
@@ -440,6 +445,7 @@ fn lock_free_syscall(frame: &mut TrapFrame) -> bool {
     }
     frame.sepc += 4; // past the ecall
     if n == nr::CLOCK_GET {
+        crate::user::note_clock_trap();
         frame.set_return(0, Some(crate::thread::now_ns()), None);
     } else if n == nr::FUTEX_WAIT {
         // L19, T213: the whole call with no big lock, from the translation of the word to the wake; false: nothing was done (or the wait ended
