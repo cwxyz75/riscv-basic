@@ -769,6 +769,10 @@ fn protect_while_siblings_write() -> Result<(), String> {
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn teardown_with_threads_on_other_harts() -> Result<(), String> {
     use crate::user;
+    // (AB7: the first process of a boot makes the system library's shared VMOs, which stay: one round first, so that they are not counted as a leak)
+    let (pid, tid) = user::start(user::CRASH_ELF, 41).map_err(|e| format!("{e:?}"))?;
+    user::end_process(pid, -9);
+    let _ = user::finish(pid, tid);
     let frames_before = crate::irq::without(crate::kmem::free_frames_accounted);
     for round in 0..120 {
         let (pid, tid) = user::start(user::CRASH_ELF, 41).map_err(|e| format!("{e:?}"))?;
