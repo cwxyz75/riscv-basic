@@ -201,8 +201,16 @@ pub(super) fn process_create(a: [u64; 6]) -> Reply {
         let me = caller_pid(s).map_err(|e| (e, None, None))?;
         let kernel_half_ok = kmem::kernel_half_unchanged(); // (before the memory locks: it takes them itself)
         let k = kmem::get();
-        let handle = ksys::process_create(s, k.mm, k.jobs, k.aspace.table(), kernel_half_ok, me, a)
-            .map_err(|e| (e, None, None))?;
+        let handle = ksys::process_create(
+            s,
+            k.mm,
+            k.jobs,
+            &kmem::kernel_table(),
+            kernel_half_ok,
+            me,
+            a,
+        )
+        .map_err(|e| (e, None, None))?;
         Ok((Some(handle), None))
     })
 }

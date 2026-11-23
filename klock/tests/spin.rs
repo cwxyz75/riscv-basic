@@ -98,7 +98,7 @@ fn try_lock_takes_a_free_lock_and_is_free_says_so() {
 #[test]
 fn the_checker_hears_every_take_and_release() {
     LOG.with(|l| l.borrow_mut().clear());
-    let a: Spin<(), Host> = Spin::new(Class::Obj, 0, ());
+    let a: Spin<(), Host> = Spin::new(Class::Procs, 0, ());
     let b: Spin<(), Host> = Spin::new(Class::Rq, 3, ());
     {
         let _ga = a.lock();
@@ -108,10 +108,10 @@ fn the_checker_hears_every_take_and_release() {
     assert_eq!(
         log,
         vec![
-            ("take", Class::Obj, 0),
+            ("take", Class::Procs, 0),
             ("take", Class::Rq, 3),
             ("drop", Class::Rq, 3),
-            ("drop", Class::Obj, 0)
+            ("drop", Class::Procs, 0)
         ]
     );
 }

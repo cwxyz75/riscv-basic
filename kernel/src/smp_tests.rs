@@ -347,25 +347,25 @@ fn lock_order_violations_are_detected() -> Result<(), String> {
     // the order is BKL, then HEAP, then UART: taking an earlier class while holding a later one
     // is flagged, taking a later one while holding an earlier one is not
     for (held, probe, bad) in [
-        (Class::Heap, Class::Legacy, true),
-        (Class::Uart, Class::Legacy, true),
+        (Class::Heap, Class::Obj, true),
+        (Class::Uart, Class::Obj, true),
         (Class::Uart, Class::Heap, true),
-        (Class::Legacy, Class::Heap, false),
-        (Class::Legacy, Class::Uart, false),
+        (Class::Obj, Class::Heap, false),
+        (Class::Obj, Class::Uart, false),
         (Class::Heap, Class::Uart, false),
         // the planned classes, through the same checker (the pure table is in `klock/tests/order.rs`)
         (Class::Heap, Class::Frame, true),
         (Class::Frame, Class::Heap, false),
         // the memory locks (L16 part b): none may be held when the big lock is taken, nor taken in the wrong order
-        (Class::Vmo, Class::Legacy, true),
-        (Class::Jobs, Class::Legacy, true),
-        (Class::Frame, Class::Legacy, true),
+        (Class::Vmo, Class::Obj, true),
+        (Class::Jobs, Class::Obj, true),
+        (Class::Frame, Class::Obj, true),
         (Class::Jobs, Class::Vmo, true),
         (Class::Frame, Class::Jobs, true),
         (Class::Vmo, Class::Jobs, false),
         (Class::Jobs, Class::Frame, false),
-        (Class::Obj, Class::Futex, false),
-        (Class::Futex, Class::Obj, true),
+        (Class::Procs, Class::Futex, false),
+        (Class::Futex, Class::Procs, true),
     ] {
         if order_check(held, probe) != bad {
             return Err(format!(

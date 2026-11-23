@@ -688,7 +688,7 @@ fn trap_body(frame: &mut TrapFrame) {
             format_args!("kernel page fault with a memory lock held"),
         );
     }
-    let k = kmem::get();
+    let k = kmem::get_as();
     match k
         .aspace
         .handle_fault_mapped(k.mm, k.vmos, k.jobs, frame.stval, access)

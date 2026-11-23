@@ -196,7 +196,7 @@ ATOMICS = {
     "kernel/src/user/trap.rs": (6, "diagnostic counters, the deferred-reap flag and the attention epoch (L12b: kill and stop bump it, a user return reads it) (the attention epoch); the pointer to the allocator's published generation (L19), set once at boot"),
     "kernel/src/arch/riscv64/trap.rs": (10, "the expected-fault test hook and its log words"),
     "kernel/src/heap.rs": (14, "heap statistics, the growth guard, and the frame pool's readiness, size mirror, starvation flag and the refused-free counter"),
-    "kernel/src/kmem.rs": (4, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23)"),
+    "kernel/src/kmem.rs": (6, "the active-table bookkeeping counters, and the PI futex's lock word read and compare-and-swapped through the direct map (L23); the kernel page table's root, set once at boot (T224)"),
     "kernel/src/user/waits.rs": (2, "the flag that says a PI futex has had a waiter, so a thread's exit looks for owned PI futexes only then (L23)"),
     "kernel/src/dtb.rs": (5, "the device tree's address and length, set once at boot (PL4a), and the boot-argument and device-tree flags"),
     "kernel/src/arch/riscv64/fp.rs": (2, "the vector register length, read once on the boot hart (PL2)"),

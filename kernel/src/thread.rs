@@ -368,11 +368,11 @@ fn idle_main(_: usize) {
         // (negative control `fault-skip-poke`: the idle hart's only wake is a poke, which that kernel drops; a tick must not rescue it)
         if !cfg!(feature = "fault-skip-poke") && sched().idle_has_work(hart()) {
             irq::restore(was);
-            irq::without(reschedule_this_hart);
+            irq::off(reschedule_this_hart);
             continue;
         }
         if crate::heap::needs_service() {
-            irq::without(crate::heap::service); // an idle hart is a safe point too
+            irq::off(crate::heap::service); // an idle hart is a safe point too
         }
         let ev = program_timer(); // (an idle hart with nothing queued and no sleeper arms nothing: no timer interrupt at all)
         let idle_from = now_ns();
@@ -464,7 +464,7 @@ fn spawn_with_affinity(
     affinity: Option<usize>,
 ) -> Tid {
     let thread = new_kthread(name, entry, arg, detached);
-    irq::without(|| {
+    irq::off(|| {
         let mut k = kernel();
         let tid = sched()
             .spawn_on(hart(), SchedAttr { prio, rr: false }, affinity)
@@ -856,7 +856,7 @@ pub fn current() -> Tid {
 /// Give up the rest of the time slice.
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn yield_now() {
-    irq::without(|| {
+    irq::off(|| {
         sched().yield_on(hart()).expect("running thread");
         reschedule();
     });
@@ -886,14 +886,14 @@ pub fn yield_fast() -> bool {
 /// wait with `block` (which returns at once if a wake arrived meanwhile).
 #[allow(clippy::expect_used)] // INVARIANT: the caller is a running thread, which the scheduler always has on its hart
 pub fn prepare_block() {
-    irq::without(|| {
+    irq::off(|| {
         sched().prepare_block_on(hart()).expect("running thread");
     });
 }
 
 /// The park word of a thread (a test hook).
 pub fn park_state(tid: Tid) -> Option<kcore::park::ParkState> {
-    irq::without(|| sched().park_state(tid))
+    irq::off(|| sched().park_state(tid))
 }
 
 /// Block until woken (or return at once if a wake already arrived after `prepare_block`).
@@ -904,7 +904,7 @@ pub fn block() {
     // (MM8) a page the call made visible or replaced may be shown stale through other mappings until the call ends; a thread that sleeps
     // inside it would leave them so for as long as it sleeps
     crate::user::cow_sync();
-    irq::without(|| {
+    irq::off(|| {
         if sched().block_on(hart()).expect("running thread") {
             reschedule();
         }
@@ -914,7 +914,7 @@ pub fn block() {
 /// Wake a thread: a blocked one runs again; one that has prepared to wait will not block; otherwise nothing happens
 /// (a wake is never remembered).
 pub fn wake(tid: Tid) {
-    irq::without(|| {
+    irq::off(|| {
         let _ = sched().wake_on(hart(), tid);
         note_resched();
     });
@@ -925,7 +925,7 @@ pub fn wake(tid: Tid) {
 pub fn sleep_ns(ns: u64) {
     let deadline = now_ns().saturating_add(ns);
     loop {
-        let done = irq::without(|| {
+        let done = irq::off(|| {
             if now_ns() >= deadline {
                 return true;
             }
@@ -950,7 +950,7 @@ pub fn sleep_ticks(n: u64) {
     // A loop: a stale entry on a wait queue can wake a sleeper early, and the sleep must not
     // end before its deadline.
     loop {
-        let done = irq::without(|| {
+        let done = irq::off(|| {
             if now_ns() >= deadline {
                 return true;
             }
@@ -1003,7 +1003,7 @@ pub static DONATIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// A `channel_call` has finished (L24): a thread it woke for a direct hand-off that is still queued on this hart (the caller did not block after all) is
 /// offered to the other harts, which the hand-off had left unmarked.
 pub fn push_owed() {
-    irq::without(|| {
+    irq::off(|| {
         sched().push_owed_on(hart());
         note_resched();
     });
@@ -1012,7 +1012,7 @@ pub fn push_owed() {
 /// `from`, blocked in a `channel_call`, lends its effective priority to `to`, the thread that read its request (L22). Big lock held (the graph's
 /// lock is taken and the priorities applied). A refused donation leaves the call as it was and is counted.
 pub fn pi_donate(from: Tid, to: Tid) {
-    irq::without(|| {
+    irq::off(|| {
         pi_op(|d| match d.donate(from, to) {
             Ok(ch) => ((), ch.as_slice().to_vec()),
             Err(e) => {
@@ -1031,14 +1031,14 @@ pub fn pi_donate(from: Tid, to: Tid) {
 
 /// `tid`'s donation ends (its `channel_call` ended, for any reason): the priority it lent goes back. Big lock held.
 pub fn pi_revoke(tid: Tid) {
-    irq::without(|| {
+    irq::off(|| {
         pi_op(|d| ((), d.revoke(tid).as_slice().to_vec()));
     });
 }
 
 /// A user thread enters the donation graph at its base priority (when it registers, big lock held).
 pub fn pi_register(tid: Tid) {
-    irq::without(|| {
+    irq::off(|| {
         let base = sched().priority(tid).unwrap_or(1);
         let mut d = PI.lock();
         if d.eff(tid).is_none() {
@@ -1049,20 +1049,20 @@ pub fn pi_register(tid: Tid) {
 
 /// A user thread leaves the graph (it has exited): the donations it made and received lapse. Big lock held.
 pub fn pi_gone(tid: Tid) {
-    irq::without(|| {
+    irq::off(|| {
         pi_op(|d| ((), d.remove_thread(tid).as_slice().to_vec()));
     });
 }
 
 /// A thread's current priority (its base: nothing donates yet).
 pub fn priority_of(tid: Tid) -> Option<Prio> {
-    irq::without(|| sched().priority(tid))
+    irq::off(|| sched().priority(tid))
 }
 
 /// Set several threads' priorities in one critical section and reschedule once (a clamp must reach every thread
 /// before anything can run on the new, lower limit; review of task 8).
 pub fn set_priorities(changes: &[(Tid, Prio)]) {
-    irq::without(|| {
+    irq::off(|| {
         for &(tid, prio) in changes {
             set_priority_held(tid, prio);
         }
@@ -1071,7 +1071,7 @@ pub fn set_priorities(changes: &[(Tid, Prio)]) {
 }
 
 pub fn set_priority(tid: Tid, prio: Prio) {
-    irq::without(|| {
+    irq::off(|| {
         set_priority_held(tid, prio);
         note_resched();
     });
@@ -1095,14 +1095,14 @@ fn set_priority_held(tid: Tid, prio: Prio) {
 
 /// A thread's effective priority: its base raised by what is donated to it (the base for a thread that is not in the graph).
 pub fn effective_priority_of(tid: Tid) -> Option<Prio> {
-    irq::without(|| PI.lock().eff(tid).or_else(|| sched().priority(tid)))
+    irq::off(|| PI.lock().eff(tid).or_else(|| sched().priority(tid)))
 }
 
 /// End the calling thread. Its stack is freed by whoever `join`s it, or, if it is detached, by the hart that switches away from it
 /// (`finish_switch`); `join` of a detached thread therefore returns false.
 #[allow(clippy::expect_used, clippy::unreachable)] // INVARIANT: the caller is a running thread; an exited thread is never scheduled again
 pub fn exit() -> ! {
-    irq::without(|| {
+    irq::off(|| {
         let h = hart();
         {
             let mut k = kernel();
@@ -1144,7 +1144,7 @@ pub fn exit() -> ! {
 #[allow(clippy::expect_used)] // INVARIANT: the thread being reaped has exited (checked a few lines above) and the caller is a running thread
 pub fn join(tid: Tid) -> bool {
     loop {
-        let result = irq::without(|| {
+        let result = irq::off(|| {
             let mut k = kernel();
             if tid == running_here() {
                 return Some(false);
@@ -1186,7 +1186,7 @@ pub fn join(tid: Tid) -> bool {
 /// A wait queue, by id.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: queues.len() >= 1 after the push just above
 pub fn new_queue() -> usize {
-    irq::without(|| {
+    irq::off(|| {
         let mut k = kernel();
         k.queues.push(Waiters2::new());
         k.queues.len() - 1
@@ -1311,7 +1311,7 @@ pub fn wait_deadline_registered(
 /// blocked until the waker ran again). A thread that is not blocked is left alone (harmless to waiters that
 /// re-check).
 pub fn wake_many(tids: &[Tid]) {
-    irq::without(|| {
+    irq::off(|| {
         for &tid in tids {
             if sched().state(tid) == Some(State::Blocked) {
                 WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1338,7 +1338,7 @@ pub fn wake_many_quiet(tids: &[Tid]) {
 /// `wake_many` by a thread that is about to block (a `channel_call` that queued its request, L24): each woken thread is placed on this hart with no IPI
 /// and runs here when the caller blocks. Interrupts off, as `wake_many`; the big lock is held.
 pub fn wake_many_sync(tids: &[Tid]) {
-    irq::without(|| {
+    irq::off(|| {
         for &tid in tids {
             if sched().state(tid) == Some(State::Blocked) {
                 WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1351,7 +1351,7 @@ pub fn wake_many_sync(tids: &[Tid]) {
 
 /// Is `tid` blocked right now (a test hook)?
 pub fn is_blocked(tid: Tid) -> bool {
-    irq::without(|| sched().state(tid) == Some(State::Blocked))
+    irq::off(|| sched().state(tid) == Some(State::Blocked))
 }
 
 /// Block on queue `q` until `ready()` holds. `ready` is evaluated with interrupts
@@ -1385,7 +1385,7 @@ pub fn wait_until(q: usize, mut ready: impl FnMut() -> bool) {
 
 #[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_one(q: usize) -> bool {
-    irq::without(|| {
+    irq::off(|| {
         let mut k = kernel();
         let woke = {
             let sc = sched();
@@ -1398,7 +1398,7 @@ pub fn wake_one(q: usize) -> bool {
 
 #[allow(clippy::indexing_slicing)] // INVARIANT: q is a queue id `new_queue` returned
 pub fn wake_all(q: usize) {
-    irq::without(|| {
+    irq::off(|| {
         let mut k = kernel();
         let n = {
             let sc = sched();
@@ -1501,7 +1501,7 @@ pub fn wake_stat(which: u64) -> u64 {
 
 /// Every thread's stack guard is intact.
 pub fn stacks_intact() -> bool {
-    irq::without(|| {
+    irq::off(|| {
         kernel()
             .threads
             .values()
@@ -1519,19 +1519,19 @@ pub fn heap_free() -> usize {
 }
 
 pub fn thread_count() -> usize {
-    irq::without(|| kernel().threads.len())
+    irq::off(|| kernel().threads.len())
 }
 
 /// How many threads the scheduler core tracks (must equal `thread_count`).
 pub fn sched_thread_count() -> usize {
-    irq::without(|| sched().thread_count())
+    irq::off(|| sched().thread_count())
 }
 
 /// Test hook: damage (or repair) a thread's stack guard, to show the overflow
 /// detector sees it.
 #[allow(clippy::indexing_slicing)] // INVARIANT: a test hook: the thread's stack has at least one word
 pub fn debug_set_guard(tid: Tid, intact: bool) {
-    irq::without(|| {
+    irq::off(|| {
         if let Some(stack) = kernel()
             .threads
             .get_mut(&tid)
@@ -1555,7 +1555,7 @@ pub fn class_name() -> &'static str {
 /// The top of the calling thread's kernel stack (where a trap from user mode starts).
 #[allow(clippy::expect_used)] // INVARIANT: the running thread is in the kernel's table, with a stack unless it is the boot thread
 pub fn current_stack_top() -> u64 {
-    irq::without(|| {
+    irq::off(|| {
         let k = kernel();
         let t = k
             .threads
@@ -1574,7 +1574,7 @@ pub fn current_stack_top() -> u64 {
 /// call, or parked at the return to user mode); the caller holds the big kernel lock, which every other access to it holds too.
 #[allow(clippy::arithmetic_side_effects)] // INVARIANT: a kernel stack is far larger than the 288-byte frame
 pub fn user_frame_ptr(tid: Tid) -> Option<*mut crate::trap::TrapFrame> {
-    irq::without(|| {
+    irq::off(|| {
         let k = kernel();
         let top = (k.threads.get(&tid)?.stack.as_ref()?.top() & !15) as u64;
         Some((top - crate::trap::FRAME_BYTES) as *mut crate::trap::TrapFrame)
@@ -1624,7 +1624,7 @@ pub fn over_budget(used: usize) -> bool {
 
 /// The use of the calling thread's own stack so far (a test of the budget check reads it).
 pub fn current_stack_use() -> usize {
-    irq::without(|| {
+    irq::off(|| {
         let me = current();
         let k = kernel();
         k.threads
@@ -1700,7 +1700,7 @@ pub fn stack_budget_violation() -> Option<(alloc::string::String, Tid, usize)> {
 
 /// The scheduler's view of a thread (diagnostics for the SMP tests).
 pub fn debug_state(tid: Tid) -> alloc::string::String {
-    irq::without(|| {
+    irq::off(|| {
         let sc = sched();
         alloc::format!(
             "{:?} prio {:?} aff {:?} cur {:?} pending {:?}",
