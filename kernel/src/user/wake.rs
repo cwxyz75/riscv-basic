@@ -24,6 +24,18 @@ pub fn commit_wake() {
     commit_wake_with(false);
 }
 
+/// The object lock's commit-on-drop (W1', SCHED-SMP-SPEC 3.8, L20): called by `irq::without` at the end of every **outermost** critical section, with the
+/// lock still held: if the section touched anything a waiter can see, the wait table decides and the waiters are woken before the lock is let go. Then
+/// the trap's tail has nothing to commit and can run without the lock.
+pub fn commit_if_dirty() {
+    if !super::USER_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if state().objs.has_pending() {
+        commit_wake_with(false);
+    }
+}
+
 /// `commit_wake`, with the wakes placed on this hart as a direct hand-off when `sync` is true (a `channel_call` about to block, L24).
 fn commit_wake_with(sync: bool) {
     // (the wakes are made in the same critical section as the commit, and as one batch: every woken thread

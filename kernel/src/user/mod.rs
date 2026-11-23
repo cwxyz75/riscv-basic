@@ -86,6 +86,10 @@ impl core::ops::DerefMut for QuotaGuard {
 
 static mut USER: Option<UserState> = None;
 
+/// Set once the user state exists (`state()` made it): the commit-on-drop of `irq::without` looks at it before touching the state (L20).
+pub(crate) static USER_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[track_caller]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
 fn state() -> &'static mut UserState {
@@ -126,6 +130,7 @@ fn state() -> &'static mut UserState {
             if let Some(n) = crate::dtb::ff_value("handlegen") {
                 s.first_handle_gen = n;
             }
+            USER_READY.store(true, Ordering::Release);
             s
         })
     }

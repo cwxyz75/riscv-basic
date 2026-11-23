@@ -403,6 +403,15 @@ pub fn user_return_is_quiet() -> bool {
     crate::percpu::this().attention_seen.load(Ordering::SeqCst) == ATTENTION.load(Ordering::SeqCst)
 }
 
+/// The return to user mode of a thread that made a syscall, with **no big lock** (L20): true when nothing has been recorded that the thread must look at
+/// (the hart's attention epoch is the current one) and the thread's own record lets it install its address space on this hart without the allocator
+/// (`activate_current_quiet`: the process, the tag of the current generation, the token). False: the caller takes the full path.
+pub fn return_to_user_is_quiet() -> bool {
+    let seen = ATTENTION.load(Ordering::SeqCst);
+    crate::percpu::this().attention_seen.load(Ordering::SeqCst) == seen
+        && activate_current_quiet(seen)
+}
+
 /// A trap from user mode (called from the trap handler with interrupts off).
 pub fn user_trap(frame: &mut crate::trap::TrapFrame) {
     user_trap_inner(frame);

@@ -555,12 +555,20 @@ fn trap_handler_inner(frame: &mut TrapFrame) {
         crate::fp::trap_entry(frame);
         crate::bkl::unlock();
         trap_body(frame);
-        crate::bkl::lock();
-        crate::user::commit_wake();
-        crate::thread::preempt_point();
-        crate::user::activate_current(frame);
-        crate::heap::service();
-        crate::bkl::unlock();
+        // The tail takes the lock only when there is something to do under it: a switch a wake asked for, the heap below its mark, or a return that is
+        // not quiet (a kill, a stop or a suspend recorded, the thread's space not installed on this hart). What the call touched was committed to the
+        // waiters at the end of its own critical sections (`irq::without`, W1'), so there is nothing to commit here.
+        if crate::thread::need_resched_pending()
+            || crate::heap::needs_service()
+            || !crate::user::return_to_user_is_quiet()
+        {
+            crate::bkl::lock();
+            crate::user::commit_wake();
+            crate::thread::preempt_point();
+            crate::user::activate_current(frame);
+            crate::heap::service();
+            crate::bkl::unlock();
+        }
     } else {
         crate::bkl::lock();
         crate::fp::trap_entry(frame);
