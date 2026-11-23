@@ -247,12 +247,55 @@ fn stage_in(n: usize, a: [u64; 6]) -> Option<ksys::Staged> {
     })
 }
 
+/// The copy-in of a big `channel_call` request (T215), before the object lock is taken: the record is read, and if the request carries `OUTSIDE_COPY_MIN` bytes or
+/// more its bytes and handle words are copied under the caller's address-space lock and the memory locks only. Any failure returns `None` and the call copies for
+/// itself under the lock, so its errors and their order are unchanged.
+#[inline(never)]
+#[allow(clippy::large_stack_frames)]
+// KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)] // INVARIANT: the record is CHANNEL_CALL_ARGS_BYTES (56) long and the offsets read are below it; nhandles <= MAX_MSG_HANDLES was checked, so nhandles * 8 is small
+pub(super) fn stage_call_in(a: [u64; 6]) -> Option<ksys::Staged> {
+    let cell = current_space()?;
+    let _as = cell.lock();
+    let space = cell.held_mut();
+    let k = kmem::mem();
+    let saved = k.vmos.swap_need(None);
+    let staged = (|| {
+        let rec = copy_from_user(
+            space,
+            k.mm,
+            k.vmos,
+            k.jobs,
+            a[1],
+            abi::CHANNEL_CALL_ARGS_BYTES,
+        )
+        .ok()?;
+        let le64 = |at: usize| u64::from_le_bytes(rec[at..at + 8].try_into().unwrap_or([0; 8]));
+        let le32 = |at: usize| u32::from_le_bytes(rec[at..at + 4].try_into().unwrap_or([0; 4]));
+        let (req_bytes, req_handles) = (le64(0), le64(8));
+        let (nbytes, nhandles) = (le32(16) as usize, le32(20) as usize);
+        if !(ksys::OUTSIDE_COPY_MIN..=MAX_MSG_BYTES).contains(&nbytes) || nhandles > MAX_MSG_HANDLES
+        {
+            return None;
+        }
+        let data = copy_from_user(space, k.mm, k.vmos, k.jobs, req_bytes, nbytes).ok()?;
+        let handles = if nhandles == 0 {
+            Vec::new()
+        } else {
+            copy_from_user(space, k.mm, k.vmos, k.jobs, req_handles, nhandles * 8).ok()?
+        };
+        Some(ksys::Staged { data, handles })
+    })();
+    let _ = k.vmos.swap_need(saved);
+    staged
+}
+
 /// The copy-out of a big `channel_read` or `socket_read`, after the object lock was let go (T215): the destinations were checked against the message
 /// under it, before the message was taken. A sibling thread that unmaps or decommits the buffer in between makes this copy fail, and the message,
 /// already taken, is lost with the error: the program that does that has no use for the message (SYSCALLS.md).
 #[inline(never)]
 #[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB (the memory locks' guards); T172 shrinks them (the boot-time high-water budget check bounds the sum)
-fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
+pub(super) fn finish_out(result: Reply, deferred: Option<ksys::Deferred>) -> Reply {
     let Some(d) = deferred else {
         return result;
     };
