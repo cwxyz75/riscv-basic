@@ -90,6 +90,35 @@ impl<N: Class> Rqs<N> for Local<N> {
     }
 }
 
+/// How a wake picks a hart (KERNEL-V1-SPEC 5.6, PM4). `Spread` is the default: the thread's last hart if it would run there, else an idle hart, else the hart with the
+/// lowest running priority. `Pack` consolidates load so that other harts stay idle: the lowest-indexed online hart that runs something below the thread, else the
+/// `Spread` rule. Both keep GP1: only the choice of hart differs, never what a hart pulls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    Spread = 0,
+    Pack = 1,
+}
+
+impl Policy {
+    /// The policy a user-mode number names (`system_set_placement`): 0 spread, 1 pack.
+    pub fn from_code(code: u64) -> Option<Policy> {
+        match code {
+            0 => Some(Policy::Spread),
+            1 => Some(Policy::Pack),
+            _ => None,
+        }
+    }
+}
+
+/// The three global masks of KERNEL-V1-SPEC 5.2 (bit `h` is hart `h`): `online` (the harts that are part of the scheduler), `idle` (online, nothing running but the idle
+/// thread, nothing queued) and `overloaded` (a thread queued there that the hart is not running). `idle` and `overloaded` are published when a hart's lock is released
+/// after a change, like the hints, and are **read only as hints**: every use is re-checked under the locks, so a stale bit costs a wasted look, never a wrong move.
+struct Masks {
+    online: AtomicU64,
+    idle: AtomicU64,
+    overloaded: AtomicU64,
+}
+
 /// What the other harts may read about hart `h` without its lock: published when `h`'s lock is released after a change, **read
 /// only as a hint** whose every use is re-checked under the locks (SCHED-SMP-SPEC 4.4).
 struct Hint {
@@ -113,11 +142,13 @@ impl Hint {
         }
     }
     fn publish<N: Class>(&self, rq: &HartRq<N>) {
-        self.cur_eff.store(rq.cur_eff(), Ordering::Release);
+        // (SeqCst: a settle that finds a hart's bit in `overloaded` clear takes no lock on it, so "this hart published its hint, then read the mask" and "that hart set its
+        // bit, then read this hart's hint" must not both miss each other: store-then-load on two atomics from two harts needs one total order, SC2 review)
+        self.cur_eff.store(rq.cur_eff(), Ordering::SeqCst);
         self.queued_len.store(rq.queued_len(), Ordering::Release);
         let key = rq.would_run_key();
         if self.key.load(Ordering::Relaxed) != key {
-            self.would_run.store(rq.would_run_mask(), Ordering::Release);
+            self.would_run.store(rq.would_run_mask(), Ordering::SeqCst);
             self.key.store(key, Ordering::Relaxed);
         }
     }
@@ -127,6 +158,8 @@ impl Hint {
 struct Hq<'a, N: Class, R: Rqs<N> + 'a> {
     g: R::Guard<'a>,
     hint: &'a Hint,
+    masks: &'a Masks,
+    bit: u64,
     changed: bool,
 }
 
@@ -146,6 +179,19 @@ impl<N: Class, R: Rqs<N>> Drop for Hq<'_, N, R> {
     fn drop(&mut self) {
         if self.changed {
             self.hint.publish(&self.g);
+            let queued = self.g.queued_len() > 0;
+            let idle = !queued && self.g.cur_eff() == 0;
+            if idle {
+                self.masks.idle.fetch_or(self.bit, Ordering::SeqCst);
+            } else {
+                self.masks.idle.fetch_and(!self.bit, Ordering::SeqCst);
+            }
+            // (negative control: a hart that never says it has a queued thread is never pulled from, and a thread starves in the models)
+            if queued && !cfg!(feature = "fault-skip-overloaded") {
+                self.masks.overloaded.fetch_or(self.bit, Ordering::SeqCst);
+            } else {
+                self.masks.overloaded.fetch_and(!self.bit, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -161,6 +207,11 @@ pub struct Sched2<N: Class, R: Rqs<N> = Local<N>> {
     /// Harts that are part of the scheduler: only they are chosen to run or hold threads (a hart that has not joined
     /// yet is skipped by placement and by push). Every hart starts online; the kernel clears the others until they join.
     online: Vec<AtomicBool>,
+    masks: Masks,
+    /// The placement policy (`Policy`), read at each wake.
+    policy: AtomicU8,
+    /// How many times a hart looked into another hart's queue under its lock to pull (SC2: zero while no hart is overloaded).
+    pull_looks: AtomicU64,
     hint: Vec<Hint>,
     /// `transit[h]`: the thread (0: none) hart `h` has just been told to stop running and has queued (preempted, rotated, yielded) but
     /// whose context the kernel has not finished saving. It is not available to any other hart (no pull, no balance, no
@@ -204,6 +255,16 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
             next_tid: AtomicU64::new(1),
             pending: (0..harts).map(|_| AtomicBool::new(false)).collect(),
             online: (0..harts).map(|_| AtomicBool::new(true)).collect(),
+            masks: {
+                let all = u64::MAX >> 64usize.saturating_sub(harts); // (harts is 1 to 64)
+                Masks {
+                    online: AtomicU64::new(all),
+                    idle: AtomicU64::new(all),
+                    overloaded: AtomicU64::new(0),
+                }
+            },
+            policy: AtomicU8::new(Policy::Spread as u8),
+            pull_looks: AtomicU64::new(0),
             hint: (0..harts).map(|_| Hint::new()).collect(),
             transit: (0..harts).map(|_| AtomicU64::new(0)).collect(),
             deferred: AtomicBool::new(false),
@@ -263,6 +324,8 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         Hq {
             g: self.rqs.lock(x),
             hint: &self.hint[x],
+            masks: &self.masks,
+            bit: 1u64 << x,
             changed: false,
         }
     }
@@ -275,7 +338,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// The hint for `would_run`: would a thread of priority `p` queued on hart `x` run instead of what runs there?
     #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count; p <= PRIO_MAX = 63, so the shift is below 64
     fn would_run_hint(&self, x: usize, p: Prio) -> bool {
-        p <= PRIO_MAX && self.hint[x].would_run.load(Ordering::Acquire) & (1 << p) != 0
+        p <= PRIO_MAX && self.hint[x].would_run.load(Ordering::SeqCst) & (1 << p) != 0
     }
 
     fn home_of(&self, tid: Tid) -> Option<usize> {
@@ -301,6 +364,29 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::indexing_slicing)] // INVARIANT: hart is a hart index below the hart count
     pub fn set_online(&self, hart: usize, online: bool) {
         self.online[hart].store(online, Ordering::Release);
+        if online {
+            self.masks.online.fetch_or(1 << hart, Ordering::AcqRel);
+        } else {
+            self.masks
+                .online
+                .fetch_and(!(1u64 << hart), Ordering::AcqRel);
+        }
+    }
+    /// The placement policy in force.
+    pub fn policy(&self) -> Policy {
+        if self.policy.load(Ordering::Relaxed) == Policy::Pack as u8 {
+            Policy::Pack
+        } else {
+            Policy::Spread
+        }
+    }
+    /// Change the placement policy (PM4): threads already placed stay where they are; the next wake uses the new rule.
+    pub fn set_policy(&self, policy: Policy) {
+        self.policy.store(policy as u8, Ordering::Relaxed);
+    }
+    /// How many times a settle looked into another hart's queue under its lock (SC2).
+    pub fn pull_looks(&self) -> u64 {
+        self.pull_looks.load(Ordering::Relaxed)
     }
     /// Set `hart`'s clock without running any timers (when it joins).
     pub fn set_clock(&self, hart: usize, now: Time) {
@@ -497,7 +583,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn view_cur(&self, h: usize) -> Prio {
-        self.hint[h].cur_eff.load(Ordering::Acquire)
+        self.hint[h].cur_eff.load(Ordering::SeqCst)
     }
 
     /// 4.4 `select_hart` (rules 1, 3, 4 and 5; rule 2, the synchronous-wake hint, is `wake_sync_on`'s). Reads only
@@ -511,14 +597,45 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if !self.is_online(last) {
             last = (0..self.harts()).find(|&x| self.is_online(x)).unwrap_or(0);
         }
-        if self.view_cur(last) < rec.eff {
+        match self.policy() {
+            Policy::Spread => self.select_spread(last, rec.eff),
+            Policy::Pack => self.select_pack(last, rec.eff),
+        }
+    }
+
+    /// `Pack`: the lowest-indexed online hart that runs something below `eff` (idle ones included), found from the masks and the running-priority hints; when every
+    /// hart is busy with something at least as good, the `Spread` rule (which then leaves the thread queued where it was).
+    fn select_pack(&self, last: usize, eff: Prio) -> usize {
+        let mut cand = self.masks.online.load(Ordering::Acquire);
+        while cand != 0 {
+            let h = cand.trailing_zeros() as usize;
+            cand &= cand.saturating_sub(1);
+            if self.view_cur(h) < eff {
+                return h;
+            }
+        }
+        self.select_spread(last, eff)
+    }
+
+    /// `Spread`: the thread's last hart if it would run there, else an idle hart, else the hart with the lowest running priority.
+    fn select_spread(&self, last: usize, eff: Prio) -> usize {
+        if self.view_cur(last) < eff {
             return last;
+        }
+        // an idle hart from the mask (the lowest one with nothing running and nothing queued), without looking at the others
+        let idle =
+            self.masks.idle.load(Ordering::Acquire) & self.masks.online.load(Ordering::Acquire);
+        if idle != 0 {
+            let x = idle.trailing_zeros() as usize;
+            if self.view_cur(x) < eff {
+                return x;
+            }
         }
         let best = (0..self.harts())
             .filter(|&h| self.is_online(h))
             .min_by_key(|&h| (self.view_cur(h), h))
             .unwrap_or(last);
-        if self.view_cur(best) < rec.eff {
+        if self.view_cur(best) < eff {
             best
         } else {
             last
@@ -670,10 +787,12 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     #[allow(clippy::arithmetic_side_effects, clippy::expect_used)] // INVARIANT: the thread was found queued under the same two locks a few lines above
     fn pull_work(&self, h: usize) -> usize {
         let mut n = 0;
-        for g in 0..self.harts() {
-            if g == h {
-                continue;
-            }
+        // only the harts that say they have a queued thread, lowest first (the mask is a hint: what is found is re-checked under the locks)
+        let mut cand = self.masks.overloaded.load(Ordering::SeqCst) & !(1u64 << h);
+        while cand != 0 {
+            let g = cand.trailing_zeros() as usize;
+            cand &= cand - 1;
+            self.pull_looks.fetch_add(1, Ordering::Relaxed);
             // look at `g` alone, then take both locks in order and look again before moving anything
             let found = {
                 let src = self.lq(g);

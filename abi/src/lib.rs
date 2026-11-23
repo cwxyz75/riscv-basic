@@ -455,6 +455,8 @@ pub mod syscall {
     pub const FUTEX_UNLOCK_PI: usize = 113;
     /// The debug resource (HD4): a privileged process (the one the kernel started) gets the handle that `debug_write` and `debug_stat` now need.
     pub const DEBUG_ROOT: usize = 114;
+    /// Choose how a wake picks a hart (PM4): `a0` the root resource (MANAGE), `a1` the policy, 0 spread or 1 pack.
+    pub const SYSTEM_SET_PLACEMENT: usize = 115;
     pub const INTERRUPT_CREATE: usize = 100;
     pub const INTERRUPT_ACK: usize = 101;
 }

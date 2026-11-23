@@ -11876,6 +11876,55 @@ fn devd_serves_null_and_zero() -> Outcome {
 
 // --- Device capabilities (S6a) -------------------------------------------------------------
 
+fn system_set_placement_needs_the_resource_and_changes_the_policy() -> Outcome {
+    // PM4: the call is gated like the other root-resource calls; the policy in force reads back through debug_stat 125; the default is spread; the scheduler works under both
+    let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
+    let ev = event()?;
+    ensure_eq!(
+        st(sys::system_set_placement(0xdead, 1)),
+        Some(S::BadHandle),
+        "bad handle"
+    );
+    ensure_eq!(
+        st(sys::system_set_placement(ev, 1)),
+        Some(S::WrongType),
+        "an event is no resource"
+    );
+    let weak = ok(sys::handle_duplicate(res, Rights::TRANSFER.0), "dup")?.a1 as u64;
+    ensure_eq!(
+        st(sys::system_set_placement(weak, 1)),
+        Some(S::AccessDenied),
+        "no MANAGE"
+    );
+    ensure_eq!(
+        st(sys::system_set_placement(res, 2)),
+        Some(S::InvalidArgs),
+        "no such policy"
+    );
+    ensure_eq!(sys::debug_stat(125), 0, "spread is the default");
+    ensure_eq!(st(sys::system_set_placement(res, 1)), Some(S::Ok), "pack");
+    ensure_eq!(sys::debug_stat(125), 1, "pack is in force");
+    // threads still run and finish under pack
+    let t = new_thread(placement_probe, 0)?;
+    let r = sys::object_wait(t, sig::TERMINATED, sys::clock_get() + 5000);
+    ensure_eq!(r.status, 0, "a thread started under pack ran to its end");
+    ensure_eq!(
+        st(sys::system_set_placement(res, 0)),
+        Some(S::Ok),
+        "spread again"
+    );
+    ensure_eq!(sys::debug_stat(125), 0, "spread is back");
+    sys::handle_close(weak);
+    Ok(())
+}
+
+extern "C" fn placement_probe(_: usize) -> ! {
+    for _ in 0..4 {
+        sys::thread_yield();
+    }
+    sys::thread_exit(0)
+}
+
 fn device_caps_need_the_resource() -> Outcome {
     let res = ok(sys::resource_root(), "resource_root")?.a1 as u64;
     let ev = event()?;
@@ -14984,6 +15033,10 @@ pub fn app_main() -> i32 {
         ("channel_round_trip", channel_round_trip),
         ("channel_sends_handles", channel_sends_handles),
         ("channel_syscall_errors", channel_syscall_errors),
+        (
+            "system_set_placement_needs_the_resource_and_changes_the_policy",
+            system_set_placement_needs_the_resource_and_changes_the_policy,
+        ),
         (
             "channel_buffer_too_small_keeps_message",
             channel_buffer_too_small_keeps_message,

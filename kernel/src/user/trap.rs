@@ -941,6 +941,14 @@ pub(super) fn dispatch(n: usize, a: [u64; 6]) -> Reply {
     }
     match n {
         // (`DEBUG_WRITE` is answered in `syscall`, before this table: it holds the big lock only for the handle and the tally)
+        nr::SYSTEM_SET_PLACEMENT => {
+            ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
+            if irq::without(|| thread::set_placement(a[1])) {
+                Ok((None, None))
+            } else {
+                fail(Status::InvalidArgs)
+            }
+        }
         nr::RESOURCE_DTB => {
             ipc::resource_of(objs, &p.handles, h(0)).map_err(|e| (e, None, None))?;
             let Some(blob) =

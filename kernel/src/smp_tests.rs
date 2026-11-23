@@ -89,6 +89,60 @@ fn short_sleeper(_: usize) {
     }
 }
 
+fn periodic_light(_: usize) {
+    while !SLEEPER_STOP.load(Ordering::Relaxed) {
+        thread::sleep_ns(500_000); // 500 microseconds
+    }
+}
+
+/// How many harts took a thread's wakes for 100 ms: harts whose idle loop was entered at least ten times (a hart no thread is homed on idles once and stays there).
+fn harts_with_wakes(n: usize) -> usize {
+    let entries = |h: usize| {
+        percpu::hart(h).idle_wfi.load(Ordering::Relaxed)
+            + percpu::hart(h).idle_suspend.load(Ordering::Relaxed)
+    };
+    let before: alloc::vec::Vec<u64> = (0..n).map(entries).collect();
+    thread::sleep_ticks(100);
+    (0..n)
+        .filter(|&h| entries(h).saturating_sub(before[h]) >= 10)
+        .count()
+}
+
+/// PM4 (KERNEL-V1-SPEC 5.6): two light periodic threads on four harts. Under `pack` at most two harts leave idle; under `spread` they sit on separate harts.
+#[allow(clippy::large_stack_frames)] // KT13: audited, a frame over 1 KiB; T172 shrinks them (the boot-time high-water budget check bounds the sum)
+fn pack_keeps_light_threads_on_few_harts() -> Result<(), String> {
+    let n = smp::started();
+    if n < 4 {
+        return Ok(());
+    }
+    let mut busy = [0usize; 2];
+    for (i, policy) in [1u64, 0u64].into_iter().enumerate() {
+        thread::set_placement(policy);
+        SLEEPER_STOP.store(false, Ordering::Relaxed);
+        let a = thread::spawn_free("light_a", 20, periodic_light, 0);
+        let b = thread::spawn_free("light_b", 20, periodic_light, 0);
+        thread::sleep_ticks(20); // (let them settle in)
+        busy[i] = harts_with_wakes(n);
+        SLEEPER_STOP.store(true, Ordering::Relaxed);
+        thread::join(a);
+        thread::join(b);
+    }
+    thread::set_placement(0);
+    if busy[0] > 2 {
+        return Err(format!(
+            "under pack {} harts took wakes of two light threads, wanted at most two",
+            busy[0]
+        ));
+    }
+    if busy[1] < 2 {
+        return Err(format!(
+            "under spread {} harts took wakes of two light threads, wanted two",
+            busy[1]
+        ));
+    }
+    Ok(())
+}
+
 /// PM2 (KERNEL-V1-SPEC 5.5): a hart with nothing to do for a long time enters the firmware's retentive suspend, and a hart whose next
 /// event is a hundred microseconds away uses `wfi`. On QEMU the two are equivalent in effect (OpenSBI's default retentive suspend is
 /// a `wfi`); the counters are what tells them apart.
@@ -147,6 +201,10 @@ pub const TESTS: &[Test] = &[
     (
         "long_idle_suspends_and_a_short_sleeper_does_not",
         long_idle_suspends_and_a_short_sleeper_does_not,
+    ),
+    (
+        "pack_keeps_light_threads_on_few_harts",
+        pack_keeps_light_threads_on_few_harts,
     ),
     ("harts_come_online", harts_come_online),
     ("ipi_reaches_every_hart", ipi_reaches_every_hart),

@@ -174,10 +174,15 @@ impl World {
     }
 }
 
-#[allow(clippy::needless_late_init)] // (each arm names the operation it did, for the failure message)
 fn walk(harts: usize, seed: u64, steps: usize) {
+    walk_with(harts, seed, steps, kcore::sched_smp::Policy::Spread);
+}
+
+#[allow(clippy::needless_late_init)] // (each arm names the operation it did, for the failure message)
+fn walk_with(harts: usize, seed: u64, steps: usize, policy: kcore::sched_smp::Policy) {
     let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut w = World::new(harts);
+    w.s.set_policy(policy);
     // thread: the boot code on hart 0
     let boot =
         w.s.adopt_current_on(
@@ -346,6 +351,21 @@ fn gp1_and_gp2_hold_on_random_walks_over_one_to_eight_harts() {
     for harts in 1..=8usize {
         for seed in 1..=60u64 {
             walk(harts, seed * 31 + harts as u64, 400);
+        }
+    }
+}
+
+#[test]
+fn gp1_and_gp2_hold_under_the_pack_policy_too() {
+    // PM4: the same walks and the same reference, with placement consolidating onto low harts
+    for harts in 1..=8usize {
+        for seed in 1..=60u64 {
+            walk_with(
+                harts,
+                seed * 37 + harts as u64,
+                400,
+                kcore::sched_smp::Policy::Pack,
+            );
         }
     }
 }

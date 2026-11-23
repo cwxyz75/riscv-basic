@@ -223,6 +223,7 @@ does not give, or that executes an illegal instruction, ends its process (exit c
 | 112 | futex_lock_pi | `a0` address, `a1` deadline | |
 | 113 | futex_unlock_pi | `a0` address | |
 | 102 | resource_dtb | `a0` resource | `a1` handle, `a2` length |
+| 115 | system_set_placement | `a0` resource, `a1` policy | |
 
 A handles array is `nhandles` 64-bit values (8 bytes each, little endian); a handles buffer receives that many.
 
@@ -481,6 +482,14 @@ A read-only VMO (rights READ, MAP, DUPLICATE, TRANSFER) holding a copy of the de
 handed to the kernel; `length` is its size in bytes. `resource` needs MANAGE. NOT_SUPPORTED if the
 kernel found no tree (or one over `MAX_DTB_BYTES`, 256 KiB); NO_MEMORY if the caller's job is out of
 pages. The tree is data from the firmware: the reader (`kcore::fdt::parse`) is hostile-input safe.
+
+### system_set_placement(resource, policy) -> status
+
+Chooses how a wake picks a hart (PM4, KERNEL-V1-SPEC 5.6): `policy` 0 is **spread** (the default: the thread's last hart if it would run there, else an idle hart, else the hart
+running the lowest priority) and 1 is **pack** (the lowest-indexed online hart running something below the thread, so load consolidates and the other harts stay idle; when
+every hart is busy, spread's rule). Threads already placed stay where they are; the next wake uses the new rule; what a hart pulls is the same under both, so the scheduler's
+guarantee (no hart runs a lower priority than a thread waiting for it) holds under both. `resource` needs MANAGE. Errors: BAD_HANDLE; WRONG_TYPE (not a resource);
+ACCESS_DENIED (no MANAGE); INVALID_ARGS (any other `policy`). `debug_stat` 125 reads the policy in force.
 
 ### futex_wait(address, expected, deadline) -> status
 
@@ -994,6 +1003,7 @@ Tests: `cycles_are_swept`, `a_sweep_gives_back_the_references_doomed_objects_hel
 | vmo_create_physical, vmo_create_dma, vmo_phys_addr, resource_root | specified and implemented (S6a) |
 | interrupt_create, interrupt_ack | specified and implemented (S6a-2) |
 | resource_dtb | specified and implemented (S6c) |
+| system_set_placement | specified and implemented (PM4) |
 | futex_wait, futex_wake | specified and implemented (S7b) |
 
 ## Planned changes (SCHED-SMP-SPEC.md; **none of this is implemented**)
