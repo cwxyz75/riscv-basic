@@ -295,6 +295,12 @@ impl<T: Object> Registry<T> {
     }
 
     /// The handles removed since the last call (oldest first), for ending the bindings made through them.
+    /// Is anything waiting for a commit (a touched object in the dirty log, an overflowed log, a handle removed whose bindings have not ended)? W1': the
+    /// kernel commits at the end of every outermost critical section, so this is false whenever the object lock is let go.
+    pub fn has_pending(&self) -> bool {
+        !self.dirty.is_empty() || self.dirty_overflow || !self.gone.is_empty()
+    }
+
     pub fn take_gone(&mut self) -> Vec<(ObjId, u64, u64)> {
         core::mem::take(&mut self.gone)
     }
