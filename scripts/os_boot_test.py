@@ -101,6 +101,8 @@ PRIORITY_ONLY = {
     "higher_priority_runs_at_once_on_spawn", "wake_many_makes_every_waiter_runnable_before_any_runs", "lower_priority_waits_for_higher",
     "set_priority_takes_effect", "realtime_thread_stays_responsive_under_load",
     "the_latency_test_can_fail",
+    # (the controls need a starved low-priority thread: round-robin gives it a slice)
+    "a_call_lends_its_priority_to_the_server", "pi_futex_bounds_inversion",
 }
 TEST = re.compile(r"^##TEST (\S+) (PASS|FAIL)(?: (.*))?$")
 DONE = re.compile(r"^##DONE pass=(\d+) fail=(\d+)$")
