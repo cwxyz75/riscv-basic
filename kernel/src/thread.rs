@@ -1562,6 +1562,8 @@ pub fn wake_stat(which: u64) -> u64 {
         125 => irq::without(|| sched().policy() as u64),
         // 126: whether the firmware has the system suspend extension (PM3): 1 yes, 0 no
         126 => u64::from(crate::arch::sbi::system_suspend_present()),
+        // 127: 1 if the scheduling class is round-robin (the controls that need a thread starved by priority skip themselves)
+        127 => u64::from(cfg!(feature = "sched-round-robin")),
         0 => SLEEPS.load(Relaxed),
         1 => RESLEEPS.load(Relaxed),
         2 => WAKES.load(Relaxed),

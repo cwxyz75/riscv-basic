@@ -13060,6 +13060,9 @@ fn donation_run(client_prio: u32) -> Result<(u64, u64, u32), Detail> {
 /// A call lends its priority to the thread that reads its request: a server of priority 5 answers a priority-25 caller under hogs of priority 15; a
 /// caller of the server's own priority gets nothing lent and its call times out (the control: the hogs do starve the server).
 fn a_call_lends_its_priority_to_the_server() -> Outcome {
+    if sys::debug_stat(127) == 1 {
+        return Ok(()); // (round-robin starves nobody: the control cannot hold)
+    }
     let (status, _, work) = donation_run(5)?;
     ensure_eq!(
         status as i64,
@@ -13081,6 +13084,9 @@ fn a_call_lends_its_priority_to_the_server() -> Outcome {
 /// The classic three-thread inversion: a low-priority thread owns the lock and a hog of middle priority runs on every hart, so the owner gets no CPU
 /// (checked first: the control); a high-priority thread then waits for the lock, and through the donation the owner runs, finishes and unlocks.
 fn pi_futex_bounds_inversion() -> Outcome {
+    if sys::debug_stat(127) == 1 {
+        return Ok(()); // (round-robin starves nobody: the control cannot hold)
+    }
     if let Some(r) = pi_ids_do_not_fit() {
         return r;
     }
