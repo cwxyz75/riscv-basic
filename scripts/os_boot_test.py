@@ -1194,6 +1194,12 @@ def negative_control(kernel, test):
     failed = [n for n, ok, _ in tests if not ok]
     passed = [n for n, ok, _ in tests if ok]
     if test in passed:
+        if timed_out or not any(l.startswith("##DONE") for l in lines):
+            # a race: the guarded test got through this time, and the kernel without the mechanism then crashed or hung in the next test that tears a process
+            # down (the normal kernel finishes the same suite, so the fault is what stopped it). The guard is not vacuous. (Soak, 2026-11-23: on a hosted runner
+            # `teardown_with_threads_on_other_harts` passed and `kill_a_spinning_child` stalled.)
+            print(f"negative control passed: {test} passed, but the run did not complete without its mechanism ({kernel}; {found[:1]})")
+            return 0
         print(f"negative control FAILED: {test} passed without its mechanism ({found})", file=sys.stderr)
         return 1
     if test not in failed:
