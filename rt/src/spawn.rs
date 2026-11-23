@@ -177,13 +177,19 @@ pub fn map_image(
     let mut base = 0u64;
     let mut stack_top = STACK_TOP;
     if parsed.pie {
+        // (both reservations stay until both are made, so that the stack cannot be given the image's place; then both go)
         let Ok(b) = reserve(proc, parsed.span, job) else {
             return Err(SpawnError::TooBig);
         };
-        base = b;
-        let Ok(st) = reserve(proc, (STACK_PAGES + 2) * 4096, job) else {
+        let st = reserve(proc, (STACK_PAGES + 2) * 4096, job);
+        let given = sys::process_unmap_range(proc, b, parsed.span).status;
+        let Ok(st) = st else {
             return Err(SpawnError::TooBig);
         };
+        if given != 0 || sys::process_unmap_range(proc, st, (STACK_PAGES + 2) * 4096).status != 0 {
+            return Err(SpawnError::TooBig);
+        }
+        base = b;
         stack_top = st + 4096 + STACK_PAGES * 4096;
     }
     for seg in &parsed.segments {
@@ -295,8 +301,8 @@ fn build_and_start(
     Ok(())
 }
 
-/// Where the kernel would put `bytes` of address space in `proc`: map a lazy VMO ANYWHERE, note the address and unmap it again. Only for a process that has not
-/// started (nobody else maps into it between this and the mappings that follow).
+/// Where the kernel would put `bytes` of address space in `proc`: map a lazy VMO ANYWHERE and note the address; the caller unmaps it (the reservation stands
+/// until then). Only for a process that has not started (nobody else maps into it between this and the mappings that follow).
 fn reserve(proc: u64, bytes: u64, job: u64) -> Result<u64, ()> {
     let v = sys::vmo_create_in(bytes / 4096, job);
     if v.status != 0 {
@@ -308,11 +314,7 @@ fn reserve(proc: u64, bytes: u64, job: u64) -> Result<u64, ()> {
     if m.status != 0 {
         return Err(());
     }
-    let at = m.a1 as u64;
-    if sys::process_unmap_range(proc, at, bytes).status != 0 {
-        return Err(());
-    }
-    Ok(at)
+    Ok(m.a1 as u64)
 }
 
 /// Read `len` bytes at `offset` from a VMO into memory (for an image). `None` if the extent is
