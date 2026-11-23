@@ -1193,6 +1193,18 @@ def negative_control(kernel, test):
     _, tests, _, panics, _ = parse(lines)
     failed = [n for n, ok, _ in tests if not ok]
     passed = [n for n, ok, _ in tests if ok]
+    # (a control may name several tests, comma separated: those that end a process through the same mechanism; the first of them that fails or hangs is the detection)
+    names = test.split(",")
+    if len(names) > 1:
+        hit = [n for n in names if n in failed]
+        if hit:
+            print(f"negative control passed: {hit[0]} failed without its mechanism ({kernel})")
+            return 0
+        order = [n for n in REQUIRED if n not in {x for x, _, _ in tests}]
+        if order and order[0] in names:
+            print(f"negative control passed: {order[0]} crashed or hung the kernel without its mechanism ({kernel})")
+            return 0
+        test = names[-1]
     if test in passed:
         if timed_out or not any(l.startswith("##DONE") for l in lines):
             # a race: the guarded test got through this time, and the kernel without the mechanism then crashed or hung in the next test that tears a process
