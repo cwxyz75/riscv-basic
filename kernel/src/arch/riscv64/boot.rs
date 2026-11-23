@@ -37,7 +37,7 @@ pub fn kernel_delta() -> u64 {
 
 /// Where `early_trap` ends the run in a test build: QEMU's `virt` test finisher, at its fixed address (the tree is not read this early). A release
 /// build writes nothing there and ends through the firmware.
-const EARLY_FINISHER: u64 = if cfg!(feature = "release") {
+const EARLY_FINISHER: u64 = if cfg!(all(feature = "release", not(feature = "release-suite"))) {
     0
 } else {
     0x10_0000

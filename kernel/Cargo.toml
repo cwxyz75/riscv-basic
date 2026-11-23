@@ -25,6 +25,9 @@ interactive = []
 # The system as it is meant to be used (T48): the interactive boot without the boot self-tests,
 # the banners or the `##` lines for passing checks. Build it optimised (`make os-release`).
 release = ["interactive"]
+# HD4 part 3: the release content (no boot self-tests, no sched/smp tests) that still runs the embedded user suite and the kernel-side leak checks, so the
+# Kernel tests (shard `k`) run on the optimised kernel that has no test code of its own. Not a shipped build: it holds the suite and its helper thread.
+release-suite = ["release"]
 # The interactive boot with `init` in its test-command mode (the scripted S4a-S4d checks drive its
 # `run`, `ls`, `console` ... commands) instead of the supervisor that starts the shell.
 repl = ["interactive"]

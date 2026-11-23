@@ -804,6 +804,19 @@ def _suite_tests():
 
 SUITE_TESTS = _suite_tests()
 
+# HD4 part 3 (`make os-ktest-release-content`): the kernel is built with the `release-suite` feature, which has the release content (no boot self-tests,
+# no scheduler or SMP tests) and still runs the suite and `user_tests.rs`'s checks. So the kernel's own boot tests are not required of it: what stays is
+# every test of the suite, what `user_tests.rs` reports, and the scheduler class line.
+RELEASE_SUITE = os.environ.get("OS_RELEASE_SUITE") == "1"
+
+
+def _user_tests_names():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernel", "src", "user_tests.rs")).read()
+    return set(re.findall(r'"([a-z0-9_]+)"', src)) | {"scheduler_class_is_fixed_priority"}
+
+
+RELEASE_SUITE_KEEP = SUITE_TESTS | _user_tests_names() if RELEASE_SUITE else set()
+
 
 def is_system_test(name):
     """A test of the suite that a kernel-only boot must not run (it starts a server or needs a disk or the network)."""
@@ -824,6 +837,8 @@ def is_net_test(name):
 def shard_required(required):
     """The required tests of this run: the whole list, or the part the shard runs (the kernel's own tests run in both)."""
     names = REQUIRED if required is None else required
+    if RELEASE_SUITE:
+        names = [n for n in names if n in RELEASE_SUITE_KEEP or n.startswith("lua_upstream_")]
     if SHARD == "a":
         return [n for n in names if not is_shard_b_test(n)]
     if SHARD == "b":

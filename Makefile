@@ -10,7 +10,7 @@ DISK_FLAGS    := -global virtio-mmio.force-legacy=false -drive file=$(DISK),if=n
 
 
 .PHONY: os-boot-test-sbi-console os-boot-test-entropy os-boot-test-loadaddr os-latency os-bench os-boot-test-overflow fetch-third-party libc-gap
-.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
+.PHONY: lint-host os-aarch64-check os-models feature build lint-target hooks epic-bisect os-allocfail os-fuzz-host os-coverage os-mutants os-chaos smoke soak check-all overnight-repeat-smp os-boot-test-checked os-kchecked-build kernel-main lint-kernel os-repeat os-boot-test-fail-run os-ktest os-ktest-small os-ktest-4 os-ktest-release os-ktest-release-content kquick os-boot-test-smoke os-boot-test-smoke-a os-boot-test-smoke-b docs-check os-boot-test-smp-neg help disk os-user kernel os-test os-miri os-boot-test os-boot-test-main os-boot-test-fail-demo os-boot-test-rr os-boot-test-release os-boot-test-smp os-boot-test-smp-neg os-boot-test-sched-neg os-boot-test-nodisk os-boot-test-aia os-boot-test-cpu-neg os-interactive os-run os-release os-release-run os-release-smoke os-serial-test os-auth-test test fmt fmt-check lint home-kernel home-run home-run-logo home-debug home-boot-test check
 
 help:
 	@echo "make test       host tests for the home-computer crates (no QEMU needed)"
@@ -206,6 +206,14 @@ os-ktest-release:
 	cd init && cargo build --release
 	cd kernel && OS_USER_PROFILE=release cargo build --release --target-dir ../target/os-krelease
 	OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KREL_ELF)
+
+# HD4 part 3: the Kernel tests on a kernel with the release content (no boot self-tests, no scheduler or SMP tests, no `fault-*` features: the `release-suite` feature),
+# at four harts, from the separately built suite. The release content itself (no deny-listed symbol) is checked by `os-release-smoke`.
+OS_KRC_ELF := target/os-krc/$(KERNEL_TARGET)/release/kernel
+os-ktest-release-content:
+	cd init && cargo build --release
+	cd kernel && OS_USER_PROFILE=release cargo build --release --features release-suite --target-dir ../target/os-krc
+	OS_RELEASE_SUITE=1 OS_SHARD=k OS_SMP=4 python3 scripts/os_boot_test.py $(OS_KRC_ELF)
 
 # `make os-repeat TARGET=<target> N=<n>`: run a target N times with SOAK_JOBS=1 and print `pass/N` (KT2, OD140); the serial log of
 # every failing run is saved under target/repeat/. Over a soak target this is a soak run, which only the owner starts (OD142).
@@ -470,7 +478,7 @@ feature: $(FEATURE_TARGETS)
 # Tier 1, the epic gate (OD144, TESTING.md): what an epic branch must pass before it merges into main. The feature gate, then the
 # boots: the suite on the default machine at four harts, the kernel-only boots, the instruction counts, the home computer's boot,
 # the release smoke.
-SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-count os-release-smoke
+SMOKE_TARGETS := $(FEATURE_TARGETS) home-boot-test os-boot-test-smoke os-ktest os-ktest-release os-ktest-release-content os-count os-release-smoke
 smoke: $(SMOKE_TARGETS)
 
 # Tier 2 (soak): the full matrix, every negative control, the serial sessions. Never required, and run ONLY when the
