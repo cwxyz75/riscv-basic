@@ -330,6 +330,9 @@ pub mod cpu {
     pub fn cpu_idle() {
         unimplemented!()
     }
+    pub fn stack_pointer() -> usize {
+        unimplemented!()
+    }
     pub fn thread_pointer() -> usize {
         unimplemented!()
     }
