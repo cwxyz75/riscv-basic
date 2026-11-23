@@ -4,7 +4,7 @@ kind: slice
 title: The freeze: the last review, three green soak and long runs started by the owner, the declaration
 area: kernel
 horizon: long
-blocked_by: [AB9, KT14, KT8, KT9, L20, PM3, PM4, HD3, HD4, PL8, SC2]
+blocked_by: [AB9, KT14, KT8, KT9, L20, HD3, HD4, PL8, SC2]
 refs: [KERNEL-V1-SPEC, OD126]
 ---
 
