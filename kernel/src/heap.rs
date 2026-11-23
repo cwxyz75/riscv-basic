@@ -414,6 +414,7 @@ pub fn grow(bytes: usize) -> usize {
     }
     // (a mapping that was invalid is now valid: no remote flush is needed; this hart is the only one that can touch
     // the new pages until the allocator hands them out)
+    // (a hart that cached the entry while it was invalid and is handed the memory later takes a fault the kernel's trap handler answers with a local flush: T241)
     crate::arch::tlb_flush_all();
     let added = mapped * PAGE_SIZE as usize;
     // (the big kernel lock is held and interrupts are off; `irq::without` would take the BKL again, after the memory locks `k` holds)

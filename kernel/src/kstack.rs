@@ -145,6 +145,7 @@ fn make_slot(s: &mut Slots) -> Option<u32> {
     }
     // (a mapping that was invalid is now valid: no remote flush is needed for that, and this hart is the
     // only one that can touch the slot until the stack is handed out)
+    // (a hart that cached the entry while it was invalid and is handed the memory later takes a fault the kernel's trap handler answers with a local flush: T241)
     crate::arch::tlb_flush_all();
     s.next += 1;
     Some(slot)
