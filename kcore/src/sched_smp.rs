@@ -122,11 +122,13 @@ impl Hint {
         }
     }
     fn publish<N: Class>(&self, rq: &HartRq<N>) {
-        self.cur_eff.store(rq.cur_eff(), Ordering::Release);
+        // (SeqCst: a settle that finds a hart's bit in `overloaded` clear takes no lock on it, so "this hart published its hint, then read the mask" and "that hart set its
+        // bit, then read this hart's hint" must not both miss each other: store-then-load on two atomics from two harts needs one total order, SC2 review)
+        self.cur_eff.store(rq.cur_eff(), Ordering::SeqCst);
         self.queued_len.store(rq.queued_len(), Ordering::Release);
         let key = rq.would_run_key();
         if self.key.load(Ordering::Relaxed) != key {
-            self.would_run.store(rq.would_run_mask(), Ordering::Release);
+            self.would_run.store(rq.would_run_mask(), Ordering::SeqCst);
             self.key.store(key, Ordering::Relaxed);
         }
     }
@@ -160,15 +162,15 @@ impl<N: Class, R: Rqs<N>> Drop for Hq<'_, N, R> {
             let queued = self.g.queued_len() > 0;
             let idle = !queued && self.g.cur_eff() == 0;
             if idle {
-                self.masks.idle.fetch_or(self.bit, Ordering::AcqRel);
+                self.masks.idle.fetch_or(self.bit, Ordering::SeqCst);
             } else {
-                self.masks.idle.fetch_and(!self.bit, Ordering::AcqRel);
+                self.masks.idle.fetch_and(!self.bit, Ordering::SeqCst);
             }
             // (negative control: a hart that never says it has a queued thread is never pulled from, and a thread starves in the models)
             if queued && !cfg!(feature = "fault-skip-overloaded") {
-                self.masks.overloaded.fetch_or(self.bit, Ordering::AcqRel);
+                self.masks.overloaded.fetch_or(self.bit, Ordering::SeqCst);
             } else {
-                self.masks.overloaded.fetch_and(!self.bit, Ordering::AcqRel);
+                self.masks.overloaded.fetch_and(!self.bit, Ordering::SeqCst);
             }
         }
     }
@@ -313,7 +315,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     /// The hint for `would_run`: would a thread of priority `p` queued on hart `x` run instead of what runs there?
     #[allow(clippy::indexing_slicing)] // INVARIANT: x is a hart index below the hart count; p <= PRIO_MAX = 63, so the shift is below 64
     fn would_run_hint(&self, x: usize, p: Prio) -> bool {
-        p <= PRIO_MAX && self.hint[x].would_run.load(Ordering::Acquire) & (1 << p) != 0
+        p <= PRIO_MAX && self.hint[x].would_run.load(Ordering::SeqCst) & (1 << p) != 0
     }
 
     fn home_of(&self, tid: Tid) -> Option<usize> {
@@ -546,7 +548,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
 
     #[allow(clippy::indexing_slicing)] // INVARIANT: h is a hart index below the hart count
     fn view_cur(&self, h: usize) -> Prio {
-        self.hint[h].cur_eff.load(Ordering::Acquire)
+        self.hint[h].cur_eff.load(Ordering::SeqCst)
     }
 
     /// 4.4 `select_hart` (rules 1, 3, 4 and 5; rule 2, the synchronous-wake hint, is `wake_sync_on`'s). Reads only
@@ -563,7 +565,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
         if self.view_cur(last) < rec.eff {
             return last;
         }
-        // an idle hart from the mask (the lowest: what the minimum below would pick when one is idle), without looking at the others
+        // an idle hart from the mask (the lowest one with nothing running and nothing queued), without looking at the others
         let idle =
             self.masks.idle.load(Ordering::Acquire) & self.masks.online.load(Ordering::Acquire);
         if idle != 0 {
@@ -729,7 +731,7 @@ impl<N: Class, R: Rqs<N>> Sched2<N, R> {
     fn pull_work(&self, h: usize) -> usize {
         let mut n = 0;
         // only the harts that say they have a queued thread, lowest first (the mask is a hint: what is found is re-checked under the locks)
-        let mut cand = self.masks.overloaded.load(Ordering::Acquire) & !(1u64 << h);
+        let mut cand = self.masks.overloaded.load(Ordering::SeqCst) & !(1u64 << h);
         while cand != 0 {
             let g = cand.trailing_zeros() as usize;
             cand &= cand - 1;

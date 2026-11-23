@@ -136,6 +136,8 @@ os-aarch64-check:
 
 # The loom and shuttle model checkers alone (CI runs them as their own job, parallel to the host tests).
 os-models:
+	# SC2's negative control: with no hart ever marked overloaded the masks' acceptance test must fail
+	@if cargo test -p kcore --features fault-skip-overloaded --test sched_masks --target-dir target/neg-overloaded >/dev/null 2>&1; then echo 'fault-skip-overloaded was not caught by sched_masks'; exit 1; fi
 	RUSTFLAGS="--cfg loom" cargo test -p klock --release --test spin_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg loom" cargo test -p netring --release --test doorbell_concurrency --target-dir target/loom
 	RUSTFLAGS="--cfg shuttle" cargo test -p klock --release --test spin_concurrency --target-dir target/shuttle
