@@ -223,9 +223,10 @@ fn sequences_of_calls_keep_every_audit_clean() {
 #[test]
 fn a_seed_replays_to_the_same_hash_and_another_seed_does_not() {
     let at = Cell::new(("", 0));
-    let a = run_seed(5, 200, &at).unwrap();
-    let b = run_seed(5, 200, &at).unwrap();
-    let c = run_seed(6, 200, &at).unwrap();
+    let calls = if cfg!(miri) { 30 } else { 200 };
+    let a = run_seed(5, calls, &at).unwrap();
+    let b = run_seed(5, calls, &at).unwrap();
+    let c = run_seed(6, calls, &at).unwrap();
     assert_eq!(a, b, "the same seed, the same calls and replies");
     assert_ne!(a, c);
 }
