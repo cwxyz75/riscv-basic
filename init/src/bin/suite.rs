@@ -2006,11 +2006,18 @@ fn wait_ended(proc: u64, ticks: u64) -> Result<(), Detail> {
 /// this one does (T243: on a loaded four-hart run the first thread was seen starting more than 3 ms late).
 fn started_and_blocked(t: u64) -> Outcome {
     let mut last = 0u64;
+    let mut steady = 0u32;
     for _ in 0..400 {
         nap(5)?;
         let now = sys::thread_cpu_ns(t).a1 as u64;
-        if now > 1_000_000 && now == last {
-            return Ok(());
+        // (it has run at all, and has not moved over two naps: a release build's start-up is well under a millisecond)
+        if now > 0 && now == last {
+            steady += 1;
+            if steady >= 2 {
+                return Ok(());
+            }
+        } else {
+            steady = 0;
         }
         last = now;
     }
