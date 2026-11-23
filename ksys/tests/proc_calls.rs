@@ -1544,7 +1544,9 @@ fn process_clone_region_shares_or_snapshots_a_region_into_another_process() {
 fn random_memory_calls_never_panic_and_keep_their_audits() {
     // (how many calls of each kind succeeded over all seeds: the sequences must do real work)
     let mut succeeded = std::collections::BTreeMap::<usize, u32>::new();
-    for seed in 1..=25u64 {
+    // (Miri runs this about a thousand times slower: two seeds of sixty calls there)
+    let (seeds, steps) = if cfg!(miri) { (2u64, 60) } else { (25u64, 400) };
+    for seed in 1..=seeds {
         let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         let mut rnd = move |n: u64| {
             x ^= x << 13;
@@ -1562,7 +1564,7 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
                 h
             })
             .collect();
-        for step in 0..400 {
+        for step in 0..steps {
             let p = procs[rnd(2) as usize];
             let v = vmo_handles[rnd(vmo_handles.len() as u64) as usize];
             let va = VA + rnd(6) * 0x10_0000 + rnd(4) * 4096;
@@ -1676,7 +1678,7 @@ fn random_memory_calls_never_panic_and_keep_their_audits() {
         nr::PROCESS_CLONE_REGION,
     ] {
         assert!(
-            succeeded.get(&n).copied().unwrap_or(0) > 5,
+            cfg!(miri) || succeeded.get(&n).copied().unwrap_or(0) > 5, // (Miri: too short a run to promise it)
             "call {n} never did anything: {succeeded:?}"
         );
     }
