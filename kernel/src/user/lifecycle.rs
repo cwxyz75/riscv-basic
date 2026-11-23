@@ -420,7 +420,7 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
         ksys::thread_suspend_forget(s, tid);
         sync_suspends(s);
         let pid = s.thread_pid.remove(&tid)?;
-        pi_thread_gone(tid, pid); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
+        pi_thread_gone(s, tid, pid); // (a PI futex it owned is poisoned, and it leaves the donation graph: L23)
         let UserState { objs, procs, .. } = s;
         let p = procs.get_mut(&pid)?;
         p.live_tids.remove(&tid);
@@ -474,6 +474,11 @@ pub(super) fn leave(code: i32, whole: bool) -> ! {
 /// Whether the calling thread has a pending `thread_interrupt` (for wait conditions; interrupts are off or the lock is held).
 pub(super) fn interrupted_now() -> bool {
     with_state(|s| s.interrupts.contains(&thread::current()))
+}
+
+/// `interrupted_now` for a caller that has the state open already.
+pub(super) fn interrupted_in(s: &UserState) -> bool {
+    s.interrupts.contains(&thread::current())
 }
 
 /// Take the calling thread's pending interrupt, if any: the blocking call that reports INTERRUPTED does this.
@@ -533,10 +538,13 @@ pub(super) fn take_interrupt_held() -> bool {
 
 /// The exit code the calling thread's process was told to die with (`process_kill`), if any.
 pub(super) fn killed_now() -> Option<i32> {
-    with_state(|s| {
-        let pid = s.thread_pid.get(&thread::current())?;
-        s.procs.get(pid)?.killed
-    })
+    with_state(|s| killed_in(s))
+}
+
+/// `killed_now` for a caller that has the state open already.
+pub(super) fn killed_in(s: &UserState) -> Option<i32> {
+    let pid = s.thread_pid.get(&thread::current())?;
+    s.procs.get(pid)?.killed
 }
 
 /// Where a stopped process stops, a suspended thread stops (`thread_suspend`, EX1) and a killed one dies: the calling thread's return to user
