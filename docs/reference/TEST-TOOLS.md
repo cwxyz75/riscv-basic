@@ -67,6 +67,11 @@ harts may not reproduce under it, and its instruction-counted time changes what 
 **Repeat.** `make os-repeat TARGET=<target> N=<n>` runs a target N times, one at a time, prints `pass/N` and keeps the
 serial log of every failing run in `target/repeat/`. Over a soak target this is a soak run (`TESTING.md` rule 6).
 
+**Where a panic came from.** A kernel `##PANIC` line from a thread that entered from user mode ends with `[stack 0x... 0x...]`: the words on its
+kernel stack that point into the kernel's code, innermost first (the panic handler's own frames, then the return addresses of the calls that led
+here, among a few stale ones). `python3 scripts/resolve_trace.py <kernel ELF> <log file>` names the symbol nearest each address (it needs only
+`nm`); `llvm-addr2line -e <ELF> <addr>` gives the line. It is how a panic whose location is the standard library's (T233) is traced to its caller.
+
 **The harness can see a failure.** `make os-boot-test-fail-demo` boots a kernel built with a deliberate fault and
 requires the harness to fail it; CI runs it when the harness or the Makefile changed.
 
